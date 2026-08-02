@@ -667,4 +667,56 @@ class TestAsyncQueueLogging:
             for h in hermes_logging.rotating_file_handlers()
         )
 
+class TestLogFilePermissionsS1:
+    """AUDIT-20260801 S-1: logs carry channel credentials (ntfy topics are
+    bearer tokens) and session text, so the umask default of 0644
+    (world-readable) is too loose on a single-user install."""
+
+    def test_unmanaged_initial_open_is_owner_only(self, tmp_path):
+        log_path = tmp_path / "unmanaged-open.log"
+        logger = logging.getLogger("_test_rotating_unmanaged_open")
+        formatter = logging.Formatter("%(message)s")
+
+        old_umask = os.umask(0o022)
+        try:
+            with patch("hermes_cli.config.is_managed", return_value=False):
+                hermes_logging._add_rotating_handler(
+                    logger, log_path,
+                    level=logging.INFO, max_bytes=1024, backup_count=1,
+                    formatter=formatter,
+                )
+        finally:
+            os.umask(old_umask)
+
+        assert log_path.exists()
+        mode = stat.S_IMODE(log_path.stat().st_mode)
+        assert mode == 0o600
+        assert not mode & 0o077  # no group/other access at all
+
+    def test_unmanaged_rollover_is_owner_only(self, tmp_path):
+        """A rotated file must not silently regain 0644."""
+        log_path = tmp_path / "unmanaged-rollover.log"
+        logger = logging.getLogger("_test_rotating_unmanaged_rollover")
+        formatter = logging.Formatter("%(message)s")
+
+        old_umask = os.umask(0o022)
+        try:
+            with patch("hermes_cli.config.is_managed", return_value=False):
+                hermes_logging._add_rotating_handler(
+                    logger, log_path,
+                    level=logging.INFO, max_bytes=1, backup_count=1,
+                    formatter=formatter,
+                )
+                logger.info("a" * 256)
+                hermes_logging.flush_log_queue()
+        finally:
+            os.umask(old_umask)
+
+        assert log_path.exists()
+        assert stat.S_IMODE(log_path.stat().st_mode) == 0o600
+
+        for h in list(logger.handlers):
+            if isinstance(h, RotatingFileHandler):
+                logger.removeHandler(h)
+                h.close()
 

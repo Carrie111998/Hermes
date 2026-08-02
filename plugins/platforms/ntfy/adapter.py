@@ -67,6 +67,11 @@ from gateway.platforms.base import (
     MessageType,
     SendResult,
 )
+# An ntfy topic is a bearer credential — anyone who knows it can read the
+# channel and publish into it (see the identity-model note in the module
+# docstring). It must never be logged verbatim; ``mask_topic`` keeps only the
+# last 6 chars, matching the hermes-push-ntfy plugin's helper exactly.
+from agent.redact import mask_topic
 
 from agent.secret_scope import UnscopedSecretError as _UnscopedSecretError
 from agent.secret_scope import get_secret as _scoped_get_secret
@@ -220,7 +225,10 @@ class NtfyAdapter(BasePlatformAdapter):
             self._http_client = httpx.AsyncClient(timeout=None)
             self._stream_task = asyncio.create_task(self._run_stream())
             self._mark_connected()
-            logger.info("[%s] Connected — subscribing to %s/%s", self.name, self._server, self._topic)
+            logger.info(
+                "[%s] Connected — subscribing to %s/%s",
+                self.name, self._server, mask_topic(self._topic),
+            )
             return True
         except Exception as e:
             logger.error("[%s] Failed to connect: %s", self.name, e)
@@ -231,11 +239,13 @@ class NtfyAdapter(BasePlatformAdapter):
         backoff_idx = 0
         stream_start: float = 0.0
         url = f"{self._server}/{self._topic}/json"
+        # Never log ``url`` — it embeds the topic. Log this instead.
+        masked_url = f"{self._server}/{mask_topic(self._topic)}/json"
         headers = self._auth_headers()
 
         while self._running:
             try:
-                logger.debug("[%s] Opening stream to %s", self.name, url)
+                logger.debug("[%s] Opening stream to %s", self.name, masked_url)
                 stream_start = time.monotonic()
                 await self._consume_stream(url, headers)
             except asyncio.CancelledError:
@@ -284,11 +294,11 @@ class NtfyAdapter(BasePlatformAdapter):
             if response.status_code == 404:
                 logger.error(
                     "[%s] Topic not found (404): %s — stopping reconnect loop.",
-                    self.name, self._topic,
+                    self.name, mask_topic(self._topic),
                 )
                 self._set_fatal_error(
                     "ntfy_topic_not_found",
-                    f"ntfy topic '{self._topic}' returned 404. Check NTFY_TOPIC.",
+                    f"ntfy topic '{mask_topic(self._topic)}' returned 404. Check NTFY_TOPIC.",
                     retryable=False,
                 )
                 raise _FatalStreamError("404 Not Found")
@@ -383,7 +393,7 @@ class NtfyAdapter(BasePlatformAdapter):
             timestamp=timestamp,
         )
 
-        logger.debug("[%s] Message on topic %s: %s", self.name, topic, text[:80])
+        logger.debug("[%s] Message on topic %s: %s", self.name, mask_topic(topic), text[:80])
         await self.handle_message(message_event)
 
     # -- Deduplication ------------------------------------------------------

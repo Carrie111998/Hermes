@@ -831,3 +831,105 @@ class TestKeywordWordBoundary:
         assert "hunter2hunter2hunter2hh" not in result
 
 
+class TestNtfyTopicRedaction:
+    """AUDIT-20260801 S-1 — an ntfy topic IS the channel credential.
+
+    Anyone who learns the topic can read every message on it and publish
+    into it. Topics carry no vendor prefix, so no other pass in this module
+    catches them; the configured values are redacted by literal.
+    """
+
+    TOPIC = "hermes-in-8f3a91c47bde"
+
+    @pytest.fixture(autouse=True)
+    def _clear_topic_cache(self):
+        # The compiled alternation is cached against the raw env tuple;
+        # reset it so tests don't inherit a sibling test's pattern.
+        import agent.redact as _r
+        _r._ntfy_topic_cache = ((), None)
+        yield
+        _r._ntfy_topic_cache = ((), None)
+
+    def test_mask_topic_keeps_last_six(self):
+        from agent.redact import mask_topic
+        assert mask_topic(self.TOPIC) == "…c47bde"
+
+    def test_mask_topic_matches_push_plugin_semantics(self):
+        """Must stay byte-identical to hermes-push-ntfy's mask_topic()."""
+        from agent.redact import mask_topic
+        def reference(topic):  # ntfy_sender.py:95
+            return ("…" + topic[-6:]) if len(topic) > 6 else "…"
+        for t in (self.TOPIC, "abcdefg", "short", "exactly6"):
+            assert mask_topic(t) == reference(t)
+
+    def test_short_and_empty_topics_fully_masked(self):
+        from agent.redact import mask_topic
+        assert mask_topic("short") == "…"
+        assert mask_topic("") == "…"
+
+    def test_configured_topic_redacted_from_text(self, monkeypatch):
+        monkeypatch.setenv("NTFY_TOPIC", self.TOPIC)
+        text = f"Connected — subscribing to https://ntfy.sh/{self.TOPIC}"
+        result = redact_sensitive_text(text)
+        assert self.TOPIC not in result
+        assert "…c47bde" in result
+
+    def test_publish_topic_also_redacted(self, monkeypatch):
+        pub = "hermes-out-9d2b7e1caf40"
+        monkeypatch.setenv("NTFY_PUBLISH_TOPIC", pub)
+        result = redact_sensitive_text(f"home channel ntfy:{pub}")
+        assert pub not in result
+        assert "…1caf40" in result
+
+    def test_no_topic_configured_is_a_noop(self, monkeypatch):
+        for var in ("NTFY_TOPIC", "NTFY_PUBLISH_TOPIC",
+                    "NTFY_HOME_CHANNEL", "HERMES_PUSH_NTFY_TOPIC"):
+            monkeypatch.delenv(var, raising=False)
+        text = f"subscribing to {self.TOPIC}"
+        assert redact_sensitive_text(text) == text
+
+    def test_short_topic_below_floor_not_swept(self, monkeypatch):
+        """Short topic names would otherwise mangle unrelated prose."""
+        monkeypatch.setenv("NTFY_TOPIC", "hermes-in")
+        text = "hermes-in is the default topic name"
+        assert redact_sensitive_text(text) == text
+
+    def test_env_change_invalidates_cache(self, monkeypatch):
+        monkeypatch.setenv("NTFY_TOPIC", self.TOPIC)
+        assert self.TOPIC not in redact_sensitive_text(self.TOPIC)
+        rotated = "hermes-in-0000deadbeef"
+        monkeypatch.setenv("NTFY_TOPIC", rotated)
+        out = redact_sensitive_text(f"{self.TOPIC} {rotated}")
+        assert rotated not in out
+        assert self.TOPIC in out  # old topic no longer configured
+
+    def test_log_formatter_redacts_topic(self, monkeypatch):
+        monkeypatch.setenv("NTFY_TOPIC", self.TOPIC)
+        formatter = RedactingFormatter("%(message)s")
+        record = logging.LogRecord(
+            name="t", level=logging.INFO, pathname="", lineno=0,
+            msg="subscribing to %s/%s",
+            args=("https://ntfy.sh", self.TOPIC), exc_info=None,
+        )
+        out = formatter.format(record)
+        assert self.TOPIC not in out
+        assert "…c47bde" in out
+
+
+class TestMaskHomeChannelId:
+    """Only ntfy chat ids are credentials; every other platform's id is an
+    opaque routing identifier operators need verbatim for debugging."""
+
+    def test_ntfy_chat_id_is_masked(self):
+        from agent.redact import mask_home_channel_id
+        assert mask_home_channel_id("ntfy", "hermes-out-9d2b7e1caf40") == "…1caf40"
+
+    def test_other_platforms_pass_through(self):
+        from agent.redact import mask_home_channel_id
+        assert mask_home_channel_id("telegram", -1001234567890) == "-1001234567890"
+        assert mask_home_channel_id("discord", "123456789") == "123456789"
+
+    def test_none_chat_id_is_safe(self):
+        from agent.redact import mask_home_channel_id
+        assert mask_home_channel_id("ntfy", None) == "…"
+        assert mask_home_channel_id("telegram", None) == ""

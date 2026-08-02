@@ -490,4 +490,79 @@ class TestTruncateHelper:
     def test_short_message_passes_through(self):
         assert _ntfy._truncate_body("hi", context="test") == b"hi"
 
+class TestFatalErrorMaskingS1:
+    """A realistic high-entropy topic must not survive into the fatal-error
+    message — it is surfaced to operators and written to logs."""
+
+    def test_404_message_masks_long_topic(self):
+        secret = "hermes-in-8f3a91c47bde"
+        adapter = NtfyAdapter(PlatformConfig(enabled=True, extra={"topic": secret}))
+        adapter._http_client = MagicMock()
+
+        mock_response = MagicMock()
+        mock_response.status_code = 404
+        mock_cm = AsyncMock()
+        mock_cm.__aenter__ = AsyncMock(return_value=mock_response)
+        mock_cm.__aexit__ = AsyncMock(return_value=None)
+        adapter._http_client.stream = MagicMock(return_value=mock_cm)
+
+        fake_httpx = MagicMock()
+        fake_httpx.Timeout = MagicMock()
+        with patch.object(_ntfy, "httpx", fake_httpx):
+            with pytest.raises(_ntfy._FatalStreamError):
+                _run(adapter._consume_stream("https://ntfy.example/t/json", {}))
+
+        assert secret not in adapter._fatal_error_message
+        assert "…c47bde" in adapter._fatal_error_message
+
+
+class TestTopicMaskingInLogs:
+    """Regression guard for AUDIT-20260801 S-1.
+
+    The live inbound topic was found in cleartext in ~/.hermes/logs/agent.log
+    and gateway.log. An ntfy topic is a bearer credential — no logger call in
+    this adapter may emit it verbatim.
+    """
+
+    def test_connect_logs_masked_topic(self, caplog):
+        secret = "hermes-in-8f3a91c47bde"
+        adapter = NtfyAdapter(PlatformConfig(enabled=True, extra={"topic": secret}))
+
+        fake_httpx = MagicMock()
+        fake_httpx.AsyncClient = MagicMock(return_value=MagicMock())
+        # Close the coroutine instead of scheduling it — the stream task is
+        # irrelevant here and an un-awaited coroutine emits a RuntimeWarning.
+        def _swallow_task(coro):
+            coro.close()
+            return MagicMock()
+        with patch.object(_ntfy, "httpx", fake_httpx), \
+                patch.object(_ntfy, "HTTPX_AVAILABLE", True), \
+                patch.object(_ntfy.asyncio, "create_task", _swallow_task):
+            with caplog.at_level("INFO"):
+                assert _run(adapter.connect()) is True
+
+        joined = "\n".join(r.getMessage() for r in caplog.records)
+        assert secret not in joined
+        assert "…c47bde" in joined
+
+    def test_adapter_uses_the_canonical_mask_helper(self):
+        """No second masking helper with divergent semantics (task S-1)."""
+        from agent.redact import mask_topic as canonical
+        assert _ntfy.mask_topic is canonical
+
+    def test_message_handler_logs_masked_topic(self, caplog):
+        secret = "hermes-in-8f3a91c47bde"
+        adapter = NtfyAdapter(PlatformConfig(enabled=True, extra={"topic": secret}))
+        adapter.handle_message = AsyncMock()
+
+        with caplog.at_level("DEBUG"):
+            _run(adapter._on_message({
+                "id": "abc123",
+                "message": "hello",
+                "topic": secret,
+                "time": 0,
+            }))
+
+        joined = "\n".join(r.getMessage() for r in caplog.records)
+        assert secret not in joined
 
