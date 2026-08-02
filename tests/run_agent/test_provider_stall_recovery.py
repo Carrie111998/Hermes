@@ -219,7 +219,7 @@ def test_first_zero_chunk_stall_probes_cancels_and_retries_with_fresh_client(
     agent, monkeypatch
 ):
     _install_policy(monkeypatch)
-    monkeypatch.setenv("HERMES_STREAM_RETRIES", "0")
+    monkeypatch.setenv("HERMES_STREAM_RETRIES", "1")
     first_aborted = threading.Event()
     first_client = _client(_BlockingStream(first_aborted))
     second_client = _client(iter([_chunk("recovered", finish_reason="stop")]))
@@ -249,6 +249,36 @@ def test_first_zero_chunk_stall_probes_cancels_and_retries_with_fresh_client(
         "⚠️ No response chunks from unknown/test/model for 0s; "
         "endpoint reachable but request wedged. Reconnecting once with a fresh connection."
     ]
+
+
+def test_explicit_zero_stream_retries_prevents_same_provider_stall_retry(
+    agent, monkeypatch
+):
+    _install_policy(monkeypatch, retries=1)
+    monkeypatch.setenv("HERMES_STREAM_RETRIES", "0")
+    aborted = threading.Event()
+    client = _client(_BlockingStream(aborted))
+    agent._create_request_openai_client = MagicMock(return_value=client)
+    agent._abort_request_openai_client = MagicMock(
+        side_effect=lambda request_client, reason: aborted.set()
+    )
+    statuses: list[str] = []
+    agent._buffer_status = statuses.append
+    probe = MagicMock(
+        return_value=ProbeOutcome(
+            status="reachable", http_status=401, detail="endpoint returned HTTP 401"
+        )
+    )
+    monkeypatch.setattr("agent.chat_completion_helpers.probe_provider_endpoint", probe)
+
+    with pytest.raises(ProviderStalledError) as caught:
+        agent._interruptible_streaming_api_call({"model": "test/model"})
+
+    assert caught.value.attempt == 1
+    assert probe.call_count == 1
+    assert agent._create_request_openai_client.call_count == 1
+    assert aborted.is_set()
+    assert statuses == []
 
 
 def test_chunk_arriving_during_probe_prevents_cancellation(agent, monkeypatch):
@@ -297,7 +327,7 @@ def test_chunk_released_after_probe_recheck_cannot_reach_any_callback(
     agent, monkeypatch
 ):
     _install_policy(monkeypatch)
-    monkeypatch.setenv("HERMES_STREAM_RETRIES", "0")
+    monkeypatch.setenv("HERMES_STREAM_RETRIES", "1")
     release_chunk = threading.Event()
     chunk_yielded = threading.Event()
     first_aborted = threading.Event()
@@ -401,7 +431,7 @@ def test_interrupt_during_blocked_probe_aborts_promptly_and_never_retries(
 
 def test_late_chunks_from_cancelled_stall_attempt_are_discarded(agent, monkeypatch):
     _install_policy(monkeypatch, probe=False)
-    monkeypatch.setenv("HERMES_STREAM_RETRIES", "0")
+    monkeypatch.setenv("HERMES_STREAM_RETRIES", "1")
     first_aborted = threading.Event()
     clients = [
         _client(_BlockingStream(first_aborted, late_chunk="late")),

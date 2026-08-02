@@ -971,7 +971,7 @@ agent:
 - `enabled` controls the bounded recovery path after a zero-chunk interval expires.
 - `health_probe_enabled` opts into one diagnostic, credential-free HTTP `HEAD` request to the provider base URL. Hermes sends no API credential, prompt, generation payload, or response content, does not follow redirects, and never uses the probe to keep the stalled inference request alive. **Any HTTP status means only that the endpoint is reachable**—including 4xx or 5xx—not that authentication, inference, the selected model, or the provider is healthy.
 - `health_probe_timeout_seconds` bounds that diagnostic request (default `5`; values are clamped to 1–30 seconds).
-- `same_provider_retries` is bounded to `0` or `1` (default `1`). With `1`, Hermes cancels the stalled transport and makes exactly one fresh-connection retry on the same provider.
+- `same_provider_retries` is bounded to `0` or `1` (default `1`). With `1`, Hermes cancels the stalled transport and makes at most one fresh-connection retry on the same provider. This retry consumes the existing `HERMES_STREAM_RETRIES` budget, so an explicit `HERMES_STREAM_RETRIES=0` disables it while preserving stall diagnosis and configured provider fallback.
 
 A real provider chunk can arrive while the probe is running, so Hermes rechecks the original attempt after the probe and lets that recovered response win. If the fresh same-provider attempt also reaches the zero-chunk interval, Hermes immediately activates the configured `fallback_providers` chain instead of starting another stall retry. Without a fallback, the turn ends with a specific provider/model, silent-duration, attempt, and probe diagnosis rather than retrying indefinitely.
 

@@ -2753,6 +2753,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     # Resolve once for the whole logical streaming call.  In particular, do
     # not reload config between the request-local reconnect attempts below.
     stall_recovery_config = get_provider_stall_recovery_config()
+    _max_stream_retries = env_int("HERMES_STREAM_RETRIES", 2)
 
     # Cross-turn stale-stream circuit breaker (#58962) — see the canonical
     # comment block above ``_stale_streak()``.  Raises past the give-up
@@ -2992,6 +2993,14 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     def _current_stream_attempt_id() -> int:
         with stream_attempt_lock:
             return int(stream_attempt_state.get("current") or 0)
+
+    def _same_provider_stall_retry_available() -> bool:
+        """Return whether both stall-specific and overall retry budgets allow it."""
+        return (
+            stall_recovery["zero_chunk_stalls"]
+            <= stall_recovery_config.same_provider_retries
+            and _current_stream_attempt_id() <= _max_stream_retries
+        )
 
     def _zero_chunk_probe_snapshot() -> tuple[int, float] | None:
         with stream_attempt_lock:
@@ -3798,8 +3807,6 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     def _call():
         import httpx as _httpx
 
-        _max_stream_retries = env_int("HERMES_STREAM_RETRIES", 2)
-
         try:
             _stream_attempt = 0  # Generic transient-retry index only.
             while _stream_attempt <= _max_stream_retries:
@@ -3835,18 +3842,16 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     _stall = _zero_chunk_stall_for_attempt(stream_attempt_id)
                     if stall_recovery_config.enabled and _stall is not None:
                         _silent_seconds, _probe = _stall
-                        if (
-                            stall_recovery["zero_chunk_stalls"]
-                            <= stall_recovery_config.same_provider_retries
-                        ):
-                            # This retry budget is deliberately independent of
-                            # HERMES_STREAM_RETRIES.  The watchdog already
-                            # socket-aborted this request-local transport; the
-                            # worker-owned cleanup below releases it before the
-                            # next attempt creates a fresh client.
+                        if _same_provider_stall_retry_available():
+                            # The watchdog already socket-aborted this
+                            # request-local transport; worker-owned cleanup
+                            # releases it before the next attempt creates a
+                            # fresh client. This reconnect consumes the same
+                            # overall budget as every other stream retry.
                             _close_request_client_once(
                                 "provider_zero_chunk_stall_retry_cleanup"
                             )
+                            _stream_attempt += 1
                             continue
                         result["error"] = ProviderStalledError(
                             provider=str(
@@ -4334,18 +4339,16 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     attempt=stall_recovery["zero_chunk_stalls"],
                     probe=_probe,
                 )
-                if (
-                    stall_recovery["zero_chunk_stalls"]
-                    <= stall_recovery_config.same_provider_retries
-                ):
+                if _same_provider_stall_retry_available():
                     agent._buffer_status(
                         format_provider_stall_status(_stall_error, "reconnecting")
                     )
 
-                _stall_log = logger.info if (
-                    stall_recovery["zero_chunk_stalls"]
-                    <= stall_recovery_config.same_provider_retries
-                ) else logger.warning
+                _stall_log = (
+                    logger.info
+                    if _same_provider_stall_retry_available()
+                    else logger.warning
+                )
                 _stall_log(
                     "Provider stall provider=%s model=%s attempt=%s silent_seconds=%.3f "
                     "probe_status=%s probe_http_status=%s",
