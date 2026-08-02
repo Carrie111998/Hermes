@@ -284,7 +284,14 @@ def write_session_markdown(
     return path
 
 
-def append_manifest_entry(output_dir: Path | str, session: dict[str, Any], path: Path | str, *, fmt: str) -> Path:
+def append_manifest_entry(
+    output_dir: Path | str,
+    session: dict[str, Any],
+    path: Path | str,
+    *,
+    fmt: str,
+    source_fingerprint: str | None = None,
+) -> Path:
     out_dir = Path(output_dir).expanduser()
     out_dir.mkdir(parents=True, exist_ok=True)
     export_path = Path(path)
@@ -297,6 +304,8 @@ def append_manifest_entry(output_dir: Path | str, session: dict[str, Any], path:
         "sha256": file_sha256(export_path),
         "exported_at": time.time(),
     }
+    if source_fingerprint:
+        entry["source_fingerprint"] = source_fingerprint
     manifest = out_dir / "manifest.jsonl"
     with manifest.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n")
