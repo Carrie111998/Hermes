@@ -156,6 +156,57 @@ class TestBlockingGatewayApproval:
         assert not e2.event.is_set()
         assert len(_gateway_queues[session_key]) == 1
 
+    def test_exact_entries_require_id_and_isolate_concurrent_siblings(self):
+        """FIFO/all/scope grants cannot select exact one-operation entries."""
+        from tools.approval import (
+            _ApprovalEntry,
+            _gateway_queues,
+            resolve_gateway_approval,
+            resolve_gateway_approval_by_id,
+        )
+
+        session_key = "test-exact-concurrent"
+        exact_data = {
+            "command": "opaque",
+            "allow_permanent": False,
+            "allow_session": False,
+            "exact_execution": True,
+        }
+        first = _ApprovalEntry(exact_data)
+        second = _ApprovalEntry(exact_data)
+        _gateway_queues[session_key] = [first, second]
+
+        assert resolve_gateway_approval(session_key, "once") == 0
+        assert resolve_gateway_approval(
+            session_key,
+            "deny",
+            resolve_all=True,
+        ) == 0
+        assert resolve_gateway_approval_by_id(
+            session_key,
+            second.approval_id,
+            "session",
+        ) == 0
+        assert not first.event.is_set()
+        assert not second.event.is_set()
+
+        assert resolve_gateway_approval_by_id(
+            session_key,
+            second.approval_id,
+            "once",
+        ) == 1
+        assert second.event.is_set()
+        assert second.result == "once"
+        assert not first.event.is_set()
+
+        assert resolve_gateway_approval_by_id(
+            session_key,
+            first.approval_id,
+            "deny",
+        ) == 1
+        assert first.event.is_set()
+        assert first.result == "deny"
+
 
 # ------------------------------------------------------------------
 # /approve command
@@ -204,6 +255,38 @@ class TestApproveCommand:
         assert e1.result == "session"
         assert e2.result == "session"
 
+    @pytest.mark.asyncio
+    async def test_exact_approve_requires_id_and_once_scope(self):
+        from tools.approval import _ApprovalEntry, _gateway_queues
+
+        runner = _make_runner()
+        source = _make_source()
+        session_key = runner._session_key_for_source(source)
+        entry = _ApprovalEntry({
+            "command": "exact",
+            "allow_permanent": False,
+            "allow_session": False,
+            "exact_execution": True,
+        })
+        _gateway_queues[session_key] = [entry]
+
+        missing_id = await runner._handle_approve_command(
+            _make_event("/approve all")
+        )
+        broad = await runner._handle_approve_command(
+            _make_event(f"/approve {entry.approval_id} session")
+        )
+        assert "opaque ID" in missing_id
+        assert "only one operation" in broad
+        assert not entry.event.is_set()
+
+        accepted = await runner._handle_approve_command(
+            _make_event(f"/approve {entry.approval_id}")
+        )
+        assert "approved" in accepted.lower()
+        assert entry.event.is_set()
+        assert entry.result == "once"
+
 
 # ------------------------------------------------------------------
 # /deny command
@@ -214,6 +297,33 @@ class TestDenyCommand:
 
     def setup_method(self):
         _clear_approval_state()
+
+    @pytest.mark.asyncio
+    async def test_exact_deny_requires_id(self):
+        from tools.approval import _ApprovalEntry, _gateway_queues
+
+        runner = _make_runner()
+        source = _make_source()
+        session_key = runner._session_key_for_source(source)
+        entry = _ApprovalEntry({
+            "command": "exact",
+            "allow_permanent": False,
+            "allow_session": False,
+            "exact_execution": True,
+        })
+        _gateway_queues[session_key] = [entry]
+
+        missing_id = await runner._handle_deny_command(_make_event("/deny all"))
+        assert "opaque ID" in missing_id
+        assert not entry.event.is_set()
+
+        accepted = await runner._handle_deny_command(
+            _make_event(f"/deny {entry.approval_id} not now")
+        )
+        assert "denied" in accepted.lower()
+        assert entry.event.is_set()
+        assert entry.result == "deny"
+        assert entry.reason == "not now"
 
 
     @pytest.mark.asyncio

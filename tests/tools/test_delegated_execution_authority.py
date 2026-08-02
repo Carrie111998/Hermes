@@ -143,15 +143,6 @@ def test_temp_root_real_terminal_and_execute_code_paths_use_exact_plan(
 ):
     command = "pwd"
     code = "print('stage-b-code-ok')\n"
-    approval.grant_plan_capability(
-        session_key=SESSION_KEY,
-        plan_id="plan-stage-b-e2e",
-        exact_commands=[command],
-        exact_code_scripts=[code],
-        approved_by_user_id=OWNER_ID,
-        max_uses_per_command=1,
-    )
-
     config = {
         "env_type": "local",
         "cwd": str(tmp_path),
@@ -165,6 +156,14 @@ def test_temp_root_real_terminal_and_execute_code_paths_use_exact_plan(
     monkeypatch.setattr(terminal_tool, "_last_activity", {})
     monkeypatch.setattr(terminal_tool, "_task_env_overrides", {})
     monkeypatch.setattr(terminal_tool, "_session_cwd", {})
+    approval.grant_plan_capability(
+        session_key=SESSION_KEY,
+        plan_id="plan-stage-b-e2e",
+        exact_commands=[command],
+        exact_code_scripts=[code],
+        approved_by_user_id=OWNER_ID,
+        max_uses_per_command=1,
+    )
 
     session_token, delegated_token = _bind_delegated_session()
     try:

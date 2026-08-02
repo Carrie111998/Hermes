@@ -47,7 +47,6 @@ def _isolated_local_capability_runtime(monkeypatch):
         "max_concurrent_children": 4,
         "max_spawn_depth": 2,
         "orchestrator_enabled": True,
-        "subagent_auto_approve": False,
     }
     monkeypatch.setattr(delegate_tool, "_load_config", lambda: delegation_config)
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *args, **kwargs: None)

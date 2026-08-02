@@ -970,10 +970,22 @@ def _format_exec_approval_fallback(
     *,
     allow_permanent: bool = True,
     allow_session: bool = True,
+    approval_id: str = "",
+    exact_execution: bool = False,
 ) -> str:
     """Render a mechanical owner-approval prompt from declared capabilities."""
     cmd_preview = command[:200] + "..." if len(command) > 200 else command
     heading = "⚠️ **Dangerous command requires approval:**"
+
+    if exact_execution:
+        if re.fullmatch(r"[0-9a-f]{32}", str(approval_id or "")) is None:
+            raise ValueError("exact approval fallback requires one opaque approval ID")
+        return (
+            f"{heading}\n"
+            f"```\n{cmd_preview}\n```\nReason: {description}\n\n"
+            f"Reply `{command_prefix}approve {approval_id}` to execute only "
+            f"this operation, or `{command_prefix}deny {approval_id}` to cancel it."
+        )
 
     choices = [f"Reply `{command_prefix}approve` to execute this one operation"]
     if allow_session:
@@ -6515,6 +6527,8 @@ class TurnRunner:
                 _p,
                 allow_permanent=approval_data.get("allow_permanent", True),
                 allow_session=approval_data.get("allow_session", True),
+                approval_id=str(approval_data.get("approval_id", "") or ""),
+                exact_execution=approval_data.get("exact_execution") is True,
             )
             try:
                 _approval_send_fut = safe_schedule_threadsafe(

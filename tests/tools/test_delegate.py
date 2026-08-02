@@ -3441,9 +3441,8 @@ class TestSubagentApprovalCallback(unittest.TestCase):
     installed so dangerous-command prompts don't fall back to input() and
     deadlock the parent's prompt_toolkit TUI.
 
-    Governed by delegation.subagent_auto_approve:
-      false (default) → _subagent_auto_deny
-      true            → _subagent_auto_approve
+    Exact plan capability consumption happens before this compatibility
+    callback. The callback itself is unconditionally deny-only.
     """
 
     def test_auto_deny_returns_deny(self):
@@ -3451,13 +3450,6 @@ class TestSubagentApprovalCallback(unittest.TestCase):
         self.assertEqual(
             _subagent_auto_deny("rm -rf /tmp/x", "dangerous"),
             "deny",
-        )
-
-    def test_auto_approve_returns_once(self):
-        from tools.delegate_tool import _subagent_auto_approve
-        self.assertEqual(
-            _subagent_auto_approve("rm -rf /tmp/x", "dangerous"),
-            "once",
         )
 
     @patch("tools.delegate_tool._load_config", return_value={})
@@ -3483,24 +3475,23 @@ class TestSubagentApprovalCallback(unittest.TestCase):
         "tools.delegate_tool._load_config",
         return_value={"subagent_auto_approve": True},
     )
-    def test_getter_true_is_approve(self, _mock_cfg):
+    def test_removed_true_config_cannot_restore_auto_approval(self, _mock_cfg):
         from tools.delegate_tool import (
             _get_subagent_approval_callback,
-            _subagent_auto_approve,
+            _subagent_auto_deny,
         )
-        self.assertIs(_get_subagent_approval_callback(), _subagent_auto_approve)
+        self.assertIs(_get_subagent_approval_callback(), _subagent_auto_deny)
 
     @patch(
         "tools.delegate_tool._load_config",
         return_value={"subagent_auto_approve": "yes"},
     )
-    def test_getter_truthy_string_is_approve(self, _mock_cfg):
-        """is_truthy_value accepts 'yes'/'1'/'true' as truthy."""
+    def test_removed_truthy_config_cannot_restore_auto_approval(self, _mock_cfg):
         from tools.delegate_tool import (
             _get_subagent_approval_callback,
-            _subagent_auto_approve,
+            _subagent_auto_deny,
         )
-        self.assertIs(_get_subagent_approval_callback(), _subagent_auto_approve)
+        self.assertIs(_get_subagent_approval_callback(), _subagent_auto_deny)
 
     def test_executor_initializer_installs_callback_in_worker(self):
         """The initializer sets the callback on the worker thread's TLS,

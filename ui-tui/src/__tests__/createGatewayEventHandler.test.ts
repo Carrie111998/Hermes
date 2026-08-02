@@ -1175,6 +1175,7 @@ describe('createGatewayEventHandler', () => {
 
     onEvent({
       payload: {
+        approval_id: 'a'.repeat(32),
         allow_permanent: true,
         choices: ['once', 'deny'],
         command: 'rm -rf /tmp/x',
@@ -1183,7 +1184,10 @@ describe('createGatewayEventHandler', () => {
       type: 'approval.request'
     } as any)
 
-    expect(getOverlayState().approval).toMatchObject({ choices: ['once', 'deny'] })
+    expect(getOverlayState().approval).toMatchObject({
+      approvalId: 'a'.repeat(32),
+      choices: ['once', 'deny']
+    })
   })
 
   it('still surfaces terminal turn failures as errors', () => {

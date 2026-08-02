@@ -50,6 +50,7 @@ class TestTuiApprovalEmitRedaction:
     @pytest.mark.parametrize(
         ("data", "expected"),
         [
+            ({"allow_session": False}, ["once", "deny"]),
             ({"allow_permanent": False}, ["once", "session", "deny"]),
             ({"allow_permanent": True}, ["once", "session", "always", "deny"]),
         ],

@@ -913,17 +913,29 @@ def _(rid, params: dict) -> dict:
     if err:
         return err
     try:
-        from tools.approval import resolve_gateway_approval
+        from tools.approval import (
+            resolve_gateway_approval,
+            resolve_gateway_approval_by_id,
+        )
+
+        approval_id = str(params.get("approval_id") or "")
+        resolved = (
+            resolve_gateway_approval_by_id(
+                session["session_key"],
+                approval_id,
+                params.get("choice", "deny"),
+            )
+            if approval_id
+            else resolve_gateway_approval(
+                session["session_key"],
+                params.get("choice", "deny"),
+                resolve_all=params.get("all", False),
+            )
+        )
 
         return _ok(
             rid,
-            {
-                "resolved": resolve_gateway_approval(
-                    session["session_key"],
-                    params.get("choice", "deny"),
-                    resolve_all=params.get("all", False),
-                )
-            },
+            {"resolved": resolved},
         )
     except Exception as e:
         return _err(rid, 5004, str(e))

@@ -1043,10 +1043,8 @@ def _execute_remote(
     timeout = _cfg.get("timeout", DEFAULT_TIMEOUT)
     max_tool_calls = _cfg.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS)
 
-    session_tools = set(enabled_tools) if enabled_tools else set()
+    session_tools = set(enabled_tools) if enabled_tools is not None else set()
     sandbox_tools = frozenset(SANDBOX_ALLOWED_TOOLS & session_tools)
-    if not sandbox_tools:
-        sandbox_tools = SANDBOX_ALLOWED_TOOLS
 
     effective_task_id = task_id or "default"
     env, env_type = _get_or_create_env(effective_task_id)
@@ -1250,7 +1248,11 @@ def execute_code(
         return tool_error("No code provided.")
 
     # Dispatch: remote backends use file-based RPC, local uses UDS
-    from tools.terminal_tool import _get_env_config, _docker_has_host_access
+    from tools.terminal_tool import (
+        _docker_has_host_access,
+        _get_approval_callback,
+        _get_env_config,
+    )
     _env_config = _get_env_config()
     env_type = _env_config["env_type"]
 
@@ -1260,10 +1262,13 @@ def execute_code(
     # caller (tool-executor) thread, which holds the session context (#30882).
     # A Docker sandbox with host bind mounts is no longer isolated, so its
     # script does not get the container fast-path.
-    from tools.approval import check_execute_code_guard
+    from tools.approval import check_execute_code_guard, get_current_session_key
     _guard = check_execute_code_guard(
         code, env_type,
         has_host_access=_docker_has_host_access(_env_config),
+        env_config=_env_config,
+        session_key=get_current_session_key(default="") or (task_id or ""),
+        approval_callback=_get_approval_callback(),
     )
     if not _guard.get("approved", False):
         return json.dumps({
@@ -1297,11 +1302,8 @@ def execute_code(
     max_tool_calls = _cfg.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS)
 
     # Determine which tools the sandbox can call
-    session_tools = set(enabled_tools) if enabled_tools else set()
+    session_tools = set(enabled_tools) if enabled_tools is not None else set()
     sandbox_tools = frozenset(SANDBOX_ALLOWED_TOOLS & session_tools)
-
-    if not sandbox_tools:
-        sandbox_tools = SANDBOX_ALLOWED_TOOLS
 
     # --- Set up temp directory with hermes_tools.py and script.py ---
     tmpdir = tempfile.mkdtemp(prefix="hermes_sandbox_")
@@ -1340,8 +1342,8 @@ def execute_code(
         # those bytes; the child then fails to import with a SyntaxError
         # ("'utf-8' codec can't decode byte 0x97 in position ...") because
         # Python source files are decoded as UTF-8 by default (PEP 3120).
-        # sandbox_tools is already the correct set (intersection with session
-        # tools, or SANDBOX_ALLOWED_TOOLS as fallback — see lines above).
+        # sandbox_tools is the exact intersection with session tools.  An
+        # empty or non-overlapping toolset deliberately grants no RPC tools.
         tools_src = generate_hermes_tools_module(list(sandbox_tools))
         with open(os.path.join(tmpdir, "hermes_tools.py"), "w", encoding="utf-8") as f:
             f.write(tools_src)

@@ -398,9 +398,10 @@ def test_tools_writer_consume_requires_success_and_returns_plan_id(monkeypatch):
     )
     assert calls[0][0] == CanonicalWriterOperation.CAPABILITY_CONSUME.value
     assert calls[0][1]["idempotency_key"] == calls[0][2]
-    assert calls[0][1]["command_sha256"] == hashlib.sha256(
-        b"git status --short"
-    ).hexdigest()
+    assert calls[0][1]["command_sha256"] == approval._exact_execution_subject(
+        "terminal",
+        "git status --short",
+    )["subject_sha256"]
 
     monkeypatch.setattr(
         writer_boundary,

@@ -5706,8 +5706,9 @@ class GatewaySlashCommandsMixin:
         flow as the CLI's synchronous input() approval.
 
         Supports multiple concurrent approvals (parallel subagents,
-        execute_code).  ``/approve`` resolves the oldest pending command;
-        ``/approve all`` resolves every pending command at once.
+        execute_code). Legacy prompts retain FIFO/all controls. Exact
+        one-operation prompts require their opaque ID and never accept FIFO,
+        all, session, or permanent authority.
 
         Usage:
             /approve              — approve oldest pending command once
@@ -5735,7 +5736,9 @@ class GatewaySlashCommandsMixin:
         session_key = self._session_key_for_source(source)
 
         from tools.approval import (
+            get_pending_gateway_approvals,
             has_blocking_approval,
+            has_exact_blocking_approval,
             resolve_gateway_approval,
             resolve_gateway_approval_by_id,
             resolve_gateway_owner_escalation_by_id,
@@ -5774,6 +5777,30 @@ class GatewaySlashCommandsMixin:
             choice = "session"
         else:
             choice = "once"
+
+        local_pending = get_pending_gateway_approvals(session_key)
+        selected = next(
+            (
+                item for item in local_pending
+                if item.get("approval_id") == approval_id
+            ),
+            None,
+        )
+        if (
+            isinstance(selected, dict)
+            and selected.get("exact_execution") is True
+            and choice not in {"once", "deny"}
+        ):
+            return (
+                "Exact approvals allow only one operation. Use "
+                f"`/approve {approval_id}` or `/deny {approval_id}`."
+            )
+        if not approval_id and has_exact_blocking_approval(session_key):
+            return (
+                "An exact approval is pending. Use the opaque ID shown in its "
+                "prompt: `/approve <approval_id>` or `/deny <approval_id>`. "
+                "FIFO and `all` are unavailable for exact approvals."
+            )
 
         has_local_pending = has_blocking_approval(session_key)
         if not has_local_pending and not (production_boundary and approval_id):
@@ -5846,6 +5873,7 @@ class GatewaySlashCommandsMixin:
 
         from tools.approval import (
             has_blocking_approval,
+            has_exact_blocking_approval,
             resolve_gateway_approval,
             resolve_gateway_approval_by_id,
             resolve_gateway_owner_escalation_by_id,
@@ -5871,6 +5899,13 @@ class GatewaySlashCommandsMixin:
         # Cap to a sane one-liner; the agent only needs a short hint.
         if reason:
             reason = reason[:280].strip()
+
+        if not approval_id and has_exact_blocking_approval(session_key):
+            return (
+                "An exact approval is pending. Use the opaque ID shown in its "
+                "prompt: `/deny <approval_id> [reason]`. FIFO and `all` are "
+                "unavailable for exact approvals."
+            )
 
         has_local_pending = has_blocking_approval(session_key)
         if not has_local_pending and not (production_boundary and approval_id):

@@ -327,7 +327,9 @@ def _reset_cached_sudo_passwords() -> None:
 
 # Dangerous command detection + approval now consolidated in tools/approval.py
 from tools.approval import (
+    check_exact_execution_authority as _check_exact_execution_authority_impl,
     check_all_command_guards as _check_all_guards_impl,
+    _normalize_execution_cwd,
 )
 
 
@@ -353,11 +355,39 @@ def _docker_has_host_access(config: Dict[str, Any]) -> bool:
 
 
 def _check_all_guards(command: str, env_type: str,
-                      has_host_access: bool = False) -> dict:
+                      has_host_access: bool = False,
+                      env_config: Optional[dict] = None,
+                      resource_sha256: str = "",
+                      effective_cwd: str = "",
+                      session_key: str = "",
+                      exact_authority: Optional[dict] = None) -> dict:
     """Delegate to consolidated guard (tirith + dangerous cmd) with CLI callback."""
     return _check_all_guards_impl(command, env_type,
                                   approval_callback=_get_approval_callback(),
-                                  has_host_access=has_host_access)
+                                  has_host_access=has_host_access,
+                                  env_config=env_config,
+                                  resource_sha256=resource_sha256,
+                                  effective_cwd=effective_cwd,
+                                  session_key=session_key,
+                                  exact_authority=exact_authority)
+
+
+def _check_exact_authority(command: str, env_type: str,
+                           *, env_config: Optional[dict] = None,
+                           session_key: str = "",
+                           effective_cwd: str = "",
+                           has_host_access: bool = False) -> Optional[dict]:
+    """Resolve typed exact authority before command-content compatibility guards."""
+    return _check_exact_execution_authority_impl(
+        command,
+        "terminal",
+        env_type,
+        env_config=env_config,
+        effective_cwd=effective_cwd,
+        session_key=session_key,
+        has_host_access=has_host_access,
+        approval_callback=_get_approval_callback(),
+    )
 
 
 # Allowlist: characters that can legitimately appear in directory paths.
@@ -2649,6 +2679,76 @@ def terminal_tool(
 
         session_key = get_current_session_key(default="") or (task_id or "")
 
+        # Resolve and normalize the execution cwd once, before authority is
+        # checked.  The exact subject and every foreground/background/backend
+        # execution path below receive this same value, so an approval cannot
+        # be replayed under a different per-call workdir.
+        if workdir:
+            workdir_error = _validate_workdir(workdir)
+            if workdir_error:
+                logger.warning("Blocked dangerous workdir: %s (command: %s)",
+                               workdir[:200], _safe_command_preview(command))
+                return json.dumps({
+                    "output": "",
+                    "exit_code": -1,
+                    "error": workdir_error,
+                    "status": "blocked"
+                }, ensure_ascii=False)
+        cwd_base = (
+            get_session_cwd(session_key)
+            or getattr(env, "cwd", None)
+            or cwd
+        )
+        try:
+            effective_cwd = _normalize_execution_cwd(
+                _resolve_command_cwd(
+                    workdir=workdir,
+                    default_cwd=cwd_base,
+                    session_key=session_key,
+                ),
+                env_type=env_type,
+                env_config=config,
+                base_cwd=cwd_base,
+            )
+        except (TypeError, ValueError) as exc:
+            return json.dumps({
+                "output": "",
+                "exit_code": -1,
+                "error": f"Invalid workdir: {exc}",
+                "status": "blocked",
+            }, ensure_ascii=False)
+
+        # Exact model-authored plan authority is resolved before the legacy
+        # command-content compatibility guards below.  A hit is final and a
+        # miss inside exact-plan topology is returned without letting regex,
+        # deny/allow lists, lifecycle string parsing, Tirith, or YOLO override
+        # it. ``force`` remains an internal replay path for an already-resolved
+        # interactive prompt.
+        exact_authority = None
+        if not force:
+            exact_authority = _check_exact_authority(
+                command,
+                env_type,
+                env_config=config,
+                session_key=session_key,
+                effective_cwd=effective_cwd,
+                has_host_access=_docker_has_host_access(config),
+            )
+            if (
+                exact_authority is not None
+                and exact_authority.get("approved") is not True
+            ):
+                return json.dumps({
+                    "output": "",
+                    "exit_code": -1,
+                    "error": exact_authority.get("message") or (
+                        "Command is outside exact execution authority."
+                    ),
+                    "status": exact_authority.get("status") or "blocked",
+                    "outcome": exact_authority.get("outcome"),
+                    "error_code": exact_authority.get("error_code"),
+                }, ensure_ascii=False)
+
         # Hard-block: gateway lifecycle commands (systemctl/launchctl/hermes
         # restart|stop targeting hermes-gateway) must never run inside the
         # gateway process itself. The restart would SIGTERM the gateway, which
@@ -2656,7 +2756,10 @@ def terminal_tool(
         # never restart. This mirrors the `hermes gateway restart` guard in
         # hermes_cli/gateway.py and the cron-path guard in hermes_cli/cron.py,
         # but applies unconditionally (force=True cannot help here).
-        if os.environ.get("_HERMES_GATEWAY") == "1":
+        if (
+            exact_authority is None
+            and os.environ.get("_HERMES_GATEWAY") == "1"
+        ):
             from cron.lifecycle_guard import (
                 contains_gateway_lifecycle_command_or_referenced_script,
                 contains_launchctl_submit_command,
@@ -2673,14 +2776,7 @@ def terminal_tool(
                     ),
                     "status": "error",
                 }, ensure_ascii=False)
-            guard_cwd_base = get_session_cwd(session_key)
-            if guard_cwd_base is None:
-                guard_cwd_base = getattr(env, "cwd", None) or cwd
-            guard_cwd = _resolve_command_cwd(
-                workdir=workdir,
-                default_cwd=guard_cwd_base,
-                session_key=session_key,
-            )
+            guard_cwd = effective_cwd
 
             def _read_script_in_env(script_path: str) -> Optional[str]:
                 """Best-effort script read; uses env.execute only when local read fails.
@@ -2742,6 +2838,10 @@ def terminal_tool(
             approval = _check_all_guards(
                 command, env_type,
                 has_host_access=_docker_has_host_access(config),
+                env_config=config,
+                session_key=session_key,
+                effective_cwd=effective_cwd,
+                exact_authority=exact_authority,
             )
             if not approval["approved"]:
                 # Check if this is an approval_required (gateway ask mode)
@@ -2781,19 +2881,6 @@ def terminal_tool(
                 )
                 _approved_run = True
 
-        # Validate workdir against shell injection
-        if workdir:
-            workdir_error = _validate_workdir(workdir)
-            if workdir_error:
-                logger.warning("Blocked dangerous workdir: %s (command: %s)",
-                               workdir[:200], _safe_command_preview(command))
-                return json.dumps({
-                    "output": "",
-                    "exit_code": -1,
-                    "error": workdir_error,
-                    "status": "blocked"
-                }, ensure_ascii=False)
-
         # Prepare command for execution
         pty_disabled_reason = None
         effective_pty = pty
@@ -2813,11 +2900,6 @@ def terminal_tool(
             # For non-local backends: runs inside the sandbox via env.execute().
             from tools.process_registry import process_registry
 
-            effective_cwd = _resolve_command_cwd(
-                workdir=workdir,
-                default_cwd=cwd,
-                session_key=session_key,
-            )
             try:
                 if env_type == "local":
                     proc_session = process_registry.spawn_local(
@@ -3075,11 +3157,7 @@ def terminal_tool(
 
             while retry_count <= max_retries:
                 try:
-                    command_cwd = _resolve_command_cwd(
-                        workdir=workdir,
-                        default_cwd=cwd,
-                        session_key=session_key,
-                    )
+                    command_cwd = effective_cwd
                     execute_kwargs = {
                         "timeout": effective_timeout,
                         "cwd": command_cwd,

@@ -506,10 +506,7 @@ def test_producer_preserves_unrelated_config_and_seals_target() -> None:
     assert effective["memory"]["provider"] == ""
     assert effective["memory"]["memory_enabled"] is True
     assert effective["memory"]["user_profile_enabled"] is True
-    assert {
-        key: effective["delegation"][key]
-        for key in runtime._PRODUCTION_DELEGATION_CONFIG
-    } == runtime._PRODUCTION_DELEGATION_CONFIG
+    assert effective["delegation"] == runtime._PRODUCTION_DELEGATION_CONFIG
     assert "memory" in effective["platform_toolsets"]["api_server"]
     assert "memory" in effective["platform_toolsets"]["relay"]
     assert "memory" in effective["platform_toolsets"]["discord"]
@@ -570,6 +567,15 @@ def test_production_reasoning_baseline_migrates_once_without_semantic_routing() 
         match="production_agent_baseline_drifted",
     ):
         runtime.overlay_production_gateway_config(source)
+
+
+def test_overlay_removes_retired_broad_subagent_approval_knob() -> None:
+    source = _source_mapping()
+    source["delegation"]["subagent_auto_approve"] = True
+
+    effective = runtime.overlay_production_gateway_config(source)
+
+    assert effective["delegation"] == runtime._PRODUCTION_DELEGATION_CONFIG
 
 
 def test_validator_rejects_legacy_direct_helper_compatibility() -> None:

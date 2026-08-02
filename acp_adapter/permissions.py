@@ -38,19 +38,24 @@ def _permission_option_supports_kind(kind: str) -> bool:
     return True
 
 
-def _build_permission_options(*, allow_permanent: bool) -> list[PermissionOption]:
+def _build_permission_options(
+    *,
+    allow_permanent: bool,
+    allow_session: bool = True,
+) -> list[PermissionOption]:
     """Return ACP options that match Hermes approval semantics."""
     options = [PermissionOption(
         option_id="allow_once", kind="allow_once", name="Allow once",
     )]
-    options.append(PermissionOption(
-        option_id="allow_session",
-        # ACP has no session-scoped kind, so use the closest persistent
-        # hint while keeping Hermes semantics in the option id.
-        kind="allow_always",
-        name="Allow for session",
-    ))
-    if allow_permanent:
+    if allow_session:
+        options.append(PermissionOption(
+            option_id="allow_session",
+            # ACP has no session-scoped kind, so use the closest persistent
+            # hint while keeping Hermes semantics in the option id.
+            kind="allow_always",
+            name="Allow for session",
+        ))
+    if allow_session and allow_permanent:
         options.append(
             PermissionOption(
                 option_id="allow_always",
@@ -59,7 +64,7 @@ def _build_permission_options(*, allow_permanent: bool) -> list[PermissionOption
             ),
         )
     options.append(PermissionOption(option_id="deny", kind="reject_once", name="Deny"))
-    if _permission_option_supports_kind("reject_always"):
+    if allow_session and _permission_option_supports_kind("reject_always"):
         options.append(
             PermissionOption(
                 option_id="deny_always",
@@ -129,13 +134,24 @@ def make_approval_callback(
         description: str,
         *,
         allow_permanent: bool = True,
+        allow_session: bool = True,
+        approval_id: str = "",
+        exact_execution: bool = False,
         **_: object,
     ) -> str:
         from agent.async_utils import safe_schedule_threadsafe
 
-        options = _build_permission_options(allow_permanent=allow_permanent)
+        options = _build_permission_options(
+            allow_permanent=allow_permanent,
+            allow_session=allow_session,
+        )
 
         tool_call = _build_permission_tool_call(command, description)
+        if exact_execution:
+            tool_call.raw_input.update({
+                "approval_id": approval_id,
+                "exact_execution": True,
+            })
         coro = request_permission_fn(
             session_id=session_id,
             tool_call=tool_call,

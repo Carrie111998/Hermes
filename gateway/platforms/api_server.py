@@ -2846,8 +2846,13 @@ class APIServerAdapter(BasePlatformAdapter):
                 raise RuntimeError("approval core returned an invalid authority epoch")
 
             allow_permanent = bool(approval_data.get("allow_permanent", False))
-            choices = list(API_APPROVAL_CHOICES)
-            if not allow_permanent:
+            allow_session = bool(approval_data.get("allow_session", True))
+            choices = (
+                ["once", "deny"]
+                if not allow_session
+                else list(API_APPROVAL_CHOICES)
+            )
+            if allow_session and not allow_permanent:
                 choices.remove("always")
             pattern_keys = [
                 redact_sensitive_text(str(value))
@@ -2867,6 +2872,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 ),
                 "pattern_keys": pattern_keys,
                 "allow_permanent": allow_permanent,
+                "allow_session": allow_session,
                 "choices": choices,
                 "owner_authority_required_for": [
                     value for value in choices if value != "deny"
@@ -6004,6 +6010,14 @@ class APIServerAdapter(BasePlatformAdapter):
                     _openai_error(
                         "Permanent approval is not offered for this action",
                         code="permanent_approval_not_allowed",
+                    ),
+                    status=400,
+                )
+            if choice not in state.get("choices", ()):
+                return web.json_response(
+                    _openai_error(
+                        "Approval choice is not offered for this exact action",
+                        code="approval_choice_not_allowed",
                     ),
                     status=400,
                 )
@@ -12125,8 +12139,15 @@ class APIServerAdapter(BasePlatformAdapter):
                     allow_permanent = bool(
                         (approval_data or {}).get("allow_permanent", False)
                     )
-                    choices = list(API_APPROVAL_CHOICES)
-                    if not allow_permanent:
+                    allow_session = bool(
+                        (approval_data or {}).get("allow_session", True)
+                    )
+                    choices = (
+                        ["once", "deny"]
+                        if not allow_session
+                        else list(API_APPROVAL_CHOICES)
+                    )
+                    if allow_session and not allow_permanent:
                         choices.remove("always")
                     event = {
                         "event": "approval.request",
@@ -12150,6 +12171,7 @@ class APIServerAdapter(BasePlatformAdapter):
                             )
                         ],
                         "allow_permanent": allow_permanent,
+                        "allow_session": allow_session,
                         "choices": choices,
                         "owner_authority_required_for": [
                             value for value in choices if value != "deny"
@@ -12909,6 +12931,18 @@ class APIServerAdapter(BasePlatformAdapter):
                 _openai_error(
                     "Permanent approval is not offered for this action",
                     code="permanent_approval_not_allowed",
+                ),
+                status=400,
+            )
+        if (
+            pending.get("exact_execution") is True
+            and pending.get("allow_session") is False
+            and choice not in {"once", "deny"}
+        ):
+            return web.json_response(
+                _openai_error(
+                    "Exact execution approvals allow only once or deny",
+                    code="approval_choice_not_allowed",
                 ),
                 status=400,
             )
