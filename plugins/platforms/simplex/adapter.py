@@ -1218,17 +1218,44 @@ async def _standalone_send(
                 if media_files:
                     items = []
                     for media_path, _is_voice in media_files:
-                        thumb = _make_jpeg_thumb(media_path)
-                        items.append(
-                            {
-                                "filePath": media_path,
-                                "msgContent": {
-                                    "type": "image",
-                                    "image": thumb,
-                                    "text": message or "",
-                                },
-                            }
-                        )
+                        ext = os.path.splitext(str(media_path))[1].lower()
+                        if _is_voice:
+                            # Voice note — inline player, mirrors live
+                            # send_voice (fileSource + type "voice").
+                            items.append(
+                                {
+                                    "fileSource": {"filePath": str(media_path)},
+                                    "msgContent": {
+                                        "type": "voice",
+                                        "text": message or "",
+                                        "duration": 0,
+                                    },
+                                }
+                            )
+                        elif _is_image_ext(ext):
+                            thumb = _make_jpeg_thumb(str(media_path))
+                            items.append(
+                                {
+                                    "filePath": str(media_path),
+                                    "msgContent": {
+                                        "type": "image",
+                                        "image": thumb,
+                                        "text": message or "",
+                                    },
+                                }
+                            )
+                        else:
+                            # Generic file attachment — mirrors live
+                            # send_document (type "file").
+                            items.append(
+                                {
+                                    "filePath": str(media_path),
+                                    "msgContent": {
+                                        "type": "file",
+                                        "text": message or "",
+                                    },
+                                }
+                            )
                     composed = json.dumps(items)
                 else:
                     composed = json.dumps(
@@ -1242,11 +1269,13 @@ async def _standalone_send(
             }
 
             await ws.send(json.dumps(payload))
+            acked = False
             if media_files:
                 # Media sends are async on the daemon side (XFTP upload).
                 # Closing the socket before the daemon confirms would abort
                 # the transfer — wait for the newChatItems ack (or a short
-                # timeout) so the file actually lands.
+                # timeout) so the file actually lands. A missing ack must
+                # NOT be reported as a successful delivery.
                 deadline = time.monotonic() + 20.0
                 while time.monotonic() < deadline:
                     try:
@@ -1256,6 +1285,7 @@ async def _standalone_send(
                         except Exception:
                             rtype = ""
                         if rtype == "newChatItems":
+                            acked = True
                             break
                     except asyncio.TimeoutError:
                         break
@@ -1263,6 +1293,15 @@ async def _standalone_send(
                 # Give the daemon a moment to process the command before
                 # closing (text commands are synchronous).
                 await asyncio.sleep(0.5)
+
+            if media_files and not acked:
+                return {
+                    "error": (
+                        "SimpleX send: daemon did not acknowledge the media "
+                        "transfer (no newChatItems within 20s); delivery "
+                        "unconfirmed — not reporting success"
+                    )
+                }
 
         return {"success": True, "platform": "simplex", "chat_id": chat_id}
     except Exception as e:

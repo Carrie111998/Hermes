@@ -329,6 +329,130 @@ async def test_standalone_send_media_unpacks_tuples(monkeypatch, tmp_path):
     assert len(items[0]["msgContent"]["image"]) > 100
 
 
+@pytest.mark.asyncio
+async def test_standalone_send_media_voice_branch(monkeypatch, tmp_path):
+    """is_voice=True must build the voice-note payload (fileSource + type
+    "voice"), not an image — mirrors live send_voice."""
+    audio = tmp_path / "note.ogg"
+    audio.write_bytes(b"OggS fake audio")
+
+    events = []
+
+    class FakeWS:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def send(self, payload):
+            events.append(("send", payload))
+
+        async def recv(self):
+            return '{"resp": {"type": "newChatItems"}}'
+
+    class FakeWSClient:
+        @staticmethod
+        def connect(uri, **kw):
+            return FakeWS()
+
+    monkeypatch.setattr(websockets, "connect", FakeWSClient.connect)
+    pconfig = MagicMock()
+    pconfig.extra = {"ws_url": "ws://localhost:5225"}
+    result = await _standalone_send(
+        pconfig, "5", "caption", media_files=[(str(audio), True)]
+    )
+    assert result["success"] is True
+    cmd = json.loads(events[0][1])["cmd"]
+    items = json.loads(cmd.split(" json ", 1)[1])
+    assert items[0]["fileSource"]["filePath"] == str(audio)
+    assert items[0]["msgContent"]["type"] == "voice"
+    assert items[0]["msgContent"]["text"] == "caption"
+
+
+@pytest.mark.asyncio
+async def test_standalone_send_media_document_branch(monkeypatch, tmp_path):
+    """Non-image, non-voice attachments must go as generic file (type
+    "file") — mirrors live send_document, not an image payload."""
+    doc = tmp_path / "report.pdf"
+    doc.write_bytes(b"%PDF fake")
+
+    events = []
+
+    class FakeWS:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def send(self, payload):
+            events.append(("send", payload))
+
+        async def recv(self):
+            return '{"resp": {"type": "newChatItems"}}'
+
+    class FakeWSClient:
+        @staticmethod
+        def connect(uri, **kw):
+            return FakeWS()
+
+    monkeypatch.setattr(websockets, "connect", FakeWSClient.connect)
+    pconfig = MagicMock()
+    pconfig.extra = {"ws_url": "ws://localhost:5225"}
+    result = await _standalone_send(
+        pconfig, "5", "", media_files=[(str(doc), False)]
+    )
+    assert result["success"] is True
+    cmd = json.loads(events[0][1])["cmd"]
+    items = json.loads(cmd.split(" json ", 1)[1])
+    assert items[0]["filePath"] == str(doc)
+    assert items[0]["msgContent"]["type"] == "file"
+    # No image/thumbnail key on the generic file payload.
+    assert "image" not in items[0]["msgContent"]
+
+
+@pytest.mark.asyncio
+async def test_standalone_send_media_no_ack_returns_error(monkeypatch, tmp_path):
+    """A media send whose newChatItems ack never arrives must NOT report
+    success — the daemon never confirmed the transfer, so a false-success
+    would mask a lost file (the exact bug class this PR fixes)."""
+    import asyncio as _asyncio
+
+    img = tmp_path / "test.png"
+    from PIL import Image
+
+    Image.new("RGB", (64, 64), (200, 30, 30)).save(img)
+
+    class FakeWS:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def send(self, payload):
+            pass
+
+        async def recv(self):
+            raise _asyncio.TimeoutError("no ack from daemon")
+
+    class FakeWSClient:
+        @staticmethod
+        def connect(uri, **kw):
+            return FakeWS()
+
+    monkeypatch.setattr(websockets, "connect", FakeWSClient.connect)
+    pconfig = MagicMock()
+    pconfig.extra = {"ws_url": "ws://localhost:5225"}
+    result = await _standalone_send(
+        pconfig, "5", "", media_files=[(str(img), False)]
+    )
+    assert "success" not in result
+    assert "error" in result
+    assert "did not acknowledge" in result["error"]
+
+
 # ---------------------------------------------------------------------------
 # 10. register() — plugin-side metadata
 # ---------------------------------------------------------------------------
