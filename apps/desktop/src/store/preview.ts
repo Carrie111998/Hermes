@@ -1,5 +1,6 @@
 import { atom, computed } from 'nanostores'
 
+import { normalizeOrLocalPreviewTarget } from '@/lib/local-preview'
 import { persistentAtom } from '@/lib/persisted'
 import { normalize } from '@/lib/text'
 
@@ -316,5 +317,32 @@ export function failPreviewServerRestart(taskId: string, message: string) {
     ...current,
     message,
     status: 'error'
+  })
+}
+
+/** Open a web URL in the preview rail — the shared entry for UI-initiated URL
+ *  opens (the 🖥 button next to chat links). Routes through the same
+ *  normalizer as the file browser and the gateway `preview.open` handler, then
+ *  lands in `openPreview` (the rail's only entry point), so URLs, localhost and
+ *  file paths all resolve identically. Schemes that can't be a web page
+ *  (javascript:/data:/file:) are rejected up front — local files travel
+ *  through the file-card path instead. */
+export function openPreviewUrl(url: string, label?: string): Promise<PreviewTarget | null> {
+  const target = url.trim()
+
+  if (!target || !/^https?:/i.test(target)) {
+    return Promise.resolve(null)
+  }
+
+  return normalizeOrLocalPreviewTarget(target).then(resolved => {
+    if (!resolved) {
+      return null
+    }
+
+    const trimmedLabel = label?.trim()
+
+    openPreview(trimmedLabel ? { ...resolved, label: trimmedLabel } : resolved, 'explicit-link')
+
+    return resolved
   })
 }

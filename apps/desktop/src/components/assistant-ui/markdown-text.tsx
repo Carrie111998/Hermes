@@ -11,6 +11,7 @@ import type { code as streamdownCode } from '@streamdown/code'
 import { type ComponentProps, memo, useEffect, useMemo, useState } from 'react'
 
 import { ExpandableBlock } from '@/components/chat/expandable-block'
+import { splitFilePathTokens } from '@/components/chat/file-card'
 import { PreviewAttachment } from '@/components/chat/preview-attachment'
 import { chunkByLines, SyntaxHighlighter } from '@/components/chat/shiki-highlighter'
 import { ZoomableImage } from '@/components/chat/zoomable-image'
@@ -299,7 +300,13 @@ function MarkdownLink({ children, className, href, ...props }: ComponentProps<'a
   const fallbackLabel = text && normalizeExternalUrl(text) !== target ? text : undefined
 
   return (
-    <PrettyLink className={cn('wrap-anywhere', className)} fallbackLabel={fallbackLabel} href={target} {...props} />
+    <PrettyLink
+      className={cn('wrap-anywhere', className)}
+      fallbackLabel={fallbackLabel}
+      href={target}
+      showPreviewButton
+      {...props}
+    />
   )
 }
 
@@ -455,6 +462,32 @@ function HugeTextFallback({ containerClassName, text }: { containerClassName?: s
   )
 }
 
+function renderParagraphChildren(children: React.ReactNode): React.ReactNode {
+  if (typeof children === 'string') {
+    return splitFilePathTokens(children)
+  }
+
+  if (Array.isArray(children)) {
+    const parts: React.ReactNode[] = []
+
+    for (let i = 0; i < children.length; i++) {
+      const child = children[i]
+
+      if (typeof child === 'string') {
+        for (const part of splitFilePathTokens(child)) {
+          parts.push(part)
+        }
+      } else {
+        parts.push(child)
+      }
+    }
+
+    return parts
+  }
+
+  return children
+}
+
 function MarkdownTextSurface({
   containerClassName,
   containerProps,
@@ -486,11 +519,13 @@ function MarkdownTextSurface({
         h4: ({ className, ...props }: ComponentProps<'h4'>) => (
           <h4 className={cn('my-1 font-semibold', HEADING_SIZES.h4, className)} {...props} />
         ),
-        p: ({ className, ...props }: ComponentProps<'p'>) => (
+        p: ({ children, className, ...props }: ComponentProps<'p'>) => (
           // Vertical rhythm is owned by styles.css (`--paragraph-gap`), which
           // must out-specify Tailwind Typography's `prose` margins — so no
           // `my-*` here on purpose.
-          <p className={cn('wrap-anywhere leading-(--dt-line-height)', className)} {...props} />
+          <p className={cn('wrap-anywhere leading-(--dt-line-height)', className)} {...props}>
+            {renderParagraphChildren(children)}
+          </p>
         ),
         a: MarkdownLink,
         // Inline code must not vote when an ancestor resolves `dir="auto"`
