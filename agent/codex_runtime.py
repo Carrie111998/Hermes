@@ -611,6 +611,10 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
         pending_agent_message = None
         _fire_agent_message_completed(item)
 
+    def _clear_pending_agent_message() -> None:
+        nonlocal pending_agent_message
+        pending_agent_message = None
+
     def on_event(note: dict) -> None:
         if not isinstance(note, dict):
             return
@@ -640,7 +644,25 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
             elif item_type == "agentMessage":
                 _buffer_agent_message_completed(item)
 
+    on_event.clear_pending_agent_message = (  # type: ignore[attr-defined]
+        _clear_pending_agent_message
+    )
     return on_event
+
+
+def _clear_codex_app_server_event_bridge_pending(session: Any) -> None:
+    """Discard buffered app-server final-message candidates for turn boundaries."""
+    on_event = getattr(session, "_on_event", None)
+    clear = getattr(on_event, "clear_pending_agent_message", None)
+    if not callable(clear):
+        return
+    try:
+        clear()
+    except Exception:
+        logger.debug(
+            "codex app-server event bridge pending-message clear raised",
+            exc_info=True,
+        )
 
 
 def run_codex_app_server_turn(
@@ -723,8 +745,10 @@ def run_codex_app_server_turn(
     # return reaches us. Do NOT append again — that would duplicate.
 
     try:
+        _clear_codex_app_server_event_bridge_pending(agent._codex_session)
         turn = agent._codex_session.run_turn(user_input=user_message)
     except Exception as exc:
+        _clear_codex_app_server_event_bridge_pending(agent._codex_session)
         logger.exception("codex app-server turn failed")
         # Crash → unconditionally drop the session so the next turn
         # respawns from scratch instead of reusing a dead client.
@@ -760,6 +784,9 @@ def run_codex_app_server_turn(
             ),
             "error": str(exc),
         }
+    finally:
+        if getattr(agent, "_codex_session", None) is not None:
+            _clear_codex_app_server_event_bridge_pending(agent._codex_session)
 
     # This runtime bypasses the normal conversation-loop finalizer. Mirror its
     # interrupt handoff/cleanup so a hard stop cannot poison the next turn and a
