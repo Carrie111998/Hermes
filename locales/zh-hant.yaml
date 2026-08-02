@@ -101,6 +101,10 @@ gateway:
     usage:                 "用法：/background <提示>\n範例：/background 摘要今天 HN 上的熱門故事\n\n在獨立工作階段中執行該提示。你可以繼續聊天 — 完成後結果將顯示於此。"
     started:               "🔄 背景任務已啟動：「{preview}」\n任務 ID：{task_id}\n你可以繼續聊天 — 完成後結果將顯示於此。"
 
+  activity:
+    still_on_it:                 "還在處理中"
+    one_sec:                     "稍等一下"
+
   branch:
     db_unavailable:        "工作階段資料庫無法使用。"
     no_conversation:       "沒有可分支的對話 — 請先傳送一則訊息。"
@@ -108,6 +112,12 @@ gateway:
     switch_failed:         "分支已建立，但無法切換到該分支。"
     branched_one:          "⑂ 已分支至 **{title}**（已複製 {count} 則訊息）\n原始：`{parent}`\n分支：`{new}`\n使用 `/resume` 切換回原始工作階段。"
     branched_many:         "⑂ 已分支至 **{title}**（已複製 {count} 則訊息）\n原始：`{parent}`\n分支：`{new}`\n使用 `/resume` 切換回原始工作階段。"
+
+  busy_reject:
+    model:                  "代理正在執行中 — 請等待或先 /stop，然後切換模型。"
+    codex_runtime:          "代理正在執行中 — 請等待或先 /stop，然後變更執行階段。"
+    moa:                    "代理正在執行中 — 請等待或先 /stop，然後執行 /moa。"
+    generic:                "⏳ 代理正在執行中 — `/{name}` 無法在回合中執行。請等待目前回應或先 `/stop`。"
 
   commands:
     usage:                 "用法：`/commands [page]`"
@@ -175,6 +185,7 @@ gateway:
     resumed:               "▶ 目標已恢復：{goal}\n傳送任意訊息繼續，或等待 — 我會在下一輪繼續推進。"
     invalid:               "無效目標：{error}"
     set:                   "⊙ 目標已設定（{budget} 輪預算）：{goal}\n我會持續工作直到目標完成、你暫停／清除目標，或預算耗盡。\n控制指令：/goal status · /goal pause · /goal resume · /goal clear"
+    contract_draft_failed: "（無法起草合約 — 以自由形式目標執行。）"
 
   help:
     header:                "📖 **Hermes 指令**\n"
@@ -358,6 +369,9 @@ Future messages in this room will use that transcript until `/reset` or another 
     state_no:              "否"
     queued:                "**排隊中的後續：** {count}"
     platforms:             "**已連線平台：** {platforms}"
+
+  steer:
+    usage_no_agent:          "用法：/steer <提示>  （沒有代理正在執行中；作為一般訊息傳送）"
 
   stop:
     stopped_pending:       "⚡ 已停止。代理尚未啟動 — 你可以繼續此工作階段。"

@@ -91,6 +91,10 @@ gateway:
     usage_switch_provider:  "`/model <name> --provider <slug>` — switch provider"
     usage_persist:          "`/model <name> --global` — persist"
 
+  activity:
+    still_on_it:                 "still on it"
+    one_sec:                     "one sec"
+
   agents:
     header:                "🤖 **Active Agents & Tasks**"
     active_agents:         "**Active agents:** {count}"
@@ -123,6 +127,12 @@ gateway:
     switch_failed:         "Branch created but failed to switch to it."
     branched_one:          "⑂ Branched to **{title}** ({count} message copied)\nOriginal: `{parent}`\nBranch: `{new}`\nUse `/resume` to switch back to the original."
     branched_many:         "⑂ Branched to **{title}** ({count} messages copied)\nOriginal: `{parent}`\nBranch: `{new}`\nUse `/resume` to switch back to the original."
+
+  busy_reject:
+    model:                  "Agent is running — wait or /stop first, then switch models."
+    codex_runtime:          "Agent is running — wait or /stop first, then change runtime."
+    moa:                    "Agent is running — wait or /stop first, then run /moa."
+    generic:                "⏳ Agent is running — `/{name}` can't run mid-turn. Wait for the current response or `/stop` first."
 
   commands:
     usage:                 "Usage: `/commands [page]`"
@@ -190,6 +200,7 @@ gateway:
     resumed:               "▶ Goal resumed: {goal}\nSend any message to continue, or wait — I'll take the next step on the next turn."
     invalid:               "Invalid goal: {error}"
     set:                   "⊙ Goal set ({budget}-turn budget): {goal}\nI'll keep working until the goal is done, you pause/clear it, or the budget is exhausted.\nControls: /goal status · /goal pause · /goal resume · /goal clear"
+    contract_draft_failed: "(Couldn't draft a contract — running as a free-form goal.)"
 
   help:
     header:                "📖 **Hermes Commands**\n"
@@ -371,6 +382,9 @@ gateway:
     state_no:              "No"
     queued:                "**Queued follow-ups:** {count}"
     platforms:             "**Connected Platforms:** {platforms}"
+
+  steer:
+    usage_no_agent:          "Usage: /steer <prompt>  (no agent is running; sending as a normal message)"
 
   stop:
     stopped_pending:       "⚡ Stopped. The agent hadn't started yet — you can continue this session."

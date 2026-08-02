@@ -101,6 +101,10 @@ gateway:
     usage:                 "使い方: /background <プロンプト>\n例: /background 今日の HN トップ記事を要約して\n\nプロンプトを別のセッションで実行します。チャットを続けられます — 完了したらここに結果が表示されます。"
     started:               "🔄 バックグラウンドタスクを開始しました: 「{preview}」\nタスク ID: {task_id}\nチャットを続けられます — 完了したらここに結果が表示されます。"
 
+  activity:
+    still_on_it:                 "まだ作業中"
+    one_sec:                     "ちょっと待って"
+
   branch:
     db_unavailable:        "セッションデータベースは利用できません。"
     no_conversation:       "分岐する会話がありません — まずメッセージを送信してください。"
@@ -108,6 +112,12 @@ gateway:
     switch_failed:         "ブランチは作成されましたが、切り替えに失敗しました。"
     branched_one:          "⑂ **{title}** に分岐しました ({count} メッセージをコピー)\n元: `{parent}`\nブランチ: `{new}`\n元のセッションに戻るには `/resume` を使用してください。"
     branched_many:         "⑂ **{title}** に分岐しました ({count} メッセージをコピー)\n元: `{parent}`\nブランチ: `{new}`\n元のセッションに戻るには `/resume` を使用してください。"
+
+  busy_reject:
+    model:                  "エージェントは実行中です — 先に待つか /stop してからモデルを切り替えてください。"
+    codex_runtime:          "エージェントは実行中です — 先に待つか /stop してからランタイムを変更してください。"
+    moa:                    "エージェントは実行中です — 先に待つか /stop してから /moa を実行してください。"
+    generic:                "⏳ エージェントは実行中です — `/{name}` はターン途中で実行できません。現在の応答を待つか、先に `/stop` してください。"
 
   commands:
     usage:                 "使い方: `/commands [page]`"
@@ -175,6 +185,7 @@ gateway:
     resumed:               "▶ 目標を再開しました: {goal}\nメッセージを送って続行するか、お待ちください — 次のターンで続きを進めます。"
     invalid:               "無効な目標: {error}"
     set:                   "⊙ 目標を設定しました ({budget} ターンの予算): {goal}\n目標が完了するか、一時停止/解除されるか、予算が尽きるまで作業を続けます。\nコントロール: /goal status · /goal pause · /goal resume · /goal clear"
+    contract_draft_failed: "（コントラクトを作成できませんでした — 自由形式の目標として実行します。）"
 
   help:
     header:                "📖 **Hermes コマンド**\n"
@@ -358,6 +369,9 @@ Future messages in this room will use that transcript until `/reset` or another 
     state_no:              "いいえ"
     queued:                "**キュー内の後続:** {count}"
     platforms:             "**接続プラットフォーム:** {platforms}"
+
+  steer:
+    usage_no_agent:          "使い方: /steer <プロンプト>  (エージェントは実行されていません。通常のメッセージとして送信します)"
 
   stop:
     stopped_pending:       "⚡ 停止しました。エージェントはまだ開始していません — このセッションを続行できます。"

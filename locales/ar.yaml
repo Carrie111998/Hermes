@@ -99,6 +99,10 @@ gateway:
     usage_switch_provider:  "`/model <name> --provider <slug>` — تبديل المزوّد"
     usage_persist:          "`/model <name> --global` — حفظ دائم"
 
+  activity:
+    still_on_it:                 "ما زلت أعمل عليها"
+    one_sec:                     "لحظة واحدة"
+
   agents:
     header:                "🤖 **الوكلاء والمهام النشطة**"
     active_agents:         "**الوكلاء النشطون:** {count}"
@@ -131,6 +135,12 @@ gateway:
     switch_failed:         "أُنشئ الفرع لكن تعذّر التبديل إليه."
     branched_one:          "⑂ تم التفريع إلى **{title}** (نُسخت {count} رسالة)\nالأصل: `{parent}`\nالفرع: `{new}`\nاستخدم `/resume` للعودة إلى الأصل."
     branched_many:         "⑂ تم التفريع إلى **{title}** (نُسخت {count} رسالة)\nالأصل: `{parent}`\nالفرع: `{new}`\nاستخدم `/resume` للعودة إلى الأصل."
+
+  busy_reject:
+    model:                  "الوكيل قيد التشغيل — انتظر أو استخدم /stop أولًا، ثم بدّل النماذج."
+    codex_runtime:          "الوكيل قيد التشغيل — انتظر أو استخدم /stop أولًا، ثم غيّر بيئة التشغيل."
+    moa:                    "الوكيل قيد التشغيل — انتظر أو استخدم /stop أولًا، ثم شغّل /moa."
+    generic:                "⏳ الوكيل قيد التشغيل — `/{name}` لا يمكن تشغيله في منتصف الدورة. انتظر الرد الحالي أو استخدم `/stop` أولًا."
 
   commands:
     usage:                 "الاستخدام: `/commands [page]`"
@@ -198,6 +208,7 @@ gateway:
     resumed:               "▶ استُؤنف الهدف: {goal}\nأرسل أي رسالة للمتابعة، أو انتظر — سأتخذ الخطوة التالية في الدور القادم."
     invalid:               "هدف غير صالح: {error}"
     set:                   "⊙ حُدِّد الهدف (ميزانية {budget} دور): {goal}\nسأواصل العمل حتى يكتمل الهدف، أو توقفه/تمسحه، أو تنفد الميزانية.\nالتحكم: /goal status · /goal pause · /goal resume · /goal clear"
+    contract_draft_failed: "(تعذّر صياغة عقد — التشغيل كهدف حر.)"
 
   help:
     header:                "📖 **أوامر Hermes**\n"
@@ -360,6 +371,9 @@ gateway:
     state_no:              "لا"
     queued:                "**المتابعات في الطابور:** {count}"
     platforms:             "**المنصّات المتصلة:** {platforms}"
+
+  steer:
+    usage_no_agent:          "الاستخدام: /steer <prompt>  (لا يوجد وكيل نشط؛ يُرسل كرسالة عادية)"
 
   stop:
     stopped_pending:       "⚡ تم الإيقاف. لم يكن الوكيل قد بدأ بعد — يمكنك متابعة هذه الجلسة."

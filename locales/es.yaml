@@ -76,6 +76,10 @@ gateway:
     usage_switch_provider:  "`/model <name> --provider <slug>` — cambiar proveedor"
     usage_persist:          "`/model <name> --global` — guardar de forma permanente"
 
+  activity:
+    still_on_it:                 "todavía en ello"
+    one_sec:                     "un segundo"
+
   agents:
     header:                "🤖 **Agentes y tareas activos**"
     active_agents:         "**Agentes activos:** {count}"
@@ -108,6 +112,12 @@ gateway:
     switch_failed:         "Rama creada pero no se pudo cambiar a ella."
     branched_one:          "⑂ Ramificado a **{title}** ({count} mensaje copiado)\nOriginal: `{parent}`\nRama: `{new}`\nUsa `/resume` para volver al original."
     branched_many:         "⑂ Ramificado a **{title}** ({count} mensajes copiados)\nOriginal: `{parent}`\nRama: `{new}`\nUsa `/resume` para volver al original."
+
+  busy_reject:
+    model:                  "El agente está en ejecución — espera o usa /stop primero, luego cambia de modelo."
+    codex_runtime:          "El agente está en ejecución — espera o usa /stop primero, luego cambia el runtime."
+    moa:                    "El agente está en ejecución — espera o usa /stop primero, luego ejecuta /moa."
+    generic:                "⏳ El agente está en ejecución — `/{name}` no se puede ejecutar a mitad de turno. Espera la respuesta actual o usa `/stop` primero."
 
   commands:
     usage:                 "Uso: `/commands [page]`"
@@ -175,6 +185,7 @@ gateway:
     resumed:               "▶ Objetivo reanudado: {goal}\nEnvía cualquier mensaje para continuar, o espera — daré el siguiente paso en el próximo turno."
     invalid:               "Objetivo no válido: {error}"
     set:                   "⊙ Objetivo establecido (presupuesto de {budget} turnos): {goal}\nSeguiré trabajando hasta que el objetivo se complete, lo pauses/elimines o se agote el presupuesto.\nControles: /goal status · /goal pause · /goal resume · /goal clear"
+    contract_draft_failed: "(No se pudo redactar un contrato — ejecutando como objetivo libre.)"
 
   help:
     header:                "📖 **Comandos de Hermes**\n"
@@ -355,6 +366,9 @@ gateway:
     state_no:              "No"
     queued:                "**Seguimientos en cola:** {count}"
     platforms:             "**Plataformas conectadas:** {platforms}"
+
+  steer:
+    usage_no_agent:          "Uso: /steer <prompt>  (no hay agente en ejecución; enviando como mensaje normal)"
 
   stop:
     stopped_pending:       "⚡ Detenido. El agente aún no había comenzado — puedes continuar esta sesión."

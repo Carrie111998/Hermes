@@ -76,6 +76,10 @@ gateway:
     usage_switch_provider:  "`/model <name> --provider <slug>` — sağlayıcıyı değiştir"
     usage_persist:          "`/model <name> --global` — kalıcı kaydet"
 
+  activity:
+    still_on_it:                 "hâlâ üzerinde"
+    one_sec:                     "bir saniye"
+
   agents:
     header:                "🤖 **Aktif Ajanlar ve Görevler**"
     active_agents:         "**Aktif ajanlar:** {count}"
@@ -108,6 +112,12 @@ gateway:
     switch_failed:         "Dal oluşturuldu ancak ona geçilemedi."
     branched_one:          "⑂ **{title}** dalına geçildi ({count} mesaj kopyalandı)\nOrijinal: `{parent}`\nDal: `{new}`\nOrijinale geri dönmek için `/resume` kullanın."
     branched_many:         "⑂ **{title}** dalına geçildi ({count} mesaj kopyalandı)\nOrijinal: `{parent}`\nDal: `{new}`\nOrijinale geri dönmek için `/resume` kullanın."
+
+  busy_reject:
+    model:                  "Ajan çalışıyor — bekle veya önce /stop yap, sonra model değiştir."
+    codex_runtime:          "Ajan çalışıyor — bekle veya önce /stop yap, sonra çalışma zamanını değiştir."
+    moa:                    "Ajan çalışıyor — bekle veya önce /stop yap, sonra /moa çalıştır."
+    generic:                "⏳ Ajan çalışıyor — `/{name}` tur ortasında çalıştırılamaz. Mevcut yanıtı bekle veya önce `/stop` yap."
 
   commands:
     usage:                 "Kullanım: `/commands [page]`"
@@ -175,6 +185,7 @@ gateway:
     resumed:               "▶ Hedef devam ettirildi: {goal}\nDevam etmek için herhangi bir mesaj gönderin veya bekleyin — bir sonraki turda adımı atacağım."
     invalid:               "Geçersiz hedef: {error}"
     set:                   "⊙ Hedef ayarlandı ({budget} turluk bütçe): {goal}\nHedef tamamlanana, siz duraklatana/temizleyene veya bütçe tükenene kadar çalışmaya devam edeceğim.\nKontroller: /goal status · /goal pause · /goal resume · /goal clear"
+    contract_draft_failed: "(Sözleşme taslağı hazırlanamadı — serbest biçimli hedef olarak çalışıyor.)"
 
   help:
     header:                "📖 **Hermes Komutları**\n"
@@ -358,6 +369,9 @@ Future messages in this room will use that transcript until `/reset` or another 
     state_no:              "Hayır"
     queued:                "**Sıradaki devam:** {count}"
     platforms:             "**Bağlı platformlar:** {platforms}"
+
+  steer:
+    usage_no_agent:          "Kullanım: /steer <prompt>  (çalışan ajan yok; normal mesaj olarak gönderiliyor)"
 
   stop:
     stopped_pending:       "⚡ Durduruldu. Ajan henüz başlamamıştı — bu oturuma devam edebilirsin."

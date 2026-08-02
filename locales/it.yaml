@@ -76,6 +76,10 @@ gateway:
     usage_switch_provider:  "`/model <name> --provider <slug>` — cambia provider"
     usage_persist:          "`/model <name> --global` — rendi permanente"
 
+  activity:
+    still_on_it:                 "ci sto ancora lavorando"
+    one_sec:                     "un secondo"
+
   agents:
     header:                "🤖 **Agenti e attività attivi**"
     active_agents:         "**Agenti attivi:** {count}"
@@ -108,6 +112,12 @@ gateway:
     switch_failed:         "Ramo creato ma il passaggio ad esso non è riuscito."
     branched_one:          "⑂ Diramato in **{title}** ({count} messaggio copiato)\nOriginale: `{parent}`\nRamo: `{new}`\nUsa `/resume` per tornare all'originale."
     branched_many:         "⑂ Diramato in **{title}** ({count} messaggi copiati)\nOriginale: `{parent}`\nRamo: `{new}`\nUsa `/resume` per tornare all'originale."
+
+  busy_reject:
+    model:                  "L'agente è in esecuzione — attendi o usa /stop prima, poi cambia modello."
+    codex_runtime:          "L'agente è in esecuzione — attendi o usa /stop prima, poi cambia runtime."
+    moa:                    "L'agente è in esecuzione — attendi o usa /stop prima, poi esegui /moa."
+    generic:                "⏳ L'agente è in esecuzione — `/{name}` non può essere eseguito durante un turno. Attendi la risposta corrente o usa `/stop` prima."
 
   commands:
     usage:                 "Uso: `/commands [page]`"
@@ -175,6 +185,7 @@ gateway:
     resumed:               "▶ Obiettivo ripreso: {goal}\nInvia un messaggio per continuare, oppure aspetta — farò il prossimo passo al turno successivo."
     invalid:               "Obiettivo non valido: {error}"
     set:                   "⊙ Obiettivo impostato (budget di {budget} turni): {goal}\nContinuerò a lavorare finché l'obiettivo non sarà completato, lo metterai in pausa/lo cancellerai, oppure il budget sarà esaurito.\nControlli: /goal status · /goal pause · /goal resume · /goal clear"
+    contract_draft_failed: "(Impossibile redigere un contratto — esecuzione come obiettivo libero.)"
 
   help:
     header:                "📖 **Comandi Hermes**\n"
@@ -358,6 +369,9 @@ Future messages in this room will use that transcript until `/reset` or another 
     state_no:              "No"
     queued:                "**Follow-up in coda:** {count}"
     platforms:             "**Piattaforme connesse:** {platforms}"
+
+  steer:
+    usage_no_agent:          "Uso: /steer <prompt>  (nessun agente in esecuzione; inviato come messaggio normale)"
 
   stop:
     stopped_pending:       "⚡ Fermato. L'agente non era ancora partito — puoi continuare questa sessione."

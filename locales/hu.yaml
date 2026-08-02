@@ -76,6 +76,10 @@ gateway:
     usage_switch_provider:  "`/model <name> --provider <slug>` — szolgáltató váltása"
     usage_persist:          "`/model <name> --global` — megőrzés"
 
+  activity:
+    still_on_it:                 "még dolgozom rajta"
+    one_sec:                     "egy pillanat"
+
   agents:
     header:                "🤖 **Aktív ügynökök és feladatok**"
     active_agents:         "**Aktív ügynökök:** {count}"
@@ -108,6 +112,12 @@ gateway:
     switch_failed:         "Az ág létrejött, de nem sikerült rá váltani."
     branched_one:          "⑂ Új ág: **{title}** ({count} üzenet másolva)\nEredeti: `{parent}`\nÁg: `{new}`\nHasználd a `/resume` parancsot az eredetihez való visszatéréshez."
     branched_many:         "⑂ Új ág: **{title}** ({count} üzenet másolva)\nEredeti: `{parent}`\nÁg: `{new}`\nHasználd a `/resume` parancsot az eredetihez való visszatéréshez."
+
+  busy_reject:
+    model:                  "Az ügynök éppen fut — várj vagy használd a /stop parancsot előbb, utána válts modellt."
+    codex_runtime:          "Az ügynök éppen fut — várj vagy használd a /stop parancsot előbb, utána válts runtime-ot."
+    moa:                    "Az ügynök éppen fut — várj vagy használd a /stop parancsot előbb, utána futtasd a /moa parancsot."
+    generic:                "⏳ Az ügynök éppen fut — a `/{name}` nem futtatható kör közben. Várj a jelenlegi válaszra, vagy használd a `/stop` parancsot előbb."
 
   commands:
     usage:                 "Használat: `/commands [page]`"
@@ -175,6 +185,7 @@ gateway:
     resumed:               "▶ Cél folytatva: {goal}\nKüldj bármilyen üzenetet a folytatáshoz, vagy várj — a következő körben megteszem a következő lépést."
     invalid:               "Érvénytelen cél: {error}"
     set:                   "⊙ Cél beállítva ({budget} körös keret): {goal}\nDolgozni fogok rajta, amíg a cél el nem készül, te nem szünetelteted/törlöd, vagy a keret ki nem merül.\nVezérlés: /goal status · /goal pause · /goal resume · /goal clear"
+    contract_draft_failed: "(Nem sikerült szerződést megfogalmazni — futás szabad formátumú célként.)"
 
   help:
     header:                "📖 **Hermes parancsok**\n"
@@ -358,6 +369,9 @@ Future messages in this room will use that transcript until `/reset` or another 
     state_no:              "Nem"
     queued:                "**Sorban álló folytatások:** {count}"
     platforms:             "**Csatlakoztatott platformok:** {platforms}"
+
+  steer:
+    usage_no_agent:          "Használat: /steer <prompt>  (egy ügynök sem fut; küldés normál üzenetként)"
 
   stop:
     stopped_pending:       "⚡ Leállítva. Az ügynök még el sem kezdte — folytathatod ezt a munkamenetet."

@@ -2737,7 +2737,7 @@ class GatewaySlashCommandsMixin:
             return f"{base}\nCompletion contract:\n{state.contract.render_block()}"
         if lower.startswith("draft"):
             # Drafting was requested but the aux model couldn't produce one.
-            return f"{base}\n(Couldn't draft a contract — running as a free-form goal.)"
+            return f"{base}\n{t('gateway.goal.contract_draft_failed')}"
         return base
 
     async def _handle_subgoal_command(self, event: "MessageEvent") -> str:

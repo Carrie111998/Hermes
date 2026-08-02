@@ -76,6 +76,10 @@ gateway:
     usage_switch_provider:  "`/model <name> --provider <slug>` — verander verskaffer"
     usage_persist:          "`/model <name> --global` — stoor permanent"
 
+  activity:
+    still_on_it:                 "steeds besig"
+    one_sec:                     "een oomblik"
+
   agents:
     header:                "🤖 **Aktiewe Agente & Take**"
     active_agents:         "**Aktiewe agente:** {count}"
@@ -108,6 +112,12 @@ gateway:
     switch_failed:         "Tak is geskep, maar oorskakeling het misluk."
     branched_one:          "⑂ Vertak na **{title}** ({count} boodskap gekopieer)\nOorspronklik: `{parent}`\nTak: `{new}`\nGebruik `/resume` om terug te gaan na die oorspronklike."
     branched_many:         "⑂ Vertak na **{title}** ({count} boodskappe gekopieer)\nOorspronklik: `{parent}`\nTak: `{new}`\nGebruik `/resume` om terug te gaan na die oorspronklike."
+
+  busy_reject:
+    model:                  "Agent is tans besig — wag of /stop eers, verander dan modelle."
+    codex_runtime:          "Agent is tans besig — wag of /stop eers, verander dan die runtime."
+    moa:                    "Agent is tans besig — wag of /stop eers, voer dan /moa uit."
+    generic:                "⏳ Agent is tans besig — `/{name}` kan nie tydens ''n beurt loop nie. Wag vir die huidige antwoord of `/stop` eers."
 
   commands:
     usage:                 "Gebruik: `/commands [page]`"
@@ -175,6 +185,7 @@ gateway:
     resumed:               "▶ Doelwit hervat: {goal}\nStuur enige boodskap om voort te gaan, of wag — ek sal die volgende stap met die volgende beurt neem."
     invalid:               "Ongeldige doelwit: {error}"
     set:                   "⊙ Doelwit gestel ({budget}-beurt-begroting): {goal}\nEk sal aanhou werk totdat die doelwit klaar is, jy dit pouseer/verwyder, of die begroting opgebruik is.\nBeheer: /goal status · /goal pause · /goal resume · /goal clear"
+    contract_draft_failed: "(Kon nie ''n kontrak opstel nie — loop as ''n vryvorm-doelwit.)"
 
   help:
     header:                "📖 **Hermes-opdragte**\n"
@@ -358,6 +369,9 @@ Future messages in this room will use that transcript until `/reset` or another 
     state_no:              "Nee"
     queued:                "**Opgehoopte opvolge:** {count}"
     platforms:             "**Verbinde Platforms:** {platforms}"
+
+  steer:
+    usage_no_agent:          "Gebruik: /steer <prompt>  (geen agent loop nie; stuur as ''n gewone boodskap)"
 
   stop:
     stopped_pending:       "⚡ Gestop. Die agent het nog nie begin nie — jy kan met hierdie sessie voortgaan."

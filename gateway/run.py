@@ -13961,10 +13961,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # busy_handler naming an entry here). All other rejected commands get
     # the generic catch-all text in _dispatch_busy_slash_command.
     _BUSY_REJECT_TEXT: Dict[str, str] = {
-        "model": "Agent is running — wait or /stop first, then switch models.",
-        "codex-runtime": ("Agent is running — wait or /stop first, then "
-                          "change runtime."),
-        "moa": "Agent is running — wait or /stop first, then run /moa.",
+        "model": lambda: t("gateway.busy_reject.model"),
+        "codex-runtime": lambda: t("gateway.busy_reject.codex_runtime"),
+        "moa": lambda: t("gateway.busy_reject.moa"),
     }
 
     async def _dispatch_busy_slash_command(
@@ -14003,7 +14002,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return await special(event, quick_key, source)
             reject_text = self._BUSY_REJECT_TEXT.get(handler_key)
             if reject_text is not None:
-                return reject_text
+                return reject_text()
 
         if policy in ("dispatch", "interrupt_then_dispatch"):
             plain = {
@@ -14035,10 +14034,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Catch-all: any other recognized slash command reached the
         # running-agent guard. Reject gracefully rather than falling
         # through to interrupt + discard.
-        return (
-            f"⏳ Agent is running — `/{name}` can't run "
-            f"mid-turn. Wait for the current response or `/stop` first."
-        )
+        return t("gateway.busy_reject.generic", name=name)
 
     async def _busy_start_command(self, event: MessageEvent, quick_key: str, source):
         # Telegram sends /start for bot launches/deep-links. Treat it as a
@@ -15209,7 +15205,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # message. If the payload is empty, surface the usage hint.
             steer_payload = event.get_command_args().strip()
             if not steer_payload:
-                return "Usage: /steer <prompt>  (no agent is running; sending as a normal message)"
+                return t("gateway.steer.usage_no_agent")
             try:
                 event.text = steer_payload
             except Exception:
@@ -24145,7 +24141,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
             except Exception as _phrase_err:
                 logger.debug("generic status phrase selection failed: %s", _phrase_err)
-                return "still on it" if kind in {"heartbeat", "waiting", "long_running", "status"} else "one sec"
+                return t("gateway.activity.still_on_it") if kind in {"heartbeat", "waiting", "long_running", "status"} else t("gateway.activity.one_sec")
         # Disable tool progress for webhooks - they don't support message editing,
         # so each progress line would be sent as a separate message.
         from gateway.config import Platform

@@ -76,6 +76,10 @@ gateway:
     usage_switch_provider:  "`/model <name> --provider <slug>` — changer de fournisseur"
     usage_persist:          "`/model <name> --global` — conserver"
 
+  activity:
+    still_on_it:                 "toujours dessus"
+    one_sec:                     "une seconde"
+
   agents:
     header:                "🤖 **Agents et tâches actifs**"
     active_agents:         "**Agents actifs :** {count}"
@@ -108,6 +112,12 @@ gateway:
     switch_failed:         "Branche créée mais impossible de basculer dessus."
     branched_one:          "⑂ Branche **{title}** créée ({count} message copié)\nOriginal : `{parent}`\nBranche : `{new}`\nUtilisez `/resume` pour revenir à l'original."
     branched_many:         "⑂ Branche **{title}** créée ({count} messages copiés)\nOriginal : `{parent}`\nBranche : `{new}`\nUtilisez `/resume` pour revenir à l'original."
+
+  busy_reject:
+    model:                  "L'agent est en cours d'exécution — attendez ou faites /stop d'abord, puis changez de modèle."
+    codex_runtime:          "L'agent est en cours d'exécution — attendez ou faites /stop d'abord, puis changez le runtime."
+    moa:                    "L'agent est en cours d'exécution — attendez ou faites /stop d'abord, puis lancez /moa."
+    generic:                "⏳ L'agent est en cours d'exécution — `/{name}` ne peut pas s'exécuter en milieu de tour. Attendez la réponse en cours ou faites `/stop` d'abord."
 
   commands:
     usage:                 "Utilisation : `/commands [page]`"
@@ -175,6 +185,7 @@ gateway:
     resumed:               "▶ Objectif repris : {goal}\nEnvoyez un message pour continuer, ou attendez — je passerai à l'étape suivante au prochain tour."
     invalid:               "Objectif invalide : {error}"
     set:                   "⊙ Objectif défini (budget de {budget} tours) : {goal}\nJe continuerai jusqu'à ce que l'objectif soit terminé, que vous le mettiez en pause/effaciez, ou que le budget soit épuisé.\nContrôles : /goal status · /goal pause · /goal resume · /goal clear"
+    contract_draft_failed: "(Impossible de rédiger un contrat — exécution en tant qu'objectif libre.)"
 
   help:
     header:                "📖 **Commandes Hermes**\n"
@@ -358,6 +369,9 @@ Future messages in this room will use that transcript until `/reset` or another 
     state_no:              "Non"
     queued:                "**Suivis en file :** {count}"
     platforms:             "**Plateformes connectées :** {platforms}"
+
+  steer:
+    usage_no_agent:          "Utilisation : /steer <prompt>  (aucun agent en cours d'exécution ; envoi comme message normal)"
 
   stop:
     stopped_pending:       "⚡ Arrêté. L'agent n'avait pas encore commencé — vous pouvez continuer cette session."

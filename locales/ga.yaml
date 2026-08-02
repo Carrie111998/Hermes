@@ -80,6 +80,10 @@ gateway:
     usage_switch_provider:  "`/model <name> --provider <slug>` — athraigh an soláthraí"
     usage_persist:          "`/model <name> --global` — coinnigh"
 
+  activity:
+    still_on_it:                 "fós air"
+    one_sec:                     "soicind amháin"
+
   agents:
     header:                "🤖 **Gníomhairí & Tascanna Gníomhacha**"
     active_agents:         "**Gníomhairí gníomhacha:** {count}"
@@ -112,6 +116,12 @@ gateway:
     switch_failed:         "Cruthaíodh an brainse ach theip ar athrú chuige."
     branched_one:          "⑂ Brainseáilte go **{title}** ({count} teachtaireacht cóipeáilte)\nBunaidh: `{parent}`\nBrainse: `{new}`\nÚsáid `/resume` chun filleadh ar an mbunaidh."
     branched_many:         "⑂ Brainseáilte go **{title}** ({count} teachtaireacht cóipeáilte)\nBunaidh: `{parent}`\nBrainse: `{new}`\nÚsáid `/resume` chun filleadh ar an mbunaidh."
+
+  busy_reject:
+    model:                  "Tá an gníomhaire ag rith — fan nó úsáid /stop ar dtús, ansin athraigh samhlacha."
+    codex_runtime:          "Tá an gníomhaire ag rith — fan nó úsáid /stop ar dtús, ansin athraigh runtime."
+    moa:                    "Tá an gníomhaire ag rith — fan nó úsáid /stop ar dtús, ansin rith /moa."
+    generic:                "⏳ Tá an gníomhaire ag rith — ní féidir `/{name}` a rith i lár seala. Fan leis an bhfreagra reatha nó úsáid `/stop` ar dtús."
 
   commands:
     usage:                 "Úsáid: `/commands [page]`"
@@ -179,6 +189,7 @@ gateway:
     resumed:               "▶ Sprioc atosaithe: {goal}\nSeol teachtaireacht ar bith chun leanúint, nó fan — déanfaidh mé an chéad chéim eile sa chéad seal eile."
     invalid:               "Sprioc neamhbhailí: {error}"
     set:                   "⊙ Sprioc socraithe (buiséad {budget} seal): {goal}\nLeanfaidh mé ag obair go dtí go bhfuil an sprioc críochnaithe, go gcuirfidh tú ar sos / go nglanfaidh tú í, nó go n-úsáidfear an buiséad.\nSmacht: /goal status · /goal pause · /goal resume · /goal clear"
+    contract_draft_failed: "(Níorbh fhéidir conradh a dhréachtú — ag rith mar sprioc shaor.)"
 
   help:
     header:                "📖 **Orduithe Hermes**\n"
@@ -362,6 +373,9 @@ Future messages in this room will use that transcript until `/reset` or another 
     state_no:              "Níl"
     queued:                "**Tascanna i scuaine:** {count}"
     platforms:             "**Ardáin Cheangailte:** {platforms}"
+
+  steer:
+    usage_no_agent:          "Úsáid: /steer <prompt>  (níl aon ghníomhaire ag rith; á sheoladh mar ghnáth-theachtaireacht)"
 
   stop:
     stopped_pending:       "⚡ Stoptha. Ní raibh an gníomhaire tosaithe fós — is féidir leat leanúint leis an seisiún seo."
