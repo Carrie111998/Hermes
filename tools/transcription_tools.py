@@ -129,15 +129,127 @@ LOCAL_NATIVE_AUDIO_FORMATS = {".wav", ".aiff", ".aif"}
 MAX_FILE_SIZE = 25 * 1024 * 1024  # 25 MB
 
 STT_FAILURE_MESSAGE = "Speech transcription failed"
-_STT_FAILURE_TOKEN = object()
+_STT_SAFE_ERROR_CODES = frozenset(
+    {
+        "audio_access_denied",
+        "audio_preprocess_failed",
+        "command_failed",
+        "command_not_configured",
+        "command_output_failed",
+        "command_timeout",
+        "credentials_unavailable",
+        "empty_transcript",
+        "file_access_failed",
+        "file_not_found",
+        "file_too_large",
+        "local_backend_unavailable",
+        "local_command_failed",
+        "local_command_output_missing",
+        "local_command_template_invalid",
+        "local_command_unavailable",
+        "local_dependency_unavailable",
+        "local_transcription_failed",
+        "not_a_file",
+        "path_read_blocked",
+        "plugin_availability_failed",
+        "plugin_discovery_failed",
+        "plugin_invalid_result",
+        "plugin_result_failure",
+        "plugin_transcription_failed",
+        "plugin_unavailable",
+        "prepared_validation_failed",
+        "provider_api_error",
+        "provider_connection_failed",
+        "provider_dependency_unavailable",
+        "provider_dispatch_failed",
+        "provider_failure",
+        "provider_http_error",
+        "provider_invalid_result",
+        "provider_model_unavailable",
+        "provider_not_registered",
+        "provider_request_failed",
+        "provider_resolution_failed",
+        "provider_result_failure",
+        "provider_sdk_error",
+        "provider_timeout",
+        "provider_transcription_failed",
+        "provider_unavailable",
+        "silk_dependency_unavailable",
+        "source_validation_failed",
+        "symbolic_link_rejected",
+        "unsupported_audio_format",
+        "stt_failed",
+    }
+)
+_STT_SAFE_STAGES = frozenset(
+    {
+        "availability",
+        "command",
+        "configuration",
+        "dependency",
+        "discovery",
+        "dispatch",
+        "parse_response",
+        "preprocess",
+        "read_audio",
+        "read_output",
+        "request",
+        "selection",
+        "transcode",
+        "transcribe",
+        "validation",
+        "unknown",
+    }
+)
+_STT_SAFE_ERROR_TYPES = frozenset(
+    {
+        "APIConnectionError",
+        "APIError",
+        "APIStatusError",
+        "APITimeoutError",
+        "AudioPreprocessError",
+        "AudioTranscodeError",
+        "BackendUnavailableError",
+        "CalledProcessError",
+        "ConfigurationError",
+        "ConnectionError",
+        "CredentialsUnavailableError",
+        "DependencyUnavailableError",
+        "EmptyTranscriptError",
+        "FileNotFoundError",
+        "FileTooLargeError",
+        "FileTypeError",
+        "HTTPError",
+        "ImportError",
+        "InvalidResultError",
+        "ModelUnavailableError",
+        "ModuleNotFoundError",
+        "OSError",
+        "OutputMissingError",
+        "PathSafetyError",
+        "PermissionError",
+        "PreprocessError",
+        "ProviderError",
+        "ProviderNotRegisteredError",
+        "ProviderUnavailableError",
+        "RuntimeError",
+        "STTError",
+        "TimeoutError",
+        "TypeError",
+        "UnsupportedFormatError",
+        "ValidationError",
+        "ValueError",
+    }
+)
 
 
 class _STTFailure(dict):
     """Marker subclass for failures created by the privacy boundary."""
 
-    def __init__(self, values: Dict[str, Any], *, _token: object = None) -> None:
-        super().__init__(values)
-        self._trusted_boundary_value = _token is _STT_FAILURE_TOKEN
+
+def _allowlisted_stt_metadata(value: Any, allowed: frozenset[str], fallback: str) -> str:
+    token = _safe_stt_metadata_token(value, fallback)
+    return token if token in allowed else fallback
 
 
 def _safe_stt_metadata_token(value: Any, fallback: str) -> str:
@@ -156,8 +268,10 @@ def log_stt_failure(provider: str, stage: str, error_type: str) -> None:
     logger.warning(
         "STT provider failure provider=%s stage=%s type=%s",
         _safe_stt_metadata_token(provider, "unknown"),
-        _safe_stt_metadata_token(stage, "unknown"),
-        _safe_stt_metadata_token(error_type, "STTError"),
+        _allowlisted_stt_metadata(stage, _STT_SAFE_STAGES, "unknown"),
+        _allowlisted_stt_metadata(
+            error_type, _STT_SAFE_ERROR_TYPES, "STTError"
+        ),
     )
 
 
@@ -179,12 +293,17 @@ def make_stt_failure(
             "success": False,
             "transcript": "",
             "error": STT_FAILURE_MESSAGE,
-            "error_code": _safe_stt_metadata_token(error_code, "stt_failed"),
+            "error_code": _allowlisted_stt_metadata(
+                error_code, _STT_SAFE_ERROR_CODES, "stt_failed"
+            ),
             "provider": _safe_stt_metadata_token(provider, "unknown"),
-            "stage": _safe_stt_metadata_token(stage, "unknown"),
-            "error_type": _safe_stt_metadata_token(error_type, "STTError"),
-        },
-        _token=_STT_FAILURE_TOKEN,
+            "stage": _allowlisted_stt_metadata(
+                stage, _STT_SAFE_STAGES, "unknown"
+            ),
+            "error_type": _allowlisted_stt_metadata(
+                error_type, _STT_SAFE_ERROR_TYPES, "STTError"
+            ),
+        }
     )
     if no_speech:
         result["no_speech"] = True
@@ -218,21 +337,21 @@ def normalize_stt_result(
             "transcript": transcript,
             "provider": safe_provider,
         }
-    if isinstance(result, _STTFailure) and getattr(
-        result, "_trusted_boundary_value", False
-    ):
+    if isinstance(result, _STTFailure):
         # The marker is an implementation detail, not a trust capability.
         # Rebuild it from the allowlisted schema so a plugin that imports the
         # class cannot smuggle transcript/error bodies or arbitrary extra keys
         # through the public boundary.
         return make_stt_failure(
-            error_code=_safe_stt_metadata_token(
-                result.get("error_code"), error_code
+            error_code=_allowlisted_stt_metadata(
+                result.get("error_code"), _STT_SAFE_ERROR_CODES, error_code
             ),
             provider=safe_provider,
-            stage=_safe_stt_metadata_token(result.get("stage"), stage),
-            error_type=_safe_stt_metadata_token(
-                result.get("error_type"), error_type
+            stage=_allowlisted_stt_metadata(
+                result.get("stage"), _STT_SAFE_STAGES, stage
+            ),
+            error_type=_allowlisted_stt_metadata(
+                result.get("error_type"), _STT_SAFE_ERROR_TYPES, error_type
             ),
             no_speech=bool(result.get("no_speech")),
         )

@@ -956,6 +956,37 @@ def test_close_during_blocked_startup_eventually_closes_engine_and_state():
     assert manager.snapshot_stats()["queue_depth"] == 0
 
 
+def test_close_during_blocked_failing_factory_publishes_closed():
+    factory_entered = threading.Event()
+    release_factory = threading.Event()
+
+    def failing_factory(*_args):
+        factory_entered.set()
+        assert release_factory.wait(timeout=2)
+        raise RuntimeError("private startup body")
+
+    manager = DiscordStreamingKwsManager(
+        StreamingKwsConfig(enabled=True),
+        ("하나야 잠깐",),
+        lambda _event: None,
+        engine_factory=failing_factory,
+    )
+    assert factory_entered.wait(timeout=1)
+
+    manager.close()
+    assert manager.snapshot_stats()["state"] == "CLOSING"
+    release_factory.set()
+    manager._thread.join(timeout=1)
+
+    assert not manager._thread.is_alive()
+    stats = manager.snapshot_stats()
+    assert stats["state"] == "CLOSED"
+    assert stats["queue_depth"] == 0
+    assert stats["forced_end_depth"] == 0
+    assert manager.begin_playback(1, 61) is False
+    assert manager.offer_pcm(1, 61, 42, b"pcm") is False
+
+
 def test_close_is_prompt_while_already_admitted_callback_is_blocked():
     callback_entered = threading.Event()
     release_callback = threading.Event()

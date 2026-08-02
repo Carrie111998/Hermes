@@ -510,6 +510,11 @@ class DiscordStreamingKwsManager:
                 if self._state is DiscordStreamingKwsState.STARTING:
                     self._state = DiscordStreamingKwsState.FAILED
                     self._closed.set()
+                elif self._state is DiscordStreamingKwsState.CLOSING:
+                    # close() won while the native factory was blocked. The
+                    # worker is now exiting, so publish the terminal state even
+                    # though no engine object was created.
+                    self._state = DiscordStreamingKwsState.CLOSED
                 self._discard_queue()
                 with self._forced_end_lock:
                     self._forced_ends.clear()

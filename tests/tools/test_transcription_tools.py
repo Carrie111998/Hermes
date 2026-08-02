@@ -667,8 +667,9 @@ class TestTranscriptionFailurePrivacy:
             "error_code": "provider_sdk_error",
             "provider": "mistral",
             "stage": "request",
-            "error_type": "MistralSDKError",
+            "error_type": "STTError",
         }
+        assert "type=STTError" in caplog.text
         assert canary not in repr(result)
         assert canary not in caplog.text
         assert all(record.exc_info is None for record in caplog.records)
@@ -1793,10 +1794,10 @@ class TestFinalSttBoundaryAdversarial:
             "success": False,
             "transcript": "",
             "error": "Speech transcription failed",
-            "error_code": "provider_failure",
+            "error_code": "provider_api_error",
             "provider": "openai",
-            "stage": "transcribe",
-            "error_type": "ProviderError",
+            "stage": "request",
+            "error_type": "APIError",
         }
         assert canary not in repr(result)
         assert "stdout" not in result and "stderr" not in result
@@ -1819,6 +1820,7 @@ class TestFinalSttBoundaryAdversarial:
                 "stderr": canary,
             }
         )
+        setattr(unsafe, "_trusted_boundary_value", True)
         with patch(
             "tools.transcription_tools._load_stt_config",
             return_value={"provider": "local"},
