@@ -31,15 +31,11 @@ class CuaFleetConfig:
     client_id: str = ""
     client_secret: str = ""
     image: str = "trycua/cua:latest"
-    image_pull_secret: str = "ecr-credentials"
     pool: str = "hermes-desktop"
     replicas: int = 1
     cwd: str = "/root"
     timeout: int = 60
-    cpu: int | None = 2
-    memory: str | None = "8192Mi"
     ready_timeout: float = 600
-    ready_poll_interval: float = 5
     request_timeout: float = 30
     services: Mapping[str, int] = field(
         default_factory=lambda: {"server": 8000, "mcp": 3000}
