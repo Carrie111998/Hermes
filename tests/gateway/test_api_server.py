@@ -30,6 +30,9 @@ from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.api_server import (
     APIServerAdapter,
     ResponseStore,
+    RUN_INLINE_IMAGE_MAX_BYTES,
+    RUN_INLINE_IMAGE_MAX_COUNT,
+    RUN_INLINE_IMAGE_REQUEST_MAX_BYTES,
     _IdempotencyCache,
     _derive_chat_session_id,
     _hermes_version,
@@ -871,9 +874,30 @@ class TestCapabilitiesEndpoint:
             assert data["features"]["run_status"] is True
             assert data["features"]["run_events_sse"] is True
             assert data["features"]["model_options"] is True
+            assert data["features"]["run_inline_images"] is True
+            assert data["features"]["run_inline_images_version"] == 1
+            assert data["features"]["run_inline_images_data_urls_only"] is True
+            assert (
+                data["features"]["run_inline_images_max_request_bytes"]
+                == RUN_INLINE_IMAGE_REQUEST_MAX_BYTES
+            )
             assert data["features"]["session_continuity_header"] == "X-Hermes-Session-Id"
             assert data["endpoints"]["run_status"]["path"] == "/v1/runs/{run_id}"
-            assert data["endpoints"]["model_options"] == {"method": "GET", "path": "/api/model/options"}
+            assert data["endpoints"]["model_options"] == {
+                "method": "GET",
+                "path": "/api/model/options",
+            }
+            assert data["endpoints"]["run_inline_images"] == {
+                "method": "POST",
+                "path": "/v1/runs",
+                "version": 1,
+                "input": "OpenAI content parts: input_text and input_image",
+                "image_transport": "data_url_only",
+                "mime_types": ["image/gif", "image/jpeg", "image/png", "image/webp"],
+                "max_count": RUN_INLINE_IMAGE_MAX_COUNT,
+                "max_bytes_per_image": RUN_INLINE_IMAGE_MAX_BYTES,
+                "max_request_bytes": RUN_INLINE_IMAGE_REQUEST_MAX_BYTES,
+            }
             assert data["endpoints"]["skills"] == {"method": "GET", "path": "/v1/skills"}
             assert data["endpoints"]["toolsets"] == {"method": "GET", "path": "/v1/toolsets"}
 
@@ -2845,5 +2869,3 @@ class TestCreateAgentModelRecovery:
         )
         adapter._create_agent(session_id="another-session", gateway_session_key="stable-chan-1")
         assert captured[1]["model"] == "minimax/minimax-m3"
-
-

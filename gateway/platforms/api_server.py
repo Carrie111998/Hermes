@@ -40,6 +40,8 @@ Requires:
 """
 
 import asyncio
+import base64
+import binascii
 import errno
 import hashlib
 import hmac
@@ -131,6 +133,26 @@ MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
 RESPONSES_AUTO_TRUNCATION_HISTORY_LIMIT = 100
 _COMPRESSED_SUMMARY_METADATA_KEY = "_compressed_summary"
+
+# ``/v1/runs`` is the controllable, pollable agent lifecycle intended for
+# remote control planes. Its image input is deliberately narrower than the
+# chat/responses surface: callers can send a small, inline image they already
+# possess, but cannot cause the Hermes host to fetch a URL or inspect a local
+# path. The values are advertised through ``/v1/capabilities``.
+RUN_INLINE_IMAGE_MAX_COUNT = 4
+RUN_INLINE_IMAGE_MAX_BYTES = 5 * 1024 * 1024
+RUN_INLINE_IMAGE_REQUEST_MAX_BYTES = 32 * 1024 * 1024
+RUN_INLINE_IMAGE_MIME_TYPES = frozenset({
+    "image/png",
+    "image/jpeg",
+    "image/gif",
+    "image/webp",
+})
+_RUN_INLINE_IMAGE_DATA_URL_RE = re.compile(
+    r"^data:(image/(?:png|jpeg|gif|webp));base64,([A-Za-z0-9+/]+={0,2})$",
+    re.IGNORECASE,
+)
+_RUN_SUBMISSION_PATH_RE = re.compile(r"^(?:/p/[^/]+)?/v1/runs$")
 
 
 def _coerce_port(value: Any, default: int = DEFAULT_PORT) -> int:
@@ -590,6 +612,87 @@ def _normalize_multimodal_content(content: Any) -> Any:
         return "\n".join(p["text"] for p in normalized_parts if p.get("text"))
 
     return normalized_parts
+
+
+def _normalize_run_input(raw_input: Any) -> Any:
+    """Normalize a bounded, path-free Runs message.
+
+    Plain string input retains the original Runs contract. A structured Runs
+    input uses the same OpenAI content-part shape as chat/responses, but image
+    references are intentionally restricted to validated inline data URLs.
+    This avoids turning an authenticated remote control endpoint into an SSRF
+    fetcher or a local-file transport while preserving the exact Runs status,
+    event, approval, and stop lifecycle.
+
+    Raises ``ValueError`` with an ``error_code:message`` value suitable for an
+    OpenAI-style client error. Validation completes before a run ID, stream,
+    or agent is allocated.
+    """
+    if isinstance(raw_input, str):
+        return raw_input
+    if not isinstance(raw_input, list) or not raw_input:
+        raise ValueError("invalid_run_input:No user message found in input")
+
+    # Accept direct content parts (the compact form suited to Runs) as well as
+    # the existing Responses-style list of message objects. Earlier messages
+    # continue through the established conversation-history path below.
+    if all(isinstance(item, dict) and "type" in item for item in raw_input):
+        content = raw_input
+    else:
+        last = raw_input[-1]
+        if not isinstance(last, dict) or "content" not in last:
+            raise ValueError("invalid_run_input:No user message found in input")
+        content = last.get("content")
+
+    normalized = _normalize_multimodal_content(content)
+    if not normalized:
+        raise ValueError("invalid_run_input:No user message found in input")
+    if isinstance(normalized, str):
+        return normalized
+
+    image_count = 0
+    text_length = 0
+    for part in normalized:
+        if part.get("type") == "text":
+            text_length += len(str(part.get("text") or ""))
+            continue
+        if part.get("type") != "image_url":
+            raise ValueError("invalid_run_input:Runs input contains an unsupported content part")
+        image_count += 1
+        if image_count > RUN_INLINE_IMAGE_MAX_COUNT:
+            raise ValueError(
+                f"run_image_limit:Runs accepts at most {RUN_INLINE_IMAGE_MAX_COUNT} inline images"
+            )
+        image_ref = part.get("image_url")
+        url_value = image_ref.get("url") if isinstance(image_ref, dict) else None
+        detail = image_ref.get("detail") if isinstance(image_ref, dict) else None
+        if detail not in (None, "low", "high", "auto"):
+            raise ValueError(
+                "run_image_detail_unsupported:Runs image detail must be low, high, or auto"
+            )
+        match = _RUN_INLINE_IMAGE_DATA_URL_RE.fullmatch(str(url_value or ""))
+        if not match:
+            raise ValueError(
+                "run_image_data_url_required:Runs images must use an inline data:image/...;base64 URL"
+            )
+        mime_type = match.group(1).lower()
+        if mime_type not in RUN_INLINE_IMAGE_MIME_TYPES:
+            raise ValueError("run_image_mime_unsupported:Runs image MIME type is unsupported")
+        encoded = match.group(2)
+        # Reject oversized input before decoding, then check decoded bytes so
+        # the advertised limit is exact even for padded base64 input.
+        if len(encoded) > ((RUN_INLINE_IMAGE_MAX_BYTES + 2) // 3) * 4:
+            raise ValueError("run_image_too_large:Runs inline image exceeds the size limit")
+        try:
+            decoded = base64.b64decode(encoded, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError("invalid_image_url:Runs image data URL has invalid base64") from exc
+        if not decoded or len(decoded) > RUN_INLINE_IMAGE_MAX_BYTES:
+            raise ValueError("run_image_too_large:Runs inline image exceeds the size limit")
+
+    if text_length > MAX_NORMALIZED_TEXT_LENGTH:
+        raise ValueError("run_text_too_large:Runs inline input has too much text")
+    return normalized
 
 
 def _content_has_visible_payload(content: Any) -> bool:
@@ -1089,12 +1192,25 @@ def _reserve_pending_api_work(adapter):
 if AIOHTTP_AVAILABLE:
     @web.middleware
     async def body_limit_middleware(request, handler):
-        """Reject overly large request bodies early based on Content-Length."""
+        """Apply the default body cap, with a fixed larger budget for Runs images."""
+        max_request_bytes = MAX_REQUEST_BYTES
+        if (
+            request.method == "POST"
+            and _RUN_SUBMISSION_PATH_RE.fullmatch(request.path)
+        ):
+            # Four 5 MiB images expand to about 28 MiB when base64 encoded.
+            # Clone only this fixed route so aiohttp's read-time cap matches
+            # the advertised Runs contract without widening any other API
+            # surface. The handler still validates count, decoded size, MIME,
+            # and transport before allocating a run.
+            max_request_bytes = RUN_INLINE_IMAGE_REQUEST_MAX_BYTES
+            request = request.clone(client_max_size=max_request_bytes)
+
         if request.method in {"POST", "PUT", "PATCH"}:
             cl = request.headers.get("Content-Length")
             if cl is not None:
                 try:
-                    if int(cl) > MAX_REQUEST_BYTES:
+                    if int(cl) > max_request_bytes:
                         return web.json_response(_openai_error("Request body too large.", code="body_too_large"), status=413)
                 except ValueError:
                     return web.json_response(_openai_error("Invalid Content-Length header.", code="invalid_content_length"), status=400)
@@ -2974,6 +3090,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_status": True,
                 "run_events_sse": True,
                 "run_stop": True,
+                "run_inline_images": True,
+                "run_inline_images_version": 1,
+                "run_inline_images_data_urls_only": True,
+                "run_inline_images_max_count": RUN_INLINE_IMAGE_MAX_COUNT,
+                "run_inline_images_max_bytes": RUN_INLINE_IMAGE_MAX_BYTES,
+                "run_inline_images_max_request_bytes": (
+                    RUN_INLINE_IMAGE_REQUEST_MAX_BYTES
+                ),
                 "run_approval_response": True,
                 "tool_progress_events": True,
                 "approval_events": True,
@@ -3001,6 +3125,17 @@ class APIServerAdapter(BasePlatformAdapter):
                 "chat_completions": {"method": "POST", "path": "/v1/chat/completions"},
                 "responses": {"method": "POST", "path": "/v1/responses"},
                 "runs": {"method": "POST", "path": "/v1/runs"},
+                "run_inline_images": {
+                    "method": "POST",
+                    "path": "/v1/runs",
+                    "version": 1,
+                    "input": "OpenAI content parts: input_text and input_image",
+                    "image_transport": "data_url_only",
+                    "mime_types": sorted(RUN_INLINE_IMAGE_MIME_TYPES),
+                    "max_count": RUN_INLINE_IMAGE_MAX_COUNT,
+                    "max_bytes_per_image": RUN_INLINE_IMAGE_MAX_BYTES,
+                    "max_request_bytes": RUN_INLINE_IMAGE_REQUEST_MAX_BYTES,
+                },
                 "run_status": {"method": "GET", "path": "/v1/runs/{run_id}"},
                 "run_events": {"method": "GET", "path": "/v1/runs/{run_id}/events"},
                 "run_approval": {"method": "POST", "path": "/v1/runs/{run_id}/approval"},
@@ -6227,12 +6362,16 @@ class APIServerAdapter(BasePlatformAdapter):
             return web.json_response(_openai_error("Invalid JSON"), status=400)
 
         raw_input = body.get("input")
-        if not raw_input:
+        if raw_input is None or raw_input == "" or raw_input == []:
             return web.json_response(_openai_error("Missing 'input' field"), status=400)
-
-        user_message = raw_input if isinstance(raw_input, str) else (raw_input[-1].get("content", "") if isinstance(raw_input, list) else "")
-        if not user_message:
-            return web.json_response(_openai_error("No user message found in input"), status=400)
+        try:
+            user_message = _normalize_run_input(raw_input)
+        except ValueError as exc:
+            code, _, message = str(exc).partition(":")
+            return web.json_response(
+                _openai_error(message or "The Runs input is invalid", code=code or "invalid_run_input"),
+                status=400,
+            )
 
         instructions = body.get("instructions")
         previous_response_id = body.get("previous_response_id")
@@ -6894,6 +7033,37 @@ class APIServerAdapter(BasePlatformAdapter):
             return False
         return True
 
+    def _build_http_application(self) -> "web.Application":
+        """Build the exact aiohttp application used by the live API server."""
+        mws = [
+            mw
+            for mw in (
+                self._make_profile_prefix_middleware(),
+                cors_middleware,
+                body_limit_middleware,
+                security_headers_middleware,
+            )
+            if mw is not None
+        ]
+        app = web.Application(
+            middlewares=mws,
+            client_max_size=MAX_REQUEST_BYTES,
+        )
+        # Native routes + multiplex /p/<profile>/… mirrors. Same handlers;
+        # the profile-prefix middleware validates the prefix and scopes
+        # config/credentials to that profile when multiplexing is on.
+        for method, path, handler in self._http_route_table():
+            app.router.add_route(method, path, handler)
+            app.router.add_route(method, f"/p/{{profile}}{path}", handler)
+        # Store the adapter after native routes are registered. Local
+        # Hermes-Relay bootstrap shims use this key as a feature-detection
+        # hook; registering native routes first lets those shims no-op instead
+        # of shadowing the upstream session-control handlers.
+        app["api_server_adapter"] = self
+        if self.gateway_runner is not None:
+            app["gateway_runner"] = self.gateway_runner
+        return app
+
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Start the aiohttp web server."""
         if not AIOHTTP_AVAILABLE:
@@ -6924,31 +7094,7 @@ class APIServerAdapter(BasePlatformAdapter):
             return False
 
         try:
-            mws = [
-                mw
-                for mw in (
-                    self._make_profile_prefix_middleware(),
-                    cors_middleware,
-                    body_limit_middleware,
-                    security_headers_middleware,
-                )
-                if mw is not None
-            ]
-            self._app = web.Application(middlewares=mws, client_max_size=MAX_REQUEST_BYTES)
-            assert self._app is not None
-            # Native routes + multiplex /p/<profile>/… mirrors. Same handlers;
-            # the profile-prefix middleware validates the prefix and scopes
-            # config/credentials to that profile when multiplexing is on.
-            for method, path, handler in self._http_route_table():
-                self._app.router.add_route(method, path, handler)
-                self._app.router.add_route(method, f"/p/{{profile}}{path}", handler)
-            # Store the adapter after native routes are registered. Local Hermes-Relay
-            # bootstrap shims use this key as a feature-detection hook; registering
-            # native routes first lets those shims no-op instead of shadowing the
-            # upstream session-control handlers.
-            self._app["api_server_adapter"] = self
-            if self.gateway_runner is not None:
-                self._app["gateway_runner"] = self.gateway_runner
+            self._app = self._build_http_application()
 
             # Start background sweep to clean up orphaned (unconsumed) run streams
             sweep_task = asyncio.create_task(self._sweep_orphaned_runs())
