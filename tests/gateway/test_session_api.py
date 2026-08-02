@@ -127,6 +127,65 @@ async def test_run_agent_binds_api_session_context_for_tool_env(adapter, monkeyp
 
 
 @pytest.mark.asyncio
+async def test_list_sessions_can_include_detailed_model_and_aux_usage(adapter, session_db):
+    session_id = session_db.create_session(
+        "usage-session", "discord", model="gpt-5.6-sol"
+    )
+    session_db.update_token_counts(
+        session_id,
+        input_tokens=100,
+        output_tokens=20,
+        cache_read_tokens=80,
+        model="gpt-5.6-sol",
+        billing_provider="openai-codex",
+        billing_mode="subscription_included",
+        api_call_count=1,
+    )
+    session_db.record_auxiliary_usage(
+        session_id,
+        "compression",
+        model="gpt-5.6-luna",
+        billing_provider="openai-codex",
+        input_tokens=30,
+        output_tokens=10,
+    )
+
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        ordinary = await (await cli.get("/api/sessions?include_children=true")).json()
+        detailed = await (
+            await cli.get(
+                "/api/sessions?include_children=true&include_usage=true"
+            )
+        ).json()
+
+    assert "usage_by_model" not in ordinary["data"][0]
+    usage = detailed["data"][0]["usage_by_model"]
+    assert [row["task"] for row in usage] == ["", "compression"]
+    assert usage[0] == {
+        "model": "gpt-5.6-sol",
+        "billing_provider": "openai-codex",
+        "billing_mode": "subscription_included",
+        "task": "",
+        "api_call_count": 1,
+        "input_tokens": 100,
+        "output_tokens": 20,
+        "cache_read_tokens": 80,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": 0,
+        "estimated_cost_usd": 0.0,
+        "actual_cost_usd": 0.0,
+        "first_seen": usage[0]["first_seen"],
+        "last_seen": usage[0]["last_seen"],
+    }
+    assert usage[0]["first_seen"] > 0
+    assert usage[0]["last_seen"] >= usage[0]["first_seen"]
+    assert usage[1]["model"] == "gpt-5.6-luna"
+    assert usage[1]["input_tokens"] == 30
+    assert usage[1]["output_tokens"] == 10
+
+
+@pytest.mark.asyncio
 async def test_session_chat_stream_run_completed_carries_turn_transcript(adapter, session_db):
     """run.completed must include the full interleaved turn transcript so a
     client that lost intermediate (pre-tool-call) assistant text from the live

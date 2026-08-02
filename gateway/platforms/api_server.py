@@ -3090,6 +3090,7 @@ class APIServerAdapter(BasePlatformAdapter):
         offset = self._parse_nonnegative_int(request.query.get("offset"), default=0, maximum=1_000_000)
         source = request.query.get("source") or None
         include_children = _coerce_request_bool(request.query.get("include_children"), default=False)
+        include_usage = _coerce_request_bool(request.query.get("include_usage"), default=False)
         sessions = await asyncio.to_thread(db.list_sessions_rich,
             source=source,
             limit=limit,
@@ -3097,9 +3098,19 @@ class APIServerAdapter(BasePlatformAdapter):
             include_children=include_children,
             order_by_last_active=True,
         )
+        payloads = [self._session_response(session) for session in sessions]
+        if include_usage:
+            usage_by_session = await asyncio.to_thread(
+                db.get_session_model_usage,
+                [str(session.get("id") or "") for session in sessions],
+            )
+            for payload in payloads:
+                payload["usage_by_model"] = usage_by_session.get(
+                    str(payload.get("id") or ""), []
+                )
         return web.json_response({
             "object": "list",
-            "data": [self._session_response(s) for s in sessions],
+            "data": payloads,
             "limit": limit,
             "offset": offset,
             "has_more": len(sessions) == limit,
