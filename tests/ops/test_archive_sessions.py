@@ -11,6 +11,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 os.environ.setdefault("HERMES_ARCHIVE_SOURCE", str(ROOT))
 os.environ.setdefault("HERMES_ARCHIVE_HOME", "/tmp/hermes-archive-regression-home")
+os.environ.setdefault("HERMES_ARCHIVE_SYNC_DEVICE_ID", "test-device")
 
 from hermes_cli.session_export_md import (  # noqa: E402
     append_manifest_entry,
@@ -238,3 +239,13 @@ def test_ended_candidate_becomes_eligible_after_latest_activity_grace():
     db = CandidateDB(last_active=time.time() - 120)
 
     assert archive.ended_candidates(db, None, min_age=60) == [SESSION_ID]
+
+
+def test_syncthing_device_id_must_be_configured(monkeypatch):
+    monkeypatch.setattr(archive, "MAC_DEVICE_ID", "")
+
+    with pytest.raises(
+        RuntimeError,
+        match="HERMES_ARCHIVE_SYNC_DEVICE_ID is not configured",
+    ):
+        archive.syncthing_remote_device_id()

@@ -47,7 +47,7 @@ EVENT_LOG = VAULT / "90 System/Archive Logs/archive-events.jsonl"
 SYNCTHING_CONFIG = Path("/var/lib/hermes-jack/.config/syncthing/config.xml")
 SYNCTHING_API = "http://127.0.0.1:8384/rest"
 SYNCTHING_FOLDER = "jack-hermes-v2"
-MAC_DEVICE_ID = "VCRSNRS-ST5WDPR-J2AD5B6-LLFK7HE-MNNZKZV-6QAWWSG-WLXUVZX-UNTAHAK"
+MAC_DEVICE_ID = os.environ.get("HERMES_ARCHIVE_SYNC_DEVICE_ID", "").strip()
 
 sys.path.insert(0, str(HERMES_SOURCE))
 sys.path.insert(0, str(WEBUI_SOURCE))
@@ -65,6 +65,12 @@ from hermes_state import SessionDB  # noqa: E402
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def syncthing_remote_device_id() -> str:
+    if not MAC_DEVICE_ID:
+        raise RuntimeError("HERMES_ARCHIVE_SYNC_DEVICE_ID is not configured")
+    return MAC_DEVICE_ID
 
 
 def append_event(event: dict) -> None:
@@ -100,10 +106,11 @@ def syncthing_json(
 
 
 def remote_connected() -> bool:
+    device_id = syncthing_remote_device_id()
     payload = syncthing_json("/system/connections")
     return bool(
         payload.get("connections", {})
-        .get(MAC_DEVICE_ID, {})
+        .get(device_id, {})
         .get("connected")
     )
 
@@ -136,11 +143,12 @@ def local_index_has_file(relative_path: str, expected_size: int) -> bool:
 
 
 def remote_complete() -> bool:
+    device_id = syncthing_remote_device_id()
     if not remote_connected():
         return False
     payload = syncthing_json(
         "/db/completion",
-        params={"device": MAC_DEVICE_ID, "folder": SYNCTHING_FOLDER},
+        params={"device": device_id, "folder": SYNCTHING_FOLDER},
     )
     return (
         payload.get("remoteState") == "valid"
@@ -617,7 +625,7 @@ def archive_one(
         "archive_sha256": hashlib.sha256(export_path.read_bytes()).hexdigest(),
         "archive_message_count": durable_message_count(data),
         "source_fingerprint": source_fingerprint,
-        "remote_device": MAC_DEVICE_ID,
+        "remote_device": syncthing_remote_device_id(),
         "remote_confirmed": remote_confirmed,
         "deleted_session_ids": deleted,
         "deleted_webui_session_ids": webui_deleted,
