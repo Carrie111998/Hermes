@@ -357,6 +357,48 @@ def test_sanitize_drops_empty_tool_calls_array():
 
 
 
+def test_sanitize_preserves_reused_tool_call_ids_across_turns():
+    """Dedup must be scoped per assistant message, not conversation-wide.
+
+    Hermes reuses local tool_call id counters on every turn
+    (``image_generate:0..N`` in successive image rounds), so the same ids
+    legitimately appear in MULTIPLE assistant messages. A conversation-wide
+    seen-set misclassifies later turns' calls as duplicates, strips them and
+    re-writes ``tool_calls: []`` — which DeepSeek rejects with HTTP 400
+    (the #58755 follow-up: the dedup pass ran after the empty-array drop
+    and re-introduced `[]`). Each assistant message opens a fresh id scope.
+    """
+    from agent.agent_runtime_helpers import sanitize_api_messages
+
+    def _tc(cid: str) -> dict:
+        return {"id": cid, "call_id": cid, "type": "function",
+                "function": {"name": "image_generate", "arguments": "{}"}}
+
+    messages = [
+        {"role": "user", "content": "make images"},
+        # turn 1: image_generate:0..1
+        {"role": "assistant", "content": "one",
+         "tool_calls": [_tc("image_generate:0"), _tc("image_generate:1")]},
+        {"role": "tool", "tool_call_id": "image_generate:0", "content": "imgA"},
+        {"role": "tool", "tool_call_id": "image_generate:1", "content": "imgB"},
+        # turn 2: SAME local ids again — legitimate, must survive
+        {"role": "assistant", "content": "two",
+         "tool_calls": [_tc("image_generate:0"), _tc("image_generate:1")]},
+        {"role": "tool", "tool_call_id": "image_generate:0", "content": "imgC"},
+        {"role": "tool", "tool_call_id": "image_generate:1", "content": "imgD"},
+    ]
+    out = sanitize_api_messages(list(messages))
+    assistants = [m for m in out if m.get("role") == "assistant" and m.get("tool_calls")]
+    assert len(assistants) == 2
+    for a in assistants:
+        ids = [tc["id"] for tc in a["tool_calls"]]
+        assert ids == ["image_generate:0", "image_generate:1"]
+    assert all("tool_calls" in a and a["tool_calls"] for a in assistants)
+    tool_ids = sorted(m["tool_call_id"] for m in out if m.get("role") == "tool")
+    assert tool_ids == ["image_generate:0", "image_generate:0",
+                        "image_generate:1", "image_generate:1"]
+
+
 # ── Self-recovery: heal empty-content non-final messages ──────────────────
 # Repro of the production incident: a dead stream persisted an empty-content
 # assistant stub mid-transcript, and every later request 400'd with

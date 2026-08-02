@@ -3269,13 +3269,22 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
     # here even though repair_message_sequence also consumes matched ids.
     #   (a) collapse duplicate tool_calls WITHIN an assistant message
     #   (b) drop later tool result messages reusing an already-seen id
-    seen_assistant_call_ids: set = set()
-    seen_result_call_ids: set = set()
     deduped: List[Dict[str, Any]] = []
     removed_dupes = 0
     for msg in messages:
         role = msg.get("role")
         if role == "assistant" and msg.get("tool_calls"):
+            # Tool-call IDs are LOCAL per assistant message: Hermes reuses
+            # `toolname:0..N` counters on every turn, so the seen-sets must
+            # be reset at each assistant message. A conversation-wide
+            # seen-set misclassifies later turns' calls as duplicates of the
+            # first turn's, strips them, and (before the #58755 follow-up
+            # below) wrote `tool_calls: []` — which strict providers
+            # (DeepSeek) reject with HTTP 400 "Invalid 'messages[N].
+            # tool_calls': empty array". Mirrors repair_message_sequence
+            # Pass 1, which resets its known_tool_ids per assistant message.
+            seen_assistant_call_ids = set()
+            seen_result_call_ids = set()
             kept_tcs = []
             for tc in msg.get("tool_calls") or []:
                 cid = _ra().AIAgent._get_tool_call_id_static(tc)
@@ -3286,7 +3295,18 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
                     seen_assistant_call_ids.add(cid)
                 kept_tcs.append(tc)
             if len(kept_tcs) != len(msg.get("tool_calls") or []):
-                msg = {**msg, "tool_calls": kept_tcs}
+                if kept_tcs:
+                    msg = {**msg, "tool_calls": kept_tcs}
+                else:
+                    # All tool calls in this message were duplicates — drop
+                    # the key entirely instead of writing an empty array.
+                    # Strict providers (DeepSeek) reject `tool_calls: []`
+                    # with HTTP 400 "Invalid 'messages[N].tool_calls':
+                    # empty array" (#58755 follow-up: the dedup pass runs
+                    # AFTER the empty-array normalization above and
+                    # re-introduced `[]` when every call in a message was
+                    # already seen).
+                    msg = {k: v for k, v in msg.items() if k != "tool_calls"}
             deduped.append(msg)
         elif role == "tool":
             cid = (msg.get("tool_call_id") or "").strip()
