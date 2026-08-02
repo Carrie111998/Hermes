@@ -168,7 +168,7 @@ export async function uploadComposerAttachment(
     path,
     session_id: sessionId,
     ...(dataUrl ? { data_url: dataUrl } : {})
-  })
+  }, PROMPT_SUBMIT_REQUEST_TIMEOUT_MS)
 
   if (!result.attached || !result.ref_text) {
     throw new Error(result.message || `Could not attach ${label}`)
