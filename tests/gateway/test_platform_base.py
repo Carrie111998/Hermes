@@ -2,6 +2,7 @@
 
 import os
 import time
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -885,6 +886,128 @@ class TestMediaDeliveryDefaultMode:
         assert BasePlatformAdapter.validate_media_delivery_path(str(linked_token)) is None
         assert BasePlatformAdapter.validate_media_delivery_path(str(linked_notes)) == str(
             linked_notes.resolve()
+        )
+
+    def _mixed_case_alias(self, path: Path, *replacements: tuple[str, str]) -> str:
+        """Rewrite path components' spelling without touching the real file."""
+        text = str(path)
+        for old, new in replacements:
+            text = text.replace(old, new)
+        return text
+
+    def test_mixed_case_sibling_credential_helpers(self, tmp_path, monkeypatch):
+        """Casefolded profile/credential matching must catch mixed-case aliases.
+
+        On case-insensitive volumes, ``Path.resolve()`` can preserve the
+        supplied spelling of non-symlink components. Helpers must therefore
+        deny ``PROFILES/bob/.ENV`` even when on-disk names are lowercase.
+        """
+        hermes_root = tmp_path / ".hermes"
+        hermes_root.mkdir()
+        monkeypatch.setattr("gateway.platforms.base._HERMES_ROOT", hermes_root)
+
+        import gateway.platforms.base as base
+
+        mixed = Path(self._mixed_case_alias(
+            hermes_root / "profiles" / "bob" / ".env",
+            ("profiles", "PROFILES"),
+            (".env", ".ENV"),
+        ))
+        mixed_token = Path(self._mixed_case_alias(
+            hermes_root / "profiles" / "bob" / "mcp-tokens" / "t.json",
+            ("profiles", "PROFILES"),
+            ("mcp-tokens", "MCP-TOKENS"),
+        ))
+        mixed_notes = Path(self._mixed_case_alias(
+            hermes_root / "profiles" / "bob" / "notes.md",
+            ("profiles", "PROFILES"),
+        ))
+
+        assert base._rel_matches_hermes_root_credential(Path(".ENV")) is True
+        assert base._rel_matches_hermes_root_credential(Path("MCP-TOKENS") / "t.json") is True
+        assert base._path_is_profile_tree_credential(mixed) is True
+        assert base._path_is_lexical_profile_tree_credential(mixed) is True
+        assert base._path_is_profile_tree_credential(mixed_token) is True
+        assert base._path_is_lexical_profile_tree_credential(mixed_token) is True
+        assert base._path_is_profile_tree_credential(mixed_notes) is False
+        assert base._path_is_lexical_profile_tree_credential(mixed_notes) is False
+
+    def test_mixed_case_sibling_credential_denied(self, tmp_path, monkeypatch):
+        """Mixed-case MEDIA paths must not deliver sibling credentials."""
+        self._patch_roots(monkeypatch)
+
+        fake_home = tmp_path / "home"
+        hermes_root = fake_home / ".hermes"
+        alice = hermes_root / "profiles" / "alice"
+        bob = hermes_root / "profiles" / "bob"
+        alice.mkdir(parents=True)
+        secret = bob / ".env"
+        secret.parent.mkdir(parents=True)
+        secret.write_text("SECRET=1")
+        token = bob / "mcp-tokens" / "t.json"
+        token.parent.mkdir()
+        token.write_text("{}")
+        notes = bob / "notes.md"
+        notes.write_text("# ok\n")
+        monkeypatch.setenv("HOME", str(fake_home))
+        monkeypatch.setattr("gateway.platforms.base._HERMES_HOME", alice)
+        monkeypatch.setattr("gateway.platforms.base._HERMES_ROOT", hermes_root)
+
+        mixed_secret = self._mixed_case_alias(
+            secret, ("profiles", "PROFILES"), (".env", ".ENV"),
+        )
+        mixed_token = self._mixed_case_alias(
+            token, ("profiles", "PROFILES"), ("mcp-tokens", "MCP-TOKENS"),
+        )
+        mixed_notes = self._mixed_case_alias(notes, ("profiles", "PROFILES"))
+
+        assert BasePlatformAdapter.validate_media_delivery_path(mixed_secret) is None
+        assert BasePlatformAdapter.validate_media_delivery_path(mixed_token) is None
+        assert BasePlatformAdapter.validate_media_delivery_path(mixed_notes) == str(
+            notes.resolve()
+        )
+
+    def test_mixed_case_sibling_credential_denied_when_enumeration_fails(
+        self, tmp_path, monkeypatch,
+    ):
+        """Mixed-case aliases stay denied when profiles/ listing raises."""
+        self._patch_roots(monkeypatch)
+
+        fake_home = tmp_path / "home"
+        hermes_root = fake_home / ".hermes"
+        profiles_dir = hermes_root / "profiles"
+        alice = profiles_dir / "alice"
+        bob = profiles_dir / "bob"
+        alice.mkdir(parents=True)
+        secret = bob / ".env"
+        secret.parent.mkdir(parents=True)
+        secret.write_text("SECRET=1")
+        notes = bob / "notes.md"
+        notes.write_text("# ok\n")
+        monkeypatch.setenv("HOME", str(fake_home))
+        monkeypatch.setattr("gateway.platforms.base._HERMES_HOME", alice)
+        monkeypatch.setattr("gateway.platforms.base._HERMES_ROOT", hermes_root)
+
+        real_iterdir = type(profiles_dir).iterdir
+
+        def _iterdir_raises(self):
+            if self.resolve() == profiles_dir.resolve():
+                raise PermissionError("profiles dir not readable")
+            return real_iterdir(self)
+
+        monkeypatch.setattr(type(profiles_dir), "iterdir", _iterdir_raises)
+
+        import gateway.platforms.base as base
+
+        mixed_secret = self._mixed_case_alias(
+            secret, ("profiles", "PROFILES"), (".env", ".ENV"),
+        )
+        mixed_notes = self._mixed_case_alias(notes, ("profiles", "PROFILES"))
+
+        assert base._iter_hermes_profile_dirs() == []
+        assert BasePlatformAdapter.validate_media_delivery_path(mixed_secret) is None
+        assert BasePlatformAdapter.validate_media_delivery_path(mixed_notes) == str(
+            notes.resolve()
         )
 
     def test_denylist_blocks_google_token_default_mode(self, tmp_path, monkeypatch):

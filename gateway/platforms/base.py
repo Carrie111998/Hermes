@@ -1286,17 +1286,65 @@ def _iter_hermes_profile_dirs() -> List[Path]:
         return []
 
 
+def _path_parts_casefold(path: Path) -> Tuple[str, ...]:
+    """Return path parts casefolded for case-insensitive deny matching."""
+    return tuple(part.casefold() for part in Path(path).parts)
+
+
+def _parts_is_within_casefold(
+    path_parts: Tuple[str, ...],
+    root_parts: Tuple[str, ...],
+) -> bool:
+    """Return True if ``path_parts`` is ``root_parts`` or a descendant."""
+    if not root_parts:
+        return False
+    return (
+        len(path_parts) >= len(root_parts)
+        and path_parts[: len(root_parts)] == root_parts
+    )
+
+
+def _paths_equal_casefold(left: Path, right: Path) -> bool:
+    """Return True if both paths match under casefold semantics."""
+    return _path_parts_casefold(left) == _path_parts_casefold(right)
+
+
+def _path_is_within_casefold(path: Path, root: Path) -> bool:
+    """Containment check that treats path components case-insensitively.
+
+    Used only on the media-delivery denylist side. Case-insensitive volumes
+    (default macOS / Windows) preserve mixed-case spellings through
+    ``Path.resolve()`` for non-symlink components, so case-sensitive
+    ``relative_to`` would miss real credential files opened via alias
+    casing. Fail closed: deny when the casefolded ancestry matches.
+    """
+    return _parts_is_within_casefold(
+        _path_parts_casefold(path),
+        _path_parts_casefold(root),
+    )
+
+
+def _relative_parts_casefold(path: Path, root: Path) -> Optional[Tuple[str, ...]]:
+    """Return casefolded parts of ``path`` relative to ``root``, or None."""
+    path_parts = _path_parts_casefold(path)
+    root_parts = _path_parts_casefold(root)
+    if not _parts_is_within_casefold(path_parts, root_parts):
+        return None
+    return path_parts[len(root_parts) :]
+
+
 def _rel_matches_hermes_root_credential(rel: Path) -> bool:
     """Return True if ``rel`` (relative to a Hermes home) is a credential path."""
     if not rel.parts:
         return False
+    rel_parts = _path_parts_casefold(rel)
     for denied_rel in _MEDIA_DELIVERY_ROOT_CREDENTIAL_FILES:
-        denied = Path(denied_rel)
-        if rel == denied or _path_is_within(rel, denied):
+        denied_parts = _path_parts_casefold(Path(denied_rel))
+        if rel_parts == denied_parts or _parts_is_within_casefold(rel_parts, denied_parts):
             return True
     for denied_rel in _MEDIA_DELIVERY_ROOT_CREDENTIAL_DIRS:
-        denied = Path(denied_rel)
-        if rel == denied or _path_is_within(rel, denied):
+        denied_parts = _path_parts_casefold(Path(denied_rel))
+        if rel_parts == denied_parts or _parts_is_within_casefold(rel_parts, denied_parts):
             return True
     return False
 
@@ -1308,6 +1356,10 @@ def _path_is_profile_tree_credential(resolved: Path) -> bool:
     openable (POSIX execute-only directory). Structural matching keeps the
     credential policy intact under that error condition — denial must not
     depend on ``_iter_hermes_profile_dirs()``.
+
+    Comparisons are casefolded so mixed-case aliases on case-insensitive
+    filesystems (``PROFILES/bob/.ENV``) cannot miss the deny check while
+    still opening the real credential file.
     """
     profiles_root = _HERMES_ROOT / "profiles"
     try:
@@ -1316,16 +1368,14 @@ def _path_is_profile_tree_credential(resolved: Path) -> bool:
         # Fail closed: still match against the unresolved profiles path
         # rather than skipping sibling credential denial entirely.
         profiles_root = _HERMES_ROOT / "profiles"
-    try:
-        rel = resolved.relative_to(profiles_root)
-    except ValueError:
+    rel_parts = _relative_parts_casefold(resolved, profiles_root)
+    if rel_parts is None:
         return False
     # Need at least <profile_name>/<credential...> — a bare profiles/<name>
     # path is not a deliverable file anyway (validate requires is_file).
-    parts = rel.parts
-    if len(parts) < 2:
+    if len(rel_parts) < 2:
         return False
-    return _rel_matches_hermes_root_credential(Path(*parts[1:]))
+    return _rel_matches_hermes_root_credential(Path(*rel_parts[1:]))
 
 
 def _path_is_lexical_profile_tree_credential(absolute: Path) -> bool:
@@ -1338,20 +1388,22 @@ def _path_is_lexical_profile_tree_credential(absolute: Path) -> bool:
     denylist cannot recover the target. Matching the normalized absolute
     input against ``<root>/profiles/<name>/<credential...>`` closes that
     conjunction without depending on directory enumeration.
+
+    Path components are compared casefolded so case-insensitive volumes
+    cannot bypass denial via mixed-case spelling of ``profiles/`` or
+    credential basenames.
     """
     try:
         profiles_root = Path(os.path.normpath(str(_HERMES_ROOT.expanduser() / "profiles")))
         candidate = Path(os.path.normpath(str(absolute)))
     except (OSError, RuntimeError, ValueError):
         return False
-    try:
-        rel = candidate.relative_to(profiles_root)
-    except ValueError:
+    rel_parts = _relative_parts_casefold(candidate, profiles_root)
+    if rel_parts is None:
         return False
-    parts = rel.parts
-    if len(parts) < 2:
+    if len(rel_parts) < 2:
         return False
-    return _rel_matches_hermes_root_credential(Path(*parts[1:]))
+    return _rel_matches_hermes_root_credential(Path(*rel_parts[1:]))
 
 
 def _profile_cache_roots() -> List[Path]:
@@ -1529,11 +1581,17 @@ def _path_under_denied_prefix(resolved: Path, lexical: Optional[Path] = None) ->
             resolved_denied = denied.expanduser().resolve(strict=False)
         except (OSError, RuntimeError, ValueError):
             continue
-        if not (_path_is_within(resolved, resolved_denied) or resolved == resolved_denied):
+        # Casefold deny matching: on case-insensitive volumes, resolve() may
+        # preserve mixed-case input spelling while discovered denied paths use
+        # the on-disk casing from iterdir()/Path construction.
+        if not (
+            _path_is_within_casefold(resolved, resolved_denied)
+            or _paths_equal_casefold(resolved, resolved_denied)
+        ):
             continue
         # Allow the running user's own home tree; its credential sub-dirs are
         # caught by their own (more-specific) denylist entries above.
-        if home is not None and resolved_denied == home:
+        if home is not None and _paths_equal_casefold(resolved_denied, home):
             continue
         return True
     return False
