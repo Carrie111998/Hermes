@@ -833,13 +833,9 @@ agent:
   # underneath this wrapper — this is the Hermes-level loop.
   # api_max_retries: 3
 
-  # After the agent edits code without fresh passing verification, nudge it to
-  # verify before finishing. The default "auto" enables it on interactive
-  # coding surfaces (CLI, TUI, desktop) and programmatic callers, and disables
-  # it on conversational messaging surfaces (Telegram, Discord, etc.) where the
-  # verification summary would reach a human as chat noise. Set true or false to
-  # force it on or off; the HERMES_VERIFY_ON_STOP env var (1/0) takes precedence.
-  # verify_on_stop: auto
+  # Legacy compatibility key. Host code no longer classifies filenames or
+  # terminal command text to decide whether the model may finish.
+  # verify_on_stop: false  # legacy compatibility key; host classifier retired
 
   # Standing operator instructions for the coding posture (when Hermes is in a
   # code workspace). Appended to the coding brief as an extra system block, so
@@ -849,9 +845,7 @@ agent:
   #   - "For UI work, don't run tsc/lint until I approve the look."
   #   - "Clean the diff before you commit and push."
 
-  # When verify-on-stop finds edited code without fresh verification evidence,
-  # append guidance for creative UI work (avoid broad tsc/lint/test before visual
-  # approval) and clean-diff expectations. Set false to keep that nudge terse.
+  # Append coding guidance to explicit user/plugin pre_verify continuations.
   # verify_guidance: true
 
   # A `pre_verify` hook (plugin or shell, see Event Hooks docs) can keep the

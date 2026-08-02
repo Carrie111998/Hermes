@@ -83,9 +83,9 @@ DEFAULT_CONFIG = {
         "service_tier": "",
         # Tool-use enforcement: injects system prompt guidance that tells the
         # model to actually call tools instead of describing intended actions.
-        # Values: "auto" (default — applies to gpt/codex models), true/false
-        # (force on/off for all models), or a list of model-name substrings
-        # to match (e.g. ["gpt", "codex", "gemini", "qwen"]).
+        # Only an explicit true enables it for every model. Legacy "auto" and
+        # model-name-list values are retained as non-injecting config inputs;
+        # model identifiers never route behavioral prompt content.
         "tool_use_enforcement": "auto",
         # Universal "finish the job" guidance — short prompt block applied to
         # all models that targets two cross-family failure modes: (1) stopping
@@ -139,23 +139,15 @@ DEFAULT_CONFIG = {
         # approve. Clean the diff before you commit and push." Cache-safe:
         # takes effect next session. Empty by default.
         "coding_instructions": "",
-        # When verify-on-stop finds edited code without fresh verification
-        # evidence, append guidance for creative UI work (avoid broad
-        # tsc/lint/test before visual approval) and clean-diff expectations.
-        # Set false to keep the evidence nudge terse.
+        # Guidance appended to explicit user/plugin `pre_verify`
+        # continuations. The retired built-in filename/command classifier
+        # cannot activate this path.
         "verify_guidance": True,
         # Upper bound on consecutive `pre_verify` "continue" nudges in a single
         # turn, so a user/plugin hook can never trap the loop.
         "max_verify_nudges": 3,
-        # Verification closure: after the agent edits files in a code workspace,
-        # do not accept a final answer until fresh verification evidence exists
-        # or the agent explains why it cannot run checks. The loop is bounded
-        # and uses the passive verification ledger. Default is "auto" —
-        # surface-aware: on for interactive coding surfaces (CLI, TUI, desktop)
-        # and programmatic callers, off for conversational messaging surfaces
-        # (Telegram, Discord, etc.) where the verification narrative would reach
-        # a human as chat noise. Doc/markdown/skill-only edits never fire it.
-        # Set true to force on everywhere, or false to disable.
+        # Legacy compatibility key. The built-in verify-on-stop classifier is
+        # retired and cannot be reactivated by bool/string/env configuration.
         "verify_on_stop": "auto",
         # Staged inactivity warning: send a warning to the user at this
         # threshold before escalating to a full timeout.  The warning fires

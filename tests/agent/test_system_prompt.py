@@ -143,6 +143,28 @@ def test_build_system_prompt_records_stable_prefix():
     assert prompt[len(agent._cached_system_prompt_static):].startswith("\n\ncontext")
 
 
+def test_model_identity_compatibility_does_not_restore_behavioral_routing():
+    from agent.prompt_builder import (
+        GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
+        OPENAI_MODEL_EXECUTION_GUIDANCE,
+        TOOL_USE_ENFORCEMENT_GUIDANCE,
+    )
+
+    stable = _stable_prompt(
+        _make_agent(
+            valid_tool_names=["terminal"],
+            provider="alibaba",
+            model="alibaba/qwen3.6-plus",
+            _tool_use_enforcement="auto",
+        )
+    )
+
+    assert "The exact model ID is alibaba/qwen3.6-plus" in stable
+    assert TOOL_USE_ENFORCEMENT_GUIDANCE not in stable
+    assert OPENAI_MODEL_EXECUTION_GUIDANCE not in stable
+    assert GOOGLE_MODEL_OPERATIONAL_GUIDANCE not in stable
+
+
 def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
     """The cache split must not reorder the stored coding prompt."""
     import agent.system_prompt as system_prompt

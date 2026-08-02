@@ -190,10 +190,6 @@ def test_code_like_filename_cannot_withhold_or_continue_model_completion(agent):
             "agent.verification_stop.build_verify_on_stop_nudge",
             side_effect=AssertionError("host semantic gate must not run"),
         ),
-        patch(
-            "agent.verification_stop._is_non_code_path",
-            side_effect=AssertionError("filename classifier must not run"),
-        ),
         patch("hermes_cli.plugins.invoke_hook", return_value=[]),
     ):
         result = agent.run_conversation("edit and finish the implementation")
@@ -267,10 +263,6 @@ def test_test_like_terminal_prose_is_opaque_and_cannot_decide_workflow(agent):
     agent._execute_tool_calls = execute_tools
 
     with (
-        patch(
-            "agent.verification_evidence._find_canonical_match",
-            side_effect=AssertionError("command classifier must not run"),
-        ),
         patch(
             "agent.verification_evidence.classify_verification_command",
             side_effect=AssertionError("command semantics must not run"),

@@ -911,21 +911,28 @@ When the iteration budget is fully exhausted, the CLI shows a notification to th
 
 `agent.api_max_retries` controls how many times Hermes retries a provider API call on transient errors (rate limits, connection drops, 5xx) **before** fallback-provider switching engages. The default is `3` — four attempts total. If you have [fallback providers](/user-guide/features/fallback-providers) configured and want to fail over faster, drop this to `0` so the first transient error on your primary immediately hands off to the fallback instead of churning retries against the flaky endpoint.
 
-## Verify-on-Stop (coding verification)
+## Verify-on-Stop (retired compatibility settings)
 
-When enabled, Hermes refuses to accept a final answer on a turn where the agent edited code in a workspace but produced no fresh verification evidence (a passing test run, build, lint, etc.) — it injects a synthetic follow-up asking the agent to verify or explain why it can't. Doc/markdown/skill-only edits never trigger it, and the loop is bounded so it can never trap the agent.
+Hermes no longer classifies filenames, project metadata, or terminal command
+text to decide whether a model may finish. Verification strategy and completion
+remain model-authored. The former settings are accepted during upgrades but
+cannot reactivate the retired host-side classifier or synthetic follow-up.
 
 ```yaml
 agent:
-  verify_on_stop: false        # true | false | "auto" (surface-aware: on for CLI/TUI/desktop, off for messaging)
-  verify_guidance: true        # Append creative-UI / clean-diff guidance to the missing-evidence nudge
-  max_verify_nudges: 3         # Cap on consecutive continue nudges per turn (built-in + pre_verify hooks)
+  verify_on_stop: false        # legacy compatibility key; no host-side effect
+  verify_guidance: true        # guidance for explicit pre_verify hook continuations
+  max_verify_nudges: 3         # cap consecutive pre_verify hook continuations
   coding_instructions: ""      # Standing project-wide coding rules appended to the coding brief
 ```
 
-`verify_on_stop` accepts `true` (on everywhere), `false` (off), or `"auto"` (on for interactive coding surfaces — CLI, TUI, desktop — and programmatic callers; off for messaging surfaces like Telegram/Discord where the verification narrative reads as chat noise). The config migration turns it **off** on existing installs, so treat off as the effective default and opt in explicitly. The `HERMES_VERIFY_ON_STOP` env var overrides the config value when set.
+Older boolean, `"auto"`, and environment values are parsed only for config
+compatibility; none can enable semantic command/path classification.
 
-For a user/plugin policy gate at the same point — keep the agent going with your own checks — see the [`pre_verify` hook](/user-guide/features/hooks#pre_verify).
+Explicit user/plugin policy remains available through the
+[`pre_verify` hook](/user-guide/features/hooks#pre_verify). `verify_guidance`
+and `max_verify_nudges` configure those explicit hook continuations; they do
+not restore the retired built-in classifier.
 
 ## Standing Goals (`/goal`)
 
@@ -1470,35 +1477,31 @@ Some models occasionally describe intended actions as text instead of making too
 
 ```yaml
 agent:
-  tool_use_enforcement: "auto"   # "auto" | true | false | ["model-substring", ...]
+  tool_use_enforcement: true   # true | false; legacy "auto"/lists do not inject
 ```
 
 | Value | Behavior |
 |-------|----------|
-| `"auto"` (default) | Enabled for models matching: `gpt`, `codex`, `gemini`, `gemma`, `grok`, `glm`, `qwen`, `deepseek`. Disabled for all others (e.g. Claude). |
-| `true` | Always enabled, regardless of model. Useful if you notice your current model describing actions instead of performing them. |
-| `false` | Always disabled, regardless of model. |
-| `["gpt", "codex", "qwen", "llama"]` | Enabled only when the model name contains one of the listed substrings (case-insensitive). |
+| `true` | Enabled for every model. Useful if you want explicit universal tool-use guidance. |
+| `false` | Disabled for every model. |
+| `"auto"` (legacy default) | Disabled. Retained for config compatibility; it never interprets the model name. |
+| Lists (legacy) | Disabled. Model-name substring routing is no longer supported. |
 
 ### What it injects
 
-When enabled, three layers of guidance may be added to the system prompt:
-
-1. **General tool-use enforcement** (all matched models) — instructs the model to make tool calls immediately instead of describing intentions, keep working until the task is complete, and never end a turn with a promise of future action.
-
-2. **OpenAI execution discipline** (GPT, Codex, and Grok models) — additional guidance addressing GPT-specific failure modes: abandoning work on partial results, skipping prerequisite lookups, hallucinating instead of using tools, and declaring "done" without verification.
-
-3. **Google operational guidance** (Gemini and Gemma models only) — conciseness, absolute paths, parallel tool calls, and verify-before-edit patterns.
-
-These are transparent to the user and only affect the system prompt. Models that already use tools reliably (like Claude) don't need this guidance, which is why `"auto"` excludes them.
+When explicitly enabled, Hermes adds one model-agnostic guidance block. It
+instructs the model to make tool calls instead of describing intentions, keep
+working until the task is complete, and not end a turn with a promise of future
+action. The model identifier does not change the system prompt.
 
 ### When to turn it on
 
-If you're using a model not in the default auto list and notice it frequently describes what it *would* do instead of doing it, set `tool_use_enforcement: true` or add the model substring to the list:
+If you want this guidance, enable it explicitly. The same behavior applies to
+all models:
 
 ```yaml
 agent:
-  tool_use_enforcement: ["gpt", "codex", "gemini", "grok", "my-custom-model"]
+  tool_use_enforcement: true
 ```
 
 ## Tool-Loop Guardrails
