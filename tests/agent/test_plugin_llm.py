@@ -401,6 +401,11 @@ class TestPluginLlmFacade:
         assert captured["profile_override"] is None
         assert result.usage.input_tokens == 4
         assert result.usage.total_tokens == 10
+        assert result.audit == {
+            "plugin_id": "my-plugin",
+            "purpose": "",
+            "profile": "",
+        }
 
 
 

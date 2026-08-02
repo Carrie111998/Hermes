@@ -688,7 +688,7 @@ class PluginLlm:
                 "plugin_id": self._plugin_id,
                 "purpose": purpose or "",
                 "profile": eff_profile or "",
-                **execution_audit.as_dict(),
+                **self._strict_audit_fields(execution_audit),
             },
         )
         logger.info(
@@ -787,7 +787,7 @@ class PluginLlm:
                 "purpose": purpose or "",
                 "profile": eff_profile or "",
                 "schema_name": schema_name or "",
-                **execution_audit.as_dict(),
+                **self._strict_audit_fields(execution_audit),
             },
         )
         logger.info(
@@ -849,7 +849,7 @@ class PluginLlm:
                 "plugin_id": self._plugin_id,
                 "purpose": purpose or "",
                 "profile": eff_profile or "",
-                **execution_audit.as_dict(),
+                **self._strict_audit_fields(execution_audit),
             },
         )
 
@@ -928,11 +928,17 @@ class PluginLlm:
                 "purpose": purpose or "",
                 "profile": eff_profile or "",
                 "schema_name": schema_name or "",
-                **execution_audit.as_dict(),
+                **self._strict_audit_fields(execution_audit),
             },
         )
 
     # -- internals ---------------------------------------------------------
+
+    @staticmethod
+    def _strict_audit_fields(audit: LlmExecutionAudit) -> Dict[str, Any]:
+        """Keep the observable default-mode audit mapping byte-compatible."""
+
+        return audit.as_dict() if _strict_mode(audit.execution_mode) else {}
 
     @staticmethod
     def _new_execution_audit(
