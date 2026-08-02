@@ -922,15 +922,26 @@ def _run_review_in_thread(
                     _digest_history(messages_snapshot) if _routed
                     else messages_snapshot
                 )
-                review_agent.run_conversation(
-                    user_message=(
-                        prompt
-                        + "\n\nYou can only call memory and skill "
-                        "management tools. Other tools will be denied "
-                        "at runtime — do not attempt them."
-                    ),
-                    conversation_history=_review_history,
+                from agent.learning_context import (
+                    build_learning_metadata,
+                    learning_metadata_scope,
                 )
+
+                _learning_metadata = build_learning_metadata(
+                    messages_snapshot,
+                    session_id=agent.session_id or "",
+                    platform=agent.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
+                )
+                with learning_metadata_scope(_learning_metadata):
+                    review_agent.run_conversation(
+                        user_message=(
+                            prompt
+                            + "\n\nYou can only call memory and skill "
+                            "management tools. Other tools will be denied "
+                            "at runtime — do not attempt them."
+                        ),
+                        conversation_history=_review_history,
+                    )
             finally:
                 clear_thread_tool_whitelist()
 

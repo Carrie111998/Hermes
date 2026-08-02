@@ -23,6 +23,7 @@ Design:
 - Frozen snapshot pattern: system prompt is stable, tool responses show live state
 """
 
+import hashlib
 import json
 import logging
 import time
@@ -909,7 +910,7 @@ def load_on_disk_store() -> "MemoryStore":
 
 
 def _apply_write_gate(action: str, target: str, content: Optional[str],
-                      old_text: Optional[str]) -> Optional[str]:
+                      old_text: Optional[str], store: "MemoryStore") -> Optional[str]:
     """Evaluate the memory write gate. Returns a JSON tool-result string when
     the write should NOT proceed normally (blocked or staged), or None when the
     caller should perform the real write.
@@ -953,11 +954,29 @@ def _apply_write_gate(action: str, target: str, content: Optional[str],
         "content": content,
         "old_text": old_text,
     }
+    entries = store._entries_for(target)
+    target_fingerprint = hashlib.sha256(
+        json.dumps(entries, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
     record = wa.stage_write(
         wa.MEMORY, payload,
         summary=f"{summary}: {detail[:120]}",
         origin=wa.current_origin(),
+        metadata={"precondition": {"target_fingerprint": target_fingerprint}},
     )
+    if record.get("staged") is False:
+        return tool_error("Failed to persist pending memory write; nothing was saved.", success=False)
+    if record.get("suppressed"):
+        return json.dumps(
+            {
+                "success": True,
+                "staged": False,
+                "deduplicated": True,
+                "candidate_id": record["candidate_id"],
+                "message": "Equivalent learning candidate already exists; no duplicate was staged.",
+            },
+            ensure_ascii=False,
+        )
     return json.dumps(
         {"success": True, "staged": True, "pending_id": record["id"],
          "message": decision.message},
@@ -965,7 +984,8 @@ def _apply_write_gate(action: str, target: str, content: Optional[str],
     )
 
 
-def _apply_batch_write_gate(target: str, operations: List[Dict[str, Any]]) -> Optional[str]:
+def _apply_batch_write_gate(target: str, operations: List[Dict[str, Any]],
+                            store: "MemoryStore") -> Optional[str]:
     """Evaluate the write gate for a batch of memory operations.
 
     Returns a JSON tool-result string when the batch should NOT proceed
@@ -1000,11 +1020,29 @@ def _apply_batch_write_gate(target: str, operations: List[Dict[str, Any]]) -> Op
         return tool_error(decision.message, success=False)
 
     payload = {"action": "batch", "target": target, "operations": operations}
+    entries = store._entries_for(target)
+    target_fingerprint = hashlib.sha256(
+        json.dumps(entries, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
     record = wa.stage_write(
         wa.MEMORY, payload,
         summary=f"{summary}: {detail[:120]}",
         origin=wa.current_origin(),
+        metadata={"precondition": {"target_fingerprint": target_fingerprint}},
     )
+    if record.get("staged") is False:
+        return tool_error("Failed to persist pending memory write; nothing was saved.", success=False)
+    if record.get("suppressed"):
+        return json.dumps(
+            {
+                "success": True,
+                "staged": False,
+                "deduplicated": True,
+                "candidate_id": record["candidate_id"],
+                "message": "Equivalent learning candidate already exists; no duplicate was staged.",
+            },
+            ensure_ascii=False,
+        )
     return json.dumps(
         {"success": True, "staged": True, "pending_id": record["id"],
          "message": decision.message},
@@ -1078,7 +1116,7 @@ def memory_tool(
     if operations:
         if not isinstance(operations, list):
             return tool_error("operations must be a list of {action, content?, old_text?} objects.", success=False)
-        gate_result = _apply_batch_write_gate(target, operations)
+        gate_result = _apply_batch_write_gate(target, operations, store)
         if gate_result is not None:
             return gate_result
         result = store.apply_batch(target, operations)
@@ -1103,7 +1141,7 @@ def memory_tool(
 
     # Approval gate: when on, stages the write (background/gateway) or prompts
     # inline (interactive CLI); when off (default) passes straight through.
-    gate_result = _apply_write_gate(action, target, content, old_text)
+    gate_result = _apply_write_gate(action, target, content, old_text, store)
     if gate_result is not None:
         return gate_result
 

@@ -1431,6 +1431,20 @@ def _apply_skill_write_gate(action, name, **payload_kwargs):
         new_string=payload_kwargs.get("new_string") or "",
     )
     record = wa.stage_write(wa.SKILLS, payload, summary=gist, origin=wa.current_origin())
+    if record.get("staged") is False:
+        return tool_error("Failed to persist pending skill write; nothing was saved.", success=False)
+    if record.get("suppressed"):
+        return json.dumps(
+            {
+                "success": True,
+                "staged": False,
+                "deduplicated": True,
+                "candidate_id": record["candidate_id"],
+                "gist": gist,
+                "message": "Equivalent learning candidate already exists; no duplicate was staged.",
+            },
+            ensure_ascii=False,
+        )
     return json.dumps(
         {"success": True, "staged": True, "pending_id": record["id"],
          "gist": gist, "message": decision.message},
@@ -1530,6 +1544,14 @@ def skill_manage(
     preflight = _background_review_preflight(action, name)
     if preflight is not None:
         return json.dumps(preflight, ensure_ascii=False)
+
+    # Validate file targets before the review gate serializes or previews them.
+    # Otherwise an invalid absolute/traversal path can become a read primitive
+    # through `/skills diff` even though the eventual mutation would reject it.
+    if action in {"write_file", "remove_file"} or (action == "patch" and file_path):
+        path_error = _validate_file_path(file_path or "")
+        if path_error:
+            return tool_error(path_error, success=False)
 
     # Approval gate: when on, stages the write for review (skills are too large
     # to review inline, so they always stage regardless of origin); when off
