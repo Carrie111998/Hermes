@@ -4011,11 +4011,14 @@ def _merge_task_history(
     summary: str,
     metadata: dict,
 ) -> None:
-    """Move an implementation card's durable history onto its PR card.
+    """Merge a source card's durable history into the canonical review card.
 
-    This runs inside the caller's write transaction. The source card remains
-    as an archived audit marker, while runs/events/comments/attachments all
-    point at the one active canonical card.
+    This runs inside the caller's write transaction. The native implementation
+    card is authoritative when it is present; a webhook-created card is an
+    observation/replay source. The source card remains as an archived audit
+    marker, while runs/events/comments/attachments point at the canonical card.
+    If ``source_run_id`` is supplied, its active run is finalized as part of
+    the reconciliation before the source card is archived.
     """
     if source_id == canonical_id:
         return
@@ -4024,8 +4027,8 @@ def _merge_task_history(
     if source is None or canonical is None:
         raise ValueError("review reconciliation task disappeared")
 
-    # Preserve the implementation workspace/routing on a webhook-created card
-    # when it has not established one of its own.
+    # Preserve source workspace/routing when the canonical card has not
+    # established one of its own. This supports either reconciliation order.
     if canonical["workspace_kind"] == "scratch" and source["workspace_kind"] != "scratch":
         conn.execute(
             "UPDATE tasks SET workspace_kind=?, workspace_path=?, branch_name=?, "
@@ -4041,7 +4044,35 @@ def _merge_task_history(
     conn.execute("UPDATE task_events SET task_id = ? WHERE task_id = ?", (canonical_id, source_id))
     conn.execute("UPDATE task_comments SET task_id = ? WHERE task_id = ?", (canonical_id, source_id))
     conn.execute("UPDATE task_attachments SET task_id = ? WHERE task_id = ?", (canonical_id, source_id))
-    conn.execute("UPDATE kanban_notify_subs SET task_id = ? WHERE task_id = ?", (canonical_id, source_id))
+
+    # A webhook replay and the native worker can both auto-subscribe the same
+    # platform/chat/thread tuple.  Re-key subscriptions one row at a time so
+    # a duplicate primary key keeps the canonical card's row instead of making
+    # the whole reconciliation transaction fail with IntegrityError.  Preserve
+    # the furthest event cursor even when the destination row already exists.
+    source_subs = conn.execute(
+        "SELECT platform, chat_id, chat_type, thread_id, user_id, "
+        "notifier_profile, delivery_metadata, created_at, last_event_id "
+        "FROM kanban_notify_subs WHERE task_id=?",
+        (source_id,),
+    ).fetchall()
+    for sub in source_subs:
+        conn.execute(
+            "INSERT OR IGNORE INTO kanban_notify_subs "
+            "(task_id, platform, chat_id, chat_type, thread_id, user_id, "
+            "notifier_profile, delivery_metadata, created_at, last_event_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (canonical_id, sub["platform"], sub["chat_id"], sub["chat_type"],
+             sub["thread_id"], sub["user_id"], sub["notifier_profile"],
+             sub["delivery_metadata"], sub["created_at"], sub["last_event_id"]),
+        )
+        conn.execute(
+            "UPDATE kanban_notify_subs SET last_event_id = MAX(last_event_id, ?) "
+            "WHERE task_id=? AND platform=? AND chat_id=? AND thread_id=?",
+            (sub["last_event_id"], canonical_id, sub["platform"],
+             sub["chat_id"], sub["thread_id"]),
+        )
+    conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (source_id,))
 
     if source_run_id is not None:
         run_metadata = dict(metadata)
@@ -4616,7 +4647,7 @@ def submit_for_review(
         # then fold the implementation card into the already-created webhook
         # card instead of creating a second lifecycle.
         duplicate = conn.execute(
-            "SELECT id, status FROM tasks WHERE idempotency_key = ? AND id != ? "
+            "SELECT id, status, current_run_id FROM tasks WHERE idempotency_key = ? AND id != ? "
             "AND status != 'archived' LIMIT 1",
             (review_identity, task_id),
         ).fetchone()
@@ -4627,41 +4658,23 @@ def submit_for_review(
             "review_identity": review_identity,
         })
         if duplicate is not None:
-            canonical_id = str(duplicate["id"])
+            # The native implementation card is authoritative: webhook
+            # ingestion is an observation/replay and must never replace the
+            # worker's canonical task id.  Fold the webhook card into this
+            # running task, then let the normal handoff below close its run.
+            canonical_id = task_id
             _merge_task_history(
                 conn,
-                task_id,
+                str(duplicate["id"]),
                 canonical_id,
-                source_run_id=int(row["current_run_id"]) if row["current_run_id"] else None,
+                source_run_id=(
+                    int(duplicate["current_run_id"])
+                    if duplicate["current_run_id"] is not None else None
+                ),
                 reviewer=reviewer,
                 summary=summary,
                 metadata=handoff,
             )
-            canonical_status = duplicate["status"]
-            if canonical_status in {"blocked", "triage"}:
-                conn.execute(
-                    "UPDATE tasks SET status='review', assignee=?, idempotency_key=?, "
-                    "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL WHERE id=?",
-                    (reviewer, review_identity, canonical_id),
-                )
-            else:
-                conn.execute(
-                    "UPDATE tasks SET idempotency_key=? WHERE id=?",
-                    (review_identity, canonical_id),
-                )
-            _append_event(
-                conn,
-                canonical_id,
-                "review_submitted",
-                {
-                    "reviewer": reviewer,
-                    "original_assignee": original_assignee,
-                    "summary": summary.strip().splitlines()[0][:400],
-                    "metadata": handoff,
-                },
-                run_id=int(row["current_run_id"]) if row["current_run_id"] else None,
-            )
-            return True
 
         where = "id = ? AND status = 'running'"
         params: tuple[Any, ...] = (task_id,)
