@@ -985,8 +985,11 @@ _SCHEMA_OVERRIDES: Dict[str, Dict[str, Any]] = {
     "plugins.hook_callback_timeout": {
         "type": "number",
         "description": (
-            "Wall-clock cap (seconds) for a single in-process Python plugin "
-            "hook callback. 0 disables the cap; values above 600 are clamped."
+            "Wall-clock cap (seconds) for timeout-bounded in-process Python "
+            "plugin hook callbacks (hot-path observers + pre_tool_call). "
+            "Timed-out pre_tool_call fails closed. 0 disables the cap; "
+            "values above 600 are clamped. Caller-thread hooks such as "
+            "subagent_stop are never moved onto a timeout worker."
         ),
     },
 }

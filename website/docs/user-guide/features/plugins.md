@@ -153,8 +153,11 @@ plugins:
     - disk-cleanup
   disabled:       # optional deny-list — always wins if a name appears in both
     - noisy-plugin
-  # Optional: wall-clock cap (seconds) for in-process Python plugin hook
-  # callbacks. Default 30; set 0 to disable; values above 600 are clamped.
+  # Optional: wall-clock cap (seconds) for timeout-bounded in-process Python
+  # plugin hook callbacks (hot-path observers + pre_tool_call). Default 30;
+  # set 0 to disable; values above 600 are clamped. Timed-out pre_tool_call
+  # callbacks fail closed (block the tool). Caller-thread hooks such as
+  # subagent_stop are never moved onto a timeout worker.
   # Shell hooks keep their own per-entry timeout under the top-level hooks: key.
   hook_callback_timeout: 30
 ```

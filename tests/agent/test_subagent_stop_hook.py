@@ -2,8 +2,8 @@
 
 Covers wire-up from tools.delegate_tool.delegate_task:
   * fires once per child in both single-task and batch modes
-  * is dispatched from the parent thread (no child-pool re-entrancy);
-    callback bodies may run on a hermes-hook-* timeout worker
+  * is dispatched from the parent thread (no child-pool re-entrancy)
+    and callback bodies stay on that caller thread
   * carries child_role when the agent exposes _delegate_role
   * carries child_role=None when _delegate_role is not set (pre-M3)
   * exposes a detached, metadata-only tool_call_history
@@ -109,7 +109,7 @@ class TestSingleTask:
         assert payload["duration_ms"] == 5000
 
     def test_fires_on_parent_thread(self):
-        """Dispatch is marshalled to the parent; callback may use a timeout worker."""
+        """Dispatch and callback body stay on the parent/caller thread."""
         captured = _register_capturing_hook()
         main_thread = threading.current_thread()
         dispatch_threads = []
@@ -131,9 +131,7 @@ class TestSingleTask:
 
         assert dispatch_threads and all(t is main_thread for t in dispatch_threads)
         cb_thread = captured[0]["_thread"]
-        # Default plugins.hook_callback_timeout > 0 runs the body on a
-        # hermes-hook-* daemon worker; timeout 0 keeps it on the caller.
-        assert cb_thread is main_thread or cb_thread.name.startswith("hermes-hook-")
+        assert cb_thread is main_thread
 
     def test_payload_includes_parent_session_id(self):
         captured = _register_capturing_hook()
@@ -212,8 +210,7 @@ class TestBatchMode:
         assert len(dispatch_threads) == 2
         assert all(t is main_thread for t in dispatch_threads)
         for payload in captured:
-            cb_thread = payload["_thread"]
-            assert cb_thread is main_thread or cb_thread.name.startswith("hermes-hook-")
+            assert payload["_thread"] is main_thread
 
 
 # ── payload shape ─────────────────────────────────────────────────────────

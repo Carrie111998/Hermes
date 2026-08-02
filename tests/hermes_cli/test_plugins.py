@@ -447,6 +447,135 @@ class TestPluginHooks:
 
         assert plugins_mod._resolve_hook_callback_timeout() == 0.12
 
+    def test_subagent_stop_stays_on_caller_thread(self, monkeypatch):
+        """Caller-thread hooks must not move the body onto a timeout worker."""
+        monkeypatch.setattr(
+            "hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 1.0
+        )
+        seen = {}
+
+        def capture(**_kwargs):
+            seen["thread"] = threading.current_thread()
+            return "ok"
+
+        mgr = PluginManager()
+        mgr._hooks["subagent_stop"] = [capture]
+        caller = threading.current_thread()
+        assert mgr.invoke_hook("subagent_stop", parent_session_id="p1") == ["ok"]
+        assert seen["thread"] is caller
+
+    def test_hung_callback_suppresses_repeat_fires(self, monkeypatch):
+        """A still-running timed-out callback must not spawn another worker."""
+        import time
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 0.1
+        )
+
+        hold = threading.Event()
+        starts = []
+
+        def blocker(**_kwargs):
+            starts.append(1)
+            hold.wait(timeout=10.0)
+            return "late"
+
+        mgr = PluginManager()
+        mgr._hooks["post_tool_call"] = [blocker]
+
+        t0 = time.monotonic()
+        assert mgr.invoke_hook("post_tool_call") == []
+        assert mgr.invoke_hook("post_tool_call") == []
+        elapsed = time.monotonic() - t0
+
+        assert len(starts) == 1
+        assert elapsed < 1.0
+        hold.set()
+
+    def test_pre_tool_call_timeout_fail_closed(self, monkeypatch):
+        """Timed-out pre_tool_call must return a block directive, not allow."""
+        import time
+
+        from hermes_cli.plugins import (
+            _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE,
+            resolve_pre_tool_block,
+        )
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 0.1
+        )
+
+        hold = threading.Event()
+
+        def hung_policy(**_kwargs):
+            hold.wait(timeout=10.0)
+            return None
+
+        mgr = PluginManager()
+        mgr._hooks["pre_tool_call"] = [hung_policy]
+
+        import hermes_cli.plugins as plugins_mod
+
+        monkeypatch.setattr(plugins_mod, "_plugin_manager", mgr)
+
+        t0 = time.monotonic()
+        msg = resolve_pre_tool_block("web_search", {"query": "x"})
+        elapsed = time.monotonic() - t0
+
+        assert msg == _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE
+        assert elapsed < 1.0
+
+        # Still-running / suppression window must also fail closed.
+        msg2 = resolve_pre_tool_block("web_search", {"query": "y"})
+        assert msg2 == _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE
+        hold.set()
+
+    def test_pre_tool_call_timeout_does_not_reach_tool_handler(self, monkeypatch):
+        """E2E: timed-out pre_tool_call blocks handle_function_call before dispatch."""
+        import json
+
+        from hermes_cli.plugins import _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 0.1
+        )
+
+        hold = threading.Event()
+
+        def hung_policy(**_kwargs):
+            hold.wait(timeout=10.0)
+            return None
+
+        mgr = PluginManager()
+        mgr._hooks["pre_tool_call"] = [hung_policy]
+
+        import hermes_cli.plugins as plugins_mod
+
+        monkeypatch.setattr(plugins_mod, "_plugin_manager", mgr)
+
+        dispatch_calls = []
+
+        def _dispatch(name, args, **kwargs):
+            dispatch_calls.append((name, args))
+            return json.dumps({"ok": True})
+
+        mock_registry = MagicMock()
+        mock_registry.dispatch.side_effect = _dispatch
+
+        with patch("model_tools.registry", mock_registry):
+            from model_tools import handle_function_call
+
+            result = handle_function_call(
+                "web_search",
+                {"query": "test"},
+                task_id="t1",
+                session_id="s1",
+            )
+
+        assert dispatch_calls == []
+        assert _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE in result
+        hold.set()
+
 
 class TestPreToolCallBlocking:
     """Tests for the pre_tool_call block directive helper."""
