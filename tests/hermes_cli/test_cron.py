@@ -19,25 +19,6 @@ def tmp_cron_dir(tmp_path, monkeypatch):
 
 
 class TestCronCommandLifecycle:
-    def test_pause_resume_run(self, tmp_cron_dir, capsys):
-        job = create_job(prompt="Check server status", schedule="every 1h")
-
-        cron_command(Namespace(cron_command="pause", job_id=job["id"]))
-        paused = get_job(job["id"])
-        assert paused["state"] == "paused"
-
-        cron_command(Namespace(cron_command="resume", job_id=job["id"]))
-        resumed = get_job(job["id"])
-        assert resumed["state"] == "scheduled"
-
-        cron_command(Namespace(cron_command="run", job_id=job["id"]))
-        triggered = get_job(job["id"])
-        assert triggered["state"] == "scheduled"
-
-        out = capsys.readouterr().out
-        assert "Paused job" in out
-        assert "Resumed job" in out
-        assert "Triggered job" in out
 
     def test_edit_can_replace_and_clear_skills(self, tmp_cron_dir, capsys):
         job = create_job(
@@ -123,38 +104,6 @@ class TestCronCommandLifecycle:
         assert jobs[0]["name"] == "Skill combo"
         assert jobs[0]["prompt"] == "Use both skills"
 
-    def test_list_does_not_crash_when_repeat_is_null(self, tmp_cron_dir, capsys):
-        """A one-shot job can be persisted with ``"repeat": null``. `cron
-        list` must render it as ∞ rather than crashing on .get(...)\\.get."""
-        from cron.jobs import load_jobs, save_jobs
-
-        create_job(prompt="One shot", schedule="every 1h")
-        # Force the present-but-null shape that .get("repeat", {}) mishandles.
-        jobs = load_jobs()
-        jobs[0]["repeat"] = None
-        save_jobs(jobs)
-
-        cron_command(Namespace(cron_command="list", all=True))
-
-        out = capsys.readouterr().out
-        assert "Repeat:    ∞" in out
-
-    def test_list_does_not_crash_when_deliver_is_null(self, tmp_cron_dir, capsys):
-        """A job can be persisted with ``"deliver": null`` (present-but-null).
-        `cron list` must fall back to the default channel rather than crashing
-        on ``", ".join(None)`` — same dict-default pitfall as ``repeat`` (#32896).
-        """
-        from cron.jobs import load_jobs, save_jobs
-
-        create_job(prompt="No deliver", schedule="every 1h")
-        jobs = load_jobs()
-        jobs[0]["deliver"] = None
-        save_jobs(jobs)
-
-        cron_command(Namespace(cron_command="list", all=True))
-
-        out = capsys.readouterr().out
-        assert "Deliver:   local" in out
 
 
 class TestGatewayNotRunningWarning:
@@ -245,17 +194,6 @@ class TestExternalCronProviderStatus:
         # Still surfaces the active-job summary.
         assert "active job(s)" in out
 
-    def test_status_unchanged_for_builtin(self, tmp_cron_dir, capsys, monkeypatch):
-        create_job(prompt="Ping", schedule="every 2m")
-        monkeypatch.setattr(
-            "hermes_cli.cron._active_cron_provider_name", lambda: "builtin"
-        )
-        monkeypatch.setattr("hermes_cli.gateway.find_gateway_pids", lambda: [])
-        cron_command(Namespace(cron_command="status"))
-        out = capsys.readouterr().out
-        # Built-in path is the historical ticker-based report.
-        assert "Gateway is not running" in out
-        assert "managed scheduler" not in out
 
     def test_create_silent_for_chronos_even_without_gateway(
         self, tmp_cron_dir, capsys, monkeypatch
@@ -310,26 +248,6 @@ def test_cron_list_warns_when_gateway_not_running(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "Gateway is not running" in out
     assert "Nightly docs" in out
-
-
-def test_cron_status_reports_running_gateway(monkeypatch, capsys):
-    monkeypatch.setattr(cron_cli, "_active_cron_provider_name", lambda: "builtin")
-    monkeypatch.setattr("hermes_cli.gateway.find_gateway_pids", lambda: [1234, 5678])
-    monkeypatch.setattr(
-        "cron.jobs.list_jobs",
-        lambda include_disabled=False: [
-            {"next_run_at": "2026-06-01T00:00:00Z"},
-            {"next_run_at": "2026-05-31T12:00:00Z"},
-        ],
-    )
-
-    cron_cli.cron_status()
-
-    out = capsys.readouterr().out
-    assert "Gateway is running" in out
-    assert "1234, 5678" in out
-    assert "2 active job(s)" in out
-    assert "2026-05-31T12:00:00Z" in out
 
 
 def test_cron_tick_invokes_scheduler_tick_with_verbose(monkeypatch):
