@@ -12,13 +12,28 @@ import pytest
 
 def _create_same_dedup_candidate(home: str, candidate_id: str, queue) -> None:
     os.environ["HERMES_HOME"] = home
+    import time
+
     from agent import learning_ledger
 
-    try:
-        learning_ledger.create_candidate(_candidate(candidate_id))
-        queue.put("created")
-    except sqlite3.IntegrityError:
-        queue.put("duplicate")
+    # Two fresh processes can race schema initialization on the same new
+    # profile; a lock timeout there is contention, not a behavioral result.
+    # Retry briefly, then classify the dedup outcome.
+    last_error: Exception | None = None
+    for _ in range(20):
+        try:
+            learning_ledger.create_candidate(_candidate(candidate_id))
+            queue.put("created")
+            return
+        except sqlite3.IntegrityError:
+            queue.put("duplicate")
+            return
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower():
+                raise
+            last_error = exc
+            time.sleep(0.1)
+    raise last_error  # type: ignore[misc]
 
 
 def _candidate(candidate_id: str = "candidate-1") -> dict:
