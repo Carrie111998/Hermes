@@ -22,8 +22,10 @@ Header schema (12 headers total):
 
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Mapping, Optional
 
 
@@ -73,6 +75,50 @@ class RateLimitState:
         if not self.has_data:
             return float("inf")
         return time.time() - self.captured_at
+
+
+def _timestamp_to_utc_iso(value: float) -> Optional[str]:
+    if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value) or value <= 0:
+        return None
+    return datetime.fromtimestamp(float(value), tz=timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _bucket_to_dict(bucket: RateLimitBucket) -> dict[str, Any]:
+    reset_at = (
+        bucket.captured_at + bucket.reset_seconds
+        if math.isfinite(bucket.captured_at)
+        and bucket.captured_at > 0
+        and math.isfinite(bucket.reset_seconds)
+        and bucket.reset_seconds >= 0
+        else 0.0
+    )
+    used_percent = bucket.usage_pct
+    return {
+        "limit": int(bucket.limit),
+        "remaining": int(bucket.remaining),
+        "used": int(bucket.used),
+        "used_percent": float(used_percent) if math.isfinite(used_percent) else None,
+        "reset_at": _timestamp_to_utc_iso(reset_at),
+    }
+
+
+def rate_limit_state_to_dict(state: Optional[RateLimitState]) -> Optional[dict[str, Any]]:
+    """Serialize captured provider limits without response headers or credentials."""
+    if state is None:
+        return None
+    age_seconds = state.age_seconds
+    return {
+        "provider": str(state.provider or ""),
+        "captured_at": _timestamp_to_utc_iso(state.captured_at),
+        "age_seconds": max(0.0, float(age_seconds)) if math.isfinite(age_seconds) else None,
+        "available": state.has_data,
+        "buckets": {
+            "requests_min": _bucket_to_dict(state.requests_min),
+            "requests_hour": _bucket_to_dict(state.requests_hour),
+            "tokens_min": _bucket_to_dict(state.tokens_min),
+            "tokens_hour": _bucket_to_dict(state.tokens_hour),
+        },
+    }
 
 
 def _safe_int(value: Any, default: int = 0) -> int:

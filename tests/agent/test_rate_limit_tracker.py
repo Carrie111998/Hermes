@@ -1,6 +1,8 @@
 """Tests for agent.rate_limit_tracker — header parsing and formatting."""
-
+import json
 import time
+from datetime import datetime, timezone
+
 import pytest
 from agent.rate_limit_tracker import (
     RateLimitBucket,
@@ -62,6 +64,54 @@ class TestParseHeaders:
 
 
 class TestBucket:
+    def test_snapshot_serialization_is_json_safe(self, monkeypatch):
+        captured_at = 1_700_000_000.0
+        monkeypatch.setattr(time, "time", lambda: captured_at + 15)
+        state = RateLimitState(
+            requests_min=RateLimitBucket(limit=100, remaining=75, reset_seconds=60, captured_at=captured_at),
+            requests_hour=RateLimitBucket(limit=1000, remaining=900, reset_seconds=3600, captured_at=captured_at),
+            captured_at=captured_at,
+            provider="xai-oauth",
+        )
+
+        from agent.rate_limit_tracker import rate_limit_state_to_dict
+
+        payload = rate_limit_state_to_dict(state)
+
+        assert payload is not None
+        assert set(payload) == {"provider", "captured_at", "age_seconds", "available", "buckets"}
+        assert payload["provider"] == "xai-oauth"
+        assert payload["captured_at"] == datetime.fromtimestamp(captured_at, tz=timezone.utc).isoformat().replace(
+            "+00:00", "Z"
+        )
+        assert payload["age_seconds"] == pytest.approx(15)
+        assert payload["available"] is True
+        assert set(payload["buckets"]) == {"requests_min", "requests_hour", "tokens_min", "tokens_hour"}
+        request_bucket = payload["buckets"]["requests_min"]
+        assert set(request_bucket) == {"limit", "remaining", "used", "used_percent", "reset_at"}
+        assert request_bucket == {
+            "limit": 100,
+            "remaining": 75,
+            "used": 25,
+            "used_percent": 25.0,
+            "reset_at": datetime.fromtimestamp(captured_at + 60, tz=timezone.utc)
+            .isoformat()
+            .replace("+00:00", "Z"),
+        }
+        json.dumps(payload, allow_nan=False)
+
+    def test_snapshot_serialization_handles_none_and_non_finite_values(self):
+        from agent.rate_limit_tracker import rate_limit_state_to_dict
+
+        assert rate_limit_state_to_dict(None) is None
+        state = RateLimitState(
+            requests_min=RateLimitBucket(limit=100, remaining=20, reset_seconds=float("inf"), captured_at=1.0),
+            captured_at=1.0,
+            provider="xai",
+        )
+        payload = rate_limit_state_to_dict(state)
+        assert payload["buckets"]["requests_min"]["reset_at"] is None
+        json.dumps(payload, allow_nan=False)
 
     def test_usage_pct(self):
         b = RateLimitBucket(limit=100, remaining=20, reset_seconds=30.0, captured_at=time.time())
