@@ -144,8 +144,30 @@ You can also ask Hermes to rename the current chat; provide the meaningful
 title and Hermes will add the appropriate status icon. Meaningful names you set
 manually are respected rather than replaced unnecessarily.
 
-The bot must have permission to change the room name. If it does not, the agent
-turn continues normally and the room name remains unchanged.
+Complete both setup steps:
+
+1. Set `matrix.dynamic_room_name: true` in `~/.hermes/config.yaml`, then restart
+   or reload the gateway so the configuration takes effect.
+2. In each existing Matrix DM, give the bot the least-privilege permission
+   needed to rename that room. In Element Web/Desktop, open the DM, then go to
+   **Room settings → Roles & Permissions**, find **Change room name**, and allow
+   **Members** (power level `0`), or the equivalent level already held by the
+   bot. Client wording may vary. Do not promote the bot to Moderator or Admin
+   solely for this feature.
+
+Room-name permission is configured per room for existing DMs. Newly created
+rooms also need a policy that lets the bot rename them, unless they are already
+configured that way.
+
+:::note Advanced least-privilege configuration
+If the client or administration interface does not expose this setting, set
+only the event-specific `m.room.name` power-level threshold to `0`. Preserve
+every other power-level field.
+:::
+
+To verify the setup, send a message in the DM. The room title should move from
+`🟡` to `✅`. If it remains unchanged, check the room permissions; Hermes should
+still answer normally even when it cannot rename the room.
 
 :::note
 If you are upgrading from a version that did not have `MATRIX_REQUIRE_MENTION`, the bot previously responded to all messages in rooms. To preserve that behavior, set `MATRIX_REQUIRE_MENTION=false`.
