@@ -190,7 +190,7 @@ def _iter_referenced_shell_scripts(
         executable = segment[index]
         executable_name = Path(executable).name
 
-        if executable_name in {".", "source"}:
+        if executable in {".", "source"} or executable_name == "source":
             if len(segment) > index + 1:
                 yield _resolve_terminal_script_path(segment[index + 1], cwd)
             continue
@@ -219,8 +219,12 @@ def _iter_referenced_shell_scripts(
                 yield _resolve_terminal_script_path(arguments[arg_index], cwd)
             continue
 
-        if "/" in executable or executable.endswith((".sh", ".bash", ".zsh")):
+        if executable.endswith((".sh", ".bash", ".zsh")):
             yield _resolve_terminal_script_path(executable, cwd)
+        elif "/" in executable:
+            candidate = _resolve_terminal_script_path(executable, cwd)
+            if candidate.suffix in (".sh", ".bash", ".zsh") or _is_shell_script_file(candidate):
+                yield candidate
 
 
 def _iter_shell_command_payloads(command: str) -> Iterator[str]:
@@ -252,7 +256,7 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
     try:
         descriptor = os.open(path, flags)
-    except OSError:
+    except (OSError, ValueError):
         return None, False
     try:
         metadata = os.fstat(descriptor)
@@ -268,6 +272,35 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
     if len(data) > _MAX_REFERENCED_SCRIPT_BYTES:
         return None, True
     return data.decode("utf-8", errors="replace"), False
+
+
+def _is_shell_script_file(path: Path) -> bool:
+    """Return whether *path* is a bounded-read script candidate.
+
+    Text candidates are scanned (defence-in-depth: POSIX shells execute
+    extensionless text scripts without a shebang via the ENOEXEC fallback),
+    while clearly binary files are skipped using a bounded NUL-byte header
+    check — a binary decoded as UTF-8 embeds NUL bytes that previously
+    crashed the resolver (ValueError: embedded null byte) or produced
+    false-positive gateway-lifecycle verdicts.
+    """
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except (OSError, ValueError):
+        return False
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            return False
+        data = os.read(descriptor, 512)
+    except OSError:
+        return False
+    finally:
+        os.close(descriptor)
+    if not data:
+        return False
+    return b"\x00" not in data
 
 
 def _contains_unsafe_gateway_action(
@@ -298,7 +331,7 @@ def _contains_unsafe_gateway_action(
     for script_path in _iter_referenced_shell_scripts(command, cwd=cwd):
         try:
             resolved = script_path.resolve(strict=False)
-        except OSError:
+        except (OSError, ValueError):
             resolved = script_path
         if resolved in visited:
             continue
