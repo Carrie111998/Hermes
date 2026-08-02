@@ -3521,6 +3521,66 @@ def check_all_command_guards(command: str, env_type: str,
                             ),
                         }
                     # else: tirith_fail_open is True — allow as before
+        elif _get_noninteractive_approval_mode() == "deny":
+            # Non-cron and still nobody present: a scripted or headless run, a
+            # dispatched worker, hermes-agent embedded as a library. Same
+            # reasoning as the cron branch above, under its own key — and this
+            # is the branch that governs real terminal calls, since
+            # terminal_tool routes here rather than through
+            # check_dangerous_command.
+            is_dangerous, _pk, description = detect_dangerous_command(command)
+            if is_dangerous:
+                return {
+                    "approved": False,
+                    "message": (
+                        f"BLOCKED: Command flagged as dangerous ({description}) "
+                        "but no interactive user or gateway is present to "
+                        "approve it (approvals.noninteractive_mode: deny). "
+                        "Find an alternative approach, or run this where a "
+                        "human can answer."
+                    ),
+                }
+            # Content-level threats that the pattern detector does not match
+            # (homograph URLs, pipe-to-interpreter, terminal injection) are
+            # caught the same way cron catches them.
+            try:
+                from tools.tirith_security import check_command_security
+                _ni_tirith = check_command_security(command)
+                if _ni_tirith.get("action") in ("block", "warn"):
+                    return {
+                        "approved": False,
+                        "message": (
+                            f"BLOCKED: {_format_tirith_description(_ni_tirith)} "
+                            "but no interactive user or gateway is present to "
+                            "approve it (approvals.noninteractive_mode: deny). "
+                            "Find an alternative approach, or run this where a "
+                            "human can answer."
+                        ),
+                    }
+            except ImportError:
+                # Mirrors the cron branch: an operator who opted into
+                # tirith fail-closed must not be silently allowed here either.
+                _ni_fail_open = True
+                try:
+                    from hermes_cli.config import load_config as _load_cfg
+                    _sec = (_load_cfg() or {}).get("security", {}) or {}
+                    if _sec.get("tirith_enabled", True):
+                        _ni_fail_open = _sec.get("tirith_fail_open", True)
+                except Exception:
+                    pass
+                if not _ni_fail_open:
+                    return {
+                        "approved": False,
+                        "message": (
+                            "BLOCKED: the Tirith security scanner could not be "
+                            "imported and security.tirith_fail_open is false, "
+                            "so this command cannot be silently allowed — and "
+                            "no interactive user or gateway is present to "
+                            "approve it. Find an alternative approach, install "
+                            "tirith, or set approvals.noninteractive_mode: "
+                            "approve in config.yaml."
+                        ),
+                    }
         return {"approved": True, "message": None}
 
     # --- Phase 1: Gather findings from both checks ---
