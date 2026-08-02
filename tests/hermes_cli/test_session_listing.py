@@ -1,8 +1,11 @@
 """Tests for the shared session-listing helpers (hermes_cli/session_listing.py)."""
 
+from pathlib import Path
+
 import pytest
 
 from hermes_cli.session_listing import (
+    AUTOMATION_SOURCES,
     parse_session_listing_args,
     query_session_listing,
 )
@@ -135,3 +138,82 @@ class TestQuerySessionListingLaneScope:
         )
 
         assert [row["id"] for row in rows] == ["foreign_59"]
+
+
+class TestAutomationSourcesDenyList:
+    """The picker denylist of internal/automation sources (#47214, #15745)."""
+
+    def test_constant_is_the_canonical_internal_set(self):
+        assert AUTOMATION_SOURCES == frozenset(
+            {"cron", "tool", "kanban", "subagent", "acp", "batch"}
+        )
+
+    @pytest.mark.parametrize("human", ["cli", "tui", "webui", "telegram", "discord", "signal", "slack", "whatsapp"])
+    def test_human_surfaces_are_not_denied(self, human):
+        # A denylist must never contain a human conversation surface, so new
+        # gateway platforms surface in the picker automatically.
+        assert human not in AUTOMATION_SOURCES
+
+    @pytest.fixture
+    def mixed_db(self, tmp_path):
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "deny.db")
+        # Human surfaces, every one must be visible.
+        for sid, src in [
+            ("h_cli", "cli"),
+            ("h_tui", "tui"),
+            ("h_webui", "webui"),
+            ("h_telegram", "telegram"),
+        ]:
+            db.create_session(sid, src)
+            db.set_session_title(sid, f"Title {sid}")
+        # Automation/internal, every one must be hidden.
+        for sid, src in [
+            ("a_cron", "cron"),
+            ("a_tool", "tool"),
+            ("a_kanban", "kanban"),
+            ("a_sub", "subagent"),
+            ("a_acp", "acp"),
+            ("a_batch", "batch"),
+        ]:
+            db.create_session(sid, src)
+            db.set_session_title(sid, f"Title {sid}")
+        yield db
+        db.close()
+
+    def test_picker_shows_all_human_sources_hides_automation(self, mixed_db):
+        # This is the exact call shape cli.py::_list_recent_sessions makes.
+        rows = query_session_listing(
+            mixed_db,
+            source=None,
+            include_all_sources=True,
+            include_unnamed=True,
+            exclude_sources=sorted(AUTOMATION_SOURCES),
+            limit=20,
+        )
+        ids = {r["id"] for r in rows}
+        assert {"h_cli", "h_tui", "h_webui", "h_telegram"} <= ids
+        assert ids.isdisjoint(
+            {"a_cron", "a_tool", "a_kanban", "a_sub", "a_acp", "a_batch"}
+        )
+
+    def test_gateway_sessions_uses_shared_deny_list(self):
+        """The gateway /sessions handler must route through the shared
+        AUTOMATION_SOURCES constant, not a private inline list, so
+        Signal/Telegram listings follow the same policy as the CLI picker.
+
+        This pins the wiring at source level: the handler needs heavy
+        gateway scaffolding to instantiate, and the thing being protected
+        is the wiring decision itself. A revert to an inline denylist must
+        fail this test.
+        """
+        src = (
+            Path(__file__).resolve().parents[2]
+            / "gateway" / "slash_commands.py"
+        ).read_text()
+        handler = src.split("async def _handle_sessions_command")[1]
+        handler = handler.split("\n    async def ")[0]
+        assert "AUTOMATION_SOURCES" in handler
+        assert 'exclude_sources=["tool"]' not in handler
+        assert "exclude_sources=sorted(AUTOMATION_SOURCES)" in handler
