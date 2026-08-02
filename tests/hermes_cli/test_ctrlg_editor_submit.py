@@ -63,3 +63,36 @@ def test_slash_command_dispatched_not_queued():
 
     assert seen.get("cmd") == "/status"
     assert c._pending_input.empty()
+
+
+def test_failed_durable_slash_admission_keeps_external_editor_draft():
+    for command in ("/queue preserve me", "/steer preserve me"):
+        c = _make(agent_running=True)
+        calls = []
+        c._handle_explicit_durable_command_inline = (
+            lambda text, *, has_images=False: calls.append((text, has_images)) or False
+        )
+        c.process_command = lambda command: (_ for _ in ()).throw(
+            AssertionError("durable slash must not bypass inline admission")
+        )
+        buf = _FakeBuf(command)
+
+        c._submit_editor_buffer(buf)
+
+        assert calls == [(command, False)]
+        assert buf.text == command
+        assert not buf.reset_called
+
+
+def test_successful_durable_slash_admission_clears_external_editor_draft():
+    c = _make(agent_running=True)
+    c._handle_explicit_durable_command_inline = lambda *_args, **_kwargs: True
+    c.process_command = lambda command: (_ for _ in ()).throw(
+        AssertionError("durable slash must not use generic dispatcher")
+    )
+    buf = _FakeBuf("/queue accepted")
+
+    c._submit_editor_buffer(buf)
+
+    assert buf.reset_called
+    assert buf.text == ""

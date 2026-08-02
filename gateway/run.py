@@ -25,23 +25,29 @@ except ModuleNotFoundError:
     pass
 
 import asyncio
+import copy
 import concurrent.futures
 import dataclasses
 import faulthandler
+import hashlib
 import inspect
 import json
 import logging
+import math
 import os
 import queue
 import re
+import secrets
 import shlex
 import site
 import sys
 import signal
+import stat
 import threading
 import time
 from collections import OrderedDict
 from contextvars import copy_context
+from functools import wraps
 from pathlib import Path
 from datetime import datetime
 from typing import Awaitable, Callable, Dict, Optional, Any, List, Tuple, Union, cast
@@ -2687,6 +2693,7 @@ _INTERRUPT_REASON_TIMEOUT = "Execution timed out (inactivity)"
 _INTERRUPT_REASON_SSE_DISCONNECT = "SSE client disconnected"
 _INTERRUPT_REASON_GATEWAY_SHUTDOWN = "Gateway shutting down"
 _INTERRUPT_REASON_GATEWAY_RESTART = "Gateway restarting"
+_INTERRUPT_REASON_RECALL = "Current message was recalled"
 
 _CONTROL_INTERRUPT_MESSAGES = frozenset(
     {
@@ -2696,6 +2703,7 @@ _CONTROL_INTERRUPT_MESSAGES = frozenset(
         _INTERRUPT_REASON_SSE_DISCONNECT.lower(),
         _INTERRUPT_REASON_GATEWAY_SHUTDOWN.lower(),
         _INTERRUPT_REASON_GATEWAY_RESTART.lower(),
+        _INTERRUPT_REASON_RECALL.lower(),
     }
 )
 
@@ -5429,6 +5437,30 @@ class TurnRunner:
 
 
 
+def _durable_busy_queue_terminal_boundary(method):
+    """Finalize a frozen durable claim on every worker return or exception."""
+    signature = inspect.signature(method)
+
+    @wraps(method)
+    async def _wrapped(*args, **kwargs):
+        bound = signature.bind_partial(*args, **kwargs)
+        claim = bound.arguments.get("busy_queue_claim")
+        self = bound.arguments.get("self")
+        try:
+            result = await method(*args, **kwargs)
+        except BaseException:
+            if self is not None and claim is not None:
+                session_key, source, token = claim
+                self._busy_queue_finalize_claim(session_key, source, token, None)
+            raise
+        if self is not None and claim is not None:
+            session_key, source, token = claim
+            self._busy_queue_finalize_claim(session_key, source, token, result)
+        return result
+
+    return _wrapped
+
+
 class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, GatewaySlashCommandsMixin):
     """
     Main gateway controller.
@@ -5705,6 +5737,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # preserve the queue.  Lives on SessionState.conversation.queued_events;
         # native image paths, busy-ack debounce timestamps and the monotonic
         # run-generation counter (#28686, NEVER reset) live on SessionState too.
+        # Durable busy-queue state is serialized with its adapter slot under one
+        # process-local lock. The on-disk atomic replace is the admission point:
+        # callers cannot issue a positive receipt until it succeeds.
+        self._busy_queue_lock = threading.RLock()
+        self._busy_queue_uncertain_sessions: set[str] = set()
+        self._busy_queue_uncertain_digests: set[str] = set()
+        self._busy_queue_uncertain_paths: set[str] = set()
+        # A live claim means the event has been durably moved out of ``ready``
+        # but has not yet reached a proven terminal result.  The token fences
+        # stale commits; retaining the event object lets a definitely-not-started
+        # dispatch be rolled back without losing adapter-only metadata.
+        self._busy_queue_active_claims: Dict[str, str] = {}
+        self._busy_queue_claimed_events: Dict[str, MessageEvent] = {}
+        self._busy_queue_cancelled_claim_tokens: set[str] = set()
+        self._busy_queue_finalized_claim_tokens: set[str] = set()
+        self._busy_queue_restored_sessions: set[str] = set()
+        self._busy_queue_restored_sources: Dict[str, SessionSource] = {}
+        self._busy_queue_replay_tasks: Dict[str, asyncio.Task] = {}
         # Startup restore gate: while restart-interrupted sessions are being
         # auto-resumed, real inbound messages are queued instead of competing
         # with the synthetic resume turns for the same session.  The queued
@@ -7361,17 +7411,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # it up.  Clearing happens on /new and /reset via
     # _handle_reset_command.
 
-    def _enqueue_fifo(self, session_key: str, queued_event: "MessageEvent", adapter: Any) -> None:
-        """Append a /queue event to the FIFO chain for a session."""
+    def _enqueue_fifo(
+        self,
+        session_key: str,
+        queued_event: "MessageEvent",
+        adapter: Any,
+        *,
+        front: bool = False,
+    ) -> None:
+        """Stage one accepted event in the process-local FIFO projection."""
         if adapter is None:
             return
         pending_slot = getattr(adapter, "_pending_messages", None)
         if pending_slot is None:
             return
-        if session_key in pending_slot:
-            self._session_state(session_key).conversation.queued_events.append(
-                queued_event
-            )
+        queued_events = self._session_state(session_key).conversation.queued_events
+        if front and session_key in pending_slot:
+            queued_events.insert(0, pending_slot[session_key])
+            pending_slot[session_key] = queued_event
+        elif session_key in pending_slot:
+            queued_events.append(queued_event)
         else:
             pending_slot[session_key] = queued_event
 
@@ -7559,6 +7618,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_key: str,
         adapter: Any,
         decision: Any,
+        *,
+        accepted: bool = True,
     ) -> None:
         """Acknowledge every SMART route without exposing session identifiers."""
         cfg = _load_gateway_runtime_config()
@@ -7577,7 +7638,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "on",
             "enabled",
         }
-        if not ack_enabled:
+        delivery_uncertain = session_key in self.__dict__.setdefault(
+            "_busy_queue_uncertain_sessions", set()
+        )
+        # Persistence rejection and post-handoff uncertainty are safety signals,
+        # not optional success acknowledgments. Never hide either one.
+        if accepted and not delivery_uncertain and not ack_enabled:
             return
 
         from hermes_cli.smart_orchestrator import format_smart_ack
@@ -7600,7 +7666,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             mission_label = "[MISSÃO ATIVA]"
         ack_prefix = f"{prefix}\n{mission_label}" if prefix else mission_label
-        message = format_smart_ack(decision, prefix=ack_prefix)
+        if delivery_uncertain:
+            message = (
+                f"{ack_prefix}\n\n⚠ A entrega do steer ficou incerta após "
+                "admissão durável. Não reenvie automaticamente; os sucessores "
+                "estão cercados até recuperação explícita."
+            )
+        elif accepted:
+            message = format_smart_ack(decision, prefix=ack_prefix)
+        else:
+            message = (
+                f"{ack_prefix}\n\n⚠ A mensagem não foi aceita: "
+                "a fila de próximos turnos atingiu o limite seguro."
+            )
 
         reply_anchor = self._reply_anchor_for_event(event)
         thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
@@ -7641,6 +7719,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             build_parallel_steer_payload,
         )
 
+        route_started = time.monotonic()
+
+        def log_route(decision: Any, *, accepted: bool, steered: bool) -> None:
+            """Emit bounded SMART telemetry without user-derived identifiers."""
+
+            logger.info(
+                "smart_route surface=gateway route=%s source=%s "
+                "latency_ms=%d accepted=%s steered=%s "
+                "queue_depth=%d worker_accepted=false interrupt=false",
+                getattr(decision, "route", "ambiguous"),
+                getattr(decision, "source", "unknown"),
+                int((time.monotonic() - route_started) * 1000),
+                accepted,
+                steered,
+                self._queue_depth(session_key, adapter=adapter),
+            )
+
         locks = getattr(self, "_smart_route_locks", None)
         if not isinstance(locks, dict):
             locks = {}
@@ -7678,8 +7773,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     reason="The active agent is still starting; using the safe queue fallback.",
                     source="policy",
                 )
-                self._queue_or_replace_pending_event(session_key, event)
-                await self._send_smart_busy_ack(event, session_key, adapter, decision)
+                accepted = self._queue_or_replace_pending_event(session_key, event)
+                log_route(decision, accepted=accepted, steered=False)
+                await self._send_smart_busy_ack(
+                    event,
+                    session_key,
+                    adapter,
+                    decision,
+                    accepted=accepted,
+                )
                 return True
 
             # Attachments retain their native event object and are always queued;
@@ -7691,8 +7793,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     reason="Attachments are preserved for the next full turn.",
                     source="policy",
                 )
-                self._queue_or_replace_pending_event(session_key, event)
-                await self._send_smart_busy_ack(event, session_key, adapter, decision)
+                accepted = self._queue_or_replace_pending_event(session_key, event)
+                log_route(decision, accepted=accepted, steered=False)
+                await self._send_smart_busy_ack(
+                    event,
+                    session_key,
+                    adapter,
+                    decision,
+                    accepted=accepted,
+                )
                 return True
 
             try:
@@ -7730,50 +7839,60 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
 
             steered = False
-            if same_active_run and decision.route in {ROUTE_RELATED, ROUTE_INDEPENDENT}:
+            accepted = False
+            steer_candidate = (
+                same_active_run
+                and decision.route in {ROUTE_RELATED, ROUTE_INDEPENDENT}
+            )
+            if steer_candidate:
                 steer_payload = payload
                 if decision.route == ROUTE_INDEPENDENT:
                     steer_payload = build_parallel_steer_payload(payload)
-                if steer_payload and hasattr(running_agent, "steer"):
-                    try:
-                        if supports_steer_generation:
-                            steered = bool(
-                                running_agent.steer(
-                                    steer_payload,
-                                    run_generation=admitted_steer_generation,
-                                )
-                            )
-                        else:
-                            steered = bool(running_agent.steer(steer_payload))
-                    except Exception as exc:
-                        logger.warning(
-                            "SMART steer failed for session %s: %s",
-                            session_key,
-                            exc,
-                        )
+                if steer_payload:
+                    accepted, steered = self._admit_and_maybe_steer_event(
+                        session_key,
+                        event,
+                        running_agent,
+                        adapter,
+                        steer_payload,
+                        expected_run_generation=(
+                            admitted_steer_generation
+                            if supports_steer_generation
+                            else None
+                        ),
+                    )
+                else:
+                    accepted = self._queue_or_replace_pending_event(
+                        session_key, event
+                    )
+            else:
+                accepted = self._queue_or_replace_pending_event(session_key, event)
 
             if steered and decision.route == ROUTE_INDEPENDENT:
-                # We delivered an orchestration instruction to the active run;
-                # no parallel worker has accepted ownership yet.  Do not emit
-                # the independent/parallel receipt until such a receipt exists.
+                # We durably transferred an orchestration claim to the active
+                # run; no parallel worker has accepted ownership yet.
                 decision = SmartRouteDecision(
                     route=ROUTE_RELATED,
                     confidence=decision.confidence,
                     reason="Parallel orchestration requested inside the active run.",
                     source="delivery",
                 )
+            elif not steered and decision.route in {ROUTE_RELATED, ROUTE_INDEPENDENT}:
+                decision = SmartRouteDecision(
+                    route=ROUTE_AMBIGUOUS,
+                    confidence=0.0,
+                    reason="The active checkpoint closed before steering; queued safely.",
+                    source="fallback",
+                )
 
-            if not steered:
-                self._queue_or_replace_pending_event(session_key, event)
-                if decision.route in {ROUTE_RELATED, ROUTE_INDEPENDENT}:
-                    decision = SmartRouteDecision(
-                        route=ROUTE_AMBIGUOUS,
-                        confidence=0.0,
-                        reason="The active checkpoint closed before steering; queued safely.",
-                        source="fallback",
-                    )
-
-            await self._send_smart_busy_ack(event, session_key, adapter, decision)
+            log_route(decision, accepted=accepted, steered=steered)
+            await self._send_smart_busy_ack(
+                event,
+                session_key,
+                adapter,
+                decision,
+                accepted=accepted,
+            )
             return True
 
     def _queue_depth(self, session_key: str, *, adapter: Any = None) -> int:
@@ -8330,7 +8449,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return "steer"
         if mode == "smart":
             return "smart"
-        return "interrupt"
+        if mode in {"", "interrupt"}:
+            return "interrupt"
+        return "queue"
 
     @staticmethod
     def _load_busy_text_mode() -> str:
@@ -8636,13 +8757,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         except (AttributeError, TypeError):
             return False
-        except Exception:
+        except Exception as exc:
             logger.warning(
-                "Compression in-flight check failed while reading session %s; "
+                "Compression in-flight check failed error_type=%s; "
                 "treating compression as active to avoid interrupting a possible "
                 "parent-session rotation",
-                session_key,
-                exc_info=True,
+                type(exc).__name__,
             )
             return True
         if not session_id:
@@ -8658,13 +8778,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return bool(holder)
         except (AttributeError, TypeError):
             return False
-        except Exception:
+        except Exception as exc:
             logger.warning(
                 "Compression in-flight check failed while reading lock holder "
-                "for session %s; treating compression as active to avoid "
+                "error_type=%s; treating compression as active to avoid "
                 "interrupting a possible parent-session rotation",
-                session_id,
-                exc_info=True,
+                type(exc).__name__,
             )
             return True
 
@@ -8684,45 +8803,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # follow-ups is far beyond any realistic conversational backlog while
     # still small enough to never threaten memory.
     _BUSY_QUEUE_MAX_PENDING = 32
+    _BUSY_QUEUE_MAX_MEDIA = 32
+    _BUSY_QUEUE_MAX_BYTES_DEFAULT = 1024 * 1024
+    _BUSY_QUEUE_STATE_VERSION = 1
+    _busy_queue_root_override: Optional[Path] = None
 
-    def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> None:
-        adapter = self._adapter_for_source(event.source)
-        if not adapter:
-            return
-        # #28503 — Previously this called ``merge_pending_message_event``
-        # with the default ``merge_text=False``, which silently OVERWROTE
-        # the single pending slot when consecutive text messages arrived
-        # in ``busy_input_mode: queue``. Route through the FIFO
-        # infrastructure shared with ``/queue`` so each follow-up gets
-        # its own turn in arrival order. Photo bursts still merge into
-        # the head slot via ``merge_pending_message_event`` (album
-        # semantics); everything else appends to the overflow tail.
-        pending_slot = getattr(adapter, "_pending_messages", None)
-        existing = pending_slot.get(session_key) if isinstance(pending_slot, dict) else None
-        if existing is not None and (
-            getattr(existing, "message_type", None) == MessageType.PHOTO
-            or event.message_type == MessageType.PHOTO
-            or bool(getattr(existing, "media_urls", None))
-            or bool(getattr(event, "media_urls", None))
-        ):
-            # Preserve photo-burst / media-merge semantics for the head slot.
-            merge_pending_message_event(
-                adapter._pending_messages,
+    def _queue_or_replace_pending_event(
+        self,
+        session_key: str,
+        event: MessageEvent,
+        *,
+        coalesce: bool = True,
+        front: bool = False,
+        already_accepted: bool = False,
+    ) -> bool:
+        lock = self.__dict__.get("_busy_queue_lock")
+        if lock is None:
+            logger.error(
+                "Rejecting busy-mode follow-up: durable admission is unavailable"
+            )
+            return False
+        with lock:
+            return self._queue_or_replace_pending_event_locked(
                 session_key,
                 event,
-                merge_text=event.message_type == MessageType.TEXT,
+                coalesce=coalesce,
+                front=front,
+                already_accepted=already_accepted,
             )
-            return
-
-        if self._queue_depth(session_key, adapter=adapter) >= self._BUSY_QUEUE_MAX_PENDING:
-            logger.warning(
-                "Dropping busy-mode follow-up for session %s — pending queue at cap (%d).",
-                session_key,
-                self._BUSY_QUEUE_MAX_PENDING,
-            )
-            return
-
-        self._enqueue_fifo(session_key, event, adapter)
 
     async def _prepare_busy_steer_text(self, event: MessageEvent) -> str:
         """Return steerable text for a busy follow-up, transcribing voice first.
@@ -8786,11 +8894,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             reply_anchor = self._reply_anchor_for_event(event)
             thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
-            if self._queue_during_drain_enabled():
-                self._queue_or_replace_pending_event(session_key, event)
-                message = f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
-            else:
-                message = f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
+            # Process-local queues do not survive a supervisor restart. New
+            # drain-time input must therefore be rejected explicitly; only
+            # events accepted before drain are completed below before exit.
+            message = (
+                f"⏳ Gateway is {self._status_action_gerund()} and did not accept "
+                "this message. Please retry after it reconnects."
+            )
 
             await adapter._send_with_retry(
                 chat_id=event.source.chat_id,
@@ -8887,18 +8997,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return False  # let default path handle it
 
         # --- Internal synthetic events must never interrupt/steer ---
-        # Async-delegation completions (delegate_task(background=true)) and
-        # background-process completions (terminal notify_on_complete) re-enter
-        # the originating session as internal MessageEvents. When the session
-        # is busy, treating them like a user TEXT message means interrupt-mode
-        # (the default busy_text_mode) aborts the active turn AND sends a "⚡
-        # Interrupting current task" ack — exactly the opposite of the design
-        # invariant that a completion surfaces as a NEW turn only when idle and
-        # never splices into a running turn. Fall through to the base adapter,
-        # which queues internal events silently (no interrupt, no ack) so they
-        # cascade after the current turn finishes.
+        # Async-delegation and background-process completions are real delivery
+        # obligations. Persist them silently behind the current FIFO head before
+        # returning; falling through to the adapter would create only a volatile
+        # process-local copy.
         if getattr(event, "internal", False):
-            return False
+            accepted = self._queue_or_replace_pending_event(
+                session_key,
+                event,
+                coalesce=False,
+            )
+            if not accepted:
+                logger.error(
+                    "Internal synthetic event rejected at durable admission boundary"
+                )
+                raise RuntimeError("durable synthetic-event admission failed")
+            return True
 
         _busy_state = self._peek_session_state(session_key)
         running_agent = _busy_state.turn.agent if _busy_state else None
@@ -8918,7 +9032,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             and busy_text_mode == "queue"
             and effective_mode != "steer"
         ):
-            return False
+            # Legacy text debounce must not bypass the durable busy ledger.
+            # Normalize it to queue mode here so admission, ACK and replay use
+            # the same persist-first protocol as every other busy follow-up.
+            effective_mode = "queue"
 
         # Steer mode: inject mid-run via running_agent.steer() instead of
         # queueing + interrupting.  If the agent isn't running yet
@@ -8956,8 +9073,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             effective_mode = "queue"
         steered = False
         redirected = False
+        steer_admission_attempted = False
+        queue_accepted = True
         if effective_mode == "steer":
             steer_text = await self._prepare_busy_steer_text(event)
+            if steer_text:
+                event.text = steer_text
             # A follow-up qualifies for steering when it is plain text, OR
             # when every attachment is STT-eligible voice media whose
             # transcript was just folded into steer_text — otherwise a voice
@@ -8981,13 +9102,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 and hasattr(running_agent, "steer")
             )
             if can_steer:
-                try:
-                    steered = bool(running_agent.steer(steer_text))
-                except Exception as exc:
-                    logger.warning("Gateway steer failed for session %s: %s", session_key, exc)
-                    steered = False
+                steer_admission_attempted = True
+                queue_accepted, steered = self._admit_and_maybe_steer_event(
+                    session_key,
+                    event,
+                    running_agent,
+                    adapter,
+                    steer_text,
+                )
             if not steered:
-                # Fall back to queue (merge into pending messages, no interrupt)
+                # Unsupported agents and pre-existing FIFO work stay queued. A
+                # failed durable handoff is not retried through a second path.
                 effective_mode = "queue"
         elif (
             effective_mode == "interrupt"
@@ -9020,38 +9145,51 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # turn (#43066 sub-bug 2). The FIFO path gives each text its own
         # turn in arrival order while still preserving photo-burst / album
         # merge semantics for media.
-        if not steered and not redirected:
-            self._queue_or_replace_pending_event(session_key, event)
+        if not steered and not redirected and not steer_admission_attempted:
+            if effective_mode == "interrupt":
+                queue_accepted = self._admit_interrupting_event(
+                    session_key,
+                    event,
+                )
+            else:
+                queue_accepted = self._queue_or_replace_pending_event(
+                    session_key,
+                    event,
+                )
+
+        if not queue_accepted:
+            # Persistence/admission comes before any interrupt or success ACK.
+            # A post-handoff exception leaves a durable claim with unknown model
+            # visibility; that is not a capacity rejection and must stop retries.
+            steer_uncertain = session_key in self.__dict__.setdefault(
+                "_busy_queue_uncertain_sessions", set()
+            )
+            rejection_message = (
+                "⚠ Steer delivery is uncertain after durable admission. "
+                "Do not resend automatically; successors are fenced pending recovery."
+                if steer_uncertain
+                else "⚠ Message not accepted: the safe next-turn queue is full."
+            )
+            reply_anchor = self._reply_anchor_for_event(event)
+            try:
+                await adapter._send_with_retry(
+                    chat_id=event.source.chat_id,
+                    content=rejection_message,
+                    reply_to=reply_anchor,
+                    metadata=self._thread_metadata_for_source(event.source, reply_anchor),
+                )
+            except Exception:
+                logger.debug("Failed to send busy queue rejection", exc_info=True)
+            return True
 
         is_queue_mode = effective_mode == "queue"
         is_steer_mode = effective_mode == "steer"
         is_redirect_mode = effective_mode == "interrupt" and redirected
 
-        # If not in queue/steer mode, interrupt the running agent immediately.
-        # This aborts in-flight tool calls and causes the agent loop to exit
-        # at the next check point.
-        if (
-            effective_mode == "interrupt"
-            and not redirected
-            and running_agent
-            and running_agent is not _AGENT_PENDING_SENTINEL
-        ):
-            try:
-                _interrupt_text = event.text
-                _media_urls = getattr(event, "media_urls", None) or []
-                if self._pending_event_audio_paths(event):
-                    _interrupt_text, _ = await self._transcribe_and_echo_pending_voice(
-                        event,
-                        adapter,
-                        event.source,
-                        event.text or "",
-                        log_context="Voice-busy-interrupt",
-                    )
-                elif not _interrupt_text and _media_urls:
-                    _interrupt_text = _build_media_placeholder(event)
-                running_agent.interrupt(_interrupt_text)
-            except Exception:
-                pass  # don't let interrupt failure block the ack
+        # Interrupt-mode signaling is performed by
+        # ``_admit_interrupting_event`` only after the ledger update (and any
+        # active claim supersession) is durable.  Never call ``agent.interrupt``
+        # here: doing so would create a second, unreceipted delivery path.
 
         # Check if busy ack is disabled — skip sending but still process the input.
         # Placed before debounce so we don't stamp a "last ack" timestamp that was
@@ -11384,7 +11522,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # that session) is strictly cheaper and more correct than re-running
         # the whole turn.
         await self._redeliver_pending_obligations()
+        restored_busy_sessions = self._restore_busy_queues()
         self._schedule_resume_pending_sessions()
+        self._schedule_busy_queue_replays(restored_busy_sessions)
         await self._finish_startup_restore()
 
         # Drain any recovered process watchers (from crash recovery checkpoint)
@@ -12176,6 +12316,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         # connected yet. Now that it's back, retry the
                         # auto-resume scoped to this platform so recovery
                         # doesn't silently wait for a manual user message.
+                        restored_busy_sessions = self._restore_busy_queues()
                         try:
                             self._schedule_resume_pending_sessions(platform=platform)
                         except Exception:
@@ -12184,6 +12325,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 platform.value,
                                 exc_info=True,
                             )
+                        self._schedule_busy_queue_replays(restored_busy_sessions)
                     # Check if the failure is non-retryable
                     elif adapter.has_fatal_error and not adapter.fatal_error_retryable:
                         self._update_platform_runtime_status(
@@ -13900,60 +14042,56 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 internal=event.internal,
                 timestamp=event.timestamp,
             )
-            self._enqueue_fifo(quick_key, queued_event, adapter)
+            accepted = self._queue_or_replace_pending_event(
+                quick_key,
+                queued_event,
+                coalesce=False,
+            )
+            if not accepted:
+                return "⚠ Message not accepted: durable admission failed."
         depth = self._queue_depth(quick_key, adapter=self._adapter_for_source(source))
         if depth <= 1:
             return "Queued for the next turn."
         return f"Queued for the next turn. ({depth} queued)"
 
     async def _busy_steer_command(self, event: MessageEvent, quick_key: str, source):
-        # /steer <prompt> — inject mid-run after the next tool call.
-        # Unlike /queue (turn boundary), /steer lands BETWEEN tool-call
-        # iterations inside the same agent run, by appending to the
-        # last tool result's content. No interrupt, no new user turn,
-        # no role-alternation violation.
+        """Persist a /steer payload, then transfer its claim when supported."""
         steer_text = event.get_command_args().strip()
         if not steer_text:
             return "Usage: /steer <prompt>"
-        _steer_state = self._peek_session_state(quick_key)
-        running_agent = _steer_state.turn.agent if _steer_state else None
-        if running_agent is _AGENT_PENDING_SENTINEL:
-            # Agent hasn't started yet — queue as turn-boundary fallback.
-            adapter = self._adapter_for_source(source)
-            if adapter:
-                queued_event = MessageEvent(
-                    text=steer_text,
-                    message_type=MessageType.TEXT,
-                    source=event.source,
-                    message_id=event.message_id,
-                    channel_prompt=event.channel_prompt,
-                    channel_context=event.channel_context,
-                )
-                self._enqueue_fifo(quick_key, queued_event, adapter)
-            return "Agent still starting — /steer queued for the next turn."
-        if running_agent and hasattr(running_agent, "steer"):
-            try:
-                accepted = running_agent.steer(steer_text)
-            except Exception as exc:
-                logger.warning("Steer failed for session %s: %s", quick_key, exc)
-                return f"⚠️ Steer failed: {exc}"
-            if accepted:
-                preview = steer_text[:60] + ("..." if len(steer_text) > 60 else "")
-                return f"⏩ Steer queued — arrives after the next tool call: '{preview}'"
-            return "Steer rejected (empty payload)."
-        # Running agent is missing or lacks steer() — fall back to queue.
+
         adapter = self._adapter_for_source(source)
-        if adapter:
-            queued_event = MessageEvent(
-                text=steer_text,
-                message_type=MessageType.TEXT,
-                source=event.source,
-                message_id=event.message_id,
-                channel_prompt=event.channel_prompt,
-                channel_context=event.channel_context,
-            )
-            self._enqueue_fifo(quick_key, queued_event, adapter)
-        return "No active agent — /steer queued for the next turn."
+        if adapter is None:
+            return "⚠️ Steer not accepted: platform adapter unavailable."
+        queued_event = MessageEvent(
+            text=steer_text,
+            message_type=MessageType.TEXT,
+            source=event.source,
+            message_id=event.message_id,
+            channel_prompt=event.channel_prompt,
+            channel_context=event.channel_context,
+        )
+        steer_state = self._peek_session_state(quick_key)
+        running_agent = steer_state.turn.agent if steer_state else None
+        accepted, steered = self._admit_and_maybe_steer_event(
+            quick_key,
+            queued_event,
+            running_agent,
+            adapter,
+            steer_text,
+        )
+        if not accepted:
+            if quick_key in self.__dict__.setdefault(
+                "_busy_queue_uncertain_sessions", set()
+            ):
+                return "⚠️ Steer uncertain: durable handoff could not be confirmed."
+            return "⚠️ Steer not accepted: durable admission failed."
+        if steered:
+            preview = steer_text[:60] + ("..." if len(steer_text) > 60 else "")
+            return f"⏩ Steer queued — arrives after the next tool call: '{preview}'"
+        if running_agent is _AGENT_PENDING_SENTINEL:
+            return "Agent still starting — /steer queued for the next turn."
+        return "Steer queued for the next turn (receipt support unavailable)."
 
     async def _busy_goal_command(self, event: MessageEvent, quick_key: str, source):
         # /goal is safe mid-run for status/pause/clear/wait (inspection
@@ -14440,22 +14578,43 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     event, _cmd_def_inner, _quick_key, source,
                 )
 
-            # SMART reuses the canonical busy handler so authorization,
-            # approval replies and internal-event guards remain identical to
-            # the non-priority path. Never fall through to legacy interrupt.
+            # The adapter busy callback and this direct PRIORITY dispatch are
+            # two entrances to the same active-session router. SMART normal
+            # text must use the fail-closed SMART path here as well; treating
+            # the unknown mode as legacy interrupt violates its contract.
+            if self._busy_input_mode == "smart" and is_internal:
+                # Synthetic completion/follow-up events have no user intent to
+                # classify. Preserve them for the next turn; SMART must never
+                # fall through to the legacy interrupt path.
+                adapter = self._adapter_for_source(source)
+                if not adapter:
+                    return "⚠ Message not accepted: durable admission failed."
+                accepted = self._queue_or_replace_pending_event(
+                    _quick_key,
+                    event,
+                    coalesce=False,
+                    already_accepted=False,
+                )
+                return (
+                    None
+                    if accepted
+                    else "⚠ Message not accepted: durable admission failed."
+                )
+
             if self._busy_input_mode == "smart":
-                if getattr(event, "internal", False):
-                    self._queue_or_replace_pending_event(_quick_key, event)
-                    return None
                 if await self._handle_active_session_busy_message(event, _quick_key):
                     return None
 
             if event.message_type == MessageType.PHOTO:
-                logger.debug("PRIORITY photo follow-up for session %s — queueing without interrupt", _quick_key)
-                adapter = self._adapter_for_source(source)
-                if adapter:
-                    merge_pending_message_event(adapter._pending_messages, _quick_key, event)
-                return None
+                logger.debug(
+                    "PRIORITY photo follow-up — queueing without interrupt"
+                )
+                accepted = self._queue_or_replace_pending_event(_quick_key, event)
+                return (
+                    None
+                    if accepted
+                    else "⚠ Message not accepted: the safe next-turn queue is full."
+                )
 
             _telegram_followup_grace = float(
                 os.getenv("HERMES_TELEGRAM_FOLLOWUP_GRACE_SECONDS", "3.0")
@@ -14474,18 +14633,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     time.time() - _started_at,
                     _quick_key,
                 )
-                adapter = self._adapter_for_source(source)
-                if adapter:
-                    if self._busy_input_mode == "queue":
-                        self._enqueue_fifo(_quick_key, event, adapter)
-                    else:
-                        merge_pending_message_event(
-                            adapter._pending_messages,
-                            _quick_key,
-                            event,
-                            merge_text=True,
-                        )
-                return None
+                accepted = self._queue_or_replace_pending_event(_quick_key, event)
+                return (
+                    None
+                    if accepted
+                    else "⚠ Message not accepted: the safe next-turn queue is full."
+                )
 
             _ra_state = self._peek_session_state(_quick_key)
             running_agent = _ra_state.turn.agent if _ra_state else None
@@ -14498,27 +14651,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     return EphemeralReply("⚡ Force-stopped. The agent was still starting — session unlocked.")
                 # Queue the message so it will be picked up after the
                 # agent starts.
-                adapter = self._adapter_for_source(source)
-                if adapter:
-                    merge_pending_message_event(
-                        adapter._pending_messages,
-                        _quick_key,
-                        event,
-                        merge_text=True,
-                    )
-                return None
-            if self._draining:
-                if self._queue_during_drain_enabled():
-                    self._queue_or_replace_pending_event(_quick_key, event)
+                accepted = self._queue_or_replace_pending_event(_quick_key, event)
                 return (
-                    f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
-                    if self._queue_during_drain_enabled()
-                    else f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
+                    None
+                    if accepted
+                    else "⚠ Message not accepted: the safe next-turn queue is full."
+                )
+            if self._draining:
+                return (
+                    f"⏳ Gateway is {self._status_action_gerund()} and is not accepting "
+                    "new work right now; this message was not accepted."
                 )
             if self._busy_input_mode == "queue":
                 logger.debug("PRIORITY queue follow-up for session %s", _quick_key)
-                self._queue_or_replace_pending_event(_quick_key, event)
-                return None
+                accepted = self._queue_or_replace_pending_event(_quick_key, event)
+                return (
+                    None
+                    if accepted
+                    else "⚠ Message not accepted: the safe next-turn queue is full."
+                )
             if self._busy_input_mode == "steer":
                 # Steer mode: inject text into the running agent mid-run via
                 # agent.steer().  Falls back to queue semantics if the payload
@@ -14541,8 +14692,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     logger.debug("PRIORITY steer for session %s", _quick_key)
                     return None
                 logger.debug("PRIORITY steer-fallback-to-queue for session %s", _quick_key)
-                self._queue_or_replace_pending_event(_quick_key, event)
-                return None
+                accepted = self._queue_or_replace_pending_event(_quick_key, event)
+                return (
+                    None
+                    if accepted
+                    else "⚠ Message not accepted: the safe next-turn queue is full."
+                )
             # #30170 — Subagent protection (PRIORITY path). Same rationale
             # as ``_handle_active_session_busy_message``: an interrupt
             # cascades through ``_active_children`` and aborts in-flight
@@ -14557,8 +14712,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "because the running agent has active subagents (#30170)",
                     _quick_key,
                 )
-                self._queue_or_replace_pending_event(_quick_key, event)
-                return None
+                accepted = self._queue_or_replace_pending_event(_quick_key, event)
+                return (
+                    None
+                    if accepted
+                    else "⚠ Message not accepted: the safe next-turn queue is full."
+                )
             # #56391 — Compression protection (PRIORITY path). Same
             # rationale as ``_handle_active_session_busy_message``: context
             # compression is interrupt-protected (#23975), but an interrupt
@@ -14573,47 +14732,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "because context compression is in flight (#56391)",
                     _quick_key,
                 )
-                self._queue_or_replace_pending_event(_quick_key, event)
-                return None
-            # Text-only corrections redirect the live turn (preserving
-            # displayed context) when the runtime supports it; media/voice and
-            # older runtimes fall back to the proven interrupt path below.
-            if (
-                event.message_type == MessageType.TEXT
-                and not event.media_urls
-                and not event.media_types
-                and getattr(running_agent, "_supports_active_turn_redirect", False)
-                is True
-                and hasattr(running_agent, "redirect")
-            ):
-                try:
-                    if running_agent.redirect((event.text or "").strip()):
-                        logger.debug("PRIORITY redirect for session %s", _quick_key)
-                        return None
-                except Exception as exc:
-                    logger.warning(
-                        "PRIORITY redirect failed for session %s: %s",
-                        _quick_key,
-                        exc,
-                    )
-            logger.debug("PRIORITY interrupt for session %s", _quick_key)
-            _interrupt_text = event.text
-            _media_urls = getattr(event, "media_urls", None) or []
-            if self._pending_event_audio_paths(event):
-                _interrupt_text, _ = await self._transcribe_and_echo_pending_voice(
-                    event,
-                    self._adapter_for_source(source),
-                    source,
-                    event.text or "",
-                    log_context="Voice-priority-interrupt",
+                accepted = self._queue_or_replace_pending_event(_quick_key, event)
+                return (
+                    None
+                    if accepted
+                    else "⚠ Message not accepted: the safe next-turn queue is full."
                 )
-            elif not _interrupt_text and _media_urls:
-                _interrupt_text = _build_media_placeholder(event)
-            running_agent.interrupt(_interrupt_text)
-            # NOTE: self._pending_messages was write-only (never consumed).
-            # The actual interrupt message is delivered via adapter._pending_messages
-            # which is read by _run_agent. Removed to prevent unbounded growth.
-            return None
+            logger.debug("PRIORITY interrupt admission")
+            accepted = self._admit_interrupting_event(_quick_key, event)
+            return (
+                None
+                if accepted
+                else "⚠ Message not accepted: durable interrupt admission failed."
+            )
 
         # Check for commands
         command = event.get_command()
@@ -15927,7 +16058,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pass
         return source
 
-    async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
+    async def _handle_message_with_agent(
+        self,
+        event,
+        source,
+        _quick_key: str,
+        run_generation: int,
+        busy_queue_claim: Optional[tuple[str, SessionSource, str]] = None,
+    ):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
@@ -17109,6 +17247,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=event.message_type,
+                busy_queue_claim=busy_queue_claim,
             )
 
             # Stop persistent typing indicator now that the agent is done.
@@ -18412,7 +18551,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     message_id=None,
                     channel_prompt=None,
                 )
-                self._enqueue_fifo(_quick_key, cont_event, adapter)
+                if not self._queue_or_replace_pending_event(
+                    _quick_key,
+                    cont_event,
+                    coalesce=False,
+                    already_accepted=True,
+                ):
+                    logger.warning(
+                        "goal continuation: durable queue admission failed"
+                    )
         except Exception as exc:
             logger.debug("goal continuation: enqueue failed: %s", exc)
 
@@ -21954,21 +22101,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     @classmethod
     def _extract_honcho_cache_busting_config(cls) -> dict[str, Any]:
-        """Extract Honcho identity keys, memoized by honcho.json mtime."""
+        """Extract Honcho identity keys, memoized by a content digest."""
         try:
-            from plugins.memory.honcho.client import HonchoClientConfig, resolve_config_path
+            from plugins.memory.honcho.client import (
+                HonchoClientConfig,
+                resolve_active_host,
+                resolve_config_path,
+            )
 
             path = resolve_config_path()
+            host = resolve_active_host()
             try:
-                mtime_ns = path.stat().st_mtime_ns
+                content_digest = hashlib.blake2b(
+                    path.read_bytes(), digest_size=16
+                ).digest()
             except OSError:
-                mtime_ns = None
-            memo_key = (str(path), mtime_ns)
+                content_digest = None
+            memo_key = (str(path), host, content_digest)
             cached = cls._HONCHO_CACHE_BUSTING_MEMO.get(memo_key)
             if cached is not None:
                 return dict(cached)
 
-            hcfg = HonchoClientConfig.from_global_config(config_path=path)
+            hcfg = HonchoClientConfig.from_global_config(host=host, config_path=path)
             aliases = hcfg.user_peer_aliases or {}
             values = {
                 "honcho.peer_name": hcfg.peer_name,
@@ -22498,12 +22652,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Interrupt the current run and clear queued session state consistently."""
         if not session_key:
             return
+        adapter = self._adapter_for_source(source)
+        self._busy_queue_cancel_session(session_key, source, adapter)
         _iac_state = self._peek_session_state(session_key)
         running_agent = _iac_state.turn.agent if _iac_state else None
         if running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
             running_agent.interrupt(interrupt_reason)
         self._invalidate_session_run_generation(session_key, reason=invalidation_reason)
-        adapter = self._adapter_for_source(source)
         interrupt_session_activity = getattr(
             type(adapter), "interrupt_session_activity", None
         )
@@ -23234,27 +23389,60 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         remote server via ``POST /v1/chat/completions`` with SSE streaming.
 
         This lets a Docker container handle Matrix E2EE while the actual
-        agent runs on the host with full access to local files, memory,
-        skills, and a unified session store.
+        agent runs on the host with full access to local files, memory, skills,
+        and a unified session store.
         """
+        def _proxy_result(
+            *,
+            final_response: str,
+            messages: Optional[List[Dict[str, Any]]] = None,
+            api_calls: int = 0,
+            completed: bool = False,
+            failed: bool = False,
+            partial: bool = False,
+            interrupted: bool = False,
+            cleanup_errors: Optional[List[str]] = None,
+            response_previewed: bool = False,
+            result_session_id: Optional[str] = None,
+        ) -> Dict[str, Any]:
+            errors = list(cleanup_errors or [])
+            terminal_success = bool(
+                completed
+                and not failed
+                and not partial
+                and not interrupted
+                and not errors
+            )
+            return {
+                "final_response": final_response,
+                "messages": list(messages or []),
+                "api_calls": api_calls,
+                "tools": [],
+                "history_offset": len(history),
+                "session_id": result_session_id or session_id,
+                "response_previewed": response_previewed,
+                "completed": terminal_success,
+                "receipt_terminal_success": terminal_success,
+                "failed": bool(failed),
+                "partial": bool(partial),
+                "interrupted": bool(interrupted),
+                "cleanup_errors": errors,
+            }
+
         try:
             from aiohttp import ClientSession as _AioClientSession, ClientTimeout
         except ImportError:
-            return {
-                "final_response": "⚠️ Proxy mode requires aiohttp. Install with: pip install aiohttp",
-                "messages": [],
-                "api_calls": 0,
-                "tools": [],
-            }
+            return _proxy_result(
+                final_response="⚠️ Proxy mode requires aiohttp. Install with: pip install aiohttp",
+                failed=True,
+            )
 
         proxy_url = self._get_proxy_url()
         if not proxy_url:
-            return {
-                "final_response": "⚠️ Proxy URL not configured (GATEWAY_PROXY_URL or gateway.proxy_url)",
-                "messages": [],
-                "api_calls": 0,
-                "tools": [],
-            }
+            return _proxy_result(
+                final_response="⚠️ Proxy URL not configured (GATEWAY_PROXY_URL or gateway.proxy_url)",
+                failed=True,
+            )
 
         proxy_key = os.getenv("GATEWAY_PROXY_KEY", "").strip()
 
@@ -23359,6 +23547,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Make the HTTP request with SSE streaming -----------------------
         full_response = ""
+        saw_done = False
+        stream_failed = False
+        public_failure_response = ""
+        cleanup_errors: List[str] = []
+        remote_terminal: Optional[Dict[str, Any]] = None
+        remote_session_id = session_id
         _start = time.time()
 
         try:
@@ -23370,121 +23564,234 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     headers=headers,
                 ) as resp:
                     if resp.status != 200:
-                        error_text = await resp.text()
                         logger.warning(
-                            "Proxy error (%d) from %s: %s",
-                            resp.status, proxy_url, error_text[:500],
+                            "Proxy HTTP request failed status=%d",
+                            resp.status,
                         )
-                        return {
-                            "final_response": f"⚠️ Proxy error ({resp.status}): {error_text[:300]}",
-                            "messages": [],
-                            "api_calls": 0,
-                            "tools": [],
-                        }
+                        return _proxy_result(
+                            final_response=f"⚠️ Proxy error ({resp.status})",
+                            failed=True,
+                        )
 
-                    # Parse SSE stream
+                    # Parse SSE stream. [DONE] only terminates framing; a
+                    # canonical Hermes terminal envelope is the success receipt.
                     buffer = ""
+                    current_sse_event: Optional[str] = None
                     async for chunk in resp.content.iter_any():
                         if not _run_still_current():
                             logger.info(
-                                "Discarding stale proxy stream for %s — generation %d is no longer current",
-                                session_key or "?",
-                                run_generation or 0,
+                                "Discarding stale proxy stream",
                             )
-                            return {
-                                "final_response": "",
-                                "messages": [],
-                                "api_calls": 0,
-                                "tools": [],
-                                "history_offset": len(history),
-                                "session_id": session_id,
-                                "response_previewed": False,
-                            }
+                            return _proxy_result(
+                                final_response="",
+                                interrupted=True,
+                            )
                         text = chunk.decode("utf-8", errors="replace")
                         buffer += text
 
-                        # Process complete SSE lines
+                        # Process complete SSE lines.
                         while "\n" in buffer:
                             line, buffer = buffer.split("\n", 1)
                             line = line.strip()
                             if not line:
+                                current_sse_event = None
                                 continue
-                            if line.startswith("data: "):
-                                data = line[6:]
-                                if data.strip() == "[DONE]":
-                                    break
-                                try:
-                                    obj = json.loads(data)
-                                    choices = obj.get("choices", [])
-                                    if choices:
-                                        delta = choices[0].get("delta", {})
-                                        content = delta.get("content", "")
-                                        if content:
-                                            full_response += content
-                                            if _stream_consumer:
-                                                _stream_consumer.on_delta(content)
-                                except json.JSONDecodeError:
-                                    pass
+                            if line.startswith(":"):
+                                continue
+                            if line.startswith("event:"):
+                                current_sse_event = line[6:].strip() or None
+                                continue
+                            if not line.startswith("data:"):
+                                continue
+                            data = line[5:].lstrip()
+                            if current_sse_event not in (None, "message"):
+                                continue
+                            if data.strip() == "[DONE]":
+                                saw_done = True
+                                break
+                            try:
+                                obj = json.loads(data)
+                            except json.JSONDecodeError as exc:
+                                raise ValueError(
+                                    "Proxy SSE protocol violation"
+                                ) from exc
+                            if not isinstance(obj, dict):
+                                raise ValueError("Proxy SSE protocol violation")
+                            choices = obj.get("choices", [])
+                            if not isinstance(choices, list) or not choices:
+                                raise ValueError("Proxy SSE protocol violation")
+                            choice = choices[0]
+                            if not isinstance(choice, dict):
+                                raise ValueError("Proxy SSE protocol violation")
+                            finish_reason = choice.get("finish_reason")
+                            if finish_reason is not None:
+                                if remote_terminal is not None:
+                                    raise ValueError("Proxy SSE protocol violation")
+                                if finish_reason not in {"stop", "error", "length"}:
+                                    raise ValueError("Proxy SSE protocol violation")
+                                hermes = obj.get("hermes")
+                                if not isinstance(hermes, dict):
+                                    raise ValueError("Proxy SSE protocol violation")
+                                bool_fields = (
+                                    "receipt_terminal_success",
+                                    "completed",
+                                    "failed",
+                                    "partial",
+                                    "interrupted",
+                                )
+                                if any(
+                                    type(hermes.get(field)) is not bool
+                                    for field in bool_fields
+                                ):
+                                    raise ValueError("Proxy SSE protocol violation")
+                                remote_cleanup = hermes.get("cleanup_errors")
+                                result_id = hermes.get("session_id")
+                                if not isinstance(remote_cleanup, list):
+                                    raise ValueError("Proxy SSE protocol violation")
+                                if not isinstance(result_id, str) or not result_id.strip():
+                                    raise ValueError("Proxy SSE protocol violation")
+                                declared_success = hermes["receipt_terminal_success"]
+                                canonical_success = bool(
+                                    hermes["completed"]
+                                    and not hermes["failed"]
+                                    and not hermes["partial"]
+                                    and not hermes["interrupted"]
+                                    and not remote_cleanup
+                                )
+                                if declared_success is not canonical_success:
+                                    raise ValueError("Proxy SSE protocol violation")
+                                if (finish_reason == "stop") is not canonical_success:
+                                    raise ValueError("Proxy SSE protocol violation")
+                                remote_terminal = {
+                                    **hermes,
+                                    "finish_reason": finish_reason,
+                                }
+                                remote_session_id = result_id.strip()
+                                continue
+                            if remote_terminal is not None:
+                                raise ValueError("Proxy SSE protocol violation")
+                            delta = choice.get("delta", {})
+                            if not isinstance(delta, dict):
+                                raise ValueError("Proxy SSE protocol violation")
+                            content = delta.get("content", "")
+                            if content is not None and not isinstance(content, str):
+                                raise ValueError("Proxy SSE protocol violation")
+                            if content:
+                                full_response += content
+                                if _stream_consumer:
+                                    _stream_consumer.on_delta(content)
                         if len(buffer) > _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS:
                             raise ValueError(
                                 "Proxy SSE stream exceeded max buffer size without a line boundary"
                             )
+                        if saw_done:
+                            break
 
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            logger.error("Proxy connection error to %s: %s", proxy_url, e)
-            if not full_response:
-                return {
-                    "final_response": f"⚠️ Proxy connection error: {e}",
-                    "messages": [],
-                    "api_calls": 0,
-                    "tools": [],
-                }
-            # Partial response — return what we got
+            stream_failed = True
+            if (
+                isinstance(e, ValueError)
+                and str(e)
+                == "Proxy SSE stream exceeded max buffer size without a line boundary"
+            ):
+                public_failure_response = (
+                    "⚠️ Proxy connection error: Proxy SSE stream exceeded max buffer "
+                    "size without a line boundary"
+                )
+            else:
+                public_failure_response = "⚠️ Proxy connection error"
+            logger.error(
+                "Proxy stream failed error_type=%s",
+                type(e).__name__,
+            )
         finally:
             # Finalize stream consumer
             if _stream_consumer:
-                _stream_consumer.finish()
+                try:
+                    _stream_consumer.finish()
+                except Exception as exc:
+                    cleanup_errors.append("proxy stream consumer finish failed")
+                    logger.error(
+                        "Proxy stream consumer finish failed error_type=%s",
+                        type(exc).__name__,
+                    )
             if stream_task:
                 try:
                     await asyncio.wait_for(stream_task, timeout=5.0)
                 except (asyncio.TimeoutError, asyncio.CancelledError):
                     stream_task.cancel()
+                    cleanup_errors.append("proxy stream consumer cleanup incomplete")
+                except Exception as exc:
+                    cleanup_errors.append("proxy stream consumer cleanup failed")
+                    logger.error(
+                        "Proxy stream consumer cleanup failed error_type=%s",
+                        type(exc).__name__,
+                    )
 
         _elapsed = time.time() - _start
         if not _run_still_current():
             logger.info(
-                "Discarding stale proxy result for %s — generation %d is no longer current",
-                session_key or "?",
-                run_generation or 0,
+                "Discarding stale proxy result",
             )
-            return {
-                "final_response": "",
-                "messages": [],
-                "api_calls": 0,
-                "tools": [],
-                "history_offset": len(history),
-                "session_id": session_id,
-                "response_previewed": False,
-            }
+            return _proxy_result(
+                final_response="",
+                api_calls=1,
+                partial=bool(full_response),
+                interrupted=True,
+                cleanup_errors=cleanup_errors,
+            )
+        remote_cleanup_errors = (
+            ["remote proxy cleanup incomplete"]
+            if remote_terminal and remote_terminal.get("cleanup_errors")
+            else []
+        )
+        effective_cleanup_errors = cleanup_errors + remote_cleanup_errors
+        terminal_success = bool(
+            saw_done
+            and remote_terminal is not None
+            and remote_terminal.get("receipt_terminal_success") is True
+            and not stream_failed
+            and not effective_cleanup_errors
+        )
         logger.info(
-            "proxy response: url=%s session=%s time=%.1fs response=%d chars",
-            proxy_url, (session_id or "")[:20], _elapsed, len(full_response),
+            "Proxy stream finished time=%.1fs response_chars=%d completed=%s",
+            _elapsed,
+            len(full_response),
+            terminal_success,
         )
 
-        return {
-            "final_response": full_response or "(No response from remote agent)",
-            "messages": [
+        return _proxy_result(
+            final_response=(
+                full_response
+                or (
+                    "(No response from remote agent)"
+                    if terminal_success
+                    else (
+                        public_failure_response
+                        or "⚠️ Proxy stream ended before completion"
+                    )
+                )
+            ),
+            messages=[
                 {"role": "user", "content": message},
                 {"role": "assistant", "content": full_response},
             ],
-            "api_calls": 1,
-            "tools": [],
-            "history_offset": len(history),
-            "session_id": session_id,
-            "response_previewed": _stream_consumer is not None and bool(full_response),
-        }
+            api_calls=1,
+            completed=terminal_success,
+            failed=not terminal_success,
+            partial=bool(
+                (bool(full_response) and not terminal_success)
+                or (remote_terminal and remote_terminal.get("partial"))
+            ),
+            interrupted=bool(
+                remote_terminal and remote_terminal.get("interrupted")
+            ),
+            cleanup_errors=effective_cleanup_errors,
+            response_previewed=_stream_consumer is not None and bool(full_response),
+            result_session_id=(remote_session_id if terminal_success else session_id),
+        )
 
     # ------------------------------------------------------------------
 
@@ -23504,6 +23811,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         message_type: Optional[str] = None,
+        busy_queue_claim: Optional[tuple[str, SessionSource, str]] = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -23532,6 +23840,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=message_type,
+                busy_queue_claim=busy_queue_claim,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -23544,6 +23853,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=message_type,
+                busy_queue_claim=busy_queue_claim,
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -23650,6 +23960,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return get_hermes_home()
 
+    @_durable_busy_queue_terminal_boundary
     async def _run_agent_inner(
         self,
         message: str,
@@ -23666,6 +23977,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         message_type: Optional[str] = None,
+        busy_queue_claim: Optional[tuple[str, SessionSource, str]] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -23679,9 +23991,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         This is run in a thread pool to not block the event loop.
         Supports interruption via new messages.
         """
+        # Freeze durable ownership across event rewriting, profile routing and
+        # recursive follow-ups. A scope mismatch is uncertain: dispatching
+        # under a different key/profile could commit the wrong record.
+        if busy_queue_claim is not None:
+            claim_session_key, claim_source, claim_token = busy_queue_claim
+            dispatch_session_key = self._session_key_for_source(source)
+            if (
+                not claim_session_key
+                or not claim_token
+                or dispatch_session_key != session_key
+                or self._busy_queue_source_scope(claim_source)
+                != self._busy_queue_source_scope(source)
+            ):
+                claim_path = self._busy_queue_state_path(
+                    claim_session_key, claim_source
+                )
+                self._busy_queue_note_uncertain(
+                    self._busy_queue_session_digest(claim_session_key),
+                    claim_session_key,
+                    claim_path,
+                )
+                raise RuntimeError("durable busy-queue claim scope changed")
+
         # ---- Proxy mode: delegate to remote API server ----
         if self._get_proxy_url():
-            return await self._run_agent_via_proxy(
+            proxy_result = await self._run_agent_via_proxy(
                 message=message,
                 context_prompt=context_prompt,
                 history=history,
@@ -23691,6 +24026,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 run_generation=run_generation,
                 event_message_id=event_message_id,
             )
+            await self._drain_busy_queue_recursively(
+                session_key=session_key,
+                source=source,
+                result=proxy_result,
+                busy_queue_claim=busy_queue_claim,
+                context_prompt=context_prompt,
+                history=history,
+                session_id=session_id,
+                run_generation=run_generation,
+                interrupt_depth=_interrupt_depth,
+                event_message_id=event_message_id,
+                channel_prompt=channel_prompt,
+            )
+            return proxy_result
 
         from run_agent import AIAgent
         import queue
@@ -24459,6 +24808,65 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         return False
             return False
 
+        def _preserve_failed_turn_steer() -> bool:
+            import hashlib
+
+            failed_agent = agent_holder[0]
+            take_failed = getattr(
+                failed_agent,
+                "take_failed_turn_pending_steer",
+                None,
+            )
+            if not callable(take_failed):
+                return False
+            leftover = str(take_failed() or "").strip()
+            if not leftover:
+                return False
+            recovery_adapter = self._adapter_for_source(source)
+            if recovery_adapter is None or not session_key:
+                logger.error("accepted gateway steer has no recovery adapter")
+                return False
+            recovery_event = MessageEvent(
+                text=leftover,
+                message_type=MessageType.TEXT,
+                source=source,
+                message_id=(
+                    f"{event_message_id}:smart-steer-recovery:{run_generation}"
+                    if event_message_id
+                    else None
+                ),
+            )
+            # The text already owns an acceptance receipt, so recovery bypasses
+            # new-admission caps and preserves it at the FIFO tail.
+            if not self._queue_or_replace_pending_event(
+                session_key,
+                recovery_event,
+                coalesce=False,
+                already_accepted=True,
+            ):
+                recovery_path = self._busy_queue_state_path(session_key, source)
+                self._busy_queue_note_uncertain(
+                    self._busy_queue_session_digest(session_key),
+                    session_key,
+                    recovery_path,
+                )
+                return False
+            logger.info(
+                "Restaged accepted gateway steer after failed turn"
+            )
+            return True
+
+        busy_queue_claim_finalized = bool(
+            busy_queue_claim is None
+            or busy_queue_claim[2]
+            in self.__dict__.setdefault(
+                "_busy_queue_cancelled_claim_tokens", set()
+            )
+        )
+        pending_busy_queue_claim: Optional[
+            tuple[str, SessionSource, str]
+        ] = None
+
         try:
             # Run in thread pool to not block.  Use an *inactivity*-based
             # timeout instead of a wall-clock limit: the agent can run for
@@ -24490,7 +24898,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         {_executor_task}, timeout=_POLL_INTERVAL
                     )
                     if done:
-                        response = _executor_task.result()
+                        try:
+                            response = _executor_task.result()
+                        except BaseException:
+                            _preserve_failed_turn_steer()
+                            raise
                         break
                     # Backup interrupt check: if the monitor task died or
                     # missed the interrupt, catch it here.
@@ -24538,7 +24950,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         {_executor_task}, timeout=_POLL_INTERVAL
                     )
                     if done:
-                        response = _executor_task.result()
+                        try:
+                            response = _executor_task.result()
+                        except BaseException:
+                            _preserve_failed_turn_steer()
+                            raise
                         break
                     # Agent still running — check inactivity.
                     _agent_ref = agent_holder[0]
@@ -24634,6 +25050,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # pool worker is freed.
                 if _timed_out_agent and hasattr(_timed_out_agent, "interrupt"):
                     _timed_out_agent.interrupt(_INTERRUPT_REASON_TIMEOUT)
+                    _preserve_failed_turn_steer()
 
                 _timeout_mins = int(_agent_timeout // 60) or 1
 
@@ -24741,15 +25158,71 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             pending_event = None
             pending = None
             if result and adapter and session_key:
-                pending_event = _dequeue_pending_event(adapter, session_key)
-                # /queue overflow: after consuming the adapter's "next-up"
-                # slot, promote the next queued event into it so the
-                # recursive run's drain will see it.  This keeps the slot
-                # occupied for the full FIFO chain, which (a) preserves
-                # order, and (b) causes any mid-chain /queue to correctly
-                # route to overflow rather than jumping the queue.
-                pending_event = self._promote_queued_event(session_key, adapter, pending_event)
-                if result.get("interrupted") and not pending_event and result.get("interrupt_message"):
+                if busy_queue_claim is not None and not busy_queue_claim_finalized:
+                    claim_key, claim_source, claim_token = busy_queue_claim
+                    busy_queue_claim_finalized = self._busy_queue_finalize_claim(
+                        claim_key, claim_source, claim_token, result
+                    )
+                    if not busy_queue_claim_finalized:
+                        return result
+
+                # A steer accepted after the final tool checkpoint is still an
+                # obligation. Persist it at the FIFO front before claiming any
+                # already-queued successor so the related update keeps priority
+                # without displacing or duplicating that successor.
+                leftover_steer = str(result.get("pending_steer") or "").strip()
+                if leftover_steer and self._busy_queue_result_is_terminal(result):
+                    steer_event = MessageEvent(
+                        text=leftover_steer,
+                        message_type=MessageType.TEXT,
+                        source=source,
+                        message_id=(
+                            f"{event_message_id}:late-steer:{run_generation}"
+                            if event_message_id
+                            else None
+                        ),
+                    )
+                    if not self._queue_or_replace_pending_event(
+                        session_key,
+                        steer_event,
+                        coalesce=False,
+                        front=True,
+                        already_accepted=True,
+                    ):
+                        path = self._busy_queue_state_path(session_key, source)
+                        self._busy_queue_note_uncertain(
+                            self._busy_queue_session_digest(session_key),
+                            session_key,
+                            path,
+                        )
+                        return result
+                    result["pending_steer"] = None
+
+                if (
+                    self._busy_queue_result_is_terminal(result)
+                    or result.get("interrupted")
+                ):
+                    pending_event, pending_token = self._busy_queue_claim_next_event(
+                        session_key, adapter
+                    )
+                    if pending_event is not None and pending_token is not None:
+                        try:
+                            frozen_pending_source = dataclasses.replace(
+                                pending_event.source
+                            )
+                        except Exception:
+                            frozen_pending_source = copy.copy(pending_event.source)
+                        pending_event.source = frozen_pending_source
+                        pending_busy_queue_claim = (
+                            session_key,
+                            frozen_pending_source,
+                            pending_token,
+                        )
+                if (
+                    pending_event is None
+                    and result.get("interrupted")
+                    and result.get("interrupt_message")
+                ):
                     interrupt_message = result.get("interrupt_message")
                     if _is_control_interrupt_message(interrupt_message):
                         logger.info(
@@ -24759,7 +25232,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                     else:
                         pending = interrupt_message
-                elif pending_event:
+
+                if pending_event:
                     # Transcribe audio media on the dequeued event BEFORE it is
                     # handed back as the next user turn, so queued/interrupting
                     # voice messages drain with the real transcript instead of
@@ -24784,28 +25258,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if pending:
                         logger.debug("Processing queued message after agent completion: '%s...'", pending[:40])
 
-            # Leftover /steer: if a steer arrived after the last tool batch,
-            # prioritize it as the next turn. Restage any event already
-            # dequeued at the FIFO head so neither message is lost.
-            if result:
-                _before_leftover_pending = pending
-                pending_event, pending = self._prioritize_leftover_steer(
-                    session_key=session_key,
-                    adapter=adapter,
-                    pending_event=pending_event,
-                    pending_text=pending,
-                    result=result,
-                )
-                if (
-                    pending
-                    and pending != _before_leftover_pending
-                    and result.get("pending_steer")
-                ):
-                    logger.debug(
-                        "Delivering leftover /steer as next turn: '%s...'",
-                        pending[:40],
-                    )
-
             # Safety net: if the pending text is a slash command (e.g. "/stop",
             # "/new"), discard it — commands should never be passed to the agent
             # as user input.  The primary fix is in base.py (commands bypass the
@@ -24823,6 +25275,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 "commands must not be passed as agent input",
                                 _pending_cmd_word,
                             )
+                            if pending_busy_queue_claim is not None:
+                                claim_key, claim_source, claim_token = (
+                                    pending_busy_queue_claim
+                                )
+                                self._busy_queue_finalize_claim(
+                                    claim_key,
+                                    claim_source,
+                                    claim_token,
+                                    {"completed": True},
+                                )
+                                pending_busy_queue_claim = None
                             pending_event = None
                             pending = None
                     except Exception:
@@ -24830,12 +25293,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             if self._draining and (pending_event or pending):
                 logger.info(
-                    "Discarding pending follow-up for session %s during gateway %s",
+                    "Completing already-accepted follow-up for session %s before gateway %s",
                     session_key or "?",
                     self._status_action_label(),
                 )
-                pending_event = None
-                pending = None
 
             if pending_event or pending:
                 logger.debug("Processing pending message: '%s...'", pending[:40])
@@ -24854,11 +25315,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "queueing message instead of recursing.",
                         _interrupt_depth, session_key,
                     )
-                    adapter = self._adapter_for_source(source)
-                    if adapter and pending_event:
-                        merge_pending_message_event(adapter._pending_messages, session_key, pending_event)
-                    elif adapter and hasattr(adapter, 'queue_message'):
-                        adapter.queue_message(session_key, pending)
+                    if pending_busy_queue_claim is not None:
+                        claim_key, claim_source, claim_token = pending_busy_queue_claim
+                        self._busy_queue_rollback_claim(
+                            claim_key,
+                            claim_source,
+                            claim_token,
+                            adapter,
+                        )
+                    elif pending:
+                        fallback_event = MessageEvent(
+                            text=pending,
+                            message_type=MessageType.TEXT,
+                            source=source,
+                            message_id=event_message_id,
+                        )
+                        self._queue_or_replace_pending_event(
+                            session_key,
+                            fallback_event,
+                            coalesce=False,
+                            front=True,
+                            already_accepted=True,
+                        )
                     return result_holder[0] or {"final_response": response, "messages": history}
 
                 was_interrupted = result.get("interrupted")
@@ -24970,6 +25448,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "Discarding stale goal continuation for session %s — goal is no longer active",
                             session_key or "?",
                         )
+                        if pending_busy_queue_claim is not None:
+                            claim_key, claim_source, claim_token = (
+                                pending_busy_queue_claim
+                            )
+                            self._busy_queue_finalize_claim(
+                                claim_key,
+                                claim_source,
+                                claim_token,
+                                {"completed": True},
+                            )
                         return result
                     # Resolve the follow-up's session key BEFORE preparing the
                     # inbound text: _prepare_inbound_message_text buffers native
@@ -24991,6 +25479,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         session_key=next_session_key,
                     )
                     if next_message is None:
+                        if pending_busy_queue_claim is not None:
+                            claim_key, claim_source, claim_token = (
+                                pending_busy_queue_claim
+                            )
+                            self._busy_queue_rollback_claim(
+                                claim_key,
+                                claim_source,
+                                claim_token,
+                                adapter,
+                            )
                         return result
                     next_message_id = self._reply_anchor_for_event(pending_event)
                     next_channel_prompt = getattr(pending_event, "channel_prompt", None)
@@ -25036,21 +25534,48 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # follow-up.  Use the same (session_key, session_id) the
                 # recursive call runs under so the snapshot matches exactly
                 # what the follow-up's guard will consult.  Fail-safe in helper.
-                await self._refresh_agent_cache_message_count(session_key, session_id)
-
-                followup_result = await self._run_agent(
-                    message=next_message,
-                    context_prompt=context_prompt,
-                    history=updated_history,
-                    source=next_source,
-                    session_id=session_id,
-                    session_key=next_session_key,
-                    run_generation=run_generation,
-                    _interrupt_depth=_interrupt_depth + 1,
-                    event_message_id=next_message_id,
-                    channel_prompt=next_channel_prompt,
-                    message_type=next_message_type,
+                await self._refresh_agent_cache_message_count(
+                    next_session_key, session_id
                 )
+
+                if pending_busy_queue_claim is not None:
+                    followup_result = await self._drain_busy_queue_recursively(
+                        session_key=next_session_key,
+                        source=next_source,
+                        result=result,
+                        busy_queue_claim=(
+                            None
+                            if busy_queue_claim_finalized
+                            else busy_queue_claim
+                        ),
+                        context_prompt=context_prompt,
+                        history=history,
+                        session_id=session_id,
+                        run_generation=run_generation,
+                        interrupt_depth=_interrupt_depth,
+                        pending_event=pending_event,
+                        pending_claim=pending_busy_queue_claim,
+                        prepared_message=next_message,
+                        updated_history=updated_history,
+                        event_message_id=next_message_id,
+                        channel_prompt=next_channel_prompt,
+                    )
+                    if followup_result is None:
+                        return result
+                else:
+                    followup_result = await self._run_agent(
+                        message=next_message,
+                        context_prompt=context_prompt,
+                        history=updated_history,
+                        source=next_source,
+                        session_id=session_id,
+                        session_key=next_session_key,
+                        run_generation=run_generation,
+                        _interrupt_depth=_interrupt_depth + 1,
+                        event_message_id=next_message_id,
+                        channel_prompt=next_channel_prompt,
+                        message_type=next_message_type,
+                    )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:
             # Stop progress sender, interrupt monitor, and notification task
@@ -25301,6 +25826,1971 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.debug("Post-delivery cleanup registration failed: %s", _rpe)
 
         return response
+
+
+    @staticmethod
+    def _busy_queue_session_digest(session_key: str) -> str:
+        return hashlib.sha256(session_key.encode("utf-8", errors="strict")).hexdigest()
+
+    def _busy_queue_profile_home(self, source: SessionSource) -> Path:
+        override = self.__dict__.get("_busy_queue_root_override")
+        if override is not None:
+            return Path(override)
+        return Path(self._resolve_profile_home_for_source(source))
+
+    def _busy_queue_state_path(self, session_key: str, source: SessionSource) -> Path:
+        digest = self._busy_queue_session_digest(session_key)
+        return self._busy_queue_profile_home(source) / "gateway" / "busy_queue" / f"{digest}.json"
+
+    @staticmethod
+    def _busy_queue_strict_json_value(value: Any, *, depth: int = 0) -> Any:
+        """Return a JSON-native copy or raise instead of stringifying data.
+
+        Queue persistence is a recovery contract, not a diagnostic dump. An
+        unsupported object must reject admission rather than round-trip as an
+        ambiguous repr. NaN/Infinity are rejected because they are not JSON.
+        """
+        if depth > 32:
+            raise ValueError("busy queue JSON nesting is too deep")
+        if value is None or isinstance(value, (str, bool)):
+            return value
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+        if isinstance(value, float):
+            if not math.isfinite(value):
+                raise ValueError("busy queue JSON contains a non-finite number")
+            return value
+        if isinstance(value, (list, tuple)):
+            return [
+                GatewayRunner._busy_queue_strict_json_value(item, depth=depth + 1)
+                for item in value
+            ]
+        if isinstance(value, dict):
+            result: Dict[str, Any] = {}
+            for key, item in value.items():
+                if not isinstance(key, str):
+                    raise TypeError("busy queue JSON object keys must be strings")
+                result[key] = GatewayRunner._busy_queue_strict_json_value(
+                    item, depth=depth + 1
+                )
+            return result
+        raise TypeError("busy queue payload is not strict JSON")
+
+    @classmethod
+    def _busy_queue_event_receipt_ids(cls, event: MessageEvent) -> List[str]:
+        existing = getattr(event, "_busy_queue_receipt_ids", None)
+        if isinstance(existing, list) and existing and all(
+            isinstance(item, str) and re.fullmatch(r"[0-9a-f]{32}", item)
+            for item in existing
+        ):
+            return list(existing)
+        receipt_ids = [secrets.token_hex(16)]
+        event._busy_queue_receipt_ids = receipt_ids  # type: ignore[attr-defined]
+        return list(receipt_ids)
+
+    @classmethod
+    def _busy_queue_serialize_event(cls, event: MessageEvent) -> Dict[str, Any]:
+        source = getattr(event, "source", None)
+        if not isinstance(source, SessionSource):
+            raise TypeError("busy queue event has no concrete SessionSource")
+
+        source_payload = {
+            "platform": source.platform.value,
+            "chat_id": source.chat_id,
+            "chat_name": source.chat_name,
+            "chat_type": source.chat_type,
+            "user_id": source.user_id,
+            "user_name": source.user_name,
+            "thread_id": source.thread_id,
+            "chat_topic": source.chat_topic,
+            "user_id_alt": source.user_id_alt,
+            "chat_id_alt": source.chat_id_alt,
+            "is_bot": source.is_bot,
+            "scope_id": source.scope_id,
+            "parent_chat_id": source.parent_chat_id,
+            "message_id": source.message_id,
+            "role_authorized": source.role_authorized,
+            "profile": source.profile,
+            "auto_thread_created": source.auto_thread_created,
+            "auto_thread_initial_name": source.auto_thread_initial_name,
+        }
+        timestamp = event.timestamp
+        if not isinstance(timestamp, datetime):
+            raise TypeError("busy queue event timestamp must be a datetime")
+        event_payload = {
+            "text": event.text,
+            "message_type": event.message_type.value,
+            "source": source_payload,
+            # raw_message is an adapter-owned live object and is deliberately
+            # excluded. All stable routing/reply fields are copied explicitly.
+            "message_id": event.message_id,
+            "platform_update_id": event.platform_update_id,
+            "media_urls": list(event.media_urls or []),
+            "media_types": list(event.media_types or []),
+            "reply_to_message_id": event.reply_to_message_id,
+            "reply_to_text": event.reply_to_text,
+            "reply_to_author_id": event.reply_to_author_id,
+            "reply_to_author_name": event.reply_to_author_name,
+            "reply_to_is_own_message": event.reply_to_is_own_message,
+            "auto_skill": event.auto_skill,
+            "channel_prompt": event.channel_prompt,
+            "channel_context": event.channel_context,
+            "internal": event.internal,
+            "metadata": event.metadata,
+            "timestamp": timestamp.isoformat(),
+        }
+        receipt_ids = cls._busy_queue_event_receipt_ids(event)
+        return {
+            "receipt_ids": receipt_ids,
+            "item_count": cls._busy_queue_event_item_count(event),
+            "event": cls._busy_queue_strict_json_value(event_payload),
+        }
+
+    @staticmethod
+    def _busy_queue_require_exact_keys(
+        value: Any, expected: set[str], *, label: str
+    ) -> Dict[str, Any]:
+        if not isinstance(value, dict) or set(value) != expected:
+            raise ValueError(f"invalid busy queue {label} schema")
+        return value
+
+    @classmethod
+    def _busy_queue_deserialize_event(cls, envelope: Any) -> MessageEvent:
+        envelope = cls._busy_queue_require_exact_keys(
+            envelope,
+            {"receipt_ids", "item_count", "event"},
+            label="envelope",
+        )
+        receipt_ids = envelope["receipt_ids"]
+        item_count = envelope["item_count"]
+        if (
+            not isinstance(receipt_ids, list)
+            or not receipt_ids
+            or not all(
+                isinstance(item, str) and re.fullmatch(r"[0-9a-f]{32}", item)
+                for item in receipt_ids
+            )
+            or len(set(receipt_ids)) != len(receipt_ids)
+            or not isinstance(item_count, int)
+            or isinstance(item_count, bool)
+            or item_count != len(receipt_ids)
+        ):
+            raise ValueError("invalid busy queue receipt envelope")
+
+        event_payload = cls._busy_queue_require_exact_keys(
+            envelope["event"],
+            {
+                "text", "message_type", "source", "message_id",
+                "platform_update_id", "media_urls", "media_types",
+                "reply_to_message_id", "reply_to_text", "reply_to_author_id",
+                "reply_to_author_name", "reply_to_is_own_message", "auto_skill",
+                "channel_prompt", "channel_context", "internal", "metadata",
+                "timestamp",
+            },
+            label="event",
+        )
+        source_payload = cls._busy_queue_require_exact_keys(
+            event_payload["source"],
+            {
+                "platform", "chat_id", "chat_name", "chat_type", "user_id",
+                "user_name", "thread_id", "chat_topic", "user_id_alt",
+                "chat_id_alt", "is_bot", "scope_id", "parent_chat_id",
+                "message_id", "role_authorized", "profile",
+                "auto_thread_created", "auto_thread_initial_name",
+            },
+            label="source",
+        )
+        source_payload = cls._busy_queue_strict_json_value(source_payload)
+        event_payload = cls._busy_queue_strict_json_value(event_payload)
+
+        optional_source_strings = {
+            "chat_name", "user_id", "user_name", "thread_id", "chat_topic",
+            "user_id_alt", "chat_id_alt", "scope_id", "parent_chat_id",
+            "message_id", "profile", "auto_thread_initial_name",
+        }
+        if not isinstance(source_payload["chat_id"], str) or not source_payload["chat_id"]:
+            raise ValueError("invalid busy queue source chat id")
+        if not isinstance(source_payload["chat_type"], str):
+            raise ValueError("invalid busy queue source chat type")
+        for field in optional_source_strings:
+            if source_payload[field] is not None and not isinstance(source_payload[field], str):
+                raise ValueError("invalid busy queue optional source field")
+        for field in {"is_bot", "role_authorized", "auto_thread_created"}:
+            if not isinstance(source_payload[field], bool):
+                raise ValueError("invalid busy queue source boolean")
+
+        source = SessionSource(
+            platform=Platform(source_payload["platform"]),
+            chat_id=source_payload["chat_id"],
+            chat_name=source_payload["chat_name"],
+            chat_type=source_payload["chat_type"],
+            user_id=source_payload["user_id"],
+            user_name=source_payload["user_name"],
+            thread_id=source_payload["thread_id"],
+            chat_topic=source_payload["chat_topic"],
+            user_id_alt=source_payload["user_id_alt"],
+            chat_id_alt=source_payload["chat_id_alt"],
+            is_bot=source_payload["is_bot"],
+            scope_id=source_payload["scope_id"],
+            parent_chat_id=source_payload["parent_chat_id"],
+            message_id=source_payload["message_id"],
+            role_authorized=source_payload["role_authorized"],
+            profile=source_payload["profile"],
+            auto_thread_created=source_payload["auto_thread_created"],
+            auto_thread_initial_name=source_payload["auto_thread_initial_name"],
+        )
+
+        if not isinstance(event_payload["text"], str):
+            raise ValueError("invalid busy queue event text")
+        if not isinstance(event_payload["reply_to_is_own_message"], bool):
+            raise ValueError("invalid busy queue reply ownership")
+        if not isinstance(event_payload["internal"], bool):
+            raise ValueError("invalid busy queue internal flag")
+        if not isinstance(event_payload["media_urls"], list) or not all(
+            isinstance(item, str) for item in event_payload["media_urls"]
+        ):
+            raise ValueError("invalid busy queue media urls")
+        if not isinstance(event_payload["media_types"], list) or not all(
+            isinstance(item, str) for item in event_payload["media_types"]
+        ):
+            raise ValueError("invalid busy queue media types")
+        if len(event_payload["media_types"]) > len(event_payload["media_urls"]):
+            raise ValueError("invalid busy queue media alignment")
+        if not isinstance(event_payload["metadata"], dict):
+            raise ValueError("invalid busy queue metadata")
+        auto_skill = event_payload["auto_skill"]
+        if auto_skill is not None and not isinstance(auto_skill, str) and not (
+            isinstance(auto_skill, list)
+            and all(isinstance(item, str) for item in auto_skill)
+        ):
+            raise ValueError("invalid busy queue auto skill")
+        for field in {
+            "message_id", "reply_to_message_id", "reply_to_text",
+            "reply_to_author_id", "reply_to_author_name", "channel_prompt",
+            "channel_context",
+        }:
+            if event_payload[field] is not None and not isinstance(event_payload[field], str):
+                raise ValueError("invalid busy queue optional event field")
+        platform_update_id = event_payload["platform_update_id"]
+        if platform_update_id is not None and (
+            not isinstance(platform_update_id, int) or isinstance(platform_update_id, bool)
+        ):
+            raise ValueError("invalid busy queue platform update id")
+        timestamp_raw = event_payload["timestamp"]
+        if not isinstance(timestamp_raw, str):
+            raise ValueError("invalid busy queue timestamp")
+        timestamp = datetime.fromisoformat(timestamp_raw)
+
+        event = MessageEvent(
+            text=event_payload["text"],
+            message_type=MessageType(event_payload["message_type"]),
+            source=source,
+            raw_message=None,
+            message_id=event_payload["message_id"],
+            platform_update_id=platform_update_id,
+            media_urls=event_payload["media_urls"],
+            media_types=event_payload["media_types"],
+            reply_to_message_id=event_payload["reply_to_message_id"],
+            reply_to_text=event_payload["reply_to_text"],
+            reply_to_author_id=event_payload["reply_to_author_id"],
+            reply_to_author_name=event_payload["reply_to_author_name"],
+            reply_to_is_own_message=event_payload["reply_to_is_own_message"],
+            auto_skill=auto_skill,
+            channel_prompt=event_payload["channel_prompt"],
+            channel_context=event_payload["channel_context"],
+            internal=event_payload["internal"],
+            metadata=event_payload["metadata"],
+            timestamp=timestamp,
+        )
+        event._busy_queue_receipt_ids = list(receipt_ids)  # type: ignore[attr-defined]
+        event._busy_queue_item_count = item_count  # type: ignore[attr-defined]
+        event._hermes_durable_busy_replay = True  # type: ignore[attr-defined]
+        return event
+
+    @staticmethod
+    def _busy_queue_reject_duplicate_keys(pairs: List[tuple[str, Any]]) -> Dict[str, Any]:
+        result: Dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate key in busy queue JSON")
+            result[key] = value
+        return result
+
+    def _busy_queue_max_serialized_bytes(self) -> int:
+        """Bound encoded state while allowing worst-case valid JSON escaping.
+
+        A decoded byte can become ``\\u00xx`` (six bytes), and receipts plus the
+        strict routing envelope add bounded framing.  Keeping a separate hard
+        reader cap prevents self-written, valid one-MiB payloads from being
+        quarantined merely because they contain quotes/control characters.
+        """
+        logical = int(self._busy_queue_max_bytes())
+        return max(64 * 1024, logical * 8 + 512 * 1024)
+
+    @staticmethod
+    def _busy_queue_open_private_directory(
+        directory: Path, *, create: bool
+    ) -> Optional[int]:
+        """Open a symlink-free owner-only directory through stable descriptors."""
+        directory = directory.absolute()
+        if os.name == "nt":
+            if create:
+                directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+            metadata = directory.lstat()
+            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+                raise PermissionError("busy queue directory is not private")
+            return None
+
+        flags = os.O_RDONLY
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_DIRECTORY", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        current_fd = os.open(directory.anchor, flags)
+        try:
+            for part in directory.parts[1:]:
+                try:
+                    next_fd = os.open(part, flags, dir_fd=current_fd)
+                except FileNotFoundError:
+                    if not create:
+                        raise
+                    os.mkdir(part, mode=0o700, dir_fd=current_fd)
+                    os.fsync(current_fd)
+                    next_fd = os.open(part, flags, dir_fd=current_fd)
+                metadata = os.fstat(next_fd)
+                if not stat.S_ISDIR(metadata.st_mode):
+                    os.close(next_fd)
+                    raise PermissionError("busy queue path contains a non-directory")
+                os.close(current_fd)
+                current_fd = next_fd
+
+            metadata = os.fstat(current_fd)
+            effective_uid = os.geteuid() if hasattr(os, "geteuid") else os.getuid()
+            if metadata.st_uid != effective_uid:
+                raise PermissionError("busy queue directory has an unexpected owner")
+            os.fchmod(current_fd, 0o700)
+            return current_fd
+        except BaseException:
+            os.close(current_fd)
+            raise
+
+    @staticmethod
+    def _busy_queue_validate_private_file(fd: int) -> os.stat_result:
+        """Validate and repair one opened owner-only regular file."""
+        metadata = os.fstat(fd)
+        effective_uid = os.geteuid() if hasattr(os, "geteuid") else os.getuid()
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_uid != effective_uid
+        ):
+            raise PermissionError("busy queue state is not a private regular file")
+        if os.name != "nt":
+            os.fchmod(fd, 0o600)
+            metadata = os.fstat(fd)
+        return metadata
+
+    def _busy_queue_read_private_file(self, path: Path) -> bytes:
+        """Read one state file without a path-validation/read race."""
+        directory_fd = self._busy_queue_open_private_directory(
+            path.parent, create=False
+        )
+        flags = os.O_RDONLY
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        fd: Optional[int] = None
+        try:
+            if os.name == "nt":
+                if path.is_symlink():
+                    raise PermissionError("busy queue state is a symlink")
+                fd = os.open(path, flags)
+            else:
+                fd = os.open(path.name, flags, dir_fd=directory_fd)
+            metadata = self._busy_queue_validate_private_file(fd)
+            max_bytes = self._busy_queue_max_serialized_bytes()
+            if metadata.st_size <= 0 or metadata.st_size > max_bytes:
+                raise ValueError("busy queue state size is outside the allowed range")
+            with os.fdopen(fd, "rb", closefd=False) as handle:
+                raw = handle.read(max_bytes + 1)
+            after = os.fstat(fd)
+            if (
+                len(raw) != metadata.st_size
+                or after.st_dev != metadata.st_dev
+                or after.st_ino != metadata.st_ino
+                or after.st_size != metadata.st_size
+            ):
+                raise OSError("busy queue state changed while reading")
+            return raw
+        finally:
+            if fd is not None:
+                os.close(fd)
+            if directory_fd is not None:
+                os.close(directory_fd)
+
+    def _busy_queue_load_state(self, path: Path) -> Dict[str, Any]:
+        raw = self._busy_queue_read_private_file(path)
+
+        def _reject_constant(_value: str) -> Any:
+            raise ValueError("non-finite value in busy queue JSON")
+
+        loaded = json.loads(
+            raw.decode("utf-8", errors="strict"),
+            object_pairs_hook=self._busy_queue_reject_duplicate_keys,
+            parse_constant=_reject_constant,
+        )
+        required_keys = frozenset(
+            {"version", "session_digest", "revision", "claim", "queue"}
+        )
+        if not isinstance(loaded, dict):
+            raise ValueError("state must be an object")
+        loaded_keys = frozenset(loaded)
+        if loaded_keys not in (
+            required_keys,
+            required_keys | {"owner_session_key"},
+        ):
+            raise ValueError("state has unexpected keys")
+        return loaded
+
+    @staticmethod
+    def _busy_queue_envelope_receipts(envelope: Dict[str, Any]) -> tuple[str, ...]:
+        receipt_ids = envelope.get("receipt_ids")
+        if not isinstance(receipt_ids, list):
+            return ()
+        return tuple(item for item in receipt_ids if isinstance(item, str))
+
+    def _busy_queue_validate_state(
+        self,
+        path: Path,
+        state: Dict[str, Any],
+        *,
+        expected_session_key: Optional[str] = None,
+    ) -> tuple[Optional[MessageEvent], List[MessageEvent], Optional[str]]:
+        """Validate one complete ready/claimed state without mutating memory."""
+        digest = path.stem
+        if (
+            not re.fullmatch(r"[0-9a-f]{64}", digest)
+            or state["version"] != self._BUSY_QUEUE_STATE_VERSION
+            or state["session_digest"] != digest
+            or not isinstance(state["revision"], int)
+            or isinstance(state["revision"], bool)
+            or state["revision"] <= 0
+            or not isinstance(state["queue"], list)
+        ):
+            raise ValueError("invalid busy queue state header")
+
+        ready_events = [
+            self._busy_queue_deserialize_event(item) for item in state["queue"]
+        ]
+        claimed_event: Optional[MessageEvent] = None
+        claim = state["claim"]
+        if claim is not None:
+            claim = self._busy_queue_require_exact_keys(
+                claim, {"token", "event"}, label="claim"
+            )
+            if not isinstance(claim["token"], str) or not re.fullmatch(
+                r"[0-9a-f]{32}", claim["token"]
+            ):
+                raise ValueError("invalid busy queue claim token")
+            claimed_event = self._busy_queue_deserialize_event(claim["event"])
+
+        events = ([claimed_event] if claimed_event is not None else []) + ready_events
+        owner_session_key = state.get("owner_session_key")
+        if owner_session_key is not None:
+            if (
+                not isinstance(owner_session_key, str)
+                or not owner_session_key
+                or len(owner_session_key) > 4096
+                or self._busy_queue_session_digest(owner_session_key) != digest
+            ):
+                raise ValueError("invalid busy queue owner session key")
+        if not events:
+            # Empty durable tombstones are valid.  They close the crash window
+            # between recording terminal cancellation/commit and unlinking the
+            # state file.
+            return None, [], owner_session_key or expected_session_key
+
+        derived_session_key = self._session_key_for_source(events[0].source)
+        session_key = owner_session_key or derived_session_key
+        if expected_session_key is not None and session_key != expected_session_key:
+            raise ValueError("busy queue session key mismatch")
+        if self._busy_queue_session_digest(session_key) != digest:
+            raise ValueError("busy queue session digest mismatch")
+        if owner_session_key is None:
+            if any(
+                self._session_key_for_source(item.source) != session_key
+                for item in events
+            ):
+                raise ValueError("busy queue record crosses session boundary")
+        else:
+            derived_keys = [
+                self._session_key_for_source(item.source) for item in events
+            ]
+            if any(
+                candidate != owner_session_key
+                and not candidate.startswith(f"{owner_session_key}:")
+                and not owner_session_key.startswith(f"{candidate}:")
+                for candidate in derived_keys
+            ):
+                raise ValueError("busy queue owner and event scope diverged")
+            first_scope = self._busy_queue_source_scope(events[0].source)
+            if any(
+                self._busy_queue_source_scope(item.source) != first_scope
+                for item in events[1:]
+            ):
+                raise ValueError("busy queue record crosses routing scope")
+        if self._busy_queue_admission_failure(events) is not None:
+            raise ValueError("busy queue record exceeds admission limits")
+
+        receipt_ids = [
+            receipt_id
+            for item in events
+            for receipt_id in getattr(item, "_busy_queue_receipt_ids", [])
+        ]
+        if len(receipt_ids) != len(set(receipt_ids)):
+            raise ValueError("busy queue record repeats a receipt")
+        return claimed_event, ready_events, session_key
+
+    def _busy_queue_note_uncertain(
+        self,
+        digest: str,
+        session_key: Optional[str] = None,
+        path: Optional[Path] = None,
+    ) -> None:
+        self.__dict__.setdefault("_busy_queue_uncertain_digests", set()).add(digest)
+        if session_key:
+            self.__dict__.setdefault("_busy_queue_uncertain_sessions", set()).add(
+                session_key
+            )
+        if path is not None:
+            self.__dict__.setdefault("_busy_queue_uncertain_paths", set()).add(
+                str(path)
+            )
+
+    def _busy_queue_profile_homes(self) -> List[Path]:
+        override = self.__dict__.get("_busy_queue_root_override")
+        if override is not None:
+            return [Path(override)]
+        homes = {Path(_hermes_home)}
+        profile_adapters = self.__dict__.get("_profile_adapters") or {}
+        if isinstance(profile_adapters, dict):
+            from hermes_cli.profiles import get_profile_dir
+
+            for profile_name in profile_adapters:
+                if isinstance(profile_name, str) and profile_name:
+                    homes.add(Path(get_profile_dir(profile_name)))
+        return sorted(homes, key=str)
+
+    def _restore_busy_queues(
+        self, profile_homes: Optional[List[Path]] = None
+    ) -> List[str]:
+        """Strictly restore ready records; quarantine claims/corruption."""
+        restored: List[str] = []
+        lock = self.__dict__.get("_busy_queue_lock")
+        if lock is None:
+            return restored
+        with lock:
+            for profile_home in profile_homes or self._busy_queue_profile_homes():
+                directory = Path(profile_home) / "gateway" / "busy_queue"
+                if not directory.exists():
+                    continue
+                try:
+                    directory_stat = directory.lstat()
+                    if (
+                        stat.S_ISLNK(directory_stat.st_mode)
+                        or not stat.S_ISDIR(directory_stat.st_mode)
+                        or stat.S_IMODE(directory_stat.st_mode) != 0o700
+                    ):
+                        raise PermissionError("unsafe busy queue directory")
+                    paths = sorted(directory.glob("*.json"), key=lambda item: item.name)
+                except Exception as exc:
+                    logger.error(
+                        "Busy queue restore skipped profile state error_type=%s",
+                        type(exc).__name__,
+                    )
+                    continue
+
+                for path in paths:
+                    digest = path.stem
+                    session_key: Optional[str] = None
+                    try:
+                        state = self._busy_queue_load_state(path)
+                        claimed_event, events, session_key = (
+                            self._busy_queue_validate_state(path, state)
+                        )
+                        if not events and claimed_event is None:
+                            # Complete a prior tombstone cleanup.  The empty
+                            # record itself is already the durable terminal fact.
+                            path.unlink(missing_ok=True)
+                            self._busy_queue_fsync_directory(path.parent)
+                            continue
+                        all_events = (
+                            [claimed_event, *events]
+                            if claimed_event is not None
+                            else events
+                        )
+                        expected_home = self._busy_queue_profile_home(
+                            all_events[0].source
+                        )
+                        if expected_home.resolve() != Path(profile_home).resolve():
+                            raise ValueError("busy queue record crosses profile boundary")
+                        if claimed_event is not None:
+                            self._busy_queue_note_uncertain(
+                                digest, session_key, path
+                            )
+                            logger.error(
+                                "Busy queue claim is uncertain after restart"
+                            )
+                            continue
+                        if session_key in self.__dict__.setdefault(
+                            "_busy_queue_restored_sessions", set()
+                        ):
+                            continue
+                        adapter = self._adapter_for_source(events[0].source)
+                        if adapter is None or not hasattr(adapter, "_pending_messages"):
+                            continue
+                        pending = getattr(adapter, "_pending_messages")
+                        overflow = self._session_state(
+                            session_key
+                        ).conversation.queued_events
+                        if session_key in pending or overflow:
+                            raise RuntimeError("busy queue restore collided with live state")
+                        pending[session_key] = events[0]
+                        overflow[:] = list(events[1:])
+                        self._busy_queue_restored_sessions.add(session_key)
+                        self.__dict__.setdefault("_busy_queue_restored_sources", {})[
+                            session_key
+                        ] = events[0].source
+                        restored.append(session_key)
+                    except Exception as exc:
+                        self._busy_queue_note_uncertain(digest, session_key, path)
+                        logger.error(
+                            "Busy queue restore quarantined error_type=%s",
+                            type(exc).__name__,
+                        )
+        return restored
+
+    async def _run_busy_queue_replay(
+        self,
+        session_key: str,
+        source: SessionSource,
+    ) -> None:
+        """Claim one restored FIFO head and hand it to its rebound adapter."""
+        adapter = self._adapter_for_source(source)
+        if adapter is None:
+            return
+        if self._is_session_running(session_key):
+            # A recovered predecessor owns the session. Its normal recursive
+            # drain will claim the already-staged durable successor.
+            return
+
+        event, token = self._busy_queue_claim_next_event(session_key, adapter)
+        if event is None or token is None:
+            return
+
+        try:
+            frozen_source = dataclasses.replace(event.source)
+        except Exception:
+            frozen_source = event.source
+        event._hermes_busy_queue_claim_context = (  # type: ignore[attr-defined]
+            session_key,
+            frozen_source,
+            token,
+        )
+        event._hermes_startup_restore_replay = True  # type: ignore[attr-defined]
+
+        # A predecessor can become active after the first liveness check but
+        # before the durable claim. Restore the exact claim at the FIFO front;
+        # never re-admit it as a new receipt.
+        if self._is_session_running(session_key):
+            self._busy_queue_rollback_claim(
+                session_key, frozen_source, token, adapter
+            )
+            return
+
+        try:
+            # BasePlatformAdapter.handle_message is only a launcher. The claim
+            # intentionally survives this await and is finalized by the actual
+            # agent turn carrying the frozen context above.
+            await adapter.handle_message(event)
+        except BaseException as exc:
+            path = self._busy_queue_state_path(session_key, frozen_source)
+            self._busy_queue_note_uncertain(
+                self._busy_queue_session_digest(session_key), session_key, path
+            )
+            logger.error(
+                "Busy queue replay launch is uncertain error_type=%s",
+                type(exc).__name__,
+            )
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+
+    def _schedule_busy_queue_replays(self, session_keys: List[str]) -> int:
+        """Schedule restored heads asynchronously, at most once per session."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return 0
+
+        replay_tasks = self.__dict__.setdefault("_busy_queue_replay_tasks", {})
+        restored_sources = self.__dict__.setdefault(
+            "_busy_queue_restored_sources", {}
+        )
+        scheduled = 0
+        for session_key in dict.fromkeys(session_keys):
+            existing = replay_tasks.get(session_key)
+            if existing is not None and not existing.done():
+                continue
+            source = restored_sources.get(session_key)
+            if not isinstance(source, SessionSource):
+                continue
+            task = loop.create_task(
+                self._run_busy_queue_replay(session_key, source)
+            )
+            replay_tasks[session_key] = task
+            if getattr(self, "_startup_restore_in_progress", False):
+                startup_tasks = self.__dict__.setdefault(
+                    "_startup_restore_tasks", []
+                )
+                startup_tasks.append(task)
+
+            def _forget(done: asyncio.Task, key: str = session_key) -> None:
+                if replay_tasks.get(key) is done:
+                    replay_tasks.pop(key, None)
+                if not done.cancelled():
+                    done.exception()
+
+            task.add_done_callback(_forget)
+            scheduled += 1
+        return scheduled
+
+    @classmethod
+    def _busy_queue_fsync_directory(cls, directory: Path) -> None:
+        fd = cls._busy_queue_open_private_directory(directory, create=False)
+        if fd is None:
+            flags = os.O_RDONLY
+            if hasattr(os, "O_DIRECTORY"):
+                flags |= os.O_DIRECTORY
+            fd = os.open(str(directory), flags)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    @classmethod
+    def _busy_queue_ensure_directory(cls, directory: Path) -> Path:
+        """Create and validate the private directory through stable descriptors."""
+        directory = directory.absolute()
+        fd = cls._busy_queue_open_private_directory(directory, create=True)
+        if fd is not None:
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        else:
+            os.chmod(directory, 0o700)
+        return directory
+
+    @classmethod
+    def _busy_queue_atomic_write(cls, path: Path, payload: Dict[str, Any]) -> None:
+        directory = cls._busy_queue_ensure_directory(path.parent)
+
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        directory_fd = cls._busy_queue_open_private_directory(
+            directory, create=False
+        )
+        temp_name = f".{path.stem}.{secrets.token_hex(16)}.tmp"
+        temp_path = directory / temp_name
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        fd: Optional[int] = None
+        try:
+            if os.name == "nt":
+                fd = os.open(temp_path, flags, 0o600)
+            else:
+                fd = os.open(temp_name, flags, 0o600, dir_fd=directory_fd)
+            cls._busy_queue_validate_private_file(fd)
+            with os.fdopen(fd, "wb", closefd=False) as handle:
+                handle.write(encoded)
+                handle.flush()
+                os.fsync(handle.fileno())
+            if os.name == "nt":
+                os.replace(temp_path, path)
+                cls._busy_queue_fsync_directory(directory)
+            else:
+                os.replace(
+                    temp_name,
+                    path.name,
+                    src_dir_fd=directory_fd,
+                    dst_dir_fd=directory_fd,
+                )
+                os.fsync(directory_fd)
+        finally:
+            if fd is not None:
+                os.close(fd)
+            try:
+                if os.name == "nt":
+                    temp_path.unlink(missing_ok=True)
+                else:
+                    os.unlink(temp_name, dir_fd=directory_fd)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+            if directory_fd is not None:
+                os.close(directory_fd)
+
+    @classmethod
+    def _busy_queue_events_receipts(
+        cls, events: List[MessageEvent]
+    ) -> tuple[tuple[str, ...], ...]:
+        return tuple(
+            tuple(cls._busy_queue_event_receipt_ids(item)) for item in events
+        )
+
+    def _busy_queue_persist_ready(
+        self,
+        session_key: str,
+        source: SessionSource,
+        events: List[MessageEvent],
+        *,
+        expected_prior_events: Optional[List[MessageEvent]] = None,
+    ) -> None:
+        path = self._busy_queue_state_path(session_key, source)
+        digest = self._busy_queue_session_digest(session_key)
+        if (
+            session_key
+            in self.__dict__.setdefault("_busy_queue_uncertain_sessions", set())
+            or digest
+            in self.__dict__.setdefault("_busy_queue_uncertain_digests", set())
+        ):
+            raise RuntimeError("busy queue session is fenced by uncertain state")
+
+        claim_payload: Optional[Dict[str, Any]] = None
+        if os.path.lexists(path):
+            try:
+                state = self._busy_queue_load_state(path)
+                claimed_event, ready_events, stored_session_key = (
+                    self._busy_queue_validate_state(
+                        path, state, expected_session_key=session_key
+                    )
+                )
+                if stored_session_key not in {None, session_key}:
+                    raise ValueError("busy queue state belongs to another session")
+                expected_prior = expected_prior_events or []
+                if self._busy_queue_events_receipts(ready_events) != (
+                    self._busy_queue_events_receipts(expected_prior)
+                ):
+                    raise RuntimeError("busy queue durable and live ready state diverged")
+                if claimed_event is not None:
+                    token = state["claim"]["token"]
+                    active_token = self.__dict__.setdefault(
+                        "_busy_queue_active_claims", {}
+                    ).get(session_key)
+                    if active_token != token:
+                        raise RuntimeError("busy queue claim ownership is uncertain")
+                    claim_payload = state["claim"]
+            except Exception:
+                self._busy_queue_note_uncertain(digest, session_key, path)
+                raise
+        elif expected_prior_events:
+            # Memory already contains accepted work but no durable predecessor.
+            # Never silently mint a new ledger that could reorder/forget it.
+            raise RuntimeError("busy queue durable predecessor is missing")
+
+        payload = {
+            "version": self._BUSY_QUEUE_STATE_VERSION,
+            "session_digest": digest,
+            "owner_session_key": session_key,
+            "revision": time.time_ns(),
+            "claim": claim_payload,
+            "queue": [self._busy_queue_serialize_event(item) for item in events],
+        }
+        encoded_size = len(
+            json.dumps(
+                payload,
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        if encoded_size > self._busy_queue_max_serialized_bytes():
+            raise ValueError("busy queue encoded state exceeds hard reader cap")
+        self._busy_queue_atomic_write(path, payload)
+
+    def _busy_queue_claim_event_locked(
+        self, session_key: str, event: MessageEvent
+    ) -> Optional[str]:
+        """Persist ``ready[0] -> claimed``; the caller must still own memory."""
+        source = getattr(event, "source", None)
+        if not isinstance(source, SessionSource):
+            return None
+        digest = self._busy_queue_session_digest(session_key)
+        path = self._busy_queue_state_path(session_key, source)
+        if (
+            session_key
+            in self.__dict__.setdefault("_busy_queue_uncertain_sessions", set())
+            or digest
+            in self.__dict__.setdefault("_busy_queue_uncertain_digests", set())
+            or not os.path.lexists(path)
+        ):
+            return None
+        try:
+            state = self._busy_queue_load_state(path)
+            claimed_event, ready_events, _ = self._busy_queue_validate_state(
+                path, state, expected_session_key=session_key
+            )
+            if claimed_event is not None or not ready_events:
+                return None
+            event_receipts = tuple(self._busy_queue_event_receipt_ids(event))
+            head_receipts = self._busy_queue_envelope_receipts(state["queue"][0])
+            if event_receipts != head_receipts:
+                raise RuntimeError("busy queue claim does not match durable FIFO head")
+
+            token = secrets.token_hex(16)
+            payload = {
+                "version": self._BUSY_QUEUE_STATE_VERSION,
+                "session_digest": digest,
+                "owner_session_key": state.get(
+                    "owner_session_key", session_key
+                ),
+                "revision": time.time_ns(),
+                "claim": {"token": token, "event": state["queue"][0]},
+                "queue": list(state["queue"][1:]),
+            }
+            self._busy_queue_atomic_write(path, payload)
+            self.__dict__.setdefault("_busy_queue_active_claims", {})[
+                session_key
+            ] = token
+            self.__dict__.setdefault("_busy_queue_claimed_events", {})[
+                session_key
+            ] = event
+            event._busy_queue_claim_token = token  # type: ignore[attr-defined]
+            return token
+        except Exception as exc:
+            self._busy_queue_note_uncertain(digest, session_key, path)
+            logger.error(
+                "Busy queue durable claim failed error_type=%s",
+                type(exc).__name__,
+            )
+            return None
+
+    def _busy_queue_claim_event(
+        self, session_key: str, event: MessageEvent
+    ) -> Optional[str]:
+        """Public lock-taking claim primitive used by tests and drain paths."""
+        lock = self.__dict__.get("_busy_queue_lock")
+        if lock is None:
+            return None
+        with lock:
+            return self._busy_queue_claim_event_locked(session_key, event)
+
+    def _busy_queue_claim_next_event(
+        self, session_key: str, adapter: Any
+    ) -> tuple[Optional[MessageEvent], Optional[str]]:
+        """Claim the FIFO head durably *before* removing/promoting memory."""
+        pending_slot = getattr(adapter, "_pending_messages", None)
+        if not isinstance(pending_slot, dict):
+            return None, None
+        lock = self.__dict__.get("_busy_queue_lock")
+        if lock is None:
+            # A positive replay handoff without the durable lock would create a
+            # dequeue gap.  Fail closed instead of dispatching volatile work.
+            return None, None
+
+        with lock:
+            event = pending_slot.get(session_key)
+            if not isinstance(event, MessageEvent):
+                return None, None
+            source = event.source
+            path = self._busy_queue_state_path(session_key, source)
+            if not os.path.lexists(path):
+                # Legacy/internal producers may have staged accepted work before
+                # durable admission existed.  Write all still-reachable work as
+                # ready first, then claim; never dequeue an unledgered event.
+                current_events = self._busy_queue_events(session_key, adapter)
+                try:
+                    self._busy_queue_persist_ready(
+                        session_key,
+                        source,
+                        current_events,
+                        expected_prior_events=[],
+                    )
+                except Exception as exc:
+                    self._busy_queue_note_uncertain(
+                        self._busy_queue_session_digest(session_key),
+                        session_key,
+                        path,
+                    )
+                    logger.error(
+                        "Busy queue legacy staging failed error_type=%s",
+                        type(exc).__name__,
+                    )
+                    return None, None
+            token = self._busy_queue_claim_event_locked(session_key, event)
+            if token is None:
+                return None, None
+            event._hermes_busy_queue_claim_token = token  # type: ignore[attr-defined]
+            event._hermes_busy_queue_claim_session_key = session_key  # type: ignore[attr-defined]
+            # The durable claim is now the source of truth.  Only now may the
+            # adapter slot move to its successor.
+            removed = pending_slot.pop(session_key, None)
+            if removed is not event:
+                self._busy_queue_note_uncertain(
+                    self._busy_queue_session_digest(session_key), session_key, path
+                )
+                if removed is not None:
+                    pending_slot[session_key] = removed
+                return None, None
+            claimed_event = self._promote_queued_event(session_key, adapter, event)
+            return claimed_event, token
+
+    def _busy_queue_commit_claim(
+        self, session_key: str, source: SessionSource, token: str
+    ) -> bool:
+        """Durably record terminal ownership before forgetting a live claim."""
+        lock = self.__dict__.get("_busy_queue_lock")
+        if lock is None:
+            return False
+        digest = self._busy_queue_session_digest(session_key)
+        path = self._busy_queue_state_path(session_key, source)
+        with lock:
+            try:
+                state = self._busy_queue_load_state(path)
+                claimed_event, _ready_events, _ = self._busy_queue_validate_state(
+                    path, state, expected_session_key=session_key
+                )
+                claim = state["claim"]
+                if (
+                    claimed_event is None
+                    or not isinstance(claim, dict)
+                    or claim.get("token") != token
+                    or self.__dict__.setdefault("_busy_queue_active_claims", {}).get(
+                        session_key
+                    )
+                    != token
+                ):
+                    return False
+                payload = {
+                    "version": self._BUSY_QUEUE_STATE_VERSION,
+                    "session_digest": digest,
+                    "owner_session_key": state.get(
+                        "owner_session_key", session_key
+                    ),
+                    "revision": time.time_ns(),
+                    "claim": None,
+                    "queue": list(state["queue"]),
+                }
+                self._busy_queue_atomic_write(path, payload)
+                self.__dict__.setdefault("_busy_queue_active_claims", {}).pop(
+                    session_key, None
+                )
+                self.__dict__.setdefault("_busy_queue_claimed_events", {}).pop(
+                    session_key, None
+                )
+                if not state["queue"]:
+                    path.unlink(missing_ok=True)
+                    self._busy_queue_fsync_directory(path.parent)
+                    self.__dict__.setdefault(
+                        "_busy_queue_restored_sessions", set()
+                    ).discard(session_key)
+                return True
+            except Exception as exc:
+                self._busy_queue_note_uncertain(digest, session_key, path)
+                logger.error(
+                    "Busy queue durable commit failed error_type=%s",
+                    type(exc).__name__,
+                )
+                return False
+
+    def _busy_queue_rollback_claim(
+        self,
+        session_key: str,
+        source: SessionSource,
+        token: str,
+        adapter: Any,
+    ) -> bool:
+        """Restage a definitely-not-dispatched claim, or fence on uncertainty."""
+        lock = self.__dict__.get("_busy_queue_lock")
+        if lock is None:
+            return False
+        digest = self._busy_queue_session_digest(session_key)
+        path = self._busy_queue_state_path(session_key, source)
+        with lock:
+            try:
+                state = self._busy_queue_load_state(path)
+                claimed_event, ready_events, _ = self._busy_queue_validate_state(
+                    path, state, expected_session_key=session_key
+                )
+                if (
+                    claimed_event is None
+                    or state["claim"].get("token") != token
+                    or self.__dict__.setdefault("_busy_queue_active_claims", {}).get(
+                        session_key
+                    )
+                    != token
+                ):
+                    return False
+                payload = {
+                    "version": self._BUSY_QUEUE_STATE_VERSION,
+                    "session_digest": digest,
+                    "owner_session_key": state.get(
+                        "owner_session_key", session_key
+                    ),
+                    "revision": time.time_ns(),
+                    "claim": None,
+                    "queue": [state["claim"]["event"], *state["queue"]],
+                }
+                self._busy_queue_atomic_write(path, payload)
+
+                # Publish the durable ordering atomically under the same lock.
+                pending_slot = getattr(adapter, "_pending_messages", None)
+                if not isinstance(pending_slot, dict):
+                    raise RuntimeError("busy queue adapter has no pending slot")
+                live_claim = self.__dict__.setdefault(
+                    "_busy_queue_claimed_events", {}
+                ).get(session_key, claimed_event)
+                pending_slot[session_key] = live_claim
+                overflow = self._session_state(
+                    session_key
+                ).conversation.queued_events
+                overflow[:] = ready_events
+                self.__dict__.setdefault("_busy_queue_active_claims", {}).pop(
+                    session_key, None
+                )
+                self.__dict__.setdefault("_busy_queue_claimed_events", {}).pop(
+                    session_key, None
+                )
+                return True
+            except Exception as exc:
+                self._busy_queue_note_uncertain(digest, session_key, path)
+                logger.error(
+                    "Busy queue claim rollback failed error_type=%s",
+                    type(exc).__name__,
+                )
+                return False
+
+    def _busy_queue_cancel_session(
+        self, session_key: str, source: SessionSource, adapter: Any = None
+    ) -> bool:
+        """Persist an explicit cancellation tombstone before clearing projections."""
+        replay_task = self.__dict__.setdefault(
+            "_busy_queue_replay_tasks", {}
+        ).pop(session_key, None)
+        if replay_task is not None and not replay_task.done():
+            try:
+                current_task = asyncio.current_task()
+            except RuntimeError:
+                current_task = None
+            if replay_task is not current_task:
+                replay_task.cancel()
+
+        if adapter is None:
+            adapter = self._adapter_for_source(source)
+        lock = self.__dict__.get("_busy_queue_lock")
+        if lock is None:
+            token = self.__dict__.setdefault("_busy_queue_active_claims", {}).get(
+                session_key
+            )
+            if token:
+                self.__dict__.setdefault(
+                    "_busy_queue_cancelled_claim_tokens", set()
+                ).add(token)
+            pending = getattr(adapter, "_pending_messages", None)
+            if isinstance(pending, dict):
+                pending.pop(session_key, None)
+            self._session_state(session_key).conversation.queued_events.clear()
+            self.__dict__.setdefault("_busy_queue_active_claims", {}).pop(
+                session_key, None
+            )
+            self.__dict__.setdefault("_busy_queue_claimed_events", {}).pop(
+                session_key, None
+            )
+            return True
+
+        digest = self._busy_queue_session_digest(session_key)
+        path = self._busy_queue_state_path(session_key, source)
+        with lock:
+            try:
+                cancelled_tokens = self.__dict__.setdefault(
+                    "_busy_queue_cancelled_claim_tokens", set()
+                )
+                active_token = self.__dict__.setdefault(
+                    "_busy_queue_active_claims", {}
+                ).get(session_key)
+                if active_token:
+                    cancelled_tokens.add(active_token)
+                if os.path.lexists(path):
+                    state = self._busy_queue_load_state(path)
+                    claim = state.get("claim") if isinstance(state, dict) else None
+                    persisted_token = (
+                        claim.get("token") if isinstance(claim, dict) else None
+                    )
+                    if persisted_token:
+                        cancelled_tokens.add(persisted_token)
+                    tombstone = {
+                        "version": self._BUSY_QUEUE_STATE_VERSION,
+                        "session_digest": digest,
+                        "owner_session_key": state.get(
+                            "owner_session_key", session_key
+                        ),
+                        "revision": time.time_ns(),
+                        "claim": None,
+                        "queue": [],
+                    }
+                    self._busy_queue_atomic_write(path, tombstone)
+                    path.unlink(missing_ok=True)
+                    self._busy_queue_fsync_directory(path.parent)
+                pending = getattr(adapter, "_pending_messages", None)
+                if isinstance(pending, dict):
+                    pending.pop(session_key, None)
+                self._session_state(session_key).conversation.queued_events.clear()
+                self.__dict__.setdefault("_busy_queue_active_claims", {}).pop(
+                    session_key, None
+                )
+                self.__dict__.setdefault("_busy_queue_claimed_events", {}).pop(
+                    session_key, None
+                )
+                self.__dict__.setdefault("_busy_queue_restored_sessions", set()).discard(
+                    session_key
+                )
+                self.__dict__.setdefault("_busy_queue_uncertain_sessions", set()).discard(
+                    session_key
+                )
+                self.__dict__.setdefault("_busy_queue_uncertain_digests", set()).discard(
+                    digest
+                )
+                self.__dict__.setdefault("_busy_queue_uncertain_paths", set()).discard(
+                    str(path)
+                )
+                return True
+            except Exception as exc:
+                self._busy_queue_note_uncertain(digest, session_key, path)
+                logger.error(
+                    "Busy queue explicit cancellation failed error_type=%s",
+                    type(exc).__name__,
+                )
+                return False
+
+    @staticmethod
+    def _busy_queue_source_scope(
+        source: SessionSource,
+    ) -> tuple[Any, Any, Any, Any]:
+        platform = getattr(source.platform, "value", source.platform)
+        return (
+            platform,
+            source.profile,
+            source.chat_id,
+            source.chat_type,
+        )
+
+    @staticmethod
+    def _busy_queue_result_is_terminal(result: Optional[Dict[str, Any]]) -> bool:
+        """Release a receipt only for an explicit, cleanly committed turn."""
+        return bool(
+            isinstance(result, dict)
+            and result.get("completed") is True
+            and result.get("receipt_terminal_success") is True
+            and not result.get("failed")
+            and not result.get("partial")
+            and not result.get("interrupted")
+            and not result.get("cleanup_errors")
+        )
+
+    def _busy_queue_finalize_claim(
+        self,
+        session_key: str,
+        source: SessionSource,
+        token: str,
+        result: Any,
+    ) -> bool:
+        """Commit a terminal claim or quarantine an ambiguous turn outcome."""
+        cancelled = self.__dict__.setdefault(
+            "_busy_queue_cancelled_claim_tokens", set()
+        )
+        finalized = self.__dict__.setdefault(
+            "_busy_queue_finalized_claim_tokens", set()
+        )
+        if token in cancelled or token in finalized:
+            # A stale/duplicate callback may never authorize a successor.
+            return False
+        if self._busy_queue_result_is_terminal(result):
+            committed = self._busy_queue_commit_claim(session_key, source, token)
+            if committed:
+                finalized.add(token)
+            return committed
+        path = self._busy_queue_state_path(session_key, source)
+        self._busy_queue_note_uncertain(
+            self._busy_queue_session_digest(session_key), session_key, path
+        )
+        finalized.add(token)
+        return False
+
+    async def _drain_busy_queue_recursively(
+        self,
+        *,
+        session_key: str,
+        source: SessionSource,
+        result: Optional[Dict[str, Any]],
+        busy_queue_claim: Optional[tuple[str, SessionSource, str]],
+        context_prompt: str,
+        history: List[Dict[str, Any]],
+        session_id: str,
+        system_prompt: Optional[str] = None,
+        ephemeral_system_prompt: Optional[str] = None,
+        reasoning_config: Optional[Any] = None,
+        provider_routing: Optional[Any] = None,
+        fallback_model: Optional[str] = None,
+        restart_context: Optional[Any] = None,
+        run_generation: Optional[int] = None,
+        interrupt_depth: int = 0,
+        pending_event: Optional[MessageEvent] = None,
+        pending_claim: Optional[tuple[str, SessionSource, str]] = None,
+        prepared_message: Optional[str] = None,
+        updated_history: Optional[List[Dict[str, Any]]] = None,
+        event_message_id: Optional[str] = None,
+        channel_prompt: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Commit the predecessor, claim the FIFO head, then dispatch it."""
+        del system_prompt, ephemeral_system_prompt, reasoning_config
+        del provider_routing, fallback_model, restart_context
+
+        if busy_queue_claim is not None:
+            claim_key, claim_source, claim_token = busy_queue_claim
+            if not self._busy_queue_finalize_claim(
+                claim_key, claim_source, claim_token, result
+            ):
+                return None
+        elif not self._busy_queue_result_is_terminal(result) and pending_claim is None:
+            return None
+
+        adapter = self._adapter_for_source(source)
+        if adapter is None:
+            return None
+
+        if pending_claim is None:
+            pending_event, token = self._busy_queue_claim_next_event(
+                session_key, adapter
+            )
+            if pending_event is None or token is None:
+                return None
+            try:
+                frozen_source = dataclasses.replace(pending_event.source)
+            except Exception:
+                frozen_source = copy.copy(pending_event.source)
+            pending_event.source = frozen_source
+            claim_key = session_key
+            pending_claim = (claim_key, frozen_source, token)
+        else:
+            claim_key, frozen_source, token = pending_claim
+            if pending_event is None:
+                pending_event = self.__dict__.setdefault(
+                    "_busy_queue_claimed_events", {}
+                ).get(claim_key)
+                if pending_event is None:
+                    self._busy_queue_note_uncertain(
+                        self._busy_queue_session_digest(claim_key),
+                        claim_key,
+                        self._busy_queue_state_path(claim_key, frozen_source),
+                    )
+                    return None
+
+        pending_event._hermes_busy_queue_claim_context = pending_claim  # type: ignore[attr-defined]
+        pending_event._hermes_busy_queue_claim_token = token  # type: ignore[attr-defined]
+        pending_event._hermes_busy_queue_claim_session_key = claim_key  # type: ignore[attr-defined]
+        next_message = prepared_message
+        if next_message is None:
+            next_message = pending_event.text or _build_media_placeholder(pending_event)
+
+        try:
+            return await self._run_agent(
+                message=next_message,
+                context_prompt=context_prompt,
+                history=updated_history if updated_history is not None else history,
+                source=frozen_source,
+                session_id=session_id,
+                session_key=session_key,
+                run_generation=run_generation,
+                _interrupt_depth=interrupt_depth + 1,
+                event_message_id=event_message_id,
+                channel_prompt=channel_prompt,
+                busy_queue_claim=pending_claim,
+            )
+        except BaseException:
+            finalized = self.__dict__.setdefault(
+                "_busy_queue_finalized_claim_tokens", set()
+            )
+            cancelled = self.__dict__.setdefault(
+                "_busy_queue_cancelled_claim_tokens", set()
+            )
+            if token not in finalized and token not in cancelled:
+                self._busy_queue_rollback_claim(
+                    claim_key, frozen_source, token, adapter
+                )
+            raise
+
+    @staticmethod
+    def _busy_queue_event_item_count(event: MessageEvent) -> int:
+        try:
+            return max(1, int(getattr(event, "_busy_queue_item_count", 1)))
+        except (TypeError, ValueError):
+            return 1
+
+    @staticmethod
+    def _busy_queue_event_media_count(event: MessageEvent) -> int:
+        return max(
+            len(getattr(event, "media_urls", None) or []),
+            len(getattr(event, "media_types", None) or []),
+        )
+
+    @staticmethod
+    def _busy_queue_json_default(value: Any) -> Any:
+        enum_value = getattr(value, "value", None)
+        if isinstance(enum_value, (str, int, float, bool)) or enum_value is None:
+            if enum_value is not None:
+                return enum_value
+        if dataclasses.is_dataclass(value) and not isinstance(value, type):
+            return {
+                field.name: getattr(value, field.name, None)
+                for field in dataclasses.fields(value)
+            }
+        return str(value)
+
+    @classmethod
+    def _busy_queue_logical_json_bytes(cls, value: Any, *, include_keys: bool = True) -> int:
+        """Measure decoded logical data, never JSON escaping or framing bytes.
+
+        The public one-MiB limit is an admission bound on retained user data.
+        JSON quoting can expand one byte to six bytes and the durable state adds
+        receipts/schema fields; neither is another user payload.  Mapping keys
+        are counted for user-supplied metadata, while fixed protocol keys are
+        not passed to this helper.
+        """
+        if value is None:
+            return 0
+        if isinstance(value, str):
+            return len(value.encode("utf-8", errors="strict"))
+        if isinstance(value, bool):
+            return 1
+        if isinstance(value, int) and not isinstance(value, bool):
+            return len(str(value).encode("ascii"))
+        if isinstance(value, float):
+            if not math.isfinite(value):
+                raise ValueError("busy queue JSON contains a non-finite number")
+            return len(repr(value).encode("ascii"))
+        if isinstance(value, (list, tuple)):
+            return sum(
+                cls._busy_queue_logical_json_bytes(item, include_keys=include_keys)
+                for item in value
+            )
+        if isinstance(value, dict):
+            total = 0
+            for key, item in value.items():
+                if not isinstance(key, str):
+                    raise TypeError("busy queue JSON object keys must be strings")
+                if include_keys:
+                    total += len(key.encode("utf-8", errors="strict"))
+                total += cls._busy_queue_logical_json_bytes(
+                    item, include_keys=include_keys
+                )
+            return total
+        raise TypeError("busy queue payload is not strict JSON")
+
+    @classmethod
+    def _busy_queue_event_bytes(cls, event: MessageEvent) -> int:
+        """Return decoded logical bytes for every retained content field.
+
+        Routing identity, timestamps, booleans and fixed schema labels are
+        bounded by the transport/schema and do not consume the public payload
+        budget.  All variable message content does, including every media URL
+        and type, captions/replies, channel context, skills and nested metadata.
+        """
+        try:
+            # Also validates the complete durable envelope strictly.  Receipt
+            # allocation here is intentional: a later positive ACK refers to
+            # the exact envelope that passed admission.
+            envelope = cls._busy_queue_serialize_event(event)
+            payload = envelope["event"]
+            retained_content = [
+                payload["text"],
+                payload["message_id"],
+                payload["platform_update_id"],
+                payload["media_urls"],
+                payload["media_types"],
+                payload["reply_to_message_id"],
+                payload["reply_to_text"],
+                payload["reply_to_author_id"],
+                payload["reply_to_author_name"],
+                payload["auto_skill"],
+                payload["channel_prompt"],
+                payload["channel_context"],
+            ]
+            total = sum(
+                cls._busy_queue_logical_json_bytes(item, include_keys=False)
+                for item in retained_content
+            )
+            total += cls._busy_queue_logical_json_bytes(
+                payload["metadata"], include_keys=True
+            )
+            return total
+        except (TypeError, ValueError, UnicodeError, RecursionError, OverflowError):
+            # An event that cannot be validated and bounded deterministically is
+            # not safe to retain.
+            return sys.maxsize
+
+    def _busy_queue_max_bytes(self) -> int:
+        try:
+            raw = cfg_get(
+                _load_gateway_runtime_config(),
+                "display",
+                "busy_queue_max_bytes",
+                default=self._BUSY_QUEUE_MAX_BYTES_DEFAULT,
+            )
+            value = int(raw)
+            if value < 1:
+                raise ValueError
+            return value
+        except (TypeError, ValueError):
+            return self._BUSY_QUEUE_MAX_BYTES_DEFAULT
+
+    def _busy_queue_events(self, session_key: str, adapter: Any) -> List[MessageEvent]:
+        events: List[MessageEvent] = []
+        pending_slot = getattr(adapter, "_pending_messages", None)
+        if isinstance(pending_slot, dict) and session_key in pending_slot:
+            events.append(pending_slot[session_key])
+        state = self._peek_session_state(session_key)
+        if state is not None:
+            events.extend(state.conversation.queued_events)
+        return events
+
+    def _busy_queue_admission_failure(
+        self,
+        proposed_events: List[MessageEvent],
+    ) -> Optional[str]:
+        if sum(self._busy_queue_event_item_count(item) for item in proposed_events) > self._BUSY_QUEUE_MAX_PENDING:
+            return "items"
+        if sum(self._busy_queue_event_media_count(item) for item in proposed_events) > self._BUSY_QUEUE_MAX_MEDIA:
+            return "media"
+        max_bytes = self._busy_queue_max_bytes()
+        total_bytes = 0
+        for item in proposed_events:
+            total_bytes += self._busy_queue_event_bytes(item)
+            if total_bytes > max_bytes:
+                return "bytes"
+        return None
+
+    def _queue_or_replace_pending_event_locked(
+        self,
+        session_key: str,
+        event: MessageEvent,
+        *,
+        coalesce: bool,
+        front: bool,
+        already_accepted: bool,
+    ) -> bool:
+        # One admission gate owns every busy path (photo/grace/sentinel,
+        # PRIORITY, SMART and explicit /queue).  Accepted work already present
+        # in the ledger still drains while this gate is closed.
+        if not already_accepted and (
+            bool(getattr(self, "_draining", False))
+            or bool(getattr(self, "_external_drain_active", False))
+        ):
+            return False
+        digest = self._busy_queue_session_digest(session_key)
+        if (
+            session_key
+            in self.__dict__.setdefault("_busy_queue_uncertain_sessions", set())
+            or digest
+            in self.__dict__.setdefault("_busy_queue_uncertain_digests", set())
+        ):
+            logger.error(
+                "Rejecting busy-mode follow-up: durable state is uncertain"
+            )
+            return False
+        adapter = self._adapter_for_source(event.source)
+        if not adapter:
+            return False
+        # #28503 — Previously this called ``merge_pending_message_event``
+        # with the default ``merge_text=False``, which silently OVERWROTE
+        # the single pending slot when consecutive text messages arrived
+        # in ``busy_input_mode: queue``. Route through the FIFO
+        # infrastructure shared with ``/queue`` so each follow-up gets
+        # its own turn in arrival order. Photo bursts still merge into
+        # the head slot via ``merge_pending_message_event`` (album
+        # semantics); everything else appends to the overflow tail.
+        pending_slot = getattr(adapter, "_pending_messages", None)
+        if not isinstance(pending_slot, dict):
+            return False
+        existing = pending_slot.get(session_key)
+        current_events = self._busy_queue_events(session_key, adapter)
+        merge_into_head = coalesce and not front and existing is not None and (
+            getattr(existing, "message_type", None) == MessageType.PHOTO
+            or event.message_type == MessageType.PHOTO
+            or bool(getattr(existing, "media_urls", None))
+            or bool(getattr(event, "media_urls", None))
+        )
+
+        candidate = None
+        if merge_into_head:
+            # Merge into an isolated copy first. Rejection therefore leaves the
+            # accepted head's captions and media lists byte-for-byte unchanged.
+            candidate = copy.copy(existing)
+            candidate.media_urls = list(getattr(existing, "media_urls", None) or [])
+            candidate.media_types = list(getattr(existing, "media_types", None) or [])
+            candidate_slot = {session_key: candidate}
+            merge_pending_message_event(
+                candidate_slot,
+                session_key,
+                event,
+                merge_text=event.message_type == MessageType.TEXT,
+            )
+            candidate = candidate_slot[session_key]
+            candidate._busy_queue_receipt_ids = (  # type: ignore[attr-defined]
+                self._busy_queue_event_receipt_ids(existing)
+                + self._busy_queue_event_receipt_ids(event)
+            )
+            candidate._busy_queue_item_count = (  # type: ignore[attr-defined]
+                self._busy_queue_event_item_count(existing)
+                + self._busy_queue_event_item_count(event)
+            )
+            proposed_events = [candidate, *current_events[1:]]
+        elif front:
+            proposed_events = [event, *current_events]
+        else:
+            proposed_events = [*current_events, event]
+
+        admission_events = list(proposed_events)
+        claimed_event = self.__dict__.setdefault(
+            "_busy_queue_claimed_events", {}
+        ).get(session_key)
+        if claimed_event is not None:
+            admission_events.insert(0, claimed_event)
+        failure = (
+            None
+            if already_accepted
+            else self._busy_queue_admission_failure(admission_events)
+        )
+        if failure is not None:
+            logger.warning(
+                "Rejecting busy-mode follow-up: pending queue cap reached reason=%s",
+                failure,
+            )
+            return False
+
+        if self.__dict__.get("_busy_queue_lock") is not None:
+            try:
+                self._busy_queue_persist_ready(
+                    session_key,
+                    event.source,
+                    proposed_events,
+                    expected_prior_events=current_events,
+                )
+            except Exception as exc:
+                logger.error(
+                    "Busy queue durable admission failed error_type=%s",
+                    type(exc).__name__,
+                )
+                return False
+
+        if candidate is not None:
+            pending_slot[session_key] = candidate
+        else:
+            self._enqueue_fifo(session_key, event, adapter, front=front)
+        return True
+
+    def _admit_interrupting_event(
+        self,
+        session_key: str,
+        event: MessageEvent,
+        *,
+        control_interrupt_reason: Optional[str] = None,
+    ) -> bool:
+        """Persist a priority event before signaling interruption.
+
+        The durable FIFO is the only delivery authority.  The adapter event is
+        raised only after the atomic ready-state replacement succeeds, so the
+        interrupt monitor can safely peek the newly persisted head.  If the
+        obligation cannot be admitted, stop the invalidated turn with a pure
+        control interrupt and fence the session rather than manufacturing an
+        unreceipted user turn.
+        """
+        adapter = self._adapter_for_source(event.source)
+        if adapter is None or self._session_key_for_source(event.source) != session_key:
+            logger.error("Rejecting interrupting event: durable scope is unavailable")
+            return False
+
+        accepted = self._queue_or_replace_pending_event(
+            session_key,
+            event,
+            coalesce=False,
+            front=True,
+            already_accepted=False,
+        )
+        if not accepted:
+            try:
+                self._busy_queue_note_uncertain(
+                    self._busy_queue_session_digest(session_key),
+                    session_key,
+                    self._busy_queue_state_path(session_key, event.source),
+                )
+            except Exception:
+                logger.error("Failed to fence rejected interrupting event")
+            running_state = self._peek_session_state(session_key)
+            running_agent = running_state.turn.agent if running_state else None
+            if (
+                control_interrupt_reason
+                and running_agent not in (None, _AGENT_PENDING_SENTINEL)
+            ):
+                try:
+                    running_agent.interrupt(control_interrupt_reason)
+                except Exception as exc:
+                    logger.error(
+                        "Control interrupt after rejected durable admission failed "
+                        "error_type=%s",
+                        type(exc).__name__,
+                    )
+            return False
+
+        active_claim_token = self.__dict__.setdefault(
+            "_busy_queue_active_claims", {}
+        ).get(session_key)
+        if active_claim_token:
+            claimed_event = self.__dict__.setdefault(
+                "_busy_queue_claimed_events", {}
+            ).get(session_key)
+            claimed_source = getattr(claimed_event, "source", None)
+            if not isinstance(claimed_source, SessionSource) or not self._busy_queue_commit_claim(
+                session_key,
+                claimed_source,
+                active_claim_token,
+            ):
+                self._busy_queue_note_uncertain(
+                    self._busy_queue_session_digest(session_key),
+                    session_key,
+                    self._busy_queue_state_path(session_key, event.source),
+                )
+                logger.error("Interrupting event could not supersede active claim")
+                return False
+            self.__dict__.setdefault(
+                "_busy_queue_cancelled_claim_tokens", set()
+            ).add(active_claim_token)
+
+        active_event = getattr(adapter, "_active_sessions", {}).get(session_key)
+        if active_event is not None:
+            try:
+                active_event.set()
+            except Exception as exc:
+                # The payload remains durable and will drain on normal terminal
+                # completion.  Stop the invalidated turn directly as a control
+                # action so signaling failure cannot continue recalled work.
+                logger.error(
+                    "Interrupt signal failed after durable admission error_type=%s",
+                    type(exc).__name__,
+                )
+                running_state = self._peek_session_state(session_key)
+                running_agent = running_state.turn.agent if running_state else None
+                if (
+                    control_interrupt_reason
+                    and running_agent not in (None, _AGENT_PENDING_SENTINEL)
+                ):
+                    try:
+                        running_agent.interrupt(control_interrupt_reason)
+                    except Exception:
+                        logger.error("Fallback control interrupt failed")
+        return True
+
+    def _admit_and_maybe_steer_event(
+        self,
+        session_key: str,
+        event: MessageEvent,
+        running_agent: Any,
+        adapter: Any,
+        steer_text: str,
+        *,
+        expected_run_generation: Optional[int] = None,
+    ) -> tuple[bool, bool]:
+        """Durably admit one event, then transfer its claim to a steer lease.
+
+        ``accepted`` is true only after the ready state is durable. ``steered``
+        is true only when the agent accepted the matching claim plus terminal
+        consumption callbacks. Older queued work always remains ahead of the
+        new event, so a steer can never jump the durable FIFO head.
+        """
+        lock = self.__dict__.get("_busy_queue_lock")
+        if lock is None:
+            return False, False
+        if not isinstance(adapter, object) or not isinstance(event.source, SessionSource):
+            return False, False
+
+        with lock:
+            prior_events = self._busy_queue_events(session_key, adapter)
+            accepted = self._queue_or_replace_pending_event(
+                session_key,
+                event,
+                coalesce=False,
+            )
+            if not accepted:
+                return False, False
+            if prior_events:
+                return True, False
+
+            supports_reader = getattr(
+                type(running_agent), "supports_steer_consumption_ack", None
+            )
+            generation_reader = getattr(type(running_agent), "get_steer_generation", None)
+            if not callable(supports_reader) or not callable(generation_reader):
+                return True, False
+            try:
+                if running_agent.supports_steer_consumption_ack() is not True:
+                    return True, False
+                steer_generation = running_agent.get_steer_generation()
+            except Exception:
+                return True, False
+            if not isinstance(steer_generation, int) or isinstance(steer_generation, bool):
+                return True, False
+            if (
+                expected_run_generation is not None
+                and steer_generation != expected_run_generation
+            ):
+                return True, False
+
+            claimed_event, token = self._busy_queue_claim_next_event(
+                session_key, adapter
+            )
+            if token is None or claimed_event is not event:
+                return True, False
+
+            source = event.source
+            path = self._busy_queue_state_path(session_key, source)
+            callback_lock = threading.Lock()
+            callback_state = {"settled": False}
+
+            def _settle(action: Callable[[], bool], *, terminal: bool = False) -> bool:
+                with callback_lock:
+                    if callback_state["settled"]:
+                        return False
+                    outcome = bool(action())
+                    if outcome or terminal:
+                        callback_state["settled"] = True
+                    return outcome
+
+            def _on_consumed() -> bool:
+                return _settle(
+                    lambda: self._busy_queue_commit_claim(
+                        session_key, source, token
+                    )
+                )
+
+            def _on_unconsumed() -> bool:
+                return _settle(
+                    lambda: self._busy_queue_rollback_claim(
+                        session_key, source, token, adapter
+                    )
+                )
+
+            def _on_uncertain() -> bool:
+                def _fence() -> bool:
+                    self._busy_queue_note_uncertain(
+                        self._busy_queue_session_digest(session_key),
+                        session_key,
+                        path,
+                    )
+                    return False
+
+                return _settle(_fence, terminal=True)
+
+            try:
+                steered = running_agent.steer(
+                    steer_text,
+                    run_generation=steer_generation,
+                    on_consumed=_on_consumed,
+                    on_unconsumed=_on_unconsumed,
+                    on_uncertain=_on_uncertain,
+                ) is True
+            except Exception as exc:
+                _on_uncertain()
+                logger.warning(
+                    "Durable steer handoff failed error_type=%s",
+                    type(exc).__name__,
+                )
+                return False, False
+
+            if not steered:
+                rolled_back = _on_unconsumed()
+                return bool(rolled_back), False
+            return True, True
+
+    async def _dequeue_pending_with_transcription(
+        self,
+        adapter,
+        session_key: str,
+        source,
+    ) -> str | None:
+        """Dequeue a pending queued message, auto-transcribing audio media.
+
+        When a voice/audio message arrives during an active agent run, the
+        adapter stores the event in its pending queue and signals an interrupt
+        (see base.BaseAdapter.handle_message). The adapter path bypasses
+        _handle_message entirely, so the normal STT pipeline at message-receive
+        time never runs.
+
+        This helper fills that gap: when the dequeued event has audio media,
+        we transcribe inline, echo the raw transcript back to the user (same
+        "🎙️" format as the fresh-message path), and return enriched text.
+        Non-audio events fall back to _build_media_placeholder, matching the
+        original _dequeue_pending_text behavior.
+        """
+        event = adapter.get_pending_message(session_key)
+        if not event:
+            return None
+
+        text = event.text or ""
+
+        audio_paths: List[str] = []
+        media_urls = getattr(event, "media_urls", None) or []
+        media_types = getattr(event, "media_types", None) or []
+        for i, path in enumerate(media_urls):
+            mtype = media_types[i] if i < len(media_types) else ""
+            is_audio = (
+                mtype.startswith("audio/")
+                or getattr(event, "message_type", None) in (MessageType.VOICE, MessageType.AUDIO)
+            )
+            if is_audio:
+                audio_paths.append(path)
+
+        if audio_paths:
+            enriched_text, successful_transcripts = await self._enrich_message_with_transcription(
+                text, audio_paths,
+            )
+            # Echo raw transcripts back to the user when configured so voice
+            # interrupts feel identical to fresh voice messages.
+            if successful_transcripts and self._should_echo_stt_transcripts():
+                echo_adapter = self._adapter_for_source(source)
+                echo_meta = {"thread_id": source.thread_id} if source.thread_id else None
+                if echo_adapter:
+                    for tx in successful_transcripts:
+                        try:
+                            await echo_adapter.send(
+                                source.chat_id,
+                                f'🎙️ "{tx}"',
+                                metadata=echo_meta,
+                            )
+                        except Exception as echo_exc:
+                            logger.debug(
+                                "Transcript echo failed (non-fatal): %s", echo_exc,
+                            )
+            return enriched_text or None
+
+        # Non-audio fallback: preserve original _dequeue_pending_text semantics.
+        if not text and media_urls:
+            text = _build_media_placeholder(event)
+        return text or None
 
 
 def _run_planned_stop_watcher(

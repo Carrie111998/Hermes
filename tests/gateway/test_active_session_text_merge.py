@@ -111,6 +111,41 @@ def _make_adapter() -> BasePlatformAdapter:
     return adapter
 
 
+@pytest.mark.asyncio
+async def test_busy_handler_failure_fails_closed_before_raw_fallback():
+    adapter = _make_adapter()
+    event = _make_event("must remain behind the durable boundary")
+    session_key = build_session_key(event.source)
+    adapter._active_sessions[session_key] = asyncio.Event()
+    adapter._busy_session_handler = AsyncMock(side_effect=RuntimeError("boom"))
+
+    await adapter.handle_message(event)
+
+    assert adapter._pending_messages == {}
+    assert adapter._text_debounce == {}
+    adapter._message_handler.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_busy_handler_failure_after_accept_does_not_duplicate_event():
+    adapter = _make_adapter()
+    event = _make_event("accepted once")
+    session_key = build_session_key(event.source)
+    adapter._active_sessions[session_key] = asyncio.Event()
+
+    async def _persist_then_fail(accepted_event, *_args):
+        adapter._pending_messages[session_key] = accepted_event
+        raise RuntimeError("post-admission ack failure")
+
+    adapter._busy_session_handler = _persist_then_fail
+
+    await adapter.handle_message(event)
+
+    assert adapter._pending_messages[session_key].text == "accepted once"
+    assert adapter._text_debounce == {}
+    adapter._message_handler.assert_not_awaited()
+
+
 def _debounced_event(adapter: BasePlatformAdapter, session_key: str) -> MessageEvent:
     return adapter._text_debounce[session_key].event
 

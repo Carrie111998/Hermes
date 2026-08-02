@@ -1,4 +1,5 @@
 import asyncio
+import threading
 from collections import OrderedDict
 from unittest.mock import AsyncMock, MagicMock
 
@@ -75,6 +76,15 @@ def make_restart_runner(
     runner._restart_drain_timeout = DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
     runner._stop_task = None
     runner._busy_input_mode = "interrupt"
+    runner._busy_text_mode = "interrupt"
+    runner._queued_events = {}
+    runner._external_drain_active = False
+    runner._busy_queue_lock = threading.RLock()
+    runner._busy_queue_claimed_events = {}
+    runner._busy_queue_uncertain_sessions = set()
+    runner._busy_queue_uncertain_digests = set()
+    runner._busy_queue_persist_ready = MagicMock(return_value=None)
+    runner._busy_queue_max_bytes = lambda: 1024 * 1024
     runner._update_prompt_pending = {}
     runner._voice_mode = {}
     runner._session_model_overrides = {}

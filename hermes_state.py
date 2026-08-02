@@ -23,6 +23,7 @@ import os
 import random
 import re
 import sqlite3
+import stat
 import sys
 import threading
 import time
@@ -969,6 +970,126 @@ def is_disk_full_error(exc: BaseException | str | None) -> bool:
     lowered = text.lower()
     return any(marker in lowered for marker in _DISK_FULL_MARKERS)
 
+def _private_sqlite_owner_ok(info: os.stat_result) -> bool:
+    getuid = getattr(os, "geteuid", None)
+    return getuid is None or info.st_uid == getuid()
+
+
+def _secure_private_sqlite_directory(
+    path: Path,
+    *,
+    create: bool,
+    repair_permissions: bool = True,
+) -> None:
+    """Create/repair or validate an owner-private directory without links."""
+    if create:
+        path.mkdir(parents=True, mode=0o700, exist_ok=True)
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        raise OSError("unsafe private SQLite directory: missing") from None
+    if path.is_symlink() or not stat.S_ISDIR(info.st_mode):
+        raise OSError("unsafe private SQLite directory: symlink or non-directory")
+    if not _private_sqlite_owner_ok(info):
+        raise OSError("unsafe private SQLite directory: unexpected owner")
+    if os.name != "nt":
+        if repair_permissions:
+            os.chmod(path, 0o700)
+        else:
+            mode = stat.S_IMODE(info.st_mode)
+            if mode & 0o077 or mode & 0o500 != 0o500:
+                raise OSError("unsafe private SQLite directory: insecure permissions")
+
+
+def _secure_private_sqlite_file(
+    path: Path,
+    *,
+    repair_permissions: bool = True,
+) -> os.stat_result | None:
+    """Create/repair or validate one DB artifact without following links."""
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return None
+    if path.is_symlink() or not stat.S_ISREG(info.st_mode):
+        raise OSError("unsafe private SQLite artifact: symlink or non-regular file")
+    if not _private_sqlite_owner_ok(info):
+        raise OSError("unsafe private SQLite artifact: unexpected owner")
+    if info.st_nlink != 1:
+        raise OSError("unsafe private SQLite artifact: hardlink count is not one")
+    if os.name != "nt":
+        if repair_permissions:
+            os.chmod(path, 0o600)
+        else:
+            mode = stat.S_IMODE(info.st_mode)
+            if mode & 0o077 or mode & 0o400 != 0o400:
+                raise OSError("unsafe private SQLite artifact: insecure permissions")
+    return info
+
+
+def _sqlite_artifact_paths(db_path: Path) -> Tuple[Path, ...]:
+    return (
+        db_path,
+        db_path.with_name(db_path.name + "-wal"),
+        db_path.with_name(db_path.name + "-shm"),
+        db_path.with_name(db_path.name + "-journal"),
+    )
+
+
+def _secure_sqlite_artifacts(
+    db_path: Path,
+    *,
+    repair_permissions: bool = True,
+) -> None:
+    for artifact in _sqlite_artifact_paths(db_path):
+        _secure_private_sqlite_file(
+            artifact,
+            repair_permissions=repair_permissions,
+        )
+
+
+def _prepare_private_sqlite_path(
+    db_path: Path,
+    *,
+    read_only: bool,
+    create_missing: bool = True,
+) -> None:
+    """Establish the private-filesystem boundary before SQLite sees a path."""
+    db_path = Path(db_path)
+    repair_permissions = not read_only
+    _secure_private_sqlite_directory(
+        db_path.parent,
+        create=not read_only and create_missing,
+        repair_permissions=repair_permissions,
+    )
+    existing = _secure_private_sqlite_file(
+        db_path,
+        repair_permissions=repair_permissions,
+    )
+    if existing is None:
+        if read_only or not create_missing:
+            raise OSError("unsafe private SQLite artifact: database is missing")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(db_path, flags, 0o600)
+        try:
+            info = os.fstat(fd)
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or not _private_sqlite_owner_ok(info)
+                or info.st_nlink != 1
+            ):
+                raise OSError("unsafe private SQLite artifact after creation")
+            if os.name != "nt":
+                os.fchmod(fd, 0o600)
+        finally:
+            os.close(fd)
+    _secure_sqlite_artifacts(
+        db_path,
+        repair_permissions=repair_permissions,
+    )
+
 
 def _claim_repair_attempt(db_path: Path) -> bool:
     """Claim the one-shot repair attempt for *db_path* in this process.
@@ -985,22 +1106,80 @@ def _claim_repair_attempt(db_path: Path) -> bool:
         return True
 
 
+_MALFORMED_BACKUP_RETENTION = 3
+
+
+def _copy_private_db_artifact(source: Path, destination: Path) -> None:
+    source_info = _secure_private_sqlite_file(source)
+    if source_info is None:
+        raise FileNotFoundError(source)
+
+    read_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    read_flags |= getattr(os, "O_NOFOLLOW", 0)
+    write_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    write_flags |= getattr(os, "O_CLOEXEC", 0)
+    write_flags |= getattr(os, "O_NOFOLLOW", 0)
+    source_fd = os.open(source, read_flags)
+    try:
+        destination_fd = os.open(destination, write_flags, 0o600)
+        try:
+            src_info = os.fstat(source_fd)
+            dst_info = os.fstat(destination_fd)
+            if (
+                not stat.S_ISREG(src_info.st_mode)
+                or not stat.S_ISREG(dst_info.st_mode)
+                or not _private_sqlite_owner_ok(src_info)
+                or not _private_sqlite_owner_ok(dst_info)
+                or src_info.st_nlink != 1
+                or dst_info.st_nlink != 1
+            ):
+                raise OSError("unsafe private SQLite backup artifact")
+            if os.name != "nt":
+                os.fchmod(destination_fd, 0o600)
+            while True:
+                chunk = os.read(source_fd, 1024 * 1024)
+                if not chunk:
+                    break
+                view = memoryview(chunk)
+                while view:
+                    written = os.write(destination_fd, view)
+                    if written <= 0:
+                        raise OSError("short write while creating SQLite backup")
+                    view = view[written:]
+            os.fsync(destination_fd)
+        finally:
+            os.close(destination_fd)
+    finally:
+        os.close(source_fd)
+
+
+def _prune_malformed_db_backups(db_path: Path) -> None:
+    prefix = f"{db_path.name}.malformed-backup-"
+    bases = [
+        path
+        for path in db_path.parent.glob(prefix + "*")
+        if not path.name.endswith(("-wal", "-shm"))
+    ]
+    for stale in sorted(bases, key=lambda item: item.name, reverse=True)[
+        _MALFORMED_BACKUP_RETENTION:
+    ]:
+        for artifact in (
+            stale,
+            stale.with_name(stale.name + "-wal"),
+            stale.with_name(stale.name + "-shm"),
+        ):
+            try:
+                if _secure_private_sqlite_file(artifact) is not None:
+                    artifact.unlink()
+            except OSError:
+                logger.warning("Refusing to prune unsafe malformed DB backup artifact")
+
+
 def _backup_db_file(db_path: Path) -> Optional[Path]:
-    """Copy a (possibly malformed) DB file to a timestamped backup beside it.
-
-    Raw file copy on purpose: the DB won't open cleanly, so we preserve the
-    bytes exactly for forensics / manual restore. WAL and SHM sidecars are
-    copied too when present. Returns the backup path, or None on failure.
-
-    Refuses when a connection to this database is still live in the process:
-    reading the file would ``close()`` a descriptor for it and cancel that
-    connection's POSIX advisory locks (see ``hermes_cli.sqlite_safe_read``).
-    The repair path can be entered by one SessionDB while the gateway holds
-    others, so this is a real possibility rather than a theoretical one.
-    """
+    """Copy a malformed DB and sidecars to bounded owner-private backups."""
     import datetime
-    import shutil
 
+    db_path = Path(db_path)
     try:
         from hermes_cli.sqlite_safe_read import has_live_connection
     except ImportError:
@@ -1015,17 +1194,35 @@ def _backup_db_file(db_path: Path) -> Optional[Path]:
         )
         return None
 
-    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     backup_path = db_path.with_name(f"{db_path.name}.malformed-backup-{stamp}")
+    created: list[Path] = []
     try:
-        shutil.copy2(db_path, backup_path)
+        _secure_private_sqlite_directory(db_path.parent, create=False)
+        sources = [db_path]
         for suffix in ("-wal", "-shm"):
             sidecar = db_path.with_name(db_path.name + suffix)
-            if sidecar.exists():
-                shutil.copy2(sidecar, backup_path.with_name(backup_path.name + suffix))
+            if _secure_private_sqlite_file(sidecar) is not None:
+                sources.append(sidecar)
+        # Validate every source before creating the first destination so an
+        # unsafe sidecar cannot leave a misleading partial forensic backup.
+        for source in sources:
+            _secure_private_sqlite_file(source)
+        for source in sources:
+            suffix = source.name[len(db_path.name):]
+            destination = backup_path.with_name(backup_path.name + suffix)
+            _copy_private_db_artifact(source, destination)
+            created.append(destination)
+        _prune_malformed_db_backups(db_path)
         return backup_path
     except Exception as exc:  # pragma: no cover - best effort
-        logger.warning("Could not back up malformed DB %s: %s", db_path, exc)
+        for artifact in created:
+            try:
+                if _secure_private_sqlite_file(artifact) is not None:
+                    artifact.unlink()
+            except OSError:
+                pass
+        logger.warning("Could not create a private malformed DB backup: %s", type(exc).__name__)
         return None
 
 
@@ -1282,6 +1479,15 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
     db_path = Path(db_path)
     if not db_path.exists():
         report["error"] = f"{db_path} does not exist"
+        return report
+    try:
+        _prepare_private_sqlite_path(
+            db_path,
+            read_only=False,
+            create_missing=False,
+        )
+    except OSError as exc:
+        report["error"] = str(exc)
         return report
 
     if _db_opens_cleanly(db_path) is None:
@@ -1845,7 +2051,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     _IMPORT_MAX_TOTAL_BYTES = 25 * 1024 * 1024
 
     def __init__(self, db_path: Path = None, read_only: bool = False):
-        self.db_path = db_path or _default_db_path()
+        self.db_path = Path(db_path or _default_db_path())
         self.read_only = read_only
 
         self._lock = threading.Lock()
@@ -1893,6 +2099,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self._token_writer_stop = False
         self._token_writer_busy = False
         try:
+            _prepare_private_sqlite_path(self.db_path, read_only=read_only)
             if read_only:
                 # Read-only attach for cross-profile aggregation: SELECT-only,
                 # so we skip schema init entirely (no DDL, no FTS probe, no
@@ -1902,8 +2109,27 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 # must already exist + be initialised (callers guard on
                 # db_path.exists()); a SELECT against an empty file raises and
                 # the caller degrades per-profile.
+                read_only_uri = f"{self.db_path.absolute().as_uri()}?mode=ro"
+                _, wal_path, shm_path, journal_path = _sqlite_artifact_paths(
+                    self.db_path
+                )
+                wal_exists = wal_path.exists()
+                shm_exists = shm_path.exists()
+                if wal_exists and not shm_exists:
+                    raise OSError(
+                        "read-only SQLite WAL requires an existing SHM sidecar"
+                    )
+                # SQLite remembers WAL mode in the main DB header. A SELECT on
+                # an otherwise checkpointed database can therefore create empty
+                # -wal/-shm files even through mode=ro. When no sidecar exists,
+                # the main file is the complete frozen snapshot, so immutable=1
+                # prevents those observational reads from mutating storage. If
+                # WAL and SHM both exist we must retain ordinary mode=ro so
+                # committed WAL pages remain visible to cross-profile readers.
+                if not (wal_exists or shm_exists or journal_path.exists()):
+                    read_only_uri += "&immutable=1"
                 self._conn = _connect_tracked_db(
-                    f"file:{self.db_path}?mode=ro",
+                    read_only_uri,
                     tracking_path=self.db_path,
                     uri=True,
                     check_same_thread=False,
@@ -1912,8 +2138,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 )
                 self._conn.row_factory = sqlite3.Row
                 return
-
-            self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
             # Read-only file/sidecar preflight (port of kilocode#12508):
             # repair-or-refuse BEFORE the first connection so users get an
@@ -1972,6 +2196,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 self._conn.execute("PRAGMA foreign_keys=ON")
                 self._fts_cjk_loaded = load_fts5_cjk_extension(self._conn)
                 self._init_schema()
+                _secure_sqlite_artifacts(self.db_path)
 
             def _connect_and_init_with_lock_patience():
                 # Lock contention during open: _init_schema's DDL/reconcile
@@ -2045,6 +2270,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # an unattended open. (An interrupted optimize resumes when the
             # user re-runs the command.)
         except Exception as exc:
+            # Never leave a connection open when a post-connect filesystem
+            # invariant fails (for example an unsafe WAL/SHM artifact).
+            try:
+                if self._conn is not None:
+                    self._conn.close()
+                    self._conn = None
+            except Exception:
+                pass
             # Capture the cause so /resume and friends can surface WHY the
             # session DB is unavailable instead of a bare "Session database
             # not available."  Callers that catch this exception keep their
@@ -2656,10 +2889,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self._read_local.conn = None
         with self._lock:
             if self._conn:
-                try:
-                    self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-                except Exception as exc:
-                    logger.debug("WAL checkpoint (TRUNCATE) at close failed: %s", exc)
+                if not self.read_only:
+                    try:
+                        self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                    except Exception as exc:
+                        logger.debug("WAL checkpoint (TRUNCATE) at close failed: %s", exc)
                 self._conn.close()
                 self._conn = None
 

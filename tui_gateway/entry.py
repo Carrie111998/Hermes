@@ -20,6 +20,10 @@ import traceback
 from tui_gateway._stdin_recovery import handle_spurious_eof
 
 from tui_gateway import server
+from tui_gateway.crash_log import (
+    append_crash_record as _append_crash_record,
+    safe_crash_text as _safe_crash_text,
+)
 from tui_gateway.server import _CRASH_LOG, dispatch, resolve_skin, write_json
 from tui_gateway.transport import TeeTransport
 
@@ -113,24 +117,19 @@ def _log_signal(signum: int, frame) -> None:
         if _sig is not None:
             _signal_names[int(_sig)] = _attr
     name = _signal_names.get(signum, f"signal {signum}")
-    try:
-        os.makedirs(os.path.dirname(_CRASH_LOG), exist_ok=True)
-        with open(_CRASH_LOG, "a", encoding="utf-8") as f:
-            f.write(
-                f"\n=== {name} received · {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n"
-            )
-            if frame is not None:
-                f.write("main-thread stack at signal delivery:\n")
-                traceback.print_stack(frame, file=f)
-            # All live threads — signal may have been triggered by a
-            # background thread (write to broken stdout from TTS, etc.).
-            import threading as _threading
-            for tid, th in _threading._active.items():
-                f.write(f"\n--- thread {th.name} (id={tid}) ---\n")
-                f.write("".join(traceback.format_stack(sys._current_frames().get(tid))))
-    except Exception:
-        pass
-    print(f"[gateway-signal] {name}", file=sys.stderr, flush=True)
+    detail_parts: list[str] = []
+    if frame is not None:
+        detail_parts.append("main-thread stack at signal delivery:\n")
+        detail_parts.extend(traceback.format_stack(frame))
+    # Stack frames remain useful after forced redaction.  Names and thread IDs
+    # are intentionally omitted because integrations may derive them from
+    # stable session/customer identifiers.
+    for index, live_frame in enumerate(sys._current_frames().values(), start=1):
+        detail_parts.append(f"\n--- live thread {index} ---\n")
+        if live_frame is not None:
+            detail_parts.extend(traceback.format_stack(live_frame))
+    _append_crash_record(_CRASH_LOG, f"{name} received", "".join(detail_parts))
+    print(f"[gateway-signal] {_safe_crash_text(name)}", file=sys.stderr, flush=True)
 
     import threading as _threading
 
@@ -230,26 +229,41 @@ elif hasattr(signal, "SIGBREAK"):
 _install_signal("SIGINT", signal.SIG_IGN)
 
 
-def _log_exit(reason: str) -> None:
+_EXIT_CODES = {
+    "startup_write_failed": "startup_write_failed",
+    "parse_error_write_failed": "parse_error_write_failed",
+    "response_write_failed": "response_write_failed",
+    "stdin_eof": "stdin_eof",
+}
+# Keep this deliberately tiny. Values are canonical literals so no RPC-provided
+# string is ever copied into a durable record, even after an exact-match check.
+_LOGGABLE_EXIT_METHODS = {"session.create": "session.create"}
+
+
+def _log_exit(code: object, *, method: object = None) -> None:
     """Record why the gateway subprocess is shutting down.
 
     Three exit paths (startup write fail, parse-error-response write fail,
     dispatch-response write fail, stdin EOF) all collapse into a silent
     sys.exit(0) here.  Without this trail the TUI shows "gateway exited"
-    with no actionable clue about WHICH broken pipe or WHICH message
-    triggered it — the main reason voice-mode turns look like phantom
-    crashes when the real story is "TUI read pipe closed on this event".
+    with no actionable clue about WHICH broken pipe failed. Only fixed codes
+    and canonical allowlisted method names may cross this logging boundary;
+    raw RPC values must never reach the crash log or stderr.
     """
-    try:
-        os.makedirs(os.path.dirname(_CRASH_LOG), exist_ok=True)
-        with open(_CRASH_LOG, "a", encoding="utf-8") as f:
-            f.write(
-                f"\n=== gateway exit · {time.strftime('%Y-%m-%d %H:%M:%S')} "
-                f"· reason={reason} ===\n"
-            )
-    except Exception:
-        pass
-    print(f"[gateway-exit] {reason}", file=sys.stderr, flush=True)
+    canonical_code = _EXIT_CODES.get(code) if isinstance(code, str) else None
+    fields = [f"code={canonical_code or 'unclassified'}"]
+    canonical_method = (
+        _LOGGABLE_EXIT_METHODS.get(method) if isinstance(method, str) else None
+    )
+    if canonical_method is not None:
+        fields.append(f"method={canonical_method}")
+    detail = " ".join(fields)
+    _append_crash_record(_CRASH_LOG, "gateway exit", detail)
+    print(
+        f"[gateway-exit] {detail}",
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 def wait_for_mcp_discovery(timeout: "float | None" = None) -> None:
@@ -449,7 +463,7 @@ def main():
             "payload": {"skin": resolve_skin(), "change_events": True},
         },
     }):
-        _log_exit("startup write failed (broken stdout pipe before first event)")
+        _log_exit("startup_write_failed")
         sys.exit(0)
 
     # Live-apply skins Hermes activates mid-conversation.
@@ -472,7 +486,7 @@ def main():
             req = json.loads(line)
         except json.JSONDecodeError:
             if not write_json({"jsonrpc": "2.0", "error": {"code": -32700, "message": "parse error"}, "id": None}):
-                _log_exit("parse-error-response write failed (broken stdout pipe)")
+                _log_exit("parse_error_write_failed")
                 sys.exit(0)
             continue
 
@@ -480,8 +494,10 @@ def main():
         resp = dispatch(req)
         if resp is not None:
             if not write_json(resp):
-                _log_exit(f"response write failed for method={method!r} (broken stdout pipe)")
+                _log_exit("response_write_failed", method=method)
                 sys.exit(0)
+
+    _log_exit("stdin_eof")
 
 
 if __name__ == "__main__":

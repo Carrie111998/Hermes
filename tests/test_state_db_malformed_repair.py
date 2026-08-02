@@ -204,6 +204,49 @@ class _NoFts5RuntimeCursor(sqlite3.Cursor):
             raise sqlite3.OperationalError("no such module: fts5")
         return super().execute(sql, parameters)
 
+def test_repair_does_not_create_database_that_disappears_after_preflight(
+    tmp_path, monkeypatch
+):
+    db_path = tmp_path / "state.db"
+    real_exists = Path.exists
+    first_check = True
+
+    def vanishing_exists(path):
+        nonlocal first_check
+        if path == db_path and first_check:
+            first_check = False
+            return True
+        return real_exists(path)
+
+    monkeypatch.setattr(Path, "exists", vanishing_exists)
+
+    report = repair_state_db_schema(db_path)
+
+    assert report["repaired"] is False
+    assert report["backup_path"] is None
+    assert "missing" in str(report["error"]).lower()
+    assert not real_exists(db_path)
+
+
+def test_non_malformed_error_is_not_auto_repaired(tmp_path, monkeypatch):
+    """Auto-heal must only trigger for the malformed-schema class, not for
+    e.g. 'file is not a database' — those raise unchanged."""
+    db_path = tmp_path / "state.db"
+    db_path.write_bytes(b"this is definitely not a sqlite database")
+    monkeypatch.setattr(hermes_state, "_repair_attempted_paths", set())
+
+    called = {"n": 0}
+    orig = hermes_state.repair_state_db_schema
+
+    def spy(*a, **kw):
+        called["n"] += 1
+        return orig(*a, **kw)
+
+    monkeypatch.setattr(hermes_state, "repair_state_db_schema", spy)
+    with pytest.raises(sqlite3.DatabaseError):
+        SessionDB(db_path=db_path)
+    assert called["n"] == 0
+
 
 class _NoFts5RuntimeConnection(sqlite3.Connection):
     def cursor(self, factory=None):

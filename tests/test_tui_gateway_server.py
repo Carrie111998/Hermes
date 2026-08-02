@@ -15,6 +15,7 @@ from hermes_constants import reset_hermes_home_override, set_hermes_home_overrid
 from hermes_cli.active_sessions import active_session_registry_snapshot
 from hermes_cli.browser_connect import ChromeDebugLaunch
 from tui_gateway import server
+from unittest.mock import patch
 
 
 @pytest.fixture(autouse=True)
@@ -287,64 +288,7 @@ def test_compute_host_explicit_images_do_not_clear_later_attachment(monkeypatch)
     assert session["attached_images"] == ["/tmp/c.png"]
 
 
-def test_prompt_submit_fails_open_inline_when_compute_host_dispatch_breaks(monkeypatch):
-    class _BrokenSupervisor:
-        def submit_turn(self, frame, *, on_complete=None):
-            if on_complete is not None:
-                on_complete(
-                    {
-                        "type": "turn.error",
-                        "request_id": frame["request_id"],
-                        "reason": "send_failed",
-                        "message": "broken pipe",
-                    }
-                )
-            raise BrokenPipeError("broken pipe")
 
-    class _ImmediateThread:
-        def __init__(self, target=None, **_kwargs):
-            self._target = target
-
-        def start(self):
-            assert self._target is not None
-            self._target()
-
-    session = _session(agent=None, agent_ready=threading.Event())
-    server._sessions["iso-fallback"] = session
-    inline_calls = []
-    monkeypatch.setattr(server, "_load_cfg", lambda: {"dashboard": {"turn_isolation": True}})
-    monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda _cfg=None: _BrokenSupervisor())
-    monkeypatch.setattr(server, "_ensure_session_db_row", lambda _session: None)
-    monkeypatch.setattr(server, "_persist_branch_seed", lambda _session: None)
-    monkeypatch.setattr(server, "_start_agent_build", lambda _sid, _session: None)
-    monkeypatch.setattr(server, "_wait_agent", lambda _session, _rid: None)
-    # The deferred inline-fallback thread now waits via the patient variant.
-    monkeypatch.setattr(server, "_wait_agent_for_prompt", lambda _session, _rid, _sid: None)
-    monkeypatch.setattr(
-        server,
-        "_run_prompt_submit",
-        lambda rid, sid, _session, text: inline_calls.append((rid, sid, text)),
-    )
-    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
-
-    try:
-        resp = server.handle_request(
-            {
-                "id": "fallback-turn",
-                "method": "prompt.submit",
-                "params": {"session_id": "iso-fallback", "text": "hello"},
-            }
-        )
-    finally:
-        server._sessions.pop("iso-fallback", None)
-
-    assert resp == {
-        "jsonrpc": "2.0",
-        "id": "fallback-turn",
-        "result": {"status": "streaming"},
-    }
-    assert inline_calls == [("fallback-turn", "iso-fallback", "hello")]
-    assert session.get("_compute_host_active") is not True
 
 
 def test_compute_host_turn_end_updates_metadata_mirror(monkeypatch):
@@ -7668,35 +7612,16 @@ def test_prompt_submit_expands_context_refs(monkeypatch):
     assert captured["prompt"] == "expanded prompt"
 
 
-def test_image_attach_appends_local_image(monkeypatch):
-    fake_cli = types.ModuleType("cli")
-    fake_cli._IMAGE_EXTENSIONS = {".png"}
-    fake_cli._detect_file_drop = lambda raw: {
-        "path": Path("/tmp/cat.png"),
-        "is_image": True,
-        "remainder": "",
-    }
-    fake_cli._split_path_input = lambda raw: (raw, "")
-    fake_cli._resolve_attachment_path = lambda raw: Path("/tmp/cat.png")
-
-    server._sessions["sid"] = _session()
-    monkeypatch.setitem(sys.modules, "cli", fake_cli)
-
-    resp = server.handle_request(
-        {
-            "id": "1",
-            "method": "image.attach",
-            "params": {"session_id": "sid", "path": "/tmp/cat.png"},
-        }
-    )
-
-    assert resp["result"]["attached"] is True
-    assert resp["result"]["name"] == "cat.png"
-    assert len(server._sessions["sid"]["attached_images"]) == 1
 
 
-def test_image_attach_accepts_unquoted_screenshot_path_with_spaces(monkeypatch):
-    screenshot = Path("/tmp/Screenshot 2026-04-21 at 1.04.43 PM.png")
+
+def test_image_attach_accepts_unquoted_screenshot_path_with_spaces(
+    monkeypatch, tmp_path
+):
+    screenshot = tmp_path / "Screenshot 2026-04-21 at 1.04.43 PM.png"
+    screenshot.write_bytes(b"\x89PNG\r\n\x1a\n")
+    profile_home = tmp_path / "profile"
+    monkeypatch.setattr(server, "_hermes_home", profile_home)
     fake_cli = types.ModuleType("cli")
     fake_cli._IMAGE_EXTENSIONS = {".png"}
     fake_cli._detect_file_drop = lambda raw: {
@@ -7705,12 +7630,12 @@ def test_image_attach_accepts_unquoted_screenshot_path_with_spaces(monkeypatch):
         "remainder": "",
     }
     fake_cli._split_path_input = lambda raw: (
-        "/tmp/Screenshot",
+        str(tmp_path / "Screenshot"),
         "2026-04-21 at 1.04.43 PM.png",
     )
     fake_cli._resolve_attachment_path = lambda raw: None
 
-    server._sessions["sid"] = _session()
+    server._sessions["sid"] = _session(profile_home=str(profile_home))
     monkeypatch.setitem(sys.modules, "cli", fake_cli)
 
     resp = server.handle_request(
@@ -7722,9 +7647,12 @@ def test_image_attach_accepts_unquoted_screenshot_path_with_spaces(monkeypatch):
     )
 
     assert resp["result"]["attached"] is True
-    assert resp["result"]["path"] == str(screenshot)
     assert resp["result"]["remainder"] == ""
-    assert len(server._sessions["sid"]["attached_images"]) == 1
+    stored = Path(server._sessions["sid"]["attached_images"][0])
+    assert resp["result"]["path"] == str(stored)
+    assert resp["result"]["source_path"] == str(screenshot)
+    assert stored != screenshot
+    assert stored.read_bytes() == screenshot.read_bytes()
 
 
 def test_file_attach_uploads_remote_file_into_session_workspace(monkeypatch, tmp_path):
@@ -7740,18 +7668,22 @@ def test_file_attach_uploads_remote_file_into_session_workspace(monkeypatch, tmp
     monkeypatch.setitem(sys.modules, "cli", fake_cli)
 
     try:
-        resp = server.handle_request(
-            {
-                "id": "1",
-                "method": "file.attach",
-                "params": {
-                    "session_id": "sid",
-                    "path": "/Users/alice/Downloads/report.txt",
-                    "name": "report.txt",
-                    "data_url": "data:text/plain;base64,aGVsbG8gd29ybGQ=",
-                },
-            }
-        )
+        previous_umask = os.umask(0)
+        try:
+            resp = server.handle_request(
+                {
+                    "id": "1",
+                    "method": "file.attach",
+                    "params": {
+                        "session_id": "sid",
+                        "path": "/Users/alice/Downloads/report.txt",
+                        "name": "report.txt",
+                        "data_url": "data:text/plain;base64,aGVsbG8gd29ybGQ=",
+                    },
+                }
+            )
+        finally:
+            os.umask(previous_umask)
 
         stored = workspace / ".hermes" / "desktop-attachments" / "report.txt"
         assert resp["result"]["attached"] is True
@@ -7759,6 +7691,10 @@ def test_file_attach_uploads_remote_file_into_session_workspace(monkeypatch, tmp
         assert resp["result"]["path"] == str(stored)
         assert resp["result"]["ref_text"] == "@file:.hermes/desktop-attachments/report.txt"
         assert stored.read_text(encoding="utf-8") == "hello world"
+        if os.name != "nt":
+            assert (workspace / ".hermes").stat().st_mode & 0o777 == 0o700
+            assert stored.parent.stat().st_mode & 0o777 == 0o700
+            assert stored.stat().st_mode & 0o777 == 0o600
     finally:
         server._sessions.pop("sid", None)
 
@@ -8182,15 +8118,19 @@ def test_complete_slash_surfaces_completer_error(monkeypatch):
     assert "no completer" in resp["error"]["message"]
 
 
-def test_input_detect_drop_attaches_image(monkeypatch):
+def test_input_detect_drop_attaches_image(monkeypatch, tmp_path):
+    image = tmp_path / "cat.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\n")
+    profile_home = tmp_path / "profile"
+    monkeypatch.setattr(server, "_hermes_home", profile_home)
     fake_cli = types.ModuleType("cli")
     fake_cli._detect_file_drop = lambda raw: {
-        "path": Path("/tmp/cat.png"),
+        "path": image,
         "is_image": True,
         "remainder": "",
     }
 
-    server._sessions["sid"] = _session()
+    server._sessions["sid"] = _session(profile_home=str(profile_home))
     monkeypatch.setitem(sys.modules, "cli", fake_cli)
 
     resp = server.handle_request(
@@ -8206,13 +8146,15 @@ def test_input_detect_drop_attaches_image(monkeypatch):
     assert resp["result"]["text"] == "[User attached image: cat.png]"
 
 
-def test_input_detect_drop_path_with_spaces(tmp_path):
+def test_input_detect_drop_path_with_spaces(tmp_path, monkeypatch):
     """input.detect_drop correctly handles image paths containing spaces."""
     # Create a minimal PNG file with a space in its name
     img = tmp_path / "screenshot with spaces.png"
     img.write_bytes(b"\x89PNG\r\n\x1a\n")  # valid PNG header
+    profile_home = tmp_path / "profile"
+    monkeypatch.setattr(server, "_hermes_home", profile_home)
 
-    server._sessions["sid"] = _session()
+    server._sessions["sid"] = _session(profile_home=str(profile_home))
 
     resp = server.handle_request(
         {
@@ -8226,17 +8168,27 @@ def test_input_detect_drop_path_with_spaces(tmp_path):
     assert resp["result"]["is_image"] is True
     assert resp["result"]["path"] == str(img)
     assert resp["result"]["text"] == f"[User attached image: {img.name}]"
-    # Verify attachment was recorded in the session
-    assert len(server._sessions["sid"]["attached_images"]) == 1
-    assert server._sessions["sid"]["attached_images"][0] == str(img)
+    # The attachment is reserved and copied into profile-owned private storage;
+    # deleting or changing the original path cannot mutate an accepted payload.
+    reservation = resp["result"]["attachment_batch_id"]
+    assert server._sessions["sid"]["attached_images"] == []
+    stored = server._sessions["sid"]["attached_images_by_owner"][
+        f"batch:{reservation}"
+    ][0]
+    assert Path(stored) != img
+    assert Path(stored).is_relative_to(profile_home)
+    assert Path(stored).read_bytes() == img.read_bytes()
+    assert Path(stored).stat().st_mode & 0o777 == 0o600
 
 
-def test_input_detect_drop_path_with_spaces_and_remainder(tmp_path):
+def test_input_detect_drop_path_with_spaces_and_remainder(tmp_path, monkeypatch):
     """input.detect_drop splits remainder when path contains spaces."""
     img = tmp_path / "photo with space.jpg"
     img.write_bytes(b"\xff\xd8\xff" + b"fakejpeg")  # minimal-ish JPEG header
+    profile_home = tmp_path / "profile"
+    monkeypatch.setattr(server, "_hermes_home", profile_home)
 
-    server._sessions["sid"] = _session()
+    server._sessions["sid"] = _session(profile_home=str(profile_home))
 
     user_input = f"{img} describe this image"
     resp = server.handle_request(
@@ -8252,7 +8204,13 @@ def test_input_detect_drop_path_with_spaces_and_remainder(tmp_path):
     assert resp["result"]["path"] == str(img)
     # Remainder becomes the text sent to the model
     assert resp["result"]["text"] == "describe this image"
-    assert server._sessions["sid"]["attached_images"][0] == str(img)
+    reservation = resp["result"]["attachment_batch_id"]
+    assert server._sessions["sid"]["attached_images"] == []
+    stored = server._sessions["sid"]["attached_images_by_owner"][
+        f"batch:{reservation}"
+    ][0]
+    assert Path(stored).is_relative_to(profile_home)
+    assert Path(stored).read_bytes() == img.read_bytes()
 
 
 def test_rollback_restore_resolves_number_and_file_path():
@@ -8335,21 +8293,46 @@ def test_rollback_restore_truncates_from_real_user_turn_not_marker(monkeypatch):
 # ── session.steer ────────────────────────────────────────────────────
 
 
-def test_session_steer_calls_agent_steer_when_agent_supports_it():
-    """The TUI RPC method must call agent.steer(text) and return a
-    queued status without touching interrupt state.
-    """
+def test_session_steer_calls_agent_steer_when_agent_supports_it(tmp_path):
+    """The TUI RPC persists ownership and binds steer to the live generation."""
     calls = {}
 
     class _Agent:
-        def steer(self, text):
-            calls["steer_text"] = text
+        def get_steer_generation(self):
+            return 73
+
+        def supports_steer_consumption_ack(self):
+            return True
+
+        def steer(
+            self,
+            text,
+            *,
+            run_generation=None,
+            on_consumed=None,
+            on_unconsumed=None,
+            on_uncertain=None,
+        ):
+            calls.update(
+                text=text,
+                run_generation=run_generation,
+                on_consumed=on_consumed,
+                on_unconsumed=on_unconsumed,
+                on_uncertain=on_uncertain,
+            )
             return True
 
         def interrupt(self, *args, **kwargs):
             calls["interrupt_called"] = True
 
-    server._sessions["sid"] = _session(agent=_Agent())
+    session = _session(
+        agent=_Agent(),
+        running=True,
+        turn_generation=4,
+        inflight_turn={"generation": 4, "user": "active", "streaming": True},
+        profile_home=str(tmp_path / "profile"),
+    )
+    server._sessions["sid"] = session
     try:
         resp = server.handle_request(
             {
@@ -8362,10 +8345,17 @@ def test_session_steer_calls_agent_steer_when_agent_supports_it():
         server._sessions.pop("sid", None)
 
     assert "result" in resp, resp
-    assert resp["result"]["status"] == "queued"
-    assert resp["result"]["text"] == "also check auth.log"
-    assert calls["steer_text"] == "also check auth.log"
-    assert "interrupt_called" not in calls  # must NOT interrupt
+    assert resp["result"]["status"] == "steered"
+    assert resp["result"]["accepted"] is True
+    assert calls["text"] == "also check auth.log"
+    assert calls["run_generation"] == 73
+    assert callable(calls["on_consumed"])
+    assert callable(calls["on_unconsumed"])
+    assert callable(calls["on_uncertain"])
+    assert session["_smart_steer_claim"]["text"] == "also check auth.log"
+    assert "interrupt_called" not in calls
+    calls["on_consumed"]()
+    assert session.get("_smart_steer_claim") is None
 
 
 def test_session_steer_rejects_empty_text():
@@ -9123,36 +9113,7 @@ def test_run_prompt_submit_registers_turn_thread_for_interrupt(monkeypatch):
         server._sessions.pop("sid", None)
 
 
-def test_interrupt_drops_queued_prompt_for_session():
-    """Explicit stop cancels a queued next turn instead of auto-draining it."""
-    calls = {"interrupted": False}
 
-    class _LiveThread:
-        def is_alive(self):
-            return True
-
-    session = _session(
-        agent=types.SimpleNamespace(
-            interrupt=lambda: calls.__setitem__("interrupted", True)
-        ),
-        running=True,
-        queued_prompt={"text": "next prompt", "transport": None},
-        queued_prompts=[{"text": "later prompt", "image_paths": ["/tmp/later.png"], "transport": None}],
-        _run_thread=_LiveThread(),
-    )
-    server._sessions["sid"] = session
-
-    try:
-        resp = server.handle_request(
-            {"id": "1", "method": "session.interrupt", "params": {"session_id": "sid"}}
-        )
-
-        assert resp.get("result"), f"got error: {resp.get('error')}"
-        assert calls["interrupted"] is True
-        assert session.get("queued_prompt") is None
-        assert session.get("queued_prompts") is None
-    finally:
-        server._sessions.pop("sid", None)
 
 
 def test_interrupt_before_agent_ready_prevents_late_turn_start(monkeypatch):
@@ -11058,6 +11019,11 @@ def test_session_branch_writes_to_parent_profile_db(monkeypatch, tmp_path):
     }
     server._sessions["parent"] = parent
     monkeypatch.setattr(server, "_get_db", lambda: LaunchDB())
+    monkeypatch.setattr(
+        server,
+        "_profile_home",
+        lambda name: profile_home if name == "mlperf" else None,
+    )
     monkeypatch.setattr("hermes_state.SessionDB", ProfileDB)
     monkeypatch.setattr(server, "_claim_active_session_slot", lambda *a, **k: (None, None))
 
@@ -13276,7 +13242,11 @@ def test_session_save_writes_under_hermes_home_with_system_prompt(monkeypatch, t
         "created_at": 1735732800.0,
     }
     try:
-        resp = server._methods["session.save"]("1", {"session_id": sid})
+        previous_umask = os.umask(0)
+        try:
+            resp = server._methods["session.save"]("1", {"session_id": sid})
+        finally:
+            os.umask(previous_umask)
     finally:
         server._sessions.pop(sid, None)
 
@@ -13289,6 +13259,10 @@ def test_session_save_writes_under_hermes_home_with_system_prompt(monkeypatch, t
     saved_dir = home / "sessions" / "saved"
     assert saved_file.parent == saved_dir
     assert saved_file.exists()
+    if os.name != "nt":
+        assert saved_dir.stat().st_mode & 0o777 == 0o700
+        assert (home / "sessions").stat().st_mode & 0o777 == 0o700
+        assert saved_file.stat().st_mode & 0o777 == 0o600
 
     payload = json.loads(saved_file.read_text())
     assert payload["model"] == "hermes-test"
@@ -15386,3 +15360,556 @@ def test_prompt_submit_passes_persist_user_message_to_agent(monkeypatch):
         assert captured.get("persist_user_message") == "hi"
     finally:
         server._sessions.pop("sid", None)
+
+
+def _install_local_prompt_claim(session, text: str) -> dict:
+    envelope = {
+        "text": text,
+        "images": [],
+        "transport": None,
+        "metadata": {
+            "arrival_ordinal": 1,
+            "receipt_id": f"receipt-{text}",
+            "request_id": f"request-{text}",
+            "received_at": 1.0,
+        },
+    }
+    with server._prompt_queue_lock(session):
+        server._queued_prompt_items_locked(session)
+        server._store_queued_prompt_items_locked(session, [], claim=envelope)
+    session["active_prompt_envelope"] = envelope
+    return envelope
+
+
+@pytest.fixture(autouse=True)
+def _isolate_tui_queue_home(monkeypatch, tmp_path):
+    """Never let unit-test prompt ledgers touch the operator's live profile."""
+
+    monkeypatch.setattr(server, "_hermes_home", tmp_path / ".hermes")
+
+
+def test_clipboard_paste_spools_private_profile_image(monkeypatch, tmp_path):
+    profile_home = tmp_path / "profile"
+    monkeypatch.setattr(server, "_hermes_home", profile_home)
+    fake_clipboard = types.ModuleType("hermes_cli.clipboard")
+    fake_clipboard.has_clipboard_image = lambda: True
+
+    def save_clipboard_image(path):
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        Path(path).write_bytes(b"\x89PNG\r\n\x1a\n")
+        return True
+
+    fake_clipboard.save_clipboard_image = save_clipboard_image
+    monkeypatch.setitem(sys.modules, "hermes_cli.clipboard", fake_clipboard)
+    server._sessions["clip"] = _session(profile_home=str(profile_home))
+
+    response = server.handle_request(
+        {"id": "clip", "method": "clipboard.paste", "params": {"session_id": "clip"}}
+    )
+
+    stored = Path(response["result"]["path"])
+    assert response["result"]["attached"] is True
+    assert stored.is_relative_to(profile_home)
+    assert stored.read_bytes() == b"\x89PNG\r\n\x1a\n"
+    if os.name != "nt":
+        assert stored.stat().st_mode & 0o777 == 0o600
+        assert stored.parent.stat().st_mode & 0o777 == 0o700
+
+
+def test_compute_host_crash_quarantines_claim_without_replay(monkeypatch, tmp_path):
+    monkeypatch.setattr(server, "_hermes_home", tmp_path)
+    session = _session(
+        agent=None,
+        agent_ready=threading.Event(),
+        session_key="compute-crash-claim",
+        running=True,
+        _compute_host_active=True,
+    )
+    assert server._enqueue_prompt(session, "accepted once", "ws")["accepted"]
+    with server._prompt_queue_lock(session):
+        items = server._queued_prompt_items_locked(session)
+        claim = items[0]
+        server._store_queued_prompt_items_locked(session, items[1:], claim=claim)
+
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        server,
+        "_drain_queued_prompt",
+        lambda *_args, **_kwargs: pytest.fail("an ambiguous claim must not replay"),
+    )
+
+    server._on_compute_host_turn_done(
+        "turn-crash",
+        "sid",
+        session,
+        {
+            "type": "turn.error",
+            "sid": "sid",
+            "request_id": "turn-crash",
+            "reason": "crash",
+            "message": "host exited",
+        },
+    )
+
+    assert session["running"] is False
+    assert session["_prompt_queue_restore_error"] is True
+    assert session["_prompt_queue_uncertain_claim"]["text"] == "accepted once"
+    recovered = _session(session_key="compute-crash-claim", transport="new-ws")
+    with server._prompt_queue_lock(recovered):
+        assert server._queued_prompt_items_locked(recovered) == []
+    assert recovered["_prompt_queue_restore_error"] is True
+    assert recovered["_prompt_queue_uncertain_claim"]["text"] == "accepted once"
+
+
+def test_compute_host_not_started_error_restores_claim_to_ready(monkeypatch, tmp_path):
+    monkeypatch.setattr(server, "_hermes_home", tmp_path)
+    session = _session(
+        agent=None,
+        agent_ready=threading.Event(),
+        session_key="compute-not-started",
+        running=True,
+        _compute_host_active=True,
+    )
+    assert server._enqueue_prompt(session, "safe to retry", "ws")["accepted"]
+    with server._prompt_queue_lock(session):
+        items = server._queued_prompt_items_locked(session)
+        server._store_queued_prompt_items_locked(session, [], claim=items[0])
+
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        server,
+        "_drain_queued_prompt",
+        lambda *_args, **_kwargs: pytest.fail("error callbacks must not retry inline"),
+    )
+
+    server._on_compute_host_turn_done(
+        "turn-not-started",
+        "sid",
+        session,
+        {
+            "type": "turn.error",
+            "sid": "sid",
+            "request_id": "turn-not-started",
+            "reason": "not_started",
+            "execution_state": "not_started",
+            "message": "session busy",
+        },
+    )
+
+    recovered = _session(session_key="compute-not-started", transport="new-ws")
+    with server._prompt_queue_lock(recovered):
+        ready = server._queued_prompt_items_locked(recovered)
+    assert [item["text"] for item in ready] == ["safe to retry"]
+    assert recovered.get("_queued_prompt_claim") is None
+    assert recovered.get("_prompt_queue_restore_error") is not True
+
+
+def test_compute_host_worker_publishes_typed_terminal_outcome(monkeypatch, tmp_path):
+    _configure_immediate_prompt_run(monkeypatch, tmp_path)
+
+    class _TerminalAgent(_RecordingAgent):
+        def run_conversation(
+            self, prompt, conversation_history=None, stream_callback=None
+        ):
+            self._turns.append(prompt)
+            return {
+                "final_response": "done",
+                "messages": [
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": "done"},
+                ],
+                "completed": True,
+                "receipt_terminal_success": True,
+                "failed": False,
+                "interrupted": False,
+                "partial": False,
+                "cleanup_errors": [],
+            }
+
+    turns = []
+    session = _session(
+        session_key="compute-host-terminal",
+        agent=_TerminalAgent(turns),
+        running=True,
+        _compute_host_worker=True,
+        active_prompt_envelope={
+            "text": "terminal turn",
+            "images": [],
+            "transport": None,
+        },
+    )
+
+    server._run_prompt_submit(
+        "terminal-request",
+        "terminal-sid",
+        session,
+        "terminal turn",
+    )
+
+    assert turns == ["terminal turn"]
+    assert session["_prompt_terminal_outcome"] == {
+        "request_id": "terminal-request",
+        "disposition": "terminal",
+    }
+
+
+def test_compute_host_worker_run_does_not_touch_parent_owned_prompt_queue(
+    monkeypatch, tmp_path
+):
+    _configure_immediate_prompt_run(monkeypatch, tmp_path)
+    calls = []
+    turns = []
+    monkeypatch.setattr(
+        server,
+        "_complete_queued_prompt_claim",
+        lambda *_args, **_kwargs: calls.append("complete"),
+    )
+    monkeypatch.setattr(
+        server,
+        "_drain_queued_prompt",
+        lambda *_args, **_kwargs: calls.append("drain") or False,
+    )
+    session = _session(
+        session_key="compute-host-worker",
+        agent=_RecordingAgent(turns),
+        running=True,
+        _compute_host_worker=True,
+        active_prompt_envelope={
+            "text": "host turn",
+            "images": [],
+            "transport": None,
+        },
+    )
+
+    server._run_prompt_submit("host-request", "host-sid", session, "host turn")
+
+    assert turns == ["host turn"]
+    assert calls == []
+
+
+def test_image_attach_returns_private_handle_that_detach_consumes(monkeypatch, tmp_path):
+    image = tmp_path / "cat.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\n")
+    profile_home = tmp_path / "profile"
+    monkeypatch.setattr(server, "_hermes_home", profile_home)
+    fake_cli = types.ModuleType("cli")
+    fake_cli._IMAGE_EXTENSIONS = {".png"}
+    fake_cli._detect_file_drop = lambda raw: {
+        "path": image,
+        "is_image": True,
+        "remainder": "",
+    }
+    fake_cli._split_path_input = lambda raw: (raw, "")
+    fake_cli._resolve_attachment_path = lambda raw: image
+
+    server._sessions["sid"] = _session(profile_home=str(profile_home))
+    monkeypatch.setitem(sys.modules, "cli", fake_cli)
+
+    resp = server.handle_request(
+        {
+            "id": "1",
+            "method": "image.attach",
+            "params": {"session_id": "sid", "path": str(image)},
+        }
+    )
+
+    assert resp["result"]["attached"] is True
+    assert resp["result"]["name"] == "cat.png"
+    stored = Path(server._sessions["sid"]["attached_images"][0])
+    assert resp["result"]["path"] == str(stored)
+    assert resp["result"]["source_path"] == str(image)
+    assert stored != image
+    assert stored.is_relative_to(profile_home)
+    assert stored.read_bytes() == image.read_bytes()
+
+    detached = server.handle_request(
+        {
+            "id": "2",
+            "method": "image.detach",
+            "params": {"session_id": "sid", "path": resp["result"]["path"]},
+        }
+    )
+
+    assert detached["result"] == {"detached": True, "count": 0}
+    assert server._sessions["sid"]["attached_images"] == []
+
+
+def test_interrupt_stops_only_active_turn_and_preserves_accepted_fifo():
+    """Explicit stop cancels the active turn, not separately accepted prompts."""
+    calls = {"interrupted": False}
+
+    class _LiveThread:
+        def is_alive(self):
+            return True
+
+    session = _session(
+        agent=types.SimpleNamespace(
+            interrupt=lambda: calls.__setitem__("interrupted", True)
+        ),
+        running=True,
+        queued_prompt={"text": "next prompt", "transport": None},
+        _run_thread=_LiveThread(),
+    )
+    server._sessions["sid"] = session
+
+    try:
+        resp = server.handle_request(
+            {"id": "1", "method": "session.interrupt", "params": {"session_id": "sid"}}
+        )
+
+        assert resp.get("result"), f"got error: {resp.get('error')}"
+        assert calls["interrupted"] is True
+        assert session.get("queued_prompt", {}).get("text") == "next prompt"
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_local_worker_commits_claim_only_after_canonical_terminal_result(
+    monkeypatch, tmp_path
+):
+    _configure_immediate_prompt_run(monkeypatch, tmp_path)
+
+    class _TerminalAgent(_RecordingAgent):
+        def run_conversation(
+            self, prompt, conversation_history=None, stream_callback=None
+        ):
+            self._turns.append(prompt)
+            return {
+                "final_response": "done",
+                "messages": [
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": "done"},
+                ],
+                "completed": True,
+                "receipt_terminal_success": True,
+                "failed": False,
+                "interrupted": False,
+                "partial": False,
+                "cleanup_errors": [],
+            }
+
+    turns = []
+    session = _session(
+        session_key="local-terminal-claim",
+        profile_home=str(tmp_path / "profile-terminal"),
+        agent=_TerminalAgent(turns),
+        running=True,
+    )
+    _install_local_prompt_claim(session, "terminal turn")
+
+    server._run_prompt_submit("terminal-request", "terminal-sid", session, "terminal turn")
+
+    assert turns == ["terminal turn"]
+    assert session.get("_queued_prompt_claim") is None
+    assert session.get("_prompt_queue_uncertain_claim") is None
+    assert session.get("_prompt_queue_restore_error") is not True
+
+
+def test_local_worker_quarantines_claim_after_noncanonical_terminal_result(
+    monkeypatch, tmp_path
+):
+    _configure_immediate_prompt_run(monkeypatch, tmp_path)
+
+    class _PartialAgent(_RecordingAgent):
+        def run_conversation(
+            self, prompt, conversation_history=None, stream_callback=None
+        ):
+            self._turns.append(prompt)
+            return {
+                "final_response": "partial",
+                "messages": [
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": "partial"},
+                ],
+                "completed": False,
+                "receipt_terminal_success": False,
+                "failed": True,
+                "partial": True,
+            }
+
+    turns = []
+    session = _session(
+        session_key="local-partial-claim",
+        profile_home=str(tmp_path / "profile-partial"),
+        agent=_PartialAgent(turns),
+        running=True,
+    )
+    envelope = _install_local_prompt_claim(session, "partial turn")
+
+    server._run_prompt_submit("partial-request", "partial-sid", session, "partial turn")
+
+    assert turns == ["partial turn"]
+    assert server._prompt_envelopes_match(session["_queued_prompt_claim"], envelope)
+    assert server._prompt_envelopes_match(
+        session["_prompt_queue_uncertain_claim"], envelope
+    )
+    assert session["_prompt_queue_restore_error"] is True
+
+
+def test_profile_home_accepts_owned_directory_and_repairs_private_mode(
+    monkeypatch,
+    tmp_path,
+):
+    from hermes_cli import profiles as profiles_mod
+
+    launch_home = tmp_path / "launch"
+    profiles_root = tmp_path / "profiles"
+    profile_home = profiles_root / "worker"
+    launch_home.mkdir()
+    profiles_root.mkdir(mode=0o700)
+    profile_home.mkdir(parents=True, mode=0o755)
+    profile_home.chmod(0o755)
+
+    monkeypatch.setattr(profiles_mod, "_get_profiles_root", lambda: profiles_root)
+    monkeypatch.setattr(
+        profiles_mod,
+        "_get_default_hermes_home",
+        lambda: launch_home,
+    )
+    monkeypatch.setattr(server, "_hermes_home", str(launch_home))
+
+    assert server._profile_home("WORKER") == profile_home.resolve()
+    assert profile_home.stat().st_mode & 0o077 == 0
+
+
+def test_profile_home_rejects_traversal_symlink_and_unknown(monkeypatch, tmp_path):
+    from hermes_cli import profiles as profiles_mod
+
+    launch_home = tmp_path / "launch"
+    profiles_root = tmp_path / "profiles"
+    launch_home.mkdir()
+    profiles_root.mkdir(mode=0o700)
+    outside = tmp_path / "escape"
+    outside.mkdir()
+    (profiles_root / "linked").symlink_to(outside, target_is_directory=True)
+
+    monkeypatch.setattr(profiles_mod, "_get_profiles_root", lambda: profiles_root)
+    monkeypatch.setattr(
+        profiles_mod,
+        "_get_default_hermes_home",
+        lambda: launch_home,
+    )
+    monkeypatch.setattr(server, "_hermes_home", str(launch_home))
+
+    for profile in ("../escape", str(outside), "linked", "missing"):
+        with pytest.raises(ValueError):
+            server._profile_home(profile)
+
+
+def test_prompt_submit_fails_closed_to_queue_when_compute_host_dispatch_breaks(
+    monkeypatch,
+    tmp_path,
+):
+    class _BrokenSupervisor:
+        def submit_turn(self, frame, *, on_complete=None):
+            if on_complete is not None:
+                on_complete(
+                    {
+                        "type": "turn.error",
+                        "request_id": frame["request_id"],
+                        "reason": "send_failed",
+                        "message": "broken pipe",
+                    }
+                )
+            raise BrokenPipeError("broken pipe")
+
+    session = _session(agent_ready=threading.Event(), attached_images=["/tmp/private.png"])
+    # _session(None) supplies a generic test agent; force the real lazy dashboard
+    # representation so this test actually enters the compute-host path.
+    session["agent"] = None
+    server._sessions["iso-fallback"] = session
+    monkeypatch.setattr(server, "_hermes_home", tmp_path)
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"dashboard": {"turn_isolation": True}})
+    monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda _cfg=None: _BrokenSupervisor())
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda *_args, **_kwargs: pytest.fail("isolation failure must not run inline"),
+    )
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "fallback-turn",
+                "method": "prompt.submit",
+                "params": {"session_id": "iso-fallback", "text": "hello"},
+            }
+        )
+    finally:
+        server._sessions.pop("iso-fallback", None)
+
+    assert resp == {
+        "jsonrpc": "2.0",
+        "id": "fallback-turn",
+        "result": {
+            "status": "queued_isolation_unavailable",
+            "accepted": True,
+            "depth": 1,
+            "queued_bytes": session["queued_prompt_bytes"],
+            "ack": "Compute host unavailable; prompt preserved for isolated retry.",
+        },
+    }
+    assert session["queued_prompt"]["text"] == "hello"
+    assert session["queued_prompt"]["images"] == ["/tmp/private.png"]
+    assert session["running"] is False
+    assert session.get("_compute_host_active") is not True
+
+
+def test_session_create_rejects_invalid_profile_before_claiming_slot(
+    monkeypatch,
+    tmp_path,
+):
+    from hermes_cli import profiles as profiles_mod
+
+    profiles_root = tmp_path / "profiles"
+    profiles_root.mkdir(mode=0o700)
+    monkeypatch.setattr(profiles_mod, "_get_profiles_root", lambda: profiles_root)
+    monkeypatch.setattr(
+        profiles_mod,
+        "_get_default_hermes_home",
+        lambda: tmp_path / "default",
+    )
+    monkeypatch.setattr(server, "_hermes_home", str(tmp_path / "default"))
+    monkeypatch.setattr(
+        server,
+        "_claim_active_session_slot",
+        lambda *args, **kwargs: pytest.fail("invalid profile reached slot claim"),
+    )
+
+    response = server._methods["session.create"](
+        "profile-invalid",
+        {"profile": "../escape"},
+    )
+
+    assert response["error"]["code"] == 4008
+    assert response["error"]["message"] == "invalid or unavailable profile"
+
+
+def test_session_resume_rejects_invalid_profile_before_opening_db(
+    monkeypatch,
+    tmp_path,
+):
+    from hermes_cli import profiles as profiles_mod
+
+    profiles_root = tmp_path / "profiles"
+    profiles_root.mkdir(mode=0o700)
+    monkeypatch.setattr(profiles_mod, "_get_profiles_root", lambda: profiles_root)
+    monkeypatch.setattr(
+        profiles_mod,
+        "_get_default_hermes_home",
+        lambda: tmp_path / "default",
+    )
+    monkeypatch.setattr(server, "_hermes_home", str(tmp_path / "default"))
+    monkeypatch.setattr(
+        server,
+        "_get_db",
+        lambda: pytest.fail("invalid profile reached launch database"),
+    )
+
+    response = server._methods["session.resume"](
+        "profile-resume-invalid",
+        {"session_id": "example", "profile": "../escape"},
+    )
+
+    assert response["error"]["code"] == 4008
+    assert response["error"]["message"] == "invalid or unavailable profile"

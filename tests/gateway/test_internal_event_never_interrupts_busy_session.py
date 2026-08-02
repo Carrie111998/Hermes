@@ -71,8 +71,19 @@ def _make_runner() -> GatewayRunner:
     runner._pending_messages = {}
     runner._busy_ack_ts = {}
     runner._draining = False
+    runner._external_drain_active = False
+    runner._queued_events = {}
+    runner._busy_queue_lock = threading.RLock()
+    runner._busy_queue_claimed_events = {}
+    runner._busy_queue_uncertain_sessions = set()
+    runner._busy_queue_uncertain_digests = set()
+    runner._busy_queue_persist_ready = MagicMock(return_value=None)
+    runner._busy_queue_max_bytes = lambda: 1024 * 1024
     runner.adapters = {}
     runner.config = MagicMock()
+    runner.config.group_sessions_per_user = True
+    runner.config.thread_sessions_per_user = False
+    runner.config.multiplex_profiles = False
     runner.session_store = None
     runner.hooks = MagicMock()
     runner.hooks.emit = AsyncMock()
@@ -118,12 +129,38 @@ async def test_internal_event_does_not_interrupt_busy_session() -> None:
 
     handled = await runner._handle_active_session_busy_message(event, sk)
 
-    # Returns False so the base adapter silently queues the internal event
-    # as a cascading next turn — it must NOT be handled-with-interrupt here.
-    assert handled is False
+    # The gateway now owns durable admission for synthetic events rather than
+    # falling through to the adapter's volatile process-local queue.
+    assert handled is True
     # The active turn must survive.
     parent.interrupt.assert_not_called()
+    assert adapter._pending_messages.get(sk) is event
     # No "⚡ Interrupting current task" (or any) ack for a synthetic event.
     adapter._send_with_retry.assert_not_called()
 
 
+@pytest.mark.asyncio
+async def test_non_internal_event_still_interrupts() -> None:
+    """Regression-guard the other direction: a real user message in interrupt
+    mode with no subagents still signals the active turn."""
+    runner = _make_runner()
+    runner._busy_input_mode = "interrupt"
+    adapter = _make_adapter()
+    event = _make_internal_event(text="please stop")
+    # Flip to a real user message.
+    object.__setattr__(event, "internal", False)
+    sk = build_session_key(event.source)
+    parent = _make_running_parent()
+    runner._running_agents[sk] = parent
+    runner.adapters[event.source.platform] = adapter
+    active_event = threading.Event()
+    adapter._active_sessions = {sk: active_event}
+
+    from unittest.mock import patch
+
+    with patch("gateway.run.merge_pending_message_event"):
+        handled = await runner._handle_active_session_busy_message(event, sk)
+
+    assert handled is True
+    assert active_event.is_set()
+    parent.interrupt.assert_not_called()

@@ -154,6 +154,210 @@ def test_unacknowledged_interrupt_message_is_requeued_not_dropped():
     assert agent.clear_calls >= 1
 
 
+def test_chat_caught_agent_exception_is_not_terminal_success():
+    cli = _make_cli()
+
+    class _RaisingAgent(_StubAgent):
+        def run_conversation(self, **kwargs):
+            raise RuntimeError("provider failed")
+
+    cli.agent = _RaisingAgent(cli.session_id, turn_seconds=0)
+    cli._interrupt_queue = queue.Queue()
+    cli._pending_input = queue.Queue()
+
+    with patch.object(cli, "_ensure_runtime_credentials", return_value=True), \
+         patch.object(cli, "_resolve_turn_agent_config", return_value={
+             "signature": cli._active_agent_route_signature,
+             "model": None, "runtime": None, "request_overrides": None,
+         }), \
+         patch.object(cli, "_init_agent", return_value=True):
+        cli.chat("original")
+
+    assert getattr(cli, "_last_chat_turn_terminal_success", None) is False
+
+
+def test_chat_clean_completed_result_publishes_terminal_success():
+    cli = _make_cli()
+
+    class _CleanAgent(_StubAgent):
+        def run_conversation(self, **kwargs):
+            return {
+                "final_response": "",
+                "messages": [],
+                "api_calls": 1,
+                "completed": True,
+                "receipt_terminal_success": True,
+                "failed": False,
+                "partial": False,
+                "interrupted": False,
+                "response_previewed": True,
+            }
+
+    cli.agent = _CleanAgent(cli.session_id, turn_seconds=0)
+    cli._interrupt_queue = queue.Queue()
+    cli._pending_input = queue.Queue()
+
+    with patch.object(cli, "_ensure_runtime_credentials", return_value=True), \
+         patch.object(cli, "_resolve_turn_agent_config", return_value={
+             "signature": cli._active_agent_route_signature,
+             "model": None, "runtime": None, "request_overrides": None,
+         }), \
+         patch.object(cli, "_init_agent", return_value=True):
+        cli.chat("original")
+
+    assert getattr(cli, "_last_chat_turn_terminal_success", None) is True
+
+
+def test_legacy_completed_shape_without_typed_receipt_outcome_fails_closed():
+    from run_agent import is_explicit_terminal_success
+
+    assert is_explicit_terminal_success(
+        {
+            "completed": True,
+            "failed": False,
+            "partial": False,
+            "interrupted": False,
+        }
+    ) is False
+
+
+def test_chat_auto_compression_rotation_migrates_smart_receipt_ownership(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
+    cli = _make_cli()
+    parent_session_id = cli.session_id
+    child_session_id = "compression-continuation-child"
+    cli._append_smart_cli_durable_job(
+        "rotation-receipt",
+        "queued during parent turn",
+        parent_session_id,
+    )
+
+    class _RotatingAgent(_StubAgent):
+        def run_conversation(self, **kwargs):
+            self.session_id = child_session_id
+            return {
+                "final_response": "",
+                "messages": [],
+                "api_calls": 1,
+                "completed": True,
+                "failed": False,
+                "partial": False,
+                "interrupted": False,
+                "response_previewed": True,
+            }
+
+    cli.agent = _RotatingAgent(parent_session_id, turn_seconds=0)
+    cli._interrupt_queue = queue.Queue()
+    cli._pending_input = queue.Queue()
+
+    with patch.object(cli, "_ensure_runtime_credentials", return_value=True), \
+         patch.object(cli, "_resolve_turn_agent_config", return_value={
+             "signature": cli._active_agent_route_signature,
+             "model": None, "runtime": None, "request_overrides": None,
+         }), \
+         patch.object(cli, "_init_agent", return_value=True):
+        cli.chat("original")
+
+    assert cli.session_id == child_session_id
+    recreated = _make_cli()
+    recreated.agent = _StubAgent(child_session_id, turn_seconds=0)
+    assert recreated._restore_smart_cli_durable_inputs() == 1
+    recovered = recreated._pending_input.get_nowait()
+    assert recovered.durable_id == "rotation-receipt"
+    assert recovered.durable_session_id == parent_session_id
+    assert recovered.payload == "queued during parent turn"
+
+
+def test_chat_auto_compression_does_not_advance_ownership_when_alias_publish_fails(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
+    cli = _make_cli()
+    parent_session_id = cli.session_id
+    child_session_id = "compression-unpublished-child"
+
+    class _RotatingAgent(_StubAgent):
+        def run_conversation(self, **kwargs):
+            self.session_id = child_session_id
+            return {
+                "final_response": "",
+                "messages": [],
+                "api_calls": 1,
+                "completed": True,
+                "failed": False,
+                "partial": False,
+                "interrupted": False,
+                "response_previewed": True,
+            }
+
+    cli.agent = _RotatingAgent(parent_session_id, turn_seconds=0)
+    cli._interrupt_queue = queue.Queue()
+    cli._pending_input = queue.Queue()
+
+    def fail_publication(*_args, **_kwargs):
+        cli._smart_cli_restore_error = True
+        return False
+
+    with patch.object(cli, "_ensure_runtime_credentials", return_value=True), \
+         patch.object(cli, "_resolve_turn_agent_config", return_value={
+             "signature": cli._active_agent_route_signature,
+             "model": None, "runtime": None, "request_overrides": None,
+         }), \
+         patch.object(cli, "_init_agent", return_value=True), \
+         patch.object(
+             cli,
+             "_migrate_smart_cli_session_scope",
+             side_effect=fail_publication,
+         ) as migration:
+        cli.chat("original")
+
+    migration.assert_called()
+    assert cli.session_id == parent_session_id
+    assert cli._smart_cli_restore_error is True
+
+
+def test_acknowledged_interrupt_still_requeues_message():
+    """The pre-existing path (result carries interrupted=True) still works."""
+    cli = _make_cli()
+
+    class _AckAgent(_StubAgent):
+        def run_conversation(self, **kwargs):
+            # Wait until the monitor loop delivers the interrupt.
+            for _ in range(100):
+                if self._interrupt_requested:
+                    break
+                time.sleep(0.05)
+            return {
+                "final_response": "partial work",
+                "messages": [{"role": "assistant", "content": "partial work"}],
+                "api_calls": 1,
+                "completed": False,
+                "interrupted": True,
+                "interrupt_message": self._interrupt_message,
+                "partial": True,
+            }
+
+    agent = _AckAgent(cli.session_id)
+    cli.agent = agent
+    cli._interrupt_queue = queue.Queue()
+    cli._pending_input = queue.Queue()
+    cli._interrupt_queue.put("redirect please")
+
+    with patch.object(cli, "_ensure_runtime_credentials", return_value=True), \
+         patch.object(cli, "_resolve_turn_agent_config", return_value={
+             "signature": cli._active_agent_route_signature,
+             "model": None, "runtime": None, "request_overrides": None,
+         }), \
+         patch.object(cli, "_init_agent", return_value=True):
+        cli.chat("original")
+
+    queued = []
+    while not cli._pending_input.empty():
+        queued.append(cli._pending_input.get_nowait())
+    assert any("redirect please" in str(q) for q in queued)
+    assert cli._last_turn_interrupted is True
 
 
 def test_chat_opens_and_closes_smart_turn_snapshot_on_real_turn_path():

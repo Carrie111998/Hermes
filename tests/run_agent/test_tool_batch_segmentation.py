@@ -518,9 +518,11 @@ class TestSegmentedDispatchIntegration:
         def fake_handle(name, args, task_id, **kwargs):
             return json.dumps({"ok": True})
 
-        agent.steer("focus on the tests")
+        generation = agent._open_steer_checkpoint()
+        assert agent.steer("focus on the tests", run_generation=generation) is True
         with patch("run_agent.handle_function_call", side_effect=fake_handle):
             agent._execute_tool_calls(msg, messages, "task-1")
+        assert agent._close_steer_checkpoint(generation) is None
 
         contents = [m["content"] for m in messages]
         hits = [c for c in contents if "focus on the tests" in c]

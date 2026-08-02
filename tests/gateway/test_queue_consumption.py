@@ -6,8 +6,10 @@ after the agent finishes its current task — not silently dropped.
 """
 
 import asyncio
+import threading
 from unittest.mock import MagicMock
 
+import pytest
 
 from gateway.run import _dequeue_pending_event
 from gateway.platforms.base import (
@@ -17,6 +19,7 @@ from gateway.platforms.base import (
     PlatformConfig,
     Platform,
 )
+from gateway.session import SessionSource, build_session_key
 
 
 # ---------------------------------------------------------------------------
@@ -180,30 +183,48 @@ class TestBusyInputModeQueueFifo:
     its own turn in arrival order.
     """
 
+    @pytest.fixture(autouse=True)
+    def _private_durable_queue_home(self, tmp_path):
+        self._durable_profile_home = tmp_path
+
     def _make_runner_and_adapter(self):
         from gateway.run import GatewayRunner
 
         runner = GatewayRunner.__new__(GatewayRunner)
         runner._queued_events = {}
+        runner._busy_queue_lock = threading.RLock()
+        runner._busy_queue_uncertain_sessions = set()
+        runner._busy_queue_uncertain_digests = set()
+        # These tests isolate FIFO/cap semantics. The durability suite exercises
+        # the real atomic store; this witness preserves the commit-before-ACK
+        # boundary without reviving a volatile production fallback.
+        runner._busy_queue_persist_ready = MagicMock(return_value=None)
+        runner._busy_queue_profile_home = lambda source: self._durable_profile_home
         adapter = _StubAdapter()
         runner.adapters = {Platform.TELEGRAM: adapter}
         return runner, adapter
 
+    @staticmethod
+    def _source() -> SessionSource:
+        return SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="c1",
+            chat_type="dm",
+            user_id="u1",
+        )
+
     def _text_event(self, text: str) -> MessageEvent:
-        # profile=None: a MagicMock auto-attribute reads as a truthy stamped
-        # profile and trips fail-closed adapter resolution (AGENTS.md #17).
-        source = MagicMock(chat_id="c1", platform=Platform.TELEGRAM, profile=None)
         return MessageEvent(
             text=text,
             message_type=MessageType.TEXT,
-            source=source,
+            source=self._source(),
             message_id=f"m-{text}",
         )
 
     def test_rapid_text_followups_are_queued_in_fifo_order(self):
         """Five rapid texts in queue mode must all survive (none silently dropped)."""
         runner, adapter = self._make_runner_and_adapter()
-        session_key = "telegram:user:fifo"
+        session_key = build_session_key(self._source())
 
         texts = ["one", "two", "three", "four", "five"]
         for text in texts:
@@ -219,4 +240,183 @@ class TestBusyInputModeQueueFifo:
         ]
         assert runner._queue_depth(session_key, adapter=adapter) == len(texts)
 
+    def test_queue_respects_bounded_cap(self):
+        """Beyond the per-session cap, follow-ups are dropped (with a warning)."""
+        from gateway.run import GatewayRunner
 
+        runner, adapter = self._make_runner_and_adapter()
+        session_key = build_session_key(self._source())
+
+        cap = GatewayRunner._BUSY_QUEUE_MAX_PENDING
+        for i in range(cap + 5):
+            runner._queue_or_replace_pending_event(
+                session_key, self._text_event(f"msg-{i:03d}")
+            )
+
+        # Exactly ``cap`` follow-ups retained (head + cap-1 in overflow).
+        assert runner._queue_depth(session_key, adapter=adapter) == cap
+        assert adapter._pending_messages[session_key].text == "msg-000"
+        # The last accepted overflow item is msg-{cap-1}.
+        assert runner._queued_events[session_key][-1].text == f"msg-{cap - 1:03d}"
+
+    def test_photo_burst_still_merges_in_head_slot(self):
+        """Photo bursts must keep album-merge semantics, not split into N turns."""
+        runner, adapter = self._make_runner_and_adapter()
+        session_key = build_session_key(self._source())
+
+        source = self._source()
+        for i in range(3):
+            runner._queue_or_replace_pending_event(
+                session_key,
+                MessageEvent(
+                    text="",
+                    message_type=MessageType.PHOTO,
+                    source=source,
+                    message_id=f"p-{i}",
+                    media_urls=[f"http://example.com/{i}.jpg"],
+                    media_types=["image/jpeg"],
+                ),
+            )
+
+        # Single merged head event with all three media URLs.
+        assert session_key not in runner._queued_events or not runner._queued_events[session_key]
+        head = adapter._pending_messages[session_key]
+        assert head.message_type == MessageType.PHOTO
+        assert len(head.media_urls) == 3
+
+    def test_photo_burst_rejects_media_past_cap_without_partial_merge(self):
+        """A depth-one album cannot bypass the 32-item admission cap."""
+        runner, adapter = self._make_runner_and_adapter()
+        session_key = build_session_key(self._source())
+        source = self._source()
+        cap = runner._BUSY_QUEUE_MAX_PENDING
+
+        receipts = []
+        for i in range(cap + 1):
+            receipts.append(
+                runner._queue_or_replace_pending_event(
+                    session_key,
+                    MessageEvent(
+                        text=f"caption-{i}",
+                        message_type=MessageType.PHOTO,
+                        source=source,
+                        message_id=f"p-{i}",
+                        media_urls=[f"http://example.com/{i}.jpg"],
+                        media_types=["image/jpeg"],
+                    ),
+                )
+            )
+
+        assert receipts == ([True] * cap) + [False]
+        assert runner._queue_depth(session_key, adapter=adapter) == 1
+        head = adapter._pending_messages[session_key]
+        assert head.media_urls == [
+            f"http://example.com/{i}.jpg" for i in range(cap)
+        ]
+        assert head.media_types == ["image/jpeg"] * cap
+        assert head.text == "\n\n".join(f"caption-{i}" for i in range(cap))
+        assert "caption-32" not in head.text
+
+    def test_single_album_over_media_cap_is_rejected_without_queue_mutation(self):
+        """One platform album can carry many attachments but still has a media cap."""
+        runner, adapter = self._make_runner_and_adapter()
+        session_key = build_session_key(self._source())
+        source = self._source()
+        media_count = runner._BUSY_QUEUE_MAX_PENDING + 1
+        album = MessageEvent(
+            text="oversized album",
+            message_type=MessageType.PHOTO,
+            source=source,
+            message_id="album-oversized",
+            media_urls=[f"http://example.com/{i}.jpg" for i in range(media_count)],
+            media_types=["image/jpeg"] * media_count,
+        )
+
+        accepted = runner._queue_or_replace_pending_event(session_key, album)
+
+        assert accepted is False
+        assert session_key not in adapter._pending_messages
+        assert session_key not in runner._queued_events
+
+    def test_media_head_rejects_caption_coalescing_past_item_cap(self):
+        """Short text captions cannot bypass the item cap through a media head."""
+        runner, adapter = self._make_runner_and_adapter()
+        session_key = build_session_key(self._source())
+        source = self._source()
+        cap = runner._BUSY_QUEUE_MAX_PENDING
+        first = MessageEvent(
+            text="caption-0",
+            message_type=MessageType.PHOTO,
+            source=source,
+            message_id="p-0",
+            media_urls=["http://example.com/0.jpg"],
+            media_types=["image/jpeg"],
+        )
+        assert runner._queue_or_replace_pending_event(session_key, first) is True
+
+        receipts = []
+        for i in range(1, cap + 1):
+            receipts.append(
+                runner._queue_or_replace_pending_event(
+                    session_key,
+                    MessageEvent(
+                        text=f"caption-{i}",
+                        message_type=MessageType.TEXT,
+                        source=source,
+                        message_id=f"t-{i}",
+                    ),
+                )
+            )
+
+        assert receipts == ([True] * (cap - 1)) + [False]
+        head = adapter._pending_messages[session_key]
+        assert head.media_urls == ["http://example.com/0.jpg"]
+        assert head.media_types == ["image/jpeg"]
+        assert head.text == "\n\n".join(f"caption-{i}" for i in range(cap))
+        assert "caption-32" not in head.text
+
+    def test_photo_merge_rejects_aggregate_bytes_without_partial_mutation(
+        self, monkeypatch
+    ):
+        """A merged media head stays below the 1 MiB serialized backlog cap."""
+        from gateway import run as gateway_run
+
+        runner, adapter = self._make_runner_and_adapter()
+        session_key = build_session_key(self._source())
+        source = self._source()
+        byte_limit = 1024 * 1024
+        monkeypatch.setattr(
+            gateway_run,
+            "_load_gateway_runtime_config",
+            lambda: {"display": {"busy_queue_max_bytes": byte_limit}},
+        )
+        first_caption = "a" * (byte_limit - 16 * 1024)
+        rejected_caption = "b" * (32 * 1024)
+
+        first = MessageEvent(
+            text=first_caption,
+            message_type=MessageType.PHOTO,
+            source=source,
+            message_id="p-first",
+            media_urls=["http://example.com/first.jpg"],
+            media_types=["image/jpeg"],
+        )
+        rejected = MessageEvent(
+            text=rejected_caption,
+            message_type=MessageType.PHOTO,
+            source=source,
+            message_id="p-rejected",
+            media_urls=["http://example.com/rejected.jpg"],
+            media_types=["image/jpeg"],
+        )
+
+        assert runner._queue_or_replace_pending_event(session_key, first) is True
+        head = adapter._pending_messages[session_key]
+        before = (head.text, list(head.media_urls), list(head.media_types))
+
+        accepted = runner._queue_or_replace_pending_event(session_key, rejected)
+
+        assert accepted is False
+        assert adapter._pending_messages[session_key] is head
+        assert (head.text, head.media_urls, head.media_types) == before
+        assert runner._queue_depth(session_key, adapter=adapter) == 1

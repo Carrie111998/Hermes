@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import time
 from unittest.mock import AsyncMock, MagicMock
 
@@ -77,7 +78,8 @@ async def _decision(route, payload="payload", confidence=0.95):
 
 
 @pytest.mark.asyncio
-async def test_smart_related_steers_and_never_interrupts():
+async def test_smart_related_steers_and_never_interrupts(caplog):
+    caplog.set_level(logging.INFO, logger="gateway.run")
     runner, agent = _runner_and_agent()
     event = _event("consider this correction")
     sk = build_session_key(event.source)
@@ -87,14 +89,37 @@ async def test_smart_related_steers_and_never_interrupts():
     )
     runner._send_smart_busy_ack = AsyncMock()
     runner._queue_or_replace_pending_event = MagicMock()
+    runner._admit_and_maybe_steer_event = MagicMock(return_value=(True, True))
+    adapter = MagicMock()
 
-    handled = await runner._handle_smart_busy_message(event, sk, agent, MagicMock())
+    handled = await runner._handle_smart_busy_message(event, sk, agent, adapter)
 
     assert handled is True
-    agent.steer.assert_called_once_with(event.text)
+    runner._admit_and_maybe_steer_event.assert_called_once_with(
+        sk,
+        event,
+        agent,
+        adapter,
+        event.text,
+        expected_run_generation=None,
+    )
+    agent.steer.assert_not_called()
     agent.interrupt.assert_not_called()
     runner._queue_or_replace_pending_event.assert_not_called()
     runner._send_smart_busy_ack.assert_awaited_once()
+    telemetry = "\n".join(record.getMessage() for record in caplog.records)
+    assert "smart_route surface=gateway" in telemetry
+    assert "accepted=True" in telemetry
+    assert "interrupt=false" in telemetry
+    for private_value in (
+        event.text,
+        sk,
+        "mission=",
+        "confidence",
+        "0.950",
+        "reason-related",
+    ):
+        assert private_value not in telemetry
 
 
 @pytest.mark.asyncio
@@ -108,14 +133,17 @@ async def test_smart_independent_steers_parallel_directive_without_false_paralle
     )
     runner._send_smart_busy_ack = AsyncMock()
     runner._queue_or_replace_pending_event = MagicMock()
+    runner._admit_and_maybe_steer_event = MagicMock(return_value=(True, True))
+    adapter = MagicMock()
 
-    await runner._handle_smart_busy_message(event, sk, agent, MagicMock())
+    await runner._handle_smart_busy_message(event, sk, agent, adapter)
 
-    injected = agent.steer.call_args.args[0]
+    injected = runner._admit_and_maybe_steer_event.call_args.args[4]
     assert "SMART ORCHESTRATOR" in injected
     assert "research another market" in injected
     assert "delegate_task" in injected
     agent.interrupt.assert_not_called()
+    agent.steer.assert_not_called()
     runner._queue_or_replace_pending_event.assert_not_called()
     # A steering instruction is not a parallel-worker receipt. Until a real
     # worker accepts ownership, acknowledge only active-run delivery.
@@ -142,6 +170,44 @@ async def test_smart_unsafe_or_non_parallel_routes_queue_losslessly(route):
     agent.interrupt.assert_not_called()
 
 
+def test_busy_queue_returns_false_instead_of_silently_dropping_at_cap():
+    runner, _agent = _runner_and_agent()
+    event = _event("rejected-at-cap")
+    sk = build_session_key(event.source)
+    adapter = MagicMock()
+    adapter._pending_messages = {sk: _event("head")}
+    runner._adapter_for_source = MagicMock(return_value=adapter)
+    runner._queued_events[sk] = [
+        _event(f"queued-{index}")
+        for index in range(runner._BUSY_QUEUE_MAX_PENDING - 1)
+    ]
+
+    accepted = runner._queue_or_replace_pending_event(sk, event)
+
+    assert accepted is False
+    assert len(runner._queued_events[sk]) == runner._BUSY_QUEUE_MAX_PENDING - 1
+    assert adapter._pending_messages[sk].text == "head"
+
+
+@pytest.mark.asyncio
+async def test_smart_queue_cap_emits_rejection_receipt_without_interrupt():
+    runner, agent = _runner_and_agent()
+    event = _event("dependent but queue is full")
+    sk = build_session_key(event.source)
+    runner._running_agents[sk] = agent
+    runner._classify_smart_busy_message = AsyncMock(
+        return_value=await _decision(ROUTE_DEPENDENT, event.text)
+    )
+    runner._queue_or_replace_pending_event = MagicMock(return_value=False)
+    runner._send_smart_busy_ack = AsyncMock()
+
+    await runner._handle_smart_busy_message(event, sk, agent, MagicMock())
+
+    agent.steer.assert_not_called()
+    agent.interrupt.assert_not_called()
+    assert runner._send_smart_busy_ack.await_args.kwargs["accepted"] is False
+
+
 @pytest.mark.asyncio
 async def test_smart_steer_rejection_falls_back_to_queue():
     runner, agent = _runner_and_agent()
@@ -154,10 +220,13 @@ async def test_smart_steer_rejection_falls_back_to_queue():
     )
     runner._send_smart_busy_ack = AsyncMock()
     runner._queue_or_replace_pending_event = MagicMock()
+    runner._admit_and_maybe_steer_event = MagicMock(return_value=(True, False))
+    adapter = MagicMock()
 
-    await runner._handle_smart_busy_message(event, sk, agent, MagicMock())
+    await runner._handle_smart_busy_message(event, sk, agent, adapter)
 
-    runner._queue_or_replace_pending_event.assert_called_once_with(sk, event)
+    runner._admit_and_maybe_steer_event.assert_called_once()
+    runner._queue_or_replace_pending_event.assert_not_called()
     agent.interrupt.assert_not_called()
     ack_decision = runner._send_smart_busy_ack.await_args.args[-1]
     assert ack_decision.route == ROUTE_AMBIGUOUS
@@ -262,6 +331,7 @@ async def test_smart_per_session_lock_serializes_classification_order():
     runner._running_agents[sk] = agent
     runner._send_smart_busy_ack = AsyncMock()
     runner._queue_or_replace_pending_event = MagicMock()
+    runner._admit_and_maybe_steer_event = MagicMock(return_value=(True, True))
 
     entered = []
     release_first = asyncio.Event()
@@ -287,7 +357,10 @@ async def test_smart_per_session_lock_serializes_classification_order():
     release_first.set()
     await asyncio.gather(t1, t2)
     assert entered == ["first", "second"]
-    assert [call.args[0] for call in agent.steer.call_args_list] == ["first", "second"]
+    assert [
+        call.args[4]
+        for call in runner._admit_and_maybe_steer_event.call_args_list
+    ] == ["first", "second"]
 
 
 @pytest.mark.asyncio
@@ -443,6 +516,70 @@ async def test_smart_ack_can_be_disabled_by_managed_config(monkeypatch):
     )
 
     adapter._send_with_retry.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_smart_queue_rejection_bypasses_optional_ack_disable(monkeypatch):
+    from gateway import run as gateway_run
+
+    runner, _agent = _runner_and_agent()
+    runner._reply_anchor_for_event = MagicMock(return_value=None)
+    adapter = MagicMock()
+    adapter._send_with_retry = AsyncMock()
+    event = _event("rejected work")
+    monkeypatch.delenv("HERMES_GATEWAY_BUSY_ACK_ENABLED", raising=False)
+    monkeypatch.setattr(
+        gateway_run,
+        "_load_gateway_runtime_config",
+        lambda: {"display": {"busy_ack_enabled": False}},
+    )
+
+    await runner._send_smart_busy_ack(
+        event,
+        build_session_key(event.source),
+        adapter,
+        (await _decision(ROUTE_DEPENDENT))[0],
+        accepted=False,
+    )
+
+    adapter._send_with_retry.assert_awaited_once()
+    sent_text = adapter._send_with_retry.await_args.kwargs["content"]
+    assert "não foi aceita" in sent_text
+    assert "fila" in sent_text
+
+
+@pytest.mark.asyncio
+async def test_smart_uncertain_steer_bypasses_ack_disable_without_private_text(monkeypatch):
+    from gateway import run as gateway_run
+
+    runner, _agent = _runner_and_agent()
+    runner._reply_anchor_for_event = MagicMock(return_value=None)
+    adapter = MagicMock()
+    adapter._send_with_retry = AsyncMock()
+    event = _event("private customer correction")
+    session_key = build_session_key(event.source)
+    runner._busy_queue_uncertain_sessions = {session_key}
+    monkeypatch.delenv("HERMES_GATEWAY_BUSY_ACK_ENABLED", raising=False)
+    monkeypatch.setattr(
+        gateway_run,
+        "_load_gateway_runtime_config",
+        lambda: {"display": {"busy_ack_enabled": False}},
+    )
+
+    await runner._send_smart_busy_ack(
+        event,
+        session_key,
+        adapter,
+        (await _decision(ROUTE_RELATED))[0],
+        accepted=False,
+    )
+
+    adapter._send_with_retry.assert_awaited_once()
+    sent_text = adapter._send_with_retry.await_args.kwargs["content"]
+    assert "incerta" in sent_text.lower()
+    assert "não reenvie" in sent_text.lower()
+    assert event.text not in sent_text
+    assert session_key not in sent_text
 
 
 def test_leftover_steer_is_prioritized_without_losing_existing_fifo_events():

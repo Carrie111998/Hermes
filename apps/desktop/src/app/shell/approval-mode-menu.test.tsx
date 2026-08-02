@@ -8,6 +8,10 @@ import { $approvalModes } from '@/store/approval-mode'
 
 import { useApprovalModeStatusbarItem } from './approval-mode-menu'
 
+vi.mock('react-router-dom', () => ({
+  useNavigate: () => vi.fn()
+}))
+
 class TestResizeObserver {
   observe() {}
   unobserve() {}
@@ -36,11 +40,7 @@ function Harness({
 }) {
   const item = useApprovalModeStatusbarItem(profile, requestGateway)
 
-  return (
-    <MemoryRouter>
-      <StatusbarControls items={[item]} />
-    </MemoryRouter>
-  )
+  return <StatusbarControls items={[item]} />
 }
 
 describe('approval mode statusbar item', () => {

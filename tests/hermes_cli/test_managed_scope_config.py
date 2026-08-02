@@ -1,4 +1,5 @@
 """Config integration tests — managed scope wins over user config at the leaf."""
+import os
 import textwrap
 
 import pytest
@@ -48,6 +49,39 @@ def test_managed_list_wins_wholesale(homes):
     _write(home / "config.yaml", "toolsets:\n  enabled: [a, b, c]\n")
     _write(managed / "config.yaml", "toolsets:\n  enabled: [x]\n")
     assert cfg_get(load_config(), "toolsets", "enabled") == ["x"]
+
+
+def test_editing_managed_file_invalidates_cache(homes):
+    from hermes_cli.config import load_config, cfg_get
+
+    home, managed = homes
+    _write(home / "config.yaml", "model:\n  default: user/model\n")
+    _write(managed / "config.yaml", "model:\n  default: managed/v1\n")
+    assert cfg_get(load_config(), "model", "default") == "managed/v1"
+    _write(managed / "config.yaml", "model:\n  default: managed/v2\n")
+    assert cfg_get(load_config(), "model", "default") == "managed/v2"
+
+
+def test_same_size_managed_edit_with_restored_mtime_invalidates_public_cache(homes):
+    from hermes_cli.config import cfg_get, load_config
+
+    home, managed = homes
+    _write(home / "config.yaml", "model:\n  default: user/model\n")
+    managed_path = managed / "config.yaml"
+    _write(managed_path, "model:\n  default: managed/v1\n")
+    assert cfg_get(load_config(), "model", "default") == "managed/v1"
+
+    before = managed_path.stat()
+    managed_path.write_text("model:\n  default: managed/v2\n", encoding="utf-8")
+    os.utime(
+        managed_path,
+        ns=(before.st_atime_ns, before.st_mtime_ns),
+    )
+    after = managed_path.stat()
+    assert after.st_size == before.st_size
+    assert after.st_mtime_ns == before.st_mtime_ns
+
+    assert cfg_get(load_config(), "model", "default") == "managed/v2"
 
 
 def test_user_cannot_shadow_managed_literal_via_envref(homes, monkeypatch):

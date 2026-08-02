@@ -59,7 +59,11 @@ def test_profile_local_mcp_tool_is_visible_in_slash_worker(tmp_path):
         if key.endswith("_API_KEY") or key.endswith("_TOKEN"):
             env.pop(key)
     env["HERMES_HOME"] = str(profile_home)
-    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[2])
+    env["PYTHONPATH"] = (
+        str(Path(__file__).resolve().parents[2])
+        + os.pathsep
+        + env.get("PYTHONPATH", "")
+    )
     env["HERMES_SLASH_WATCHDOG_GRACE_S"] = "0"
     env["HERMES_SLASH_WATCHDOG_POLL_S"] = "0.05"
     proc = subprocess.Popen(

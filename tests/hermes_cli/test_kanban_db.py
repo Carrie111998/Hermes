@@ -39,6 +39,20 @@ def _init_git_repo(repo: Path) -> None:
     subprocess.run(["git", "-C", str(repo), "commit", "-m", "init"], check=True, capture_output=True, text=True)
 
 
+def _git_common_dir(repo_or_worktree: Path) -> str:
+    """Resolve --git-common-dir without requiring Git 2.31 path formatting."""
+    raw = subprocess.run(
+        ["git", "-C", str(repo_or_worktree), "rev-parse", "--git-common-dir"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    common = Path(raw)
+    if not common.is_absolute():
+        common = repo_or_worktree / common
+    return str(common.resolve())
+
+
 # ---------------------------------------------------------------------------
 # Schema / init
 # ---------------------------------------------------------------------------
@@ -517,6 +531,38 @@ def test_delete_task_removes_task_and_cascades(kanban_home):
 
 
 
+    expected = repo / ".worktrees" / t
+    assert ws == expected
+    assert ws.exists()
+    repo_common = _git_common_dir(repo)
+    ws_common = _git_common_dir(ws)
+    assert ws_common == repo_common
+    listed = subprocess.run(
+        ["git", "-C", str(repo), "worktree", "list", "--porcelain"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert f"worktree {expected}" in listed
+    assert f"branch refs/heads/wt/{t}" in listed
+
+
+def test_worktree_no_path_anchors_on_board_default_workdir(kanban_home, tmp_path):
+    """A worktree task created with no explicit path inherits the board's
+    default_workdir as its anchor and materializes a per-task linked worktree
+    at ``<repo>/.worktrees/<id>`` — NOT the dispatcher's CWD, and NOT the
+    shared default_workdir verbatim (which would collapse every task into one
+    directory)."""
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    kb.create_board("wt-default-board", default_workdir=str(repo))
+    with kb.connect(board="wt-default-board") as conn:
+        t = kb.create_task(
+            conn, title="ship", workspace_kind="worktree", board="wt-default-board"
+        )
+        task = kb.get_task(conn, t)
+        assert task is not None
+        ws = kb.resolve_workspace(task, board="wt-default-board")
 
 
 
@@ -539,18 +585,8 @@ def test_worktree_workspace_explicit_target_materializes_linked_worktree(kanban_
 
     assert ws == target
     assert ws.exists()
-    repo_common = subprocess.run(
-        ["git", "-C", str(repo), "rev-parse", "--path-format=absolute", "--git-common-dir"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-    ws_common = subprocess.run(
-        ["git", "-C", str(ws), "rev-parse", "--path-format=absolute", "--git-common-dir"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
+    repo_common = _git_common_dir(repo)
+    ws_common = _git_common_dir(ws)
     assert ws_common == repo_common
     listed = subprocess.run(
         ["git", "-C", str(repo), "worktree", "list", "--porcelain"],

@@ -184,8 +184,9 @@ def test_parallel_payload_preserves_user_text_and_forbids_abandoning_active_miss
     ],
 )
 def test_ack_is_bounded_prefixed_and_reports_route(route, needle):
+    private_reason = "private classifier rationale /customers/acme/secret.json"
     decision = SmartRouteDecision(
-        route=route, confidence=0.9, reason="motivo seguro", source="classifier"
+        route=route, confidence=0.9, reason=private_reason, source="classifier"
     )
     ack = format_smart_ack(
         decision,
@@ -194,6 +195,7 @@ def test_ack_is_bounded_prefixed_and_reports_route(route, needle):
     assert ack.startswith("⚕ Hermes Agent - Roteamento de mensagem")
     assert needle.lower() in ack.lower()
     assert "missão atual continua" in ack.lower()
+    assert private_reason not in ack
     assert len(ack) < 600
 
 

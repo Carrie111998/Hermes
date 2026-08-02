@@ -18,11 +18,13 @@ Attribution: do not reference any third-party product by name in this file.
 from __future__ import annotations
 
 import copy
+import io
 import logging
 import os
+import stat
 import threading
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 import yaml
 
@@ -31,74 +33,273 @@ logger = logging.getLogger(__name__)
 # POSIX default. Other-platform locations are a deliberate v2 item; when added,
 # they belong ONLY inside get_managed_dir().
 _DEFAULT_MANAGED_DIR = Path("/etc/hermes")
+_OVERRIDE_MARKER = ".hermes-managed"
+_OVERRIDE_MARKER_CONTENT = b"hermes-managed-scope-v1\n"
 
 _CACHE_LOCK = threading.Lock()
-# path_key -> (mtime_ns, size, parsed)
+# path_key -> ((dev, ino, mtime_ns, ctime_ns, size), parsed)
 _CONFIG_CACHE: Dict[str, tuple] = {}
-_ENV_CACHE: Dict[str, tuple] = {}
 
 
-def _under_pytest() -> bool:
-    """True when running inside the test suite.
+def _has_valid_override_marker(directory_fd: int) -> bool:
+    """Return whether an opened directory carries explicit admin authorization."""
+    marker_flags = (
+        os.O_RDONLY
+        | os.O_NOFOLLOW
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    try:
+        marker_fd = os.open(_OVERRIDE_MARKER, marker_flags, dir_fd=directory_fd)
+    except OSError:
+        return False
+    try:
+        marker_stat = os.fstat(marker_fd)
+        if (
+            not stat.S_ISREG(marker_stat.st_mode)
+            or marker_stat.st_uid != 0
+            or marker_stat.st_mode & 0o022
+        ):
+            return False
+        data = b""
+        limit = len(_OVERRIDE_MARKER_CONTENT) + 1
+        while len(data) < limit:
+            chunk = os.read(marker_fd, limit - len(data))
+            if not chunk:
+                break
+            data += chunk
+        return data == _OVERRIDE_MARKER_CONTENT
+    except OSError:
+        return False
+    finally:
+        os.close(marker_fd)
 
-    Used to ignore the system default ``/etc/hermes`` during tests so a real
-    managed scope on a developer/CI box can't leak policy into the suite. Tests
-    that exercise managed scope set ``HERMES_MANAGED_DIR`` explicitly, which is
-    still honored (the override path below runs before this guard takes effect).
+
+def _is_trusted_managed_dir(path: Path) -> Optional[Path]:
+    """Return a pinned-and-validated canonical admin policy directory."""
+    opened_dir = _open_trusted_managed_dir(path)
+    if opened_dir is None:
+        return None
+    resolved, directory_fd = opened_dir
+    try:
+        directory_stat = os.fstat(directory_fd)
+        if (
+            not stat.S_ISDIR(directory_stat.st_mode)
+            or directory_stat.st_uid != 0
+            or directory_stat.st_mode & 0o022
+        ):
+            return None
+        if not _has_valid_override_marker(directory_fd):
+            return None
+
+        present = False
+        for filename in ("config.yaml", ".env"):
+            try:
+                file_stat = os.stat(filename, dir_fd=directory_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            except OSError:
+                return None
+            present = True
+            if (
+                not stat.S_ISREG(file_stat.st_mode)
+                or file_stat.st_uid != 0
+                or file_stat.st_mode & 0o022
+            ):
+                return None
+        return resolved if present else None
+    finally:
+        os.close(directory_fd)
+
+
+def _managed_dir_is_trusted(path: Path) -> Optional[Path]:
+    """Canonical resolver seam overridden only by the hermetic test harness."""
+    return _is_trusted_managed_dir(path)
+
+
+def _managed_stat_is_trusted(file_stat: os.stat_result) -> bool:
+    """Return whether an opened managed-scope inode is admin-controlled."""
+    return file_stat.st_uid == 0 and not file_stat.st_mode & 0o022
+
+
+def _managed_ancestor_stat_is_trusted(directory_stat: os.stat_result) -> bool:
+    """Return whether users cannot replace root-owned children in an ancestor."""
+    if directory_stat.st_uid != 0:
+        return False
+    writable = bool(directory_stat.st_mode & 0o022)
+    sticky = bool(directory_stat.st_mode & stat.S_ISVTX)
+    return not writable or sticky
+
+
+def _open_trusted_managed_dir(managed_dir: Path):
+    """Resolve and pin a managed directory through a trusted POSIX namespace.
+
+    Each canonical component is opened relative to the already-pinned parent.
+    That prevents a later pathname reopen from selecting a different inode.
     """
-    return "PYTEST_CURRENT_TEST" in os.environ
+    if not hasattr(os, "O_DIRECTORY") or not hasattr(os, "O_NOFOLLOW"):
+        return None
+    try:
+        resolved = managed_dir.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None
+
+    directory_flags = (
+        os.O_RDONLY
+        | os.O_DIRECTORY
+        | os.O_NOFOLLOW
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    current_fd = -1
+    try:
+        current_fd = os.open(resolved.anchor or os.sep, directory_flags)
+        for component in resolved.parts[1:]:
+            ancestor_stat = os.fstat(current_fd)
+            if not stat.S_ISDIR(
+                ancestor_stat.st_mode
+            ) or not _managed_ancestor_stat_is_trusted(ancestor_stat):
+                return None
+            next_fd = os.open(component, directory_flags, dir_fd=current_fd)
+            os.close(current_fd)
+            current_fd = next_fd
+
+        directory_stat = os.fstat(current_fd)
+        if not stat.S_ISDIR(directory_stat.st_mode) or not _managed_stat_is_trusted(
+            directory_stat
+        ):
+            return None
+        result = (resolved, current_fd)
+        current_fd = -1
+        return result
+    except OSError:
+        return None
+    finally:
+        if current_fd >= 0:
+            os.close(current_fd)
 
 
 def get_managed_dir() -> Optional[Path]:
-    """Resolve the managed-scope directory, or None when no scope is present.
-
-    Resolution (highest priority first):
-      1. ``$HERMES_MANAGED_DIR`` — deployment/bootstrap path override (IT-only;
-         never persisted to any .env). Honored only when set to a non-empty value
-         AND the directory exists.
-      2. ``/etc/hermes`` — POSIX default, when it exists. Ignored under pytest so
-         a real system managed scope can't leak into the test suite.
-
-    A non-existent directory at either tier resolves to None (no managed scope),
-    which is the common case and must be cheap + side-effect-free.
-    """
+    """Resolve the trusted managed-scope directory, or ``None`` when absent."""
     override = os.environ.get("HERMES_MANAGED_DIR", "").strip()
     if override:
-        p = Path(override)
-        return p if p.is_dir() else None
-    if _under_pytest():
-        return None
+        path = Path(override)
+        trusted = _managed_dir_is_trusted(path)
+        if trusted:
+            if trusted is True:
+                try:
+                    return path.resolve(strict=True)
+                except (OSError, RuntimeError):
+                    trusted = None
+            else:
+                return Path(trusted)
+        logger.warning(
+            "managed scope: refusing invalid or untrusted "
+            "HERMES_MANAGED_DIR=%s; falling back to the system managed scope",
+            path,
+        )
     return _DEFAULT_MANAGED_DIR if _DEFAULT_MANAGED_DIR.is_dir() else None
 
 
 def invalidate_managed_cache() -> None:
-    """Drop cached managed config/env. For tests and post-edit reloads."""
+    """Drop cached managed config. For tests and post-edit reloads."""
     with _CACHE_LOCK:
         _CONFIG_CACHE.clear()
-        _ENV_CACHE.clear()
 
 
-def _cached_read(path: Path, cache: Dict[str, tuple], parse):
-    """Shared (mtime_ns, size)-keyed read. Returns a deepcopy of the parsed value.
+def _open_managed_policy(managed_dir: Path, filename: str):
+    """Open a validated policy inode relative to a pinned directory descriptor."""
+    opened_dir = _open_trusted_managed_dir(managed_dir)
+    if opened_dir is None:
+        return None
+    _resolved, directory_fd = opened_dir
+
+    file_flags = (
+        os.O_RDONLY
+        | os.O_NOFOLLOW
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    try:
+        try:
+            file_fd = os.open(filename, file_flags, dir_fd=directory_fd)
+        except OSError:
+            return None
+        try:
+            file_stat = os.fstat(file_fd)
+            if not stat.S_ISREG(file_stat.st_mode) or not _managed_stat_is_trusted(
+                file_stat
+            ):
+                os.close(file_fd)
+                return None
+        except OSError:
+            os.close(file_fd)
+            return None
+        return file_fd, file_stat
+    finally:
+        os.close(directory_fd)
+
+
+def get_managed_config_revision() -> Optional[Tuple[int, int, int, int, int]]:
+    """Return the validated inode revision for managed ``config.yaml``.
+
+    The signature comes from ``fstat`` on the same ``openat``/``O_NOFOLLOW``
+    policy inode used by the loader, so outer caches never re-stat a pathname.
+    """
+    managed_dir = get_managed_dir()
+    if managed_dir is None:
+        return None
+    opened = _open_managed_policy(managed_dir, "config.yaml")
+    if opened is None:
+        return None
+    file_fd, file_stat = opened
+    try:
+        return (
+            file_stat.st_dev,
+            file_stat.st_ino,
+            file_stat.st_mtime_ns,
+            file_stat.st_ctime_ns,
+            file_stat.st_size,
+        )
+    finally:
+        os.close(file_fd)
+
+
+def _cached_read(
+    managed_dir: Path,
+    filename: str,
+    cache: Optional[Dict[str, tuple]],
+    parse,
+):
+    """Read a trusted policy inode and return a deepcopy of the parsed value.
 
     Returns ``None`` when the file is absent or fails to parse (fail-open). A
     parse failure is logged LOUDLY — the admin needs to know their policy isn't
     being applied — but never raises, so a malformed managed file can't brick
     startup.
     """
-    try:
-        st = path.stat()
-    except OSError:
-        return None  # absent
-    key = (st.st_mtime_ns, st.st_size)
+    opened = _open_managed_policy(managed_dir, filename)
+    if opened is None:
+        return None
+    file_fd, file_stat = opened
+    key = (
+        file_stat.st_dev,
+        file_stat.st_ino,
+        file_stat.st_mtime_ns,
+        file_stat.st_ctime_ns,
+        file_stat.st_size,
+    )
+    path = managed_dir / filename
     path_key = str(path)
-    with _CACHE_LOCK:
-        hit = cache.get(path_key)
-        if hit is not None and hit[:2] == key:
-            return copy.deepcopy(hit[2])
+    if cache is not None:
+        with _CACHE_LOCK:
+            hit = cache.get(path_key)
+            if hit is not None and hit[0] == key:
+                os.close(file_fd)
+                return copy.deepcopy(hit[1])
     try:
-        with open(path, encoding="utf-8") as f:
-            parsed = parse(f)
+        with os.fdopen(file_fd, "rb") as f:
+            file_fd = -1
+            parsed = parse(f.read())
     except Exception as exc:  # noqa: BLE001 — fail-open, but LOUD
         logger.warning(
             "managed scope: failed to parse %s: %s — IGNORING this managed file. "
@@ -107,8 +308,12 @@ def _cached_read(path: Path, cache: Dict[str, tuple], parse):
             exc,
         )
         return None
-    with _CACHE_LOCK:
-        cache[path_key] = (key[0], key[1], copy.deepcopy(parsed))
+    finally:
+        if file_fd >= 0:
+            os.close(file_fd)
+    if cache is not None:
+        with _CACHE_LOCK:
+            cache[path_key] = (key, copy.deepcopy(parsed))
     return parsed
 
 
@@ -118,9 +323,10 @@ def load_managed_config() -> dict:
     if managed_dir is None:
         return {}
     parsed = _cached_read(
-        managed_dir / "config.yaml",
+        managed_dir,
+        "config.yaml",
         _CONFIG_CACHE,
-        lambda f: yaml.safe_load(f) or {},
+        lambda raw: yaml.safe_load(raw.decode("utf-8")) or {},
     )
     return parsed if isinstance(parsed, dict) else {}
 
@@ -130,7 +336,9 @@ def load_managed_env() -> Dict[str, str]:
     managed_dir = get_managed_dir()
     if managed_dir is None:
         return {}
-    parsed = _cached_read(managed_dir / ".env", _ENV_CACHE, _parse_env)
+    # dotenv interpolation depends on the live process environment. Caching the
+    # parsed mapping would pin stale expansions when a referenced variable rotates.
+    parsed = _cached_read(managed_dir, ".env", None, _parse_env)
     return parsed if isinstance(parsed, dict) else {}
 
 
@@ -177,15 +385,15 @@ def apply_managed_overlay(config: dict) -> dict:
         return config
 
 
-def _parse_env(f) -> Dict[str, str]:
-    out: Dict[str, str] = {}
-    for line in f:
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, _, value = line.partition("=")
-        out[key.strip()] = value.strip().strip("\"'")
-    return out
+def _parse_env(raw: bytes) -> Dict[str, str]:
+    from dotenv import dotenv_values
+
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        text = raw.decode("latin-1")
+    parsed = dotenv_values(stream=io.StringIO(text))
+    return {key: value for key, value in parsed.items() if value is not None}
 
 
 def _flatten_keys(d: dict, prefix: str = "") -> set:

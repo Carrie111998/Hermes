@@ -132,3 +132,164 @@ def _make_compress_host_session(events: list) -> dict:
     }
 
 
+def test_compute_host_does_not_publish_turn_end_for_uncertain_worker_outcome(
+    monkeypatch,
+):
+    from tui_gateway import server
+
+    class _JoinedThread:
+        def join(self):
+            return None
+
+    out = io.StringIO()
+    host = ComputeHost(stdout=out, max_workers=1, heartbeat_secs=0)
+    session = {
+        "history_lock": threading.RLock(),
+        "running": False,
+        "history_version": 0,
+        "history": [],
+        "session_key": "uncertain-key",
+        "agent": None,
+    }
+
+    monkeypatch.setattr(host, "_ensure_server_session", lambda *_args: session)
+    monkeypatch.setattr(server, "_start_inflight_turn", lambda *_args: None)
+    monkeypatch.setattr(server, "_ensure_session_db_row", lambda *_args: None)
+    monkeypatch.setattr(server, "_persist_branch_seed", lambda *_args: None)
+    monkeypatch.setattr(server, "_session_info", lambda *_args: {})
+
+    def _uncertain_submit(request_id, _sid, target, _text):
+        target["_prompt_terminal_outcome"] = {
+            "request_id": request_id,
+            "disposition": "uncertain",
+        }
+        target["_run_thread"] = _JoinedThread()
+
+    monkeypatch.setattr(server, "_run_prompt_submit", _uncertain_submit)
+
+    try:
+        host._run_real_turn(
+            {
+                "sid": "uncertain-sid",
+                "request_id": "uncertain-turn",
+                "text": "do work",
+            }
+        )
+        frame = next(
+            candidate
+            for candidate in _json_lines(out)
+            if candidate.get("request_id") == "uncertain-turn"
+            and candidate.get("type") in {"turn.end", "turn.error"}
+        )
+    finally:
+        host.close()
+
+    assert frame["type"] == "turn.error"
+    assert frame["execution_state"] == "ambiguous"
+
+
+def test_compute_host_labels_preexecution_rejection_as_not_started():
+    out = io.StringIO()
+    host = ComputeHost(stdout=out, max_workers=1, heartbeat_secs=0)
+    try:
+        host._run_real_turn({"sid": "", "request_id": "missing-sid"})
+        frame = next(
+            candidate
+            for candidate in _json_lines(out)
+            if candidate.get("request_id") == "missing-sid"
+        )
+    finally:
+        host.close()
+
+    assert frame["type"] == "turn.error"
+    assert frame["reason"] == "not_started"
+    assert frame["execution_state"] == "not_started"
+
+
+def test_compute_host_marks_existing_server_session_as_non_queue_owner():
+    from tui_gateway import server
+
+    out = io.StringIO()
+    host = ComputeHost(stdout=out, max_workers=1, heartbeat_secs=0)
+    session = {"transport": None}
+    server._sessions["worker-owner"] = session
+    try:
+        resolved = host._ensure_server_session(
+            server,
+            {"sid": "worker-owner", "session_key": "durable-session"},
+        )
+        assert resolved is session
+        assert resolved["_compute_host_worker"] is True
+    finally:
+        server._sessions.pop("worker-owner", None)
+        host.close()
+
+
+@pytest.mark.parametrize("explicit_profile_home", [True, False])
+def test_respawn_rehydrates_authoritative_history_from_effective_profile_db(
+    tmp_path,
+    monkeypatch,
+    explicit_profile_home,
+):
+    from tui_gateway.compute_host import ComputeHost
+
+    effective_home = tmp_path / "effective-profile"
+    effective_home.mkdir()
+    persisted_history = [
+        {"role": "user", "content": "turn one"},
+        {"role": "assistant", "content": "answer one"},
+    ]
+    opened_db_paths = []
+
+    class FakeSessionDB:
+        def __init__(self, db_path):
+            self.db_path = Path(db_path)
+            opened_db_paths.append(self.db_path)
+
+        def get_messages_as_conversation(self, session_id, repair_alternation=False):
+            assert session_id == "durable-key"
+            assert repair_alternation is True
+            return list(persisted_history)
+
+    import hermes_state
+    import hermes_constants
+
+    monkeypatch.setattr(hermes_state, "SessionDB", FakeSessionDB)
+    monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: effective_home)
+
+    class FakeServer:
+        def __init__(self):
+            self._sessions = {}
+
+        def _make_agent(self, *_args, **_kwargs):
+            return object()
+
+        def _init_session(self, sid, key, agent, history, **kwargs):
+            self._sessions[sid] = {
+                "agent": agent,
+                "session_key": key,
+                "history": list(history),
+                "history_lock": threading.Lock(),
+                "transport": None,
+                **kwargs,
+            }
+
+    host = ComputeHost.__new__(ComputeHost)
+    host._transport = object()
+    server = FakeServer()
+    session = host._ensure_server_session(
+        server,
+        {
+            "sid": "live-sid",
+            "session_key": "durable-key",
+            "profile_home": str(effective_home) if explicit_profile_home else "",
+            "history": [{"role": "user", "content": "stale parent copy"}],
+            "history_version": 7,
+            "cols": 80,
+        },
+    )
+
+    assert opened_db_paths == [effective_home / "state.db"]
+    assert session["history"] == persisted_history
+    assert session["history_version"] == 7
+    assert session["profile_home"] == str(effective_home)

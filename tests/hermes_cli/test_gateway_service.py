@@ -232,6 +232,73 @@ class TestGeneratedSystemdUnits:
         assert str(local_bin) in plist
         assert str(profile_node_bin) not in plist
 
+    def test_user_unit_includes_wsl_windows_interop_paths(self, monkeypatch):
+        monkeypatch.setattr(gateway_cli, "is_wsl", lambda: True)
+        monkeypatch.setenv(
+            "PATH",
+            "/usr/local/bin:/mnt/c/WINDOWS/system32:/mnt/c/WINDOWS/System32/WindowsPowerShell/v1.0/",
+        )
+        monkeypatch.setattr(gateway_cli.shutil, "which", lambda cmd: None)
+
+        unit = gateway_cli.generate_systemd_unit(system=False)
+
+        assert "/mnt/c/WINDOWS/system32" in unit
+        assert "/mnt/c/WINDOWS/System32/WindowsPowerShell/v1.0/" in unit
+
+    def test_user_unit_omits_windows_interop_paths_outside_wsl(self, monkeypatch):
+        monkeypatch.setattr(gateway_cli, "is_wsl", lambda: False)
+        monkeypatch.setenv("PATH", "/usr/local/bin:/mnt/c/WINDOWS/system32")
+        monkeypatch.setattr(gateway_cli.shutil, "which", lambda cmd: None)
+
+        unit = gateway_cli.generate_systemd_unit(system=False)
+
+        assert "/mnt/c/WINDOWS/system32" not in unit
+
+    def test_system_unit_includes_wsl_windows_interop_paths(self, monkeypatch):
+        monkeypatch.setattr(gateway_cli, "is_wsl", lambda: True)
+        monkeypatch.setattr(
+            gateway_cli,
+            "_system_service_identity",
+            lambda run_as_user=None: ("alice", "alice", "/home/alice"),
+        )
+        monkeypatch.setattr(gateway_cli, "_hermes_home_for_target_user", lambda home: "/home/alice/.hermes")
+        monkeypatch.setenv("PATH", "/usr/local/bin:/mnt/c/WINDOWS/system32")
+        monkeypatch.setattr(gateway_cli.shutil, "which", lambda cmd: None)
+
+        unit = gateway_cli.generate_systemd_unit(system=True, run_as_user="alice")
+
+        assert "/mnt/c/WINDOWS/system32" in unit
+
+    def test_system_unit_avoids_recursive_execstop_and_uses_extended_stop_timeout(self, monkeypatch):
+        monkeypatch.setattr(
+            gateway_cli,
+            "_system_service_identity",
+            lambda run_as_user=None: ("alice", "alice", "/home/alice"),
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_get_restart_drain_timeout",
+            lambda: DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
+        )
+        unit = gateway_cli.generate_systemd_unit(system=True)
+
+        assert "ExecStart=" in unit
+        assert "ExecStop=" not in unit
+        assert "ExecReload=/bin/kill -USR1 $MAINPID" in unit
+        assert f"RestartForceExitStatus={GATEWAY_SERVICE_RESTART_EXIT_CODE}" in unit
+        assert f"RestartPreventExitStatus={GATEWAY_FATAL_CONFIG_EXIT_CODE}" in unit
+        # The default drain is immediate, so keep a bounded 60-second stop
+        # budget without forcing every restart to wait 90 seconds.
+        assert self._expected_timeout_stop_sec() in unit
+        assert "WantedBy=multi-user.target" in unit
+        # ExecStopPost reaps any process the gateway didn't clean up itself,
+        # so long-lived helpers (e.g. adb) can't be left orphaned in the
+        # cgroup and block Restart=always — issue #37454.
+        assert "ExecStopPost=" in unit
+        assert "-m gateway.cgroup_cleanup" in unit
+        # KillMode=mixed is preserved so the gateway still reaps its own
+        # tool-call children before systemd SIGKILLs the cgroup — #8202.
+        assert "KillMode=mixed" in unit
 
 
 class TestGatewayStopCleanup:
@@ -804,6 +871,11 @@ class TestGeneratedUnitIncludesLocalBin:
 
 
     def test_system_unit_includes_local_bin_in_path(self, monkeypatch):
+        monkeypatch.setattr(
+            gateway_cli,
+            "_system_service_identity",
+            lambda run_as_user=None: ("alice", "alice", "/home/alice"),
+        )
         monkeypatch.setattr(
             gateway_cli,
             "_build_user_local_paths",

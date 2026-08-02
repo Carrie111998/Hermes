@@ -58,7 +58,7 @@ TIPS = [
     "Ctrl+C interrupts the agent. Double-press within 2 seconds to force exit.",
     "Ctrl+Z suspends Hermes to the background — run fg in your shell to resume.",
     "Tab accepts auto-suggestion ghost text or autocompletes slash commands.",
-    "Type a new message while the agent is working to interrupt and redirect it.",
+    "With SMART busy routing, new messages steer, parallelize, or queue without cancelling the active turn.",
     "Alt+V pastes an image from your clipboard into the conversation.",
     "Pasting 5+ lines auto-saves to a file and inserts a compact reference instead.",
 
@@ -302,7 +302,6 @@ TIPS = [
     "HERMES_HOME_MODE env var (octal, e.g. 0701) sets custom directory permissions for web server traversal.",
     "Container mode: place .container-mode in HERMES_HOME and the host CLI auto-execs into the container.",
     "Ctrl+C has 5 priority tiers: cancel recording → cancel prompts → cancel picker → interrupt agent → exit.",
-    "Every interrupt during an agent run is logged to ~/.hermes/interrupt_debug.log with timestamps.",
     "BROWSER_CDP_URL connects browser tools to any running Chromium-family browser — accepts WebSocket, HTTP, or host:port.",
     "BROWSERBASE_ADVANCED_STEALTH=true enables advanced anti-detection with custom Chromium (Scale Plan).",
     "The CLI auto-switches to compact mode in terminals narrower than 80 columns.",

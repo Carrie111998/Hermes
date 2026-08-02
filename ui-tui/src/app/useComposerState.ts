@@ -291,7 +291,10 @@ export function useComposerState({ gw, submitRef, sys }: UseComposerStateOptions
       setComposerTokens(prev => trimTokens([...prev, { kind: 'paste', label, text: cleanedText }]))
 
       void gw
-        .request<{ path?: string }>('paste.collapse', { text: cleanedText })
+        .request<{ path?: string }>('paste.collapse', {
+          session_id: sid,
+          text: cleanedText
+        })
         .then(r => {
           const path = r?.path
 

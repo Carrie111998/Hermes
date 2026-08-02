@@ -3,6 +3,7 @@
 import asyncio
 import importlib
 import sys
+import threading
 import time
 import types
 from types import SimpleNamespace
@@ -338,6 +339,14 @@ def _make_runner(adapter):
     runner._session_db = None
     runner._running_agents = {}
     runner._session_run_generation = {}
+    runner._queued_events = {}
+    runner._external_drain_active = False
+    runner._busy_queue_lock = threading.RLock()
+    runner._busy_queue_claimed_events = {}
+    runner._busy_queue_uncertain_sessions = set()
+    runner._busy_queue_uncertain_digests = set()
+    runner._busy_queue_persist_ready = lambda *args, **kwargs: None
+    runner._busy_queue_max_bytes = lambda: 1024 * 1024
     runner.session_store = SimpleNamespace(_entries={}, _save=lambda: None)
     runner.hooks = SimpleNamespace(loaded_hooks=False)
     runner.config = SimpleNamespace(
@@ -581,6 +590,8 @@ class QueuedCommentaryAgent:
             "final_response": f"final response {type(self).calls}",
             "messages": [],
             "api_calls": 1,
+            "completed": True,
+            "receipt_terminal_success": True,
         }
 
 
@@ -706,11 +717,18 @@ async def _run_with_agent(
     if thread_id:
         session_key = f"{session_key}:{thread_id}"
     if pending_text is not None:
-        adapter._pending_messages[session_key] = MessageEvent(
+        runner._busy_queue_root_override = tmp_path
+        # Claiming is intentionally fail-closed unless a durable ledger exists;
+        # use the production persistence path for this queue-drain test.
+        runner.__dict__.pop("_busy_queue_persist_ready", None)
+        pending_event = MessageEvent(
             text=pending_text,
             message_type=MessageType.TEXT,
             source=source,
             message_id="queued-1",
+        )
+        assert runner._queue_or_replace_pending_event(
+            session_key, pending_event, coalesce=False
         )
 
     result = await runner._run_agent(

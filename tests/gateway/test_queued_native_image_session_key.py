@@ -1,6 +1,7 @@
 import base64
 import importlib
 import sys
+import threading
 import types
 from types import SimpleNamespace
 
@@ -62,6 +63,10 @@ class CaptureQueuedNativeImageAgent:
             "final_response": f"done-{len(type(self).calls)}",
             "messages": [],
             "api_calls": 1,
+            "completed": True,
+            "failed": False,
+            "partial": False,
+            "receipt_terminal_success": True,
         }
 
 
@@ -78,6 +83,17 @@ def _make_runner(adapter):
     runner._session_db = None
     runner._running_agents = {}
     runner._session_run_generation = {}
+    runner._busy_queue_lock = threading.RLock()
+    runner._queued_events = {}
+    runner._busy_queue_active_claims = {}
+    runner._busy_queue_claimed_events = {}
+    runner._busy_queue_cancelled_claim_tokens = set()
+    runner._busy_queue_finalized_claim_tokens = set()
+    runner._busy_queue_uncertain_sessions = set()
+    runner._busy_queue_uncertain_digests = set()
+    runner._busy_queue_uncertain_paths = set()
+    runner._busy_queue_restored_sessions = set()
+    runner._busy_queue_restored_sources = {}
     runner.hooks = SimpleNamespace(loaded_hooks=False)
     runner.config = SimpleNamespace(
         thread_sessions_per_user=False,
@@ -124,13 +140,17 @@ async def test_queued_followup_uses_pending_event_session_key_for_native_images(
         thread_id="17585",
     )
 
-    adapter._pending_messages["agent:main:telegram:group:-1001"] = MessageEvent(
+    queued_event = MessageEvent(
         text="describe this",
         message_type=MessageType.PHOTO,
         source=pending_source,
         media_urls=[str(image_path)],
         media_types=["image/png"],
         message_id="queued-1",
+    )
+    assert runner._queue_or_replace_pending_event(
+        "agent:main:telegram:group:-1001",
+        queued_event,
     )
 
     result = await runner._run_agent(

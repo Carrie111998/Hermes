@@ -22,12 +22,16 @@ These tests drive the real methods through the real local terminal backend.
 """
 
 import os
+from pathlib import Path
 import shutil
+import subprocess
+import tempfile
 
 import pytest
 
 from tools.file_operations import (
     ShellFileOperations,
+    _is_line_oriented_newline_error,
     _pattern_has_regex_newline,
     _split_tool_diagnostics,
 )
@@ -49,6 +53,11 @@ def match_tree(tmp_path):
 @pytest.fixture
 def partial_error_tree(tmp_path):
     """A tree with matches plus one unreadable file (forces exit 2 + matches)."""
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        pytest.skip(
+            "root bypasses mode-bit permission errors; diagnostic splitting has "
+            "deterministic unit coverage below"
+        )
     for i in range(4):
         (tmp_path / f"f{i}.txt").write_text(f"needle line {i}\n")
     sub = tmp_path / "sub"
@@ -96,7 +105,95 @@ class TestSearchErrorGuard:
         assert res.total_count >= 4
 
 
+@pytest.mark.skipif(
+    not hasattr(os, "geteuid") or os.geteuid() != 0,
+    reason="non-root runs the parametrized partial-error integration directly",
+)
+@pytest.mark.parametrize("method", _METHODS)
+@pytest.mark.parametrize("output_mode", ["content", "files_only", "count"])
+def test_partial_error_integration_demotes_root_to_unprivileged_uid(
+    method,
+    output_mode,
+):
+    """Exercise real EACCES branches for every result shape under root."""
+    import pwd
+
+    try:
+        account = pwd.getpwnam("nobody")
+    except KeyError:
+        pytest.skip("host has no nobody account for unprivileged integration")
+
+    root = Path(tempfile.mkdtemp(prefix="hermes-search-unprivileged-", dir="/tmp"))
+    root.chmod(0o755)
+    locked = root / "locked.txt"
+    try:
+        for index in range(4):
+            path = root / f"f{index}.txt"
+            path.write_text(f"needle line {index}\n")
+            path.chmod(0o644)
+        locked.write_text("needle in locked\n")
+        locked.chmod(0o000)
+
+        class _UnprivilegedEnvironment:
+            cwd = str(root)
+
+            def execute(self, command, cwd=None, timeout=None, stdin_data=None):
+                def _demote():
+                    os.setgroups([])
+                    os.setgid(account.pw_gid)
+                    os.setuid(account.pw_uid)
+
+                completed = subprocess.run(
+                    ["/bin/bash", "-c", command],
+                    cwd=cwd or self.cwd,
+                    env=os.environ.copy(),
+                    input=stdin_data,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    timeout=timeout,
+                    check=False,
+                    preexec_fn=_demote,
+                )
+                return {
+                    "output": completed.stdout,
+                    "returncode": completed.returncode,
+                }
+
+        ops = ShellFileOperations(_UnprivilegedEnvironment(), cwd=str(root))
+        result = _search(ops, method, "needle", root, output_mode=output_mode)
+        assert result.error is None
+        if output_mode == "content":
+            assert len(result.matches) == 4
+            assert all(match.path != str(locked) for match in result.matches)
+        elif output_mode == "files_only":
+            assert len(result.files) == 4
+            assert all("locked.txt" not in path for path in result.files)
+        else:
+            assert result.total_count == 4
+            assert all("locked.txt" not in path for path in result.counts)
+    finally:
+        locked.chmod(0o644)
+        shutil.rmtree(root)
+
+
 class TestSearchContentNewlineWarning:
+    def test_newline_error_classifier_requires_real_rg_diagnostic_shape(self):
+        actual = (
+            "Search failed: the literal '\"\\n\"' is not allowed in a regex\n\n"
+            "Consider enabling multiline mode with the --multiline flag "
+            "(or -U for short).\n"
+            "When multiline mode is enabled, new line characters can be matched."
+        )
+        assert _is_line_oriented_newline_error(actual)
+
+    def test_newline_error_classifier_rejects_keyword_coincidence(self):
+        unrelated = (
+            "Search failed: docs.txt:1: ordinary content mentions literal \\n "
+            "not allowed while discussing multiline parsing"
+        )
+        assert not _is_line_oriented_newline_error(unrelated)
+
     def test_odd_backslash_n_is_detected_as_regex_newline(self):
         assert _pattern_has_regex_newline(r"needle\n")
         assert _pattern_has_regex_newline(r"needle\\\n")
@@ -123,6 +220,35 @@ class TestSplitToolDiagnostics:
         assert payload.strip() == ""
         assert "regex parse error" in diagnostics
 
+    def test_partial_error_separates_matches(self):
+        out = ("rg: sub/locked.txt: Permission denied (os error 13)\n"
+               "a.txt:1:needle here\nb.txt:2:needle there\n")
+        diagnostics, payload = _split_tool_diagnostics(out)
+        assert "Permission denied" in diagnostics
+        assert "a.txt:1:needle here" in payload
+        assert "b.txt:2:needle there" in payload
+        assert "Permission denied" not in payload
+
+    def test_unprefixed_diagnostic_with_hyphen_digits_is_not_a_file(self):
+        out = (
+            "/tmp/hermes-search-3285_case/locked.txt: Permission denied "
+            "(os error 13)\n"
+            "/tmp/hermes-search-3285_case/f0.txt\n"
+        )
+        diagnostics, payload = _split_tool_diagnostics(out)
+        assert "Permission denied" in diagnostics
+        assert "locked.txt" not in payload
+        assert payload == "/tmp/hermes-search-3285_case/f0.txt"
+
+    def test_files_only_is_payload(self):
+        diagnostics, payload = _split_tool_diagnostics("src/a.py\nsrc/b.py\n")
+        assert diagnostics == ""
+        assert payload == "src/a.py\nsrc/b.py"
+
+    def test_count_lines_are_payload(self):
+        diagnostics, payload = _split_tool_diagnostics("src/a.py:3\nsrc/b.py:1\n")
+        assert diagnostics == ""
+        assert "src/a.py:3" in payload
 
     def test_context_lines_and_separator_are_payload(self):
         out = "a.py:5:hit\na.py-6-after\n--\nb.py:9:hit\n"

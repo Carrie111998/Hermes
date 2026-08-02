@@ -628,6 +628,18 @@ def finalize_turn(
             last_reasoning = msg["reasoning"]
             break
 
+    # Durable receipt owners need a narrower predicate than the historical
+    # ``completed`` field.  Recovery/guardrail/partial exits may intentionally
+    # return user-visible text and therefore remain ``completed`` for legacy
+    # callers, but they must not acknowledge an exactly-once obligation.  Only
+    # a clean normal text terminal with successful persistence is publishable.
+    receipt_terminal_success = bool(
+        normal_text_response
+        and completed
+        and not interrupted
+        and not _cleanup_errors
+    )
+
     # Build result with interrupt info if applicable
     result = {
         "final_response": final_response,
@@ -635,6 +647,7 @@ def finalize_turn(
         "messages": messages,
         "api_calls": api_call_count,
         "completed": completed,
+        "receipt_terminal_success": receipt_terminal_success,
         "turn_exit_reason": _turn_exit_reason,
         "failed": failed,
         "partial": False,  # True only when stopped due to invalid tool calls

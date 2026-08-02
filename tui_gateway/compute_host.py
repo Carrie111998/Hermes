@@ -241,11 +241,29 @@ class ComputeHost:
         sid = str(frame.get("sid") or "")
         session = self._sessions.get(sid)
         if session is None:
-            self.emit({"type": "turn.error", "sid": sid, "request_id": frame.get("request_id"), "message": "unknown session"})
+            self.emit(
+                {
+                    "type": "turn.error",
+                    "sid": sid,
+                    "request_id": frame.get("request_id"),
+                    "reason": "not_started",
+                    "execution_state": "not_started",
+                    "message": "unknown session",
+                }
+            )
             return
         with session.lock:
             if session.running:
-                self.emit({"type": "turn.error", "sid": sid, "request_id": frame.get("request_id"), "message": "session busy"})
+                self.emit(
+                    {
+                        "type": "turn.error",
+                        "sid": sid,
+                        "request_id": frame.get("request_id"),
+                        "reason": "not_started",
+                        "execution_state": "not_started",
+                        "message": "session busy",
+                    }
+                )
                 return
             session.running = True
         future = self._executor.submit(self._run_spike_turn, session, dict(frame))
@@ -342,7 +360,16 @@ class ComputeHost:
         except Exception as exc:  # pragma: no cover - defensive host boundary
             with session.lock:
                 session.running = False
-            self.emit({"type": "turn.error", "sid": session.sid, "request_id": request_id, "message": str(exc)})
+            self.emit(
+                {
+                    "type": "turn.error",
+                    "sid": session.sid,
+                    "request_id": request_id,
+                    "reason": "exception",
+                    "execution_state": "ambiguous",
+                    "message": str(exc),
+                }
+            )
 
     # ── Real dashboard turn path ───────────────────────────────────────
 
@@ -350,8 +377,18 @@ class ComputeHost:
         sid = str(frame.get("sid") or "")
         request_id = str(frame.get("request_id") or uuid.uuid4().hex)
         if not sid:
-            self.emit({"type": "turn.error", "sid": sid, "request_id": request_id, "message": "sid required"})
+            self.emit(
+                {
+                    "type": "turn.error",
+                    "sid": sid,
+                    "request_id": request_id,
+                    "reason": "not_started",
+                    "execution_state": "not_started",
+                    "message": "sid required",
+                }
+            )
             return
+        execution_started = False
         try:
             from tui_gateway import server
 
@@ -374,13 +411,23 @@ class ComputeHost:
                     )
                     return
                 if session.get("running"):
-                    self.emit({"type": "turn.error", "sid": sid, "request_id": request_id, "message": "session busy"})
+                    self.emit(
+                        {
+                            "type": "turn.error",
+                            "sid": sid,
+                            "request_id": request_id,
+                            "reason": "not_started",
+                            "execution_state": "not_started",
+                            "message": "session busy",
+                        }
+                    )
                     return
                 session["running"] = True
                 session["_turn_cancel_requested"] = False
                 session["last_active"] = time.time()
                 server._start_inflight_turn(session, frame.get("text") if "text" in frame else frame.get("prompt"))
             self.emit({"type": "turn.started", "sid": sid, "request_id": request_id, "started_ns": now_ns()})
+            execution_started = True
             try:
                 server._ensure_session_db_row(session)
             except Exception:
@@ -401,6 +448,28 @@ class ComputeHost:
             if run_thread is not None and hasattr(run_thread, "join"):
                 run_thread.join()
             with session["history_lock"]:
+                outcome = session.pop("_prompt_terminal_outcome", None)
+            terminal_success = bool(
+                isinstance(outcome, dict)
+                and str(outcome.get("request_id")) == request_id
+                and outcome.get("disposition") == "terminal"
+            )
+            if not terminal_success:
+                with session["history_lock"]:
+                    session["running"] = False
+                self._bump_progress()
+                self.emit(
+                    {
+                        "type": "turn.error",
+                        "sid": sid,
+                        "request_id": request_id,
+                        "reason": "terminal_not_committed",
+                        "execution_state": "ambiguous",
+                        "message": "compute host turn did not publish terminal success",
+                    }
+                )
+                return
+            with session["history_lock"]:
                 history_version = int(session.get("history_version", 0))
                 message_count = len(session.get("history") or [])
                 interrupted = bool(session.get("_turn_cancel_requested"))
@@ -416,6 +485,7 @@ class ComputeHost:
                     "session_key": session_key,
                     "message_count": message_count,
                     "interrupted": interrupted,
+                    "terminal_success": True,
                     "ended_ns": now_ns(),
                     "session_info": session_info,
                     "session_info_emitted": True,
@@ -432,13 +502,23 @@ class ComputeHost:
                         server._clear_inflight_turn(session)
             except Exception:
                 pass
-            self.emit({"type": "turn.error", "sid": sid, "request_id": request_id, "reason": "exception", "message": str(exc)})
+            self.emit(
+                {
+                    "type": "turn.error",
+                    "sid": sid,
+                    "request_id": request_id,
+                    "reason": "exception" if execution_started else "not_started",
+                    "execution_state": "ambiguous" if execution_started else "not_started",
+                    "message": str(exc),
+                }
+            )
 
     def _ensure_server_session(self, server: Any, frame: dict[str, Any]) -> dict:
         sid = str(frame.get("sid") or "")
         key = str(frame.get("session_key") or sid)
         session = server._sessions.get(sid)
         if session is not None:
+            session["_compute_host_worker"] = True
             session["transport"] = self._transport
             if frame.get("cols") is not None:
                 session["cols"] = int(frame.get("cols") or 80)
@@ -451,19 +531,45 @@ class ComputeHost:
             return session
 
         history = frame.get("history") if isinstance(frame.get("history"), list) else []
-        profile_home = str(frame.get("profile_home") or "")
+        frame_profile_home = str(frame.get("profile_home") or "").strip()
+        if frame_profile_home:
+            effective_profile_home = Path(frame_profile_home).expanduser().resolve()
+        else:
+            # Launch/default sessions intentionally omit profile_home on the
+            # wire. Resolve the child process's effective Hermes home instead
+            # of treating an empty string as "no durable transcript".
+            from hermes_constants import get_hermes_home
+
+            effective_profile_home = Path(get_hermes_home()).expanduser().resolve()
+        profile_home = str(effective_profile_home)
+        try:
+            seeded_history_version = max(0, int(frame.get("history_version") or 0))
+        except (TypeError, ValueError):
+            seeded_history_version = 0
         session_db = None
         home_token = None
         secret_token = None
         try:
-            if profile_home:
-                from hermes_constants import set_hermes_home_override
-                from agent.secret_scope import build_profile_secret_scope, set_secret_scope
-                from hermes_state import SessionDB
+            from agent.secret_scope import build_profile_secret_scope, set_secret_scope
+            from hermes_constants import set_hermes_home_override
+            from hermes_state import SessionDB
 
-                home_token = set_hermes_home_override(profile_home)
-                secret_token = set_secret_scope(build_profile_secret_scope(Path(profile_home)))
-                session_db = SessionDB(db_path=Path(profile_home) / "state.db")
+            home_token = set_hermes_home_override(profile_home)
+            secret_token = set_secret_scope(build_profile_secret_scope(effective_profile_home))
+            session_db = SessionDB(db_path=effective_profile_home / "state.db")
+            try:
+                persisted_history = session_db.get_messages_as_conversation(
+                    key,
+                    repair_alternation=True,
+                )
+            except Exception:
+                persisted_history = []
+            if isinstance(persisted_history, list) and persisted_history:
+                # The serving process mirrors only metadata after an isolated
+                # turn. On host respawn its frame history can therefore be
+                # stale; the profile-scoped DB is the durable transcript
+                # authority. Fall back to the frame only for a brand-new row.
+                history = list(persisted_history)
             agent = server._make_agent(
                 sid,
                 key,
@@ -478,9 +584,14 @@ class ComputeHost:
             if home_token is not None:
                 try:
                     from hermes_constants import reset_hermes_home_override
-                    from agent.secret_scope import reset_secret_scope
 
                     reset_hermes_home_override(home_token)
+                except Exception:
+                    pass
+            if secret_token is not None:
+                try:
+                    from agent.secret_scope import reset_secret_scope
+
                     reset_secret_scope(secret_token)
                 except Exception:
                     pass
@@ -498,6 +609,7 @@ class ComputeHost:
                     cwd=str(frame.get("cwd") or "") or None,
                     session_db=session_db,
                     source=frame.get("source"),
+                    compute_host_worker=True,
                 )
             finally:
                 reset_transport(token)
@@ -510,11 +622,12 @@ class ComputeHost:
                 "session_key": key,
                 "history": list(history),
                 "history_lock": threading.Lock(),
-                "history_version": int(frame.get("history_version") or 0),
+                "history_version": seeded_history_version,
                 "inflight_turn": None,
                 "created_at": time.time(),
                 "last_active": time.time(),
                 "running": False,
+                "_compute_host_worker": True,
                 "attached_images": [],
                 "image_counter": 0,
                 "cwd": str(frame.get("cwd") or os.getcwd()),
@@ -529,8 +642,13 @@ class ComputeHost:
                 "transport": self._transport,
             }
         session = server._sessions[sid]
+        session["_compute_host_worker"] = True
         session["transport"] = self._transport
-        session["profile_home"] = profile_home or session.get("profile_home")
+        session["profile_home"] = profile_home
+        session["history_version"] = max(
+            seeded_history_version,
+            int(session.get("history_version", 0) or 0),
+        )
         if isinstance(frame.get("attached_images"), list):
             session["attached_images"] = list(frame.get("attached_images") or [])
         if frame.get("model_override") is not None:

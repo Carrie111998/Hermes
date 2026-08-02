@@ -399,7 +399,11 @@ def _split_tool_diagnostics(output: str) -> tuple[str, str]:
 # diagnostics ("rg: ...", "grep: ...", "error: ...", indented carets) never
 # match because the path token forbids whitespace and a leading tool prefix
 # like "rg" is followed by ": " (space) which the negated class rejects.
-_SEARCH_OUTPUT_RE = re.compile(r'^([A-Za-z]:)?[^\s:][^\n]*?[:\-]\d|^[^\s:][^\s]*$')
+_SEARCH_OUTPUT_RE = re.compile(
+    r"^(?:[A-Za-z]:)?[^\s:][^\n]*?:\d+(?::|$)"
+    r"|^(?:[A-Za-z]:)?[^\s:][^\n]*?-\d+-"
+    r"|^[^\s:][^\s]*$"
+)
 
 
 def _parse_search_context_line(line: str) -> tuple[str, int, str] | None:
@@ -768,10 +772,38 @@ def _pattern_has_regex_newline(pattern: str) -> bool:
 
 
 def _is_line_oriented_newline_error(error: Optional[str]) -> bool:
-    """Return True for rg's hard error when multiline mode is required."""
+    """Return True only for rg's shaped multiline-required diagnostic.
+
+    Match the diagnostic's anchored first line plus its dedicated remediation
+    line. Mere keyword coincidence in an unrelated search failure must remain
+    a hard error.
+    """
     if not error:
         return False
-    return "literal \"\\n\" is not allowed" in error and "--multiline" in error
+
+    lines = [line.strip() for line in error.splitlines() if line.strip()]
+    if not lines:
+        return False
+
+    first = lines[0]
+    for prefix in ("Search failed:", "rg:"):
+        if first.lower().startswith(prefix.lower()):
+            first = first[len(prefix):].lstrip()
+    if first.lower().startswith("rg:"):
+        first = first[3:].lstrip()
+
+    diagnostic = re.fullmatch(
+        r"the literal\s+['\"]*\\n['\"]*\s+is not allowed in a regex",
+        first,
+        flags=re.IGNORECASE,
+    )
+    remediation = any(
+        line.lower().startswith(
+            "consider enabling multiline mode with the --multiline flag"
+        )
+        for line in lines[1:]
+    )
+    return diagnostic is not None and remediation
 
 
 def _maybe_warn_line_oriented_newline_pattern(result: SearchResult, pattern: str) -> SearchResult:

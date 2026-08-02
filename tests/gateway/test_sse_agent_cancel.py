@@ -8,7 +8,10 @@ task wrapper is cancelled.
 
 import asyncio
 import queue
+import threading
 from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 
 
 # ---------------------------------------------------------------------------
@@ -120,6 +123,286 @@ class TestSSEAgentCancelOnDisconnect:
 
         asyncio.run(run())
 
+    def test_already_done_task_not_cancelled_on_disconnect(self):
+        """If agent already finished before disconnect, don't try to cancel."""
+        adapter = _make_adapter()
+
+        stream_q = queue.Queue()
+        stream_q.put("data")
+
+        async def fake_agent():
+            return {"final_response": "done"}, {}
+
+        async def run():
+            from aiohttp import web
+
+            agent_task = asyncio.ensure_future(fake_agent())
+            await asyncio.sleep(0)  # Let agent complete
+
+            mock_response = AsyncMock(spec=web.StreamResponse)
+            call_count = 0
+
+            async def write_side_effect(data):
+                nonlocal call_count
+                call_count += 1
+                if call_count >= 2:
+                    raise ConnectionResetError("late disconnect")
+
+            mock_response.write = AsyncMock(side_effect=write_side_effect)
+            mock_response.prepare = AsyncMock()
+
+            with patch("gateway.platforms.api_server.web.StreamResponse",
+                       return_value=mock_response):
+                await adapter._write_sse_chat_completion(
+                    _make_request(), "cmpl-done", "gpt-4", 1234567890,
+                    stream_q, agent_task,
+                )
+
+            # Task was already done — should not be cancelled
+            assert agent_task.done()
+            assert not agent_task.cancelled()
+
+        asyncio.run(run())
+
+    def test_agent_interrupt_called_on_disconnect(self):
+        """When the client disconnects, agent.interrupt() must be called
+        so the agent thread stops making LLM API calls."""
+        adapter = _make_adapter()
+
+        stream_q = queue.Queue()
+        stream_q.put("hello ")
+
+        agent_done = asyncio.Event()
+
+        async def fake_agent():
+            await agent_done.wait()
+            return {"final_response": "done"}, {}
+
+        # Mock agent with an interrupt method
+        mock_agent = MagicMock()
+        mock_agent.interrupt = MagicMock()
+
+        async def run():
+            from aiohttp import web
+
+            agent_task = asyncio.ensure_future(fake_agent())
+            agent_ref = [mock_agent]
+
+            mock_response = AsyncMock(spec=web.StreamResponse)
+            call_count = 0
+
+            async def write_side_effect(data):
+                nonlocal call_count
+                call_count += 1
+                if call_count >= 2:
+                    raise ConnectionResetError("client disconnected")
+
+            mock_response.write = AsyncMock(side_effect=write_side_effect)
+            mock_response.prepare = AsyncMock()
+
+            with patch("gateway.platforms.api_server.web.StreamResponse",
+                       return_value=mock_response):
+                await adapter._write_sse_chat_completion(
+                    _make_request(), "cmpl-int", "gpt-4", 1234567890,
+                    stream_q, agent_task, agent_ref,
+                )
+
+            # agent.interrupt() must have been called
+            mock_agent.interrupt.assert_called_once_with("SSE client disconnected")
+            # Clean up
+            agent_done.set()
+
+        asyncio.run(run())
+
+    def test_agent_ref_none_still_cancels_task(self):
+        """When agent_ref is not provided (None), the task is still cancelled
+        on disconnect — just without the interrupt() call."""
+        adapter = _make_adapter()
+
+        stream_q = queue.Queue()
+
+        async def fake_agent():
+            await asyncio.sleep(999)
+            return {}, {}
+
+        async def run():
+            from aiohttp import web
+
+            agent_task = asyncio.ensure_future(fake_agent())
+
+            mock_response = AsyncMock(spec=web.StreamResponse)
+            mock_response.write = AsyncMock(side_effect=BrokenPipeError("gone"))
+            mock_response.prepare = AsyncMock()
+
+            with patch("gateway.platforms.api_server.web.StreamResponse",
+                       return_value=mock_response):
+                # No agent_ref passed — should still handle disconnect cleanly
+                await adapter._write_sse_chat_completion(
+                    _make_request(), "cmpl-noref", "gpt-4", 1234567890,
+                    stream_q, agent_task,
+                )
+
+            assert agent_task.cancelled() or agent_task.done()
+
+        asyncio.run(run())
+
+    def test_prepare_failure_interrupts_and_joins_agent(self):
+        adapter = _make_adapter()
+        stream_q = queue.Queue()
+        agent_done = asyncio.Event()
+        mock_agent = MagicMock()
+        cancel_signal = threading.Event()
+
+        async def fake_agent():
+            await agent_done.wait()
+            return {
+                "completed": False,
+                "failed": True,
+                "receipt_terminal_success": False,
+            }, {}
+
+        async def run():
+            from aiohttp import web
+
+            mock_agent.interrupt.side_effect = lambda _reason: agent_done.set()
+            agent_task = asyncio.create_task(fake_agent())
+            response = AsyncMock(spec=web.StreamResponse)
+            response.prepare = AsyncMock(
+                side_effect=ConnectionResetError("prepare disconnected")
+            )
+            with patch(
+                "gateway.platforms.api_server.web.StreamResponse",
+                return_value=response,
+            ):
+                await adapter._write_sse_chat_completion(
+                    _make_request(),
+                    "cmpl-prepare",
+                    "gpt-4",
+                    1234567890,
+                    stream_q,
+                    agent_task,
+                    [mock_agent, cancel_signal],
+                )
+
+            assert cancel_signal.is_set()
+            mock_agent.interrupt.assert_called_once_with("SSE client disconnected")
+            assert agent_task.done()
+            assert not agent_task.cancelled()
+
+        asyncio.run(run())
+
+    def test_cancellation_while_waiting_for_delta_interrupts_and_joins_agent(self):
+        adapter = _make_adapter()
+        stream_q = queue.Queue()
+        agent_done = asyncio.Event()
+        first_write = asyncio.Event()
+        mock_agent = MagicMock()
+        cancel_signal = threading.Event()
+
+        async def fake_agent():
+            await agent_done.wait()
+            return {
+                "completed": False,
+                "failed": True,
+                "receipt_terminal_success": False,
+            }, {}
+
+        async def run():
+            from aiohttp import web
+
+            mock_agent.interrupt.side_effect = lambda _reason: agent_done.set()
+            agent_task = asyncio.create_task(fake_agent())
+            response = AsyncMock(spec=web.StreamResponse)
+            response.prepare = AsyncMock()
+
+            async def write(_data):
+                first_write.set()
+
+            response.write = AsyncMock(side_effect=write)
+            with patch(
+                "gateway.platforms.api_server.web.StreamResponse",
+                return_value=response,
+            ):
+                writer_task = asyncio.create_task(
+                    adapter._write_sse_chat_completion(
+                        _make_request(),
+                        "cmpl-wait",
+                        "gpt-4",
+                        1234567890,
+                        stream_q,
+                        agent_task,
+                        [mock_agent, cancel_signal],
+                    )
+                )
+                await first_write.wait()
+                writer_task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await writer_task
+
+            assert cancel_signal.is_set()
+            mock_agent.interrupt.assert_called_once_with("SSE client disconnected")
+            assert agent_task.done()
+            assert not agent_task.cancelled()
+
+        asyncio.run(run())
+
+    def test_non_transport_writer_failure_interrupts_agent_and_never_reports_success(self):
+        adapter = _make_adapter()
+        stream_q = queue.Queue()
+        stream_q.put("delta")
+        agent_done = asyncio.Event()
+        mock_agent = MagicMock()
+        cancel_signal = threading.Event()
+        chunks = []
+
+        async def fake_agent():
+            await agent_done.wait()
+            return {
+                "completed": False,
+                "failed": True,
+                "receipt_terminal_success": False,
+            }, {}
+
+        async def run():
+            from aiohttp import web
+
+            mock_agent.interrupt.side_effect = lambda _reason: agent_done.set()
+            agent_task = asyncio.create_task(fake_agent())
+            response = AsyncMock(spec=web.StreamResponse)
+            response.prepare = AsyncMock()
+            call_count = 0
+
+            async def write(data):
+                nonlocal call_count
+                call_count += 1
+                if call_count == 2:
+                    raise RuntimeError("writer codec failed")
+                chunks.append(data.decode())
+
+            response.write = AsyncMock(side_effect=write)
+            with patch(
+                "gateway.platforms.api_server.web.StreamResponse",
+                return_value=response,
+            ):
+                await adapter._write_sse_chat_completion(
+                    _make_request(),
+                    "cmpl-writer",
+                    "gpt-4",
+                    1234567890,
+                    stream_q,
+                    agent_task,
+                    [mock_agent, cancel_signal],
+                )
+
+            assert cancel_signal.is_set()
+            mock_agent.interrupt.assert_called_once_with("SSE client disconnected")
+            assert agent_task.done()
+            rendered = "".join(chunks)
+            assert '"receipt_terminal_success": false' in rendered
+            assert '"finish_reason": "stop"' not in rendered
+
+        asyncio.run(run())
+
 
 def _capturing_response():
     """Mock StreamResponse that records all written SSE bytes as text."""
@@ -189,3 +472,72 @@ class TestSSEAgentFailureFinishReason:
         assert "data: [DONE]" in sse
 
 
+        reason, finish, _ = self._run(failed)
+        assert reason == "error"
+        assert finish.get("hermes", {}).get("failed") is True
+
+    def test_truncated_result_reports_length(self):
+        async def trunc():
+            return (
+                {"final_response": "half", "partial": True, "completed": False,
+                 "error": "output was truncated"},
+                {"input_tokens": 5, "output_tokens": 3, "total_tokens": 8},
+            )
+
+        reason, finish, _ = self._run(trunc)
+        assert reason == "length"
+        assert finish["hermes"]["error_code"] == "output_truncated"
+
+    def test_successful_completion_reports_stop(self):
+        async def ok():
+            return (
+                {
+                    "final_response": "hi",
+                    "completed": True,
+                    "receipt_terminal_success": True,
+                    "failed": False,
+                    "partial": False,
+                    "interrupted": False,
+                    "cleanup_errors": [],
+                    "session_id": "child-session",
+                },
+                {"input_tokens": 5, "output_tokens": 2, "total_tokens": 7},
+            )
+
+        reason, finish, _ = self._run(ok)
+        assert reason == "stop"
+        assert "error" not in finish
+        assert finish["hermes"]["receipt_terminal_success"] is True
+        assert finish["hermes"]["session_id"] == "child-session"
+
+    @pytest.mark.parametrize(
+        "result",
+        [
+            {"completed": True, "receipt_terminal_success": False},
+            {
+                "completed": True,
+                "receipt_terminal_success": False,
+                "cleanup_errors": ["private cleanup detail"],
+            },
+            {
+                "completed": False,
+                "receipt_terminal_success": False,
+                "interrupted": True,
+            },
+            {
+                "completed": False,
+                "receipt_terminal_success": False,
+                "partial": True,
+            },
+        ],
+    )
+    def test_noncanonical_terminal_result_never_reports_stop(self, result):
+        async def noncanonical():
+            return (
+                {"final_response": "partial", "session_id": "parent", **result},
+                {"input_tokens": 5, "output_tokens": 1, "total_tokens": 6},
+            )
+
+        reason, finish, _ = self._run(noncanonical)
+        assert reason in {"error", "length"}
+        assert finish["hermes"]["receipt_terminal_success"] is False

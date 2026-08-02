@@ -723,6 +723,9 @@ def run_codex_app_server_turn(
             "messages": messages,
             "api_calls": 0,
             "completed": False,
+            "receipt_terminal_success": False,
+            "failed": True,
+            "interrupted": False,
             "partial": True,
             "interrupted": _user_interrupted,
             **(
@@ -864,6 +867,9 @@ def run_codex_app_server_turn(
         "messages": messages,
         "api_calls": api_calls,
         "completed": not turn.interrupted and turn.error is None,
+        "receipt_terminal_success": not turn.interrupted and turn.error is None,
+        "failed": turn.error is not None,
+        "interrupted": turn.interrupted,
         "partial": turn.interrupted or turn.error is not None,
         "interrupted": _user_interrupted,
         **(

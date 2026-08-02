@@ -27,7 +27,9 @@ turn against the pre-rotation parent session exactly as #56391 describes.
 
 from datetime import datetime
 from types import SimpleNamespace
+import threading
 from unittest.mock import AsyncMock, MagicMock
+from typing import cast
 
 import pytest
 
@@ -50,7 +52,7 @@ def _make_event(text: str) -> MessageEvent:
     return MessageEvent(text=text, source=_make_source(), message_id="m1")
 
 
-def _make_runner(*, compression_in_flight: bool):
+def _make_runner(tmp_path, *, compression_in_flight: bool):
     """Minimal GatewayRunner with an active running agent for this session.
 
     Mirrors tests/gateway/test_running_agent_session_toggles.py's harness
@@ -73,6 +75,7 @@ def _make_runner(*, compression_in_flight: bool):
 
     source = _make_source()
     sk = build_session_key(source)
+    adapter._active_sessions = {sk: MagicMock()}
     session_entry = SessionEntry(
         session_key=sk,
         session_id="sess-1",
@@ -108,6 +111,13 @@ def _make_runner(*, compression_in_flight: bool):
     runner._emit_gateway_run_progress = AsyncMock()
     runner._draining = False
     runner._busy_input_mode = "interrupt"
+    runner._busy_queue_root_override = tmp_path / "profile"
+    runner._busy_queue_lock = threading.RLock()
+    runner._busy_queue_uncertain_sessions = set()
+    runner._busy_queue_restored_sessions = set()
+    runner._queued_events = {}
+    runner._adapter_for_source = lambda source: adapter
+    runner._busy_queue_max_bytes = lambda: 1024 * 1024
 
     # No subagents active — isolates the compression-demotion behavior from
     # the (already-correct) subagent-demotion branch.
@@ -134,11 +144,11 @@ def _make_runner(*, compression_in_flight: bool):
 
 
 @pytest.mark.asyncio
-async def test_priority_path_does_not_interrupt_when_compression_in_flight():
+async def test_priority_path_does_not_interrupt_when_compression_in_flight(tmp_path):
     """A plain-text follow-up must NOT interrupt the running agent while
     context compression is in flight — it must queue instead, mirroring
     _handle_active_session_busy_message's #56391 demotion."""
-    runner, agent_mock, sk = _make_runner(compression_in_flight=True)
+    runner, agent_mock, sk = _make_runner(tmp_path, compression_in_flight=True)
 
     await runner._handle_message(_make_event("still there?"))
 
@@ -148,20 +158,25 @@ async def test_priority_path_does_not_interrupt_when_compression_in_flight():
 
 
 @pytest.mark.asyncio
-async def test_priority_path_still_interrupts_without_compression_lock():
-    """Sanity control: without a compression lock, the PRIORITY path's
-    default interrupt behavior is unchanged."""
-    runner, agent_mock, sk = _make_runner(compression_in_flight=False)
+async def test_priority_interrupt_is_admitted_before_signal(tmp_path):
+    """Without a compression lock, interrupt mode persists the follow-up
+    before signaling the monitor; it never calls the agent directly."""
+    runner, agent_mock, sk = _make_runner(tmp_path, compression_in_flight=False)
 
-    await runner._handle_message(_make_event("still there?"))
+    result = await runner._handle_message(_make_event("still there?"))
 
-    agent_mock.interrupt.assert_called_once_with("still there?")
+    assert result is None
+    agent_mock.interrupt.assert_not_called()
+    signal = cast(MagicMock, runner.adapters[Platform.TELEGRAM]._active_sessions[sk])
+    signal.set.assert_called_once_with()
+    queued = runner.adapters[Platform.TELEGRAM]._pending_messages.get(sk)
+    assert queued is not None and queued.text == "still there?"
 
 
 @pytest.mark.asyncio
-async def test_priority_dispatch_delegates_smart_mode_without_legacy_interrupt():
+async def test_priority_dispatch_delegates_smart_mode_without_legacy_interrupt(tmp_path):
     """The inline PRIORITY path must not reinterpret SMART as interrupt."""
-    runner, agent_mock, sk = _make_runner(compression_in_flight=False)
+    runner, agent_mock, sk = _make_runner(tmp_path, compression_in_flight=False)
     runner._busy_input_mode = "smart"
     runner._handle_smart_busy_message = AsyncMock(return_value=True)
     event = _make_event("normal SMART follow-up")
@@ -179,9 +194,9 @@ async def test_priority_dispatch_delegates_smart_mode_without_legacy_interrupt()
 
 
 @pytest.mark.asyncio
-async def test_priority_smart_internal_event_queues_without_legacy_interrupt():
+async def test_priority_smart_internal_event_queues_without_legacy_interrupt(tmp_path):
     """Synthetic/internal follow-ups skip classification but remain fail-closed."""
-    runner, agent_mock, sk = _make_runner(compression_in_flight=False)
+    runner, agent_mock, sk = _make_runner(tmp_path, compression_in_flight=False)
     runner._busy_input_mode = "smart"
     runner._handle_smart_busy_message = AsyncMock(return_value=True)
     event = _make_event("internal SMART follow-up")
@@ -194,3 +209,23 @@ async def test_priority_smart_internal_event_queues_without_legacy_interrupt():
     agent_mock.interrupt.assert_not_called()
     queued = runner.adapters[Platform.TELEGRAM]._pending_messages.get(sk)
     assert queued is not None and queued.text == event.text
+
+
+@pytest.mark.asyncio
+async def test_priority_smart_internal_event_rejects_when_durable_admission_fails(tmp_path):
+    runner, agent_mock, sk = _make_runner(tmp_path, compression_in_flight=False)
+    runner._busy_input_mode = "smart"
+    runner._queue_or_replace_pending_event = MagicMock(return_value=False)
+    event = _make_event("internal SMART follow-up")
+    event.internal = True
+
+    result = await runner._handle_message(event)
+
+    assert result == "⚠ Message not accepted: durable admission failed."
+    runner._queue_or_replace_pending_event.assert_called_once_with(
+        sk,
+        event,
+        coalesce=False,
+        already_accepted=False,
+    )
+    agent_mock.interrupt.assert_not_called()

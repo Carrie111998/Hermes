@@ -52,6 +52,7 @@ import os
 import re
 import sqlite3
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -125,6 +126,7 @@ DEFAULT_PORT = 8642
 MAX_STORED_RESPONSES = 100
 MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversations with tool calls
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
+CHAT_COMPLETIONS_SSE_CANCEL_GRACE_SECONDS = 5.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
 RESPONSES_AUTO_TRUNCATION_HISTORY_LIMIT = 100
@@ -3924,7 +3926,7 @@ class APIServerAdapter(BasePlatformAdapter):
             # side-by-side with ``tool_start_callback``/``tool_complete_callback``.
             # The structured callbacks are strictly richer (they carry
             # the tool_call id), so they own the chat-completions SSE channel.
-            agent_ref = [None]
+            agent_ref = [None, threading.Event()]
             agent_task = asyncio.ensure_future(self._run_agent(
                 user_message=user_message,
                 conversation_history=history,
@@ -4093,9 +4095,56 @@ class APIServerAdapter(BasePlatformAdapter):
         if gateway_session_key:
             sse_headers["X-Hermes-Session-Key"] = gateway_session_key
         response = web.StreamResponse(status=200, headers=sse_headers)
-        await response.prepare(request)
+
+        async def _interrupt_and_join_agent(reason: str) -> None:
+            """Fence a failed SSE transport before returning to the caller."""
+
+            cancel_signal = (
+                agent_ref[1]
+                if agent_ref is not None
+                and len(agent_ref) > 1
+                and hasattr(agent_ref[1], "set")
+                else None
+            )
+            if cancel_signal is not None:
+                cancel_signal.set()
+            agent = agent_ref[0] if agent_ref else None
+            if agent is not None and not agent_task.done():
+                try:
+                    agent.interrupt(reason)
+                except Exception:
+                    pass
+            if agent_task.done():
+                try:
+                    await agent_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+                return
+            if cancel_signal is None:
+                # Legacy callers cannot fence the executor startup race. Cancel
+                # their wrapper immediately after interrupting the live agent.
+                agent_task.cancel()
+                try:
+                    await agent_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+                return
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(agent_task),
+                    timeout=CHAT_COMPLETIONS_SSE_CANCEL_GRACE_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                agent_task.cancel()
+                try:
+                    await agent_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+            except (asyncio.CancelledError, Exception):
+                pass
 
         try:
+            await response.prepare(request)
             last_activity = time.monotonic()
 
             # Role chunk
@@ -4176,26 +4225,41 @@ class APIServerAdapter(BasePlatformAdapter):
             except Exception as exc:
                 agent_error = exc
                 logger.error(
-                    "Agent task %s failed during SSE streaming: %s", completion_id, exc
+                    "Agent task failed during SSE streaming error_type=%s",
+                    type(exc).__name__,
                 )
 
-            # Inspect the result dict for a flagged (non-exception) failure.
-            is_partial = bool(result.get("partial")) if isinstance(result, dict) else False
-            is_failed = bool(result.get("failed")) if isinstance(result, dict) else False
-            completed = bool(result.get("completed", True)) if isinstance(result, dict) else True
-            err_msg = result.get("error") if isinstance(result, dict) else None
-            if agent_error is not None:
-                is_failed = True
-                err_msg = err_msg or str(agent_error)
+            # Publish one canonical terminal envelope. [DONE] below means only
+            # framing EOF; consumers must use receipt_terminal_success.
+            result_dict = result if isinstance(result, dict) else {}
+            is_partial = result_dict.get("partial") is True
+            completed = result_dict.get("completed") is True
+            interrupted = result_dict.get("interrupted") is True
+            raw_cleanup = result_dict.get("cleanup_errors")
+            cleanup_incomplete = bool(raw_cleanup) if isinstance(raw_cleanup, list) else False
+            declared_receipt = result_dict.get("receipt_terminal_success") is True
+            declared_failed = result_dict.get("failed") is True
+            terminal_success = bool(
+                agent_error is None
+                and declared_receipt
+                and completed
+                and not declared_failed
+                and not is_partial
+                and not interrupted
+                and not cleanup_incomplete
+            )
+            terminal_failed = bool(declared_failed or agent_error is not None or not terminal_success)
 
-            # Decide finish_reason, matching the non-streaming logic: "length"
-            # for truncation, "error" for failure, "stop" for normal completion.
-            if is_partial and err_msg and "truncat" in err_msg.lower():
+            if is_partial:
                 finish_reason = "length"
-            elif agent_error is not None or is_failed or (not completed and err_msg):
-                finish_reason = "error"
-            else:
+            elif terminal_success:
                 finish_reason = "stop"
+            else:
+                finish_reason = "error"
+
+            result_session_id = result_dict.get("session_id")
+            if not isinstance(result_session_id, str) or not result_session_id.strip():
+                result_session_id = session_id or completion_id
 
             # Finish chunk
             finish_chunk = {
@@ -4207,51 +4271,66 @@ class APIServerAdapter(BasePlatformAdapter):
                     "completion_tokens": usage.get("output_tokens", 0),
                     "total_tokens": usage.get("total_tokens", 0),
                 },
-            }
-            if finish_reason != "stop":
-                finish_chunk["choices"][0]["delta"] = {}
-                if err_msg:
-                    finish_chunk["error"] = {
-                        "message": err_msg,
-                        "type": type(agent_error).__name__ if agent_error else "agent_error",
-                    }
-                finish_chunk["hermes"] = {
+                "hermes": {
+                    "receipt_terminal_success": terminal_success,
                     "completed": completed,
+                    "failed": terminal_failed,
                     "partial": is_partial,
-                    "failed": is_failed,
-                    "error": err_msg,
-                    "error_code": "output_truncated" if finish_reason == "length" else "agent_error",
+                    "interrupted": interrupted,
+                    "cleanup_errors": (
+                        ["remote_cleanup_incomplete"] if cleanup_incomplete else []
+                    ),
+                    "session_id": result_session_id,
+                    "error_code": (
+                        None
+                        if terminal_success
+                        else ("output_truncated" if finish_reason == "length" else "agent_error")
+                    ),
+                },
+            }
+            if not terminal_success:
+                finish_chunk["error"] = {
+                    "message": "Remote agent did not complete successfully",
+                    "type": type(agent_error).__name__ if agent_error else "agent_error",
                 }
             await response.write(f"data: {json.dumps(finish_chunk)}\n\n".encode())
             await response.write(b"data: [DONE]\n\n")
+        except asyncio.CancelledError:
+            await _interrupt_and_join_agent("SSE client disconnected")
+            raise
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
-            # Client disconnected mid-stream.  Interrupt the agent so it
-            # stops making LLM API calls at the next loop iteration, then
-            # cancel the asyncio task wrapper.
-            agent = agent_ref[0] if agent_ref else None
-            if agent is not None:
-                try:
-                    agent.interrupt("SSE client disconnected")
-                except Exception:
-                    pass
-            if not agent_task.done():
-                agent_task.cancel()
-                try:
-                    await agent_task
-                except (asyncio.CancelledError, Exception):
-                    pass
-            logger.info("SSE client disconnected; interrupted agent task %s", completion_id)
-        except Exception as _exc:
-            # Agent crashed mid-stream.  Try to emit an error chunk
-            # so the client gets a proper response instead of a
-            # TransferEncodingError from incomplete chunked encoding.
-            import traceback as _tb
-            logger.error("Agent crashed mid-stream for %s: %s", completion_id, _tb.format_exc()[:300])
+            await _interrupt_and_join_agent("SSE client disconnected")
+            logger.info(
+                "SSE client disconnected; interrupted agent task %s",
+                completion_id,
+            )
+        except Exception as exc:
+            # A writer/runtime failure makes the stream non-authoritative. Stop
+            # and join the agent before attempting a best-effort error envelope.
+            await _interrupt_and_join_agent("SSE client disconnected")
+            logger.error(
+                "Agent crashed mid-stream error_type=%s",
+                type(exc).__name__,
+            )
             try:
                 error_chunk = {
                     "id": completion_id, "object": "chat.completion.chunk",
                     "created": created, "model": model,
                     "choices": [{"index": 0, "delta": {}, "finish_reason": "error"}],
+                    "error": {
+                        "message": "Remote agent did not complete successfully",
+                        "type": "agent_error",
+                    },
+                    "hermes": {
+                        "receipt_terminal_success": False,
+                        "completed": False,
+                        "failed": True,
+                        "partial": True,
+                        "interrupted": False,
+                        "cleanup_errors": [],
+                        "session_id": session_id or completion_id,
+                        "error_code": "agent_error",
+                    },
                 }
                 await response.write(f"data: {json.dumps(error_chunk)}\n\n".encode())
                 await response.write(b"data: [DONE]\n\n")
@@ -5031,7 +5110,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "result": function_result,
                 }))
 
-            agent_ref = [None]
+            agent_ref = [None, threading.Event()]
             agent_task = asyncio.ensure_future(self._run_agent(
                 user_message=user_message,
                 conversation_history=conversation_history,
@@ -5805,6 +5884,13 @@ class APIServerAdapter(BasePlatformAdapter):
         # run_in_executor threads, so the profile scope must be re-entered
         # inside _run() from this explicit value.
         request_profile = _api_request_profile.get()
+        cancel_signal = (
+            agent_ref[1]
+            if agent_ref is not None
+            and len(agent_ref) > 1
+            and hasattr(agent_ref[1], "is_set")
+            else None
+        )
 
         def _run():
             from gateway.session_context import clear_session_vars
@@ -5833,6 +5919,28 @@ class APIServerAdapter(BasePlatformAdapter):
                     )
                     if agent_ref is not None:
                         agent_ref[0] = agent
+                    if cancel_signal is not None and cancel_signal.is_set():
+                        try:
+                            agent.interrupt("SSE client disconnected")
+                        except Exception:
+                            pass
+                        return (
+                            {
+                                "final_response": "",
+                                "completed": False,
+                                "failed": True,
+                                "partial": False,
+                                "interrupted": True,
+                                "receipt_terminal_success": False,
+                                "cleanup_errors": [],
+                                "session_id": session_id,
+                            },
+                            {
+                                "input_tokens": 0,
+                                "output_tokens": 0,
+                                "total_tokens": 0,
+                            },
+                        )
                     effective_task_id = session_id or str(uuid.uuid4())
                     result = agent.run_conversation(
                         user_message=user_message,

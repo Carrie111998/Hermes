@@ -13,13 +13,16 @@ import logging
 import os
 import shutil
 import sqlite3
+import stat
 import sys
 import tempfile
 import time
 import zipfile
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional
+from urllib.parse import quote
 
 from hermes_constants import get_default_hermes_root, get_hermes_home, display_hermes_home
 
@@ -250,8 +253,202 @@ def _should_skip_backup_file(abs_path: Path, rel_path: Path, out_path: Path) -> 
 
 
 # ---------------------------------------------------------------------------
-# SQLite safe copy
+# Private backup artifacts and SQLite safe copy
 # ---------------------------------------------------------------------------
+
+
+def _owned_by_current_user(metadata: os.stat_result) -> bool:
+    getuid = getattr(os, "geteuid", None)
+    return getuid is None or metadata.st_uid == getuid()
+
+
+def _validate_regular_owned_single_link(path: Path, *, purpose: str) -> os.stat_result:
+    metadata = path.lstat()
+    if path.is_symlink() or not stat.S_ISREG(metadata.st_mode):
+        raise OSError(f"unsafe {purpose} artifact type")
+    if not _owned_by_current_user(metadata) or metadata.st_nlink != 1:
+        raise OSError(f"unsafe {purpose} ownership or link count")
+    return metadata
+
+
+def _validate_open_regular_owned_single_link(
+    fd: int, *, purpose: str
+) -> os.stat_result:
+    metadata = os.fstat(fd)
+    if not stat.S_ISREG(metadata.st_mode):
+        raise OSError(f"unsafe {purpose} artifact type")
+    if not _owned_by_current_user(metadata) or metadata.st_nlink != 1:
+        raise OSError(f"unsafe {purpose} ownership or link count")
+    return metadata
+
+
+def _same_file_identity(left: os.stat_result, right: os.stat_result) -> bool:
+    return (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
+
+
+def _revalidate_pinned_path(path: Path, fd: int, *, purpose: str) -> os.stat_result:
+    path_metadata = _validate_regular_owned_single_link(path, purpose=purpose)
+    opened_metadata = _validate_open_regular_owned_single_link(fd, purpose=purpose)
+    if not _same_file_identity(path_metadata, opened_metadata):
+        raise OSError(f"{purpose} identity changed")
+    return opened_metadata
+
+
+def _sqlite_path_for_pinned_fd(fd: int, fallback: Path) -> Path:
+    """Return a descriptor-backed SQLite path where the platform provides one."""
+
+    if os.name == "nt":
+        return fallback.absolute()
+
+    opened_metadata = os.fstat(fd)
+    for descriptor_root in (Path("/proc/self/fd"), Path("/dev/fd")):
+        candidate = descriptor_root / str(fd)
+        try:
+            candidate_metadata = candidate.stat()
+        except OSError:
+            continue
+        if _same_file_identity(opened_metadata, candidate_metadata):
+            return candidate
+    raise OSError("descriptor-backed SQLite paths are unavailable")
+
+
+def _ensure_private_directory(path: Path) -> None:
+    """Create/validate one owner-only directory without following its leaf."""
+
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if os.name == "nt":
+        if path.is_symlink() or not path.is_dir():
+            raise OSError("unsafe quick snapshot directory")
+        return
+
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_DIRECTORY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags)
+    try:
+        metadata = os.fstat(fd)
+        if not stat.S_ISDIR(metadata.st_mode) or not _owned_by_current_user(metadata):
+            raise OSError("unsafe quick snapshot directory")
+        os.fchmod(fd, 0o700)
+    finally:
+        os.close(fd)
+
+
+def _ensure_private_directory_tree(root: Path, directory: Path) -> None:
+    """Create every directory below a validated private snapshot root."""
+
+    current = root
+    _ensure_private_directory(current)
+    for part in directory.relative_to(root).parts:
+        if part in ("", ".", ".."):
+            raise OSError("unsafe quick snapshot directory path")
+        current /= part
+        _ensure_private_directory(current)
+
+
+@contextmanager
+def _private_atomic_writer(out_path: Path) -> Iterator[Any]:
+    """Yield a private temp file and atomically publish it on success."""
+
+    _ensure_private_directory(out_path.parent)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{out_path.name}.", suffix=".tmp", dir=str(out_path.parent)
+    )
+    tmp_path = Path(tmp_name)
+    file_obj = None
+    try:
+        _validate_open_regular_owned_single_link(fd, purpose="snapshot temporary")
+        if os.name != "nt":
+            os.fchmod(fd, 0o600)
+        file_obj = os.fdopen(fd, "wb", closefd=True)
+        fd = -1
+        yield file_obj
+        file_obj.flush()
+        os.fsync(file_obj.fileno())
+        file_obj.close()
+        file_obj = None
+
+        if os.path.lexists(out_path):
+            _validate_regular_owned_single_link(out_path, purpose="snapshot output")
+        os.replace(tmp_path, out_path)
+        _validate_regular_owned_single_link(out_path, purpose="snapshot output")
+    finally:
+        if file_obj is not None:
+            file_obj.close()
+        elif fd >= 0:
+            os.close(fd)
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _private_copy_file(src: Path, dst: Path) -> None:
+    """Copy one regular owned file through pinned descriptors into a private file."""
+
+    expected = _validate_regular_owned_single_link(src, purpose="snapshot source")
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    src_fd = os.open(src, flags)
+    try:
+        opened = _validate_open_regular_owned_single_link(
+            src_fd, purpose="snapshot source"
+        )
+        if not _same_file_identity(expected, opened):
+            raise OSError("snapshot source changed before open")
+        with os.fdopen(src_fd, "rb", closefd=False) as source:
+            with _private_atomic_writer(dst) as target:
+                shutil.copyfileobj(source, target)
+                current = _validate_regular_owned_single_link(
+                    src, purpose="snapshot source"
+                )
+                opened = _validate_open_regular_owned_single_link(
+                    src_fd, purpose="snapshot source"
+                )
+                if not _same_file_identity(current, opened):
+                    raise OSError("snapshot source changed while copying")
+    finally:
+        os.close(src_fd)
+
+
+@contextmanager
+def _private_zip_writer(out_path: Path) -> Iterator[zipfile.ZipFile]:
+    """Open one owner-only zip without following an attacker-planted link."""
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    if os.path.lexists(out_path):
+        _validate_regular_owned_single_link(out_path, purpose="backup output")
+    flags = os.O_RDWR | os.O_CREAT | os.O_TRUNC
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(out_path, flags, 0o600)
+    file_obj = None
+    try:
+        metadata = os.fstat(fd)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or not _owned_by_current_user(metadata)
+            or metadata.st_nlink != 1
+        ):
+            raise OSError("unsafe backup output after open")
+        if os.name != "nt":
+            os.fchmod(fd, 0o600)
+        file_obj = os.fdopen(fd, "w+b", closefd=True)
+        fd = -1
+        with zipfile.ZipFile(
+            file_obj, "w", zipfile.ZIP_DEFLATED, compresslevel=6
+        ) as archive:
+            yield archive
+        file_obj.flush()
+        os.fsync(file_obj.fileno())
+    finally:
+        if file_obj is not None:
+            file_obj.close()
+        elif fd >= 0:
+            os.close(fd)
+
 
 def _safe_copy_db(src: Path, dst: Path) -> bool:
     """Copy a SQLite database safely using the backup() API.
@@ -262,17 +459,80 @@ def _safe_copy_db(src: Path, dst: Path) -> bool:
     """
     conn = None
     backup_conn = None
+    source_fd = None
+    destination_fd = None
+    candidate_path = None
     try:
-        conn = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
-        backup_conn = sqlite3.connect(str(dst))
+        source_metadata = _validate_regular_owned_single_link(
+            src, purpose="SQLite source"
+        )
+        source_flags = os.O_RDONLY
+        source_flags |= getattr(os, "O_CLOEXEC", 0)
+        source_flags |= getattr(os, "O_NOFOLLOW", 0)
+        source_fd = os.open(src, source_flags)
+        opened_source = _validate_open_regular_owned_single_link(
+            source_fd, purpose="SQLite source"
+        )
+        if not _same_file_identity(source_metadata, opened_source):
+            raise OSError("SQLite source identity changed before open")
+
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        expected_destination = None
+        if os.path.lexists(dst):
+            expected_destination = _validate_regular_owned_single_link(
+                dst, purpose="SQLite snapshot"
+            )
+
+        destination_fd, candidate_name = tempfile.mkstemp(
+            prefix=f".{dst.name}.", suffix=".tmp", dir=str(dst.parent)
+        )
+        candidate_path = Path(candidate_name)
+        _validate_open_regular_owned_single_link(
+            destination_fd, purpose="SQLite snapshot candidate"
+        )
+        if os.name != "nt":
+            os.fchmod(destination_fd, 0o600)
+
+        pinned_src = _sqlite_path_for_pinned_fd(source_fd, src)
+        encoded_src = quote(str(pinned_src), safe="/:")
+        conn = sqlite3.connect(f"file:{encoded_src}?mode=ro", uri=True)
+        _revalidate_pinned_path(src, source_fd, purpose="SQLite source")
+
+        pinned_dst = _sqlite_path_for_pinned_fd(destination_fd, candidate_path)
+        encoded_dst = quote(str(pinned_dst), safe="/:")
+        backup_conn = sqlite3.connect(f"file:{encoded_dst}?mode=rw", uri=True)
+        _revalidate_pinned_path(
+            candidate_path,
+            destination_fd,
+            purpose="SQLite snapshot candidate",
+        )
         conn.backup(backup_conn)
+        backup_conn.close()
+        backup_conn = None
+        conn.close()
+        conn = None
+        os.fsync(destination_fd)
+        _revalidate_pinned_path(src, source_fd, purpose="SQLite source")
+        _revalidate_pinned_path(
+            candidate_path,
+            destination_fd,
+            purpose="SQLite snapshot candidate",
+        )
+        if expected_destination is None:
+            if os.path.lexists(dst):
+                raise OSError("SQLite snapshot destination appeared during backup")
+        else:
+            current_destination = _validate_regular_owned_single_link(
+                dst, purpose="SQLite snapshot"
+            )
+            if not _same_file_identity(expected_destination, current_destination):
+                raise OSError("SQLite snapshot destination identity changed")
+        os.replace(candidate_path, dst)
+        candidate_path = None
+        _revalidate_pinned_path(dst, destination_fd, purpose="SQLite snapshot")
         return True
     except Exception as exc:
         logger.warning("SQLite safe copy failed for %s: %s", src, exc)
-        try:
-            dst.unlink(missing_ok=True)
-        except OSError:
-            pass
         return False
     finally:
         for connection in (backup_conn, conn):
@@ -281,6 +541,19 @@ def _safe_copy_db(src: Path, dst: Path) -> bool:
                     connection.close()
                 except Exception:
                     pass
+        if candidate_path is not None and destination_fd is not None:
+            try:
+                _revalidate_pinned_path(
+                    candidate_path,
+                    destination_fd,
+                    purpose="SQLite snapshot candidate",
+                )
+                candidate_path.unlink()
+            except OSError:
+                pass
+        for fd in (destination_fd, source_fd):
+            if fd is not None:
+                os.close(fd)
 
 
 def is_zeroed_sqlite_file(
@@ -511,7 +784,10 @@ def run_backup(args) -> None:
 
     # Determine output path
     if args.output:
-        out_path = Path(args.output).expanduser().resolve()
+        expanded_output = Path(args.output).expanduser()
+        # Keep the final component unresolved so O_NOFOLLOW can reject a
+        # planted output symlink instead of silently converting it to its target.
+        out_path = Path(os.path.abspath(str(expanded_output)))
         # If user gave a directory, put the zip inside it
         if out_path.is_dir():
             stamp = datetime.now().strftime("%Y-%m-%d-%H%M%S")
@@ -593,7 +869,14 @@ def run_backup(args) -> None:
     errors = []
     t0 = time.monotonic()
 
-    with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+    if os.path.lexists(out_path):
+        try:
+            _validate_regular_owned_single_link(out_path, purpose="backup output")
+        except OSError:
+            print("Error: Backup output path is not a safe private regular file.")
+            sys.exit(1)
+
+    with _private_zip_writer(out_path) as zf:
         for i, (abs_path, rel_path) in enumerate(files_to_add, 1):
             try:
                 # Safe copy for SQLite databases (handles WAL mode)
@@ -1060,7 +1343,8 @@ def create_quick_snapshot(
     ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     snap_id = f"{ts}-{label}" if label else ts
     snap_dir = root / snap_id
-    snap_dir.mkdir(parents=True, exist_ok=True)
+    _ensure_private_directory(root)
+    _ensure_private_directory_tree(root, snap_dir)
 
     manifest: Dict[str, int] = {}  # rel_path -> file size
     failed_dbs: list[str] = []  # present *.db that could not be snapshotted
@@ -1093,7 +1377,7 @@ def create_quick_snapshot(
                         oversized_skipped.append(sub_rel)
                     continue
                 dst = snap_dir / sub_rel
-                dst.parent.mkdir(parents=True, exist_ok=True)
+                _ensure_private_directory_tree(snap_dir, dst.parent)
                 try:
                     # Route SQLite DBs through the WAL-safe backup() path so a
                     # board DB with an open WAL (the gateway may hold it at
@@ -1112,7 +1396,7 @@ def create_quick_snapshot(
                                 )
                             continue
                     else:
-                        shutil.copy2(sub, dst)
+                        _private_copy_file(sub, dst)
                     manifest[sub_rel] = dst.stat().st_size
                 except (OSError, PermissionError) as exc:
                     logger.warning("Could not snapshot %s: %s", sub_rel, exc)
@@ -1127,7 +1411,7 @@ def create_quick_snapshot(
             continue
 
         dst = snap_dir / rel
-        dst.parent.mkdir(parents=True, exist_ok=True)
+        _ensure_private_directory_tree(snap_dir, dst.parent)
 
         try:
             if src.suffix == ".db":
@@ -1144,7 +1428,7 @@ def create_quick_snapshot(
                         )
                     continue
             else:
-                shutil.copy2(src, dst)
+                _private_copy_file(src, dst)
             manifest[rel] = dst.stat().st_size
         except (OSError, PermissionError) as exc:
             logger.warning("Could not snapshot %s: %s", rel, exc)
@@ -1187,8 +1471,8 @@ def create_quick_snapshot(
         "failed_dbs": failed_dbs,
         "oversized_skipped": oversized_skipped,
     }
-    with open(snap_dir / "manifest.json", "w", encoding="utf-8") as f:
-        json.dump(meta, f, indent=2)
+    with _private_atomic_writer(snap_dir / "manifest.json") as f:
+        f.write(json.dumps(meta, indent=2).encode("utf-8"))
 
     # Auto-prune. Defaults preserve historical manual /snapshot behavior; callers
     # with known high-churn safety snapshots (for example pre-update) can pass a
@@ -1515,7 +1799,7 @@ def _write_full_zip_backup(out_path: Path, hermes_root: Path) -> Optional[Path]:
 
     sqlite_snapshot_failed = False
     try:
-        with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+        with _private_zip_writer(out_path) as zf:
             for abs_path, rel_path in files_to_add:
                 try:
                     if abs_path.suffix == ".db":

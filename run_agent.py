@@ -63,6 +63,7 @@ from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
+from agent.agent_runtime_helpers import SmartCliDurableDisposition
 from hermes_constants import get_hermes_home
 
 
@@ -101,6 +102,40 @@ def _session_source_for_agent(platform: Optional[str]) -> str:
     if source:
         return source
     return platform or "cli"
+
+
+def is_explicit_terminal_success(result: Any) -> bool:
+    """Return whether a turn published an unambiguously committed outcome.
+
+    A normal Python return is not enough: several runtimes return partial,
+    interrupted, failed, or cleanup-degraded result dictionaries.  Durable
+    owners may release a receipt only for the explicit clean terminal shape.
+    """
+
+    return bool(
+        isinstance(result, dict)
+        and result.get("completed") is True
+        and result.get("receipt_terminal_success") is True
+        and not result.get("failed")
+        and not result.get("partial")
+        and not result.get("interrupted")
+        and not result.get("cleanup_errors")
+    )
+
+
+def _steer_receipt_callback_succeeded(outcome: Any) -> bool:
+    """Interpret typed receipt outcomes while preserving legacy callbacks."""
+
+    if outcome is SmartCliDurableDisposition.COMMITTED_CURRENT:
+        return True
+    if outcome is SmartCliDurableDisposition.STALE:
+        return True
+    if outcome in {
+        SmartCliDurableDisposition.BLOCKED_BY_PREDECESSOR,
+        SmartCliDurableDisposition.IO_ERROR,
+    }:
+        return False
+    return outcome is not False
 
 
 # OpenAI lazy proxy + safe stdio + proxy URL helpers — see agent/process_bootstrap.py.
@@ -167,6 +202,7 @@ from agent.prompt_builder import (  # noqa: F401  # re-exported via _ra() / mock
     build_context_files_prompt,
     build_environment_hints,
     build_nous_subscription_prompt,
+    format_steer_marker,
     load_soul_md,
 )
 from agent.process_bootstrap import _get_proxy_from_env  # noqa: F401
@@ -2973,7 +3009,10 @@ class AIAgent:
 
         except Exception as e:
             if self.verbose_logging:
-                logging.warning(f"Failed to save session log: {e}")
+                logging.warning(
+                    "Failed to save session log error_type=%s",
+                    type(e).__name__,
+                )
 
 
     def interrupt(self, message: str = None) -> None:
@@ -3026,7 +3065,59 @@ class AIAgent:
                         "Failed to interrupt Codex app-server turn",
                         exc_info=True,
                     )
-
+        # Close the delivery lease at the interrupt linearization point. System
+        # failures retain accepted text; user-driven interrupt/stop/reset owns a
+        # different next message and cancels this mailbox.
+        _steer_lock = getattr(self, "_pending_steer_lock", None)
+        unconsumed_callbacks: list[Callable[[], Any]] = []
+        if _steer_lock is not None:
+            with _steer_lock:
+                pending = getattr(self, "_pending_steer", None)
+                receipts = list(getattr(self, "_pending_steer_receipts", []) or [])
+                normalized_reason = str(message or "").strip().lower()
+                system_interrupt = any(
+                    marker in normalized_reason
+                    for marker in (
+                        "timed out",
+                        "gateway shutting down",
+                        "gateway restarting",
+                        "sse client disconnected",
+                    )
+                )
+                carryover_parts: list[str] = []
+                for receipt_text, _on_consumed, on_unconsumed, _on_uncertain in receipts:
+                    if on_unconsumed is not None:
+                        unconsumed_callbacks.append(on_unconsumed)
+                    elif system_interrupt:
+                        carryover_parts.append(receipt_text)
+                if pending and system_interrupt and not receipts:
+                    carryover_parts.append(pending)
+                if carryover_parts:
+                    existing_failed = getattr(
+                        self,
+                        "_failed_turn_pending_steer",
+                        None,
+                    )
+                    carryover = "\n\n".join(carryover_parts)
+                    self._failed_turn_pending_steer = (
+                        f"{existing_failed}\n\n{carryover}"
+                        if existing_failed
+                        else carryover
+                    )
+                self._pending_steer = None
+                self._pending_steer_count = 0
+                self._pending_steer_receipts = []
+                self._steer_checkpoint_open = False
+        for callback in unconsumed_callbacks:
+            try:
+                if not _steer_receipt_callback_succeeded(callback()):
+                    self._steer_receipt_callback_failed = True
+            except Exception as exc:
+                self._steer_receipt_callback_failed = True
+                logger.debug(
+                    "Steer interrupt return callback failed error_type=%s",
+                    type(exc).__name__,
+                )
         # A cron turn performs its API request on the conversation thread to
         # avoid the nested interrupt-worker deadlock.  Unlike the normal worker
         # path, its client is registered here so this cross-thread interrupt can
@@ -3035,8 +3126,11 @@ class AIAgent:
         if callable(_abort_active_request):
             try:
                 _abort_active_request("interrupt_abort")
-            except Exception:
-                logger.debug("Failed to abort active inline request", exc_info=True)
+            except Exception as exc:
+                logger.debug(
+                    "Failed to abort active inline request error_type=%s",
+                    type(exc).__name__,
+                )
         # Signal all tools to abort any in-flight operations immediately.
         # Scope the interrupt to this agent's execution thread so other
         # agents running in the same process (gateway) are not affected.
@@ -3074,10 +3168,13 @@ class AIAgent:
         for child in children_copy:
             try:
                 child.interrupt(message)
-            except Exception as e:
-                logger.debug("Failed to propagate interrupt to child agent: %s", e)
+            except Exception as exc:
+                logger.debug(
+                    "Failed to propagate interrupt to child agent error_type=%s",
+                    type(exc).__name__,
+                )
         if not self.quiet_mode:
-            print("\n⚡ Interrupt requested" + (f": '{message[:40]}...'" if message and len(message) > 40 else f": '{message}'" if message else ""))
+            print("\n⚡ Interrupt requested.")
 
     def clear_interrupt(self, *, preserve_redirect: bool = False) -> bool:
         """Clear the interrupt request and per-thread tool signal.
@@ -3122,14 +3219,13 @@ class AIAgent:
                     _set_interrupt(False, _wtid)
                 except Exception:
                     pass
-        # A hard interrupt supersedes any pending /steer — the steer was
-        # meant for the agent's next tool-call iteration, which will no
-        # longer happen. Drop it instead of surprising the user with a
-        # late injection on the post-interrupt turn.
+        # interrupt() already closed the lease and transferred any system-error
+        # carryover. Keep this as an idempotent cleanup for legacy test stubs.
         _steer_lock = getattr(self, "_pending_steer_lock", None)
         if _steer_lock is not None:
             with _steer_lock:
                 self._pending_steer = None
+                self._pending_steer_count = 0
         return True
 
     def get_steer_generation(self) -> Optional[int]:
@@ -3143,6 +3239,10 @@ class AIAgent:
             generation = getattr(self, "_steer_run_generation", None)
             return generation if isinstance(generation, int) else None
 
+    def supports_steer_consumption_ack(self) -> bool:
+        """Advertise terminal consumption callbacks for durable steer owners."""
+        return True
+
     def _open_steer_checkpoint(self) -> int:
         """Atomically open a fresh turn-scoped steering generation."""
         lock = getattr(self, "_pending_steer_lock", None)
@@ -3153,6 +3253,7 @@ class AIAgent:
                 raise RuntimeError("an AIAgent cannot run two steering turns concurrently")
             if getattr(self, "_pending_steer", None):
                 raise RuntimeError("closed steering checkpoint retained an undelivered message")
+            self._pending_steer_count = 0
             generation = int(getattr(self, "_steer_run_generation", 0)) + 1
             self._steer_run_generation = generation
             self._steer_checkpoint_open = True
@@ -3173,11 +3274,43 @@ class AIAgent:
             if not getattr(self, "_steer_checkpoint_open", False):
                 return None
             self._steer_checkpoint_open = False
-            text = getattr(self, "_pending_steer", None)
+            raw_text = getattr(self, "_pending_steer", None)
+            receipts = list(getattr(self, "_pending_steer_receipts", []) or [])
             self._pending_steer = None
-            return text
+            self._pending_steer_count = 0
+            self._pending_steer_receipts = []
 
-    def steer(self, text: str, *, run_generation: Optional[int] = None) -> bool:
+        if not receipts:
+            return raw_text
+
+        unconsumed_callbacks: list[Callable[[], Any]] = []
+        leftover_parts: list[str] = []
+        for text, _on_consumed, on_unconsumed, _on_uncertain in receipts:
+            if on_unconsumed is None:
+                leftover_parts.append(text)
+            else:
+                unconsumed_callbacks.append(on_unconsumed)
+        for callback in unconsumed_callbacks:
+            try:
+                if not _steer_receipt_callback_succeeded(callback()):
+                    self._steer_receipt_callback_failed = True
+            except Exception as exc:
+                self._steer_receipt_callback_failed = True
+                logger.debug(
+                    "Steer unconsumed callback failed error_type=%s",
+                    type(exc).__name__,
+                )
+        return "\n".join(leftover_parts) or None
+
+    def steer(
+        self,
+        text: str,
+        *,
+        run_generation: Optional[int] = None,
+        on_consumed: Optional[Callable[[], Any]] = None,
+        on_unconsumed: Optional[Callable[[], Any]] = None,
+        on_uncertain: Optional[Callable[[], Any]] = None,
+    ) -> bool:
         """Inject text into an open, turn-scoped delivery checkpoint.
 
         Returns True only when the text was accepted by an open checkpoint for
@@ -3187,6 +3320,8 @@ class AIAgent:
         if not text or not text.strip():
             return False
         cleaned = text.strip()
+        if len(cleaned) > 4_000:
+            return False
         lock = getattr(self, "_pending_steer_lock", None)
         if lock is None:
             # A receipt without atomic ownership is worse than falling back to
@@ -3198,10 +3333,22 @@ class AIAgent:
             current = getattr(self, "_steer_run_generation", None)
             if run_generation is not None and run_generation != current:
                 return False
+            pending_count = int(getattr(self, "_pending_steer_count", 0))
+            combined_chars = len(cleaned) + len(self._pending_steer or "")
+            if self._pending_steer:
+                combined_chars += 1  # separating newline
+            if pending_count >= 8 or combined_chars > 16_000:
+                return False
             if self._pending_steer:
                 self._pending_steer = self._pending_steer + "\n" + cleaned
             else:
                 self._pending_steer = cleaned
+            self._pending_steer_count = pending_count + 1
+            receipts = getattr(self, "_pending_steer_receipts", None)
+            if receipts is None:
+                receipts = []
+                self._pending_steer_receipts = receipts
+            receipts.append((cleaned, on_consumed, on_unconsumed, on_uncertain))
         return True
 
     def redirect(self, text: str) -> bool:
@@ -3326,11 +3473,192 @@ class AIAgent:
         if _lock is None:
             text = getattr(self, "_pending_steer", None)
             self._pending_steer = None
+            self._pending_steer_count = 0
             return text
         with _lock:
+            receipts = list(getattr(self, "_pending_steer_receipts", []) or [])
+            if any(
+                on_consumed is not None or on_uncertain is not None
+                for _, on_consumed, _on_unconsumed, on_uncertain in receipts
+            ) and not bool(
+                getattr(self, "_steer_commit_capable_drain", False)
+            ):
+                return None
             text = self._pending_steer
             self._pending_steer = None
+            self._pending_steer_count = 0
+            self._pending_steer_receipts = []
+            self._steer_drained_receipts = receipts
         return text
+
+    def _inject_pending_steer_into_tool_message(self, target_message: dict) -> int:
+        """Atomically transfer the current steer envelope into one tool result.
+
+        Payload, receipt callbacks, and run generation change ownership under
+        the mailbox lock. An interrupt therefore observes either the complete
+        pending envelope or the complete injected envelope, never a detached
+        intermediate representation.
+        """
+
+        lock = getattr(self, "_pending_steer_lock", None)
+        if lock is None:
+            return 0
+        with lock:
+            if not getattr(self, "_steer_checkpoint_open", False):
+                return 0
+            text = getattr(self, "_pending_steer", None)
+            if not text:
+                return 0
+            generation = getattr(self, "_steer_run_generation", None)
+            receipts = list(getattr(self, "_pending_steer_receipts", []) or [])
+            marker = format_steer_marker(text)
+            existing_content = target_message.get("content", "")
+            if isinstance(existing_content, str):
+                new_content = existing_content + marker
+            else:
+                try:
+                    blocks = list(existing_content) if existing_content else []
+                    blocks.append({"type": "text", "text": marker.lstrip()})
+                    new_content = blocks
+                except Exception:
+                    new_content = f"{existing_content}{marker}"
+
+            target_message["content"] = new_content
+            self._pending_steer = None
+            self._pending_steer_count = 0
+            self._pending_steer_receipts = []
+            self._steer_drained_receipts = []
+            if receipts:
+                injected_by_generation = getattr(
+                    self,
+                    "_injected_steer_receipts_by_generation",
+                    None,
+                )
+                if not isinstance(injected_by_generation, dict):
+                    injected_by_generation = {}
+                    self._injected_steer_receipts_by_generation = (
+                        injected_by_generation
+                    )
+                injected_by_generation.setdefault(generation, []).extend(receipts)
+                envelopes_by_generation = getattr(
+                    self,
+                    "_injected_steer_envelopes_by_generation",
+                    None,
+                )
+                if not isinstance(envelopes_by_generation, dict):
+                    envelopes_by_generation = {}
+                    self._injected_steer_envelopes_by_generation = (
+                        envelopes_by_generation
+                    )
+                envelopes_by_generation.setdefault(generation, []).append(
+                    (marker.strip(), tuple(id(receipt) for receipt in receipts))
+                )
+                self._injected_steer_receipts = [
+                    entry
+                    for entries in injected_by_generation.values()
+                    for entry in entries
+                ]
+            return len(text)
+
+    @staticmethod
+    def _steer_marker_present_in_request(value: Any, marker: str) -> bool:
+        """Return whether a final provider payload still contains one exact marker."""
+
+        if isinstance(value, str):
+            return marker in value
+        if isinstance(value, dict):
+            return any(
+                AIAgent._steer_marker_present_in_request(item, marker)
+                for item in value.values()
+            )
+        if isinstance(value, (list, tuple)):
+            return any(
+                AIAgent._steer_marker_present_in_request(item, marker)
+                for item in value
+            )
+        return False
+
+    def _mark_injected_steer_receipts_requested(self, request: Any) -> int:
+        """Record receipts visible in the exact payload passed to the provider."""
+
+        generation = getattr(self, "_steer_run_generation", None)
+        lock = getattr(self, "_pending_steer_lock", None)
+
+        def _mark_locked() -> int:
+            injected_by_generation = getattr(
+                self, "_injected_steer_receipts_by_generation", None
+            )
+            if not isinstance(injected_by_generation, dict):
+                return 0
+            receipts = list(injected_by_generation.get(generation, []) or [])
+            requested = getattr(
+                self, "_requested_steer_receipt_ids_by_generation", None
+            )
+            if not isinstance(requested, dict):
+                requested = {}
+                self._requested_steer_receipt_ids_by_generation = requested
+            generation_ids = requested.setdefault(generation, set())
+            before = len(generation_ids)
+            envelopes_by_generation = getattr(
+                self, "_injected_steer_envelopes_by_generation", None
+            )
+            envelopes = (
+                list(envelopes_by_generation.get(generation, []) or [])
+                if isinstance(envelopes_by_generation, dict)
+                else []
+            )
+            if envelopes:
+                for marker, receipt_ids in envelopes:
+                    if marker and self._steer_marker_present_in_request(
+                        request, marker
+                    ):
+                        generation_ids.update(receipt_ids)
+            else:
+                # Legacy test stubs may populate the receipt map directly.
+                for receipt in receipts:
+                    marker = format_steer_marker(receipt[0]).strip()
+                    if marker and self._steer_marker_present_in_request(
+                        request, marker
+                    ):
+                        generation_ids.add(id(receipt))
+            return len(generation_ids) - before
+
+        if lock is None:
+            return _mark_locked()
+        with lock:
+            return _mark_locked()
+
+    def _stash_failed_turn_pending_steer(self, message: Optional[str]) -> None:
+        """Retain an already-accepted steer when a turn exits exceptionally."""
+
+        cleaned = str(message or "").strip()
+        if not cleaned:
+            return
+        lock = getattr(self, "_pending_steer_lock", None)
+        if lock is None:
+            existing = getattr(self, "_failed_turn_pending_steer", None)
+            self._failed_turn_pending_steer = (
+                f"{existing}\n\n{cleaned}" if existing else cleaned
+            )
+            return
+        with lock:
+            existing = getattr(self, "_failed_turn_pending_steer", None)
+            self._failed_turn_pending_steer = (
+                f"{existing}\n\n{cleaned}" if existing else cleaned
+            )
+
+    def take_failed_turn_pending_steer(self) -> Optional[str]:
+        """Transfer ownership of an accepted steer after a failed turn."""
+
+        lock = getattr(self, "_pending_steer_lock", None)
+        if lock is None:
+            message = getattr(self, "_failed_turn_pending_steer", None)
+            self._failed_turn_pending_steer = None
+            return message
+        with lock:
+            message = getattr(self, "_failed_turn_pending_steer", None)
+            self._failed_turn_pending_steer = None
+            return message
 
     def _record_file_mutation_result(
         self,
@@ -7238,6 +7566,11 @@ class AIAgent:
         task_started = False
         task_finished = False
         relay_outcome = "failed"
+        from agent.auxiliary_client import scoped_runtime_main
+
+        # Track receipt callback failures per turn; ContextVar ownership remains
+        # local to this caller thread through scoped_runtime_main below.
+        self._steer_receipt_callback_failed = False
         result: Optional[Dict[str, Any]] = None
         steer_generation = self._open_steer_checkpoint()
         try:
@@ -7272,8 +7605,6 @@ class AIAgent:
                 getattr(self, "_session_db", None),
                 getattr(self, "session_id", None),
             )
-            from agent.auxiliary_client import scoped_runtime_main
-
             # The outer token restores the caller's Context even though turn setup
             # replaces the value with the live runtime after fallback restoration.
             # Keep the scope local instead of storing ContextVar tokens on the agent,
@@ -7324,16 +7655,104 @@ class AIAgent:
             raise
         finally:
             # Linearization point for the final checkpoint: either steer()
-            # acquired the same lock first and its text is returned with this
-            # turn, or it observes the closed lease and returns False so the
-            # caller can queue it. A cached agent's next run gets a different
-            # generation and rejects stale classifier decisions.
+            # acquired the same lock first and its text is returned with
+            # this turn, or it observes the closed lease and returns False
+            # so gateway/CLI can queue it. A cached agent's next run gets a
+            # different generation and rejects stale classifier decisions.
             final_steer = self._close_steer_checkpoint(steer_generation)
+            committed = is_explicit_terminal_success(result)
+            def _take_injected_receipts():
+                injected_by_generation = getattr(
+                    self,
+                    "_injected_steer_receipts_by_generation",
+                    None,
+                )
+                if isinstance(injected_by_generation, dict):
+                    injected = list(
+                        injected_by_generation.pop(steer_generation, []) or []
+                    )
+                    self._injected_steer_receipts = [
+                        entry
+                        for entries in injected_by_generation.values()
+                        for entry in entries
+                    ]
+                else:
+                    # Legacy object.__new__ stubs may predate generation
+                    # ownership. Their single open turn owns the old list.
+                    injected = list(
+                        getattr(self, "_injected_steer_receipts", []) or []
+                    )
+                    self._injected_steer_receipts = []
+                requested_by_generation = getattr(
+                    self,
+                    "_requested_steer_receipt_ids_by_generation",
+                    None,
+                )
+                if isinstance(requested_by_generation, dict):
+                    requested_ids = set(
+                        requested_by_generation.pop(steer_generation, set())
+                        or set()
+                    )
+                else:
+                    requested_ids = set()
+                envelopes_by_generation = getattr(
+                    self,
+                    "_injected_steer_envelopes_by_generation",
+                    None,
+                )
+                if isinstance(envelopes_by_generation, dict):
+                    envelopes_by_generation.pop(steer_generation, None)
+                return injected, requested_ids
+
+            pending_steer_lock = getattr(self, "_pending_steer_lock", None)
+            if pending_steer_lock is None:
+                injected, requested_ids = _take_injected_receipts()
+            else:
+                with pending_steer_lock:
+                    injected, requested_ids = _take_injected_receipts()
+            callback_failed = bool(
+                getattr(self, "_steer_receipt_callback_failed", False)
+            )
+            for receipt in injected:
+                _text, on_consumed, on_unconsumed, on_uncertain = receipt
+                requested = id(receipt) in requested_ids
+                if requested and committed:
+                    callback = on_consumed
+                    callback_label = "consumption"
+                elif requested:
+                    callback = on_uncertain
+                    callback_label = "uncertain"
+                else:
+                    callback = on_unconsumed
+                    callback_label = "unconsumed"
+                if callback is None:
+                    continue
+                try:
+                    callback_failed = not _steer_receipt_callback_succeeded(
+                        callback()
+                    ) or callback_failed
+                except Exception as exc:
+                    callback_failed = True
+                    logger.debug(
+                        "Steer %s acknowledgement callback failed error_type=%s",
+                        callback_label,
+                        type(exc).__name__,
+                    )
+            if callback_failed and isinstance(result, dict):
+                cleanup_errors = result.get("cleanup_errors")
+                if not isinstance(cleanup_errors, list):
+                    cleanup_errors = []
+                    result["cleanup_errors"] = cleanup_errors
+                marker = "steer receipt finalization failed"
+                if marker not in cleanup_errors:
+                    cleanup_errors.append(marker)
             if final_steer and result is not None:
                 existing = result.get("pending_steer")
                 result["pending_steer"] = (
                     f"{existing}\n{final_steer}" if existing else final_steer
                 )
+            elif final_steer:
+                self._stash_failed_turn_pending_steer(final_steer)
             try:
                 if relay_turn is not None:
                     relay_runtime.SESSION_COORDINATOR.end_turn(

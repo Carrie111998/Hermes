@@ -25,6 +25,7 @@ except ModuleNotFoundError:
 
 import logging
 import copy
+import asyncio
 import os
 import shutil
 import subprocess
@@ -35,6 +36,7 @@ import concurrent.futures
 import base64
 import atexit
 import errno
+import stat
 import tempfile
 import time
 import uuid
@@ -42,10 +44,12 @@ import textwrap
 from dataclasses import dataclass
 from collections import deque
 from urllib.parse import unquote, urlparse
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from datetime import datetime
 from typing import List, Dict, Any, Optional
+
+from agent.agent_runtime_helpers import SmartCliDurableDisposition
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +71,182 @@ class SmartCliRouteContext:
     agent: Any
     steer_generation: Optional[int]
     supports_generation: bool
+    supports_consumption_ack: bool = False
+    owner_session_id: str = ""
+
+
+@dataclass(frozen=True)
+class SmartCliClassifierJob:
+    """One durably admitted classifier obligation."""
+
+    durable_id: str
+    durable_session_id: str
+    text: str
+    route_context: SmartCliRouteContext
+
+
+@dataclass(frozen=True)
+class DurableCliInput:
+    """Next-turn payload whose durable record clears only after processing."""
+
+    durable_id: str
+    durable_session_id: str
+    payload: Any
+
+
+_SMART_CLI_QUEUE_MAX_ITEMS = 32
+_SMART_CLI_QUEUE_MAX_BYTES = 1024 * 1024
+# JSON may escape one payload byte as six ASCII bytes (for example ``\u0000``).
+# This is a storage safety bound, not an admission allowance: decoded text is
+# still capped at exactly 1 MiB below.
+_SMART_CLI_STATE_MAX_BYTES = _SMART_CLI_QUEUE_MAX_BYTES * 6 + 128 * 1024
+_SMART_CLI_ROTATION_MAX_BYTES = 4096
+
+
+def _open_private_directory(path: Path, *, create: bool) -> Optional[int]:
+    """Open one owner-only directory for stable descriptor-relative I/O."""
+
+    if create:
+        path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if os.name == "nt":
+        if path.is_symlink() or not path.is_dir():
+            raise PermissionError("private directory is not an owned directory")
+        return None
+
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_DIRECTORY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags)
+    try:
+        metadata = os.fstat(fd)
+        if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.getuid():
+            raise PermissionError("private directory ownership is invalid")
+        os.fchmod(fd, 0o700)
+        return fd
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def _ensure_private_directory(path: Path, *, create: bool) -> None:
+    """Validate one owner-only directory and repair its mode before use."""
+
+    fd = _open_private_directory(path, create=create)
+    if fd is not None:
+        os.close(fd)
+
+
+def _validate_private_regular_file(fd: int) -> os.stat_result:
+    """Validate an opened private file and repair its mode before I/O."""
+
+    metadata = os.fstat(fd)
+    if not stat.S_ISREG(metadata.st_mode):
+        raise PermissionError("private file type is invalid")
+    if metadata.st_nlink != 1:
+        raise PermissionError("private file link count is invalid")
+    if os.name != "nt":
+        if metadata.st_uid != os.getuid():
+            raise PermissionError("private file ownership is invalid")
+        os.fchmod(fd, 0o600)
+        metadata = os.fstat(fd)
+    return metadata
+
+
+def _read_private_file(
+    path: Path,
+    *,
+    max_bytes: Optional[int] = None,
+    consume: bool = False,
+) -> bytes:
+    """Read one owner-only regular file through a no-follow descriptor."""
+
+    directory_fd = _open_private_directory(path.parent, create=False)
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    fd: Optional[int] = None
+    try:
+        if os.name == "nt":
+            if path.is_symlink():
+                raise PermissionError("private file type is invalid")
+            fd = os.open(path, flags)
+        else:
+            fd = os.open(path.name, flags, dir_fd=directory_fd)
+        metadata = _validate_private_regular_file(fd)
+        if max_bytes is not None and metadata.st_size > max_bytes:
+            raise RuntimeError("private file exceeded its size limit")
+        with os.fdopen(fd, "rb", closefd=False) as handle:
+            payload = handle.read() if max_bytes is None else handle.read(max_bytes + 1)
+        if max_bytes is not None and len(payload) > max_bytes:
+            raise RuntimeError("private file exceeded its size limit")
+        if consume:
+            if os.name == "nt":
+                os.unlink(path)
+            else:
+                os.unlink(path.name, dir_fd=directory_fd)
+                os.fsync(directory_fd)
+        return payload
+    finally:
+        if fd is not None:
+            os.close(fd)
+        if directory_fd is not None:
+            os.close(directory_fd)
+
+
+def _write_private_file_atomic(path: Path, payload: bytes) -> None:
+    """Durably replace an owner-only file without following link targets."""
+
+    directory_fd = _open_private_directory(path.parent, create=True)
+    temp_name = f".{path.name}.{uuid.uuid4().hex}.tmp"
+    temp_path = path.parent / temp_name
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    fd: Optional[int] = None
+    try:
+        if os.name == "nt":
+            fd = os.open(temp_path, flags, 0o600)
+        else:
+            fd = os.open(temp_name, flags, 0o600, dir_fd=directory_fd)
+        _validate_private_regular_file(fd)
+        with os.fdopen(fd, "wb", closefd=False) as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if os.name == "nt":
+            os.replace(temp_path, path)
+            try:
+                fsync_fd = os.open(path.parent, os.O_RDONLY)
+                try:
+                    os.fsync(fsync_fd)
+                finally:
+                    os.close(fsync_fd)
+            except OSError:
+                pass
+        else:
+            os.replace(
+                temp_name,
+                path.name,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+            )
+            os.fsync(directory_fd)
+    finally:
+        if fd is not None:
+            os.close(fd)
+        try:
+            if os.name == "nt":
+                temp_path.unlink(missing_ok=True)
+            else:
+                os.unlink(temp_name, dir_fd=directory_fd)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+        if directory_fd is not None:
+            os.close(directory_fd)
+
 
 # Suppress startup messages for clean CLI experience
 os.environ["HERMES_QUIET"] = "1"  # Our own modules
@@ -1777,12 +1957,14 @@ def _setup_worktree(repo_root: str = None, sync_base: bool = True) -> Optional[D
             logger.debug("Error copying .worktreeinclude entries: %s", e)
 
     # Lock the worktree so other processes (and `git worktree remove`) can see
-    # it is actively in use.  Fail-soft: a lock failure never blocks the session.
+    # it is actively in use. Git <2.31 lacks ``--reason``; the helper supplies
+    # a compatible administrative lock file in that case.
     try:
-        subprocess.run(
-            ["git", "worktree", "lock", "--reason", f"hermes pid={os.getpid()}", str(wt_path)],
-            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10, cwd=repo_root,
+        locked = _lock_worktree(
+            repo_root, str(wt_path), f"hermes pid={os.getpid()}", timeout=10
         )
+        if not locked:
+            raise RuntimeError("git worktree lock did not complete")
         logger.debug("Worktree locked: %s (pid=%s)", wt_path, os.getpid())
     except Exception as e:
         logger.debug("git worktree lock failed (non-fatal): %s", e)
@@ -2003,6 +2185,69 @@ def _worktree_commits_all_merged_upstream(
         return False
 
 
+def _worktree_admin_dir(worktree_path: str, timeout: int = 10) -> Optional[Path]:
+    """Return the administrative git directory for a linked worktree."""
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--git-dir"],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            cwd=worktree_path,
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return None
+        git_dir = Path(result.stdout.strip())
+        if not git_dir.is_absolute():
+            git_dir = Path(worktree_path) / git_dir
+        return git_dir.resolve()
+    except Exception:
+        return None
+
+
+def _lock_worktree(
+    repo_root: str,
+    worktree_path: str,
+    reason: str,
+    timeout: int = 10,
+) -> bool:
+    """Lock a linked worktree with an attributable Hermes PID reason.
+
+    The supported Git versions accept ``worktree lock --reason``. If that
+    reasoned lock fails, fail closed rather than installing a reasonless lock
+    that the stale-worktree pruner cannot safely attribute to this process.
+    """
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            ["git", "worktree", "lock", "--reason", reason, worktree_path],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            cwd=repo_root,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def _read_worktree_lock_reason(worktree_path: str, timeout: int = 10) -> Optional[str]:
+    """Read a linked worktree's native lock reason, or ``None`` fail-closed."""
+    admin_dir = _worktree_admin_dir(worktree_path, timeout=timeout)
+    if admin_dir is None:
+        return None
+    lock_path = admin_dir / "locked"
+    try:
+        if not lock_path.is_file():
+            return None
+        return lock_path.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return None
+
+
 def _worktree_lock_is_live(repo_root: str, worktree_path: str, timeout: int = 10):
     """Classify a worktree's git lock as live, dead, or absent.
 
@@ -2014,55 +2259,83 @@ def _worktree_lock_is_live(repo_root: str, worktree_path: str, timeout: int = 10
     pruner tell the two apart:
 
     - ``"live"``  — locked and the owning pid is still running (skip it).
-    - ``"dead"``  — locked but the owning pid is gone, or the reason isn't a
-                    parseable hermes lock (safe to unlock + reap).
+    - ``"dead"``  — an exactly parseable Hermes lock whose owning pid is gone.
     - ``None``    — not locked at all.
 
     Fails SAFE toward ``"live"``: if git can't be queried at all we cannot
     prove the worktree is safe to touch, so we report it as live.
     """
     import re
-    import subprocess
-
+    admin_dir = _worktree_admin_dir(worktree_path, timeout=timeout)
+    if admin_dir is None:
+        return "live"
+    lock_path = admin_dir / "locked"
     try:
-        result = subprocess.run(
-            ["git", "worktree", "list", "--porcelain"],
-            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, cwd=repo_root,
-        )
-        if result.returncode != 0:
-            return "live"
-    except Exception:
+        if not lock_path.is_file():
+            return None
+        reason = lock_path.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
         return "live"
 
-    target = Path(worktree_path).resolve()
-    current: Optional[Path] = None
-    for line in result.stdout.splitlines():
-        if line.startswith("worktree "):
-            try:
-                current = Path(line[len("worktree "):].strip()).resolve()
-            except Exception:
-                current = None
-        elif line == "locked" or line.startswith("locked "):
-            if current != target:
-                continue
-            reason = line[len("locked"):].strip()
-            m = re.search(r"hermes pid=(\d+)", reason)
-            if not m:
-                # Locked by something we don't recognize as a hermes session
-                # (or lock reason unavailable). Treat as dead — a foreign lock
-                # on a hermes -w worktree is almost certainly a leftover, and
-                # the age/dirty/unpushed gates already ran before we got here.
-                return "dead"
-            pid = int(m.group(1))
-            if pid == os.getpid():
-                return "live"
-            try:
-                from gateway.status import _pid_exists
-                return "live" if _pid_exists(pid) else "dead"
-            except Exception:
-                # Can't determine liveness — fail safe toward keeping it.
-                return "live"
-    return None
+    m = re.fullmatch(r"hermes pid=([1-9]\d*)", reason)
+    if not m:
+        # A native reasonless lock or a lock owned by another tool cannot be
+        # attributed to a dead Hermes process. Preserve it fail-closed: only a
+        # well-formed ``hermes pid=<n>`` lock may ever be classified as dead.
+        return "live"
+    pid = int(m.group(1))
+    if pid == os.getpid():
+        return "live"
+    try:
+        from gateway.status import _pid_exists
+
+        return "live" if _pid_exists(pid) else "dead"
+    except Exception:
+        # Can't determine liveness — fail safe toward keeping it.
+        return "live"
+
+
+def _unlock_dead_hermes_worktree(
+    repo_root: str,
+    worktree_path: str,
+    expected_reason: Optional[str],
+    timeout: int = 10,
+) -> bool:
+    """Unlock only the unchanged, attributable lock of a dead Hermes PID."""
+    import re
+    import subprocess
+
+    if not expected_reason:
+        return False
+    marker = re.fullmatch(r"hermes pid=([1-9]\d*)", expected_reason)
+    if marker is None:
+        return False
+    pid = int(marker.group(1))
+    if pid == os.getpid():
+        return False
+    try:
+        from gateway.status import _pid_exists
+
+        if _pid_exists(pid):
+            return False
+    except Exception:
+        return False
+
+    # Re-read after the liveness check. A concurrent owner may have replaced
+    # the stale lock while pruning was in progress; any change fails closed.
+    if _read_worktree_lock_reason(worktree_path, timeout=timeout) != expected_reason:
+        return False
+    try:
+        result = subprocess.run(
+            ["git", "worktree", "unlock", worktree_path],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            cwd=repo_root,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
 
 
 def _cleanup_worktree(info: Dict[str, str] = None) -> None:
@@ -2333,7 +2606,7 @@ def _prune_stale_worktrees(repo_root: str, max_age_hours: int = 24) -> None:
         # work; only clean, fully-merged/pushed trees (the scratch trees that
         # actually cause .worktrees/ bloat) are ever reaped.
         if _worktree_is_dirty(str(entry), timeout=5):
-            return (entry, mtime, force, "dirty", None)
+            return (entry, mtime, force, "dirty", None, None)
         if _worktree_has_unpushed_commits(str(entry), timeout=5):
             # Squash-merge escape hatch: commits unreachable from any remote
             # ref but patch-equivalent to upstream commits are merged work,
@@ -2346,17 +2619,18 @@ def _prune_stale_worktrees(repo_root: str, max_age_hours: int = 24) -> None:
             with cache_lock:
                 merge_cache.update(snapshot)
             if not merged:
-                return (entry, mtime, force, "unpushed", None)
+                return (entry, mtime, force, "unpushed", None, None)
 
         # Respect git-native session locks. A lock owned by a still-running
         # hermes process means the worktree is actively in use — never touch
         # it. A lock whose owning pid is gone is a crashed session's leftover:
         # unlock it so `git worktree remove --force` (single -f) can reap it,
         # otherwise dead-locked worktrees pile up indefinitely.
+        lock_reason = _read_worktree_lock_reason(str(entry), timeout=5)
         lock_state = _worktree_lock_is_live(repo_root, str(entry), timeout=5)
         if lock_state == "live":
-            return (entry, mtime, force, "locked-live", None)
-        return (entry, mtime, force, "reap", lock_state)
+            return (entry, mtime, force, "locked-live", None, lock_reason)
+        return (entry, mtime, force, "reap", lock_state, lock_reason)
 
     # Bounded pool: enough to hide git's per-process startup latency without
     # spawning dozens of concurrent git processes on a small machine.
@@ -2378,7 +2652,7 @@ def _prune_stale_worktrees(repo_root: str, max_age_hours: int = 24) -> None:
         _save_worktree_merge_cache(merge_cache)
 
     # ── Phase 3: mutate serially (unlock / remove / branch -D) ──────────────
-    for entry, mtime, force, verdict, lock_state in verdicts:
+    for entry, mtime, force, verdict, lock_state, lock_reason in verdicts:
         if verdict == "dirty":
             if mtime <= stale_work_cutoff:
                 preserved_stale.append(f"{entry.name} (uncommitted changes)")
@@ -2390,15 +2664,17 @@ def _prune_stale_worktrees(repo_root: str, max_age_hours: int = 24) -> None:
         if verdict == "locked-live":
             logger.debug("Skipping live-locked worktree: %s", entry.name)
             continue
-
-        if lock_state == "dead":
-            try:
-                subprocess.run(
-                    ["git", "worktree", "unlock", str(entry)],
-                    capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10, cwd=repo_root,
-                )
-            except Exception as e:
-                logger.debug("Failed to unlock dead worktree %s: %s", entry.name, e)
+        if lock_state == "dead" and not _unlock_dead_hermes_worktree(
+            repo_root,
+            str(entry),
+            lock_reason,
+            timeout=10,
+        ):
+            logger.debug(
+                "Skipping worktree whose stale lock changed or could not be unlocked: %s",
+                entry.name,
+            )
+            continue
 
         # Safe to remove
         try:
@@ -4304,9 +4580,19 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self.busy_input_mode = "steer"
         elif _bim == "smart":
             self.busy_input_mode = "smart"
-        else:
+        elif _bim == "interrupt":
             self.busy_input_mode = "interrupt"
-        self._smart_cli_input_queue = queue.Queue()
+        else:
+            # An explicit but invalid value must never regain destructive
+            # interrupt semantics. Absence still resolves to the valid default
+            # above because ``dict.get`` supplies "interrupt".
+            self.busy_input_mode = "queue"
+        self._smart_cli_input_queue = queue.Queue(maxsize=_SMART_CLI_QUEUE_MAX_ITEMS)
+        self._smart_cli_queue_lock = threading.Lock()
+        self._smart_cli_queued_bytes = 0
+        self._smart_cli_durable_lock = threading.Lock()
+        self._smart_cli_restored_ids: set[str] = set()
+        self._smart_cli_restore_error = False
         self._smart_cli_worker_lock = threading.Lock()
         self._smart_cli_worker = None
         self._smart_cli_turn_lock = threading.Lock()
@@ -6628,24 +6914,88 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         preview_lines.extend(f"[bold]{_escape(line)}[/]" for line in tail)
         return "\n".join(preview_lines)
 
-    def _expand_paste_references(self, text: str | None) -> str:
-        """Expand [Pasted text #N -> file] placeholders into file contents."""
+    def _store_private_paste_reference(
+        self,
+        text: str,
+        *,
+        display_index: int,
+        line_count: int,
+    ) -> Optional[str]:
+        """Persist a collapsed paste and return a path-free opaque placeholder."""
+
+        from hermes_constants import get_hermes_home
+
+        payload = str(text).encode("utf-8")
+        if not payload or len(payload) > _SMART_CLI_QUEUE_MAX_BYTES:
+            logger.warning(
+                "Collapsed paste rejected state=invalid_size bytes=%d",
+                len(payload),
+            )
+            return None
+        opaque_id = uuid.uuid4().hex
+        paste_path = get_hermes_home() / "pastes" / f"{opaque_id}.txt"
+        try:
+            _write_private_file_atomic(paste_path, payload)
+        except Exception as exc:
+            logger.warning(
+                "Could not store collapsed paste error_type=%s",
+                type(exc).__name__,
+            )
+            return None
+        safe_index = max(1, int(display_index))
+        safe_line_count = max(1, int(line_count))
+        logger.info(
+            "Collapsed paste lines=%d chars=%d",
+            safe_line_count,
+            len(text),
+        )
+        return (
+            f"[Pasted text #{safe_index}: {safe_line_count} lines "
+            f"→ paste:{opaque_id}]"
+        )
+
+    def _expand_paste_references(
+        self,
+        text: str | None,
+        *,
+        consume: bool = True,
+    ) -> str:
+        """Expand only opaque references owned by this Hermes profile."""
+
         if not isinstance(text, str) or "[Pasted text #" not in text:
             return text or ""
-        paste_ref_re = re.compile(r'\[Pasted text #\d+: \d+ lines \u2192 (.+?)\]')
+        from hermes_constants import get_hermes_home
+
+        paste_ref_re = re.compile(
+            r"\[Pasted text #\d+: \d+ lines → paste:([0-9a-f]{32})\]"
+        )
 
         def _expand_ref(match):
-            path = Path(match.group(1))
-            # Use try/except instead of path.exists() to avoid TOCTOU race:
-            # the paste file may be deleted between check and read, causing
-            # the input to be silently dropped (#17666).
+            opaque_id = match.group(1)
+            paste_path = get_hermes_home() / "pastes" / f"{opaque_id}.txt"
             try:
-                return path.read_text(encoding="utf-8")
-            except (OSError, IOError):
-                logger.warning("Paste file gone or unreadable, returning placeholder: %s", path)
+                return _read_private_file(
+                    paste_path,
+                    max_bytes=_SMART_CLI_QUEUE_MAX_BYTES,
+                    consume=consume,
+                ).decode("utf-8")
+            except Exception as exc:
+                logger.warning(
+                    "Paste reference unavailable error_type=%s",
+                    type(exc).__name__,
+                )
                 return match.group(0)
 
         return paste_ref_re.sub(_expand_ref, text)
+
+    @staticmethod
+    def _has_private_paste_reference(text: str | None) -> bool:
+        if not isinstance(text, str):
+            return False
+        return re.search(
+            r"\[Pasted text #\d+: \d+ lines → paste:[0-9a-f]{32}\]",
+            text,
+        ) is not None
 
     def _print_user_message_preview(self, user_input: str) -> None:
         """Render a user message using the normal chat scrollback style."""
@@ -7111,30 +7461,153 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         if target_buffer is None:
             _cprint(f"{_DIM}No active input buffer is available for the external editor.{_RST}")
             return False
+        had_accept_handler = hasattr(target_buffer, "accept_handler")
+        original_accept_handler = getattr(target_buffer, "accept_handler", None)
         try:
-            # Inline pastes so the editor (and the draft it submits) sees real
-            # content; skip flag unconditionally so the editor-close text-change
-            # doesn't re-collapse it, even when there was nothing to inline.
-            self._inline_pastes(target_buffer)
+            existing_text = getattr(target_buffer, "text", "")
+            private_reference_text = (
+                existing_text
+                if self._has_private_paste_reference(existing_text)
+                else None
+            )
+            expanded_text = self._expand_paste_references(
+                existing_text,
+                consume=False,
+            )
+            if expanded_text != existing_text and hasattr(target_buffer, "text"):
+                self._skip_paste_collapse = True
+                target_buffer.text = expanded_text
+                if hasattr(target_buffer, "cursor_position"):
+                    target_buffer.cursor_position = len(expanded_text)
+            # Set skip flag (again) so the text-change event fired when the
+            # editor closes does not re-collapse the returned content.
             self._skip_paste_collapse = True
-            # Open the editor, then submit the saved draft on a clean exit —
-            # matching the TUI's Ctrl+G (openEditor), which sends the buffer
-            # instead of requiring a second Enter. Submission in this CLI is
-            # driven by the custom `enter` keybinding, NOT the buffer's
-            # accept_handler, so validate_and_handle can't route through it;
-            # chain a done-callback on the returned Task that re-uses the
-            # real submit pipeline via _submit_editor_buffer().
-            task = target_buffer.open_in_editor(validate_and_handle=False)
+            # Prompt_toolkit invokes the temporary accept handler only after
+            # the editor exits successfully and its tempfile is read back.
+            editor_state: dict[str, Optional[str]] = {
+                "error_type": None,
+                "private_reference_text": private_reference_text,
+            }
+
+            def _accept_editor_buffer(edited_buffer):
+                self._submit_editor_buffer(
+                    edited_buffer,
+                    private_reference_text=editor_state["private_reference_text"],
+                )
+                return True
+
+            target_buffer.accept_handler = _accept_editor_buffer
+            create_background_task = getattr(app, "create_background_task", None)
+            if callable(create_background_task):
+                def _create_supervised_editor_task(coro):
+                    async def _supervise_editor():
+                        try:
+                            await coro
+                        except asyncio.CancelledError:
+                            raise
+                        except BaseException as exc:
+                            editor_state["error_type"] = type(exc).__name__
+
+                    return create_background_task(_supervise_editor())
+
+                app.create_background_task = _create_supervised_editor_task
+            try:
+                task = target_buffer.open_in_editor(validate_and_handle=True)
+            finally:
+                if callable(create_background_task):
+                    app.create_background_task = create_background_task
             if task is not None and hasattr(task, "add_done_callback"):
                 task.add_done_callback(
-                    lambda _t, b=target_buffer: self._submit_editor_buffer(b)
+                    lambda completed, b=target_buffer: (
+                        self._complete_external_editor(
+                            completed,
+                            b,
+                            had_accept_handler,
+                            original_accept_handler,
+                            editor_state,
+                        )
+                    )
+                )
+            else:
+                self._restore_external_editor_accept_handler(
+                    target_buffer,
+                    had_accept_handler,
+                    original_accept_handler,
                 )
             return True
         except Exception as exc:
-            _cprint(f"{_DIM}Failed to open external editor: {exc}{_RST}")
+            self._restore_external_editor_accept_handler(
+                target_buffer,
+                had_accept_handler,
+                original_accept_handler,
+            )
+            _cprint(
+                f"{_DIM}Failed to open external editor "
+                f"({type(exc).__name__}).{_RST}"
+            )
             return False
 
-    def _submit_editor_buffer(self, buffer) -> None:
+    @staticmethod
+    def _restore_external_editor_accept_handler(
+        buffer,
+        had_accept_handler: bool,
+        original_accept_handler,
+    ) -> None:
+        """Restore the buffer's normal accept path after the editor Task."""
+
+        try:
+            if had_accept_handler:
+                buffer.accept_handler = original_accept_handler
+            else:
+                delattr(buffer, "accept_handler")
+        except Exception:
+            pass
+
+    def _complete_external_editor(
+        self,
+        task,
+        buffer,
+        had_accept_handler: bool,
+        original_accept_handler,
+        editor_state,
+    ) -> None:
+        """Restore editor state and consume cancellation/failure safely."""
+
+        self._restore_external_editor_accept_handler(
+            buffer,
+            had_accept_handler,
+            original_accept_handler,
+        )
+
+        if task.cancelled():
+            return
+        error_type = editor_state.get("error_type")
+        if error_type:
+            _cprint(
+                f"{_DIM}External editor failed ({error_type}).{_RST}"
+            )
+            return
+        try:
+            error = task.exception()
+        except BaseException as exc:
+            _cprint(
+                f"{_DIM}External editor completion failed "
+                f"({type(exc).__name__}).{_RST}"
+            )
+            return
+        if error is not None:
+            _cprint(
+                f"{_DIM}External editor failed "
+                f"({type(error).__name__}).{_RST}"
+            )
+        return
+
+    def _submit_editor_buffer(
+        self,
+        buffer,
+        *,
+        private_reference_text: Optional[str] = None,
+    ) -> None:
         """Submit the draft an external editor left in ``buffer``.
 
         Invoked from the Ctrl+G done-callback so saving the editor sends the
@@ -7166,24 +7639,36 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     app.invalidate()
                 return
         except Exception as exc:
-            _cprint(f"  {_DIM}Shell command failed: {exc}{_RST}")
+            _cprint(f"  {_DIM}Shell command failed ({type(exc).__name__}).{_RST}")
             self._reset_input_buffer(buffer)
             if app is not None:
                 app.invalidate()
             return
 
-        # Slash commands: dispatch directly, same as the Enter handler's
-        # _looks_like_slash_command branch.
+        # Slash commands: route explicit durable commands through the same
+        # persistence-first admission gate as the normal Enter path.  A failed
+        # /queue or /steer admission must leave the editor draft intact.
         if _looks_like_slash_command(text):
             try:
+                durable = self._handle_explicit_durable_command_inline(
+                    text,
+                    has_images=bool(getattr(self, "_attached_images", None)),
+                )
+                if durable is not None:
+                    if durable:
+                        self._reset_input_buffer(buffer)
+                    if app is not None:
+                        app.invalidate()
+                    return
                 if not self.process_command(text):
                     self._should_exit = True
                     if app is not None and app.is_running:
                         app.exit()
             except Exception as exc:
-                _cprint(f"  {_DIM}Command failed: {exc}{_RST}")
-            finally:
+                _cprint(f"  {_DIM}Command failed ({type(exc).__name__}).{_RST}")
+            else:
                 self._reset_input_buffer(buffer)
+            finally:
                 if app is not None:
                     app.invalidate()
             return
@@ -7191,16 +7676,53 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # Regular prompt: route through the same queues the Enter handler uses.
         if self._agent_running:
             if self.busy_input_mode == "smart":
-                self._enqueue_smart_cli_input(text)
-                preview = text[:80] + ("..." if len(text) > 80 else "")
-                _cprint(f"  {_ACCENT}🧭 SMART routing: '{preview}'{_RST}")
+                if private_reference_text:
+                    accepted = self._enqueue_private_smart_cli_input(
+                        private_reference_text,
+                        delivery_text=text,
+                    )
+                else:
+                    accepted = self._enqueue_smart_cli_input(text)
+                if accepted:
+                    if private_reference_text:
+                        _cprint(
+                            f"  {_ACCENT}🧭 Private input queued without "
+                            f"external classification.{_RST}"
+                        )
+                    else:
+                        _cprint(f"  {_ACCENT}🧭 SMART routing accepted.{_RST}")
+                else:
+                    _cprint("  SMART admission rejected; draft kept in the composer.")
+                    if app is not None:
+                        app.invalidate()
+                    return
             elif self.busy_input_mode == "interrupt":
+                if private_reference_text:
+                    consumed = self._expand_paste_references(
+                        private_reference_text,
+                        consume=True,
+                    )
+                    if self._has_private_paste_reference(consumed):
+                        return
                 self._interrupt_queue.put(text)
             else:
+                if private_reference_text:
+                    consumed = self._expand_paste_references(
+                        private_reference_text,
+                        consume=True,
+                    )
+                    if self._has_private_paste_reference(consumed):
+                        return
                 self._pending_input.put(text)
-                preview = text[:80] + ("..." if len(text) > 80 else "")
-                _cprint(f"  Queued for the next turn: {preview}")
+                _cprint("  Queued for the next turn.")
         else:
+            if private_reference_text:
+                consumed = self._expand_paste_references(
+                    private_reference_text,
+                    consume=True,
+                )
+                if self._has_private_paste_reference(consumed):
+                    return
             self._pending_input.put(text)
 
         self._reset_input_buffer(buffer)
@@ -7227,6 +7749,133 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     buffer.cursor_position = len(expanded)
         except Exception:
             logger.debug("Failed to inline paste placeholders", exc_info=True)
+
+    def _reset_input_buffer(self, buffer) -> None:
+        """Clear an input buffer after a programmatic submit (best-effort)."""
+        try:
+            buffer.reset(append_to_history=True)
+        except Exception:
+            try:
+                buffer.text = ""
+            except Exception:
+                pass
+
+    def _submit_normal_input(self, event) -> None:
+        """Submit the normal composer through the production Enter route."""
+
+        text = event.app.current_buffer.text.strip()
+        has_images = bool(self._attached_images)
+        if not (text or has_images):
+            return
+
+        explicit_durable = self._handle_explicit_durable_command_inline(
+            text,
+            has_images=has_images,
+        )
+        if explicit_durable is not None:
+            if explicit_durable:
+                event.app.current_buffer.reset(append_to_history=True)
+            event.app.invalidate()
+            return
+
+        if self._should_handle_model_command_inline(text, has_images=has_images):
+            if not self.process_command(text):
+                self._should_exit = True
+                if event.app.is_running:
+                    event.app.exit()
+            event.app.current_buffer.reset(append_to_history=True)
+            event.app.invalidate()
+            return
+
+        if self._should_handle_steer_command_inline(text, has_images=has_images):
+            self.process_command(text)
+            event.app.current_buffer.reset(append_to_history=True)
+            event.app.invalidate()
+            return
+
+        images = list(self._attached_images)
+        payload = (text, images) if images else text
+        if self._agent_running and not (text and _looks_like_slash_command(text)):
+            effective_mode = self.busy_input_mode
+            if effective_mode == "smart":
+                if images or not text:
+                    effective_mode = "queue"
+                else:
+                    private_paste = self._has_private_paste_reference(text)
+                    if private_paste:
+                        accepted = self._enqueue_private_smart_cli_input(text)
+                    else:
+                        accepted = self._enqueue_smart_cli_input(text)
+                    if accepted:
+                        if private_paste:
+                            _cprint(
+                                f"  {_ACCENT}🧭 Private input queued without "
+                                f"external classification.{_RST}"
+                            )
+                        else:
+                            _cprint(f"  {_ACCENT}🧭 SMART routing accepted.{_RST}")
+                    else:
+                        _cprint(
+                            "  SMART admission rejected; draft kept in the composer."
+                        )
+                        event.app.invalidate()
+                        return
+            if effective_mode == "steer":
+                if images or not text:
+                    effective_mode = "queue"
+                else:
+                    accepted = self._admit_explicit_cli_steer(text)
+                    if accepted:
+                        _cprint(
+                            f"  {_ACCENT}⏩ Steer persisted; awaiting receipt.{_RST}"
+                        )
+                    else:
+                        _cprint(
+                            "  Steer admission failed before persistence; "
+                            "draft kept in the composer."
+                        )
+                        event.app.invalidate()
+                        return
+            if effective_mode == "queue":
+                if images:
+                    _cprint(
+                        "  Busy attachment queue rejected: attachments cannot yet "
+                        "be restart-safe; draft and attachments retained."
+                    )
+                    event.app.invalidate()
+                    return
+                accepted = self._admit_explicit_cli_queue(text)
+                if not accepted:
+                    _cprint(
+                        "  Queue admission failed before persistence; "
+                        "draft kept in the composer."
+                    )
+                    event.app.invalidate()
+                    return
+                _cprint("  Persisted for the next turn; awaiting terminal receipt.")
+            elif effective_mode == "interrupt":
+                self._interrupt_queue.put(payload)
+            try:
+                from agent.onboarding import (
+                    BUSY_INPUT_FLAG,
+                    busy_input_hint_cli,
+                    is_seen,
+                    mark_seen,
+                )
+
+                if not is_seen(CLI_CONFIG, BUSY_INPUT_FLAG):
+                    _cprint(f"  {_DIM}{busy_input_hint_cli(self.busy_input_mode)}{_RST}")
+                    mark_seen(_hermes_home / "config.yaml", BUSY_INPUT_FLAG)
+                    CLI_CONFIG.setdefault("onboarding", {}).setdefault("seen", {})[
+                        BUSY_INPUT_FLAG
+                    ] = True
+            except Exception:
+                pass
+        else:
+            self._pending_input.put(payload)
+        self._attached_images.clear()
+        event.app.current_buffer.reset(append_to_history=True)
+        event.app.invalidate()
 
     def _reset_input_buffer(self, buffer) -> None:
         """Clear an input buffer after a programmatic submit (best-effort)."""
@@ -7278,27 +7927,48 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         agent = snapshot.agent if snapshot is not None else getattr(self, "agent", None)
         generation_reader = getattr(type(agent), "get_steer_generation", None)
         supports_steer_generation = callable(generation_reader)
+        consumption_ack_reader = getattr(
+            type(agent), "supports_steer_consumption_ack", None
+        )
+        supports_consumption_ack = False
+        if callable(consumption_ack_reader):
+            try:
+                supports_consumption_ack = bool(
+                    agent.supports_steer_consumption_ack()
+                )
+            except Exception:
+                supports_consumption_ack = False
         steer_generation = None
         if supports_steer_generation:
             try:
                 candidate = agent.get_steer_generation()
                 if isinstance(candidate, int) and not isinstance(candidate, bool):
                     steer_generation = candidate
-            except Exception:
-                logger.debug("Could not snapshot CLI steer generation", exc_info=True)
+            except Exception as exc:
+                logger.debug(
+                    "Could not snapshot CLI steer generation error_type=%s",
+                    type(exc).__name__,
+                )
         return SmartCliRouteContext(
             turn_snapshot=snapshot,
             agent=agent,
             steer_generation=steer_generation,
             supports_generation=supports_steer_generation,
+            supports_consumption_ack=supports_consumption_ack,
+            owner_session_id=str(getattr(agent, "session_id", "") or ""),
         )
 
     def _route_smart_cli_input(
         self,
         text: str,
         route_context: Optional[SmartCliRouteContext] = None,
+        durable_id: Optional[str] = None,
+        durable_session_id: Optional[str] = None,
+        *,
+        forced_route: Optional[str] = None,
     ) -> str:
         """Classify and route one CLI follow-up without using interrupt."""
+        route_started = time.monotonic()
         from hermes_cli.smart_orchestrator import (
             ROUTE_AMBIGUOUS,
             ROUTE_INDEPENDENT,
@@ -7326,7 +7996,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         turn_snapshot = route_context.turn_snapshot
         agent = route_context.agent
         supports_steer_generation = route_context.supports_generation
+        supports_consumption_ack = route_context.supports_consumption_ack
         steer_generation = route_context.steer_generation
+        route_owner_session_id = route_context.owner_session_id
         if turn_snapshot is not None:
             active_goal = turn_snapshot.prompt
         else:
@@ -7361,24 +8033,42 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         if not main_runtime.get("provider") or not main_runtime.get("model"):
             main_runtime = {}
 
-        decision, payload = classify_smart_message(
-            active_goal=active_goal,
-            incoming_text=text,
-            activity_summary=json.dumps(activity, ensure_ascii=False, default=str),
-            confidence_threshold=max(0.0, min(1.0, threshold)),
-            classifier_timeout_seconds=max(1.0, min(60.0, timeout)),
-            main_runtime=main_runtime or None,
-        )
+        if forced_route is not None:
+            if forced_route not in {ROUTE_RELATED, ROUTE_INDEPENDENT}:
+                raise ValueError("invalid forced SMART CLI route")
+            decision = SmartRouteDecision(
+                route=forced_route,
+                confidence=1.0,
+                reason="Explicit durable CLI command.",
+                source="explicit",
+            )
+            payload = text
+        else:
+            decision, payload = classify_smart_message(
+                active_goal=active_goal,
+                incoming_text=text,
+                activity_summary=json.dumps(
+                    activity, ensure_ascii=False, default=str
+                ),
+                confidence_threshold=max(0.0, min(1.0, threshold)),
+                classifier_timeout_seconds=max(1.0, min(60.0, timeout)),
+                main_runtime=main_runtime or None,
+            )
 
         with self._smart_cli_turn_lock:
             same_active_turn = (
                 turn_snapshot is not None
                 and self._smart_cli_active_snapshot is turn_snapshot
                 and self._agent_running
+                and not bool(getattr(self, "_should_exit", False))
                 and agent is getattr(self, "agent", None)
             )
 
         steered = False
+        transfer_fenced = False
+        recovery_blocked = False
+        steer_call_uncertain = False
+        transfer_claim_token: Optional[str] = None
         if (
             same_active_turn
             and (not supports_steer_generation or steer_generation is not None)
@@ -7387,20 +8077,61 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             steer_payload = payload
             if decision.route == ROUTE_INDEPENDENT:
                 steer_payload = build_parallel_steer_payload(payload)
+            if durable_id and not supports_consumption_ack:
+                steer_payload = ""
+            if steer_payload and hasattr(agent, "steer"):
+                if durable_id:
+                    transfer_claim_token = uuid.uuid4().hex
+                    claim_disposition = self._claim_smart_cli_durable_job(
+                        durable_id,
+                        "transferring",
+                        durable_session_id,
+                        owner_session_id=route_owner_session_id,
+                        claim_token=transfer_claim_token,
+                    )
+                    transfer_fenced = (
+                        claim_disposition
+                        is SmartCliDurableDisposition.COMMITTED_CURRENT
+                    )
+                    recovery_blocked = not transfer_fenced
+                else:
+                    transfer_fenced = True
+                if not transfer_fenced:
+                    steer_payload = ""
             if steer_payload and hasattr(agent, "steer"):
                 try:
                     if supports_steer_generation:
-                        steered = bool(
-                            agent.steer(
-                                steer_payload,
-                                run_generation=steer_generation,
+                        steer_kwargs: dict[str, Any] = {
+                            "run_generation": steer_generation,
+                        }
+                        if durable_id:
+                            steer_kwargs.update(
+                                on_consumed=lambda: self._finalize_consumed_smart_cli_steer(
+                                    durable_id,
+                                    durable_session_id,
+                                    owner_session_id=route_owner_session_id,
+                                    claim_token=transfer_claim_token,
+                                ),
+                                on_unconsumed=lambda: self._requeue_unconsumed_smart_cli_steer(
+                                    durable_id,
+                                    durable_session_id,
+                                    text,
+                                    owner_session_id=route_owner_session_id,
+                                    claim_token=transfer_claim_token,
+                                ),
+                                on_uncertain=lambda: self._mark_uncertain_smart_cli_steer(
+                                    durable_id,
+                                    durable_session_id,
+                                    owner_session_id=route_owner_session_id,
+                                    claim_token=transfer_claim_token,
+                                ),
                             )
-                        )
+                        steered = bool(agent.steer(steer_payload, **steer_kwargs))
                     else:
                         steered = bool(agent.steer(steer_payload))
                 except Exception:
                     steered = False
-
+                    steer_call_uncertain = bool(durable_id and transfer_fenced)
         if steered and decision.route == ROUTE_INDEPENDENT:
             # This is an instruction delivered to the active agent, not a
             # receipt from a parallel worker. Keep the acknowledgment truthful.
@@ -7412,18 +8143,1361 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             )
 
         if not steered:
-            self._pending_input.put(text)
+            if durable_id:
+                if transfer_fenced and not recovery_blocked:
+                    rollback_state = (
+                        "uncertain" if steer_call_uncertain else "accepted"
+                    )
+                    rollback = self._transition_smart_cli_durable_job(
+                        durable_id,
+                        rollback_state,
+                        durable_session_id,
+                        expected_state="transferring",
+                        owner_session_id=route_owner_session_id,
+                        claim_token=transfer_claim_token,
+                    )
+                    recovery_blocked = (
+                        steer_call_uncertain
+                        or rollback
+                        is not SmartCliDurableDisposition.COMMITTED_CURRENT
+                    )
+                if not recovery_blocked:
+                    try:
+                        self._sync_smart_cli_pending_inputs_from_ledger(
+                            route_owner_session_id or durable_session_id
+                        )
+                    except Exception as exc:
+                        self._smart_cli_restore_error = True
+                        recovery_blocked = True
+                        logger.error(
+                            "Could not stage SMART CLI durable fallback "
+                            "error_type=%s",
+                            type(exc).__name__,
+                        )
+            elif not recovery_blocked:
+                self._pending_input.put(text)
             if decision.route in {ROUTE_RELATED, ROUTE_INDEPENDENT}:
                 decision = SmartRouteDecision(
                     route=ROUTE_AMBIGUOUS,
                     confidence=0.0,
-                    reason="The active checkpoint closed before steering; queued safely.",
+                    reason=(
+                        "Durable steer transfer is uncertain; payload preserved "
+                        "for explicit recovery."
+                        if recovery_blocked
+                        else "The active checkpoint closed before steering; queued safely."
+                    ),
                     source="fallback",
                 )
 
         prefix = str(smart_cfg.get("ack_prefix", "") or "").strip()
         _cprint(format_smart_ack(decision, prefix=prefix))
+        logger.info(
+            "smart_route surface=cli route=%s source=%s latency_ms=%d "
+            "accepted=true steered=%s queue_depth=%d "
+            "worker_accepted=false interrupt=false",
+            decision.route,
+            decision.source,
+            int((time.monotonic() - route_started) * 1000),
+            steered,
+            self._pending_input.qsize(),
+        )
         return decision.route
+
+    def _smart_cli_durable_path(self, session_id: Optional[str] = None) -> Path:
+        """Return a profile- and session-scoped recovery file path."""
+
+        import hashlib
+
+        from hermes_constants import get_hermes_home
+
+        session_id = str(
+            session_id
+            or getattr(getattr(self, "agent", None), "session_id", "")
+            or ""
+        )
+        if not session_id:
+            raise RuntimeError("SMART CLI durable admission requires an active session id")
+        stem = hashlib.sha256(session_id.encode("utf-8")).hexdigest()
+        return get_hermes_home() / "cache" / "smart-cli-pending" / f"{stem}.json"
+
+    def _smart_cli_rotation_path(self, source_session_id: str, target_session_id: str) -> Path:
+        """Return the private immutable ownership-alias path for a continuation."""
+
+        import hashlib
+
+        from hermes_constants import get_hermes_home
+
+        identity = f"{source_session_id}\0{target_session_id}".encode("utf-8")
+        stem = hashlib.sha256(identity).hexdigest()
+        return (
+            get_hermes_home()
+            / "cache"
+            / "smart-cli-pending"
+            / "rotations"
+            / f"{stem}.json"
+        )
+
+    def _migrate_smart_cli_session_scope(
+        self,
+        source_session_id: str,
+        target_session_id: str,
+    ) -> bool:
+        """Atomically transfer continuation ownership without copying receipts.
+
+        Receipt records retain their admission scope so late callbacks can only
+        acknowledge that exact file.  A private, atomically-replaced alias makes
+        the continuation session the sole restore owner of both scopes.  This
+        avoids the unavoidable loss/duplication window of a two-file copy/delete
+        migration while preserving FIFO across a compression lineage.
+        """
+
+        source_session_id = str(source_session_id or "")
+        target_session_id = str(target_session_id or "")
+        if (
+            not source_session_id
+            or not target_session_id
+            or source_session_id == target_session_id
+        ):
+            return False
+        path = self._smart_cli_rotation_path(source_session_id, target_session_id)
+        payload = json.dumps(
+            {
+                "version": 1,
+                "source": source_session_id,
+                "target": target_session_id,
+            },
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        try:
+            # Alias publication is one graph transaction. The stable lock is
+            # profile-scoped and process-shared; without it, two continuations
+            # can both validate a stale graph and publish a fork/fan-in.
+            with self._smart_cli_durable_lock_obj("__rotation_graph__"):
+                edges = self._load_smart_cli_rotation_edges()
+                outgoing = {source: target for source, target in edges}
+                incoming = {target: source for source, target in edges}
+                if outgoing.get(source_session_id) == target_session_id:
+                    return True
+                if (
+                    source_session_id in outgoing
+                    or target_session_id in incoming
+                ):
+                    self._smart_cli_restore_error = True
+                    return False
+
+                cursor = target_session_id
+                seen: set[str] = set()
+                while cursor in outgoing:
+                    if cursor in seen:
+                        self._smart_cli_restore_error = True
+                        return False
+                    seen.add(cursor)
+                    cursor = outgoing[cursor]
+                    if cursor == source_session_id:
+                        self._smart_cli_restore_error = True
+                        return False
+
+                _write_private_file_atomic(path, payload)
+                return True
+        except Exception as exc:
+            self._smart_cli_restore_error = True
+            logger.error(
+                "Could not persist SMART CLI session rotation error_type=%s",
+                type(exc).__name__,
+            )
+            return False
+
+    def _adopt_smart_cli_continuation_session(
+        self,
+        source_session_id: str,
+        target_session_id: str,
+    ) -> bool:
+        """Advance CLI ownership only after its durable alias is published."""
+
+        db = getattr(self, "_session_db", None) or getattr(
+            getattr(self, "agent", None), "_session_db", None
+        )
+        if db is not None and hasattr(db, "get_session"):
+            try:
+                child = db.get_session(target_session_id)
+                parent = db.get_session(source_session_id)
+            except Exception as exc:
+                self._smart_cli_restore_error = True
+                logger.warning(
+                    "Could not verify SMART CLI continuation error_type=%s",
+                    type(exc).__name__,
+                )
+                return False
+            # Generic mocks/legacy stores may not expose row dictionaries. When
+            # rows are available, only a compression child may transfer queue
+            # ownership; /branch carries a stable _branched_from marker.
+            if isinstance(child, dict) and isinstance(parent, dict):
+                config = child.get("model_config")
+                if isinstance(config, str):
+                    try:
+                        config = json.loads(config)
+                    except (TypeError, ValueError):
+                        config = {}
+                if (
+                    child.get("parent_session_id") != source_session_id
+                    or parent.get("end_reason") != "compression"
+                    or (
+                        isinstance(config, dict)
+                        and bool(config.get("_branched_from"))
+                    )
+                ):
+                    return False
+
+        if not self._migrate_smart_cli_session_scope(
+            source_session_id,
+            target_session_id,
+        ):
+            self._smart_cli_restore_error = True
+            return False
+        self._transfer_session_yolo(source_session_id, target_session_id)
+        self.session_id = target_session_id
+        self._pending_title = None
+        return True
+
+    def _load_smart_cli_rotation_edges(self) -> list[tuple[str, str]]:
+        """Strictly load private continuation aliases without logging identity."""
+
+        import hashlib
+
+        from hermes_constants import get_hermes_home
+
+        directory = (
+            get_hermes_home() / "cache" / "smart-cli-pending" / "rotations"
+        )
+        try:
+            _ensure_private_directory(directory, create=False)
+        except FileNotFoundError:
+            return []
+        except Exception:
+            raise RuntimeError("SMART CLI rotation directory is invalid") from None
+        edges: list[tuple[str, str]] = []
+        for path in sorted(directory.glob("*.json")):
+            try:
+                raw = json.loads(
+                    _read_private_file(
+                        path,
+                        max_bytes=_SMART_CLI_ROTATION_MAX_BYTES,
+                    ).decode("utf-8")
+                )
+            except Exception:
+                raise RuntimeError("SMART CLI rotation record is invalid") from None
+            if not isinstance(raw, dict) or set(raw) != {
+                "version",
+                "source",
+                "target",
+            }:
+                raise RuntimeError("SMART CLI rotation record schema is invalid")
+            source = raw.get("source")
+            target = raw.get("target")
+            if (
+                raw.get("version") != 1
+                or not isinstance(source, str)
+                or not source
+                or not isinstance(target, str)
+                or not target
+                or source == target
+            ):
+                raise RuntimeError("SMART CLI rotation record is invalid")
+            expected_stem = hashlib.sha256(
+                f"{source}\0{target}".encode("utf-8")
+            ).hexdigest()
+            if path.stem != expected_stem:
+                raise RuntimeError("SMART CLI rotation record identity is invalid")
+            edges.append((source, target))
+        return edges
+
+    def _smart_cli_db_rotation_edges(self, session_id: str) -> list[tuple[str, str]]:
+        """Recover compression edges if the process died before alias publication."""
+
+        db = getattr(self, "_session_db", None) or getattr(
+            getattr(self, "agent", None), "_session_db", None
+        )
+        if db is None or not hasattr(db, "get_session"):
+            return []
+        edges: list[tuple[str, str]] = []
+        cursor = session_id
+        seen: set[str] = set()
+        try:
+            for _ in range(100):
+                if not cursor or cursor in seen:
+                    break
+                seen.add(cursor)
+                child = db.get_session(cursor) or {}
+                config = child.get("model_config")
+                if isinstance(config, str):
+                    try:
+                        config = json.loads(config)
+                    except (TypeError, ValueError):
+                        config = {}
+                # /branch also records parent_session_id but intentionally starts
+                # independent SMART ownership. Compression continuations do not
+                # carry the branch marker.
+                if isinstance(config, dict) and config.get("_branched_from"):
+                    break
+                parent_id = child.get("parent_session_id")
+                if not isinstance(parent_id, str) or not parent_id:
+                    break
+                parent = db.get_session(parent_id) or {}
+                if parent.get("end_reason") != "compression":
+                    break
+                edges.append((parent_id, cursor))
+                cursor = parent_id
+        except Exception as exc:
+            logger.warning(
+                "Could not inspect SMART CLI compression lineage error_type=%s",
+                type(exc).__name__,
+            )
+        return edges
+
+    def _smart_cli_owned_durable_scopes(self, session_id: str) -> list[str]:
+        """Return oldest-to-newest receipt scopes owned by one continuation leaf."""
+
+        incoming: dict[str, str] = {}
+        outgoing: dict[str, str] = {}
+        edges = self._load_smart_cli_rotation_edges()
+        edges.extend(self._smart_cli_db_rotation_edges(session_id))
+        for source, target in edges:
+            if source in outgoing and outgoing[source] != target:
+                raise RuntimeError("SMART CLI rotation source has multiple targets")
+            if target in incoming and incoming[target] != source:
+                raise RuntimeError("SMART CLI rotation target has multiple sources")
+            outgoing[source] = target
+            incoming[target] = source
+        if session_id in outgoing:
+            raise RuntimeError("SMART CLI receipts belong to a continuation session")
+        scopes = [session_id]
+        seen = {session_id}
+        cursor = session_id
+        while cursor in incoming:
+            cursor = incoming[cursor]
+            if cursor in seen:
+                raise RuntimeError("SMART CLI rotation cycle is invalid")
+            seen.add(cursor)
+            scopes.append(cursor)
+        scopes.reverse()
+        return scopes
+
+    @contextmanager
+    def _smart_cli_durable_scope_locks(self, session_ids: list[str]):
+        """Acquire several receipt scopes in deterministic path order."""
+
+        ordered = sorted(
+            set(session_ids),
+            key=lambda value: str(self._smart_cli_durable_path(value)),
+        )
+        with ExitStack() as stack:
+            for session_id in ordered:
+                stack.enter_context(self._smart_cli_durable_lock_obj(session_id))
+            yield
+
+    @contextmanager
+    def _smart_cli_durable_lock_obj(self, session_id: Optional[str] = None):
+        """Serialize one profile/session transaction across threads and processes.
+
+        The JSON inode is replaced on every commit, so it cannot be the lock
+        target. A private sibling ``.lock`` file remains stable even while the
+        queue is empty. Process-local locks are regenerated after ``fork`` so a
+        child never inherits a possibly-owned mutex from its parent.
+        """
+
+        state_path = self._smart_cli_durable_path(session_id)
+        lock_path = state_path.with_suffix(".lock")
+        _ensure_private_directory(lock_path.parent, create=True)
+
+        pid = os.getpid()
+        if getattr(self, "_smart_cli_durable_lock_pid", None) != pid:
+            self._smart_cli_durable_session_locks = {}
+            self._smart_cli_durable_lock_pid = pid
+        local_locks = self._smart_cli_durable_session_locks
+        local_lock = local_locks.setdefault(str(lock_path), threading.RLock())
+
+        with local_lock:
+            flags = os.O_RDWR | os.O_CREAT
+            flags |= getattr(os, "O_CLOEXEC", 0)
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(lock_path, flags, 0o600)
+            try:
+                _validate_private_regular_file(fd)
+                if os.name != "nt":
+                    import fcntl
+
+                    fcntl.flock(fd, fcntl.LOCK_EX)
+                yield
+            finally:
+                if os.name != "nt":
+                    try:
+                        import fcntl
+
+                        fcntl.flock(fd, fcntl.LOCK_UN)
+                    except OSError:
+                        pass
+                os.close(fd)
+
+    def _load_smart_cli_durable_state_locked(
+        self, session_id: Optional[str] = None
+    ) -> dict[str, Any]:
+        """Load and validate the authoritative state for one locked session."""
+
+        path = self._smart_cli_durable_path(session_id)
+        try:
+            payload = _read_private_file(path, max_bytes=_SMART_CLI_STATE_MAX_BYTES)
+        except FileNotFoundError:
+            return {
+                "version": 4,
+                "incarnation": uuid.uuid4().hex,
+                "revision": 0,
+                "jobs": [],
+                "attempts": {},
+            }
+        raw = json.loads(payload.decode("utf-8"))
+        version = raw.get("version") if isinstance(raw, dict) else None
+        if version not in {1, 2, 3, 4}:
+            raise RuntimeError("SMART CLI durable queue schema is invalid")
+        if version == 4:
+            if set(raw) != {
+                "version",
+                "incarnation",
+                "revision",
+                "jobs",
+                "attempts",
+            }:
+                raise RuntimeError("SMART CLI durable queue schema is invalid")
+            incarnation = raw.get("incarnation")
+            revision = raw.get("revision")
+            if (
+                not isinstance(incarnation, str)
+                or re.fullmatch(r"[0-9a-f]{32}", incarnation) is None
+                or not isinstance(revision, int)
+                or isinstance(revision, bool)
+                or revision < 0
+            ):
+                raise RuntimeError("SMART CLI durable queue generation is invalid")
+        elif version == 3:
+            if set(raw) != {"version", "incarnation", "revision", "jobs"}:
+                raise RuntimeError("SMART CLI durable queue schema is invalid")
+            incarnation = raw.get("incarnation")
+            revision = raw.get("revision")
+            if (
+                not isinstance(incarnation, str)
+                or re.fullmatch(r"[0-9a-f]{32}", incarnation) is None
+                or not isinstance(revision, int)
+                or isinstance(revision, bool)
+                or revision < 0
+            ):
+                raise RuntimeError("SMART CLI durable queue generation is invalid")
+        else:
+            # Legacy v1/v2 files gain a non-repeating generation on their next
+            # atomic write. They remain readable during an in-place upgrade.
+            incarnation = uuid.uuid4().hex
+            revision = 0
+        jobs = raw.get("jobs")
+        if not isinstance(jobs, list) or len(jobs) > _SMART_CLI_QUEUE_MAX_ITEMS:
+            raise RuntimeError("SMART CLI durable queue item count is invalid")
+        cleaned: list[dict[str, str]] = []
+        seen: set[str] = set()
+        aggregate = 0
+        for job in jobs:
+            expected_keys = {"id", "text"} if version == 1 else {"id", "text", "state"}
+            if not isinstance(job, dict) or set(job) != expected_keys:
+                raise RuntimeError("SMART CLI durable queue item schema is invalid")
+            durable_id = job.get("id")
+            text = job.get("text")
+            state = "accepted" if version == 1 else job.get("state")
+            if (
+                not isinstance(durable_id, str)
+                or not durable_id
+                or durable_id in seen
+                or not isinstance(text, str)
+                or not text
+                or state
+                not in {"accepted", "processing", "transferring", "uncertain"}
+            ):
+                raise RuntimeError("SMART CLI durable queue item is invalid")
+            aggregate += len(text.encode("utf-8", errors="replace"))
+            if aggregate > _SMART_CLI_QUEUE_MAX_BYTES:
+                raise RuntimeError("SMART CLI durable queue byte limit is invalid")
+            seen.add(durable_id)
+            cleaned.append({"id": durable_id, "text": text, "state": str(state)})
+
+        attempts: dict[str, dict[str, Any]] = {}
+        if version == 4:
+            raw_attempts = raw.get("attempts")
+            if not isinstance(raw_attempts, dict) or len(raw_attempts) > len(cleaned):
+                raise RuntimeError("SMART CLI durable attempt count is invalid")
+            states_by_id = {job["id"]: job["state"] for job in cleaned}
+            for durable_id, attempt in raw_attempts.items():
+                if (
+                    durable_id not in states_by_id
+                    or not isinstance(attempt, dict)
+                    or set(attempt) != {"epoch", "token"}
+                ):
+                    raise RuntimeError("SMART CLI durable attempt schema is invalid")
+                epoch = attempt.get("epoch")
+                token = attempt.get("token")
+                if (
+                    not isinstance(epoch, int)
+                    or isinstance(epoch, bool)
+                    or epoch < 0
+                    or (
+                        token is not None
+                        and (
+                            not isinstance(token, str)
+                            or re.fullmatch(r"[0-9a-f]{32}", token) is None
+                        )
+                    )
+                ):
+                    raise RuntimeError("SMART CLI durable attempt is invalid")
+                job_state = states_by_id[durable_id]
+                if token is not None and job_state not in {"processing", "transferring"}:
+                    raise RuntimeError("SMART CLI durable attempt state is invalid")
+                if (
+                    job_state in {"processing", "transferring"}
+                    and token is None
+                    and epoch != 0
+                ):
+                    raise RuntimeError("SMART CLI durable attempt state is invalid")
+                attempts[durable_id] = {"epoch": epoch, "token": token}
+        else:
+            # In-flight legacy jobs have no attempt identity and are therefore
+            # recoverable only as uncertain; they can never authorize a callback.
+            attempts = {
+                job["id"]: {"epoch": 0, "token": None}
+                for job in cleaned
+                if job["state"] in {"processing", "transferring"}
+            }
+        return {
+            "version": 4,
+            "incarnation": incarnation,
+            "revision": revision,
+            "jobs": cleaned,
+            "attempts": attempts,
+        }
+
+    def _load_smart_cli_durable_jobs_locked(
+        self, session_id: Optional[str] = None
+    ) -> list[dict[str, str]]:
+        state = self._load_smart_cli_durable_state_locked(session_id)
+        return state["jobs"]
+
+    def _write_smart_cli_durable_jobs_locked(
+        self,
+        jobs: list[dict[str, str]],
+        session_id: Optional[str] = None,
+        *,
+        attempts: Optional[dict[str, dict[str, Any]]] = None,
+    ) -> None:
+        path = self._smart_cli_durable_path(session_id)
+        _ensure_private_directory(path.parent, create=True)
+        current = self._load_smart_cli_durable_state_locked(session_id)
+        live_ids = {job["id"] for job in jobs}
+        effective_attempts = attempts if attempts is not None else current["attempts"]
+        effective_attempts = {
+            durable_id: attempt
+            for durable_id, attempt in effective_attempts.items()
+            if durable_id in live_ids
+        }
+        payload = json.dumps(
+            {
+                "version": 4,
+                "incarnation": current["incarnation"],
+                "revision": int(current["revision"]) + 1,
+                "jobs": jobs,
+                "attempts": effective_attempts,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        _write_private_file_atomic(path, payload)
+
+    def _append_smart_cli_durable_job(
+        self,
+        durable_id: str,
+        text: str,
+        session_id: Optional[str] = None,
+    ) -> None:
+        with self._smart_cli_durable_lock_obj(session_id):
+            jobs = self._load_smart_cli_durable_jobs_locked(session_id)
+            aggregate = sum(
+                len(job["text"].encode("utf-8", errors="replace")) for job in jobs
+            )
+            item_bytes = len(text.encode("utf-8", errors="replace"))
+            if (
+                len(jobs) >= _SMART_CLI_QUEUE_MAX_ITEMS
+                or aggregate + item_bytes > _SMART_CLI_QUEUE_MAX_BYTES
+            ):
+                raise queue.Full
+            jobs.append({"id": durable_id, "text": text, "state": "accepted"})
+            self._write_smart_cli_durable_jobs_locked(jobs, session_id)
+
+    def _claim_smart_cli_durable_job(
+        self,
+        durable_id: str,
+        state: str,
+        session_id: Optional[str] = None,
+        *,
+        owner_session_id: Optional[str] = None,
+        claim_token: Optional[str] = None,
+    ) -> SmartCliDurableDisposition:
+        """CAS the oldest accepted receipt before crossing an effect boundary."""
+
+        if state not in {"processing", "transferring"}:
+            raise ValueError("invalid SMART CLI durable claim state")
+        claim_token = claim_token or uuid.uuid4().hex
+        if re.fullmatch(r"[0-9a-f]{32}", claim_token) is None:
+            raise ValueError("invalid SMART CLI durable claim token")
+        receipt_scope = str(
+            session_id
+            or getattr(getattr(self, "agent", None), "session_id", "")
+            or ""
+        )
+        ownership_leaf = str(
+            owner_session_id
+            or getattr(getattr(self, "agent", None), "session_id", "")
+            or receipt_scope
+        )
+        if not receipt_scope or not ownership_leaf:
+            return SmartCliDurableDisposition.STALE
+        try:
+            scopes = self._smart_cli_owned_durable_scopes(ownership_leaf)
+            if receipt_scope not in scopes:
+                return SmartCliDurableDisposition.STALE
+            with self._smart_cli_durable_scope_locks(scopes):
+                scoped_jobs: list[tuple[str, dict[str, str]]] = []
+                seen_ids: set[str] = set()
+                jobs_by_scope: dict[str, list[dict[str, str]]] = {}
+                attempts_by_scope: dict[str, dict[str, dict[str, Any]]] = {}
+                for scope in scopes:
+                    durable_state = self._load_smart_cli_durable_state_locked(scope)
+                    jobs = durable_state["jobs"]
+                    jobs_by_scope[scope] = jobs
+                    attempts_by_scope[scope] = durable_state["attempts"]
+                    for job in jobs:
+                        if job["id"] in seen_ids:
+                            raise RuntimeError(
+                                "SMART CLI receipt identity is duplicated across sessions"
+                            )
+                        seen_ids.add(job["id"])
+                        scoped_jobs.append((scope, job))
+
+                target_index = next(
+                    (
+                        index
+                        for index, (_scope, job) in enumerate(scoped_jobs)
+                        if job["id"] == durable_id
+                    ),
+                    None,
+                )
+                if target_index is None:
+                    return SmartCliDurableDisposition.STALE
+                target_scope, target = scoped_jobs[target_index]
+                if target["state"] != "accepted":
+                    return SmartCliDurableDisposition.STALE
+                if target_index != 0:
+                    return SmartCliDurableDisposition.BLOCKED_BY_PREDECESSOR
+
+                updated = [
+                    {**job, "state": state} if job["id"] == durable_id else job
+                    for job in jobs_by_scope[target_scope]
+                ]
+                target_attempts = dict(attempts_by_scope[target_scope])
+                previous_attempt = target_attempts.get(
+                    durable_id, {"epoch": 0, "token": None}
+                )
+                target_attempts[durable_id] = {
+                    "epoch": int(previous_attempt["epoch"]) + 1,
+                    "token": claim_token,
+                }
+                self._write_smart_cli_durable_jobs_locked(
+                    updated,
+                    target_scope,
+                    attempts=target_attempts,
+                )
+                return SmartCliDurableDisposition.COMMITTED_CURRENT
+        except Exception as exc:
+            self._smart_cli_restore_error = True
+            logger.error(
+                "Could not claim SMART CLI durable head error_type=%s",
+                type(exc).__name__,
+            )
+            return SmartCliDurableDisposition.IO_ERROR
+
+    def _sync_smart_cli_pending_inputs_from_ledger(
+        self,
+        owner_session_id: Optional[str] = None,
+    ) -> int:
+        """Atomically align the live durable lane with the eligible ledger prefix."""
+
+        ownership_leaf = str(
+            owner_session_id
+            or getattr(getattr(self, "agent", None), "session_id", "")
+            or ""
+        )
+        if not ownership_leaf:
+            return 0
+        scopes = self._smart_cli_owned_durable_scopes(ownership_leaf)
+        with self._smart_cli_durable_scope_locks(scopes):
+            eligible: list[DurableCliInput] = []
+            seen_ids: set[str] = set()
+            blocked = False
+            for scope in scopes:
+                for job in self._load_smart_cli_durable_jobs_locked(scope):
+                    if job["id"] in seen_ids:
+                        raise RuntimeError(
+                            "SMART CLI receipt identity is duplicated across sessions"
+                        )
+                    seen_ids.add(job["id"])
+                    if job["state"] != "accepted":
+                        blocked = True
+                        break
+                    eligible.append(
+                        DurableCliInput(job["id"], scope, job["text"])
+                    )
+                if blocked:
+                    eligible = []
+                    break
+
+        pending = self._pending_input
+        lineage_scopes = set(scopes)
+        with pending.mutex:
+            current = list(pending.queue)
+            lane_indexes = [
+                index
+                for index, item in enumerate(current)
+                if isinstance(item, DurableCliInput)
+                and item.durable_session_id in lineage_scopes
+            ]
+            insertion_index = lane_indexes[0] if lane_indexes else len(current)
+            existing_lane_ids = {
+                (item.durable_session_id, item.durable_id)
+                for item in current
+                if isinstance(item, DurableCliInput)
+                and item.durable_session_id in lineage_scopes
+            }
+            preserved = [
+                item
+                for item in current
+                if not (
+                    isinstance(item, DurableCliInput)
+                    and item.durable_session_id in lineage_scopes
+                )
+            ]
+            replacement = (
+                preserved[:insertion_index]
+                + eligible
+                + preserved[insertion_index:]
+            )
+            pending.queue.clear()
+            pending.queue.extend(replacement)
+            pending.unfinished_tasks += len(replacement) - len(current)
+            if eligible:
+                pending.not_empty.notify_all()
+
+        eligible_ids = {
+            (item.durable_session_id, item.durable_id) for item in eligible
+        }
+        return len(eligible_ids - existing_lane_ids)
+
+    def _set_smart_cli_durable_job_state(
+        self,
+        durable_id: str,
+        state: str,
+        session_id: Optional[str] = None,
+        expected_state: Optional[str] = None,
+    ) -> bool:
+        """Fence a non-idempotent steer transfer before invoking the agent."""
+
+        if state not in {"accepted", "processing", "transferring", "uncertain"}:
+            raise ValueError("invalid SMART CLI durable job state")
+        try:
+            with self._smart_cli_durable_lock_obj(session_id):
+                durable_state = self._load_smart_cli_durable_state_locked(session_id)
+                jobs = durable_state["jobs"]
+                attempts = dict(durable_state["attempts"])
+                found = False
+                updated: list[dict[str, str]] = []
+                for job in jobs:
+                    if job["id"] == durable_id:
+                        if expected_state is not None and job["state"] != expected_state:
+                            return False
+                        found = True
+                        updated.append({**job, "state": state})
+                    else:
+                        updated.append(job)
+                if not found:
+                    return False
+                previous = attempts.get(durable_id, {"epoch": 0, "token": None})
+                if state in {"processing", "transferring"}:
+                    attempts[durable_id] = {
+                        "epoch": int(previous["epoch"]) + 1,
+                        "token": uuid.uuid4().hex,
+                    }
+                elif durable_id in attempts:
+                    attempts[durable_id] = {
+                        "epoch": int(previous["epoch"]),
+                        "token": None,
+                    }
+                self._write_smart_cli_durable_jobs_locked(
+                    updated,
+                    session_id,
+                    attempts=attempts,
+                )
+                return True
+        except Exception as exc:
+            logger.error(
+                "Could not fence SMART CLI durable transfer error_type=%s",
+                type(exc).__name__,
+            )
+            return False
+
+    def _transition_smart_cli_durable_job(
+        self,
+        durable_id: str,
+        state: str,
+        session_id: Optional[str] = None,
+        *,
+        expected_state: str,
+        owner_session_id: Optional[str] = None,
+        claim_token: Optional[str] = None,
+    ) -> SmartCliDurableDisposition:
+        """CAS one current lineage head between non-terminal states."""
+
+        if state not in {"accepted", "processing", "transferring", "uncertain"}:
+            raise ValueError("invalid SMART CLI durable job state")
+        if expected_state in {"processing", "transferring"} and (
+            not isinstance(claim_token, str)
+            or re.fullmatch(r"[0-9a-f]{32}", claim_token) is None
+        ):
+            return SmartCliDurableDisposition.STALE
+        receipt_scope = str(
+            session_id
+            or getattr(getattr(self, "agent", None), "session_id", "")
+            or ""
+        )
+        ownership_leaf = str(
+            owner_session_id
+            or getattr(getattr(self, "agent", None), "session_id", "")
+            or receipt_scope
+        )
+        if not receipt_scope or not ownership_leaf:
+            return SmartCliDurableDisposition.STALE
+        try:
+            scopes = self._smart_cli_owned_durable_scopes(ownership_leaf)
+            if receipt_scope not in scopes:
+                return SmartCliDurableDisposition.STALE
+            with self._smart_cli_durable_scope_locks(scopes):
+                scoped_jobs: list[tuple[str, dict[str, str]]] = []
+                jobs_by_scope: dict[str, list[dict[str, str]]] = {}
+                attempts_by_scope: dict[str, dict[str, dict[str, Any]]] = {}
+                seen_ids: set[str] = set()
+                for scope in scopes:
+                    durable_state = self._load_smart_cli_durable_state_locked(scope)
+                    jobs = durable_state["jobs"]
+                    jobs_by_scope[scope] = jobs
+                    attempts_by_scope[scope] = durable_state["attempts"]
+                    for job in jobs:
+                        if job["id"] in seen_ids:
+                            raise RuntimeError(
+                                "SMART CLI receipt identity is duplicated across sessions"
+                            )
+                        seen_ids.add(job["id"])
+                        scoped_jobs.append((scope, job))
+                target_index = next(
+                    (
+                        index
+                        for index, (_scope, job) in enumerate(scoped_jobs)
+                        if job["id"] == durable_id
+                    ),
+                    None,
+                )
+                if target_index is None:
+                    return SmartCliDurableDisposition.STALE
+                target_scope, target = scoped_jobs[target_index]
+                if target["state"] != expected_state:
+                    return SmartCliDurableDisposition.STALE
+                target_attempts = dict(attempts_by_scope[target_scope])
+                current_attempt = target_attempts.get(durable_id)
+                if expected_state in {"processing", "transferring"} and (
+                    current_attempt is None
+                    or current_attempt.get("token") != claim_token
+                ):
+                    return SmartCliDurableDisposition.STALE
+                if target_index != 0:
+                    return SmartCliDurableDisposition.BLOCKED_BY_PREDECESSOR
+                updated = [
+                    {**job, "state": state} if job["id"] == durable_id else job
+                    for job in jobs_by_scope[target_scope]
+                ]
+                if state in {"accepted", "uncertain"} and current_attempt is not None:
+                    target_attempts[durable_id] = {
+                        "epoch": int(current_attempt["epoch"]),
+                        "token": None,
+                    }
+                self._write_smart_cli_durable_jobs_locked(
+                    updated,
+                    target_scope,
+                    attempts=target_attempts,
+                )
+                return SmartCliDurableDisposition.COMMITTED_CURRENT
+        except Exception as exc:
+            self._smart_cli_restore_error = True
+            logger.error(
+                "Could not transition SMART CLI durable head error_type=%s",
+                type(exc).__name__,
+            )
+            return SmartCliDurableDisposition.IO_ERROR
+
+    def _ack_smart_cli_durable_job(
+        self,
+        durable_id: str,
+        session_id: Optional[str] = None,
+        expected_state: Optional[str] = None,
+        *,
+        claim_token: Optional[str] = None,
+    ) -> bool:
+        try:
+            with self._smart_cli_durable_lock_obj(session_id):
+                durable_state = self._load_smart_cli_durable_state_locked(session_id)
+                jobs = durable_state["jobs"]
+                matched = next((job for job in jobs if job["id"] == durable_id), None)
+                if matched is None:
+                    return False
+                if expected_state is not None and matched["state"] != expected_state:
+                    return False
+                if expected_state in {"processing", "transferring"}:
+                    attempt = durable_state["attempts"].get(durable_id)
+                    if attempt is None or attempt.get("token") != claim_token:
+                        return False
+                remaining = [job for job in jobs if job["id"] != durable_id]
+                self._write_smart_cli_durable_jobs_locked(remaining, session_id)
+                return True
+        except Exception as exc:
+            logger.error(
+                "Could not acknowledge SMART CLI durable job error_type=%s",
+                type(exc).__name__,
+            )
+            return False
+
+    def _commit_smart_cli_durable_job(
+        self,
+        durable_id: str,
+        session_id: Optional[str] = None,
+        *,
+        expected_state: str,
+        owner_session_id: Optional[str] = None,
+        claim_token: Optional[str] = None,
+    ) -> SmartCliDurableDisposition:
+        """Remove only the current lineage head for this exact attempt."""
+
+        if (
+            not isinstance(claim_token, str)
+            or re.fullmatch(r"[0-9a-f]{32}", claim_token) is None
+        ):
+            return SmartCliDurableDisposition.STALE
+
+        receipt_scope = str(
+            session_id
+            or getattr(getattr(self, "agent", None), "session_id", "")
+            or ""
+        )
+        ownership_leaf = str(
+            owner_session_id
+            or getattr(getattr(self, "agent", None), "session_id", "")
+            or receipt_scope
+        )
+        if not receipt_scope or not ownership_leaf:
+            return SmartCliDurableDisposition.STALE
+        try:
+            scopes = self._smart_cli_owned_durable_scopes(ownership_leaf)
+            if receipt_scope not in scopes:
+                return SmartCliDurableDisposition.STALE
+            with self._smart_cli_durable_scope_locks(scopes):
+                scoped_jobs: list[tuple[str, dict[str, str]]] = []
+                jobs_by_scope: dict[str, list[dict[str, str]]] = {}
+                attempts_by_scope: dict[str, dict[str, dict[str, Any]]] = {}
+                seen_ids: set[str] = set()
+                for scope in scopes:
+                    durable_state = self._load_smart_cli_durable_state_locked(scope)
+                    jobs = durable_state["jobs"]
+                    jobs_by_scope[scope] = jobs
+                    attempts_by_scope[scope] = durable_state["attempts"]
+                    for job in jobs:
+                        if job["id"] in seen_ids:
+                            raise RuntimeError(
+                                "SMART CLI receipt identity is duplicated across sessions"
+                            )
+                        seen_ids.add(job["id"])
+                        scoped_jobs.append((scope, job))
+
+                target_index = next(
+                    (
+                        index
+                        for index, (_scope, job) in enumerate(scoped_jobs)
+                        if job["id"] == durable_id
+                    ),
+                    None,
+                )
+                if target_index is None:
+                    return SmartCliDurableDisposition.STALE
+                target_scope, target = scoped_jobs[target_index]
+                if target["state"] != expected_state:
+                    return SmartCliDurableDisposition.STALE
+                current_attempt = attempts_by_scope[target_scope].get(durable_id)
+                if (
+                    current_attempt is None
+                    or current_attempt.get("token") != claim_token
+                ):
+                    return SmartCliDurableDisposition.STALE
+                if target_index != 0:
+                    return SmartCliDurableDisposition.BLOCKED_BY_PREDECESSOR
+                remaining = [
+                    job
+                    for job in jobs_by_scope[target_scope]
+                    if job["id"] != durable_id
+                ]
+                self._write_smart_cli_durable_jobs_locked(remaining, target_scope)
+                return SmartCliDurableDisposition.COMMITTED_CURRENT
+        except Exception as exc:
+            self._smart_cli_restore_error = True
+            logger.error(
+                "Could not commit SMART CLI durable head error_type=%s",
+                type(exc).__name__,
+            )
+            return SmartCliDurableDisposition.IO_ERROR
+
+    def _finalize_consumed_smart_cli_steer(
+        self,
+        durable_id: str,
+        session_id: Optional[str],
+        owner_session_id: Optional[str] = None,
+        claim_token: Optional[str] = None,
+    ) -> SmartCliDurableDisposition:
+        """Commit the current steer receipt before waking its successor."""
+
+        owner_session_id = str(
+            owner_session_id
+            or getattr(getattr(self, "agent", None), "session_id", "")
+            or session_id
+            or ""
+        )
+        disposition = self._commit_smart_cli_durable_job(
+            durable_id,
+            session_id,
+            expected_state="transferring",
+            owner_session_id=owner_session_id,
+            claim_token=claim_token,
+        )
+        if disposition is not SmartCliDurableDisposition.COMMITTED_CURRENT:
+            return disposition
+        try:
+            self._sync_smart_cli_pending_inputs_from_ledger(owner_session_id)
+        except Exception as exc:
+            self._smart_cli_restore_error = True
+            logger.error(
+                "Could not promote SMART CLI durable successor error_type=%s",
+                type(exc).__name__,
+            )
+            return SmartCliDurableDisposition.IO_ERROR
+        return SmartCliDurableDisposition.COMMITTED_CURRENT
+
+    def _ack_smart_cli_input_after_chat(
+        self,
+        durable_id: Optional[str],
+        session_id: Optional[str],
+        claim_token: Optional[str] = None,
+    ) -> bool:
+        """Compatibility wrapper around the attempt-fenced finalizer."""
+
+        terminal_success = bool(
+            getattr(self, "_last_chat_turn_terminal_success", False)
+        )
+        disposition = self._finalize_smart_cli_input_after_chat(
+            durable_id,
+            session_id,
+            claim_token=claim_token,
+        )
+        return (
+            terminal_success
+            and disposition is SmartCliDurableDisposition.COMMITTED_CURRENT
+        )
+
+    def _finalize_smart_cli_input_after_chat(
+        self,
+        durable_id: Optional[str],
+        session_id: Optional[str],
+        claim_token: Optional[str] = None,
+    ) -> SmartCliDurableDisposition:
+        """Finalize one claimed full turn and wake successors only after commit."""
+
+        if not durable_id:
+            return SmartCliDurableDisposition.STALE
+        owner_session_id = str(
+            getattr(getattr(self, "agent", None), "session_id", "")
+            or session_id
+            or ""
+        )
+        if not bool(getattr(self, "_last_chat_turn_terminal_success", False)):
+            return self._transition_smart_cli_durable_job(
+                durable_id,
+                "uncertain",
+                session_id,
+                expected_state="processing",
+                owner_session_id=owner_session_id,
+                claim_token=claim_token,
+            )
+        disposition = self._commit_smart_cli_durable_job(
+            durable_id,
+            session_id,
+            expected_state="processing",
+            owner_session_id=owner_session_id,
+            claim_token=claim_token,
+        )
+        if disposition is not SmartCliDurableDisposition.COMMITTED_CURRENT:
+            return disposition
+        try:
+            self._sync_smart_cli_pending_inputs_from_ledger(owner_session_id)
+        except Exception as exc:
+            self._smart_cli_restore_error = True
+            logger.error(
+                "Could not promote SMART CLI full-turn successor error_type=%s",
+                type(exc).__name__,
+            )
+            return SmartCliDurableDisposition.IO_ERROR
+        return SmartCliDurableDisposition.COMMITTED_CURRENT
+
+    def _requeue_unconsumed_smart_cli_steer(
+        self,
+        durable_id: str,
+        session_id: Optional[str],
+        text: str,
+        owner_session_id: Optional[str] = None,
+        claim_token: Optional[str] = None,
+    ) -> SmartCliDurableDisposition:
+        """Return an unconsumed steer receipt to the durable next-turn queue."""
+        owner_session_id = str(
+            owner_session_id
+            or getattr(getattr(self, "agent", None), "session_id", "")
+            or session_id
+            or ""
+        )
+        disposition = self._transition_smart_cli_durable_job(
+            durable_id,
+            "accepted",
+            session_id,
+            expected_state="transferring",
+            owner_session_id=owner_session_id,
+            claim_token=claim_token,
+        )
+        if disposition is not SmartCliDurableDisposition.COMMITTED_CURRENT:
+            return disposition
+        try:
+            self._sync_smart_cli_pending_inputs_from_ledger(owner_session_id)
+        except Exception as exc:
+            self._smart_cli_restore_error = True
+            logger.error(
+                "Could not restage SMART CLI durable head error_type=%s",
+                type(exc).__name__,
+            )
+            return SmartCliDurableDisposition.IO_ERROR
+        return SmartCliDurableDisposition.COMMITTED_CURRENT
+
+    def _mark_uncertain_smart_cli_steer(
+        self,
+        durable_id: str,
+        session_id: Optional[str],
+        owner_session_id: Optional[str] = None,
+        claim_token: Optional[str] = None,
+    ) -> SmartCliDurableDisposition:
+        """Fence an injected receipt as uncertain without waking a successor."""
+
+        return self._transition_smart_cli_durable_job(
+            durable_id,
+            "uncertain",
+            session_id,
+            expected_state="transferring",
+            owner_session_id=str(
+                owner_session_id
+                or getattr(getattr(self, "agent", None), "session_id", "")
+                or session_id
+                or ""
+            ),
+            claim_token=claim_token,
+        )
+
+    def _resolve_uncertain_smart_cli_head(
+        self,
+        action: str,
+        owner_session_id: Optional[str] = None,
+    ) -> SmartCliDurableDisposition:
+        """Atomically retry or discard the uncertain lineage head."""
+
+        if action not in {"retry", "discard"}:
+            raise ValueError("invalid SMART CLI recovery action")
+        ownership_leaf = str(
+            owner_session_id or self._current_smart_cli_session_id() or ""
+        )
+        if not ownership_leaf:
+            return SmartCliDurableDisposition.STALE
+        try:
+            scopes = self._smart_cli_owned_durable_scopes(ownership_leaf)
+            with self._smart_cli_durable_scope_locks(scopes):
+                scoped_jobs: list[tuple[str, dict[str, str]]] = []
+                states: dict[str, dict[str, Any]] = {}
+                for scope in scopes:
+                    state = self._load_smart_cli_durable_state_locked(scope)
+                    states[scope] = state
+                    scoped_jobs.extend((scope, job) for job in state["jobs"])
+                if not scoped_jobs or scoped_jobs[0][1]["state"] != "uncertain":
+                    return SmartCliDurableDisposition.STALE
+                target_scope, target = scoped_jobs[0]
+                target_state = states[target_scope]
+                attempts = dict(target_state["attempts"])
+                previous = attempts.get(target["id"], {"epoch": 0, "token": None})
+                if action == "retry":
+                    jobs = [
+                        {**job, "state": "accepted"}
+                        if job["id"] == target["id"]
+                        else job
+                        for job in target_state["jobs"]
+                    ]
+                    attempts[target["id"]] = {
+                        "epoch": int(previous["epoch"]),
+                        "token": None,
+                    }
+                else:
+                    jobs = [
+                        job
+                        for job in target_state["jobs"]
+                        if job["id"] != target["id"]
+                    ]
+                    attempts.pop(target["id"], None)
+                self._write_smart_cli_durable_jobs_locked(
+                    jobs,
+                    target_scope,
+                    attempts=attempts,
+                )
+            self._sync_smart_cli_pending_inputs_from_ledger(ownership_leaf)
+            return SmartCliDurableDisposition.COMMITTED_CURRENT
+        except Exception as exc:
+            self._smart_cli_restore_error = True
+            logger.error(
+                "Could not resolve uncertain SMART CLI head error_type=%s",
+                type(exc).__name__,
+            )
+            return SmartCliDurableDisposition.IO_ERROR
+
+    def _restore_smart_cli_durable_inputs(self) -> int:
+        """Restage unacknowledged classifier jobs as conservative next turns."""
+
+        session_id = str(
+            getattr(getattr(self, "agent", None), "session_id", "")
+            or getattr(self, "session_id", "")
+            or ""
+        )
+        if not session_id:
+            return 0
+        try:
+            scopes = self._smart_cli_owned_durable_scopes(session_id)
+            scoped_jobs: list[tuple[str, dict[str, str]]] = []
+            seen_ids: set[str] = set()
+            with self._smart_cli_durable_scope_locks(scopes):
+                for scope in scopes:
+                    durable_state = self._load_smart_cli_durable_state_locked(scope)
+                    jobs = durable_state["jobs"]
+                    attempts = dict(durable_state["attempts"])
+                    in_flight_ids = {
+                        job["id"]
+                        for job in jobs
+                        if job.get("state") in {"processing", "transferring"}
+                    }
+                    if in_flight_ids:
+                        jobs = [
+                            {**job, "state": "uncertain"}
+                            if job["id"] in in_flight_ids
+                            else job
+                            for job in jobs
+                        ]
+                        for durable_id in in_flight_ids:
+                            previous = attempts.get(
+                                durable_id, {"epoch": 0, "token": None}
+                            )
+                            attempts[durable_id] = {
+                                "epoch": int(previous["epoch"]),
+                                "token": None,
+                            }
+                        self._write_smart_cli_durable_jobs_locked(
+                            jobs,
+                            scope,
+                            attempts=attempts,
+                        )
+                    for job in jobs:
+                        if job["id"] in seen_ids:
+                            raise RuntimeError(
+                                "SMART CLI receipt identity is duplicated across sessions"
+                            )
+                        seen_ids.add(job["id"])
+                        scoped_jobs.append((scope, job))
+        except Exception as exc:
+            self._smart_cli_restore_error = True
+            logger.error(
+                "Could not restore SMART CLI durable jobs error_type=%s",
+                type(exc).__name__,
+            )
+            return 0
+        if any(job.get("state") != "accepted" for _, job in scoped_jobs):
+            # The process may have died immediately before/after a steer or
+            # while an accepted next turn was executing. Replaying would risk
+            # duplicate side effects; dropping would lose an accepted obligation.
+            # Preserve the payload and require explicit recovery instead of guessing.
+            self._smart_cli_restore_error = True
+            logger.error(
+                "SMART CLI recovery blocked by an uncertain accepted delivery"
+            )
+            return 0
+        self._smart_cli_restore_error = False
+        restored_ids = getattr(self, "_smart_cli_restored_ids", None)
+        if restored_ids is None:
+            restored_ids = set()
+            self._smart_cli_restored_ids = restored_ids
+        restored = 0
+        for scope, job in scoped_jobs:
+            restore_key = (scope, job["id"])
+            if restore_key in restored_ids:
+                continue
+            self._pending_input.put(
+                DurableCliInput(job["id"], scope, job["text"])
+            )
+            restored_ids.add(restore_key)
+            restored += 1
+        return restored
+
+    def _smart_cli_durable_job_count(self) -> int:
+        session_id = str(
+            getattr(getattr(self, "agent", None), "session_id", "")
+            or getattr(self, "session_id", "")
+            or ""
+        )
+        if not session_id:
+            return 0
+        try:
+            scopes = self._smart_cli_owned_durable_scopes(session_id)
+            with self._smart_cli_durable_scope_locks(scopes):
+                return sum(
+                    len(self._load_smart_cli_durable_jobs_locked(scope))
+                    for scope in scopes
+                )
+        except Exception as exc:
+            logger.error(
+                "Could not inspect SMART CLI durable jobs error_type=%s",
+                type(exc).__name__,
+            )
+            return 0
 
     def _smart_cli_worker_loop(self) -> None:
         """Drain SMART follow-ups in FIFO order on one classifier worker."""
@@ -7436,22 +9510,179 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         self._smart_cli_worker = None
                         return
                 continue
+            item_bytes = 0
             try:
                 if item is None:
                     return
-                text, route_context = item
-                self._route_smart_cli_input(text, route_context=route_context)
+                durable_id = None
+                if isinstance(item, SmartCliClassifierJob):
+                    text = item.text
+                    route_context = item.route_context
+                    durable_id = item.durable_id
+                    durable_session_id = item.durable_session_id
+                else:
+                    # Compatibility for extensions/tests that staged the
+                    # historical tuple form before durable jobs existed.
+                    text, route_context = item
+                    durable_session_id = None
+                item_bytes = len(str(text).encode("utf-8", errors="replace"))
+                if durable_id:
+                    self._route_smart_cli_input(
+                        text,
+                        route_context=route_context,
+                        durable_id=durable_id,
+                        durable_session_id=durable_session_id,
+                    )
+                else:
+                    self._route_smart_cli_input(text, route_context=route_context)
             finally:
+                queue_lock = getattr(self, "_smart_cli_queue_lock", None)
+                if queue_lock is not None and item_bytes:
+                    with queue_lock:
+                        self._smart_cli_queued_bytes = max(
+                            0,
+                            int(getattr(self, "_smart_cli_queued_bytes", 0))
+                            - item_bytes,
+                        )
                 self._smart_cli_input_queue.task_done()
 
-    def _enqueue_smart_cli_input(self, text: str) -> None:
-        """Submit a SMART follow-up without blocking prompt_toolkit's UI thread."""
+    def _current_smart_cli_session_id(self) -> str:
+        """Return the controller-owned durable scope without coercing mock objects."""
+
+        for candidate in (
+            getattr(getattr(self, "agent", None), "session_id", None),
+            getattr(self, "session_id", None),
+        ):
+            if isinstance(candidate, str) and candidate:
+                return candidate
+        return ""
+
+    def _admit_explicit_cli_queue(self, text: str) -> bool:
+        """Persist an explicit next turn before staging its typed receipt."""
+
+        cleaned = str(text or "")
+        if not cleaned or len(cleaned.encode("utf-8", errors="replace")) > _SMART_CLI_QUEUE_MAX_BYTES:
+            return False
+        session_id = self._current_smart_cli_session_id()
+        if not session_id:
+            return False
+        durable_id = uuid.uuid4().hex
+        try:
+            self._append_smart_cli_durable_job(durable_id, cleaned, session_id)
+        except Exception as exc:
+            logger.error(
+                "Could not persist explicit CLI queue receipt error_type=%s",
+                type(exc).__name__,
+            )
+            return False
+        try:
+            self._sync_smart_cli_pending_inputs_from_ledger(session_id)
+        except Exception as exc:
+            # Admission already committed. Preserve the receipt for restart/recovery
+            # rather than deleting it merely because live staging failed.
+            self._smart_cli_restore_error = True
+            logger.error(
+                "Explicit CLI queue receipt persisted but staging failed "
+                "error_type=%s",
+                type(exc).__name__,
+            )
+        return True
+
+    def _admit_explicit_cli_steer(self, text: str) -> bool:
+        """Persist an explicit steer, then route it through the fenced lane."""
+
+        cleaned = str(text or "")
+        if not cleaned or len(cleaned.encode("utf-8", errors="replace")) > _SMART_CLI_QUEUE_MAX_BYTES:
+            return False
         route_context = self._capture_smart_cli_route_context()
-        self._smart_cli_input_queue.put((text, route_context))
+        session_id = (
+            route_context.owner_session_id or self._current_smart_cli_session_id()
+        )
+        if not session_id:
+            return False
+        durable_id = uuid.uuid4().hex
+        try:
+            self._append_smart_cli_durable_job(durable_id, cleaned, session_id)
+        except Exception as exc:
+            logger.error(
+                "Could not persist explicit CLI steer receipt error_type=%s",
+                type(exc).__name__,
+            )
+            return False
+        try:
+            from hermes_cli.smart_orchestrator import ROUTE_RELATED
+
+            self._route_smart_cli_input(
+                cleaned,
+                route_context=route_context,
+                durable_id=durable_id,
+                durable_session_id=session_id,
+                forced_route=ROUTE_RELATED,
+            )
+        except Exception as exc:
+            # The durable receipt remains authoritative even if live routing fails.
+            self._smart_cli_restore_error = True
+            logger.error(
+                "Explicit CLI steer receipt persisted but routing failed "
+                "error_type=%s",
+                type(exc).__name__,
+            )
+            try:
+                self._sync_smart_cli_pending_inputs_from_ledger(session_id)
+            except Exception:
+                pass
+        return True
+
+    def _enqueue_smart_cli_input(self, text: str) -> bool:
+        """Admit one bounded SMART classifier job without blocking the UI."""
+
+        cleaned = str(text or "")
+        item_bytes = len(cleaned.encode("utf-8", errors="replace"))
+        if not cleaned or item_bytes > _SMART_CLI_QUEUE_MAX_BYTES:
+            return False
+        route_context = self._capture_smart_cli_route_context()
+        durable_session_id = str(
+            getattr(getattr(self, "agent", None), "session_id", "") or ""
+        )
+        if not durable_session_id:
+            return False
+        durable_id = uuid.uuid4().hex
+        job = SmartCliClassifierJob(
+            durable_id,
+            durable_session_id,
+            cleaned,
+            route_context,
+        )
+        queue_lock = getattr(self, "_smart_cli_queue_lock", None)
+        if queue_lock is None:
+            queue_lock = threading.Lock()
+            self._smart_cli_queue_lock = queue_lock
+            self._smart_cli_queued_bytes = 0
+        with queue_lock:
+            queued_bytes = int(getattr(self, "_smart_cli_queued_bytes", 0))
+            if (
+                self._smart_cli_input_queue.qsize() >= _SMART_CLI_QUEUE_MAX_ITEMS
+                or queued_bytes + item_bytes > _SMART_CLI_QUEUE_MAX_BYTES
+            ):
+                return False
+            try:
+                # Persistence is the commit point for the positive UI receipt.
+                # The daemon worker is allowed to die after this call because a
+                # later CLI process will conservatively restage the text.
+                self._append_smart_cli_durable_job(
+                    durable_id,
+                    cleaned,
+                    durable_session_id,
+                )
+                self._smart_cli_input_queue.put_nowait(job)
+            except Exception:
+                self._ack_smart_cli_durable_job(durable_id, durable_session_id)
+                return False
+            self._smart_cli_queued_bytes = queued_bytes + item_bytes
         with self._smart_cli_worker_lock:
             worker = getattr(self, "_smart_cli_worker", None)
             if worker is not None and worker.is_alive():
-                return
+                return True
             worker = threading.Thread(
                 target=self._smart_cli_worker_loop,
                 name="hermes-smart-cli-router",
@@ -7459,6 +9690,64 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             )
             self._smart_cli_worker = worker
             worker.start()
+        return True
+
+    def _enqueue_private_smart_cli_input(
+        self,
+        reference_text: str,
+        *,
+        delivery_text: Optional[str] = None,
+    ) -> bool:
+        """Durably queue a private paste without any auxiliary classification."""
+
+        reference_text = str(reference_text or "")
+        if not self._has_private_paste_reference(reference_text):
+            return False
+        resolved = self._expand_paste_references(reference_text, consume=False)
+        if self._has_private_paste_reference(resolved):
+            return False
+        delivery = str(delivery_text if delivery_text is not None else resolved)
+        delivery_bytes = len(delivery.encode("utf-8", errors="replace"))
+        if not delivery or delivery_bytes > _SMART_CLI_QUEUE_MAX_BYTES:
+            return False
+        session_id = str(
+            getattr(getattr(self, "agent", None), "session_id", "")
+            or getattr(self, "session_id", "")
+            or ""
+        )
+        if not session_id:
+            return False
+        durable_id = uuid.uuid4().hex
+        queue_lock = getattr(self, "_smart_cli_queue_lock", None)
+        if queue_lock is None:
+            queue_lock = threading.Lock()
+            self._smart_cli_queue_lock = queue_lock
+            self._smart_cli_queued_bytes = 0
+        with queue_lock:
+            try:
+                # Persist the exact local delivery body before invalidating the
+                # opaque spill capability. Recovery no longer depends on it.
+                self._append_smart_cli_durable_job(
+                    durable_id,
+                    delivery,
+                    session_id,
+                )
+                consumed = self._expand_paste_references(
+                    reference_text,
+                    consume=True,
+                )
+                if self._has_private_paste_reference(consumed) or (
+                    delivery_text is None and consumed != resolved
+                ):
+                    self._ack_smart_cli_durable_job(durable_id, session_id)
+                    return False
+                self._pending_input.put(
+                    DurableCliInput(durable_id, session_id, delivery)
+                )
+            except Exception:
+                self._ack_smart_cli_durable_job(durable_id, session_id)
+                return False
+        return True
 
     def _install_tool_callbacks(self) -> None:
         """Install tool callbacks that need the live prompt UI."""
@@ -9910,6 +12199,64 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         if result.success and result.requires_new_session:
             _cprint("    Tip: `/reset` starts a new session immediately.")
 
+    def _handle_explicit_durable_command_inline(
+        self,
+        text: str,
+        *,
+        has_images: bool = False,
+    ) -> Optional[bool]:
+        """Handle /queue and /steer at Enter time with persistence-first admission."""
+
+        if not text or has_images or not _looks_like_slash_command(text):
+            return None
+        try:
+            from hermes_cli.commands import resolve_command
+
+            base = text.split(None, 1)[0].lower().lstrip("/")
+            command = resolve_command(base)
+            canonical = command.name if command is not None else ""
+        except Exception:
+            return None
+        if canonical not in {"queue", "steer"}:
+            return None
+        parts = text.split(None, 1)
+        payload = parts[1].strip() if len(parts) > 1 else ""
+        if not payload:
+            _cprint(f"  Usage: /{canonical} <prompt>")
+            return True
+        if canonical == "queue" and payload in {
+            "--retry-uncertain",
+            "--discard-uncertain",
+        }:
+            action = "retry" if payload == "--retry-uncertain" else "discard"
+            disposition = self._resolve_uncertain_smart_cli_head(action)
+            if disposition is SmartCliDurableDisposition.COMMITTED_CURRENT:
+                _cprint(f"  Uncertain queue head resolved via {action}.")
+                return True
+            _cprint("  No uncertain queue head was resolved; command retained.")
+            return False
+        if self._has_private_paste_reference(payload):
+            _cprint(
+                "  Durable command rejected; submit the private paste as normal "
+                "input so it can be consumed safely."
+            )
+            return False
+        admitted = (
+            self._admit_explicit_cli_queue(payload)
+            if canonical == "queue"
+            else self._admit_explicit_cli_steer(payload)
+        )
+        if admitted:
+            if canonical == "queue":
+                _cprint("  Persisted for the next turn; awaiting terminal receipt.")
+            else:
+                _cprint("  Steer persisted and routed; awaiting consumption receipt.")
+        else:
+            _cprint(
+                f"  /{canonical} admission failed before persistence; draft retained."
+            )
+        return admitted
+
     def _should_handle_model_command_inline(self, text: str, has_images: bool = False) -> bool:
         """Return True when /model should be handled immediately on the UI thread."""
         if not text or has_images or not _looks_like_slash_command(text):
@@ -10544,43 +12891,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self._handle_journey_command(cmd_original)
         elif canonical == "background":
             self._handle_background_command(cmd_original)
-        elif canonical == "queue":
-            # Extract prompt after "/queue " or "/q "
-            parts = cmd_original.split(None, 1)
-            payload = parts[1].strip() if len(parts) > 1 else ""
-            payload = self._expand_paste_references(payload)
-            if not payload:
-                _cprint("  Usage: /queue <prompt>")
-            else:
-                self._pending_input.put(payload)
-                if self._agent_running:
-                    _cprint(f"  Queued for the next turn: {payload[:80]}{'...' if len(payload) > 80 else ''}")
-                else:
-                    _cprint(f"  Queued: {payload[:80]}{'...' if len(payload) > 80 else ''}")
-        elif canonical == "steer":
-            # Inject a message after the next tool call without interrupting.
-            # If the agent is actively running, push the text into the agent's
-            # pending_steer slot — the drain hook in _execute_tool_calls_*
-            # will append it to the next tool result's content. If no agent
-            # is running, fall back to queue semantics (same as /queue).
-            parts = cmd_original.split(None, 1)
-            payload = parts[1].strip() if len(parts) > 1 else ""
-            if not payload:
-                _cprint("  Usage: /steer <prompt>")
-            elif self._agent_running and self.agent is not None and hasattr(self.agent, "steer"):
-                try:
-                    accepted = self.agent.steer(payload)
-                except Exception as exc:
-                    _cprint(f"  Steer failed: {exc}")
-                else:
-                    if accepted:
-                        _cprint(f"  ⏩ Steer queued — arrives after the next tool call: {payload[:80]}{'...' if len(payload) > 80 else ''}")
-                    else:
-                        _cprint("  Steer rejected (empty payload).")
-            else:
-                # No active run — treat as a normal next-turn message.
-                self._pending_input.put(payload)
-                _cprint(f"  No agent running; queued as next turn: {payload[:80]}{'...' if len(payload) > 80 else ''}")
+        elif canonical in {"queue", "steer"}:
+            self._handle_explicit_durable_command_inline(cmd_original)
         elif canonical == "goal":
             self._handle_goal_command(cmd_original)
         elif canonical == "moa":
@@ -11408,8 +13720,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     getattr(self.agent, "session_id", None)
                     and self.agent.session_id != self.session_id
                 ):
-                    self.session_id = self.agent.session_id
-                    self._pending_title = None
+                    self._adopt_smart_cli_continuation_session(
+                        self.session_id,
+                        self.agent.session_id,
+                    )
                     # Manual /compress replaces conversation_history with a new
                     # compressed handoff for the child session. Persist it from
                     # offset 0 so resume can recover the continuation after exit.
@@ -13903,6 +16217,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         Returns:
             The agent's response, or None on error
         """
+        # A durable caller must never infer success merely because chat() caught
+        # an exception and returned normally.  Only the explicit clean agent
+        # result near the terminal return may flip this marker to True.
+        self._last_chat_turn_terminal_success = False
+
         # Single-query and direct chat callers do not go through run(), so
         # register secure secret capture here as well.
         set_secret_capture_callback(self._secret_capture_callback)
@@ -14343,17 +16662,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                             # explicitly reset — without this the CLI freezes after
                             # an interrupt until the prompt's own timeout expires (#14026).
                             self._clear_active_overlays_for_interrupt()
-                            # Debug: log to file (stdout may be devnull from redirect_stdout)
-                            try:
-                                _dbg = _hermes_home / "interrupt_debug.log"
-                                with open(_dbg, "a", encoding="utf-8") as _f:
-                                    _f.write(f"{time.strftime('%H:%M:%S')} interrupt fired: msg={str(interrupt_msg)[:60]!r}, "
-                                             f"children={len(self.agent._active_children)}, "
-                                             f"parent._interrupt={self.agent._interrupt_requested}\n")
-                                    for _ci, _ch in enumerate(self.agent._active_children):
-                                        _f.write(f"  child[{_ci}]._interrupt={_ch._interrupt_requested}\n")
-                            except Exception:
-                                pass
                             break
                     except queue.Empty:
                         # Force prompt_toolkit to flush any pending stdout
@@ -14449,9 +16757,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 and getattr(self.agent, "session_id", None)
                 and self.agent.session_id != self.session_id
             ):
-                self._transfer_session_yolo(self.session_id, self.agent.session_id)
-                self.session_id = self.agent.session_id
-                self._pending_title = None
+                self._adopt_smart_cli_continuation_session(
+                    self.session_id,
+                    self.agent.session_id,
+                )
 
             # Get the final response
             response = result.get("final_response", "") if result else ""
@@ -14708,9 +17017,22 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 print(f"\n⏩ Delivering leftover /steer as next turn: '{preview}'")
                 self._pending_input.put(_leftover_steer)
 
+            from run_agent import is_explicit_terminal_success
+
+            self._last_chat_turn_terminal_success = is_explicit_terminal_success(result)
             return response
             
         except Exception as e:
+            take_failed_steer = getattr(
+                getattr(self, "agent", None),
+                "take_failed_turn_pending_steer",
+                None,
+            )
+            if callable(take_failed_steer) and hasattr(self, "_pending_input"):
+                failed_leftover = take_failed_steer()
+                if failed_leftover:
+                    self._pending_input.put(failed_leftover)
+                    print("Accepted SMART update preserved for the next turn.")
             print(f"Error: {e}")
             return None
         finally:
@@ -14850,8 +17172,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
             agent._ensure_db_session()
             agent._persist_session(messages, conversation_history)
-            if getattr(agent, "session_id", None):
-                self.session_id = agent.session_id
+            target_session_id = str(getattr(agent, "session_id", None) or "")
+            if target_session_id and target_session_id != self.session_id:
+                self._adopt_smart_cli_continuation_session(
+                    self.session_id,
+                    target_session_id,
+                )
 
         try:
             if persist_lock is None:
@@ -15347,7 +17673,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._agent_running = False
         self._pending_input = queue.Queue()     # For normal input (commands + new queries)
         self._interrupt_queue = queue.Queue()   # For messages typed while agent is running
-        self._smart_cli_input_queue = queue.Queue()
+        self._smart_cli_input_queue = queue.Queue(maxsize=_SMART_CLI_QUEUE_MAX_ITEMS)
+        self._smart_cli_queue_lock = threading.Lock()
+        self._smart_cli_queued_bytes = 0
+        self._smart_cli_durable_lock = threading.Lock()
+        self._smart_cli_restored_ids: set[str] = set()
+        self._smart_cli_restore_error = False
         self._smart_cli_worker_lock = threading.Lock()
         self._smart_cli_worker = None
         # See constructor note. Mirrored here for the run() path that skips
@@ -15567,169 +17898,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 return
 
             # --- Normal input routing ---
-            text = event.app.current_buffer.text.strip()
-            has_images = bool(self._attached_images)
-            if text or has_images:
-                # Handle /model directly on the UI thread so interactive pickers
-                # can safely use prompt_toolkit terminal handoff helpers.
-                if self._should_handle_model_command_inline(text, has_images=has_images):
-                    if not self.process_command(text):
-                        self._should_exit = True
-                        if event.app.is_running:
-                            event.app.exit()
-                    event.app.current_buffer.reset(append_to_history=True)
-                    # Force a repaint: process_command() prints through
-                    # patch_stdout (scrolls output above the prompt) and never
-                    # invalidates the app, so the just-cleared input area can
-                    # keep showing the submitted text until some unrelated
-                    # redraw fires. Every other early-return branch in this
-                    # handler invalidates after reset — match them.
-                    event.app.invalidate()
-                    return
-
-                # Handle /steer while the agent is running immediately on the
-                # UI thread.  Queuing through _pending_input would deadlock the
-                # steer until after the agent loop finishes (process_loop is
-                # blocked inside self.chat()), which turns /steer into a
-                # post-run next-turn message — defeating mid-run injection.
-                # agent.steer() is thread-safe (holds _pending_steer_lock).
-                if self._should_handle_steer_command_inline(text, has_images=has_images):
-                    self.process_command(text)
-                    event.app.current_buffer.reset(append_to_history=True)
-                    # Force a repaint after clearing the buffer.  /steer is
-                    # dispatched mid-run while the agent streams output through
-                    # patch_stdout; process_command() never invalidates the
-                    # app, so without this the submitted "/steer <text>" can
-                    # linger in the input area (looking unsent) and invite an
-                    # accidental re-submit. See issue #34569.
-                    event.app.invalidate()
-                    return
-
-                # Same treatment for /background (/bg, /btw) while the agent is
-                # running.  Queuing it defeats the entire point of the command:
-                # process_loop is blocked inside self.chat(), so the background
-                # task would only start once the foreground turn it was meant to
-                # run alongside has already finished (#75221).  The foreground
-                # turn is left alone: no interrupt, no steer.
-                if self._should_handle_background_command_inline(
-                    text, has_images=has_images
-                ):
-                    self.process_command(text)
-                    event.app.current_buffer.reset(append_to_history=True)
-                    # Repaint for the same reason as the /steer branch above:
-                    # process_command() prints through patch_stdout and never
-                    # invalidates the app, so the submitted text can linger in
-                    # the input area looking unsent.
-                    event.app.invalidate()
-                    return
-
-                # Snapshot and clear attached images
-                images = list(self._attached_images)
-                self._attached_images.clear()
-                event.app.invalidate()
-                # Bundle text + images as a tuple when images are present
-                payload = (text, images) if images else text
-                # A bang command is treated like a slash command while the
-                # agent is busy: it must never be routed into steer/redirect
-                # (which would inject `!git status` into the model's context as
-                # a prompt). It queues and runs locally once the loop drains.
-                _is_local_dispatch = bool(text) and (
-                    _looks_like_slash_command(text) or text.strip().startswith("!")
-                )
-                if self._agent_running and not _is_local_dispatch:
-                    _effective_mode = self.busy_input_mode
-                    redirected = False
-                    if _effective_mode == "smart":
-                        # Preserve media for a full next turn. Text is routed by
-                        # one FIFO worker so provider latency never freezes the UI
-                        # and concurrent follow-ups retain arrival order.
-                        if images or not text:
-                            _effective_mode = "queue"
-                        else:
-                            self._enqueue_smart_cli_input(text)
-                            preview = text[:80] + ("..." if len(text) > 80 else "")
-                            _cprint(f"  {_ACCENT}🧭 SMART routing: '{preview}'{_RST}")
-                    if _effective_mode == "steer":
-                        # Route Enter through /steer — inject mid-run after the
-                        # next tool call.  Images can't ride along (steer only
-                        # appends text), so fall back to queue when images are
-                        # attached.  If the agent lacks steer() or rejects the
-                        # payload, also fall back to queue so nothing is lost.
-                        if images or not text:
-                            _effective_mode = "queue"
-                        else:
-                            accepted = False
-                            try:
-                                if self.agent is not None and hasattr(self.agent, "steer"):
-                                    accepted = bool(self.agent.steer(text))
-                            except Exception as exc:
-                                _cprint(f"  {_DIM}Steer failed ({exc}) — queued for next turn.{_RST}")
-                                accepted = False
-                            if accepted:
-                                preview = text[:80] + ("..." if len(text) > 80 else "")
-                                _cprint(f"  {_ACCENT}⏩ Steered: '{preview}'{_RST}")
-                            else:
-                                _effective_mode = "queue"
-                    if _effective_mode == "queue":
-                        # Queue for the next turn instead of interrupting
-                        self._pending_input.put(payload)
-                        preview = text if text else f"[{len(images)} image{'s' if len(images) != 1 else ''} attached]"
-                        _cprint(f"  Queued for the next turn: {preview[:80]}{'...' if len(preview) > 80 else ''}")
-                    elif _effective_mode == "interrupt":
-                        if not images and text:
-                            try:
-                                if (
-                                    self.agent is not None
-                                    and getattr(
-                                        self.agent,
-                                        "_supports_active_turn_redirect",
-                                        False,
-                                    )
-                                    is True
-                                    and hasattr(self.agent, "redirect")
-                                ):
-                                    redirected = bool(self.agent.redirect(text))
-                            except Exception:
-                                redirected = False
-                        if redirected:
-                            preview = text[:80] + ("..." if len(text) > 80 else "")
-                            _cprint(f"  {_ACCENT}↪ Redirected current turn: '{preview}'{_RST}")
-                        else:
-                            # Compatibility path for older agents, multimodal
-                            # follow-ups, or a turn that finished in the race.
-                            self._interrupt_queue.put(payload)
-                            try:
-                                _dbg = _hermes_home / "interrupt_debug.log"
-                                with open(_dbg, "a", encoding="utf-8") as _f:
-                                    _f.write(f"{time.strftime('%H:%M:%S')} ENTER: queued interrupt msg={str(payload)[:60]!r}, "
-                                             f"agent_running={self._agent_running}\n")
-                            except Exception:
-                                pass
-                    # First-touch onboarding: on the very first busy-while-running
-                    # event for this install, print a one-line tip explaining the
-                    # /busy knob.  Flag persists to config.yaml and never fires
-                    # again.  Guarded for exceptions so onboarding can't break
-                    # the input loop.
-                    try:
-                        from agent.onboarding import (
-                            BUSY_INPUT_FLAG,
-                            busy_input_hint_cli,
-                            is_seen,
-                            mark_seen,
-                        )
-                        if not is_seen(CLI_CONFIG, BUSY_INPUT_FLAG):
-                            _hint_mode = "redirect" if redirected else _effective_mode
-                            _cprint(f"  {_DIM}{busy_input_hint_cli(_hint_mode)}{_RST}")
-                            mark_seen(_hermes_home / "config.yaml", BUSY_INPUT_FLAG)
-                            CLI_CONFIG.setdefault("onboarding", {}).setdefault("seen", {})[BUSY_INPUT_FLAG] = True
-                    except Exception:
-                        pass
-                else:
-                    self._pending_input.put(payload)
-                # History stores real pasted content, not the placeholder, so
-                # up-arrow recall restores the actual text.
-                self._inline_pastes(event.app.current_buffer)
-                event.app.current_buffer.reset(append_to_history=True)
+            self._submit_normal_input(event)
 
         _bind_prompt_submit_keys(kb, handle_enter)
         
@@ -16504,17 +18673,19 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 chars_hit = char_threshold > 0 and len(pasted_text) >= char_threshold
                 if (lines_hit or chars_hit) and not buf.text.strip().startswith('/'):
                     _paste_counter[0] += 1
-                    paste_dir = _hermes_home / "pastes"
-                    paste_dir.mkdir(parents=True, exist_ok=True)
-                    paste_file = paste_dir / f"paste_{_paste_counter[0]}_{datetime.now().strftime('%H%M%S')}.txt"
-                    paste_file.write_text(pasted_text, encoding="utf-8")
-                    logger.info("Collapsed paste #%d: %d lines, %d chars -> %s", _paste_counter[0], line_count + 1, len(pasted_text), paste_file)
-                    placeholder = f"[Pasted text #{_paste_counter[0]}: {line_count + 1} lines \u2192 {paste_file}]"
-                    prefix = ""
-                    if buf.cursor_position > 0 and buf.text[buf.cursor_position - 1] != '\n':
-                        prefix = "\n"
-                    _paste_just_collapsed[0] = True
-                    buf.insert_text(prefix + placeholder)
+                    placeholder = self._store_private_paste_reference(
+                        pasted_text,
+                        display_index=_paste_counter[0],
+                        line_count=line_count + 1,
+                    )
+                    if placeholder is None:
+                        buf.insert_text(pasted_text)
+                    else:
+                        prefix = ""
+                        if buf.cursor_position > 0 and buf.text[buf.cursor_position - 1] != '\n':
+                            prefix = "\n"
+                        _paste_just_collapsed[0] = True
+                        buf.insert_text(prefix + placeholder)
                 else:
                     buf.insert_text(pasted_text)
             _paste_handler_elapsed_ms = (time.perf_counter() - _paste_handler_start) * 1000.0
@@ -16675,14 +18846,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             chars_hit = char_threshold > 0 and len(text) >= char_threshold
             if (lines_hit or chars_hit) and is_paste and not text.startswith('/'):
                 _paste_counter[0] += 1
-                paste_dir = _hermes_home / "pastes"
-                paste_dir.mkdir(parents=True, exist_ok=True)
-                paste_file = paste_dir / f"paste_{_paste_counter[0]}_{datetime.now().strftime('%H%M%S')}.txt"
-                paste_file.write_text(text, encoding="utf-8")
-                logger.info("Collapsed paste #%d: %d lines, %d chars -> %s (fallback)", _paste_counter[0], line_count + 1, len(text), paste_file)
-                _paste_just_collapsed[0] = True
-                buf.text = f"[Pasted text #{_paste_counter[0]}: {line_count + 1} lines \u2192 {paste_file}]"
-                buf.cursor_position = len(buf.text)
+                placeholder = self._store_private_paste_reference(
+                    text,
+                    display_index=_paste_counter[0],
+                    line_count=line_count + 1,
+                )
+                if placeholder is not None:
+                    _paste_just_collapsed[0] = True
+                    buf.text = placeholder
+                    buf.cursor_position = len(buf.text)
 
         input_area.buffer.on_text_changed += _on_text_changed
 
@@ -17596,6 +19768,36 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     if not user_input:
                         continue
 
+                    durable_input_id = None
+                    durable_input_session_id = None
+                    durable_input_claim_token: Optional[str] = None
+                    if isinstance(user_input, DurableCliInput):
+                        durable_input_id = user_input.durable_id
+                        durable_input_session_id = user_input.durable_session_id
+                        durable_input_claim_token = uuid.uuid4().hex
+                        claim_disposition = self._claim_smart_cli_durable_job(
+                            durable_input_id,
+                            "processing",
+                            durable_input_session_id,
+                            owner_session_id=str(
+                                getattr(getattr(self, "agent", None), "session_id", "")
+                                or getattr(self, "session_id", "")
+                                or ""
+                            ),
+                            claim_token=durable_input_claim_token,
+                        )
+                        if (
+                            claim_disposition
+                            is not SmartCliDurableDisposition.COMMITTED_CURRENT
+                        ):
+                            self._smart_cli_restore_error = True
+                            _cprint(
+                                f"\033[1;31mSMART recovery paused before execution; "
+                                f"the accepted payload remains in private durable state.{_RST}"
+                            )
+                            continue
+                        user_input = user_input.payload
+
                     # The user has typed and submitted something, so any
                     # post-resize transient suppression should end here.
                     self._status_bar_suppressed_after_resize = False
@@ -17685,13 +19887,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         else:
                             continue
                     
-                    # Expand paste references back to full content
+                    # Render the opaque marker first. The private body is
+                    # resolved only after display/history handling, immediately
+                    # before the trusted agent delivery boundary.
                     _paste_ref_re = re.compile(r'\[Pasted text #\d+: \d+ lines \u2192 (.+?)\]')
                     paste_refs = list(_paste_ref_re.finditer(user_input)) if isinstance(user_input, str) else []
-                    if paste_refs:
-                        user_input = self._expand_paste_references(user_input)
                     print()
                     self._print_user_message_preview(user_input)
+                    if paste_refs:
+                        user_input = self._expand_paste_references(user_input)
                     
                     # Show image attachment count
                     if submit_images:
@@ -17706,9 +19910,23 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     self._turn_summary_begin()
                     app.invalidate()  # Refresh status line
 
+                    # Reset defensively even when chat() is monkeypatched: an
+                    # old successful turn must never authorize this receipt.
+                    self._last_chat_turn_terminal_success = False
                     try:
                         self.chat(user_input, images=submit_images or None, voice_input=is_voice_input)
                     finally:
+                        if durable_input_id:
+                            disposition = self._finalize_smart_cli_input_after_chat(
+                                durable_input_id,
+                                durable_input_session_id,
+                                claim_token=durable_input_claim_token,
+                            )
+                            if (
+                                disposition
+                                is not SmartCliDurableDisposition.COMMITTED_CURRENT
+                            ):
+                                self._smart_cli_restore_error = True
                         self._agent_running = False
                         self._spinner_text = ""
                         self._tool_start_time = 0.0
@@ -17753,7 +19971,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         try:
                             self._maybe_continue_goal_after_turn()
                         except Exception as _goal_exc:
-                            logging.debug("goal continuation hook failed: %s", _goal_exc)
+                            logging.debug(
+                                "goal continuation hook failed error_type=%s",
+                                type(_goal_exc).__name__,
+                            )
 
                         # Continuous voice: auto-restart recording after agent responds.
                         # Dispatch to a daemon thread so play_beep (sd.wait) and
@@ -17772,7 +19993,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                                     self._voice_start_recording()
                                     app.invalidate()
                                 except Exception as e:
-                                    _cprint(f"{_DIM}Voice auto-restart failed: {e}{_RST}")
+                                    _cprint(
+                                        f"{_DIM}Voice auto-restart failed "
+                                        f"({type(e).__name__}).{_RST}"
+                                    )
                             threading.Thread(target=_restart_recording, daemon=True).start()
 
                         # Drain process notifications (completions + watch matches)
@@ -17783,8 +20007,25 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                             pass  # Non-fatal — don't break the main loop
 
                 except Exception as e:
-                    logger.warning("process_loop unhandled error (msg may be lost): %s", e)
+                    logger.warning(
+                        "process_loop unhandled error state=message_may_be_lost "
+                        "error_type=%s",
+                        type(e).__name__,
+                    )
         
+        restored_smart_jobs = self._restore_smart_cli_durable_inputs()
+        if restored_smart_jobs:
+            _cprint(
+                f"  {_DIM}Restored {restored_smart_jobs} accepted SMART "
+                f"message{'s' if restored_smart_jobs != 1 else ''} for safe next-turn processing.{_RST}"
+            )
+        elif self._smart_cli_restore_error:
+            _cprint(
+                f"  \033[1;31mSMART recovery paused: an accepted steer has an "
+                f"uncertain delivery outcome. Its private recovery record was "
+                f"preserved; do not replay it automatically.{_RST}"
+            )
+
         # Start processing thread
         process_thread = threading.Thread(target=process_loop, daemon=True)
         process_thread.start()
@@ -18030,6 +20271,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 print(f"{_DIM}Shutting down… (finalizing session){_RST}", flush=True)
             except Exception:
                 pass
+            durable_smart_jobs = self._smart_cli_durable_job_count()
+            if durable_smart_jobs:
+                try:
+                    print(
+                        f"{_YELLOW}Preserved {durable_smart_jobs} accepted SMART "
+                        f"message{'s' if durable_smart_jobs != 1 else ''} for this session. "
+                        f"Resume the session to continue them safely.{_RST}",
+                        flush=True,
+                    )
+                except Exception:
+                    pass
             # Interrupt the agent immediately so its daemon thread stops making
             # API calls and exits promptly (agent_thread is daemon, so the
             # process will exit once the main thread finishes, but interrupting

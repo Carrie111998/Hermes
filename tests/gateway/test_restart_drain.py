@@ -56,6 +56,74 @@ async def test_restart_command_while_busy_requests_drain_without_interrupt(monke
     runner.request_restart.assert_called_once_with(detached=True, via_service=False)
 
 
+@pytest.mark.asyncio
+async def test_drain_queue_mode_rejects_process_local_follow_up_without_interrupt():
+    runner, adapter = make_restart_runner()
+    runner._draining = True
+    runner._restart_requested = True
+    runner._busy_input_mode = "queue"
+
+    event = MessageEvent(
+        text="follow up",
+        message_type=MessageType.TEXT,
+        source=make_restart_source(),
+        message_id="m2",
+    )
+    session_key = build_session_key(event.source)
+    adapter._active_sessions[session_key] = asyncio.Event()
+
+    await adapter.handle_message(event)
+
+    assert session_key not in adapter._pending_messages
+    assert not adapter._active_sessions[session_key].is_set()
+    assert any("did not accept" in message for message in adapter.sent)
+
+
+@pytest.mark.asyncio
+async def test_draining_rejects_new_session_messages():
+    runner, _adapter = make_restart_runner()
+    runner._draining = True
+    runner._restart_requested = True
+
+    event = MessageEvent(
+        text="hello",
+        message_type=MessageType.TEXT,
+        source=make_restart_source("fresh"),
+        message_id="m3",
+    )
+
+    result = await runner._handle_message(event)
+
+    assert result == "⏳ Gateway is restarting and is not accepting new work right now."
+
+
+def test_load_busy_input_mode_prefers_env_then_config_then_default(tmp_path, monkeypatch):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.delenv("HERMES_GATEWAY_BUSY_INPUT_MODE", raising=False)
+
+    assert gateway_run.GatewayRunner._load_busy_input_mode() == "interrupt"
+
+    (tmp_path / "config.yaml").write_text(
+        "display:\n  busy_input_mode: queue\n", encoding="utf-8"
+    )
+    assert gateway_run.GatewayRunner._load_busy_input_mode() == "queue"
+
+    (tmp_path / "config.yaml").write_text(
+        "display:\n  busy_input_mode: steer\n", encoding="utf-8"
+    )
+    assert gateway_run.GatewayRunner._load_busy_input_mode() == "steer"
+
+    monkeypatch.setenv("HERMES_GATEWAY_BUSY_INPUT_MODE", "interrupt")
+    assert gateway_run.GatewayRunner._load_busy_input_mode() == "interrupt"
+
+    monkeypatch.setenv("HERMES_GATEWAY_BUSY_INPUT_MODE", "steer")
+    assert gateway_run.GatewayRunner._load_busy_input_mode() == "steer"
+
+    # Unknown configured values fail closed without interrupting active work.
+    monkeypatch.setenv("HERMES_GATEWAY_BUSY_INPUT_MODE", "bogus")
+    assert gateway_run.GatewayRunner._load_busy_input_mode() == "queue"
+
+
 def test_load_busy_text_mode_follows_input_mode_and_honors_legacy(tmp_path, monkeypatch):
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.delenv("HERMES_GATEWAY_BUSY_TEXT_MODE", raising=False)

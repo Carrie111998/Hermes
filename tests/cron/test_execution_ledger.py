@@ -120,7 +120,7 @@ def test_restart_marks_interrupted_execution_unknown_without_requeue(tmp_path):
     repo = Path(__file__).resolve().parents[2]
     env = os.environ.copy()
     env["HERMES_HOME"] = str(home)
-    env["PYTHONPATH"] = str(repo)
+    env["PYTHONPATH"] = str(repo) + os.pathsep + env.get("PYTHONPATH", "")
 
     create = subprocess.run(
         [

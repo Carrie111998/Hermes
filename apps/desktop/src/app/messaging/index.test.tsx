@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { MemoryRouter } from 'react-router'
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { MessagingPlatformInfo } from '@/types/hermes'
 
@@ -11,6 +11,8 @@ const getPairing = vi.fn()
 const approvePairing = vi.fn()
 const revokePairing = vi.fn()
 const openExternalLink = vi.fn()
+const loadMessagingView = async () => (await import('./index')).MessagingView
+let MessagingView: Awaited<ReturnType<typeof loadMessagingView>>
 
 vi.mock('@/hermes', () => ({
   approvePairing: (platformId: string, requestId: string) => approvePairing(platformId, requestId),
@@ -32,6 +34,15 @@ vi.mock('@/store/notifications', () => ({
 vi.mock('@/store/system-actions', () => ({
   runGatewayRestart: vi.fn()
 }))
+
+vi.mock('react-router-dom', () => ({
+  useLocation: () => ({ hash: '', pathname: '/messaging', search: '' }),
+  useNavigate: () => vi.fn()
+}))
+
+beforeAll(async () => {
+  MessagingView = await loadMessagingView()
+}, 45_000)
 
 function platform(patch: Partial<MessagingPlatformInfo> = {}): MessagingPlatformInfo {
   return {
@@ -59,14 +70,9 @@ afterEach(() => {
 })
 
 async function renderMessaging() {
-  const { MessagingView } = await import('./index')
   let result: ReturnType<typeof render>
   await act(async () => {
-    result = render(
-      <MemoryRouter>
-        <MessagingView />
-      </MemoryRouter>
-    )
+    result = render(<MessagingView />)
   })
 
   return result!

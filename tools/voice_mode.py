@@ -139,6 +139,11 @@ def _voice_capture_install_hint() -> str:
     return "pip install sounddevice numpy"
 
 
+def _recording_timestamp() -> str:
+    """Return the filename timestamp through a narrow, testable boundary."""
+    return time.strftime("%Y%m%d_%H%M%S")
+
+
 def _termux_microphone_command() -> Optional[str]:
     if not _is_termux_environment():
         return None
@@ -725,7 +730,7 @@ class TermuxAudioRecorder:
             if self._recording:
                 return
             os.makedirs(_TEMP_DIR, exist_ok=True)
-            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            timestamp = _recording_timestamp()
             self._recording_path = os.path.join(_TEMP_DIR, f"recording_{timestamp}.aac")
 
         command = [
@@ -1183,7 +1188,7 @@ class AudioRecorder:
         Returns the file path.
         """
         os.makedirs(_TEMP_DIR, exist_ok=True)
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        timestamp = _recording_timestamp()
         wav_path = os.path.join(_TEMP_DIR, f"recording_{timestamp}.wav")
 
         with wave.open(wav_path, "wb") as wf:

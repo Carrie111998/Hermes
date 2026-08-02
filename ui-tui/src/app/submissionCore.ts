@@ -60,7 +60,7 @@ export function submitPrompt(
   // Close the async-busy gap up front, before the detect_drop round-trip.
   markSubmitting()
 
-  const startSubmit = (displayText: string, submitText: string, show = true) => {
+  const startSubmit = (displayText: string, submitText: string, show = true, attachmentBatchId?: string) => {
     const liveSid = getUiState().sid
 
     if (!liveSid) {
@@ -79,7 +79,11 @@ export function submitPrompt(
     turnController.interrupted = false
 
     deps.gw
-      .request<PromptSubmitResponse>('prompt.submit', { session_id: liveSid, text: submitText })
+      .request<PromptSubmitResponse>('prompt.submit', {
+        ...(attachmentBatchId ? { attachment_batch_id: attachmentBatchId } : {}),
+        session_id: liveSid,
+        text: submitText
+      })
       .then(result => {
         if (result?.ack) {
           deps.sys(result.ack)
@@ -92,6 +96,31 @@ export function submitPrompt(
           patchUiState({ busy: false, status: 'ready' })
         } else if (result?.status === 'smart_queued' || result?.status === 'queued') {
           patchUiState({ busy: true, status: 'queued for next turn' })
+        }
+
+        if (result?.status === 'queued_isolation_unavailable') {
+          patchUiState({ busy: true, status: 'queued for isolated retry' })
+        }
+
+        if (result?.status === 'smart_uncertain') {
+          patchUiState({ busy: true, status: 'recovery required — do not resend' })
+        }
+
+        if (
+          result?.status === 'smart_rejected' ||
+          result?.status === 'queue_rejected' ||
+          result?.accepted === false
+        ) {
+          // A bounded backend queue may reject explicitly. The acknowledgement
+          // above is the source of truth; do not leave the composer pretending
+          // the message is running or queued when it was not accepted.
+          const recoveryReason = result?.reason === 'recovery_error' || result?.reason === 'persistence'
+          patchUiState({
+            busy: true,
+            status: recoveryReason
+              ? 'not accepted — durable recovery required'
+              : 'not accepted — queue limit reached',
+          })
         }
       })
       .catch((e: Error) => {
@@ -126,7 +155,7 @@ export function submitPrompt(
         return startSubmit(text, deps.expand(text), showUserMessage)
       }
 
-      startSubmit(r.text || text, deps.expand(r.text || text), showUserMessage)
+      startSubmit(r.text || text, deps.expand(r.text || text), showUserMessage, r.attachment_batch_id)
     })
     .catch(() => startSubmit(text, deps.expand(text), showUserMessage))
 }

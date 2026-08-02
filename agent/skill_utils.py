@@ -5,6 +5,7 @@ heavy dependency chain.  It is safe to import at module level without triggering
 tool registration or provider resolution.
 """
 
+import hashlib
 import logging
 import os
 import re
@@ -374,7 +375,8 @@ def skill_matches_environment(frontmatter: Dict[str, Any]) -> bool:
 # ── Disabled skills ───────────────────────────────────────────────────────
 
 
-_RAW_CONFIG_CACHE: Dict[Tuple[str, int, int], Dict[str, Any]] = {}
+_RawConfigCacheKey = Tuple[str, bytes]
+_RAW_CONFIG_CACHE: Dict[_RawConfigCacheKey, Dict[str, Any]] = {}
 
 
 def _raw_config_cache_clear() -> None:
@@ -382,38 +384,47 @@ def _raw_config_cache_clear() -> None:
     _RAW_CONFIG_CACHE.clear()
 
 
-def _load_raw_config() -> Dict[str, Any]:
-    """Read config.yaml with a shared mtime+size keyed cache.
+def _load_raw_config_snapshot() -> Tuple[Dict[str, Any], Optional[_RawConfigCacheKey]]:
+    """Read config.yaml and return parsed data plus its content key.
 
     This module intentionally avoids importing ``hermes_cli.config`` on the
-    skill prompt/build path. A tiny local cache gives the same repeated-read
-    win without pulling the heavier CLI config stack into startup.
+    skill prompt/build path. Reading and hashing the small config on each call
+    avoids stale values on filesystems with coarse timestamps, while the cache
+    still prevents repeated YAML parsing on the hot skill discovery path.
     """
     config_path = get_config_path()
-    if not config_path.exists():
-        return {}
     try:
-        stat = config_path.stat()
-        cache_key = (str(config_path), stat.st_mtime_ns, stat.st_size)
-    except OSError:
-        cache_key = None
-
-    if cache_key is not None:
-        cached = _RAW_CONFIG_CACHE.get(cache_key)
-        if cached is not None:
-            return cached
-
-    try:
-        parsed = yaml_load(config_path.read_text(encoding="utf-8"))
+        raw = config_path.read_bytes()
+    except FileNotFoundError:
+        return {}, None
     except Exception as e:
         logger.debug("Could not read skill config %s: %s", config_path, e)
-        return {}
-    if not isinstance(parsed, dict):
-        return {}
+        return {}, None
 
-    if cache_key is not None:
-        _RAW_CONFIG_CACHE.clear()
-        _RAW_CONFIG_CACHE[cache_key] = parsed
+    cache_key: _RawConfigCacheKey = (
+        str(config_path),
+        hashlib.blake2b(raw, digest_size=16).digest(),
+    )
+    cached = _RAW_CONFIG_CACHE.get(cache_key)
+    if cached is not None:
+        return cached, cache_key
+
+    try:
+        parsed = yaml_load(raw.decode("utf-8"))
+    except Exception as e:
+        logger.debug("Could not parse skill config %s: %s", config_path, e)
+        return {}, cache_key
+    if not isinstance(parsed, dict):
+        return {}, cache_key
+
+    _RAW_CONFIG_CACHE.clear()
+    _RAW_CONFIG_CACHE[cache_key] = parsed
+    return parsed, cache_key
+
+
+def _load_raw_config() -> Dict[str, Any]:
+    """Return parsed config data from the shared content-keyed cache."""
+    parsed, _cache_key = _load_raw_config_snapshot()
     return parsed
 
 
@@ -465,13 +476,13 @@ def _normalize_string_set(values) -> Set[str]:
 
 # ── External skills directories ──────────────────────────────────────────
 
-# (config_path_str, mtime_ns) -> resolved external dirs list.  Keyed by
-# mtime_ns so a config.yaml edit mid-run is picked up automatically;
+# Config content signature -> resolved external dirs list. Content keys detect
+# rapid same-length rewrites even on filesystems with coarse timestamps;
 # otherwise every call would re-read + re-YAML-parse the 15KB config,
 # which becomes the dominant cost of ``hermes`` startup when ~120 skills
 # each trigger a category lookup during banner construction (10+ seconds
 # of pure waste).
-_EXTERNAL_DIRS_CACHE: Dict[Tuple[str, int], List[Path]] = {}
+_EXTERNAL_DIRS_CACHE: Dict[_RawConfigCacheKey, List[Path]] = {}
 
 
 def _external_dirs_cache_clear() -> None:
@@ -487,30 +498,18 @@ def get_external_skills_dirs() -> List[Path]:
     path.  Only directories that actually exist are returned.  Duplicates and
     paths that resolve to the local ``~/.hermes/skills/`` are silently skipped.
 
-    Cached in-process, keyed on ``config.yaml`` mtime — the function is
+    Cached in-process, keyed on a ``config.yaml`` content signature — the function is
     called once per skill during banner / tool-registry scans, and YAML
     parsing a non-trivial config dominates ``hermes`` cold-start time
     when the cache is absent.
     """
-    config_path = get_config_path()
-    if not config_path.exists():
-        return []
-
-    # Cache key: (absolute path, mtime_ns).  stat() is ~2us vs ~85ms for
-    # the full YAML parse, so the fast path is nearly free.
-    try:
-        stat = config_path.stat()
-        cache_key: Tuple[str, int] = (str(config_path), stat.st_mtime_ns)
-    except OSError:
-        cache_key = None  # type: ignore[assignment]
-
+    parsed, cache_key = _load_raw_config_snapshot()
     if cache_key is not None:
         cached = _EXTERNAL_DIRS_CACHE.get(cache_key)
         if cached is not None:
             # Return a copy so callers can't mutate the cached list.
             return list(cached)
 
-    parsed = _load_raw_config()
     if not parsed:
         return []
 
@@ -877,18 +876,34 @@ def iter_skill_index_files(skills_dir: Path, filename: str):
     active_org = read_active_org_id(skills_dir)
     org_root = os.path.join(skills_dir_str, ORG_MIRROR_DIR_NAME)
     matches: list[str] = []
+    seen_real_dirs: set[str] = set()
     for root, dirs, files in os.walk(skills_dir_str, followlinks=True):
+        # os.walk(followlinks=True) does not detect symlink cycles itself.
+        # Prune any real directory already visited while retaining the logical
+        # symlink path for the first traversal.
+        root_identity = os.path.normcase(os.path.realpath(root))
+        if root_identity in seen_real_dirs:
+            dirs[:] = []
+            continue
+        seen_real_dirs.add(root_identity)
+
         has_skill_md = "SKILL.md" in files
         if root == skills_dir_str and ORG_MIRROR_DIR_NAME in dirs and active_org is None:
             dirs.remove(ORG_MIRROR_DIR_NAME)
         elif root == org_root:
             # Inside _org/: descend ONLY into the active org's mirror.
             dirs[:] = [d for d in dirs if d == active_org]
-        dirs[:] = [
+        eligible_dirs = [
             d
             for d in dirs
             if d not in EXCLUDED_SKILL_DIRS
             and not (has_skill_md and d in SKILL_SUPPORT_DIRS)
+        ]
+        dirs[:] = [
+            d
+            for d in eligible_dirs
+            if os.path.normcase(os.path.realpath(os.path.join(root, d)))
+            not in seen_real_dirs
         ]
         if filename in files:
             matches.append(os.path.join(root, filename))

@@ -124,6 +124,60 @@ def _finalize(
 
 
 
+def test_text_response_publishes_explicit_receipt_terminal_success(monkeypatch):
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = _LimitAgent()
+
+    result = _finalize(
+        agent,
+        final_response="normal answer",
+        exit_reason="text_response(finish_reason=stop)",
+        api_call_count=1,
+    )
+
+    assert result["receipt_terminal_success"] is True
+
+
+@pytest.mark.parametrize(
+    "exit_reason",
+    [
+        "local_processing_error(boom)",
+        "error_near_max_iterations(boom)",
+        "guardrail_halt",
+        "partial_stream_recovery",
+        "fallback_prior_turn_content",
+        "empty_response_exhausted",
+    ],
+)
+def test_non_text_exit_never_publishes_receipt_terminal_success(
+    monkeypatch, exit_reason
+):
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = _LimitAgent()
+
+    result = _finalize(
+        agent,
+        final_response="diagnostic or partial content",
+        exit_reason=exit_reason,
+        api_call_count=1,
+    )
+
+    assert result["receipt_terminal_success"] is False
+
+
+@pytest.mark.parametrize(
+    "exit_reason",
+    [
+        "error_near_max_iterations(boom)",
+        "guardrail_halt",
+        "partial_stream_recovery",
+        "fallback_prior_turn_content",
+        "empty_response_exhausted",
+    ],
+)
+def test_unrelated_non_success_response_is_not_reclassified(monkeypatch, exit_reason):
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = _LimitAgent()
 
 
 

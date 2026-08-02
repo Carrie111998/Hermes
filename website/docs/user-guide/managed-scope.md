@@ -50,16 +50,27 @@ knob — like `HERMES_HOME` — set by the same administrator who owns the manag
 files. It is **never persisted** to any `.env` by Hermes.
 
 ```bash
-# Point managed scope at a custom directory (set by IT / the deployment, not the user)
+# Explicitly authorize the alternate directory (performed by IT / deployment)
+sudo mkdir -p /opt/org/hermes-policy
+printf 'hermes-managed-scope-v1\n' | sudo tee /opt/org/hermes-policy/.hermes-managed >/dev/null
+sudo chown root:root /opt/org/hermes-policy /opt/org/hermes-policy/.hermes-managed
+sudo chmod 0755 /opt/org/hermes-policy
+sudo chmod 0644 /opt/org/hermes-policy/.hermes-managed
+
+# Point managed scope at the authorized custom directory
 export HERMES_MANAGED_DIR=/opt/org/hermes-policy
 ```
 
 :::warning
-A user who can set `HERMES_MANAGED_DIR` can repoint managed scope at a directory
-they control, defeating it. In a real deployment this variable should be fixed
-by the administrator (e.g. baked into the service unit / container image), not
-left user-settable. `hermes doctor` reports the *resolved* managed directory so
-a redirect is visible.
+An alternate `HERMES_MANAGED_DIR` is accepted only when the directory is
+root-owned, not group/world writable, contains at least one protected root-owned
+policy file (`config.yaml` or `.env`), and carries a regular protected
+`.hermes-managed` file whose exact content is `hermes-managed-scope-v1`. The
+fixed `/etc/hermes` location does not need this marker because its path is the
+authorization anchor. Empty, unmarked, symlinked-policy, invalid, and
+user-writable overrides fall back to `/etc/hermes`. The variable should still be
+fixed by the administrator (for example in a root-owned service unit), and
+`hermes doctor` reports the resolved managed directory.
 :::
 
 ## Precedence

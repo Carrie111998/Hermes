@@ -74,6 +74,44 @@ def test_runtime_context_token_restores_previous_value_after_turn():
     assert aux._normalize_main_runtime(None) == {}
 
 
+def test_aiagent_wrapper_resets_runtime_context_after_turn():
+    """Every production run_conversation exit restores the caller's Context."""
+    from run_agent import AIAgent
+
+    agent = SimpleNamespace(
+        _conversation_root_id=lambda: "root-session",
+        _session_db=None,
+        session_id="session-id",
+        _open_steer_checkpoint=lambda: 1,
+        _close_steer_checkpoint=lambda _generation: None,
+    )
+
+    def fake_turn(*_args, **_kwargs):
+        aux.set_runtime_main(**_runtime("wrapped-turn"))
+        return {"final_response": "ok"}
+
+    with patch("agent.conversation_loop.run_conversation", side_effect=fake_turn):
+        result = AIAgent.run_conversation(agent, "hello")
+
+    assert result["final_response"] == "ok"
+    assert aux._normalize_main_runtime(None) == {}
+
+
+def test_legacy_patched_globals_are_visible_only_without_an_active_runtime():
+    """Direct legacy patches work, but never override context-local session state."""
+    with patch.object(aux, "_RUNTIME_MAIN_PROVIDER", "custom:legacy"), patch.object(
+        aux, "_RUNTIME_MAIN_MODEL", "legacy-model"
+    ), patch.object(
+        aux, "_RUNTIME_MAIN_BASE_URL", "https://legacy.test/v1"
+    ):
+        assert aux._normalize_main_runtime(None)["model"] == "legacy-model"
+
+        aux.set_runtime_main(**_runtime("active-session-model"))
+        runtime = aux._normalize_main_runtime(None)
+
+    assert runtime["model"] == "active-session-model"
+    assert runtime["base_url"] == "http://llama-swap.test/v1"
+
 
 
 

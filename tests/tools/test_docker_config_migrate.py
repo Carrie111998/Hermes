@@ -29,7 +29,9 @@ def _run_migration(hermes_home: Path, **env_overrides: str) -> subprocess.Comple
         {
             "HERMES_HOME": str(hermes_home),
             "HERMES_SKIP_CHMOD": "1",
-            "PYTHONPATH": str(REPO_ROOT),
+            "PYTHONPATH": str(REPO_ROOT)
+            + os.pathsep
+            + os.environ.get("PYTHONPATH", ""),
         }
     )
     env.update(env_overrides)

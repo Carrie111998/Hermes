@@ -23,6 +23,7 @@ def _bare_agent() -> AIAgent:
     """
     agent = object.__new__(AIAgent)
     agent._pending_steer = None
+    agent._pending_steer_count = 0
     agent._pending_steer_lock = threading.Lock()
     agent._pending_redirect = None
     agent._pending_redirect_lock = threading.Lock()
@@ -103,6 +104,19 @@ class TestActiveTurnRedirect:
         assert agent.redirect("too late") is False
         assert agent._pending_redirect is None
 
+    def test_rejects_ninth_pending_steer_without_losing_the_first_eight(self):
+        agent = _bare_agent()
+        assert all(agent.steer(f"note-{index}") for index in range(8))
+
+        assert agent.steer("note-8") is False
+        assert agent._pending_steer.splitlines() == [f"note-{index}" for index in range(8)]
+
+    def test_rejects_oversized_item_for_lossless_queue_fallback(self):
+        agent = _bare_agent()
+
+        assert agent.steer("x" * 4_001) is False
+        assert agent._pending_steer is None
+
     def test_rejects_after_checkpoint_is_closed(self):
         agent = _bare_agent()
         generation = agent._steer_run_generation
@@ -172,6 +186,443 @@ class TestActiveTurnRedirect:
 
         assert result["pending_steer"] == "accepted before close"
         assert agent.steer("after close") is False
+
+    def test_consumption_ack_waits_for_injection_and_successful_turn(self, monkeypatch):
+        agent = _bare_agent()
+        agent._steer_run_generation = 0
+        agent._steer_checkpoint_open = False
+        agent.session_id = None
+        agent._session_db = None
+        consumed = []
+
+        def fake_run_conversation(live_agent, *_args, **_kwargs):
+            generation = live_agent._steer_run_generation
+            assert live_agent.steer(
+                "durable correction",
+                run_generation=generation,
+                on_consumed=lambda: consumed.append("committed"),
+            )
+            assert consumed == []
+            messages = [{"role": "tool", "content": "result", "tool_call_id": "1"}]
+            live_agent._apply_pending_steer_to_tool_results(messages, 1)
+            live_agent._mark_injected_steer_receipts_requested(
+                {"messages": messages}
+            )
+            assert "durable correction" in messages[0]["content"]
+            assert consumed == []
+            return {
+                "final_response": "done",
+                "messages": messages,
+                "completed": True,
+                "receipt_terminal_success": True,
+            }
+
+        monkeypatch.setattr(
+            "agent.conversation_loop.run_conversation",
+            fake_run_conversation,
+        )
+
+        agent.run_conversation("prompt")
+
+        assert consumed == ["committed"]
+
+    def test_clean_turn_without_marker_in_final_request_returns_unconsumed(
+        self, monkeypatch
+    ):
+        agent = _bare_agent()
+        agent._steer_run_generation = 0
+        agent._steer_checkpoint_open = False
+        agent.session_id = None
+        agent._session_db = None
+        callbacks = []
+
+        def fake_run_conversation(live_agent, *_args, **_kwargs):
+            assert live_agent.steer(
+                "durable correction",
+                run_generation=live_agent._steer_run_generation,
+                on_consumed=lambda: callbacks.append("consumed"),
+                on_unconsumed=lambda: callbacks.append("unconsumed"),
+                on_uncertain=lambda: callbacks.append("uncertain"),
+            )
+            injected_messages = [
+                {"role": "tool", "content": "result", "tool_call_id": "1"}
+            ]
+            live_agent._apply_pending_steer_to_tool_results(injected_messages, 1)
+            # Simulate middleware replacing the provider payload after injection.
+            assert (
+                live_agent._mark_injected_steer_receipts_requested(
+                    {
+                        "messages": [
+                            {
+                                "role": "tool",
+                                "content": "result without marker",
+                                "tool_call_id": "1",
+                            }
+                        ]
+                    }
+                )
+                == 0
+            )
+            return {
+                "final_response": "done",
+                "messages": injected_messages,
+                "completed": True,
+                "receipt_terminal_success": True,
+            }
+
+        monkeypatch.setattr(
+            "agent.conversation_loop.run_conversation",
+            fake_run_conversation,
+        )
+
+        agent.run_conversation("prompt")
+
+        assert callbacks == ["unconsumed"]
+
+    def test_multiple_receipts_in_one_marker_are_all_linked_to_provider_request(
+        self, monkeypatch
+    ):
+        agent = _bare_agent()
+        agent._steer_run_generation = 0
+        agent._steer_checkpoint_open = False
+        agent.session_id = None
+        agent._session_db = None
+        callbacks = []
+
+        def fake_run_conversation(live_agent, *_args, **_kwargs):
+            generation = live_agent._steer_run_generation
+            for text in ("first correction", "second correction"):
+                assert live_agent.steer(
+                    text,
+                    run_generation=generation,
+                    on_consumed=lambda text=text: callbacks.append(
+                        f"consumed:{text}"
+                    ),
+                    on_unconsumed=lambda text=text: callbacks.append(
+                        f"unconsumed:{text}"
+                    ),
+                    on_uncertain=lambda text=text: callbacks.append(
+                        f"uncertain:{text}"
+                    ),
+                )
+            messages = [
+                {"role": "tool", "content": "result", "tool_call_id": "1"}
+            ]
+            live_agent._apply_pending_steer_to_tool_results(messages, 1)
+            assert (
+                live_agent._mark_injected_steer_receipts_requested(
+                    {"messages": messages}
+                )
+                == 2
+            )
+            return {
+                "final_response": "done",
+                "messages": messages,
+                "completed": True,
+                "receipt_terminal_success": True,
+            }
+
+        monkeypatch.setattr(
+            "agent.conversation_loop.run_conversation",
+            fake_run_conversation,
+        )
+
+        agent.run_conversation("prompt")
+
+        assert callbacks == [
+            "consumed:first correction",
+            "consumed:second correction",
+        ]
+
+    def test_consumption_ack_rejects_completed_turn_with_cleanup_errors(self, monkeypatch):
+        agent = _bare_agent()
+        agent._steer_run_generation = 0
+        agent._steer_checkpoint_open = False
+        agent.session_id = None
+        agent._session_db = None
+        consumed = []
+
+        def fake_run_conversation(live_agent, *_args, **_kwargs):
+            assert live_agent.steer(
+                "durable correction",
+                run_generation=live_agent._steer_run_generation,
+                on_consumed=lambda: consumed.append("committed"),
+            )
+            messages = [{"role": "tool", "content": "result", "tool_call_id": "1"}]
+            live_agent._apply_pending_steer_to_tool_results(messages, 1)
+            live_agent._mark_injected_steer_receipts_requested(
+                {"messages": messages}
+            )
+            return {
+                "final_response": "done",
+                "messages": messages,
+                "completed": True,
+                "receipt_terminal_success": True,
+                "cleanup_errors": ["session persistence failed"],
+            }
+
+        monkeypatch.setattr(
+            "agent.conversation_loop.run_conversation",
+            fake_run_conversation,
+        )
+
+        agent.run_conversation("prompt")
+
+        assert consumed == []
+
+    def test_consumption_ack_io_error_is_not_ignored_by_turn_finalizer(
+        self, monkeypatch
+    ):
+        from cli import SmartCliDurableDisposition
+
+        agent = _bare_agent()
+        agent._steer_run_generation = 0
+        agent._steer_checkpoint_open = False
+        agent.session_id = None
+        agent._session_db = None
+
+        def fake_run_conversation(live_agent, *_args, **_kwargs):
+            assert live_agent.steer(
+                "durable correction",
+                run_generation=live_agent._steer_run_generation,
+                on_consumed=lambda: SmartCliDurableDisposition.IO_ERROR,
+            )
+            messages = [{"role": "tool", "content": "result", "tool_call_id": "1"}]
+            live_agent._apply_pending_steer_to_tool_results(messages, 1)
+            live_agent._mark_injected_steer_receipts_requested(
+                {"messages": messages}
+            )
+            return {
+                "final_response": "done",
+                "messages": messages,
+                "completed": True,
+                "receipt_terminal_success": True,
+            }
+
+        monkeypatch.setattr(
+            "agent.conversation_loop.run_conversation",
+            fake_run_conversation,
+        )
+
+        result = agent.run_conversation("prompt")
+
+        assert result["cleanup_errors"] == ["steer receipt finalization failed"]
+
+    def test_injected_receipt_reports_uncertain_on_dirty_terminal_result(self, monkeypatch):
+        agent = _bare_agent()
+        agent._steer_run_generation = 0
+        agent._steer_checkpoint_open = False
+        agent.session_id = None
+        agent._session_db = None
+        consumed = []
+        unconsumed = []
+        uncertain = []
+
+        def fake_run_conversation(live_agent, *_args, **_kwargs):
+            assert live_agent.steer(
+                "durable correction",
+                run_generation=live_agent._steer_run_generation,
+                on_consumed=lambda: consumed.append(True),
+                on_unconsumed=lambda: unconsumed.append(True),
+                on_uncertain=lambda: uncertain.append(True),
+            )
+            messages = [{"role": "tool", "content": "result", "tool_call_id": "1"}]
+            live_agent._apply_pending_steer_to_tool_results(messages, 1)
+            live_agent._mark_injected_steer_receipts_requested(
+                {"messages": messages}
+            )
+            return {
+                "final_response": "partial",
+                "messages": messages,
+                "completed": False,
+                "partial": True,
+            }
+
+        monkeypatch.setattr(
+            "agent.conversation_loop.run_conversation",
+            fake_run_conversation,
+        )
+
+        agent.run_conversation("prompt")
+
+        assert consumed == []
+        assert unconsumed == []
+        assert uncertain == [True]
+
+    def test_late_generation_finalizer_cannot_terminalize_next_generation_receipt(
+        self, monkeypatch
+    ):
+        agent = _bare_agent()
+        agent._steer_run_generation = 0
+        agent._steer_checkpoint_open = False
+        agent.session_id = None
+        agent._session_db = None
+        agent._execution_thread_id = None
+        agent._interrupt_thread_signal_pending = False
+        agent._tool_worker_threads = None
+        agent._tool_worker_threads_lock = None
+        agent._active_children_lock = threading.Lock()
+        agent._active_children = set()
+        agent.quiet_mode = True
+        generation_n_injected = threading.Event()
+        generation_n_plus_one_injected = threading.Event()
+        release_generation_n = threading.Event()
+        release_generation_n_plus_one = threading.Event()
+        callbacks = []
+        failures = []
+
+        def fake_run_conversation(live_agent, user_message, *_args, **_kwargs):
+            generation = live_agent._steer_run_generation
+            if user_message == "generation-n":
+                assert live_agent.steer(
+                    "payload-n",
+                    run_generation=generation,
+                    on_consumed=lambda: callbacks.append("n-consumed"),
+                    on_unconsumed=lambda: callbacks.append("n-unconsumed"),
+                    on_uncertain=lambda: callbacks.append("n-uncertain"),
+                )
+                messages = [
+                    {"role": "tool", "content": "result-n", "tool_call_id": "n"}
+                ]
+                live_agent._apply_pending_steer_to_tool_results(messages, 1)
+                live_agent._mark_injected_steer_receipts_requested(
+                    {"messages": messages}
+                )
+                generation_n_injected.set()
+                assert release_generation_n.wait(timeout=5)
+                return {
+                    "final_response": "interrupted",
+                    "messages": messages,
+                    "completed": False,
+                    "interrupted": True,
+                }
+
+            assert user_message == "generation-n-plus-one"
+            assert live_agent.steer(
+                "payload-n-plus-one",
+                run_generation=generation,
+                on_consumed=lambda: callbacks.append("n+1-consumed"),
+                on_unconsumed=lambda: callbacks.append("n+1-unconsumed"),
+                on_uncertain=lambda: callbacks.append("n+1-uncertain"),
+            )
+            messages = [
+                {"role": "tool", "content": "result-n+1", "tool_call_id": "n+1"}
+            ]
+            live_agent._apply_pending_steer_to_tool_results(messages, 1)
+            live_agent._mark_injected_steer_receipts_requested(
+                {"messages": messages}
+            )
+            generation_n_plus_one_injected.set()
+            assert release_generation_n_plus_one.wait(timeout=5)
+            return {
+                "final_response": "done",
+                "messages": messages,
+                "completed": True,
+                "receipt_terminal_success": True,
+            }
+
+        monkeypatch.setattr(
+            "agent.conversation_loop.run_conversation",
+            fake_run_conversation,
+        )
+
+        def run_turn(message):
+            try:
+                agent.run_conversation(message)
+            except BaseException as exc:  # pragma: no cover - surfaced below
+                failures.append(exc)
+
+        generation_n_thread = threading.Thread(
+            target=run_turn,
+            args=("generation-n",),
+        )
+        generation_n_thread.start()
+        assert generation_n_injected.wait(timeout=5)
+        agent.interrupt("replace the active turn")
+
+        generation_n_plus_one_thread = threading.Thread(
+            target=run_turn,
+            args=("generation-n-plus-one",),
+        )
+        generation_n_plus_one_thread.start()
+        assert generation_n_plus_one_injected.wait(timeout=5)
+
+        release_generation_n.set()
+        generation_n_thread.join(timeout=5)
+        assert not generation_n_thread.is_alive()
+        release_generation_n_plus_one.set()
+        generation_n_plus_one_thread.join(timeout=5)
+        assert not generation_n_plus_one_thread.is_alive()
+
+        assert failures == []
+        assert callbacks == ["n-uncertain", "n+1-consumed"]
+
+    def test_unconsumed_callback_owns_steer_when_turn_closes_without_tool(self, monkeypatch):
+        agent = _bare_agent()
+        agent._steer_run_generation = 0
+        agent._steer_checkpoint_open = False
+        agent.session_id = None
+        agent._session_db = None
+        consumed = []
+        unconsumed = []
+
+        def fake_run_conversation(live_agent, *_args, **_kwargs):
+            assert live_agent.steer(
+                "late durable correction",
+                run_generation=live_agent._steer_run_generation,
+                on_consumed=lambda: consumed.append(True),
+                on_unconsumed=lambda: unconsumed.append(True),
+            )
+            return {
+                "final_response": "done",
+                "messages": [],
+                "completed": True,
+                "receipt_terminal_success": True,
+            }
+
+        monkeypatch.setattr(
+            "agent.conversation_loop.run_conversation",
+            fake_run_conversation,
+        )
+
+        result = agent.run_conversation("prompt")
+
+        assert consumed == []
+        assert unconsumed == [True]
+        assert "pending_steer" not in result
+
+    def test_unconsumed_io_error_is_not_ignored_when_checkpoint_closes(
+        self, monkeypatch
+    ):
+        from agent.agent_runtime_helpers import SmartCliDurableDisposition
+
+        agent = _bare_agent()
+        agent._steer_run_generation = 0
+        agent._steer_checkpoint_open = False
+        agent.session_id = None
+        agent._session_db = None
+
+        def fake_run_conversation(live_agent, *_args, **_kwargs):
+            assert live_agent.steer(
+                "late durable correction",
+                run_generation=live_agent._steer_run_generation,
+                on_unconsumed=lambda: SmartCliDurableDisposition.IO_ERROR,
+            )
+            return {
+                "final_response": "done",
+                "messages": [],
+                "completed": True,
+                "receipt_terminal_success": True,
+            }
+
+        monkeypatch.setattr(
+            "agent.conversation_loop.run_conversation",
+            fake_run_conversation,
+        )
+
+        result = agent.run_conversation("prompt")
+
+        assert result["cleanup_errors"] == ["steer receipt finalization failed"]
 
 
     def test_reasoning_deltas_are_display_only(self):
@@ -455,14 +906,183 @@ class TestSteerInjection:
         assert "extra note" in new_content[1]["text"]
 
 
+    def test_interrupt_during_no_tool_restore_keeps_payload_and_receipt_atomic(self):
+        agent = _bare_agent()
+        agent._execution_thread_id = None
+        agent._interrupt_thread_signal_pending = False
+        agent._tool_worker_threads = None
+        agent._tool_worker_threads_lock = None
+        agent._active_children_lock = threading.Lock()
+        agent._active_children = set()
+        agent.quiet_mode = True
+        callbacks = []
+
+        assert agent.steer(
+            "durable correction",
+            on_consumed=lambda: callbacks.append("consumed"),
+            on_unconsumed=lambda: callbacks.append("unconsumed"),
+            on_uncertain=lambda: callbacks.append("uncertain"),
+        ) is True
+
+        class InterruptOnSplitVector:
+            """Interrupt exactly when text exists without its drained receipt."""
+
+            def __init__(self):
+                self._lock = threading.RLock()
+                self.fired = False
+
+            def __enter__(self):
+                self._lock.acquire()
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                self._lock.release()
+                split_vector = (
+                    bool(getattr(agent, "_pending_steer", None))
+                    and not getattr(agent, "_pending_steer_receipts", [])
+                    and bool(getattr(agent, "_steer_drained_receipts", []))
+                )
+                if split_vector and not self.fired:
+                    self.fired = True
+                    agent.interrupt("replace the active turn")
+                return False
+
+        split_lock = InterruptOnSplitVector()
+        agent._pending_steer_lock = split_lock
+        messages = [
+            {"role": "user", "content": "original"},
+            {"role": "assistant", "content": "tool batch was skipped"},
+        ]
+
+        agent._apply_pending_steer_to_tool_results(messages, num_tool_msgs=2)
+        if not split_lock.fired:
+            # A correct implementation never exposes the split vector. Exercise
+            # interrupt against the still-indivisible pending envelope instead.
+            agent.interrupt("replace the active turn")
+
+        assert "durable correction" not in str(messages)
+        assert callbacks == ["unconsumed"]
+        assert not getattr(agent, "_injected_steer_receipts", [])
+
+    def test_interrupt_does_not_ignore_typed_unconsumed_failure(self):
+        from agent.agent_runtime_helpers import SmartCliDurableDisposition
+
+        agent = _bare_agent()
+        agent._execution_thread_id = None
+        agent._interrupt_thread_signal_pending = False
+        agent._tool_worker_threads = None
+        agent._tool_worker_threads_lock = None
+        agent._active_children_lock = threading.Lock()
+        agent._active_children = set()
+        agent._steer_receipt_callback_failed = False
+        agent.quiet_mode = True
+
+        assert agent.steer(
+            "durable correction",
+            on_unconsumed=lambda: SmartCliDurableDisposition.IO_ERROR,
+        ) is True
+
+        agent.interrupt("replace the active turn")
+
+        assert agent._steer_receipt_callback_failed is True
+
+    def test_interrupt_cannot_observe_receipt_detached_before_tool_injection(
+        self, monkeypatch
+    ):
+        agent = _bare_agent()
+        agent._steer_run_generation = 0
+        agent._steer_checkpoint_open = False
+        agent.session_id = None
+        agent._session_db = None
+        agent._execution_thread_id = None
+        agent._interrupt_thread_signal_pending = False
+        agent._tool_worker_threads = None
+        agent._tool_worker_threads_lock = None
+        agent._active_children_lock = threading.Lock()
+        agent._active_children = set()
+        agent.quiet_mode = True
+        callbacks = []
+        detached_observed = []
+
+        def fake_run_conversation(live_agent, *_args, **_kwargs):
+            assert live_agent.steer(
+                "durable correction",
+                run_generation=live_agent._steer_run_generation,
+                on_consumed=lambda: callbacks.append("consumed"),
+                on_unconsumed=lambda: callbacks.append("unconsumed"),
+                on_uncertain=lambda: callbacks.append("uncertain"),
+            )
+            messages = [
+                {"role": "tool", "content": "result", "tool_call_id": "1"}
+            ]
+
+            class InterruptOnDetachedEnvelope:
+                def __init__(self):
+                    self._lock = threading.RLock()
+                    self.fired = False
+
+                def __enter__(self):
+                    self._lock.acquire()
+                    return self
+
+                def __exit__(self, exc_type, exc, tb):
+                    self._lock.release()
+                    injected = getattr(
+                        live_agent,
+                        "_injected_steer_receipts_by_generation",
+                        {},
+                    )
+                    detached = (
+                        not getattr(live_agent, "_pending_steer", None)
+                        and bool(getattr(live_agent, "_steer_drained_receipts", []))
+                        and not any(injected.values())
+                        and "durable correction" not in str(messages)
+                    )
+                    if detached and not self.fired:
+                        self.fired = True
+                        detached_observed.append(True)
+                        live_agent.interrupt("replace the active turn")
+                    return False
+
+            split_lock = InterruptOnDetachedEnvelope()
+            live_agent._pending_steer_lock = split_lock
+            live_agent._apply_pending_steer_to_tool_results(messages, 1)
+            live_agent._mark_injected_steer_receipts_requested(
+                {"messages": messages}
+            )
+            if not split_lock.fired:
+                live_agent.interrupt("replace the active turn")
+            assert "durable correction" in messages[0]["content"]
+            return {
+                "final_response": "interrupted",
+                "messages": messages,
+                "completed": False,
+                "interrupted": True,
+            }
+
+        monkeypatch.setattr(
+            "agent.conversation_loop.run_conversation",
+            fake_run_conversation,
+        )
+
+        agent.run_conversation("prompt")
+
+        assert detached_observed == []
+        assert callbacks == ["uncertain"]
+
 
 class TestSteerThreadSafety:
-    def test_concurrent_steer_calls_preserve_all_text(self):
+    def test_concurrent_steer_calls_admit_exactly_the_bounded_capacity(self):
         agent = _bare_agent()
         N = 200
 
+        accepted: list[tuple[int, bool]] = []
+        accepted_lock = threading.Lock()
+
         def worker(idx: int) -> None:
-            agent.steer(f"note-{idx}")
+            result = agent.steer(f"note-{idx}")
+            with accepted_lock:
+                accepted.append((idx, result))
 
         threads = [threading.Thread(target=worker, args=(i,)) for i in range(N)]
         for t in threads:
@@ -472,17 +1092,17 @@ class TestSteerThreadSafety:
 
         text = agent._drain_pending_steer()
         assert text is not None
-        # Every single note must be preserved — none dropped by the lock.
+        # The mailbox is bounded atomically; rejected callers can safely queue.
         lines = text.split("\n")
-        assert len(lines) == N
-        assert set(lines) == {f"note-{i}" for i in range(N)}
+        accepted_indexes = {idx for idx, result in accepted if result}
+        assert len(lines) == 8
+        assert len(accepted_indexes) == 8
+        assert set(lines) == {f"note-{idx}" for idx in accepted_indexes}
 
 
 class TestSteerClearedOnInterrupt:
     def test_clear_interrupt_drops_pending_steer(self):
-        """A hard interrupt supersedes any pending steer — the agent's
-        next tool iteration won't happen, so delivering the steer later
-        would be surprising."""
+        """An explicit user cancellation owns the terminal disposition."""
         agent = _bare_agent()
         # Minimal surface needed by clear_interrupt()
         agent._interrupt_requested = True
@@ -499,6 +1119,63 @@ class TestSteerClearedOnInterrupt:
         agent.clear_interrupt()
         assert agent._pending_steer is None
         assert agent._pending_redirect is None
+
+    def test_system_timeout_transfers_accepted_steer_to_recovery_mailbox(self):
+        agent = _bare_agent()
+        agent._execution_thread_id = None
+        agent._interrupt_thread_signal_pending = False
+        agent._tool_worker_threads = None
+        agent._tool_worker_threads_lock = None
+        agent._active_children_lock = threading.Lock()
+        agent._active_children = set()
+        agent.quiet_mode = True
+
+        assert agent.steer("preserve after timeout") is True
+
+        agent.interrupt("Execution timed out (inactivity)")
+
+        assert agent._pending_steer is None
+        assert agent.get_steer_generation() is None
+        assert agent.take_failed_turn_pending_steer() == "preserve after timeout"
+        assert agent.take_failed_turn_pending_steer() is None
+
+    def test_interrupt_resets_mailbox_receipts_before_the_next_generation(self):
+        agent = _bare_agent()
+        agent._execution_thread_id = None
+        agent._interrupt_thread_signal_pending = False
+        agent._tool_worker_threads = None
+        agent._tool_worker_threads_lock = None
+        agent._active_children_lock = threading.Lock()
+        agent._active_children = set()
+        agent.quiet_mode = True
+        returned = []
+
+        assert agent.steer(
+            "generation-n payload",
+            on_consumed=lambda: returned.append("wrongly consumed"),
+            on_unconsumed=lambda: returned.append("returned"),
+        ) is True
+
+        agent.interrupt("replace the active turn")
+
+        assert returned == ["returned"]
+        assert agent._pending_steer is None
+        assert agent._pending_steer_count == 0
+        assert agent._pending_steer_receipts == []
+
+        next_generation = agent._open_steer_checkpoint()
+        assert agent.steer(
+            "generation-n-plus-one payload",
+            run_generation=next_generation,
+        ) is True
+        messages = [{"role": "tool", "content": "result", "tool_call_id": "1"}]
+        agent._apply_pending_steer_to_tool_results(messages, num_tool_msgs=1)
+
+        assert "generation-n payload" not in messages[0]["content"]
+        assert "generation-n-plus-one payload" in messages[0]["content"]
+        assert getattr(agent, "_injected_steer_receipts", []) == [
+            ("generation-n-plus-one payload", None, None, None)
+        ]
 
 
 class TestPreApiCallSteerDrain:
@@ -597,6 +1274,80 @@ class TestSteerCommandRegistry:
 
         assert "steer" in ACTIVE_SESSION_BYPASS_COMMANDS
         assert should_bypass_active_session("steer") is True
+
+    def test_callback_failure_log_redacts_private_exception_details(self, caplog):
+        caplog.set_level("DEBUG", logger="run_agent")
+        agent = _bare_agent()
+        generation = agent._steer_run_generation
+        private_error = "private customer path /accounts/acme/secret.json"
+
+        def fail_unconsumed_callback():
+            raise RuntimeError(private_error)
+
+        assert agent.steer(
+            "durable correction",
+            run_generation=generation,
+            on_unconsumed=fail_unconsumed_callback,
+        ) is True
+
+        assert agent._close_steer_checkpoint(generation) is None
+        assert private_error not in caplog.text
+
+
+def test_steer_delivery_log_contains_metadata_not_payload(caplog):
+    caplog.set_level("INFO", logger="agent.agent_runtime_helpers")
+    agent = _bare_agent()
+    private_payload = "private steer /customers/acme/secret.json session-123"
+    assert agent.steer(private_payload) is True
+    messages = [{"role": "tool", "content": "result", "tool_call_id": "1"}]
+
+    agent._apply_pending_steer_to_tool_results(messages, num_tool_msgs=1)
+
+    assert private_payload in messages[0]["content"]
+    assert private_payload not in caplog.text
+    assert "steer_chars=" in caplog.text
+
+
+def test_interrupt_diagnostics_hide_payload_exception_text_and_traceback(caplog, capsys):
+    caplog.set_level("DEBUG", logger="run_agent")
+    agent = _bare_agent()
+    agent._execution_thread_id = None
+    agent._interrupt_thread_signal_pending = False
+    agent._tool_worker_threads = None
+    agent._tool_worker_threads_lock = None
+    agent._active_children_lock = threading.Lock()
+    agent.quiet_mode = False
+    private_message = "private interrupt /customers/acme/secret.json session-123"
+    private_abort_error = "abort leaked /srv/private/customer.sock"
+    private_child_error = "child leaked /srv/private/child.sock"
+
+    class PrivateAbortFailure(RuntimeError):
+        pass
+
+    class PrivateChildFailure(RuntimeError):
+        pass
+
+    def fail_abort(_reason):
+        raise PrivateAbortFailure(private_abort_error)
+
+    class Child:
+        def interrupt(self, _message):
+            raise PrivateChildFailure(private_child_error)
+
+    agent._active_request_abort = fail_abort
+    agent._active_children = [Child()]
+
+    agent.interrupt(private_message)
+
+    output = capsys.readouterr().out
+    diagnostic = caplog.text + output
+    assert agent._interrupt_message == private_message
+    assert private_message not in diagnostic
+    assert private_abort_error not in diagnostic
+    assert private_child_error not in diagnostic
+    assert "Traceback" not in diagnostic
+    assert "PrivateAbortFailure" in caplog.text
+    assert "PrivateChildFailure" in caplog.text
 
 
 if __name__ == "__main__":  # pragma: no cover

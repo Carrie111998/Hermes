@@ -115,6 +115,57 @@ from utils import base_url_host_matches, base_url_hostname, env_float, model_for
 
 logger = logging.getLogger(__name__)
 
+_STRICT_AUXILIARY_DIAGNOSTICS = contextvars.ContextVar(
+    "strict_auxiliary_diagnostics",
+    default=False,
+)
+_STRICT_AUXILIARY_LOG_FILTER_LOCK = threading.Lock()
+
+
+class _StrictAuxiliaryLogFilter(logging.Filter):
+    """Suppress free-form records while a privacy-sensitive aux call is active."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if not _STRICT_AUXILIARY_DIAGNOSTICS.get():
+            return True
+        return bool(getattr(record, "strict_metadata_only", False))
+
+
+_STRICT_AUXILIARY_LOG_FILTER = _StrictAuxiliaryLogFilter()
+
+
+def _install_strict_auxiliary_log_filter() -> None:
+    """Attach the contextual privacy filter to every currently registered sink."""
+
+    with _STRICT_AUXILIARY_LOG_FILTER_LOCK:
+        loggers: list[logging.Logger] = [logging.getLogger()]
+        loggers.extend(
+            candidate
+            for candidate in logging.Logger.manager.loggerDict.values()
+            if isinstance(candidate, logging.Logger)
+        )
+        for current_logger in loggers:
+            for handler in current_logger.handlers:
+                if _STRICT_AUXILIARY_LOG_FILTER not in handler.filters:
+                    handler.addFilter(_STRICT_AUXILIARY_LOG_FILTER)
+
+
+def _guard_strict_auxiliary_diagnostics(func):
+    """Apply metadata-only diagnostics to the complete strict provider stack."""
+
+    @functools.wraps(func)
+    def guarded(*args, **kwargs):
+        if not bool(kwargs.get("strict_single_provider", False)):
+            return func(*args, **kwargs)
+        _install_strict_auxiliary_log_filter()
+        token = _STRICT_AUXILIARY_DIAGNOSTICS.set(True)
+        try:
+            return func(*args, **kwargs)
+        finally:
+            _STRICT_AUXILIARY_DIAGNOSTICS.reset(token)
+
+    return guarded
+
 
 # ── resolve_provider_client fall-through dedup ───────────────────────────
 # Both fall-through warning sites in resolve_provider_client (the "unknown
@@ -310,6 +361,83 @@ def _extract_url_query_params(url: str):
         params = {k: v[0] for k, v in parse_qs(parsed.query).items()}
         return clean, params
     return url, None
+
+
+def _safe_endpoint_for_log(url: str) -> str:
+    """Render an endpoint without userinfo, query parameters, or fragments."""
+
+    try:
+        parsed = urlparse(str(url or ""))
+        host = parsed.hostname
+        if not parsed.scheme or not host:
+            return "<configured-endpoint>"
+        host_part = f"[{host}]" if ":" in host else host
+        if parsed.port is not None:
+            host_part = f"{host_part}:{parsed.port}"
+        return urlunparse((parsed.scheme, host_part, parsed.path, "", "", ""))
+    except (TypeError, ValueError):
+        return "<configured-endpoint>"
+
+
+def _cache_endpoint_components(url: Optional[str]) -> Tuple[str, Any]:
+    """Return a canonical endpoint plus an opaque discriminator for URL secrets.
+
+    Cache keys must distinguish connection routes without retaining credentials
+    embedded in URL userinfo or query parameters.  The visible component keeps
+    only the normalized scheme/host/port/path; any removed routing material is
+    represented by a one-way digest.  Fragments are intentionally ignored
+    because HTTP clients never send them to the server.
+    """
+
+    raw = str(url or "").strip()
+    if not raw:
+        return "", ""
+
+    try:
+        parsed = urlparse(raw)
+        scheme = (parsed.scheme or "").lower()
+        host = (parsed.hostname or "").lower().rstrip(".")
+        if not scheme or not host:
+            raise ValueError("endpoint requires scheme and host")
+
+        port = parsed.port
+        if (scheme == "https" and port == 443) or (scheme == "http" and port == 80):
+            port = None
+        host_part = f"[{host}]" if ":" in host else host
+        if port is not None:
+            host_part = f"{host_part}:{port}"
+
+        path = (parsed.path or "").rstrip("/")
+        endpoint = urlunparse((scheme, host_part, path, "", "", ""))
+
+        hidden_route_data = {
+            "username": parsed.username or "",
+            "password": parsed.password or "",
+            "query": sorted(parse_qsl(parsed.query, keep_blank_values=True)),
+        }
+        if any(hidden_route_data.values()):
+            material = json.dumps(
+                hidden_route_data,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            hidden_key: Any = (
+                "endpoint-options-digest",
+                hashlib.blake2b(material, digest_size=16).digest(),
+            )
+        else:
+            hidden_key = ""
+        return endpoint, hidden_key
+    except (TypeError, ValueError):
+        # Malformed/non-standard endpoints must remain isolated too, but never
+        # retain their potentially secret-bearing literal in cache-key memory.
+        return (
+            "<configured-endpoint>",
+            (
+                "endpoint-digest",
+                hashlib.blake2b(raw.encode("utf-8"), digest_size=16).digest(),
+            ),
+        )
 
 
 # Module-level flag: only warn once per process about stale OPENAI_BASE_URL.
@@ -827,7 +955,11 @@ def _codex_cloudflare_headers(access_token: str) -> Dict[str, str]:
     return headers
 
 
-def _to_openai_base_url(base_url: str) -> str:
+def _to_openai_base_url(
+    base_url: str,
+    *,
+    emit_diagnostics: bool = True,
+) -> str:
     """Normalize an Anthropic-style base URL to OpenAI-compatible format.
 
     Some providers (MiniMax, MiniMax-CN) expose an ``/anthropic`` endpoint for
@@ -842,17 +974,20 @@ def _to_openai_base_url(base_url: str) -> str:
         # but /api/paas/v4 for OpenAI wire — the generic /v1 rewrite is wrong.
         if "open.bigmodel.cn" in url or "bigmodel" in url:
             rewritten = url[: -len("/anthropic")] + "/paas/v4"
-            logger.debug("Auxiliary client: rewrote ZAI base URL %s → %s", url, rewritten)
+            if emit_diagnostics:
+                logger.debug("Auxiliary client: rewrote ZAI base URL %s → %s", url, rewritten)
             return rewritten
         rewritten = url[: -len("/anthropic")] + "/v1"
-        logger.debug("Auxiliary client: rewrote base URL %s → %s", url, rewritten)
+        if emit_diagnostics:
+            logger.debug("Auxiliary client: rewrote base URL %s → %s", url, rewritten)
         return rewritten
     if "api.kimi.com" in url and url.endswith("/coding"):
         # Kimi Code uses /coding/v1/messages for Anthropic SDK (appends /v1/messages)
         # but /coding/v1/chat/completions for OpenAI SDK (appends /chat/completions)
         # Without /v1 here, OpenAI SDK hits /coding/chat/completions — a 404.
         rewritten = url + "/v1"
-        logger.debug("Auxiliary client: rewrote Kimi base URL %s → %s", url, rewritten)
+        if emit_diagnostics:
+            logger.debug("Auxiliary client: rewrote Kimi base URL %s → %s", url, rewritten)
         return rewritten
     return url
 
@@ -5716,10 +5851,26 @@ def resolve_provider_client(
             custom_entry = _get_named_custom_provider(original_provider)
         if custom_entry is None:
             custom_entry = _get_named_custom_provider(provider)
-        if custom_entry:
-            custom_base = (custom_entry.get("base_url") or "").strip()
-            custom_key = (custom_entry.get("api_key") or "").strip()
-            custom_key_env = (custom_entry.get("key_env") or custom_entry.get("api_key_env") or "").strip()
+        frozen_named_route = bool(
+            original_provider.startswith("custom:") and explicit_base_url
+        )
+        if custom_entry or frozen_named_route:
+            # Strict callers resolve the named entry once before cache lookup
+            # and pass that immutable route through explicit_* arguments.  Use
+            # those values first (and allow the snapshot to survive a concurrent
+            # config rewrite/removal) instead of reading a second route here.
+            custom_entry = custom_entry or {}
+            custom_base = (
+                explicit_base_url or custom_entry.get("base_url") or ""
+            ).strip()
+            custom_key = (
+                explicit_api_key or custom_entry.get("api_key") or ""
+            ).strip()
+            custom_key_env = (
+                custom_entry.get("key_env")
+                or custom_entry.get("api_key_env")
+                or ""
+            ).strip()
             if not custom_key and custom_key_env:
                 custom_key = os.getenv(custom_key_env, "").strip()
             custom_key = custom_key or "no-key-required"
@@ -6573,7 +6724,9 @@ def auxiliary_max_tokens_param(value: int, *, model: Optional[str] = None) -> di
 # Every auxiliary LLM consumer should use these instead of manually
 # constructing clients and calling .chat.completions.create().
 
-# Client cache: (provider, async_mode, base_url, api_key, api_mode, runtime_key) -> (client, default_model, loop)
+# Client cache: (profile, effective provider, async mode, canonical endpoint,
+# opaque endpoint options, credential discriminator, API mode, runtime, vision,
+# task, pool, model) -> (client, default_model, loop)
 # NOTE: loop identity is NOT part of the key.  On async cache hits we check
 # whether the cached loop is the *current* loop; if not, the stale entry is
 # replaced in-place.  This bounds cache growth to one entry per unique
@@ -6628,16 +6781,22 @@ def _client_cache_key(
     task: Optional[str] = None,
     model: Optional[str] = None,
 ) -> tuple:
+    # Callers pass the resolved provider identity. Preserve it verbatim (aside
+    # from case/outer whitespace normalization): a bare name may intentionally
+    # target a user-defined provider that shadows a built-in alias (for example
+    # custom ``kimi`` versus built-in ``kimi-coding``), so alias folding here
+    # would make two different routes share a cache namespace.
+    provider_key = str(provider or "").strip().lower()
     runtime = _normalize_main_runtime(main_runtime)
     runtime_key = tuple(
         _runtime_cache_discriminator(field, runtime.get(field, ""))
         for field in _MAIN_RUNTIME_FIELDS
-    ) if provider == "auto" else ()
+    ) if provider_key == "auto" else ()
     # `auto` can now resolve through task-specific or main fallback policy,
     # so the task participates in the cache key. Non-auto providers keep the
     # old cache shape because the explicit provider/model tuple is sufficient.
-    task_key = (task or "") if provider == "auto" else ""
-    pool_hint = _pool_cache_hint(provider, main_runtime=main_runtime)
+    task_key = (task or "") if provider_key == "auto" else ""
+    pool_hint = _pool_cache_hint(provider_key, main_runtime=main_runtime)
     # The model MUST participate in the key. Two concurrent auxiliary calls to
     # the SAME provider/base_url/key but DIFFERENT models (e.g. a MoA reference
     # fan-out running opus + gpt-5.5 in parallel threads) would otherwise share
@@ -6649,7 +6808,25 @@ def _client_cache_key(
     # model its own client, so concurrent fan-out calls never cross-close.
     model_key = model or runtime.get("model", "")
     api_key_key = _runtime_cache_discriminator("api_key", api_key or "")
-    return (provider, async_mode, base_url or "", api_key_key, api_mode or "", runtime_key, is_vision, task_key, pool_hint, model_key)
+    endpoint_key, endpoint_options_key = _cache_endpoint_components(base_url)
+    # A named custom provider can resolve to different endpoint/credential data
+    # under each Hermes profile. Scope every cache entry to the active Hermes
+    # home so a multiplexed gateway can never reuse profile A's client for B.
+    profile_scope = str(get_hermes_home().expanduser().resolve())
+    return (
+        profile_scope,
+        provider_key,
+        async_mode,
+        endpoint_key,
+        endpoint_options_key,
+        api_key_key,
+        api_mode or "",
+        runtime_key,
+        is_vision,
+        task_key,
+        pool_hint,
+        model_key,
+    )
 
 
 def _store_cached_client(cache_key: tuple, client: Any, default_model: Optional[str], *, bound_loop: Any = None) -> None:
@@ -8116,6 +8293,72 @@ async def _acreate_with_stream(
     )
 
 
+def _freeze_strict_named_custom_route(
+    provider: str,
+    model: Optional[str],
+    base_url: Optional[str],
+    api_key: Optional[str],
+    api_mode: Optional[str],
+) -> Tuple[str, Optional[str], Optional[str], Optional[str], Optional[str]]:
+    """Resolve a strict ``custom:<alias>`` into one immutable route snapshot.
+
+    A named provider's alias/model alone are not sufficient cache identity:
+    every Hermes profile can bind the same alias to different endpoint and
+    credential data.  Resolve those fields before lookup, then pass the same
+    snapshot to client construction so keying and construction cannot observe
+    different profile/config states.
+    """
+
+    raw_provider = str(provider or "").strip()
+    if base_url or not raw_provider.lower().startswith("custom:"):
+        return provider, model, base_url, api_key, api_mode
+
+    try:
+        from hermes_cli.runtime_provider import _get_named_custom_provider
+    except ImportError:
+        return provider, model, base_url, api_key, api_mode
+
+    entry = _get_named_custom_provider(raw_provider)
+    if not isinstance(entry, dict):
+        return provider, model, base_url, api_key, api_mode
+
+    frozen_base_url = str(entry.get("base_url") or "").strip() or None
+    frozen_api_key = str(api_key or entry.get("api_key") or "").strip()
+    key_env = str(entry.get("key_env") or entry.get("api_key_env") or "").strip()
+    if not frozen_api_key and key_env:
+        frozen_api_key = os.getenv(key_env, "").strip()
+    if frozen_base_url and not frozen_api_key:
+        frozen_api_key = "no-key-required"
+
+    frozen_api_mode = str(api_mode or entry.get("api_mode") or "").strip()
+    if not frozen_api_mode and frozen_base_url:
+        if _endpoint_speaks_anthropic_messages(frozen_base_url):
+            frozen_api_mode = "anthropic_messages"
+        elif (
+            base_url_hostname(frozen_base_url) == "api.openai.com"
+            and "codex" in str(model or "").lower()
+        ):
+            frozen_api_mode = "codex_responses"
+        else:
+            frozen_api_mode = "chat_completions"
+
+    # Match the named-provider builder's OpenAI-wire endpoint rewrite before
+    # both keying and construction. Anthropic Messages must keep its raw URL.
+    if frozen_base_url and frozen_api_mode != "anthropic_messages":
+        frozen_base_url = _to_openai_base_url(
+            frozen_base_url,
+            emit_diagnostics=False,
+        )
+
+    return (
+        provider,
+        model,
+        frozen_base_url,
+        frozen_api_key or None,
+        frozen_api_mode or None,
+    )
+
+
 def _strict_single_provider_inputs(
     task: Optional[str],
     provider: Optional[str],
@@ -8174,6 +8417,7 @@ def _strict_single_provider_inputs(
 
 
 @_relay_auxiliary_call
+@_guard_strict_auxiliary_diagnostics
 def call_llm(
     task: str = None,
     *,
@@ -8261,7 +8505,20 @@ def call_llm(
             strict_base_url,
             strict_api_key,
         )
-        resolved_api_mode = strict_api_mode or resolved_api_mode
+        resolved_api_mode = api_mode or strict_api_mode or resolved_api_mode
+        (
+            resolved_provider,
+            resolved_model,
+            resolved_base_url,
+            resolved_api_key,
+            resolved_api_mode,
+        ) = _freeze_strict_named_custom_route(
+            resolved_provider,
+            resolved_model,
+            resolved_base_url,
+            resolved_api_key,
+            resolved_api_mode,
+        )
         main_runtime = {}
         if (
             str(resolved_provider or "").strip().lower() in {"", "auto", "main"}
@@ -8377,9 +8634,16 @@ def call_llm(
     # Log what we're about to do — makes auxiliary operations visible
     _base_info = str(getattr(client, "base_url", resolved_base_url) or "")
     if task:
-        logger.info("Auxiliary %s: using %s (%s)%s",
-                     task, resolved_provider or "auto", final_model or "default",
-                     f" at {_base_info}" if _base_info and "openrouter" not in _base_info else "")
+        if strict_single_provider:
+            logger.info(
+                "Auxiliary strict_call state=dispatch",
+                extra={"strict_metadata_only": True},
+            )
+        else:
+            _safe_base_info = _safe_endpoint_for_log(_base_info) if _base_info else ""
+            logger.info("Auxiliary %s: using %s (%s)%s",
+                        task, resolved_provider or "auto", final_model or "default",
+                        f" at {_safe_base_info}" if _safe_base_info and "openrouter" not in _safe_base_info else "")
 
     # Pass the client's actual base_url (not just resolved_base_url) so
     # endpoint-specific temperature overrides can distinguish

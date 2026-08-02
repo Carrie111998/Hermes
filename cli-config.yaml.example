@@ -1389,14 +1389,23 @@ display:
   #              after the next tool call — no interrupt, no role violation.
   #              Falls back to 'queue' if the agent isn't running yet or if
   #              images are attached (steer only carries text).
-  #   smart:     Use the fail-closed SMART classifier. Related messages steer,
-  #              independent work is offered to parallel orchestration, and
-  #              dependent/ambiguous/error cases queue. Never interrupts.
+  #   smart:     Use the fail-closed SMART classifier. Related messages are
+  #              fenced for the next safe checkpoint; independent work is
+  #              described as parallel only after an isolated worker returns a
+  #              durable admission ID; dependent/ambiguous/error cases queue.
+  #              It never interrupts and never executes isolation fallback inline.
+  #              A steering receipt commits only when the agent checkpoint
+  #              consumes the mailbox, not merely when steer() accepts it.
   #              Requires an explicit auxiliary.smart_router provider + model
   #              for classifier egress; otherwise every non-alias input queues.
   # Ctrl+C (or /stop in gateway) always interrupts regardless of this setting.
   # Toggle in the CLI with /busy <smart|interrupt|queue|steer>.
   busy_input_mode: interrupt
+
+  # Aggregate CLI/TUI/Desktop/gateway durable-queue cap. The logical obligation
+  # count is fixed at 32 and coalesced media/captions count before mutation.
+  # Accepted receipts never expire silently.
+  busy_queue_max_bytes: 1048576
 
   # Background process notifications (gateway/messaging only).
   # Controls how chatty the process watcher is when you use

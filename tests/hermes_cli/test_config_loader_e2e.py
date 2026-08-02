@@ -70,6 +70,7 @@ def test_behavioral_read_gets_expansion_and_overlay_while_writeback_stays_raw(
 
     managed_dir = tmp_path / "managed"
     managed_dir.mkdir()
+    (managed_dir / ".hermes-managed").write_bytes(b"hermes-managed-scope-v1\n")
     # Administrator pins reasoning_effort — must win over the user's "low".
     (managed_dir / "config.yaml").write_text(
         "agent:\n  reasoning_effort: high\n", encoding="utf-8"

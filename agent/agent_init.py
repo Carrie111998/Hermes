@@ -779,6 +779,8 @@ def init_agent(
     # iteration. Message-role alternation is preserved (we modify an
     # existing tool message rather than inserting a new user turn).
     agent._pending_steer: Optional[str] = None
+    agent._pending_steer_count = 0
+    agent._failed_turn_pending_steer = None
     agent._pending_steer_lock = threading.Lock()
     # Acceptance is a turn-scoped lease, not merely a writable mailbox. The
     # generation fences a cached AIAgent reused for a later run; the open bit

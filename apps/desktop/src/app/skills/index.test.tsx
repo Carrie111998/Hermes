@@ -3,7 +3,7 @@ import { QueryClientProvider } from '@tanstack/react-query'
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { MemoryRouter } from 'react-router'
 import type * as ReactRouterDom from 'react-router'
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type * as HermesApi from '@/hermes'
 import { queryClient } from '@/lib/query-client'
@@ -15,6 +15,8 @@ const setToolsetEnabled = vi.fn()
 const getToolsetConfig = vi.fn()
 const selectToolsetProvider = vi.fn()
 const getUsageAnalytics = vi.fn()
+const loadSkillsView = async () => (await import('./index')).SkillsView
+let SkillsView: Awaited<ReturnType<typeof loadSkillsView>>
 
 // Partial mock: keep the real module (SkillsView pulls in @/store/profile,
 // whose import-time subscription calls setApiRequestProfile) and stub only the
@@ -45,6 +47,15 @@ vi.mock('react-router', async importOriginal => ({
   useNavigate: () => navigateSpy
 }))
 
+vi.mock('react-router-dom', () => ({
+  useLocation: () => ({ hash: '', pathname: '/skills', search: '?tab=toolsets' }),
+  useNavigate: () => vi.fn()
+}))
+
+beforeAll(async () => {
+  SkillsView = await loadSkillsView()
+}, 45_000)
+
 function toolset(overrides: Record<string, unknown> = {}) {
   return {
     name: 'web',
@@ -59,15 +70,12 @@ function toolset(overrides: Record<string, unknown> = {}) {
 }
 
 async function renderSkills() {
-  const { SkillsView } = await import('./index')
   let result: ReturnType<typeof render>
   await act(async () => {
     result = render(
       // SkillsView reads skills/toolsets via useQuery, so it needs a provider.
       <QueryClientProvider client={queryClient}>
-        <MemoryRouter initialEntries={['/skills?tab=toolsets']}>
-          <SkillsView />
-        </MemoryRouter>
+        <SkillsView />
       </QueryClientProvider>
     )
   })

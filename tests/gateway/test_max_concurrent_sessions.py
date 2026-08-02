@@ -1,6 +1,7 @@
 """Tests for the gateway max_concurrent_sessions active-session cap."""
 
 import asyncio
+import threading
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -75,6 +76,13 @@ def _make_runner(max_concurrent_sessions: int | None = None) -> GatewayRunner:
     runner._busy_input_mode = "interrupt"
     runner._busy_text_mode = "interrupt"
     runner._queued_events = {}
+    runner._external_drain_active = False
+    runner._busy_queue_lock = threading.RLock()
+    runner._busy_queue_claimed_events = {}
+    runner._busy_queue_uncertain_sessions = set()
+    runner._busy_queue_uncertain_digests = set()
+    runner._busy_queue_persist_ready = MagicMock(return_value=None)
+    runner._busy_queue_max_bytes = lambda: 1024 * 1024
     runner._update_runtime_status = MagicMock()
     runner._is_user_authorized = lambda _source: True
     runner.hooks = MagicMock()

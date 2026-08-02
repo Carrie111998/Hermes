@@ -75,6 +75,7 @@ class TestLoadConfigDefaults:
             assert "terminal" in config
             assert config["terminal"]["backend"] == "local"
             assert config["display"]["interim_assistant_messages"] is True
+            assert config["display"]["busy_queue_max_bytes"] == 1_048_576
 
     def test_legacy_root_level_max_turns_migrates_to_agent_config(self, tmp_path):
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
@@ -943,6 +944,15 @@ class TestCustomProviderCompatibility:
                 "provider_key": "my-provider",
             }
         ]
+
+
+class TestSmartOrchestrationConfig:
+    """SMART routing knobs are first-class defaults, not ad-hoc keys."""
+
+    def test_default_config_exposes_fail_closed_smart_defaults(self):
+        smart = DEFAULT_CONFIG["orchestration"]["smart"]
+        assert smart["confidence_threshold"] == 0.78
+        assert smart["classifier_timeout_seconds"] == 12
 
 
 class TestInterimAssistantMessageConfig:

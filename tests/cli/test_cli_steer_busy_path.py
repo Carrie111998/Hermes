@@ -107,37 +107,77 @@ class TestSteerBusyPathDispatch:
     """When the detector fires, process_command('/steer ...') must call
     agent.steer() directly rather than the idle-path fallback."""
 
-    def test_process_command_routes_to_agent_steer(self):
-        """With _agent_running=True and agent.steer present, /steer reaches
-        agent.steer(payload), NOT _pending_input."""
+    def test_process_command_routes_to_agent_steer(self, tmp_path, monkeypatch):
+        """Busy /steer persists, claims, and waits for a consumption callback."""
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
         cli = _make_cli()
-        cli._agent_running = True
-        cli.agent = MagicMock()
-        cli.agent.steer = MagicMock(return_value=True)
-        # Make sure the idle-path fallback would be observable if taken
-        cli._pending_input = MagicMock()
+
+        class AckAgent:
+            session_id = "explicit-steer-busy"
+            provider = None
+            model = None
+
+            def __init__(self):
+                self.calls = []
+
+            def get_activity_summary(self):
+                return {}
+
+            def get_steer_generation(self):
+                return 7
+
+            def supports_steer_consumption_ack(self):
+                return True
+
+            def steer(self, payload, **kwargs):
+                self.calls.append((payload, kwargs))
+                return True
+
+        agent = AckAgent()
+        cli.agent = agent
+        cli._begin_smart_cli_turn("active work")
 
         cli.process_command("/steer focus on errors")
 
-        cli.agent.steer.assert_called_once_with("focus on errors")
-        cli._pending_input.put.assert_not_called()
+        assert len(agent.calls) == 1
+        payload, kwargs = agent.calls[0]
+        assert payload == "focus on errors"
+        assert kwargs["run_generation"] == 7
+        assert callable(kwargs["on_consumed"])
+        assert callable(kwargs["on_unconsumed"])
+        assert callable(kwargs["on_uncertain"])
+        jobs = cli._load_smart_cli_durable_jobs_locked(agent.session_id)
+        assert len(jobs) == 1
+        assert jobs[0]["text"] == payload
+        assert jobs[0]["state"] == "transferring"
+        assert cli._pending_input.empty()
 
-    def test_idle_path_queues_as_next_turn(self):
-        """Control — when the agent is NOT running, /steer correctly falls
-        back to next-turn queue semantics.  Demonstrates why the fix was
-        needed: the queue path only works when you can actually drain it."""
+        kwargs["on_consumed"]()
+        assert cli._load_smart_cli_durable_jobs_locked(agent.session_id) == []
+
+    def test_idle_path_queues_as_next_turn(self, tmp_path, monkeypatch):
+        """Idle /steer is still persistence-first and stages a typed receipt."""
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
         cli = _make_cli()
         cli._agent_running = False
-        cli.agent = MagicMock()
-        cli.agent.steer = MagicMock(return_value=True)
-        cli._pending_input = MagicMock()
 
         cli.process_command("/steer would-be-next-turn")
 
-        # Idle path does NOT call agent.steer
-        cli.agent.steer.assert_not_called()
-        # It puts the payload in the queue as a normal next-turn message
-        cli._pending_input.put.assert_called_once_with("would-be-next-turn")
+        queued = cli._pending_input.get_nowait()
+        assert queued.payload == "would-be-next-turn"
+        assert queued.durable_id
+        jobs = cli._load_smart_cli_durable_jobs_locked(
+            queued.durable_session_id
+        )
+        assert jobs == [
+            {
+                "id": queued.durable_id,
+                "text": "would-be-next-turn",
+                "state": "accepted",
+            }
+        ]
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -16,6 +16,33 @@ from hermes_cli.urllib_security import (
     url_origin,
 )
 
+# A distinct URL hostname that still resolves deterministically to the IPv4
+# loopback listener. Some minimal hosts map ``localhost`` only to ``::1``.
+_CROSS_HOST_LOOPBACK = "127.1"
+
+
+class _NoProxyHandler(urllib.request.ProxyHandler):
+    """Explicit no-op proxy policy that survives opener reconstruction."""
+
+    def __init__(self):
+        super().__init__({})
+
+    def http_open(self, _request):
+        return None
+
+    https_open = http_open
+
+
+def _test_opener(*handlers):
+    return urllib.request.build_opener(_NoProxyHandler(), *handlers)
+
+
+@pytest.fixture(autouse=True)
+def _disable_environment_proxies_for_loopback(monkeypatch):
+    """Keep wire-level loopback tests independent of corporate proxy env."""
+    opener = _test_opener()
+    monkeypatch.setattr(urllib.request, "_opener", opener)
+
 
 class _Response:
     def __init__(self, payload: bytes = b"{}") -> None:
@@ -93,7 +120,7 @@ def test_cross_host_redirect_drops_arbitrary_credentials_on_wire():
     sink = _server()
     _RecordingHandler.requests = []
     _RecordingHandler.redirect_status = 302
-    _RecordingHandler.redirect_to = f"http://localhost:{sink.server_port}/sink"
+    _RecordingHandler.redirect_to = f"http://{_CROSS_HOST_LOOPBACK}:{sink.server_port}/sink"
     try:
         request = urllib.request.Request(
             f"http://127.0.0.1:{source.server_port}/redirect",
@@ -183,6 +210,40 @@ def test_explicit_opener_factory_is_instrumentable_without_security_bypass():
     assert calls == [("https://models.example.test/models", 7)]
 
 
+def test_installed_custom_opener_policy_is_preserved(monkeypatch):
+    opened = []
+
+    class FooHandler(urllib.request.BaseHandler):
+        def foo_open(self, request):
+            opened.append(request.full_url)
+            return _Response(b"custom")
+
+    installed = _test_opener(FooHandler())
+    installed.addheaders = [
+        ("X-Trace-Policy", "installed"),
+        ("User-agent", "enterprise-client"),
+    ]
+    monkeypatch.setattr(urllib.request, "_opener", installed)
+
+    from hermes_cli.urllib_security import _secure_opener_from_installed_policy
+
+    secured = _secure_opener_from_installed_policy(
+        "foo://models.example.test/catalog"
+    )
+    assert secured.addheaders == []
+    assert getattr(secured, "_hermes_initial_addheaders") == installed.addheaders
+
+    request = urllib.request.Request(
+        "foo://models.example.test/catalog", headers={"Authorization": "secret"}
+    )
+    with open_credentialed_url(request, timeout=3) as response:
+        assert response.read() == b"custom"
+    request_headers = {
+        name.lower(): value for name, value in request.header_items()
+    }
+    assert request_headers["x-trace-policy"] == "installed"
+    assert request_headers["user-agent"] == "enterprise-client"
+    assert opened == ["foo://models.example.test/catalog"]
 
 
 
@@ -194,7 +255,7 @@ def test_installed_request_processor_cannot_resurrect_cross_origin_secret(
     sink = _server()
     _RecordingHandler.requests = []
     _RecordingHandler.redirect_status = 302
-    _RecordingHandler.redirect_to = f"http://localhost:{sink.server_port}/sink"
+    _RecordingHandler.redirect_to = f"http://{_CROSS_HOST_LOOPBACK}:{sink.server_port}/sink"
 
     class SecretProcessor(urllib.request.BaseHandler):
         handler_order = float("inf")  # type: ignore[assignment]
@@ -203,7 +264,7 @@ def test_installed_request_processor_cannot_resurrect_cross_origin_secret(
             request.add_header("X-Installed-Secret", "must-not-cross")
             return request
 
-    installed = urllib.request.build_opener(SecretProcessor())
+    installed = _test_opener(SecretProcessor())
     installed.addheaders = [("X-Opener-Secret", "also-must-not-cross")]
     monkeypatch.setattr(urllib.request, "_opener", installed)
     try:
@@ -281,7 +342,7 @@ def test_probe_api_models_drops_custom_credentials_on_wire():
     sink = _server()
     _RecordingHandler.requests = []
     _RecordingHandler.redirect_status = 302
-    _RecordingHandler.redirect_to = f"http://localhost:{sink.server_port}/sink"
+    _RecordingHandler.redirect_to = f"http://{_CROSS_HOST_LOOPBACK}:{sink.server_port}/sink"
     try:
         result = probe_api_models(
             "provider-key",
@@ -327,7 +388,7 @@ def test_anthropic_profile_drops_x_api_key_on_redirect(monkeypatch):
     sink = _server()
     _RecordingHandler.requests = []
     _RecordingHandler.redirect_status = 302
-    _RecordingHandler.redirect_to = f"http://localhost:{sink.server_port}/sink"
+    _RecordingHandler.redirect_to = f"http://{_CROSS_HOST_LOOPBACK}:{sink.server_port}/sink"
 
     original_request = urllib.request.Request
 
@@ -358,7 +419,7 @@ def test_azure_catalog_probe_drops_api_key_and_bearer_on_redirect():
     sink = _server()
     _RecordingHandler.requests = []
     _RecordingHandler.redirect_status = 302
-    _RecordingHandler.redirect_to = f"http://localhost:{sink.server_port}/sink"
+    _RecordingHandler.redirect_to = f"http://{_CROSS_HOST_LOOPBACK}:{sink.server_port}/sink"
     try:
         status, body = azure_detect._http_get_json(
             f"http://127.0.0.1:{source.server_port}/redirect", "azure-secret", timeout=3
@@ -381,7 +442,7 @@ def test_azure_anthropic_probe_drops_api_key_and_bearer_on_redirect():
     source = ThreadingHTTPServer(("127.0.0.1", 0), _LmStudioSourceHandler)
     Thread(target=source.serve_forever, daemon=True).start()
     _RecordingHandler.requests = []
-    _LmStudioSourceHandler.redirect_to = f"http://localhost:{sink.server_port}/sink"
+    _LmStudioSourceHandler.redirect_to = f"http://{_CROSS_HOST_LOOPBACK}:{sink.server_port}/sink"
     try:
         azure_detect._probe_anthropic_messages(
             f"http://127.0.0.1:{source.server_port}", "azure-secret"
@@ -395,3 +456,35 @@ def test_azure_anthropic_probe_drops_api_key_and_bearer_on_redirect():
     assert "api-key" not in headers
 
 
+def test_lmstudio_load_post_drops_bearer_on_redirect(monkeypatch):
+    from hermes_cli import models
+
+    sink = _server()
+    source = ThreadingHTTPServer(("127.0.0.1", 0), _LmStudioSourceHandler)
+    Thread(target=source.serve_forever, daemon=True).start()
+    _RecordingHandler.requests = []
+    _LmStudioSourceHandler.redirect_to = f"http://{_CROSS_HOST_LOOPBACK}:{sink.server_port}/sink"
+    monkeypatch.setattr(
+        models,
+        "_lmstudio_fetch_raw_models",
+        lambda **_kwargs: [
+            {"id": "model", "max_context_length": 8192, "loaded_instances": []}
+        ],
+    )
+    try:
+        loaded = models.ensure_lmstudio_model_loaded(
+            "model",
+            f"http://127.0.0.1:{source.server_port}",
+            api_key="lm-secret",
+            target_context_length=4096,
+            timeout=3,
+        )
+    finally:
+        source.shutdown()
+        sink.shutdown()
+
+    assert loaded == 4096
+    method, headers = _RecordingHandler.requests[-1]
+    assert method == "GET"
+    assert "authorization" not in headers
+    assert "content-type" not in headers
