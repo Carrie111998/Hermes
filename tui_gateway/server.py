@@ -9845,6 +9845,23 @@ def _run_prompt_submit(
                     _persist_live_session_system_prompt(session)
                 except Exception:
                     logger.debug("TUI one-turn model restore failed", exc_info=True)
+
+            # Drop both local snapshots of the pre-turn history before asking
+            # glibc to return pages. session["history"] already points at the
+            # new/pruned result; retaining either list defeats this trim.
+            history.clear()
+            local_run_kwargs = locals().get("run_kwargs")
+            if isinstance(local_run_kwargs, dict):
+                local_run_kwargs.clear()
+
+            # Run while any profile-specific HERMES_HOME override is still active
+            # so context.memory_trim is resolved from the session's own config.
+            try:
+                from hermes_cli.mem_trim import trim_memory
+
+                trim_memory(reason="tui turn completion")
+            except Exception:
+                logger.debug("post-turn memory trim failed", exc_info=True)
             try:
                 if approval_token is not None:
                     reset_current_session_key(approval_token)
