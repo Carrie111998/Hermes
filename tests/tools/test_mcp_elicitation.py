@@ -221,6 +221,40 @@ class TestElicitationHandlerContextBridge:
             f"consent call; got {seen!r}"
         )
 
+    def test_gateway_context_ignores_stale_process_cron_identity(self, monkeypatch):
+        """A prior cron run must not route Discord elicitation to CLI."""
+        import contextvars
+        from types import SimpleNamespace
+
+        from gateway.session_context import clear_session_vars, set_session_vars
+        from tools.approval import _is_gateway_approval_context
+
+        monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+        tokens = set_session_vars(
+            platform="discord", chat_id="456", session_key="discord:456"
+        )
+        try:
+            captured = contextvars.copy_context()
+        finally:
+            clear_session_vars(tokens)
+
+        seen = []
+
+        def fake_consent(*_args, **_kwargs):
+            seen.append(_is_gateway_approval_context())
+            return "accept" if seen[-1] else "decline"
+
+        owner = SimpleNamespace(_pending_call_context=captured)
+        handler = ElicitationHandler("soul_broker", {"timeout": 5}, owner=owner)
+
+        with patch(
+            "tools.approval.request_elicitation_consent", side_effect=fake_consent
+        ):
+            result = asyncio.run(handler(context=None, params=_form_params()))
+
+        assert result.action == "accept"
+        assert seen == [True]
+
     def test_missing_captured_context_falls_back_to_direct_call(self):
         """Without an owner (or with an owner that hasn't entered a tool
         call) the handler must still invoke the consent router -- just

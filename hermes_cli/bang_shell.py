@@ -64,14 +64,23 @@ def bang_shell_enabled() -> bool:
     remote-execution surface with no approving human at the keyboard.
     """
     try:
-        from utils import env_var_enabled
+        from utils import env_var_enabled, is_truthy_value
     except Exception:  # pragma: no cover - utils is always importable in-tree
+        def is_truthy_value(value, default=False):  # type: ignore[misc]
+            return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
         def env_var_enabled(name, default=""):  # type: ignore[misc]
-            return str(os.getenv(name, default)).strip().lower() in {"1", "true", "yes", "on"}
+            return is_truthy_value(os.getenv(name, default))
 
     if env_var_enabled("HERMES_GATEWAY_SESSION"):
         return False
-    if env_var_enabled("HERMES_CRON_SESSION"):
+    try:
+        from gateway.session_context import get_session_env
+
+        cron_session = get_session_env("HERMES_CRON_SESSION", "")
+    except Exception:
+        cron_session = os.getenv("HERMES_CRON_SESSION", "")
+    if is_truthy_value(cron_session):
         return False
     if (os.getenv("HERMES_SESSION_PLATFORM") or "").strip():
         return False

@@ -85,6 +85,16 @@ class TestBangContextGating:
         monkeypatch.setenv(var, value)
         assert bang_shell_enabled() is False
 
+    def test_disabled_in_task_local_cron_context(self, monkeypatch):
+        monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
+        from gateway.session_context import clear_session_vars, set_session_vars
+
+        tokens = set_session_vars(cron_session=True)
+        try:
+            assert bang_shell_enabled() is False
+        finally:
+            clear_session_vars(tokens)
+
 
 # ── execution ──────────────────────────────────────────────────────────────
 
