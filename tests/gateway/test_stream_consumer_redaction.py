@@ -14,10 +14,34 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from agent.redact import _SENSITIVE_BODY_KEYS, _SENSITIVE_QUERY_PARAMS
 from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig, _hold_back_credential_prefix_tail
 
 
 _BOUNDARY_SECRET = "sk-abc123def456ghi789jkl012mno345pqr678stu"
+
+
+_ASSIGNMENT_SECRET = "MY_API_KEY=supersecretvalue123456789"
+_SENSITIVE_FORM_KEYS = tuple(sorted(_SENSITIVE_BODY_KEYS))
+
+_STRUCTURAL_REDACTION_CASES = (
+    ("env assignment", "MY_AP", "I_KEY=supersecretvalue123456789"),
+    ("dotted config", "spring.datasource.passwo", "rd=supersecretvalue123456789"),
+    ("yaml assignment", "\npassword", ": supersecretvalue123456789"),
+    ("json field", '{"apiK', 'ey": "supersecretvalue123456789"}'),
+    ("authorization header", "Authorization: Bear", "er sk-abc123def456ghi789jkl"),
+    ("secret header", "\nx-api", "-key: supersecretvalue123456789"),
+    (
+        "private key",
+        "-----BEGIN RSA PRIVATE",
+        " KEY-----\nABCDEF\n-----END RSA PRIVATE KEY-----",
+    ),
+    ("database URL", "postgres://user:", "password@db.example/db"),
+    ("bare URL token", "https://", "secretvalue@example.com"),
+    ("JWT", "eyJ", "hbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.signature"),
+    ("Telegram token", "12345678", ":ABCdefGHIjklMNOpqrSTUvwxYZ0123456789"),
+    ("phone number", "+123456", "789012"),
+)
 
 
 def _overflow_adapter() -> MagicMock:
@@ -136,12 +160,18 @@ class _RecordingSendAdapter:
     id, and a sealed finalize=True chunk is immutable.
     """
 
-    def __init__(self, max_len: int = 601):
+    def __init__(
+        self,
+        max_len: int = 601,
+        *,
+        first_delivery: asyncio.Event | None = None,
+    ):
         self.MAX_MESSAGE_LENGTH = max_len
         self.REQUIRES_EDIT_FINALIZE = False
         self._counter = 0
         self._editable: "dict[str, str]" = {}
         self._editable_order: "list[str]" = []
+        self._first_delivery = first_delivery
         self.send = AsyncMock(side_effect=self._send)
         self.edit_message = AsyncMock(side_effect=self._edit)
 
@@ -150,12 +180,16 @@ class _RecordingSendAdapter:
         mid = f"s{self._counter}"
         self._editable[mid] = kw["content"]
         self._editable_order.append(mid)
+        if self._first_delivery is not None:
+            self._first_delivery.set()
         return SimpleNamespace(success=True, message_id=mid)
 
     async def _edit(self, **kw):
         if self._editable_order:
             target = self._editable_order[-1]
             self._editable[target] = kw["content"]
+        if self._first_delivery is not None:
+            self._first_delivery.set()
         return SimpleNamespace(success=True, message_id=f"e{self._counter}")
 
     def final_visible_text(self) -> str:
@@ -238,6 +272,176 @@ class TestIncrementalStreamingHoldback:
         assert _BOUNDARY_SECRET not in visible, (
             "P1 bypass: incremental streaming reconstructed the raw credential "
             "across sealed messages (existing-message branch)"
+        )
+
+    @pytest.mark.asyncio
+    async def test_incremental_assignment_split_fresh_message(self):
+        """Fresh-message branch: a generic secret assignment must remain
+        mutable when the split lands inside its key name."""
+        adapter = _RecordingSendAdapter()
+        consumer = GatewayStreamConsumer(
+            adapter, "chat_1",
+            StreamConsumerConfig(buffer_threshold=1, edit_interval=0.0),
+        )
+        delta1 = "x" * 495 + "MY_API_KEY"
+        suffix = _ASSIGNMENT_SECRET[len("MY_API_KEY"):]
+
+        task = asyncio.create_task(consumer.run())
+        consumer.on_delta(delta1)
+        for _ in range(50):
+            await asyncio.sleep(0.005)
+            if consumer._queue.empty():
+                break
+        consumer.on_delta(suffix)
+        consumer.finish()
+        await task
+
+        visible = adapter.final_visible_text()
+        assert _ASSIGNMENT_SECRET not in visible, (
+            "P1 bypass: generic assignment reconstructed across fresh-message "
+            "overflow chunks"
+        )
+
+    @pytest.mark.asyncio
+    async def test_incremental_assignment_split_existing_message(self):
+        """Existing-message branch: the same generic assignment boundary
+        must not be reconstructable from the replacement-edit flow."""
+        adapter = _RecordingSendAdapter()
+        consumer = GatewayStreamConsumer(
+            adapter, "chat_1",
+            StreamConsumerConfig(buffer_threshold=1, edit_interval=0.0),
+        )
+        consumer._message_id = "preview"
+        consumer._already_sent = True
+
+        delta1 = "x" * 495 + "MY_API_KEY"
+        suffix = _ASSIGNMENT_SECRET[len("MY_API_KEY"):]
+
+        task = asyncio.create_task(consumer.run())
+        consumer.on_delta(delta1)
+        for _ in range(50):
+            await asyncio.sleep(0.005)
+            if consumer._queue.empty():
+                break
+        consumer.on_delta(suffix)
+        consumer.finish()
+        await task
+
+        visible = adapter.final_visible_text()
+        assert _ASSIGNMENT_SECRET not in visible, (
+            "P1 bypass: generic assignment reconstructed across existing-message "
+            "overflow chunks"
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "existing_message", [False, True], ids=["fresh", "existing"]
+    )
+    @pytest.mark.parametrize(
+        "key", _SENSITIVE_FORM_KEYS, ids=lambda key: str(key)
+    )
+    async def test_incremental_authoritative_form_key_split_offsets(
+        self, key, existing_message
+    ):
+        """Every authoritative form-body key stays mutable at every split offset.
+
+        The first delta ends exactly at the 500-character streaming boundary,
+        with the key preceded by a query/form delimiter.  The test waits until
+        the first send/edit has completed before supplying the value suffix, so
+        the assertion models immutable platform delivery rather than queue
+        ordering.
+        """
+        value = "form-secret-value-123456789"
+        for split_offset in range(1, len(key) + 1):
+            first_delivery = asyncio.Event()
+            adapter = _RecordingSendAdapter(first_delivery=first_delivery)
+            consumer = GatewayStreamConsumer(
+                adapter,
+                "chat_1",
+                StreamConsumerConfig(buffer_threshold=1, edit_interval=0.0),
+            )
+            if existing_message:
+                consumer._message_id = "preview"
+                consumer._already_sent = True
+
+            prefix = f"&{key[:split_offset]}"
+            delta1 = "filler=" + "x" * (500 - len("filler=") - len(prefix)) + prefix
+            suffix = f"{key[split_offset:]}={value}"
+
+            task = asyncio.create_task(consumer.run())
+            consumer.on_delta(delta1)
+            await asyncio.wait_for(first_delivery.wait(), timeout=1.0)
+            consumer.on_delta(suffix)
+            consumer.finish()
+            await task
+
+            raw_secret = f"&{key}={value}"
+            assert raw_secret not in adapter.final_visible_text(), (
+                f"{key!r} leaked across {('existing' if existing_message else 'fresh')} "
+                f"streaming boundary at split offset {split_offset}"
+            )
+
+    @pytest.mark.parametrize("delimiter", ["?", "&"], ids=["query", "form"])
+    @pytest.mark.parametrize(
+        "key", tuple(sorted(_SENSITIVE_QUERY_PARAMS)), ids=lambda key: str(key)
+    )
+    def test_authoritative_query_key_prefix_is_held_at_each_split_offset(
+        self, key, delimiter
+    ):
+        """Delimiter-aware query prefixes stay mutable until their key resolves."""
+        for split_offset in range(1, len(key) + 1):
+            text = f"safe{delimiter}{key[:split_offset]}"
+            head, tail = _hold_back_credential_prefix_tail(text)
+            assert head == "safe"
+            assert tail == f"{delimiter}{key[:split_offset]}"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "existing_message", [False, True], ids=["fresh", "existing"]
+    )
+    @pytest.mark.parametrize(
+        "case",
+        _STRUCTURAL_REDACTION_CASES,
+        ids=[case[0] for case in _STRUCTURAL_REDACTION_CASES],
+    )
+    async def test_incremental_structural_detector_split_cannot_reconstruct_secret(
+        self, case, existing_message
+    ):
+        """Every authoritative detector keeps its incomplete form mutable.
+
+        The first delta is deliberately one overflowing chunk whose detector
+        prefix straddles the 500-character boundary.  The second delta makes
+        it a complete credential.  Both delivery branches must avoid exposing
+        the raw reconstructed value.
+        """
+        _, prefix, suffix = case
+        adapter = _RecordingSendAdapter()
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "chat_1",
+            StreamConsumerConfig(buffer_threshold=1, edit_interval=0.0),
+        )
+        if existing_message:
+            consumer._message_id = "preview"
+            consumer._already_sent = True
+
+        split_start = 500 - max(1, len(prefix) // 2)
+        delta1 = "x" * split_start + prefix
+
+        task = asyncio.create_task(consumer.run())
+        consumer.on_delta(delta1)
+        for _ in range(50):
+            await asyncio.sleep(0.005)
+            if consumer._queue.empty():
+                break
+        consumer.on_delta(suffix)
+        consumer.finish()
+        await task
+
+        raw_secret = prefix + suffix
+        assert raw_secret not in adapter.final_visible_text(), (
+            f"{case[0]} secret reconstructed across {('existing' if existing_message else 'fresh')} "
+            "streaming overflow branch"
         )
 
     @pytest.mark.asyncio

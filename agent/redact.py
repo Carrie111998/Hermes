@@ -471,7 +471,11 @@ def _mask_token(token: str) -> str:
     return mask_secret(token, head=6, tail=4, floor=18)
 
 
-def _redact_query_string(query: str) -> str:
+def _redact_query_string(
+    query: str,
+    *,
+    sensitive_keys: "frozenset[str] | set[str] | None" = None,
+) -> str:
     """Redact sensitive parameter values in a URL query string.
 
     Handles `k=v&k=v` format. Sensitive keys (case-insensitive) have values
@@ -480,13 +484,14 @@ def _redact_query_string(query: str) -> str:
     """
     if not query:
         return query
+    keys = _SENSITIVE_QUERY_PARAMS if sensitive_keys is None else sensitive_keys
     parts = []
     for pair in query.split("&"):
         if "=" not in pair:
             parts.append(pair)
             continue
         key, _, value = pair.partition("=")
-        if key.lower() in _SENSITIVE_QUERY_PARAMS:
+        if key.lower() in keys:
             parts.append(f"{key}=***")
         else:
             parts.append(pair)
@@ -603,7 +608,7 @@ def _redact_form_body(text: str) -> str:
     # The body-body form check is strict: only trigger on clean k=v&k=v.
     if not _FORM_BODY_RE.match(text.strip()):
         return text
-    return _redact_query_string(text.strip())
+    return _redact_query_string(text.strip(), sensitive_keys=_SENSITIVE_BODY_KEYS)
 
 
 def _mask_token_nonreusable(token: str) -> str:

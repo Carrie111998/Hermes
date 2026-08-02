@@ -51,13 +51,11 @@ _TOOL_TRACE_RE = re.compile(
 # tail (``self._accumulated``) until either a delimiting character or
 # end-of-stream (got_done) proves it cannot grow into a credential.
 #
-# The seed list is derived from the same ``_PREFIX_SUBSTRINGS`` the redactor
-# itself uses, plus every proper prefix of those substrings ("sk-", "sk", "s"
-# would over-match — we deliberately start from real credential starts like
-# "sk-", "ghp_", "gAAAA", … and also keep their partial tails like "sk" only
-# when not already prefixed by a digit-or-letter continuation).  This keeps
-# the behavior crisp: " chairs" never triggers holdback; " ch AirSk" doesn't
-# either; " sk-" does.
+# The vendor seed list is derived from the same ``_PREFIX_SUBSTRINGS`` the
+# redactor itself uses, plus proper prefixes that could still grow into those
+# tokens.  Structural detector classes are handled by the companion patterns
+# below; all of them intentionally prefer a short delivery delay over sealing
+# a fragment that a later delta can turn into a secret.
 
 def _build_streaming_credential_prefix_tail_re() -> "re.Pattern[str]":
     """Compile a regex matching a trailing credential-prefix candidate.
@@ -114,7 +112,282 @@ def _build_streaming_credential_prefix_tail_re() -> "re.Pattern[str]":
 _CREDENTIAL_PREFIX_TAIL_RE = _build_streaming_credential_prefix_tail_re()
 
 
-def _hold_back_credential_prefix_tail(text: str, *, finalize: bool = False) -> "tuple[str, str]":
+# The prefix matcher above covers vendor-shaped tokens.  The authoritative
+# redactor also recognizes credentials whose beginning is structural rather
+# than vendor-specific (for example ``MY_API_KEY=...``, JSON fields,
+# authorization headers, JWTs, private-key blocks, and connection URLs).  A
+# stream can be split before those forms are complete, so keep a trailing
+# candidate mutable as well.  These patterns deliberately err on the side of
+# retaining a little extra text: delaying an edit is safe; sealing a fragment
+# that a later delta can turn into a secret is not.
+def _streaming_literal_prefixes(
+    values: tuple[str, ...], *, min_length: int = 1
+) -> tuple[str, ...]:
+    """Return distinct literal prefixes in longest-first order."""
+    prefixes: set[str] = set()
+    for value in values:
+        for index in range(min_length, len(value) + 1):
+            prefixes.add(value[:index])
+    ordered = list(prefixes)
+    ordered.sort(key=len, reverse=True)
+    return tuple(ordered)
+
+
+_STREAMING_SECRET_KEY_FORMS: tuple[str, ...] = (
+    "API_KEY",
+    "APIKEY",
+    "API.KEY",
+    "API-KEY",
+    "API KEY",
+    "TOKEN",
+    "SECRET",
+    "PASSWORD",
+    "PASSWD",
+    "CREDENTIAL",
+    "AUTH",
+)
+_STREAMING_SECRET_KEY_PARTS = _streaming_literal_prefixes(
+    _STREAMING_SECRET_KEY_FORMS, min_length=2
+)
+_STREAMING_SECRET_KEY_PART_ALT = "|".join(
+    re.escape(part) for part in _STREAMING_SECRET_KEY_PARTS
+)
+_STREAMING_SECRET_KEY_PART_ALT_LOWER = "|".join(
+    re.escape(part.lower()) for part in _STREAMING_SECRET_KEY_PARTS if len(part) >= 2
+)
+_STREAMING_SECRET_KEY_FULL_RE = (
+    r"(?:API[ _.\-]?KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH)"
+)
+_STREAMING_ASSIGNMENT_SUFFIX = r"(?:[ \t]*(?:=|:)[ \t]*[^\s&]*)?"
+_STREAMING_COMPLETE_ASSIGNMENT_SUFFIX = r"[ \t]*(?:=|:)[ \t]*[^\s&]*"
+
+# Upper-case env assignments use the same key alphabet and 50-character
+# affix limits as agent.redact._ENV_ASSIGN_RE.  The lookbehind intentionally
+# excludes only upper-case token-continuation characters: that lets this
+# match ``...MY_API_KEY`` at the point where the authoritative regex would
+# begin a match, even when ordinary lower-case prose precedes it.
+_STREAMING_UPPER_SECRET_ASSIGNMENT_RE = re.compile(
+    r"(?<![A-Z0-9_])(?P<tail>[A-Z0-9_]{0,50}"
+    + _STREAMING_SECRET_KEY_FULL_RE
+    + r"[A-Z0-9_]{0,50}"
+    + _STREAMING_COMPLETE_ASSIGNMENT_SUFFIX
+    + r")\Z"
+)
+_STREAMING_UPPER_SECRET_KEY_TAIL_RE = re.compile(
+    r"(?<![A-Z0-9_])(?P<tail>[A-Z0-9_]*(?:"
+    + _STREAMING_SECRET_KEY_PART_ALT
+    + r")[A-Z0-9_]*"
+    + _STREAMING_ASSIGNMENT_SUFFIX
+    + r")\Z"
+)
+
+# Lower-case/dotted config forms are line-anchored or namespaced in the
+# authoritative redactor.  Keeping the complete forms separate lets them
+# remain protected even when a long value grows beyond the bounded partial
+# context used below.
+_STREAMING_LOWER_SECRET_ASSIGNMENT_RE = re.compile(
+    r"(?m)^[ \t]*(?:export[ \t]+)?(?P<tail>[a-z0-9_.-]*"
+    + _STREAMING_SECRET_KEY_FULL_RE.lower()
+    + r"[a-z0-9_.-]*"
+    + _STREAMING_COMPLETE_ASSIGNMENT_SUFFIX
+    + r")\Z"
+)
+_STREAMING_DOTTED_SECRET_ASSIGNMENT_RE = re.compile(
+    r"(?<![A-Za-z0-9_.-])(?P<tail>[A-Za-z0-9_-]+"
+    r"(?:\.[A-Za-z0-9_-]+)*\.[A-Za-z0-9_.-]*"
+    + _STREAMING_SECRET_KEY_FULL_RE
+    + r"[A-Za-z0-9_.-]*"
+    + _STREAMING_COMPLETE_ASSIGNMENT_SUFFIX
+    + r")\Z",
+    re.IGNORECASE,
+)
+
+# Partial config keys are only inspected in a bounded suffix.  This prevents
+# an ordinary long prose line that happens to end in a short keyword prefix
+# from making the whole response immutable, while complete assignments above
+# continue to protect arbitrarily long secret values.
+_STREAMING_CONFIG_CONTEXT_WINDOW = 256
+_STREAMING_CONFIG_KEY_PARTIAL_RE = re.compile(
+    r"(?m)^[ \t]*(?:export[ \t]+)?(?P<tail>[A-Za-z0-9_.-]*"
+    + r"(?:"
+    + _STREAMING_SECRET_KEY_PART_ALT_LOWER
+    + r")[A-Za-z0-9_.-]*"
+    + _STREAMING_ASSIGNMENT_SUFFIX
+    + r")\Z",
+    re.IGNORECASE,
+)
+_STREAMING_DOTTED_CONFIG_KEY_PARTIAL_RE = re.compile(
+    r"(?<![A-Za-z0-9_.-])(?P<tail>[A-Za-z0-9_-]+"
+    r"(?:\.[A-Za-z0-9_-]+)*\.[A-Za-z0-9_.-]*"
+    + r"(?:"
+    + _STREAMING_SECRET_KEY_PART_ALT_LOWER
+    + r")[A-Za-z0-9_.-]*"
+    + _STREAMING_ASSIGNMENT_SUFFIX
+    + r")\Z",
+    re.IGNORECASE,
+)
+
+
+def _build_streaming_sensitive_form_key_tail_re() -> "re.Pattern[str]":
+    """Compile delimiter-aware tails from the authoritative form/query keys."""
+    try:
+        from agent.redact import _SENSITIVE_BODY_KEYS, _SENSITIVE_QUERY_PARAMS
+
+        sensitive_keys: set[str] = set()
+        for raw_key in (*_SENSITIVE_BODY_KEYS, *_SENSITIVE_QUERY_PARAMS):
+            if isinstance(raw_key, str) and raw_key:
+                sensitive_keys.add(raw_key.casefold())
+    except Exception:
+        # Keep the existing structural vocabulary as a last-resort fallback if
+        # the redactor module cannot be imported during partial installation.
+        sensitive_keys = {key.casefold() for key in _STREAMING_SECRET_KEY_FORMS}
+
+    prefixes: set[str] = set()
+    for key in sensitive_keys:
+        prefixes.update(key[:index] for index in range(1, len(key) + 1))
+    delimiter_prefixes: list[str] = list(prefixes)
+    delimiter_prefixes.sort(key=len, reverse=True)
+    delimiter_alternation = "|".join(re.escape(prefix) for prefix in delimiter_prefixes)
+    start_prefixes: list[str] = [prefix for prefix in prefixes if len(prefix) >= 2]
+    start_prefixes.sort(key=len, reverse=True)
+    start_alternation = "|".join(re.escape(prefix) for prefix in start_prefixes)
+    # The delimiter is part of the held tail.  This covers both query strings
+    # and form bodies while avoiding ordinary prose occurrences of a sensitive
+    # key.  Exact prefixes only are accepted, so a divergent key such as
+    # ``&access_log`` is not held merely because it starts with ``access_``.
+    # A one-character key prefix at absolute text start is intentionally not
+    # held: without a delimiter it is indistinguishable from ordinary prose
+    # (for example, a standalone ``C`` segment).
+    return re.compile(
+        r"(?P<tail>(?:[?&;](?:"
+        + delimiter_alternation
+        + r")|^(?:"
+        + start_alternation
+        + r")))\Z",
+        re.IGNORECASE,
+    )
+
+
+_STREAMING_SENSITIVE_FORM_KEY_TAIL_RE = _build_streaming_sensitive_form_key_tail_re()
+
+
+_STREAMING_JSON_FIELD_NAMES: tuple[str, ...] = (
+    "api_key",
+    "apikey",
+    "token",
+    "secret",
+    "password",
+    "access_token",
+    "refresh_token",
+    "auth_token",
+    "bearer",
+    "secret_value",
+    "raw_secret",
+    "secret_input",
+    "key_material",
+)
+_STREAMING_JSON_FIELD_PREFIX_ALT = "|".join(
+    re.escape(prefix)
+    for prefix in _streaming_literal_prefixes(_STREAMING_JSON_FIELD_NAMES)
+)
+_STREAMING_JSON_FIELD_TAIL_RE = re.compile(
+    r'(?P<tail>"(?:'
+    + _STREAMING_JSON_FIELD_PREFIX_ALT
+    + r')[^"]*(?:"[ \t]*:[ \t]*(?:"[^"]*)?)?)\Z',
+    re.IGNORECASE,
+)
+
+_STREAMING_HEADER_NAMES: tuple[str, ...] = (
+    "proxy-authorization",
+    "authorization",
+    "x-api-key",
+    "x-goog-api-key",
+    "api-key",
+    "apikey",
+    "x-api-token",
+    "x-auth-token",
+    "x-access-token",
+)
+_STREAMING_HEADER_PREFIX_ALT = "|".join(
+    re.escape(prefix)
+    for prefix in _streaming_literal_prefixes(_STREAMING_HEADER_NAMES, min_length=4)
+)
+_STREAMING_HEADER_TAIL_RE = re.compile(
+    r"(?P<tail>(?:" + _STREAMING_HEADER_PREFIX_ALT + r")[^\r\n]*)\Z",
+    re.IGNORECASE,
+)
+
+# URL userinfo, database connection strings, and JWTs all have a fixed
+# structural beginning but unbounded credential bodies.  Retain the complete
+# trailing structure until a delimiter or the end of the stream resolves it.
+_STREAMING_URL_TAIL_RE = re.compile(
+    r"(?P<tail>(?:https?|wss?|ftp|ftps|sftp|git|ssh|"
+    r"postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqp)://[^\s]*)\Z",
+    re.IGNORECASE,
+)
+_STREAMING_JWT_TAIL_RE = re.compile(
+    r"(?P<tail>eyJ[A-Za-z0-9_=-]*(?:\.[A-Za-z0-9_=-]*){0,2})\Z"
+)
+_STREAMING_TELEGRAM_TAIL_RE = re.compile(r"(?P<tail>\d{8,}(?::[-A-Za-z0-9_]*)?)\Z")
+_STREAMING_PHONE_TAIL_RE = re.compile(r"(?P<tail>\+[1-9]\d{0,14})\Z")
+
+
+def _find_streaming_redaction_tail_start(text: str) -> Optional[int]:
+    """Return the earliest start of a trailing redaction-risk candidate.
+
+    The returned suffix must remain mutable until a later delta or stream end
+    resolves it.  Complete structural assignments are checked against the
+    full buffer so a long value cannot age out of the bounded partial window;
+    partial config-key candidates are bounded to avoid retaining arbitrary
+    prose forever.
+    """
+    starts: list[int] = []
+
+    prefix_match = _CREDENTIAL_PREFIX_TAIL_RE.search(text)
+    if prefix_match:
+        starts.append(prefix_match.start(1))
+
+    complete_patterns = (
+        _STREAMING_UPPER_SECRET_ASSIGNMENT_RE,
+        _STREAMING_LOWER_SECRET_ASSIGNMENT_RE,
+        _STREAMING_DOTTED_SECRET_ASSIGNMENT_RE,
+        _STREAMING_SENSITIVE_FORM_KEY_TAIL_RE,
+        _STREAMING_JSON_FIELD_TAIL_RE,
+        _STREAMING_HEADER_TAIL_RE,
+        _STREAMING_URL_TAIL_RE,
+        _STREAMING_JWT_TAIL_RE,
+        _STREAMING_TELEGRAM_TAIL_RE,
+        _STREAMING_PHONE_TAIL_RE,
+    )
+    for pattern in complete_patterns:
+        match = pattern.search(text)
+        if match:
+            starts.append(match.start("tail"))
+
+    context_start = max(0, len(text) - _STREAMING_CONFIG_CONTEXT_WINDOW)
+    context = text[context_start:]
+    for pattern in (
+        _STREAMING_UPPER_SECRET_KEY_TAIL_RE,
+        _STREAMING_CONFIG_KEY_PARTIAL_RE,
+        _STREAMING_DOTTED_CONFIG_KEY_PARTIAL_RE,
+    ):
+        match = pattern.search(context)
+        if match:
+            starts.append(context_start + match.start("tail"))
+
+    # Private-key blocks are multi-line and have no bounded body length.  Keep
+    # the block mutable from its BEGIN marker until the matching END marker
+    # appears; a false-positive hold is harmless and is released at finalize.
+    begin = text.rfind("-----BEGIN")
+    if begin >= 0 and "-----END" not in text[begin:]:
+        starts.append(begin)
+
+    return min(starts) if starts else None
+
+
+def _hold_back_credential_prefix_tail(
+    text: str, *, finalize: bool = False
+) -> "tuple[str, str]":
     """Split a sanitized display buffer into (sealable_head, holdback_tail).
 
     The holdback tail is the trailing substring of ``text`` that could still
@@ -129,30 +402,20 @@ def _hold_back_credential_prefix_tail(text: str, *, finalize: bool = False) -> "
     a fragment too short to be a real credential is not a credential).
 
     The split point is chosen so the head never ends mid-token inside a
-    potential credential: we find the LAST trailing credential-prefix
-    candidate in ``text`` and hold back from its first character.  Any
-    characters between that candidate and the end of ``text`` stay in the
-    tail; the next delta appends to the tail and the whole tail is re-tested
-    next iteration.
+    potential credential: the scan finds the earliest trailing redaction-risk
+    candidate and holds back from its first character.  Any characters between
+    that candidate and the end of ``text`` stay in the tail; the next delta
+    appends to the tail and the whole tail is re-tested next iteration.
     """
     if finalize or not text:
         return text, ""
-    # Find the start of the trailing credential-prefix candidate.  The regex
-    # above matches a trailing run starting at a non-token-continuation
-    # boundary.  m.start(1) is the index where the candidate seed itself
-    # begins inside the overall match; we hold back from there so any leading
-    # whitespace before the seed stays in the sealed head (it is safe to seal
-    # whitespace — it cannot be part of a credential).
-    m = _CREDENTIAL_PREFIX_TAIL_RE.search(text)
-    if not m:
+    # Keep the earliest candidate start returned by the authoritative-form
+    # holdback scan.  The prefix matcher remains one input to that scan, but
+    # structural detector classes (assignments, fields, headers, URLs, JWTs,
+    # and key blocks) are handled there too.
+    start = _find_streaming_redaction_tail_start(text)
+    if start is None:
         return text, ""
-    # m.start() is the start of the whole match (the candidate+trailing-run);
-    # the candidate seed starts at m.start(1).  Keep a small safety margin:
-    # also keep one character upstream of the seed so a sealed head never
-    # ends flush against the holdback when that character would visually
-    # "snap" the candidate into the prior token.  This is cosmetic — the
-    # security boundary is m.start(1).
-    start = m.start(1)
     return text[:start], text[start:]
 
 
@@ -1099,7 +1362,19 @@ class GatewayStreamConsumer:
                         self._message_id = None
                         self._last_sent_text = ""
 
-                    display_text = self._accumulated
+                    # When a trailing candidate is being held but the
+                    # sealable portion is still below the platform limit, do
+                    # not send the raw full buffer: it may contain the first
+                    # fragment of a structural secret.  Keep the full raw
+                    # buffer in ``_accumulated`` for the next delta, while
+                    # exposing only the sanitized, sealable head.  Overflow
+                    # branches above replace ``_accumulated`` with their
+                    # remainder, so they continue to use that remainder here.
+                    display_text = (
+                        _sealable_head
+                        if _len_fn(_sealable_head) <= _safe_limit
+                        else self._accumulated
+                    )
                     if not got_done and not got_segment_break and commentary_text is None:
                         display_text += self.cfg.cursor
 

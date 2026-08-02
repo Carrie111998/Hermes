@@ -4,7 +4,12 @@ import logging
 
 import pytest
 
-from agent.redact import redact_cdp_url, redact_sensitive_text, RedactingFormatter
+from agent.redact import (
+    _SENSITIVE_BODY_KEYS,
+    redact_cdp_url,
+    redact_sensitive_text,
+    RedactingFormatter,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -447,6 +452,12 @@ class TestBareTokenUserinfoRedaction:
 
 class TestFormBodyRedaction:
     """Form-urlencoded body redaction (k=v&k=v with no other text)."""
+
+    @pytest.mark.parametrize("key", tuple(sorted(_SENSITIVE_BODY_KEYS)))
+    def test_every_authoritative_body_key_is_redacted(self, key):
+        text = f"filler=public&{key}=body-secret-value-123456789"
+        result = redact_sensitive_text(text, force=True)
+        assert "body-secret-value-123456789" not in result
 
     def test_pure_form_body(self):
         text = "password=mysecret&username=bob&token=opaqueValue"
