@@ -371,6 +371,16 @@ def _aggregator_row(slug: str, models: list[str]) -> dict:
     }
 
 
+def _assert_local_agent_catalogs(rows_by_slug: dict) -> None:
+    for slug, row in rows_by_slug.items():
+        assert row["models"][0] == "default", slug
+        assert row["total_models"] == len(row["models"]), slug
+        if slug == "cowork":
+            assert row["models"] == ["default"]
+        else:
+            assert len(row["models"]) > 1, slug
+
+
 def test_load_picker_context_full_dict():
     cfg = _cfg(
         model={
@@ -582,6 +592,99 @@ def test_list_authenticated_providers_refresh_busts_cache():
         assert clear.call_count == 0
         model_switch.list_authenticated_providers(refresh=True)
         assert clear.call_count == 1
+
+
+def test_with_overrides_truthy_only_strings():
+    ctx = _empty_ctx()
+    overlaid = ctx.with_overrides(current_provider="", current_model="", current_base_url="")
+    assert overlaid.current_provider == "orig"
+    assert overlaid.current_model == "orig-model"
+    assert overlaid.current_base_url == "orig-url"
+
+
+def test_with_overrides_truthy_value_replaces():
+    ctx = _empty_ctx()
+    overlaid = ctx.with_overrides(current_provider="anthropic")
+    assert overlaid.current_provider == "anthropic"
+    assert overlaid.current_model == "orig-model"
+
+
+def test_with_overrides_no_args_returns_self_or_equivalent():
+    ctx = _empty_ctx()
+    assert ctx.with_overrides() == ctx
+
+
+def test_build_models_payload_returns_expected_shape():
+    rows = [{
+        "slug": "openrouter", "name": "OpenRouter", "models": ["m1"],
+        "total_models": 1, "is_current": True, "is_user_defined": False,
+        "source": "built-in",
+    }]
+    ctx = _empty_ctx(provider="openrouter", model="m1", base_url="")
+    with _list_auth_returning(rows):
+        payload = build_models_payload(ctx)
+    assert set(payload) == {"providers", "model", "provider"}
+    assert payload["model"] == "m1"
+    assert payload["provider"] == "openrouter"
+    assert payload["providers"][0]["slug"] == "moa"
+    assert payload["providers"][1] == rows[0]
+
+
+def test_all_local_agents_remain_visible_to_explicit_desktop_catalog(monkeypatch):
+    ctx = _empty_ctx(provider="openai-api", model="gpt-test", base_url="")
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.list_authenticated_providers",
+        lambda **_kwargs: [],
+    )
+    payload = build_models_payload(ctx, explicit_only=True, include_unconfigured=False, picker_hints=True)
+    local = {
+        row["slug"]: row for row in payload["providers"]
+        if row["slug"] in {"claude-cli", "codex-cli", "cowork"}
+    }
+    assert set(local) == {"claude-cli", "codex-cli", "cowork"}
+    _assert_local_agent_catalogs(local)
+    assert all(row["authenticated"] is False for row in local.values())
+
+
+def test_local_agent_fallback_honors_disabled_and_excluded_providers(monkeypatch):
+    ctx = _empty_ctx(
+        provider="openai-api", model="gpt-test",
+        user_providers={"cowork": {"enabled": False}},
+        excluded_providers=["codex-cli"],
+    )
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.list_authenticated_providers",
+        lambda **_kwargs: [],
+    )
+    payload = build_models_payload(ctx, explicit_only=True, include_unconfigured=True, picker_hints=True)
+    slugs = {row["slug"] for row in payload["providers"]}
+    assert "claude-cli" in slugs
+    assert "codex-cli" not in slugs
+    assert "cowork" not in slugs
+
+
+def test_picker_hints_adds_warning_to_skeleton_rows():
+    with _list_auth_returning([]):
+        payload = build_models_payload(_empty_ctx(), include_unconfigured=True, picker_hints=True)
+    skeleton_rows = [r for r in payload["providers"] if r.get("source") == "canonical"]
+    assert skeleton_rows
+    assert all(not row["authenticated"] and "warning" in row for row in skeleton_rows)
+
+
+def test_canonical_order_with_unconfigured_preserves_full_universe():
+    from hermes_cli.models import CANONICAL_PROVIDERS
+    rows = [{
+        "slug": "custom:Ollama", "name": "Ollama", "models": [],
+        "total_models": 0, "is_current": False, "is_user_defined": True,
+        "source": "user-config",
+    }]
+    with _list_auth_returning(rows):
+        payload = build_models_payload(
+            _empty_ctx(), include_unconfigured=True, picker_hints=True, canonical_order=True
+        )
+    slugs = [r["slug"] for r in payload["providers"]]
+    assert slugs[0] == CANONICAL_PROVIDERS[0].slug
+    assert slugs.index("custom:Ollama") >= len(CANONICAL_PROVIDERS)
 
 
 def test_explicit_only_keeps_unauthenticated_current_provider_visible():

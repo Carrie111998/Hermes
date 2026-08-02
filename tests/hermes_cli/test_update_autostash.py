@@ -270,6 +270,33 @@ def test_restore_stashed_changes_keeps_stash_when_durable_ref_cannot_be_created_
     ) is True
 
 
+def test_restore_stashed_changes_success_preserves_exact_sha_before_drop(
+    monkeypatch, tmp_path
+):
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd[1:3] == ["stash", "apply"]:
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
+        if cmd[1:3] == ["diff", "--name-only"]:
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
+        if cmd[1] == "update-ref":
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
+        if cmd[1:3] == ["stash", "list"]:
+            return SimpleNamespace(stdout="stash@{1} abc1234\n", stderr="", returncode=0)
+        if cmd[1:3] == ["stash", "drop"]:
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
+        raise AssertionError(f"unexpected command: {cmd}")
+
+    monkeypatch.setattr(hermes_main.subprocess, "run", fake_run)
+    assert hermes_main._restore_stashed_changes(
+        ["git"], tmp_path, "abc1234", prompt_user=False
+    ) is True
+    assert [cmd[1] for cmd in calls] == ["stash", "diff", "update-ref", "stash", "stash"]
+    assert calls[2] == ["git", "update-ref", "refs/hermes/autostash/abc1234", "abc1234"]
+
+
 
 
 

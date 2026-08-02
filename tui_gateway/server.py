@@ -12403,7 +12403,6 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
     return ""
 
 
-@method("slash.exec")
 def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)
     if err:
