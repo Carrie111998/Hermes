@@ -575,6 +575,69 @@ class TestMemoryDirPermissions:
         # 0o777 & ~0o022 == 0o755; OR-in 0o700 leaves it unchanged.
         assert mode == 0o755, oct(mode)
 
+    def test_recovers_pre_existing_000_tree(self, tmp_path, monkeypatch):
+        """A memories dir + files + lock left at 000 by an earlier
+        restrictive-umask run must be repaired, not silently read as empty
+        (the maintainer-flagged gap on #66183)."""
+        mem_dir = tmp_path / "memories"
+        mem_dir.mkdir()
+        (mem_dir / "MEMORY.md").write_text(
+            "pre-existing fact\n\u00a7\nsecond fact\n", encoding="utf-8"
+        )
+        (mem_dir / "MEMORY.md.lock").write_text("", encoding="utf-8")
+        # Clamp the whole tree to 000, as a prior umask-0777 run would leave it.
+        os.chmod(mem_dir / "MEMORY.md", 0o000)
+        os.chmod(mem_dir / "MEMORY.md.lock", 0o000)
+        os.chmod(mem_dir, 0o000)
+        monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: mem_dir)
+
+        try:
+            store = MemoryStore()
+            store.load_from_disk()  # must recover, not return []
+            # A mutation must succeed despite the pre-existing 000 lock file.
+            result = store.add("memory", "added after recovery")
+        finally:
+            # Ensure cleanup can remove the tree even if an assert fails.
+            for p in (mem_dir / "MEMORY.md", mem_dir / "MEMORY.md.lock", mem_dir):
+                try:
+                    os.chmod(p, 0o700)
+                except OSError:
+                    pass
+
+        assert "pre-existing fact" in store.memory_entries
+        assert "second fact" in store.memory_entries
+        assert result["success"] is True
+
+    def test_creates_nested_missing_parents_owner_accessible(
+        self, tmp_path, monkeypatch
+    ):
+        """Every missing parent component must be created owner-accessible, so
+        descent doesn't stall on a 000 intermediate dir under umask 0777."""
+        deep = tmp_path / "a" / "b" / "c" / "memories"  # 3 missing parents
+        monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: deep)
+
+        old_umask = os.umask(0o777)
+        try:
+            store = MemoryStore()
+            store.load_from_disk()
+            store.add("memory", "nested works")
+        finally:
+            os.umask(old_umask)
+
+        for component in (
+            tmp_path / "a",
+            tmp_path / "a" / "b",
+            tmp_path / "a" / "b" / "c",
+            deep,
+        ):
+            mode = stat.S_IMODE(component.stat().st_mode)
+            assert mode & 0o700 == 0o700, f"{component}: {oct(mode)}"
+
+        reloaded = MemoryStore()
+        monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: deep)
+        reloaded.load_from_disk()
+        assert "nested works" in reloaded.memory_entries
+
 
 class TestMemoryStoreSnapshot:
     def test_snapshot_frozen_at_load(self, store):

@@ -84,8 +84,28 @@ def _ensure_owner_access(path: Path, mask: int) -> None:
 
 
 def _ensure_memory_dir(path: Path) -> None:
-    """Create ``path`` (and parents) and guarantee owner ``rwx`` on it (#66183)."""
-    path.mkdir(parents=True, exist_ok=True)
+    """Create ``path`` (and any missing parents) with guaranteed owner ``rwx``.
+
+    A plain ``mkdir(parents=True)`` followed by a single chmod is not enough
+    under a restrictive umask (e.g. ``0o777``): each intermediate parent is
+    created ``000`` first, and descent into it fails before the chmod on the
+    leaf is ever reached. So we create each missing component individually and
+    OR-in owner ``rwx`` on it before descending further (#66183). The final
+    call also repairs a pre-existing ``000`` target directory.
+    """
+    missing: list[Path] = []
+    probe = path
+    while not probe.exists():
+        missing.append(probe)
+        if probe.parent == probe:  # reached filesystem root
+            break
+        probe = probe.parent
+    for component in reversed(missing):
+        try:
+            component.mkdir(exist_ok=True)
+        except FileExistsError:
+            pass
+        _ensure_owner_access(component, 0o700)
     _ensure_owner_access(path, 0o700)
 
 
@@ -288,9 +308,13 @@ class MemoryStore:
             yield
             return
 
+        # Repair a pre-existing 000 lock file BEFORE opening it: an unreadable
+        # lock left by an earlier restrictive-umask run would otherwise fail to
+        # open here and wedge every mutation path (#66183). No-op if absent.
+        _ensure_owner_access(lock_path, 0o600)
         fd = open(lock_path, "a+", encoding="utf-8")
-        # Under a restrictive umask the lock file can land at 000, blocking the
-        # next process from opening it — keep it owner-accessible (#66183).
+        # And repair the freshly-created case: open() under a restrictive umask
+        # creates the lock file at 000, blocking the NEXT process from opening it.
         _ensure_owner_access(lock_path, 0o600)
         try:
             if fcntl:
@@ -724,6 +748,11 @@ class MemoryStore:
         """
         if not path.exists():
             return []
+        # Repair a pre-existing 000 memory file left by an earlier
+        # restrictive-umask run before reading it. Without this the read below
+        # fails with PermissionError, the except returns [], and the entries
+        # silently vanish from the session (#66183).
+        _ensure_owner_access(path, 0o600)
         try:
             raw = path.read_text(encoding="utf-8")
         except (OSError, IOError):
