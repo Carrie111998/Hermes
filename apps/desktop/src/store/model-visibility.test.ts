@@ -326,4 +326,43 @@ describe('setProviderVisibility', () => {
     // The -fast sibling is represented by its base family, not its own key.
     expect(next.has(modelVisibilityKey('nous', 'model-fast'))).toBe(false)
   })
+
+  it('injects pinned gpt-5.6 flagships for a stale openrouter selection', () => {
+    // Stored set captured BEFORE gpt-5.6 existed: only an older model chosen.
+    const stored = new Set([
+      modelVisibilityKey('openrouter', 'openai/gpt-5.1'),
+      modelVisibilityKey('copilot', 'claude-sonnet-4.6')
+    ])
+
+    const visible = effectiveVisibleKeys(stored, [
+      provider('openrouter', [
+        'openai/gpt-5.1',
+        'openai/gpt-5.6-luna',
+        'openai/gpt-5.6-sol'
+      ]),
+      provider('copilot', ['claude-sonnet-4.6'])
+    ])
+
+    // Stale selection preserved.
+    expect(visible.has(modelVisibilityKey('openrouter', 'openai/gpt-5.1'))).toBe(true)
+    // Pinned flagship injected despite stale store.
+    expect(visible.has(modelVisibilityKey('openrouter', 'openai/gpt-5.6-luna'))).toBe(true)
+    expect(visible.has(modelVisibilityKey('openrouter', 'openai/gpt-5.6-sol'))).toBe(true)
+    // Unrelated provider untouched.
+    expect(visible.has(modelVisibilityKey('copilot', 'claude-sonnet-4.6'))).toBe(true)
+  })
+
+  it('respects openrouter hide-all sentinel (no pinned resurrection)', () => {
+    const stored = new Set([emptyProviderSentinelKey('openrouter')])
+
+    const visible = effectiveVisibleKeys(stored, [
+      provider('openrouter', [
+        'openai/gpt-5.1',
+        'openai/gpt-5.6-luna'
+      ])
+    ])
+
+    expect(visible.has(modelVisibilityKey('openrouter', 'openai/gpt-5.6-luna'))).toBe(false)
+    expect(visible.has(emptyProviderSentinelKey('openrouter'))).toBe(false)
+  })
 })

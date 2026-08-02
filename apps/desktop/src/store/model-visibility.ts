@@ -32,6 +32,46 @@ export interface ModelFamily {
   id: string
 }
 
+/** Flaghip models guaranteed visible in a provider's working set, regardless
+ *  of the backend's `featured_models` shortlist OR a stale persisted visibility
+ *  store.
+ *
+ *  Motivation: when OpenAI ships a new flagship family (e.g. `gpt-5.6`), it
+ *  lands in the curated `models` catalog immediately but may be omitted from a
+ *  user's already-persisted `visibleModels` selection (captured before the
+ *  model existed) or pushed out by the per-lab "newest N" featured cap. Without
+ *  this, the model is unselectable until the user manually re-shows it. Pinning
+ *  it at the resolver layer guarantees it is always present for any provider
+ *  the user has NOT explicitly hidden entirely.
+ *
+ *  These are injected ONLY for providers with a partial stored selection (or no
+ *  selection). A hide-all sentinel is always respected — we never resurrect a
+ *  provider the user deliberately emptied. */
+const PINNED_DEFAULT_MODELS: Record<string, string[]> = {
+  openrouter: [
+    'openai/gpt-5.6-luna',
+    'openai/gpt-5.6-luna-pro',
+    'openai/gpt-5.6-sol',
+    'openai/gpt-5.6-sol-pro',
+    'openai/gpt-5.6-terra',
+    'openai/gpt-5.6-terra-pro'
+  ]
+}
+
+/** Inject pinned flagship models into `target` for the given provider, but
+ *  only when the provider has NOT been explicitly hidden (sentinel). Safe to
+ *  call for any provider; no-op when the provider has no pinned models. */
+function injectPinnedDefaults(provider: ModelOptionProvider, target: Set<string>): void {
+  const pinned = PINNED_DEFAULT_MODELS[provider.slug]
+  if (!pinned) return
+  const present = new Set(provider.models ?? [])
+  for (const model of pinned) {
+    if (present.has(model)) {
+      target.add(modelVisibilityKey(provider.slug, model))
+    }
+  }
+}
+
 /** Collapse a provider's model list so a base model and its `…-fast` variant
  *  become a single family (one row, one toggle). Order is preserved by the
  *  base model's position. A `…-fast` model with no base stands on its own. */
@@ -154,11 +194,22 @@ export function resolveVisibleKeys(stored: Set<string> | null, providers: readon
 
     const hasSentinel = stored.has(emptyProviderSentinelKey(provider.slug))
 
-    if (hasStoredProvider || hasSentinel) {
+    if (hasSentinel) {
+      // User explicitly hid every model for this provider — never resurrect
+      // it, even for pinned flagships.
       continue
     }
 
-    expandProviderDefaults(provider, next)
+    if (!hasStoredProvider) {
+      // Uncustomized provider: seed with the curated defaults.
+      expandProviderDefaults(provider, next)
+    }
+
+    // For a provider the user HAS customized (partial selection) OR left
+    // uncustomized, always ensure pinned flagships are present. This fixes
+    // the stale-visibility case: a persisted selection captured before a
+    // new flagship (e.g. gpt-5.6) existed would otherwise hide it forever.
+    injectPinnedDefaults(provider, next)
   }
 
   return next
