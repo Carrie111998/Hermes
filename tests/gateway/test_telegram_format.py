@@ -140,6 +140,94 @@ class TestFormatMessageCodeBlocks:
 
 
 @pytest.mark.asyncio
+async def test_legacy_send_keeps_chunk_indicators_outside_fenced_code_lines(adapter):
+    """Chunk markers must not corrupt Telegram MarkdownV2 code fences.
+
+    Telegram treats a closing fenced-code line with trailing text, e.g.
+    ````` (1/2)``, as malformed MarkdownV2. The bot then falls back to plain
+    text, which is the user-visible duplicate/malformed preview symptom.
+    """
+    adapter._bot = MagicMock()
+    adapter._bot.send_message = AsyncMock(
+        side_effect=[SimpleNamespace(message_id=i) for i in range(1, 20)]
+    )
+    adapter._bot.send_chat_action = AsyncMock()
+    object.__setattr__(adapter, "MAX_MESSAGE_LENGTH", 120)
+    adapter._rich_messages_enabled = False
+
+    content = (
+        "Intro before code block\n"
+        "```text\n"
+        + ("~/.hermes/skills/github/hermes-contribution-workflow/SKILL.md\n" * 8)
+        + "```\n"
+        "After."
+    )
+
+    result = await adapter.send("12345", content, metadata={"expect_edits": True})
+
+    assert result.success is True
+    sent_texts = [call.kwargs["text"] for call in adapter._bot.send_message.await_args_list]
+    assert len(sent_texts) > 1
+    expected_ids = tuple(str(i) for i in range(2, len(sent_texts) + 1))
+    assert result.message_id == str(len(sent_texts))
+    assert result.continuation_message_ids == expected_ids
+    assert result.delivery_route == "telegram.markdown_v2"
+    assert result.chunk_count == len(sent_texts)
+    for text in sent_texts:
+        for line in text.splitlines():
+            assert not re.match(r"^```\s+\\?\(\d+/\d+\\?\)$", line), text
+            assert not re.match(r"^```\s+\(\d+/\d+\)$", line), text
+
+
+@pytest.mark.asyncio
+async def test_legacy_send_records_plain_fallback_route(adapter):
+    calls = []
+
+    async def _send_message(**kwargs):
+        calls.append(kwargs)
+        if kwargs.get("parse_mode") is not None:
+            raise RuntimeError("can't parse markdown")
+        return SimpleNamespace(message_id=7)
+
+    adapter._bot = MagicMock()
+    adapter._bot.send_message = AsyncMock(side_effect=_send_message)
+    adapter._bot.send_chat_action = AsyncMock()
+    adapter._rich_messages_enabled = False
+
+    result = await adapter.send("12345", "odd _markdown")
+
+    assert result.success is True
+    assert result.message_id == "7"
+    assert result.delivery_route == "telegram.plain_fallback"
+    assert result.chunk_count == 1
+    assert len(calls) == 2
+    assert calls[0]["parse_mode"] is not None
+    assert calls[1]["parse_mode"] is None
+
+
+@pytest.mark.asyncio
+async def test_legacy_send_records_mixed_chunk_routes(adapter):
+    adapter.truncate_message = lambda *_args, **_kwargs: ["first", "second"]
+
+    async def _send_message(**kwargs):
+        if kwargs["text"] == "second" and kwargs.get("parse_mode") is not None:
+            raise RuntimeError("can't parse markdown")
+        return SimpleNamespace(message_id=1 if kwargs["text"] == "first" else 2)
+
+    adapter._bot = MagicMock()
+    adapter._bot.send_message = AsyncMock(side_effect=_send_message)
+    adapter._bot.send_chat_action = AsyncMock()
+    adapter._rich_messages_enabled = False
+
+    result = await adapter.send("12345", "content")
+
+    assert result.success is True
+    assert result.message_id == "2"
+    assert result.delivery_route == "telegram.markdown_v2_mixed_plain"
+    assert result.chunk_count == 2
+
+
+@pytest.mark.asyncio
 async def test_final_send_does_not_retrigger_typing(adapter):
     """The final reply (metadata['notify']) must NOT re-arm Telegram's typing
     timer. The gateway has already torn down the refresh loop by then, so a

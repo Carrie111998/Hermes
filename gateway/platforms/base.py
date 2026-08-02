@@ -2230,6 +2230,19 @@ class SendResult:
     # ``None`` (unset / not classified).  Producers should set this via
     # :func:`classify_send_error`.
     error_kind: Optional[str] = None
+    # Sanitized delivery receipt metadata.  These fields are deliberately
+    # scalar and content-free so cross-layer audit consumers never need to
+    # inspect ``raw_response`` (which is adapter-specific and may contain
+    # provider payloads). ``delivery_route`` is a short namespaced enum such
+    # as ``telegram.rich``; ``chunk_count`` counts provider-acknowledged
+    # messages, not chunks merely planned before the send. For routed platforms,
+    # ``effective_thread_id`` is the destination acknowledged by the provider,
+    # while ``thread_fallback`` records whether delivery dropped the requested
+    # thread/topic to reach the parent chat.
+    delivery_route: Optional[str] = None
+    chunk_count: Optional[int] = None
+    effective_thread_id: Optional[str] = None
+    thread_fallback: Optional[bool] = None
 
 
 # Machine-readable send-failure categories.  Kept platform-neutral so every
@@ -6083,7 +6096,24 @@ class BasePlatformAdapter(ABC):
                             )
 
                             if getattr(result, "success", False):
-                                mark_delivered(_obligation_id)
+                                mark_delivered(
+                                    _obligation_id,
+                                    provider_message_id=getattr(
+                                        result, "message_id", None
+                                    ),
+                                    delivery_route=getattr(
+                                        result, "delivery_route", None
+                                    ),
+                                    chunk_count=getattr(
+                                        result, "chunk_count", None
+                                    ),
+                                    effective_thread_id=getattr(
+                                        result, "effective_thread_id", None
+                                    ),
+                                    thread_fallback=getattr(
+                                        result, "thread_fallback", None
+                                    ),
+                                )
                             else:
                                 mark_failed(
                                     _obligation_id,

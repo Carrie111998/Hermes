@@ -44,7 +44,14 @@ class _Adapter(BasePlatformAdapter):  # type: ignore[misc]
 
     async def send(self, chat_id, content, reply_to=None, metadata=None):
         self.sent.append(content)
-        return SendResult(success=True, message_id="m1")
+        return SendResult(
+            success=True,
+            message_id="m1",
+            delivery_route="slack.web_api",
+            chunk_count=1,
+            effective_thread_id="171.001",
+            thread_fallback=False,
+        )
 
 
 def _event(text="hello agent"):
@@ -61,7 +68,10 @@ def _event(text="hello agent"):
 def _rows():
     with dl._connect() as conn:
         return conn.execute(
-            "SELECT obligation_id, state, content FROM delivery_obligations"
+            """SELECT obligation_id, state, content, provider_message_id,
+                      delivery_route, chunk_count, effective_thread_id,
+                      thread_fallback
+               FROM delivery_obligations"""
         ).fetchall()
 
 
@@ -83,6 +93,9 @@ class TestProducerHook:
         assert len(rows) == 1
         assert rows[0][1] == "delivered"
         assert rows[0][2] == "final answer"
+        assert rows[0][3:] == (
+            "m1", "slack.web_api", 1, "171.001", 0,
+        )
 
     @pytest.mark.asyncio
     async def test_send_failure_leaves_failed_row(self):
@@ -95,6 +108,7 @@ class TestProducerHook:
         rows = _rows()
         assert len(rows) == 1
         assert rows[0][1] == "failed"
+        assert rows[0][3:] == (None, None, None, None, None)
 
 
     @pytest.mark.asyncio

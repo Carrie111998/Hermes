@@ -9,6 +9,8 @@ id stability, and the startup redelivery sweep's contract:
 - poison rows abandon at the attempts cap / stale cutoff
 """
 
+import json
+import sqlite3
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -41,12 +43,17 @@ def _record(oid="ob-1", session_key="agent:main:slack:channel:C1", **kw):
 def _row(oid):
     with dl._connect() as conn:
         r = conn.execute(
-            """SELECT state, attempts, owner_pid, content
+            """SELECT state, attempts, owner_pid, content,
+                      provider_message_id, delivery_route, chunk_count,
+                      effective_thread_id, thread_fallback
                FROM delivery_obligations WHERE obligation_id=?""",
             (oid,),
         ).fetchone()
     return None if r is None else {
         "state": r[0], "attempts": r[1], "owner_pid": r[2], "content": r[3],
+        "provider_message_id": r[4], "delivery_route": r[5],
+        "chunk_count": r[6], "effective_thread_id": r[7],
+        "thread_fallback": r[8],
     }
 
 
@@ -65,6 +72,73 @@ class TestStateMachine:
         _record()
         assert _row("ob-1")["state"] == "pending"
 
+    def test_full_happy_path(self):
+        _record()
+        dl.mark_attempting("ob-1")
+        assert _row("ob-1")["state"] == "attempting"
+        dl.mark_delivered(
+            "ob-1",
+            provider_message_id=481,
+            delivery_route="telegram.markdown_v2",
+            chunk_count=2,
+            effective_thread_id="17585",
+            thread_fallback=False,
+        )
+        row = _row("ob-1")
+        assert row["state"] == "delivered"
+        assert row["provider_message_id"] == "481"
+        assert row["delivery_route"] == "telegram.markdown_v2"
+        assert row["chunk_count"] == 2
+        assert row["effective_thread_id"] == "17585"
+        assert row["thread_fallback"] == 0
+
+    def test_idempotent_mark_without_receipt_does_not_erase_receipt(self):
+        _record()
+        dl.mark_delivered(
+            "ob-1",
+            provider_message_id="481",
+            delivery_route="telegram.rich",
+            chunk_count=1,
+            thread_fallback=True,
+        )
+        dl.mark_delivered("ob-1")
+
+        row = _row("ob-1")
+        assert row["provider_message_id"] == "481"
+        assert row["delivery_route"] == "telegram.rich"
+        assert row["chunk_count"] == 1
+        assert row["thread_fallback"] == 1
+
+    def test_receipt_rejects_unstructured_metadata(self):
+        _record()
+        dl.mark_delivered(
+            "ob-1",
+            provider_message_id=object(),
+            delivery_route="telegram.rich token=must-not-persist",
+            chunk_count="one",
+            effective_thread_id=object(),
+            thread_fallback="yes",
+        )
+
+        row = _row("ob-1")
+        assert row["state"] == "delivered"
+        assert row["provider_message_id"] is None
+        assert row["delivery_route"] is None
+        assert row["chunk_count"] is None
+        assert row["effective_thread_id"] is None
+        assert row["thread_fallback"] is None
+
+    def test_failed_records_error(self):
+        _record()
+        dl.mark_attempting("ob-1")
+        dl.mark_failed("ob-1", "chat_not_found")
+        assert _row("ob-1")["state"] == "failed"
+
+    def test_rerecord_same_id_is_idempotent(self):
+        _record()
+        dl.mark_attempting("ob-1")
+        _record()  # INSERT OR REPLACE resets to pending — same turn re-record
+        assert _row("ob-1")["state"] == "pending"
 
 class TestObligationId:
     def test_stable_and_distinct(self):
@@ -76,6 +150,72 @@ class TestObligationId:
         assert a != dl.compute_obligation_id("sk1", "msg2", "hello")
         assert a != dl.compute_obligation_id("sk1", "msg1", "other")
         assert len(a) == 24
+
+
+class TestSchemaMigration:
+    def test_existing_ledger_adds_receipt_columns_without_losing_rows(self):
+        path = dl._db_path()
+        with sqlite3.connect(path) as conn:
+            conn.execute(
+                """CREATE TABLE delivery_obligations (
+                    obligation_id TEXT PRIMARY KEY,
+                    session_key TEXT NOT NULL,
+                    platform TEXT NOT NULL,
+                    chat_id TEXT NOT NULL,
+                    thread_id TEXT,
+                    content TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    owner_pid INTEGER,
+                    owner_started_at INTEGER,
+                    last_error TEXT
+                )"""
+            )
+            conn.execute(
+                """INSERT INTO delivery_obligations
+                   VALUES ('old-1', 'session', 'telegram', 'chat', NULL,
+                           'answer', 'pending', 0, 1, 1, NULL, NULL, NULL)"""
+            )
+
+        with dl._connect() as conn:
+            columns = {
+                row[1] for row in conn.execute(
+                    "PRAGMA table_info(delivery_obligations)"
+                )
+            }
+            state = conn.execute(
+                "SELECT state FROM delivery_obligations WHERE obligation_id='old-1'"
+            ).fetchone()[0]
+
+        assert {
+            "provider_message_id", "delivery_route", "chunk_count",
+            "effective_thread_id", "thread_fallback",
+        } <= columns
+        assert state == "pending"
+
+
+class TestDebugRows:
+    def test_receipt_is_visible_without_exposing_content(self):
+        _record(content="private final answer")
+        dl.mark_delivered(
+            "ob-1",
+            provider_message_id="481",
+            delivery_route="telegram.rich",
+            chunk_count=1,
+            thread_fallback=True,
+        )
+
+        [row] = json.loads(dl.debug_rows())
+
+        assert row["provider_message_id"] == "481"
+        assert row["delivery_route"] == "telegram.rich"
+        assert row["chunk_count"] == 1
+        assert row["effective_thread_id"] is None
+        assert row["thread_fallback"] is True
+        assert "content" not in row
+        assert "private final answer" not in dl.debug_rows()
 
 
 class TestSweep:
@@ -135,7 +275,15 @@ class TestGatewayRedeliverySweep:
     def _adapter(success=True):
         adapter = MagicMock()
         adapter.send = AsyncMock(
-            return_value=MagicMock(success=success, error="" if success else "nope")
+            return_value=MagicMock(
+                success=success,
+                error="" if success else "nope",
+                message_id="m-recovered" if success else None,
+                delivery_route="slack.web_api" if success else None,
+                chunk_count=1 if success else None,
+                effective_thread_id="171.001" if success else None,
+                thread_fallback=False if success else None,
+            )
         )
         return adapter
 
@@ -152,7 +300,13 @@ class TestGatewayRedeliverySweep:
         sent = adapter.send.call_args.kwargs
         assert sent["content"] == "the final answer"  # no marker
         assert sent["metadata"] == {"thread_id": "171.001"}
-        assert _row("ob-1")["state"] == "delivered"
+        row = _row("ob-1")
+        assert row["state"] == "delivered"
+        assert row["provider_message_id"] == "m-recovered"
+        assert row["delivery_route"] == "slack.web_api"
+        assert row["chunk_count"] == 1
+        assert row["effective_thread_id"] == "171.001"
+        assert row["thread_fallback"] == 0
         runner._async_session_store.clear_resume_pending.assert_awaited_once_with(
             "agent:main:slack:channel:C1"
         )

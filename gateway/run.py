@@ -10138,7 +10138,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 result = None
             try:
                 if result is not None and getattr(result, "success", False):
-                    mark_delivered(row["obligation_id"])
+                    mark_delivered(
+                        row["obligation_id"],
+                        provider_message_id=getattr(result, "message_id", None),
+                        delivery_route=getattr(result, "delivery_route", None),
+                        chunk_count=getattr(result, "chunk_count", None),
+                        effective_thread_id=getattr(
+                            result, "effective_thread_id", None
+                        ),
+                        thread_fallback=getattr(
+                            result, "thread_fallback", None
+                        ),
+                    )
                     redelivered += 1
                     logger.info(
                         "Redelivered recovered final response to %s:%s "

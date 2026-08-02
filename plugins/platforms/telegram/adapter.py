@@ -1943,6 +1943,20 @@ class TelegramAdapter(BasePlatformAdapter):
         return SendResult(
             success=True,
             message_id=str(message_id) if message_id is not None else None,
+            delivery_route="telegram.rich",
+            chunk_count=1,
+            effective_thread_id=(
+                str(
+                    thread_kwargs.get("message_thread_id")
+                    or thread_kwargs.get("direct_messages_topic_id")
+                )
+                if (
+                    thread_kwargs.get("message_thread_id") is not None
+                    or thread_kwargs.get("direct_messages_topic_id") is not None
+                )
+                else None
+            ),
+            thread_fallback=False,
         )
 
     async def _try_edit_rich(
@@ -4471,6 +4485,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 ]
             
             message_ids = []
+            delivery_routes_used = set()
             thread_id = self._metadata_thread_id(metadata)
             requested_thread_id = self._message_thread_id_for_send(thread_id)
             used_thread_fallback = False
@@ -4528,13 +4543,22 @@ class TelegramAdapter(BasePlatformAdapter):
                     reply_to_message_id=reply_to_id,
                     reply_to_mode=self._reply_to_mode,
                 )
-                if used_thread_fallback and thread_kwargs.get("message_thread_id") is not None:
-                    thread_kwargs = dict(thread_kwargs)
-                    thread_kwargs["message_thread_id"] = None
+                if used_thread_fallback:
+                    # Once any Telegram topic route has been rejected, keep all
+                    # later multipart chunks on the parent chat.  This covers
+                    # both forum ``message_thread_id`` and Bot API direct-message
+                    # ``direct_messages_topic_id`` routing.
+                    thread_kwargs = {}
                 effective_thread_id = thread_kwargs.get("message_thread_id")
+                if effective_thread_id is None:
+                    effective_thread_id = thread_kwargs.get(
+                        "direct_messages_topic_id"
+                    )
 
                 msg = None
+                chunk_delivery_route = "telegram.markdown_v2"
                 for _send_attempt in range(3):
+                    chunk_delivery_route = "telegram.markdown_v2"
                     try:
                         # Try Markdown first, fall back to plain text if it fails
                         try:
@@ -4552,6 +4576,7 @@ class TelegramAdapter(BasePlatformAdapter):
                             if "parse" in str(md_error).lower() or "markdown" in str(md_error).lower():
                                 logger.warning("[%s] MarkdownV2 parse failed, falling back to plain text: %s", self.name, md_error)
                                 plain_chunk = _strip_mdv2(chunk)
+                                chunk_delivery_route = "telegram.plain_fallback"
                                 msg = await self._bot.send_message(
                                     chat_id=normalize_telegram_chat_id(chat_id),
                                     text=plain_chunk,
@@ -4605,7 +4630,7 @@ class TelegramAdapter(BasePlatformAdapter):
                                 )
                                 used_thread_fallback = True
                                 effective_thread_id = None
-                                thread_kwargs = {"message_thread_id": None}
+                                thread_kwargs = {}
                                 continue
                             err_lower = str(send_err).lower()
                             if "message to be replied not found" in err_lower and reply_to_id is not None:
@@ -4627,6 +4652,8 @@ class TelegramAdapter(BasePlatformAdapter):
                                 )
                                 reply_to_id = None
                                 if metadata and metadata.get("telegram_dm_topic_reply_fallback"):
+                                    if effective_thread_id is not None:
+                                        used_thread_fallback = True
                                     thread_kwargs = {}
                                     effective_thread_id = None
                                 else:
@@ -4683,6 +4710,7 @@ class TelegramAdapter(BasePlatformAdapter):
                                 continue
                         raise
                 message_ids.append(str(msg.message_id))
+                delivery_routes_used.add(chunk_delivery_route)
 
             # Re-trigger typing indicator after sending a message.
             # Telegram clears the typing state when a new message is delivered,
@@ -4700,14 +4728,33 @@ class TelegramAdapter(BasePlatformAdapter):
                 except Exception:
                     pass  # Typing failures are non-fatal
 
+            if delivery_routes_used == {"telegram.markdown_v2"}:
+                delivery_route = "telegram.markdown_v2"
+            elif delivery_routes_used == {"telegram.plain_fallback"}:
+                delivery_route = "telegram.plain_fallback"
+            else:
+                delivery_route = "telegram.markdown_v2_mixed_plain"
+
             return SendResult(
                 success=True,
-                message_id=message_ids[0] if message_ids else None,
+                # SendResult's split-delivery contract targets the last visible
+                # message.  Keep the full list in raw_response for existing
+                # stream-cleanup consumers and expose later chunks explicitly.
+                message_id=message_ids[-1] if message_ids else None,
                 raw_response={
                     "message_ids": message_ids,
                     "requested_thread_id": requested_thread_id,
                     "thread_fallback": used_thread_fallback,
                 },
+                continuation_message_ids=tuple(message_ids[1:]),
+                delivery_route=delivery_route,
+                chunk_count=len(message_ids),
+                effective_thread_id=(
+                    str(effective_thread_id)
+                    if effective_thread_id is not None
+                    else None
+                ),
+                thread_fallback=used_thread_fallback,
             )
             
         except Exception as e:
