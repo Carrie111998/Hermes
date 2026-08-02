@@ -22,6 +22,18 @@ from rich.markup import escape as _escape
 class CLIAgentSetupMixin:
     """Agent construction + session-resume display methods for ``HermesCLI``."""
 
+    def _observe_postgres_hot_shadow(self, session_id: str) -> None:
+        """Run the optional shadow observer without changing SQLite authority."""
+        from cli import logger
+
+        try:
+            from hermes_cli.postgres_hot_shadow_runtime import observe_sqlite_session
+
+            observe_sqlite_session(self._session_db, session_id)
+        except Exception:
+            # Never include exception text: a driver failure may embed credentials.
+            logger.warning("PostgreSQL hot shadow observation failed open")
+
     def _ensure_runtime_credentials(self) -> bool:
         """
         Ensure runtime credentials are resolved before agent use.
@@ -429,6 +441,7 @@ class CLIAgentSetupMixin:
                         f"({msg_count} user message{'s' if msg_count != 1 else ''}, {len(restored)} total messages)"
                     )
                 self._restore_session_cwd(session_meta, quiet=_quiet_mode)
+                self._observe_postgres_hot_shadow(self.session_id)
             else:
                 if _quiet_mode:
                     print(
@@ -640,6 +653,7 @@ class CLIAgentSetupMixin:
                 f"{len(restored)} total messages)[/]"
             )
             self._restore_session_cwd(session_meta)
+            self._observe_postgres_hot_shadow(self.session_id)
         else:
             accent_color = _accent_hex()
             self._console_print(

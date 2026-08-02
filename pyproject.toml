@@ -145,6 +145,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# One-shot SQLite -> PostgreSQL hot importer and default-off shadow runtime.
+# asyncpg is imported lazily and only needed when an operator opts in.
+postgres-migration = ["asyncpg==0.31.0"]
 # Native Anthropic provider — only needed when provider=anthropic (not via
 # OpenRouter or other aggregators).
 anthropic = ["anthropic==0.87.0"]  # CVE-2026-34450, CVE-2026-34452
@@ -389,7 +392,7 @@ py-modules = [
 include = ["agent", "agent.*", "tools", "tools.*", "hermes_cli", "hermes_cli.*", "gateway", "gateway.*", "tui_gateway", "tui_gateway.*", "cron", "cron.*", "acp_adapter", "plugins", "plugins.*", "providers", "providers.*"]
 
 [tool.setuptools.package-data]
-hermes_cli = ["observability/schemas/*.json"]
+hermes_cli = ["observability/schemas/*.json", "migrations/*.sql"]
 # gateway/assets/ ships status_phrases.yaml and the Telegram BotFather
 # screenshot. Without this, sealed venvs (uv2nix) silently lose both —
 # status phrases fall back to the tiny hardcoded set and the Telegram

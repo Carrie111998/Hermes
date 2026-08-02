@@ -6397,6 +6397,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         include_inactive: bool = False,
         limit: Optional[int] = None,
         offset: int = 0,
+        since_timestamp: Optional[float] = None,
     ) -> List[Dict[str, Any]]:
         """Load messages for a session in insertion order.
 
@@ -6413,13 +6414,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         pagination for the API endpoint to avoid loading entire transcripts.
         ``offset`` alone (without ``limit``) also pages — SQLite requires a
         LIMIT clause for OFFSET, so it's emitted as ``LIMIT -1`` (unbounded).
+        ``since_timestamp`` filters rows before pagination and preserves id order.
         """
         active_clause = "" if include_inactive else " AND active = 1"
+        timestamp_clause = "" if since_timestamp is None else " AND timestamp >= ?"
         sql = (
             "SELECT * FROM messages WHERE session_id = ?"
-            f"{active_clause} ORDER BY id"
+            f"{active_clause}{timestamp_clause} ORDER BY id"
         )
         params: list = [session_id]
+        if since_timestamp is not None:
+            params.append(since_timestamp)
         if limit is not None or offset:
             # SQLite's OFFSET requires LIMIT; -1 means "no limit".
             sql += " LIMIT ? OFFSET ?"
