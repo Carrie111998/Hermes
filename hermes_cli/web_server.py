@@ -9196,6 +9196,8 @@ async def get_messaging_platforms(profile: Optional[str] = None):
     # load_env() honors the HERMES_HOME contextvar override; the gateway
     # status readers do NOT (they resolve process-level paths), so the
     # profile directory is passed explicitly for those (#71211).
+    from starlette.concurrency import run_in_threadpool
+
     with _profile_scope(profile) as scoped_dir:
         env_on_disk = load_env()
         runtime = (
@@ -9203,10 +9205,15 @@ async def get_messaging_platforms(profile: Optional[str] = None):
             if scoped_dir is not None
             else read_runtime_status()
         )
-        return {
-            "env_path": str(get_env_path()),
-            "gateway_start_command": _gateway_display_command(profile, "start"),
-            "platforms": [
+        # The per-platform payload builder performs synchronous liveness
+        # probes (PID/process-table probing + file I/O via
+        # resolve_gateway_liveness) for every catalog entry — ~32 on a stock
+        # install. Running that on the event-loop thread starves the loop for
+        # 6-12s and trips Desktop's readiness timeout (event-loop-stalled
+        # warnings in errors.log). Mirror the /api/status topology pattern
+        # and run the whole synchronous build in a worker thread.
+        def _build_payloads() -> list[dict[str, Any]]:
+            return [
                 _messaging_platform_payload(
                     entry,
                     env_on_disk,
@@ -9216,6 +9223,12 @@ async def get_messaging_platforms(profile: Optional[str] = None):
                 )
                 for entry in _messaging_platform_catalog()
             ]
+
+        platforms = await run_in_threadpool(_build_payloads)
+        return {
+            "env_path": str(get_env_path()),
+            "gateway_start_command": _gateway_display_command(profile, "start"),
+            "platforms": platforms,
         }
 
 
