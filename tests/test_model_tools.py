@@ -30,6 +30,18 @@ class TestHandleFunctionCall:
         assert "error" in result
         assert "totally_fake_tool_xyz" in result["error"]
 
+    def test_registry_dispatch_receives_turn_owner(self):
+        with patch("model_tools.registry.dispatch", return_value='{"ok": true}') as dispatch:
+            handle_function_call(
+                "read_file",
+                {"path": "README.md"},
+                task_id="shared-session",
+                session_id="api-session",
+                turn_id="api-run-b",
+            )
+
+        assert dispatch.call_args.kwargs["turn_id"] == "api-run-b"
+
 
 
     def test_post_tool_call_receives_non_negative_integer_duration_ms(self):

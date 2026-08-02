@@ -7663,9 +7663,13 @@ class AIAgent:
             "task_id": effective_task_id,
             "platform": getattr(self, "platform", None) or "",
         }
-        relay_turn_id = (
-            f"{session_id or 'session'}:{effective_task_id}:{uuid.uuid4().hex[:8]}"
-        )
+        relay_turn_id = str(
+            getattr(self, "_relay_pending_turn_id", "") or ""
+        ).strip()
+        if not relay_turn_id:
+            relay_turn_id = (
+                f"{session_id or 'session'}:{effective_task_id}:{uuid.uuid4().hex[:8]}"
+            )
         self._relay_pending_turn_id = relay_turn_id
         relay_parent_session_id = (
             str(getattr(self, "_parent_session_id", None) or "")

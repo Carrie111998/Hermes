@@ -434,31 +434,49 @@ class TestDisconnectedAgentReap:
     processes the disconnected turn created, and must no-op when no turn
     ownership was ever recorded on the agent."""
 
-    def test_reaps_baseline_diff_for_owned_turn(self, monkeypatch):
-        from gateway.platforms.api_server import _reap_disconnected_agent_processes
+    def test_reaps_exact_owner_for_published_turn(self, monkeypatch):
+        from gateway.platforms.api_server import (
+            _clear_turn_process_ownership,
+            _publish_turn_process_ownership,
+            _reap_disconnected_agent_processes,
+            _snapshot_turn_process_ownership,
+        )
         from tools.process_registry import process_registry
 
         calls = []
         monkeypatch.setattr(
             process_registry,
             "kill_started_since",
-            lambda task_id, baseline, *, source: calls.append(
-                (task_id, baseline, source)
+            lambda task_id, baseline, *, source, owner_id: calls.append(
+                (task_id, baseline, owner_id, source)
             )
             or 1,
         )
-        agent = types.SimpleNamespace(
-            _gateway_turn_process_task_id="session-abc",
-            _gateway_turn_process_baseline=frozenset({"proc-1"}),
+        monkeypatch.setattr(
+            process_registry,
+            "snapshot_running_ids",
+            lambda _task_id: frozenset({"proc-1"}),
         )
+        agent = types.SimpleNamespace()
+        _publish_turn_process_ownership(agent, "session-abc")
+        owner_id = agent._gateway_turn_process_owner_id
+        snapshot = _snapshot_turn_process_ownership(agent)
+        assert snapshot is not None
+        _clear_turn_process_ownership(agent)
 
-        _reap_disconnected_agent_processes(agent)
-
-        deadline = time.time() + 1.0
-        while not calls and time.time() < deadline:
-            time.sleep(0.01)
+        reaper = _reap_disconnected_agent_processes(
+            agent, ownership_snapshot=snapshot
+        )
+        assert reaper is not None
+        reaper.join(1.0)
+        assert not reaper.is_alive()
         assert calls == [
-            ("session-abc", frozenset({"proc-1"}), "api_server_sse_disconnect")
+            (
+                "session-abc",
+                frozenset({"proc-1"}),
+                owner_id,
+                "api_server_sse_disconnect",
+            )
         ]
 
     def test_noop_when_agent_has_no_ownership_markers(self, monkeypatch):
@@ -514,22 +532,21 @@ class TestDisconnectedAgentReap:
         assert calls == []
         _clear_turn_process_ownership(agent)
 
-    def test_stale_epoch_skips_reap_when_newer_run_claimed_task_id(self, monkeypatch):
-        """#76188 follow-up: concurrent API runs can share a client-provided
-        session_id (same task_id). A disconnecting run whose epoch has been
-        superseded must NOT kill the newer run's processes."""
+    def test_older_owner_reap_is_not_suppressed_by_newer_run(self, monkeypatch):
+        """Overlapping runs sharing task_id retain independent ownership."""
         from gateway.platforms.api_server import (
             _clear_turn_process_ownership,
             _publish_turn_process_ownership,
             _reap_disconnected_agent_processes,
+            _snapshot_turn_process_ownership,
         )
         from tools.process_registry import process_registry
 
-        calls = []
+        owners = []
         monkeypatch.setattr(
             process_registry,
             "kill_started_since",
-            lambda *a, **k: calls.append(True) or 1,
+            lambda *_a, owner_id, **_k: owners.append(owner_id) or 1,
         )
         monkeypatch.setattr(
             process_registry, "snapshot_running_ids", lambda _tid: frozenset()
@@ -538,25 +555,29 @@ class TestDisconnectedAgentReap:
         run_a = types.SimpleNamespace()
         run_b = types.SimpleNamespace()
         _publish_turn_process_ownership(run_a, "shared-session")
-        # Run B claims the same session_id — supersedes A's epoch.
         _publish_turn_process_ownership(run_b, "shared-session")
+        owner_a = run_a._gateway_turn_process_owner_id
+        owner_b = run_b._gateway_turn_process_owner_id
+        snapshot_a = _snapshot_turn_process_ownership(run_a)
+        assert snapshot_a is not None
+        _clear_turn_process_ownership(run_a)
 
-        _reap_disconnected_agent_processes(run_a)
-        time.sleep(0.2)
-        assert calls == [], "stale run A must not reap run B's processes"
+        reaper = _reap_disconnected_agent_processes(
+            run_a, ownership_snapshot=snapshot_a
+        )
+        assert reaper is not None
+        reaper.join(1.0)
+        assert not reaper.is_alive()
 
-        # Run B disconnecting IS current — its reap proceeds.
-        _reap_disconnected_agent_processes(run_b)
-        deadline = time.time() + 1.0
-        while not calls and time.time() < deadline:
-            time.sleep(0.01)
-        assert calls == [True]
+        assert owners == [owner_a]
+        assert owners[0] != owner_b
         _clear_turn_process_ownership(run_b)
 
-    def test_reap_proceeds_when_own_clear_pruned_the_epoch_entry(self, monkeypatch):
-        """A missing epoch entry (the abandoned run's own finally already
-        cleared it) means no newer claimant — the reap must proceed using a
-        pre-captured marker snapshot, or the leak survives."""
+    def test_reaper_does_not_block_overlapping_publication(self, monkeypatch):
+        """Exact owner selection preserves intentional same-session concurrency."""
+        import threading
+
+        import gateway.platforms.api_server as api_server_module
         from gateway.platforms.api_server import (
             _clear_turn_process_ownership,
             _publish_turn_process_ownership,
@@ -564,11 +585,104 @@ class TestDisconnectedAgentReap:
         )
         from tools.process_registry import process_registry
 
-        calls = []
+        reap_started = threading.Event()
+        allow_reap = threading.Event()
+        reap_finished = threading.Event()
+        replacement_published = threading.Event()
+        real_reap = api_server_module._run_owned_process_reaper
+
+        def delayed_reap(*args, **kwargs):
+            reap_started.set()
+            assert allow_reap.wait(2.0)
+            try:
+                return real_reap(*args, **kwargs)
+            finally:
+                reap_finished.set()
+
+        monkeypatch.setattr(
+            api_server_module, "_run_owned_process_reaper", delayed_reap
+        )
+        monkeypatch.setattr(
+            process_registry, "snapshot_running_ids", lambda _task_id: frozenset()
+        )
+        monkeypatch.setattr(
+            process_registry, "kill_started_since", lambda *_args, **_kwargs: 0
+        )
+
+        abandoned = types.SimpleNamespace()
+        replacement = types.SimpleNamespace()
+        _publish_turn_process_ownership(abandoned, "concurrent-task")
+        abandoned_owner = abandoned._gateway_turn_process_owner_id
+        _reap_disconnected_agent_processes(abandoned)
+        assert reap_started.wait(1.0)
+
+        publisher = threading.Thread(
+            target=lambda: (
+                _publish_turn_process_ownership(replacement, "concurrent-task"),
+                replacement_published.set(),
+            )
+        )
+        publisher.start()
+        try:
+            assert replacement_published.wait(1.0)
+            assert replacement._gateway_turn_process_owner_id != (
+                abandoned_owner
+            )
+        finally:
+            _clear_turn_process_ownership(abandoned)
+            allow_reap.set()
+            publisher.join(1.0)
+
+        assert reap_finished.wait(1.0)
+        _clear_turn_process_ownership(replacement)
+
+    def test_reaper_launch_failure_preserves_owner_for_retry(self, monkeypatch):
+        import gateway.platforms.api_server as api_server_module
+        from gateway.platforms.api_server import (
+            _clear_turn_process_ownership,
+            _publish_turn_process_ownership,
+            _reap_disconnected_agent_processes,
+            _snapshot_turn_process_ownership,
+        )
+        from tools.process_registry import process_registry
+
+        monkeypatch.setattr(
+            process_registry, "snapshot_running_ids", lambda _task_id: frozenset()
+        )
+        agent = types.SimpleNamespace()
+        _publish_turn_process_ownership(agent, "launch-failure-task")
+        published = _snapshot_turn_process_ownership(agent)
+
+        def fail_thread_construction(*_args, **_kwargs):
+            raise RuntimeError("thread construction failed")
+
+        monkeypatch.setattr(
+            api_server_module.threading, "Thread", fail_thread_construction
+        )
+        with pytest.raises(RuntimeError, match="thread construction failed"):
+            _reap_disconnected_agent_processes(agent)
+
+        # No reservation exists to leak, and the immutable owner remains
+        # available for a caller-controlled retry until its worker finalizer.
+        assert _snapshot_turn_process_ownership(agent) == published
+        _clear_turn_process_ownership(agent)
+        assert _snapshot_turn_process_ownership(agent) is None
+
+    def test_preclear_snapshot_reaps_after_owner_markers_clear(self, monkeypatch):
+        """A pre-signal immutable snapshot survives synchronous finalization."""
+        from gateway.platforms.api_server import (
+            _clear_turn_process_ownership,
+            _publish_turn_process_ownership,
+            _reap_disconnected_agent_processes,
+            _snapshot_turn_process_ownership,
+        )
+        from tools.process_registry import process_registry
+
+        owners = []
         monkeypatch.setattr(
             process_registry,
             "kill_started_since",
-            lambda *a, **k: calls.append(True) or 1,
+            lambda *_a, owner_id, **_k: owners.append(owner_id) or 1,
         )
         monkeypatch.setattr(
             process_registry, "snapshot_running_ids", lambda _tid: frozenset()
@@ -576,26 +690,24 @@ class TestDisconnectedAgentReap:
 
         run = types.SimpleNamespace()
         _publish_turn_process_ownership(run, "solo-session")
-        # Simulate the disconnect handler capturing the agent while the
-        # worker's finally clears ownership: snapshot markers, then clear.
-        stale_view = types.SimpleNamespace(
-            _gateway_turn_process_task_id=run._gateway_turn_process_task_id,
-            _gateway_turn_process_baseline=run._gateway_turn_process_baseline,
-            _gateway_turn_process_epoch=run._gateway_turn_process_epoch,
-        )
+        expected_owner = run._gateway_turn_process_owner_id
+        ownership_snapshot = _snapshot_turn_process_ownership(run)
+        assert ownership_snapshot is not None
         _clear_turn_process_ownership(run)
 
-        _reap_disconnected_agent_processes(stale_view)
-        deadline = time.time() + 1.0
-        while not calls and time.time() < deadline:
-            time.sleep(0.01)
-        assert calls == [True]
+        reaper = _reap_disconnected_agent_processes(
+            run, ownership_snapshot=ownership_snapshot
+        )
+        assert reaper is not None
+        reaper.join(1.0)
+        assert not reaper.is_alive()
+        assert owners == [expected_owner]
 
     def test_publish_and_clear_ownership_roundtrip(self, monkeypatch):
         from gateway.platforms.api_server import (
-            _TURN_PROCESS_EPOCHS,
             _clear_turn_process_ownership,
             _publish_turn_process_ownership,
+            _snapshot_turn_process_ownership,
         )
         from tools.process_registry import process_registry
 
@@ -607,31 +719,238 @@ class TestDisconnectedAgentReap:
 
         agent = types.SimpleNamespace()
         _publish_turn_process_ownership(agent, "sess-rt")
-        assert agent._gateway_turn_process_task_id == "sess-rt"
-        assert agent._gateway_turn_process_baseline == frozenset({"pre-sess-rt"})
-        assert isinstance(agent._gateway_turn_process_epoch, int)
-        assert "sess-rt" in _TURN_PROCESS_EPOCHS
+        owner_id = agent._gateway_turn_process_owner_id
+        ownership = _snapshot_turn_process_ownership(agent)
+        assert ownership is not None
+        assert ownership[:3] == (
+            "sess-rt",
+            frozenset({"pre-sess-rt"}),
+            owner_id,
+        )
+        producer_done = ownership[3]
+        assert not producer_done.is_set()
+        assert agent._relay_pending_turn_id == owner_id
 
         _clear_turn_process_ownership(agent)
+        assert producer_done.is_set()
+        assert _snapshot_turn_process_ownership(agent) is None
+        assert agent._gateway_turn_process_ownership is None
         assert agent._gateway_turn_process_task_id == ""
         assert agent._gateway_turn_process_baseline == frozenset()
-        assert agent._gateway_turn_process_epoch is None
-        # Entry pruned — dict stays bounded to in-flight runs.
-        assert "sess-rt" not in _TURN_PROCESS_EPOCHS
+        assert agent._gateway_turn_process_owner_id == ""
+        assert agent._relay_pending_turn_id is None
+
+    def test_publish_assigns_unique_process_owner_to_relay_turn(self, monkeypatch):
+        from gateway.platforms.api_server import (
+            _clear_turn_process_ownership,
+            _publish_turn_process_ownership,
+        )
+        from tools.process_registry import process_registry
+
+        monkeypatch.setattr(
+            process_registry, "snapshot_running_ids", lambda _task_id: frozenset()
+        )
+        run_a = types.SimpleNamespace()
+        run_b = types.SimpleNamespace()
+
+        _publish_turn_process_ownership(run_a, "shared-session")
+        _publish_turn_process_ownership(run_b, "shared-session")
+
+        assert run_a._gateway_turn_process_owner_id
+        assert run_b._gateway_turn_process_owner_id
+        assert run_a._gateway_turn_process_owner_id != run_b._gateway_turn_process_owner_id
+        assert run_a._relay_pending_turn_id == run_a._gateway_turn_process_owner_id
+        assert run_b._relay_pending_turn_id == run_b._gateway_turn_process_owner_id
+
+        _clear_turn_process_ownership(run_a)
+        _clear_turn_process_ownership(run_b)
+
+    def test_current_reaper_preserves_older_live_owner_with_same_task(
+        self, monkeypatch
+    ):
+        """Production selection must survive reverse overlap A-live/B-abandoned."""
+        import tools.process_registry as process_registry_module
+        from gateway.platforms.api_server import (
+            _clear_turn_process_ownership,
+            _publish_turn_process_ownership,
+            _reap_disconnected_agent_processes,
+            _snapshot_turn_process_ownership,
+        )
+        from tools.process_registry import ProcessRegistry, ProcessSession
+
+        registry = ProcessRegistry()
+        monkeypatch.setattr(process_registry_module, "process_registry", registry)
+        run_a = types.SimpleNamespace()
+        run_b = types.SimpleNamespace()
+        _publish_turn_process_ownership(run_a, "shared-session")
+        _publish_turn_process_ownership(run_b, "shared-session")
+
+        # Both processes start after B's baseline. Task/baseline selection sees
+        # both; immutable owner selection must see only abandoned B.
+        proc_a = ProcessSession(
+            id="proc-live-a",
+            command="sleep 60",
+            task_id="shared-session",
+            owner_id=run_a._gateway_turn_process_owner_id,
+        )
+        proc_b = ProcessSession(
+            id="proc-abandoned-b",
+            command="sleep 60",
+            task_id="shared-session",
+            owner_id=run_b._gateway_turn_process_owner_id,
+        )
+        registry._running[proc_a.id] = proc_a
+        registry._running[proc_b.id] = proc_b
+        killed = []
+
+        def fake_kill(session_id, **_kwargs):
+            killed.append(session_id)
+            registry._running.pop(session_id, None)
+            return {"status": "killed"}
+
+        registry.kill_process = fake_kill
+        snapshot_b = _snapshot_turn_process_ownership(run_b)
+        assert snapshot_b is not None
+        _clear_turn_process_ownership(run_b)
+        reaper = _reap_disconnected_agent_processes(
+            run_b, ownership_snapshot=snapshot_b
+        )
+        assert reaper is not None
+        reaper.join(1.0)
+        assert not reaper.is_alive()
+
+        assert killed == ["proc-abandoned-b"]
+        _clear_turn_process_ownership(run_a)
+
+    def test_reaper_catches_process_registered_after_first_owner_sweep(
+        self, monkeypatch
+    ):
+        """The owner remains reapable until its producer finalizer runs."""
+        import threading
+
+        import tools.process_registry as process_registry_module
+        from gateway.platforms.api_server import (
+            _clear_turn_process_ownership,
+            _publish_turn_process_ownership,
+            _reap_disconnected_agent_processes,
+            _snapshot_turn_process_ownership,
+        )
+        from tools.process_registry import ProcessRegistry, ProcessSession
+
+        registry = ProcessRegistry()
+        monkeypatch.setattr(process_registry_module, "process_registry", registry)
+        agent = types.SimpleNamespace()
+        _publish_turn_process_ownership(agent, "late-registration-session")
+        owner_id = agent._gateway_turn_process_owner_id
+        snapshot = _snapshot_turn_process_ownership(agent)
+        assert snapshot is not None
+        registry._running["proc-early"] = ProcessSession(
+            id="proc-early",
+            command="sleep 60",
+            task_id="late-registration-session",
+            owner_id=owner_id,
+        )
+        first_sweep_done = threading.Event()
+        killed = []
+
+        def fake_kill(session_id, **_kwargs):
+            killed.append(session_id)
+            registry._running.pop(session_id, None)
+            if session_id == "proc-early":
+                first_sweep_done.set()
+            return {"status": "killed"}
+
+        registry.kill_process = fake_kill
+        reaper = _reap_disconnected_agent_processes(
+            agent, ownership_snapshot=snapshot
+        )
+        assert reaper is not None
+        assert first_sweep_done.wait(1.0)
+
+        registry._running["proc-late"] = ProcessSession(
+            id="proc-late",
+            command="sleep 60",
+            task_id="late-registration-session",
+            owner_id=owner_id,
+        )
+        _clear_turn_process_ownership(agent)
+        reaper.join(1.0)
+        assert not reaper.is_alive()
+        assert sorted(killed) == ["proc-early", "proc-late"]
+
+    def test_each_abandoned_owner_reaps_its_own_process_after_overlap(
+        self, monkeypatch
+    ):
+        """A newer publication must not leak an older abandoned owner's work."""
+        import tools.process_registry as process_registry_module
+        from gateway.platforms.api_server import (
+            _clear_turn_process_ownership,
+            _publish_turn_process_ownership,
+            _reap_disconnected_agent_processes,
+            _snapshot_turn_process_ownership,
+        )
+        from tools.process_registry import ProcessRegistry, ProcessSession
+
+        registry = ProcessRegistry()
+        monkeypatch.setattr(process_registry_module, "process_registry", registry)
+        run_a = types.SimpleNamespace()
+        run_b = types.SimpleNamespace()
+        _publish_turn_process_ownership(run_a, "shared-abandoned-session")
+        _publish_turn_process_ownership(run_b, "shared-abandoned-session")
+        registry._running["proc-a"] = ProcessSession(
+            id="proc-a",
+            command="sleep 60",
+            task_id="shared-abandoned-session",
+            owner_id=run_a._gateway_turn_process_owner_id,
+        )
+        registry._running["proc-b"] = ProcessSession(
+            id="proc-b",
+            command="sleep 60",
+            task_id="shared-abandoned-session",
+            owner_id=run_b._gateway_turn_process_owner_id,
+        )
+        killed = []
+
+        def fake_kill(session_id, **_kwargs):
+            killed.append(session_id)
+            registry._running.pop(session_id, None)
+            return {"status": "killed"}
+
+        registry.kill_process = fake_kill
+        snapshot_a = _snapshot_turn_process_ownership(run_a)
+        snapshot_b = _snapshot_turn_process_ownership(run_b)
+        assert snapshot_a is not None and snapshot_b is not None
+        _clear_turn_process_ownership(run_a)
+        _clear_turn_process_ownership(run_b)
+        reaper_a = _reap_disconnected_agent_processes(
+            run_a, ownership_snapshot=snapshot_a
+        )
+        reaper_b = _reap_disconnected_agent_processes(
+            run_b, ownership_snapshot=snapshot_b
+        )
+        assert reaper_a is not None and reaper_b is not None
+        reaper_a.join(1.0)
+        reaper_b.join(1.0)
+        assert not reaper_a.is_alive() and not reaper_b.is_alive()
+
+        assert sorted(killed) == ["proc-a", "proc-b"]
 
     @pytest.mark.asyncio
     async def test_stop_run_reaps_owned_processes(self, adapter, monkeypatch):
         """POST /v1/runs/{id}/stop abandons the run — it must reap the
         background processes that run created (#76115 sibling surface)."""
-        from gateway.platforms.api_server import _publish_turn_process_ownership
+        from gateway.platforms.api_server import (
+            _clear_turn_process_ownership,
+            _publish_turn_process_ownership,
+        )
         from tools.process_registry import process_registry
 
         calls = []
         monkeypatch.setattr(
             process_registry,
             "kill_started_since",
-            lambda task_id, baseline, *, source: calls.append(
-                (task_id, baseline, source)
+            lambda task_id, baseline, *, source, owner_id: calls.append(
+                (task_id, baseline, owner_id, source)
             )
             or 1,
         )
@@ -641,6 +960,8 @@ class TestDisconnectedAgentReap:
 
         agent = MagicMock()
         _publish_turn_process_ownership(agent, "run-stop-sess")
+        owner_id = agent._gateway_turn_process_owner_id
+        agent.interrupt.side_effect = lambda _reason: _clear_turn_process_ownership(agent)
         adapter._active_run_agents["run_x"] = agent
 
         request = MagicMock()
@@ -651,7 +972,9 @@ class TestDisconnectedAgentReap:
         deadline = time.time() + 1.0
         while not calls and time.time() < deadline:
             time.sleep(0.01)
-        assert calls == [("run-stop-sess", frozenset(), "api_server_run_stop")]
+        assert calls == [
+            ("run-stop-sess", frozenset(), owner_id, "api_server_run_stop")
+        ]
         agent.interrupt.assert_called_once()
 
     @pytest.mark.asyncio
@@ -659,8 +982,9 @@ class TestDisconnectedAgentReap:
         self, adapter, monkeypatch
     ):
         """A synchronous hard interrupt may let the worker finalizer clear
-        mutable ownership markers before the detached reaper starts.  The stop
-        boundary must therefore freeze task/baseline/epoch before signalling.
+        mutable ownership markers before the detached reaper starts. The stop
+        boundary must therefore freeze the immutable owner snapshot before
+        signalling.
         """
         from gateway.platforms.api_server import (
             _clear_turn_process_ownership,
@@ -672,8 +996,8 @@ class TestDisconnectedAgentReap:
         monkeypatch.setattr(
             process_registry,
             "kill_started_since",
-            lambda task_id, baseline, *, source: calls.append(
-                (task_id, baseline, source)
+            lambda task_id, baseline, *, source, owner_id: calls.append(
+                (task_id, baseline, owner_id, source)
             )
             or 1,
         )
@@ -685,6 +1009,7 @@ class TestDisconnectedAgentReap:
 
         agent = MagicMock()
         _publish_turn_process_ownership(agent, "run-stop-snapshot")
+        owner_id = agent._gateway_turn_process_owner_id
         agent.interrupt.side_effect = lambda _reason: _clear_turn_process_ownership(agent)
         adapter._active_run_agents["run_snapshot"] = agent
 
@@ -700,6 +1025,7 @@ class TestDisconnectedAgentReap:
             (
                 "run-stop-snapshot",
                 frozenset({"preexisting-process"}),
+                owner_id,
                 "api_server_run_stop",
             )
         ]

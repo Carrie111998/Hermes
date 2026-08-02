@@ -2644,6 +2644,36 @@ class TestRunConversation:
         coordinator.release_conversation.assert_called_once_with(relay_lease)
         assert agent._relay_pending_turn_id is None
 
+    def test_preseeded_relay_turn_id_is_preserved_for_process_owner(self, agent):
+        self._setup_agent(agent)
+        relay_lease = SimpleNamespace(
+            parent_session_id="",
+            profile_key="/profile",
+            session_id=agent.session_id or "",
+        )
+        relay_turn = object()
+        coordinator = MagicMock()
+        coordinator.acquire_conversation.return_value = relay_lease
+        coordinator.begin_turn.return_value = relay_turn
+        agent._relay_pending_turn_id = "api-process-owner-b"
+
+        with (
+            patch("agent.relay_runtime.SESSION_COORDINATOR", coordinator),
+            patch("agent.relay_runtime.current_profile_key", return_value="/profile"),
+            patch("hermes_cli.observability.relay_shared_metrics.start_task_run"),
+            patch("hermes_cli.observability.relay_shared_metrics.finish_task_run"),
+            patch(
+                "agent.conversation_loop.run_conversation",
+                return_value={"final_response": "ok", "completed": True},
+            ),
+        ):
+            agent.run_conversation("hello", task_id="shared-session")
+
+        assert coordinator.begin_turn.call_args.kwargs["turn_id"] == (
+            "api-process-owner-b"
+        )
+        assert agent._relay_pending_turn_id is None
+
     def test_stop_finish_reason_returns_response(self, agent):
         self._setup_agent(agent)
         resp = _mock_response(content="Final answer", finish_reason="stop")

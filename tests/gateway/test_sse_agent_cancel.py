@@ -237,8 +237,8 @@ class TestSSEAgentCancelOnDisconnect:
         monkeypatch.setattr(
             process_registry,
             "kill_started_since",
-            lambda task_id, baseline, *, source: calls.append(
-                (task_id, baseline, source)
+            lambda task_id, baseline, *, source, owner_id: calls.append(
+                (task_id, baseline, owner_id, source)
             )
             or 1,
         )
@@ -255,6 +255,7 @@ class TestSSEAgentCancelOnDisconnect:
             mock_agent = MagicMock()
             mock_agent.interrupt = MagicMock()
             _publish_turn_process_ownership(mock_agent, "sse-snapshot")
+            owner_id = mock_agent._gateway_turn_process_owner_id
 
             class ClearingSignal:
                 def set(self):
@@ -296,6 +297,7 @@ class TestSSEAgentCancelOnDisconnect:
                 (
                     "sse-snapshot",
                     frozenset({"preexisting-process"}),
+                    owner_id,
                     "api_server_sse_disconnect",
                 )
             ]

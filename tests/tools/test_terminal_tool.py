@@ -30,6 +30,24 @@ def test_terminal_schema_advertises_persistent_env_state():
     assert "do not re-source the same environment before every command" in description
 
 
+def test_registry_handler_passes_immutable_turn_owner(monkeypatch):
+    captured = {}
+
+    def fake_terminal_tool(**kwargs):
+        captured.update(kwargs)
+        return "ok"
+
+    monkeypatch.setattr(terminal_tool, "terminal_tool", fake_terminal_tool)
+
+    assert terminal_tool._handle_terminal(
+        {"command": "sleep 60", "background": True, "owner_id": "forged"},
+        task_id="shared-session",
+        session_id="api-session",
+        turn_id="api-run-b",
+    ) == "ok"
+    assert captured["owner_id"] == "api-run-b"
+
+
 def test_printf_literal_sudo_does_not_trigger_rewrite(monkeypatch):
     monkeypatch.delenv("SUDO_PASSWORD", raising=False)
     monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)

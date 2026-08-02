@@ -30,6 +30,7 @@ def _make_session(
     sid="proc_test123",
     command="echo hello",
     task_id="t1",
+    owner_id="",
     exited=False,
     exit_code=None,
     output="",
@@ -40,6 +41,7 @@ def _make_session(
         id=sid,
         command=command,
         task_id=task_id,
+        owner_id=owner_id,
         started_at=started_at or time.time(),
         exited=exited,
         exit_code=exit_code,
@@ -86,6 +88,46 @@ def test_kill_started_since_preserves_preexisting_and_foreign_processes(registry
             "proc_new",
             {
                 "source": "gateway_turn_timeout",
+                "consume_output": True,
+            },
+        )
+    ]
+
+
+def test_kill_started_since_with_owner_id_preserves_overlapping_run(registry):
+    """An abandoned current run must not kill an older still-live producer.
+
+    API runs may intentionally share a task/session ID. The shared baseline
+    cannot distinguish a process that the older run starts after the newer
+    run's snapshot, so destructive selection must use immutable run ownership.
+    """
+    older = _make_session(
+        sid="proc_live_a", task_id="shared-session", owner_id="run-a"
+    )
+    abandoned = _make_session(
+        sid="proc_abandoned_b", task_id="shared-session", owner_id="run-b"
+    )
+    registry._running[older.id] = older
+    registry._running[abandoned.id] = abandoned
+    calls = []
+
+    def fake_kill(session_id, **kwargs):
+        calls.append((session_id, kwargs))
+        return {"status": "killed"}
+
+    registry.kill_process = fake_kill
+
+    assert registry.kill_started_since(
+        "shared-session",
+        frozenset(),
+        owner_id="run-b",
+        source="api_server_sse_disconnect",
+    ) == 1
+    assert calls == [
+        (
+            "proc_abandoned_b",
+            {
+                "source": "api_server_sse_disconnect",
                 "consume_output": True,
             },
         )
@@ -653,9 +695,10 @@ class TestSpawnEnvSanitization:
             patch("subprocess.Popen", side_effect=fake_popen), \
             patch("threading.Thread", return_value=fake_thread), \
             patch.object(registry, "_write_checkpoint"):
-            registry.spawn_local(
+            session = registry.spawn_local(
                 "echo hello",
                 cwd="/tmp",
+                owner_id="api-turn-owner-123",
                 env_vars={
                     "MY_CUSTOM_VAR": "keep-me",
                     "TELEGRAM_BOT_TOKEN": "drop-me",
@@ -663,6 +706,7 @@ class TestSpawnEnvSanitization:
                 },
             )
 
+        assert session.owner_id == "api-turn-owner-123"
         env = captured["env"]
         assert env["MY_CUSTOM_VAR"] == "keep-me"
         assert env["TELEGRAM_BOT_TOKEN"] == "forced-bot-token"
@@ -871,6 +915,33 @@ class TestSpawnRewriteCompoundBackground:
 # =========================================================================
 
 class TestCheckpoint:
+    def test_recover_preserves_immutable_owner_id(self, registry, tmp_path):
+        checkpoint = tmp_path / "procs.json"
+        checkpoint.write_text(
+            json.dumps(
+                [
+                    {
+                        "session_id": "proc_owned",
+                        "command": "sleep 999",
+                        "pid": 424242,
+                        "task_id": "shared-session",
+                        "owner_id": "api-turn-owner-123",
+                        "pid_scope": "host",
+                        "host_start_time": 123.0,
+                    }
+                ]
+            )
+        )
+
+        with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint), patch.object(
+            registry, "_host_pid_is_ours", return_value=True
+        ):
+            assert registry.recover_from_checkpoint() == 1
+
+        recovered = registry.get("proc_owned")
+        assert recovered is not None
+        assert recovered.owner_id == "api-turn-owner-123"
+
     def test_recover_dead_pid(self, registry, tmp_path):
         checkpoint = tmp_path / "procs.json"
         checkpoint.write_text(json.dumps([{

@@ -43,7 +43,6 @@ import asyncio
 import errno
 import hashlib
 import hmac
-import itertools
 import json
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
@@ -646,25 +645,84 @@ def _multimodal_validation_error(exc: ValueError, *, param: str) -> "web.Respons
 
 
 _TURN_PROCESS_OWNERSHIP_UNSET = object()
-_TurnProcessOwnershipSnapshot = tuple[str, frozenset[str], Optional[int]]
+_TurnProcessOwnershipSnapshot = tuple[
+    str, frozenset[str], str, threading.Event
+]
 
 
 def _snapshot_turn_process_ownership(
     agent: Any,
 ) -> Optional[_TurnProcessOwnershipSnapshot]:
-    """Freeze one API turn's process ownership before cancellation can clear it."""
-    with _TURN_PROCESS_EPOCH_LOCK:
-        process_task_id = getattr(agent, "_gateway_turn_process_task_id", "")
-        process_baseline = getattr(agent, "_gateway_turn_process_baseline", None)
-        epoch = getattr(agent, "_gateway_turn_process_epoch", None)
-        if (
-            not isinstance(process_task_id, str)
-            or not process_task_id
-            or not isinstance(process_baseline, frozenset)
-            or (epoch is not None and not isinstance(epoch, int))
-        ):
-            return None
-        return process_task_id, process_baseline, epoch
+    """Atomically freeze the immutable ownership published for one API run."""
+    ownership = getattr(agent, "_gateway_turn_process_ownership", None)
+    if not isinstance(ownership, tuple) or len(ownership) != 4:
+        return None
+    process_task_id, process_baseline, owner_id, producer_done = ownership
+    if (
+        not isinstance(process_task_id, str)
+        or not process_task_id
+        or not isinstance(process_baseline, frozenset)
+        or not isinstance(owner_id, str)
+        or not owner_id
+        or not callable(getattr(producer_done, "wait", None))
+        or not callable(getattr(producer_done, "set", None))
+        or not callable(getattr(producer_done, "is_set", None))
+    ):
+        return None
+    return process_task_id, process_baseline, owner_id, producer_done
+
+
+def _run_owned_process_reaper(
+    process_task_id: str,
+    process_baseline: frozenset[str],
+    owner_id: str,
+    producer_done: threading.Event,
+    source: str,
+) -> int:
+    """Reap one owner until its tool-producing run has fully finalized."""
+    from tools.process_registry import process_registry
+
+    total_killed = 0
+
+    def reap_once() -> None:
+        nonlocal total_killed
+        try:
+            total_killed += process_registry.kill_started_since(
+                process_task_id,
+                process_baseline,
+                source=source,
+                owner_id=owner_id,
+            )
+        except Exception:
+            logger.warning(
+                "Failed to reap processes owned by API turn %s (%s)",
+                owner_id,
+                source,
+                exc_info=True,
+            )
+
+    # Sweep immediately, continue sweeping while an interrupted tool call may
+    # still register a process, then sweep once more after finalization. The
+    # final pass closes the registration-after-first-snapshot race. If the
+    # producer had already finalized before this thread started, one exact-owner
+    # sweep is already final and avoids redundant kill attempts.
+    producer_was_done = producer_done.is_set()
+    reap_once()
+    if not producer_was_done:
+        poll_interval = 0.1
+        while not producer_done.wait(poll_interval):
+            reap_once()
+            poll_interval = min(poll_interval * 2, 2.0)
+        reap_once()
+
+    if total_killed:
+        logger.warning(
+            "Reaped %d background process(es) owned by abandoned API turn %s (%s)",
+            total_killed,
+            owner_id,
+            source,
+        )
+    return total_killed
 
 
 def _reap_disconnected_agent_processes(
@@ -672,109 +730,72 @@ def _reap_disconnected_agent_processes(
     *,
     source: str = "api_server_sse_disconnect",
     ownership_snapshot: Any = _TURN_PROCESS_OWNERSHIP_UNSET,
-) -> None:
-    """Reap background processes an abandoned API-server turn created.
+) -> Optional[threading.Thread]:
+    """Reap exactly the processes owned by one abandoned API-server run.
 
-    Mirrors the gateway-turn cleanup in ``gateway/run.py`` (#76115) for this
-    API-server surface, which runs its own agent lifecycle via ``_run_agent``
-    and never passes through ``TurnRunner`` — so it needs its own trigger for
-    the same baseline-diff reap. Fire-and-forget on a daemon thread so the
-    SSE handler's own cleanup isn't blocked on process-tree teardown.
-
-    Reaping is epoch-gated: client-provided session IDs are conversation
-    scopes, and multiple concurrent runs can intentionally share one (see
-    ``_handle_runs``). Without the gate, run A disconnecting could kill a
-    process a still-live run B (same task_id) spawned after A's baseline
-    snapshot — the same stale-reaper bug class the gateway path gates via
-    ``run_generation``. The epoch closure skips the reap when a newer run
-    has since claimed the task_id; that newer run's own baseline covers its
-    eventual cleanup.
-
-    Cancellation may synchronously release the worker, whose finalizer clears
-    the mutable agent markers.  Callers at a cancellation boundary therefore
-    pass a snapshot captured *before* signalling.  The sentinel distinguishes
-    an omitted snapshot (legacy/direct helper call: capture now) from an
-    explicitly empty pre-cancellation snapshot (do not recapture a newer run).
+    Runs may intentionally overlap under the same session/task ID, so neither
+    a shared baseline nor a latest-generation fence is a safe owner identity.
+    The immutable owner ID is captured before cancellation and follows every
+    tracked process created by the run. An explicit ``None`` snapshot remains
+    a terminal no-op and cannot recapture a replacement run.
     """
     if ownership_snapshot is _TURN_PROCESS_OWNERSHIP_UNSET:
         ownership_snapshot = _snapshot_turn_process_ownership(agent)
     if ownership_snapshot is None:
         return
-    process_task_id, process_baseline, epoch = ownership_snapshot
-    is_still_current: Optional[Any] = None
-    if epoch is not None:
-        def _epoch_still_current(_task_id=process_task_id, _epoch=epoch):
-            # Skip only when a NEWER run has claimed this task_id. A missing
-            # entry means the abandoned run's own clear pruned it (worker
-            # returned after the interrupt) — no newer claimant exists, so
-            # the reap must still proceed or the leak survives. This matches
-            # the gateway gate's semantics: worker completion does not bump
-            # run_generation either.
-            with _TURN_PROCESS_EPOCH_LOCK:
-                current = _TURN_PROCESS_EPOCHS.get(_task_id)
-            return current is None or current == _epoch
-
-        is_still_current = _epoch_still_current
-
-    from gateway.run import _reap_gateway_turn_processes
-
-    threading.Thread(
-        target=_reap_gateway_turn_processes,
-        args=(process_task_id, process_baseline),
-        kwargs={"source": source, "is_still_current": is_still_current},
-        name=f"api-turn-reaper-{process_task_id[:12]}",
+    process_task_id, process_baseline, owner_id, producer_done = ownership_snapshot
+    thread = threading.Thread(
+        target=_run_owned_process_reaper,
+        args=(process_task_id, process_baseline, owner_id, producer_done, source),
+        name=f"api-turn-reaper-{owner_id[-12:]}",
         daemon=True,
-    ).start()
-
-
-# Per-task-id run epochs for the reap gate above. task_id is a conversation
-# scope shared by concurrent API runs, so each run that claims it bumps the
-# epoch; a reaper holding a stale epoch declines to kill. Epochs come from a
-# single monotonic counter (never reused), so pruning an entry and later
-# re-claiming the task_id can never resurrect a stale reaper's claim.
-# Entries are pruned on clear when still current, bounding the dict to
-# in-flight runs.
-_TURN_PROCESS_EPOCHS: Dict[str, int] = {}
-_TURN_PROCESS_EPOCH_LOCK = threading.Lock()
-_TURN_PROCESS_EPOCH_COUNTER = itertools.count(1)
+    )
+    thread.start()
+    return thread
 
 
 def _publish_turn_process_ownership(agent: Any, task_id: str) -> None:
-    """Snapshot the process baseline and claim the task_id's current epoch.
-
-    Single place all API-server agent lifecycles (chat/responses ``_run_agent``
-    and ``/v1/runs``) record turn ownership, so the marker attribute names and
-    epoch bookkeeping cannot drift between surfaces.
-    """
+    """Publish one immutable process owner before an API agent can run tools."""
     from tools.process_registry import process_registry
 
     process_baseline = process_registry.snapshot_running_ids(task_id)
-    with _TURN_PROCESS_EPOCH_LOCK:
-        epoch = next(_TURN_PROCESS_EPOCH_COUNTER)
-        _TURN_PROCESS_EPOCHS[task_id] = epoch
-        agent._gateway_turn_process_task_id = task_id
-        agent._gateway_turn_process_baseline = process_baseline
-        agent._gateway_turn_process_epoch = epoch
+    process_owner_id = f"api-turn-{uuid.uuid4().hex}"
+
+    # The relay turn ID is the value tool dispatch forwards to terminal_tool.
+    # Set it before the ownership tuple; a cancellation racing before the tuple
+    # sees no ownership, and no process can have been spawned yet.
+    agent._relay_pending_turn_id = process_owner_id
+    producer_done = threading.Event()
+    ownership = (task_id, process_baseline, process_owner_id, producer_done)
+    agent._gateway_turn_process_ownership = ownership
+
+    # Compatibility mirrors for lightweight doubles and diagnostics. The tuple
+    # above is the sole authoritative snapshot and is published atomically.
+    agent._gateway_turn_process_task_id = task_id
+    agent._gateway_turn_process_baseline = process_baseline
+    agent._gateway_turn_process_owner_id = process_owner_id
 
 
 def _clear_turn_process_ownership(agent: Any) -> None:
-    """Clear turn ownership the moment the turn finishes (success or crash).
+    """Retire one run's owner without disturbing concurrent owners."""
+    ownership = getattr(agent, "_gateway_turn_process_ownership", None)
+    owner_id = ownership[2] if isinstance(ownership, tuple) and len(ownership) == 4 else ""
+    producer_done = ownership[3] if isinstance(ownership, tuple) and len(ownership) == 4 else None
 
-    A disconnect/cancel landing after this point must not reap background
-    work the turn deliberately left running — mirrors the same race-window
-    guard in ``gateway/run.py``'s ``_run_sync_with_timeout_lifecycle``.
-    """
-    with _TURN_PROCESS_EPOCH_LOCK:
-        task_id = getattr(agent, "_gateway_turn_process_task_id", "")
-        epoch = getattr(agent, "_gateway_turn_process_epoch", None)
-        if task_id and epoch is not None:
-            # Prune only when this run is still the current claimant; a newer
-            # concurrent run owns the entry otherwise.
-            if _TURN_PROCESS_EPOCHS.get(task_id) == epoch:
-                del _TURN_PROCESS_EPOCHS[task_id]
-        agent._gateway_turn_process_task_id = ""
-        agent._gateway_turn_process_baseline = frozenset()
-        agent._gateway_turn_process_epoch = None
+    # This function runs only from the owning worker's finalizer. Once set, no
+    # synchronous tool call can register another process for this owner.
+    producer_done_set = getattr(producer_done, "set", None)
+    if callable(producer_done_set):
+        producer_done_set()
+
+    # Linearization point: cancellation snapshots after this assignment cannot
+    # recapture stale compatibility mirrors or a replacement run.
+    agent._gateway_turn_process_ownership = None
+    agent._gateway_turn_process_task_id = ""
+    agent._gateway_turn_process_baseline = frozenset()
+    agent._gateway_turn_process_owner_id = ""
+    if getattr(agent, "_relay_pending_turn_id", None) == owner_id:
+        agent._relay_pending_turn_id = None
 
 
 def _session_chat_user_message(body: Dict[str, Any], *, param: str = "message") -> tuple[Any, Optional["web.Response"]]:
@@ -4270,7 +4291,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 _snapshot_turn_process_ownership(agent) if should_interrupt else None
             )
             if cancel_signal is not None:
-                cancel_signal.set()
+                try:
+                    cancel_signal.set()
+                except Exception:
+                    logger.debug("Failed to set SSE agent cancellation signal", exc_info=True)
             if should_interrupt:
                 try:
                     request_hard_interrupt(agent, reason)
