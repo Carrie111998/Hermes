@@ -714,9 +714,13 @@ class TestInstallerTimeoutKillsProcessGroup:
 
 class TestInstallerNoShell:
     """The POSIX installer path must not use shell=True or command
-    substitution: the script is downloaded to a mkstemp file and exec'd
-    as a plain argv list (salvage of #34974's intent, without the fixed
-    /tmp path TOCTOU that PR introduced)."""
+    substitution: the upstream script set is downloaded into a mkdtemp
+    directory and install.sh is exec'd as a plain argv list (salvage of
+    #34974's intent, without the fixed /tmp path TOCTOU that PR introduced).
+
+    All three scripts come from GitHub raw so install.sh finds its siblings
+    on disk instead of curling them from the cua.ai vanity CDN, whose public
+    DNS is NXDOMAIN."""
 
     def _run(self, download_rc=0):
         import subprocess
@@ -756,22 +760,54 @@ class TestInstallerNoShell:
         assert ok is True
         run_calls = [c for c in calls if c[0] == "run"]
         popen_calls = [c for c in calls if c[0] == "popen"]
-        assert len(run_calls) == 1 and len(popen_calls) == 1
-        # Download: plain argv curl, no shell.
-        dl_cmd = run_calls[0][1]
-        assert isinstance(dl_cmd, list) and dl_cmd[0] == "curl"
-        # Exec: argv list ["/bin/bash", <mkstemp path>], shell=False.
+        # One curl per upstream script: install.sh + both siblings.
+        assert len(run_calls) == 3 and len(popen_calls) == 1
+        # Downloads: plain argv curl, no shell, all from GitHub raw.
+        urls = []
+        for _, dl_cmd, _kw in run_calls:
+            assert isinstance(dl_cmd, list) and dl_cmd[0] == "curl"
+            urls.append(dl_cmd[-1])
+        for url in urls:
+            assert url.startswith(
+                "https://raw.githubusercontent.com/trycua/cua/"
+            ), url
+            # The vanity CDN is NXDOMAIN — it must not be in the fetch path.
+            assert "cua.ai" not in url, url
+        assert [u.rsplit("/", 1)[-1] for u in urls] == [
+            "install.sh", "_install-rust.sh", "_install-common.sh",
+        ]
+        # Exec: argv list ["/bin/bash", <temp dir>/install.sh], shell=False.
         exec_cmd, exec_kw = popen_calls[0][1], popen_calls[0][2]
         assert isinstance(exec_cmd, list) and exec_cmd[0] == "/bin/bash"
         assert "cua-driver-install-" in exec_cmd[1]
+        assert exec_cmd[1].endswith("/install.sh")
         assert exec_kw.get("shell") is False
 
+    def test_sibling_scripts_land_next_to_install_sh(self):
+        """install.sh only skips the cua.ai fetch when the siblings are in
+        its own directory."""
+        import os
+        ok, calls = self._run()
+        assert ok is True
+        # curl -fsSL -o <path> <url> — the target path is the arg after -o.
+        out_paths = [
+            c[1][c[1].index("-o") + 1] for c in calls if c[0] == "run"
+        ]
+        install_sh = [c[1][1] for c in calls if c[0] == "popen"][0]
+        assert {os.path.basename(p) for p in out_paths} == {
+            "install.sh", "_install-rust.sh", "_install-common.sh",
+        }
+        assert {os.path.dirname(p) for p in out_paths} == {
+            os.path.dirname(install_sh)
+        }
+
     def test_download_failure_returns_false_without_exec(self):
+        # Fail-fast: the first curl failing is enough to abort the install.
         ok, calls = self._run(download_rc=6)
         assert ok is False
         assert not [c for c in calls if c[0] == "popen"]
 
-    def test_temp_script_removed_after_run(self, tmp_path):
+    def test_temp_script_dir_removed_after_run(self, tmp_path):
         import os
         captured = {}
         import subprocess
@@ -802,6 +838,8 @@ class TestInstallerNoShell:
             tools_config._run_cua_driver_installer(label="Refreshing", verbose=False)
 
         assert "script" in captured
+        # The whole temp dir goes, not just install.sh.
+        assert not os.path.exists(os.path.dirname(captured["script"]))
         assert not os.path.exists(captured["script"])
 
 

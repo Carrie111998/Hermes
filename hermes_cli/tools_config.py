@@ -1372,7 +1372,12 @@ def _run_cua_driver_installer(
     The scripts are idempotent: they always download the latest release, so
     re-running on an already-installed system performs an upgrade.
 
-    * macOS / Linux → ``curl -fsSL …/install.sh | /bin/bash``.
+    * macOS / Linux → download the full upstream script set (``install.sh``
+      plus its ``_install-rust.sh`` / ``_install-common.sh`` siblings) from
+      GitHub raw into a temp dir and exec ``/bin/bash <dir>/install.sh``.
+      ``install.sh`` prefers on-disk siblings over fetching them from the
+      ``cua.ai`` vanity CDN, so shipping all three keeps the install working
+      even when that host does not resolve.
     * Windows       → ``powershell -NoProfile -ExecutionPolicy Bypass -Command
       "irm …/install.ps1 | iex"``.
 
@@ -1405,46 +1410,46 @@ def _run_cua_driver_installer(
             'powershell -NoProfile -ExecutionPolicy Bypass -Command '
             f'"{ps_oneliner}"'
         )
-        script_path = None
+        script_dir = None
     else:
         # Download-then-exec instead of `bash -c "$(curl …)"`: no shell=True,
-        # no command substitution, and the script lands in a mkstemp file
-        # (unpredictable name, 0600) rather than a fixed /tmp path — avoiding
+        # no command substitution, and the scripts land in a mkdtemp directory
+        # (unpredictable name, 0700) rather than fixed /tmp paths — avoiding
         # both the shell-injection surface and a symlink/TOCTOU race on
-        # multi-user machines. The manual hint stays the upstream one-liner
-        # since that's what the docs/README teach.
+        # multi-user machines. install.sh sources _install-rust.sh /
+        # _install-common.sh from its own directory when they are present and
+        # only falls back to fetching them from the cua.ai vanity CDN
+        # otherwise, so the whole set is downloaded as siblings and no DNS
+        # beyond GitHub is required. The manual hint stays the upstream
+        # one-liner since that's what the docs/README teach.
         import tempfile as _tempfile
 
-        install_url = (
+        scripts_base = (
             "https://raw.githubusercontent.com/trycua/cua/main/"
-            "libs/cua-driver/scripts/install.sh"
+            "libs/cua-driver/scripts/"
         )
-        manual_hint = f'/bin/bash -c "$(curl -fsSL {install_url})"'
-        fd, script_path = _tempfile.mkstemp(prefix="cua-driver-install-", suffix=".sh")
-        os.close(fd)
-        try:
-            dl = subprocess.run(
-                ["curl", "-fsSL", "-o", script_path, install_url],
-                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120,
-            )
-        except (subprocess.TimeoutExpired, OSError) as e:
-            _print_warning(f"    cua-driver installer download failed: {e}")
+        script_names = ("install.sh", "_install-rust.sh", "_install-common.sh")
+        manual_hint = f'/bin/bash -c "$(curl -fsSL {scripts_base}install.sh)"'
+        script_dir = _tempfile.mkdtemp(prefix="cua-driver-install-")
+
+        def _download_failed(detail: str) -> None:
+            _print_warning(f"    cua-driver installer download failed: {detail}")
+            shutil.rmtree(script_dir, ignore_errors=True)
+
+        for name in script_names:
             try:
-                os.remove(script_path)
-            except OSError:
-                pass
-            return False
-        if dl.returncode != 0:
-            _print_warning(
-                "    cua-driver installer download failed: "
-                f"{(dl.stderr or '').strip()[:200]}"
-            )
-            try:
-                os.remove(script_path)
-            except OSError:
-                pass
-            return False
-        install_cmd = ["/bin/bash", script_path]
+                dl = subprocess.run(
+                    ["curl", "-fsSL", "-o", os.path.join(script_dir, name),
+                     scripts_base + name],
+                    capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120,
+                )
+            except (subprocess.TimeoutExpired, OSError) as e:
+                _download_failed(f"{name}: {e}")
+                return False
+            if dl.returncode != 0:
+                _download_failed(f"{name}: {(dl.stderr or '').strip()[:200]}")
+                return False
+        install_cmd = ["/bin/bash", os.path.join(script_dir, "install.sh")]
     use_shell = False
 
     if show_progress:
@@ -1620,11 +1625,8 @@ def _run_cua_driver_installer(
         _print_warning(f"    cua-driver {label.lower()} failed: {e}")
         return False
     finally:
-        if script_path:
-            try:
-                os.remove(script_path)
-            except OSError:
-                pass
+        if script_dir:
+            shutil.rmtree(script_dir, ignore_errors=True)
 
 
 def _run_post_setup(post_setup_key: str):
