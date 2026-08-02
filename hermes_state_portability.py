@@ -514,6 +514,13 @@ class SessionPortabilityMixin:
                 if started_at is None:
                     started_at = time.time()
                 archived = 1 if raw.get("archived") else 0
+                # ``pinned`` is a durable user decision ("keep this session"),
+                # not live runtime state — the same class as ``archived``, which
+                # this import already restores. Dropping it meant a restored
+                # backup came back unpinned and the sessions.auto_archive stale
+                # sweep, which exists to honour the flag, then swept exactly the
+                # sessions the user marked keep.
+                pinned = 1 if raw.get("pinned") else 0
 
                 conn.execute(
                     """INSERT INTO sessions (
@@ -524,7 +531,7 @@ class SessionPortabilityMixin:
                            cwd, git_branch, git_repo_root,
                            billing_provider, billing_base_url, billing_mode,
                            estimated_cost_usd, actual_cost_usd, cost_status, cost_source,
-                           pricing_version, title, api_call_count, archived
+                           pricing_version, title, api_call_count, archived, pinned
                        )
                        VALUES (
                            :id, :source, :user_id, :model, :model_config,
@@ -535,7 +542,7 @@ class SessionPortabilityMixin:
                            :billing_provider, :billing_base_url, :billing_mode,
                            :estimated_cost_usd, :actual_cost_usd, :cost_status,
                            :cost_source, :pricing_version, :title,
-                           :api_call_count, :archived
+                           :api_call_count, :archived, :pinned
                        )""",
                     {
                         "id": session_id,
@@ -576,6 +583,7 @@ class SessionPortabilityMixin:
                         "title": raw.get("title"),
                         "api_call_count": self._int_or_default(raw.get("api_call_count")),
                         "archived": archived,
+                        "pinned": pinned,
                     },
                 )
 
