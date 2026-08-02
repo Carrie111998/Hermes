@@ -1636,12 +1636,27 @@ def switch_model(
             alias_url = _da.base_url
             # Same-provider bare custom/local may have just preserved the live
             # session credential for the prior host. If the alias points at a
-            # different endpoint, drop that credential before validation so
-            # key A is never probed against host B.
+            # different endpoint, drop that credential and re-resolve for host
+            # B (pool / host-gated env / host-derived key) before validation so
+            # key A is never probed against B, while authenticated aliases still
+            # get B's configured key. no-key-required only when B has none.
             if (base_url or "").rstrip("/") != alias_url.rstrip("/"):
-                api_key = ""
+                try:
+                    runtime = resolve_runtime_provider(
+                        requested=target_provider,
+                        target_model=new_model,
+                        explicit_base_url=alias_url,
+                    )
+                    api_key = runtime.get("api_key", "") or "no-key-required"
+                    api_mode = runtime.get("api_mode", "") or ""
+                except Exception:
+                    api_key = "no-key-required"
+                    api_mode = ""
+            else:
+                api_mode = ""  # clear so determine_api_mode re-detects from URL
+                if not api_key:
+                    api_key = "no-key-required"
             base_url = alias_url
-            api_mode = ""  # clear so determine_api_mode re-detects from URL
             if not api_key:
                 api_key = "no-key-required"
 

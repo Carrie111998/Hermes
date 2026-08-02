@@ -1053,9 +1053,13 @@ def _resolve_named_custom_runtime(
             return pool_result
         _da_is_openai_url   = base_url_host_matches(base_url, "openai.com") or base_url_host_matches(base_url, "openai.azure.com")
         _da_is_openrouter   = base_url_host_matches(base_url, "openrouter.ai")
+        # Match host, not substring — look-alikes must not receive OLLAMA_API_KEY
+        # (GHSA-76xc-57q6-vm5m). Mirrors the plain-custom path below.
+        _da_is_ollama_url   = base_url_host_matches(base_url, "ollama.com")
         api_key_candidates = [
             (explicit_api_key or "").strip(),
             # Gate env key fallbacks on authoritative hosts (#28660)
+            (_getenv("OLLAMA_API_KEY", "").strip()     if _da_is_ollama_url  else ""),
             (_getenv("OPENAI_API_KEY", "").strip()     if _da_is_openai_url else ""),
             (_getenv("OPENROUTER_API_KEY", "").strip() if _da_is_openrouter  else ""),
             # Bonus (#28660): derive `<VENDOR>_API_KEY` from the host so users

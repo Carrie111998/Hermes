@@ -795,3 +795,146 @@ def test_same_provider_direct_alias_does_not_send_session_key_to_alias_host(
     for call in validation_calls:
         assert (call["base_url"] or "").rstrip("/") == alias_url.rstrip("/")
         assert call["api_key"] != session_key
+
+
+def test_same_provider_direct_alias_resolves_authenticated_endpoint_b_key(
+    tmp_path, monkeypatch
+):
+    """URL-changing direct alias must resolve endpoint B's configured key.
+
+    Clearing A's session credential is required, but immediately forcing
+    no-key-required rejects authenticated aliases (e.g. host-derived vendor
+    keys / Ollama Cloud) even when B's key is configured.
+    """
+    import hermes_cli.model_switch as ms
+    from hermes_cli.model_switch import DirectAlias
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _clear_provider_env(monkeypatch)
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    monkeypatch.delenv("OLLAMA_API_KEY", raising=False)
+
+    session_url = "https://endpoint-a.example/v1"
+    session_key = "sk-endpoint-a-private"
+    alias_url = "https://api.deepseek.com/v1"
+    endpoint_b_key = "sk-endpoint-b-deepseek"
+
+    monkeypatch.setenv("DEEPSEEK_API_KEY", endpoint_b_key)
+    monkeypatch.setattr(
+        ms,
+        "DIRECT_ALIASES",
+        {
+            "alias-b": DirectAlias("deepseek-chat", "custom", alias_url),
+        },
+    )
+    monkeypatch.setattr(
+        ms,
+        "resolve_alias",
+        lambda raw, prov: ("custom", "deepseek-chat", "alias-b"),
+    )
+
+    validation_calls: list[dict] = []
+
+    def _capture_validate(model_name, provider, **kwargs):
+        validation_calls.append(
+            {
+                "model_name": model_name,
+                "provider": provider,
+                "api_key": kwargs.get("api_key"),
+                "base_url": kwargs.get("base_url"),
+            }
+        )
+        return _MOCK_VALIDATION
+
+    monkeypatch.setattr(
+        "hermes_cli.models.validate_requested_model", _capture_validate
+    )
+    monkeypatch.setattr("hermes_cli.model_switch.get_model_info", lambda *a, **k: None)
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.get_model_capabilities", lambda *a, **k: None
+    )
+
+    result = switch_model(
+        raw_input="alias-b",
+        current_provider="custom",
+        current_model="model-a",
+        current_api_key=session_key,
+        current_base_url=session_url,
+    )
+
+    assert result.success is True
+    assert result.base_url.rstrip("/") == alias_url.rstrip("/")
+    assert result.api_key == endpoint_b_key
+    assert result.api_key != session_key
+    assert result.api_key != "no-key-required"
+    assert validation_calls, "expected validate_requested_model to run"
+    for call in validation_calls:
+        assert (call["base_url"] or "").rstrip("/") == alias_url.rstrip("/")
+        assert call["api_key"] == endpoint_b_key
+
+
+def test_same_provider_direct_alias_resolves_ollama_cloud_key(
+    tmp_path, monkeypatch
+):
+    """Authenticated Ollama Cloud aliases must pick up OLLAMA_API_KEY for B."""
+    import hermes_cli.model_switch as ms
+    from hermes_cli.model_switch import DirectAlias
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _clear_provider_env(monkeypatch)
+    monkeypatch.delenv("OLLAMA_API_KEY", raising=False)
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+
+    session_url = "https://endpoint-a.example/v1"
+    session_key = "sk-endpoint-a-private"
+    alias_url = "https://ollama.com/v1"
+    ollama_key = "sk-ollama-cloud-b"
+
+    monkeypatch.setenv("OLLAMA_API_KEY", ollama_key)
+    monkeypatch.setattr(
+        ms,
+        "DIRECT_ALIASES",
+        {
+            "cloud-llama": DirectAlias("llama3.2", "custom", alias_url),
+        },
+    )
+    monkeypatch.setattr(
+        ms,
+        "resolve_alias",
+        lambda raw, prov: ("custom", "llama3.2", "cloud-llama"),
+    )
+
+    validation_calls: list[dict] = []
+
+    def _capture_validate(model_name, provider, **kwargs):
+        validation_calls.append(
+            {
+                "api_key": kwargs.get("api_key"),
+                "base_url": kwargs.get("base_url"),
+            }
+        )
+        return _MOCK_VALIDATION
+
+    monkeypatch.setattr(
+        "hermes_cli.models.validate_requested_model", _capture_validate
+    )
+    monkeypatch.setattr("hermes_cli.model_switch.get_model_info", lambda *a, **k: None)
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.get_model_capabilities", lambda *a, **k: None
+    )
+
+    result = switch_model(
+        raw_input="cloud-llama",
+        current_provider="custom",
+        current_model="model-a",
+        current_api_key=session_key,
+        current_base_url=session_url,
+    )
+
+    assert result.success is True
+    assert result.base_url.rstrip("/") == alias_url.rstrip("/")
+    assert result.api_key == ollama_key
+    assert result.api_key != session_key
+    assert validation_calls
+    for call in validation_calls:
+        assert call["api_key"] == ollama_key
