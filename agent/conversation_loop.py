@@ -5526,12 +5526,25 @@ def run_conversation(
 
             # Notify progress callback of model's thinking (used by subagent
             # delegation to relay the child's reasoning to the parent display).
-            if (assistant_message.content and agent.tool_progress_callback):
+            # Prioritise structured reasoning fields (reasoning/reasoning_content)
+            # over content with inline <think> tags.  Models with structured
+            # reasoning (DeepSeek, Qwen, Kimi thinking mode) return the final
+            # answer in content and thinking in a separate field; sending content
+            # as "reasoning" would put the answer text in execution_details
+            # instead of the message output.
+            _think_text = ""
+            if hasattr(assistant_message, 'reasoning') and assistant_message.reasoning:
+                _think_text = assistant_message.reasoning.strip()
+            elif hasattr(assistant_message, 'reasoning_content') and assistant_message.reasoning_content:
+                _think_text = assistant_message.reasoning_content.strip()
+            if not _think_text and assistant_message.content:
                 _think_text = assistant_message.content.strip()
                 # Strip reasoning XML tags that shouldn't leak to parent display
                 _think_text = re.sub(
                     r'</?(?:REASONING_SCRATCHPAD|think|reasoning)>', '', _think_text
                 ).strip()
+
+            if _think_text and agent.tool_progress_callback:
                 # For subagents: relay first line to parent display (existing behaviour).
                 # For all agents with a structured callback: emit reasoning.available event.
                 first_line = _think_text.split('\n')[0][:80] if _think_text else ""

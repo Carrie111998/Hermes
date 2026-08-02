@@ -2980,49 +2980,34 @@ class TestCodexAdapterGithubResponsesMessageIdDrop:
 
 class TestVisionAutoSkipsKimiCoding:
     """_resolve_auto vision branch skips providers that have no vision on
-    their main endpoint (e.g. Kimi Coding Plan /coding) and falls through
-    to the aggregator chain instead of handing back a client that will 404
-    on every request (#17076).
+    their main endpoint and falls through to the aggregator chain instead of
+    handing back a client that will 404 on every request (#17076). Kimi K3 on
+    api.kimi.com/coding/v1 now accepts image input, so the skip only applies
+    to still-unverified variants.
     """
 
-    def test_kimi_coding_skipped_falls_through_to_openrouter(self, monkeypatch):
-        """kimi-coding as main + vision auto → OpenRouter (not kimi)."""
-        fake_or_client = MagicMock(name="openrouter_client")
-
+    def test_kimi_coding_k3_auto_uses_main_provider(self, monkeypatch):
+        """kimi-coding/k3 as main + vision auto → Kimi, not OpenRouter."""
+        fake_kimi_client = MagicMock(name="kimi_client")
         monkeypatch.setattr(
             "agent.auxiliary_client._read_main_provider", lambda: "kimi-coding",
         )
         monkeypatch.setattr(
-            "agent.auxiliary_client._read_main_model", lambda: "kimi-code",
+            "agent.auxiliary_client._read_main_model", lambda: "k3",
         )
-        # Guard: if the skip doesn't fire, _resolve_strict_vision_backend
-        # and resolve_provider_client both would try kimi-coding — detect
-        # either via the main-provider call and fail loud.
-        rpc_mock = MagicMock(side_effect=AssertionError(
-            "resolve_provider_client should NOT be called for kimi-coding "
-            "on the vision auto path"))
         monkeypatch.setattr(
-            "agent.auxiliary_client.resolve_provider_client", rpc_mock,
+            "agent.auxiliary_client._main_model_supports_vision",
+            lambda provider, model: True,
         )
-
-        def fake_strict(provider, model=None):
-            if provider == "openrouter":
-                return fake_or_client, "google/gemini-3-flash-preview"
-            if provider == "nous":
-                return None, None
-            raise AssertionError(
-                f"strict vision backend should not be called for {provider!r} "
-                "when main provider is kimi-coding"
-            )
         monkeypatch.setattr(
-            "agent.auxiliary_client._resolve_strict_vision_backend",
-            fake_strict,
+            "agent.auxiliary_client.resolve_provider_client",
+            MagicMock(return_value=(fake_kimi_client, "k3")),
         )
 
         provider, client, model = resolve_vision_provider_client()
-        assert provider == "openrouter"
-        assert client is fake_or_client
-        assert model == "google/gemini-3-flash-preview"
+        assert provider == "kimi-coding"
+        assert client is fake_kimi_client
+        assert model == "k3"
 
 
 
@@ -3030,7 +3015,6 @@ class TestVisionAutoSkipsKimiCoding:
         """Guard against accidental widening of the skip list."""
         from agent.auxiliary_client import _PROVIDERS_WITHOUT_VISION
         assert _PROVIDERS_WITHOUT_VISION == frozenset({
-            "kimi-coding",
             "kimi-coding-cn",
         })
 

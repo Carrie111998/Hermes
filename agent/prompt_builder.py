@@ -13,7 +13,12 @@ import contextvars
 from collections import OrderedDict
 from pathlib import Path
 
-from hermes_constants import get_hermes_home, get_skills_dir, is_wsl
+from hermes_constants import (
+    get_default_hermes_root,
+    get_hermes_home,
+    get_skills_dir,
+    is_wsl,
+)
 from typing import Optional
 
 from agent.runtime_cwd import resolve_agent_cwd
@@ -243,14 +248,11 @@ KANBAN_GUIDANCE = (
     "(`{changed_files: [...], tests_run: N, decisions: [...]}`). Downstream "
     "workers read both via their own `kanban_show`. Never put secrets / "
     "tokens / raw PII in either field — run rows are durable forever. "
-    "Exception: if your output is a code change that needs human review "
-    "before counting as merged/done (most coding tasks), drop the "
-    "structured metadata (changed_files / tests_run / diff_path) into a "
-    "`kanban_comment` first, then end with "
-    "`kanban_block(reason=\"review-required: <one-line summary>\")` so a "
-    "reviewer can approve+unblock or request changes. Reviewing-then-"
-    "completing is more honest than auto-completing work that still needs "
-    "eyes on it.\n"
+    "Exception: if your output is a code change that needs independent review, "
+    "call `kanban_submit_review(reviewer=..., summary=..., metadata=...)`. "
+    "It preserves implementation evidence and routes the card to the Review "
+    "lane; `kanban_block` remains for genuine human input, credentials, "
+    "capability, dependency, or transient failures.\n"
     "6. **If follow-up work appears, create it; don't do it.** Use "
     "`kanban_create(title=..., assignee=<right-profile>, parents=[your-task-id])` "
     "to spawn a child task for the appropriate specialist profile instead of "
@@ -2010,6 +2012,49 @@ def load_soul_md(context_length: Optional[int] = None) -> Optional[str]:
         return content
     except Exception as e:
         logger.debug("Could not read SOUL.md from %s: %s", soul_path, e)
+        return None
+
+
+def load_universal_policy_md(context_length: Optional[int] = None) -> Optional[str]:
+    """Load the root universal policy for a named profile, if configured.
+
+    ``<root>/AGENTS.md`` is intentionally *not* part of ordinary project-context
+    discovery: ``AGENTS.md`` remains cwd-only so portable project instructions
+    never leak across workspaces.  The root file is instead an explicit,
+    profile-wide policy source for named profiles.  Returning the body without
+    a project-context wrapper lets the system-prompt builder keep it separate
+    and avoid a duplicate when the root directory is deliberately the cwd.
+
+    The default profile already owns the root and does not receive a second
+    copy.  ``--ignore-rules`` is enforced by the caller, alongside SOUL and
+    project-context loading.
+    """
+    profile_home = get_hermes_home()
+    root_home = get_default_hermes_root()
+    try:
+        if profile_home.resolve() == root_home.resolve():
+            return None
+    except OSError:
+        # A path that cannot be resolved is not a safe basis for cross-profile
+        # policy inheritance; preserve the profile's normal isolated prompt.
+        return None
+
+    policy_path = root_home / "AGENTS.md"
+    if not policy_path.is_file():
+        return None
+    try:
+        content = policy_path.read_text(encoding="utf-8").strip()
+        if not content:
+            return None
+        content = _scan_context_content(content, "universal AGENTS.md")
+        return _truncate_content(
+            content,
+            "universal AGENTS.md",
+            context_length=context_length,
+            read_path=str(policy_path),
+        )
+    except Exception as e:
+        logger.debug("Could not read universal policy from %s: %s", policy_path, e)
         return None
 
 

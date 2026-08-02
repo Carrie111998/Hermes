@@ -231,6 +231,7 @@ def test_auth_lock_reentrancy_is_scoped_after_profile_context_switch(profile_env
     assert getattr(holder_a, "depth", 0) == 0
 
 
+
 # ---------------------------------------------------------------------------
 # write_credential_pool — stale-snapshot cooldown merge
 # ---------------------------------------------------------------------------
@@ -288,3 +289,58 @@ def test_write_pool_never_merges_cooldown_onto_reauthed_entry(classic_env):
     assert persisted["access_token"] == "sk-new"
     assert persisted.get("last_status") != "exhausted"
     assert persisted.get("last_error_code") is None
+
+def test_codex_profile_shadow_is_ignored_and_pool_writes_root(profile_env):
+    """Named profiles cannot shadow or mutate the shared Codex pool."""
+    from hermes_cli.auth import read_credential_pool, write_credential_pool
+
+    _write(profile_env["global"] / "auth.json", _make_auth_store(pool={
+        "openai-codex": [{"id": "root", "access_token": "root-token"}],
+    }, providers={
+        "openai-codex": {"tokens": {"access_token": "root-token", "refresh_token": "root-refresh"}},
+    }))
+    _write(profile_env["profile"] / "auth.json", _make_auth_store(pool={
+        "openai-codex": [{"id": "stale", "access_token": "stale-token"}],
+        "openrouter": [{"id": "profile-or", "access_token": "profile-key"}],
+    }, providers={
+        "openai-codex": {"tokens": {"access_token": "stale-token", "refresh_token": "stale-refresh"}},
+    }))
+
+    assert [entry["id"] for entry in read_credential_pool("openai-codex")] == ["root"]
+    write_credential_pool("openai-codex", [{
+        "id": "root",
+        "auth_type": "oauth",
+        "source": "device_code",
+        "access_token": "refreshed",
+        "refresh_token": "refreshed-refresh",
+    }])
+
+    root = json.loads((profile_env["global"] / "auth.json").read_text())
+    profile = json.loads((profile_env["profile"] / "auth.json").read_text())
+    assert root["credential_pool"]["openai-codex"][0]["access_token"] == "refreshed"
+    assert profile["credential_pool"]["openai-codex"][0]["access_token"] == "stale-token"
+    assert profile["credential_pool"]["openrouter"][0]["id"] == "profile-or"
+
+
+def test_save_codex_tokens_from_profile_writes_root_only(profile_env):
+    """Profile reauthorization updates the root singleton and root pool."""
+    from hermes_cli.auth import _save_codex_tokens
+
+    _write(profile_env["global"] / "auth.json", _make_auth_store(pool={
+        "openai-codex": [{"id": "root", "source": "device_code", "access_token": "old"}],
+    }, providers={
+        "openai-codex": {"tokens": {"access_token": "old", "refresh_token": "old-refresh"}},
+    }))
+    _write(profile_env["profile"] / "auth.json", _make_auth_store(pool={
+        "openrouter": [{"id": "profile-or", "access_token": "profile-key"}],
+    }, providers={"openrouter": {"api_key": "profile-key"}}))
+
+    _save_codex_tokens({"access_token": "fresh", "refresh_token": "fresh-refresh"})
+
+    root = json.loads((profile_env["global"] / "auth.json").read_text())
+    profile = json.loads((profile_env["profile"] / "auth.json").read_text())
+    assert root["providers"]["openai-codex"]["tokens"]["access_token"] == "fresh"
+    assert root["credential_pool"]["openai-codex"][0]["access_token"] == "fresh"
+    assert "openai-codex" not in profile["providers"]
+    assert "openai-codex" not in profile.get("credential_pool", {})
+    assert profile["providers"]["openrouter"]["api_key"] == "profile-key"

@@ -17,7 +17,6 @@ import { prevRenderedMsg } from '../domain/blockLayout.js'
 import {
   COMPOSER_PROMPT_GAP_WIDTH,
   composerPromptWidth,
-  inputVisualHeight,
   stableComposerColumns
 } from '../lib/inputMetrics.js'
 import { PerfPane } from '../lib/perfPane.js'
@@ -290,7 +289,6 @@ const ComposerPane = memo(function ComposerPane({
   const promptWidth = composerPromptWidth(promptText)
   const promptBlank = ' '.repeat(promptWidth)
   const inputColumns = stableComposerColumns(composer.cols, promptWidth, TERMUX_TUI_MODE)
-  const inputHeight = inputVisualHeight(composer.input, inputColumns)
   const inputMouseRef = useRef<null | TextInputMouseApi>(null)
 
   const captureInputDrag = (e: GutterMouseEvent) => {
@@ -414,7 +412,12 @@ const ComposerPane = memo(function ComposerPane({
                 )}
               </Box>
 
-              <Box flexGrow={0} flexShrink={0} height={inputHeight} width={inputColumns}>
+              {/* NOTE: no explicit `height` here — TextInput renders from its own internal
+                  refs (vRef.current), NOT from the React `value` prop, so a stale
+                  `inputHeight` derived from `composer.input` (which lags behind during
+                  fast-echo backspace/append) would leave the box taller than the actual
+                  text. Omission lets Ink auto-size from the always-fresh rendered content. */}
+              <Box flexGrow={0} flexShrink={0} width={inputColumns}>
                 {/* Reserve the transcript scrollbar gutter too so typing never rewraps when the scrollbar column repaints. */}
                 <TextInput
                   color={ui.theme.color.text}

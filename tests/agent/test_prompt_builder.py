@@ -18,6 +18,7 @@ from agent.prompt_builder import (
     build_skills_system_prompt,
     build_nous_subscription_prompt,
     build_context_files_prompt,
+    load_universal_policy_md,
     CONTEXT_FILE_MAX_CHARS,
     _dynamic_context_file_max_chars,
     _get_context_file_max_chars,
@@ -516,6 +517,29 @@ class TestBuildContextFilesPrompt:
 
 
 
+
+
+class TestUniversalProfilePolicy:
+    def test_named_profile_loads_root_policy_without_changing_cwd_discovery(
+        self, tmp_path, monkeypatch
+    ):
+        root = tmp_path / "hermes"
+        profile = root / "profiles" / "specialist"
+        profile.mkdir(parents=True)
+        (root / "AGENTS.md").write_text("Universal SoLoRecall policy.")
+        monkeypatch.setenv("HERMES_HOME", str(profile))
+
+        assert load_universal_policy_md() == "Universal SoLoRecall policy."
+
+    def test_default_profile_does_not_load_its_root_policy_twice(
+        self, tmp_path, monkeypatch
+    ):
+        root = tmp_path / "hermes"
+        root.mkdir()
+        (root / "AGENTS.md").write_text("Universal SoLoRecall policy.")
+        monkeypatch.setenv("HERMES_HOME", str(root))
+
+        assert load_universal_policy_md() is None
 
 
 # =========================================================================

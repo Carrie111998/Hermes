@@ -416,6 +416,36 @@ def test_create_happy_path(worker_env):
         conn.close()
 
 
+def test_create_review_status_enters_review_and_is_claimable(worker_env):
+    """Tool-created PR review cards use the native review dispatch path."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    schema = kt.KANBAN_CREATE_SCHEMA["parameters"]["properties"]["initial_status"]
+    assert schema["enum"] == ["running", "blocked", "review"]
+
+    out = json.loads(kt._handle_create({
+        "title": "review child task",
+        "assignee": "reviewer",
+        "initial_status": "review",
+    }))
+    assert out["ok"] is True
+    assert out["status"] == "review"
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, out["task_id"])
+        assert task is not None
+        assert task.status == "review"
+        claimed = kb.claim_review_task(
+            conn, out["task_id"], claimer="worker:reviewer"
+        )
+        assert claimed is not None
+        assert claimed.status == "running"
+    finally:
+        conn.close()
+
+
 def test_link_happy_path(worker_env):
     from hermes_cli import kanban_db as kb
     conn = kb.connect()

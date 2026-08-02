@@ -401,6 +401,22 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "to skip the brief running-to-blocked transition.")
     p_create.add_argument("--json", action="store_true", help="Emit JSON output")
 
+    p_ingest_pr = sub.add_parser(
+        "ingest-pr", help="Idempotently create/update a Review card from a GitHub pull_request event"
+    )
+    p_ingest_pr.add_argument("--repository", required=True, help="owner/repo")
+    p_ingest_pr.add_argument("--number", required=True, type=int, help="Pull request number")
+    p_ingest_pr.add_argument("--head-sha", required=True, help="PR head SHA")
+    p_ingest_pr.add_argument("--title", required=True, help="PR title")
+    p_ingest_pr.add_argument("--assignee", default=None, help="Reviewer profile")
+    p_ingest_pr.add_argument("--url", default=None, help="PR URL")
+    p_ingest_pr.add_argument("--draft", action="store_true")
+    p_ingest_pr.add_argument("--checks-passed", choices=("true", "false"), default=None)
+    p_ingest_pr.add_argument("--mergeable", choices=("true", "false"), default=None)
+    p_ingest_pr.add_argument("--action", choices=("open", "reopened", "synchronize", "closed", "merged"), default="open")
+    p_ingest_pr.add_argument("--metadata", default=None, help="Additional JSON payload metadata")
+    p_ingest_pr.add_argument("--json", action="store_true")
+
     # --- swarm ---
     p_swarm = sub.add_parser(
         "swarm",
@@ -600,6 +616,21 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_complete.add_argument("--metadata", default=None,
                             help='JSON dict of structured facts (e.g. \'{"changed_files": [...], '
                                  '"tests_run": 12}\'). Stored on the closing run.')
+
+    p_submit_review = sub.add_parser(
+        "submit-review", help="Submit a running implementation to the Review lane"
+    )
+    p_submit_review.add_argument("task_id")
+    p_submit_review.add_argument("reviewer")
+    p_submit_review.add_argument("summary", nargs="+", help="Review handoff summary")
+    p_submit_review.add_argument("--metadata", default=None, help="JSON evidence object")
+
+    p_review_changes = sub.add_parser(
+        "review-changes", help="Complete a review and create implementer remediation"
+    )
+    p_review_changes.add_argument("task_id")
+    p_review_changes.add_argument("summary", nargs="+", help="Requested changes")
+    p_review_changes.add_argument("--metadata", default=None, help="JSON findings object")
 
     p_edit = sub.add_parser(
         "edit",
@@ -1044,6 +1075,7 @@ def kanban_command(args: argparse.Namespace) -> int:
         handlers = {
             "init":     _cmd_init,
             "create":   _cmd_create,
+            "ingest-pr": _cmd_ingest_pr,
             "swarm":    _cmd_swarm,
             "list":     _cmd_list,
             "ls":       _cmd_list,
@@ -1062,6 +1094,8 @@ def kanban_command(args: argparse.Namespace) -> int:
             "attachments": _cmd_attachments,
             "attach-rm": _cmd_attach_rm,
             "complete": _cmd_complete,
+            "submit-review": _cmd_submit_review,
+            "review-changes": _cmd_review_changes,
             "edit":     _cmd_edit,
             "block":    _cmd_block,
             "schedule": _cmd_schedule,
@@ -1099,6 +1133,34 @@ def kanban_command(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 # Handlers
 # ---------------------------------------------------------------------------
+
+def _cmd_ingest_pr(args: argparse.Namespace) -> int:
+    if args.metadata:
+        try:
+            metadata = json.loads(args.metadata)
+        except json.JSONDecodeError as exc:
+            print(f"kanban: --metadata: {exc}", file=sys.stderr)
+            return 2
+        if not isinstance(metadata, dict):
+            print("kanban: --metadata must be a JSON object", file=sys.stderr)
+            return 2
+    else:
+        metadata = None
+    def as_bool(value):
+        return None if value is None else value == "true"
+    with kb.connect_closing() as conn:
+        task_id = kb.ingest_pull_request(
+            conn, repository=args.repository, number=args.number, head_sha=args.head_sha,
+            title=args.title, reviewer=args.assignee, url=args.url, draft=args.draft,
+            checks_passed=as_bool(args.checks_passed), mergeable=as_bool(args.mergeable),
+            metadata=metadata, action=args.action,
+        )
+        task = kb.get_task(conn, task_id)
+    if args.json:
+        print(json.dumps(_task_to_dict(task), ensure_ascii=False))
+    else:
+        print(f"Ingested GitHub PR as {task_id} ({task.status if task else 'unknown'})")
+    return 0
 
 def _profile_author() -> str:
     """Best-effort author name for an interactive CLI call."""
@@ -2136,6 +2198,46 @@ def _worker_run_id_for(task_id: str) -> Optional[int]:
         return int(raw)
     except ValueError:
         return None
+
+
+def _cmd_submit_review(args: argparse.Namespace) -> int:
+    metadata = None
+    if args.metadata:
+        metadata = json.loads(args.metadata)
+        if not isinstance(metadata, dict):
+            raise ValueError("--metadata must be a JSON object")
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, args.task_id)
+        run_id = task.current_run_id if task else None
+        if not kb.submit_for_review(
+            conn, args.task_id, reviewer=args.reviewer,
+            summary=" ".join(args.summary), metadata=metadata,
+            expected_run_id=run_id,
+        ):
+            print(f"cannot submit {args.task_id} for review", file=sys.stderr)
+            return 1
+    print(f"Submitted {args.task_id} for review")
+    return 0
+
+
+def _cmd_review_changes(args: argparse.Namespace) -> int:
+    metadata = None
+    if args.metadata:
+        metadata = json.loads(args.metadata)
+        if not isinstance(metadata, dict):
+            raise ValueError("--metadata must be a JSON object")
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, args.task_id)
+        run_id = task.current_run_id if task else None
+        remediation = kb.request_review_changes(
+            conn, args.task_id, summary=" ".join(args.summary), metadata=metadata,
+            expected_run_id=run_id,
+        )
+    if not remediation:
+        print(f"cannot request changes for {args.task_id}", file=sys.stderr)
+        return 1
+    print(f"Review changes recorded; remediation task: {remediation}")
+    return 0
 
 
 def _cmd_complete(args: argparse.Namespace) -> int:

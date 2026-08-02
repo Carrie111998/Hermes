@@ -140,6 +140,91 @@ class TestSystemdServiceRefresh:
 
 
 
+class TestSystemdUnitCurrentPathNormalization:
+    def _configure_stable_user_unit(self, tmp_path, monkeypatch):
+        unit_path = tmp_path / "hermes-gateway.service"
+        hermes_home = tmp_path / "home" / ".hermes"
+        hermes_home.mkdir(parents=True)
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path / "home"))
+        monkeypatch.setattr(
+            gateway_cli, "get_systemd_unit_path", lambda system=False: unit_path
+        )
+        monkeypatch.setattr(gateway_cli, "is_wsl", lambda: False)
+        monkeypatch.setattr(
+            gateway_cli, "_build_user_local_paths", lambda home, existing: []
+        )
+        return unit_path
+
+    @pytest.mark.parametrize(
+        "current_node",
+        [
+            "/home/test/.nvm/versions/node/v24.14.0/bin/node",
+            "/home/linuxbrew/.linuxbrew/bin/node",
+            "/usr/bin/node",
+            None,
+        ],
+    )
+    def test_systemd_unit_is_current_ignores_path_payload_drift(
+        self, tmp_path, monkeypatch, current_node
+    ):
+        unit_path = self._configure_stable_user_unit(tmp_path, monkeypatch)
+        installed_node = "/home/test/.nvm/versions/node/v24.14.0/bin/node"
+        node_path = {"value": installed_node}
+        monkeypatch.setattr(
+            gateway_cli.shutil,
+            "which",
+            lambda cmd: node_path["value"] if cmd == "node" else None,
+        )
+
+        installed = gateway_cli.generate_systemd_unit(system=False)
+        assert "/home/test/.nvm/versions/node/v24.14.0/bin" in installed
+        unit_path.write_text(installed, encoding="utf-8")
+
+        node_path["value"] = current_node
+
+        assert gateway_cli.systemd_unit_is_current(system=False) is True
+
+    @pytest.mark.parametrize("stale_field", ["timeout", "hermes_home"])
+    def test_systemd_unit_is_current_still_detects_real_drift(
+        self, tmp_path, monkeypatch, stale_field
+    ):
+        unit_path = self._configure_stable_user_unit(tmp_path, monkeypatch)
+        node_path = {"value": "/home/test/.nvm/versions/node/v24.14.0/bin/node"}
+        monkeypatch.setattr(
+            gateway_cli.shutil,
+            "which",
+            lambda cmd: node_path["value"] if cmd == "node" else None,
+        )
+        installed = gateway_cli.generate_systemd_unit(system=False)
+
+        if stale_field == "timeout":
+            timeout_line = next(
+                line
+                for line in installed.splitlines()
+                if line.startswith("TimeoutStopSec=")
+            )
+            timeout = int(timeout_line.split("=", 1)[1])
+            installed = installed.replace(
+                timeout_line, f"TimeoutStopSec={timeout + 1}"
+            )
+        else:
+            hermes_home_line = next(
+                line
+                for line in installed.splitlines()
+                if line.startswith('Environment="HERMES_HOME=')
+            )
+            installed = installed.replace(
+                hermes_home_line,
+                'Environment="HERMES_HOME=/opt/stale-hermes"',
+            )
+
+        unit_path.write_text(installed, encoding="utf-8")
+        node_path["value"] = "/home/linuxbrew/.linuxbrew/bin/node"
+
+        assert gateway_cli.systemd_unit_is_current(system=False) is False
+
+
 class TestTempHomeServiceDefinitionGuard:
     """_temp_home_in_service_definition() — structural temp-dir detection."""
 

@@ -2926,6 +2926,26 @@ def _normalize_launchd_plist_for_comparison(text: str) -> str:
     )
 
 
+def _normalize_systemd_unit_for_comparison(text: str) -> str:
+    """Normalize systemd unit text for staleness checks.
+
+    The generated unit captures a PATH assembled from the invoking shell,
+    including the directory where ``node`` is found. That makes raw text
+    comparison unstable across shells, so ignore only the PATH payload while
+    keeping all other directives compared verbatim.
+    """
+    import re
+
+    normalized = _normalize_service_definition(
+        _strip_optional_systemd_directives(text)
+    )
+    return re.sub(
+        r'(?m)^(\s*Environment="PATH=)[^"\n]*(")$',
+        r"\1__HERMES_PATH__\2",
+        normalized,
+    )
+
+
 def systemd_unit_is_current(system: bool = False) -> bool:
     # ── HERMES_HOME sync chokepoint ──────────────────────────────────────
     # Every path that compares OR regenerates the unit funnels through here:
@@ -2952,15 +2972,8 @@ def systemd_unit_is_current(system: bool = False) -> bool:
     installed = unit_path.read_text(encoding="utf-8")
     expected_user = _read_systemd_user_from_unit(unit_path) if system else None
     expected = generate_systemd_unit(system=system, run_as_user=expected_user)
-    # Normalize out directives that older systemd versions silently drop
-    # (RestartMaxDelaySec, RestartSteps) so a unit that differs only by
-    # those directives is not perpetually flagged as outdated.
-    norm_installed = _normalize_service_definition(
-        _strip_optional_systemd_directives(installed)
-    )
-    norm_expected = _normalize_service_definition(
-        _strip_optional_systemd_directives(expected)
-    )
+    norm_installed = _normalize_systemd_unit_for_comparison(installed)
+    norm_expected = _normalize_systemd_unit_for_comparison(expected)
     return norm_installed == norm_expected
 
 

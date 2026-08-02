@@ -142,6 +142,31 @@ def has_bundled_skills_opt_out(profile_dir: Path) -> bool:
         return False
 
 
+def _strip_codex_auth_state(profile_dir: Path) -> None:
+    """Remove copied root-owned Codex state from a newly created profile."""
+    auth_path = profile_dir / "auth.json"
+    if not auth_path.is_file():
+        return
+    try:
+        auth_store = json.loads(auth_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return
+    if not isinstance(auth_store, dict):
+        return
+    changed = False
+    providers = auth_store.get("providers")
+    if isinstance(providers, dict) and providers.pop("openai-codex", None) is not None:
+        changed = True
+    pool = auth_store.get("credential_pool")
+    if isinstance(pool, dict) and pool.pop("openai-codex", None) is not None:
+        changed = True
+    if changed:
+        try:
+            auth_path.write_text(json.dumps(auth_store, indent=2) + "\n", encoding="utf-8")
+        except OSError:
+            pass
+
+
 def _clone_all_copytree_ignore(source_dir: Path):
     """Exclude infrastructure artifacts when cloning a profile via --clone-all.
 
@@ -1106,6 +1131,11 @@ def create_profile(
                     dst = profile_dir / relpath
                     dst.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(src, dst)
+
+    # Codex OAuth and its credential pool are shared at the root. A full
+    # clone may have copied auth.json, so drop only that provider's state while
+    # preserving every other profile credential.
+    _strip_codex_auth_state(profile_dir)
 
     # Seed an empty .env so the profile has its own credentials file from
     # day one. Without it, profile-scoped env writes (dashboard Channels /
