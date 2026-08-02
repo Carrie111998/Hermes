@@ -1445,6 +1445,28 @@ def _path_is_within(path: Path, root: Path) -> bool:
         return False
 
 
+# MSYS/Cygwin-style drive paths (``/c/Users/...``, ``/d/tmp``, or a bare
+# ``/c``). Git Bash rewrites Windows paths into this form, so any tool the
+# agent runs through it reports files this way.
+_MSYS_DRIVE_RE = re.compile(r"^/([A-Za-z])(?:/(?P<rest>.*))?$")
+
+
+def _msys_to_windows_path(path: str) -> str:
+    r"""Translate an MSYS/Cygwin drive path to native Windows form.
+
+    ``/c/Users/me/out.png`` -> ``C:\Users\me\out.png``. Windows-only: on
+    POSIX hosts ``/c/...`` is a legitimate absolute path and must be left
+    alone. Anything that is not a drive path is returned unchanged.
+    """
+    if not path or sys.platform != "win32":
+        return path
+    match = _MSYS_DRIVE_RE.match(path)
+    if not match:
+        return path
+    rest = (match.group("rest") or "").replace("/", "\\")
+    return f"{match.group(1).upper()}:\\{rest}"
+
+
 def validate_media_delivery_path(path: str) -> Optional[str]:
     """Return a safe absolute file path for native media delivery, else None.
 
@@ -1474,6 +1496,11 @@ def validate_media_delivery_path(path: str) -> Optional[str]:
     candidate = candidate.lstrip("`\"'").rstrip("`\"',.;:)}]")
     if not candidate:
         return None
+
+    # A path produced via Git Bash arrives as ``/c/Users/...``. Path() on
+    # Windows treats that as rooted-but-driveless, so ``is_absolute()`` is
+    # False and the file is rejected as unsafe even though it exists.
+    candidate = _msys_to_windows_path(candidate)
 
     try:
         expanded = Path(os.path.expanduser(candidate))

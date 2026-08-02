@@ -1,6 +1,7 @@
 """Tests for gateway/platforms/base.py — MessageEvent, media extraction, message truncation."""
 
 import os
+import sys
 import time
 from unittest.mock import patch
 
@@ -1117,3 +1118,56 @@ class TestMediaFallbackDoesNotLeakHostPath:
         sent_text = adapter.sent[0]["content"]
         assert "Here's the daily summary." in sent_text
         assert self.SENSITIVE_PATH not in sent_text
+
+
+class TestMsysMediaDeliveryPaths:
+    """Git Bash hands back ``/c/Users/...``; media delivery must still accept it.
+
+    ``Path("/c/Users/me/out.png")`` on Windows is rooted but driveless, so
+    ``is_absolute()`` is False and ``validate_media_delivery_path`` rejected
+    the file as unsafe even though it existed. Any tool the agent ran through
+    Git Bash therefore produced a path it could not then deliver, surfacing
+    as "Skipping unsafe MEDIA directive path".
+    """
+
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [
+            ("/c/Users/me/out.png", r"C:\Users\me\out.png"),
+            ("/d/tmp/report.pdf", r"D:\tmp\report.pdf"),
+            ("/c/", "C:\\"),
+            ("/c", "C:\\"),
+            # Already-native paths and POSIX non-drive paths are untouched.
+            (r"C:\Users\me\out.png", r"C:\Users\me\out.png"),
+            ("/home/me/out.png", "/home/me/out.png"),
+            ("/usr/share/thing.png", "/usr/share/thing.png"),
+            ("", ""),
+        ],
+    )
+    def test_conversion_on_windows(self, raw, expected, monkeypatch):
+        import gateway.platforms.base as base
+
+        monkeypatch.setattr(base.sys, "platform", "win32")
+        assert base._msys_to_windows_path(raw) == expected
+
+    @pytest.mark.parametrize("raw", ["/c/Users/me/out.png", "/d/tmp/report.pdf"])
+    def test_noop_on_posix(self, raw, monkeypatch):
+        """On POSIX ``/c/...`` is a real path and must never be rewritten."""
+        import gateway.platforms.base as base
+
+        monkeypatch.setattr(base.sys, "platform", "linux")
+        assert base._msys_to_windows_path(raw) == raw
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="Windows drive semantics")
+    def test_msys_path_is_accepted_end_to_end(self, tmp_path, monkeypatch):
+        import gateway.platforms.base as base
+
+        monkeypatch.setattr(base, "MEDIA_DELIVERY_SAFE_ROOTS", (str(tmp_path),))
+        monkeypatch.delenv("HERMES_MEDIA_DELIVERY_STRICT", raising=False)
+        target = tmp_path / "out.png"
+        target.write_bytes(b"\x89PNG\r\n\x1a\n")
+
+        drive, rest = str(target).split(":", 1)
+        msys = f"/{drive.lower()}{rest.replace(chr(92), '/')}"
+
+        assert base.validate_media_delivery_path(msys) is not None
