@@ -31,6 +31,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple, Set
 
+from hermes_cli.config_defaults import (
+    DEFAULT_CONFIG as _UPSTREAM_DEFAULT_CONFIG,
+    OPTIONAL_ENV_VARS,
+)
 from hermes_cli.route_identity import normalize_route_base_url
 from hermes_cli.secret_prompt import masked_secret_prompt
 
@@ -3803,6 +3807,22 @@ DEFAULT_CONFIG = {
     # Config schema version - bump this when adding new required fields
     "_config_version": 33,
 }
+
+
+def _merge_default_config(
+    base: Dict[str, Any], overrides: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Overlay fork defaults onto the upstream schema without dropping new keys."""
+    merged = copy.deepcopy(base)
+    for key, value in overrides.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _merge_default_config(merged[key], value)
+        else:
+            merged[key] = copy.deepcopy(value)
+    return merged
+
+
+DEFAULT_CONFIG = _merge_default_config(_UPSTREAM_DEFAULT_CONFIG, DEFAULT_CONFIG)
 
 # =============================================================================
 # Config Migration System
