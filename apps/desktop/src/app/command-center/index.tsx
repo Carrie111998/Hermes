@@ -47,6 +47,7 @@ const LOG_LEVELS = ['ALL', 'INFO', 'WARNING', 'ERROR'] as const
 
 const USAGE_PERIODS = [7, 30, 90] as const
 type UsagePeriod = (typeof USAGE_PERIODS)[number]
+const MIN_DISPLAYED_USAGE_COST_USD = 0.0001
 
 // Stable empty arrays so the selector returns the same reference when we're
 // not on the Sessions tab — useStoreSelector bails out on Object.is, so the
@@ -75,6 +76,35 @@ function formatTimestamp(value?: number | null): string {
   }
 
   return fmtDateTime.format(date)
+}
+
+function formatUsageCost(value: null | number | undefined, locale: string): string {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
+    return '$0.00'
+  }
+
+  const fractionDigits = value < 0.01 ? 4 : 2
+
+  const formatter = new Intl.NumberFormat(locale, {
+    currency: 'USD',
+    maximumFractionDigits: fractionDigits,
+    minimumFractionDigits: fractionDigits,
+    style: 'currency'
+  })
+
+  if (value < MIN_DISPLAYED_USAGE_COST_USD) {
+    return `<${formatter.format(MIN_DISPLAYED_USAGE_COST_USD)}`
+  }
+
+  return formatter.format(value)
+}
+
+function formatUsageRate(estimatedCost: number, totalTokens: number, locale: string): string {
+  if (!Number.isFinite(totalTokens) || totalTokens <= 0) {
+    return '$0.00'
+  }
+
+  return formatUsageCost((estimatedCost / totalTokens) * 1_000_000, locale)
 }
 
 function useDebouncedValue<T>(value: T, delayMs: number): T {
@@ -521,8 +551,8 @@ interface UsagePanelProps {
   usage: AnalyticsResponse | null
 }
 
-function UsagePanel({ error, loading, onRefresh, period, usage }: UsagePanelProps) {
-  const { t } = useI18n()
+export function UsagePanel({ error, loading, onRefresh, period, usage }: UsagePanelProps) {
+  const { locale, t } = useI18n()
   const cc = t.commandCenter
   const daily = useMemo(() => usage?.daily ?? [], [usage])
   const totals = usage?.totals
@@ -625,14 +655,28 @@ function UsagePanel({ error, loading, onRefresh, period, usage }: UsagePanelProp
         )}
       </section>
 
-      <div className="grid min-h-0 gap-x-8 gap-y-5 pt-1 sm:grid-cols-2">
+      <div className="grid min-h-0 gap-x-8 gap-y-5 pt-1 md:grid-cols-2">
         <UsageList
           emptyLabel={cc.noModelUsage}
-          rows={byModel.slice(0, 6).map(entry => ({
-            key: entry.model,
-            label: entry.model,
-            value: `${compactNumber((entry.input_tokens || 0) + (entry.output_tokens || 0))}`
-          }))}
+          rows={byModel.slice(0, 6).map(entry => {
+            const modelTokens = (entry.input_tokens || 0) + (entry.output_tokens || 0)
+
+            const hasEstimatedRate =
+              Number.isFinite(entry.estimated_cost) && entry.estimated_cost > 0 && modelTokens > 0
+
+            return {
+              key: entry.model,
+              label: entry.model,
+              value: hasEstimatedRate
+                ? cc.modelUsage(
+                    compactNumber(modelTokens),
+                    formatUsageCost(entry.estimated_cost, locale),
+                    formatUsageRate(entry.estimated_cost, modelTokens, locale)
+                  )
+                : cc.modelTokens(compactNumber(modelTokens))
+            }
+          })}
+          stacked
           title={cc.topModels}
         />
         <UsageList
@@ -652,10 +696,12 @@ function UsagePanel({ error, loading, onRefresh, period, usage }: UsagePanelProp
 function UsageList({
   emptyLabel,
   rows,
+  stacked = false,
   title
 }: {
   emptyLabel: string
   rows: Array<{ key: string; label: string; value: string }>
+  stacked?: boolean
   title: string
 }) {
   return (
@@ -670,9 +716,11 @@ function UsageList({
       ) : (
         <ul>
           {rows.map(row => (
-            <li className="flex items-center justify-between gap-2 py-1.5" key={row.key}>
-              <span className="min-w-0 truncate font-mono text-[0.7rem] text-foreground">{row.label}</span>
-              <span className="shrink-0 text-[0.65rem] text-(--ui-text-tertiary)">{row.value}</span>
+            <li className={cn(stacked ? 'py-1.5' : 'flex items-center justify-between gap-2 py-1.5')} key={row.key}>
+              <span className="block min-w-0 truncate font-mono text-[0.7rem] text-foreground">{row.label}</span>
+              <span className={cn('text-[0.65rem] text-(--ui-text-tertiary)', stacked ? 'mt-0.5 block' : 'shrink-0')}>
+                {row.value}
+              </span>
             </li>
           ))}
         </ul>

@@ -1283,6 +1283,9 @@ export const en: Translations = {
     noDailyActivity: 'No daily activity.',
     topModels: 'Top models',
     noModelUsage: 'No model usage yet.',
+    modelUsage: (tokens, estimatedCost, effectiveRate) =>
+      `${tokens} I/O tokens · recorded est. ${estimatedCost} · effective ${effectiveRate} per 1M displayed I/O tokens`,
+    modelTokens: tokens => `${tokens} I/O tokens`,
     topSkills: 'Top skills',
     noSkillActivity: 'No skill activity yet.',
     actions: count => `${count} actions`,

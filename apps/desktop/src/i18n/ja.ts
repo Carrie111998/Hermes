@@ -1243,6 +1243,9 @@ export const ja = defineLocale({
     noDailyActivity: '日別アクティビティがありません。',
     topModels: 'よく使うモデル',
     noModelUsage: 'モデルの使用履歴はまだありません。',
+    modelUsage: (tokens, estimatedCost, effectiveRate) =>
+      `${tokens} I/Oトークン · 記録済み推定 ${estimatedCost} · 表示I/Oトークン100万件あたりの実効 ${effectiveRate}`,
+    modelTokens: tokens => `${tokens} I/Oトークン`,
     topSkills: 'よく使うスキル',
     noSkillActivity: 'スキルのアクティビティはまだありません。',
     actions: count => `${count} アクション`

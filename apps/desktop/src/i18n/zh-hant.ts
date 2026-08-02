@@ -1208,6 +1208,9 @@ export const zhHant = defineLocale({
     noDailyActivity: '暫無每日活動。',
     topModels: '常用模型',
     noModelUsage: '暫無模型使用量。',
+    modelUsage: (tokens, estimatedCost, effectiveRate) =>
+      `${tokens} 輸入/輸出詞元 · 已記錄預估 ${estimatedCost} · 每百萬已顯示輸入/輸出詞元折算 ${effectiveRate}`,
+    modelTokens: tokens => `${tokens} 輸入/輸出詞元`,
     topSkills: '常用技能',
     noSkillActivity: '暫無技能活動。',
     actions: count => `${count} 次動作`

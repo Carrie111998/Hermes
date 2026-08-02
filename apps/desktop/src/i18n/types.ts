@@ -1128,6 +1128,8 @@ export interface Translations {
     noDailyActivity: string
     topModels: string
     noModelUsage: string
+    modelUsage: (tokens: string, estimatedCost: string, effectiveRate: string) => string
+    modelTokens: (tokens: string) => string
     topSkills: string
     noSkillActivity: string
     actions: (count: string) => string

@@ -1479,6 +1479,9 @@ export const zh: Translations = {
     noDailyActivity: '暂无每日活动。',
     topModels: '常用模型',
     noModelUsage: '暂无模型用量。',
+    modelUsage: (tokens, estimatedCost, effectiveRate) =>
+      `${tokens} 输入/输出词元 · 已记录预估 ${estimatedCost} · 每百万已显示输入/输出词元折算 ${effectiveRate}`,
+    modelTokens: tokens => `${tokens} 输入/输出词元`,
     topSkills: '常用技能',
     noSkillActivity: '暂无技能活动。',
     actions: count => `${count} 次操作`,

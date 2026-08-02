@@ -1109,6 +1109,9 @@ export const ar = defineLocale({
     noDailyActivity: 'لا يوجد نشاط يومي',
     topModels: 'أكثر النماذج استخداما',
     noModelUsage: 'لا يوجد استخدام نماذج',
+    modelUsage: (tokens, estimatedCost, effectiveRate) =>
+      `${tokens} رمز إدخال/إخراج · تقدير مسجل ${estimatedCost} · معدل تقديري ${effectiveRate} لكل مليون رمز إدخال/إخراج معروض`,
+    modelTokens: tokens => `${tokens} رمز إدخال/إخراج`,
     topSkills: 'أكثر المهارات استخداما',
     noSkillActivity: 'لا يوجد نشاط مهارات',
     actions: count => `${count} إجراء`
