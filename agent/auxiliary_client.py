@@ -231,6 +231,30 @@ def _create_openai_client(*, api_key: str, base_url: str, **kwargs: Any) -> Any:
     return OpenAI(api_key=api_key, base_url=base_url, **kwargs)
 
 
+def _mark_resolved_api_mode(client: Any, api_mode: Optional[str]) -> Any:
+    """Carry non-secret resolver transport metadata with a concrete client."""
+
+    mode = str(api_mode or "").strip().lower()
+    if mode:
+        try:
+            setattr(client, "_hermes_resolved_api_mode", mode)
+        except Exception:
+            logger.debug(
+                "Auxiliary client does not accept resolved API mode metadata",
+                exc_info=True,
+            )
+    return client
+
+
+def _inherit_resolved_api_mode(source: Any, target: Any) -> Any:
+    """Preserve resolver transport metadata across sync-to-async wrapping."""
+
+    return _mark_resolved_api_mode(
+        target,
+        getattr(source, "_hermes_resolved_api_mode", None),
+    )
+
+
 # ── Interrupt protection for atomic auxiliary tasks ──────────────────────
 # Some auxiliary tasks must NOT be aborted mid-flight by a gateway interrupt
 # (e.g. an incoming user message while the agent is busy). Context
@@ -3465,20 +3489,22 @@ def _try_azure_foundry(
         # GPT-5.x / o-series / codex models on Azure Foundry are
         # Responses-API-only — wrap so chat.completions.create() is
         # translated to /responses behind the scenes.
-        return CodexAuxiliaryClient(client, final_model), final_model
+        client = CodexAuxiliaryClient(client, final_model)
+        return _mark_resolved_api_mode(client, runtime_api_mode), final_model
 
     if runtime_api_mode == "anthropic_messages":
         # Forward ``api_key`` verbatim — for static keys it's a string,
         # for Entra ID it's a callable. ``_maybe_wrap_anthropic`` →
         # ``build_anthropic_client`` detects the callable and installs
         # the bearer-injecting httpx hook.
-        return _maybe_wrap_anthropic(
+        client = _maybe_wrap_anthropic(
             client, final_model, api_key,
             base_url, runtime_api_mode,
-        ), final_model
+        )
+        return _mark_resolved_api_mode(client, runtime_api_mode), final_model
 
     # chat_completions — return the plain OpenAI client.
-    return client, final_model
+    return _mark_resolved_api_mode(client, runtime_api_mode), final_model
 
 
 def _try_anthropic(explicit_api_key: str = None) -> Tuple[Optional[Any], Optional[str]]:
@@ -5590,16 +5616,20 @@ def _to_async_client(sync_client, model: str, is_vision: bool = False):
     from openai import AsyncOpenAI
 
     if isinstance(sync_client, CodexAuxiliaryClient):
-        return AsyncCodexAuxiliaryClient(sync_client), model
+        async_client = AsyncCodexAuxiliaryClient(sync_client)
+        return _inherit_resolved_api_mode(sync_client, async_client), model
     if isinstance(sync_client, AnthropicAuxiliaryClient):
-        return AsyncAnthropicAuxiliaryClient(sync_client), model
+        async_client = AsyncAnthropicAuxiliaryClient(sync_client)
+        return _inherit_resolved_api_mode(sync_client, async_client), model
     if isinstance(sync_client, BedrockAuxiliaryClient):
-        return AsyncBedrockAuxiliaryClient(sync_client), model
+        async_client = AsyncBedrockAuxiliaryClient(sync_client)
+        return _inherit_resolved_api_mode(sync_client, async_client), model
     try:
         from agent.gemini_native_adapter import GeminiNativeClient, AsyncGeminiNativeClient
 
         if isinstance(sync_client, GeminiNativeClient):
-            return AsyncGeminiNativeClient(sync_client), model
+            async_client = AsyncGeminiNativeClient(sync_client)
+            return _inherit_resolved_api_mode(sync_client, async_client), model
     except ImportError:
         pass
     try:
@@ -5654,7 +5684,8 @@ def _to_async_client(sync_client, model: str, is_vision: bool = False):
     # See _create_openai_client: disable SDK-internal retries so Hermes owns
     # the auxiliary retry/timeout budget (issue #54465).
     async_kwargs.setdefault("max_retries", 0)
-    return AsyncOpenAI(**async_kwargs), model
+    async_client = AsyncOpenAI(**async_kwargs)
+    return _inherit_resolved_api_mode(sync_client, async_client), model
 
 
 def _normalize_resolved_model(model_name: Optional[str], provider: str) -> Optional[str]:
@@ -5899,6 +5930,7 @@ def resolve_provider_client(
         client = _maybe_wrap_anthropic(
             client, final_model, api_key_str, base_url_str, portal_mode,
         )
+        client = _mark_resolved_api_mode(client, portal_mode)
         return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
                 else (client, final_model))
 
@@ -8458,6 +8490,120 @@ _STRICT_SUPPORTED_CLIENT_NAMES = frozenset({
     "AsyncCodexAuxiliaryClient",
 })
 
+_STRICT_EARLY_ROUTER_PROVIDERS = frozenset({
+    "auto",
+    "custom",
+    "moa",
+    "nous",
+    "openai-codex",
+    "openrouter",
+    "xai-oauth",
+})
+
+
+def _strict_named_custom_entry(provider: str) -> Optional[Dict[str, Any]]:
+    """Resolve the same named-custom precedence used by the client router."""
+
+    raw_provider = str(provider or "").strip().lower()
+    normalized_provider = _normalize_aux_provider(raw_provider)
+    if normalized_provider in _STRICT_EARLY_ROUTER_PROVIDERS:
+        return None
+    try:
+        from hermes_cli.runtime_provider import _get_named_custom_provider
+
+        if raw_provider and raw_provider != normalized_provider:
+            entry = _get_named_custom_provider(raw_provider)
+            if entry is not None:
+                return entry
+        return _get_named_custom_provider(normalized_provider)
+    except (ImportError, TypeError, ValueError):
+        return None
+
+
+def _strict_declared_api_mode(
+    provider: str,
+    api_mode: Optional[str],
+) -> Optional[str]:
+    """Return an explicit or named-provider wire mode for fail-closed checks."""
+
+    declared = str(api_mode or "").strip().lower()
+    if declared:
+        return declared
+    entry = _strict_named_custom_entry(provider)
+    if entry is None:
+        return None
+    return str(entry.get("api_mode") or "").strip().lower() or None
+
+
+def _strict_canonical_provider(
+    provider: str,
+    *,
+    preserve_custom_prefix: bool = False,
+) -> str:
+    """Canonicalize built-in aliases without hiding named custom providers."""
+
+    raw_provider = str(provider or "").strip().lower()
+    normalized_provider = _normalize_aux_provider(raw_provider)
+    if preserve_custom_prefix and raw_provider.startswith("custom:"):
+        return raw_provider
+    if normalized_provider in _STRICT_EARLY_ROUTER_PROVIDERS:
+        return normalized_provider
+    if raw_provider != normalized_provider:
+        entry = _strict_named_custom_entry(raw_provider)
+        if entry is not None:
+            return raw_provider
+    return normalized_provider
+
+
+def _require_strict_transport_api_mode(
+    client: Any,
+    *,
+    api_mode: Optional[str],
+    base_url: str,
+) -> None:
+    """Reject any configured wire-mode downgrade before outbound dispatch."""
+
+    mode = str(api_mode or "").strip().lower()
+    resolver_mode = str(
+        getattr(client, "_hermes_resolved_api_mode", None) or ""
+    ).strip().lower()
+    if mode and resolver_mode and mode != resolver_mode:
+        raise StrictExecutionUnsupported(
+            "strict_single_attempt API mode changed during client resolution"
+        )
+    mode = mode or resolver_mode
+    if not mode and _endpoint_speaks_anthropic_messages(base_url):
+        mode = "anthropic_messages"
+    if not mode:
+        return
+
+    is_anthropic = isinstance(
+        client,
+        (AnthropicAuxiliaryClient, AsyncAnthropicAuxiliaryClient),
+    )
+    is_codex = isinstance(
+        client,
+        (CodexAuxiliaryClient, AsyncCodexAuxiliaryClient),
+    )
+    if mode == "anthropic_messages" and is_anthropic:
+        return
+    if mode == "codex_responses" and is_codex:
+        return
+    if mode == "chat_completions" and not is_anthropic and not is_codex:
+        return
+    if mode not in {
+        "anthropic_messages",
+        "chat_completions",
+        "codex_responses",
+    }:
+        raise StrictExecutionUnsupported(
+            f"strict_single_attempt does not recognize API mode {mode!r}"
+        )
+    raise StrictExecutionUnsupported(
+        "strict_single_attempt transport does not match configured API mode "
+        f"{mode!r}"
+    )
+
 
 def _strict_transport_supported(client: Any) -> bool:
     """Return whether the transport exposes a provable one-invocation seam.
@@ -8508,12 +8654,23 @@ def _strict_sync_completion(
     dispatched_provider: str,
     dispatched_model: str,
     resolved_base_url: Optional[str],
+    resolved_api_mode: Optional[str],
     audit: LlmExecutionAudit,
 ) -> Any:
     require_matching_strict_route(
         audit,
         provider=dispatched_provider,
         model=dispatched_model,
+        requested_provider_for_match=_strict_canonical_provider(
+            requested_provider,
+            preserve_custom_prefix=True,
+        ),
+    )
+    base_url = str(getattr(client, "base_url", resolved_base_url) or "")
+    _require_strict_transport_api_mode(
+        client,
+        api_mode=resolved_api_mode,
+        base_url=base_url,
     )
     if not _strict_transport_supported(client):
         raise StrictExecutionUnsupported(
@@ -8525,7 +8682,6 @@ def _strict_sync_completion(
     try:
         if isinstance(client, AnthropicAuxiliaryClient):
             kwargs = {**kwargs, "_strict_single_attempt": True}
-        base_url = str(getattr(client, "base_url", resolved_base_url) or "")
         if _provider_requires_stream(dispatched_provider, base_url):
             response = _create_with_progress(
                 client,
@@ -8558,12 +8714,23 @@ async def _strict_async_completion(
     dispatched_provider: str,
     dispatched_model: str,
     resolved_base_url: Optional[str],
+    resolved_api_mode: Optional[str],
     audit: LlmExecutionAudit,
 ) -> Any:
     require_matching_strict_route(
         audit,
         provider=dispatched_provider,
         model=dispatched_model,
+        requested_provider_for_match=_strict_canonical_provider(
+            requested_provider,
+            preserve_custom_prefix=True,
+        ),
+    )
+    base_url = str(getattr(client, "base_url", resolved_base_url) or "")
+    _require_strict_transport_api_mode(
+        client,
+        api_mode=resolved_api_mode,
+        base_url=base_url,
     )
     if not _strict_transport_supported(client):
         raise StrictExecutionUnsupported(
@@ -8575,7 +8742,6 @@ async def _strict_async_completion(
     try:
         if isinstance(client, AsyncAnthropicAuxiliaryClient):
             kwargs = {**kwargs, "_strict_single_attempt": True}
-        base_url = str(getattr(client, "base_url", resolved_base_url) or "")
         force_stream = _provider_requires_stream(dispatched_provider, base_url)
         if force_stream and not isinstance(client, (
             AsyncCodexAuxiliaryClient,
@@ -8697,6 +8863,11 @@ def call_llm(
         resolved_api_mode = resolved_api_mode or custom_mode
     if api_mode:
         resolved_api_mode = api_mode
+    if not _allow_retry(resolved_execution_mode):
+        resolved_api_mode = _strict_declared_api_mode(
+            resolved_provider,
+            resolved_api_mode,
+        )
     effective_extra_body = _get_task_extra_body(task)
     effective_extra_body.update(extra_body or {})
 
@@ -8810,7 +8981,6 @@ def call_llm(
         kwargs["messages"] = _convert_openai_images_to_anthropic(kwargs["messages"])
 
     if not _allow_retry(resolved_execution_mode):
-        strict_provider_label = resolved_provider
         requested_provider = str(provider or "").strip().lower()
         direct_base = _AUX_DIRECT_API_BASE_URLS.get(requested_provider, "")
         if (
@@ -8819,6 +8989,8 @@ def call_llm(
             and str(resolved_base_url or "").rstrip("/") == direct_base.rstrip("/")
         ):
             strict_provider_label = str(provider).strip()
+        else:
+            strict_provider_label = _strict_canonical_provider(resolved_provider)
         return _strict_sync_completion(
             client,
             kwargs,
@@ -8828,6 +9000,7 @@ def call_llm(
             dispatched_provider=strict_provider_label,
             dispatched_model=str(final_model or ""),
             resolved_base_url=resolved_base_url,
+            resolved_api_mode=resolved_api_mode,
             audit=execution_audit,
         )
 
@@ -9475,6 +9648,11 @@ async def async_call_llm(
         resolved_base_url = custom_base
         resolved_api_key = custom_key
         resolved_api_mode = resolved_api_mode or custom_mode
+    if not _allow_retry(resolved_execution_mode):
+        resolved_api_mode = _strict_declared_api_mode(
+            resolved_provider,
+            resolved_api_mode,
+        )
     effective_extra_body = _get_task_extra_body(task)
     effective_extra_body.update(extra_body or {})
 
@@ -9572,7 +9750,6 @@ async def async_call_llm(
         kwargs["messages"] = _convert_openai_images_to_anthropic(kwargs["messages"])
 
     if not _allow_retry(resolved_execution_mode):
-        strict_provider_label = resolved_provider
         requested_provider = str(provider or "").strip().lower()
         direct_base = _AUX_DIRECT_API_BASE_URLS.get(requested_provider, "")
         if (
@@ -9581,6 +9758,8 @@ async def async_call_llm(
             and str(resolved_base_url or "").rstrip("/") == direct_base.rstrip("/")
         ):
             strict_provider_label = str(provider).strip()
+        else:
+            strict_provider_label = _strict_canonical_provider(resolved_provider)
         return await _strict_async_completion(
             client,
             kwargs,
@@ -9590,6 +9769,7 @@ async def async_call_llm(
             dispatched_provider=strict_provider_label,
             dispatched_model=str(final_model or ""),
             resolved_base_url=resolved_base_url,
+            resolved_api_mode=resolved_api_mode,
             audit=execution_audit,
         )
 

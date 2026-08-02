@@ -74,6 +74,7 @@ from agent.llm_execution import (
     StrictExecutionRouteMismatch,
     StrictExecutionUnsupported,
     _strict_mode,
+    attach_execution_audit,
     require_matching_strict_route,
     validate_strict_request,
 )
@@ -1013,24 +1014,30 @@ class PluginLlm:
         ``agent.auxiliary_client`` to avoid circular deps at plugin
         discovery time."""
         if self._sync_caller is not None:
-            if execution_audit is not None and _strict_mode(execution_mode):
+            strict_execution = _strict_mode(execution_mode)
+            if execution_audit is not None and strict_execution:
                 execution_audit.record_attempt()
+            caller_kwargs = {
+                "messages": messages,
+                "provider_override": provider_override,
+                "model_override": model_override,
+                "profile_override": profile_override,
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+                "timeout": timeout,
+                "extra_body": extra_body,
+            }
+            if strict_execution:
+                caller_kwargs.update({
+                    "execution_mode": execution_mode,
+                    "execution_audit": execution_audit,
+                })
             try:
-                provider, model, response = self._sync_caller(
-                    messages=messages,
-                    provider_override=provider_override,
-                    model_override=model_override,
-                    profile_override=profile_override,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    timeout=timeout,
-                    extra_body=extra_body,
-                    execution_mode=execution_mode,
-                    execution_audit=execution_audit,
-                )
+                provider, model, response = self._sync_caller(**caller_kwargs)
             except Exception as exc:
-                if execution_audit is not None and _strict_mode(execution_mode):
+                if execution_audit is not None and strict_execution:
                     execution_audit.record_failure(exc)
+                    attach_execution_audit(exc, execution_audit)
                 raise
             if execution_audit is not None:
                 self._record_injected_result(
@@ -1044,18 +1051,23 @@ class PluginLlm:
         merged_extra = dict(extra_body or {})
         if profile_override:
             merged_extra.setdefault("metadata", {})["auth_profile"] = profile_override
-        response = call_llm(
-            task=None,
-            provider=provider_override,
-            model=model_override,
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            timeout=timeout,
-            extra_body=merged_extra or None,
-            execution_mode=execution_mode,
-            execution_audit=execution_audit,
-        )
+        try:
+            response = call_llm(
+                task=None,
+                provider=provider_override,
+                model=model_override,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                timeout=timeout,
+                extra_body=merged_extra or None,
+                execution_mode=execution_mode,
+                execution_audit=execution_audit,
+            )
+        except Exception as exc:
+            if execution_audit is not None and _strict_mode(execution_mode):
+                attach_execution_audit(exc, execution_audit)
+            raise
         provider, model = _resolve_attribution(
             provider_override=provider_override,
             model_override=model_override,
@@ -1078,24 +1090,30 @@ class PluginLlm:
         execution_audit: Optional[LlmExecutionAudit] = None,
     ) -> tuple[str, str, Any]:
         if self._async_caller is not None:
-            if execution_audit is not None and _strict_mode(execution_mode):
+            strict_execution = _strict_mode(execution_mode)
+            if execution_audit is not None and strict_execution:
                 execution_audit.record_attempt()
+            caller_kwargs = {
+                "messages": messages,
+                "provider_override": provider_override,
+                "model_override": model_override,
+                "profile_override": profile_override,
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+                "timeout": timeout,
+                "extra_body": extra_body,
+            }
+            if strict_execution:
+                caller_kwargs.update({
+                    "execution_mode": execution_mode,
+                    "execution_audit": execution_audit,
+                })
             try:
-                provider, model, response = await self._async_caller(
-                    messages=messages,
-                    provider_override=provider_override,
-                    model_override=model_override,
-                    profile_override=profile_override,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    timeout=timeout,
-                    extra_body=extra_body,
-                    execution_mode=execution_mode,
-                    execution_audit=execution_audit,
-                )
+                provider, model, response = await self._async_caller(**caller_kwargs)
             except Exception as exc:
-                if execution_audit is not None and _strict_mode(execution_mode):
+                if execution_audit is not None and strict_execution:
                     execution_audit.record_failure(exc)
+                    attach_execution_audit(exc, execution_audit)
                 raise
             if execution_audit is not None:
                 self._record_injected_result(
@@ -1109,18 +1127,23 @@ class PluginLlm:
         merged_extra = dict(extra_body or {})
         if profile_override:
             merged_extra.setdefault("metadata", {})["auth_profile"] = profile_override
-        response = await async_call_llm(
-            task=None,
-            provider=provider_override,
-            model=model_override,
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            timeout=timeout,
-            extra_body=merged_extra or None,
-            execution_mode=execution_mode,
-            execution_audit=execution_audit,
-        )
+        try:
+            response = await async_call_llm(
+                task=None,
+                provider=provider_override,
+                model=model_override,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                timeout=timeout,
+                extra_body=merged_extra or None,
+                execution_mode=execution_mode,
+                execution_audit=execution_audit,
+            )
+        except Exception as exc:
+            if execution_audit is not None and _strict_mode(execution_mode):
+                attach_execution_audit(exc, execution_audit)
+            raise
         provider, model = _resolve_attribution(
             provider_override=provider_override,
             model_override=model_override,

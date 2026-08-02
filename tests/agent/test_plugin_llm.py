@@ -371,8 +371,8 @@ class TestPluginLlmFacade:
             "requested_model": "test-model",
             "dispatched_provider": "test-provider",
             "dispatched_model": "test-model",
-            "response_provider": "test-provider",
-            "response_model": "test-model",
+            "response_provider": "",
+            "response_model": "",
             "attempt_count": 1,
             "fallback_used": False,
             "credential_rotation_used": False,
@@ -380,6 +380,68 @@ class TestPluginLlmFacade:
             "delivery_ambiguous": False,
             "strict_contract_satisfied": True,
         }
+
+    def test_strict_failure_exposes_audit_without_replacing_exception(self):
+        def fake_caller(**_kwargs):
+            raise TimeoutError("request timed out")
+
+        llm = make_plugin_llm_for_test(
+            plugin_id="strict-plugin",
+            policy=_trusted_policy("strict-plugin"),
+            sync_caller=fake_caller,
+        )
+
+        for invoke in (
+            lambda: llm.complete(
+                [{"role": "user", "content": "hi"}],
+                provider="test-provider",
+                model="test-model",
+                execution_mode="strict_single_attempt",
+            ),
+            lambda: llm.complete_structured(
+                instructions="Return one result",
+                input=[{"type": "text", "text": "input"}],
+                provider="test-provider",
+                model="test-model",
+                execution_mode="strict_single_attempt",
+            ),
+        ):
+            with pytest.raises(TimeoutError) as caught:
+                invoke()
+            assert caught.value.execution_audit["attempt_count"] == 1
+            assert caught.value.execution_audit["delivery_ambiguous"] is True
+
+    def test_default_mode_keeps_injected_caller_signature_compatible(self):
+        def old_signature_caller(
+            *,
+            messages,
+            provider_override,
+            model_override,
+            profile_override,
+            temperature,
+            max_tokens,
+            timeout,
+            extra_body,
+        ):
+            assert messages
+            assert provider_override is None
+            assert model_override is None
+            assert profile_override is None
+            assert temperature is None
+            assert max_tokens is None
+            assert timeout is None
+            assert extra_body is None
+            return "openai", "gpt-4o", _fake_response("compatible")
+
+        llm = make_plugin_llm_for_test(
+            plugin_id="legacy-plugin",
+            policy=_trusted_policy("legacy-plugin"),
+            sync_caller=old_signature_caller,
+        )
+
+        result = llm.complete([{"role": "user", "content": "hi"}])
+
+        assert result.text == "compatible"
 
     def test_complete_uses_active_model_by_default(self):
         captured: dict = {}
@@ -526,6 +588,72 @@ class TestAsyncSurface:
         assert captured["execution_mode"] == "strict_single_attempt"
         assert result.audit["attempt_count"] == 1
         assert result.audit["strict_contract_satisfied"] is True
+
+    def test_async_strict_failures_expose_audit_for_both_methods(self):
+        async def fake_async(**_kwargs):
+            raise TimeoutError("connection timed out")
+
+        llm = make_plugin_llm_for_test(
+            plugin_id="strict-plugin",
+            policy=_trusted_policy("strict-plugin"),
+            async_caller=fake_async,
+        )
+
+        async def run() -> None:
+            calls = (
+                llm.acomplete(
+                    [{"role": "user", "content": "hi"}],
+                    provider="test-provider",
+                    model="test-model",
+                    execution_mode="strict_single_attempt",
+                ),
+                llm.acomplete_structured(
+                    instructions="Return one result",
+                    input=[{"type": "text", "text": "input"}],
+                    provider="test-provider",
+                    model="test-model",
+                    execution_mode="strict_single_attempt",
+                ),
+            )
+            for call in calls:
+                with pytest.raises(TimeoutError) as caught:
+                    await call
+                assert caught.value.execution_audit["attempt_count"] == 1
+                assert caught.value.execution_audit["delivery_ambiguous"] is True
+
+        asyncio.run(run())
+
+    def test_async_default_keeps_injected_caller_signature_compatible(self):
+        async def old_signature_caller(
+            *,
+            messages,
+            provider_override,
+            model_override,
+            profile_override,
+            temperature,
+            max_tokens,
+            timeout,
+            extra_body,
+        ):
+            assert messages
+            assert provider_override is None
+            assert model_override is None
+            assert profile_override is None
+            assert temperature is None
+            assert max_tokens is None
+            assert timeout is None
+            assert extra_body is None
+            return "openai", "gpt-4o", _fake_response("compatible")
+
+        llm = make_plugin_llm_for_test(
+            plugin_id="legacy-plugin",
+            policy=_trusted_policy("legacy-plugin"),
+            async_caller=old_signature_caller,
+        )
+
+        result = asyncio.run(llm.acomplete([{"role": "user", "content": "hi"}]))
+
+        assert result.text == "compatible"
 
     def test_acomplete_uses_async_caller(self):
         async def fake_async(**_kwargs):

@@ -43,6 +43,7 @@ from agent.auxiliary_client import (
 from agent.llm_execution import (
     LlmExecutionAudit,
     LlmExecutionMode,
+    StrictExecutionRouteMismatch,
     StrictExecutionUnsupported,
 )
 
@@ -4406,9 +4407,10 @@ class _StrictFakeClient:
         self.chat = SimpleNamespace(completions=completions)
 
 
-def _strict_response(model="test-model"):
+def _strict_response(model="test-model", provider=None):
     return SimpleNamespace(
         model=model,
+        provider=provider,
         choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))],
         usage=None,
     )
@@ -4536,6 +4538,56 @@ class TestStrictSingleAttemptExecution:
         assert response.model == "test-model"
         assert completions.calls == 1
         assert audit.attempt_count == 1
+        assert audit.response_provider == ""
+        assert audit.response_model == "test-model"
+        assert audit.strict_contract_satisfied is True
+
+    def test_strict_response_route_mismatch_is_not_reported_as_satisfied(
+        self, monkeypatch
+    ):
+        completions = _StrictSyncCompletions(
+            _strict_response(model="other-model", provider="other-provider")
+        )
+        _install_strict_client(monkeypatch, _StrictFakeClient(completions))
+        audit = LlmExecutionAudit()
+
+        call_llm(
+            provider="test-provider",
+            model="test-model",
+            messages=[{"role": "user", "content": "hi"}],
+            execution_mode="strict_single_attempt",
+            execution_audit=audit,
+        )
+
+        assert completions.calls == 1
+        assert audit.response_provider == "other-provider"
+        assert audit.response_model == "other-model"
+        assert audit.route_changed is True
+        assert audit.strict_contract_satisfied is False
+
+    @pytest.mark.parametrize(
+        ("requested_provider", "canonical_provider"),
+        [("codex", "openai-codex"), ("github", "copilot")],
+    )
+    def test_strict_alias_records_canonical_dispatch_without_route_change(
+        self, monkeypatch, requested_provider, canonical_provider
+    ):
+        completions = _StrictSyncCompletions(_strict_response())
+        _install_strict_client(monkeypatch, _StrictFakeClient(completions))
+        audit = LlmExecutionAudit()
+
+        call_llm(
+            provider=requested_provider,
+            model="test-model",
+            messages=[{"role": "user", "content": "hi"}],
+            execution_mode="strict_single_attempt",
+            execution_audit=audit,
+        )
+
+        assert completions.calls == 1
+        assert audit.requested_provider == requested_provider
+        assert audit.dispatched_provider == canonical_provider
+        assert audit.route_changed is False
         assert audit.strict_contract_satisfied is True
 
     @pytest.mark.parametrize(
@@ -4636,6 +4688,95 @@ class TestStrictSingleAttemptExecution:
                 messages=[{"role": "user", "content": "hi"}],
                 execution_mode="strict_single_attempt",
             )
+        assert completions.calls == 0
+
+    @pytest.mark.parametrize("api_mode", ["anthropic_messages", "codex_responses"])
+    def test_strict_transport_downgrade_is_rejected_before_outbound(
+        self, monkeypatch, api_mode
+    ):
+        completions = _StrictSyncCompletions(_strict_response())
+        _install_strict_client(monkeypatch, _StrictFakeClient(completions))
+        audit = LlmExecutionAudit()
+
+        with pytest.raises(StrictExecutionUnsupported, match="configured API mode"):
+            call_llm(
+                provider="test-provider",
+                model="test-model",
+                api_mode=api_mode,
+                messages=[{"role": "user", "content": "hi"}],
+                execution_mode="strict_single_attempt",
+                execution_audit=audit,
+            )
+
+        assert completions.calls == 0
+        assert audit.attempt_count == 0
+
+    def test_named_custom_transport_downgrade_is_rejected_before_outbound(
+        self, monkeypatch
+    ):
+        completions = _StrictSyncCompletions(_strict_response())
+        _install_strict_client(monkeypatch, _StrictFakeClient(completions))
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider._get_named_custom_provider",
+            lambda name: (
+                {"name": name, "api_mode": "anthropic_messages"}
+                if name == "named-provider"
+                else None
+            ),
+        )
+
+        with pytest.raises(StrictExecutionUnsupported, match="configured API mode"):
+            call_llm(
+                provider="named-provider",
+                model="test-model",
+                messages=[{"role": "user", "content": "hi"}],
+                execution_mode="strict_single_attempt",
+            )
+
+        assert completions.calls == 0
+
+    def test_resolver_api_mode_downgrade_is_rejected_before_outbound(
+        self, monkeypatch
+    ):
+        completions = _StrictSyncCompletions(_strict_response())
+        client = _StrictFakeClient(completions)
+        client._hermes_resolved_api_mode = "anthropic_messages"
+        _install_strict_client(monkeypatch, client)
+
+        with pytest.raises(StrictExecutionUnsupported, match="configured API mode"):
+            call_llm(
+                provider="nous",
+                model="test-model",
+                messages=[{"role": "user", "content": "hi"}],
+                execution_mode="strict_single_attempt",
+            )
+
+        assert completions.calls == 0
+
+    def test_custom_prefix_cannot_hide_early_builtin_route(self, monkeypatch):
+        completions = _StrictSyncCompletions(_strict_response())
+        _install_strict_client(monkeypatch, _StrictFakeClient(completions))
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider._get_named_custom_provider",
+            lambda name: (
+                {
+                    "name": "openrouter",
+                    "base_url": "https://named.invalid/v1",
+                    "api_mode": "chat_completions",
+                }
+                if name in {"custom:openrouter", "openrouter"}
+                else None
+            ),
+        )
+
+        with pytest.raises(StrictExecutionRouteMismatch, match="route resolution"):
+            call_llm(
+                provider="custom:openrouter",
+                model="test-model",
+                messages=[{"role": "user", "content": "hi"}],
+                execution_mode="strict_single_attempt",
+            )
+
         assert completions.calls == 0
 
     @pytest.mark.asyncio

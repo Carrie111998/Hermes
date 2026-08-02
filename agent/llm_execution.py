@@ -94,10 +94,14 @@ class LlmExecutionAudit:
     def record_response(self, response: Any) -> None:
         response_provider = getattr(response, "provider", None)
         response_model = getattr(response, "model", None)
-        self.response_provider = str(
-            response_provider or self.dispatched_provider
-        ).strip()
-        self.response_model = str(response_model or self.dispatched_model).strip()
+        self.response_provider = str(response_provider or "").strip()
+        self.response_model = str(response_model or "").strip()
+        if self.response_provider and (
+            self.response_provider.lower() != self.dispatched_provider.lower()
+        ):
+            self.route_changed = True
+        if self.response_model and self.response_model != self.dispatched_model:
+            self.route_changed = True
         self.strict_contract_satisfied = (
             _strict_mode(self.execution_mode)
             and self.attempt_count == 1
@@ -192,8 +196,16 @@ def require_matching_strict_route(
     *,
     provider: str | None,
     model: str | None,
+    requested_provider_for_match: str | None = None,
 ) -> None:
     audit.record_dispatch(provider, model)
+    if requested_provider_for_match is not None:
+        audit.route_changed = not routes_match(
+            requested_provider_for_match,
+            audit.requested_model,
+            audit.dispatched_provider,
+            audit.dispatched_model,
+        )
     if audit.route_changed:
         audit.strict_contract_satisfied = False
         raise StrictExecutionRouteMismatch(
@@ -201,6 +213,20 @@ def require_matching_strict_route(
             f"{audit.requested_provider!r}/{audit.requested_model!r} to "
             f"{audit.dispatched_provider!r}/{audit.dispatched_model!r}"
         )
+
+
+def attach_execution_audit(
+    exc: BaseException,
+    audit: LlmExecutionAudit,
+) -> None:
+    """Expose a secret-free strict audit without replacing the error type."""
+
+    try:
+        setattr(exc, "execution_audit", audit.as_dict())
+    except Exception:
+        # Some third-party exception implementations may reject attributes.
+        # The original exception must still propagate unchanged.
+        pass
 
 
 def _delivery_may_be_ambiguous(exc: BaseException) -> bool:
@@ -229,4 +255,5 @@ __all__ = [
     "StrictExecutionConfigurationError",
     "StrictExecutionRouteMismatch",
     "StrictExecutionUnsupported",
+    "attach_execution_audit",
 ]

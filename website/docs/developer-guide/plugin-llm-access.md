@@ -127,16 +127,19 @@ Local JSON parsing and schema validation still run after a successful response.
 
 This is not a provider-side exactly-once guarantee. A provider may accept a
 request before the client observes a timeout or broken connection, so those
-failures are reported with `delivery_ambiguous=True` and are never retried
-automatically.
+failures are never retried automatically. The original exception type is
+preserved and its secret-free `execution_audit` attribute reports
+`delivery_ambiguous=True`.
 
 Strict support is transport-specific. OpenAI-compatible clients, native
 Anthropic, and the OpenAI Codex transport are accepted only when the host can
 verify that SDK retries are disabled. OAuth and custom endpoints are supported
 when they resolve to one of those verified transports without changing the
-requested provider/model. External-process, virtual, or other adapters that
-cannot prove a single physical invocation raise `StrictExecutionUnsupported`
-before outbound dispatch.
+requested provider/model. A caller-, model-, or runtime-selected API mode must
+also match the concrete transport; downgrades fail before outbound dispatch.
+External-process, virtual, or other adapters that cannot prove a single
+physical invocation raise `StrictExecutionUnsupported` before outbound
+dispatch.
 
 Every strict result adds these stable fields to `result.audit`:
 
@@ -145,13 +148,17 @@ Every strict result adds these stable fields to `result.audit`:
 | `execution_mode` | `strict_single_attempt` for this contract |
 | `requested_provider`, `requested_model` | Explicit route supplied by the plugin |
 | `dispatched_provider`, `dispatched_model` | Route verified immediately before dispatch |
-| `response_provider`, `response_model` | Provider/model attribution returned or observed |
+| `response_provider`, `response_model` | Attribution declared by the response; empty when absent |
 | `attempt_count` | Host outbound invocation count; never greater than one |
 | `fallback_used` | Whether host fallback ran; always false in strict mode |
 | `credential_rotation_used` | Whether post-failure rotation ran; always false in strict mode |
 | `route_changed` | Whether resolution changed the requested route |
 | `delivery_ambiguous` | Whether transport failure may have followed provider receipt |
 | `strict_contract_satisfied` | Whether the host honored the strict execution policy |
+
+The host does not copy requested or dispatched values into missing response
+attribution. If a response declares a different provider or model,
+`route_changed` is true and `strict_contract_satisfied` is false.
 
 ## Quick start
 
