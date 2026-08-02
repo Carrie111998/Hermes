@@ -233,6 +233,11 @@ def _reject_denylisted_env_var(key: str) -> None:
         )
 
 _LAST_EXPANDED_CONFIG_BY_PATH: Dict[str, Any] = {}
+# Last successfully normalized user/default layer, before the managed overlay.
+# Keeping this separately is critical when the user YAML becomes invalid: the
+# current managed policy must be reapplied to the user LKG rather than serving
+# an effective LKG that already contains an obsolete managed revision.
+_LAST_NORMALIZED_USER_CONFIG_BY_PATH: Dict[str, Dict[str, Any]] = {}
 # (path, mtime_ns, size) -> cached expanded config dict.
 # load_config() returns a deepcopy of the cached value when the file
 # hasn't changed since the last load, skipping yaml.safe_load +
@@ -3327,6 +3332,7 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
                 return copy.deepcopy(cached_value) if want_deepcopy else cached_value
 
         config = copy.deepcopy(DEFAULT_CONFIG)
+        normalized: Optional[Dict[str, Any]] = None
 
         if user_sig is not None:
             try:
@@ -3354,35 +3360,34 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
                 # loaded config — keep serving it until the file is fixed.
                 # Fresh processes with no last-known-good keep the existing
                 # DEFAULT_CONFIG fallback.
-                lkg = _LAST_EXPANDED_CONFIG_BY_PATH.get(path_key)
+                lkg = _LAST_NORMALIZED_USER_CONFIG_BY_PATH.get(path_key)
+                if lkg is None:
+                    # Compatibility for in-process state created before this
+                    # layered LKG existed. New successful loads and save_config()
+                    # always populate the normalized user layer.
+                    lkg = _LAST_EXPANDED_CONFIG_BY_PATH.get(path_key)
                 _warn_config_parse_failure(
                     config_path,
                     e,
                     fallback="last-known-good" if lkg is not None else "defaults",
                 )
                 if lkg is not None:
-                    # save_config() stores the pre-expansion normalized dict
-                    # (env-ref templates preserved); the load path stores the
-                    # expanded one. Expand defensively — idempotent when the
-                    # stored value is already expanded.
+                    # Keep the normalized user/default layer and continue through
+                    # the regular managed merge below. Returning here would pin
+                    # the previous effective managed overlay under the new inode
+                    # revision, allowing an invalid user YAML to mask policy
+                    # updates indefinitely.
                     from typing import cast as _cast
-                    lkg_copy: Dict[str, Any] = _cast(
-                        Dict[str, Any], _expand_env_vars(copy.deepcopy(lkg))
+                    normalized = _cast(
+                        Dict[str, Any], copy.deepcopy(lkg)
                     )
-                    if cache_sig is not None:
-                        # Cache under the corrupt file's signature (empty env
-                        # snapshot: always valid) so repeated loads don't
-                        # re-parse the broken file; fixing the file changes the
-                        # signature and triggers a normal reload.
-                        _empty_env: Dict[str, Optional[str]] = {}
-                        _LOAD_CONFIG_CACHE[path_key] = (
-                            cache_sig,
-                            lkg_copy,
-                            _empty_env,
-                        )
-                    return copy.deepcopy(lkg_copy) if want_deepcopy else lkg_copy
+                    config = normalized
 
-        normalized = _normalize_root_model_keys(_normalize_max_turns_config(config))
+        if normalized is None:
+            normalized = _normalize_root_model_keys(
+                _normalize_max_turns_config(config)
+            )
+            _LAST_NORMALIZED_USER_CONFIG_BY_PATH[path_key] = copy.deepcopy(normalized)
         expanded = _expand_env_vars(normalized)
         # Managed scope wins at the leaf. Applied AFTER user expansion so a user
         # ${VAR} cannot shadow a managed literal: managed values are expanded only
@@ -3612,6 +3617,9 @@ def save_config(
         _secure_file(config_path)
         _RAW_CONFIG_CACHE.pop(str(config_path), None)
         _LAST_EXPANDED_CONFIG_BY_PATH[str(config_path)] = copy.deepcopy(current_normalized)
+        _LAST_NORMALIZED_USER_CONFIG_BY_PATH[str(config_path)] = copy.deepcopy(
+            current_normalized
+        )
 
 
 def _parse_env_value(raw_value: str) -> str:

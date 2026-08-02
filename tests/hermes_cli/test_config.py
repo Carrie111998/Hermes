@@ -171,9 +171,6 @@ class TestLoadConfigParseFailure:
             assert "previously loaded config" in err
 
 
-
-
-
 class TestEmptyConfigSections:
     """Empty section keys (``terminal:`` with no value) parse as YAML None
     and must not replace the default dict for that section (#58277)."""

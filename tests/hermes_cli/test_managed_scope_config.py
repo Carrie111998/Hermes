@@ -84,6 +84,30 @@ def test_same_size_managed_edit_with_restored_mtime_invalidates_public_cache(hom
     assert cfg_get(load_config(), "model", "default") == "managed/v2"
 
 
+def test_invalid_user_yaml_reapplies_current_managed_overlay(homes):
+    from hermes_cli.config import load_config
+
+    home, managed = homes
+    user_path = home / "config.yaml"
+    managed_path = managed / "config.yaml"
+    _write(user_path, "source: user\n")
+    _write(managed_path, "source: managed-old\n")
+    assert load_config()["source"] == "managed-old"
+
+    # Do not clear any process cache: this reproduces a long-running gateway
+    # while the user is in the middle of an invalid YAML edit.
+    user_path.write_text("\tbroken:\n", encoding="utf-8")
+    managed_path.write_text("source: managed-new\n", encoding="utf-8")
+
+    assert load_config()["source"] == "managed-new"
+    assert load_config()["source"] == "managed-new"
+
+    # Removing a managed pin must reveal the last valid user layer, not retain
+    # the old effective overlay that happened to be in the LKG.
+    managed_path.unlink()
+    assert load_config()["source"] == "user"
+
+
 def test_user_cannot_shadow_managed_literal_via_envref(homes, monkeypatch):
     """A managed literal must NOT be expandable via a ${VAR} the user controls.
 
