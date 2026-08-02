@@ -1,3 +1,5 @@
+import json
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -48,6 +50,91 @@ def codex_usage_payload():
         },
         "credits": {"has_credits": False},
     }
+
+
+def test_account_usage_snapshot_to_dict_returns_none_for_none():
+    assert account_usage.account_usage_snapshot_to_dict(None) is None
+
+
+def test_account_usage_snapshot_to_dict_serializes_complete_snapshot():
+    snapshot = account_usage.AccountUsageSnapshot(
+        provider="openai-codex",
+        source="usage-api",
+        fetched_at=datetime(
+            2026, 8, 2, 14, 30, 45, tzinfo=timezone(timedelta(hours=2))
+        ),
+        title="Codex limits",
+        plan="Pro",
+        windows=(
+            account_usage.AccountUsageWindow(
+                label="Session",
+                used_percent=12.5,
+                reset_at=datetime(
+                    2026, 8, 3, 1, 15, tzinfo=timezone(timedelta(hours=-5))
+                ),
+                detail="5 hour window",
+            ),
+        ),
+        details=("Credits available", "Priority access"),
+    )
+
+    result = account_usage.account_usage_snapshot_to_dict(snapshot)
+
+    assert result == {
+        "provider": "openai-codex",
+        "source": "usage-api",
+        "fetched_at": "2026-08-02T12:30:45Z",
+        "title": "Codex limits",
+        "plan": "Pro",
+        "available": True,
+        "windows": [
+            {
+                "label": "Session",
+                "used_percent": 12.5,
+                "reset_at": "2026-08-03T06:15:00Z",
+                "detail": "5 hour window",
+            }
+        ],
+        "details": ["Credits available", "Priority access"],
+        "unavailable_reason": None,
+    }
+    assert set(result) == {
+        "provider",
+        "source",
+        "fetched_at",
+        "title",
+        "plan",
+        "available",
+        "windows",
+        "details",
+        "unavailable_reason",
+    }
+    assert set(result["windows"][0]) == {"label", "used_percent", "reset_at", "detail"}
+    json.dumps(result, allow_nan=False)
+
+
+def test_account_usage_snapshot_to_dict_serializes_unavailable_snapshot():
+    snapshot = account_usage.AccountUsageSnapshot(
+        provider="anthropic",
+        source="oauth-usage-api",
+        fetched_at=datetime(2026, 8, 2, tzinfo=timezone.utc),
+        unavailable_reason="Usage endpoint unavailable",
+    )
+
+    result = account_usage.account_usage_snapshot_to_dict(snapshot)
+
+    assert result == {
+        "provider": "anthropic",
+        "source": "oauth-usage-api",
+        "fetched_at": "2026-08-02T00:00:00Z",
+        "title": "Account limits",
+        "plan": None,
+        "available": False,
+        "windows": [],
+        "details": [],
+        "unavailable_reason": "Usage endpoint unavailable",
+    }
+    json.dumps(result, allow_nan=False)
 
 
 def test_codex_usage_prefers_explicit_live_agent_credentials(monkeypatch, codex_usage_payload):

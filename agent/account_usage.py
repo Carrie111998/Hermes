@@ -46,6 +46,41 @@ class AccountUsageSnapshot:
         return bool(self.windows or self.details) and not self.unavailable_reason
 
 
+def _datetime_to_utc_iso(value: Optional[datetime]) -> Optional[str]:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc).isoformat().removesuffix("+00:00") + "Z"
+
+
+def account_usage_snapshot_to_dict(
+    snapshot: Optional[AccountUsageSnapshot],
+) -> Optional[dict[str, Any]]:
+    """Serialize an account-usage snapshot using only credential-free JSON fields."""
+    if snapshot is None:
+        return None
+    return {
+        "provider": snapshot.provider,
+        "source": snapshot.source,
+        "fetched_at": _datetime_to_utc_iso(snapshot.fetched_at),
+        "title": snapshot.title,
+        "plan": snapshot.plan,
+        "available": snapshot.available,
+        "windows": [
+            {
+                "label": window.label,
+                "used_percent": window.used_percent,
+                "reset_at": _datetime_to_utc_iso(window.reset_at),
+                "detail": window.detail,
+            }
+            for window in snapshot.windows
+        ],
+        "details": list(snapshot.details),
+        "unavailable_reason": snapshot.unavailable_reason,
+    }
+
+
 def _title_case_slug(value: Optional[str]) -> Optional[str]:
     cleaned = str(value or "").strip()
     if not cleaned:
