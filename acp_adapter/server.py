@@ -78,6 +78,7 @@ from agent.context_compressor import (
     COMPRESSED_SUMMARY_METADATA_KEY,
     ContextCompressor,
 )
+from agent.interrupt_compat import request_hard_interrupt
 from tools.approval import (
     reset_hermes_interactive_context,
     set_hermes_interactive_context,
@@ -1547,8 +1548,8 @@ class HermesACPAgent(acp.Agent):
                 # redirectable work.
                 state.cancel_event.set()
                 try:
-                    if getattr(state, "agent", None) and hasattr(state.agent, "interrupt"):
-                        state.agent.interrupt()
+                    if getattr(state, "agent", None):
+                        request_hard_interrupt(state.agent)
                 except Exception:
                     logger.debug(
                         "Failed to interrupt ACP session %s",
@@ -1868,7 +1869,7 @@ class HermesACPAgent(acp.Agent):
                 # model emits absolute paths under ~/.hermes/workspace and the
                 # edit silently lands outside the editor's workspace.
                 session_tokens = set_session_vars(
-                    session_key=session_id, cwd=state.cwd,
+                    session_key=session_id, session_id=session_id, cwd=state.cwd,
                 )
             except Exception:
                 session_tokens = None
