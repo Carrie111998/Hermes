@@ -3618,87 +3618,51 @@ def save_config(
         _LAST_EXPANDED_CONFIG_BY_PATH[str(config_path)] = copy.deepcopy(current_normalized)
 
 
-def _unquote_env_value(value: str) -> Optional[str]:
-    """Unquote a fully-quoted .env value; ``None`` when not fully quoted.
+def _parse_dotenv_text(text: str) -> Dict[str, str]:
+    """Parse .env text with the pinned python-dotenv (==1.2.2).
 
-    Mirrors :func:`_quote_env_value` (the writer side): a value whose first
-    and last characters are matching quotes is unescaped. A ``#`` inside
-    the quotes is data, not a comment.
+    #76544's root cause was two hand-rolled .env loaders diverging on inline
+    comments and quoting. Both loaders now feed the file text through
+    dotenv_values directly instead of maintaining a third parser:
+
+    - interpolate=False keeps ${VAR} values literal — Hermes never
+      expands .env values, and dotenv interpolates by default, so leaving it
+      on would silently change behavior.
+    - Keys without a value (a bare FOO line) come back as None and
+      are dropped, as are bindings whose value cannot be parsed (unclosed
+      quotes, junk after the closing quote).
+    - export KEY=..., inline # comments, duplicate keys (last wins)
+      and quoted/escaped values are handled by dotenv itself.
     """
-    if len(value) >= 2 and value[0] == value[-1] == '"':
-        quoted = value[1:-1]
-        parsed: list[str] = []
-        i = 0
-        while i < len(quoted):
-            ch = quoted[i]
-            if ch == "\\" and i + 1 < len(quoted):
-                next_ch = quoted[i + 1]
-                if next_ch in {'"', "\\"}:
-                    parsed.append(next_ch)
-                    i += 2
-                    continue
-            parsed.append(ch)
-            i += 1
-        return "".join(parsed)
-    if len(value) >= 2 and value[0] == value[-1] == "'":
-        return value[1:-1]
-    return None
+    from io import StringIO
 
+    from dotenv import dotenv_values
 
-def _parse_env_value(raw_value: str) -> str:
-    """Parse the small .env value subset Hermes writes itself.
-
-    Quoted values are unescaped and returned as-is (a ``#`` inside quotes
-    is data, not a comment). Unquoted values get any inline comment
-    stripped — a ``#`` preceded by whitespace starts a comment, matching
-    python-dotenv. Without this, lines like
-    ``MINIMAX_BASE_URL=https://api.minimax.io/anthropic  # note`` silently
-    include the comment text in the value, corrupting the resolved base
-    URL and failing later with an opaque 404 (#76544).
-    """
-    value = raw_value.strip()
-    unquoted = _unquote_env_value(value)
-    if unquoted is not None:
-        return unquoted
-    # Inline comments: a ``#`` preceded by whitespace ends the value.
-    # A value that starts with a quote may still carry a trailing comment
-    # (``"a # b"  # note``), so the scan honours quotes it opened — a ``#``
-    # inside those quotes is data, not a comment.
-    quote_char = None
-    i = 0
-    n = len(value)
-    while i < n:
-        ch = value[i]
-        if quote_char is None:
-            if ch in ('"', "'"):
-                quote_char = ch
-            elif ch == "#" and i > 0 and value[i - 1] in (" ", "\t"):
-                value = value[:i].rstrip()
-                break
-        else:
-            # Backslash escapes the next character inside double quotes.
-            if quote_char == '"' and ch == "\\" and i + 1 < n:
-                i += 1
-            elif ch == quote_char:
-                quote_char = None
-        i += 1
-    # A comment can also trail a quoted value — re-check once it is gone.
-    unquoted = _unquote_env_value(value)
-    if unquoted is not None:
-        return unquoted
-    return value
+    return {
+        key: value
+        for key, value in dotenv_values(
+            stream=StringIO(text), interpolate=False
+        ).items()
+        if value is not None
+    }
 
 
 def load_env() -> Dict[str, str]:
     """Load environment variables from ~/.hermes/.env.
 
-    Normalizes line endings before parsing while treating each assignment's
-    value as opaque data for boundary discovery.
+    The file text is handed to the pinned python-dotenv
+    (``dotenv_values(..., interpolate=False)``) via :func:`_parse_dotenv_text`
+    verbatim — the same parser the skill loader uses, so the two loaders can
+    never diverge again on inline comments, quoting or malformed lines
+    (#76544). No per-line normalization is applied first: dotenv's quoted
+    values may span physical lines, where every byte (including leading and
+    trailing whitespace) is value content, so any line-by-line
+    transformation would corrupt them.
 
     The parsed dict is memoised keyed on the .env file mtime, because
     ``get_env_value()`` is called dozens-to-hundreds of times per
     interactive menu render (`hermes tools`, `hermes setup`, status
-    panels). Sanitisation is O(lines), so re-parsing the
+    panels). Parsing is O(lines), so re-parsing the
     same file on every call was burning ~300ms of CPU per `hermes tools`
     menu paint on top of the OAuth-refresh slowness. The mtime check
     invalidates the cache when the user edits .env mid-process.
@@ -3728,19 +3692,8 @@ def load_env() -> Dict[str, str]:
         # via utf-8-sig since users may edit .env in Notepad which adds one.
         open_kw = {"encoding": "utf-8-sig", "errors": "replace"}
         with open(env_path, **open_kw) as f:
-            raw_lines = f.readlines()
-        # Normalize line endings without interpreting value contents as syntax.
-        lines = _sanitize_env_lines(raw_lines)
-        for line in lines:
-            line = line.strip()
-            if line and not line.startswith('#') and '=' in line:
-                # Strip the bash-compatible ``export `` prefix so lines like
-                # ``export API_KEY=...`` parse as ``API_KEY`` rather than being
-                # stored under the wrong key ``"export API_KEY"`` (#6659).
-                if line.startswith('export '):
-                    line = line[7:]
-                key, _, value = line.partition('=')
-                env_vars[key.strip()] = _parse_env_value(value)
+            text = f.read()
+        env_vars = _parse_dotenv_text(text)
 
     if cache_key is not None:
         _env_cache = (cache_key, dict(env_vars))
