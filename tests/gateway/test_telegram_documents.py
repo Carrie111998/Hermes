@@ -111,9 +111,18 @@ def _make_message(document=None, caption=None, media_group_id=None, photo=None):
 
 
 def _make_update(msg):
-    """Wrap a message in a mock Update."""
+    """Wrap a message in a mock Update.
+
+    ``effective_message`` mirrors python-telegram-bot semantics: for a
+    normal message it is the same object as ``update.message``, while
+    channel posts are exposed only via ``effective_message`` (with
+    ``update.message`` being None).  Handlers route through
+    ``_effective_update_message()``, so both must be set explicitly —
+    a MagicMock attribute access would otherwise return an auto-mock.
+    """
     update = MagicMock()
     update.message = msg
+    update.effective_message = msg
     return update
 
 
@@ -564,3 +573,42 @@ class TestSendVideo:
 
         call_kwargs = connected_adapter._bot.send_video.call_args[1]
         assert call_kwargs["message_thread_id"] == 789
+
+
+# ---------------------------------------------------------------------------
+# TestForwardedChannelMedia (#76615)
+# ---------------------------------------------------------------------------
+
+class TestForwardedChannelMedia:
+    """Media forwarded from a channel arrives with update.message=None and
+    the real payload on update.effective_message; the handler must route
+    through _effective_update_message() instead of dropping the update."""
+
+    @pytest.mark.asyncio
+    async def test_forwarded_channel_photo_is_delivered(self, adapter):
+        photo = _make_photo()
+        msg = _make_message(photo=photo)
+        # Channel-post shape: message is None, payload lives on effective_message.
+        update = MagicMock()
+        update.message = None
+        update.effective_message = msg
+
+        await adapter._handle_media_message(update, MagicMock())
+
+        event = adapter.handle_message.call_args[0][0]
+        assert event is not None
+        assert event.message_type == MessageType.PHOTO
+
+    @pytest.mark.asyncio
+    async def test_forwarded_channel_document_is_delivered(self, adapter):
+        doc = _make_document()
+        msg = _make_message(document=doc)
+        update = MagicMock()
+        update.message = None
+        update.effective_message = msg
+
+        await adapter._handle_media_message(update, MagicMock())
+
+        event = adapter.handle_message.call_args[0][0]
+        assert event is not None
+        assert event.message_type == MessageType.DOCUMENT
