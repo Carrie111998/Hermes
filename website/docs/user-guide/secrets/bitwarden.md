@@ -2,6 +2,23 @@
 
 Pull API keys from [Bitwarden Secrets Manager](https://bitwarden.com/products/secrets-manager/) at process startup instead of storing them in plaintext inside `~/.hermes/.env`. One bootstrap secret (a machine-account access token) replaces N per-provider keys, and rotating a credential becomes a single change in the Bitwarden web app.
 
+## Immediate action: rotate your access token
+
+If you have used this integration on **any Hermes version before the secrets-exfiltration hardening series**, your secret values were persisted in a plaintext cache file on disk, and your machine-account access token was inherited by every child process Hermes spawned. The vulnerability is now closed by design, but **rotate the token now** — anyone who read that cache file or any spawned child's environment could have taken it.
+
+1. In the Bitwarden web app → **Secrets Manager** → **Machine accounts** → your machine account → **Access tokens**.
+2. **Revoke** the existing token(s).
+3. **Create a new access token** and copy it (it starts with `0.`). Bitwarden shows it once.
+4. In your terminal, run:
+
+   ```bash
+   hermes secrets bitwarden token
+   ```
+
+5. **Paste the new token value** when prompted (input is hidden).
+
+The command probes Bitwarden with the new token **before** writing anything — a rejected token leaves your current `.env` untouched — and on success clears the fetch caches. After rotating, also rotate any high-value secrets (provider API keys, database passwords) that were exposed to processes spawned while the old token was live, since those values could have been read by any child process during that window.
+
 ## The security posture is the feature
 
 Hermes does not merely *support* Bitwarden Secrets Manager — it implements the integration so that **the plaintext-secrets vulnerability class does not exist in the default configuration**. Four disclosure channels are closed by design, and a hermetic end-to-end test pins them shut:

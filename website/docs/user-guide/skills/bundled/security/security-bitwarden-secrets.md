@@ -63,9 +63,16 @@ The authoritative protocol for operating Bitwarden Secrets Manager (`bws`) insid
 2. Run `hermes secrets bitwarden setup`. It installs the pinned `bws` binary (SHA-256 verified) into `~/.hermes/bin/`, prompts for the token (hidden input), records the region (`BWS_SERVER_URL`), lists projects, test-fetches, and flips `enabled: true`.
 3. Confirm with `hermes secrets bitwarden status`.
 
-### 2. Rotation
+### 2. Rotation — user action only
 
-`hermes secrets bitwarden token` probes the new token against Bitwarden **before** writing anything — a rejected token leaves the current `.env` untouched. On success it stores the token, clears fetch caches, and warns if the configured project is invisible to the new machine account. Prefer this over editing `.env` by hand.
+**Rotating the BWS token is exclusively a user action.** The agent never performs it and never asks for the token value. The rotation happens in the Bitwarden web app (revoke → create new token) and in the user's terminal (`hermes secrets bitwarden token`, hidden input) — the agent has no legitimate role in either step.
+
+The agent's role is to **instruct and verify**:
+
+- If the user used this integration on **any pre-hardening Hermes version**, tell them the first action is theirs: revoke the old machine-account access token in the web app, create a new one, and run `hermes secrets bitwarden token` in their terminal, pasting the new value when prompted. Do not proceed with anything that depends on fresh secrets until they confirm this is done. This is the one token that was persisted everywhere — plaintext cache file, status lines, logs, and every spawned child's environment — so rotation comes first, before any other mitigation.
+- After the user reports rotating, verify with `hermes secrets bitwarden status` (token present and valid) — but the token VALUE never enters the conversation. If the user pastes a token value into chat, do not repeat it, log it, or store it; tell them to run `hermes secrets bitwarden token` themselves and delete the message.
+
+`hermes secrets bitwarden token` probes the new token against Bitwarden **before** writing anything — a rejected token leaves the current `.env` untouched. On success it stores the token, clears fetch caches, and warns if the configured project is invisible to the new machine account.
 
 ### 3. Verification after any change
 
