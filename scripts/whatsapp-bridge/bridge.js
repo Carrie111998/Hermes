@@ -19,7 +19,7 @@
  *   node bridge.js --port 3000 --session ~/.hermes/whatsapp/session
  */
 
-import { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, downloadMediaMessage, getAggregateVotesInPollMessage, decryptPollVote, getKeyAuthor, jidNormalizedUser } from '@whiskeysockets/baileys';
+import { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, fetchLatestWaWebVersion, downloadMediaMessage, getAggregateVotesInPollMessage, decryptPollVote, getKeyAuthor, jidNormalizedUser } from '@whiskeysockets/baileys';
 import express from 'express';
 import { Boom } from '@hapi/boom';
 import pino from 'pino';
@@ -393,9 +393,32 @@ function emitPairEvent(event) {
   } catch {}
 }
 
+/**
+ * Resolve the WhatsApp Web version to use for the socket.
+ * Prefers the live WA Web version fetched via fetchLatestWaWebVersion(),
+ * falling back to the Baileys-bundled version if the live fetch fails
+ * or is not the latest. This prevents HTTP 405 errors caused by WhatsApp
+ * rejecting stale versions from fetchLatestBaileysVersion().
+ * See: https://github.com/WhiskeySockets/Baileys/issues/2731
+ */
+async function resolveWaVersion() {
+  try {
+    const waWeb = await fetchLatestWaWebVersion();
+    if (waWeb.isLatest && !waWeb.error) {
+      logger.info({ waVersion: waWeb.version }, 'Using live WhatsApp Web version');
+      return waWeb.version;
+    }
+  } catch (err) {
+    logger.warn({ err }, 'Failed to fetch live WA Web version, falling back to Baileys');
+  }
+  const { version } = await fetchLatestBaileysVersion();
+  logger.info({ version }, 'Using Baileys-bundled WhatsApp version');
+  return version;
+}
+
 async function startSocket() {
   const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
-  const { version } = await fetchLatestBaileysVersion();
+  const version = await resolveWaVersion();
 
   sock = makeWASocket({
     version,
