@@ -1,6 +1,7 @@
 """Tests for the platform adapter registry and dynamic Platform enum."""
 
 import os
+import threading
 import pytest
 from unittest.mock import MagicMock
 
@@ -98,6 +99,119 @@ class TestPlatformRegistry:
         )
         reg.register(entry)
         assert reg.create_adapter("novalidate", MagicMock()) is mock_adapter
+
+    def test_deferred_loader_is_resolved_once_under_concurrency(self):
+        reg = PlatformRegistry()
+        entry, _ = self._make_entry("deferred-once")
+        loader_entered = threading.Event()
+        release_loader = threading.Event()
+        second_attempted = threading.Event()
+        second_done = threading.Event()
+        loader_calls = 0
+        loader_calls_lock = threading.Lock()
+
+        def _loader():
+            nonlocal loader_calls
+            with loader_calls_lock:
+                loader_calls += 1
+            loader_entered.set()
+            assert release_loader.wait(timeout=5)
+            reg.register(entry)
+
+        reg.register_deferred(entry.name, _loader)
+        results = []
+
+        def _read(*, second=False):
+            if second:
+                second_attempted.set()
+            results.append(reg.get(entry.name))
+            if second:
+                second_done.set()
+
+        first = threading.Thread(target=_read, daemon=True)
+        first.start()
+        assert loader_entered.wait(timeout=5)
+
+        second = threading.Thread(target=_read, kwargs={"second": True}, daemon=True)
+        second.start()
+        assert second_attempted.wait(timeout=5)
+        second_done.wait(timeout=2)
+        release_loader.set()
+
+        first.join(timeout=5)
+        second.join(timeout=5)
+        assert not first.is_alive()
+        assert not second.is_alive()
+        assert loader_calls == 1
+        assert results == [entry, entry]
+
+    @pytest.mark.parametrize("callback_name", ["check", "validate", "factory"])
+    def test_adapter_callbacks_run_without_registry_lock_held(self, callback_name):
+        reg = PlatformRegistry()
+        worker_finished = threading.Event()
+        worker_threads = []
+
+        def _callback_result(result):
+            def _callback(*args, **kwargs):
+                worker = threading.Thread(
+                    target=lambda: (
+                        reg.register(self._make_entry("callback-write")[0]),
+                        worker_finished.set(),
+                    ),
+                    daemon=True,
+                )
+                worker_threads.append(worker)
+                worker.start()
+                assert worker_finished.wait(timeout=5)
+                return result
+
+            return _callback
+
+        check_fn = _callback_result(True) if callback_name == "check" else lambda: True
+        validate_fn = (
+            _callback_result(True) if callback_name == "validate" else lambda config: True
+        )
+        factory_fn = (
+            _callback_result("adapter")
+            if callback_name == "factory"
+            else lambda config: "adapter"
+        )
+        reg.register(
+            PlatformEntry(
+                name="callback-source",
+                label="Callback source",
+                adapter_factory=factory_fn,
+                check_fn=check_fn,
+                validate_config=validate_fn,
+            )
+        )
+
+        assert reg.create_adapter("callback-source", object()) == "adapter"
+        worker_threads[0].join(timeout=5)
+        assert not worker_threads[0].is_alive()
+
+    def test_deferred_loader_runs_without_registry_lock_held(self):
+        reg = PlatformRegistry()
+        entry, _ = self._make_entry("loader-unlocked")
+        worker_finished = threading.Event()
+
+        def _loader():
+            worker = threading.Thread(
+                target=lambda: (
+                    reg.register(self._make_entry("loader-side-write")[0]),
+                    worker_finished.set(),
+                ),
+                daemon=True,
+            )
+            worker.start()
+            assert worker_finished.wait(timeout=5)
+            worker.join(timeout=5)
+            assert not worker.is_alive()
+            reg.register(entry)
+
+        reg.register_deferred(entry.name, _loader)
+
+        assert reg.get(entry.name) is entry
 
 
 # ── GatewayConfig integration ────────────────────────────────────────────

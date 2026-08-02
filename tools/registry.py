@@ -24,6 +24,8 @@ import time
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Set
 
+from registry_transaction import RegistryTransactionConflict
+
 logger = logging.getLogger(__name__)
 
 
@@ -438,6 +440,7 @@ class ToolRegistry:
         # snapshot binds a staging view to one live registry and one baseline.
         self._transaction_owner: Optional["ToolRegistry"] = None
         self._transaction_snapshot: Optional[_ToolRegistrySnapshot] = None
+        self._transaction_frozen = False
 
     def _take_transaction_snapshot(self) -> _ToolRegistrySnapshot:
         """Return an opaque host-private checkpoint under the registry lock."""
@@ -464,14 +467,34 @@ class ToolRegistry:
     def _create_transaction_view(
         self,
         snapshot: _ToolRegistrySnapshot,
+        *,
+        remove_names: Set[str] | None = None,
+        remove_policy_names: Set[str] | None = None,
     ) -> "ToolRegistry":
         """Create an isolated registry seeded only from an opaque checkpoint."""
         self._validate_transaction_snapshot(snapshot)
+        removed = remove_names or set()
         staged = ToolRegistry()
-        staged._tools = dict(snapshot._tools)
-        staged._toolset_checks = dict(snapshot._toolset_checks)
-        staged._toolset_aliases = dict(snapshot._toolset_aliases)
-        staged._plugin_override_policy = dict(snapshot._plugin_override_policy)
+        staged._tools = {
+            name: entry for name, entry in snapshot._tools if name not in removed
+        }
+        remaining_toolsets = {entry.toolset for entry in staged._tools.values()}
+        staged._toolset_checks = {
+            name: check
+            for name, check in snapshot._toolset_checks
+            if name in remaining_toolsets
+        }
+        staged._toolset_aliases = {
+            alias: target
+            for alias, target in snapshot._toolset_aliases
+            if target in remaining_toolsets
+        }
+        removed_policies = remove_policy_names or set()
+        staged._plugin_override_policy = {
+            name: allowed
+            for name, allowed in snapshot._plugin_override_policy
+            if name not in removed_policies
+        }
         staged._generation = snapshot._generation
         staged._transaction_owner = self
         staged._transaction_snapshot = snapshot
@@ -491,7 +514,7 @@ class ToolRegistry:
         ):
             raise ValueError("transaction view belongs to a different ToolRegistry")
         with staged._lock:
-            return _PreparedToolRegistryState(
+            prepared = _PreparedToolRegistryState(
                 owner=self,
                 snapshot=snapshot,
                 tools=dict(staged._tools),
@@ -500,6 +523,8 @@ class ToolRegistry:
                 plugin_override_policy=dict(staged._plugin_override_policy),
                 generation=staged._generation,
             )
+            staged._transaction_frozen = True
+            return prepared
 
     def _matches_transaction_snapshot_locked(
         self,
@@ -508,8 +533,17 @@ class ToolRegistry:
         """Return whether live state is still the exact captured baseline."""
         return (
             self._generation == snapshot._generation
-            and tuple(self._tools.items()) == snapshot._tools
-            and tuple(self._toolset_checks.items()) == snapshot._toolset_checks
+            and len(self._tools) == len(snapshot._tools)
+            and all(
+                name in self._tools and self._tools[name] is entry
+                for name, entry in snapshot._tools
+            )
+            and len(self._toolset_checks) == len(snapshot._toolset_checks)
+            and all(
+                name in self._toolset_checks
+                and self._toolset_checks[name] is check
+                for name, check in snapshot._toolset_checks
+            )
             and tuple(self._toolset_aliases.items()) == snapshot._toolset_aliases
             and tuple(self._plugin_override_policy.items())
             == snapshot._plugin_override_policy
@@ -528,8 +562,10 @@ class ToolRegistry:
         ):
             raise ValueError("transaction view belongs to a different ToolRegistry")
         if not self._matches_transaction_snapshot_locked(snapshot):
-            raise RuntimeError(
-                "tool registry changed during plugin registration; refusing commit"
+            raise RegistryTransactionConflict(
+                "tool",
+                snapshot._generation,
+                self._generation,
             )
 
     def _install_prepared_transaction_locked(
@@ -662,6 +698,8 @@ class ToolRegistry:
         transactions restore the previous policy checkpoint.
         """
         with self._lock:
+            if self._transaction_frozen:
+                raise RuntimeError("tool transaction view is frozen")
             self._plugin_override_policy[module_namespace] = bool(allowed)
             self._generation += 1
 
@@ -729,6 +767,8 @@ class ToolRegistry:
         toolset are rejected to prevent accidental overwrites.
         """
         with self._lock:
+            if self._transaction_frozen:
+                raise RuntimeError("tool transaction view is frozen")
             existing = self._tools.get(name)
             if existing and existing.toolset != toolset:
                 if override:
@@ -806,6 +846,8 @@ class ToolRegistry:
         every refresh and has no plugin-override concept.
         """
         with self._lock:
+            if self._transaction_frozen:
+                raise RuntimeError("tool transaction view is frozen")
             entry = self._tools.get(name)
             if entry is None:
                 return

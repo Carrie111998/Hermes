@@ -65,6 +65,8 @@ def get_bundled_plugins_dir() -> Path:
         return Path(env_override)
     return Path(__file__).resolve().parent.parent / "plugins"
 
+from registry_transaction import RegistryTransactionConflict
+
 try:
     import yaml
 except ImportError:  # pragma: no cover – yaml is optional at import time
@@ -248,24 +250,6 @@ def _directory_module_name(manifest: "PluginManifest") -> str:
     return f"{_NS_PARENT}.{slug}"
 
 
-class _ExternalRegistrySnapshot:
-    """Opaque checkpoint for one legacy external registration surface."""
-
-    __slots__ = ("_surface", "_owner", "_items", "_extra")
-
-    def __init__(
-        self,
-        surface: str,
-        owner: Any,
-        items: tuple,
-        extra: Any = None,
-    ) -> None:
-        self._surface = surface
-        self._owner = owner
-        self._items = items
-        self._extra = extra
-
-
 _PROVIDER_REGISTRY_MODULES = {
     "image_gen": "agent.image_gen_registry",
     "video_gen": "agent.video_gen_registry",
@@ -275,68 +259,33 @@ _PROVIDER_REGISTRY_MODULES = {
     "stt": "agent.transcription_registry",
     "dashboard": "hermes_cli.dashboard_auth.registry",
 }
-_EXTERNAL_REGISTRY_SURFACES = (
+_EXTERNAL_COMMIT_SURFACES = (
     "platform",
+    "browser",
+    "dashboard",
     "image_gen",
+    "secret",
+    "stt",
+    "tts",
     "video_gen",
     "web",
-    "browser",
-    "secret",
-    "tts",
-    "stt",
-    "dashboard",
 )
 
 
-def _take_external_registry_snapshot(surface: str) -> _ExternalRegistrySnapshot:
-    """Checkpoint a traced PluginContext external surface without exposing maps."""
-    if surface == "platform":
-        from gateway.platform_registry import platform_registry
+def _external_registry_transactions() -> Dict[str, Any]:
+    """Return opaque registry-owned transaction surfaces in commit order."""
+    from gateway.platform_registry import platform_registry
 
-        return _ExternalRegistrySnapshot(
-            surface,
-            platform_registry,
-            tuple(platform_registry._entries.items()),
-            tuple(platform_registry._deferred.items()),
+    transactions: Dict[str, Any] = {"platform": platform_registry}
+    for surface in _EXTERNAL_COMMIT_SURFACES[1:]:
+        module_name = (
+            "agent.secret_sources.registry"
+            if surface == "secret"
+            else _PROVIDER_REGISTRY_MODULES[surface]
         )
-    if surface == "secret":
-        module = importlib.import_module("agent.secret_sources.registry")
-        return _ExternalRegistrySnapshot(
-            surface,
-            module,
-            tuple(module._SOURCES.items()),
-            module._BUILTINS_LOADED,
-        )
-    module_name = _PROVIDER_REGISTRY_MODULES.get(surface)
-    if module_name is None:
-        raise ValueError(f"unsupported external plugin registry surface: {surface}")
-    module = importlib.import_module(module_name)
-    with module._lock:
-        items = tuple(module._providers.items())
-    return _ExternalRegistrySnapshot(surface, module, items)
-
-
-def _restore_external_registry_snapshot(
-    snapshot: _ExternalRegistrySnapshot,
-) -> None:
-    """Restore an external checkpoint; no plugin callback is invoked."""
-    if snapshot._surface == "platform":
-        registry = snapshot._owner
-        registry._entries.clear()
-        registry._entries.update(snapshot._items)
-        registry._deferred.clear()
-        registry._deferred.update(snapshot._extra)
-        return
-    if snapshot._surface == "secret":
-        module = snapshot._owner
-        module._SOURCES.clear()
-        module._SOURCES.update(snapshot._items)
-        module._BUILTINS_LOADED = snapshot._extra
-        return
-    module = snapshot._owner
-    with module._lock:
-        module._providers.clear()
-        module._providers.update(snapshot._items)
+        module = importlib.import_module(module_name)
+        transactions[surface] = module._plugin_transaction
+    return transactions
 
 
 def _env_enabled(name: str) -> bool:
@@ -466,6 +415,10 @@ class _PluginManagerState:
         }
         self._plugin_tool_names = set(manager._plugin_tool_names)
         self._plugin_platform_names = set(manager._plugin_platform_names)
+        self._plugin_external_names = {
+            surface: set(names)
+            for surface, names in manager._plugin_external_names.items()
+        }
         self._cli_commands = {
             name: dict(entry) for name, entry in manager._cli_commands.items()
         }
@@ -485,6 +438,7 @@ class _PluginManagerState:
         }
         self._slack_action_handlers = list(manager._slack_action_handlers)
         self._discovered = manager._discovered
+        self._generation = manager._generation
 
 
 class _PluginRegistrationView:
@@ -507,6 +461,10 @@ class _PluginRegistrationView:
         }
         self._plugin_tool_names = set(state._plugin_tool_names)
         self._plugin_platform_names = set(state._plugin_platform_names)
+        self._plugin_external_names = {
+            surface: set(names)
+            for surface, names in state._plugin_external_names.items()
+        }
         self._cli_commands = {
             name: dict(entry) for name, entry in state._cli_commands.items()
         }
@@ -526,25 +484,192 @@ class _PluginRegistrationView:
         }
         self._slack_action_handlers = list(state._slack_action_handlers)
         self._discovered = state._discovered
+        self._generation = state._generation
         self._cli_ref = cli_ref
         self._lock = threading.RLock()
         self._transaction_tools_registered: List[str] = []
         self._transaction_commands_registered: List[str] = []
-        self._external_registry_snapshots: Dict[
-            str, _ExternalRegistrySnapshot
-        ] = {}
+        self._frozen = False
 
-    def _checkpoint_external_registry(self, surface: str) -> None:
-        if surface not in self._external_registry_snapshots:
-            self._external_registry_snapshots[surface] = (
-                _take_external_registry_snapshot(surface)
+    def _record_external_registration(self, surface: str, name: str) -> None:
+        self._plugin_external_names.setdefault(surface, set()).add(name)
+        if surface == "platform":
+            self._plugin_platform_names.add(name)
+        self._generation += 1
+
+    def _freeze(self) -> None:
+        """Make every staged manager container reject late registrations."""
+        self._plugins = types.MappingProxyType(dict(self._plugins))
+        self._hooks = types.MappingProxyType(
+            {name: tuple(callbacks) for name, callbacks in self._hooks.items()}
+        )
+        self._middleware = types.MappingProxyType(
+            {
+                name: tuple(callbacks)
+                for name, callbacks in self._middleware.items()
+            }
+        )
+        self._plugin_tool_names = frozenset(self._plugin_tool_names)
+        self._plugin_platform_names = frozenset(self._plugin_platform_names)
+        self._plugin_external_names = types.MappingProxyType(
+            {
+                surface: frozenset(names)
+                for surface, names in self._plugin_external_names.items()
+            }
+        )
+        self._cli_commands = types.MappingProxyType(dict(self._cli_commands))
+        self._plugin_commands = types.MappingProxyType(dict(self._plugin_commands))
+        self._plugin_skills = types.MappingProxyType(dict(self._plugin_skills))
+        self._aux_tasks = types.MappingProxyType(dict(self._aux_tasks))
+        self._slack_action_handlers = tuple(self._slack_action_handlers)
+        self._frozen = True
+
+
+class _RegistrationTransaction:
+    """One isolated plugin registration or complete force-reload candidate."""
+
+    def __init__(
+        self,
+        manager: "PluginManager",
+        *,
+        replace_owned: bool = False,
+    ) -> None:
+        from tools.registry import registry as tool_registry
+
+        self.manager = manager
+        self.manager_before = manager._snapshot_owned_state()
+        self.manager_view = _PluginRegistrationView(
+            self.manager_before,
+            manager._cli_ref,
+        )
+        if replace_owned:
+            self.manager_view._plugins = {}
+            self.manager_view._hooks = {}
+            self.manager_view._middleware = {}
+            self.manager_view._plugin_tool_names = set()
+            self.manager_view._plugin_platform_names = set()
+            self.manager_view._plugin_external_names = {
+                surface: set() for surface in _EXTERNAL_COMMIT_SURFACES
+            }
+            self.manager_view._cli_commands = {}
+            self.manager_view._context_engine = None
+            self.manager_view._plugin_commands = {}
+            self.manager_view._plugin_skills = {}
+            self.manager_view._aux_tasks = {}
+            self.manager_view._slack_action_handlers = []
+        self.manager_view._discovered = True
+
+        self.tool_registry = tool_registry
+        self.tool_snapshot = tool_registry._take_transaction_snapshot()
+        removed_tool_names = (
+            self.manager_before._plugin_tool_names if replace_owned else set()
+        )
+        removed_policy_names = set()
+        if replace_owned:
+            for loaded in self.manager_before._plugins.values():
+                manifest = loaded.manifest
+                plugin_id = manifest.key or manifest.name
+                if manifest.source in {"user", "project", "bundled"}:
+                    removed_policy_names.add(_directory_module_name(manifest))
+                else:
+                    removed_policy_names.add(plugin_id)
+        self.tool_view = tool_registry._create_transaction_view(
+            self.tool_snapshot,
+            remove_names=removed_tool_names,
+            remove_policy_names=removed_policy_names,
+        )
+
+        self.external_transactions = _external_registry_transactions()
+        self.external_snapshots = {
+            surface: transaction.take_snapshot()
+            for surface, transaction in self.external_transactions.items()
+        }
+        self.external_views = {}
+        for surface, transaction in self.external_transactions.items():
+            remove_keys = (
+                self.manager_before._plugin_external_names.get(surface, set())
+                if replace_owned
+                else set()
             )
+            self.external_views[surface] = transaction.create_view(
+                self.external_snapshots[surface],
+                remove_keys=remove_keys,
+            )
+        self.contexts: List["PluginContext"] = []
 
-    def _rollback_external_registries(self) -> None:
-        for snapshot in reversed(
-            list(self._external_registry_snapshots.values())
-        ):
-            _restore_external_registry_snapshot(snapshot)
+    def context_targets(self) -> Dict[str, tuple[Any, Any]]:
+        return {
+            surface: (transaction, self.external_views[surface])
+            for surface, transaction in self.external_transactions.items()
+        }
+
+    def commit(self) -> None:
+        """Validate every baseline, then install all surfaces under one lock set."""
+        prepared_tools = self.tool_registry._prepare_transaction_commit(
+            self.tool_snapshot,
+            self.tool_view,
+        )
+        prepared_external = {
+            surface: transaction.prepare(
+                self.external_snapshots[surface],
+                self.external_views[surface],
+            )
+            for surface, transaction in self.external_transactions.items()
+        }
+        with self.manager_view._lock:
+            next_manager = _PluginManagerState(self.manager_view)
+            self.manager_view._freeze()
+
+        locks = [
+            self.manager._lock,
+            self.tool_registry._lock,
+            *(
+                self.external_transactions[surface].lock
+                for surface in _EXTERNAL_COMMIT_SURFACES
+            ),
+        ]
+        for lock in locks:
+            lock.acquire()
+        try:
+            if self.manager._generation != self.manager_before._generation:
+                raise RegistryTransactionConflict(
+                    "manager",
+                    self.manager_before._generation,
+                    self.manager._generation,
+                )
+            self.tool_registry._validate_prepared_transaction_locked(
+                self.tool_snapshot,
+                prepared_tools,
+            )
+            for surface in _EXTERNAL_COMMIT_SURFACES:
+                transaction = self.external_transactions[surface]
+                transaction.validate_prepared_locked(
+                    self.external_snapshots[surface],
+                    prepared_external[surface],
+                )
+
+            self.tool_registry._install_prepared_transaction_locked(
+                self.tool_snapshot,
+                prepared_tools,
+            )
+            for surface in _EXTERNAL_COMMIT_SURFACES:
+                transaction = self.external_transactions[surface]
+                transaction.install_prepared_locked(
+                    self.external_snapshots[surface],
+                    prepared_external[surface],
+                )
+            for context in self.contexts:
+                context._registration_registry = self.tool_registry
+                context._registration_manager = self.manager
+                context._registration_external_registries = None
+            self.manager._install_owned_state_locked(next_manager)
+        finally:
+            for lock in reversed(locks):
+                lock.release()
+
+
+class _ForceSweepAbort(RuntimeError):
+    """Internal sentinel: a force candidate failed and must not publish."""
 
 
 # ---------------------------------------------------------------------------
@@ -561,6 +686,7 @@ class PluginContext:
         *,
         registration_manager: Any = None,
         registration_registry: Any = None,
+        registration_external_registries: Any = None,
     ):
         self.manifest = manifest
         self._manager = manager
@@ -568,19 +694,36 @@ class PluginContext:
         # Managed discovery supplies an isolated ToolRegistry transaction view.
         # Direct/runtime contexts leave this unset and target the live registry.
         self._registration_registry = registration_registry
+        self._registration_external_registries = registration_external_registries
         # Lazy-built host-owned LLM facade — see ctx.llm property below.
         self._llm: Any = None
         self._subagent_lifecycle: Any = None
 
-    def _checkpoint_external_registry(self, surface: str) -> None:
-        """Lazily journal an external surface during managed plugin loading."""
-        checkpoint = getattr(
-            self._registration_manager,
-            "_checkpoint_external_registry",
-            None,
-        )
-        if checkpoint is not None:
-            checkpoint(surface)
+    def _record_external_registration(self, surface: str, name: str) -> None:
+        target = self._registration_manager
+        recorder = getattr(target, "_record_external_registration", None)
+        if recorder is not None:
+            with target._lock:
+                recorder(surface, name)
+
+    def _register_external_value(
+        self,
+        surface: str,
+        value: Any,
+        live_register: Callable[[Any], Any],
+    ) -> Optional[str]:
+        targets = self._registration_external_registries
+        if targets is None:
+            result = live_register(value)
+            if surface == "secret" and not result:
+                return None
+            name = value.name
+        else:
+            transaction, staged = targets[surface]
+            name = transaction.register(staged, value)
+        if name:
+            self._record_external_registration(surface, name)
+        return name
 
     # -- host-owned LLM access ----------------------------------------------
 
@@ -704,6 +847,7 @@ class PluginContext:
             )
             if registered is not None and name not in registered:
                 registered.append(name)
+            target._generation += 1
         logger.debug(
             "Plugin %s registered tool: %s%s",
             self.manifest.name, name, " (override)" if override else "",
@@ -788,6 +932,7 @@ class PluginContext:
                 "handler_fn": handler_fn,
                 "plugin": self.manifest.name,
             }
+            target._generation += 1
         logger.debug("Plugin %s registered CLI command: %s", self.manifest.name, name)
 
     # -- slash command registration -------------------------------------------
@@ -851,6 +996,7 @@ class PluginContext:
             )
             if registered is not None and clean not in registered:
                 registered.append(clean)
+            target._generation += 1
         logger.debug("Plugin %s registered command: /%s", self.manifest.name, clean)
 
     # -- tool dispatch -------------------------------------------------------
@@ -905,6 +1051,8 @@ class PluginContext:
             return
         target = self._registration_manager
         with target._lock:
+            if getattr(target, "_frozen", False):
+                raise RuntimeError("plugin registration transaction is frozen")
             if target._context_engine is not None:
                 logger.warning(
                     "Plugin '%s' tried to register a context engine, but one is "
@@ -913,6 +1061,7 @@ class PluginContext:
                 )
                 return
             target._context_engine = engine
+            target._generation += 1
         logger.info(
             "Plugin '%s' registered context engine: %s",
             self.manifest.name, engine.name,
@@ -939,8 +1088,7 @@ class PluginContext:
                 self.manifest.name,
             )
             return
-        self._checkpoint_external_registry("image_gen")
-        register_provider(provider)
+        self._register_external_value("image_gen", provider, register_provider)
         logger.info(
             "Plugin '%s' registered image_gen provider: %s",
             self.manifest.name, provider.name,
@@ -972,15 +1120,20 @@ class PluginContext:
                 self.manifest.name,
             )
             return
-        self._checkpoint_external_registry("dashboard")
         try:
-            register_provider(provider)
+            name = self._register_external_value(
+                "dashboard",
+                provider,
+                register_provider,
+            )
         except (TypeError, ValueError) as e:
             logger.warning(
                 "Plugin '%s' failed to register dashboard-auth provider "
                 "%r: %s",
                 self.manifest.name, getattr(provider, "name", "?"), e,
             )
+            return
+        if name is None:
             return
         logger.info(
             "Plugin '%s' registered dashboard-auth provider: %s (%s)",
@@ -1008,8 +1161,11 @@ class PluginContext:
                 self.manifest.name,
             )
             return
-        self._checkpoint_external_registry("video_gen")
-        _register_video_provider(provider)
+        self._register_external_value(
+            "video_gen",
+            provider,
+            _register_video_provider,
+        )
         logger.info(
             "Plugin '%s' registered video_gen provider: %s",
             self.manifest.name, provider.name,
@@ -1037,8 +1193,7 @@ class PluginContext:
                 self.manifest.name,
             )
             return
-        self._checkpoint_external_registry("web")
-        _register_web_provider(provider)
+        self._register_external_value("web", provider, _register_web_provider)
         logger.info(
             "Plugin '%s' registered web provider: %s",
             self.manifest.name, provider.name,
@@ -1070,8 +1225,11 @@ class PluginContext:
                 self.manifest.name,
             )
             return
-        self._checkpoint_external_registry("browser")
-        _register_browser_provider(provider)
+        self._register_external_value(
+            "browser",
+            provider,
+            _register_browser_provider,
+        )
         logger.info(
             "Plugin '%s' registered browser provider: %s",
             self.manifest.name, provider.name,
@@ -1118,8 +1276,7 @@ class PluginContext:
                 self.manifest.name,
             )
             return
-        self._checkpoint_external_registry("secret")
-        if register_source(source):
+        if self._register_external_value("secret", source, register_source):
             logger.info(
                 "Plugin '%s' registered secret source: %s",
                 self.manifest.name, source.name,
@@ -1157,8 +1314,13 @@ class PluginContext:
                 self.manifest.name,
             )
             return
-        self._checkpoint_external_registry("tts")
-        _register_tts_provider(provider)
+        name = self._register_external_value(
+            "tts",
+            provider,
+            _register_tts_provider,
+        )
+        if name is None:
+            return
         logger.info(
             "Plugin '%s' registered TTS provider: %s",
             self.manifest.name, provider.name,
@@ -1202,8 +1364,13 @@ class PluginContext:
                 self.manifest.name,
             )
             return
-        self._checkpoint_external_registry("stt")
-        _register_stt_provider(provider)
+        name = self._register_external_value(
+            "stt",
+            provider,
+            _register_stt_provider,
+        )
+        if name is None:
+            return
         logger.info(
             "Plugin '%s' registered transcription provider: %s",
             self.manifest.name, provider.name,
@@ -1257,11 +1424,13 @@ class PluginContext:
             source="plugin",
             **entry_kwargs,
         )
-        self._checkpoint_external_registry("platform")
-        platform_registry.register(entry)
-        target = self._registration_manager
-        with target._lock:
-            target._plugin_platform_names.add(name)
+        targets = self._registration_external_registries
+        if targets is None:
+            platform_registry.register(entry)
+        else:
+            _transaction, staged = targets["platform"]
+            staged.register(entry)
+        self._record_external_registration("platform", name)
         logger.debug(
             "Plugin %s registered platform: %s",
             self.manifest.name,
@@ -1322,6 +1491,7 @@ class PluginContext:
             target._slack_action_handlers.append(
                 (action_id, callback, self.manifest.name)
             )
+            target._generation += 1
         logger.debug(
             "Plugin %s registered Slack action handler: %s",
             self.manifest.name,
@@ -1439,6 +1609,7 @@ class PluginContext:
                 "defaults": merged_defaults,
                 "plugin": self.manifest.name,
             }
+            target._generation += 1
         logger.debug(
             "Plugin %s registered auxiliary task: %s (%s)",
             self.manifest.name,
@@ -1463,6 +1634,7 @@ class PluginContext:
         target = self._registration_manager
         with target._lock:
             target._hooks.setdefault(hook_name, []).append(callback)
+            target._generation += 1
         logger.debug("Plugin %s registered hook: %s", self.manifest.name, hook_name)
 
     # -- middleware registration -------------------------------------------
@@ -1486,6 +1658,7 @@ class PluginContext:
         target = self._registration_manager
         with target._lock:
             target._middleware.setdefault(kind, []).append(callback)
+            target._generation += 1
         logger.debug("Plugin %s registered middleware: %s", self.manifest.name, kind)
 
     # -- skill registration -------------------------------------------------
@@ -1532,6 +1705,7 @@ class PluginContext:
                 "bare_name": name,
                 "description": description,
             }
+            target._generation += 1
         logger.debug(
             "Plugin %s registered skill: %s",
             self.manifest.name, qualified,
@@ -1546,15 +1720,19 @@ class PluginManager:
     """Central manager that discovers, loads, and invokes plugins."""
 
     def __init__(self) -> None:
-        # Lock order when both registries are touched is always:
-        # ToolRegistry first, then PluginManager. Plugin callbacks are never
-        # invoked while this state lock is held.
+        # Discovery writers serialize here while readers keep using the live
+        # generation. Plugin callbacks are never invoked under registry locks.
+        self._discovery_lock = threading.RLock()
         self._lock = threading.RLock()
+        self._generation = 0
         self._plugins: Dict[str, LoadedPlugin] = {}
         self._hooks: Dict[str, List[Callable]] = {}
         self._middleware: Dict[str, List[Callable]] = {}
         self._plugin_tool_names: Set[str] = set()
         self._plugin_platform_names: Set[str] = set()
+        self._plugin_external_names: Dict[str, Set[str]] = {
+            surface: set() for surface in _EXTERNAL_COMMIT_SURFACES
+        }
         self._cli_commands: Dict[str, dict] = {}
         self._context_engine = None  # Set by a plugin via register_context_engine()
         self._plugin_commands: Dict[str, dict] = {}  # Slash commands registered by plugins
@@ -1572,15 +1750,17 @@ class PluginManager:
         # ``re.Pattern``, or a constraint dict); ``callback`` is an async
         # function with the slack_bolt signature ``(ack, body, action)``.
         self._slack_action_handlers: List[tuple] = []
+
+    def _record_external_registration(self, surface: str, name: str) -> None:
+        self._plugin_external_names.setdefault(surface, set()).add(name)
+        if surface == "platform":
+            self._plugin_platform_names.add(name)
+        self._generation += 1
+
     def _snapshot_owned_state(self) -> _PluginManagerState:
         """Take a non-aliasing checkpoint under the manager state lock."""
         with self._lock:
             return _PluginManagerState(self)
-
-    def _replace_owned_state(self, state: Any) -> None:
-        """Atomically replace every manager-owned registration surface."""
-        with self._lock:
-            self._install_owned_state_locked(state)
 
     def _install_owned_state_locked(self, state: Any) -> None:
         """Install already-independent manager state while ``_lock`` is held."""
@@ -1589,6 +1769,7 @@ class PluginManager:
         self._middleware = state._middleware
         self._plugin_tool_names = state._plugin_tool_names
         self._plugin_platform_names = state._plugin_platform_names
+        self._plugin_external_names = state._plugin_external_names
         self._cli_commands = state._cli_commands
         self._context_engine = state._context_engine
         self._plugin_commands = state._plugin_commands
@@ -1596,208 +1777,65 @@ class PluginManager:
         self._aux_tasks = state._aux_tasks
         self._slack_action_handlers = state._slack_action_handlers
         self._discovered = state._discovered
-
-    def _clear_owned_state_for_discovery(self) -> None:
-        """Install one coherent empty discovery state under the lock."""
-        with self._lock:
-            self._plugins = {}
-            self._hooks = {}
-            self._middleware = {}
-            self._plugin_tool_names = set()
-            self._plugin_platform_names = set()
-            self._cli_commands = {}
-            self._plugin_commands = {}
-            self._plugin_skills = {}
-            self._aux_tasks = {}
-            self._slack_action_handlers = []
-            self._context_engine = None
-
-    def _commit_registration_view(
-        self,
-        before: _PluginManagerState,
-        staged: _PluginRegistrationView,
-        plugin_id: str,
-        loaded: LoadedPlugin,
-        tool_registry: Any,
-        tool_snapshot: Any,
-        staged_tool_registry: Any,
-        context: PluginContext,
-    ) -> None:
-        """Atomically commit staged tool and manager state.
-
-        The fixed live-lock order is ToolRegistry then PluginManager. Tool
-        state is conflict-checked against the exact baseline before either
-        registry changes. Both next states are built independently first, so
-        an error cannot expose a half-applied registration.
-        """
-        prepared_tools = tool_registry._prepare_transaction_commit(
-            tool_snapshot,
-            staged_tool_registry,
-        )
-
-        tool_registry._lock.acquire()
-        manager_locked = False
-        install_attempted = False
-        manager_at_commit = None
-        try:
-            self._lock.acquire()
-            manager_locked = True
-            tool_registry._validate_prepared_transaction_locked(
-                tool_snapshot,
-                prepared_tools,
-            )
-            manager_at_commit = _PluginManagerState(self)
-            next_manager = self._build_committed_state_locked(
-                before,
-                staged,
-                plugin_id,
-                loaded,
-            )
-            try:
-                install_attempted = True
-                tool_registry._install_prepared_transaction_locked(
-                    tool_snapshot,
-                    prepared_tools,
-                )
-                self._install_owned_state_locked(next_manager)
-                # Callbacks may retain ctx. Flip both registration targets
-                # before readers can observe the committed manager state.
-                context._registration_registry = tool_registry
-                context._registration_manager = self
-            except BaseException:
-                if install_attempted:
-                    tool_registry._restore_transaction_snapshot_locked(
-                        tool_snapshot
-                    )
-                if manager_at_commit is not None:
-                    self._install_owned_state_locked(manager_at_commit)
-                raise
-        finally:
-            # Publish tools first. A tool reader that immediately asks for
-            # manager attribution blocks until the new manager state is ready.
-            tool_registry._lock.release()
-            if manager_locked:
-                self._lock.release()
-
-    def _build_committed_state_locked(
-        self,
-        before: _PluginManagerState,
-        staged: _PluginRegistrationView,
-        plugin_id: str,
-        loaded: LoadedPlugin,
-    ) -> _PluginManagerState:
-        """Build the merged manager state without mutating the live manager."""
-        if staged._context_engine is not before._context_engine:
-            if self._context_engine is not before._context_engine:
-                raise RuntimeError(
-                    "context engine changed during plugin registration"
-                )
-
-        committed = _PluginManagerState(self)
-        for name, callbacks in staged._hooks.items():
-            baseline_count = len(before._hooks.get(name, []))
-            additions = callbacks[baseline_count:]
-            if additions:
-                committed._hooks.setdefault(name, []).extend(additions)
-        for name, callbacks in staged._middleware.items():
-            baseline_count = len(before._middleware.get(name, []))
-            additions = callbacks[baseline_count:]
-            if additions:
-                committed._middleware.setdefault(name, []).extend(additions)
-
-        committed._plugin_tool_names.update(
-            staged._plugin_tool_names - before._plugin_tool_names
-        )
-        committed._plugin_platform_names.update(
-            staged._plugin_platform_names - before._plugin_platform_names
-        )
-
-        for attr in (
-            "_cli_commands",
-            "_plugin_commands",
-            "_plugin_skills",
-            "_aux_tasks",
-        ):
-            committed_map = getattr(committed, attr)
-            before_map = getattr(before, attr)
-            staged_map = getattr(staged, attr)
-            for name, entry in staged_map.items():
-                if name not in before_map or entry != before_map[name]:
-                    committed_map[name] = dict(entry)
-
-        slack_additions = staged._slack_action_handlers[
-            len(before._slack_action_handlers):
-        ]
-        committed._slack_action_handlers.extend(slack_additions)
-        if staged._context_engine is not before._context_engine:
-            committed._context_engine = staged._context_engine
-        committed._plugins[plugin_id] = loaded
-        return committed
-
-    # -----------------------------------------------------------------------
-    # Public
-    # -----------------------------------------------------------------------
+        self._generation = max(self._generation, state._generation) + 1
 
     def discover_and_load(self, force: bool = False) -> None:
-        """Scan all plugin sources and load each plugin found.
-
-        When ``force`` is true, clear cached discovery state first so config
-        changes or newly-added bundled backends become visible in long-lived
-        sessions without requiring a full agent restart.
-        """
-        with self._lock:
-            if self._discovered and not force:
+        """Load plugins, publishing a force reload as one complete generation."""
+        with self._discovery_lock:
+            with self._lock:
+                if self._discovered and not force:
+                    return
+            if env_var_enabled("HERMES_SAFE_MODE"):
+                logger.info("HERMES_SAFE_MODE=1 - plugin discovery skipped")
+                with self._lock:
+                    self._discovered = True
+                    self._generation += 1
                 return
-        if env_var_enabled("HERMES_SAFE_MODE"):
-            logger.info("HERMES_SAFE_MODE=1 — plugin discovery skipped")
+
+            if force:
+                transaction = _RegistrationTransaction(
+                    self,
+                    replace_owned=True,
+                )
+                module_snapshot = _snapshot_module_namespace(_NS_PARENT)
+                try:
+                    self._discover_and_load_inner(transaction)
+                    transaction.commit()
+                except (_ForceSweepAbort, RegistryTransactionConflict) as exc:
+                    _restore_module_namespace(_NS_PARENT, module_snapshot)
+                    if isinstance(exc, RegistryTransactionConflict):
+                        logger.warning(
+                            "Plugin force-reload commit conflict: "
+                            "surface=%s expected_generation=%d "
+                            "actual_generation=%d; retaining prior generation",
+                            exc.surface,
+                            exc.expected_generation,
+                            exc.actual_generation,
+                        )
+                    return
+                except BaseException:
+                    _restore_module_namespace(_NS_PARENT, module_snapshot)
+                    raise
+                return
+
             with self._lock:
                 self._discovered = True
-            return
-        previous_state = self._snapshot_owned_state() if force else None
-        tool_snapshot = None
-        module_snapshot = None
-        external_snapshots: List[_ExternalRegistrySnapshot] = []
-        if force:
-            from tools.registry import registry as _registry
-
-            tool_snapshot = _registry._take_transaction_snapshot()
-            external_snapshots = [
-                _take_external_registry_snapshot(surface)
-                for surface in _EXTERNAL_REGISTRY_SURFACES
-            ]
-            module_snapshot = _snapshot_module_namespace(_NS_PARENT)
-            self._clear_owned_state_for_discovery()
-        # Set the flag up front as a re-entrancy guard (a plugin's register()
-        # can transitively trigger discovery again), but reset it if the sweep
-        # raises so a failed scan is NOT cached as "discovered with an empty
-        # registry" — callers swallow the exception and would otherwise be
-        # permanently stranded on the early-return above (the "No web provider
-        # configured" class of failures).
-        with self._lock:
-            self._discovered = True
-        try:
-            self._discover_and_load_inner()
-        except BaseException:
-            if force:
-                from tools.registry import registry as _registry
-
-                assert previous_state is not None
-                assert tool_snapshot is not None
-                assert module_snapshot is not None
-                # Fixed rollback order: ToolRegistry, module cache, manager.
-                _registry._restore_transaction_snapshot(tool_snapshot)
-                for snapshot in reversed(external_snapshots):
-                    _restore_external_registry_snapshot(snapshot)
-                _restore_module_namespace(_NS_PARENT, module_snapshot)
-                self._replace_owned_state(previous_state)
-            else:
+                self._generation += 1
+            try:
+                self._discover_and_load_inner()
+            except BaseException:
                 with self._lock:
                     self._discovered = False
-            raise
+                    self._generation += 1
+                raise
 
-    def _discover_and_load_inner(self) -> None:
+    def _discover_and_load_inner(
+        self,
+        transaction: Optional[_RegistrationTransaction] = None,
+    ) -> None:
         """The actual discovery sweep — see :meth:`discover_and_load`."""
         manifests: List[PluginManifest] = []
+        target = transaction.manager_view if transaction is not None else self
 
         # 1. Bundled plugins (<repo>/plugins/<name>/)
         #
@@ -1872,8 +1910,9 @@ class PluginManager:
             if lookup_key in disabled or manifest.name in disabled:
                 loaded = LoadedPlugin(manifest=manifest, enabled=False)
                 loaded.error = "disabled via config"
-                with self._lock:
-                    self._plugins[lookup_key] = loaded
+                with target._lock:
+                    target._plugins[lookup_key] = loaded
+                    target._generation += 1
                 logger.debug("Skipping disabled plugin '%s'", lookup_key)
                 continue
 
@@ -1885,8 +1924,9 @@ class PluginManager:
                 loaded.error = (
                     "exclusive plugin — activate via <category>.provider config"
                 )
-                with self._lock:
-                    self._plugins[lookup_key] = loaded
+                with target._lock:
+                    target._plugins[lookup_key] = loaded
+                    target._generation += 1
                 logger.debug(
                     "Skipping '%s' (exclusive, handled by category discovery)",
                     lookup_key,
@@ -1901,8 +1941,9 @@ class PluginManager:
             # override semantics between bundled and user plugins.
             if manifest.kind == "model-provider":
                 loaded = LoadedPlugin(manifest=manifest, enabled=True)
-                with self._lock:
-                    self._plugins[lookup_key] = loaded
+                with target._lock:
+                    target._plugins[lookup_key] = loaded
+                    target._generation += 1
                 logger.debug(
                     "Skipping '%s' (model-provider, handled by providers/ discovery)",
                     lookup_key,
@@ -1914,7 +1955,7 @@ class PluginManager:
             # services calls) is driven by ``<category>.provider`` config,
             # enforced by the tool wrapper.
             if manifest.source == "bundled" and manifest.kind == "backend":
-                self._load_plugin(manifest)
+                self._load_plugin(manifest, transaction=transaction)
                 continue
 
             # Bundled platform plugins (gateway adapters: telegram, discord,
@@ -1929,7 +1970,10 @@ class PluginManager:
             # path actually asks for that platform. Every platform Hermes ships
             # remains available out of the box — it just loads on first use.
             if manifest.source == "bundled" and manifest.kind == "platform":
-                self._register_deferred_platform(manifest)
+                self._register_deferred_platform(
+                    manifest,
+                    transaction=transaction,
+                )
                 continue
 
             # Everything else (standalone, user-installed backends,
@@ -1946,19 +1990,20 @@ class PluginManager:
                     "not enabled in config (run `hermes plugins enable {}` to activate)"
                     .format(lookup_key)
                 )
-                with self._lock:
-                    self._plugins[lookup_key] = loaded
+                with target._lock:
+                    target._plugins[lookup_key] = loaded
+                    target._generation += 1
                 logger.debug(
                     "Skipping '%s' (not in plugins.enabled)", lookup_key
                 )
                 continue
-            self._load_plugin(manifest)
+            self._load_plugin(manifest, transaction=transaction)
 
         if manifests:
-            with self._lock:
-                found_count = len(self._plugins)
+            with target._lock:
+                found_count = len(target._plugins)
                 enabled_count = sum(
-                    1 for plugin in self._plugins.values() if plugin.enabled
+                    1 for plugin in target._plugins.values() if plugin.enabled
                 )
             logger.info(
                 "Plugin discovery complete: %d found, %d enabled",
@@ -2195,71 +2240,67 @@ class PluginManager:
             return Path(manifest.path).name
         return name
 
-    def _register_deferred_platform(self, manifest: PluginManifest) -> None:
-        """Register a lazy loader for a bundled platform plugin.
-
-        The platform adapter module is imported only when the gateway / cron /
-        setup / send_message path first asks the ``platform_registry`` for this
-        platform. Until then we record a lightweight ``LoadedPlugin`` so
-        ``hermes plugins list`` still shows the platform as available, and we
-        hand the registry a loader that runs the normal eager-load path.
-        """
+    def _register_deferred_platform(
+        self,
+        manifest: PluginManifest,
+        transaction: Optional[_RegistrationTransaction] = None,
+    ) -> None:
+        """Stage a bundled platform loader with its manager attribution."""
+        own_transaction = transaction is None
+        transaction = transaction or _RegistrationTransaction(self)
+        target = transaction.manager_view
         lookup_key = manifest.key or manifest.name
         platform_name = self._platform_name_from_manifest(manifest)
 
-        # Record an enabled placeholder for introspection (`hermes plugins
-        # list`). The real module load swaps in a fully-populated LoadedPlugin
-        # (tools/hooks/commands attribution) when the loader fires.
         loaded = LoadedPlugin(manifest=manifest, enabled=True)
         loaded.deferred = True
-        with self._lock:
-            self._plugins[lookup_key] = loaded
+        with target._lock:
+            target._plugins[lookup_key] = loaded
+            target._record_external_registration("platform", platform_name)
 
         def _loader(_manifest: PluginManifest = manifest) -> None:
             self._load_plugin(_manifest)
 
-        try:
-            from gateway.platform_registry import platform_registry
-
-            platform_registry.register_deferred(platform_name, _loader)
-            logger.debug(
-                "Registered deferred platform loader: %s (plugin=%s)",
-                platform_name,
-                lookup_key,
-            )
-        except Exception:
-            # If the registry import fails for any reason, fall back to eager
-            # loading so the platform is never silently lost.
-            logger.debug(
-                "Deferred platform registration failed for '%s'; eager-loading",
-                lookup_key,
-                exc_info=True,
-            )
-            self._load_plugin(manifest)
-
-    def _load_plugin(self, manifest: PluginManifest) -> None:
-        """Import a plugin module and call its ``register(ctx)`` function."""
-        loaded = LoadedPlugin(manifest=manifest)
+        transaction.external_views["platform"].register_deferred(
+            platform_name,
+            _loader,
+        )
+        if own_transaction:
+            transaction.commit()
         logger.debug(
-            "Loading plugin '%s' (source=%s, kind=%s, path=%s)",
-            manifest.key or manifest.name, manifest.source, manifest.kind, manifest.path,
+            "Registered deferred platform loader: %s (plugin=%s)",
+            platform_name,
+            lookup_key,
         )
 
-        from tools.registry import registry as _registry
+    def _load_plugin(
+        self,
+        manifest: PluginManifest,
+        transaction: Optional[_RegistrationTransaction] = None,
+    ) -> None:
+        """Stage one plugin and publish only through the ordered transaction."""
+        with self._discovery_lock:
+            self._load_plugin_serialized(manifest, transaction)
 
+    def _load_plugin_serialized(
+        self,
+        manifest: PluginManifest,
+        transaction: Optional[_RegistrationTransaction],
+    ) -> None:
+        own_transaction = transaction is None
+        transaction = transaction or _RegistrationTransaction(self)
+        loaded = LoadedPlugin(manifest=manifest)
         plugin_id = manifest.key or manifest.name
         module_root = (
             _directory_module_name(manifest)
             if manifest.source in {"user", "project", "bundled"}
             else None
         )
-        manager_before = self._snapshot_owned_state()
-        registration_view = _PluginRegistrationView(
-            manager_before,
-            self._cli_ref,
+        manager_before = _PluginManagerState(transaction.manager_view)
+        tools_start = len(transaction.manager_view._transaction_tools_registered)
+        commands_start = len(
+            transaction.manager_view._transaction_commands_registered
         )
-        tool_before = _registry._take_transaction_snapshot()
-        tool_registration_view = _registry._create_transaction_view(tool_before)
         modules_before = (
             _snapshot_module_namespace(module_root) if module_root else {}
         )
@@ -2267,11 +2308,12 @@ class PluginManager:
         context = PluginContext(
             manifest,
             self,
-            registration_manager=registration_view,
-            registration_registry=tool_registration_view,
+            registration_manager=transaction.manager_view,
+            registration_registry=transaction.tool_view,
+            registration_external_registries=transaction.context_targets(),
         )
         try:
-            tool_registration_view.register_plugin_override_policy(
+            transaction.tool_view.register_plugin_override_policy(
                 module_root or plugin_id,
                 context._tool_override_allowed(""),
             )
@@ -2287,69 +2329,73 @@ class PluginManager:
 
             phase = "registration"
             register_fn(context)
+            staged = transaction.manager_view
             loaded.tools_registered = list(
-                registration_view._transaction_tools_registered
+                staged._transaction_tools_registered[tools_start:]
             )
             loaded.hooks_registered = [
                 name
-                for name, callbacks in registration_view._hooks.items()
+                for name, callbacks in staged._hooks.items()
                 if len(callbacks) > len(manager_before._hooks.get(name, []))
             ]
             loaded.middleware_registered = [
                 name
-                for name, callbacks in registration_view._middleware.items()
+                for name, callbacks in staged._middleware.items()
                 if len(callbacks) > len(manager_before._middleware.get(name, []))
             ]
             loaded.commands_registered = list(
-                registration_view._transaction_commands_registered
+                staged._transaction_commands_registered[commands_start:]
             )
             loaded.enabled = True
+            with staged._lock:
+                staged._plugins[plugin_id] = loaded
+                staged._generation += 1
+            transaction.contexts.append(context)
             phase = "commit"
-            self._commit_registration_view(
-                manager_before,
-                registration_view,
-                plugin_id,
-                loaded,
-                _registry,
-                tool_before,
-                tool_registration_view,
-                context,
-            )
+            if own_transaction:
+                transaction.commit()
             logger.debug(
-                "  registered: %d tool(s), %d hook(s), %d middleware, "
-                "%d slash command(s), %d CLI command(s)",
+                "Plugin '%s' staged %d tool(s), %d hook(s), %d middleware, "
+                "%d slash command(s)",
+                plugin_id,
                 len(loaded.tools_registered),
                 len(loaded.hooks_registered),
                 len(loaded.middleware_registered),
                 len(loaded.commands_registered),
-                sum(
-                    1
-                    for entry in registration_view._cli_commands.values()
-                    if entry.get("plugin") == manifest.name
-                ),
             )
             return
-
         except BaseException as exc:
-            # Live tools and manager registrations were never touched unless
-            # the atomic commit completed. External registries retain their
-            # existing explicit journals.
-            registration_view._rollback_external_registries()
             if module_root:
                 _restore_module_namespace(module_root, modules_before)
             loaded.enabled = False
             loaded.module = None
             if not isinstance(exc, Exception):
                 raise
-
-            loaded.error = f"{type(exc).__name__}: plugin {phase} failed"
-            logger.warning(
-                "Failed to load plugin '%s': %s",
-                manifest.name,
-                loaded.error,
+            loaded.error = (
+                "RuntimeError: plugin commit failed"
+                if phase == "commit"
+                else f"{type(exc).__name__}: plugin {phase} failed"
             )
+            if isinstance(exc, RegistryTransactionConflict):
+                logger.warning(
+                    "Plugin commit conflict: plugin=%s surface=%s "
+                    "expected_generation=%d actual_generation=%d",
+                    plugin_id,
+                    exc.surface,
+                    exc.expected_generation,
+                    exc.actual_generation,
+                )
+            else:
+                logger.warning(
+                    "Failed to load plugin '%s': %s",
+                    manifest.name,
+                    loaded.error,
+                )
+            if not own_transaction:
+                raise _ForceSweepAbort() from None
             with self._lock:
                 self._plugins[plugin_id] = loaded
+                self._generation += 1
 
     def _load_directory_module(self, manifest: PluginManifest) -> types.ModuleType:
         """Import a directory-based plugin as ``hermes_plugins.<slug>``.

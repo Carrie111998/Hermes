@@ -1,0 +1,689 @@
+"""Concurrency contracts for transactional plugin registration."""
+
+from __future__ import annotations
+
+import sys
+import threading
+import types
+from pathlib import Path
+from typing import Any
+
+import pytest
+import yaml
+
+from agent.browser_provider import BrowserProvider
+from agent.image_gen_provider import ImageGenProvider
+from agent.secret_sources.base import FetchResult, SecretSource
+from agent.transcription_provider import TranscriptionProvider
+from agent.tts_provider import TTSProvider
+from agent.video_gen_provider import VideoGenProvider
+from agent.web_search_provider import WebSearchProvider
+from gateway.platform_registry import PlatformEntry, PlatformRegistry
+from hermes_cli.dashboard_auth import DashboardAuthProvider
+from hermes_cli.plugins import PluginManager
+from tools.registry import registry
+
+
+_SUPPORT_MODULE = "h1_transaction_test_support"
+_TOOL_NAME = "h1_transaction_generation_tool"
+_PLUGIN_NAME = "h1-transaction-concurrency"
+
+
+class _ImageProvider(ImageGenProvider):
+    def __init__(self, name: str, marker: str) -> None:
+        self._name = name
+        self.marker = marker
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    def generate(self, prompt: str, aspect_ratio: str = "landscape", **kwargs: Any) -> dict:
+        return {"marker": self.marker}
+
+
+class _VideoProvider(VideoGenProvider):
+    def __init__(self, name: str, marker: str) -> None:
+        self._name = name
+        self.marker = marker
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    def generate(self, prompt: str, **kwargs: Any) -> dict:
+        return {"marker": self.marker}
+
+
+class _WebProvider(WebSearchProvider):
+    def __init__(self, name: str, marker: str) -> None:
+        self._name = name
+        self.marker = marker
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    def is_available(self) -> bool:
+        return True
+
+    def search(self, query: str, limit: int = 5) -> dict:
+        return {"marker": self.marker}
+
+
+class _BrowserProvider(BrowserProvider):
+    def __init__(self, name: str, marker: str) -> None:
+        self._name = name
+        self.marker = marker
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    def is_available(self) -> bool:
+        return True
+
+    def create_session(self, task_id: str) -> dict:
+        return {"marker": self.marker}
+
+    def close_session(self, session_id: str) -> bool:
+        return True
+
+    def emergency_cleanup(self, session_id: str) -> None:
+        return None
+
+
+class _TTSProvider(TTSProvider):
+    def __init__(self, name: str, marker: str) -> None:
+        self._name = name
+        self.marker = marker
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    def synthesize(self, text: str, output_path: str, **kwargs: Any) -> str:
+        return output_path
+
+
+class _STTProvider(TranscriptionProvider):
+    def __init__(self, name: str, marker: str) -> None:
+        self._name = name
+        self.marker = marker
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    def transcribe(self, file_path: str, **kwargs: Any) -> dict:
+        return {"success": True, "transcript": self.marker, "provider": self.name}
+
+
+class _DashboardProvider(DashboardAuthProvider):
+    name = "h1-dashboard-test"
+    display_name = "H1 dashboard test"
+
+    def __init__(self, name: str, marker: str) -> None:
+        self.name = name
+        self.display_name = marker
+        self.marker = marker
+
+    def start_login(self, *, redirect_uri: str):
+        raise NotImplementedError
+
+    def complete_login(self, **kwargs: Any):
+        raise NotImplementedError
+
+    def verify_session(self, *, access_token: str):
+        return None
+
+    def refresh_session(self, *, refresh_token: str):
+        raise NotImplementedError
+
+    def revoke_session(self, *, refresh_token: str) -> None:
+        return None
+
+
+class _SecretProvider(SecretSource):
+    shape = "mapped"
+
+    def __init__(self, name: str, marker: str) -> None:
+        self.name = name
+        self.label = marker
+        self.marker = marker
+
+    def fetch(self, cfg: dict, home_path: Path) -> FetchResult:
+        return FetchResult()
+
+
+def _external_values(marker: str, namespace: str) -> dict[str, Any]:
+    names = {
+        surface: f"h1-{namespace}-{surface.replace('_', '-')}"
+        for surface in (
+            "image_gen",
+            "video_gen",
+            "web",
+            "browser",
+            "secret",
+            "tts",
+            "stt",
+            "dashboard",
+            "platform",
+        )
+    }
+    names["secret"] = f"h1_{namespace.replace('-', '_')}_secret"
+    return {
+        "image_gen": _ImageProvider(names["image_gen"], marker),
+        "video_gen": _VideoProvider(names["video_gen"], marker),
+        "web": _WebProvider(names["web"], marker),
+        "browser": _BrowserProvider(names["browser"], marker),
+        "secret": _SecretProvider(names["secret"], marker),
+        "tts": _TTSProvider(names["tts"], marker),
+        "stt": _STTProvider(names["stt"], marker),
+        "dashboard": _DashboardProvider(names["dashboard"], marker),
+        "platform": PlatformEntry(
+            name=names["platform"],
+            label=marker,
+            adapter_factory=lambda config, value=marker: value,
+            check_fn=lambda: True,
+            source="plugin",
+            plugin_name=_PLUGIN_NAME,
+        ),
+    }
+
+
+def _write_plugin(home: Path) -> None:
+    plugin_dir = home / "plugins" / _PLUGIN_NAME
+    plugin_dir.mkdir(parents=True)
+    (plugin_dir / "plugin.yaml").write_text(
+        yaml.safe_dump({"name": _PLUGIN_NAME, "version": "1.0"}),
+        encoding="utf-8",
+    )
+    (plugin_dir / "__init__.py").write_text(
+        f'''import {_SUPPORT_MODULE} as support
+
+def register(ctx):
+    values = support.values
+    ctx.register_image_gen_provider(values["image_gen"])
+    ctx.register_video_gen_provider(values["video_gen"])
+    ctx.register_web_search_provider(values["web"])
+    ctx.register_browser_provider(values["browser"])
+    ctx.register_secret_source(values["secret"])
+    ctx.register_tts_provider(values["tts"])
+    ctx.register_transcription_provider(values["stt"])
+    ctx.register_dashboard_auth_provider(values["dashboard"])
+    platform = values["platform"]
+    ctx.register_platform(
+        name=platform.name,
+        label=platform.label,
+        adapter_factory=platform.adapter_factory,
+        check_fn=platform.check_fn,
+    )
+    if support.register_generation_state:
+        ctx.register_tool(
+            {_TOOL_NAME!r},
+            "h1_transaction",
+            {{
+                "name": {_TOOL_NAME!r},
+                "description": support.marker,
+                "parameters": {{"type": "object", "properties": {{}}}},
+            }},
+            support.tool_handler,
+        )
+        ctx.register_hook("post_tool_call", support.hook)
+    support.started.set()
+    if not support.release.wait(timeout=5):
+        raise RuntimeError("test release timeout")
+    if support.fail:
+        raise RuntimeError("planned registration failure")
+''',
+        encoding="utf-8",
+    )
+    (home / "config.yaml").write_text(
+        yaml.safe_dump({"plugins": {"enabled": [_PLUGIN_NAME]}}),
+        encoding="utf-8",
+    )
+
+
+def _support(
+    values: dict[str, Any],
+    marker: str,
+    *,
+    released: bool = False,
+    fail: bool = False,
+    register_generation_state: bool = False,
+) -> types.ModuleType:
+    module = types.ModuleType(_SUPPORT_MODULE)
+    module.values = values
+    module.marker = marker
+    module.started = threading.Event()
+    module.release = threading.Event()
+    if released:
+        module.release.set()
+    module.fail = fail
+    module.register_generation_state = register_generation_state
+    module.tool_handler = lambda args, **kwargs: marker
+    module.hook = lambda **kwargs: marker
+    sys.modules[_SUPPORT_MODULE] = module
+    return module
+
+
+def _start_discovery(
+    manager: PluginManager,
+    *,
+    force: bool = False,
+) -> tuple[threading.Thread, threading.Event, list[BaseException]]:
+    done = threading.Event()
+    failures: list[BaseException] = []
+
+    def _run() -> None:
+        try:
+            manager.discover_and_load(force=force)
+        except BaseException as exc:  # pragma: no cover - asserted by callers
+            failures.append(exc)
+        finally:
+            done.set()
+
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+    return thread, done, failures
+
+
+def _join(thread: threading.Thread, done: threading.Event) -> None:
+    assert done.wait(timeout=5), "plugin discovery did not finish"
+    thread.join(timeout=1)
+    assert not thread.is_alive()
+
+
+def _external_readers(platform_registry: PlatformRegistry) -> dict[str, Any]:
+    from agent import (
+        browser_registry,
+        image_gen_registry,
+        transcription_registry,
+        tts_registry,
+        video_gen_registry,
+        web_search_registry,
+    )
+    from agent.secret_sources import registry as secret_registry
+    from hermes_cli.dashboard_auth import get_provider as get_dashboard_provider
+
+    return {
+        "image_gen": image_gen_registry.get_provider,
+        "video_gen": video_gen_registry.get_provider,
+        "web": web_search_registry.get_provider,
+        "browser": browser_registry.get_provider,
+        "secret": secret_registry.get_source,
+        "tts": tts_registry.get_provider,
+        "stt": transcription_registry.get_provider,
+        "dashboard": get_dashboard_provider,
+        "platform": platform_registry.get,
+    }
+
+
+def _read_external_generation(
+    values: dict[str, Any],
+    platform_registry: PlatformRegistry,
+) -> dict[str, Any]:
+    readers = _external_readers(platform_registry)
+    return {
+        surface: readers[surface](value.name)
+        for surface, value in values.items()
+    }
+
+
+def _register_external_direct(
+    surface: str,
+    value: Any,
+    platform_registry: PlatformRegistry,
+) -> None:
+    from agent import (
+        browser_registry,
+        image_gen_registry,
+        transcription_registry,
+        tts_registry,
+        video_gen_registry,
+        web_search_registry,
+    )
+    from agent.secret_sources import registry as secret_registry
+    from hermes_cli.dashboard_auth import register_provider as register_dashboard
+
+    registrations = {
+        "image_gen": image_gen_registry.register_provider,
+        "video_gen": video_gen_registry.register_provider,
+        "web": web_search_registry.register_provider,
+        "browser": browser_registry.register_provider,
+        "secret": secret_registry.register_source,
+        "tts": tts_registry.register_provider,
+        "stt": transcription_registry.register_provider,
+        "dashboard": register_dashboard,
+        "platform": platform_registry.register,
+    }
+    registrations[surface](value)
+
+
+@pytest.fixture(autouse=True)
+def isolated_registries(tmp_path, monkeypatch):
+    from agent import (
+        browser_registry,
+        image_gen_registry,
+        transcription_registry,
+        tts_registry,
+        video_gen_registry,
+        web_search_registry,
+    )
+    from agent.secret_sources import registry as secret_registry
+    from gateway import platform_registry as platform_module
+    from hermes_cli.dashboard_auth import clear_providers
+
+    provider_modules = (
+        image_gen_registry,
+        video_gen_registry,
+        web_search_registry,
+        browser_registry,
+        tts_registry,
+        transcription_registry,
+    )
+    for module in provider_modules:
+        module._reset_for_tests()
+    clear_providers()
+    secret_registry._reset_registry_for_tests()
+    monkeypatch.setattr(secret_registry, "_ensure_builtin_sources", lambda: None)
+    isolated_platform_registry = PlatformRegistry()
+    monkeypatch.setattr(
+        platform_module,
+        "platform_registry",
+        isolated_platform_registry,
+    )
+
+    with registry._lock:
+        tool_state = (
+            dict(registry._tools),
+            dict(registry._toolset_checks),
+            dict(registry._toolset_aliases),
+            dict(registry._plugin_override_policy),
+            registry._generation,
+        )
+
+    bundled = tmp_path / "empty-bundled"
+    bundled.mkdir()
+    monkeypatch.setenv("HERMES_BUNDLED_PLUGINS", str(bundled))
+    yield isolated_platform_registry
+
+    with registry._lock:
+        (
+            registry._tools,
+            registry._toolset_checks,
+            registry._toolset_aliases,
+            registry._plugin_override_policy,
+            old_generation,
+        ) = tool_state
+        registry._generation = max(registry._generation, old_generation) + 1
+    sys.modules.pop(_SUPPORT_MODULE, None)
+    for name in list(sys.modules):
+        if name.startswith("hermes_plugins.h1_transaction_concurrency"):
+            sys.modules.pop(name, None)
+
+
+def test_provider_and_platform_readers_never_observe_provisional_registration(
+    tmp_path, monkeypatch, isolated_registries
+):
+    home = tmp_path / "hermes-home"
+    values = _external_values("candidate", "visibility-success")
+    support = _support(values, "candidate")
+    _write_plugin(home)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    manager = PluginManager()
+
+    thread, done, failures = _start_discovery(manager)
+    assert support.started.wait(timeout=5)
+
+    blocked_observation = _read_external_generation(values, isolated_registries)
+    support.release.set()
+    _join(thread, done)
+    assert failures == []
+    assert all(observed is None for observed in blocked_observation.values())
+    assert _read_external_generation(values, isolated_registries) == values
+
+
+def test_failed_provider_and_platform_registration_never_becomes_visible(
+    tmp_path, monkeypatch, isolated_registries
+):
+    home = tmp_path / "hermes-home"
+    values = _external_values("candidate", "visibility-failure")
+    support = _support(values, "candidate", fail=True)
+    _write_plugin(home)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    manager = PluginManager()
+
+    thread, done, failures = _start_discovery(manager)
+    assert support.started.wait(timeout=5)
+
+    blocked_observation = _read_external_generation(values, isolated_registries)
+    support.release.set()
+    _join(thread, done)
+
+    assert failures == []
+    assert all(observed is None for observed in blocked_observation.values())
+    assert all(
+        observed is None
+        for observed in _read_external_generation(values, isolated_registries).values()
+    )
+    assert manager._plugins[_PLUGIN_NAME].enabled is False
+
+
+def test_force_reload_readers_observe_old_generation_until_atomic_swap(
+    tmp_path, monkeypatch, isolated_registries
+):
+    home = tmp_path / "hermes-home"
+    old_values = _external_values("generation-a", "force")
+    support = _support(
+        old_values,
+        "generation-a",
+        released=True,
+        register_generation_state=True,
+    )
+    _write_plugin(home)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    manager = PluginManager()
+    manager.discover_and_load()
+    old_tool = registry.get_entry(_TOOL_NAME)
+    assert old_tool is not None
+
+    new_values = _external_values("generation-b", "force")
+    support = _support(
+        new_values,
+        "generation-b",
+        register_generation_state=True,
+    )
+    thread, done, failures = _start_discovery(manager, force=True)
+    assert support.started.wait(timeout=5)
+
+    blocked_hook = manager.invoke_hook("post_tool_call")
+    blocked_tool = registry.get_entry(_TOOL_NAME)
+    blocked_external = _read_external_generation(old_values, isolated_registries)
+
+    support.release.set()
+    _join(thread, done)
+    assert failures == []
+    assert blocked_hook == ["generation-a"]
+    assert blocked_tool is old_tool
+    assert blocked_external == old_values
+    assert manager.invoke_hook("post_tool_call") == ["generation-b"]
+    assert registry.get_entry(_TOOL_NAME).handler is support.tool_handler
+    assert _read_external_generation(new_values, isolated_registries) == new_values
+
+
+def test_force_reload_failure_preserves_old_generation_without_empty_window(
+    tmp_path, monkeypatch, isolated_registries
+):
+    home = tmp_path / "hermes-home"
+    old_values = _external_values("generation-a", "force-failure")
+    _support(
+        old_values,
+        "generation-a",
+        released=True,
+        register_generation_state=True,
+    )
+    _write_plugin(home)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    manager = PluginManager()
+    manager.discover_and_load()
+    old_tool = registry.get_entry(_TOOL_NAME)
+    assert old_tool is not None
+
+    new_values = _external_values("generation-b", "force-failure")
+    support = _support(
+        new_values,
+        "generation-b",
+        fail=True,
+        register_generation_state=True,
+    )
+    thread, done, failures = _start_discovery(manager, force=True)
+    assert support.started.wait(timeout=5)
+
+    blocked_hook = manager.invoke_hook("post_tool_call")
+    blocked_tool = registry.get_entry(_TOOL_NAME)
+    blocked_external = _read_external_generation(old_values, isolated_registries)
+
+    support.release.set()
+    _join(thread, done)
+    assert failures == []
+    assert blocked_hook == ["generation-a"]
+    assert blocked_tool is old_tool
+    assert blocked_external == old_values
+    assert manager.invoke_hook("post_tool_call") == ["generation-a"]
+    assert registry.get_entry(_TOOL_NAME) is old_tool
+    observed = _read_external_generation(old_values, isolated_registries)
+    assert observed == old_values
+    assert {
+        getattr(value, "marker", getattr(value, "label", None))
+        for value in observed.values()
+    } == {"generation-a"}
+
+
+def test_force_reload_removes_registrations_absent_from_new_generation(
+    tmp_path, monkeypatch, isolated_registries
+):
+    home = tmp_path / "hermes-home"
+    old_values = _external_values("generation-a", "force-remove")
+    _support(
+        old_values,
+        "generation-a",
+        released=True,
+        register_generation_state=True,
+    )
+    _write_plugin(home)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    manager = PluginManager()
+    manager.discover_and_load()
+
+    assert registry.get_entry(_TOOL_NAME) is not None
+    assert _read_external_generation(old_values, isolated_registries) == old_values
+    module_namespace = f"hermes_plugins.{_PLUGIN_NAME.replace('-', '_')}"
+    with registry._lock:
+        assert module_namespace in registry._plugin_override_policy
+
+    (home / "config.yaml").write_text(
+        yaml.safe_dump({"plugins": {"enabled": []}}),
+        encoding="utf-8",
+    )
+    manager.discover_and_load(force=True)
+
+    assert manager.invoke_hook("post_tool_call") == []
+    assert registry.get_entry(_TOOL_NAME) is None
+    assert all(
+        observed is None
+        for observed in _read_external_generation(
+            old_values,
+            isolated_registries,
+        ).values()
+    )
+    assert manager._plugin_tool_names == set()
+    assert all(not names for names in manager._plugin_external_names.values())
+    assert manager._plugins[_PLUGIN_NAME].enabled is False
+    with registry._lock:
+        assert module_namespace not in registry._plugin_override_policy
+
+
+@pytest.mark.parametrize(
+    "conflict_surface",
+    [
+        "platform",
+        "browser",
+        "dashboard",
+        "image_gen",
+        "secret",
+        "stt",
+        "tts",
+        "video_gen",
+        "web",
+    ],
+)
+def test_external_registry_commit_conflict_preserves_concurrent_writer(
+    tmp_path, monkeypatch, isolated_registries, conflict_surface
+):
+    home = tmp_path / "hermes-home"
+    candidate_values = _external_values("candidate", "conflict")
+    support = _support(candidate_values, "candidate")
+    _write_plugin(home)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    manager = PluginManager()
+
+    thread, done, failures = _start_discovery(manager)
+    assert support.started.wait(timeout=5)
+
+    concurrent_values = _external_values(
+        "concurrent-writer",
+        "conflict-writer",
+    )
+    _register_external_direct(
+        conflict_surface,
+        concurrent_values[conflict_surface],
+        isolated_registries,
+    )
+
+    support.release.set()
+    _join(thread, done)
+    assert failures == []
+    observed_concurrent = _read_external_generation(
+        concurrent_values,
+        isolated_registries,
+    )
+    assert observed_concurrent[conflict_surface] is concurrent_values[conflict_surface]
+    assert all(
+        observed is None
+        for observed in _read_external_generation(
+            candidate_values,
+            isolated_registries,
+        ).values()
+    )
+    assert manager._plugins[_PLUGIN_NAME].enabled is False
+    assert manager._plugins[_PLUGIN_NAME].error == "RuntimeError: plugin commit failed"
+
+
+def test_context_retained_after_commit_targets_live_external_registries(
+    tmp_path, monkeypatch, isolated_registries
+):
+    home = tmp_path / "hermes-home"
+    values = _external_values("initial", "retained-context")
+    support = _support(values, "initial", released=True)
+    support.saved_context = None
+    _write_plugin(home)
+    plugin_file = home / "plugins" / _PLUGIN_NAME / "__init__.py"
+    plugin_file.write_text(
+        plugin_file.read_text(encoding="utf-8").replace(
+            "values = support.values",
+            "support.saved_context = ctx\n    values = support.values",
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    manager = PluginManager()
+    manager.discover_and_load()
+
+    late = _ImageProvider("h1-retained-context-late", "late")
+    support.saved_context.register_image_gen_provider(late)
+
+    from agent.image_gen_registry import get_provider
+
+    assert get_provider(late.name) is late
