@@ -17,6 +17,8 @@ from tools.process_registry import (
     FINISHED_TTL_SECONDS,
     MAX_PROCESSES,
     MAX_ACTIVE_PROCESS_AGE,
+    _format_age,
+    format_uptime_short,
 )
 
 
@@ -1534,3 +1536,25 @@ class TestReaderLoopOrphanedPipe:
             except (ProcessLookupError, PermissionError):
                 pass
 
+
+
+class TestElapsedFormatConsistency:
+    """The two elapsed-time formatters must render the same value identically.
+
+    _format_age (delegation completion text) and format_uptime_short (/proc
+    and /agents surfaces) previously produced different shapes for the same
+    input ('1m5s' vs '1m 5s', '2h' vs '2h 0m'), so a session's age could
+    read differently depending on which surface printed it. _format_age now
+    delegates to format_uptime_short; this pins the cross-surface contract.
+    """
+
+    @pytest.mark.parametrize("seconds", [0, 5, 59, 60, 65, 90, 3599, 3600, 3661, 7200, 7325, 86399, 86400])
+    def test_age_matches_uptime_short(self, seconds):
+        assert _format_age(seconds) == format_uptime_short(seconds)
+
+    def test_age_keeps_defensive_fallback(self):
+        assert _format_age(None) == "?"
+        assert _format_age("not-a-number") == "?"
+
+    def test_age_clamps_negative(self):
+        assert _format_age(-10) == "0s"

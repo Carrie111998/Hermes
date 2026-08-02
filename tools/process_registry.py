@@ -2172,18 +2172,19 @@ process_registry = ProcessRegistry()
 
 
 def _format_age(seconds: float) -> str:
-    """Human-friendly elapsed string ('18m', '2h3m', '45s')."""
+    """Human-friendly elapsed string, consistent with ``format_uptime_short``.
+
+    The delegation completion text and the /proc-style uptime surfaces must
+    render the same elapsed value the same way — previously ``_format_age``
+    produced a different shape ('1m5s', '2h') than ``format_uptime_short``
+    ('1m 5s', '2h 0m') for the same input, so a session's age could read
+    differently depending on which surface printed it. One canonical
+    formatter; this wrapper only keeps the defensive non-numeric fallback.
+    """
     try:
-        s = int(max(0, seconds))
+        return format_uptime_short(int(max(0, seconds)))
     except (TypeError, ValueError):
         return "?"
-    if s < 60:
-        return f"{s}s"
-    m, s = divmod(s, 60)
-    if m < 60:
-        return f"{m}m" if s == 0 else f"{m}m{s}s"
-    h, m = divmod(m, 60)
-    return f"{h}h" if m == 0 else f"{h}h{m}m"
 
 
 def _format_async_delegation(evt: dict) -> str:
