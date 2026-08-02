@@ -404,10 +404,25 @@ def check_gateway_lifecycle(
             combined = f"{combined}\n{script_text}"
 
     script_dir = _resolve_script_directory(script) if script else None
-    if contains_gateway_lifecycle_command_or_referenced_script(
-        combined,
-        cwd=script_dir,
-    ):
+    # Cron scripts are executed by the scheduler with Python unless they are
+    # shell scripts. The referenced-script walker is intentionally shell
+    # syntax-aware, so applying it to Python source misreads expressions such
+    # as `Path("/tmp") / "x"` as an executed absolute path and fails closed on
+    # the directory. Keep direct lifecycle-command matching for Python (and
+    # other non-shell) scripts, while retaining recursive shell scanning for
+    # shell scripts.
+    is_shell_script = bool(
+        script and Path(script).suffix.lower() in {".sh", ".bash", ".zsh"}
+    )
+    blocked = (
+        contains_gateway_lifecycle_command_or_referenced_script(
+            combined,
+            cwd=script_dir,
+        )
+        if is_shell_script or not script
+        else contains_gateway_lifecycle_command(combined)
+    )
+    if blocked:
         raise GatewayLifecycleBlocked(
             "Blocked: cron job contains a gateway lifecycle command or persistent "
             "launchctl submit operation. This is blocked to prevent agent-driven "

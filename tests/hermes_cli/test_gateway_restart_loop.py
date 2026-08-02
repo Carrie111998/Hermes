@@ -634,6 +634,7 @@ class TestLifecycleGuardModule:
         script.write_text(
             "from pathlib import Path\n"
             "ENV = Path.home() / '.hermes' / '.env'\n"
+            "TMP = Path('/tmp') / 'workspace'\n"
         )
         check_gateway_lifecycle("", str(script))
 
