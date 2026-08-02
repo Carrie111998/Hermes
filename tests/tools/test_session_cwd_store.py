@@ -43,6 +43,49 @@ class TestDualWriteSites:
         assert tt.get_session_cwd("desktop-sess") == "/wt/desktop"
 
 
+    def test_update_task_env_overrides_merges_without_changing_register_contract(self):
+        tt.register_task_env_overrides("session", {"docker_image": "neutral:latest"})
+        tt.update_task_env_overrides("session", {"cwd": "/work/neutral"})
+        assert tt._task_env_overrides["session"] == {
+            "docker_image": "neutral:latest",
+            "cwd": "/work/neutral",
+        }
+
+        tt.register_task_env_overrides("session", {"modal_image": "neutral:v2"})
+        assert tt._task_env_overrides["session"] == {"modal_image": "neutral:v2"}
+
+    def test_clear_task_env_override_cwd_preserves_other_keys_and_newer_cwd(self):
+        tt.register_task_env_overrides(
+            "session",
+            {"docker_image": "neutral:latest", "cwd": "/work/first"},
+        )
+        assert not tt.clear_task_env_override_cwd(
+            "session",
+            expected_cwd="/work/stale",
+        )
+        assert tt._task_env_overrides["session"]["cwd"] == "/work/first"
+
+        assert tt.clear_task_env_override_cwd(
+            "session",
+            expected_cwd="/work/first",
+        )
+        assert tt._task_env_overrides["session"] == {
+            "docker_image": "neutral:latest"
+        }
+
+    def test_clear_owned_override_drops_terminal_mutated_session_cwd(self):
+        tt.register_task_env_overrides("session", {"cwd": "/work/project"})
+        # A terminal `cd subdir` updates the session record but deliberately
+        # leaves the gateway-owned registry value as its ownership guard.
+        tt.record_session_cwd("session", "/work/project/subdir")
+
+        assert tt.clear_task_env_override_cwd(
+            "session",
+            expected_cwd="/work/project",
+        )
+        assert tt.get_session_cwd("session") is None
+        assert "session" not in tt._task_env_overrides
+
     def test_reregistration_updates_the_record(self):
         """ACP session/load switching project roots mid-session."""
         tt.register_task_env_overrides("acp-sess", {"cwd": "/proj/one"})
