@@ -188,6 +188,38 @@ class TestCronDenyModeAllGuards:
             assert not result["approved"]
             assert "BLOCKED" in result["message"]
 
+    def test_inherited_ask_mode_cannot_bypass_cron_deny(self, monkeypatch):
+        """A gateway parent may export HERMES_EXEC_ASK into a cron worker.
+
+        Cron identity must win: no human is attached to the unattended run, so
+        the inherited ask surface cannot turn cron_mode=deny into approval.
+        """
+        monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+        monkeypatch.setenv("HERMES_EXEC_ASK", "1")
+        monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+        monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+        monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
+
+        from unittest.mock import patch as mock_patch
+        with mock_patch("tools.approval._get_cron_approval_mode", return_value="deny"):
+            result = check_all_command_guards("rm -rf /tmp/stuff", "local")
+        assert not result["approved"]
+        assert "cron jobs run without a user present" in result["message"]
+        assert result.get("status") != "approval_required"
+
+    def test_inherited_ask_mode_uses_explicit_cron_approve(self, monkeypatch):
+        monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+        monkeypatch.setenv("HERMES_EXEC_ASK", "1")
+        monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+        monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+        monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
+
+        from unittest.mock import patch as mock_patch
+        with mock_patch("tools.approval._get_cron_approval_mode", return_value="approve"):
+            result = check_all_command_guards("rm -rf /tmp/stuff", "local")
+        assert result["approved"]
+        assert result.get("status") != "approval_required"
+
     def test_safe_command_allowed_in_combined_guard(self, monkeypatch):
         monkeypatch.setenv("HERMES_CRON_SESSION", "1")
         monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
