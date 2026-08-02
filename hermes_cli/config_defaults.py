@@ -734,6 +734,9 @@ DEFAULT_CONFIG = {
     #   See: https://openrouter.ai/docs/guides/features/response-caching
     # response_cache_ttl: how long cached responses remain valid, in seconds (1-86400).
     #   Default 300 (5 minutes). Only used when response_cache is enabled.
+    # zdr: require Zero Data Retention on every OpenRouter inference request.
+    #   Enforced at the final request boundary so request overrides and delegated
+    #   provider changes cannot weaken a profile-wide privacy requirement.
     # min_coding_score: knob for the openrouter/pareto-code router (0.0-1.0).
     #   Only applied when model.model is "openrouter/pareto-code". Higher
     #   values route to stronger (more expensive) coders; lower values open
@@ -745,6 +748,7 @@ DEFAULT_CONFIG = {
     "openrouter": {
         "response_cache": True,
         "response_cache_ttl": 300,
+        "zdr": False,
         "min_coding_score": 0.65,
     },
 

@@ -192,6 +192,7 @@ def _provider_preferences_for_agent(agent) -> Dict[str, Any]:
         preferences["require_parameters"] = True
     if agent.provider_data_collection:
         preferences["data_collection"] = agent.provider_data_collection
+
     return preferences
 
 
@@ -218,6 +219,34 @@ def _merge_nous_portal_messages_extra_body(agent, anthropic_kwargs: dict) -> dic
     except Exception as exc:  # noqa: BLE001 — never block a turn on tagging
         logger.debug("Nous Portal extra_body merge failed: %s", exc)
     return anthropic_kwargs
+
+
+def _enforce_summary_openrouter_zdr(agent, api_kwargs: dict) -> None:
+    """Apply OpenRouter ZDR to direct iteration-limit summary calls."""
+    from agent.openrouter_zdr import enforce_openrouter_zdr
+
+    try:
+        is_openrouter = (
+            (agent.provider or "").strip().lower() == "openrouter"
+            or agent._is_openrouter_url()
+        )
+    except Exception as exc:
+        # Preserve enforcement when the canonical OpenRouter host is still
+        # identifiable even if the agent-specific detector fails.
+        is_openrouter = base_url_host_matches(
+            str(getattr(agent, "base_url", None) or ""), "openrouter.ai"
+        )
+        logger.warning(
+            "OpenRouter detection failed for a summary request; "
+            "host fallback selected is_openrouter=%s: %s",
+            is_openrouter,
+            exc,
+        )
+    enforce_openrouter_zdr(
+        api_kwargs,
+        is_openrouter=is_openrouter,
+        base_url=getattr(agent, "base_url", None),
+    )
 
 
 def _env_float(name: str, default: float) -> float:
@@ -2298,6 +2327,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 _summary_result = _tsum.normalize_response(summary_response, strip_tool_prefix=agent._is_anthropic_oauth)
                 final_response = (_summary_result.content or "").strip()
             else:
+                _enforce_summary_openrouter_zdr(agent, summary_kwargs)
                 summary_client = agent._ensure_primary_openai_client(
                     reason="iteration_limit_summary"
                 )
@@ -2360,6 +2390,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 if summary_extra_body:
                     summary_kwargs["extra_body"] = summary_extra_body
 
+                _enforce_summary_openrouter_zdr(agent, summary_kwargs)
                 summary_client = agent._ensure_primary_openai_client(
                     reason="iteration_limit_summary_retry"
                 )

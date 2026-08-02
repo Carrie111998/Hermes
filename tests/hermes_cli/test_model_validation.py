@@ -33,8 +33,8 @@ FAKE_API_MODELS = [
 ]
 
 
-def _validate(model, provider="openrouter", api_models=FAKE_API_MODELS, **kw):
-    """Shortcut: call validate_requested_model with mocked API."""
+def _validate(model, provider="zai", api_models=FAKE_API_MODELS, **kw):
+    """Shortcut: exercise generic provider validation with a mocked API."""
     probe_payload = {
         "models": api_models,
         "probed_url": "http://localhost:11434/v1/models",

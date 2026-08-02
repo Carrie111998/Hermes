@@ -246,6 +246,18 @@ _LAST_EXPANDED_CONFIG_BY_PATH: Dict[str, Any] = {}
 # managed_scope), and the env snapshot invalidates it when a referenced ${VAR}
 # changes value (late .env load, in-process rotation — #58514).
 _LOAD_CONFIG_CACHE: Dict[str, Tuple[int, int, int, int, Dict[str, Any], Dict[str, Optional[str]]]] = {}
+# User-config path -> resolved managed target identity used to build its cached
+# effective config. Kept separate from the fixed-shape tuple for backward
+# compatibility with tests/helpers that inspect cache entries. The canonical
+# target path plus device/inode catches both directory changes and stable-link
+# retargets even when target files share identical (mtime_ns, size).
+_LOAD_CONFIG_MANAGED_IDENTITY_BY_USER_PATH: Dict[str, Tuple[str, int, int]] = {}
+# Path -> (mtime_ns, size) for a user config that the canonical loader could
+# not parse/merge. The effective config may be defaults or last-known-good,
+# but privacy-sensitive readers must be able to distinguish that degraded
+# state from an explicit setting. Entries are signature-bound so fixing or
+# replacing the file invalidates the failure without a separate reset hook.
+_CONFIG_LOAD_FAILURE_BY_PATH: Dict[str, Tuple[int, int]] = {}
 # (path, mtime_ns, size) -> cached raw yaml dict. Same pattern as
 # _LOAD_CONFIG_CACHE but for read_raw_config() — used when callers want
 # the user's on-disk values without defaults merged in.
@@ -3152,6 +3164,42 @@ def load_config_readonly() -> Dict[str, Any]:
     return _load_config_impl(want_deepcopy=False)
 
 
+def openrouter_zdr_enabled() -> bool:
+    """Return whether request-time OpenRouter ZDR enforcement is enabled.
+
+    The mtime-keyed read-only cache lets profile config changes apply to the
+    next request without rebuilding an active conversation.  This accessor is
+    intentionally strict because its result controls a privacy boundary:
+    unreadable/unparseable YAML and malformed ``openrouter``/``zdr`` values
+    raise so the final request guard can enforce ZDR fail closed instead of
+    mistaking loader defaults for an explicit opt-out.
+    """
+    with _CONFIG_LOCK:
+        config = load_config_readonly()
+        config_path = get_config_path()
+        if str(config_path) in _CONFIG_LOAD_FAILURE_BY_PATH:
+            raise RuntimeError(
+                f"OpenRouter ZDR state is unknown because {config_path} "
+                "could not be parsed"
+            )
+
+        from hermes_cli import managed_scope
+
+        if managed_scope.managed_config_load_degraded():
+            raise RuntimeError(
+                "OpenRouter ZDR state is unknown because the managed config "
+                "could not be parsed"
+            )
+
+    openrouter = config.get("openrouter")
+    if not isinstance(openrouter, dict):
+        raise ValueError("effective openrouter config must be a mapping")
+    zdr = openrouter.get("zdr")
+    if not isinstance(zdr, bool):
+        raise ValueError("effective openrouter.zdr must be a boolean")
+    return zdr
+
+
 def write_platform_config_field(
     platform_key: str,
     field_key: str,
@@ -3291,6 +3339,7 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
             user_sig: Optional[Tuple[int, int]] = (st.st_mtime_ns, st.st_size)
         except FileNotFoundError:
             user_sig = None
+            _CONFIG_LOAD_FAILURE_BY_PATH.pop(path_key, None)
 
         # Managed scope: fold the managed config file's (mtime, size) into the
         # cache signature so editing /etc/hermes/config.yaml invalidates the
@@ -3299,11 +3348,24 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
 
         managed_dir = managed_scope.get_managed_dir()
         managed_cfg_path = (managed_dir / "config.yaml") if managed_dir else None
+        if managed_cfg_path is not None:
+            try:
+                managed_target_path = str(managed_cfg_path.resolve(strict=False))
+            except OSError:
+                managed_target_path = str(managed_cfg_path.absolute())
+        else:
+            managed_target_path = ""
         try:
             mst = managed_cfg_path.stat() if managed_cfg_path else None
             managed_sig = (mst.st_mtime_ns, mst.st_size) if mst else (0, 0)
+            managed_identity = (
+                managed_target_path,
+                mst.st_dev if mst else 0,
+                mst.st_ino if mst else 0,
+            )
         except OSError:
             managed_sig = (0, 0)
+            managed_identity = (managed_target_path, 0, 0)
 
         # Combined cache signature: user file + managed file. None only when the
         # user config is absent AND no managed file exists (nothing to cache on).
@@ -3320,7 +3382,13 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
             cache_sig = None
 
         cached = _LOAD_CONFIG_CACHE.get(path_key)
-        if cached is not None and cache_sig is not None and cached[:4] == cache_sig:
+        if (
+            cached is not None
+            and cache_sig is not None
+            and cached[:4] == cache_sig
+            and _LOAD_CONFIG_MANAGED_IDENTITY_BY_USER_PATH.get(path_key)
+            == managed_identity
+        ):
             # File signatures match, but the cached expansion is only valid if
             # every ${VAR} it was expanded against still has the same value.
             # Without this, a load_config() that ran before load_hermes_dotenv()
@@ -3345,7 +3413,9 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
                     user_config.pop("max_turns", None)
 
                 config = _deep_merge(config, user_config)
+                _CONFIG_LOAD_FAILURE_BY_PATH.pop(path_key, None)
             except Exception as e:
+                _CONFIG_LOAD_FAILURE_BY_PATH[path_key] = user_sig
                 # Last-known-good fallback (port of openai/codex#31188's
                 # invariant: a parse failure in a policy/config file must not
                 # silently replace the effective policy with an empty/default
@@ -3384,6 +3454,9 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
                             cache_sig[2], cache_sig[3],
                             lkg_copy, _empty_env,
                         )
+                        _LOAD_CONFIG_MANAGED_IDENTITY_BY_USER_PATH[path_key] = (
+                            managed_identity
+                        )
                     return copy.deepcopy(lkg_copy) if want_deepcopy else lkg_copy
 
         normalized = _normalize_root_model_keys(_normalize_max_turns_config(config))
@@ -3412,6 +3485,7 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
             if managed_config:
                 _env_ref_snapshot(managed_config, env_snapshot)
             _LOAD_CONFIG_CACHE[path_key] = (*cache_sig, cached_copy, env_snapshot)
+            _LOAD_CONFIG_MANAGED_IDENTITY_BY_USER_PATH[path_key] = managed_identity
             # On the readonly path return the same cached object subsequent
             # calls will see — keeps "two readonly calls return the same
             # object" invariant that callers may rely on for identity checks.
@@ -3419,6 +3493,7 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
                 return cached_copy
         else:
             _LOAD_CONFIG_CACHE.pop(path_key, None)
+            _LOAD_CONFIG_MANAGED_IDENTITY_BY_USER_PATH.pop(path_key, None)
         # First-load result is a fresh dict (not aliased to the cache); safe
         # to return directly. For the deepcopy=True path this is the
         # canonical "freshly-built mutable result" the function has always

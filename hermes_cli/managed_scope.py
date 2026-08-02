@@ -33,9 +33,15 @@ logger = logging.getLogger(__name__)
 _DEFAULT_MANAGED_DIR = Path("/etc/hermes")
 
 _CACHE_LOCK = threading.Lock()
-# path_key -> (mtime_ns, size, parsed)
+# canonical target path -> (mtime_ns, size, device, inode, parsed)
 _CONFIG_CACHE: Dict[str, tuple] = {}
 _ENV_CACHE: Dict[str, tuple] = {}
+# canonical target path -> (mtime_ns, size, device, inode), or None when even
+# stat/read failed. This
+# not change managed scope's startup-safe fail-open merge semantics; it lets
+# security-sensitive request guards detect that current administrator policy
+# is degraded and choose a stricter local behavior.
+_CONFIG_FAILURE_BY_PATH: Dict[str, Optional[tuple[int, int, int, int]]] = {}
 
 
 def _under_pytest() -> bool:
@@ -76,30 +82,65 @@ def invalidate_managed_cache() -> None:
     with _CACHE_LOCK:
         _CONFIG_CACHE.clear()
         _ENV_CACHE.clear()
+        _CONFIG_FAILURE_BY_PATH.clear()
 
 
-def _cached_read(path: Path, cache: Dict[str, tuple], parse):
-    """Shared (mtime_ns, size)-keyed read. Returns a deepcopy of the parsed value.
+def _cache_path_key(path: Path) -> str:
+    """Canonical target identity seam for symlink-safe managed caches."""
+    try:
+        return str(path.resolve(strict=False))
+    except OSError:
+        return str(path.absolute())
+
+
+def _cached_read(
+    path: Path,
+    cache: Dict[str, tuple],
+    parse,
+    *,
+    failure_cache: Optional[Dict[str, Optional[tuple[int, int, int, int]]]] = None,
+):
+    """Target-identity-keyed read. Returns a deepcopy of the parsed value.
 
     Returns ``None`` when the file is absent or fails to parse (fail-open). A
     parse failure is logged LOUDLY — the admin needs to know their policy isn't
     being applied — but never raises, so a malformed managed file can't brick
-    startup.
+    startup. ``failure_cache`` records only the current degraded file state for
+    security-sensitive consumers; normal managed-overlay behavior is unchanged.
     """
+    path_key = _cache_path_key(path)
     try:
         st = path.stat()
-    except OSError:
-        return None  # absent
-    key = (st.st_mtime_ns, st.st_size)
-    path_key = str(path)
+    except FileNotFoundError:
+        if failure_cache is not None:
+            with _CACHE_LOCK:
+                failure_cache.pop(path_key, None)
+        return None
+    except OSError as exc:
+        if failure_cache is not None:
+            with _CACHE_LOCK:
+                failure_cache[path_key] = None
+        logger.warning(
+            "managed scope: failed to access %s: %s — IGNORING this managed file. "
+            "Admin policy from this file is NOT being applied. Fix and restart.",
+            path,
+            exc,
+        )
+        return None
+    key = (st.st_mtime_ns, st.st_size, st.st_dev, st.st_ino)
     with _CACHE_LOCK:
         hit = cache.get(path_key)
-        if hit is not None and hit[:2] == key:
-            return copy.deepcopy(hit[2])
+        if hit is not None and hit[:4] == key:
+            if failure_cache is not None:
+                failure_cache.pop(path_key, None)
+            return copy.deepcopy(hit[4])
     try:
         with open(path, encoding="utf-8") as f:
             parsed = parse(f)
     except Exception as exc:  # noqa: BLE001 — fail-open, but LOUD
+        if failure_cache is not None:
+            with _CACHE_LOCK:
+                failure_cache[path_key] = key
         logger.warning(
             "managed scope: failed to parse %s: %s — IGNORING this managed file. "
             "Admin policy from this file is NOT being applied. Fix and restart.",
@@ -108,7 +149,16 @@ def _cached_read(path: Path, cache: Dict[str, tuple], parse):
         )
         return None
     with _CACHE_LOCK:
-        cache[path_key] = (key[0], key[1], copy.deepcopy(parsed))
+        cache[path_key] = (*key, copy.deepcopy(parsed))
+        if failure_cache is not None:
+            failure_cache.pop(path_key, None)
+    return parsed
+
+
+def _parse_managed_config(f) -> dict:
+    parsed = yaml.safe_load(f) or {}
+    if not isinstance(parsed, dict):
+        raise ValueError("managed config root must be a mapping")
     return parsed
 
 
@@ -120,9 +170,26 @@ def load_managed_config() -> dict:
     parsed = _cached_read(
         managed_dir / "config.yaml",
         _CONFIG_CACHE,
-        lambda f: yaml.safe_load(f) or {},
+        _parse_managed_config,
+        failure_cache=_CONFIG_FAILURE_BY_PATH,
     )
     return parsed if isinstance(parsed, dict) else {}
+
+
+def managed_config_load_degraded() -> bool:
+    """Return whether the current managed config exists but cannot be trusted.
+
+    The ordinary overlay remains startup-safe and fail-open. Privacy/security
+    boundaries can call this after loading effective config and enforce a local
+    fail-closed policy while the administrator repairs the managed file.
+    """
+    managed_dir = get_managed_dir()
+    if managed_dir is None:
+        return False
+    config_path = managed_dir / "config.yaml"
+    load_managed_config()  # refresh signature-bound success/failure state
+    with _CACHE_LOCK:
+        return _cache_path_key(config_path) in _CONFIG_FAILURE_BY_PATH
 
 
 def load_managed_env() -> Dict[str, str]:

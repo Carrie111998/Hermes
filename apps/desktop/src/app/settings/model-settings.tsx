@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import { Button } from '@/components/ui/button'
+import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import { Input } from '@/components/ui/input'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Skeleton } from '@/components/ui/skeleton'
@@ -209,6 +210,7 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
   // place — mirrors the onboarding ApiKeyForm but scoped to the model picker.
   const [apiKeyDraft, setApiKeyDraft] = useState('')
   const [activating, setActivating] = useState(false)
+  const [confirmDisableZdrEpoch, setConfirmDisableZdrEpoch] = useState<number | null>(null)
 
   // Deep link from the vision Capabilities detail (?tab=config:model&aux=vision):
   // scroll the auxiliary task row into view and flash it once the list loads.
@@ -286,6 +288,7 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
     setSelectedProvider('')
     setSelectedModel('')
     setApiKeyDraft('')
+    setConfirmDisableZdrEpoch(null)
     void refresh({ replaceSelection: true })
   })
 
@@ -512,6 +515,36 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
   const effortValue = rawEffort === 'false' || rawEffort === 'disabled' ? 'none' : rawEffort || DEFAULT_REASONING_EFFORT
 
   const fastOn = isFastTier(getNested(config ?? {}, 'agent.service_tier'))
+  const openRouterZdrOn = getNested(config ?? {}, 'openrouter.zdr') === true
+
+  const writeOpenRouterZdr = useCallback(
+    async (enabled: boolean, expectedEpoch = profileEpoch.current) => {
+      if (!config || profileEpoch.current !== expectedEpoch) {
+        return
+      }
+
+      const prev = config
+      const next = setNested(config, 'openrouter.zdr', enabled)
+      setConfig(next)
+
+      try {
+        // The profile cannot change between this synchronous guard and the API
+        // call, so the write is bound to the profile that initiated the intent.
+        if (profileEpoch.current !== expectedEpoch) {
+          return
+        }
+
+        await saveHermesConfig(next)
+      } catch (err) {
+        if (profileEpoch.current === expectedEpoch) {
+          setConfig(prev)
+        }
+
+        throw err
+      }
+    },
+    [config, setConfig]
+  )
 
   // Persist a single agent.* default by round-tripping the whole config record
   // (PUT /api/config replaces it) — optimistic, with rollback on failure.
@@ -756,6 +789,29 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
 
   return (
     <div className="grid gap-6">
+      <section className="flex items-center justify-between gap-4 rounded-md border border-border px-3 py-2.5">
+        <div className="min-w-0">
+          <div className="text-sm font-medium">OpenRouter Zero Data Retention</div>
+          <p className="mt-0.5 text-xs text-muted-foreground">
+            {openRouterZdrOn
+              ? 'Hermes forces provider.zdr=true on every OpenRouter request for this profile.'
+              : 'OpenRouter account policy applies without a request-time ZDR requirement.'}
+          </p>
+        </div>
+        <Switch
+          aria-label="Enforce OpenRouter Zero Data Retention"
+          checked={openRouterZdrOn}
+          disabled={!config}
+          onCheckedChange={enabled => {
+            if (enabled) {
+              void writeOpenRouterZdr(true).catch(err => notifyError(err, 'Failed to enable OpenRouter ZDR'))
+            } else {
+              setConfirmDisableZdrEpoch(profileEpoch.current)
+            }
+          }}
+        />
+      </section>
+
       <section>
         <p className="mb-3 text-xs text-muted-foreground">{m.appliesDesc}</p>
         <div className="flex flex-wrap items-center gap-2">
@@ -1275,6 +1331,25 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
           </div>
         </section>
       )}
+      <ConfirmDialog
+        cancelLabel="Keep enabled"
+        confirmLabel="Disable ZDR"
+        description="Hermes will stop requiring Zero Data Retention on each OpenRouter request. Account and guardrail policies still apply, but eligible providers may retain prompts or use them for training."
+        destructive
+        onClose={() => setConfirmDisableZdrEpoch(null)}
+        onConfirm={async () => {
+          const expectedEpoch = confirmDisableZdrEpoch
+          setConfirmDisableZdrEpoch(null)
+
+          if (expectedEpoch === null || profileEpoch.current !== expectedEpoch) {
+            return
+          }
+
+          await writeOpenRouterZdr(false, expectedEpoch)
+        }}
+        open={confirmDisableZdrEpoch !== null}
+        title="Disable request-time ZDR?"
+      />
     </div>
   )
 }

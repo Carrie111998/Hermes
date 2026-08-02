@@ -1704,11 +1704,13 @@ def switch_model(
             "message": f"Could not validate `{new_model}`: {e}",
         }
 
-    # Override rejection if model is in the user's saved provider config.
-    # API /v1/models may not list cloud/aliased models even though the server supports them.
+    # Override rejection if a model is declared for a non-authoritative custom
+    # provider. OpenRouter's authenticated /models/user catalog is authoritative
+    # and must never be bypassed by a stale local declaration.
     if not validation.get("accepted"):
         override = False
-        if user_providers:
+        authoritative_openrouter = str(target_provider).strip().lower() == "openrouter"
+        if user_providers and not authoritative_openrouter:
             from hermes_cli.config import is_provider_enabled
             # user_providers is a dict: {provider_slug: config_dict}
             for slug, cfg in user_providers.items():
@@ -1719,8 +1721,14 @@ def switch_model(
                         override = True
                         break
         # Also check custom_providers list — models declared there should be accepted
-        # even if the remote /v1/models endpoint doesn't list them.
-        if not override and custom_providers and isinstance(custom_providers, list):
+        # even if the remote /v1/models endpoint doesn't list them. Never soften
+        # an authoritative OpenRouter policy rejection.
+        if (
+            not override
+            and not authoritative_openrouter
+            and custom_providers
+            and isinstance(custom_providers, list)
+        ):
             for entry in custom_providers:
                 if not isinstance(entry, dict):
                     continue
@@ -2191,8 +2199,18 @@ def list_authenticated_providers(
             if not isinstance(env_vars, list):
                 continue
 
-        # Check if any env var is set
+        # Check the canonical effective credential path for OpenRouter so a
+        # profile configured through model.api_key is not hidden before its
+        # authenticated policy catalog can be queried. Other providers retain
+        # their existing environment/auth-store availability checks.
         has_creds = any(os.environ.get(ev) for ev in env_vars)
+        if hermes_id == "openrouter":
+            try:
+                from hermes_cli.models import has_openrouter_catalog_credential
+
+                has_creds = has_openrouter_catalog_credential()
+            except Exception:
+                pass
         if not has_creds:
             try:
                 from hermes_cli.auth import _load_auth_store
@@ -2211,10 +2229,13 @@ def list_authenticated_providers(
 
         # Unified pathway: route through cached_provider_model_ids() so the
         # /model picker sees the SAME list `hermes model` would build, with
-        # disk caching to keep the picker open snappy. Falls back to the
-        # curated static list when the live fetcher returns nothing.
+        # disk caching to keep the picker open snappy.
         model_ids = cached_provider_model_ids(hermes_id)
-        if not model_ids:
+        # OpenRouter's authenticated /models/user response is authoritative.
+        # Curated/static entries only order and describe IDs already present in
+        # that verified set; they must not become an offline authorization
+        # fallback. Other providers retain their ordinary fallback behavior.
+        if not model_ids and hermes_id != "openrouter":
             model_ids = curated.get(hermes_id, [])
             if hermes_id in _MODELS_DEV_PREFERRED:
                 model_ids = _merge_with_models_dev(hermes_id, model_ids)
@@ -2226,6 +2247,13 @@ def list_authenticated_providers(
             configured = user_providers.get(hermes_id)
             if isinstance(configured, dict):
                 configured_models = _declared_model_ids(configured.get("models"))
+        if hermes_id == "openrouter":
+            verified_by_lower = {model_id.lower(): model_id for model_id in model_ids}
+            configured_models = [
+                verified_by_lower[model_id.lower()]
+                for model_id in configured_models
+                if model_id.lower() in verified_by_lower
+            ]
         model_ids = list(dict.fromkeys([*configured_models, *model_ids]))
         total = len(model_ids)
         if hermes_id in _UNCAPPED_PICKER_PROVIDERS:
