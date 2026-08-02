@@ -149,6 +149,10 @@ _CUA_DRIVER_DEFAULT_CMD = "cua-driver"
 _CUA_DRIVER_ARGS = ["mcp"]  # stdio MCP transport (fallback when the
                             # driver doesn't expose `manifest` — see
                             # `_resolve_mcp_invocation` below)
+# The lifecycle owner times out its own MCP startup so the same asyncio task
+# that entered stdio_client/ClientSession also unwinds them and reaps the child.
+# Keep this below the synchronous 30s ready guard to leave cleanup headroom.
+_CUA_MCP_STARTUP_TIMEOUT_SECONDS = 25.0
 
 # Whole-screen / desktop capture. cua-driver is a window-oriented driver —
 # its `get_window_state` / `screenshot` tools capture a single window (by
@@ -454,8 +458,11 @@ class _EmbeddedCuaDaemon:
             "unrestricted",
             "--dangerously-bypass-approvals",
         ]
+        from tools.mcp_stdio_watchdog import wrap_command
+
+        supervised_command, supervised_args = wrap_command(command[0], command[1:])
         self._process = subprocess.Popen(
-            command,
+            [supervised_command, *supervised_args],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
@@ -1182,55 +1189,84 @@ class _CuaDriverSession:
         self._startup_phase = "binary-check"
 
         try:
-            driver_cmd = resolve_cua_driver_cmd()
-            if not driver_cmd:
-                raise RuntimeError(cua_driver_install_hint())
+            # Own the complete startup budget here, including synchronous
+            # driver/manifest discovery.  Run blocking probes in a worker so
+            # this lifecycle task can enforce its deadline; the MCP SDK async
+            # contexts themselves still enter and exit in this same task.
+            async with asyncio.timeout(_CUA_MCP_STARTUP_TIMEOUT_SECONDS) as startup_timeout:
+                driver_cmd = await asyncio.to_thread(resolve_cua_driver_cmd)
+                if not driver_cmd:
+                    raise RuntimeError(cua_driver_install_hint())
 
-            # Surface 8: ask cua-driver itself which subcommand spawns
-            # the MCP server, instead of hardcoding ["mcp"]. Falls back
-            # transparently for older drivers / any discovery failure.
-            self._startup_phase = "manifest-discovery"
-            if self._embedded_daemon is not None:
-                command, args = self._embedded_daemon.proxy_invocation()
-                child_env = self._embedded_daemon.child_env()
-            else:
-                command, args = _resolve_mcp_invocation(driver_cmd)
-                child_env = cua_driver_child_env()
-            _t_manifest = _time.monotonic()
-            params = StdioServerParameters(
-                command=command,
-                args=args,
-                # Apply the telemetry policy first (default: disabled), then
-                # sanitize Hermes-managed secrets out of the child env.
-                env=_sanitize_subprocess_env(child_env),
-            )
-
-            async with stdio_client(params) as (read, write):
-                self._startup_phase = "mcp-initialize"
-                async with ClientSession(read, write) as session:
-                    await session.initialize()
-                    _t_init = _time.monotonic()
-                    # Populate capabilities + capability_version BEFORE
-                    # exposing the session to callers, so the first
-                    # tool call already sees them.
-                    self._startup_phase = "capability-discovery"
-                    await self._populate_capabilities(session)
-                    self._session = session
-                    self._startup_phase = "ready"
-                    self._ready_event.set()
-                    logger.info(
-                        "cua-driver session ready in %.1fs "
-                        "(manifest=%.1fs, mcp_init=%.1fs)",
-                        _time.monotonic() - _t0,
-                        _t_manifest - _t0,
-                        _t_init - _t_manifest,
+                # Surface 8: ask cua-driver itself which subcommand spawns
+                # the MCP server, instead of hardcoding ["mcp"]. Falls back
+                # transparently for older drivers / any discovery failure.
+                self._startup_phase = "manifest-discovery"
+                if self._embedded_daemon is not None:
+                    command, args = await asyncio.to_thread(
+                        self._embedded_daemon.proxy_invocation
                     )
-                    # Hold the contexts open until stop() / restart asks
-                    # us to wind down. Tool calls run as their own tasks
-                    # on the same loop and touch self._session directly.
-                    await self._shutdown_event.wait()
+                    child_env = self._embedded_daemon.child_env()
+                else:
+                    command, args = await asyncio.to_thread(
+                        _resolve_mcp_invocation, driver_cmd
+                    )
+                    child_env = cua_driver_child_env()
+                # Reuse Hermes's stdio MCP parent-death supervisor on POSIX. It
+                # owns only this invocation's process group, so a hard gateway
+                # death reaps the exact cua-driver tree without name-based kills.
+                from tools.mcp_stdio_watchdog import wrap_command
+
+                command, args = wrap_command(command, args)
+                _t_manifest = _time.monotonic()
+                params = StdioServerParameters(
+                    command=command,
+                    args=args,
+                    # Apply the telemetry policy first (default: disabled), then
+                    # sanitize Hermes-managed secrets out of the child env.
+                    env=_sanitize_subprocess_env(child_env),
+                )
+
+                self._startup_phase = "mcp-spawn"
+                async with stdio_client(params) as (read, write):
+                    self._startup_phase = "mcp-initialize"
+                    async with ClientSession(read, write) as session:
+                        await session.initialize()
+                        _t_init = _time.monotonic()
+                        # Populate capabilities + capability_version BEFORE
+                        # exposing the session to callers, so the first
+                        # tool call already sees them.
+                        self._startup_phase = "capability-discovery"
+                        await self._populate_capabilities(session)
+                        self._session = session
+                        self._startup_phase = "ready"
+                        self._ready_event.set()
+                        logger.info(
+                            "cua-driver session ready in %.1fs "
+                            "(manifest=%.1fs, mcp_init=%.1fs)",
+                            _time.monotonic() - _t0,
+                            _t_manifest - _t0,
+                            _t_init - _t_manifest,
+                        )
+                        # Startup is complete: disarm the setup deadline while
+                        # preserving this task as owner of both async contexts.
+                        startup_timeout.reschedule(None)
+                        # Hold the contexts open until stop() / restart asks
+                        # us to wind down. Tool calls run as their own tasks
+                        # on the same loop and touch self._session directly.
+                        await self._shutdown_event.wait()
+        except asyncio.TimeoutError as e:
+            phase = getattr(self, "_startup_phase", "unknown")
+            timeout_error = asyncio.TimeoutError(
+                "cua-driver MCP startup timed out after "
+                f"{_CUA_MCP_STARTUP_TIMEOUT_SECONDS:g}s "
+                f"(stuck in phase: {phase})"
+            )
+            self._setup_error = timeout_error
+            self._ready_event.set()
+            raise timeout_error from e
         except BaseException as e:
-            # Capture both ordinary errors and anyio CancelledError.
+            # Capture ordinary errors and anyio CancelledError.
             # The caller (start()) inspects this to surface setup
             # failures to the synchronous world.
             self._setup_error = e

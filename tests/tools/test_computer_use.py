@@ -1449,6 +1449,176 @@ class TestCaptureAfterExactTarget:
             "mode": "som", "app": None, "pid": 7675, "window_id": 42,
         }]
 
+class TestCuaMcpStartupCleanup:
+    def test_lifecycle_timeout_unwinds_stdio_before_outer_guard(self, monkeypatch):
+        """A wedged initialize must time out inside the lifecycle owner.
+
+        The synchronous 30s ready guard cannot safely reap an SDK-owned child:
+        setting the shutdown event is ineffective while initialize is blocked.
+        The owning asyncio task must time itself out so stdio_client.__aexit__
+        completes before setup failure is reported.
+        """
+        import asyncio
+        import time
+        from contextlib import asynccontextmanager
+        from unittest.mock import MagicMock
+
+        from tools.computer_use import cua_backend
+
+        session = cua_backend._CuaDriverSession(cua_backend._AsyncBridge())
+        stdio_exited = asyncio.Event()
+
+        @asynccontextmanager
+        async def fake_stdio_client(_params):
+            try:
+                yield MagicMock(), MagicMock()
+            finally:
+                stdio_exited.set()
+
+        class HangingSession:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_exc):
+                return False
+
+            async def initialize(self):
+                await asyncio.sleep(3600)
+
+        monkeypatch.setattr(
+            cua_backend, "_CUA_MCP_STARTUP_TIMEOUT_SECONDS", 0.05, raising=False
+        )
+        monkeypatch.setattr(cua_backend, "resolve_cua_driver_cmd", lambda: "cua-driver")
+        monkeypatch.setattr(
+            cua_backend,
+            "_resolve_mcp_invocation",
+            lambda _cmd: ("cua-driver", ["mcp"]),
+        )
+        monkeypatch.setattr("mcp.client.stdio.stdio_client", fake_stdio_client)
+        monkeypatch.setattr("mcp.ClientSession", lambda *_args, **_kwargs: HangingSession())
+
+        async def drive():
+            started = time.monotonic()
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(session._lifecycle_coro(), timeout=0.5)
+            return time.monotonic() - started
+
+        elapsed = asyncio.run(drive())
+        assert elapsed < 0.25
+        assert stdio_exited.is_set(), "stdio context must unwind before failure returns"
+        assert isinstance(session._setup_error, asyncio.TimeoutError)
+        assert "mcp-initialize" in str(session._setup_error)
+        assert "0.05s" in str(session._setup_error)
+
+    def test_startup_deadline_includes_blocking_manifest_discovery(self, monkeypatch):
+        """Manifest probing must not consume the cleanup headroom outside the deadline."""
+        import asyncio
+        import time
+        from contextlib import asynccontextmanager
+        from unittest.mock import MagicMock
+
+        from tools.computer_use import cua_backend
+
+        session = cua_backend._CuaDriverSession(cua_backend._AsyncBridge())
+        stdio_entered = False
+
+        def slow_manifest(_cmd):
+            time.sleep(0.2)
+            return "cua-driver", ["mcp"]
+
+        @asynccontextmanager
+        async def fake_stdio_client(_params):
+            nonlocal stdio_entered
+            stdio_entered = True
+            yield MagicMock(), MagicMock()
+
+        class HangingSession:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_exc):
+                return False
+
+            async def initialize(self):
+                await asyncio.sleep(3600)
+
+        monkeypatch.setattr(
+            cua_backend, "_CUA_MCP_STARTUP_TIMEOUT_SECONDS", 0.05
+        )
+        monkeypatch.setattr(cua_backend, "resolve_cua_driver_cmd", lambda: "cua-driver")
+        monkeypatch.setattr(cua_backend, "_resolve_mcp_invocation", slow_manifest)
+        monkeypatch.setattr("mcp.client.stdio.stdio_client", fake_stdio_client)
+        monkeypatch.setattr("mcp.ClientSession", lambda *_args, **_kwargs: HangingSession())
+
+        async def drive():
+            started = time.monotonic()
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(session._lifecycle_coro(), timeout=0.5)
+            return time.monotonic() - started
+
+        elapsed = asyncio.run(drive())
+        assert elapsed < 0.15
+        assert not stdio_entered
+        assert "manifest-discovery" in str(session._setup_error)
+
+    @pytest.mark.skipif(os.name != "posix", reason="process watchdog is POSIX-only")
+    def test_real_wedged_mcp_child_is_reaped_before_timeout_returns(
+        self, tmp_path, monkeypatch
+    ):
+        """Exercise the real MCP SDK + watchdog against a child that never speaks."""
+        import asyncio
+        import signal
+        import sys
+        import time
+
+        from tools.computer_use import cua_backend
+
+        pid_file = tmp_path / "wedged-child.pid"
+        server = tmp_path / "wedged_mcp.py"
+        server.write_text(
+            "import os, pathlib, sys, time\n"
+            "pathlib.Path(sys.argv[1]).write_text(str(os.getpid()))\n"
+            "time.sleep(3600)\n",
+            encoding="utf-8",
+        )
+
+        session = cua_backend._CuaDriverSession(cua_backend._AsyncBridge())
+        monkeypatch.setattr(cua_backend, "_CUA_MCP_STARTUP_TIMEOUT_SECONDS", 0.5)
+        monkeypatch.setattr(cua_backend, "resolve_cua_driver_cmd", lambda: sys.executable)
+        monkeypatch.setattr(
+            cua_backend,
+            "_resolve_mcp_invocation",
+            lambda _cmd: (sys.executable, [str(server), str(pid_file)]),
+        )
+
+        def pid_alive(pid: int) -> bool:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return False
+            except PermissionError:
+                return True
+            return True
+
+        child_pid = None
+        try:
+            with pytest.raises(asyncio.TimeoutError):
+                asyncio.run(
+                    asyncio.wait_for(session._lifecycle_coro(), timeout=5.0)
+                )
+            assert pid_file.exists(), "real child never reached its entry point"
+            child_pid = int(pid_file.read_text(encoding="utf-8"))
+            deadline = time.monotonic() + 5.0
+            while pid_alive(child_pid) and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert not pid_alive(child_pid), (
+                f"wedged MCP child {child_pid} survived lifecycle timeout cleanup"
+            )
+        finally:
+            if child_pid is not None and pid_alive(child_pid):
+                os.kill(child_pid, signal.SIGKILL)
+
+
 class TestCuaEnvironmentScrubbing:
     """Verify that cua-driver subprocess environment is sanitized (issue #37878)."""
 
@@ -1472,6 +1642,7 @@ class TestCuaEnvironmentScrubbing:
         session = _CuaDriverSession(bridge)
 
         captured_env: Dict[str, str] = {}
+        captured_invocation: Dict[str, Any] = {}
 
         async def drive_lifecycle():
             test_env = {
@@ -1484,6 +1655,10 @@ class TestCuaEnvironmentScrubbing:
 
             def capture_env(**kwargs):
                 captured_env.update(kwargs.get("env", {}))
+                captured_invocation.update({
+                    "command": kwargs.get("command"),
+                    "args": kwargs.get("args"),
+                })
                 # Return any sentinel — never actually used by the
                 # patched stdio_client path below.
                 return MagicMock()
@@ -1546,6 +1721,18 @@ class TestCuaEnvironmentScrubbing:
         # At least one safe var must survive the scrub.
         assert "PATH" in captured_env or "SAFE_VAR" in captured_env, \
             "At least one safe environment variable should be preserved"
+        if os.name == "posix":
+            from tools import mcp_stdio_watchdog
+
+            assert captured_invocation["command"] == sys.executable
+            assert captured_invocation["args"] == [
+                os.path.abspath(mcp_stdio_watchdog.__file__),
+                "--ppid",
+                str(os.getpid()),
+                "--",
+                "cua-driver",
+                "mcp",
+            ]
 
 
 class TestCuaCliFallbackResolution:
