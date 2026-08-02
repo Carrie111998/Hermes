@@ -8797,19 +8797,14 @@ def _nous_device_code_login(
         effective_interval = max(1, min(interval, DEVICE_AUTH_POLL_INTERVAL_CAP_SECONDS))
         print(f"Waiting for approval (polling every {effective_interval}s)...")
 
-        try:
-            token_data = _poll_for_token(
-                client=client,
-                portal_base_url=portal_base_url,
-                client_id=client_id,
-                device_code=str(device_data["device_code"]),
-                expires_in=expires_in,
-                poll_interval=interval,
-            )
-        except TimeoutError as exc:
-            raise TimeoutError(
-                _nous_device_auth_timeout_message(portal_base_url)
-            ) from exc
+        token_data = _poll_for_token(
+            client=client,
+            portal_base_url=portal_base_url,
+            client_id=client_id,
+            device_code=str(device_data["device_code"]),
+            expires_in=expires_in,
+            poll_interval=interval,
+        )
 
     now = datetime.now(timezone.utc)
     token_expires_in = _coerce_ttl_seconds(token_data.get("expires_in", 0))
