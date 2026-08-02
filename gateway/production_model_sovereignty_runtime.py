@@ -213,18 +213,29 @@ _PLATFORMS = {
     "relay": _RELAY_PLATFORM,
 }
 _PRODUCTION_GATEWAY_NOTIFY_INTERVAL = 180
+_PRODUCTION_GLOBAL_DISPLAY_POLICY = {
+    # Bare text sent while a turn is active augments that turn after its next
+    # atomic action. Explicit /stop remains the dedicated hard-stop command.
+    "busy_input_mode": "steer",
+    # The acting model may publish concise natural-language work updates. Tool
+    # arguments, scratch reasoning, and token deltas remain independently gated
+    # by the Discord policy below.
+    "show_commentary": True,
+}
 _PRODUCTION_DISCORD_DISPLAY_POLICY = {
-    # Production chat is final-answer-first. The relay still emits typing and
-    # one edit-in-place elapsed heartbeat, but raw commands, provisional model
-    # narration, scratch reasoning, and renewable-slice counters stay out of
-    # the Discord transcript.
+    # Keep raw commands, scratch reasoning, token deltas, and renewable-slice
+    # counters out of the transcript while allowing concise model-authored
+    # commentary between real work steps.
     "tool_progress": "off",
-    "interim_assistant_messages": False,
+    "interim_assistant_messages": True,
     "thinking_progress": False,
     "show_reasoning": False,
     "streaming": False,
     "long_running_notifications": True,
     "busy_ack_detail": False,
+    # Steering is visible through the model's subsequent commentary; avoid a
+    # second technical acknowledgement bubble for the same user message.
+    "busy_steer_ack_enabled": False,
 }
 _FORBIDDEN_ENVIRONMENT_NAMES = frozenset(
     {
@@ -683,6 +694,7 @@ def overlay_production_gateway_config(
     display = target.setdefault("display", {})
     if not isinstance(display, dict):
         raise ProductionContractError("production_display_config_invalid")
+    display.update(copy.deepcopy(_PRODUCTION_GLOBAL_DISPLAY_POLICY))
     display_platforms = display.setdefault("platforms", {})
     if not isinstance(display_platforms, dict):
         raise ProductionContractError(
@@ -922,6 +934,13 @@ def validate_production_gateway_config(raw: Mapping[str, Any]) -> None:
         raise ProductionContractError("production_mac_ops_edge_not_exact") from exc
 
     display = raw.get("display")
+    if not isinstance(display, Mapping) or any(
+        display.get(key) != expected
+        for key, expected in _PRODUCTION_GLOBAL_DISPLAY_POLICY.items()
+    ):
+        raise ProductionContractError(
+            "production_global_display_policy_not_exact"
+        )
     display_platforms = (
         display.get("platforms") if isinstance(display, Mapping) else None
     )

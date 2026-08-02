@@ -381,6 +381,61 @@ class TestBusySessionAck:
         assert sk not in adapter._pending_messages
 
     @pytest.mark.asyncio
+    async def test_production_discord_policy_steers_silently_without_interrupt(
+        self, monkeypatch
+    ):
+        """The sealed production display contract augments the live turn.
+
+        A normal Discord follow-up is model-visible steering, never a hard
+        interrupt or a replayed next turn. The explicit /stop command follows
+        its separate slash-command path and is not handled here.
+        """
+        import gateway.run as _gr
+
+        config = {
+            "display": {
+                "busy_input_mode": "steer",
+                "show_commentary": True,
+                "platforms": {
+                    "discord": {
+                        "busy_steer_ack_enabled": False,
+                        "tool_progress": "off",
+                        "interim_assistant_messages": True,
+                    }
+                },
+            }
+        }
+        monkeypatch.delenv("HERMES_GATEWAY_BUSY_INPUT_MODE", raising=False)
+        monkeypatch.delenv(
+            "HERMES_GATEWAY_BUSY_STEER_ACK_ENABLED", raising=False
+        )
+        monkeypatch.setattr(_gr, "_load_gateway_runtime_config", lambda: config)
+        monkeypatch.setattr(_gr, "_load_gateway_config", lambda: config)
+
+        runner, _sentinel = _make_runner()
+        runner._busy_input_mode = _gr.GatewayRunner._load_busy_input_mode()
+        adapter = _make_adapter(platform_val="discord")
+        event = _make_event(
+            text="also verify the migration",
+            platform_val="discord",
+        )
+        sk = build_session_key(event.source)
+        runner.adapters[event.source.platform] = adapter
+
+        agent = MagicMock()
+        agent.steer = MagicMock(return_value=True)
+        runner._running_agents[sk] = agent
+
+        handled = await runner._handle_active_session_busy_message(event, sk)
+
+        assert handled is True
+        assert runner._busy_input_mode == "steer"
+        agent.steer.assert_called_once_with("also verify the migration")
+        agent.interrupt.assert_not_called()
+        assert sk not in adapter._pending_messages
+        adapter._send_with_retry.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_steer_ack_env_override_can_suppress_visible_ack(self, monkeypatch):
         """Env override supports process-level suppression for gateway services."""
         import gateway.run as _gr
