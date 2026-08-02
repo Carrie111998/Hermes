@@ -55,6 +55,81 @@ def _m():
     return main
 
 
+
+
+def check_hermes_process() -> None:
+    """Prompt the user to stop other running hermes.exe processes on Windows.
+
+    Runs only on Windows, only in an interactive TTY, and only when the update
+    was not invoked with ``--yes``. Excludes the current process. On a ``n``
+    answer it raises SystemExit(0) so the update aborts cleanly (no error).
+    """
+    import os
+    import subprocess
+    import sys
+
+    if not sys.platform.startswith("win"):
+        return
+    if "--yes" in sys.argv:
+        return
+    try:
+        if not sys.stdin.isatty():
+            return
+    except Exception:
+        return
+
+    try:
+        result = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq hermes.exe"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        output = result.stdout or ""
+    except Exception:
+        return
+
+    proc_lines = [ln for ln in output.strip().splitlines() if "hermes.exe" in ln]
+    if not proc_lines:
+        return
+
+    current_pid = str(os.getpid())
+    pids: list[str] = []
+    for ln in proc_lines:
+        tokens = ln.split()
+        # tasklist format: IMAGENAME  PID  SESSION  ...  -> PID is tokens[1]
+        if len(tokens) >= 2 and tokens[1].isdigit():
+            pid = tokens[1]
+            if pid != current_pid and pid not in pids:
+                pids.append(pid)
+    if not pids:
+        return
+
+    print()
+    plural = "s" if len(pids) != 1 else ""
+    print(
+        "⚠ Detected {} running hermes.exe process{}: {}".format(
+            len(pids), plural, ", ".join(pids)
+        )
+    )
+    answer = input("Stop these processes before continuing? [Y/n] ").strip().lower()
+    if answer in ("", "y", "yes"):
+        for pid in pids:
+            try:
+                subprocess.run(
+                    ["taskkill", "/PID", pid, "/F"],
+                    check=False,
+                    capture_output=True,
+                )
+            except Exception:
+                pass
+        print("→ Stopped hermes.exe processes.")
+    else:
+        # User declined: abort the update cleanly, no error.
+        print()
+        print("→ Update aborted: hermes.exe processes still running.")
+        sys.exit(0)
+
 _UPDATE_RUNTIME_RELOAD_MODULES = (
     "hermes_constants",
     "tools.environments.local",
@@ -3593,7 +3668,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
     # open. Continuing would result in a string of WinError 32 warnings and
     # then either a deferred-rename leftover or a failed git-pull fast path
     # that silently falls back to the slower ZIP route. See issue #26670.
+    # On Windows, prompt (once) to stop any other running hermes.exe holding the
+    # venv shim. A "n" answer aborts the update cleanly.
     if _m()._is_windows() and not getattr(args, "force", False):
+        check_hermes_process()
+        # Re-check after a possible termination before continuing.
         scripts_dir = _m()._venv_scripts_dir()
         if scripts_dir is not None:
             concurrent = _m()._detect_concurrent_hermes_instances(scripts_dir)
