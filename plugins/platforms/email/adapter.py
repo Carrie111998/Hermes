@@ -267,14 +267,8 @@ def _extract_text_body(msg: email_lib.message.Message) -> str:
 
 
 def _strip_html(html: str) -> str:
-    """Strip HTML to readable fallback text for incoming and outgoing mail."""
-    text = re.sub(
-        r"<(style|script)\b[^>]*>.*?</\1\s*>",
-        "",
-        html,
-        flags=re.IGNORECASE | re.DOTALL,
-    )
-    text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
+    """Naive HTML tag stripper for fallback text extraction."""
+    text = re.sub(r"<br\s*/?>", "\n", html, flags=re.IGNORECASE)
     text = re.sub(r"<p[^>]*>", "\n", text, flags=re.IGNORECASE)
     text = re.sub(r"</p>", "\n", text, flags=re.IGNORECASE)
     text = re.sub(r"<[^>]+>", "", text)
@@ -284,6 +278,25 @@ def _strip_html(html: str) -> str:
     text = re.sub(r"&gt;", ">", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
+
+
+def _strip_outbound_html(html: str) -> str:
+    """Strip non-content blocks before building an outbound plain fallback."""
+    text = re.sub(
+        r"<(style|script)\b[^>]*>.*?</\1\s*>",
+        "",
+        html,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    # Be conservative with a model-emitted block missing its close tag: stop
+    # only at the structural boundary that ends metadata and starts content.
+    text = re.sub(
+        r"<(style|script)\b[^>]*>.*?(?=</head\s*>|<body\b)",
+        "",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    return _strip_html(text)
 
 
 # These literals intentionally mirror cron.scheduler._deliver_result. The
@@ -360,7 +373,7 @@ def _compose_outbound_email_body(
     if declared is not None:
         subject, html = declared
         message = MIMEMultipart("alternative")
-        message.attach(MIMEText(_strip_html(html), "plain", "utf-8"))
+        message.attach(MIMEText(_strip_outbound_html(html), "plain", "utf-8"))
         message.attach(MIMEText(html, "html", "utf-8"))
         return message, subject, True
 

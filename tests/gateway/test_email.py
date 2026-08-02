@@ -86,9 +86,22 @@ class TestHelperFunctions(unittest.TestCase):
         self.assertNotIn("<p>", result)
         self.assertNotIn("<b>", result)
 
-    def test_strip_html_omits_non_content_blocks_from_plain_fallback(self):
-        """CSS and scripts must not leak into multipart plain alternatives."""
+    def test_strip_html_preserves_script_text_for_incoming_mail(self):
+        """Inbound HTML extraction stays byte-semantically compatible."""
         from plugins.platforms.email.adapter import _strip_html
+
+        html = (
+            "<p>Why does this fail?</p>"
+            "<script>const total = items.reduce((a,b)=>a+b, 0);</script>"
+        )
+        self.assertEqual(
+            _strip_html(html),
+            "Why does this fail?\nconst total = items.reduce((a,b)=>a+b, 0);",
+        )
+
+    def test_outbound_fallback_omits_non_content_blocks(self):
+        """CSS and scripts must not leak into multipart plain alternatives."""
+        from plugins.platforms.email.adapter import _strip_outbound_html
 
         html = (
             "<!doctype html><html><head>"
@@ -96,7 +109,20 @@ class TestHelperFunctions(unittest.TestCase):
             "<script>window.alert('nope')</script>"
             "</head><body><p>Readable digest.</p></body></html>"
         )
-        result = _strip_html(html)
+        result = _strip_outbound_html(html)
+
+        self.assertEqual(result, "Readable digest.")
+
+    def test_outbound_fallback_handles_style_closed_by_head(self):
+        """A malformed style block must not leak CSS into the plain leaf."""
+        from plugins.platforms.email.adapter import _strip_outbound_html
+
+        html = (
+            "<!doctype html><html><head>"
+            "<style>.card { color: red; }</head>"
+            "<body><p>Readable digest.</p></body></html>"
+        )
+        result = _strip_outbound_html(html)
 
         self.assertEqual(result, "Readable digest.")
 
