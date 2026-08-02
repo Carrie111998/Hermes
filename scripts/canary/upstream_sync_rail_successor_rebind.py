@@ -159,7 +159,6 @@ def build_owner_request(
     target_revision: str,
     target_package_manifest_sha256: str,
     predecessor_revision: str,
-    predecessor_sender_revision: str,
     predecessor_activation_receipt_sha256: str,
     stage_c_host_artifact_manifest_sha256: str,
     stage_c_release_update_publication_sha256: str,
@@ -173,7 +172,6 @@ def build_owner_request(
         "target_revision": target_revision,
         "target_package_manifest_sha256": target_package_manifest_sha256,
         "predecessor_revision": predecessor_revision,
-        "predecessor_sender_revision": predecessor_sender_revision,
         "predecessor_activation_receipt_sha256": (
             predecessor_activation_receipt_sha256
         ),
@@ -208,7 +206,6 @@ def validate_owner_request(value: Any) -> dict[str, Any]:
         "target_revision",
         "target_package_manifest_sha256",
         "predecessor_revision",
-        "predecessor_sender_revision",
         "predecessor_activation_receipt_sha256",
         "stage_c_host_artifact_manifest_sha256",
         "stage_c_release_update_publication_sha256",
@@ -233,14 +230,9 @@ def validate_owner_request(value: Any) -> dict[str, Any]:
             for name in (
                 "target_revision",
                 "predecessor_revision",
-                "predecessor_sender_revision",
             )
         )
-        or request["target_revision"]
-        in {
-            request["predecessor_revision"],
-            request["predecessor_sender_revision"],
-        }
+        or request["target_revision"] == request["predecessor_revision"]
         or any(
             _SHA256.fullmatch(str(request.get(name, ""))) is None
             for name in (
@@ -336,27 +328,41 @@ def _release_references(raw: bytes) -> frozenset[str]:
 
 def _expected_missing_roots(
     predecessor_revision: str,
-    predecessor_sender_revision: str,
+    predecessor_sender_release_root: str,
 ) -> tuple[str, ...]:
-    if (
-        _SHA40.fullmatch(predecessor_revision or "") is None
-        or _SHA40.fullmatch(predecessor_sender_revision or "") is None
-    ):
+    predecessor_root = str(rail.release_root(predecessor_revision))
+    if _SHA40.fullmatch(predecessor_revision or "") is None:
+        _fail("upstream_sync_successor_revision_invalid")
+    valid_roots = _release_references(
+        f"{predecessor_sender_release_root}\n".encode("ascii", errors="strict")
+    )
+    if valid_roots != frozenset({predecessor_sender_release_root}):
         _fail("upstream_sync_successor_revision_invalid")
     return tuple(
-        sorted(
-            {
-                str(rail.release_root(predecessor_revision)),
-                str(rail.release_root(predecessor_sender_revision)),
-            }
-        )
+        sorted({predecessor_root, predecessor_sender_release_root})
     )
+
+
+def _derive_predecessor_sender_release_root(
+    *,
+    predecessor_revision: str,
+    predecessor_units: Mapping[str, bytes],
+) -> str:
+    report_raw = predecessor_units.get(rail.REPORT_SERVICE_UNIT)
+    if not isinstance(report_raw, bytes):
+        _fail("upstream_sync_successor_predecessor_unit_invalid")
+    predecessor_root = str(rail.release_root(predecessor_revision))
+    references = _release_references(report_raw)
+    if predecessor_root not in references or len(references) not in {1, 2}:
+        _fail("upstream_sync_successor_predecessor_refs_invalid")
+    sender_roots = references - {predecessor_root}
+    return next(iter(sender_roots), predecessor_root)
 
 
 def _validate_predecessor_unit_contracts(
     *,
     predecessor_revision: str,
-    predecessor_sender_revision: str,
+    predecessor_sender_release_root: str,
     predecessor_units: Mapping[str, bytes],
 ) -> None:
     report_raw = predecessor_units.get(rail.REPORT_SERVICE_UNIT)
@@ -378,7 +384,7 @@ def _validate_predecessor_unit_contracts(
         rail.validate_report_service(
             report_raw,
             release=rail.release_root(predecessor_revision),
-            sender_release=rail.release_root(predecessor_sender_revision),
+            sender_release=Path(predecessor_sender_release_root),
             sender_python_sha256=match.group(1).decode("ascii", errors="strict"),
         )
         rail.validate_report_timer(predecessor_units[rail.REPORT_TIMER_UNIT])
@@ -392,7 +398,6 @@ def build_authority(
     *,
     package: activation.PackageContext,
     predecessor_revision: str,
-    predecessor_sender_revision: str,
     predecessor_units: Mapping[str, bytes],
     stage_c_host_artifact_manifest_sha256: str,
     stage_c_release_update_publication_sha256: str,
@@ -419,13 +424,17 @@ def build_authority(
         or any(not isinstance(raw, bytes) or not raw for raw in predecessor_units.values())
     ):
         _fail("upstream_sync_successor_authority_invalid")
+    predecessor_sender_release_root = _derive_predecessor_sender_release_root(
+        predecessor_revision=predecessor_revision,
+        predecessor_units=predecessor_units,
+    )
     missing_roots = _expected_missing_roots(
         predecessor_revision,
-        predecessor_sender_revision,
+        predecessor_sender_release_root,
     )
     _validate_predecessor_unit_contracts(
         predecessor_revision=predecessor_revision,
-        predecessor_sender_revision=predecessor_sender_revision,
+        predecessor_sender_release_root=predecessor_sender_release_root,
         predecessor_units=predecessor_units,
     )
     observed_refs = frozenset(
@@ -448,7 +457,7 @@ def build_authority(
         "schema": AUTHORITY_SCHEMA,
         "operation": OPERATION,
         "predecessor_revision": predecessor_revision,
-        "predecessor_sender_revision": predecessor_sender_revision,
+        "predecessor_sender_release_root": predecessor_sender_release_root,
         "predecessor_unit_digests": predecessor_digests,
         "predecessor_missing_release_roots": list(missing_roots),
         "target_revision": target_revision,
@@ -492,7 +501,7 @@ def validate_authority(
         "schema",
         "operation",
         "predecessor_revision",
-        "predecessor_sender_revision",
+        "predecessor_sender_release_root",
         "predecessor_unit_digests",
         "predecessor_missing_release_roots",
         "target_revision",
@@ -519,7 +528,9 @@ def validate_authority(
     if not isinstance(value, Mapping) or set(value) != fields:
         _fail("upstream_sync_successor_authority_invalid")
     predecessor = str(value.get("predecessor_revision", ""))
-    predecessor_sender = str(value.get("predecessor_sender_revision", ""))
+    predecessor_sender_release_root = str(
+        value.get("predecessor_sender_release_root", "")
+    )
     target = str(value.get("target_revision", ""))
     digests = _unit_digest_map(
         value.get("predecessor_unit_digests"),
@@ -529,13 +540,17 @@ def validate_authority(
         value.get("target_unit_digests"),
         code="upstream_sync_successor_authority_invalid",
     )
-    expected_missing = _expected_missing_roots(predecessor, predecessor_sender)
+    expected_missing = _expected_missing_roots(
+        predecessor,
+        predecessor_sender_release_root,
+    )
     if (
         set(value) != fields
         or value.get("schema") != AUTHORITY_SCHEMA
         or value.get("operation") != OPERATION
         or _SHA40.fullmatch(target) is None
-        or target in {predecessor, predecessor_sender}
+        or target == predecessor
+        or str(rail.release_root(target)) == predecessor_sender_release_root
         or value.get("predecessor_missing_release_roots") != list(expected_missing)
         or value.get("target_release_root") != str(rail.release_root(target))
         or any(
@@ -1194,6 +1209,12 @@ def _validate_stage0_bundle(
             != request["stage_c_host_artifact_manifest_sha256"]
             or bundle.predecessor_trust.get("activation_receipt_sha256")
             != request["predecessor_activation_receipt_sha256"]
+            or bundle.predecessor_trust.get("release_revision")
+            != request["predecessor_revision"]
+            or publication.get("predecessor_revision")
+            != request["predecessor_revision"]
+            or plan.get("predecessor_revision")
+            != request["predecessor_revision"]
             or plan.get("predecessor_activation_receipt_sha256")
             != request["predecessor_activation_receipt_sha256"]
             or bundle.release_root != expected_release_root
@@ -1222,9 +1243,9 @@ def _read_staged_exact(
     *,
     raw: bytes,
     root_owned: bool,
-) -> None:
+) -> release_builder.FileIdentity:
     try:
-        observed, _metadata = activation._read_regular(  # noqa: SLF001
+        observed, metadata = activation._read_regular(  # noqa: SLF001
             path,
             maximum=activation.MAX_JSON_BYTES,
             modes=frozenset({0o444}),
@@ -1236,6 +1257,7 @@ def _read_staged_exact(
         ) from exc
     if observed != raw:
         _fail("upstream_sync_successor_stage_drifted")
+    return release_builder.FileIdentity.from_stat(metadata)
 
 
 def _read_pending_transaction_inode(
@@ -1324,7 +1346,7 @@ def _stage_create_only(
     *,
     path: Path,
     root_owned: bool,
-) -> None:
+) -> release_builder.FileIdentity:
     """Publish exact immutable bytes without an overwrite-capable edge.
 
     The deterministic pending inode makes crashes before or after ``link(2)``
@@ -1363,8 +1385,7 @@ def _stage_create_only(
                     "upstream_sync_successor_stage_invalid"
                 ) from exc
             _fsync_directory(path.parent)
-        _read_staged_exact(path, raw=raw, root_owned=root_owned)
-        return
+        return _read_staged_exact(path, raw=raw, root_owned=root_owned)
 
     if pending_exists:
         _read_staged_exact(pending, raw=raw, root_owned=root_owned)
@@ -1414,7 +1435,65 @@ def _stage_create_only(
             "upstream_sync_successor_stage_invalid"
         ) from exc
     _fsync_directory(path.parent)
-    _read_staged_exact(path, raw=raw, root_owned=root_owned)
+    return _read_staged_exact(path, raw=raw, root_owned=root_owned)
+
+
+def _remove_just_created_stage(
+    value: Mapping[str, Any],
+    *,
+    path: Path,
+    identity: release_builder.FileIdentity,
+    root_owned: bool,
+) -> None:
+    """Remove only the exact immutable inode created by this owner attempt."""
+
+    raw = activation._canonical(value) + b"\n"  # noqa: SLF001
+    try:
+        observed, metadata = activation._read_regular(  # noqa: SLF001
+            path,
+            maximum=activation.MAX_JSON_BYTES,
+            modes=frozenset({0o444}),
+            root_owned=root_owned,
+        )
+        if (
+            release_builder.FileIdentity.from_stat(metadata) != identity
+            or observed != raw
+        ):
+            _fail("upstream_sync_successor_stage_cleanup_failed")
+        path.unlink()
+        _fsync_directory(path.parent)
+    except UpstreamSyncRailSuccessorRebindError:
+        raise
+    except (OSError, activation.UpstreamSyncRailCutoverError) as exc:
+        raise UpstreamSyncRailSuccessorRebindError(
+            "upstream_sync_successor_stage_cleanup_failed"
+        ) from exc
+
+
+def _stage_create_only_guarded(
+    value: Mapping[str, Any],
+    *,
+    path: Path,
+    root_owned: bool,
+    stability_guard: Callable[[], None],
+) -> release_builder.FileIdentity:
+    """Create one fixed artifact with immediate Stage-0 pre/post guards."""
+
+    stability_guard()
+    if os.path.lexists(path):
+        _fail("upstream_sync_successor_stage_raced")
+    identity = _stage_create_only(value, path=path, root_owned=root_owned)
+    try:
+        stability_guard()
+    except release_stage0.ProductionReleaseUpdateStage0Error:
+        _remove_just_created_stage(
+            value,
+            path=path,
+            identity=identity,
+            root_owned=root_owned,
+        )
+        raise
+    return identity
 
 
 def _transaction_path(
@@ -1564,6 +1643,7 @@ def _archive_units(
         evidence_root=evidence_root,
     )
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    stability_guard()
     units = _unit_bytes(systemd_root=systemd_root, root_owned=root_owned)
     digests = _digest_bytes(units)
     for name in UNIT_NAMES:
@@ -1589,6 +1669,7 @@ def _archive_units(
             continue
         if digests[name] != authority["predecessor_unit_digests"][name]:
             _fail("upstream_sync_successor_archive_source_invalid", name)
+        stability_guard()
         activation._atomic_write(  # noqa: SLF001
             archive_path,
             units[name],
@@ -1608,7 +1689,8 @@ def _archive_units(
             "secret_material_recorded": False,
         }
     )
-    return _publish(
+    stability_guard()
+    published = _publish(
         receipt,
         path=_transaction_path(
             authority["authority_sha256"],
@@ -1617,6 +1699,8 @@ def _archive_units(
         ),
         root_owned=root_owned,
     )
+    stability_guard()
+    return published
 
 
 def _validate_archive(
@@ -1707,6 +1791,7 @@ def _install_target_units(
             _fail("upstream_sync_successor_foreign_unit_drift", name)
         if digests[name] == authority["target_unit_digests"][name]:
             continue
+        stability_guard()
         activation._atomic_write(  # noqa: SLF001
             systemd_root / name,
             package.artifacts[name],
@@ -1775,6 +1860,7 @@ def _restore_predecessor(
         root_owned=root_owned,
         cause=cause,
     )
+    stability_guard()
     host.mutate("stop", *TIMER_NAMES)
     quiescent = _observe_all(host, systemd_root=systemd_root)
     if any(quiescent[name].active_state != "inactive" for name in UNIT_NAMES):
@@ -1793,6 +1879,7 @@ def _restore_predecessor(
             root_owned=root_owned,
         )
         for name in UNIT_NAMES:
+            stability_guard()
             activation._atomic_write(  # noqa: SLF001
                 systemd_root / name,
                 archived[name],
@@ -1852,7 +1939,8 @@ def _restore_predecessor(
             "secret_material_recorded": False,
         }
     )
-    return _publish(
+    stability_guard()
+    published = _publish(
         rollback,
         path=_transaction_path(
             authority["authority_sha256"],
@@ -1861,6 +1949,8 @@ def _restore_predecessor(
         ),
         root_owned=root_owned,
     )
+    stability_guard()
+    return published
 
 
 def _rebind(
@@ -1908,12 +1998,15 @@ def _rebind(
         preflight=checked_preflight,
         root_owned=root_owned,
     ) as held:
-        def assert_stable() -> None:
+        def assert_rollback_authority() -> None:
             held.assert_stable()
+
+        def assert_forward_stable() -> None:
+            assert_rollback_authority()
             if stability_guard is not None:
                 stability_guard()
 
-        assert_stable()
+        assert_rollback_authority()
         result = _rebind_unheld(
             expected_authority_sha256=expected_authority_sha256,
             expected_preflight_sha256=expected_preflight_sha256,
@@ -1925,13 +2018,15 @@ def _rebind(
             evidence_root=evidence_root,
             root_owned=root_owned,
             release_trust_root=release_trust_root,
-            host=_GuardedHost(host, assert_stable),
+            host=_GuardedHost(host, assert_forward_stable),
+            rollback_host=_GuardedHost(host, assert_rollback_authority),
             require_root=require_root,
             activation_lock_factory=activation_lock_factory,
             progress_hook=progress_hook,
-            stability_guard=assert_stable,
+            stability_guard=assert_forward_stable,
+            rollback_stability_guard=assert_rollback_authority,
         )
-        assert_stable()
+        assert_forward_stable()
         return result
 
 
@@ -1948,10 +2043,12 @@ def _rebind_unheld(
     root_owned: bool,
     release_trust_root: Path,
     host: RebindHost,
+    rollback_host: RebindHost,
     require_root: bool,
     activation_lock_factory: Callable[[], Any] | None,
     progress_hook: Callable[[str, str | None], None] | None,
     stability_guard: Callable[[], None],
+    rollback_stability_guard: Callable[[], None],
 ) -> dict[str, Any]:
     if require_root and activation._effective_uid() != 0:  # noqa: SLF001
         _fail("upstream_sync_successor_root_required")
@@ -2002,12 +2099,13 @@ def _rebind_unheld(
         require_root=require_root,
         lock_factory=activation_lock_factory,
     ):
-        stability_guard()
+        rollback_stability_guard()
         if rollback_path.exists() or rollback_path.is_symlink():
             _fail("upstream_sync_successor_already_rolled_back")
         if terminal_path.exists() or terminal_path.is_symlink():
             if rollback_intent_path.exists() or rollback_intent_path.is_symlink():
                 _fail("upstream_sync_successor_terminal_conflicts_with_rollback")
+            stability_guard()
             return _verify(
                 expected_authority_sha256=expected_authority_sha256,
                 expected_preflight_sha256=expected_preflight_sha256,
@@ -2051,6 +2149,7 @@ def _rebind_unheld(
                 preflight=checked_preflight,
                 systemd_root=systemd_root,
             )
+            stability_guard()
             _publish(
                 _started_receipt(
                     authority=authority,
@@ -2061,6 +2160,7 @@ def _rebind_unheld(
             )
             stability_guard()
         if rollback_intent_path.exists() or rollback_intent_path.is_symlink():
+            rollback_stability_guard()
             intent = activation._read_canonical_json(  # noqa: SLF001
                 rollback_intent_path,
                 root_owned=root_owned,
@@ -2069,6 +2169,7 @@ def _rebind_unheld(
             cause = intent.get("cause") if isinstance(intent, Mapping) else None
             if not isinstance(cause, str):
                 _fail("upstream_sync_successor_rollback_intent_invalid")
+            rollback_stability_guard()
             _ensure_rollback_intent(
                 authority=authority,
                 preflight_sha256=expected_preflight_sha256,
@@ -2076,9 +2177,10 @@ def _rebind_unheld(
                 root_owned=root_owned,
                 cause=cause,
             )
+            rollback_stability_guard()
             try:
                 _restore_predecessor(
-                    host=host,
+                    host=rollback_host,
                     authority=authority,
                     preflight=checked_preflight,
                     preflight_sha256=expected_preflight_sha256,
@@ -2087,7 +2189,7 @@ def _rebind_unheld(
                     root_owned=root_owned,
                     cause=cause,
                     progress_hook=progress_hook,
-                    stability_guard=stability_guard,
+                    stability_guard=rollback_stability_guard,
                 )
             except Exception as rollback_exc:
                 raise UpstreamSyncRailSuccessorRebindError(
@@ -2227,18 +2329,30 @@ def _rebind_unheld(
                 }
             )
             stability_guard()
-            return _publish(terminal, path=terminal_path, root_owned=root_owned)
+            published = _publish(
+                terminal,
+                path=terminal_path,
+                root_owned=root_owned,
+            )
+            stability_guard()
+            return published
         except (
             UpstreamSyncRailSuccessorRebindError,
             activation.UpstreamSyncRailCutoverError,
+            release_stage0.ProductionReleaseUpdateStage0Error,
             OSError,
         ) as exc:
-            cause = (
-                exc.code
-                if isinstance(exc, UpstreamSyncRailSuccessorRebindError)
-                else "upstream_sync_successor_runtime_mutation_failed"
-            )
+            if isinstance(exc, UpstreamSyncRailSuccessorRebindError):
+                cause = exc.code
+            elif isinstance(
+                exc,
+                release_stage0.ProductionReleaseUpdateStage0Error,
+            ):
+                cause = "upstream_sync_successor_stage0_drifted"
+            else:
+                cause = "upstream_sync_successor_runtime_mutation_failed"
             try:
+                rollback_stability_guard()
                 _ensure_rollback_intent(
                     authority=authority,
                     preflight_sha256=expected_preflight_sha256,
@@ -2246,8 +2360,9 @@ def _rebind_unheld(
                     root_owned=root_owned,
                     cause=cause,
                 )
+                rollback_stability_guard()
                 _restore_predecessor(
-                    host=host,
+                    host=rollback_host,
                     authority=authority,
                     preflight=checked_preflight,
                     preflight_sha256=expected_preflight_sha256,
@@ -2256,7 +2371,7 @@ def _rebind_unheld(
                     root_owned=root_owned,
                     cause=cause,
                     progress_hook=progress_hook,
-                    stability_guard=stability_guard,
+                    stability_guard=rollback_stability_guard,
                 )
             except Exception as rollback_exc:
                 raise UpstreamSyncRailSuccessorRebindError(
@@ -2319,8 +2434,6 @@ def _authority_matches_owner_request(
     if (
         authority.get("predecessor_revision")
         != request["predecessor_revision"]
-        or authority.get("predecessor_sender_revision")
-        != request["predecessor_sender_revision"]
         or authority.get("target_revision") != request["target_revision"]
         or authority.get("target_package_manifest_sha256")
         != request["target_package_manifest_sha256"]
@@ -2600,9 +2713,6 @@ def _owner_apply_verified(
             rebuilt = build_authority(
                 package=package,
                 predecessor_revision=request["predecessor_revision"],
-                predecessor_sender_revision=request[
-                    "predecessor_sender_revision"
-                ],
                 predecessor_units=predecessor_units,
                 stage_c_host_artifact_manifest_sha256=request[
                     "stage_c_host_artifact_manifest_sha256"
@@ -2621,12 +2731,12 @@ def _owner_apply_verified(
                 root_owned=root_owned,
                 host=host,
             )
-            _stage_create_only(
+            _stage_create_only_guarded(
                 preflight_value,
                 path=preflight_path,
                 root_owned=root_owned,
+                stability_guard=stability_guard,
             )
-            stability_guard()
     else:
         predecessor_units = _unit_bytes(
             systemd_root=systemd_root,
@@ -2635,7 +2745,6 @@ def _owner_apply_verified(
         authority = build_authority(
             package=package,
             predecessor_revision=request["predecessor_revision"],
-            predecessor_sender_revision=request["predecessor_sender_revision"],
             predecessor_units=predecessor_units,
             stage_c_host_artifact_manifest_sha256=request[
                 "stage_c_host_artifact_manifest_sha256"
@@ -2654,18 +2763,33 @@ def _owner_apply_verified(
         )
         # No staged or runtime mutation is permitted until the complete exact
         # predecessor preflight above has passed in memory.
-        _stage_create_only(
-            authority,
-            path=authority_path,
-            root_owned=root_owned,
-        )
-        stability_guard()
-        _stage_create_only(
-            preflight_value,
-            path=preflight_path,
-            root_owned=root_owned,
-        )
-        stability_guard()
+        created: list[
+            tuple[Mapping[str, Any], Path, release_builder.FileIdentity]
+        ] = []
+        try:
+            authority_identity = _stage_create_only_guarded(
+                authority,
+                path=authority_path,
+                root_owned=root_owned,
+                stability_guard=stability_guard,
+            )
+            created.append((authority, authority_path, authority_identity))
+            preflight_identity = _stage_create_only_guarded(
+                preflight_value,
+                path=preflight_path,
+                root_owned=root_owned,
+                stability_guard=stability_guard,
+            )
+            created.append((preflight_value, preflight_path, preflight_identity))
+        except release_stage0.ProductionReleaseUpdateStage0Error:
+            for created_value, created_path, created_identity in reversed(created):
+                _remove_just_created_stage(
+                    created_value,
+                    path=created_path,
+                    identity=created_identity,
+                    root_owned=root_owned,
+                )
+            raise
 
     terminal = _rebind(
         expected_authority_sha256=authority["authority_sha256"],
@@ -3084,7 +3208,6 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--target-revision")
     parser.add_argument("--target-package-manifest-sha256")
     parser.add_argument("--predecessor-revision")
-    parser.add_argument("--predecessor-sender-revision")
     parser.add_argument("--predecessor-activation-receipt-sha256")
     parser.add_argument("--stage-c-host-artifact-manifest-sha256")
     parser.add_argument("--stage-c-release-update-publication-sha256")
@@ -3098,7 +3221,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         arguments.target_revision,
         arguments.target_package_manifest_sha256,
         arguments.predecessor_revision,
-        arguments.predecessor_sender_revision,
         arguments.predecessor_activation_receipt_sha256,
         arguments.stage_c_host_artifact_manifest_sha256,
         arguments.stage_c_release_update_publication_sha256,
@@ -3119,9 +3241,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                         arguments.target_package_manifest_sha256
                     ),
                     predecessor_revision=arguments.predecessor_revision,
-                    predecessor_sender_revision=(
-                        arguments.predecessor_sender_revision
-                    ),
                     predecessor_activation_receipt_sha256=(
                         arguments.predecessor_activation_receipt_sha256
                     ),
