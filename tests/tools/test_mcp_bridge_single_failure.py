@@ -86,7 +86,7 @@ class TestRegisterMcpServersIsolation:
         }
         with self._run_with_mocked_connect(attempts), \
                 patch("tools.mcp_tool._register_server_tools", return_value=[]), \
-                patch("tools.mcp_tool._filter_suspicious_mcp_servers", side_effect=lambda x: x):
+                patch("tools.mcp_tool._filter_invalid_mcp_servers", side_effect=lambda x: x):
             mcp_mod.register_mcp_servers(cfg)
             assert "good" in mcp_mod._servers
             assert "bad" not in mcp_mod._servers
@@ -105,7 +105,7 @@ class TestRegisterMcpServersIsolation:
         cfg = {"bad": {"command": "bad-cmd"}}
         with self._run_with_mocked_connect(attempts), \
                 patch("tools.mcp_tool._register_server_tools", return_value=[]), \
-                patch("tools.mcp_tool._filter_suspicious_mcp_servers", side_effect=lambda x: x):
+                patch("tools.mcp_tool._filter_invalid_mcp_servers", side_effect=lambda x: x):
             mcp_mod.register_mcp_servers(cfg)
             assert mcp_mod._connect_cooldown_active("bad") is True
 

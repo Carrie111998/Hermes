@@ -123,18 +123,14 @@ class TestStdioPidTracking:
 
         async def _run():
             # _run_stdio should reap orphans before it gets to the
-            # stdio_client spawn.  Patch the OSV check (local import)
-            # and stdio_client so no real subprocess is spawned.
+            # stdio_client spawn. Patch stdio_client so no real subprocess is
+            # spawned.
             with patch("tools.mcp_tool._MCP_AVAILABLE", True), \
                  patch("tools.mcp_tool._build_safe_env", return_value={}), \
                  patch("tools.mcp_tool._resolve_stdio_command",
                        return_value=("echo", {})), \
                  patch("tools.mcp_tool._write_stderr_log_header"), \
                  patch("tools.mcp_tool._get_mcp_stderr_log",
-                       return_value=None), \
-                 patch("tools.mcp_tool.check_package_for_malware",
-                       return_value=None, create=True), \
-                 patch("tools.osv_check.check_package_for_malware",
                        return_value=None):
                 # Patch stdio_client to raise so the test exits quickly
                 cm = MagicMock()

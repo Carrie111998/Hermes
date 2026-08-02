@@ -116,17 +116,6 @@ from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
 
-# Upper bound for the OSV malware preflight during stdio MCP startup. The
-# check makes a blocking urllib HTTPS call whose own timeout can fail to
-# interrupt a stalled SSL handshake, which froze the asyncio event loop and
-# blew past the gateway's 15s startup budget (#29184). We run it off the loop
-# AND bound it here; the check is fail-open, so a timeout lets startup proceed.
-# Set just ABOVE osv_check._TIMEOUT (10s) so the inner socket timeout fires
-# first in the normal case; this outer bound only bites when a stalled SSL
-# handshake defeats the inner timeout (the #29184 failure mode).
-_OSV_MALWARE_CHECK_TIMEOUT_S = 12.0
-
-
 # ---------------------------------------------------------------------------
 # Stdio subprocess stderr redirection
 # ---------------------------------------------------------------------------
@@ -2361,32 +2350,6 @@ class MCPServerTask:
         safe_env = _build_safe_env(user_env)
         command, safe_env = _resolve_stdio_command(command, safe_env)
 
-        # Check package against OSV malware database before spawning.
-        # Run off the event loop (the urllib HTTPS call is blocking) and bound
-        # it with a wall-clock timeout so a stalled SSL handshake can't freeze
-        # MCP discovery / gateway startup (#29184). The check is fail-open, so
-        # on timeout we log and proceed rather than blocking indefinitely.
-        # NOTE: must run against the REAL command/args — the watchdog wrap
-        # below rewrites argv to `python -m tools.mcp_stdio_watchdog …`,
-        # which would silently turn the preflight into a no-op.
-        from tools.osv_check import check_package_for_malware
-        try:
-            malware_error = await asyncio.wait_for(
-                asyncio.to_thread(check_package_for_malware, command, args),
-                timeout=_OSV_MALWARE_CHECK_TIMEOUT_S,
-            )
-        except asyncio.TimeoutError:
-            logger.warning(
-                "MCP server '%s': OSV malware preflight timed out after %.0fs "
-                "(network slow/unreachable) — proceeding without the check.",
-                self.name, _OSV_MALWARE_CHECK_TIMEOUT_S,
-            )
-            malware_error = None
-        if malware_error:
-            raise ValueError(
-                f"MCP server '{self.name}': {malware_error}"
-            )
-
         # Wrap the real command in a parent-death watchdog supervisor so an
         # ungraceful exit of this Hermes process (kill -9, crash, force-quit)
         # can't leave the stdio MCP child (and its own descendants, e.g.
@@ -2395,8 +2358,6 @@ class MCPServerTask:
         # the reaping as before -- this only covers the case where that code
         # never gets to run. POSIX-only (relies on process groups); no-op
         # elsewhere, matching existing killpg-based cleanup's platform scope.
-        # Applied AFTER the OSV preflight so the check inspects the real
-        # package, not the watchdog wrapper.
         command, args = _wrap_command_with_watchdog(command, args)
 
         server_params = StdioServerParameters(
@@ -4570,31 +4531,22 @@ def _warn_hidden_whitespace(server_name: str, config: dict) -> List[str]:
     return flagged
 
 
-def _filter_suspicious_mcp_servers(servers: Dict[str, dict]) -> Dict[str, dict]:
-    """Drop exfiltration-shaped MCP configs before any stdio spawn path."""
-    try:
-        from hermes_cli.mcp_security import validate_mcp_server_entry as _validate_mcp_server_entry
-    except Exception:
-        _validate_mcp_server_entry: Callable[[str, dict[str, Any]], list[str]] | None = None
+def _filter_invalid_mcp_servers(servers: Dict[str, dict]) -> Dict[str, dict]:
+    """Drop entries that violate the exact MCP transport/schema contract."""
+    from hermes_cli.mcp_validation import validate_mcp_server_entry
 
-    if _validate_mcp_server_entry is None:
-        return servers
-
-    safe_servers = {}
+    valid_servers = {}
     for name, cfg in servers.items():
-        if not isinstance(cfg, dict):
-            safe_servers[name] = cfg
-            continue
-        issues = _validate_mcp_server_entry(name, cfg)
+        issues = validate_mcp_server_entry(name, cfg)
         if issues:
             logger.warning(
-                "Skipping suspicious MCP server '%s': %s",
+                "Skipping invalid MCP server '%s': %s",
                 name,
                 "; ".join(issues),
             )
             continue
-        safe_servers[name] = cfg
-    return safe_servers
+        valid_servers[name] = cfg
+    return valid_servers
 
 
 def _load_mcp_config() -> Dict[str, dict]:
@@ -4624,13 +4576,13 @@ def _load_mcp_config() -> Dict[str, dict]:
             load_hermes_dotenv()
         except Exception:
             pass
-        safe_servers: Dict[str, dict] = {}
-        for name, cfg in _filter_suspicious_mcp_servers(servers).items():
+        valid_servers: Dict[str, dict] = {}
+        for name, cfg in _filter_invalid_mcp_servers(servers).items():
             interpolated = _interpolate_env_vars(cfg)
             if isinstance(interpolated, dict):
                 _warn_hidden_whitespace(name, interpolated)
-                safe_servers[name] = interpolated
-        return safe_servers
+                valid_servers[name] = interpolated
+        return valid_servers
     except Exception as exc:
         logger.debug("Failed to load MCP config: %s", exc)
         return {}
@@ -5929,7 +5881,7 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
         logger.debug("MCP SDK not available -- skipping explicit MCP registration")
         return []
 
-    servers = _filter_suspicious_mcp_servers(servers)
+    servers = _filter_invalid_mcp_servers(servers)
     if not servers:
         logger.debug("No explicit MCP servers provided")
         return []

@@ -25,7 +25,7 @@ from hermes_cli.config import (
 )
 from hermes_cli.colors import Colors, color
 from hermes_constants import display_hermes_home
-from hermes_cli.mcp_security import validate_mcp_server_entry
+from hermes_cli.mcp_validation import validate_mcp_server_entry
 from tools.mcp_tool import _ENV_VAR_PATTERN, _env_ref_name
 
 logger = logging.getLogger(__name__)
@@ -88,15 +88,14 @@ def _get_mcp_servers(config: Optional[dict] = None) -> Dict[str, dict]:
 def _save_mcp_server(name: str, server_config: dict) -> bool:
     """Add or update a server entry in config.yaml.
 
-    Returns False when a high-signal exfiltration-shaped stdio command is
-    rejected. MCP stdio servers are user-chosen local commands, so this blocks
-    shell+egress payloads rather than whitelisting command families.
+    Returns False when the entry violates the exact MCP transport/schema
+    contract. Command, argument, and environment contents are opaque here.
     """
     issues = validate_mcp_server_entry(name, server_config)
     if issues:
         for issue in issues:
             _warning(issue)
-        _warning(f"Server '{name}' was NOT saved due to suspicious configuration.")
+        _warning(f"Server '{name}' was NOT saved due to invalid configuration.")
         return False
     config = load_config()
     config.setdefault("mcp_servers", {})[name] = server_config
@@ -127,9 +126,9 @@ def _replace_mcp_servers(servers: Dict[str, dict]) -> Tuple[bool, List[str]]:
     delete them — which is why edits appeared to succeed but the old entry
     survived (see MCP tab persistence bug).
 
-    Every entry is validated up front; on any suspicious command/args the whole
-    save is rejected (returns ``(False, issues)``) so a bad paste can't be
-    partially applied.  An empty map removes the key entirely.
+    Every entry is structurally validated up front; on any schema violation
+    the whole save is rejected (returns ``(False, issues)``) so a bad paste
+    cannot be partially applied. An empty map removes the key entirely.
     """
     issues: List[str] = []
     for name, cfg in servers.items():
@@ -479,7 +478,7 @@ def cmd_mcp_add(args):
     if issues:
         for issue in issues:
             _warning(issue)
-        _warning(f"Server '{name}' was NOT saved due to suspicious configuration.")
+        _warning(f"Server '{name}' was NOT saved due to invalid configuration.")
         return
 
     # ── Authentication ────────────────────────────────────────────────
