@@ -7,6 +7,7 @@ import { api, post, when, USER, onComponentRefresh, refreshCadence, type Compone
 import { badgeClass, avatarHue, faviconFor } from "../lib/accents";
 import { Button } from "./ui";
 import { Field, deriveInputs, fieldDefaults, missingRequired } from "./Fields";
+import Prose from "./Prose";
 import {
   Play, ExternalLink, LoaderCircle, ArrowUpRight, ArrowDownRight,
   ChevronUp, ChevronDown, Workflow, MessageSquare, MousePointerClick,
@@ -125,7 +126,7 @@ export function DataView({ c, data, err }: { c: Component; data: any; err: strin
         />
       );
     case "notes":
-      return <div className="text-[13.5px] leading-relaxed text-ink-2 whitespace-pre-wrap">{data.markdown}</div>;
+      return <Prose size="md">{data.markdown}</Prose>;
     case "connections": return <ConnectionsView data={data} />;
     case "workflow": return <WorkflowView c={c} data={data} />;
     case "heatmap": return <HeatmapView data={data} />;
@@ -481,8 +482,8 @@ function WorkflowView({ c, data }: { c: Component; data: any }) {
         )}
       </div>
       {result && (
-        <div className="mt-2.5 bg-[#0d1526] border border-line rounded-lg px-3 py-2.5 text-[12.5px] leading-relaxed text-ink-2 whitespace-pre-wrap overflow-auto flex-1 min-h-0">
-          {result}
+        <div className="mt-2.5 bg-[#0d1526] border border-line rounded-lg px-3.5 py-3 overflow-auto flex-1 min-h-0">
+          <Prose>{result}</Prose>
         </div>
       )}
     </div>

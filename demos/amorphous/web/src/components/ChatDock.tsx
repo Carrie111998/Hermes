@@ -6,6 +6,7 @@ import {
   Send, PanelRight, PanelBottom, Minus, LoaderCircle, PictureInPicture2, GripHorizontal,
 } from "lucide-react";
 import { Button, Tip } from "./ui";
+import Prose from "./Prose";
 
 export interface ChatMsg { who: "you" | "hermes" | "tool"; text: string; }
 
@@ -144,7 +145,9 @@ function Body({ msgs, busy, onSend }: { msgs: ChatMsg[]; busy: boolean; onSend: 
               <span className={`block text-[10.5px] font-bold uppercase tracking-wider mb-0.5 ${m.who === "you" ? "text-blue-2" : "text-ink-3"}`}>
                 {m.who}
               </span>
-              <span className="text-ink whitespace-pre-wrap">{m.text}</span>
+              {m.who === "you"
+                ? <span className="text-ink whitespace-pre-wrap">{m.text}</span>
+                : <Prose size="md">{m.text}</Prose>}
             </div>
           )
         )}

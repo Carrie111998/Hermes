@@ -63,8 +63,13 @@ export function Field({ spec, value, onChange, invalid }: {
 
       {type === "textarea" && (
         <textarea rows={spec.rows ?? 3} value={value ?? ""} placeholder={spec.placeholder}
-                  onChange={(e) => onChange(e.target.value)}
-                  className={cn(inputCls, "h-auto py-2 resize-y leading-relaxed", err)} />
+                  onChange={(e) => {
+                    onChange(e.target.value);
+                    const el = e.target;
+                    el.style.height = "auto";
+                    el.style.height = Math.min(el.scrollHeight, 220) + "px";
+                  }}
+                  className={cn(inputCls, "h-auto py-2 leading-relaxed", err)} />
       )}
 
       {(type === "text" || type === "password" || type === "date") && (
@@ -74,10 +79,24 @@ export function Field({ spec, value, onChange, invalid }: {
       )}
 
       {type === "number" && (
-        <input type="number" value={value ?? ""} placeholder={spec.placeholder}
-               min={spec.min} max={spec.max} step={spec.step}
-               onChange={(e) => onChange(e.target.value)}
-               className={cn(inputCls, "tabular-nums", err)} />
+        <div className="relative group/num">
+          <input type="number" inputMode="numeric" value={value ?? ""} placeholder={spec.placeholder}
+                 min={spec.min} max={spec.max} step={spec.step}
+                 onChange={(e) => onChange(e.target.value)}
+                 className={cn(inputCls, "tabular-nums pr-7", err)} />
+          <div className="absolute right-1 top-1/2 -translate-y-1/2 flex flex-col opacity-0 group-hover/num:opacity-100 group-focus-within/num:opacity-100 transition-opacity">
+            <button type="button" tabIndex={-1}
+                    onClick={() => onChange(String(Math.min(Number(value || 0) + (spec.step ?? 1), spec.max ?? Infinity)))}
+                    className="h-3 px-1 text-ink-4 hover:text-ink-2 leading-none cursor-pointer">
+              <svg viewBox="0 0 8 4" className="w-2 h-1.5"><path d="M1 4 4 1 7 4" stroke="currentColor" strokeWidth="1.4" fill="none" strokeLinecap="round"/></svg>
+            </button>
+            <button type="button" tabIndex={-1}
+                    onClick={() => onChange(String(Math.max(Number(value || 0) - (spec.step ?? 1), spec.min ?? -Infinity)))}
+                    className="h-3 px-1 text-ink-4 hover:text-ink-2 leading-none cursor-pointer">
+              <svg viewBox="0 0 8 4" className="w-2 h-1.5"><path d="M1 1 4 4 7 1" stroke="currentColor" strokeWidth="1.4" fill="none" strokeLinecap="round"/></svg>
+            </button>
+          </div>
+        </div>
       )}
 
       {type === "select" && (

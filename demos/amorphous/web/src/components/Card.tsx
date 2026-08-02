@@ -12,6 +12,7 @@ import {
   Button, Dialog, DialogContent, DialogHeader, Tip, Tabs, TabsList,
   TabsTrigger, TabsContent,
 } from "./ui";
+import Prose from "./Prose";
 
 interface Props {
   c: Component;
@@ -208,7 +209,9 @@ function ChatLog({ msgs, busy, size = "sm" }: { msgs: { who: string; text: strin
       {msgs.map((m, i) => (
         <div key={i} className={`${size === "lg" ? "text-[13.5px]" : "text-[13px]"} leading-relaxed`}>
           <span className={`block text-[10px] font-bold uppercase tracking-wider mb-0.5 ${m.who === "you" ? "text-blue-2" : "text-ink-3"}`}>{m.who}</span>
-          <span className="text-ink-2 whitespace-pre-wrap">{m.text}</span>
+          {m.who === "you"
+            ? <span className="text-ink-2 whitespace-pre-wrap">{m.text}</span>
+            : <Prose size={size === "lg" ? "md" : "sm"}>{m.text}</Prose>}
         </div>
       ))}
       {busy && <LoaderCircle size={15} className="spin text-ink-3" />}

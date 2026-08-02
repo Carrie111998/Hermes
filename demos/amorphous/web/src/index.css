@@ -104,3 +104,14 @@ body {
 
 @keyframes spin { to { transform: rotate(360deg); } }
 .spin { display: inline-block; animation: spin 1s linear infinite; }
+
+/* Native control cleanup — inputs must read as OUR design system, not the
+   browser's. No spinners on number fields, no visible resize handle art,
+   dark-scheme pickers. */
+input[type="number"] { -moz-appearance: textfield; appearance: textfield; }
+input[type="number"]::-webkit-outer-spin-button,
+input[type="number"]::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+input[type="date"]::-webkit-calendar-picker-indicator { opacity: 0.45; filter: invert(0.7); cursor: pointer; }
+/* No native resize grip anywhere — textareas auto-grow with content */
+textarea { resize: none; }
+input, textarea, select, button { color-scheme: dark; }
