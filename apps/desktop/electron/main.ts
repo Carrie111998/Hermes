@@ -34,6 +34,7 @@ import nodePty from 'node-pty'
 import { classifyActiveRuntime } from './active-runtime-state'
 import { collectBackendDrainTargets } from './backend-quit-drain'
 import { stopBackendChild as stopBackendChildImpl } from './backend-child'
+import { QuitBarrier } from './quit-barrier'
 import { dashboardFallbackArgs, sourceDeclaresServe } from './backend-command'
 import { createBackendConnectionState } from './backend-connection-state'
 import { buildDesktopBackendEnv, hermesManagedNodePathEntries, normalizeHermesHomeRoot } from './backend-env'
@@ -7264,6 +7265,11 @@ let sshQuitTeardownDone = false
 // One-shot latch so the re-entrant app.quit() that ends the backend drain
 // (below) doesn't re-enter before-quit and reschedule the same drain forever.
 let backendQuitDrainScheduled = false
+// All async work that must finish before Electron actually exits. The SSH
+// deferral and the backend drain both register here so a single quit barrier
+// waits for ALL of them; a re-entrant app.quit() cannot bypass another
+// outstanding wait by re-entering before-quit early.
+const quitBarrier = new QuitBarrier()
 
 function sshScopeKey(profile) {
   return connectionScopeKey(profile) || ''
@@ -11940,20 +11946,21 @@ app.on('before-quit', event => {
   }
 
   if ((sshConnections.size > 0 || sshBootstrapCoordinator.promises().length > 0) && !sshQuitTeardownDone) {
-    event.preventDefault()
     sshBootstrapCoordinator.cancelAll()
     const scopes = [...sshConnections.keys()]
 
-    const pending = Promise.allSettled([
-      ...scopes.map(scope => teardownSshConnection(scope || null)),
-      ...sshBootstrapCoordinator.promises()
-    ])
-
-    void Promise.race([pending, new Promise(resolve => setTimeout(resolve, 4_000))]).then(async () => {
-      await sshBootstrapCoordinator.forceCleanupAll()
-      sshQuitTeardownDone = true
-      app.quit()
-    })
+    quitBarrier.add(
+      Promise.race([
+        Promise.allSettled([
+          ...scopes.map(scope => teardownSshConnection(scope || null)),
+          ...sshBootstrapCoordinator.promises()
+        ]),
+        new Promise(resolve => setTimeout(resolve, 4_000))
+      ]).then(async () => {
+        await sshBootstrapCoordinator.forceCleanupAll()
+        sshQuitTeardownDone = true
+      })
+    )
   }
 
   // Clean quit mid-boot should not trip next-launch --no-sandbox (#38216).
@@ -12008,12 +12015,26 @@ app.on('before-quit', event => {
   const primaryChild = backendConnectionState.getProcess()
   const drainTargets = collectBackendDrainTargets(primaryChild, [...backendPool.values()])
 
-  // Only intervene when there is at least one live backend to wait on — a quit
-  // with nothing running must proceed immediately (no artificial delay).
+  // Only defer the quit when there is at least one live backend to wait on —
+  // a quit with nothing running proceeds immediately (no artificial delay).
   if (!backendQuitDrainScheduled && drainTargets.length > 0) {
     backendQuitDrainScheduled = true
-    event.preventDefault()
+    for (const child of drainTargets) {
+      quitBarrier.add(waitForBackendExit(child))
+    }
+  }
 
+  stopBackendChild(primaryChild)
+  stopAllPoolBackends()
+
+  // Single guard: if any async teardown (SSH or backend) is pending, hold the
+  // quit here and re-enter once ALL of it has settled. The SSH branch and the
+  // backend drain register into the same `quitBarrier`, so a re-entrant
+  // app.quit() cannot bypass another outstanding wait — the barrier re-quits
+  // only after every promise has settled or reached its bound.
+  const barrier = quitBarrier.arm()
+  if (barrier) {
+    event.preventDefault()
     // Cmd-Q should still feel instant even though the actual exit is deferred
     // for up to ~5s while the backend drains.
     for (const win of BrowserWindow.getAllWindows()) {
@@ -12022,18 +12043,11 @@ app.on('before-quit', event => {
       }
     }
 
-    stopBackendChild(primaryChild)
-    stopAllPoolBackends()
-
-    void Promise.allSettled(drainTargets.map(child => waitForBackendExit(child)))
-      .then(() => {
-        // Re-enter quit. The latch above is now set, so before-quit runs its
-        // remaining teardown but does NOT re-schedule this drain.
-        app.quit()
-      })
-  } else {
-    stopBackendChild(primaryChild)
-    stopAllPoolBackends()
+    void barrier.then(() => {
+      // Both SSH and backend latches are now set, so this re-entrant
+      // before-quit runs the remaining teardown but does NOT re-schedule them.
+      app.quit()
+    })
   }
 })
 
