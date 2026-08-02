@@ -16,7 +16,7 @@ from tools import approval
 class TestApprovalModeParsing:
     def test_unquoted_yaml_off_boolean_maps_to_off(self):
         with patch(
-            "hermes_cli.config.load_config",
+            "hermes_cli.config.load_config_readonly",
             return_value={"approvals": {"mode": False}},
         ):
             assert approval._get_approval_mode() == "off"

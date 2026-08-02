@@ -319,7 +319,7 @@ def test_tools_never_fall_back_to_local_capability_when_writer_is_required(
     plan_id = "plan:no-fallback"
     command = "git status --short"
     digest = hashlib.sha256(command.encode()).hexdigest()
-    monkeypatch.setattr("hermes_cli.config.load_config", _writer_required_config)
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", _writer_required_config)
     monkeypatch.setattr(approval, "_observed_session_user_id", lambda: "owner-1")
     monkeypatch.setattr(approval, "_observed_session_platform", lambda: "discord")
     monkeypatch.setattr(approval, "_observed_session_message_id", lambda: "message-1")
@@ -361,7 +361,7 @@ def test_tools_writer_consume_requires_success_and_returns_plan_id(monkeypatch):
     session_key = "writer-success-plan-id"
     session_hash = hashlib.sha256(session_key.encode()).hexdigest()
     calls = []
-    monkeypatch.setattr("hermes_cli.config.load_config", _writer_required_config)
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", _writer_required_config)
     monkeypatch.setattr(approval, "_observed_session_user_id", lambda: "owner-1")
     monkeypatch.setattr(approval, "_observed_session_platform", lambda: "discord")
     monkeypatch.setattr(
@@ -416,7 +416,7 @@ def test_tools_writer_consume_rejects_another_owners_receipt(monkeypatch):
     session_hash = hashlib.sha256(session_key.encode()).hexdigest()
     command = "git status --short"
     command_hash = hashlib.sha256(command.encode()).hexdigest()
-    monkeypatch.setattr("hermes_cli.config.load_config", _writer_required_config)
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", _writer_required_config)
     monkeypatch.setattr(approval, "_observed_session_user_id", lambda: "owner-2")
     monkeypatch.setattr(approval, "_observed_session_platform", lambda: "discord")
     monkeypatch.setattr(
@@ -455,7 +455,7 @@ def test_tools_writer_consume_rejects_receipt_from_prior_routing_epoch(monkeypat
     session_hash = hashlib.sha256(session_key.encode()).hexdigest()
     command = "git status --short"
     command_hash = hashlib.sha256(command.encode()).hexdigest()
-    monkeypatch.setattr("hermes_cli.config.load_config", _writer_required_config)
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", _writer_required_config)
     monkeypatch.setattr(approval, "_observed_session_user_id", lambda: "owner-1")
     monkeypatch.setattr(approval, "_observed_session_platform", lambda: "discord")
     monkeypatch.setattr(
@@ -492,7 +492,7 @@ def test_tools_writer_consume_rejects_receipt_from_prior_routing_epoch(monkeypat
 def test_tools_reject_deduped_grant_when_durable_authority_is_inactive(monkeypatch):
     session_key = "writer-inactive-grant"
     session_hash = hashlib.sha256(session_key.encode()).hexdigest()
-    monkeypatch.setattr("hermes_cli.config.load_config", _writer_required_config)
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", _writer_required_config)
     monkeypatch.setattr(approval, "_observed_session_user_id", lambda: "owner-1")
     monkeypatch.setattr(approval, "_observed_session_platform", lambda: "discord")
     monkeypatch.setattr(approval, "_observed_session_message_id", lambda: "message-1")
