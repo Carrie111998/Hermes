@@ -281,6 +281,7 @@ class CodexAppServerSession:
         approval_callback: Optional[Callable[..., str]] = None,
         on_event: Optional[Callable[[dict], None]] = None,
         request_routing: Optional[_ServerRequestRouting] = None,
+        resume_thread_id: Optional[str] = None,
         client_factory: Optional[Callable[..., CodexAppServerClient]] = None,
     ) -> None:
         self._cwd = cwd or os.getcwd()
@@ -295,6 +296,9 @@ class CodexAppServerSession:
         self._approval_callback = approval_callback
         self._on_event = on_event  # Display hook (kawaii spinner ticks etc.)
         self._routing = request_routing or _ServerRequestRouting()
+        # Codex thread to re-open on first use, carrying this Hermes
+        # session's transcript across AIAgent instances. None = start fresh.
+        self._resume_thread_id = resume_thread_id
         self._client_factory = client_factory or CodexAppServerClient
 
         self._client: Optional[CodexAppServerClient] = None
@@ -327,6 +331,15 @@ class CodexAppServerSession:
             client_title="Hermes Agent",
             client_version=_get_hermes_version(),
         )
+        # Re-open this session's previous thread before considering a new
+        # one. The conversation transcript lives INSIDE the codex thread
+        # (turn/start carries only the newest user message), so a fresh
+        # thread here is indistinguishable from amnesia — and the gateway
+        # drops its cached AIAgent between most inbound messages, which
+        # made that the common path rather than the rare one.
+        resumed = self._try_resume_thread()
+        if resumed is not None:
+            return resumed
         # Permission selection is intentionally NOT sent on thread/start.
         # Two reasons (live-tested against codex 0.130.0):
         #   1. `thread/start.permissions` is gated behind the experimentalApi
@@ -371,6 +384,57 @@ class CodexAppServerSession:
             self._cwd,
         )
         return self._thread_id
+
+    def _try_resume_thread(self) -> Optional[str]:
+        """Re-open the codex thread this Hermes session used last time.
+
+        Returns the resumed thread id, or None when there is nothing to
+        resume or the rollout is unusable (expired, pruned, written by an
+        incompatible codex build). A failed resume must never fail the
+        user's turn: the caller falls through to ``thread/start`` and the
+        conversation simply begins fresh, which is the pre-resume
+        behavior.
+        """
+        if not self._resume_thread_id:
+            return None
+        assert self._client is not None
+        try:
+            result = self._client.request(
+                "thread/resume",
+                {"threadId": self._resume_thread_id},
+                timeout=15,
+            )
+        except Exception as exc:
+            logger.warning(
+                "codex thread/resume failed for %s (%s) — starting a fresh "
+                "thread; prior conversation context is lost",
+                str(self._resume_thread_id)[:8],
+                exc,
+            )
+            return None
+        # Cross-fill thread.id/sessionId for the same reason thread/start
+        # does: codex versions have serialized the id under either key.
+        thread_obj = result.get("thread") or {}
+        thread_id = (
+            thread_obj.get("id")
+            or thread_obj.get("sessionId")
+            or result.get("sessionId")
+            or result.get("threadId")
+        )
+        if not thread_id:
+            logger.warning(
+                "codex thread/resume returned no thread id (payload keys: "
+                "%s) — starting a fresh thread",
+                sorted(result.keys()),
+            )
+            return None
+        self._thread_id = thread_id
+        logger.info(
+            "codex app-server thread resumed: id=%s cwd=%s",
+            str(thread_id)[:8],
+            self._cwd,
+        )
+        return thread_id
 
     def close(self) -> None:
         if self._closed:

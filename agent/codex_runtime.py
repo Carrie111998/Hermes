@@ -20,7 +20,7 @@ import json
 import logging
 import time
 from types import SimpleNamespace
-from typing import Any, Callable, Dict, List
+from typing import Any, Callable, Dict, List, Optional
 
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
 
@@ -615,6 +615,83 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
     return on_event
 
 
+# ---------------------------------------------------------------------------
+# Codex thread continuity + final-send de-duplication
+#
+# Both of these exist because the codex_app_server runtime is an early-return
+# path that bypasses conversation_loop, so the bookkeeping that path normally
+# does for the gateway has to be done explicitly here.
+# ---------------------------------------------------------------------------
+
+
+def _codex_thread_meta_key(agent) -> Optional[str]:
+    """state_meta key holding the codex thread id for this Hermes session."""
+    session_id = getattr(agent, "session_id", None)
+    if not session_id:
+        return None
+    return f"codex_app_server:thread:{session_id}"
+
+
+def _load_codex_thread_id(agent) -> Optional[str]:
+    """The codex thread this session used last, if any.
+
+    Persisted rather than kept on the agent because the gateway drops its
+    cached AIAgent between most inbound messages — the in-memory session
+    object is precisely what does NOT survive to the next turn.
+
+    Persistence-isolated agents (the background skill/memory review fork,
+    which shares the parent's session_id) deliberately get None: the curator
+    must never adopt — or later overwrite — the user's live thread.
+    """
+    db = getattr(agent, "_session_db", None)
+    key = _codex_thread_meta_key(agent)
+    if db is None or key is None or getattr(agent, "_persist_disabled", False):
+        return None
+    try:
+        return db.get_meta(key) or None
+    except Exception:
+        logger.debug("codex thread-id lookup failed", exc_info=True)
+        return None
+
+
+def _save_codex_thread_id(agent, thread_id: Optional[str]) -> None:
+    """Remember the codex thread so the next AIAgent can resume it."""
+    db = getattr(agent, "_session_db", None)
+    key = _codex_thread_meta_key(agent)
+    if not thread_id or db is None or key is None:
+        return
+    if getattr(agent, "_persist_disabled", False):
+        return
+    try:
+        if db.get_meta(key) != thread_id:
+            db.set_meta(key, thread_id)
+    except Exception:
+        logger.debug("codex thread-id persist failed", exc_info=True)
+
+
+def _final_text_was_previewed(agent, final_text: Optional[str]) -> bool:
+    """True when the interim path already put the final answer on screen.
+
+    Codex emits its final answer as a completed ``agentMessage``, which the
+    event bridge forwards to ``_emit_interim_assistant_message`` — so the
+    text reaches the user before the gateway's own final send. The gateway
+    suppresses that second send only when the result reports
+    ``response_previewed`` (it then re-verifies the exact text against what
+    the stream consumer actually delivered, so a false positive here cannot
+    swallow a reply the user never saw).
+    """
+    if not final_text:
+        return False
+    checker = getattr(agent, "_interim_text_was_delivered", None)
+    if not callable(checker):
+        return False
+    try:
+        return bool(checker(final_text))
+    except Exception:
+        logger.debug("interim-delivery lookup failed", exc_info=True)
+        return False
+
+
 def run_codex_app_server_turn(
     agent,
     *,
@@ -682,6 +759,7 @@ def run_codex_app_server_turn(
         # Supersedes the narrower item/started-only bridge from #38835.
         agent._codex_session = CodexAppServerSession(
             cwd=cwd,
+            resume_thread_id=_load_codex_thread_id(agent),
             approval_callback=approval_callback,
             request_routing=_ServerRequestRouting(
                 auto_approve_exec=auto_approve_requests,
@@ -731,6 +809,7 @@ def run_codex_app_server_turn(
                 else {}
             ),
             "error": str(exc),
+            "response_previewed": False,
         }
 
     # This runtime bypasses the normal conversation-loop finalizer. Mirror its
@@ -760,6 +839,12 @@ def run_codex_app_server_turn(
         except Exception:
             pass
         agent._codex_session = None
+
+    # Remember the thread so the NEXT AIAgent for this session resumes it
+    # instead of opening an empty one. Written after every turn (cheap,
+    # and a no-op when unchanged) so a thread codex rotated mid-session
+    # is still the one we come back to.
+    _save_codex_thread_id(agent, turn.thread_id)
 
     # Splice projected messages into the conversation. The projector emits
     # standard {role, content, tool_calls, tool_call_id} entries, which
@@ -884,6 +969,11 @@ def run_codex_app_server_turn(
         # would re-INSERT the already-flushed user turn (append_message has no
         # dedup), reintroducing the #860 / #42039 duplicate-write bug.
         "agent_persisted": True,
+        # Without this the gateway cannot tell that the completed
+        # agentMessage already reached the user via the interim path, so
+        # it sends the identical text a second time — every reply arrived
+        # twice, once plain and once as a quoted reply.
+        "response_previewed": _final_text_was_previewed(agent, turn.final_text),
         "codex_thread_id": turn.thread_id,
         "codex_turn_id": turn.turn_id,
         **usage_result,

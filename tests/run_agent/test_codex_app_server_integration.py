@@ -786,3 +786,141 @@ class TestCodexToolProgressBridge:
 
         assert "on_event" in captured_init and captured_init["on_event"] is not None
         assert ("tool.started", "exec_command", "pytest") in events
+class TestFinalResponsePreviewFlag:
+    """Codex emits its final answer as a completed agentMessage, which the
+    event bridge hands to _emit_interim_assistant_message — so the text is
+    already on screen before the gateway performs its own final send. The
+    gateway suppresses that second send only when the result reports
+    response_previewed (it then re-verifies the exact text against what was
+    actually delivered). This early-return path used to omit the key
+    entirely, so every reply reached the user twice: once plain, once as a
+    quoted reply.
+    """
+
+    @staticmethod
+    def _previewing_session(monkeypatch, *, preview: bool):
+        """Fake codex turn that optionally replays the bridge's behavior of
+        surfacing the completed agentMessage through the interim path."""
+
+        def fake_run_turn(self, user_input: str, **kwargs):
+            final = f"echo: {user_input}"
+            if preview:
+                # Exactly what make_codex_app_server_event_bridge does on
+                # item/completed for an agentMessage.
+                self._agent_for_test._emit_interim_assistant_message(
+                    {"role": "assistant", "content": final}
+                )
+            return TurnResult(
+                final_text=final,
+                projected_messages=[{"role": "assistant", "content": final}],
+                tool_iterations=0,
+                interrupted=False,
+                error=None,
+                turn_id="turn-stub-1",
+                thread_id="thread-stub-1",
+            )
+
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
+        monkeypatch.setattr(
+            CodexAppServerSession, "ensure_started", lambda self: "thread-stub-1"
+        )
+
+    def _run(self, monkeypatch, *, preview: bool):
+        self._previewing_session(monkeypatch, preview=preview)
+        agent = _make_codex_agent()
+        delivered = []
+        # _emit_interim_assistant_message is a no-op without a UI callback,
+        # which is what the gateway installs when interim messages are on.
+        agent.interim_assistant_callback = (
+            lambda text, already_streamed=False: delivered.append(text)
+        )
+        monkeypatch.setattr(
+            CodexAppServerSession, "_agent_for_test", agent, raising=False
+        )
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            result = agent.run_conversation("hello there")
+        return result, delivered
+
+    def test_previewed_true_when_interim_already_delivered_final_text(self, monkeypatch):
+        result, delivered = self._run(monkeypatch, preview=True)
+        assert delivered == ["echo: hello there"]  # user already saw it
+        assert result["response_previewed"] is True
+
+    def test_previewed_false_when_final_text_was_not_delivered(self, monkeypatch):
+        result, delivered = self._run(monkeypatch, preview=False)
+        assert delivered == []
+        assert result["response_previewed"] is False
+
+    def test_result_always_carries_the_key(self, fake_session):
+        # The gateway reads this with .get(), so a missing key is
+        # indistinguishable from "not previewed" and silently reintroduces
+        # the double send.
+        agent = _make_codex_agent()
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            result = agent.run_conversation("hello there")
+        assert "response_previewed" in result
+
+
+class TestCodexThreadMetaKey:
+    """The persisted thread must survive a compression-driven session
+    rotation, or the fix quietly stops working on long conversations."""
+
+    def test_key_follows_the_lineage_root_not_the_rotated_segment(self):
+        from agent import codex_runtime
+
+        class FakeDB:
+            def get_conversation_root(self, sid):
+                assert sid == "segment-3"
+                return "root-session"
+
+        agent = SimpleNamespace(session_id="segment-3", _session_db=FakeDB())
+        assert (codex_runtime._codex_thread_meta_key(agent)
+                == "codex_app_server:thread:root-session")
+
+    def test_falls_back_to_session_id_without_a_resolver(self):
+        from agent import codex_runtime
+
+        agent = SimpleNamespace(session_id="solo", _session_db=None)
+        assert (codex_runtime._codex_thread_meta_key(agent)
+                == "codex_app_server:thread:solo")
+
+    def test_lineage_lookup_failure_degrades_to_session_id(self):
+        from agent import codex_runtime
+
+        class BoomDB:
+            def get_conversation_root(self, sid):
+                raise RuntimeError("db gone")
+
+        agent = SimpleNamespace(session_id="solo", _session_db=BoomDB())
+        assert (codex_runtime._codex_thread_meta_key(agent)
+                == "codex_app_server:thread:solo")
+
+    def test_no_session_id_means_no_persistence(self):
+        from agent import codex_runtime
+
+        agent = SimpleNamespace(session_id=None, _session_db=None)
+        assert codex_runtime._codex_thread_meta_key(agent) is None
+
+    def test_review_fork_never_reads_or_writes_the_users_thread(self):
+        from agent import codex_runtime
+
+        class FakeDB:
+            def __init__(self):
+                self.writes = []
+
+            def get_conversation_root(self, sid):
+                return sid
+
+            def get_meta(self, key):
+                return "thread-belonging-to-the-user"
+
+            def set_meta(self, key, value):
+                self.writes.append((key, value))
+
+        db = FakeDB()
+        fork = SimpleNamespace(
+            session_id="shared-with-parent", _session_db=db, _persist_disabled=True
+        )
+        assert codex_runtime._load_codex_thread_id(fork) is None
+        codex_runtime._save_codex_thread_id(fork, "curator-thread")
+        assert db.writes == []

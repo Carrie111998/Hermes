@@ -895,4 +895,79 @@ class TestClassifyOAuthFailure:
         assert _classify_oauth_failure() is None
         assert _classify_oauth_failure("") is None
         assert _classify_oauth_failure("", None) is None  # type: ignore[arg-type]
+# ---- thread resume (conversation memory across AIAgent restarts) ----
 
+class TestThreadResume:
+    """With codex_app_server the transcript lives inside the codex thread —
+    turn/start carries only the newest user message. Whenever the gateway
+    drops its cached AIAgent (which happens on most inbound messages) a
+    fresh thread/start meant the model lost every prior turn. These pin the
+    resume path that carries the thread across AIAgent instances."""
+
+    def test_resume_thread_id_resumes_instead_of_starting(self):
+        client = FakeClient()
+
+        def handler(method, params):
+            if method == "thread/resume":
+                assert params == {"threadId": "thread-prior-042"}
+                return {"thread": {"id": "thread-prior-042"}}
+            if method == "thread/start":
+                raise AssertionError("must not open a fresh thread when resuming")
+            return {}
+
+        client._request_handler = handler
+        s = make_session(client, resume_thread_id="thread-prior-042")
+        assert s.ensure_started() == "thread-prior-042"
+        assert [m for (m, _) in client.requests] == ["thread/resume"]
+
+    def test_resume_failure_falls_back_to_a_fresh_thread(self):
+        client = FakeClient()
+
+        def handler(method, params):
+            if method == "thread/resume":
+                raise session_mod.CodexAppServerError(
+                    code=-32600, message="invalid session id"
+                )
+            if method == "thread/start":
+                return {"thread": {"id": "thread-fake-001"}}
+            return {}
+
+        client._request_handler = handler
+        s = make_session(client, resume_thread_id="rolled-away")
+        # An expired//pruned rollout must degrade to a new thread rather than
+        # failing the user's turn outright.
+        assert s.ensure_started() == "thread-fake-001"
+        assert [m for (m, _) in client.requests] == ["thread/resume", "thread/start"]
+
+    def test_no_resume_id_starts_a_fresh_thread(self):
+        client = FakeClient()
+        s = make_session(client)
+        assert s.ensure_started() == "thread-fake-001"
+        assert [m for (m, _) in client.requests] == ["thread/start"]
+
+    def test_resume_is_attempted_only_once(self):
+        client = FakeClient()
+
+        def handler(method, params):
+            if method == "thread/resume":
+                return {"thread": {"id": "thread-prior-042"}}
+            return {}
+
+        client._request_handler = handler
+        s = make_session(client, resume_thread_id="thread-prior-042")
+        s.ensure_started()
+        s.ensure_started()
+        assert [m for (m, _) in client.requests].count("thread/resume") == 1
+
+    def test_resume_accepts_session_id_key(self):
+        """Codex versions have serialized the id under either key."""
+        client = FakeClient()
+
+        def handler(method, params):
+            if method == "thread/resume":
+                return {"thread": {"sessionId": "thread-prior-099"}}
+            return {}
+
+        client._request_handler = handler
+        s = make_session(client, resume_thread_id="thread-prior-099")
+        assert s.ensure_started() == "thread-prior-099"
