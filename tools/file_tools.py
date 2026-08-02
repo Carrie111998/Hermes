@@ -683,10 +683,21 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
         f"Refusing to write to sensitive system path: {filepath}\n"
         "Use the terminal tool with sudo if you need to modify system files."
     )
+    # On Windows, os.path.normpath converts POSIX paths like /etc/hosts to
+    # backslash forms (\\etc\\hosts) which miss the /-prefixed denylist.
+    # Always check the POSIX-normalized form so POSIX system targets are
+    # caught regardless of host OS.
+    posix_resolved = resolved.replace("\\", "/")
+    posix_normalized = normalized.replace("\\", "/")
     for prefix in _SENSITIVE_PATH_PREFIXES:
-        if resolved.startswith(prefix) or normalized.startswith(prefix):
+        if (resolved.startswith(prefix) or normalized.startswith(prefix)
+                or posix_resolved.startswith(prefix)
+                or posix_normalized.startswith(prefix)):
             return _err
-    if resolved in _SENSITIVE_EXACT_PATHS or normalized in _SENSITIVE_EXACT_PATHS:
+    if (resolved in _SENSITIVE_EXACT_PATHS
+            or normalized in _SENSITIVE_EXACT_PATHS
+            or posix_resolved in _SENSITIVE_EXACT_PATHS
+            or posix_normalized in _SENSITIVE_EXACT_PATHS):
         return _err
     # Prevent agents from modifying the Hermes config file directly.
     # approvals.mode and other security settings live here; a malicious or
