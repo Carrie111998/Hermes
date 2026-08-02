@@ -1782,6 +1782,13 @@ class TestMatrixDynamicRoomNames:
             message_id="$msg1",
         )
 
+    async def _drain_room_name_tasks(self):
+        while self.adapter._dynamic_room_name_tasks:
+            await asyncio.gather(
+                *tuple(self.adapter._dynamic_room_name_tasks),
+                return_exceptions=True,
+            )
+
     @pytest.mark.asyncio
     async def test_processing_and_semantic_title_update_room_name(self):
         from gateway.platforms.base import ProcessingOutcome
@@ -1789,10 +1796,12 @@ class TestMatrixDynamicRoomNames:
         event = self._event()
 
         await self.adapter.on_processing_start(event)
+        await self._drain_room_name_tasks()
         await self.adapter.on_session_title_changed(
             event.source, "Add dynamic Matrix room names"
         )
         await self.adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+        await self._drain_room_name_tasks()
 
         names = [
             call.args[2]["name"]
@@ -1810,9 +1819,13 @@ class TestMatrixDynamicRoomNames:
 
         event = self._event()
         await self.adapter.on_processing_start(event)
+        await self._drain_room_name_tasks()
         await self.adapter.on_processing_complete(event, ProcessingOutcome.FAILURE)
+        await self._drain_room_name_tasks()
         await self.adapter.on_processing_start(event)
+        await self._drain_room_name_tasks()
         await self.adapter.on_processing_complete(event, ProcessingOutcome.CANCELLED)
+        await self._drain_room_name_tasks()
 
         names = [
             call.args[2]["name"]
@@ -1856,10 +1869,12 @@ class TestMatrixDynamicRoomNames:
             self.adapter.on_processing_start(event),
             self.adapter.on_processing_start(event),
         )
+        await self._drain_room_name_tasks()
         await asyncio.gather(
             self.adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS),
             self.adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS),
         )
+        await self._drain_room_name_tasks()
 
         names = [
             call.args[2]["name"]
@@ -1872,8 +1887,73 @@ class TestMatrixDynamicRoomNames:
         self.adapter._client.send_state_event.side_effect = PermissionError("forbidden")
 
         await self.adapter.on_processing_start(self._event())
+        await self._drain_room_name_tasks()
 
         self.adapter._client.send_state_event.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_cancelled_completion_retry_is_idempotent_with_two_turns(self):
+        from gateway.platforms.base import ProcessingOutcome
+
+        first = self._event()
+        second = self._event()
+        second.message_id = "$msg2"
+        await self.adapter.on_processing_start(first)
+        await self.adapter.on_processing_start(second)
+
+        release_completion_write = asyncio.Event()
+
+        async def hanging_completion_write(*args, **kwargs):
+            await release_completion_write.wait()
+            return "$room-name"
+
+        self.adapter._dynamic_room_name_last_sent["!room:ex"] = "stale"
+        self.adapter._client.send_state_event.side_effect = hanging_completion_write
+
+        await asyncio.wait_for(
+            self.adapter.on_processing_complete(first, ProcessingOutcome.CANCELLED),
+            timeout=0.05,
+        )
+        await self.adapter.on_processing_complete(first, ProcessingOutcome.CANCELLED)
+
+        assert self.adapter._dynamic_room_name_active["!room:ex"] == 1
+        assert self.adapter._dynamic_room_name_status["!room:ex"] == "working"
+
+        await self.adapter.on_processing_complete(second, ProcessingOutcome.SUCCESS)
+        assert self.adapter._dynamic_room_name_active["!room:ex"] == 0
+        release_completion_write.set()
+        await self._drain_room_name_tasks()
+
+    @pytest.mark.asyncio
+    async def test_processing_room_name_writes_are_detached_and_latest_wins(self):
+        from gateway.platforms.base import ProcessingOutcome
+
+        first_send_started = asyncio.Event()
+        release_first_send = asyncio.Event()
+
+        async def hanging_first_send(*args, **kwargs):
+            if not first_send_started.is_set():
+                first_send_started.set()
+                await release_first_send.wait()
+            return "$room-name"
+
+        self.adapter._client.send_state_event.side_effect = hanging_first_send
+        event = self._event()
+
+        await asyncio.wait_for(self.adapter.on_processing_start(event), timeout=0.05)
+        await asyncio.wait_for(first_send_started.wait(), timeout=0.05)
+        await asyncio.wait_for(
+            self.adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS),
+            timeout=0.05,
+        )
+        release_first_send.set()
+        await self._drain_room_name_tasks()
+
+        names = [
+            call.args[2]["name"]
+            for call in self.adapter._client.send_state_event.await_args_list
+        ]
+        assert names == ["🟡 Hermes", "✅ Hermes"]
 
     def test_yaml_config_bridge_enables_feature(self, monkeypatch):
         from plugins.platforms.matrix.adapter import MatrixAdapter, _apply_yaml_config

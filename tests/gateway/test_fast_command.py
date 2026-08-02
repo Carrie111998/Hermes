@@ -353,6 +353,9 @@ async def test_adapter_title_propagation_invokes_optional_hook():
             return_value=SimpleNamespace(session_id="session-1")
         ),
     )
+    runner._session_db = SimpleNamespace(
+        get_session_title=AsyncMock(return_value="Current Session Title")
+    )
 
     adapter = SimpleNamespace(on_session_title_changed=AsyncMock())
     runner.adapters = {Platform.TELEGRAM: adapter}  # type: ignore[dict-item]
@@ -367,6 +370,34 @@ async def test_adapter_title_propagation_invokes_optional_hook():
         _make_source(),
         "Current Session Title",
     )
+
+
+@pytest.mark.asyncio
+async def test_adapter_title_propagation_does_not_overwrite_newer_manual_title(tmp_path):
+    from hermes_state import AsyncSessionDB, SessionDB
+
+    runner = _make_runner()
+    runner._async_session_store = SimpleNamespace(
+        _store=runner.session_store,
+        get_or_create_session=AsyncMock(
+            return_value=SimpleNamespace(session_id="session-1")
+        ),
+    )
+    session_db = SessionDB(db_path=tmp_path / "state.db")
+    session_db.create_session("session-1", "matrix")
+    session_db.set_session_title("session-1", "New Manual Title")
+    runner._session_db = AsyncSessionDB(session_db)
+    adapter = SimpleNamespace(on_session_title_changed=AsyncMock())
+    runner.adapters = {Platform.TELEGRAM: adapter}  # type: ignore[dict-item]
+
+    await runner._propagate_session_title_to_adapter(
+        _make_source(),
+        "session-1",
+        "Old Generated Title",
+    )
+
+    adapter.on_session_title_changed.assert_not_awaited()
+    session_db.close()
 
 
 @pytest.mark.asyncio

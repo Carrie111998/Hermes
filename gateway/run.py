@@ -19276,6 +19276,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return
         if str(getattr(current_entry, "session_id", "")) != str(session_id):
             return
+        session_db = getattr(self, "_session_db", None)
+        if session_db is None:
+            return
+        try:
+            current_title = await session_db.get_session_title(session_id)
+        except Exception:
+            logger.debug(
+                "Could not validate current title before adapter title propagation",
+                exc_info=True,
+            )
+            return
+        if current_title != title:
+            return
         adapter = self._adapter_for_source(source)
         if adapter is None:
             return
