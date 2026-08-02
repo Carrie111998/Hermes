@@ -1975,29 +1975,27 @@ class ProcessRegistry:
         *,
         source: str,
     ) -> int:
-        """Kill processes created for ``task_id`` after a prior snapshot."""
-        baseline = frozenset(baseline_ids or ())
-        with self._lock:
-            targets = [
-                s
-                for s in self._running.values()
-                if s.task_id == task_id and s.id not in baseline and not s.exited
-            ]
+        """Kill processes created for ``task_id`` after a prior snapshot.
 
-        killed = 0
-        for session in targets:
-            result = self.kill_process(
-                session.id,
-                source=source,
-                # Abandoned-turn output must not enqueue a synthetic follow-up
-                # that revives work the timeout deliberately stopped.
-                consume_output=True,
-            )
-            if result.get("status") in {"killed", "already_exited"}:
-                killed += 1
-        return killed
+        ``consume_output`` is forced on: abandoned-turn output must not
+        enqueue a synthetic follow-up that revives work the timeout
+        deliberately stopped.
+        """
+        return self.kill_all(
+            task_id,
+            exclude_ids=frozenset(baseline_ids or ()),
+            source=source,
+            consume_output=True,
+        )
 
-    def kill_all(self, task_id: str = None) -> int:
+    def kill_all(
+        self,
+        task_id: Optional[str] = None,
+        *,
+        exclude_ids: frozenset = frozenset(),
+        source: str = "kill_all",
+        consume_output: bool = False,
+    ) -> int:
         """Kill all running processes, optionally filtered by task_id. Returns count killed."""
         with self._lock:
             targets = [
