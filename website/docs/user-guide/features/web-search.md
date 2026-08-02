@@ -26,8 +26,9 @@ Both are configured through a single backend selection. Providers are chosen via
 | **Exa** | `EXA_API_KEY` | ✔ | ✔ | 1 000 searches/mo |
 | **Parallel** | `PARALLEL_API_KEY` | ✔ | ✔ | Paid |
 | **xAI (Grok)** | `XAI_API_KEY` or `hermes auth add xai-oauth` | ✔ | — | Paid (SuperGrok or per-token) |
+| **DeepSeek** | `DEEPSEEK_API_KEY` | ✔ | — | Paid (per-token) |
 
-Brave Search, DDGS, and xAI are **search-only** — pair any of them with Firecrawl/Tavily/Exa/Parallel when you also need `web_extract`. DDGS uses the [`ddgs` Python package](https://pypi.org/project/ddgs/) under the hood; if it isn't already installed, run `pip install ddgs` (or let Hermes lazy-install it on first use). xAI runs Grok's server-side `web_search` tool on the Responses API — results are LLM-generated rather than index-backed, so titles, descriptions, and URL choice are all model output (see the [trust-model caveat](#xai-grok) below).
+Brave Search, DDGS, DeepSeek, and xAI are **search-only** — pair any of them with Firecrawl/Tavily/Exa/Parallel when you also need `web_extract`. DDGS uses the [`ddgs` Python package](https://pypi.org/project/ddgs/) under the hood; if it isn't already installed, run `pip install ddgs` (or let Hermes lazy-install it on first use). xAI runs Grok's server-side `web_search` tool on the Responses API — results are LLM-generated rather than index-backed, so titles, descriptions, and URL choice are all model output (see the [trust-model caveat](#xai-grok) below). DeepSeek runs its server-side `web_search` tool on DeepSeek's Anthropic-compatible endpoint — it searches, reads, and synthesizes the pages server-side (each search costs one extra DeepSeek API call), and the provider surfaces that synthesis as a `summary` alongside the result rows (see the [trust-model caveat](#deepseek) below).
 
 **Per-capability split:** you can use different providers for search and extract independently — for example SearXNG (free) for search and Firecrawl for extract. See [Per-capability configuration](#per-capability-configuration) below.
 
@@ -315,6 +316,40 @@ web:
 Unlike index-backed providers (Brave, Tavily, Exa) which return verbatim search-engine results, xAI is an LLM choosing which URLs to surface and writing the titles and descriptions itself. The *content* of the query influences the output, so a maliciously crafted query (e.g. injected via untrusted upstream input the agent picked up) can in principle steer Grok into emitting attacker-chosen URLs. Treat returned URLs the same way you'd treat any model-generated link — validate before fetching, especially if the query came from untrusted input.
 :::
 
+### DeepSeek {#deepseek}
+
+Routes `web_search` through DeepSeek's server-side `web_search` tool on the [Anthropic-compatible endpoint](https://api-docs.deepseek.com/). DeepSeek runs the searching *and* the page-reading server-side — the final answer text is a server-side synthesis of the fetched pages, and the provider surfaces that synthesis to the agent as a `summary` alongside the standard result rows.
+
+```bash
+# ~/.hermes/.env
+DEEPSEEK_API_KEY=«redacted:sk-…»
+```
+
+Then select DeepSeek as the search backend:
+
+```yaml
+# ~/.hermes/config.yaml
+web:
+  backend: "deepseek"
+```
+
+**Optional knobs:**
+
+```yaml
+web:
+  backend: "deepseek"
+  deepseek:
+    model: deepseek-v4-flash        # default
+    max_tokens: 1024                # cap on the server-side synthesis text
+    timeout: 120                    # seconds (default)
+```
+
+**Search-only** — pair with Firecrawl / Tavily / Exa / Parallel if you also need `web_extract`. DeepSeek's web search is a server-side tool on the Anthropic-compatible endpoint: the OpenAI-compatible endpoint rejects the `web_search` tool type (`unknown variant 'web_search'`). Each search costs one extra DeepSeek API call (the server-side summary pass is billed as model tokens), and the model decides how many search rounds to run — the returned result count is not directly controllable via the tool's `limit` argument.
+
+:::caution Trust model
+Same as xAI: DeepSeek is an LLM choosing which URLs to surface and writing the titles itself. The *content* of the query influences the output, so a maliciously crafted query (e.g. injected via untrusted upstream input the agent picked up) can in principle steer DeepSeek into emitting attacker-chosen URLs. Treat returned URLs the same way you'd treat any model-generated link — validate before fetching, especially if the query came from untrusted input.
+:::
+
 ---
 
 ## Configuration
@@ -326,7 +361,7 @@ Set one provider for all web capabilities:
 ```yaml
 # ~/.hermes/config.yaml
 web:
-  backend: "searxng"   # firecrawl | searxng | brave-free | ddgs | tavily | exa | parallel | xai
+  backend: "searxng"   # firecrawl | searxng | brave-free | ddgs | deepseek | tavily | exa | parallel | xai
 ```
 
 ### Per-capability configuration
@@ -362,6 +397,8 @@ If no backend is explicitly configured, Hermes picks the first available one bas
 | `ddgs` package importable | ddgs |
 
 xAI Web Search is **not** in the auto-detection chain — having `XAI_API_KEY` set (or being signed in via xAI Grok OAuth) does not automatically route web traffic through xAI, since those credentials are also used for inference / TTS / image gen and the user may want a different backend for web. Opt in explicitly with `web.backend: "xai"`.
+
+DeepSeek Web Search is also **not** in the auto-detection chain — `DEEPSEEK_API_KEY` is the inference credential, so having it set does not route web traffic through DeepSeek. Opt in explicitly with `web.backend: "deepseek"`.
 
 ---
 

@@ -23,6 +23,8 @@ import inspect
 
 import pytest
 
+from plugins.web.deepseek.provider import DeepSeekWebSearchProvider
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -42,6 +44,7 @@ def _clear_web_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "FIRECRAWL_API_KEY",
         "FIRECRAWL_API_URL",
         "FIRECRAWL_GATEWAY_URL",
+        "DEEPSEEK_API_KEY",
         "TOOL_GATEWAY_DOMAIN",
         "TOOL_GATEWAY_USER_TOKEN",
         "XAI_API_KEY",
@@ -68,9 +71,9 @@ def _isolate_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 class TestBundledPluginsRegister:
-    """All eight bundled web plugins discover and register correctly."""
+    """All nine bundled web plugins discover and register correctly."""
 
-    def test_all_seven_plugins_present_in_registry(self) -> None:
+    def test_all_bundled_plugins_present_in_registry(self) -> None:
         _ensure_plugins_loaded()
         from agent.web_search_registry import list_providers
 
@@ -78,6 +81,7 @@ class TestBundledPluginsRegister:
         assert names == [
             "brave-free",
             "ddgs",
+            "deepseek",
             "exa",
             "firecrawl",
             "parallel",
@@ -91,6 +95,8 @@ class TestBundledPluginsRegister:
         [
             ("brave-free", True, False),
             ("ddgs", True, False),
+            # deepseek: search-only via DeepSeek's server-side web_search tool.
+            ("deepseek", True, False),
             ("searxng", True, False),
             ("exa", True, True),
             ("parallel", True, True),
@@ -116,7 +122,17 @@ class TestBundledPluginsRegister:
 
     @pytest.mark.parametrize(
         "plugin_name",
-        ["brave-free", "ddgs", "searxng", "exa", "parallel", "tavily", "firecrawl", "xai"],
+        [
+            "brave-free",
+            "ddgs",
+            "deepseek",
+            "searxng",
+            "exa",
+            "parallel",
+            "tavily",
+            "firecrawl",
+            "xai",
+        ],
     )
     def test_each_plugin_has_name_and_display_name(self, plugin_name: str) -> None:
         _ensure_plugins_loaded()
@@ -230,6 +246,22 @@ class TestIsAvailable:
         monkeypatch.setenv("XAI_API_KEY", "real")
         assert p.is_available() is True
 
+    def test_deepseek_requires_api_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """DeepSeek needs DEEPSEEK_API_KEY (shared with the inference path)."""
+        _ensure_plugins_loaded()
+        from agent.web_search_registry import get_provider
+
+        p = get_provider("deepseek")
+        assert p is not None
+        # Empty string in os.environ shadows any key in ~/.hermes/.env
+        # (get_env_value returns the environ value — even "" — before
+        # falling through to the .env file), keeping the test hermetic
+        # on dev machines that have a real key in .env.
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "")
+        assert p.is_available() is False
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "real")
+        assert p.is_available() is True
+
 
 # ---------------------------------------------------------------------------
 # Registry resolution semantics (Option B — conservative smart fallback)
@@ -310,5 +342,89 @@ class TestAsyncExtractDispatch:
 
 class TestErrorResponseShapes:
     """When credentials are missing, plugins return typed errors, not raises."""
+
+
+# ---------------------------------------------------------------------------
+# DeepSeek reply parsing (pure function — no network)
+# ---------------------------------------------------------------------------
+
+
+class TestDeepSeekParseReply:
+    """``_parse_reply`` extracts web rows + synthesis text from replies."""
+
+    @staticmethod
+    def _provider() -> "DeepSeekWebSearchProvider":
+        _ensure_plugins_loaded()
+        from agent.web_search_registry import get_provider
+        from plugins.web.deepseek.provider import DeepSeekWebSearchProvider
+
+        p = get_provider("deepseek")
+        assert isinstance(p, DeepSeekWebSearchProvider)
+        return p
+
+    def test_parses_search_results_and_summary(self) -> None:
+        p = self._provider()
+        assert p is not None
+        data = {
+            "content": [
+                {"type": "thinking", "thinking": "irrelevant"},
+                {"type": "server_tool_use", "name": "web_search", "input": {"query": "q"}},
+                {
+                    "type": "web_search_tool_result",
+                    "tool_use_id": "call_0",
+                    "content": [
+                        {
+                            "type": "web_search_result",
+                            "title": "T1",
+                            "url": "https://a.example/1",
+                            "page_age": None,
+                        },
+                        {
+                            "type": "web_search_result",
+                            "title": "T2",
+                            "url": "https://a.example/2",
+                        },
+                        # Non-result items must be skipped, not crash.
+                        {"type": "web_search_result", "title": "no-url"},
+                        {"type": "something_else", "url": "https://skip.example"},
+                    ],
+                },
+                {"type": "text", "text": "synthesis text"},
+            ]
+        }
+        rows, summary = p._parse_reply(data)
+        assert rows == [
+            {"title": "T1", "url": "https://a.example/1", "description": "", "position": 1},
+            {"title": "T2", "url": "https://a.example/2", "description": "", "position": 2},
+        ]
+        assert summary == "synthesis text"
+
+    def test_positions_renumber_after_dropped_rows(self) -> None:
+        p = self._provider()
+        assert p is not None
+        data = {
+            "content": [
+                {
+                    "type": "web_search_tool_result",
+                    "tool_use_id": "call_0",
+                    "content": [
+                        {"type": "web_search_result", "title": "", "url": ""},
+                        {"type": "web_search_result", "title": "T", "url": "https://a.example"},
+                    ],
+                }
+            ]
+        }
+        rows, summary = p._parse_reply(data)
+        assert len(rows) == 1
+        assert rows[0]["position"] == 1  # renumbered, no gap
+        assert summary == ""
+
+    def test_empty_and_malformed_replies(self) -> None:
+        p = self._provider()
+        assert p is not None
+        for data in ({}, {"content": None}, {"content": "nope"}, None):
+            rows, summary = p._parse_reply(data)
+            assert rows == []
+            assert summary == ""
 
 
