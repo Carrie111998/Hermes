@@ -32,6 +32,7 @@ import {
 import nodePty from 'node-pty'
 
 import { classifyActiveRuntime } from './active-runtime-state'
+import { collectBackendDrainTargets } from './backend-quit-drain'
 import { stopBackendChild as stopBackendChildImpl } from './backend-child'
 import { dashboardFallbackArgs, sourceDeclaresServe } from './backend-command'
 import { createBackendConnectionState } from './backend-connection-state'
@@ -7260,6 +7261,9 @@ const desktopInstallationId = loadOrCreateInstallationId(DESKTOP_INSTALLATION_PA
 const sshBootstrapCoordinator = createBootstrapCoordinator()
 
 let sshQuitTeardownDone = false
+// One-shot latch so the re-entrant app.quit() that ends the backend drain
+// (below) doesn't re-enter before-quit and reschedule the same drain forever.
+let backendQuitDrainScheduled = false
 
 function sshScopeKey(profile) {
   return connectionScopeKey(profile) || ''
@@ -11996,8 +12000,41 @@ app.on('before-quit', event => {
     disposeTerminalSession(id)
   }
 
-  stopBackendChild(backendConnectionState.getProcess())
-  stopAllPoolBackends()
+  // Drain the backend children to completion before letting Electron exit,
+  // so the SIGTERM we send below actually takes effect instead of the child
+  // being orphaned when the process tears down. The tricky part: capture the
+  // still-alive children BEFORE calling stopAllPoolBackends(), because it
+  // deletes every backendPool entry (and thus the handle) before killing.
+  const primaryChild = backendConnectionState.getProcess()
+  const drainTargets = collectBackendDrainTargets(primaryChild, [...backendPool.values()])
+
+  // Only intervene when there is at least one live backend to wait on — a quit
+  // with nothing running must proceed immediately (no artificial delay).
+  if (!backendQuitDrainScheduled && drainTargets.length > 0) {
+    backendQuitDrainScheduled = true
+    event.preventDefault()
+
+    // Cmd-Q should still feel instant even though the actual exit is deferred
+    // for up to ~5s while the backend drains.
+    for (const win of BrowserWindow.getAllWindows()) {
+      if (!win.isDestroyed()) {
+        win.hide()
+      }
+    }
+
+    stopBackendChild(primaryChild)
+    stopAllPoolBackends()
+
+    void Promise.allSettled(drainTargets.map(child => waitForBackendExit(child)))
+      .then(() => {
+        // Re-enter quit. The latch above is now set, so before-quit runs its
+        // remaining teardown but does NOT re-schedule this drain.
+        app.quit()
+      })
+  } else {
+    stopBackendChild(primaryChild)
+    stopAllPoolBackends()
+  }
 })
 
 app.on('window-all-closed', () => {
