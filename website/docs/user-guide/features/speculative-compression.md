@@ -37,9 +37,9 @@ compression:
 
 ```
 
-Ratios apply to the **effective input budget** (`context_length − max_tokens` output reservation) of the **currently active model**. `compression.threshold_tokens` (absolute cap), when set below the ratio watermarks, caps the speculative triggers too. On small context windows where the minimum-window floor collapses the watermarks, speculation disables itself.
+Ratios apply to the **effective input budget** (`context_length − max_tokens` output reservation) of the **currently active model**. `compression.threshold_tokens` (absolute cap), when set below the ratio watermarks, caps the speculative triggers too.
 
-Rollback: set `enabled: false` and restart the CLI/gateway. There is no runtime toggle.
+Rollback: set `enabled: false` — the runtime hot switch applies it to the live session without a restart (see `/speculative`).
 
 ## How to tell it is running
 

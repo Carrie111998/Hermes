@@ -807,7 +807,6 @@ compression:
     max_age_seconds: 180                             # Discard candidates older than this
     hard_wait_seconds: 2                             # Bounded foreground wait for a ready candidate
     during_tool_wait: true                           # v1 overlap window
-    during_idle: false                                # Reserved; idle scheduling is not in v1
 
 # The summarization model/provider is configured under auxiliary:
 auxiliary:
@@ -1622,7 +1621,6 @@ display:
   skin: default           # Built-in or custom CLI skin (see user-guide/features/skins)
   personality: ""         # Legacy cosmetic field still surfaced in some summaries
   compact: false          # Compact output mode (less whitespace)
-  tui_startup_panel: true # TUI: show startup banner + session/tool/skill summary
   resume_display: full    # full (show previous messages on resume) | minimal (one-liner only)
   bell_on_complete: false # Play terminal bell when agent finishes (great for long tasks)
   show_reasoning: true    # Show model reasoning/thinking above each response (default: true; toggle with /reasoning show|hide)
@@ -1640,17 +1638,6 @@ display:
   credits_notices: true   # Nous credits status-bar notices (usage bands, grant-spent, depleted). false = silence them; /usage still works
   language: en            # UI language for static messages (approval prompts, some gateway replies). en | zh | zh-hant | ja | de | es | fr | tr | uk | af | ko | it | ga | pt | ru | hu
 ```
-
-### TUI startup panel
-
-The Ink TUI normally opens with the Hermes banner and a session summary that lists the active model, tools, and skills. Set `display.tui_startup_panel: false` for a clean startup directly at the composer:
-
-```yaml
-display:
-  tui_startup_panel: false
-```
-
-This setting applies only to `hermes --tui` (or `display.interface: tui`); it does not change the classic CLI banner. Restart Hermes after changing it.
 
 ### Per-turn summary and spinner token flow
 
