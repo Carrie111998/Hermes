@@ -21,6 +21,7 @@ export function isSessionActionContributionData(value: unknown): value is Sessio
   if (!value || typeof value !== 'object') {
     return false
   }
+
   const data = value as Partial<SessionActionContributionData>
 
   return (typeof data.label === 'string' || typeof data.label === 'function') && typeof data.onSelect === 'function'

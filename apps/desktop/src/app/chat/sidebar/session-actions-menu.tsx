@@ -168,6 +168,7 @@ function useSessionActions({
     if (!isSessionActionContributionData(contribution.data)) {
       return []
     }
+
     const data = contribution.data
     let label: string
     let disabled: boolean
