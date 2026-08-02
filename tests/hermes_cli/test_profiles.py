@@ -154,8 +154,45 @@ class TestCreateProfile:
         assert cloned_config["model"] == "test"
         assert (profile_dir / ".env").read_text().strip() == "KEY=val"
         assert (profile_dir / "SOUL.md").read_text() == "Be helpful."
-        assert (profile_dir / "memories" / "MEMORY.md").read_text() == "Curated agent memory."
-        assert (profile_dir / "memories" / "USER.md").read_text() == "Curated user context."
+        assert (
+            profile_dir / "memories" / "MEMORY.md"
+        ).read_text() == "Curated agent memory."
+        assert (
+            profile_dir / "memories" / "USER.md"
+        ).read_text() == "Curated user context."
+
+    def test_clone_from_next_steps_acknowledge_copied_credentials(
+        self, profile_env, monkeypatch, capsys
+    ):
+        """--clone-from must not warn that copied credentials are missing."""
+        from hermes_cli.main import cmd_profile
+        import plugins.memory.honcho.cli as honcho_cli
+
+        profile_dir = Path(profile_env) / ".hermes" / "profiles" / "work"
+        monkeypatch.setattr(profiles, "create_profile", lambda **_: profile_dir)
+        monkeypatch.setattr(
+            profiles, "get_active_profile_name", lambda: "default"
+        )
+        monkeypatch.setattr(
+            honcho_cli, "clone_honcho_for_profile", lambda _: False
+        )
+
+        cmd_profile(
+            types.SimpleNamespace(
+                profile_action="create",
+                profile_name="work",
+                clone=False,
+                clone_all=False,
+                clone_from="coder",
+                no_alias=True,
+                no_skills=False,
+                description=None,
+            )
+        )
+
+        output = capsys.readouterr().out
+        assert "Edit" in output and "/.env for different API keys" in output
+        assert "This profile has no API keys yet" not in output
 
 
 
