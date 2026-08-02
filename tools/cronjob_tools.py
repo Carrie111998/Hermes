@@ -9,6 +9,8 @@ import json
 import logging
 import re
 import sys
+import threading
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
@@ -606,9 +608,45 @@ def _execute_job_now(job: Dict[str, Any]) -> Dict[str, Any]:
                 reason = "Job is already being fired by the scheduler; not run again."
             return {"claimed": False, "success": False, "error": reason}
 
-        # run_one_job records last_run_at/last_status via mark_job_run (which
-        # also clears the fire claim) and returns True iff it processed the job.
-        processed = run_one_job(job)
+        # Start a heartbeat thread that ticks the parent agent's activity
+        # tracker while run_one_job executes.  Without this, the gateway
+        # inactivity watchdog sees a silent tool for the entire job duration
+        # and kills the calling turn at agent_timeout (default 1800s).
+        # (#76502)
+        _stop_heartbeat = threading.Event()
+
+        def _heartbeat_loop() -> None:
+            try:
+                from tools.environments.base import _get_activity_callback
+            except Exception:
+                return
+            start = time.monotonic()
+            while not _stop_heartbeat.wait(timeout=30.0):
+                try:
+                    cb = _get_activity_callback()
+                    if cb:
+                        elapsed = int(time.monotonic() - start)
+                        cb(
+                            "running cron job %r (%ds elapsed)"
+                            % (job.get("name", job_id), elapsed)
+                        )
+                except Exception:
+                    pass
+
+        hb_thread = threading.Thread(
+            target=_heartbeat_loop,
+            daemon=True,
+            name=f"cron-heartbeat-{job_id[:8]}",
+        )
+        hb_thread.start()
+        try:
+            # run_one_job records last_run_at/last_status via mark_job_run
+            # (which also clears the fire claim) and returns True iff it
+            # processed the job.
+            processed = run_one_job(job)
+        finally:
+            _stop_heartbeat.set()
+            hb_thread.join(timeout=5)
         refreshed = get_job(job_id) or {}
         ok = refreshed.get("last_status") == "ok"
         return {
