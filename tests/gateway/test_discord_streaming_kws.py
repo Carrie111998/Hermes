@@ -10,6 +10,7 @@ import pytest
 from plugins.platforms.discord.streaming_kws import (
     DiscordStreamingKwsManager,
     StreamingKwsConfig,
+    _QueueItem,
     _build_engine,
     _normalize,
 )
@@ -32,6 +33,108 @@ class _FakeEngine:
 
     def close(self):
         self.closed = True
+
+
+def _assert_running(manager: DiscordStreamingKwsManager) -> None:
+    assert manager._ready.wait(timeout=1)
+    assert manager.snapshot_stats()["state"] == "RUNNING"
+
+
+def test_manager_rejects_starting_playback_then_accepts_next_fresh_playback():
+    factory_entered = threading.Event()
+    release_startup = threading.Event()
+    processed = threading.Event()
+    detected = threading.Event()
+    events = []
+
+    class SignallingEngine(_FakeEngine):
+        def process(self, stream, pcm):
+            processed.set()
+            return super().process(stream, pcm)
+
+    engine = SignallingEngine(None, None)
+
+    def blocking_factory(*_args):
+        factory_entered.set()
+        assert release_startup.wait(timeout=2)
+        return engine
+
+    def callback(event):
+        events.append(event)
+        detected.set()
+
+    manager = DiscordStreamingKwsManager(
+        StreamingKwsConfig(enabled=True, queue_frames=32),
+        ("하나야 잠깐",),
+        callback,
+        engine_factory=blocking_factory,
+    )
+    pcm = b"\x00" * 3840
+    try:
+        assert factory_entered.wait(timeout=1)
+        assert manager.begin_playback(1, 10) is False
+        assert manager.offer_pcm(1, 10, 42, pcm) is False
+        assert manager.end_playback(1, 10) is False
+        assert processed.is_set() is False
+
+        release_startup.set()
+        _assert_running(manager)
+
+        assert manager.begin_playback(1, 11) is True
+        assert manager.offer_pcm(1, 11, 42, pcm) is True
+        assert detected.wait(timeout=1)
+        assert [event["token"] for event in events] == [11]
+    finally:
+        release_startup.set()
+        manager.close()
+
+
+def test_manager_startup_failure_is_terminal_drained_and_close_is_idempotent():
+    factory_entered = threading.Event()
+    release_startup = threading.Event()
+
+    def broken_factory(*_args):
+        factory_entered.set()
+        assert release_startup.wait(timeout=2)
+        raise RuntimeError("model startup failed")
+
+    manager = DiscordStreamingKwsManager(
+        StreamingKwsConfig(enabled=True, queue_frames=32),
+        ("하나야 잠깐",),
+        lambda _event: None,
+        engine_factory=broken_factory,
+    )
+    assert factory_entered.wait(timeout=1)
+    assert manager.begin_playback(1, 20) is False
+    assert manager.offer_pcm(1, 20, 42, b"pcm") is False
+    assert manager.end_playback(1, 20) is False
+
+    # Seed stale internal work to prove the failure transition itself drains
+    # both channels rather than relying on STARTING admission rejection alone.
+    manager._queue.put_nowait(_QueueItem("stop", 0, 0))
+    with manager._forced_end_lock:
+        manager._forced_ends.add((1, 20))
+
+    release_startup.set()
+    assert manager._ready.wait(timeout=1)
+    manager._thread.join(timeout=1)
+    assert not manager._thread.is_alive()
+
+    stats = manager.snapshot_stats()
+    assert stats["state"] == "FAILED"
+    assert stats["startup_failed"] == 1
+    assert stats["queue_depth"] == 0
+    assert stats["forced_end_depth"] == 0
+
+    for _ in range(3):
+        assert manager.begin_playback(1, 21) is False
+        assert manager.offer_pcm(1, 21, 42, b"pcm") is False
+        assert manager.end_playback(1, 21) is False
+        manager.close()
+        stats = manager.snapshot_stats()
+        assert stats["state"] == "FAILED"
+        assert stats["queue_depth"] == 0
+        assert stats["forced_end_depth"] == 0
 
 
 def test_config_is_fail_closed_and_clamped():
@@ -375,6 +478,10 @@ def test_close_discards_saturated_queue_after_blocked_inference():
     closer.start()
     try:
         assert close_returned.wait(timeout=0.5), "close waited on blocked inference"
+        blocked_stats = manager.snapshot_stats()
+        assert blocked_stats["state"] == "CLOSING"
+        assert blocked_stats["queue_depth"] == 0
+        assert blocked_stats["forced_end_depth"] == 0
         assert manager.offer_pcm(1, 41, 42, pcm) is False
     finally:
         release.set()
@@ -385,27 +492,49 @@ def test_close_discards_saturated_queue_after_blocked_inference():
     assert len(process_calls) == 1
     assert events == []
     assert engine.closed is True
-    assert manager.snapshot_stats()["queue_depth"] == 0
+    final_stats = manager.snapshot_stats()
+    assert final_stats["state"] == "CLOSED"
+    assert final_stats["queue_depth"] == 0
 
-    started = time.monotonic()
-    manager.close()
-    assert time.monotonic() - started < 0.1
+    repeated_close_returned = threading.Event()
+    repeated_closer = threading.Thread(
+        target=lambda: (manager.close(), repeated_close_returned.set())
+    )
+    repeated_closer.start()
+    assert repeated_close_returned.wait(timeout=0.5)
+    repeated_closer.join(timeout=1)
+    assert not repeated_closer.is_alive()
 
 
-def test_close_is_linearizable_with_blocked_pcm_admission():
+def test_close_serializes_with_forced_end_side_channel_and_drains_it():
+    inference_entered = threading.Event()
+    release_inference = threading.Event()
+    forced_add_entered = threading.Event()
+    release_forced_add = threading.Event()
+    close_attempted = threading.Event()
+    close_returned = threading.Event()
+
+    class BlockingEngine(_FakeEngine):
+        def process(self, stream, _pcm):
+            inference_entered.set()
+            assert release_inference.wait(timeout=5)
+            stream["frames"] += 1
+            return None
+
+    class PausingForcedEnds(set):
+        def add(self, item):
+            forced_add_entered.set()
+            assert release_forced_add.wait(timeout=2)
+            super().add(item)
+
     class ProbeLock:
         def __init__(self):
             self._lock = threading.Lock()
-            self.offer_acquired = threading.Event()
-            self.close_attempted = threading.Event()
 
         def __enter__(self):
-            if threading.current_thread().name == "offer-probe":
-                self._lock.acquire()
-                self.offer_acquired.set()
-            else:
-                self.close_attempted.set()
-                self._lock.acquire()
+            if threading.current_thread().name == "forced-close":
+                close_attempted.set()
+            self._lock.acquire()
             return self
 
         def __exit__(self, *_exc):
@@ -415,56 +544,222 @@ def test_close_is_linearizable_with_blocked_pcm_admission():
         StreamingKwsConfig(enabled=True, queue_frames=32),
         ("하나야 잠깐",),
         lambda _event: None,
-        engine_factory=lambda *_args: _FakeEngine(None, None, fire_on=999),
+        engine_factory=lambda *_args: BlockingEngine(None, None),
     )
-    assert manager._ready.wait(timeout=1)
-    probe_lock = ProbeLock()
-    manager._close_lock = probe_lock
-    original_put = manager._queue.put_nowait
+    _assert_running(manager)
+    pcm = b"\x00" * 3840
+    assert manager.begin_playback(1, 72)
+    assert manager.offer_pcm(1, 72, 42, pcm)
+    assert inference_entered.wait(timeout=1)
+    while manager.offer_pcm(1, 72, 42, pcm):
+        pass
+
+    with manager._forced_end_lock:
+        manager._forced_ends = PausingForcedEnds()
+    manager._lifecycle_lock = ProbeLock()
+    end_results = []
+
+    ending = threading.Thread(
+        target=lambda: end_results.append(manager.end_playback(1, 72)),
+        name="forced-end",
+    )
+    closer = threading.Thread(
+        target=lambda: (manager.close(), close_returned.set()),
+        name="forced-close",
+    )
+    ending.start()
+    assert forced_add_entered.wait(timeout=1)
+    closer.start()
+    assert close_attempted.wait(timeout=1)
+    release_forced_add.set()
+    ending.join(timeout=1)
+    assert not ending.is_alive()
+    assert end_results == [False]
+    assert close_returned.wait(timeout=1)
+    closer.join(timeout=1)
+    assert not closer.is_alive()
+
+    blocked_stats = manager.snapshot_stats()
+    assert blocked_stats["state"] == "CLOSING"
+    assert blocked_stats["queue_depth"] == 0
+    assert blocked_stats["forced_end_depth"] == 0
+
+    release_inference.set()
+    manager._thread.join(timeout=1)
+    assert not manager._thread.is_alive()
+    assert manager.snapshot_stats()["state"] == "CLOSED"
+
+
+def test_detection_queued_before_terminal_transition_is_suppressed():
+    inference_entered = threading.Event()
+    release_inference = threading.Event()
+    inference_returned = threading.Event()
+    worker_at_callback_gate = threading.Event()
+    release_worker = threading.Event()
+    callback_called = threading.Event()
+    close_returned = threading.Event()
+
+    class DetectingEngine(_FakeEngine):
+        def process(self, stream, _pcm):
+            inference_entered.set()
+            assert release_inference.wait(timeout=2)
+            stream["frames"] += 1
+            inference_returned.set()
+            return 0
+
+    class CallbackGateLock:
+        def __init__(self):
+            self._lock = threading.RLock()
+
+        def __enter__(self):
+            if threading.current_thread().name == "discord-streaming-kws":
+                worker_at_callback_gate.set()
+                assert release_worker.wait(timeout=2)
+            self._lock.acquire()
+            return self
+
+        def __exit__(self, *_exc):
+            self._lock.release()
+
+    manager = DiscordStreamingKwsManager(
+        StreamingKwsConfig(enabled=True, queue_frames=32),
+        ("하나야 잠깐",),
+        lambda _event: callback_called.set(),
+        engine_factory=lambda *_args: DetectingEngine(None, None),
+    )
+    _assert_running(manager)
+    assert manager.begin_playback(1, 73)
+    assert manager.offer_pcm(1, 73, 42, b"\x00" * 3840)
+    assert inference_entered.wait(timeout=1)
+    manager._lifecycle_lock = CallbackGateLock()
+
+    release_inference.set()
+    try:
+        assert inference_returned.wait(timeout=1)
+        assert worker_at_callback_gate.wait(timeout=1)
+        assert callback_called.is_set() is False
+
+        closer = threading.Thread(
+            target=lambda: (manager.close(), close_returned.set()),
+            name="callback-close",
+        )
+        closer.start()
+        assert close_returned.wait(timeout=1)
+        closer.join(timeout=1)
+        assert not closer.is_alive()
+        assert manager.snapshot_stats()["state"] == "CLOSING"
+    finally:
+        release_worker.set()
+
+    manager._thread.join(timeout=1)
+    assert not manager._thread.is_alive()
+    assert callback_called.is_set() is False
+    assert manager.snapshot_stats()["state"] == "CLOSED"
+
+
+def test_close_is_linearizable_with_paused_pcm_admission_in_both_orders():
+    class ProbeLock:
+        def __init__(self):
+            self._lock = threading.Lock()
+            self.offer_attempted = threading.Event()
+            self.close_attempted = threading.Event()
+
+        def __enter__(self):
+            if threading.current_thread().name.startswith("offer-"):
+                self.offer_attempted.set()
+            elif threading.current_thread().name.startswith("close-"):
+                self.close_attempted.set()
+            self._lock.acquire()
+            return self
+
+        def __exit__(self, *_exc):
+            self._lock.release()
+
+    def make_manager():
+        manager = DiscordStreamingKwsManager(
+            StreamingKwsConfig(enabled=True, queue_frames=32),
+            ("하나야 잠깐",),
+            lambda _event: None,
+            engine_factory=lambda *_args: _FakeEngine(None, None, fire_on=999),
+        )
+        _assert_running(manager)
+        return manager
+
+    # Admission owns the lifecycle lock first: it may commit, then close must
+    # drain it before returning.
+    admitted_first = make_manager()
+    admitted_lock = ProbeLock()
+    admitted_first._lifecycle_lock = admitted_lock
+    original_put = admitted_first._queue.put_nowait
     offer_at_enqueue = threading.Event()
     release_offer = threading.Event()
-    sentinel_enqueued = threading.Event()
-    offer_results = []
+    admitted_results = []
 
     def blocking_put(item):
-        if item.kind == "pcm" and threading.current_thread().name == "offer-probe":
+        if item.kind == "pcm":
             offer_at_enqueue.set()
             assert release_offer.wait(timeout=2)
-        elif item.kind == "stop":
-            sentinel_enqueued.set()
         return original_put(item)
 
-    manager._queue.put_nowait = blocking_put
+    admitted_first._queue.put_nowait = blocking_put
     offer = threading.Thread(
-        target=lambda: offer_results.append(
-            manager.offer_pcm(1, 70, 42, b"\x00" * 3840)
+        target=lambda: admitted_results.append(
+            admitted_first.offer_pcm(1, 70, 42, b"\x00" * 3840)
         ),
-        name="offer-probe",
+        name="offer-first",
     )
-    closer = threading.Thread(target=manager.close, name="close-probe")
+    closer = threading.Thread(target=admitted_first.close, name="close-second")
     offer.start()
     assert offer_at_enqueue.wait(timeout=1)
     closer.start()
-    assert probe_lock.close_attempted.wait(timeout=1)
-
-    # On the buggy implementation close can enqueue its sentinel while the
-    # unprotected offer is paused. With serialized admission, close waits for
-    # the offer's lock and the controller can release it immediately.
-    if not probe_lock.offer_acquired.is_set():
-        assert sentinel_enqueued.wait(timeout=1)
+    assert admitted_lock.close_attempted.wait(timeout=1)
     release_offer.set()
     offer.join(timeout=1)
     closer.join(timeout=1)
     assert not offer.is_alive()
     assert not closer.is_alive()
-    assert offer_results == [True]
+    assert admitted_results == [True]
+    admitted_stats = admitted_first.snapshot_stats()
+    assert admitted_stats["queue_depth"] == 0
+    assert admitted_stats["forced_end_depth"] == 0
 
-    for _ in range(3):
-        assert manager.offer_pcm(1, 70, 42, b"pcm") is False
-        assert manager.begin_playback(1, 71) is False
-        manager.close()
-    manager._thread.join(timeout=1)
-    assert manager.snapshot_stats()["queue_depth"] == 0
+    # Close owns the lifecycle lock first: a concurrent offer cannot commit
+    # after the terminal transition.
+    closed_first = make_manager()
+    closed_lock = ProbeLock()
+    closed_first._lifecycle_lock = closed_lock
+    original_discard = closed_first._discard_queue
+    close_at_drain = threading.Event()
+    release_close = threading.Event()
+    closed_results = []
+
+    def blocking_discard():
+        close_at_drain.set()
+        assert release_close.wait(timeout=2)
+        original_discard()
+
+    closed_first._discard_queue = blocking_discard
+    closer = threading.Thread(target=closed_first.close, name="close-first")
+    offer = threading.Thread(
+        target=lambda: closed_results.append(
+            closed_first.offer_pcm(1, 71, 42, b"\x00" * 3840)
+        ),
+        name="offer-second",
+    )
+    closer.start()
+    assert close_at_drain.wait(timeout=1)
+    offer.start()
+    assert closed_lock.offer_attempted.wait(timeout=1)
+    assert closed_results == []
+    release_close.set()
+    closer.join(timeout=1)
+    offer.join(timeout=1)
+    assert not closer.is_alive()
+    assert not offer.is_alive()
+    assert closed_results == [False]
+    closed_stats = closed_first.snapshot_stats()
+    assert closed_stats["queue_depth"] == 0
+    assert closed_stats["forced_end_depth"] == 0
 
 
 def test_manager_idle_flush_can_detect_final_short_phrase():

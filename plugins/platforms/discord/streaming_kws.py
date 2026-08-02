@@ -13,6 +13,7 @@ import threading
 import time
 import unicodedata
 from dataclasses import dataclass
+from enum import Enum, auto
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Tuple
 
@@ -246,6 +247,15 @@ class _QueueItem:
     received_at: float = 0.0
 
 
+class DiscordStreamingKwsState(Enum):
+    NEW = auto()
+    STARTING = auto()
+    RUNNING = auto()
+    FAILED = auto()
+    CLOSING = auto()
+    CLOSED = auto()
+
+
 class DiscordStreamingKwsManager:
     """One bounded worker for all playback-scoped Discord KWS streams."""
 
@@ -262,7 +272,8 @@ class DiscordStreamingKwsManager:
         self.phrases = tuple(phrases)
         self._on_detection = on_detection
         self._queue: queue.Queue[_QueueItem] = queue.Queue(maxsize=config.queue_frames)
-        self._close_lock = threading.Lock()
+        self._lifecycle_lock = threading.RLock()
+        self._state = DiscordStreamingKwsState.NEW
         self._stats_lock = threading.Lock()
         self._forced_end_lock = threading.Lock()
         self._forced_ends: set[Tuple[int, int]] = set()
@@ -275,6 +286,7 @@ class DiscordStreamingKwsManager:
         }
         self._ready = threading.Event()
         self._closed = threading.Event()
+        self._worker_waiting = False
         self._startup_error: Optional[BaseException] = None
         self._engine_factory = engine_factory
         self._thread = threading.Thread(
@@ -282,6 +294,8 @@ class DiscordStreamingKwsManager:
             daemon=True,
             name="discord-streaming-kws",
         )
+        with self._lifecycle_lock:
+            self._state = DiscordStreamingKwsState.STARTING
         self._thread.start()
         # Production callers use the non-blocking default so a first model
         # download/load can never stall the Discord event loop. Tests and
@@ -298,17 +312,21 @@ class DiscordStreamingKwsManager:
         with self._stats_lock:
             self._stats[key] = self._stats.get(key, 0) + amount
 
-    def snapshot_stats(self) -> Dict[str, int]:
+    def snapshot_stats(self) -> Dict[str, Any]:
         with self._stats_lock:
-            stats = dict(self._stats)
-        stats["queue_depth"] = self._queue.qsize()
+            stats: Dict[str, Any] = dict(self._stats)
+        with self._lifecycle_lock:
+            stats["queue_depth"] = self._queue.qsize()
+            with self._forced_end_lock:
+                stats["forced_end_depth"] = len(self._forced_ends)
+            stats["state"] = self._state.name
         stats["ready"] = int(self._ready.is_set())
         stats["startup_failed"] = int(self._startup_error is not None)
         return stats
 
     def _put_control(self, item: _QueueItem) -> bool:
-        with self._close_lock:
-            if self._closed.is_set():
+        with self._lifecycle_lock:
+            if self._state is not DiscordStreamingKwsState.RUNNING:
                 return False
             try:
                 self._queue.put_nowait(item)
@@ -339,8 +357,8 @@ class DiscordStreamingKwsManager:
             bytes(pcm),
             time.monotonic() if received_at is None else float(received_at),
         )
-        with self._close_lock:
-            if self._closed.is_set():
+        with self._lifecycle_lock:
+            if self._state is not DiscordStreamingKwsState.RUNNING:
                 return False
             self._bump("offered_frames")
             try:
@@ -353,24 +371,34 @@ class DiscordStreamingKwsManager:
     def end_playback(self, guild_id: int, token: int) -> bool:
         guild_id = int(guild_id)
         token = int(token)
-        accepted = self._put_control(_QueueItem("end", guild_id, token))
-        if not accepted and not self._closed.is_set():
-            # Never block the Discord SocketReader. If the bounded PCM queue
-            # is saturated, the worker consumes this side-channel before its
-            # next queued frame and drops all remaining audio for the token.
-            with self._forced_end_lock:
-                self._forced_ends.add((guild_id, token))
-        return accepted
+        with self._lifecycle_lock:
+            if self._state is not DiscordStreamingKwsState.RUNNING:
+                return False
+            try:
+                self._queue.put_nowait(_QueueItem("end", guild_id, token))
+                return True
+            except queue.Full:
+                self._bump("queue_drops")
+                # Never block the Discord SocketReader. If the bounded PCM queue
+                # is saturated, the worker consumes this side-channel before its
+                # next queued frame and drops all remaining audio for the token.
+                with self._forced_end_lock:
+                    self._forced_ends.add((guild_id, token))
+                return False
 
     def close(self) -> None:
-        with self._close_lock:
+        with self._lifecycle_lock:
             if not self._closed.is_set():
+                self._state = DiscordStreamingKwsState.CLOSING
                 self._closed.set()
                 # Shutdown is terminal: discard every queued PCM/control item
                 # before waking the worker. In-flight inference may finish, but
                 # it cannot resume stale queued audio after this boundary.
                 self._discard_queue()
-                self._queue.put_nowait(_QueueItem("stop", 0, 0))
+                with self._forced_end_lock:
+                    self._forced_ends.clear()
+                if self._worker_waiting:
+                    self._queue.put_nowait(_QueueItem("stop", 0, 0))
         if self._thread is not threading.current_thread():
             # Native inference cannot be force-cancelled safely. Keep close
             # prompt and bounded; the worker observes _closed as soon as the
@@ -416,57 +444,84 @@ class DiscordStreamingKwsManager:
             keyword_index: int,
             observed_at: float,
         ) -> None:
-            token_key = stream_key[:2]
-            if (
-                self._closed.is_set()
-                or token_key in fired
-                or token_key not in active
-            ):
-                return
-            fired.add(token_key)
-            self._bump("detections")
-            first = first_received.get(stream_key, observed_at)
-            bytes_seen = audio_bytes.get(stream_key, 0)
-            event = {
-                "guild_id": stream_key[0],
-                "token": stream_key[1],
-                "user_id": stream_key[2],
-                "keyword_index": int(keyword_index),
-                "latency_ms": round((time.monotonic() - first) * 1000),
-                "audio_ms": round(
-                    bytes_seen
-                    / (_DISCORD_SAMPLE_RATE * _DISCORD_CHANNELS * _BYTES_PER_SAMPLE)
-                    * 1000
-                ),
-                "queue_delay_ms": round((time.monotonic() - observed_at) * 1000),
-            }
-            try:
-                self._on_detection(event)
-            except Exception as exc:
-                self._bump("worker_errors")
-                logger.info(
-                    "Discord streaming KWS callback failed type=%s",
-                    type(exc).__name__,
-                )
+            # Callback delivery is a lifecycle side effect. Holding the
+            # re-entrant gate makes it linearize either wholly before close or
+            # not at all; callbacks may still call close() themselves.
+            with self._lifecycle_lock:
+                token_key = stream_key[:2]
+                if (
+                    self._state is not DiscordStreamingKwsState.RUNNING
+                    or token_key in fired
+                    or token_key not in active
+                ):
+                    return
+                fired.add(token_key)
+                self._bump("detections")
+                first = first_received.get(stream_key, observed_at)
+                bytes_seen = audio_bytes.get(stream_key, 0)
+                event = {
+                    "guild_id": stream_key[0],
+                    "token": stream_key[1],
+                    "user_id": stream_key[2],
+                    "keyword_index": int(keyword_index),
+                    "latency_ms": round((time.monotonic() - first) * 1000),
+                    "audio_ms": round(
+                        bytes_seen
+                        / (
+                            _DISCORD_SAMPLE_RATE
+                            * _DISCORD_CHANNELS
+                            * _BYTES_PER_SAMPLE
+                        )
+                        * 1000
+                    ),
+                    "queue_delay_ms": round(
+                        (time.monotonic() - observed_at) * 1000
+                    ),
+                }
+                try:
+                    self._on_detection(event)
+                except Exception as exc:
+                    self._bump("worker_errors")
+                    logger.info(
+                        "Discord streaming KWS callback failed type=%s",
+                        type(exc).__name__,
+                    )
 
         try:
             engine = self._engine_factory(self.config, self.phrases)
         except BaseException as exc:
-            self._startup_error = exc
             self._bump("worker_errors")
             logger.warning(
                 "Discord streaming KWS startup failed type=%s",
                 type(exc).__name__,
             )
-            self._ready.set()
+            with self._lifecycle_lock:
+                self._startup_error = exc
+                if self._state is DiscordStreamingKwsState.STARTING:
+                    self._state = DiscordStreamingKwsState.FAILED
+                    self._closed.set()
+                self._discard_queue()
+                with self._forced_end_lock:
+                    self._forced_ends.clear()
+                self._ready.set()
             return
-        self._ready.set()
+        with self._lifecycle_lock:
+            if self._state is not DiscordStreamingKwsState.STARTING:
+                return
+            self._state = DiscordStreamingKwsState.RUNNING
+            self._ready.set()
         try:
             while not self._closed.is_set():
                 _drain_forced_ends()
+                with self._lifecycle_lock:
+                    if self._state is not DiscordStreamingKwsState.RUNNING:
+                        return
+                    self._worker_waiting = True
                 try:
                     item = self._queue.get(timeout=0.1)
                 except queue.Empty:
+                    with self._lifecycle_lock:
+                        self._worker_waiting = False
                     flush = getattr(engine, "flush", None)
                     if not callable(flush):
                         continue
@@ -497,6 +552,8 @@ class DiscordStreamingKwsManager:
                                 last_received.get(stream_key, now),
                             )
                     continue
+                with self._lifecycle_lock:
+                    self._worker_waiting = False
 
                 token_key = (item.guild_id, item.token)
                 if item.kind == "stop":
@@ -538,9 +595,14 @@ class DiscordStreamingKwsManager:
                 if keyword_index is not None:
                     _emit(stream_key, keyword_index, item.received_at)
         finally:
+            with self._lifecycle_lock:
+                self._worker_waiting = False
             self._discard_queue()
             if engine is not None:
                 try:
                     engine.close()
                 except Exception:
                     pass
+            with self._lifecycle_lock:
+                if self._state is DiscordStreamingKwsState.CLOSING:
+                    self._state = DiscordStreamingKwsState.CLOSED
