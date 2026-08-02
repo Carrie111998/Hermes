@@ -189,6 +189,23 @@ class TestStripCronWrapper(unittest.TestCase):
 
         self.assertEqual(MessageSender.strip_cron_wrapper(wrapped), body)
 
+    def test_preserves_complete_footer_sentence_inside_header_only_body(self):
+        from gateway.platforms.yuanbao import MessageSender
+
+        body = (
+            "Quoted delivery example:\n\n"
+            'To stop or manage this job, send me a new message (e.g. "stop reminder daily-report").\n\n'
+            "The report continues after the quoted example."
+        )
+        wrapped = (
+            "Cronjob Response: daily-report\n"
+            "(job_id: test-job)\n"
+            "-------------\n\n"
+            f"{body}"
+        )
+
+        self.assertEqual(MessageSender.strip_cron_wrapper(wrapped), body)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
