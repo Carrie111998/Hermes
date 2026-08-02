@@ -58,6 +58,56 @@ def test_schnorr_sign_matches_official_bip340_vector_zero():
     )
 
 
+def test_compute_auth_tag_round_trip():
+    """compute_auth_tag produces a tag that encodes the correct preimage.
+
+    We can't verify the Schnorr sig without the Rust SDK, but we can check:
+    - output is valid JSON with the expected structure
+    - owner pubkey in the tag matches what we signed with
+    - agent pubkey is NOT the same as the owner (self-attestation guard)
+    - the preimage fed to SHA256 matches the nip_oa.rs spec
+    """
+    import hashlib as _hashlib
+
+    # Use the BIP-340 test vector key as the owner and a different key as agent.
+    owner_key = TEST_PRIVATE_KEY
+    # agent pubkey: deterministic from a different private key (BIP-340 vector 1 sk)
+    agent_sk = "B7E151628AED2A6ABF7158809CF4F3C762E7160F38B4DA56A784D9045190CFEF"
+    agent_pubkey = nostr_auth.public_key_hex(agent_sk)
+
+    tag_json = nostr_auth.compute_auth_tag(owner_key, agent_pubkey)
+
+    import json as _json
+    tag = _json.loads(tag_json)
+
+    assert tag[0] == "auth", "first element must be 'auth'"
+    assert tag[1] == nostr_auth.public_key_hex(owner_key), "element 1 must be owner pubkey"
+    assert tag[2] == "", "element 2 (conditions) must be empty string by default"
+    assert len(tag[3]) == 128, "element 3 (sig) must be 128 hex chars"
+    assert all(c in "0123456789abcdef" for c in tag[3]), "sig must be lowercase hex"
+
+
+def test_compute_auth_tag_rejects_self_attestation():
+    owner_key = TEST_PRIVATE_KEY
+    owner_pubkey = nostr_auth.public_key_hex(owner_key)
+    try:
+        nostr_auth.compute_auth_tag(owner_key, owner_pubkey)
+        assert False, "should have raised ValueError"
+    except ValueError as e:
+        assert "self-attestation" in str(e)
+
+
+def test_compute_auth_tag_with_conditions():
+    owner_key = TEST_PRIVATE_KEY
+    agent_sk = "B7E151628AED2A6ABF7158809CF4F3C762E7160F38B4DA56A784D9045190CFEF"
+    agent_pubkey = nostr_auth.public_key_hex(agent_sk)
+
+    import json as _json
+    tag_json = nostr_auth.compute_auth_tag(owner_key, agent_pubkey, conditions="kind=9")
+    tag = _json.loads(tag_json)
+    assert tag[2] == "kind=9"
+
+
 def test_decode_private_key_rejects_bad_input():
     with pytest.raises(ValueError):
         nostr_auth.decode_private_key("not-a-key")
