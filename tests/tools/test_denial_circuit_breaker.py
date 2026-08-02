@@ -228,3 +228,22 @@ def test_tally_evicts_oldest_sessions():
         with A._lock:
             A._denial_tally.clear()
             A._denial_tally.update(saved)
+
+
+def test_clear_session_removes_only_the_named_denial_tally():
+    session_key = "clear-denial-session"
+    other_key = "keep-denial-session"
+    A._reset_denials(session_key)
+    A._reset_denials(other_key)
+    try:
+        A._record_denial(session_key)
+        A._record_denial(other_key)
+
+        A.clear_session(session_key)
+
+        with A._lock:
+            assert session_key not in A._denial_tally
+            assert A._denial_tally[other_key] == 1
+    finally:
+        A._reset_denials(session_key)
+        A._reset_denials(other_key)

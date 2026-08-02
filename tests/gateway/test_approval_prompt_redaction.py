@@ -120,6 +120,11 @@ class TestApprovalCommandWiring:
 
         self._assert_redacts_then_uses(api_server, "_approval_notify", "put_nowait")
 
+    def test_responses_sse_path_redacts_before_enqueue(self):
+        from gateway.platforms import api_server
+
+        self._assert_redacts_then_uses(api_server, "_on_approval_request", "_enqueue_stream_item")
+
 
 class TestApprovalTextFallbackContract:
     def test_smart_deny_only_advertises_one_operation(self):

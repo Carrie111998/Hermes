@@ -1235,6 +1235,11 @@ class APIServerAdapter(BasePlatformAdapter):
         self._runner: Optional["web.AppRunner"] = None
         self._site: Optional["web.TCPSite"] = None
         self._response_store = ResponseStore()
+        # Approval state is owned by the in-flight Responses resource, not by
+        # the conversation or memory key shared across concurrent requests.
+        # Active Responses approval state: response_id -> normalized request
+        # profile.  The response_id remains the approval-core session key.
+        self._response_approval_sessions: Dict[str, str] = {}
         # Active run streams: run_id -> asyncio.Queue of SSE event dicts
         self._run_streams: Dict[str, "asyncio.Queue[Optional[Dict]]"] = {}
         # Creation timestamps for orphaned-run TTL sweep
@@ -1780,6 +1785,11 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return _profile_runtime_scope(get_profile_dir(profile))
 
+    @staticmethod
+    def _normalized_request_profile() -> str:
+        """Return the profile identity used for response ownership checks."""
+        return _api_request_profile.get() or "default"
+
     def _make_profile_prefix_middleware(self):
         """Reject unknown /p/<profile>/ prefixes and scope the request home."""
 
@@ -1829,6 +1839,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/v1/responses", self._handle_responses),
             ("GET", "/v1/responses/{response_id}", self._handle_get_response),
             ("DELETE", "/v1/responses/{response_id}", self._handle_delete_response),
+            ("POST", "/v1/responses/{response_id}/approval", self._handle_response_approval),
             # Generic platform HTTP event callback ingress. Authenticated by
             # the target adapter's own verifier (platform-signed bearer), NOT
             # API_SERVER_KEY — external platforms hold no API server key.
@@ -4276,6 +4287,7 @@ class APIServerAdapter(BasePlatformAdapter):
         store: bool,
         session_id: str,
         gateway_session_key: Optional[str] = None,
+        stream_open: Optional[list[bool]] = None,
     ) -> "web.StreamResponse":
         """Write an SSE stream for POST /v1/responses (OpenAI Responses API).
 
@@ -4305,8 +4317,6 @@ class APIServerAdapter(BasePlatformAdapter):
         ``previous_response_id`` chaining still have something to
         recover from.
         """
-        import queue as _q
-
         sse_headers = {
             "Content-Type": "text/event-stream",
             "Cache-Control": "no-cache",
@@ -4321,7 +4331,35 @@ class APIServerAdapter(BasePlatformAdapter):
         if gateway_session_key:
             sse_headers["X-Hermes-Session-Key"] = gateway_session_key
         response = web.StreamResponse(status=200, headers=sse_headers)
-        await response.prepare(request)
+
+        def _release_response_approval() -> None:
+            if stream_open is not None:
+                stream_open[0] = False
+            approval_owner = self._response_approval_sessions.pop(response_id, None)
+            if approval_owner is None:
+                return
+            try:
+                from tools.approval import unregister_gateway_notify
+
+                unregister_gateway_notify(response_id)
+            except Exception:
+                logger.debug(
+                    "Failed to release approval state for response %s",
+                    response_id,
+                    exc_info=True,
+                )
+
+        try:
+            await response.prepare(request)
+        except BaseException:
+            _release_response_approval()
+            if not agent_task.done():
+                agent_task.cancel()
+                try:
+                    await agent_task
+                except BaseException:
+                    pass
+            raise
 
         # State accumulated during the stream
         final_text_parts: List[str] = []
@@ -4574,7 +4612,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "item": output_item,
                 })
 
-            # Main drain loop — thread-safe queue fed by agent callbacks.
+            # Main drain loop — asyncio queue fed by agent callbacks.
             async def _dispatch(it) -> None:
                 """Route a queue item to the correct SSE emitter.
 
@@ -4594,6 +4632,12 @@ class APIServerAdapter(BasePlatformAdapter):
                         await _emit_tool_started(payload)
                     elif tag == "__tool_completed__":
                         await _emit_tool_completed(payload)
+                    elif tag == "__approval_request__":
+                        await _write_event("response.approval.requested", {
+                            "type": "response.approval.requested",
+                            "response_id": response_id,
+                            "approval": payload,
+                        })
                 elif isinstance(it, str):
                     # Batch text deltas — append to buffer, flush on timer
                     _batch_buf.append(it)
@@ -4627,11 +4671,10 @@ class APIServerAdapter(BasePlatformAdapter):
                         _batch_buf = []
                         await _emit_text_delta(combined)
 
-            loop = asyncio.get_running_loop()
             while True:
                 try:
-                    item = await loop.run_in_executor(None, lambda: stream_q.get(timeout=0.5))
-                except _q.Empty:
+                    item = await asyncio.wait_for(stream_q.get(), timeout=0.5)
+                except (asyncio.TimeoutError, asyncio.QueueEmpty):
                     if agent_task.done():
                         # Drain remaining
                         while True:
@@ -4641,7 +4684,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                     break
                                 await _dispatch(item)
                                 last_activity = time.monotonic()
-                            except _q.Empty:
+                            except asyncio.QueueEmpty:
                                 break
                         break
                     if time.monotonic() - last_activity >= CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS:
@@ -4860,8 +4903,95 @@ class APIServerAdapter(BasePlatformAdapter):
             except Exception:
                 pass
             logger.error("Agent crashed mid-stream for %s: %s", response_id, str(agent_error)[:300])
+        finally:
+            _release_response_approval()
 
         return response
+
+    def _response_stream_callbacks(
+        self,
+        *,
+        response_id: str,
+        stream_q: "asyncio.Queue",
+        stream_loop,
+        stream_open: list[bool],
+    ) -> Dict[str, Any]:
+        """Build the worker-to-loop callbacks for one Responses stream."""
+        def _enqueue_stream_item(item) -> None:
+            """Transfer worker callbacks to the event-loop-owned queue."""
+            if not stream_open[0] or stream_loop.is_closed():
+                return
+
+            def _put_if_open() -> None:
+                if stream_open[0]:
+                    stream_q.put_nowait(item)
+
+            try:
+                stream_loop.call_soon_threadsafe(_put_if_open)
+            except RuntimeError:
+                # The loop may close after a client disconnects while a
+                # pooled worker is delivering its final callback.
+                return
+
+        def _on_delta(delta):
+            # None from the agent is a CLI box-close signal, not EOS.
+            # Forwarding would kill the SSE stream prematurely; the
+            # SSE writer detects completion via agent_task.done().
+            if delta is not None:
+                _enqueue_stream_item(delta)
+
+        def _on_tool_progress(event_type, name, preview, args, **kwargs):
+            """Queue non-start tool progress events if needed in future.
+
+            The structured Responses stream uses ``tool_start_callback``
+            and ``tool_complete_callback`` for exact call-id correlation,
+            so progress events are currently ignored here.
+            """
+            return
+
+        def _on_tool_start(tool_call_id, function_name, function_args):
+            """Queue a started tool for live function_call streaming."""
+            _enqueue_stream_item(("__tool_started__", {
+                "tool_call_id": tool_call_id,
+                "name": function_name,
+                "arguments": function_args or {},
+            }))
+
+        def _on_tool_complete(tool_call_id, function_name, function_args, function_result):
+            """Queue a completed tool result for live function_call_output streaming."""
+            _enqueue_stream_item(("__tool_completed__", {
+                "tool_call_id": tool_call_id,
+                "name": function_name,
+                "arguments": function_args or {},
+                "result": function_result,
+            }))
+
+        def _on_approval_request(approval_data: Dict[str, Any]) -> None:
+            """Queue a redacted approval request for live response streaming."""
+            event = dict(approval_data or {})
+            if "command" in event:
+                from gateway.run import _redact_approval_command
+
+                event["command"] = _redact_approval_command(event.get("command"))
+            event.update({
+                "event": "approval.request",
+                "response_id": response_id,
+                "timestamp": time.time(),
+                "choices": _approval_event_choices(
+                    smart_denied=bool(event.get("smart_denied")),
+                    allow_permanent=event.get("allow_permanent") is not False,
+                ),
+            })
+            _enqueue_stream_item(("__approval_request__", event))
+
+        return {
+            "enqueue_stream_item": _enqueue_stream_item,
+            "stream_delta_callback": _on_delta,
+            "tool_progress_callback": _on_tool_progress,
+            "tool_start_callback": _on_tool_start,
+            "tool_complete_callback": _on_tool_complete,
+            "approval_notify_callback": _on_approval_request,
+        }
 
     @_admit_api_agent_request
     async def _handle_responses(self, request: "web.Request") -> "web.Response":
@@ -4995,62 +5125,39 @@ class APIServerAdapter(BasePlatformAdapter):
             # Streaming branch — emit OpenAI Responses SSE events as the
             # agent runs so frontends can render text deltas and tool
             # calls in real time.  See _write_sse_responses for details.
-            import queue as _q
-            _stream_q: _q.Queue = _q.Queue()
+            _stream_q: asyncio.Queue = asyncio.Queue()
+            stream_loop = asyncio.get_running_loop()
+            stream_open = [True]
 
-            def _on_delta(delta):
-                # None from the agent is a CLI box-close signal, not EOS.
-                # Forwarding would kill the SSE stream prematurely; the
-                # SSE writer detects completion via agent_task.done().
-                if delta is not None:
-                    _stream_q.put(delta)
+            response_id = f"resp_{uuid.uuid4().hex[:28]}"
+            stream_callbacks = self._response_stream_callbacks(
+                response_id=response_id,
+                stream_q=_stream_q,
+                stream_loop=stream_loop,
+                stream_open=stream_open,
+            )
+            stream_enqueue = stream_callbacks.pop("enqueue_stream_item")
 
-            def _on_tool_progress(event_type, name, preview, args, **kwargs):
-                """Queue non-start tool progress events if needed in future.
-
-                The structured Responses stream uses ``tool_start_callback``
-                and ``tool_complete_callback`` for exact call-id correlation,
-                so progress events are currently ignored here.
-                """
-                return
-
-            def _on_tool_start(tool_call_id, function_name, function_args):
-                """Queue a started tool for live function_call streaming."""
-                _stream_q.put(("__tool_started__", {
-                    "tool_call_id": tool_call_id,
-                    "name": function_name,
-                    "arguments": function_args or {},
-                }))
-
-            def _on_tool_complete(tool_call_id, function_name, function_args, function_result):
-                """Queue a completed tool result for live function_call_output streaming."""
-                _stream_q.put(("__tool_completed__", {
-                    "tool_call_id": tool_call_id,
-                    "name": function_name,
-                    "arguments": function_args or {},
-                    "result": function_result,
-                }))
-
+            self._response_approval_sessions[response_id] = self._normalized_request_profile()
             agent_ref = [None]
             agent_task = asyncio.ensure_future(self._run_agent(
                 user_message=user_message,
                 conversation_history=conversation_history,
                 ephemeral_system_prompt=instructions,
                 session_id=session_id,
-                stream_delta_callback=_on_delta,
-                tool_progress_callback=_on_tool_progress,
-                tool_start_callback=_on_tool_start,
-                tool_complete_callback=_on_tool_complete,
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
                 **agent_overrides,
                 route=route,
+                approval_session_key=response_id,
+                **stream_callbacks,
             ))
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
-            agent_task.add_done_callback(lambda _fut: _stream_q.put(None))
+            agent_task.add_done_callback(
+                lambda _fut: stream_enqueue(None)
+            )
 
-            response_id = f"resp_{uuid.uuid4().hex[:28]}"
             model_name = body.get("model", self._model_name)
             created_at = int(time.time())
 
@@ -5069,6 +5176,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 store=store,
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
+                stream_open=stream_open,
             )
 
         async def _compute_response():
@@ -5215,6 +5323,90 @@ class APIServerAdapter(BasePlatformAdapter):
             "id": response_id,
             "object": "response",
             "deleted": True,
+        })
+
+    async def _handle_response_approval(self, request: "web.Request") -> "web.Response":
+        """POST /v1/responses/{response_id}/approval — resolve a pending approval."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        response_id = request.match_info["response_id"]
+        approval_owner = self._response_approval_sessions.get(response_id)
+        if approval_owner is None:
+            return web.json_response(
+                _openai_error(
+                    f"Response has no active approval session: {response_id}",
+                    code="approval_not_active",
+                ),
+                status=409,
+            )
+        request_profile = self._normalized_request_profile()
+        if approval_owner != request_profile:
+            return web.json_response(
+                _openai_error(
+                    f"Response approval belongs to another profile: {response_id}",
+                    code="approval_profile_mismatch",
+                ),
+                status=403,
+            )
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+        if not isinstance(body, dict):
+            return web.json_response(
+                _openai_error("Approval request body must be a JSON object"),
+                status=400,
+            )
+
+        raw_choice = str(body.get("choice", "")).strip().lower()
+        choice = {"approve": "once", "approved": "once", "allow": "once"}.get(
+            raw_choice, raw_choice
+        )
+        if choice not in {"once", "session", "always", "deny"}:
+            return web.json_response(
+                _openai_error(
+                    "Invalid approval choice; expected one of: once, session, always, deny",
+                    code="invalid_approval_choice",
+                ),
+                status=400,
+            )
+
+        resolve_all = (
+            _coerce_request_bool(body.get("all"), default=False)
+            or _coerce_request_bool(body.get("resolve_all"), default=False)
+        )
+        try:
+            from tools.approval import resolve_gateway_approval
+
+            resolved = resolve_gateway_approval(
+                response_id,
+                choice,
+                resolve_all=resolve_all,
+            )
+        except Exception as exc:
+            logger.exception(
+                "[api_server] approval resolution failed for response %s",
+                response_id,
+            )
+            return web.json_response(_openai_error(str(exc)), status=500)
+
+        if resolved <= 0:
+            return web.json_response(
+                _openai_error(
+                    f"Response has no pending approval: {response_id}",
+                    code="approval_not_pending",
+                ),
+                status=409,
+            )
+
+        return web.json_response({
+            "object": "hermes.response.approval_response",
+            "response_id": response_id,
+            "choice": choice,
+            "resolved": resolved,
         })
 
     # ------------------------------------------------------------------
@@ -5774,6 +5966,8 @@ class APIServerAdapter(BasePlatformAdapter):
         requested_runtime: Optional[Dict[str, Any]] = None,
         route_source: str = "global",
         confirmed_runtime_lock: bool = False,
+        approval_notify_callback=None,
+        approval_session_key: Optional[str] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -5815,7 +6009,12 @@ class APIServerAdapter(BasePlatformAdapter):
                     session_key=gateway_session_key or session_id or "",
                     session_id=session_id or "",
                 )
+                approval_token = None
                 try:
+                    if approval_notify_callback:
+                        from tools.approval import set_current_session_key
+
+                        approval_token = set_current_session_key(approval_session_key)
                     agent = self._create_agent(
                         ephemeral_system_prompt=ephemeral_system_prompt,
                         session_id=session_id,
@@ -5956,14 +6155,40 @@ class APIServerAdapter(BasePlatformAdapter):
                         {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
                     )
                 finally:
-                    clear_session_vars(tokens)
+                    try:
+                        if approval_token is not None:
+                            from tools.approval import reset_current_session_key
 
-        self._activate_admitted_request()
-        self._inflight_agent_runs += 1
+                            reset_current_session_key(approval_token)
+                    finally:
+                        try:
+                            if approval_notify_callback and approval_session_key:
+                                from tools.approval import clear_session
+
+                                clear_session(approval_session_key)
+                        finally:
+                            clear_session_vars(tokens)
+
+        approval_registered = False
+        if approval_notify_callback:
+            if not approval_session_key:
+                raise ValueError("approval_session_key is required with approval_notify_callback")
+            from tools.approval import register_gateway_notify
+
+            register_gateway_notify(approval_session_key, approval_notify_callback)
+            approval_registered = True
         try:
-            return await loop.run_in_executor(None, _run)
+            self._activate_admitted_request()
+            self._inflight_agent_runs += 1
+            try:
+                return await loop.run_in_executor(None, _run)
+            finally:
+                self._inflight_agent_runs -= 1
         finally:
-            self._inflight_agent_runs -= 1
+            if approval_registered:
+                from tools.approval import unregister_gateway_notify
+
+                unregister_gateway_notify(approval_session_key)
 
     # ------------------------------------------------------------------
     # /v1/runs — structured event streaming

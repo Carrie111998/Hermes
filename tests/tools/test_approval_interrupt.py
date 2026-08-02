@@ -91,6 +91,8 @@ class TestApprovalInterrupt:
             # been prompted.
             notified.set()
 
+        mod.register_gateway_notify(self.SESSION_KEY, _notify_cb)
+
         def _worker():
             result_holder["result"] = mod._await_gateway_decision(
                 self.SESSION_KEY, _notify_cb, approval_data
@@ -142,6 +144,8 @@ class TestApprovalInterrupt:
         def _notify_cb(_data):
             notified.set()
 
+        mod.register_gateway_notify(self.SESSION_KEY, _notify_cb)
+
         def _worker():
             result_holder["result"] = mod._await_gateway_decision(
                 self.SESSION_KEY, _notify_cb, approval_data
@@ -158,3 +162,59 @@ class TestApprovalInterrupt:
         assert not t.is_alive()
         # Timed out (no resolution) because the foreign interrupt was ignored.
         assert result_holder["result"] == {"resolved": False, "choice": None, "reason": None}
+
+    def test_captured_callback_cannot_register_after_disconnect(self, monkeypatch):
+        """A callback captured before teardown cannot create a new wait."""
+        from tools import approval as mod
+
+        mod._get_approval_config = lambda: {"timeout": 300}
+        approval_data = {
+            "command": "rm -rf /tmp/whatever",
+            "description": "recursive delete",
+            "pattern_key": "rm_rf",
+            "pattern_keys": ["rm_rf"],
+        }
+        callback_captured = threading.Event()
+        registration_attempted = threading.Event()
+        allow_registration = threading.Event()
+        result_holder = {}
+
+        def _notify_cb(_data):
+            pytest.fail("disconnected approval must not notify")
+
+        mod.register_gateway_notify(self.SESSION_KEY, _notify_cb)
+        original_register = mod._register_gateway_approval
+
+        def _coordinated_register(session_key, notify_cb, entry):
+            registration_attempted.set()
+            assert allow_registration.wait(timeout=5)
+            return original_register(session_key, notify_cb, entry)
+
+        monkeypatch.setattr(mod, "_register_gateway_approval", _coordinated_register)
+
+        def _worker():
+            with mod._lock:
+                captured_cb = mod._gateway_notify_cbs.get(self.SESSION_KEY)
+            callback_captured.set()
+            result_holder["result"] = mod._await_gateway_decision(
+                self.SESSION_KEY, captured_cb, approval_data
+            )
+
+        t = threading.Thread(target=_worker, daemon=True)
+        start = time.monotonic()
+        t.start()
+        assert callback_captured.wait(timeout=5)
+        assert registration_attempted.wait(timeout=5)
+
+        mod.unregister_gateway_notify(self.SESSION_KEY)
+        allow_registration.set()
+        t.join(timeout=5)
+
+        assert not t.is_alive(), "stale callback entered the approval wait"
+        assert result_holder["result"] == {
+            "resolved": False,
+            "choice": None,
+            "notify_failed": True,
+        }
+        assert self.SESSION_KEY not in mod._gateway_queues
+        assert time.monotonic() - start < 5

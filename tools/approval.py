@@ -2231,6 +2231,16 @@ def resolve_gateway_approval(session_key: str, choice: str,
     return len(targets)
 
 
+def _register_gateway_approval(session_key: str, notify_cb,
+                               entry: _ApprovalEntry) -> bool:
+    """Register an approval only while its captured callback is live."""
+    with _lock:
+        if _gateway_notify_cbs.get(session_key) is not notify_cb:
+            return False
+        _gateway_queues.setdefault(session_key, []).append(entry)
+    return True
+
+
 def has_blocking_approval(session_key: str) -> bool:
     """Check if a session has one or more blocking gateway approvals waiting."""
     with _lock:
@@ -2295,6 +2305,7 @@ def clear_session(session_key: str) -> None:
         _session_approved.pop(session_key, None)
         _session_yolo.discard(session_key)
         _pending.pop(session_key, None)
+        _denial_tally.pop(session_key, None)
         entries = _gateway_queues.pop(session_key, [])
     for entry in entries:
         # Session-boundary cleanup should cancel any blocked approval waits
@@ -3268,8 +3279,13 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     all_keys = approval_data.get("pattern_keys", [primary_key])
 
     entry = _ApprovalEntry(approval_data)
-    with _lock:
-        _gateway_queues.setdefault(session_key, []).append(entry)
+    if not _register_gateway_approval(session_key, notify_cb, entry):
+        logger.info(
+            "Gateway approval callback is no longer registered for %s; "
+            "failing closed",
+            session_key,
+        )
+        return {"resolved": False, "choice": None, "notify_failed": True}
 
     def _drop_entry() -> None:
         with _lock:
