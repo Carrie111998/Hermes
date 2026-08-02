@@ -1671,6 +1671,47 @@ def _clear_planned_restart_notification() -> None:
     _planned_restart_notification_path().unlink(missing_ok=True)
 
 
+# Stale marker cleanup: if the gateway was killed before it could send a
+# startup notification, the marker file lingers forever. On the next boot
+# the gateway tries to send the old notification again, which re-triggers
+# flood control and perpetuates the startup-restore block loop. Prune
+# markers older than the threshold before the startup notification path runs.
+_STALE_MARKER_MAX_AGE_SECONDS = 600  # 10 minutes
+
+
+def _prune_stale_startup_markers() -> int:
+    """Remove startup notification marker files older than the threshold.
+
+    Returns the number of files pruned. Safe to call before the startup
+    notification path — if the markers are recent, they're left alone so the
+    normal notification flow runs.
+    """
+    import time
+    marker_paths = [
+        _hermes_home / ".restart_pending.json",
+        _hermes_home / ".restart_notify.json",
+        _hermes_home / ".update_pending.json",
+        _hermes_home / ".update_pending.claimed.json",
+    ]
+    pruned = 0
+    now = time.time()
+    for path in marker_paths:
+        try:
+            if not path.exists():
+                continue
+            age = now - path.stat().st_mtime
+            if age > _STALE_MARKER_MAX_AGE_SECONDS:
+                path.unlink(missing_ok=True)
+                pruned += 1
+                logger.info(
+                    "Pruned stale startup marker %s (age %.0fs > %.0fs)",
+                    path.name, age, _STALE_MARKER_MAX_AGE_SECONDS,
+                )
+        except Exception:
+            pass
+    return pruned
+
+
 # Mark this process as a gateway so cli.py's module-level load_cli_config()
 # knows not to clobber TERMINAL_CWD if lazily imported.
 os.environ["_HERMES_GATEWAY"] = "1"
@@ -6058,6 +6099,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Track background tasks to prevent garbage collection mid-execution
         self._background_tasks: set = set()
+        # Track redelivery tasks spawned during startup restore so they're
+        # not garbage-collected mid-send (same pattern as _background_tasks).
+        self._spawned_redelivery_tasks: set = set()
 
         # Event-loop liveness heartbeat (#66892): rewritten every 30s while
         # the loop is dispatching. External supervisors use the file mtime /
@@ -10075,7 +10119,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Crash-ambiguity contract (see gateway/delivery_ledger.py):
         rows that were mid-send or previously rejected carry a visible
         recovered-reply marker so a possible duplicate is labeled, never
-        silent. Returns the number of redeliveries attempted.
+        silent. Returns the number of redeliveries attempted (claimed but
+        not necessarily delivered yet — sends run as background tasks).
         """
         try:
             from gateway.delivery_ledger import (
@@ -10103,6 +10148,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not claimed:
             return 0
 
+        # Fire each redelivery as a background task instead of awaiting
+        # sequentially. A single send that hits flood control can block for
+        # the full retry_after duration (sometimes 30+ minutes), which
+        # blocks _finish_startup_restore and traps all inbound messages in
+        # the startup queue. Background tasks let startup restore complete
+        # immediately; redeliveries land whenever the platform accepts them.
         redelivered = 0
         for row in claimed:
             try:
@@ -10118,54 +10169,76 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # Platform not connected this boot — leave the row claimed;
                 # attempts cap + stale cutoff bound the retries on later boots.
                 continue
-            content = row["content"]
-            if row.get("needs_marker"):
-                content = RECOVERED_MARKER + content
-            metadata = (
-                {"thread_id": row["thread_id"]} if row.get("thread_id") else None
+            task = asyncio.create_task(
+                self._redeliver_one_obligation(row, adapter)
             )
-            try:
-                result = await adapter.send(
-                    chat_id=row["chat_id"],
-                    content=content,
-                    metadata=metadata,
-                )
-            except Exception as send_err:
-                logger.warning(
-                    "obligation %s: redelivery send raised: %s",
-                    row["obligation_id"], send_err,
-                )
-                result = None
-            try:
-                if result is not None and getattr(result, "success", False):
-                    mark_delivered(row["obligation_id"])
-                    redelivered += 1
-                    logger.info(
-                        "Redelivered recovered final response to %s:%s "
-                        "(obligation %s, attempt %d)",
-                        row["platform"], row["chat_id"],
-                        row["obligation_id"], row["attempts"],
-                    )
-                else:
-                    mark_failed(
-                        row["obligation_id"],
-                        str(getattr(result, "error", "") or "send failed"),
-                    )
-            except Exception:
-                logger.debug("delivery ledger update failed", exc_info=True)
-
-            # The answer reached (or was owed to) this session — don't ALSO
-            # re-run the turn via the resume path.
-            session_key = row.get("session_key") or ""
-            if session_key:
-                try:
-                    await self.async_session_store.clear_resume_pending(session_key)
-                except Exception:
-                    logger.debug(
-                        "clear_resume_pending failed for %s", session_key,
-                        exc_info=True,
-                    )
+            self._spawned_redelivery_tasks.add(task)
+            task.add_done_callback(
+                lambda t, _set=self._spawned_redelivery_tasks: _set.discard(t)
+            )
+            redelivered += 1
+        if redelivered:
+            logger.info(
+                "Scheduled %d delivery obligation redeliver(ies) as background tasks",
+                redelivered,
+            )
         return redelivered
+
+    async def _redeliver_one_obligation(self, row, adapter) -> None:
+        """Send a single delivery-obligation row in the background and update
+        its ledger state. Isolated from the startup restore path so a flood
+        control sleep on one send cannot block inbound message dispatch."""
+        from gateway.delivery_ledger import (
+            RECOVERED_MARKER,
+            mark_delivered,
+            mark_failed,
+        )
+        content = row["content"]
+        if row.get("needs_marker"):
+            content = RECOVERED_MARKER + content
+        metadata = (
+            {"thread_id": row["thread_id"]} if row.get("thread_id") else None
+        )
+        try:
+            result = await adapter.send(
+                chat_id=row["chat_id"],
+                content=content,
+                metadata=metadata,
+            )
+        except Exception as send_err:
+            logger.warning(
+                "obligation %s: redelivery send raised: %s",
+                row["obligation_id"], send_err,
+            )
+            result = None
+        try:
+            if result is not None and getattr(result, "success", False):
+                mark_delivered(row["obligation_id"])
+                logger.info(
+                    "Redelivered recovered final response to %s:%s "
+                    "(obligation %s, attempt %d)",
+                    row["platform"], row["chat_id"],
+                    row["obligation_id"], row["attempts"],
+                )
+            else:
+                mark_failed(
+                    row["obligation_id"],
+                    str(getattr(result, "error", "") or "send failed"),
+                )
+        except Exception:
+            logger.debug("delivery ledger update failed", exc_info=True)
+
+        # The answer reached (or was owed to) this session — don't ALSO
+        # re-run the turn via the resume path.
+        session_key = row.get("session_key") or ""
+        if session_key:
+            try:
+                await self.async_session_store.clear_resume_pending(session_key)
+            except Exception:
+                logger.debug(
+                    "clear_resume_pending failed for %s", session_key,
+                    exc_info=True,
+                )
 
     def _schedule_resume_pending_sessions(self, platform=None) -> int:
         """Auto-continue fresh restart-interrupted sessions after startup.
@@ -11103,6 +11176,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.info("Channel directory built: %d target(s)", ch_count)
         except Exception as e:
             logger.warning("Channel directory build failed: %s", e)
+        
+        # Prune stale startup notification markers before the notification
+        # path runs. If the previous gateway was killed before sending a
+        # notification, the marker file lingers and re-triggers a send
+        # (and flood control) on every subsequent boot.
+        try:
+            _pruned = _prune_stale_startup_markers()
+            if _pruned:
+                logger.info(
+                    "Pruned %d stale startup marker(s) before notification path",
+                    _pruned,
+                )
+        except Exception:
+            logger.debug("Stale marker prune failed", exc_info=True)
         
         # Check if we're restarting after a /update command. If the update is
         # still running, keep watching so we notify once it actually finishes.
