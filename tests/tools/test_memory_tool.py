@@ -745,3 +745,55 @@ class TestMemoryArchive:
         assert result["success"] is False
         assert "abort" in result["error"]
         assert "Precious entry" in store.memory_entries
+
+    def test_batch_abort_never_leaves_partial_archive(
+        self, store, tmp_path, monkeypatch
+    ):
+        """Abort-mode archive failure must be caller-visible atomic: the batch
+        is refused AND the archive is untouched — no partial records from
+        earlier evictions can survive a later failure (#77154 review)."""
+        (get_hermes_home() / "config.yaml").write_text(
+            "memory:\n  archive_on_failure: abort\n", encoding="utf-8"
+        )
+        monkeypatch.setattr(
+            "tools.memory_tool._archive_append_lines",
+            lambda lines: (_ for _ in ()).throw(OSError("disk full")),
+        )
+        store.add("memory", "Entry one")
+        store.add("memory", "Entry two")
+        result = store.apply_batch(
+            "memory",
+            [
+                {"action": "remove", "old_text": "Entry one"},
+                {"action": "replace", "old_text": "Entry two", "content": "Entry two v2"},
+            ],
+        )
+        assert result["success"] is False
+        assert "abort" in result["error"]
+        # No partial archive, memory untouched.
+        assert _read_archive(tmp_path) == []
+        assert "Entry one" in store.memory_entries
+        assert "Entry two" in store.memory_entries
+
+    def test_batch_archive_failure_degrades_atomically(
+        self, store, tmp_path, monkeypatch
+    ):
+        """Default warn mode: a failed archive write leaves NO records behind
+        (atomic), the mutation proceeds, and the result says degraded."""
+        monkeypatch.setattr(
+            "tools.memory_tool._archive_append_lines",
+            lambda lines: (_ for _ in ()).throw(OSError("disk full")),
+        )
+        store.add("memory", "Entry one")
+        store.add("memory", "Entry two")
+        result = store.apply_batch(
+            "memory",
+            [
+                {"action": "remove", "old_text": "Entry one"},
+                {"action": "remove", "old_text": "Entry two"},
+            ],
+        )
+        assert result["success"] is True
+        assert result["archive_status"] == "degraded"
+        assert _read_archive(tmp_path) == []
+        assert store.memory_entries == []

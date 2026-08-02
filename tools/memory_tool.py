@@ -153,31 +153,68 @@ def _archive_abort_on_failure() -> bool:
     return _read_memory_archive_config().get("archive_on_failure") == "abort"
 
 
+def _archive_append_lines(lines: List[str]) -> None:
+    """Append prebuilt JSONL lines to ARCHIVE.jsonl in a single write.
+
+    Raises OSError on failure. The single write plus an ftruncate rollback
+    keeps the archive caller-visible atomic: either every line lands or none
+    does — no partial batch can survive an archive failure.
+    """
+    path = _archive_path()
+    get_memory_dir().mkdir(parents=True, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        start = f.tell()
+        try:
+            f.write("".join(lines))
+            f.flush()
+        except OSError:
+            try:
+                f.truncate(start)
+            except OSError:
+                pass
+            raise
+
+
+def archive_entries(
+    target: str, actions_entries: List[Tuple[str, str]]
+) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    """Append evicted entries to ARCHIVE.jsonl as one atomic batch.
+
+    Returns ``(records, None)`` on success (records carry ``id``/``ts``/
+    ``store``/``action``/``entry``) or ``([], error)`` after one retry when the
+    write keeps failing — in which case nothing was appended. Never raises.
+    """
+    records = [
+        {
+            "id": uuid.uuid4().hex,
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "store": target,
+            "action": action,  # "removed" | "superseded"
+            "entry": entry,
+        }
+        for action, entry in actions_entries
+    ]
+    lines = [json.dumps(record, ensure_ascii=False) + "\n" for record in records]
+    last_error: Optional[str] = None
+    for _ in (1, 2):  # one retry, then degrade per config
+        try:
+            _archive_append_lines(lines)
+            return records, None
+        except OSError as exc:
+            last_error = str(exc)
+    return [], last_error
+
+
 def archive_entry(target: str, action: str, entry: str) -> Tuple[Optional[str], Optional[str]]:
     """Append one evicted entry to ARCHIVE.jsonl.
 
     Returns ``(record_id, None)`` on success, ``(None, error)`` after one
     retry when the write keeps failing. Never raises.
     """
-    record = {
-        "id": uuid.uuid4().hex,
-        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "store": target,
-        "action": action,  # "removed" | "superseded"
-        "entry": entry,
-    }
-    line = json.dumps(record, ensure_ascii=False) + "\n"
-    path = _archive_path()
-    last_error: Optional[str] = None
-    for _ in (1, 2):  # one retry, then degrade per config
-        try:
-            get_memory_dir().mkdir(parents=True, exist_ok=True)
-            with open(path, "a", encoding="utf-8") as f:
-                f.write(line)
-            return record["id"], None
-        except OSError as exc:
-            last_error = str(exc)
-    return None, last_error
+    records, error = archive_entries(target, [(action, entry)])
+    if error:
+        return None, error
+    return records[0]["id"], None
 
 
 def _drift_error(path: "Path", bak_path: str) -> Dict[str, Any]:
@@ -788,28 +825,36 @@ class MemoryStore:
                 })
 
             # Archive evicted entries at the commit point — a failed batch
-            # never touches the archive. MEMORY.md always archives; USER.md
-            # only when configured in.
+            # never touches the archive, and the write itself is atomic (one
+            # append for all records, rolled back on failure), so abort mode
+            # can never leave a partial archive behind. MEMORY.md always
+            # archives; USER.md only when configured in.
             archives: List[Dict[str, Any]] = []
             degraded = False
             if evicted and _should_archive_target(target):
-                for action, entry in evicted:
-                    archived_id, archived_error = archive_entry(target, action, entry)
-                    if archived_error:
-                        if _archive_abort_on_failure():
-                            return {
-                                "success": False,
-                                "error": (
-                                    f"Archive write failed ({archived_error}) and "
-                                    "memory.archive_on_failure=abort — batch not applied."
-                                ),
-                            }
-                        logger.warning("Memory archive write failed (degraded): %s", archived_error)
-                        degraded = True
-                    else:
-                        archives.append(
-                            {"file": ARCHIVE_FILENAME, "id": archived_id, "store": target, "action": action, "entry": entry}
-                        )
+                archived_records, archived_error = archive_entries(target, evicted)
+                if archived_error:
+                    if _archive_abort_on_failure():
+                        return {
+                            "success": False,
+                            "error": (
+                                f"Archive write failed ({archived_error}) and "
+                                "memory.archive_on_failure=abort — batch not applied."
+                            ),
+                        }
+                    logger.warning("Memory archive write failed (degraded): %s", archived_error)
+                    degraded = True
+                else:
+                    archives = [
+                        {
+                            "file": ARCHIVE_FILENAME,
+                            "id": record["id"],
+                            "store": record["store"],
+                            "action": record["action"],
+                            "entry": record["entry"],
+                        }
+                        for record in archived_records
+                    ]
 
             # Commit.
             self._set_entries(target, working)

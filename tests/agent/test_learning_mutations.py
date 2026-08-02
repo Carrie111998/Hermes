@@ -117,3 +117,67 @@ def test_delete_memory_archives_evicted_chunk(home):
 
     # The delete itself still happened.
     assert (home / "memories" / "MEMORY.md").read_text(encoding="utf-8") == "beta note"
+
+
+def test_delete_profile_memory_not_archived_by_default(home):
+    """Journey profile nodes map to USER.md — archiving must honor the
+    ``memory.archive_user: false`` privacy default (#77154 review)."""
+    res = lm.delete_node("memory:profile:2")
+    assert res["ok"]
+    assert "ARCHIVE.jsonl" not in res["message"]
+    assert not (home / "memories" / "ARCHIVE.jsonl").exists()
+    # The delete itself still happened.
+    assert (home / "memories" / "USER.md").read_text(encoding="utf-8").strip() == ""
+
+
+def test_delete_profile_memory_archived_when_configured(home):
+    """With ``memory.archive_user: true``, profile deletes archive as the
+    ``user`` store — never mislabeled as ``memory``."""
+    import json
+
+    (get_hermes_home() / "config.yaml").write_text(
+        "memory:\n  archive_user: true\n", encoding="utf-8"
+    )
+    res = lm.delete_node("memory:profile:2")
+    assert res["ok"]
+    assert "ARCHIVE.jsonl" in res["message"]
+    archive = home / "memories" / "ARCHIVE.jsonl"
+    records = [
+        json.loads(line)
+        for line in archive.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(records) == 1
+    assert records[0]["store"] == "user"
+    assert records[0]["action"] == "removed"
+    assert records[0]["entry"] == "user profile note"
+
+
+def test_edit_memory_archives_superseded(home):
+    """/journey edit archives the superseded chunk (reversible edits, same
+    ARCHIVE.jsonl) instead of destroying it (#77154 review)."""
+    import json
+
+    res = lm.edit_node("memory:memory:0", "alpha rewritten")
+    assert res["ok"]
+    assert "ARCHIVE.jsonl" in res["message"]
+    archive = home / "memories" / "ARCHIVE.jsonl"
+    records = [
+        json.loads(line)
+        for line in archive.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(records) == 1
+    assert records[0]["store"] == "memory"
+    assert records[0]["action"] == "superseded"
+    assert records[0]["entry"] == "alpha note\nline two"
+    # The edit itself landed.
+    assert (home / "memories" / "MEMORY.md").read_text(encoding="utf-8").startswith("alpha rewritten")
+
+
+def test_edit_profile_memory_not_archived_by_default(home):
+    """Profile edits honor the privacy gate too — nothing archived by default."""
+    res = lm.edit_node("memory:profile:2", "rewritten profile")
+    assert res["ok"]
+    assert "ARCHIVE.jsonl" not in res["message"]
+    assert not (home / "memories" / "ARCHIVE.jsonl").exists()

@@ -18,7 +18,7 @@ file. Pure stdlib + existing skill/memory helpers.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 _MEMORY_FILES = {"memory": "MEMORY.md", "profile": "USER.md"}
 
@@ -141,6 +141,37 @@ def _delete_skill(name: str) -> dict[str, Any]:
     return {"ok": ok, "message": f"archived '{name}' — restore with: hermes curator restore {name}" if ok else message}
 
 
+def _archive_target_for_source(source: str) -> str:
+    """Journey source → memory-tool archive target.
+
+    ``profile`` nodes live in USER.md, so they must archive as ``user`` and
+    honor the same privacy gate (``memory.archive_user``) as direct USER.md
+    mutations — never as ``memory``, which would both mislabel the record and
+    bypass the opt-in default (#77154 review).
+    """
+    return "user" if source == "profile" else "memory"
+
+
+def _archive_evicted(archive_target: str, action: str, evicted: str) -> tuple[Optional[str], Optional[str]]:
+    """Archive an evicted chunk through the memory tool, gated per store.
+
+    Returns ``(record_id, None)`` when archived, ``(None, None)`` when the
+    store's privacy default skips archiving, ``(None, error)`` when the write
+    failed (mutation proceeds; the caller surfaces the degraded note).
+    """
+    try:
+        from tools.memory_tool import _should_archive_target, archive_entry
+
+        if not _should_archive_target(archive_target):
+            return None, None
+        archived_id, archived_error = archive_entry(archive_target, action, evicted)
+        if archived_error:
+            return None, archived_error
+        return archived_id, None
+    except Exception as exc:  # pragma: no cover - import/IO edge
+        return None, str(exc)
+
+
 def _delete_memory(node_id: str) -> dict[str, Any]:
     source, gidx = _parse_memory_id(node_id)
     path, chunks, local = _locate_memory(source, gidx)
@@ -148,18 +179,10 @@ def _delete_memory(node_id: str) -> dict[str, Any]:
     evicted = chunks[local]
 
     # Reversible deletion: archive the evicted chunk before the rewrite, same
-    # ARCHIVE.jsonl as the memory tool's remove/replace (store="memory",
-    # action="removed"). Failure degrades (mutation proceeds + note) rather
-    # than blocking a user-initiated delete.
-    archived_id = None
-    try:
-        from tools.memory_tool import archive_entry
-
-        archived_id, archived_error = archive_entry("memory", "removed", evicted)
-        if archived_error:
-            archived_id = None
-    except Exception as exc:  # pragma: no cover - import/IO edge
-        archived_error = str(exc)
+    # ARCHIVE.jsonl as the memory tool's remove/replace. Profile nodes archive
+    # as ``user`` and honor the ``archive_user`` gate. Failure degrades
+    # (mutation proceeds + note) rather than blocking a user-initiated delete.
+    archived_id, archived_error = _archive_evicted(_archive_target_for_source(source), "removed", evicted)
 
     del chunks[local]
     _write_memory(path, chunks)
@@ -201,10 +224,21 @@ def _edit_memory(node_id: str, content: str) -> dict[str, Any]:
         return {"ok": False, "message": "empty memory — use delete to remove it"}
     path, chunks, local = _locate_memory(source, gidx)
 
+    evicted = chunks[local]
+
+    # Reversible edit: the superseded chunk is archived before the rewrite,
+    # same gate as delete (profile → user store, honor archive_user).
+    archived_id, archived_error = _archive_evicted(_archive_target_for_source(source), "superseded", evicted)
+
     chunks[local] = body
     _write_memory(path, chunks)
 
-    return {"ok": True, "message": f"updated memory in {path.name}"}
+    message = f"updated memory in {path.name}"
+    if archived_id:
+        message += f" — superseded content archived to ARCHIVE.jsonl#{archived_id} (reversible)"
+    elif archived_error:
+        message += f" — note: archive write failed ({archived_error})"
+    return {"ok": True, "message": message}
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
