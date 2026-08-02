@@ -112,6 +112,16 @@ class _OpenAIProxy:
 OpenAI = _OpenAIProxy()  # module-level name, resolves lazily on call/isinstance
 
 from agent.credential_pool import load_pool
+from agent.llm_execution import (
+    LlmExecutionAudit,
+    LlmExecutionMode,
+    StrictExecutionConfigurationError,
+    StrictExecutionUnsupported,
+    _allow_fallback,
+    _allow_retry,
+    require_matching_strict_route,
+    validate_strict_request,
+)
 from agent.model_metadata import MINIMUM_CONTEXT_LENGTH, get_model_context_length
 from hermes_cli.config import get_hermes_home
 from hermes_constants import OPENROUTER_BASE_URL
@@ -8435,6 +8445,149 @@ async def _acreate_with_stream(
     )
 
 
+_STRICT_SUPPORTED_CLIENT_NAMES = frozenset({
+    "AnthropicAuxiliaryClient",
+    "AsyncAnthropicAuxiliaryClient",
+    "CodexAuxiliaryClient",
+    "AsyncCodexAuxiliaryClient",
+})
+
+
+def _strict_transport_supported(client: Any) -> bool:
+    """Return whether the transport exposes a provable one-invocation seam.
+
+    OpenAI SDK clients and Hermes's native Anthropic/Codex adapters all disable
+    SDK retries and expose one ``create`` call per invocation. Other adapters
+    (notably external-process and virtual providers) may hide their own retry or
+    routing behavior, so strict mode rejects them before dispatch. Tests may
+    opt a fake transport in with ``_hermes_strict_single_attempt_supported``.
+    """
+
+    if bool(getattr(client, "_hermes_strict_single_attempt_supported", False)):
+        return True
+    client_type = type(client)
+    if client_type.__name__ in _STRICT_SUPPORTED_CLIENT_NAMES:
+        real_client = getattr(client, "_real_client", None)
+        return getattr(real_client, "max_retries", None) == 0
+    return (
+        client_type.__module__.split(".", 1)[0] == "openai"
+        and getattr(client, "max_retries", None) == 0
+    )
+
+
+def _prepare_execution_audit(
+    execution_mode: LlmExecutionMode | str,
+    execution_audit: Optional[LlmExecutionAudit],
+    *,
+    provider: Optional[str],
+    model: Optional[str],
+) -> tuple[LlmExecutionMode, LlmExecutionAudit]:
+    mode = validate_strict_request(
+        execution_mode,
+        provider=provider,
+        model=model,
+    )
+    audit = execution_audit or LlmExecutionAudit()
+    audit.begin(mode, provider=provider, model=model)
+    return mode, audit
+
+
+def _strict_sync_completion(
+    client: Any,
+    kwargs: Dict[str, Any],
+    *,
+    task: Optional[str],
+    requested_provider: str,
+    requested_model: str,
+    dispatched_provider: str,
+    dispatched_model: str,
+    resolved_base_url: Optional[str],
+    audit: LlmExecutionAudit,
+) -> Any:
+    require_matching_strict_route(
+        audit,
+        provider=dispatched_provider,
+        model=dispatched_model,
+    )
+    if not _strict_transport_supported(client):
+        raise StrictExecutionUnsupported(
+            "strict_single_attempt is unsupported for transport "
+            f"{type(client).__module__}.{type(client).__name__}"
+        )
+
+    audit.record_attempt()
+    try:
+        base_url = str(getattr(client, "base_url", resolved_base_url) or "")
+        if _provider_requires_stream(dispatched_provider, base_url):
+            response = _create_with_progress(
+                client,
+                kwargs,
+                task,
+                force_stream=True,
+            )
+        else:
+            response = client.chat.completions.create(**kwargs)
+        response = _validate_llm_response(
+            response,
+            task,
+            provider=dispatched_provider,
+            base_url=base_url,
+        )
+    except Exception as exc:
+        audit.record_failure(exc)
+        raise
+    audit.record_response(response)
+    return response
+
+
+async def _strict_async_completion(
+    client: Any,
+    kwargs: Dict[str, Any],
+    *,
+    task: Optional[str],
+    requested_provider: str,
+    requested_model: str,
+    dispatched_provider: str,
+    dispatched_model: str,
+    resolved_base_url: Optional[str],
+    audit: LlmExecutionAudit,
+) -> Any:
+    require_matching_strict_route(
+        audit,
+        provider=dispatched_provider,
+        model=dispatched_model,
+    )
+    if not _strict_transport_supported(client):
+        raise StrictExecutionUnsupported(
+            "strict_single_attempt is unsupported for transport "
+            f"{type(client).__module__}.{type(client).__name__}"
+        )
+
+    audit.record_attempt()
+    try:
+        base_url = str(getattr(client, "base_url", resolved_base_url) or "")
+        force_stream = _provider_requires_stream(dispatched_provider, base_url)
+        if force_stream and not isinstance(client, (
+            AsyncCodexAuxiliaryClient,
+            AsyncAnthropicAuxiliaryClient,
+            AsyncBedrockAuxiliaryClient,
+        )):
+            response = await _acreate_with_stream(client, kwargs, task)
+        else:
+            response = await client.chat.completions.create(**kwargs)
+        response = _validate_llm_response(
+            response,
+            task,
+            provider=dispatched_provider,
+            base_url=base_url,
+        )
+    except Exception as exc:
+        audit.record_failure(exc)
+        raise
+    audit.record_response(response)
+    return response
+
+
 @_relay_auxiliary_call
 def call_llm(
     task: str = None,
@@ -8455,6 +8608,8 @@ def call_llm(
     api_mode: str = None,
     stream: bool = False,
     stream_options: dict = None,
+    execution_mode: LlmExecutionMode | str = LlmExecutionMode.DEFAULT,
+    execution_audit: Optional[LlmExecutionAudit] = None,
 ) -> Any:
     """Centralized synchronous LLM call.
 
@@ -8486,6 +8641,11 @@ def call_llm(
             output can stream to the user.
         stream_options: Passed through to the request when stream is True
             (e.g. {"include_usage": True}).
+        execution_mode: Host retry/fallback policy. The default preserves the
+            existing resilient behavior. ``strict_single_attempt`` requires an
+            explicit provider and model and dispatches at most once.
+        execution_audit: Optional mutable, secret-free audit record populated
+            by strict execution without changing the response return type.
 
     Returns:
         Response object with .choices[0].message.content, OR — when stream=True —
@@ -8494,6 +8654,17 @@ def call_llm(
     Raises:
         RuntimeError: If no provider is configured.
     """
+    resolved_execution_mode, execution_audit = _prepare_execution_audit(
+        execution_mode,
+        execution_audit,
+        provider=provider,
+        model=model,
+    )
+    if not _allow_retry(resolved_execution_mode) and stream:
+        raise StrictExecutionUnsupported(
+            "strict_single_attempt does not return a caller-consumed raw stream"
+        )
+
     # Capture one immutable runtime snapshot for keying, resolution, retries,
     # and fallbacks. Reading ambient state independently in each phase lets a
     # concurrent /model switch produce a key for one runtime and a client for
@@ -8515,7 +8686,12 @@ def call_llm(
             async_mode=False,
             main_runtime=main_runtime,
         )
-        if client is None and resolved_provider != "auto" and not resolved_base_url:
+        if (
+            client is None
+            and resolved_provider != "auto"
+            and not resolved_base_url
+            and _allow_fallback(resolved_execution_mode)
+        ):
             logger.warning(
                 "Vision provider %s unavailable, falling back to auto vision backends",
                 resolved_provider,
@@ -8542,6 +8718,10 @@ def call_llm(
             main_runtime=main_runtime,
         )
         if client is None:
+            if not _allow_fallback(resolved_execution_mode):
+                raise StrictExecutionConfigurationError(
+                    f"Strict provider {resolved_provider!r} has no usable client"
+                )
             # When the user explicitly chose a non-OpenRouter provider but no
             # credentials were found, honor the task fallback_chain before
             # raising.  Missing raw env keys are recoverable for auxiliary
@@ -8605,6 +8785,19 @@ def call_llm(
     _client_base = str(getattr(client, "base_url", "") or "")
     if _is_anthropic_compat_endpoint(resolved_provider, _client_base):
         kwargs["messages"] = _convert_openai_images_to_anthropic(kwargs["messages"])
+
+    if not _allow_retry(resolved_execution_mode):
+        return _strict_sync_completion(
+            client,
+            kwargs,
+            task=task,
+            requested_provider=str(provider),
+            requested_model=str(model),
+            dispatched_provider=resolved_provider,
+            dispatched_model=str(final_model or ""),
+            resolved_base_url=resolved_base_url,
+            audit=execution_audit,
+        )
 
     # Streaming path: return the raw SDK Stream iterator directly. This is used by
     # the MoA aggregator so its tokens stream to the user. It deliberately skips
@@ -9218,11 +9411,20 @@ async def async_call_llm(
     timeout: float = None,
     extra_body: dict = None,
     reasoning_config: Optional[dict] = None,
+    execution_mode: LlmExecutionMode | str = LlmExecutionMode.DEFAULT,
+    execution_audit: Optional[LlmExecutionAudit] = None,
 ) -> Any:
     """Centralized asynchronous LLM call.
 
     Same as call_llm() but async. See call_llm() for full documentation.
     """
+    resolved_execution_mode, execution_audit = _prepare_execution_audit(
+        execution_mode,
+        execution_audit,
+        provider=provider,
+        model=model,
+    )
+
     # Keep every async phase on the same runtime identity, even if another
     # session switches models while this task is awaiting network I/O.
     main_runtime = _normalize_main_runtime(main_runtime)
@@ -9240,7 +9442,12 @@ async def async_call_llm(
             async_mode=True,
             main_runtime=main_runtime,
         )
-        if client is None and resolved_provider != "auto" and not resolved_base_url:
+        if (
+            client is None
+            and resolved_provider != "auto"
+            and not resolved_base_url
+            and _allow_fallback(resolved_execution_mode)
+        ):
             logger.warning(
                 "Vision provider %s unavailable, falling back to auto vision backends",
                 resolved_provider,
@@ -9268,6 +9475,10 @@ async def async_call_llm(
             main_runtime=main_runtime,
         )
         if client is None:
+            if not _allow_fallback(resolved_execution_mode):
+                raise StrictExecutionConfigurationError(
+                    f"Strict provider {resolved_provider!r} has no usable client"
+                )
             _explicit = (resolved_provider or "").strip().lower()
             if _explicit and _explicit not in {"auto", "openrouter", "custom"}:
                 fb_client, fb_model, fb_label = _try_configured_fallback_for_unavailable_client(
@@ -9314,6 +9525,19 @@ async def async_call_llm(
     # Convert image blocks for Anthropic-compatible endpoints (e.g. MiniMax)
     if _is_anthropic_compat_endpoint(resolved_provider, _client_base):
         kwargs["messages"] = _convert_openai_images_to_anthropic(kwargs["messages"])
+
+    if not _allow_retry(resolved_execution_mode):
+        return await _strict_async_completion(
+            client,
+            kwargs,
+            task=task,
+            requested_provider=str(provider),
+            requested_model=str(model),
+            dispatched_provider=resolved_provider,
+            dispatched_model=str(final_model or ""),
+            resolved_base_url=resolved_base_url,
+            audit=execution_audit,
+        )
 
     try:
         # Retry ONCE on the same provider for a transient transport blip

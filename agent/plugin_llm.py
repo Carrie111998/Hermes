@@ -66,6 +66,18 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Union
 
+from agent.llm_execution import (
+    LlmExecutionAudit,
+    LlmExecutionMode,
+    LlmExecutionPolicyError,
+    StrictExecutionConfigurationError,
+    StrictExecutionRouteMismatch,
+    StrictExecutionUnsupported,
+    _strict_mode,
+    require_matching_strict_route,
+    validate_strict_request,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -631,6 +643,7 @@ class PluginLlm:
         agent_id: Optional[str] = None,
         profile: Optional[str] = None,
         purpose: Optional[str] = None,
+        execution_mode: LlmExecutionMode | str = LlmExecutionMode.DEFAULT,
     ) -> PluginLlmCompleteResult:
         """Run a host-owned chat completion against the user's active model.
 
@@ -649,6 +662,9 @@ class PluginLlm:
             requested_agent_id=agent_id,
             requested_profile=profile,
         )
+        execution_audit = self._new_execution_audit(
+            execution_mode, provider=eff_provider, model=eff_model
+        )
         real_provider, real_model, response = self._invoke_sync(
             messages=messages,
             provider_override=eff_provider,
@@ -657,6 +673,8 @@ class PluginLlm:
             temperature=temperature,
             max_tokens=max_tokens,
             timeout=timeout,
+            execution_mode=execution_mode,
+            execution_audit=execution_audit,
         )
         text = _extract_text(response)
         usage = _extract_usage(response)
@@ -670,6 +688,7 @@ class PluginLlm:
                 "plugin_id": self._plugin_id,
                 "purpose": purpose or "",
                 "profile": eff_profile or "",
+                **execution_audit.as_dict(),
             },
         )
         logger.info(
@@ -697,6 +716,7 @@ class PluginLlm:
         agent_id: Optional[str] = None,
         profile: Optional[str] = None,
         purpose: Optional[str] = None,
+        execution_mode: LlmExecutionMode | str = LlmExecutionMode.DEFAULT,
     ) -> PluginLlmStructuredResult:
         """Run a bounded host-owned structured completion.
 
@@ -723,6 +743,9 @@ class PluginLlm:
             requested_agent_id=agent_id,
             requested_profile=profile,
         )
+        execution_audit = self._new_execution_audit(
+            execution_mode, provider=eff_provider, model=eff_model
+        )
 
         messages = _build_structured_messages(
             instructions=instructions,
@@ -743,6 +766,8 @@ class PluginLlm:
             max_tokens=max_tokens,
             timeout=timeout,
             extra_body=extra_body,
+            execution_mode=execution_mode,
+            execution_audit=execution_audit,
         )
         text = _extract_text(response)
         usage = _extract_usage(response)
@@ -762,6 +787,7 @@ class PluginLlm:
                 "purpose": purpose or "",
                 "profile": eff_profile or "",
                 "schema_name": schema_name or "",
+                **execution_audit.as_dict(),
             },
         )
         logger.info(
@@ -786,6 +812,7 @@ class PluginLlm:
         agent_id: Optional[str] = None,
         profile: Optional[str] = None,
         purpose: Optional[str] = None,
+        execution_mode: LlmExecutionMode | str = LlmExecutionMode.DEFAULT,
     ) -> PluginLlmCompleteResult:
         """Async sibling of :meth:`complete`."""
         policy = self._policy_loader(self._plugin_id)
@@ -796,6 +823,9 @@ class PluginLlm:
             requested_agent_id=agent_id,
             requested_profile=profile,
         )
+        execution_audit = self._new_execution_audit(
+            execution_mode, provider=eff_provider, model=eff_model
+        )
         real_provider, real_model, response = await self._invoke_async(
             messages=messages,
             provider_override=eff_provider,
@@ -804,6 +834,8 @@ class PluginLlm:
             temperature=temperature,
             max_tokens=max_tokens,
             timeout=timeout,
+            execution_mode=execution_mode,
+            execution_audit=execution_audit,
         )
         text = _extract_text(response)
         usage = _extract_usage(response)
@@ -817,6 +849,7 @@ class PluginLlm:
                 "plugin_id": self._plugin_id,
                 "purpose": purpose or "",
                 "profile": eff_profile or "",
+                **execution_audit.as_dict(),
             },
         )
 
@@ -837,6 +870,7 @@ class PluginLlm:
         agent_id: Optional[str] = None,
         profile: Optional[str] = None,
         purpose: Optional[str] = None,
+        execution_mode: LlmExecutionMode | str = LlmExecutionMode.DEFAULT,
     ) -> PluginLlmStructuredResult:
         """Async sibling of :meth:`complete_structured`."""
         if not instructions or not instructions.strip():
@@ -851,6 +885,9 @@ class PluginLlm:
             requested_model=model,
             requested_agent_id=agent_id,
             requested_profile=profile,
+        )
+        execution_audit = self._new_execution_audit(
+            execution_mode, provider=eff_provider, model=eff_model
         )
         messages = _build_structured_messages(
             instructions=instructions,
@@ -870,6 +907,8 @@ class PluginLlm:
             max_tokens=max_tokens,
             timeout=timeout,
             extra_body=extra_body,
+            execution_mode=execution_mode,
+            execution_audit=execution_audit,
         )
         text = _extract_text(response)
         usage = _extract_usage(response)
@@ -889,10 +928,44 @@ class PluginLlm:
                 "purpose": purpose or "",
                 "profile": eff_profile or "",
                 "schema_name": schema_name or "",
+                **execution_audit.as_dict(),
             },
         )
 
     # -- internals ---------------------------------------------------------
+
+    @staticmethod
+    def _new_execution_audit(
+        execution_mode: LlmExecutionMode | str,
+        *,
+        provider: Optional[str],
+        model: Optional[str],
+    ) -> LlmExecutionAudit:
+        validate_strict_request(
+            execution_mode,
+            provider=provider,
+            model=model,
+        )
+        audit = LlmExecutionAudit()
+        audit.begin(execution_mode, provider=provider, model=model)
+        return audit
+
+    @staticmethod
+    def _record_injected_result(
+        audit: LlmExecutionAudit,
+        *,
+        provider: str,
+        model: str,
+        response: Any,
+    ) -> None:
+        if _strict_mode(audit.execution_mode):
+            require_matching_strict_route(audit, provider=provider, model=model)
+            audit.record_response(response)
+            return
+        audit.dispatched_provider = provider
+        audit.dispatched_model = model
+        audit.response_provider = str(getattr(response, "provider", None) or provider)
+        audit.response_model = str(getattr(response, "model", None) or model)
 
     @staticmethod
     def _json_response_format(
@@ -927,21 +1000,40 @@ class PluginLlm:
         max_tokens: Optional[int],
         timeout: Optional[float],
         extra_body: Optional[Dict[str, Any]] = None,
+        execution_mode: LlmExecutionMode | str = LlmExecutionMode.DEFAULT,
+        execution_audit: Optional[LlmExecutionAudit] = None,
     ) -> tuple[str, str, Any]:
         """Invoke the host's ``call_llm``. Lazy-imports
         ``agent.auxiliary_client`` to avoid circular deps at plugin
         discovery time."""
         if self._sync_caller is not None:
-            return self._sync_caller(
-                messages=messages,
-                provider_override=provider_override,
-                model_override=model_override,
-                profile_override=profile_override,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                timeout=timeout,
-                extra_body=extra_body,
-            )
+            if execution_audit is not None and _strict_mode(execution_mode):
+                execution_audit.record_attempt()
+            try:
+                provider, model, response = self._sync_caller(
+                    messages=messages,
+                    provider_override=provider_override,
+                    model_override=model_override,
+                    profile_override=profile_override,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    timeout=timeout,
+                    extra_body=extra_body,
+                    execution_mode=execution_mode,
+                    execution_audit=execution_audit,
+                )
+            except Exception as exc:
+                if execution_audit is not None and _strict_mode(execution_mode):
+                    execution_audit.record_failure(exc)
+                raise
+            if execution_audit is not None:
+                self._record_injected_result(
+                    execution_audit,
+                    provider=provider,
+                    model=model,
+                    response=response,
+                )
+            return provider, model, response
         from agent.auxiliary_client import call_llm
         merged_extra = dict(extra_body or {})
         if profile_override:
@@ -955,6 +1047,8 @@ class PluginLlm:
             max_tokens=max_tokens,
             timeout=timeout,
             extra_body=merged_extra or None,
+            execution_mode=execution_mode,
+            execution_audit=execution_audit,
         )
         provider, model = _resolve_attribution(
             provider_override=provider_override,
@@ -974,18 +1068,37 @@ class PluginLlm:
         max_tokens: Optional[int],
         timeout: Optional[float],
         extra_body: Optional[Dict[str, Any]] = None,
+        execution_mode: LlmExecutionMode | str = LlmExecutionMode.DEFAULT,
+        execution_audit: Optional[LlmExecutionAudit] = None,
     ) -> tuple[str, str, Any]:
         if self._async_caller is not None:
-            return await self._async_caller(
-                messages=messages,
-                provider_override=provider_override,
-                model_override=model_override,
-                profile_override=profile_override,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                timeout=timeout,
-                extra_body=extra_body,
-            )
+            if execution_audit is not None and _strict_mode(execution_mode):
+                execution_audit.record_attempt()
+            try:
+                provider, model, response = await self._async_caller(
+                    messages=messages,
+                    provider_override=provider_override,
+                    model_override=model_override,
+                    profile_override=profile_override,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    timeout=timeout,
+                    extra_body=extra_body,
+                    execution_mode=execution_mode,
+                    execution_audit=execution_audit,
+                )
+            except Exception as exc:
+                if execution_audit is not None and _strict_mode(execution_mode):
+                    execution_audit.record_failure(exc)
+                raise
+            if execution_audit is not None:
+                self._record_injected_result(
+                    execution_audit,
+                    provider=provider,
+                    model=model,
+                    response=response,
+                )
+            return provider, model, response
         from agent.auxiliary_client import async_call_llm
         merged_extra = dict(extra_body or {})
         if profile_override:
@@ -999,6 +1112,8 @@ class PluginLlm:
             max_tokens=max_tokens,
             timeout=timeout,
             extra_body=merged_extra or None,
+            execution_mode=execution_mode,
+            execution_audit=execution_audit,
         )
         provider, model = _resolve_attribution(
             provider_override=provider_override,
@@ -1042,5 +1157,10 @@ __all__ = [
     "PluginLlmCompleteResult",
     "PluginLlmStructuredResult",
     "PluginLlmTrustError",
+    "LlmExecutionMode",
+    "LlmExecutionPolicyError",
+    "StrictExecutionConfigurationError",
+    "StrictExecutionUnsupported",
+    "StrictExecutionRouteMismatch",
     "make_plugin_llm_for_test",
 ]
