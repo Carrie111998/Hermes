@@ -1438,6 +1438,31 @@ def _validated_historical_signer_receipt(
     return checked, raw
 
 
+def _historical_public_identity_hint(layout: SignerLayout) -> bytes | None:
+    """Return a non-authoritative public-key hint for candidate selection.
+
+    Historical receipts can outlive release layouts that no longer satisfy the
+    current runtime-mode contract.  Such an unrelated release must not prevent
+    discovery of the exact installed predecessor.  This bounded read is used
+    only to discard non-matching candidates; a matching candidate still goes
+    through the complete release-authority and signed-receipt validation below.
+    """
+
+    try:
+        public_raw = _read_regular(
+            layout.pinned_public_key,
+            maximum=32,
+            uid=layout.release_uid,
+            gid=layout.release_gid,
+            mode=0o444,
+        )
+    except TrustedSignerProvisioningError:
+        return None
+    if len(public_raw) != 32:
+        return None
+    return public_raw
+
+
 def _find_private_key_predecessor(
     layout: SignerLayout,
     *,
@@ -1446,10 +1471,11 @@ def _find_private_key_predecessor(
     """Bind an installed old seed to one canonical signed predecessor.
 
     A signer identity may have been intentionally replayed by several exact
-    immutable releases.  Every matching receipt is still validated against
-    its own release authority; the lexicographically first revision is merely
-    the deterministic representative of that cryptographically equivalent
-    lineage for the crash-replay intent.
+    immutable releases.  Candidate selection uses only the exact pinned public
+    identity so an unrelated stale release cannot veto recovery.  Every
+    matching receipt is still validated against its own release authority; the
+    lexicographically first revision is merely the deterministic representative
+    of that cryptographically equivalent lineage for the crash-replay intent.
     """
 
     if len(existing_public_raw) != 32:
@@ -1477,9 +1503,11 @@ def _find_private_key_predecessor(
             or not _same_fixed_signer_boundary(layout, candidate)
         ):
             _stable_error("trusted_signer_private_key_rollover_invalid")
+        if _historical_public_identity_hint(candidate) != existing_public_raw:
+            continue
         authority = _validate_release_and_authority(candidate)
         if authority.get("public_raw") != existing_public_raw:
-            continue
+            _stable_error("trusted_signer_private_key_rollover_invalid")
         receipt, receipt_raw = _validated_historical_signer_receipt(
             candidate,
             authority=authority,

@@ -1113,6 +1113,10 @@ def _private_key_rollover_case(
     current_seed = current_private.private_bytes_raw()
     previous_public = previous_private.public_key().public_bytes_raw()
     current_public = current_private.public_key().public_bytes_raw()
+    previous_layout.pinned_public_key.write_bytes(previous_public)
+    previous_layout.pinned_public_key.chmod(0o444)
+    current_layout.pinned_public_key.write_bytes(current_public)
+    current_layout.pinned_public_key.chmod(0o444)
     previous_authority: Mapping[str, object] = {
         "package_sha256": "3" * 64,
         "manifest_sha256": "4" * 64,
@@ -1247,6 +1251,8 @@ def test_private_key_rollover_selects_canonical_equivalent_predecessor(
         .public_key()
         .public_bytes_raw()
     )
+    first_layout.pinned_public_key.write_bytes(previous_public)
+    first_layout.pinned_public_key.chmod(0o444)
     later_authority = provisioning._validate_release_and_authority(
         later_layout
     )
@@ -1320,6 +1326,133 @@ def test_private_key_rollover_selects_canonical_equivalent_predecessor(
     assert selected_authority is first_authority
     assert receipt == receipts[first_revision][0]
     assert receipt_raw == receipts[first_revision][1]
+
+
+def test_private_key_rollover_skips_invalid_unrelated_historical_release(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    layout, _authority, previous_seed, _current_seed = (
+        _private_key_rollover_case(tmp_path, monkeypatch)
+    )
+    previous_revision = "c" * 40
+    unrelated_revision = "a" * 40
+    previous_layout = provisioning._projection_layout(
+        previous_revision,
+        role="host",
+    )
+    unrelated_release = previous_layout.release_base / unrelated_revision
+    unrelated_release.mkdir()
+    unrelated_layout = replace(
+        previous_layout,
+        release=unrelated_release,
+        authority_manifest=unrelated_release / "package-manifest.json",
+        pinned_public_key=unrelated_release / "host.pub",
+        receipt=(
+            previous_layout.receipt.parent
+            / f"host-signer-{unrelated_revision}.json"
+        ),
+        sudoers_template=unrelated_release / "sudoers.in",
+    )
+    unrelated_public = Ed25519PrivateKey.generate().public_key().public_bytes_raw()
+    unrelated_layout.pinned_public_key.write_bytes(unrelated_public)
+    unrelated_layout.pinned_public_key.chmod(0o444)
+    unrelated_layout.receipt.write_bytes(b"unrelated stale receipt")
+    unrelated_layout.receipt.chmod(0o444)
+    original_projection_layout = provisioning._projection_layout
+    monkeypatch.setattr(
+        provisioning,
+        "_projection_layout",
+        lambda revision, *, role: (
+            unrelated_layout
+            if revision == unrelated_revision and role == "host"
+            else original_projection_layout(revision, role=role)
+        ),
+    )
+    previous_public = (
+        Ed25519PrivateKey.from_private_bytes(previous_seed)
+        .public_key()
+        .public_bytes_raw()
+    )
+
+    selected, _selected_authority, _receipt, _receipt_raw = (
+        provisioning._find_private_key_predecessor(
+            layout,
+            existing_public_raw=previous_public,
+        )
+    )
+
+    assert selected is previous_layout
+
+
+def test_private_key_rollover_fails_closed_for_invalid_matching_release(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    layout, _authority, previous_seed, _current_seed = (
+        _private_key_rollover_case(tmp_path, monkeypatch)
+    )
+    previous_revision = "c" * 40
+    invalid_revision = "a" * 40
+    previous_layout = provisioning._projection_layout(
+        previous_revision,
+        role="host",
+    )
+    invalid_release = previous_layout.release_base / invalid_revision
+    invalid_release.mkdir()
+    invalid_layout = replace(
+        previous_layout,
+        release=invalid_release,
+        authority_manifest=invalid_release / "package-manifest.json",
+        pinned_public_key=invalid_release / "host.pub",
+        receipt=(
+            previous_layout.receipt.parent
+            / f"host-signer-{invalid_revision}.json"
+        ),
+        sudoers_template=invalid_release / "sudoers.in",
+    )
+    previous_public = (
+        Ed25519PrivateKey.from_private_bytes(previous_seed)
+        .public_key()
+        .public_bytes_raw()
+    )
+    invalid_layout.pinned_public_key.write_bytes(previous_public)
+    invalid_layout.pinned_public_key.chmod(0o444)
+    invalid_layout.receipt.write_bytes(b"invalid matching receipt")
+    invalid_layout.receipt.chmod(0o444)
+    original_projection_layout = provisioning._projection_layout
+    original_validate = provisioning._validate_release_and_authority
+    monkeypatch.setattr(
+        provisioning,
+        "_projection_layout",
+        lambda revision, *, role: (
+            invalid_layout
+            if revision == invalid_revision and role == "host"
+            else original_projection_layout(revision, role=role)
+        ),
+    )
+
+    def validate(selected: provisioning.SignerLayout) -> Mapping[str, object]:
+        if selected is invalid_layout:
+            raise provisioning.TrustedSignerProvisioningError(
+                "trusted_signer_release_mode_invalid"
+            )
+        return original_validate(selected)
+
+    monkeypatch.setattr(
+        provisioning,
+        "_validate_release_and_authority",
+        validate,
+    )
+
+    with pytest.raises(
+        provisioning.TrustedSignerProvisioningError,
+        match="trusted_signer_release_mode_invalid",
+    ):
+        provisioning._find_private_key_predecessor(
+            layout,
+            existing_public_raw=previous_public,
+        )
 
 
 @pytest.mark.parametrize("crash_window", ("after_stage", "after_replace"))
