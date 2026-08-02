@@ -201,8 +201,6 @@ async def test_invalid_channel_id_fails_loud_without_posting(bad_id):
 @pytest.mark.asyncio
 async def test_invalid_thread_id_fails_loud_without_posting(bad_id):
     """C-07 — thread_id goes through the same predicate as chat_id."""
-    if bad_id in (None, "", "   "):
-        pytest.skip("empty thread_id means 'no thread' and falls back to chat_id")
     channel = _channel()
     adapter = _adapter(channel)
     with _Recorder() as log:
@@ -520,3 +518,34 @@ async def test_send_with_retry_never_reposts_after_acceptance_failure():
     assert channel.send.await_count == 1, (
         "the message already landed; retry/plain-text fallback must not post again"
     )
+
+
+@pytest.mark.asyncio
+async def test_edit_message_uses_the_shared_exact_name_resolver():
+    """C-04 — edits use the same strict id/name target contract as sends."""
+    message = SimpleNamespace(id=42, edit=AsyncMock())
+    channel = _channel(channel_id=555, name="general")
+    channel.fetch_message = AsyncMock(return_value=message)
+    adapter = _adapter(None, guilds=[_guild(text_channels=[channel])])
+
+    result = await adapter.edit_message("general", "42", "updated")
+
+    assert result.success is True
+    message.edit.assert_awaited_once()
+    assert adapter._client.get_channel.call_count == 0
+    assert adapter._client.fetch_channel.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_lookup_failure_scrubs_the_configured_bot_token():
+    """C-16 — provider lookup diagnostics cannot echo the configured token."""
+    adapter = _adapter(None)
+    adapter._client.fetch_channel = AsyncMock(
+        side_effect=RuntimeError(f"lookup rejected Authorization: Bot {TOKEN}")
+    )
+    with _Recorder() as log:
+        result = await adapter.send("555", "harmless body")
+
+    assert result.success is False
+    assert TOKEN not in (result.error or "")
+    assert TOKEN not in log.text

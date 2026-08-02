@@ -3102,7 +3102,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 except Exception as e:
                     return None, (
                         f"{kind} {channel_id} lookup failed: "
-                        f"{_sanitize_delivery_error(e)}"
+                        f"{_sanitize_delivery_error(e, self._delivery_redactions(None))}"
                     )
             if not channel:
                 return None, f"{kind} {channel_id} not found"
@@ -3282,13 +3282,12 @@ class DiscordAdapter(BasePlatformAdapter):
 
         try:
             # Determine target channel: thread_id in metadata takes precedence.
-            thread_id = None
-            if metadata and metadata.get("thread_id"):
-                thread_id = metadata["thread_id"]
+            has_thread_target = isinstance(metadata, dict) and "thread_id" in metadata
+            thread_id = metadata.get("thread_id") if isinstance(metadata, dict) else None
             nonconversational = _metadata_marks_nonconversational(metadata)
             final_delivery = bool(metadata and metadata.get("notify"))
 
-            if thread_id:
+            if has_thread_target:
                 # Threads are addressed by their own ID (or name).
                 channel, resolve_error = await self._resolve_delivery_target(
                     thread_id, kind="Thread",
@@ -3595,9 +3594,13 @@ class DiscordAdapter(BasePlatformAdapter):
         if not self._client:
             return SendResult(success=False, error="Not connected")
         try:
-            channel = self._client.get_channel(int(chat_id))
-            if not channel:
-                channel = await self._client.fetch_channel(int(chat_id))
+            channel, resolve_error = await self._resolve_delivery_target(
+                chat_id, kind="Channel",
+            )
+            if channel is None:
+                return self._fail_delivery(
+                    resolve_error or "Discord channel resolution failed"
+                )
             msg = await channel.fetch_message(int(message_id))
             formatted = self.format_message(content)
 
