@@ -273,6 +273,10 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("curator", "Background skill maintenance (status, run, pin, archive, list-archived)",
                "Tools & Skills", args_hint="[subcommand]",
                subcommands=("status", "run", "pause", "resume", "pin", "unpin", "restore", "list-archived")),
+    CommandDef("scope", "Thread-scope status, create, link, dependency, complete, archive",
+               "Session", args_hint="[subcommand]",
+               subcommands=("status", "create", "link", "unlink", "dependency", "audit",
+                            "complete", "archive")),
     CommandDef("kanban", "Multi-profile collaboration board (tasks, links, comments)",
                "Tools & Skills", args_hint="[subcommand]",
                subcommands=("init", "boards", "create", "list", "ls", "show", "assign",
@@ -1257,7 +1261,11 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #     /hermes update on Slack. Demoted to free the native slot /approvals now
 #     claims — without this entry /approvals tips the registry past the 50-cap
 #     and silently clamps /update off, breaking Telegram parity.
-_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update"})
+#   - scope: thread-scope status/create/link management — infrequent relative
+#     to everyday chat commands; reached via /hermes scope on Slack so it
+#     doesn't tip the registry past the 50-command cap and silently clamp an
+#     existing native slash (see thread-scope-isolation design doc).
+_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "scope"})
 
 
 def _sanitize_slack_name(raw: str) -> str:

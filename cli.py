@@ -10044,6 +10044,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self._handle_blueprint_command(cmd_original)
         elif canonical == "curator":
             self._handle_curator_command(cmd_original)
+        elif canonical == "scope":
+            self._handle_scope_command(cmd_original)
         elif canonical == "kanban":
             self._handle_kanban_command(cmd_original)
         elif canonical == "skills":

@@ -1730,6 +1730,28 @@ class CLICommandsMixin:
         except Exception as exc:
             print(f"(._.) curator: {exc}")
 
+    def _handle_scope_command(self, cmd: str):
+        """Handle /scope slash command.
+
+        Delegates to hermes_cli.scope so the CLI/gateway and the `hermes
+        scope` subcommand share the same handler set.
+        """
+        import shlex
+
+        tokens = shlex.split(cmd)[1:] if cmd else []
+        if not tokens:
+            tokens = ["status"]
+
+        try:
+            from hermes_cli.scope import cli_main
+            cli_main(tokens)
+        except SystemExit:
+            # argparse calls sys.exit() on --help or errors; swallow so we
+            # don't kill the interactive session.
+            pass
+        except Exception as exc:
+            print(f"(._.) scope: {exc}")
+
     def _handle_kanban_command(self, cmd: str):
         """Handle the /kanban command — delegate to the shared kanban CLI.
 

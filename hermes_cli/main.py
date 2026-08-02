@@ -11659,6 +11659,27 @@ def main():
         logging.getLogger(__name__).debug("curator CLI wiring failed: %s", _exc)
 
     # =========================================================================
+    # scope command — durable per-thread scope identity and ownership
+    # =========================================================================
+    scope_parser = subparsers.add_parser(
+        "scope",
+        help="Thread-scope identity — status, create, link, dependency, complete, archive",
+        description=(
+            "A scope is the durable object representing one piece of work "
+            "(one Discord thread, one DM, one CLI project). Progress/status "
+            "questions should be answered from a scope's own owned "
+            "artifacts, not from unrelated activity sharing the same "
+            "profile or repository. See docs/design/thread-scope-isolation.md."
+        ),
+    )
+    try:
+        from hermes_cli.scope import register_cli as _register_scope_cli
+
+        _register_scope_cli(scope_parser)
+    except Exception as _exc:
+        logging.getLogger(__name__).debug("scope CLI wiring failed: %s", _exc)
+
+    # =========================================================================
     # pets command — petdex animated mascots (CLI / TUI / desktop display)
     # =========================================================================
     pets_parser = subparsers.add_parser(
