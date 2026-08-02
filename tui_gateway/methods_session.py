@@ -724,6 +724,87 @@ def _(rid, params: dict) -> dict:
     return _ok(rid, info)
 
 
+@method("session.workspace.set")
+def _(rid, params: dict) -> dict:
+    """Persist a workspace by durable SessionDB id, live or inactive."""
+    target = str(params.get("session_id") or "").strip()
+    if not target:
+        return _err(rid, 4006, "session_id required")
+    raw = str(params.get("cwd") or "").strip()
+    if not raw:
+        return _err(rid, 4016, "cwd required")
+
+    profile = (params.get("profile") or "").strip() or None
+    profile_home = _profile_home(profile)
+    with _profile_db(params) as db:
+        if db is None:
+            return _db_unavailable_error(rid, code=5006)
+        if db.get_session(target) is None:
+            return _err(rid, 4007, "session not found")
+
+        live = None
+        with _sessions_lock:
+            for sid, session in _sessions.items():
+                if session.get("_finalized") or session.get("session_key") != target:
+                    continue
+                live_home = session.get("profile_home")
+                if profile_home is None:
+                    same_profile = not live_home
+                else:
+                    same_profile = (
+                        bool(live_home)
+                        and Path(live_home).resolve() == Path(profile_home).resolve()
+                    )
+                if same_profile:
+                    live = sid, session
+                    break
+
+        if live is not None:
+            sid, session = live
+            history_lock = session.get("history_lock")
+            lock = (
+                history_lock if history_lock is not None else contextlib.nullcontext()
+            )
+            with lock:
+                if session.get("running"):
+                    return _err(rid, 4009, "session busy")
+                try:
+                    cwd = _set_session_cwd(session, raw)
+                except ValueError as e:
+                    return _err(rid, 4017, str(e))
+            agent = session.get("agent")
+            info = (
+                _session_info(agent, session)
+                if agent is not None
+                else {
+                    "cwd": cwd,
+                    "branch": _git_branch_for_cwd(cwd),
+                    "project": _project_info_for_cwd(cwd),
+                    "lazy": True,
+                }
+            )
+            _emit("session.info", sid, info)
+            return _ok(rid, info)
+
+        try:
+            cwd = _resolve_session_cwd(raw)
+        except ValueError as e:
+            return _err(rid, 4017, str(e))
+        branch = _git_branch_for_cwd(cwd)
+        repo_root = _git_common_repo_root_for_cwd(cwd)
+        db.update_session_cwd(target, cwd, branch, repo_root)
+        return _ok(
+            rid,
+            {
+                "session_id": target,
+                "cwd": cwd,
+                "branch": branch,
+                "project": _project_info_for_cwd(cwd),
+                "lazy": True,
+            },
+        )
+
+
 @method("session.active_list")
 def _(rid, params: dict) -> dict:
     """Return live TUI sessions in this gateway process.

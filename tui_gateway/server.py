@@ -2776,13 +2776,18 @@ def _persist_session_git_meta(session: dict, cwd: str) -> None:
     threading.Thread(target=_run, name="git-meta", daemon=True).start()
 
 
-def _set_session_cwd(session: dict, cwd: str) -> str:
+def _resolve_session_cwd(cwd: str) -> str:
     from hermes_constants import translate_cwd_for_wsl_backend
 
     cwd = translate_cwd_for_wsl_backend(str(cwd))
     resolved = os.path.abspath(os.path.expanduser(cwd))
     if not os.path.isdir(resolved):
         raise ValueError(f"working directory does not exist: {cwd}")
+    return resolved
+
+
+def _set_session_cwd(session: dict, cwd: str) -> str:
+    resolved = _resolve_session_cwd(cwd)
     session["cwd"] = resolved
     # An explicit user choice — persist it as the workspace (and let a later
     # lazy row creation persist it too, not the launch-dir fallback).
