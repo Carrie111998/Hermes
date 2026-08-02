@@ -11021,6 +11021,21 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 # _build_system_prompt appends system_message to prompt_parts
                 # which already contain the agent identity — resulting in the
                 # identity block appearing twice (issue #15281).
+                from agent.responses_compaction import (
+                    effective_auto_compaction_mode,
+                    prepare_manual_hermes_compaction,
+                )
+
+                _manual_authorization = prepare_manual_hermes_compaction(
+                    self.agent,
+                    reason="cli_manual_compress",
+                )
+                if _manual_authorization is False:
+                    if effective_auto_compaction_mode(self.agent) == "off":
+                        print("  Manual compression is disabled: compaction mode is off.")
+                    else:
+                        print("  Manual compression blocked: custody handoff failed.")
+                    return
                 compressed, _ = self.agent._compress_context(
                     head,
                     None,
@@ -11028,6 +11043,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     focus_topic=focus_topic or None,
                     force=True,
                     defer_context_engine_notification=True,
+                    hermes_compaction_authorization=_manual_authorization,
                 )
 
                 # If _compress_context returned unchanged because a

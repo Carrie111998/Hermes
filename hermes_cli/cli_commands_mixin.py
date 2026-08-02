@@ -1138,20 +1138,17 @@ class CLICommandsMixin:
             except Exception:
                 pass
 
-        # End the old session
+        # Publish parent end, child row, copied transcript, and native custody
+        # as one transaction. Any failure leaves the original active and no child.
         try:
-            self._session_db.end_session(self.session_id, "branched")
-        except Exception:
-            pass
-
-        # Create the new session with parent link.
-        # Persist a stable ``_branched_from`` marker in model_config so
-        # list_sessions_rich() can keep the branch visible in /resume and
-        # /sessions even after the parent is reopened and re-ended with a
-        # different end_reason (e.g. tui_shutdown overwriting 'branched').
-        try:
-            self._session_db.create_session(
-                session_id=new_session_id,
+            branch_history = [dict(msg) for msg in self.conversation_history]
+            for msg in branch_history:
+                sidecar = extract_api_content_sidecar(msg)
+                if sidecar is not None:
+                    msg["api_content"] = sidecar
+            self._session_db.create_session_fork(
+                parent_session_id=parent_session_id,
+                child_session_id=new_session_id,
                 source=os.environ.get("HERMES_SESSION_SOURCE", "cli"),
                 model=self.model,
                 model_config={
@@ -1159,51 +1156,39 @@ class CLICommandsMixin:
                     "reasoning_config": self.reasoning_config,
                     "_branched_from": parent_session_id,
                 },
-                parent_session_id=parent_session_id,
+                messages=branch_history,
+                title=branch_title,
+                quarantine_error="checkpoint_missing_in_branch",
+                end_parent_reason="branched",
             )
         except Exception as e:
-            _cprint(f"  Failed to create branch session: {e}")
+            _cprint(f"  Failed to create atomic branch session: {e}")
             return
 
-        # Copy conversation history to the new session
-        for msg in self.conversation_history:
-            try:
-                self._session_db.append_message(
-                    session_id=new_session_id,
-                    role=msg.get("role", "user"),
-                    content=msg.get("content"),
-                    tool_name=msg.get("tool_name") or msg.get("name"),
-                    tool_calls=msg.get("tool_calls"),
-                    tool_call_id=msg.get("tool_call_id"),
-                    reasoning=msg.get("reasoning"),
-                    # Keep the api_content sidecar so the branch's first turn
-                    # replays the parent's exact wire bytes (warm provider
-                    # prompt cache) instead of a full cold prefill.
-                    api_content=extract_api_content_sidecar(msg),
-                    timestamp=msg.get("timestamp"),
-                )
-            except Exception:
-                pass  # Best-effort copy
-
-        # Set title on the branch
+        # The durable child and parent termination are committed. Process-local
+        # synchronization must not turn that into a false-negative.
+        post_commit_warnings = []
         try:
-            self._session_db.set_session_title(new_session_id, branch_title)
-        except Exception:
-            pass
-
-        # Switch to the new session
-        self._transfer_session_yolo(self.session_id, new_session_id)
+            self._transfer_session_yolo(self.session_id, new_session_id)
+        except Exception as exc:
+            post_commit_warnings.append(f"session permissions: {exc}")
         self.session_id = new_session_id
         self.session_start = now
         self._pending_title = None
         self._resumed = True  # Prevents auto-title generation
-        _sync_process_session_id(new_session_id)
+        try:
+            _sync_process_session_id(new_session_id)
+        except Exception as exc:
+            post_commit_warnings.append(f"process session id: {exc}")
 
         # Sync the agent
         if self.agent:
             self.agent.session_id = new_session_id
             self.agent.session_start = now
-            self.agent.reset_session_state()
+            try:
+                self.agent.reset_session_state()
+            except Exception as exc:
+                post_commit_warnings.append(f"agent reset: {exc}")
             if hasattr(self.agent, "_last_flushed_db_idx"):
                 self.agent._last_flushed_db_idx = len(self.conversation_history)
             if hasattr(self.agent, "_todo_store"):
@@ -1213,7 +1198,10 @@ class CLICommandsMixin:
                 except Exception:
                     pass
             if hasattr(self.agent, "_invalidate_system_prompt"):
-                self.agent._invalidate_system_prompt()
+                try:
+                    self.agent._invalidate_system_prompt()
+                except Exception as exc:
+                    post_commit_warnings.append(f"system prompt refresh: {exc}")
 
             # Notify memory providers that session_id forked to a new branch.
             # reset=False — the branched session carries the transcript
@@ -1238,6 +1226,11 @@ class CLICommandsMixin:
         )
         _cprint(f"  Original session: {parent_session_id}")
         _cprint(f"  Branch session:   {new_session_id}")
+        if post_commit_warnings:
+            _cprint(
+                "  ⚠ Branch committed; ancillary sync warning: "
+                + "; ".join(post_commit_warnings)
+            )
 
     def _handle_personality_command(self, cmd: str):
         """Handle the /personality command to set predefined personalities."""

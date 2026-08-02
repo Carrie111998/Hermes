@@ -59,13 +59,8 @@ def _make_runner(history: list[dict[str, str]]):
 
 
 @pytest.mark.asyncio
-async def test_compress_command_works_when_auto_compaction_disabled():
-    """compression.enabled: false disables *automatic* compaction only.
-
-    The gateway /compress handler has never gated on the flag — pin that
-    contract (every manual-compress surface must allow manual compression
-    regardless of the auto toggle, #64438) and the force=True cooldown
-    bypass that manual compression relies on."""
+async def test_compress_command_is_blocked_when_compaction_is_off():
+    """compression.enabled: false blocks gateway textual compression too."""
     history = _make_history()
     compressed = [
         history[0],
@@ -96,10 +91,8 @@ async def test_compress_command_works_when_auto_compaction_disabled():
     ):
         result = await runner._handle_compress_command(_make_event())
 
-    assert "disabled" not in result.lower()
-    assert "Compressed:" in result
-    agent_instance._compress_context.assert_called_once()
-    assert agent_instance._compress_context.call_args.kwargs.get("force") is True
+    assert result == "Compression blocked: compaction mode is off."
+    agent_instance._compress_context.assert_not_called()
 
 
 @pytest.mark.asyncio

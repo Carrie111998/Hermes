@@ -104,6 +104,26 @@ def test_publish_compression_child_is_atomic_on_handoff_failure(
 def test_publish_compression_child_exposes_complete_child(db: SessionDB) -> None:
     db.create_session("atomic-parent", source="webui")
     db.append_message("atomic-parent", "user", "original")
+    from agent.responses_compaction import (
+        NativeCompactionLedger,
+        NativeCompactionPolicy,
+        NativeCompactionRoute,
+    )
+
+    route = NativeCompactionRoute(
+        issuer_kind="codex_backend",
+        endpoint="https://chatgpt.com/backend-api/codex",
+        model="gpt-5.6-sol",
+    )
+    policy = NativeCompactionPolicy(
+        route=route,
+        fallback_count=1,
+    ).transition("unsupported", error="unknown_parameter:context_management")
+    state = NativeCompactionLedger.empty().with_policy(policy).to_dict()
+    assert db.compare_and_set_codex_responses_compaction_state(
+        "atomic-parent", expected_revision=0, state=state
+    )
+    parent_state = db.get_codex_responses_compaction_state("atomic-parent")
     assert db.try_acquire_compression_lock("atomic-parent", "winner", ttl_seconds=60)
 
     db.publish_compression_child(
@@ -120,6 +140,7 @@ def test_publish_compression_child_exposes_complete_child(db: SessionDB) -> None
     assert child is not None
     assert child["id"] == "atomic-child"
     assert child["system_prompt"] == "compressed system"
+    assert db.get_codex_responses_compaction_state("atomic-child") == parent_state
     assert [m["content"] for m in db.get_messages("atomic-child")] == ["summary"]
 
 

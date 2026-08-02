@@ -52,6 +52,7 @@ class TestBuildReplayEntry:
             "reasoning_details": [],
             "codex_reasoning_items": [],
             "codex_message_items": [],
+            "codex_output_items": [],
             "finish_reason": "",
         }
         entry = _build_replay_entry("assistant", "answer", msg)
@@ -69,6 +70,9 @@ class TestBuildReplayEntry:
                 "content": [{"type": "output_text", "text": "x"}],
             }
         ]
+        output_items = [
+            {"type": "compaction", "encrypted_content": "opaque"}
+        ]
         msg = {
             "role": "assistant",
             "content": "answer",
@@ -77,6 +81,7 @@ class TestBuildReplayEntry:
             "reasoning_details": details,
             "codex_reasoning_items": codex_items,
             "codex_message_items": msg_items,
+            "codex_output_items": output_items,
             "finish_reason": "stop",
         }
         entry = _build_replay_entry("assistant", "answer", msg)
@@ -85,6 +90,7 @@ class TestBuildReplayEntry:
         assert entry["reasoning_details"] == details
         assert entry["codex_reasoning_items"] == codex_items
         assert entry["codex_message_items"] == msg_items
+        assert entry["codex_output_items"] == output_items
         assert entry["finish_reason"] == "stop"
 
 
@@ -96,6 +102,7 @@ class TestBuildReplayEntry:
             "reasoning_details",
             "codex_reasoning_items",
             "codex_message_items",
+            "codex_output_items",
             "finish_reason",
         )
 
@@ -143,3 +150,32 @@ class TestGatewayHistoryBuildForwardsSidecar:
         agent_history, _obs = _build_gateway_agent_history(history)
         assert agent_history[0]["api_content"] == "hi\n\nCTX"
 
+    def test_compaction_only_assistant_checkpoint_is_not_dropped(self):
+        from gateway.run import _build_gateway_agent_history
+
+        checkpoint = [
+            {
+                "type": "compaction",
+                "encrypted_content": "opaque",
+                "_issuer_kind": "codex_backend",
+                "_compaction_route": {
+                    "issuer_kind": "codex_backend",
+                    "endpoint": "https://chatgpt.com/backend-api/codex",
+                    "model": "gpt-5.6-sol",
+                },
+            }
+        ]
+        agent_history, _obs = _build_gateway_agent_history(
+            [
+                {"role": "user", "content": "work"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "codex_output_items": checkpoint,
+                    "finish_reason": "incomplete",
+                },
+            ]
+        )
+
+        assert agent_history[-1]["content"] == ""
+        assert agent_history[-1]["codex_output_items"] == checkpoint

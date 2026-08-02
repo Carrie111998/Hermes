@@ -3398,30 +3398,18 @@ class APIServerAdapter(BasePlatformAdapter):
         source, err = await self._get_existing_session_or_404(source_id)
         if err:
             return err
+        assert source is not None
         body, err = await self._read_json_body(request)
         if err:
             return err
         db = await self._ensure_session_db_async()
+        assert db is not None
         fork_id = str(body.get("id") or body.get("session_id") or f"api_{int(time.time())}_{uuid.uuid4().hex[:8]}").strip()
         if not fork_id or re.search(r'[\r\n\x00]', fork_id):
             return web.json_response(_openai_error("Invalid session ID", code="invalid_session_id"), status=400)
         if await asyncio.to_thread(db.get_session, fork_id):
             return web.json_response(_openai_error(f"Session already exists: {fork_id}", code="session_exists"), status=409)
 
-        # Match the CLI /branch semantics: mark the original as branched, then
-        # create a child session that carries the transcript forward. This uses
-        # SessionDB's native parent_session_id/end_reason visibility model rather
-        # than inventing a parallel fork store.
-        await asyncio.to_thread(db.end_session, source_id, "branched")
-        await asyncio.to_thread(db.create_session,
-            fork_id,
-            "api_server",
-            model=source.get("model"),
-            system_prompt=source.get("system_prompt"),
-            parent_session_id=source_id,
-        )
-        messages = await asyncio.to_thread(db.get_messages, source_id)
-        await asyncio.to_thread(db.replace_messages, fork_id, messages)
         title = body.get("title")
         if title is None:
             base = source.get("title") or "fork"
@@ -3430,9 +3418,44 @@ class APIServerAdapter(BasePlatformAdapter):
             except Exception:
                 title = f"{base} fork"
         try:
-            await asyncio.to_thread(db.set_session_title, fork_id, str(title))
+            title = db.sanitize_title(str(title))
         except ValueError as exc:
             return web.json_response(_openai_error(str(exc), code="invalid_title"), status=400)
+
+        # Publish parent end, child row, transcript, lifecycle, and title in one write.
+        messages = await asyncio.to_thread(
+            db.get_messages_as_conversation, source_id
+        )
+        try:
+            await asyncio.to_thread(
+                db.create_session_fork,
+                parent_session_id=source_id,
+                child_session_id=fork_id,
+                source="api_server",
+                model=source.get("model"),
+                model_config=None,
+                system_prompt=source.get("system_prompt"),
+                title=title,
+                messages=messages,
+                quarantine_error="checkpoint_missing_in_fork",
+                end_parent_reason="branched",
+            )
+        except ValueError as exc:
+            message = str(exc)
+            if message.startswith("Title ") and "already in use" in message:
+                code = "title_exists"
+            elif "already exists" in message:
+                code = "session_exists"
+            else:
+                code = "fork_conflict"
+            return web.json_response(
+                _openai_error(message, code=code), status=409
+            )
+        except Exception:
+            logger.exception("API session fork failed for %s", source_id)
+            return web.json_response(
+                _openai_error("Session fork failed", code="fork_failed"), status=500
+            )
         fork = await asyncio.to_thread(db.get_session, fork_id) or {"id": fork_id, "parent_session_id": source_id}
         return web.json_response({"object": "hermes.session", "session": self._session_response(fork)}, status=201)
 

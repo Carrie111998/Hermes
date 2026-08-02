@@ -194,6 +194,13 @@ class TestLockContended413Defer:
             result = agent.run_conversation("hello", conversation_history=list(_PREFILL))
 
         mock_compress.assert_called_once()
+        call_kwargs = mock_compress.call_args.kwargs
+        assert call_kwargs["force"] is True
+        payload_authorization = call_kwargs[
+            "emergency_hermes_compaction_authorization"
+        ]
+        assert payload_authorization is not True
+        assert payload_authorization.reason == "provider_payload_too_large"
         assert result.get("compression_deferred") is True
         assert not result.get("compression_exhausted")
         # Soft defer: transient, retry-next-message semantics — the gateway
@@ -202,6 +209,35 @@ class TestLockContended413Defer:
         assert result.get("completed") is False
         assert result.get("partial") is True
 
+    def test_lock_contended_context_overflow_forwards_emergency_authorization(
+        self, agent
+    ):
+        agent.client.chat.completions.create.side_effect = _make_overflow_error()
+
+        with (
+            patch.object(
+                agent,
+                "_compress_context",
+                side_effect=_lock_skipping_compress(agent),
+            ) as mock_compress,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation(
+                "hello", conversation_history=list(_PREFILL)
+            )
+
+        mock_compress.assert_called_once()
+        call_kwargs = mock_compress.call_args.kwargs
+        assert call_kwargs["force"] is True
+        overflow_authorization = call_kwargs[
+            "emergency_hermes_compaction_authorization"
+        ]
+        assert overflow_authorization is not True
+        assert overflow_authorization.reason == "provider_context_overflow"
+        assert result.get("compression_deferred") is True
+        assert not result.get("compression_exhausted")
 
     def test_unconfirmed_lock_skip_true_also_defers(self, agent):
         """``_compression_skipped_due_to_lock = True`` (holder unconfirmed —
@@ -223,6 +259,35 @@ class TestLockContended413Defer:
         assert not result.get("compression_exhausted")
 
 
+@pytest.mark.parametrize(
+    "error_factory",
+    [_make_413_error, _make_overflow_error],
+    ids=["payload-413", "context-overflow"],
+)
+def test_exhausted_retry_budget_does_not_prepare_emergency_handoff(
+    agent,
+    error_factory,
+):
+    """Attempt exhaustion must be decided before durable emergency preparation."""
+    agent.max_compression_attempts = 0
+    agent.client.chat.completions.create.side_effect = error_factory()
+
+    with (
+        patch(
+            "agent.conversation_loop.prepare_emergency_hermes_compaction"
+        ) as prepare_emergency,
+        patch.object(agent, "_compress_context") as compress,
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation(
+            "hello", conversation_history=list(_PREFILL)
+        )
+
+    assert result.get("compression_exhausted") is True
+    prepare_emergency.assert_not_called()
+    compress.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

@@ -675,6 +675,14 @@ DEFAULT_CONFIG = {
                                       # Hermes' compression threshold triggers
                                       # thread/compact/start; off = never auto-trigger
                                       # (codex may still compact natively).
+        "codex_responses_auto": "hermes",  # OpenAI Codex Responses runtime compaction.
+                                      # hermes = existing local semantic compressor
+                                      # (default); native = opt in to Responses
+                                      # context_management with a fail-closed local
+                                      # fallback; off = no automatic compaction.
+        "codex_responses_compact_threshold": 200000,  # Native trigger in input tokens.
+                                      # Resolved safely below the active model's
+                                      # context/output limit when native mode is used.
         "in_place": True,             # When True, compaction rewrites the message
                                       # list and rebuilds the system prompt WITHOUT
                                       # rotating the session id — the conversation

@@ -184,6 +184,7 @@ class ChatCompletionsTransport(ProviderTransport):
             if (
                 "codex_reasoning_items" in msg
                 or "codex_message_items" in msg
+                or "codex_output_items" in msg
                 or "tool_name" in msg
                 or "effect_disposition" in msg
                 or "timestamp" in msg  # #47868 — strict providers reject this
@@ -227,6 +228,7 @@ class ChatCompletionsTransport(ProviderTransport):
             if (
                 "codex_reasoning_items" in msg
                 or "codex_message_items" in msg
+                or "codex_output_items" in msg
                 or "tool_name" in msg
                 or "effect_disposition" in msg
                 or "timestamp" in msg  # #47868 — leak into strict providers
@@ -235,6 +237,7 @@ class ChatCompletionsTransport(ProviderTransport):
                 out_msg = mutable_msg()
                 out_msg.pop("codex_reasoning_items", None)
                 out_msg.pop("codex_message_items", None)
+                out_msg.pop("codex_output_items", None)
                 out_msg.pop("tool_name", None)
                 out_msg.pop("effect_disposition", None)
                 out_msg.pop("timestamp", None)  # #47868 — leak into strict providers

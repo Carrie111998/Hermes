@@ -116,6 +116,7 @@ class ResponsesApiTransport(ProviderTransport):
     # response are stamped with the endpoint that minted them. Plain class
     # attribute default; mutated on the instance, not the class.
     _last_issuer_kind: Optional[str] = None
+    _last_compaction_route: Optional[Dict[str, str]] = None
 
     @property
     def api_mode(self) -> str:
@@ -136,6 +137,10 @@ class ResponsesApiTransport(ProviderTransport):
         from agent.codex_responses_adapter import _chat_messages_to_responses_input
         issuer = self._resolve_issuer_kind(kwargs)
         self._last_issuer_kind = issuer
+        compaction_route = kwargs.get("native_compaction_route")
+        if not isinstance(compaction_route, dict):
+            compaction_route = None
+        self._last_compaction_route = compaction_route
         return _chat_messages_to_responses_input(
             messages,
             is_xai_responses=kwargs.get("is_xai_responses") is True,
@@ -144,6 +149,10 @@ class ResponsesApiTransport(ProviderTransport):
                 kwargs.get("replay_encrypted_reasoning", True)
             ),
             current_issuer_kind=issuer,
+            current_compaction_route=compaction_route,
+            expected_compaction_digest=kwargs.get(
+                "native_compaction_digest"
+            ),
         )
 
     def convert_tools(self, tools: List[Dict[str, Any]]) -> Any:
@@ -184,9 +193,26 @@ class ResponsesApiTransport(ProviderTransport):
             _chat_messages_to_responses_input,
             _responses_tools,
         )
+        from agent.responses_compaction import (
+            validate_native_request_overrides,
+            validate_responses_continuation_overrides,
+        )
 
         from run_agent import DEFAULT_AGENT_IDENTITY
 
+        raw_request_overrides = params.get("request_overrides")
+        enforce_native_request_custody = bool(
+            params.get("enforce_native_request_custody")
+            or params.get("native_context_management") is not None
+        )
+        if enforce_native_request_custody:
+            request_overrides = validate_native_request_overrides(
+                raw_request_overrides
+            )
+        else:
+            request_overrides = validate_responses_continuation_overrides(
+                raw_request_overrides
+            )
         instructions = params.get("instructions", "")
         payload_messages = messages
         if not instructions:
@@ -202,6 +228,9 @@ class ResponsesApiTransport(ProviderTransport):
         replay_encrypted_reasoning = bool(
             params.get("replay_encrypted_reasoning", True)
         )
+        replay_native_compaction = bool(
+            params.get("replay_native_compaction", True)
+        )
 
         # Resolve the issuing endpoint for this call. Stashed on the
         # transport so normalize_response can stamp it onto reasoning
@@ -210,6 +239,10 @@ class ResponsesApiTransport(ProviderTransport):
         # dropped before the API rejects them.
         issuer_kind = self._resolve_issuer_kind(params)
         self._last_issuer_kind = issuer_kind
+        compaction_route = params.get("native_compaction_route")
+        if not isinstance(compaction_route, dict):
+            compaction_route = None
+        self._last_compaction_route = compaction_route
 
         # Resolve reasoning effort
         reasoning_effort = "medium"
@@ -306,7 +339,12 @@ class ResponsesApiTransport(ProviderTransport):
                 is_xai_responses=is_xai_responses,
                 is_github_responses=is_github_responses,
                 replay_encrypted_reasoning=replay_encrypted_reasoning,
+                replay_native_compaction=replay_native_compaction,
                 current_issuer_kind=issuer_kind,
+                current_compaction_route=compaction_route,
+                expected_compaction_digest=params.get(
+                    "native_compaction_digest"
+                ),
             ),
             "store": False,
         }
@@ -365,9 +403,11 @@ class ResponsesApiTransport(ProviderTransport):
         elif not is_github_responses and not is_xai_responses:
             kwargs["include"] = []
 
-        request_overrides = params.get("request_overrides")
         if request_overrides:
             kwargs.update(request_overrides)
+        native_context_management = params.get("native_context_management")
+        if native_context_management is not None:
+            kwargs["context_management"] = native_context_management
 
         if "prompt_cache_key" in kwargs:
             bounded_cache_key = _bounded_prompt_cache_key(kwargs["prompt_cache_key"])
@@ -476,7 +516,12 @@ class ResponsesApiTransport(ProviderTransport):
         # turns can detect a model swap and drop foreign-issuer blobs.
         issuer_kind = kwargs.get("issuer_kind") or self._last_issuer_kind
         # _normalize_codex_response returns (SimpleNamespace, finish_reason_str)
-        msg, finish_reason = _normalize_codex_response(response, issuer_kind=issuer_kind)
+        compaction_route = kwargs.get("compaction_route") or self._last_compaction_route
+        msg, finish_reason = _normalize_codex_response(
+            response,
+            issuer_kind=issuer_kind,
+            compaction_route=compaction_route,
+        )
 
         tool_calls = None
         if msg and msg.tool_calls:
@@ -500,6 +545,8 @@ class ResponsesApiTransport(ProviderTransport):
             provider_data["codex_reasoning_items"] = msg.codex_reasoning_items
         if msg and hasattr(msg, "codex_message_items") and msg.codex_message_items:
             provider_data["codex_message_items"] = msg.codex_message_items
+        if msg and hasattr(msg, "codex_output_items") and msg.codex_output_items:
+            provider_data["codex_output_items"] = msg.codex_output_items
         if msg and hasattr(msg, "reasoning_details") and msg.reasoning_details:
             provider_data["reasoning_details"] = msg.reasoning_details
 

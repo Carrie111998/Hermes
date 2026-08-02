@@ -6,6 +6,7 @@ are made.
 """
 
 import ast
+import asyncio
 import inspect
 import io
 import json
@@ -135,6 +136,9 @@ def test_direct_session_db_flushes_share_marker_claim(agent):
                 self.entered.set()
                 assert self.release.wait(timeout=5)
             self.rows.append(kwargs["content"])
+
+        def flush_token_counts(self):
+            pass
 
     db = _BarrierDB()
     agent._session_db = db
@@ -2371,6 +2375,100 @@ class TestHandleMaxIterations:
             outcome="success",
         )
 
+    @pytest.mark.parametrize(
+        ("summary_texts", "expected_outcome", "expected_retries"),
+        [
+            (["Summary"], "success", [0]),
+            (["", "Summary"], "success", [0, 1]),
+            (["", ""], "failed", [0, 1]),
+        ],
+    )
+    def test_v7_codex_summary_attempts_share_one_logical_call(
+        self,
+        agent,
+        summary_texts,
+        expected_outcome,
+        expected_retries,
+    ):
+        agent.api_mode = "codex_responses"
+        agent.provider = "openai-codex"
+        agent.base_url = "https://chatgpt.com/backend-api/codex"
+        agent._base_url_lower = agent.base_url.lower()
+        agent._base_url_hostname = "chatgpt.com"
+        agent.model = "gpt-5.6-sol"
+        agent._cached_system_prompt = "You are helpful."
+        logical_calls = []
+
+        def fake_run_codex_stream(kwargs, *, logical_call_metadata=None, **_extra):
+            logical_calls.append(logical_call_metadata)
+            text = summary_texts[len(logical_calls) - 1]
+            return SimpleNamespace(
+                status="completed",
+                output=[
+                    SimpleNamespace(
+                        type="message",
+                        status="completed",
+                        content=[SimpleNamespace(type="output_text", text=text)],
+                    )
+                ],
+            )
+
+        with (
+            patch.object(
+                agent, "_run_codex_stream", side_effect=fake_run_codex_stream
+            ),
+            patch("agent.relay_llm.complete_logical_call") as complete_logical,
+        ):
+            result = agent._handle_max_iterations(
+                [{"role": "user", "content": "do stuff"}],
+                60,
+            )
+
+        assert isinstance(result, str)
+        assert all(metadata is not None for metadata in logical_calls)
+        assert [metadata["retry_count"] for metadata in logical_calls] == expected_retries
+        logical_ids = {metadata["api_request_id"] for metadata in logical_calls}
+        assert len(logical_ids) == 1
+        logical_id = logical_ids.pop()
+        assert logical_id.startswith("iteration-summary:")
+        assert all(
+            metadata["call_role"] == "iteration_summary"
+            for metadata in logical_calls
+        )
+        complete_logical.assert_called_once_with(
+            logical_id,
+            outcome=expected_outcome,
+        )
+
+    def test_v7_codex_summary_cancellation_completes_its_logical_call(self, agent):
+        agent.api_mode = "codex_responses"
+        agent.provider = "openai-codex"
+        agent.base_url = "https://chatgpt.com/backend-api/codex"
+        agent._base_url_lower = agent.base_url.lower()
+        agent._base_url_hostname = "chatgpt.com"
+        agent.model = "gpt-5.6-sol"
+        agent._cached_system_prompt = "You are helpful."
+        logical_calls = []
+
+        def cancel_summary(kwargs, *, logical_call_metadata=None, **_extra):
+            logical_calls.append(logical_call_metadata)
+            raise asyncio.CancelledError()
+
+        with (
+            patch.object(agent, "_run_codex_stream", side_effect=cancel_summary),
+            patch("agent.relay_llm.complete_logical_call") as complete_logical,
+        ):
+            with pytest.raises(asyncio.CancelledError):
+                agent._handle_max_iterations(
+                    [{"role": "user", "content": "do stuff"}],
+                    60,
+                )
+
+        assert logical_calls[0] is not None
+        logical_id = logical_calls[0]["api_request_id"]
+        assert logical_id.startswith("iteration-summary:")
+        complete_logical.assert_called_once_with(logical_id, outcome="failed")
+
     def test_api_failure_returns_error(self, agent):
         agent.client.chat.completions.create.side_effect = Exception("API down")
         agent._cached_system_prompt = "You are helpful."
@@ -2440,6 +2538,7 @@ class TestHandleMaxIterations:
                 "role": "assistant",
                 "tool_calls": [{"id": "call_1", "function": {"name": "execute_code", "arguments": "{}"}}],
                 "codex_reasoning_items": [{"id": "rs_1"}],
+                "codex_output_items": [{"type": "compaction", "encrypted_content": "opaque"}],
             },
             {"role": "tool", "tool_call_id": "call_1", "content": "result", "tool_name": "execute_code"},
             {"role": "assistant", "content": "Done.", "_empty_recovery_synthetic": True},
@@ -2453,10 +2552,14 @@ class TestHandleMaxIterations:
             assert "tool_name" not in m, m
             assert "codex_reasoning_items" not in m, m
             assert "codex_message_items" not in m, m
+            assert "codex_output_items" not in m, m
             assert not any(isinstance(k, str) and k.startswith("_") for k in m), m
         # Internal history is untouched — the path copies each message.
         assert messages[2]["tool_name"] == "execute_code"
         assert messages[1]["codex_reasoning_items"] == [{"id": "rs_1"}]
+        assert messages[1]["codex_output_items"] == [
+            {"type": "compaction", "encrypted_content": "opaque"}
+        ]
 
 
 
@@ -2473,7 +2576,7 @@ class TestHandleMaxIterations:
         agent._cached_system_prompt = "You are helpful."
         captured = {}
 
-        def fake_run_codex_stream(kwargs):
+        def fake_run_codex_stream(kwargs, **_call_metadata):
             captured.update(kwargs)
             return SimpleNamespace(
                 status="completed",

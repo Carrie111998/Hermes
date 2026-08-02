@@ -276,18 +276,28 @@ export const sessionCommands: SlashCommand[] = [
     run: (arg, ctx) => {
       const prevSid = ctx.sid
 
-      ctx.gateway.rpc<SessionBranchResponse>('session.branch', { name: arg, session_id: ctx.sid }).then(
-        ctx.guarded<SessionBranchResponse>(r => {
-          if (!r.session_id) {
-            return
-          }
+      ctx.gateway
+        .rpc<SessionBranchResponse>('session.branch', { name: arg, session_id: ctx.sid })
+        .then(
+          ctx.guarded<SessionBranchResponse>(r => {
+            if (!r.session_id) {
+              if (r.committed && r.stored_session_id) {
+                const detail = r.warning ? `: ${r.warning}` : ''
+                ctx.transcript.sys(
+                  `Branch saved as ${r.stored_session_id} but could not be opened${detail}. Resume it from sessions.`
+                )
+              }
 
-          void ctx.session.closeSession(prevSid)
-          patchUiState({ sid: r.session_id })
-          ctx.session.setSessionStartedAt(Date.now())
-          ctx.transcript.sys(`branched → ${r.title ?? ''}`)
-        })
-      )
+              return
+            }
+
+            void ctx.session.closeSession(prevSid)
+            patchUiState({ sid: r.session_id })
+            ctx.session.setSessionStartedAt(Date.now())
+            ctx.transcript.sys(`branched → ${r.title ?? ''}`)
+          })
+        )
+        .catch(ctx.guardedErr)
     }
   },
 

@@ -1170,13 +1170,14 @@ class AIAgent:
         """Disable Responses encrypted reasoning replay and strip cached state.
 
         Called from the conversation_loop retry path when the provider
-        rejects a replayed ``codex_reasoning_items`` blob with HTTP 400
+        rejects replayed encrypted state with HTTP 400
         ``invalid_encrypted_content``.  Sets ``self._codex_reasoning_replay_enabled``
         to ``False`` (consumed by ``codex_responses_adapter._chat_messages_to_responses_input``
         and ``transports/codex.py`` to drop ``reasoning.encrypted_content``
-        from subsequent requests) and pops ``codex_reasoning_items`` from
-        every assistant message in ``messages`` so they cannot be replayed
-        again later in the session.
+        from subsequent requests) and pops ``codex_reasoning_items`` from every
+        assistant message in ``messages``. Native compaction replay is disabled
+        separately by quarantining its route policy; its durable ordered output
+        remains intact as transcript evidence and for portable session replay.
 
         Returns a small stats dict ``{"messages": int, "items": int}``
         counting what was stripped — purely for diagnostic logging.
@@ -2014,6 +2015,8 @@ class AIAgent:
         _ov_idx = getattr(self, "_persist_user_message_idx", None)
         _ov_content = getattr(self, "_persist_user_message_override", None)
         _ov_timestamp = getattr(self, "_persist_user_message_timestamp", None)
+        _active_checkpoint_policy = None
+        _active_checkpoint_message = None
         try:
             # Retry row creation if the earlier attempt failed transiently.
             if not self._session_db_created:
@@ -2192,7 +2195,15 @@ class AIAgent:
                     ]
                 elif isinstance(msg.get("tool_calls"), list):
                     tool_calls_data = msg["tool_calls"]
-                self._session_db.append_message(
+                from agent.responses_compaction import (
+                    complete_native_compaction_checkpoint,
+                    pending_checkpoint_policy,
+                )
+
+                _checkpoint_policy = pending_checkpoint_policy(self, msg)
+                _active_checkpoint_policy = _checkpoint_policy
+                _active_checkpoint_message = msg
+                _append_kwargs = dict(
                     session_id=self.session_id,
                     role=role,
                     content=content,
@@ -2205,6 +2216,7 @@ class AIAgent:
                     reasoning_details=msg.get("reasoning_details") if role == "assistant" else None,
                     codex_reasoning_items=msg.get("codex_reasoning_items") if role == "assistant" else None,
                     codex_message_items=msg.get("codex_message_items") if role == "assistant" else None,
+                    codex_output_items=msg.get("codex_output_items") if role == "assistant" else None,
                     timestamp=_row_timestamp,
                     api_content=_row_api_content,
                     display_kind=(
@@ -2218,7 +2230,83 @@ class AIAgent:
                         self, "_active_compression_lock_holder", None
                     ),
                 )
+                if _checkpoint_policy is not None:
+                    _append_kwargs.update(
+                        codex_responses_compaction_policy=(
+                            _checkpoint_policy.to_dict()
+                        ),
+                        expected_codex_responses_compaction_revision=(
+                            _checkpoint_policy.revision
+                        ),
+                    )
+                _checkpoint_attempts = 2 if _checkpoint_policy is not None else 1
+                _checkpoint_reconciled = False
+                for _checkpoint_attempt in range(_checkpoint_attempts):
+                    try:
+                        self._session_db.append_message(**_append_kwargs)
+                        break
+                    except Exception as exc:
+                        from hermes_state import (
+                            CodexResponsesCompactionStateConflictError,
+                        )
+
+                        if (
+                            _checkpoint_policy is None
+                            or not isinstance(
+                                exc, CodexResponsesCompactionStateConflictError
+                            )
+                            or _checkpoint_attempt + 1 >= _checkpoint_attempts
+                        ):
+                            raise
+                        # One bounded reconciliation: another session writer
+                        # advanced an unrelated route between response receipt
+                        # and checkpoint commit. Reload the full ledger, merge
+                        # only this route, and retry the atomic INSERT+UPDATE.
+                        from agent.responses_compaction import (
+                            _merge_policy,
+                            NativeCompactionReadError,
+                            read_policy_for_route,
+                        )
+
+                        _checkpoint_read = read_policy_for_route(
+                            self._session_db,
+                            self.session_id,
+                            _checkpoint_policy.route,
+                        )
+                        self._native_compaction_read_status = _checkpoint_read
+                        if _checkpoint_read.failed_closed:
+                            raise NativeCompactionReadError(
+                                _checkpoint_read.error
+                                or "native compaction durable read failed"
+                            )
+                        assert _checkpoint_read.policy is not None
+                        _current_policy = _checkpoint_read.policy
+                        _checkpoint_policy = _merge_policy(
+                            _current_policy, _checkpoint_policy
+                        )
+                        _checkpoint_reconciled = True
+                        _append_kwargs.update(
+                            codex_responses_compaction_policy=(
+                                _checkpoint_policy.to_dict()
+                            ),
+                            expected_codex_responses_compaction_revision=(
+                                _checkpoint_policy.revision
+                            ),
+                        )
+                if _checkpoint_policy is not None:
+                    _checkpoint_receipt = complete_native_compaction_checkpoint(
+                        self,
+                        msg,
+                        _checkpoint_policy,
+                        conflict_reconciled=_checkpoint_reconciled,
+                    )
+                    if not _checkpoint_receipt.authorizes_transition:
+                        msg[_DB_PERSISTED_MARKER] = True
+                        self._db_flush_scan_prefix = None
+                        return False
                 msg[_DB_PERSISTED_MARKER] = True
+                _active_checkpoint_policy = None
+                _active_checkpoint_message = None
             # The intrinsic markers are now the sole source of truth. Reset the
             # one-shot seed so no id() outlives this flush to alias a message
             # allocated next turn at a recycled address.
@@ -2229,6 +2317,24 @@ class AIAgent:
             self._db_flush_scan_prefix = messages[:]
             return True
         except Exception as e:
+            if _active_checkpoint_policy is not None:
+                from agent.responses_compaction import (
+                    failed_closed_transition_receipt,
+                    record_native_compaction_transition_receipt,
+                )
+
+                _receipt = failed_closed_transition_receipt(
+                    _active_checkpoint_policy,
+                    error="checkpoint_persistence_failed",
+                )
+                record_native_compaction_transition_receipt(self, _receipt)
+                self._native_compaction_policy = _receipt.policy
+                _pending = getattr(
+                    self, "_native_compaction_pending_commits", None
+                )
+                if isinstance(_pending, dict) and _active_checkpoint_message is not None:
+                    _pending.pop(id(_active_checkpoint_message), None)
+                self._native_compaction_pending_policy = None
             # Force a full re-scan on the next flush: an exception mid-loop
             # leaves messages with mixed dispositions.
             self._db_flush_scan_prefix = None
@@ -5017,10 +5123,23 @@ class AIAgent:
                 exc,
             )
 
-    def _run_codex_stream(self, api_kwargs: dict, client: Any = None, on_first_delta: callable = None):
+    def _run_codex_stream(
+        self,
+        api_kwargs: dict,
+        client: Any = None,
+        on_first_delta: Callable[..., Any] | None = None,
+        *,
+        logical_call_metadata: dict[str, Any] | None = None,
+    ):
         """Forwarder — see ``agent.codex_runtime.run_codex_stream``."""
         from agent.codex_runtime import run_codex_stream
-        return run_codex_stream(self, api_kwargs, client, on_first_delta)
+        return run_codex_stream(
+            self,
+            api_kwargs,
+            client,
+            on_first_delta,
+            logical_call_metadata=logical_call_metadata,
+        )
 
     def _run_codex_create_stream_fallback(self, api_kwargs: dict, client: Any = None):
         """Forwarder — see ``agent.codex_runtime.run_codex_create_stream_fallback``."""
@@ -6569,10 +6688,21 @@ class AIAgent:
                     content[-1]["cache_control"] = {"type": "ephemeral"}
                 break
 
-    def _build_api_kwargs(self, api_messages: list, tools_for_api: Optional[list] = None) -> dict:
+    def _build_api_kwargs(
+        self,
+        api_messages: list,
+        tools_for_api: Optional[list] = None,
+        *,
+        native_summary_projection: bool = False,
+    ) -> dict:
         """Forwarder — see ``agent.chat_completion_helpers.build_api_kwargs``."""
         from agent.chat_completion_helpers import build_api_kwargs
-        return build_api_kwargs(self, api_messages, tools_for_api=tools_for_api)
+        return build_api_kwargs(
+            self,
+            api_messages,
+            tools_for_api=tools_for_api,
+            native_summary_projection=native_summary_projection,
+        )
 
     def _supports_reasoning_extra_body(self) -> bool:
         """Return True when reasoning extra_body is safe to send for this route/model.
@@ -6899,15 +7029,62 @@ class AIAgent:
         force: bool = False,
         defer_context_engine_notification: bool = False,
         commit_fence=None,
+        hermes_compaction_authorization=None,
+        emergency_hermes_compaction_authorization=None,
     ) -> tuple:
         """Forwarder — see ``agent.conversation_compression.compress_context``.
 
-        ``force=True`` is passed by the manual ``/compress`` slash command
-        so users can bypass the summary-failure cooldown after an
-        auto-compress abort.  Auto-compress callers use the default
-        ``force=False``.
+        ``force=True`` bypasses only the textual summarizer's failure cooldown;
+        it never bypasses native Responses custody. Explicit manual callers and
+        genuine provider-overflow recovery each pass a distinct one-shot,
+        route-bound authorization after durable custody is resolved.
         """
         from agent.conversation_compression import compress_context
+        from agent.responses_compaction import (
+            consume_emergency_hermes_compaction_authorization,
+            consume_manual_hermes_compaction_authorization,
+            effective_auto_compaction_mode,
+            should_defer_automatic_hermes_compaction,
+        )
+
+        if (
+            hermes_compaction_authorization is not None
+            and emergency_hermes_compaction_authorization is not None
+        ):
+            logger.warning(
+                "Hermes textual compaction denied: manual and emergency custody "
+                "authorizations are mutually exclusive"
+            )
+            return messages, system_message
+        if effective_auto_compaction_mode(self) == "off":
+            logger.info("Hermes textual compaction denied: compaction mode is off")
+            return messages, system_message
+        if hermes_compaction_authorization is not None:
+            if not consume_manual_hermes_compaction_authorization(
+                self,
+                hermes_compaction_authorization,
+            ):
+                logger.warning(
+                    "Hermes textual compaction denied: manual custody "
+                    "authorization is invalid, stale, reused, or route-mismatched"
+                )
+                return messages, system_message
+        elif emergency_hermes_compaction_authorization is not None:
+            if not consume_emergency_hermes_compaction_authorization(
+                self,
+                emergency_hermes_compaction_authorization,
+            ):
+                logger.warning(
+                    "Hermes textual compaction denied: emergency custody "
+                    "authorization is invalid, stale, reused, or route-mismatched"
+                )
+                return messages, system_message
+        elif should_defer_automatic_hermes_compaction(self, refresh=True):
+            logger.info(
+                "Hermes textual compaction deferred for current Responses route custody"
+            )
+            return messages, system_message
+
         from agent.portal_tags import (
             get_conversation_context,
             reset_conversation_context,

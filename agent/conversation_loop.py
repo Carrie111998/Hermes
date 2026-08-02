@@ -80,6 +80,13 @@ from agent.retry_utils import (
     jittered_backoff,
     zai_coding_overload_retry_ceiling,
 )
+from agent.responses_compaction import (
+    effective_auto_compaction_mode,
+    prepare_emergency_hermes_compaction,
+    record_native_compaction_transition_receipt,
+    should_defer_automatic_hermes_compaction,
+    validate_native_request_overrides,
+)
 from agent.trajectory import has_incomplete_scratchpad
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
 from hermes_constants import PARTIAL_STREAM_STUB_ID
@@ -1266,6 +1273,18 @@ def run_conversation(
     Returns:
         Dict: Complete conversation result with final response and message history
     """
+    if (
+        getattr(agent, "api_mode", None) == "codex_responses"
+        and effective_auto_compaction_mode(agent) == "native"
+    ):
+        # Request-override custody is a pre-turn invariant. Reject before turn
+        # setup can refresh route policy, compact history, or enter provider
+        # retry/fallback handling. The builder and transport repeat this same
+        # validation for direct-call safety.
+        validate_native_request_overrides(
+            getattr(agent, "request_overrides", None)
+        )
+
     if moa_config is None:
         try:
             from hermes_cli.moa_config import decode_moa_turn
@@ -1285,6 +1304,7 @@ def run_conversation(
     agent._last_compaction_in_place = False
     agent._last_compression_attempt_recorded = False
     agent._last_compression_attempt_in_place = None
+    agent._native_compaction_continuation_used = False
 
     # ── Per-turn setup (the prologue) ──
     # All once-per-turn setup — stdio guarding, retry-counter resets, user
@@ -1370,6 +1390,10 @@ def run_conversation(
     # retain that ephemeral output and rebase it onto the compacted transcript
     # on the next loop iteration. This prevents a second advisor fan-out.
     pending_moa_prepared_request = None
+    # Native Responses compaction is a provider protocol boundary, not an
+    # ordinary agent/tool iteration. One separately-bounded credit may cross
+    # the ordinary max-iteration/budget boundary to replay that checkpoint.
+    _native_protocol_continuation_credit = False
 
     # Per-turn tally of consecutive successful credential-pool token refreshes,
     # keyed by (provider, pool-entry-id). A persistent upstream 401 lets
@@ -1399,7 +1423,19 @@ def run_conversation(
             should_review_memory=_should_review_memory,
         )
 
-    while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
+    while (
+        (
+            api_call_count < agent.max_iterations
+            and agent.iteration_budget.remaining > 0
+        )
+        or agent._budget_grace_call
+        or _native_protocol_continuation_credit
+    ):
+        _using_native_protocol_continuation = bool(
+            _native_protocol_continuation_credit
+        )
+        if _using_native_protocol_continuation:
+            _native_protocol_continuation_credit = False
         _redirect_text = agent._drain_pending_redirect()
         if _redirect_text:
             _apply_active_turn_redirect(agent, messages, _redirect_text)
@@ -1428,7 +1464,9 @@ def run_conversation(
         # Grace call: the budget is exhausted but we gave the model one
         # more chance.  Consume the grace flag so the loop exits after
         # this iteration regardless of outcome.
-        if agent._budget_grace_call:
+        if _using_native_protocol_continuation:
+            pass
+        elif agent._budget_grace_call:
             agent._budget_grace_call = False
         elif not agent.iteration_budget.consume():
             _turn_exit_reason = "budget_exhausted"
@@ -1964,6 +2002,7 @@ def run_conversation(
         )()
         if (
             agent.compression_enabled
+            and not should_defer_automatic_hermes_compaction(agent)
             and len(messages) > 1
             and compression_attempts < max_compression_attempts
             and not _preflight_compression_blocked
@@ -3829,6 +3868,85 @@ def run_conversation(
                 )
 
                 if (
+                    agent.api_mode == "codex_responses"
+                    and bool(
+                        getattr(agent, "_native_compaction_request_active", False)
+                    )
+                    and not _retry.native_compaction_downgrade_attempted
+                ):
+                    from dataclasses import replace as _dc_replace
+                    from agent.responses_compaction import (
+                        is_structured_compaction_unsupported_error,
+                        persist_policy_compare_and_set,
+                        policy_after_structured_compaction_rejection,
+                    )
+                    if is_structured_compaction_unsupported_error(api_error):
+                        _retry.native_compaction_downgrade_attempted = True
+                        _native_policy = getattr(
+                            agent, "_native_compaction_policy", None
+                        )
+                        if _native_policy is not None:
+                            try:
+                                _native_policy = (
+                                    policy_after_structured_compaction_rejection(
+                                        _native_policy
+                                    )
+                                )
+                            except ValueError:
+                                pass
+                            _native_policy = _dc_replace(
+                                _native_policy,
+                                fallback_count=_native_policy.fallback_count + 1,
+                            )
+                            _native_receipt = persist_policy_compare_and_set(
+                                getattr(agent, "_session_db", None),
+                                getattr(agent, "session_id", None),
+                                _native_policy,
+                            )
+                            record_native_compaction_transition_receipt(
+                                agent, _native_receipt
+                            )
+                            agent._native_compaction_policy = (
+                                _native_receipt.policy
+                            )
+                            if not _native_receipt.authorizes_transition:
+                                agent._cleanup_task_resources(effective_task_id)
+                                return {
+                                    "final_response": (
+                                        "Native compaction downgrade persistence failed"
+                                    ),
+                                    "messages": messages,
+                                    "api_calls": api_call_count,
+                                    "completed": False,
+                                    "partial": True,
+                                    "error": (
+                                        "Native compaction downgrade persistence failed"
+                                    ),
+                                }
+                        else:
+                            agent._cleanup_task_resources(effective_task_id)
+                            return {
+                                "final_response": (
+                                    "Native compaction downgrade state is unavailable"
+                                ),
+                                "messages": messages,
+                                "api_calls": api_call_count,
+                                "completed": False,
+                                "partial": True,
+                                "error": (
+                                    "Native compaction downgrade state is unavailable"
+                                ),
+                            }
+                        agent._native_compaction_request_active = False
+                        agent._native_compaction_replay_attempted = False
+                        agent._vprint(
+                            f"{agent.log_prefix}↩️ Native Responses compaction is unsupported on this route; "
+                            "falling back to Hermes compaction and rebuilding the request once.",
+                            force=True,
+                        )
+                        continue
+
+                if (
                     classified.reason == FailoverReason.billing
                     and _is_nous_inference_route(
                         getattr(agent, "provider", "") or "",
@@ -4106,16 +4224,90 @@ def run_conversation(
                     classified.reason == FailoverReason.invalid_encrypted_content
                     and not _retry.invalid_encrypted_content_retry_attempted
                     and agent.api_mode == "codex_responses"
-                    and bool(getattr(agent, "_codex_reasoning_replay_enabled", True))
                     and any(
                         isinstance(_m, dict)
                         and _m.get("role") == "assistant"
-                        and isinstance(_m.get("codex_reasoning_items"), list)
-                        and _m.get("codex_reasoning_items")
+                        and (
+                            (
+                                bool(getattr(agent, "_codex_reasoning_replay_enabled", True))
+                                and isinstance(_m.get("codex_reasoning_items"), list)
+                                and _m.get("codex_reasoning_items")
+                            )
+                            or (
+                                isinstance(_m.get("codex_output_items"), list)
+                                and _m.get("codex_output_items")
+                            )
+                        )
                         for _m in messages
                     )
                 ):
                     _retry.invalid_encrypted_content_retry_attempted = True
+                    _native_replay_rejected = bool(
+                        getattr(agent, "_native_compaction_replay_attempted", False)
+                    )
+                    if _native_replay_rejected:
+                        from dataclasses import replace as _dc_replace
+                        from agent.responses_compaction import (
+                            persist_policy_compare_and_set,
+                        )
+                        _native_policy = getattr(
+                            agent, "_native_compaction_policy", None
+                        )
+                        if _native_policy is not None:
+                            try:
+                                _native_policy = _native_policy.transition(
+                                    "quarantined",
+                                    error="provider_rejected_compaction_replay",
+                                )
+                            except ValueError:
+                                pass
+                            _native_policy = _dc_replace(
+                                _native_policy,
+                                fallback_count=_native_policy.fallback_count + 1,
+                            )
+                            _native_receipt = persist_policy_compare_and_set(
+                                getattr(agent, "_session_db", None),
+                                getattr(agent, "session_id", None),
+                                _native_policy,
+                            )
+                            record_native_compaction_transition_receipt(
+                                agent, _native_receipt
+                            )
+                            agent._native_compaction_policy = (
+                                _native_receipt.policy
+                            )
+                            if not _native_receipt.authorizes_transition:
+                                agent._cleanup_task_resources(effective_task_id)
+                                return {
+                                    "final_response": (
+                                        "Native compaction replay quarantine "
+                                        "persistence failed"
+                                    ),
+                                    "messages": messages,
+                                    "api_calls": api_call_count,
+                                    "completed": False,
+                                    "partial": True,
+                                    "error": (
+                                        "Native compaction replay quarantine "
+                                        "persistence failed"
+                                    ),
+                                }
+                        else:
+                            agent._cleanup_task_resources(effective_task_id)
+                            return {
+                                "final_response": (
+                                    "Native compaction replay state is unavailable"
+                                ),
+                                "messages": messages,
+                                "api_calls": api_call_count,
+                                "completed": False,
+                                "partial": True,
+                                "error": (
+                                    "Native compaction replay state is unavailable"
+                                ),
+                            }
+                        agent._native_compaction_replay_attempted = False
+                        agent._native_compaction_request_active = False
                     replay_stats = agent._disable_codex_reasoning_replay(messages)
                     agent._vprint(
                         f"{agent.log_prefix}⚠️  Encrypted reasoning replay was rejected by the provider — "
@@ -4592,6 +4784,8 @@ def run_conversation(
                         force=True,
                     )
 
+                payload_emergency_authorization = None
+
                 if is_payload_too_large:
                     compression_attempts += 1
                     if compression_attempts > max_compression_attempts:
@@ -4612,6 +4806,24 @@ def run_conversation(
                             "failed": True,
                             "compression_exhausted": True,
                         }
+                    payload_emergency_authorization = prepare_emergency_hermes_compaction(
+                        agent, reason="provider_payload_too_large"
+                    )
+                    if payload_emergency_authorization is False:
+                        agent._flush_status_buffer()
+                        agent._persist_session(messages, conversation_history)
+                        _final_response = (
+                            "Request payload too large while automatic compaction is disabled."
+                        )
+                        return {
+                            "final_response": _final_response,
+                            "messages": messages,
+                            "completed": False,
+                            "api_calls": api_call_count,
+                            "error": _final_response,
+                            "partial": True,
+                            "failed": True,
+                        }
                     agent._buffer_status(f"⚠️  Request payload too large (413) — compression attempt {compression_attempts}/{max_compression_attempts}...")
 
                     original_len = len(messages)
@@ -4620,6 +4832,10 @@ def run_conversation(
                     messages, active_system_prompt = agent._compress_context(
                         messages, system_message, approx_tokens=approx_tokens,
                         task_id=effective_task_id,
+                        force=True,
+                        emergency_hermes_compaction_authorization=(
+                            payload_emergency_authorization
+                        ),
                     )
                     if messages is _overflow_input and compression_skipped_due_to_lock(agent):
                         # #69870 lock-skip: the provider proved the request
@@ -4873,6 +5089,24 @@ def run_conversation(
                             "failed": True,
                             "compression_exhausted": True,
                         }
+                    context_overflow_authorization = prepare_emergency_hermes_compaction(
+                        agent, reason="provider_context_overflow"
+                    )
+                    if context_overflow_authorization is False:
+                        agent._flush_status_buffer()
+                        agent._persist_session(messages, conversation_history)
+                        _final_response = (
+                            "Context length exceeded while automatic compaction is disabled."
+                        )
+                        return {
+                            "final_response": _final_response,
+                            "messages": messages,
+                            "completed": False,
+                            "api_calls": api_call_count,
+                            "error": _final_response,
+                            "partial": True,
+                            "failed": True,
+                        }
                     agent._buffer_status(COMPRESSION_RETRY_TOO_LARGE_STATUS_TEMPLATE.format(tokens=approx_tokens, attempt=compression_attempts, cap=max_compression_attempts))
 
                     original_len = len(messages)
@@ -4881,6 +5115,10 @@ def run_conversation(
                     messages, active_system_prompt = agent._compress_context(
                         messages, system_message, approx_tokens=approx_tokens,
                         task_id=effective_task_id,
+                        force=True,
+                        emergency_hermes_compaction_authorization=(
+                            context_overflow_authorization
+                        ),
                     )
                     if messages is _overflow_input and compression_skipped_due_to_lock(agent):
                         # #69870 lock-skip: the provider proved the request
@@ -5618,7 +5856,49 @@ def run_conversation(
             normalized = _transport.normalize_response(response, **_normalize_kwargs)
             assistant_message = normalized
             finish_reason = normalized.finish_reason
-            
+
+            if (
+                agent.api_mode == "codex_responses"
+                and bool(getattr(agent, "_native_compaction_request_active", False))
+            ):
+                from agent.responses_compaction import (
+                    advance_policy_after_success,
+                    has_compaction_item,
+                    persist_policy_compare_and_set,
+                )
+                _native_policy = getattr(agent, "_native_compaction_policy", None)
+                if _native_policy is not None:
+                    _advanced_policy = advance_policy_after_success(
+                        _native_policy,
+                        codex_output_items=getattr(
+                            assistant_message, "codex_output_items", None
+                        ),
+                        replay_attempted=bool(
+                            getattr(
+                                agent,
+                                "_native_compaction_replay_attempted",
+                                False,
+                            )
+                        ),
+                    )
+                    if has_compaction_item(
+                        getattr(assistant_message, "codex_output_items", None)
+                    ):
+                        # Do not publish item_observed yet. The exact ordered
+                        # output checkpoint must be inserted in the same SQLite
+                        # transaction as the v3 ledger transition.
+                        agent._native_compaction_pending_policy = _advanced_policy
+                    elif _advanced_policy != _native_policy:
+                        _native_receipt = persist_policy_compare_and_set(
+                            getattr(agent, "_session_db", None),
+                            getattr(agent, "session_id", None),
+                            _advanced_policy,
+                        )
+                        record_native_compaction_transition_receipt(
+                            agent, _native_receipt
+                        )
+                        agent._native_compaction_policy = _native_receipt.policy
+
             # Normalize content to string — some OpenAI-compatible servers
             # (llama-server, etc.) return content as a dict or list instead
             # of a plain string, which crashes downstream .strip() calls.
@@ -5745,19 +6025,32 @@ def run_conversation(
             agent._incomplete_scratchpad_retries = 0
 
             if agent.api_mode == "codex_responses" and finish_reason == "incomplete":
-                agent._codex_incomplete_retries += 1
-
                 interim_msg = agent._build_assistant_message(assistant_message, finish_reason)
                 interim_has_content = bool((interim_msg.get("content") or "").strip())
                 interim_has_reasoning = bool(interim_msg.get("reasoning", "").strip()) if isinstance(interim_msg.get("reasoning"), str) else False
                 interim_has_codex_reasoning = bool(interim_msg.get("codex_reasoning_items"))
                 interim_has_codex_message_items = bool(interim_msg.get("codex_message_items"))
+                interim_has_codex_output_items = bool(interim_msg.get("codex_output_items"))
+                from agent.responses_compaction import (
+                    compaction_checkpoint_digest,
+                    has_compaction_item,
+                    pending_checkpoint_policy,
+                )
+                interim_has_compaction = has_compaction_item(
+                    interim_msg.get("codex_output_items")
+                )
+                native_compaction_only = bool(
+                    interim_has_compaction
+                    and not interim_has_content
+                    and not getattr(assistant_message, "tool_calls", None)
+                )
 
                 if (
                     interim_has_content
                     or interim_has_reasoning
                     or interim_has_codex_reasoning
                     or interim_has_codex_message_items
+                    or interim_has_codex_output_items
                 ):
                     last_msg = messages[-1] if messages else None
                     # Duplicate detection: compare only visible content
@@ -5786,6 +6079,10 @@ def run_conversation(
                         and last_msg.get("role") == "assistant"
                         and last_msg.get("finish_reason") == "incomplete"
                         and same_visible_output
+                        # Opaque checkpoints are distinct durable boundaries
+                        # even when both have empty visible text. Never merge a
+                        # newer compaction blob into an already-committed row.
+                        and not interim_has_compaction
                     )
                     if visible_duplicate:
                         # Update replay state in-place so the latest provider
@@ -5798,12 +6095,115 @@ def run_conversation(
                             "reasoning_details",
                             "codex_reasoning_items",
                             "codex_message_items",
+                            "codex_output_items",
                         ):
                             if _key in interim_msg:
                                 last_msg[_key] = interim_msg[_key]
                     else:
                         messages.append(interim_msg)
                         agent._emit_interim_assistant_message(interim_msg)
+
+                if native_compaction_only:
+                    continuation_used = bool(
+                        getattr(
+                            agent,
+                            "_native_compaction_continuation_used",
+                            False,
+                        )
+                    )
+                    if continuation_used:
+                        from dataclasses import replace as _dc_replace
+
+                        checkpoint_policy = pending_checkpoint_policy(
+                            agent, interim_msg
+                        ) or getattr(agent, "_native_compaction_policy", None)
+                        if checkpoint_policy is not None:
+                            try:
+                                checkpoint_policy = checkpoint_policy.transition(
+                                    "quarantined",
+                                    error="compaction_continuation_limit",
+                                )
+                            except ValueError:
+                                pass
+                            checkpoint_policy = _dc_replace(
+                                checkpoint_policy,
+                                fallback_count=(
+                                    checkpoint_policy.fallback_count + 1
+                                ),
+                            )
+                            pending = getattr(
+                                agent,
+                                "_native_compaction_pending_commits",
+                                None,
+                            )
+                            if isinstance(pending, dict) and id(interim_msg) in pending:
+                                pending[id(interim_msg)] = checkpoint_policy
+                                agent._native_compaction_pending_policy = (
+                                    checkpoint_policy
+                                )
+                            else:
+                                agent._native_compaction_policy = checkpoint_policy
+
+                    # A compaction-only response is a provider checkpoint, not
+                    # a completed assistant turn. Commit its exact ordered
+                    # output and route state before any replay. The flush has a
+                    # bounded CAS reconciliation and returns False on failure.
+                    checkpoint_flush = agent._flush_messages_to_session_db(
+                        messages, conversation_history
+                    )
+                    checkpoint_receipt = getattr(
+                        agent, "_native_compaction_transition_receipt", None
+                    )
+                    checkpoint_digest = compaction_checkpoint_digest(
+                        interim_msg.get("codex_output_items")
+                    )
+                    checkpoint_acknowledged = bool(
+                        checkpoint_flush is True
+                        and checkpoint_receipt is not None
+                        and checkpoint_receipt.authorizes_transition
+                        and checkpoint_receipt.policy.last_compaction_digest
+                        == checkpoint_digest
+                    )
+                    if not checkpoint_acknowledged:
+                        agent._native_compaction_request_active = False
+                        agent._native_compaction_replay_attempted = False
+                        agent._cleanup_task_resources(effective_task_id)
+                        return {
+                            "final_response": (
+                                "Native compaction checkpoint persistence failed"
+                            ),
+                            "messages": messages,
+                            "api_calls": api_call_count,
+                            "completed": False,
+                            "partial": True,
+                            "error": (
+                                "Native compaction checkpoint persistence failed"
+                            ),
+                        }
+
+                    if continuation_used:
+                        agent._native_compaction_request_active = False
+                        agent._native_compaction_replay_attempted = False
+                        # The single protocol credit is exhausted. Finalization
+                        # projects a deterministic local partial response from
+                        # this newest durably-fenced checkpoint; no provider
+                        # summary or retry is permitted after this boundary.
+                        _turn_exit_reason = (
+                            "native_compaction_continuation_exhausted"
+                        )
+                        break
+
+                    agent._native_compaction_continuation_used = True
+                    _native_protocol_continuation_credit = True
+                    agent._codex_incomplete_retries = 0
+                    agent._emit_wait_notice(
+                        "↻ provider compacted context — continuing once from "
+                        "the committed checkpoint (1/1)"
+                    )
+                    agent._session_messages = messages
+                    continue
+
+                agent._codex_incomplete_retries += 1
 
                 if agent._codex_incomplete_retries < 3:
                     # When the interim message has nothing the Responses
@@ -5820,6 +6220,7 @@ def run_conversation(
                         interim_has_content
                         or interim_has_codex_reasoning
                         or interim_has_codex_message_items
+                        or interim_has_codex_output_items
                     )
                     if not interim_replayable:
                         _last_msg = messages[-1] if messages else None
@@ -6358,6 +6759,7 @@ def run_conversation(
 
                 if (
                     agent.compression_enabled
+                    and not should_defer_automatic_hermes_compaction(agent)
                     and compression_attempts < max_compression_attempts
                     and _compressor.should_compress(_real_tokens)
                 ):
@@ -6393,7 +6795,10 @@ def run_conversation(
                         conversation_history = conversation_history_after_compression(
                             agent, messages, conversation_history
                         )
-                elif agent.compression_enabled:
+                elif (
+                    agent.compression_enabled
+                    and not should_defer_automatic_hermes_compaction(agent)
+                ):
                     # Over threshold but compression is blocked (summary-LLM
                     # cooldown or anti-thrashing). Surface a deduped warning so
                     # the user isn't left with a silently growing context that

@@ -258,9 +258,6 @@ def _(rid, params: dict) -> dict:
     # string to a "disk full" toast so the user knows why the send vanished.
     try:
         _ensure_session_db_row(session)
-        # A branch becomes real here: copy its parent's transcript into the row so it
-        # resumes with full context (the agent won't persist the seed itself).
-        _persist_branch_seed(session)
     except Exception as exc:
         from hermes_state import is_disk_full_error
 

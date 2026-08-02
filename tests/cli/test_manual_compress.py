@@ -160,15 +160,8 @@ def test_manual_compress_flushes_compressed_history_to_child_session_db():
 
 
 
-def test_manual_compress_runs_when_auto_compaction_disabled(capsys):
-    """compression.enabled: false disables *automatic* compaction only.
-
-    Manual /compress must still work: the context-overflow error path
-    (agent/conversation_loop.py) explicitly directs users to /compress when
-    auto-compaction is off, and the gateway's /compress handler has never
-    gated on the flag. Regression for the CLI refusing with "Compression is
-    disabled in config."
-    """
+def test_manual_compress_is_blocked_when_compaction_is_off(capsys):
+    """compression.enabled: false is an absolute textual-compression ban."""
     shell = _make_cli()
     history = _make_history()
     compressed = [
@@ -189,11 +182,10 @@ def test_manual_compress_runs_when_auto_compaction_disabled(capsys):
         shell._manual_compress()
 
     output = capsys.readouterr().out
-    assert "Compression is disabled" not in output
-    shell.agent._compress_context.assert_called_once()
-    # Manual compression bypasses the summary-failure cooldown.
-    assert shell.agent._compress_context.call_args.kwargs.get("force") is True
-    assert shell.conversation_history == compressed
+    assert "disabled" in output.lower()
+    assert "compaction mode is off" in output.lower()
+    shell.agent._compress_context.assert_not_called()
+    assert shell.conversation_history == history
 
 
 

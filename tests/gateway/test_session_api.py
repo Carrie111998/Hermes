@@ -608,3 +608,46 @@ async def test_require_model_lock_hard_fails_when_global_default_would_be_used(a
     mock_run.assert_not_called()
 
 
+@pytest.mark.asyncio
+async def test_fork_title_conflict_returns_409_without_residue(adapter, session_db):
+    parent = session_db.create_session("fork-parent", "api_server")
+    session_db.set_session_title(parent, "Parent")
+    taken = session_db.create_session("taken", "api_server")
+    session_db.set_session_title(taken, "Taken")
+
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post(
+            f"/api/sessions/{parent}/fork",
+            json={"id": "rejected-child", "title": "Taken"},
+        )
+        assert resp.status == 409, await resp.text()
+        body = await resp.json()
+
+    assert body["error"]["code"] == "title_exists"
+    assert session_db.get_session("rejected-child") is None
+    assert session_db.get_session(parent)["ended_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_fork_runtime_failure_returns_structured_500(adapter, session_db, monkeypatch):
+    parent = session_db.create_session("fork-parent-failure", "api_server")
+
+    def _fail_fork(**_kwargs):
+        raise RuntimeError("simulated fork failure")
+
+    monkeypatch.setattr(session_db, "create_session_fork", _fail_fork)
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post(
+            f"/api/sessions/{parent}/fork",
+            json={"id": "failed-child"},
+        )
+        assert resp.status == 500, await resp.text()
+        body = await resp.json()
+
+    assert body["error"]["code"] == "fork_failed"
+    assert session_db.get_session("failed-child") is None
+    assert session_db.get_session(parent)["ended_at"] is None
+
+

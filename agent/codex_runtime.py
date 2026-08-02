@@ -1228,7 +1228,14 @@ def _consume_codex_event_stream(
     return final
 
 
-def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta=None):
+def run_codex_stream(
+    agent,
+    api_kwargs: dict,
+    client: Any = None,
+    on_first_delta=None,
+    *,
+    logical_call_metadata: dict[str, Any] | None = None,
+):
     """Execute one streaming Responses API request and return the final response.
 
     Uses ``responses.create(stream=True)`` (low-level raw event iteration)
@@ -1297,6 +1304,35 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
             )
 
         try:
+            relay_metadata = {
+                "api_mode": "codex_responses",
+                "api_request_id": getattr(agent, "_current_api_request_id", None),
+                "call_role": (
+                    "delegated"
+                    if getattr(agent, "is_subagent", False)
+                    else "fallback"
+                    if int(getattr(agent, "_fallback_index", 0) or 0) > 0
+                    else "primary"
+                ),
+                "retry_count": attempt,
+            }
+            if isinstance(logical_call_metadata, dict):
+                logical_request_id = logical_call_metadata.get("api_request_id")
+                logical_call_role = logical_call_metadata.get("call_role")
+                logical_retry_count = logical_call_metadata.get("retry_count")
+                if isinstance(logical_request_id, str) and logical_request_id:
+                    relay_metadata["api_request_id"] = logical_request_id
+                if isinstance(logical_call_role, str) and logical_call_role:
+                    relay_metadata["call_role"] = logical_call_role
+                if (
+                    isinstance(logical_retry_count, int)
+                    and not isinstance(logical_retry_count, bool)
+                    and logical_retry_count >= 0
+                ):
+                    relay_metadata["retry_count"] = logical_retry_count
+                if attempt > 0:
+                    relay_metadata["stream_retry_count"] = attempt
+
             event_stream = relay_llm.stream(
                 dict(api_kwargs),
                 _open_codex_stream,
@@ -1311,18 +1347,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                 completed_response_predicate=lambda response: bool(
                     hasattr(response, "output") and not hasattr(response, "__iter__")
                 ),
-                metadata={
-                    "api_mode": "codex_responses",
-                    "api_request_id": getattr(agent, "_current_api_request_id", None),
-                    "call_role": (
-                        "delegated"
-                        if getattr(agent, "is_subagent", False)
-                        else "fallback"
-                        if int(getattr(agent, "_fallback_index", 0) or 0) > 0
-                        else "primary"
-                    ),
-                    "retry_count": attempt,
-                },
+                metadata=relay_metadata,
                 defer_logical_completion=True,
             )
         except (

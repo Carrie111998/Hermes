@@ -143,6 +143,12 @@ class NormalizedResponse:
         pd = self.provider_data or {}
         return pd.get("codex_message_items")
 
+    @property
+    def codex_output_items(self):
+        """Exact ordered Responses output block containing native compaction."""
+        pd = self.provider_data or {}
+        return pd.get("codex_output_items")
+
 
 # ---------------------------------------------------------------------------
 # Factory helpers

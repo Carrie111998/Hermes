@@ -1020,6 +1020,7 @@ _ASSISTANT_REPLAY_FIELDS: tuple[str, ...] = (
     "reasoning_details",
     "codex_reasoning_items",
     "codex_message_items",
+    "codex_output_items",
     "finish_reason",
 )
 
@@ -1235,7 +1236,9 @@ def _build_gateway_agent_history(
         if has_tool_calls or has_tool_call_id or is_tool_message:
             clean_msg = {k: v for k, v in msg.items() if k not in {"timestamp", "observed"}}
             agent_history.append(clean_msg)
-        elif content:
+        elif content or (
+            role == "assistant" and bool(msg.get("codex_output_items"))
+        ):
             # Strip gateway-injected auto-continue notes that were persisted
             # as part of user messages during interrupted turns.  Keep the
             # user's real text after the note, but never replay the recovery
@@ -16292,7 +16295,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             session_key=session_key,
                             user_config=_hyg_data if isinstance(_hyg_data, dict) else None,
                         )
-                        if _hyg_runtime.get("api_key"):
+                        from agent.responses_compaction import (
+                            configured_codex_responses_auto_compaction_mode,
+                        )
+
+                        _hyg_responses_mode = (
+                            configured_codex_responses_auto_compaction_mode(_hyg_data)
+                        )
+                        _hyg_preagent_mutation_forbidden = (
+                            str(_hyg_runtime.get("api_mode") or "").strip().lower()
+                            == "codex_responses"
+                            and _hyg_responses_mode in {"native", "off"}
+                        )
+                        if _hyg_preagent_mutation_forbidden:
+                            logger.info(
+                                "Session hygiene: deferring Codex Responses %s-mode "
+                                "pressure handling to route-aware in-turn preflight",
+                                _hyg_responses_mode,
+                            )
+                        elif _hyg_runtime.get("api_key"):
                             # Pass the FULL transcript (tool results included).
                             # Filtering to user/assistant-only starved the
                             # compressor: tool results are usually the bulk of
@@ -21719,6 +21740,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         ("compression", "threshold_tokens"),
         ("compression", "codex_gpt55_autoraise"),
         ("compression", "codex_app_server_auto"),
+        ("compression", "codex_responses_auto"),
+        ("compression", "codex_responses_compact_threshold"),
         ("compression", "target_ratio"),
         ("compression", "protect_last_n"),
         ("compression", "proactive_prune_tokens"),

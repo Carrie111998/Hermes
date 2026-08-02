@@ -38,6 +38,7 @@ class DummyAgent:
         focus_topic=None,
         force=False,
         defer_context_engine_notification=False,
+        hermes_compaction_authorization=None,
     ):
         self.calls.append(
             {
@@ -48,6 +49,9 @@ class DummyAgent:
                 "force": force,
                 "defer_context_engine_notification": (
                     defer_context_engine_notification
+                ),
+                "hermes_compaction_authorization": (
+                    hermes_compaction_authorization
                 ),
             }
         )

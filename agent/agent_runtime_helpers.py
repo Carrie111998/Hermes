@@ -563,6 +563,7 @@ def repair_message_sequence(agent, messages: List[Dict]) -> int:
         return bool(
             m.get("codex_reasoning_items")
             or m.get("codex_message_items")
+            or m.get("codex_output_items")
             or m.get("finish_reason") == "incomplete"
         )
 

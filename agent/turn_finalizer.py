@@ -51,6 +51,9 @@ _VERIFICATION_CONTINUATION_FLAGS = (
     "_verification_stop_synthetic",
     "_pre_verify_synthetic",
 )
+_NATIVE_COMPACTION_CONTINUATION_EXHAUSTED_RESPONSE = (
+    "Native compaction could not complete after the single checkpoint continuation."
+)
 
 
 def _drop_verification_continuation_scaffolding(messages) -> None:
@@ -95,10 +98,19 @@ def finalize_turn(
         api_call_count >= agent.max_iterations
         or agent.iteration_budget.remaining <= 0
     )
+    protocol_continuation_exhausted = (
+        str(_turn_exit_reason)
+        == "native_compaction_continuation_exhausted"
+    )
+    if protocol_continuation_exhausted and final_response is None:
+        # The provider has already consumed the one ordinary request and the
+        # sole checkpoint continuation. The newest checkpoint is durably
+        # fenced; finalization must remain local and deterministic from here.
+        final_response = _NATIVE_COMPACTION_CONTINUATION_EXHAUSTED_RESPONSE
     budget_fallback_eligible = (
-        budget_exhausted
-        and not interrupted
+        not interrupted
         and not failed
+        and budget_exhausted
         and str(_turn_exit_reason) in {"unknown", "budget_exhausted"}
     )
     continuation_budget_exhausted = (
@@ -195,6 +207,8 @@ def finalize_turn(
     completed = (
         final_response is not None
         and not failed
+        and not iteration_limit_fallback
+        and not protocol_continuation_exhausted
         and (
             api_call_count < agent.max_iterations
             or normal_text_response
@@ -637,7 +651,7 @@ def finalize_turn(
         "completed": completed,
         "turn_exit_reason": _turn_exit_reason,
         "failed": failed,
-        "partial": False,  # True only when stopped due to invalid tool calls
+        "partial": protocol_continuation_exhausted,
         "interrupted": interrupted,
         "response_transformed": _response_transformed,
         "response_previewed": getattr(agent, "_response_was_previewed", False),

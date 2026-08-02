@@ -861,6 +861,41 @@ def _teardown_session(session: dict | None, *, end_reason: str = "tui_close") ->
     # finalize is unregistering the notifier and closing the in-process agent.
 
 
+def _discard_unpublished_session_runtime(session: dict | None) -> None:
+    """Drop process-local session resources without ending its durable row."""
+    if not session:
+        return
+    _release_active_session_slot(session)
+    if stop_event := session.get("_notif_stop"):
+        stop_event.set()
+    if worker := session.get("slash_worker"):
+        try:
+            worker.close()
+        except Exception:
+            pass
+    key = session.get("session_key")
+    try:
+        from tools.approval import unregister_gateway_notify
+
+        if key:
+            unregister_gateway_notify(key)
+    except Exception:
+        pass
+    try:
+        from tools.terminal_tool import clear_task_env_overrides
+
+        if key:
+            clear_task_env_overrides(key)
+    except Exception:
+        pass
+    try:
+        agent = session.get("agent")
+        if agent is not None and hasattr(agent, "close"):
+            agent.close()
+    except Exception:
+        pass
+
+
 def _attach_worker(sid: str, session: dict, worker) -> None:
     """Store worker on session iff sid still maps to it, else close it — a
     concurrent teardown already popped the session and would orphan the
@@ -2570,6 +2605,7 @@ def _ensure_session_db_row(session: dict) -> None:
             model=row_model,
             model_config=model_config or None,
             parent_session_id=parent_session_id,
+            inherit_compaction_state=not bool(parent_session_id),
             cwd=_persisted_session_cwd(session),
             # Self-describing rows: aggregators that merge multiple profile DBs
             # into one list can't rely on which file a row came from alone. NULL
@@ -2591,47 +2627,6 @@ def _ensure_session_db_row(session: dict) -> None:
                 db.close()
             except Exception:
                 pass
-
-
-def _persist_branch_seed(session: dict) -> None:
-    """First-turn persist of a branch's copied transcript.
-
-    A branch is a draft until its first submit: the parent's messages live only
-    in ``session["history"]`` (they ride into the agent as ``conversation_history``,
-    which ``_flush_messages_to_session_db`` skips by identity). Without this the
-    branch row would resume missing its pre-branch context. Runs once; the row +
-    parent link are written by ``_ensure_session_db_row`` just before this.
-    """
-    if not session.get("parent_session_id") or session.get("_branch_seed_persisted"):
-        return
-    key = session.get("session_key")
-    if not key:
-        return
-    with session["history_lock"]:
-        seed = [dict(msg) for msg in (session.get("history") or [])]
-    if not seed:
-        return
-    with _session_db(session) as db:
-        if db is None:
-            return
-        try:
-            for msg in seed:
-                db.append_message(
-                    session_id=key,
-                    role=msg.get("role", "user"),
-                    content=msg.get("content"),
-                    # Preserve the parent's original message timestamps —
-                    # append_message would otherwise stamp time.time() and the
-                    # branch's copied history would all appear authored "now".
-                    timestamp=msg.get("timestamp"),
-                )
-            session["_branch_seed_persisted"] = True
-        except Exception as exc:
-            from hermes_state import is_disk_full_error
-
-            if is_disk_full_error(exc):
-                raise
-            logger.debug("branch seed persist failed", exc_info=True)
 
 
 @contextlib.contextmanager
@@ -4544,6 +4539,21 @@ def _compress_session_history(
     # auto-compaction runs inside the agent loop, not here. Manual
     # compaction bypasses the summary-failure cooldown, matching the CLI
     # and gateway handlers.
+    from agent.responses_compaction import prepare_manual_hermes_compaction
+
+    manual_authorization = prepare_manual_hermes_compaction(
+        agent,
+        reason="tui_gateway_manual_compress",
+    )
+    if manual_authorization is False:
+        finalize_context_engine_compression_notification(
+            agent,
+            committed=False,
+        )
+        raise RuntimeError(
+            "Manual compression blocked: native Responses custody could not be "
+            "handed off safely."
+        )
     try:
         compressed, _ = agent._compress_context(
             head,
@@ -4555,6 +4565,7 @@ def _compress_session_history(
             focus_topic=focus_topic or None,
             force=True,
             defer_context_engine_notification=True,
+            hermes_compaction_authorization=manual_authorization,
         )
     except Exception:
         finalize_context_engine_compression_notification(

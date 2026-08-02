@@ -117,6 +117,35 @@ class TestBranchCommandCLI:
 
         assert cli_instance._resumed is True
 
+    def test_branch_transaction_failure_leaves_parent_active(
+        self, cli_instance, session_db, monkeypatch
+    ):
+        from cli import HermesCLI
+
+        original_id = cli_instance.session_id
+        monkeypatch.setattr(
+            session_db,
+            "create_session_fork",
+            MagicMock(side_effect=RuntimeError("transaction failed")),
+        )
+        HermesCLI._handle_branch_command(cli_instance, "/branch")
+
+        assert cli_instance.session_id == original_id
+        assert session_db.get_session(original_id)["ended_at"] is None
+
+    def test_branch_ancillary_switch_failure_keeps_committed_success(
+        self, cli_instance, session_db
+    ):
+        from cli import HermesCLI
+
+        original_id = cli_instance.session_id
+        cli_instance._transfer_session_yolo.side_effect = RuntimeError("yolo failed")
+        HermesCLI._handle_branch_command(cli_instance, "/branch")
+
+        assert cli_instance.session_id != original_id
+        assert session_db.get_session(cli_instance.session_id) is not None
+        assert session_db.get_session(original_id)["ended_at"] is not None
+
 
     def test_branch_fires_on_session_switch_hook(self, cli_instance, session_db):
         """The /branch command must notify memory providers of the rotation.

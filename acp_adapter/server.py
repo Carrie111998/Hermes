@@ -2366,6 +2366,19 @@ class HermesACPAgent(acp.Agent):
             approx_tokens = estimate_request_tokens_rough(
                 state.history, system_prompt=_sys_prompt, tools=_tools
             )
+            from agent.responses_compaction import (
+                effective_auto_compaction_mode,
+                prepare_manual_hermes_compaction,
+            )
+
+            manual_authorization = prepare_manual_hermes_compaction(
+                agent,
+                reason="acp_manual_compress",
+            )
+            if manual_authorization is False:
+                if effective_auto_compaction_mode(agent) == "off":
+                    return "Compression blocked: compaction mode is off."
+                return "Compression blocked: custody handoff failed."
             original_session_db = getattr(agent, "_session_db", None)
 
             try:
@@ -2378,6 +2391,7 @@ class HermesACPAgent(acp.Agent):
                     approx_tokens=approx_tokens,
                     task_id=state.session_id,
                     force=True,
+                    hermes_compaction_authorization=manual_authorization,
                 )
             finally:
                 agent._session_db = original_session_db

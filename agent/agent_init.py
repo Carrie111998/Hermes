@@ -2028,6 +2028,31 @@ def init_agent(
             codex_app_server_auto_compaction,
         )
         codex_app_server_auto_compaction = "native"
+    codex_responses_auto_compaction = str(
+        _compression_cfg.get("codex_responses_auto", "hermes") or "hermes"
+    ).lower()
+    if codex_responses_auto_compaction not in {"native", "hermes", "off"}:
+        _ra().logger.warning(
+            "Invalid compression.codex_responses_auto=%r; using 'hermes'. "
+            "Valid values are: native, hermes, off.",
+            codex_responses_auto_compaction,
+        )
+        codex_responses_auto_compaction = "hermes"
+    _native_threshold_raw = _compression_cfg.get(
+        "codex_responses_compact_threshold", 200_000
+    )
+    try:
+        if isinstance(_native_threshold_raw, bool):
+            raise ValueError
+        codex_responses_configured_compact_threshold = int(_native_threshold_raw)
+        if codex_responses_configured_compact_threshold <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        _ra().logger.warning(
+            "Invalid compression.codex_responses_compact_threshold=%r; using 200000.",
+            _native_threshold_raw,
+        )
+        codex_responses_configured_compact_threshold = 200_000
     # Opt-in idle compaction: compact a session up front when it resumes after
     # this many seconds of inactivity (0 = disabled). Time-based, so it
     # complements the size-based threshold above. Consumed by build_turn_context().
@@ -2484,6 +2509,40 @@ def init_agent(
             compression_micro_compact_defrag_tokens
         )
     agent.codex_app_server_auto_compaction = codex_app_server_auto_compaction
+    agent.codex_responses_auto_compaction = codex_responses_auto_compaction
+    from agent.responses_compaction import (
+        NativeCompactionPolicy,
+        read_policy_for_route,
+        resolve_native_compaction_threshold,
+        route_for_request,
+    )
+    _native_route = route_for_request(
+        provider=getattr(agent, "provider", "") or "",
+        endpoint=getattr(agent, "base_url", "") or "",
+        model=getattr(agent, "model", "") or "",
+    )
+    _native_read = read_policy_for_route(
+        getattr(agent, "_session_db", None) or session_db,
+        getattr(agent, "session_id", None),
+        _native_route,
+    )
+    agent._native_compaction_read_status = _native_read
+    agent._native_compaction_policy = (
+        _native_read.policy or NativeCompactionPolicy(route=_native_route)
+    )
+    _hermes_threshold = int(
+        getattr(agent.context_compressor, "threshold_tokens", 0) or 0
+    )
+    if _hermes_threshold <= 0:
+        _hermes_threshold = max(
+            1,
+            int(getattr(agent.context_compressor, "context_length", 272_000) * 0.5),
+        )
+    agent.codex_responses_compact_threshold = resolve_native_compaction_threshold(
+        codex_responses_configured_compact_threshold,
+        hermes_threshold=_hermes_threshold,
+    )
+    agent._native_compaction_replay_attempted = False
     agent.max_compression_attempts = compression_max_attempts
     agent.compression_idle_compact_after_seconds = (
         compression_idle_compact_after_seconds

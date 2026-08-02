@@ -516,6 +516,43 @@ describe('createSlashHandler', () => {
     expect(ctx.transcript.setHistoryItems).not.toHaveBeenCalled()
   })
 
+  it('discloses a committed branch that could not attach a runtime session', async () => {
+    patchUiState({ sid: 'sid-parent' })
+
+    const rpc = vi.fn(() =>
+      Promise.resolve({
+        committed: true,
+        session_id: null,
+        stored_session_id: 'stored-child',
+        warning: 'runtime initialization failed'
+      })
+    )
+
+    const ctx = buildCtx({ gateway: { ...buildGateway(), rpc } })
+
+    expect(createSlashHandler(ctx)('/branch')).toBe(true)
+    await vi.waitFor(() => {
+      expect(ctx.transcript.sys).toHaveBeenCalledWith(
+        'Branch saved as stored-child but could not be opened: runtime initialization failed. Resume it from sessions.'
+      )
+    })
+    expect(getUiState().sid).toBe('sid-parent')
+    expect(ctx.session.closeSession).not.toHaveBeenCalled()
+  })
+
+  it('reports a rejected branch RPC through the guarded error path', async () => {
+    patchUiState({ sid: 'sid-parent' })
+
+    const rpc = vi.fn(() => Promise.reject(new Error('branch exploded')))
+    const ctx = buildCtx({ gateway: { ...buildGateway(), rpc } })
+
+    expect(createSlashHandler(ctx)('/branch')).toBe(true)
+    await vi.waitFor(() => {
+      expect(ctx.transcript.sys).toHaveBeenCalledWith('error: branch exploded')
+    })
+    expect(getUiState().sid).toBe('sid-parent')
+  })
+
   it('reloads skills in the live gateway and refreshes the catalog', async () => {
     const rpc = vi.fn((method: string) => {
       if (method === 'skills.reload') {

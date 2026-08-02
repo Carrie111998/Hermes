@@ -2604,41 +2604,29 @@ def _(rid, params: dict) -> dict:
                     if hasattr(db, "get_next_title_in_lineage")
                     else f"{current} (branch)"
                 )
-            db.create_session(
-                new_key,
+            db.create_session_fork(
+                parent_session_id=old_key,
+                child_session_id=new_key,
                 source=source,
                 model=_resolve_model(),
-                # Stable _branched_from marker so list_sessions_rich() keeps the
-                # branch visible in /resume and /sessions. The TUI branch leaves
-                # the parent live (no end_reason='branched'), so the legacy
-                # end_reason heuristic never matches it — the marker is the only
-                # thing that surfaces TUI branches. See issue #20856.
+                # Stable marker keeps TUI branches visible without ending parent.
                 model_config={"_branched_from": old_key},
-                parent_session_id=old_key,
                 cwd=_session_cwd(session),
-                # The branch stays on its parent's profile. Explicit stamp (not
-                # just the parent-backfill) so it holds even when the parent row
-                # predates the profile_name column.
                 profile_name=(
                     Path(session["profile_home"]).name
                     if session.get("profile_home")
                     else None
                 ),
+                messages=history,
+                title=title,
+                quarantine_error="checkpoint_missing_in_branch",
             )
-            for msg in history:
-                db.append_message(
-                    session_id=new_key,
-                    role=msg.get("role", "user"),
-                    content=msg.get("content"),
-                    # Preserve the parent's original message timestamps —
-                    # branch copies are history, not new activity (9d73006ad).
-                    timestamp=msg.get("timestamp"),
-                )
-            db.set_session_title(new_key, title)
         except Exception as e:
             if lease is not None:
                 lease.release()
             return _err(rid, 5008, f"branch failed: {e}")
+    branch_db = None
+    agent = None
     try:
         # Bind the branched AGENT to the parent's profile, mirroring
         # session.create/resume: home override so config/skills/memory resolve
@@ -2648,7 +2636,6 @@ def _(rid, params: dict) -> dict:
         # parent's db while the agent stayed on the launch handle would
         # recreate the cross-profile split one turn later.
         parent_home = session.get("profile_home")
-        branch_db = None
         if parent_home:
             from hermes_state import SessionDB
 
@@ -2687,7 +2674,37 @@ def _(rid, params: dict) -> dict:
     except Exception as e:
         if lease is not None:
             lease.release()
-        return _err(rid, 5000, f"agent init failed on branch: {e}")
+        partial = _pop_session_by_id(new_sid)  # type: ignore[name-defined]
+        if partial is not None:
+            _discard_unpublished_session_runtime(partial)  # type: ignore[name-defined]
+        elif agent is not None and hasattr(agent, "close"):
+            try:
+                agent.close()
+            except Exception:
+                pass
+        if branch_db is not None:
+            try:
+                branch_db.close()
+            except Exception:
+                pass
+        logger.error(  # type: ignore[name-defined]
+            "TUI branch %s committed but runtime initialization failed",
+            new_key,
+            exc_info=True,
+        )
+        return _ok(  # type: ignore[name-defined]
+            rid,
+            {
+                "session_id": None,
+                "stored_session_id": new_key,
+                "title": title,
+                "parent": old_key,
+                "message_count": len(history),
+                "messages": _history_to_messages(history),  # type: ignore[name-defined]
+                "committed": True,
+                "warning": f"branch stored but runtime initialization failed: {e}",
+            },
+        )
     branched_session = _sessions.get(new_sid)
     return _ok(
         rid,

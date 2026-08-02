@@ -91,6 +91,8 @@ compression:
   codex_gpt55_autoraise: true  # gpt-5.5 on Codex OAuth: raise trigger to 85% (default: true)
   codex_gpt55_autoraise_notice: true  # Show the one-time autoraise notice (default: true)
   codex_app_server_auto: native  # native|hermes|off for Codex app-server thread compaction
+  codex_responses_auto: hermes    # hermes|native|off for Responses API compaction
+  codex_responses_compact_threshold: 200000  # native trigger; clamped below Hermes fallback
   in_place: true             # Compact on the same session id, no rotation (default: true)
 
 # Summarization model/provider configured under auxiliary:
@@ -115,6 +117,8 @@ auxiliary:
 | `codex_gpt55_autoraise` | `true` | bool | Raise the trigger to 85% for gpt-5.5 on the ChatGPT Codex OAuth route (see below). Set `false` to keep the global `threshold` |
 | `codex_gpt55_autoraise_notice` | `true` | bool | Show the one-time Codex gpt-5.5 autoraise notice. Set `false` to keep the 85% autoraise but suppress the banner |
 | `codex_app_server_auto` | `native` | `native`, `hermes`, `off` | Thread-compaction mode for Codex app-server sessions (see below) |
+| `codex_responses_auto` | `hermes` | `native`, `hermes`, `off` | Compaction mode for the stateless Codex Responses runtime. `native` is opt-in and route-gated; `hermes` preserves the existing local summarizer |
+| `codex_responses_compact_threshold` | `200000` | positive integer | Requested OpenAI native-compaction threshold. Hermes clamps it below the active local fallback threshold so the local safety net remains reachable |
 | `in_place` | `true` | bool | Compact on the same session id instead of rotating to a new one (see below) |
 
 ### In-place compaction (single stable session id)
@@ -186,6 +190,52 @@ To keep the 85% autoraise but hide only the one-time notice:
 hermes config set compression.codex_gpt55_autoraise_notice false
 ```
 
+### Native compaction for stateless Codex Responses
+
+The default `codex_responses` runtime continues to use Hermes' local semantic
+compressor. Native OpenAI compaction is an explicit experiment:
+
+```bash
+hermes config set compression.codex_responses_auto native
+```
+
+In `native` mode Hermes sends one `context_management` compaction rule on
+OpenAI/Codex routes only. It keeps `store: false`, does not use
+`previous_response_id`, and persists the issuer-stamped ordered response output
+that contains the encrypted `compaction` item. The visible transcript remains
+intact. On the exact same issuer/model/endpoint route only the API projection
+starts from the newest committed compaction boundary; any route change falls
+back to the full transcript and Hermes compaction.
+
+Capability is tracked per session as `unknown`, `shape_accepted`,
+`item_observed`, and `replay_verified`. Hermes' local fallback remains armed
+until an item is actually observed. A structured 400/422 rejection of
+`context_management` or `compact_threshold` downgrades the route once to
+`unsupported`; rejection of a replayed encrypted item quarantines native state.
+Both cases rebuild from canonical messages and keep Hermes compression enabled.
+Auth, rate-limit, timeout, generic 4xx, and 5xx errors do not downgrade the
+capability.
+
+The durable capability state is a strictly validated v3 route ledger, so one
+model or endpoint cannot enable native replay for another. Hermes commits the
+ordered compaction output and its ledger transition in one SQLite transaction;
+it will not replay an opaque item unless its route and digest match that
+committed state. Malformed or unsupported ledger state quarantines the route
+instead of resetting it to an enabled default. A compaction-only response is a
+checkpoint rather than an answer: Hermes commits it, continues exactly once,
+and quarantines the route if the provider returns another compaction-only
+checkpoint instead of completing the turn.
+
+Rollback is immediate and does not delete state or transcript evidence:
+
+```bash
+hermes config set compression.codex_responses_auto hermes
+```
+
+`off` disables both native and Hermes-initiated automatic compaction for this
+runtime; use it only in controlled evaluations. Native mode is not a claim of a
+3x improvement—the result depends on model, workload, tools, and harness.
+
 ### Codex app-server thread compaction
 
 Codex app-server sessions (`api_mode: codex_app_server` — the codex CLI/agent
@@ -205,8 +255,9 @@ mechanism instead:
   compaction entirely (codex may still compact natively).
 
 Hermes' local transcript is never rewritten on this runtime — state.db records
-the compaction boundary while the visible transcript stays intact. All other
-routes (including Codex OAuth chat sessions) keep Hermes' summary compressor.
+the compaction boundary while the visible transcript stays intact. Responses
+sessions follow the mode described above; all other routes keep Hermes' summary
+compressor.
 
 ### Computed Values (for a 200K context model at defaults)
 

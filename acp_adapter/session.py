@@ -249,11 +249,29 @@ class SessionManager:
             return None
 
         new_id = str(uuid.uuid4())
-        agent = self._make_agent(
-            session_id=new_id,
-            cwd=cwd,
-            model=original.model or None,
-        )
+        db = self._get_db()
+        if db is None:
+            logger.warning(
+                "Cannot create ACP fork %s from %s: session database unavailable",
+                new_id,
+                session_id,
+            )
+            return None
+        try:
+            agent = self._make_agent(
+                session_id=new_id,
+                cwd=cwd,
+                model=original.model or None,
+                register_task_cwd=False,
+            )
+        except Exception:
+            logger.warning(
+                "Failed to construct ACP fork %s from %s; child not published",
+                new_id,
+                session_id,
+                exc_info=True,
+            )
+            return None
         state = SessionState(
             session_id=new_id,
             agent=agent,
@@ -262,10 +280,35 @@ class SessionManager:
             history=copy.deepcopy(original.history),
             cancel_event=threading.Event(),
         )
+        try:
+            db.create_acp_fork(
+                parent_session_id=session_id,
+                child_session_id=new_id,
+                model=str(state.model) if state.model else None,
+                cwd=cwd,
+                messages=state.history,
+            )
+        except Exception:
+            logger.warning(
+                "Failed to create atomic ACP fork %s from %s; child not published",
+                new_id,
+                session_id,
+                exc_info=True,
+            )
+            return None
         with self._lock:
             self._sessions[new_id] = state
-        _register_task_cwd(new_id, cwd)
-        self._persist(state)
+        try:
+            _register_task_cwd(new_id, cwd)
+        except Exception:
+            # The durable child and in-memory state are already published. A
+            # process-local tool cwd failure must not report the fork itself as
+            # failed and invite a duplicate retry.
+            logger.warning(
+                "ACP fork %s committed but task cwd registration failed",
+                new_id,
+                exc_info=True,
+            )
         logger.info("Forked ACP session %s -> %s", session_id, new_id)
         return state
 
@@ -409,15 +452,16 @@ class SessionManager:
             logger.debug("SessionDB unavailable for ACP persistence", exc_info=True)
             return None
 
-    def _persist(self, state: SessionState) -> None:
+    def _persist(self, state: SessionState) -> bool:
         """Write session state to the database.
 
         Creates the session record if it doesn't exist, then replaces all
-        stored messages with the current in-memory history.
+        stored messages with the current in-memory history. Returns whether
+        the durable write completed.
         """
         db = self._get_db()
         if db is None:
-            return
+            return False
 
         # Ensure model is a plain string (not a MagicMock or other proxy).
         model_str = str(state.model) if state.model else None
@@ -491,8 +535,10 @@ class SessionManager:
                 db.replace_messages(
                     state.session_id, state.history, active_only=has_archived
                 )
+            return True
         except Exception:
             logger.warning("Failed to persist ACP session %s", state.session_id, exc_info=True)
+            return False
 
     def _restore(self, session_id: str) -> Optional[SessionState]:
         """Load a session from the database into memory, recreating the AIAgent."""
@@ -596,6 +642,7 @@ class SessionManager:
         requested_provider: str | None = None,
         base_url: str | None = None,
         api_mode: str | None = None,
+        register_task_cwd: bool = True,
     ):
         if self._agent_factory is not None:
             return self._agent_factory()
@@ -647,8 +694,6 @@ class SessionManager:
         except Exception:
             logger.debug("ACP session falling back to default provider resolution", exc_info=True)
 
-        _register_task_cwd(session_id, cwd)
-
         # Bounded wait for background MCP discovery so already-spawning fast
         # servers land in the agent's tool snapshot.  ACP entry.py fires
         # discovery in a background daemon thread (start_background_mcp_discovery);
@@ -672,7 +717,14 @@ class SessionManager:
         except Exception:
             logger.debug("ACP: bounded MCP discovery wait failed", exc_info=True)
 
-        agent = AIAgent(**kwargs)
+        if register_task_cwd:
+            _register_task_cwd(session_id, cwd)
+        try:
+            agent = AIAgent(**kwargs)
+        except Exception:
+            if register_task_cwd:
+                _clear_task_cwd(session_id)
+            raise
         # Codex app-server sessions are spawned lazily on the first turn. Stamp
         # the ACP workspace onto the agent so the Codex runtime starts from the
         # editor/session cwd instead of the Hermes daemon's process cwd.

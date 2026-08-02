@@ -442,11 +442,10 @@ class TestPreflightCompression:
         """Direct context compression should tell gateway users why the turn paused."""
         # This test calls _compress_context directly and asserts the FIRST
         # status event is the lifecycle "Compacting context" message. With
-        # compaction enabled the lazy feasibility probe would emit an
-        # aux-provider warning first (no aux key in the hermetic test env),
-        # displacing events[0]. The flag value is irrelevant to what this
-        # test asserts, so disable it to suppress the probe.
-        agent.compression_enabled = False
+        # an unchecked lazy feasibility probe, an aux-provider warning would
+        # arrive first in the hermetic test environment and displace events[0].
+        # Mark only that probe as already complete.
+        agent._compression_feasibility_checked = True
         events = []
         agent.status_callback = lambda ev, msg: events.append((ev, msg))
 
@@ -489,7 +488,7 @@ class TestPreflightCompression:
 
     def test_compress_context_emits_one_terminal_status_when_lock_is_unavailable(self, agent):
         """A rejected lock must retire the started desktop compaction phase."""
-        agent.compression_enabled = False
+        agent._compression_feasibility_checked = True
         agent.session_id = "session-with-contended-lock"
         agent._session_db = SimpleNamespace(
             get_compression_lock_holder=lambda _session_id: "other-agent",
@@ -509,7 +508,7 @@ class TestPreflightCompression:
 
     def test_compression_reuses_cached_prompt_when_memory_snapshot_is_unchanged(self, agent):
         """A memory reload without new injected text must keep the cache prefix."""
-        agent.compression_enabled = False
+        agent._compression_feasibility_checked = True
         agent._memory_enabled = True
         agent._user_profile_enabled = False
         agent._memory_manager = None
@@ -545,7 +544,7 @@ class TestPreflightCompression:
         """A prompt still carrying a memory block after all entries were
         removed must be rebuilt — empty current blocks are vacuously
         'contained', so the leftover-header check has to catch this."""
-        agent.compression_enabled = False
+        agent._compression_feasibility_checked = True
         agent._memory_enabled = True
         agent._user_profile_enabled = False
         agent._memory_manager = None

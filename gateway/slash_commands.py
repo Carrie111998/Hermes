@@ -4005,12 +4005,23 @@ class GatewaySlashCommandsMixin:
                 if not compressor.has_content_to_compress(head):
                     return t("gateway.compress.nothing_to_do")
 
-                # _run_in_executor_with_context (not a bare run_in_executor):
-                # the profile secret scope installed by the wrapper is a
-                # contextvar, and the default-executor hop would drop it —
-                # the compressor's aux-client provider resolution would then
-                # read credentials unscoped and fail closed under
-                # multiplexing.
+                from agent.responses_compaction import (
+                    effective_auto_compaction_mode,
+                    prepare_manual_hermes_compaction,
+                )
+
+                manual_authorization = prepare_manual_hermes_compaction(
+                    tmp_agent,
+                    reason="gateway_manual_compress",
+                )
+                if manual_authorization is False:
+                    if effective_auto_compaction_mode(tmp_agent) == "off":
+                        return "Compression blocked: compaction mode is off."
+                    return "Compression blocked: custody handoff failed."
+
+                # Preserve the active profile secret scope across the executor
+                # hop so the compressor's auxiliary provider resolves only the
+                # current multiplex profile's credentials.
                 compressed, _ = await self._run_in_executor_with_context(
                     lambda: tmp_agent._compress_context(
                         head,
@@ -4019,6 +4030,7 @@ class GatewaySlashCommandsMixin:
                         focus_topic=focus_topic,
                         force=True,
                         defer_context_engine_notification=True,
+                        hermes_compaction_authorization=manual_authorization,
                     )
                 )
 
@@ -4615,66 +4627,78 @@ class GatewaySlashCommandsMixin:
 
         parent_session_id = current_entry.session_id
 
-        # Create the new session with parent link.
-        # Persist a stable ``_branched_from`` marker in model_config so
-        # list_sessions_rich() keeps the branch visible in /resume and
-        # /sessions even after the parent is reopened and re-ended with a
-        # different end_reason (e.g. tui_shutdown overwriting 'branched').
+        # Publish the child row, transcript, and lifecycle in one transaction.
         try:
-            await self._session_db.create_session(
-                session_id=new_session_id,
+            branch_history = [dict(msg) for msg in history]
+            for msg in branch_history:
+                sidecar = extract_api_content_sidecar(msg)
+                if sidecar is not None:
+                    msg["api_content"] = sidecar
+            await self._session_db.create_session_fork(
+                parent_session_id=parent_session_id,
+                child_session_id=new_session_id,
                 source=source.platform.value if source.platform else "gateway",
                 model=(self.config.get("model", {}) or {}).get("default") if isinstance(self.config, dict) else None,
                 model_config={"_branched_from": parent_session_id},
-                parent_session_id=parent_session_id,
+                messages=branch_history,
+                title=branch_title,
+                quarantine_error="checkpoint_missing_in_branch",
             )
         except Exception as e:
-            logger.error("Failed to create branch session: %s", e)
+            logger.error("Failed to create atomic branch session: %s", e)
             return t("gateway.branch.create_failed", error=e)
 
-        # Copy conversation history to the new session
-        for msg in history:
+        # The durable fork is committed. Route switching is process-local and
+        # must not turn that success into a false-negative that invites a
+        # duplicate fork retry.
+        switch_warning = None
+        switch_ok = False
+        route_points_to_child = False
+        try:
+            new_entry = await self.async_session_store.switch_session(
+                session_key, new_session_id
+            )
+            switch_ok = bool(new_entry)
+            route_points_to_child = bool(
+                new_entry and new_entry.session_id == new_session_id
+            )
+        except Exception as exc:
+            logger.warning(
+                "Branch %s committed but gateway route switch failed",
+                new_session_id,
+                exc_info=True,
+            )
+            switch_warning = str(exc)
             try:
-                await self._session_db.append_message(
-                    session_id=new_session_id,
-                    role=msg.get("role", "user"),
-                    content=msg.get("content"),
-                    tool_name=msg.get("tool_name") or msg.get("name"),
-                    tool_calls=msg.get("tool_calls"),
-                    tool_call_id=msg.get("tool_call_id"),
-                    finish_reason=msg.get("finish_reason"),
-                    reasoning=msg.get("reasoning"),
-                    reasoning_content=msg.get("reasoning_content"),
-                    reasoning_details=msg.get("reasoning_details"),
-                    codex_reasoning_items=msg.get("codex_reasoning_items"),
-                    codex_message_items=msg.get("codex_message_items"),
-                    # Keep the api_content sidecar so the branch's first turn
-                    # replays the parent's exact wire bytes (warm provider
-                    # prompt cache) instead of a full cold prefill.
-                    api_content=extract_api_content_sidecar(msg),
-                    timestamp=msg.get("timestamp"),
+                active_entry = await self.async_session_store.get_or_create_session(
+                    source
+                )
+                route_points_to_child = (
+                    active_entry.session_id == new_session_id
                 )
             except Exception:
-                pass  # Best-effort copy
-
-        # Set title
-        try:
-            await self._session_db.set_session_title(new_session_id, branch_title)
-        except Exception:
-            pass
-
-        # Switch the session store entry to the new session
-        new_entry = await self.async_session_store.switch_session(session_key, new_session_id)
-        if not new_entry:
-            return t("gateway.branch.switch_failed")
-        self._clear_session_boundary_security_state(session_key)
-
-        # Evict any cached agent for this session
-        self._evict_cached_agent(session_key)
+                logger.debug(
+                    "Unable to inspect gateway route after branch switch failure",
+                    exc_info=True,
+                )
+        if route_points_to_child:
+            self._clear_session_boundary_security_state(session_key)
+            self._evict_cached_agent(session_key)
 
         msg_count = len([m for m in history if m.get("role") == "user"])
         key = "gateway.branch.branched_one" if msg_count == 1 else "gateway.branch.branched_many"
-        return t(key, title=branch_title, count=msg_count, parent=parent_session_id, new=new_session_id)
+        result = t(
+            key,
+            title=branch_title,
+            count=msg_count,
+            parent=parent_session_id,
+            new=new_session_id,
+        )
+        if not switch_ok:
+            warning = t("gateway.branch.switch_failed")
+            detail = f" ({switch_warning})" if switch_warning else ""
+            return f"{result}\n\n⚠️ {warning}{detail} [{new_session_id}]"
+        return result
 
     async def _handle_topup_command(self, event: MessageEvent) -> str:
         """Handle /topup -- show the Nous balance and hand off to the portal.

@@ -218,7 +218,7 @@ def test_prompt_submit_dispatches_to_compute_host_when_turn_isolation_enabled(mo
     server._sessions["iso-sid"] = _session(history=list(seed_history))
     server._sessions["iso-sid"]["agent"] = None
     server._sessions["iso-sid"]["agent_ready"] = threading.Event()
-    parent_writes = {"ensure_session": 0, "persist_seed": 0}
+    parent_writes = {"ensure_session": 0}
     monkeypatch.setattr(
         server,
         "_load_cfg",
@@ -229,13 +229,6 @@ def test_prompt_submit_dispatches_to_compute_host_when_turn_isolation_enabled(mo
         "_ensure_session_db_row",
         lambda _session: parent_writes.__setitem__(
             "ensure_session", parent_writes["ensure_session"] + 1
-        ),
-    )
-    monkeypatch.setattr(
-        server,
-        "_persist_branch_seed",
-        lambda _session: parent_writes.__setitem__(
-            "persist_seed", parent_writes["persist_seed"] + 1
         ),
     )
     monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda _cfg=None: fake_supervisor)
@@ -254,7 +247,7 @@ def test_prompt_submit_dispatches_to_compute_host_when_turn_isolation_enabled(mo
         assert fake_supervisor.frames[0]["text"] == "hello"
         assert fake_supervisor.frames[0]["history"] == seed_history
         assert server._sessions["iso-sid"]["history"] == seed_history
-        assert parent_writes == {"ensure_session": 0, "persist_seed": 0}
+        assert parent_writes == {"ensure_session": 0}
         assert server._sessions["iso-sid"]["running"] is True
 
         fake_supervisor.callback(
@@ -315,7 +308,6 @@ def test_prompt_submit_fails_open_inline_when_compute_host_dispatch_breaks(monke
     monkeypatch.setattr(server, "_load_cfg", lambda: {"dashboard": {"turn_isolation": True}})
     monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda _cfg=None: _BrokenSupervisor())
     monkeypatch.setattr(server, "_ensure_session_db_row", lambda _session: None)
-    monkeypatch.setattr(server, "_persist_branch_seed", lambda _session: None)
     monkeypatch.setattr(server, "_start_agent_build", lambda _sid, _session: None)
     monkeypatch.setattr(server, "_wait_agent", lambda _session, _rid: None)
     # The deferred inline-fallback thread now waits via the patient variant.
@@ -489,7 +481,6 @@ def test_prompt_submit_golden_transcript_matches_flag_off_and_on(monkeypatch):
     usage = server._get_usage(_Agent())
     monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
     monkeypatch.setattr(server, "_ensure_session_db_row", lambda _session: None)
-    monkeypatch.setattr(server, "_persist_branch_seed", lambda _session: None)
     monkeypatch.setattr(server, "_session_info", lambda _agent, _session=None: dict(fixed_info))
     monkeypatch.setattr(server, "make_stream_renderer", lambda _cols: None)
     monkeypatch.setattr(server, "render_message", lambda _raw, _cols: None)
@@ -4877,7 +4868,7 @@ def test_ensure_session_db_row_persists_explicit_cwd(monkeypatch, tmp_path):
     created = []
 
     class _FakeDB:
-        def create_session(self, key, source=None, model=None, model_config=None, parent_session_id=None, cwd=None, profile_name=None):
+        def create_session(self, key, source=None, model=None, model_config=None, parent_session_id=None, cwd=None, profile_name=None, inherit_compaction_state=True):
             created.append(
                 {"key": key, "source": source, "model": model, "model_config": model_config, "cwd": cwd}
             )
@@ -4898,7 +4889,7 @@ def test_ensure_session_db_row_persists_session_source(monkeypatch):
     created = []
 
     class _FakeDB:
-        def create_session(self, key, source=None, model=None, model_config=None, parent_session_id=None, cwd=None, profile_name=None):
+        def create_session(self, key, source=None, model=None, model_config=None, parent_session_id=None, cwd=None, profile_name=None, inherit_compaction_state=True):
             created.append(
                 {"key": key, "source": source, "model": model, "model_config": model_config, "cwd": cwd}
             )
@@ -4923,7 +4914,7 @@ def test_ensure_session_db_row_records_a_terminal_workspace(monkeypatch, tmp_pat
     created = []
 
     class _FakeDB:
-        def create_session(self, key, source=None, model=None, model_config=None, parent_session_id=None, cwd=None, profile_name=None):
+        def create_session(self, key, source=None, model=None, model_config=None, parent_session_id=None, cwd=None, profile_name=None, inherit_compaction_state=True):
             created.append(
                 {"key": key, "source": source, "model": model, "model_config": model_config, "cwd": cwd}
             )
@@ -4946,7 +4937,7 @@ def test_ensure_session_db_row_defaults_desktop_to_no_workspace(monkeypatch, tmp
     created = []
 
     class _FakeDB:
-        def create_session(self, key, source=None, model=None, model_config=None, parent_session_id=None, cwd=None, profile_name=None):
+        def create_session(self, key, source=None, model=None, model_config=None, parent_session_id=None, cwd=None, profile_name=None, inherit_compaction_state=True):
             created.append(
                 {"key": key, "source": source, "model": model, "model_config": model_config, "cwd": cwd}
             )
@@ -4973,7 +4964,7 @@ def test_ensure_session_db_row_persists_session_model_override(monkeypatch):
     created = []
 
     class _FakeDB:
-        def create_session(self, key, source=None, model=None, model_config=None, parent_session_id=None, cwd=None, profile_name=None):
+        def create_session(self, key, source=None, model=None, model_config=None, parent_session_id=None, cwd=None, profile_name=None, inherit_compaction_state=True):
             created.append(
                 {"key": key, "model": model, "model_config": model_config, "cwd": cwd}
             )
@@ -5005,7 +4996,7 @@ def test_ensure_session_db_row_no_override_uses_global(monkeypatch):
     created = []
 
     class _FakeDB:
-        def create_session(self, key, source=None, model=None, model_config=None, parent_session_id=None, cwd=None, profile_name=None):
+        def create_session(self, key, source=None, model=None, model_config=None, parent_session_id=None, cwd=None, profile_name=None, inherit_compaction_state=True):
             created.append({"model": model, "model_config": model_config})
 
     monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
@@ -7144,20 +7135,17 @@ def test_compress_session_history_passes_force():
     assert agent._compress_context.call_args.kwargs.get("force") is True
 
 
-def test_compress_session_history_works_when_auto_compaction_disabled():
-    """compression.enabled: false disables *automatic* compaction only —
-    manual /compress must still work on every TUI route (session.compress
-    RPC, slash compress/compact, slash-worker mirror), all of which converge
-    on _compress_session_history. Pin that the helper never gates on
-    agent.compression_enabled (#64438)."""
+def test_compress_session_history_blocks_when_compaction_is_off():
+    """compression.enabled: false selects absolute ``off`` mode.
+
+    Manual /compress must therefore fail closed on every TUI route rather than
+    bypassing the configured prohibition on textual compression.
+    """
     from unittest.mock import MagicMock
 
     agent = MagicMock()
     agent.compression_enabled = False
     agent.context_compressor = None  # keep _get_usage on the simple path
-    compressed = [{"role": "user", "content": "summary"}]
-    agent._compress_context.return_value = (compressed, "")
-    # Explicit non-lock-skip: MagicMock getattr would return a truthy mock.
     agent._compression_skipped_due_to_lock = False
     session = _session(
         agent=agent,
@@ -7169,12 +7157,10 @@ def test_compress_session_history_works_when_auto_compaction_disabled():
         ],
     )
 
-    removed, _usage = server._compress_session_history(session)
+    with pytest.raises(RuntimeError, match="Manual compression blocked"):
+        server._compress_session_history(session)
 
-    assert removed == 3
-    assert session["history"] == compressed
-    agent._compress_context.assert_called_once()
-    assert agent._compress_context.call_args.kwargs.get("force") is True
+    agent._compress_context.assert_not_called()
 
 
 def test_session_compress_uses_compress_helper(monkeypatch):
@@ -8754,7 +8740,6 @@ def test_prompt_submit_sanitizes_bracketed_paste_before_agent(monkeypatch):
         monkeypatch.setattr(server, "_emit", lambda *a: None)
         monkeypatch.setattr(server, "_start_agent_build", lambda *a, **k: None)
         monkeypatch.setattr(server, "_ensure_session_db_row", lambda *a, **k: None)
-        monkeypatch.setattr(server, "_persist_branch_seed", lambda *a, **k: None)
 
         resp = server.handle_request(
             {
@@ -9231,7 +9216,6 @@ def test_interrupt_before_agent_ready_prevents_late_turn_start(monkeypatch):
         monkeypatch.setattr(server.threading, "Thread", _FakeThread)
         monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
         monkeypatch.setattr(server, "_ensure_session_db_row", lambda session: None)
-        monkeypatch.setattr(server, "_persist_branch_seed", lambda session: None)
         monkeypatch.setattr(server, "_start_agent_build", lambda sid, session: None)
         monkeypatch.setattr(server, "_wait_agent", lambda session, rid: None)
         monkeypatch.setattr(
@@ -9301,7 +9285,6 @@ def test_cancelled_turn_before_agent_ready_emits_error_event(monkeypatch):
         monkeypatch.setattr(server.threading, "Thread", _FakeThread)
         monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: emitted.append(args))
         monkeypatch.setattr(server, "_ensure_session_db_row", lambda session: None)
-        monkeypatch.setattr(server, "_persist_branch_seed", lambda session: None)
         monkeypatch.setattr(server, "_start_agent_build", lambda sid, session: None)
         monkeypatch.setattr(server, "_wait_agent", lambda session, rid: None)
         monkeypatch.setattr(
@@ -9373,7 +9356,6 @@ def test_session_not_running_before_agent_ready_emits_error_event(monkeypatch):
         monkeypatch.setattr(server.threading, "Thread", _FakeThread)
         monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: emitted.append(args))
         monkeypatch.setattr(server, "_ensure_session_db_row", lambda session: None)
-        monkeypatch.setattr(server, "_persist_branch_seed", lambda session: None)
         monkeypatch.setattr(server, "_start_agent_build", lambda sid, session: None)
         monkeypatch.setattr(server, "_wait_agent", lambda session, rid: None)
         monkeypatch.setattr(
@@ -9459,7 +9441,6 @@ def test_slow_agent_build_delivers_prompt_instead_of_timing_out(monkeypatch):
         monkeypatch.setattr(server.threading, "Thread", _FakeThread)
         monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: emitted.append(args))
         monkeypatch.setattr(server, "_ensure_session_db_row", lambda session: None)
-        monkeypatch.setattr(server, "_persist_branch_seed", lambda session: None)
         monkeypatch.setattr(server, "_start_agent_build", lambda sid, session: None)
         monkeypatch.setattr(
             server,
@@ -9534,7 +9515,6 @@ def test_slow_agent_build_emits_keyed_progress_notice(monkeypatch):
         monkeypatch.setattr(server, "_AGENT_BUILD_SLOW_NOTICE_AFTER", 0.0)
         monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: emitted.append(args))
         monkeypatch.setattr(server, "_ensure_session_db_row", lambda session: None)
-        monkeypatch.setattr(server, "_persist_branch_seed", lambda session: None)
         monkeypatch.setattr(server, "_start_agent_build", lambda sid, session: None)
         monkeypatch.setattr(
             server,
@@ -9596,7 +9576,6 @@ def test_agent_build_failure_surfaces_error_and_drops_turn(monkeypatch):
         monkeypatch.setattr(server.threading, "Thread", _FakeThread)
         monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: emitted.append(args))
         monkeypatch.setattr(server, "_ensure_session_db_row", lambda session: None)
-        monkeypatch.setattr(server, "_persist_branch_seed", lambda session: None)
         monkeypatch.setattr(server, "_start_agent_build", lambda sid, session: None)
         monkeypatch.setattr(
             server,
@@ -11069,10 +11048,15 @@ def test_session_branch_writes_to_parent_profile_db(monkeypatch, tmp_path):
         def get_next_title_in_lineage(self, current):
             return f"{current} (branch)"
 
-        def create_session(self, new_key, **kwargs):
-            seen["created"] = new_key
+        def create_session_fork(self, **kwargs):
+            seen["created"] = kwargs.get("child_session_id")
             seen["parent"] = kwargs.get("parent_session_id")
             seen["profile_name"] = kwargs.get("profile_name")
+            seen["title"] = (
+                kwargs.get("child_session_id"),
+                kwargs.get("title"),
+            )
+            seen["msgs"].extend(kwargs.get("messages") or [])
 
         def append_message(self, **kwargs):
             seen["msgs"].append(kwargs)

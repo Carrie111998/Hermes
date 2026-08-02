@@ -649,6 +649,27 @@ def build_turn_context(
         if not isinstance(pending_cli_message, dict) or pending_cli_message.get("_db_persisted"):
             agent._pending_cli_user_message = None
 
+    # Resolve automatic compaction ownership before *any* idle/preflight
+    # decision.  Model/provider failover may have changed the active Responses
+    # route since the previous turn; stale capability state must never suppress
+    # or enable Hermes compaction for the wrong route.
+    _codex_native_auto = (
+        getattr(agent, "api_mode", None) == "codex_app_server"
+        and str(
+            getattr(agent, "codex_app_server_auto_compaction", "native")
+            or "native"
+        ).lower()
+        in {"native", "off"}
+    )
+    if getattr(agent, "api_mode", None) == "codex_responses":
+        from agent.responses_compaction import (
+            should_defer_automatic_hermes_compaction,
+        )
+
+        _codex_native_auto = should_defer_automatic_hermes_compaction(
+            agent, refresh=True
+        )
+
     # ── Idle-triggered compaction (opt-in; ``idle_compact_after_seconds``) ──
     # When a session resumes after a long idle gap, compact the accumulated
     # history up front so the rest of the conversation does not keep re-reading
@@ -659,7 +680,12 @@ def build_turn_context(
     # the previous turn finished. The cheap gap pre-check gates the (more
     # expensive) token estimate, mirroring ``_should_run_preflight_estimate``.
     _idle_after = getattr(agent, "compression_idle_compact_after_seconds", 0)
-    if agent.compression_enabled and _idle_after > 0 and messages:
+    if (
+        agent.compression_enabled
+        and not _codex_native_auto
+        and _idle_after > 0
+        and messages
+    ):
         _idle_gap = time.time() - getattr(agent, "_last_activity_ts", time.time())
         if _idle_gap >= _idle_after:
             _compressor = agent.context_compressor
@@ -736,11 +762,15 @@ def build_turn_context(
     _preflight_compression_blocked = False
     agent._turn_received_provider_response = False
     agent._turn_preflight_display_snapshot = None
-    if agent.compression_enabled and _should_run_preflight_estimate(
-        messages,
-        agent.context_compressor.protect_first_n,
-        agent.context_compressor.protect_last_n,
-        agent.context_compressor.threshold_tokens,
+    if (
+        agent.compression_enabled
+        and not _codex_native_auto
+        and _should_run_preflight_estimate(
+            messages,
+            agent.context_compressor.protect_first_n,
+            agent.context_compressor.protect_last_n,
+            agent.context_compressor.threshold_tokens,
+        )
     ):
         _preflight_tokens = estimate_request_tokens_rough(
             messages,
@@ -769,21 +799,6 @@ def build_turn_context(
             lambda _tokens: False,
         )
         _preflight_deferred = _defer_preflight(_preflight_tokens)
-        # Codex app-server threads are compacted by the codex agent itself;
-        # Hermes only initiates compaction in "hermes" mode (#36801).
-        _codex_native_auto = (
-            getattr(agent, "api_mode", None) == "codex_app_server"
-            and str(
-                getattr(
-                    agent,
-                    "codex_app_server_auto_compaction",
-                    "native",
-                )
-                or "native"
-            ).lower()
-            in {"native", "off"}
-        )
-
         if not _preflight_deferred:
             _last = _compressor.last_prompt_tokens
             # Do NOT overwrite the -1 sentinel (#36718).
@@ -818,12 +833,6 @@ def build_turn_context(
                 # summary-LLM cooldown — surface a warning (see block below).
                 _cooldown_secs = _compression_cooldown.get("remaining_seconds", 0.0)
                 _compress_block_reason = f"cooldown:{_cooldown_secs:.0f}"
-        elif _codex_native_auto:
-            logger.info(
-                "Skipping Hermes preflight compression for codex app-server "
-                "(mode=%s); Hermes will not start thread compaction here.",
-                getattr(agent, "codex_app_server_auto_compaction", "native"),
-            )
         else:
             _should_compress_now = _compressor.should_compress(_preflight_tokens)
             if not _should_compress_now:

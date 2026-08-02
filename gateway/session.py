@@ -248,7 +248,7 @@ class SessionSource:
         return ", ".join(parts)
     
     def to_dict(self) -> Dict[str, Any]:
-        d = {
+        d: Dict[str, Any] = {
             "platform": self.platform.value,
             "chat_id": self.chat_id,
             "chat_name": self.chat_name,
@@ -2271,7 +2271,7 @@ class SessionStore:
                 )
 
         db_end_session_id = None
-        db_create_kwargs = None
+        db_create_kwargs: Optional[Dict[str, Any]] = None
         existing_session_id = None
         force_new_observed_entry = None
 
@@ -2740,7 +2740,7 @@ class SessionStore:
     def reset_session(self, session_key: str, display_name: Optional[str] = None) -> Optional[SessionEntry]:
         """Force reset a session, creating a new session ID."""
         db_end_session_id = None
-        db_create_kwargs = None
+        db_create_kwargs: Optional[Dict[str, Any]] = None
         new_entry = None
 
         with self._lock:
@@ -3119,6 +3119,7 @@ class SessionStore:
             reasoning_details=message.get("reasoning_details") if message.get("role") == "assistant" else None,
             codex_reasoning_items=message.get("codex_reasoning_items") if message.get("role") == "assistant" else None,
             codex_message_items=message.get("codex_message_items") if message.get("role") == "assistant" else None,
+            codex_output_items=message.get("codex_output_items") if message.get("role") == "assistant" else None,
             platform_message_id=(message.get("platform_message_id") or message.get("message_id")),
             observed=bool(message.get("observed")),
             timestamp=message.get("timestamp"),

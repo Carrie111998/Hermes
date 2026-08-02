@@ -223,6 +223,14 @@ class SessionPortabilityMixin:
         session = self.get_session(session_id)
         if not session:
             return None
+        from agent.responses_compaction import NativeCompactionLedger
+
+        lifecycle = NativeCompactionLedger.from_dict(
+            self.get_codex_responses_compaction_state(session_id)
+        )
+        session["codex_responses_compaction_state"] = json.dumps(
+            lifecycle.to_dict(), sort_keys=True, separators=(",", ":")
+        )
         messages = self.get_messages(session_id)
         return {**session, "messages": messages}
 
@@ -254,8 +262,9 @@ class SessionPortabilityMixin:
         sessions = self.search_sessions(source=source, limit=100000)
         results = []
         for session in sessions:
-            messages = self.get_messages(session["id"])
-            results.append({**session, "messages": messages})
+            exported = self.export_session(session["id"])
+            if exported is not None:
+                results.append(exported)
         return results
 
     @staticmethod
@@ -440,6 +449,21 @@ class SessionPortabilityMixin:
                 clean_session["model_config"] = self._import_json_object_or_none(
                     clean_session.get("model_config"), "model_config"
                 )
+                _compaction_state = self._import_json_object_or_none(
+                    clean_session.get("codex_responses_compaction_state"),
+                    "codex_responses_compaction_state",
+                )
+                if _compaction_state is not None:
+                    from agent.responses_compaction import NativeCompactionLedger
+
+                    _compaction_state = json.dumps(
+                        NativeCompactionLedger.from_dict(
+                            json.loads(_compaction_state)
+                        ).to_dict(),
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                clean_session["codex_responses_compaction_state"] = _compaction_state
                 clean_session["parent_session_id"] = self._import_text_or_none(
                     clean_session.get("parent_session_id"), "parent_session_id"
                 )
@@ -464,6 +488,19 @@ class SessionPortabilityMixin:
                         clean_message.get("token_count"), "token_count"
                     )
                     clean_messages.append(clean_message)
+                from agent.responses_compaction import (
+                    NativeCompactionLedger,
+                    validate_compaction_lifecycle,
+                )
+
+                imported_ledger = (
+                    NativeCompactionLedger.from_dict(
+                        json.loads(_compaction_state)
+                    )
+                    if _compaction_state is not None
+                    else NativeCompactionLedger.empty()
+                )
+                validate_compaction_lifecycle(imported_ledger, clean_messages)
             except ValueError as exc:
                 errors.append(self._import_error(index, session_id, str(exc)))
                 continue
@@ -524,7 +561,8 @@ class SessionPortabilityMixin:
                            cwd, git_branch, git_repo_root,
                            billing_provider, billing_base_url, billing_mode,
                            estimated_cost_usd, actual_cost_usd, cost_status, cost_source,
-                           pricing_version, title, api_call_count, archived
+                           pricing_version, title, api_call_count, archived,
+                           codex_responses_compaction_state
                        )
                        VALUES (
                            :id, :source, :user_id, :model, :model_config,
@@ -535,7 +573,8 @@ class SessionPortabilityMixin:
                            :billing_provider, :billing_base_url, :billing_mode,
                            :estimated_cost_usd, :actual_cost_usd, :cost_status,
                            :cost_source, :pricing_version, :title,
-                           :api_call_count, :archived
+                           :api_call_count, :archived,
+                           :codex_responses_compaction_state
                        )""",
                     {
                         "id": session_id,
@@ -576,6 +615,9 @@ class SessionPortabilityMixin:
                         "title": raw.get("title"),
                         "api_call_count": self._int_or_default(raw.get("api_call_count")),
                         "archived": archived,
+                        "codex_responses_compaction_state": raw.get(
+                            "codex_responses_compaction_state"
+                        ),
                     },
                 )
 
@@ -586,6 +628,7 @@ class SessionPortabilityMixin:
                         "reasoning_details",
                         "codex_reasoning_items",
                         "codex_message_items",
+                        "codex_output_items",
                     ):
                         clean[key] = self._reasoning_json_value(clean.get(key))
                     sanitized_messages.append(clean)

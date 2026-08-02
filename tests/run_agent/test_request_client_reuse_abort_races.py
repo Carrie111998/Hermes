@@ -385,6 +385,46 @@ def test_codex_stream_close_failure_poisons_slot():
     assert abort_reasons == ["codex_stream_close_failed"]
 
 
+def test_v7_codex_stream_forwards_explicit_logical_call_metadata(monkeypatch):
+    from agent import relay_llm
+    from agent.codex_runtime import run_codex_stream
+
+    agent = _make_agent()
+    stream = _FakeCodexEventStream(
+        [_codex_delta_event("summary"), _codex_completed_event()]
+    )
+    client = MagicMock()
+    client.responses.create.return_value = stream
+    captured_metadata = []
+    original_stream = relay_llm.stream
+
+    def capture_stream(*args, **kwargs):
+        captured_metadata.append(dict(kwargs["metadata"]))
+        return original_stream(*args, **kwargs)
+
+    monkeypatch.setattr(relay_llm, "stream", capture_stream)
+    logical_metadata = {
+        "api_request_id": "iteration-summary:v7-test",
+        "call_role": "iteration_summary",
+        "retry_count": 1,
+    }
+
+    final = run_codex_stream(
+        agent,
+        {"model": "test/model"},
+        client=client,
+        logical_call_metadata=logical_metadata,
+    )
+
+    assert final.output_text == "summary"
+    assert captured_metadata == [
+        {
+            "api_mode": "codex_responses",
+            **logical_metadata,
+        }
+    ]
+
+
 def test_codex_stream_close_failure_on_primary_client_does_not_abort():
     """``client=None`` means the shared primary client — never reuse-cached,
     and its sockets must not be force-shut by the close-failure handler."""

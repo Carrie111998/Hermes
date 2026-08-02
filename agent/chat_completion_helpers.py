@@ -1120,7 +1120,13 @@ def interruptible_api_call(agent, api_kwargs: dict):
 
 
 
-def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = None) -> dict:
+def build_api_kwargs(
+    agent,
+    api_messages: list,
+    tools_for_api: list | None = None,
+    *,
+    native_summary_projection: bool = False,
+) -> dict:
     """Build the keyword arguments dict for the active API mode."""
     if tools_for_api is None:
         tools_for_api = agent.tools
@@ -1182,7 +1188,71 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
             )
         )
         is_xai_responses = agent.provider in {"xai", "xai-oauth"} or agent._base_url_hostname == "api.x.ai"
+        from agent.responses_compaction import (
+            build_native_request_overrides,
+            effective_auto_compaction_mode,
+            has_replayable_compaction_sidecar,
+            native_compaction_read_failed,
+            reconcile_policy_for_current_route,
+            validate_native_request_overrides,
+            validate_responses_continuation_overrides,
+        )
+        # Native custody is fixed from config before a durable read can refresh
+        # route state. The transport repeats this check behind an explicit bit.
+        _native_mode = effective_auto_compaction_mode(agent)
+        _raw_request_overrides = getattr(agent, "request_overrides", None)
+        if _native_mode == "native":
+            _safe_request_overrides = validate_native_request_overrides(
+                _raw_request_overrides
+            )
+        else:
+            _safe_request_overrides = validate_responses_continuation_overrides(
+                _raw_request_overrides
+            )
         _msgs_for_codex = agent._prepare_messages_for_non_vision_model(api_messages)
+        _native_policy = reconcile_policy_for_current_route(
+            agent,
+            provider=getattr(agent, "provider", "") or "",
+            endpoint=getattr(agent, "base_url", "") or "",
+            model=getattr(agent, "model", "") or "",
+        )
+        _native_read_failed = native_compaction_read_failed(agent)
+        if _native_read_failed:
+            _native_request_overrides = _safe_request_overrides
+        else:
+            _native_request_overrides = build_native_request_overrides(
+                _safe_request_overrides,
+                mode=_native_mode,
+                policy=_native_policy,
+                compact_threshold=int(
+                    getattr(agent, "codex_responses_compact_threshold", 200_000)
+                ),
+            )
+        _matching_native_checkpoint = has_replayable_compaction_sidecar(
+            _msgs_for_codex,
+            route=_native_policy.route,
+            expected_digest=_native_policy.last_compaction_digest,
+        )
+        _replay_native_compaction = (
+            not _native_read_failed
+            and _native_mode == "native"
+            and _native_policy.capability in {"item_observed", "replay_verified"}
+            and "context_management" in _native_request_overrides
+            and _matching_native_checkpoint
+        ) or (
+            not _native_read_failed
+            and native_summary_projection
+            and _native_policy.capability == "quarantined"
+            and _native_policy.last_error == "compaction_continuation_limit"
+            and _matching_native_checkpoint
+        )
+        agent._native_compaction_request_active = (
+            "context_management" in _native_request_overrides
+        )
+        agent._native_compaction_replay_attempted = _replay_native_compaction
+        _native_context_management = _native_request_overrides.pop(
+            "context_management", None
+        )
 
         # xAI's /responses endpoint rejects ``pattern`` and ``format`` keywords
         # in tool schemas (HTTP 400 "Invalid arguments passed to the model").
@@ -1225,7 +1295,9 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
             base_url=agent.base_url,
             max_tokens=agent.max_tokens,
             timeout=agent._resolved_api_call_timeout(),
-            request_overrides=agent.request_overrides,
+            request_overrides=_native_request_overrides,
+            enforce_native_request_custody=_native_mode == "native",
+            native_context_management=_native_context_management,
             is_github_responses=is_github_responses,
             is_codex_backend=is_codex_backend,
             is_xai_responses=is_xai_responses,
@@ -1233,6 +1305,9 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
             replay_encrypted_reasoning=bool(
                 getattr(agent, "_codex_reasoning_replay_enabled", True)
             ),
+            replay_native_compaction=_replay_native_compaction,
+            native_compaction_route=_native_policy.route.to_dict(),
+            native_compaction_digest=_native_policy.last_compaction_digest,
         )
 
     # ── chat_completions (default) ─────────────────────────────────────
@@ -1563,6 +1638,17 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
     codex_message_items = getattr(assistant_message, "codex_message_items", None)
     if codex_message_items:
         msg["codex_message_items"] = codex_message_items
+
+    # Native Responses compaction: preserve the exact globally ordered output
+    # block containing the compaction item. The adapter uses this as a
+    # same-issuer API projection boundary while the visible transcript remains
+    # intact for audit and foreign-provider fallback.
+    codex_output_items = getattr(assistant_message, "codex_output_items", None)
+    if codex_output_items:
+        msg["codex_output_items"] = codex_output_items
+        from agent.responses_compaction import stage_native_compaction_checkpoint
+
+        stage_native_compaction_checkpoint(agent, msg)
 
     if assistant_tool_calls:
         tool_calls = []
@@ -2075,6 +2161,16 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
     summary_api_request_id = f"iteration-summary:{uuid.uuid4()}"
     summary_call_outcome = "failed"
 
+    def _summary_call_metadata(*, retry_count: int) -> dict[str, object]:
+        return {
+            "api_mode": str(
+                getattr(agent, "api_mode", "") or "chat_completions"
+            ),
+            "api_request_id": summary_api_request_id,
+            "call_role": "iteration_summary",
+            "retry_count": retry_count,
+        }
+
     def _managed_summary_call(request, callback, *, retry_count: int):
         from agent import relay_llm
 
@@ -2083,14 +2179,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
             callback,
             name=str(getattr(agent, "provider", "") or "provider"),
             model_name=str(getattr(agent, "model", "") or ""),
-            metadata={
-                "api_mode": str(
-                    getattr(agent, "api_mode", "") or "chat_completions"
-                ),
-                "api_request_id": summary_api_request_id,
-                "call_role": "iteration_summary",
-                "retry_count": retry_count,
-            },
+            metadata=_summary_call_metadata(retry_count=retry_count),
             defer_logical_completion=True,
         )
 
@@ -2121,7 +2210,18 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
             # timestamp (preserved on gateway user replay entries for the
             # stale-confirmation expiry check — #47868 rejection class),
             # and every Hermes-internal underscore-prefixed scaffolding key.
-            for schema_foreign in ("tool_name", "codex_reasoning_items", "codex_message_items", "timestamp"):
+            for schema_foreign in (
+                "tool_name",
+                "codex_reasoning_items",
+                "codex_message_items",
+                "codex_output_items",
+                "timestamp",
+            ):
+                if (
+                    getattr(agent, "api_mode", None) == "codex_responses"
+                    and schema_foreign.startswith("codex_")
+                ):
+                    continue
                 api_msg.pop(schema_foreign, None)
             # api_content (the persist-what-you-send sidecar) carries the
             # exact bytes every main-loop call sent for this message —
@@ -2208,9 +2308,15 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
             summary_extra_body["tags"] = _portal_tags()
 
         if agent.api_mode == "codex_responses":
-            codex_kwargs = agent._build_api_kwargs(api_messages)
+            codex_kwargs = agent._build_api_kwargs(
+                api_messages,
+                native_summary_projection=True,
+            )
             codex_kwargs.pop("tools", None)
-            summary_response = agent._run_codex_stream(codex_kwargs)
+            summary_response = agent._run_codex_stream(
+                codex_kwargs,
+                logical_call_metadata=_summary_call_metadata(retry_count=0),
+            )
             _ct_sum = agent._get_transport()
             _cnr_sum = _ct_sum.normalize_response(summary_response)
             final_response = (_cnr_sum.content or "").strip()
@@ -2320,9 +2426,15 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
         else:
             # Retry summary generation
             if agent.api_mode == "codex_responses":
-                codex_kwargs = agent._build_api_kwargs(api_messages)
+                codex_kwargs = agent._build_api_kwargs(
+                    api_messages,
+                    native_summary_projection=True,
+                )
                 codex_kwargs.pop("tools", None)
-                retry_response = agent._run_codex_stream(codex_kwargs)
+                retry_response = agent._run_codex_stream(
+                    codex_kwargs,
+                    logical_call_metadata=_summary_call_metadata(retry_count=1),
+                )
                 _ct_retry = agent._get_transport()
                 _cnr_retry = _ct_retry.normalize_response(retry_response)
                 final_response = (_cnr_retry.content or "").strip()

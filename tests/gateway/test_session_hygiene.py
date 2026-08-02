@@ -905,8 +905,6 @@ def _make_progress_runner(monkeypatch, tmp_path, agent_cls, cfg_text):
     return runner, adapter, event
 
 
-
-
 # ---------------------------------------------------------------------------
 # Cooldown persistence across gateway restarts (#74136)
 # ---------------------------------------------------------------------------
@@ -1083,3 +1081,121 @@ async def test_hygiene_compression_cooldown_survives_gateway_restart(
         assert runner2._run_agent.await_count == 1
     finally:
         db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["native", "off"])
+async def test_v8_gateway_hygiene_defers_for_non_hermes_responses_mode(
+    monkeypatch, tmp_path, mode,
+):
+    """Pre-agent gateway hygiene must not mutate native/off Responses sessions."""
+    from agent.responses_compaction import (
+        NativeCompactionPolicy,
+        advance_policy_after_success,
+        route_for_request,
+    )
+    from hermes_state import SessionDB
+
+    route = route_for_request(
+        provider="openai-codex",
+        endpoint="https://chatgpt.com/backend-api/codex",
+        model="gpt-5.6-sol",
+    )
+    owner = advance_policy_after_success(
+        NativeCompactionPolicy(route=route),
+        codex_output_items=[
+            {
+                "type": "compaction",
+                "encrypted_content": "v8-gateway-owner",
+                "_issuer_kind": route.issuer_kind,
+                "_compaction_route": route.to_dict(),
+            }
+        ],
+        replay_attempted=False,
+    )
+
+    class NativeOwningHygieneAgent:
+        last_instance = None
+        compress_calls = 0
+
+        def __init__(self, **kwargs):
+            self.model = kwargs.get("model", route.model)
+            self.provider = kwargs.get("provider", "openai-codex")
+            self.api_mode = kwargs.get("api_mode", "codex_responses")
+            self.base_url = kwargs.get("base_url", route.endpoint)
+            self.session_id = kwargs["session_id"]
+            self._session_db = kwargs.get("session_db")
+            self.compression_enabled = True
+            self.codex_responses_auto_compaction = mode
+            self._native_compaction_policy = NativeCompactionPolicy(route=route)
+            self._native_compaction_transition_receipt = None
+            self._native_compaction_failed_receipts = {}
+            self._native_compaction_failed_receipts_overflow = False
+            self.compression_in_place = False
+            self._last_compaction_in_place = False
+            self._print_fn = None
+            self.context_compressor = SimpleNamespace(
+                bind_session_state=lambda *_args, **_kwargs: None,
+            )
+            self.shutdown_memory_provider = MagicMock()
+            self.close = MagicMock()
+            type(self).last_instance = self
+
+        def _compress_context(self, *_args, **_kwargs):
+            type(self).compress_calls += 1
+            self._last_compaction_in_place = True
+            return ([{"role": "user", "content": "forbidden gateway summary"}], "")
+
+    runner, _adapter, event = _make_progress_runner(
+        monkeypatch,
+        tmp_path,
+        NativeOwningHygieneAgent,
+        (
+            "compression:\n"
+            "  enabled: true\n"
+            "  threshold: 0.50\n"
+            f"  codex_responses_auto: '{mode}'\n"
+        ),
+    )
+    db = SessionDB(db_path=tmp_path / "v8-gateway-owner.db")
+    session_id = db.create_session("v8-gateway", "test", model=route.model)
+    db.append_message(
+        session_id,
+        role="assistant",
+        content="",
+        codex_output_items=[
+            {
+                "type": "compaction",
+                "encrypted_content": "v8-gateway-owner",
+                "_issuer_kind": route.issuer_kind,
+                "_compaction_route": route.to_dict(),
+            }
+        ],
+        codex_responses_compaction_policy=owner.to_dict(),
+        expected_codex_responses_compaction_revision=0,
+    )
+    runner.session_store.get_or_create_session.return_value.session_id = session_id
+    runner._session_db = SimpleNamespace(
+        _db=db,
+        get_session=AsyncMock(return_value=None),
+    )
+    runner._resolve_session_agent_runtime = MagicMock(
+        return_value=(
+            route.model,
+            {
+                "api_key": "fake",
+                "provider": "openai-codex",
+                "api_mode": "codex_responses",
+                "base_url": route.endpoint,
+            },
+        )
+    )
+
+    result = await runner._handle_message(event)
+
+    assert result == "ok"
+    assert NativeOwningHygieneAgent.last_instance is None
+    assert NativeOwningHygieneAgent.compress_calls == 0
+    runner.session_store.rewrite_transcript.assert_not_called()
+    runner._run_agent.assert_awaited_once()
+    db.close()
