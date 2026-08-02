@@ -2510,6 +2510,76 @@ def _parse_boolean(value: Any, code: str) -> bool:
     _fail(code)
 
 
+def _foundation_drift_error_code(row: Mapping[str, Any]) -> str:
+    """Return one secret-free structural reason for a classified drift row."""
+
+    invalid = "schema_reconciliation_control_database_observation_invalid"
+    counts = {
+        name: _parse_decimal(row.get(name), invalid)
+        for name in (
+            "control_admin_count",
+            "control_admin_forward_role_count",
+            "control_admin_owned_object_count",
+            "control_admin_shared_dependency_count",
+            "foreign_client_session_count",
+            "max_prepared_transactions",
+            "cluster_prepared_xact_count",
+            "executor_membership_count",
+            "executor_owned_object_count",
+            "executor_acl_dependency_count",
+            "helper_same_name_count",
+        )
+    }
+    flags = {
+        name: _parse_boolean(row.get(name), invalid)
+        for name in (
+            "control_admin_role_exact",
+            "non_template_database_inventory_exact",
+            "all_connectable_database_inventory_exact",
+            "latent_provider_exception_exact",
+            "executor_database_effective_privileges_exact",
+            "migration_owner_role_exact",
+            "current_database_owner_exact",
+            "helper_absent",
+        )
+    }
+    if (
+        counts["control_admin_count"] != 1
+        or flags["control_admin_role_exact"] is not True
+        or counts["control_admin_forward_role_count"]
+        != 1 + counts["executor_membership_count"]
+        or counts["control_admin_owned_object_count"] != 0
+        or counts["control_admin_shared_dependency_count"] != 0
+    ):
+        return "schema_reconciliation_control_admin_session_boundary_drifted"
+    if counts["foreign_client_session_count"] != 0:
+        return "schema_reconciliation_control_foreign_client_sessions_present"
+    if (
+        counts["max_prepared_transactions"] != 0
+        or counts["cluster_prepared_xact_count"] != 0
+    ):
+        return "schema_reconciliation_control_prepared_transactions_drifted"
+    if (
+        flags["non_template_database_inventory_exact"] is not True
+        or flags["all_connectable_database_inventory_exact"] is not True
+    ):
+        return "schema_reconciliation_control_database_inventory_drifted"
+    if flags["latent_provider_exception_exact"] is not True:
+        return "schema_reconciliation_control_cloudsqladmin_contract_drifted"
+    if flags["executor_database_effective_privileges_exact"] is not True:
+        return "schema_reconciliation_control_executor_privileges_drifted"
+    if flags["migration_owner_role_exact"] is not True:
+        return "schema_reconciliation_control_migration_owner_role_drifted"
+    if flags["current_database_owner_exact"] is not True:
+        return "schema_reconciliation_control_database_owner_drifted"
+    if (
+        flags["helper_absent"] is not True
+        or counts["helper_same_name_count"] != 0
+    ):
+        return "schema_reconciliation_control_routeback_helper_present"
+    return "schema_reconciliation_control_foundation_objects_drifted"
+
+
 def _parse_foundation_observation_result(
     session: Any,
     result: Any,
@@ -2556,10 +2626,13 @@ def _parse_foundation_observation_result(
         helper_absent,
         helper_same_name_count,
     ) = result.rows[0]
+    row = dict(zip(_FOUNDATION_OBSERVATION_COLUMNS, result.rows[0], strict=True))
     try:
         version = int(str(version_text))
     except (TypeError, ValueError) as exc:
         raise ControlBootstrapError(code) from exc
+    if state == "drift":
+        _fail(_foundation_drift_error_code(row))
     if (
         database != foundation.SQL_DATABASE
         or version // 10000 != 18
