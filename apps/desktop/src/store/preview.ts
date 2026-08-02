@@ -36,7 +36,7 @@ export interface PreviewTarget {
   language?: string
   mimeType?: string
   path?: string
-  previewKind?: 'binary' | 'html' | 'image' | 'text'
+  previewKind?: 'binary' | 'html' | 'image' | 'pdf' | 'text'
   renderMode?: 'preview' | 'source'
   source: string
   url: string
@@ -91,12 +91,45 @@ function isPreviewTab(value: unknown): value is PreviewTab {
   return typeof r.id === 'string' && (r.id.startsWith('file:') || r.id.startsWith('url:')) && isPreviewTarget(r.target)
 }
 
-export const $previewTabs = persistentAtom<PreviewTab[]>(TABS_STORAGE_KEY, [], {
-  decode: raw => {
-    const parsed = JSON.parse(raw) as unknown
+function isPdfFileTarget(target: PreviewTarget): boolean {
+  if (target.kind !== 'file') {
+    return false
+  }
 
-    return Array.isArray(parsed) ? parsed.filter(isPreviewTab) : []
-  },
+  if (target.mimeType?.toLowerCase() === 'application/pdf') {
+    return true
+  }
+
+  if ([target.path, target.source].some(value => (value ? /\.pdf$/i.test(value) : false))) {
+    return true
+  }
+
+  try {
+    return /\.pdf$/i.test(new URL(target.url).pathname)
+  } catch {
+    return false
+  }
+}
+
+/** Upgrade tabs persisted by builds that classified PDFs as generic binary.
+ * Without this restore-time migration, an already-open PDF keeps taking the
+ * obsolete raw-binary path after Desktop itself has been upgraded. */
+export function decodePreviewTabs(raw: string): PreviewTab[] {
+  const parsed = JSON.parse(raw) as unknown
+
+  if (!Array.isArray(parsed)) {
+    return []
+  }
+
+  return parsed.filter(isPreviewTab).map(tab =>
+    isPdfFileTarget(tab.target) && tab.target.previewKind === 'binary'
+      ? { ...tab, target: { ...tab.target, previewKind: 'pdf' } }
+      : tab
+  )
+}
+
+export const $previewTabs = persistentAtom<PreviewTab[]>(TABS_STORAGE_KEY, [], {
+  decode: decodePreviewTabs,
   // Inline image bytes (megabytes) are stripped, and artifact tabs are skipped
   // entirely — the registry behind them doesn't survive a reload either.
   encode: tabs =>
