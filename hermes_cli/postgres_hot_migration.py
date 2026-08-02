@@ -83,6 +83,16 @@ TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
  "async_delegations": ("delegation_id","origin_session","origin_ui_session_id","parent_session_id","state","dispatched_at","completed_at","updated_at","event_json","result_json","delivery_state","delivery_attempts","delivered_at","owner_pid","owner_started_at","task_json","delivery_claim","delivery_claimed_at","origin_session_id"),
  "compression_locks": ("session_id","holder","acquired_at","expires_at"), "gateway_routing": ("scope","session_key","entry_json","updated_at"), "state_meta": ("key","value"), "agent_logs": ("id","agent_name","task_description","model_used","status","created_at","trace_id","span_id"),
 }
+TARGET_REQUIRED_COLUMNS: dict[str, frozenset[str]] = {
+    "sessions": frozenset({"id", "source", "started_at", "rewind_count", "archived", "compression_fallback_streak", "compression_ineffective_count", "pinned"}),
+    "messages": frozenset({"id", "session_id", "role", "timestamp", "active", "compacted"}),
+    "session_model_usage": frozenset({"session_id", "model", "billing_provider", "billing_base_url", "billing_mode", "task", "api_call_count", "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "reasoning_tokens", "estimated_cost_usd", "actual_cost_usd"}),
+    "async_delegations": frozenset({"delegation_id", "origin_session", "origin_ui_session_id", "state", "dispatched_at", "updated_at", "delivery_state", "delivery_attempts"}),
+    "compression_locks": frozenset({"session_id", "holder", "acquired_at", "expires_at"}),
+    "gateway_routing": frozenset({"scope", "session_key", "entry_json", "updated_at"}),
+    "state_meta": frozenset({"key"}),
+    "agent_logs": frozenset({"id", "agent_name", "task_description", "status", "created_at"}),
+}
 @dataclass(frozen=True)
 class DomainSpec:
     columns: tuple[str, ...]
@@ -266,12 +276,20 @@ def _cleanup_stage(stage: ScratchStage) -> None:
         with contextlib.suppress(OSError): os.close(stage.stage_fd)
         with contextlib.suppress(OSError): os.close(stage.parent_fd)
 
-def _reject_pending_wal(path: Path) -> None:
+def _reject_pending_sqlite_sidecars(path: Path) -> None:
+    """Reject every canonical SQLite transaction sidecar, even if empty."""
     try:
-        wal = path.with_name(path.name + "-wal")
-        if wal.exists() and wal.stat().st_size: raise MigrationError("source has pending WAL")
-    except MigrationError: raise
-    except OSError as exc: raise MigrationError("source artifact cannot be read") from exc
+        for suffix in ("-wal", "-shm", "-journal"):
+            sidecar = path.with_name(path.name + suffix)
+            try:
+                sidecar.lstat()
+            except FileNotFoundError:
+                continue
+            raise MigrationError("source has pending SQLite sidecar")
+    except MigrationError:
+        raise
+    except OSError as exc:
+        raise MigrationError("source artifact cannot be read") from exc
 
 def _copy_or_reflink(source_fd: int, destination: Path, source_size: int, *, before_chunk: object | None = None) -> tuple[str, tuple[int, int]]:
     """Make a 0600 private byte snapshot; its verified digest is authority."""
@@ -353,7 +371,7 @@ def _source_read_lease(fd: int) -> Iterator[object]:
 
 
 def _stage_artifact(source: Path, destination: Path, expected_hash: str, label: str, *, before_chunk: object | None = None) -> tuple[str, tuple[int, int, int, int]]:
-    _reject_pending_wal(source); fd = -1
+    _reject_pending_sqlite_sidecars(source); fd = -1
     destination_identity: tuple[int, int] | None = None
     try:
         fd = os.open(source, os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)); info = os.fstat(fd)
@@ -363,7 +381,7 @@ def _stage_artifact(source: Path, destination: Path, expected_hash: str, label: 
         with _source_read_lease(fd) as lease_broken:
             mode, destination_identity = _copy_or_reflink(fd, destination, info.st_size, before_chunk=before_chunk)
             _require_hash(expected_hash, _sha256_file(destination), label)
-            _reject_pending_wal(source)
+            _reject_pending_sqlite_sidecars(source)
             if lease_broken() or os.fstat(fd).st_nlink != 1:
                 raise MigrationError("source artifact changed during staging")
             staged = os.stat(destination, follow_symlinks=False)
@@ -729,14 +747,19 @@ def _rows(conn:sqlite3.Connection, table:str, cutoff:float|None)->Iterator[tuple
     elif table in {"sessions","session_model_usage"}: sql,params=f"SELECT {quoted} FROM {table} WHERE session_id IN (SELECT DISTINCT session_id FROM messages WHERE timestamp>=?) ORDER BY {_order_by(table)}",(cutoff,) if table=="session_model_usage" else (cutoff,); sql = sql.replace("WHERE session_id", "WHERE id") if table=="sessions" else sql
     else: sql,params=f"SELECT {quoted} FROM \"{table}\" ORDER BY {_order_by(table)}",()
     yield from (tuple(r) for r in conn.execute(sql,params))
-def _check_row(columns:Sequence[str], row:Sequence[object], limit:int)->None:
-    for col,v in zip(columns,row,strict=True):
-        if col not in BINARY_COLUMNS and isinstance(v,str) and "\0" in v: raise MigrationError("NUL in scalar identifier")
-    if sum(len(_canon(v))+8 for v in row)>limit: raise MigrationError("source row exceeds configured byte limit")
+def _check_row(table: str, columns: Sequence[str], row: Sequence[object], limit: int) -> None:
+    required = TARGET_REQUIRED_COLUMNS[table]
+    for col, value in zip(columns, row, strict=True):
+        if col in required and value is None:
+            raise MigrationError("source row violates target nullability")
+        if col not in BINARY_COLUMNS and isinstance(value, str) and "\0" in value:
+            raise MigrationError("NUL in scalar identifier")
+    if sum(len(_canon(value)) + 8 for value in row) > limit:
+        raise MigrationError("source row exceeds configured byte limit")
 def _manifest(conn:sqlite3.Connection, table:str,cutoff:float|None,limit:int,source_hash:str)->DomainManifest:
     d=hashlib.sha256(); count=nuls=payload=0; lo=hi=None; min_ts=max_ts=None; tscol=TIMESTAMP_COLUMNS.get(table); ti=TABLE_COLUMNS[table].index(tscol) if tscol else None
     for row in _rows(conn,table,cutoff):
-        _check_row(TABLE_COLUMNS[table],row,limit); count+=1; d.update(struct.pack("!I",len(row)))
+        _check_row(table, TABLE_COLUMNS[table], row, limit); count+=1; d.update(struct.pack("!I",len(row)))
         for v in row:
             e=_canon(v);d.update(struct.pack("!Q",len(e)));d.update(e)
             if isinstance(v,(str,bytes)): payload+=len(_as_bytes(v));nuls+=_as_bytes(v).count(b"\0")
@@ -744,6 +767,31 @@ def _manifest(conn:sqlite3.Connection, table:str,cutoff:float|None,limit:int,sou
         lo=identity if lo is None or identity<lo else lo;hi=identity if hi is None or identity>hi else hi
         if ti is not None and row[ti] is not None: stamp=float(row[ti]);min_ts=stamp if min_ts is None or stamp<min_ts else min_ts;max_ts=stamp if max_ts is None or stamp>max_ts else max_ts
     return DomainManifest(table,TABLE_COLUMNS[table],d.hexdigest(),count,nuls,payload,lo,hi,min_ts,max_ts,source_hash)
+def _validate_source_integrity(conn: sqlite3.Connection) -> None:
+    try:
+        quick_check = conn.execute("PRAGMA quick_check").fetchone()
+        foreign_key_error = conn.execute("PRAGMA foreign_key_check").fetchone()
+    except sqlite3.DatabaseError as exc:
+        raise MigrationError("source integrity audit failed") from exc
+    if quick_check is None or quick_check[0] != "ok":
+        raise MigrationError("source integrity audit failed")
+    if foreign_key_error is not None:
+        raise MigrationError("source referential integrity audit failed")
+
+
+def _validate_hot_relations(conn: sqlite3.Connection, cutoff: float) -> None:
+    orphan = conn.execute(
+        """SELECT 1
+           FROM messages AS message
+           LEFT JOIN sessions AS session ON session.id = message.session_id
+           WHERE message.timestamp >= ? AND session.id IS NULL
+           LIMIT 1""",
+        (cutoff,),
+    ).fetchone()
+    if orphan is not None:
+        raise MigrationError("source referential integrity audit failed")
+
+
 def _preflight_open(state: SourceArtifact, logs: SourceArtifact, cutoff: float, row_byte_limit: int, *, approval: SnapshotApproval) -> tuple[tuple[str, str], dict[str, DomainManifest]]:
     _validate_inputs(cutoff=cutoff, row_byte_limit=row_byte_limit)
     state_hash, logs_hash = state.hash(), logs.hash()
@@ -751,6 +799,9 @@ def _preflight_open(state: SourceArtifact, logs: SourceArtifact, cutoff: float, 
     names=tuple(x for x in TABLE_COLUMNS if x!="agent_logs")
     _validate_schema(state.conn, names, approval.state_schema_fingerprint)
     _validate_schema(logs.conn, ("agent_logs",), approval.agent_logs_schema_fingerprint)
+    _validate_source_integrity(state.conn)
+    _validate_source_integrity(logs.conn)
+    _validate_hot_relations(state.conn, cutoff)
     bad=state.conn.execute("SELECT 1 FROM sessions s WHERE COALESCE(message_count,0)!=(SELECT COUNT(*) FROM messages m WHERE m.session_id=s.id AND m.active=1) LIMIT 1").fetchone()
     if bad: raise MigrationError("source active message count audit failed")
     manifests={x:_manifest(state.conn,x,cutoff if x in {"sessions","messages","session_model_usage"} else None,row_byte_limit,state_hash) for x in names}
@@ -790,7 +841,7 @@ def _migration_sql()->str:return importlib.resources.files("hermes_cli").joinpat
 async def _copy(conn:object,src:sqlite3.Connection,m:DomainManifest,cutoff:float|None,row_limit:int,batch_limit:int)->None:
     batch=[];size=0; cols=TABLE_COLUMNS[m.name]
     for raw in _rows(src,m.name,cutoff):
-        _check_row(cols,raw,row_limit); row=tuple(_as_bytes(x) if c in BINARY_COLUMNS and x is not None else x for c,x in zip(cols,raw,strict=True)); outcols=cols
+        _check_row(m.name, cols, raw, row_limit); row=tuple(_as_bytes(x) if c in BINARY_COLUMNS and x is not None else x for c,x in zip(cols,raw,strict=True)); outcols=cols
         if m.name=="sessions":
             full=src.execute("SELECT COUNT(*) FROM messages WHERE session_id=? AND active=1",(raw[0],)).fetchone()[0];hot=src.execute("SELECT COUNT(*) FROM messages WHERE session_id=? AND active=1 AND timestamp>=?",(raw[0],cutoff)).fetchone()[0]
             row=(*row,full,hot);outcols=(*cols,"source_active_message_count","hot_active_message_count")
@@ -818,7 +869,7 @@ def _source_parity_manifest(src:sqlite3.Connection,m:DomainManifest,cutoff:float
     # derive counters before digest just as target does
     d=hashlib.sha256();n=p=nu=0;lo=hi=None;mn=mx=None
     for source_row in _rows(src,"sessions",cutoff):
-        _check_row(TABLE_COLUMNS["sessions"], source_row, limit)
+        _check_row("sessions", TABLE_COLUMNS["sessions"], source_row, limit)
         full=src.execute("SELECT COUNT(*) FROM messages WHERE session_id=? AND active=1",(source_row[0],)).fetchone()[0]
         hot=src.execute("SELECT COUNT(*) FROM messages WHERE session_id=? AND active=1 AND timestamp>=?",(source_row[0],cutoff)).fetchone()[0]
         r = (*source_row, full, hot)

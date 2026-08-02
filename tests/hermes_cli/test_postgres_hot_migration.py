@@ -174,12 +174,41 @@ def test_domain_check_catalog_definition_is_exact() -> None:
     assert _domain_check_matches(expected)
     assert not _domain_check_matches([{**expected[0], "definition": EXPECTED_DOMAIN_CHECK_DEFINITION.replace("'agent_logs'", "'agent_logs'::text, 'poison'")}])
 
-def test_pending_wal_and_stage_mutation_are_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("suffix", ["-wal", "-shm", "-journal"])
+@pytest.mark.parametrize("payload", [b"", b"pending"])
+def test_pending_sqlite_sidecars_are_rejected_before_staging(
+    tmp_path: Path, suffix: str, payload: bytes
+) -> None:
+    state, logs = _fixture_dbs(tmp_path)
+    approval = _hashes(state, logs)
+    state.with_name(state.name + suffix).write_bytes(payload)
+    with pytest.raises(MigrationError, match="pending SQLite"):
+        preflight(state, logs, 1, scratch_dir=_scratch(tmp_path), **approval)
+
+
+def test_hot_orphan_is_rejected_before_target_io(tmp_path: Path) -> None:
+    state, logs = _fixture_dbs(tmp_path)
+    conn = sqlite3.connect(state)
+    conn.execute("UPDATE messages SET session_id='missing'")
+    conn.execute("UPDATE sessions SET message_count=0")
+    conn.commit()
+    conn.close()
+    with pytest.raises(MigrationError, match="source referential integrity"):
+        preflight(state, logs, 1, scratch_dir=_scratch(tmp_path), **_hashes(state, logs))
+
+
+def test_target_required_null_is_rejected_before_target_io(tmp_path: Path) -> None:
+    state, logs = _fixture_dbs(tmp_path)
+    conn = sqlite3.connect(state)
+    conn.execute("UPDATE sessions SET source=NULL")
+    conn.commit()
+    conn.close()
+    with pytest.raises(MigrationError, match="source row violates target nullability"):
+        preflight(state, logs, 1, scratch_dir=_scratch(tmp_path), **_hashes(state, logs))
+
+
+def test_stage_mutation_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     state, logs = _fixture_dbs(tmp_path); hashes = _hashes(state, logs)
-    wal = state.with_name(state.name + "-wal"); wal.write_bytes(b"pending")
-    with pytest.raises(MigrationError, match="pending WAL"):
-        preflight(state, logs, 1, scratch_dir=_scratch(tmp_path), **hashes)
-    wal.unlink()
     monkeypatch.setattr(migration.fcntl, "ioctl", lambda *args: (_ for _ in ()).throw(OSError(errno.EOPNOTSUPP, "unsupported")))
     changed = False
     def mutate() -> None:
