@@ -2249,12 +2249,33 @@ def approve_session(session_key: str, pattern_key: str):
         _session_approved.setdefault(session_key, set()).add(pattern_key)
 
 
+def _release_permission_mode_dependents(session_key: str) -> None:
+    """Drop resources whose immutable mode is derived from Hermes YOLO.
+
+    The import stays lazy so approval-only sessions do not load computer-use.
+    Releasing on both edges makes enabling YOLO replace an existing standard
+    backend and makes disabling YOLO revoke a private unrestricted daemon
+    immediately, even when no later computer-use call occurs.
+    """
+    try:
+        from tools.computer_use import release_computer_use_session
+
+        release_computer_use_session(session_key)
+    except Exception:
+        logger.debug(
+            "Failed to release permission-mode dependent resources for %s",
+            session_key,
+            exc_info=True,
+        )
+
+
 def enable_session_yolo(session_key: str) -> None:
     """Enable YOLO bypass for a single session key."""
     if not session_key:
         return
     with _lock:
         _session_yolo.add(session_key)
+    _release_permission_mode_dependents(session_key)
 
 
 def disable_session_yolo(session_key: str) -> None:
@@ -2263,6 +2284,7 @@ def disable_session_yolo(session_key: str) -> None:
         return
     with _lock:
         _session_yolo.discard(session_key)
+    _release_permission_mode_dependents(session_key)
 
 
 def clear_session(session_key: str) -> None:
@@ -2279,6 +2301,7 @@ def clear_session(session_key: str) -> None:
         # immediately so the old run can unwind instead of idling until timeout.
         entry.result = "deny"
         entry.event.set()
+    _release_permission_mode_dependents(session_key)
 
 
 def is_session_yolo_enabled(session_key: str) -> bool:
@@ -2369,8 +2392,8 @@ def load_permanent_allowlist() -> set:
     patterns added via 'always' in a previous session.
     """
     try:
-        from hermes_cli.config import load_config
-        config = load_config()
+        from hermes_cli.config import load_config_readonly
+        config = load_config_readonly()
         patterns = set(config.get("command_allowlist", []) or [])
         if patterns:
             load_permanent(patterns)
@@ -2578,10 +2601,14 @@ def _normalize_approval_mode(mode) -> str:
 
 
 def _get_approval_config() -> dict:
-    """Read the approvals config block. Returns a dict with 'mode', 'timeout', etc."""
+    """Read the approvals config block. Returns a dict with 'mode', 'timeout', etc.
+
+    Returns the LIVE config-cache sub-dict (load_config_readonly contract) —
+    callers must not mutate it or any nested structure.
+    """
     try:
-        from hermes_cli.config import load_config
-        config = load_config()
+        from hermes_cli.config import load_config_readonly
+        config = load_config_readonly()
         return config.get("approvals", {}) or {}
     except Exception as e:
         logger.warning("Failed to load approval config: %s", e)
@@ -2594,8 +2621,8 @@ def _get_approval_mode() -> str:
     return _normalize_approval_mode(mode)
 
 
-def is_approval_bypass_active() -> bool:
-    """Return True when the user has opted out of Hermes approval prompts.
+def is_approval_bypass_active_for_session(session_key: str) -> bool:
+    """Return whether one exact session bypasses Hermes approval prompts.
 
     Collapses the canonical three-source bypass check used across the codebase
     into one place:
@@ -2610,8 +2637,15 @@ def is_approval_bypass_active() -> bool:
     """
     return (
         _YOLO_MODE_FROZEN
-        or is_current_session_yolo_enabled()
+        or is_session_yolo_enabled(session_key)
         or _get_approval_mode() == "off"
+    )
+
+
+def is_approval_bypass_active() -> bool:
+    """Return whether the current approval context has bypass enabled."""
+    return is_approval_bypass_active_for_session(
+        get_current_session_key(default="")
     )
 
 
@@ -2632,8 +2666,8 @@ def _get_approval_timeout() -> int:
 def _get_cron_approval_mode() -> str:
     """Read the cron approval mode from config. Returns 'deny' or 'approve'."""
     try:
-        from hermes_cli.config import load_config
-        config = load_config()
+        from hermes_cli.config import load_config_readonly
+        config = load_config_readonly()
         mode = str(cfg_get(config, "approvals", "cron_mode", default="deny")).lower().strip()
         if mode in {"approve", "off", "allow", "yes"}:
             return "approve"
@@ -3026,7 +3060,7 @@ def _should_skip_container_guards(env_type: str, has_host_access: bool = False) 
     """
     if env_type == "docker":
         return not has_host_access
-    return env_type in ("singularity", "modal", "daytona")
+    return env_type in ("singularity", "modal", "daytona", "vercel_sandbox")
 
 
 def check_dangerous_command(command: str, env_type: str,
@@ -3440,7 +3474,7 @@ def check_all_command_guards(command: str, env_type: str,
                     # fail-closed synthesis in the main flow below; see #20733).
                     _cron_fail_open = True  # safe default if config is unreadable
                     try:
-                        from hermes_cli.config import load_config as _load_cfg
+                        from hermes_cli.config import load_config_readonly as _load_cfg
                         _sec = (_load_cfg() or {}).get("security", {}) or {}
                         if _sec.get("tirith_enabled", True):
                             _cron_fail_open = _sec.get("tirith_fail_open", True)
@@ -3478,7 +3512,7 @@ def check_all_command_guards(command: str, env_type: str,
         # normal approval flow.  Fixes #20733.
         _tirith_fail_open = True  # safe default if config is unreadable
         try:
-            from hermes_cli.config import load_config as _load_cfg
+            from hermes_cli.config import load_config_readonly as _load_cfg
             _sec = (_load_cfg() or {}).get("security", {}) or {}
             _tirith_enabled = _sec.get("tirith_enabled", True)
             if _tirith_enabled:
