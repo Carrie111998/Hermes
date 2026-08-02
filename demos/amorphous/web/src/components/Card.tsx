@@ -1,6 +1,6 @@
 /* One dashboard card: header, live data body, context menu, scoped chat,
    and pop-out (maximize into a Dialog with a full-size view + chat tab). */
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import * as ContextMenu from "@radix-ui/react-context-menu";
 import {
   MessageCircle, RefreshCw, EyeOff, Trash2, Send, LoaderCircle, Maximize2,
@@ -82,9 +82,7 @@ export default function Card({ c, preview, onHide, onRemove }: Props) {
               </div>
             )}
           </div>
-          <div className="body-fade flex-1 overflow-auto px-3.5 py-3 min-h-0">
-            <DataView c={c} data={data} err={err} />
-          </div>
+          <CardBody c={c} data={data} err={err} onPopOut={() => { setMaxOpen(true); track("maximize", c.id); }} />
           {chatOpen && <ComponentChat c={c} onClose={() => setChatOpen(false)} onChanged={refresh} />}
         </div>
       </ContextMenu.Trigger>
@@ -132,6 +130,38 @@ export default function Card({ c, preview, onHide, onRemove }: Props) {
       </DialogContent>
     </Dialog>
     </>
+  );
+}
+
+function CardBody({ c, data, err, onPopOut }: { c: Component; data: any; err: string; onPopOut: () => void }) {
+  const ref = useRef<HTMLDivElement>(null);
+  const [overflow, setOverflow] = useState(0);
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const check = () => setOverflow(Math.max(0, el.scrollHeight - el.clientHeight));
+    check();
+    const ro = new ResizeObserver(check);
+    ro.observe(el);
+    const mo = new MutationObserver(check);
+    mo.observe(el, { childList: true, subtree: true });
+    return () => { ro.disconnect(); mo.disconnect(); };
+  }, [c.id]);
+  return (
+    <div className="relative flex-1 min-h-0 flex flex-col">
+      <div ref={ref} className="body-fade flex-1 overflow-auto px-3.5 py-3 min-h-0">
+        <DataView c={c} data={data} err={err} />
+      </div>
+      {overflow > 24 && (
+        <button
+          onClick={(e) => { e.stopPropagation(); onPopOut(); }}
+          onMouseDown={(e) => e.stopPropagation()}
+          className="absolute bottom-1.5 right-2 z-10 inline-flex items-center gap-1 h-[22px] px-2 rounded-full bg-surface-2/95 border border-line-2 text-[10.5px] text-ink-3 hover:text-ink hover:border-ink-3 cursor-pointer backdrop-blur-sm"
+          title="Pop out to see everything — or resize the card">
+          <Maximize2 size={10} /> more
+        </button>
+      )}
+    </div>
   );
 }
 

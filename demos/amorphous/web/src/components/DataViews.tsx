@@ -38,6 +38,24 @@ export function useComponentData(c: Component, proposalId?: string) {
   return { data, err, refresh, flash };
 }
 
+/* Size-aware rendering primitive: every renderer can adapt its internals to
+   the card's real pixel box (drag-resize, pop-out dialogs, dock changes). */
+export function useSize<T extends HTMLElement = HTMLDivElement>() {
+  const ref = useRef<T | null>(null);
+  const [size, setSize] = useState({ w: 0, h: 0 });
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const ro = new ResizeObserver((entries) => {
+      const r = entries[0].contentRect;
+      setSize({ w: Math.round(r.width), h: Math.round(r.height) });
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+  return { ref, ...size };
+}
+
 export function Skeleton({ rows = 3 }: { rows?: number }) {
   const widths = [85, 60, 75, 50, 70, 42];
   return (
@@ -103,18 +121,24 @@ export function DataView({ c, data, err }: { c: Component; data: any; err: strin
 
 /* ---------- metric ---------- */
 function MetricView({ data }: { data: any }) {
+  const { ref, w, h } = useSize();
   const up = data.delta > 0;
   /* up=bad for latency/error-style metrics; otherwise up=good */
   const inverse = /ms|error|%err|latency|p9\d/i.test(String(data.unit || "") + String(data.label || ""));
   const good = inverse ? !up : up;
+  // type scales with the box: ~1/3 of height, bounded, and shrinks for long values
+  const chars = String(data.value).length;
+  const px = Math.max(24, Math.min(h * 0.42, (w - 40) / Math.max(chars * 0.62, 1), 84));
   return (
-    <div className="flex flex-col justify-center h-full">
-      <div className="text-[34px] font-bold tracking-tight leading-none tabular-nums">
+    <div ref={ref} className="flex flex-col justify-center h-full">
+      <div className="font-bold tracking-tight leading-none tabular-nums"
+           style={{ fontSize: px }}>
         {String(data.value)}
-        <span className="text-[15px] text-ink-3 font-medium ml-1.5">{data.unit}</span>
+        <span className="text-ink-3 font-medium ml-1.5" style={{ fontSize: Math.max(13, px * 0.42) }}>{data.unit}</span>
       </div>
       {data.delta != null && (
-        <div className={`mt-2.5 inline-flex items-center gap-1 text-[13px] font-semibold w-fit px-2 py-0.5 rounded-md ${good ? "bg-green/10 text-green" : "bg-red/10 text-red"}`}>
+        <div className={`mt-2.5 inline-flex items-center gap-1 font-semibold w-fit px-2 py-0.5 rounded-md ${good ? "bg-green/10 text-green" : "bg-red/10 text-red"}`}
+             style={{ fontSize: Math.max(12, px * 0.36) }}>
           {up ? <ArrowUpRight size={14} /> : <ArrowDownRight size={14} />}
           {Math.abs(data.delta)}
         </div>
@@ -125,8 +149,11 @@ function MetricView({ data }: { data: any }) {
 
 /* ---------- kv with smart bars ---------- */
 function KVView({ data }: { data: any }) {
+  const { ref, w } = useSize();
+  const cols = w > 640 ? 3 : w > 380 ? 2 : 1;
   return (
-    <div className="flex flex-col gap-2 content-start">
+    <div ref={ref} className="grid gap-x-8 gap-y-2 content-start"
+         style={{ gridTemplateColumns: `repeat(${cols}, minmax(0, 1fr))` }}>
       {data.pairs.map(([k, v]: [string, string], i: number) => {
         const bar = parseBar(String(v));
         return (
@@ -159,6 +186,7 @@ function parseBar(v: string): number | null {
 
 /* ---------- table: avatars, badges, sorting ---------- */
 function TableView({ data }: { data: any }) {
+  const { ref, h } = useSize();
   const [sort, setSort] = useState<{ col: number; dir: 1 | -1 } | null>(null);
   const authorCol = data.columns.findIndex((c: string) => /author|user|by/i.test(c));
   const stateCol = data.columns.findIndex((c: string) => /state|status/i.test(c));
@@ -172,7 +200,13 @@ function TableView({ data }: { data: any }) {
     });
   }, [data.rows, sort]);
 
+  const rowH = 30, headH = 30, labelH = 20;
+  let fit = h > 0 ? Math.max(1, Math.floor((h - headH) / rowH)) : rows.length;
+  if (h > 0 && rows.length > fit) fit = Math.max(1, Math.floor((h - headH - labelH) / rowH));
+  const shown = rows.slice(0, fit);
+  const extra = rows.length - shown.length;
   return (
+    <div ref={ref} className="h-full flex flex-col min-h-0">
     <table className="w-full border-collapse text-[13px]">
       <thead>
         <tr>
@@ -189,7 +223,7 @@ function TableView({ data }: { data: any }) {
         </tr>
       </thead>
       <tbody>
-        {rows.map((r: any[], i: number) => (
+        {shown.map((r: any[], i: number) => (
           <tr key={i} className="hover:bg-[#101a30] transition-colors">
             {r.map((v, j) => (
               <td key={j} title={String(v)}
@@ -204,6 +238,10 @@ function TableView({ data }: { data: any }) {
         ))}
       </tbody>
     </table>
+    {extra > 0 && (
+      <div className="text-[10.5px] text-ink-4 pt-1 shrink-0">+{extra} more — resize or pop out</div>
+    )}
+    </div>
   );
 }
 
@@ -258,7 +296,7 @@ function ChartView({ data }: { data: any }) {
         </span>
         <span className="text-[11px] text-ink-3 truncate">{data.label}</span>
       </div>
-      <div className="relative flex-1 min-h-[180px] -mx-1">
+      <div className="relative flex-1 min-h-[90px] -mx-1">
         <div className="absolute inset-0">
         <ResponsiveContainer width="100%" height="100%">
           <AreaChart data={pts} margin={{ top: 4, right: 4, bottom: 0, left: 4 }}>
@@ -304,9 +342,18 @@ function fmt(n: number) {
 
 /* ---------- links with favicons ---------- */
 function LinksView({ data }: { data: any }) {
+  const { ref, w, h } = useSize();
+  const cols = w > 560 ? 2 : 1;
+  const rowH = 33, labelH = 20;
+  let fit = h > 0 ? Math.max(1, Math.floor(h / rowH) * cols) : data.links.length;
+  if (h > 0 && data.links.length > fit)
+    fit = Math.max(1, Math.floor((h - labelH) / rowH) * cols);
+  const shown = data.links.slice(0, fit);
+  const extra = data.links.length - shown.length;
   return (
-    <div>
-      {data.links.map((l: any, i: number) => {
+    <div ref={ref} className="h-full min-h-0 grid gap-x-8 content-start"
+         style={{ gridTemplateColumns: `repeat(${cols}, minmax(0, 1fr))` }}>
+      {shown.map((l: any, i: number) => {
         const fav = faviconFor(l.url);
         return (
           <a key={i} href={l.url} target="_blank" rel="noreferrer"
@@ -320,6 +367,11 @@ function LinksView({ data }: { data: any }) {
           </a>
         );
       })}
+      {extra > 0 && (
+        <div className="text-[10.5px] text-ink-4 pt-1" style={{ gridColumn: "1 / -1" }}>
+          +{extra} more — resize or pop out
+        </div>
+      )}
     </div>
   );
 }
@@ -400,8 +452,9 @@ function WorkflowView({ c, data }: { c: Component; data: any }) {
 }
 
 
-/* ---------- GitHub-style activity heatmap ---------- */
+/* ---------- GitHub-style activity heatmap (fills its box) ---------- */
 function HeatmapView({ data }: { data: any }) {
+  const { ref, w, h } = useSize();
   const days: { date: string; count: number }[] = data.days || [];
   const weeks: { date: string; count: number }[][] = [];
   for (let i = 0; i < days.length; i += 7) weeks.push(days.slice(i, i + 7));
@@ -409,22 +462,33 @@ function HeatmapView({ data }: { data: any }) {
   const shade = (c: number) =>
     c === 0 ? "rgba(255,255,255,0.045)"
       : `rgba(59,130,246,${0.25 + 0.75 * Math.min(c / max, 1)})`;
+  // cell size derived from the actual box: fit weeks across, 7 rows down
+  const gap = Math.max(2, Math.min(4, Math.floor(w / 220)));
+  const cell = Math.max(6, Math.min(
+    Math.floor((w - gap * (weeks.length - 1)) / Math.max(weeks.length, 1)),
+    Math.floor((h - gap * 6) / 7),
+    26));
+  const radius = cell >= 14 ? 4 : 2.5;
   return (
     <div className="flex flex-col h-full">
-      <div className="text-[12px] text-ink-3 mb-2">
+      <div className="text-[12px] text-ink-3 mb-2 shrink-0">
         <span className="text-ink w510 tabular-nums">{data.total}</span> commits ·{" "}
         <span className="font-mono text-[11px]">{data.repo}</span>
       </div>
-      <div className="flex gap-[3px] flex-1 items-start overflow-hidden">
-        {weeks.map((w, i) => (
-          <div key={i} className="flex flex-col gap-[3px]">
-            {w.map((d) => (
-              <div key={d.date} title={`${d.date}: ${d.count} commit${d.count === 1 ? "" : "s"}`}
-                   className="w-[11px] h-[11px] rounded-[2.5px] transition-colors hover:ring-1 hover:ring-blue-2"
-                   style={{ background: shade(d.count) }} />
+      <div ref={ref} className="flex-1 min-h-0 flex items-center justify-center overflow-hidden">
+        {w > 0 && (
+          <div className="flex" style={{ gap }}>
+            {weeks.map((wk, i) => (
+              <div key={i} className="flex flex-col" style={{ gap }}>
+                {wk.map((d) => (
+                  <div key={d.date} title={`${d.date}: ${d.count} commit${d.count === 1 ? "" : "s"}`}
+                       className="transition-colors hover:ring-1 hover:ring-blue-2"
+                       style={{ width: cell, height: cell, borderRadius: radius, background: shade(d.count) }} />
+                ))}
+              </div>
             ))}
           </div>
-        ))}
+        )}
       </div>
     </div>
   );
