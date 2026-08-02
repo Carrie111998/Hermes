@@ -204,7 +204,7 @@ This key is found in the **Event Subscriptions** section of your Feishu app conf
 SHA256(timestamp + nonce + encrypt_key + body)
 ```
 
-The computed hash is compared against the `x-lark-signature` header using timing-safe comparison before the payload is decrypted. Requests with invalid or missing signatures are rejected with HTTP 401. Encrypted event and URL-verification payloads are decrypted with the official Feishu SDK before token validation and dispatch.
+The computed hash is compared against the `x-lark-signature` header using timing-safe comparison before the payload is decrypted. Requests with invalid or missing signatures are rejected with HTTP 401. Encrypted event and URL-verification payloads are decrypted with the official Feishu SDK before token validation and dispatch. URL verification supports both Schema 1.0 (`type` / `challenge`) and Schema 2.0 (`header.event_type` / `event.challenge`) payloads.
 
 :::tip
 In WebSocket mode, signature verification is handled by the SDK itself, so `FEISHU_ENCRYPT_KEY` is optional. In webhook mode, it is strongly recommended for production.

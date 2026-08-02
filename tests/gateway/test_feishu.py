@@ -1533,6 +1533,16 @@ class TestWebhookSecurity(unittest.TestCase):
         }, clear=True):
             return FeishuAdapter(PlatformConfig())
 
+    @staticmethod
+    def _send_webhook(adapter, body: bytes, headers=None):
+        request = SimpleNamespace(
+            remote="127.0.0.1",
+            content_length=len(body),
+            headers=headers or {"Content-Type": "application/json"},
+            content=_FakeRequestContent(body),
+        )
+        return asyncio.run(adapter._handle_webhook_request(request))
+
     def test_signature_valid_passes(self):
         import hashlib
 
@@ -1621,6 +1631,113 @@ class TestWebhookSecurity(unittest.TestCase):
 
         self.assertEqual(response.status, 400)
         self.assertIn(b"decryption failed", response.body)
+
+    def test_bad_signature_is_rejected_before_decryption(self):
+        adapter = self._make_adapter("test_secret")
+        body = json.dumps({"encrypt": "ciphertext"}).encode()
+        headers = {
+            "x-lark-request-timestamp": "1700000000",
+            "x-lark-request-nonce": "bad-signature",
+            "x-lark-signature": "invalid",
+        }
+
+        with patch("plugins.platforms.feishu.adapter.AESCipher") as cipher:
+            response = self._send_webhook(adapter, body, headers)
+
+        self.assertEqual(response.status, 401)
+        cipher.assert_not_called()
+
+    def test_unsigned_encrypted_v1_url_verification_is_decrypted(self):
+        adapter = self._make_adapter("test_secret")
+        body = json.dumps({"encrypt": "ciphertext"}).encode()
+        cipher = Mock()
+        cipher.decrypt_str.return_value = json.dumps({
+            "type": "url_verification",
+            "challenge": "schema_v1_challenge",
+        })
+
+        with patch("plugins.platforms.feishu.adapter.AESCipher", return_value=cipher):
+            response = self._send_webhook(adapter, body)
+
+        self.assertEqual(response.status, 200)
+        self.assertIn(b"schema_v1_challenge", response.body)
+
+    def test_unsigned_encrypted_v2_url_verification_is_decrypted(self):
+        adapter = self._make_adapter("test_secret")
+        body = json.dumps({"encrypt": "ciphertext"}).encode()
+        cipher = Mock()
+        cipher.decrypt_str.return_value = json.dumps({
+            "schema": "2.0",
+            "header": {"event_type": "url_verification"},
+            "event": {"challenge": "encrypted_schema_v2_challenge"},
+        })
+
+        with patch("plugins.platforms.feishu.adapter.AESCipher", return_value=cipher):
+            response = self._send_webhook(adapter, body)
+
+        self.assertEqual(response.status, 200)
+        self.assertIn(b"encrypted_schema_v2_challenge", response.body)
+
+    def test_unsigned_encrypted_normal_event_is_rejected(self):
+        adapter = self._make_adapter("test_secret")
+        body = json.dumps({"encrypt": "ciphertext"}).encode()
+        cipher = Mock()
+        cipher.decrypt_str.return_value = json.dumps({
+            "header": {"event_type": "im.message.receive_v1"},
+            "event": {},
+        })
+
+        with patch(
+            "plugins.platforms.feishu.adapter.AESCipher", return_value=cipher
+        ), patch.object(adapter, "_on_message_event") as dispatch:
+            response = self._send_webhook(adapter, body)
+
+        self.assertEqual(response.status, 401)
+        dispatch.assert_not_called()
+
+    def test_unsigned_unencrypted_normal_event_is_rejected_when_key_is_set(self):
+        adapter = self._make_adapter("test_secret")
+        body = json.dumps({
+            "header": {"event_type": "im.message.receive_v1"},
+            "event": {},
+        }).encode()
+
+        with patch.object(adapter, "_on_message_event") as dispatch:
+            response = self._send_webhook(adapter, body)
+
+        self.assertEqual(response.status, 401)
+        dispatch.assert_not_called()
+
+    def test_schema_v2_url_verification_returns_nested_challenge(self):
+        adapter = self._make_adapter()
+        body = json.dumps({
+            "schema": "2.0",
+            "header": {"event_type": "url_verification"},
+            "event": {"challenge": "schema_v2_challenge"},
+        }).encode()
+
+        response = self._send_webhook(adapter, body)
+
+        self.assertEqual(response.status, 200)
+        self.assertIn(b"schema_v2_challenge", response.body)
+
+    def test_lazy_requirement_check_rebinds_aes_cipher(self):
+        import plugins.platforms.feishu.adapter as feishu
+
+        rebound = {}
+
+        def fake_ensure_and_bind(_feature, importer, target, **_kwargs):
+            bindings = importer()
+            rebound.update(bindings)
+            target.update(bindings)
+            return True
+
+        with patch.object(feishu, "FEISHU_AVAILABLE", False), patch.object(
+            feishu, "AESCipher", None
+        ), patch("tools.lazy_deps.ensure_and_bind", side_effect=fake_ensure_and_bind):
+            self.assertTrue(feishu.check_feishu_requirements())
+
+        self.assertIs(rebound["AESCipher"], feishu.AESCipher)
 
 
     def test_rate_limit_resets_after_window_expires(self):
