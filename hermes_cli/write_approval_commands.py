@@ -97,13 +97,16 @@ def _fmt_skills_grouped(lines: list[str], records: list[dict]) -> None:
 
 
 def _extract_skill_name(r: dict) -> str:
-    """Extract the skill name from a pending record's summary or payload."""
+    """Extract the skill name from a pending record, preferring the canonical payload.name."""
+    payload = r.get("payload", {})
+    name = payload.get("name", "")
+    if name:
+        return str(name).strip()[:60]
     summary = (r.get("summary") or "").strip()
     match = re.match(r"^(create|update|patch|delete)\s+(.+?)(?:\s*[—–-].*)?$", summary, re.IGNORECASE)
     if match:
         return match.group(2).strip()
-    payload = r.get("payload", {})
-    name = payload.get("name") or payload.get("old_string", "").split("\n")[0][:40]
+    name = payload.get("old_string", "").split("\n")[0][:40]
     return name[:40] if name else summary[:40]
 
 
