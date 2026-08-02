@@ -13,6 +13,7 @@ the whole tree as modified. These tests pin down that coupling.
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import sys
@@ -63,21 +64,33 @@ def _managed_repo(tmp_path: Path, files: dict[str, bytes]) -> Path:
 
 
 def _dirty(repo: Path) -> set[str]:
-    subprocess.run(
-        ["git", "-c", "core.autocrlf=false", "update-index", "--really-refresh"],
+    tree = subprocess.run(
+        ["git", "ls-tree", "-r", "-z", "--full-tree", "HEAD"],
         cwd=repo,
         capture_output=True,
-        text=True,
-        check=False,
-    )
-    out = subprocess.run(
-        ["git", "-c", "core.autocrlf=false", "diff", "--name-only"],
-        cwd=repo,
-        capture_output=True,
-        text=True,
         check=True,
     )
-    return {line for line in out.stdout.splitlines() if line}
+    entries = {}
+    for record in tree.stdout.split(b"\0"):
+        if not record:
+            continue
+        metadata, path = record.split(b"\t", 1)
+        _mode, object_type, object_id = metadata.split(b" ", 2)
+        if object_type == b"blob":
+            entries[path] = object_id
+    paths = list(entries)
+    out = subprocess.run(
+        ["git", "-c", "core.autocrlf=false", "hash-object", "--stdin-paths"],
+        cwd=repo,
+        input=b"\n".join(paths) + b"\n",
+        capture_output=True,
+        check=True,
+    )
+    return {
+        os.fsdecode(path)
+        for path, worktree_hash in zip(paths, out.stdout.splitlines())
+        if worktree_hash != entries[path]
+    }
 
 
 def _autocrlf(repo: Path) -> str:
@@ -134,6 +147,20 @@ def test_real_edits_survive_even_when_line_endings_also_flipped(tmp_path: Path) 
     assert _autocrlf(repo) == "false"
 
 
+def test_staged_real_edit_survives_stat_cache_independent_probe(tmp_path: Path) -> None:
+    repo = _managed_repo(tmp_path, {"churn.py": b"y = 2\n", "staged.py": b"z = 3\n"})
+    (repo / "staged.py").write_bytes(b"z = 3\r\nz += 1\r\n")
+    _git(repo, "-c", "core.autocrlf=false", "add", "staged.py")
+
+    _normalize_managed_eol(GIT_CMD, repo)
+
+    staged = _git(repo, "diff", "--cached", "--name-only").stdout.splitlines()
+    assert staged == ["staged.py"]
+    assert (repo / "staged.py").read_bytes() == b"z = 3\r\nz += 1\r\n"
+    assert _dirty(repo) == {"staged.py"}
+    assert _autocrlf(repo) == "false"
+
+
 def test_pin_alone_is_written_when_there_is_no_churn(tmp_path: Path) -> None:
     repo = _managed_repo(tmp_path, {"a.py": b"x = 1\n"})
     (repo / "a.py").write_bytes(b"x = 1\n")
@@ -145,16 +172,15 @@ def test_pin_alone_is_written_when_there_is_no_churn(tmp_path: Path) -> None:
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="shim needs a POSIX shell")
-def test_pin_is_withheld_when_the_churn_cannot_be_cleared(tmp_path: Path) -> None:
+def test_pin_is_withheld_when_head_blob_read_fails(tmp_path: Path) -> None:
     """If normalization can't finish, the checkout is left as found — pinning
     anyway would surface churn we failed to clear."""
     repo = _managed_repo(tmp_path, {"a.py": b"x = 1\n"})
-    # Real git everywhere except the restore, which fails. Stands in for any
-    # reason it cannot finish: a git too old for --pathspec-from-file, an
-    # unwritable working tree, a file locked by a running process.
-    shim = tmp_path / "git-no-checkout"
+    # Real git everywhere except the batched HEAD blob read. Stands in for any
+    # reason an exact restore cannot finish; the pin must remain fail-closed.
+    shim = tmp_path / "git-no-cat-file"
     shim.write_text(
-        '#!/bin/sh\nfor a in "$@"; do [ "$a" = checkout ] && exit 1; done\nexec git "$@"\n'
+        '#!/bin/sh\nfor a in "$@"; do [ "$a" = cat-file ] && exit 1; done\nexec git "$@"\n'
     )
     shim.chmod(0o755)
 
