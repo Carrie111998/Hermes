@@ -64,6 +64,10 @@ OPENROUTER_MODELS: list[tuple[str, str]] = [
     # Google
     ("google/gemini-3.1-pro-preview",          ""),
     ("google/gemini-3.6-flash",                ""),
+    ("google/gemini-3.5-flash",                ""),
+    ("google/gemini-3.5-flash-lite",           ""),
+    ("google/gemini-3.1-flash-lite",           ""),
+    ("google/gemini-2.5-flash",                ""),
     # xAI
     ("x-ai/grok-4.5",                          ""),
     # DeepSeek
