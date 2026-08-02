@@ -238,7 +238,15 @@ def run_workflow(wf_id: str, req: WorkflowRunRequest):
     try:
         prompt = wf["prompt_template"].format(context=json.dumps(context), **req.inputs)
     except KeyError as e:
-        raise HTTPException(400, f"missing workflow input: {e}")
+        # Fill unspecified placeholders visibly instead of failing — the agent
+        # sees "<missing: name>" and asks for it; the UI now validates anyway.
+        import string
+        class _Defaulting(dict):
+            def __missing__(self, k):
+                return f"<missing: {k}>"
+        prompt = string.Formatter().vformat(
+            wf["prompt_template"], (),
+            _Defaulting(context=json.dumps(context), **req.inputs))
     store.record_event(req.user_id, "workflow_run", None, {"workflow_id": wf_id})
     agent = _agent_for(req.user_id)  # full agent: terminal, web, station tools
     try:

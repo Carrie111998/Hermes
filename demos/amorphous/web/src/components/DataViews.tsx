@@ -6,6 +6,7 @@ import {
 import { api, post, when, USER, onComponentRefresh, refreshCadence, type Component } from "../lib/api";
 import { badgeClass, avatarHue, faviconFor } from "../lib/accents";
 import { Button } from "./ui";
+import { Field, deriveInputs, fieldDefaults, missingRequired } from "./Fields";
 import {
   Play, ExternalLink, LoaderCircle, ArrowUpRight, ArrowDownRight,
   ChevronUp, ChevronDown, Workflow, MessageSquare, MousePointerClick,
@@ -435,14 +436,22 @@ function WorkflowView({ c, data }: { c: Component; data: any }) {
   const [result, setResult] = useState<string>(
     data.runs?.length ? `Last run ${when(data.runs[0].ts)}:\n${(data.runs[0].result || "").slice(0, 1500)}` : ""
   );
-  const inputsRef = useRef<Record<string, string>>({});
+  const specs = useMemo(
+    () => deriveInputs(data.workflow?.prompt_template, c.props.inputs),
+    [data.workflow?.prompt_template, JSON.stringify(c.props.inputs)]);
+  const [values, setValues] = useState<Record<string, any>>(() => fieldDefaults(specs));
+  const [touched, setTouched] = useState(false);
+  useEffect(() => { setValues((v) => ({ ...fieldDefaults(specs), ...v })); }, [specs]);
   if (!data.workflow) return <div className="text-ink-3 text-[13px]">workflow missing</div>;
-  const inputs = c.props.inputs || [];
+  const missing = missingRequired(specs, values);
+
   const run = async () => {
+    setTouched(true);
+    if (missing.length) return;
     setRunning(true);
     setResult("Hermes is working (full agent — may take a minute)…");
     try {
-      const r = await post(`/api/workflow/${data.workflow.id}/run`, { user_id: USER, inputs: inputsRef.current });
+      const r = await post(`/api/workflow/${data.workflow.id}/run`, { user_id: USER, inputs: values });
       setResult(r.result);
     } catch (e: any) {
       setResult(`⚠ ${e.message}`);
@@ -452,21 +461,27 @@ function WorkflowView({ c, data }: { c: Component; data: any }) {
   return (
     <div className="flex flex-col h-full">
       <div className="text-[13px] text-ink-2 leading-snug mb-2.5">{data.workflow.description}</div>
-      {inputs.length > 0 && (
-        <div className="flex flex-wrap gap-2 mb-2.5">
-          {inputs.map((inp: any) => (
-            <input key={inp.name} placeholder={inp.label}
-                   onChange={(e) => (inputsRef.current[inp.name] = e.target.value)}
-                   className="h-8 px-3 bg-[#101a30] border border-line rounded-md text-[13px] text-ink placeholder:text-ink-4 outline-none focus:border-line-2 min-w-[150px]" />
+      {specs.length > 0 && (
+        <div className="grid gap-2.5 mb-2.5"
+             style={{ gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))" }}>
+          {specs.map((f) => (
+            <Field key={f.name} spec={f} value={values[f.name]}
+                   invalid={touched && missingRequired([f], values).length > 0}
+                   onChange={(v) => setValues((s2) => ({ ...s2, [f.name]: v }))} />
           ))}
         </div>
       )}
-      <Button onClick={run} disabled={running} className="w-fit">
-        {running ? <LoaderCircle size={14} className="spin" /> : <Play size={13} />}
-        {running ? "Running" : "Run"}
-      </Button>
+      <div className="flex items-center gap-3">
+        <Button onClick={run} disabled={running} className="w-fit">
+          {running ? <LoaderCircle size={14} className="spin" /> : <Play size={13} />}
+          {running ? "Running" : "Run"}
+        </Button>
+        {touched && missing.length > 0 && (
+          <span className="text-[12px] text-red">needs: {missing.join(", ")}</span>
+        )}
+      </div>
       {result && (
-        <div className="mt-2.5 bg-[#101a30] border border-line rounded-lg px-3 py-2.5 text-[12.5px] leading-relaxed text-ink-2 whitespace-pre-wrap overflow-auto flex-1 min-h-0">
+        <div className="mt-2.5 bg-[#0d1526] border border-line rounded-lg px-3 py-2.5 text-[12.5px] leading-relaxed text-ink-2 whitespace-pre-wrap overflow-auto flex-1 min-h-0">
           {result}
         </div>
       )}
