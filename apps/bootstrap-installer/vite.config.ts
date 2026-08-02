@@ -2,6 +2,7 @@ import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
 import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 // Hermes Setup — Tauri-targeted Vite config.
 //
@@ -12,13 +13,16 @@ import path from 'node:path'
 // `clearScreen: false` is the Tauri convention — they spawn vite as a child
 // process and want our errors to stay visible.
 
+const configDir =
+  import.meta.dirname ?? path.dirname(fileURLToPath(import.meta.url))
+
 const host = process.env.TAURI_DEV_HOST
 
 export default defineConfig({
   plugins: [react(), tailwindcss()],
   resolve: {
     alias: {
-      '@': path.resolve(__dirname, './src')
+      '@': path.resolve(configDir, './src')
     }
   },
   clearScreen: false,

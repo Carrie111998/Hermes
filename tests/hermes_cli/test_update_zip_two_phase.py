@@ -157,6 +157,26 @@ def test_managed_uv_helper_delegates_to_the_shared_one():
     assert _venv_python(v) == venv_python_path(v)
 
 
+def test_managed_uv_helper_survives_stale_hermes_constants(monkeypatch):
+    """Update-boundary: pre-pull hermes_constants may lack venv_python_path.
+
+    ``hermes update`` keeps the old process alive; after pull, freshly
+    imported managed_uv can see a stale hermes_constants in sys.modules.
+    The helper must reload and still return a correct path (not raise).
+    """
+    import hermes_constants
+    from hermes_cli.managed_uv import _venv_python
+
+    monkeypatch.delattr(hermes_constants, "venv_python_path", raising=False)
+    assert not hasattr(hermes_constants, "venv_python_path")
+
+    v = Path("/opt/proj/venv")
+    result = _venv_python(v)
+    # Reload restored the symbol; result matches the shared helper.
+    assert callable(getattr(hermes_constants, "venv_python_path", None))
+    assert result == venv_python_path(v)
+
+
 def test_no_open_coded_venv_layout_remains_in_hermes_cli():
     """Fails if a new call site hand-rolls Scripts/bin again (#76105).
 

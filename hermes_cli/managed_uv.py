@@ -384,9 +384,28 @@ def update_managed_uv(
 
 
 def _venv_python(venv_dir: Path) -> Path:
-    from hermes_constants import venv_python_path
+    """Resolve the interpreter path inside *venv_dir*.
 
-    return venv_python_path(venv_dir, windows=platform.system() == "Windows")
+    Update-boundary safe: ``hermes update`` keeps the pre-pull process alive,
+    so ``hermes_constants`` may still be the old module object in
+    ``sys.modules`` when this runs (before
+    ``_reload_updated_runtime_modules``). If the helper is missing, reload
+    ``hermes_constants`` from disk once and retry — never hand-roll the
+    Scripts/bin layout here (see the open-coded-layout guard in tests).
+    """
+    windows = platform.system() == "Windows"
+    try:
+        from hermes_constants import venv_python_path
+
+        return venv_python_path(venv_dir, windows=windows)
+    except ImportError:
+        import importlib
+
+        import hermes_constants
+
+        importlib.invalidate_caches()
+        importlib.reload(hermes_constants)
+        return hermes_constants.venv_python_path(venv_dir, windows=windows)
 
 
 def _remove_tree(path: Path, *, boundary: Path) -> None:
