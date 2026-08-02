@@ -190,6 +190,24 @@ def _parse_string_map(host_obj: dict, root_obj: dict, key: str) -> dict[str, str
     return result
 
 
+def _parse_string_list(host_obj: dict, root_obj: dict, key: str) -> tuple[str, ...]:
+    """Parse a list of extra literal policy terms with host override."""
+    source = host_obj[key] if key in host_obj else root_obj.get(key)
+    if not isinstance(source, list):
+        return ()
+    return tuple(
+        value
+        for value in (str(item).strip() for item in source)
+        if value
+    )
+
+
+def _normalize_ingestion_mode(value: Any) -> str:
+    """Normalize the pre-ingestion policy mode."""
+    normalized = str(value or "curated").strip().lower()
+    return normalized if normalized in {"curated", "all", "off"} else "curated"
+
+
 def _parse_optional_string(
     host_obj: dict, root_obj: dict, key: str, default: str = ""
 ) -> str:
@@ -387,6 +405,13 @@ class HonchoClientConfig:
     # Toggles
     enabled: bool = False
     save_messages: bool = True
+    # Pre-ingestion quality gate. "curated" is deliberately stricter than
+    # merely enabling save_messages: ordinary conversation is not durable
+    # memory. "all" is a compatibility escape hatch for isolated development
+    # only; hard safety/topic denials still apply.
+    ingestion_mode: str = "curated"
+    ingestion_require_signal: bool = True
+    ingestion_extra_deny_terms: tuple[str, ...] = ()
     # Write frequency: "async" (background thread), "turn" (sync per turn),
     # "session" (flush on session end), or int (every N turns)
     write_frequency: str | int = "async"
@@ -575,6 +600,17 @@ class HonchoClientConfig:
         host_save = host_block.get("saveMessages")
         save_messages = host_save if host_save is not None else raw.get("saveMessages", True)
 
+        ingestion_mode = _normalize_ingestion_mode(
+            host_block.get("ingestionMode")
+            if "ingestionMode" in host_block
+            else raw.get("ingestionMode", "curated")
+        )
+        ingestion_require_signal = _resolve_bool(
+            host_block.get("ingestionRequireSignal"),
+            raw.get("ingestionRequireSignal"),
+            default=True,
+        )
+
         # sessionStrategy / sessionPeerPrefix: host first, root fallback
         session_strategy = (
             host_block.get("sessionStrategy")
@@ -620,6 +656,13 @@ class HonchoClientConfig:
             ),
             enabled=enabled,
             save_messages=save_messages,
+            ingestion_mode=ingestion_mode,
+            ingestion_require_signal=ingestion_require_signal,
+            ingestion_extra_deny_terms=_parse_string_list(
+                host_block,
+                raw,
+                "ingestionExtraDenyTerms",
+            ),
             write_frequency=write_frequency,
             context_tokens=_parse_context_tokens(
                 host_block.get("contextTokens"),

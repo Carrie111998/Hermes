@@ -178,7 +178,41 @@ CONFIG_SCHEMA = ProviderConfigSchema(
             label="Save messages",
             kind=KIND_BOOL,
             default="true",
-            description="Persist conversation messages to Honcho.",
+            description="Allow curated durable-turn messages to reach Honcho. Does not disable explicit conclusions.",
+            group="Message writing",
+        ),
+        ProviderField(
+            key="ingestionMode",
+            label="Ingestion mode",
+            kind=KIND_SELECT,
+            default="curated",
+            description="Gate what enters durable memory before Honcho receives it.",
+            info=(
+                "curated: only explicit durable or reusable project context. "
+                "off: no automatic turn writes. "
+                "all: development-only compatibility mode; hard exclusions still apply."
+            ),
+            options=(
+                ProviderFieldOption("curated", "Curated (recommended)"),
+                ProviderFieldOption("off", "Off"),
+                ProviderFieldOption("all", "All (development only)"),
+            ),
+            group="Message writing",
+        ),
+        ProviderField(
+            key="ingestionRequireSignal",
+            label="Require durable signal",
+            kind=KIND_BOOL,
+            default="true",
+            description="Reject ordinary conversation unless it contains a reusable-memory signal.",
+            group="Message writing",
+        ),
+        ProviderField(
+            key="ingestionExtraDenyTerms",
+            label="Extra deny terms",
+            kind=KIND_JSON,
+            description="Optional list of additional literal topics never written to Honcho for this profile.",
+            placeholder='["private topic", "unrelated domain"]',
             group="Message writing",
         ),
         ProviderField(

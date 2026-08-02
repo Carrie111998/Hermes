@@ -215,7 +215,31 @@ Pick **[e]** at the prompt to set the three keys directly instead of going throu
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `writeFrequency` | string/int | `"async"` | `"async"` (background), `"turn"` (sync per turn), `"session"` (batch on end), or integer N (every N turns) |
-| `saveMessages` | bool | `true` | Persist messages to Honcho API |
+| `saveMessages` | bool | `true` | Allow curated durable turns to reach Honcho. Explicit conclusions remain separately available |
+| `ingestionMode` | string | `"curated"` | `"curated"` (recommended), `"off"`, or development-only `"all"`; hard exclusions always apply |
+| `ingestionRequireSignal` | bool | `true` | Require an explicit durable signal or reusable project/technical context before a turn is written |
+| `ingestionExtraDenyTerms` | array | `[]` | Additional literal topics that this profile must never send to Honcho; built-in sports/football, current-event, secret, and injection exclusions cannot be removed |
+
+### Durable-memory ingestion policy
+
+Honcho is a long-term memory and user-model store, **not a transcript archive**. Hermes applies
+`curated-v1` before `add_messages()`:
+
+- Accepted: explicit preferences, standing constraints, durable decisions, reusable project or
+  technical context, root causes, conventions, implementation lessons, and other context that
+  will help a future task.
+- Rejected: casual conversation, greetings, football or other sports, news/weather, transient
+  operational status, raw tool output, credentials/secrets, prompt-injection-like text, and
+  ordinary chat with no durable signal.
+- `honcho_conclude` and peer-card updates use the same hard-denial gate. A conclusion is
+  intentional, but it still cannot write blocked topics or secrets.
+- Raw local-history migration is filtered through the same policy. `SOUL.md` is not uploaded by
+  automatic memory-file migration; only the curated `MEMORY.md` and `USER.md` files are eligible.
+- Every accepted turn carries non-sensitive provenance metadata: policy version, source, host,
+  workspace, user peer, AI peer, session key, and the decision tags.
+
+The agent should call `honcho_conclude` only when a fact is intentionally durable. A conversation
+does not become memory merely because it happened.
 
 ### Session Resolution
 
@@ -252,7 +276,11 @@ If `sessionPeerPrefix` is `true`, the peer name is prepended: `alice-hermes-agen
 
 ### Multi-Profile Pattern
 
-Multiple Hermes profiles can share one workspace while maintaining separate AI identities. Config resolution is **host block > root > env var > default** — host blocks inherit from root, so shared settings only need to be declared once:
+Multiple Hermes profiles may share one workspace when they intentionally collaborate over the same
+product, user, or project. Use **separate workspaces** when agents must not see or influence each
+other's memories; a workspace is the hard isolation boundary. Config resolution is **host block >
+root > env var > default** — host blocks inherit shared settings from root, but each isolated
+profile should set its own `workspace`, `peerName`, and `aiPeer` explicitly:
 
 ```json
 {
@@ -274,7 +302,10 @@ Multiple Hermes profiles can share one workspace while maintaining separate AI i
 }
 ```
 
-Both profiles see the same user (`yourname`) in the same shared environment (`hermes`), but each AI peer builds its own observations, conclusions, and behavior patterns. The coder's memory stays code-oriented; the main agent's stays broad.
+With the example above both profiles intentionally see the same user in one shared environment, but
+each AI peer builds its own observations and conclusions. For hard isolation, give each host a
+different workspace as well as a different AI peer; never rely on session names alone to separate
+agents.
 
 Host key is derived from the active Hermes profile: `hermes` (default) or `hermes_<profile>` (e.g. `hermes -p coder` -> host key `hermes_coder`). Older `hermes.<profile>` host blocks are still read for compatibility and are migrated when the CLI writes profile-scoped Honcho config.
 

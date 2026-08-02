@@ -585,3 +585,40 @@ class TestGetHonchoClientBaseUrlDoublePrefixFix:
             f"Expected {expected!r}, got {passed_base_url!r}"
         )
 
+
+def test_curated_ingestion_config_resolves_host_over_root(tmp_path):
+    config_file = tmp_path / "config.json"
+    config_file.write_text(json.dumps({
+        "apiKey": "key",
+        "workspace": "root-workspace",
+        "ingestionMode": "curated",
+        "ingestionRequireSignal": True,
+        "ingestionExtraDenyTerms": ["root-only"],
+        "hosts": {
+            "hermes": {
+                "workspace": "isolated-workspace",
+                "ingestionMode": "off",
+                "ingestionRequireSignal": False,
+                "ingestionExtraDenyTerms": ["host-only"],
+            }
+        },
+    }))
+
+    cfg = HonchoClientConfig.from_global_config(config_path=config_file, host="hermes")
+
+    assert cfg.workspace_id == "isolated-workspace"
+    assert cfg.ingestion_mode == "off"
+    assert cfg.ingestion_require_signal is False
+    assert cfg.ingestion_extra_deny_terms == ("host-only",)
+
+
+def test_curated_ingestion_defaults_are_conservative(tmp_path):
+    config_file = tmp_path / "config.json"
+    config_file.write_text(json.dumps({"apiKey": "key"}))
+
+    cfg = HonchoClientConfig.from_global_config(config_path=config_file, host="hermes")
+
+    assert cfg.ingestion_mode == "curated"
+    assert cfg.ingestion_require_signal is True
+    assert cfg.ingestion_extra_deny_terms == ()
+
