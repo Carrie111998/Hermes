@@ -1,11 +1,12 @@
-"""Tests for the SessionDB read-path split (per-thread read-only connections).
+"""Tests for the SessionDB read-path split (pooled read-only connections).
 
 The gateway shares ONE SessionDB across every agent, so recall/browse reads
 used to queue behind writer flushes on self._lock — a measured production
 convoy (a 0.2s FTS query stretched to 112s while 6-8 concurrent turns
 flushed tool results). These tests pin the new contract: reads run on a
-per-thread read-only connection under WAL, never touch self._lock, and fall
-back to the legacy locked path when WAL or the read connection is missing.
+read-only connection borrowed from a bounded pool under WAL, never touch
+self._lock, and fall back to the legacy locked path when WAL or the read
+connection is missing.
 """
 
 import gc
@@ -41,14 +42,8 @@ def test_read_conn_is_per_thread(db):
 
 
 @pytest.mark.requires_wal
-def test_short_lived_reader_threads_release_their_connections(db):
-    """A long-running gateway must not retain one SQLite FD pair per worker.
-
-    Gateway/webhook work uses short-lived threads.  The read connection is
-    thread-scoped, so the thread's exit is also the connection's ownership
-    boundary; retaining those connections until gateway shutdown eventually
-    exhausts macOS launchd's file-descriptor limit.
-    """
+def test_short_lived_reader_threads_use_the_bounded_pool(db):
+    """A long-running gateway must not retain one SQLite FD pair per worker."""
     for _ in range(40):
         thread = threading.Thread(target=lambda: db.get_session("s1"))
         thread.start()
@@ -56,11 +51,21 @@ def test_short_lived_reader_threads_release_their_connections(db):
         assert not thread.is_alive()
 
     gc.collect()
-    assert len(db._read_conns) <= 8
+    assert db._read_pool.qsize() <= 8
 
 
-def test_read_conn_reused_within_thread(db):
-    assert db._get_read_conn() is db._get_read_conn()
+def test_read_conn_reused_via_pool(db):
+    """Reuse is now the pool's job, not a per-thread memo.
+
+    The old contract (``_get_read_conn()`` returns the same object twice on one
+    thread) was the leak: that memo pinned one unclosable connection per
+    (SessionDB x thread) forever. ``_get_read_conn`` now always opens a fresh
+    connection and reuse happens via checkout/return, so assert on that.
+    """
+    with db._read_ctx() as first:
+        assert first is not None
+    with db._read_ctx() as second:
+        assert second is first, "sequential readers must reuse the pooled conn"
 
 
 @pytest.mark.requires_wal
