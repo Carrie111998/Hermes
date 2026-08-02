@@ -481,22 +481,28 @@ def _make_mcp_http_redirect_hooks(original_url: str):
     """
     import httpx
 
-    from tools.url_safety import is_always_blocked_url, is_safe_url
+    from tools.url_safety import (
+        is_always_blocked_url,
+        is_safe_url,
+        redirect_target_from_response,
+    )
 
     _original = httpx.URL(original_url)
     _original_is_public = is_safe_url(original_url)
 
     async def _on_redirect(response):
-        if not (response.is_redirect and response.next_request):
+        target_url = redirect_target_from_response(response)
+        if not target_url:
             return
-        target = response.next_request.url
-        if (target.scheme, target.host, target.port) != (
-            _original.scheme, _original.host, _original.port,
+        target = httpx.URL(target_url)
+        if (
+            response.next_request is not None
+            and (target.scheme, target.host, target.port)
+            != (_original.scheme, _original.host, _original.port)
         ):
             response.next_request.headers.pop("authorization", None)
             response.next_request.headers.pop("Authorization", None)
 
-        target_url = str(target)
         if is_always_blocked_url(target_url):
             raise ValueError(
                 f"Blocked MCP redirect to cloud metadata / always-blocked "
@@ -2837,40 +2843,34 @@ class MCPServerTask:
                 # behind OAuth 2.1 PKCE work. Previously built but never
                 # forwarded — SSE OAuth would silently fail with 401s.
                 _sse_kwargs["auth"] = _oauth_auth
-            if client_cert is not None or ssl_verify is not True:
-                # SSE transport doesn't expose verify/cert as kwargs, so route
-                # them through an httpx_client_factory that wraps the SDK's
-                # defaults (follow_redirects=True) and adds our TLS settings.
-                # The SDK calls the factory with (headers, auth, timeout); we
-                # forward all of those and layer verify/cert on top.
-                import httpx as _httpx_mod
+            # Always install the factory so the default SSE path also gets the
+            # redirect SSRF guard; the SDK's default client follows redirects.
+            import httpx as _httpx_mod
 
-                _cert_for_factory = client_cert
-                _verify_for_factory = ssl_verify
+            _cert_for_factory = client_cert
+            _verify_for_factory = ssl_verify
 
-                def _mcp_http_client_factory(
-                    headers=None, timeout=None, auth=None,
-                ):
-                    kwargs: dict = {
-                        "follow_redirects": True,
-                        "verify": _verify_for_factory,
-                        "event_hooks": {
-                            "response": _make_mcp_http_redirect_hooks(url),
-                        },
-                    }
-                    if timeout is not None:
-                        kwargs["timeout"] = timeout
-                    else:
-                        kwargs["timeout"] = _httpx_mod.Timeout(30.0, read=300.0)
-                    if headers is not None:
-                        kwargs["headers"] = headers
-                    if auth is not None:
-                        kwargs["auth"] = auth
-                    if _cert_for_factory is not None:
-                        kwargs["cert"] = _cert_for_factory
-                    return _httpx_mod.AsyncClient(**kwargs)
+            def _mcp_http_client_factory(headers=None, timeout=None, auth=None):
+                kwargs: dict = {
+                    "follow_redirects": True,
+                    "verify": _verify_for_factory,
+                    "event_hooks": {
+                        "response": _make_mcp_http_redirect_hooks(url),
+                    },
+                }
+                if timeout is not None:
+                    kwargs["timeout"] = timeout
+                else:
+                    kwargs["timeout"] = _httpx_mod.Timeout(30.0, read=300.0)
+                if headers is not None:
+                    kwargs["headers"] = headers
+                if auth is not None:
+                    kwargs["auth"] = auth
+                if _cert_for_factory is not None:
+                    kwargs["cert"] = _cert_for_factory
+                return _httpx_mod.AsyncClient(**kwargs)
 
-                _sse_kwargs["httpx_client_factory"] = _mcp_http_client_factory
+            _sse_kwargs["httpx_client_factory"] = _mcp_http_client_factory
             try:
                 async with sse_client(**_sse_kwargs) as (read_stream, write_stream):
                     async with ClientSession(

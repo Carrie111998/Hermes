@@ -398,9 +398,8 @@ def patch_sse_client():
 
 
 class TestSSEClientCert:
-    def test_no_factory_when_defaults(self, patch_sse_client):
-        """With no cert and ssl_verify=True (default), the SDK's own factory is
-        used — we don't inject one."""
+    def test_factory_injected_when_defaults(self, patch_sse_client):
+        """The default SSE path also uses our guarded httpx factory."""
         from tools.mcp_tool import MCPServerTask
 
         server = MCPServerTask("sse-test")
@@ -423,7 +422,44 @@ class TestSSEClientCert:
                     pass
 
         asyncio.run(drive())
-        assert "httpx_client_factory" not in patch_sse_client
+        assert patch_sse_client.get("httpx_client_factory") is not None
+
+    def test_redirect_guard_uses_location_without_next_request(self, patch_sse_client):
+        """A redirect hook must validate Location when next_request is absent."""
+        from tools.mcp_tool import MCPServerTask
+        import httpx
+
+        server = MCPServerTask("sse-test")
+        server._auth_type = ""
+        server._sampling = None
+
+        async def drive():
+            with patch.object(MCPServerTask, "_wait_for_lifecycle_event",
+                              new=AsyncMock(return_value="shutdown")), \
+                 patch.object(MCPServerTask, "_discover_tools", new=AsyncMock()):
+                await server._run_http({
+                    "url": "https://example.com/mcp/sse",
+                    "transport": "sse",
+                })
+
+        asyncio.run(drive())
+        factory = patch_sse_client["httpx_client_factory"]
+        captured = {}
+
+        class DummyAsyncClient:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        with patch.object(httpx, "AsyncClient", DummyAsyncClient):
+            factory()
+        hook = captured["event_hooks"]["response"][0]
+        response = httpx.Response(
+            302,
+            headers={"Location": "http://169.254.169.254/latest/meta-data"},
+            request=httpx.Request("GET", "https://example.com/mcp/sse"),
+        )
+        with pytest.raises(ValueError, match="Blocked MCP redirect"):
+            asyncio.run(hook(response))
 
     def test_factory_injected_when_cert_set(self, patch_sse_client, tmp_path):
         """With client_cert set, an httpx_client_factory is injected that
