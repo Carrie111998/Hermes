@@ -3345,9 +3345,14 @@ class AIAgent:
             )
             for path in targets:
                 # Keep the FIRST error we saw for a given path unless we
-                # later see success.  A repeated failure with a different
-                # message shouldn't silently overwrite the original.
-                if path not in state:
+                # later see success.  Exception: promote args_missing to
+                # apply_failed so a real failed edit is not hidden by the
+                # formation-error footer filter.
+                existing = state.get(path)
+                if existing is None or (
+                    existing.get("kind") == "args_missing"
+                    and kind == "apply_failed"
+                ):
                     state[path] = {
                         "tool": tool_name,
                         "error_preview": preview,
