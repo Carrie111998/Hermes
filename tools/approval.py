@@ -522,6 +522,8 @@ def detect_hardline_command(command: str) -> tuple:
     return (False, None)
 
 
+_LEADING_ASSIGNMENTS = re.compile(r"^(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)+")
+
 def _match_user_deny_rule(command: str) -> str | None:
     """Return the matching ``approvals.deny`` glob, or None.
 
@@ -551,6 +553,24 @@ def _match_user_deny_rule(command: str) -> str | None:
         for pattern in globs:
             if fnmatch.fnmatchcase(candidate, pattern.lower()):
                 return pattern
+        # Also test each command-start segment so that deny rules catch
+        # commands hidden behind prefixes like ``cd repo && git push`` or
+        # ``VAR=val git push``.  ``_mark_command_starts`` is quote-aware,
+        # so opens inside quotes (e.g. ``grep -r 'git push' docs/``) never
+        # produce a segment and remain allowed.
+        marked = _mark_command_starts(command_variant)
+        segments = marked.split("\n") if marked != command_variant else []
+        # Always test the full variant with leading assignments stripped,
+        # since ``_mark_command_starts`` may not split ``VAR=val cmd``.
+        if not segments:
+            segments = [candidate]
+        for raw in segments:
+            seg = _LEADING_ASSIGNMENTS.sub("", raw.lower().strip()).lstrip("({ ").strip()
+            if not seg:
+                continue
+            for pattern in globs:
+                if fnmatch.fnmatchcase(seg, pattern.lower()):
+                    return pattern
     return None
 
 
