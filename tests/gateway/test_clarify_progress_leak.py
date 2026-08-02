@@ -408,6 +408,49 @@ def test_gateway_generation_owner_cancels_old_prompt_and_rejects_stale_worker(
         )
 
 
+def test_gateway_generation_owner_survives_runner_recreation(tmp_path):
+    """A fresh runner must continue process authority, never restart at one."""
+    from tools import clarify_gateway
+
+    with clarify_gateway._lock:
+        clarify_gateway._entries.clear()
+        clarify_gateway._session_index.clear()
+        clarify_gateway._current_generations.clear()
+
+    session_key = "agent:main:slack:dm:generation-runner-recreation"
+    first_runner = _make_runner(ProgressCaptureAdapter(), tmp_path)
+    first = first_runner._begin_session_run_generation(session_key)
+    clarify_gateway.register(
+        "runner-recreation-old",
+        session_key,
+        "Old?",
+        ["A"],
+        generation=first,
+        identity_v1=True,
+    )
+
+    replacement_runner = _make_runner(ProgressCaptureAdapter(), tmp_path)
+    replacement = replacement_runner._begin_session_run_generation(session_key)
+
+    assert replacement > first
+    assert replacement_runner._session_run_generation[session_key] == replacement
+    assert clarify_gateway.wait_for_response(
+        "runner-recreation-old",
+        timeout=0.01,
+        session_key=session_key,
+        generation=first,
+    ) is None
+    with pytest.raises(ValueError, match="stale clarify generation"):
+        clarify_gateway.register(
+            "runner-recreation-late-old",
+            session_key,
+            "Late?",
+            ["A"],
+            generation=first,
+            identity_v1=True,
+        )
+
+
 @pytest.mark.asyncio
 async def test_failed_clarify_delivery_cancels_only_exact_request(
     monkeypatch,

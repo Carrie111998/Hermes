@@ -29799,15 +29799,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not session_key:
             return 0
         persistent = self._session_state(session_key).persistent
-        # Monotonic by design (#28686): incremented here, NEVER reset.
-        persistent.run_generation = int(persistent.run_generation) + 1
         from tools import clarify_gateway as _clarify_mod
 
-        _clarify_mod.update_session_generation(
-            session_key,
-            persistent.run_generation,
-        )
-        return persistent.run_generation
+        # Generation authority is process-wide, not runner-local.  A gateway
+        # runner can be recreated while the clarify registry remains alive
+        # (tests do this routinely, and graceful runtime replacement can too),
+        # so restarting a local counter at 1 would attempt to roll authority
+        # backwards.  Claim and publish atomically in the shared registry,
+        # then mirror the exact token into the runner's persistent state for
+        # stale-run guards and the legacy mapping view.
+        generation = _clarify_mod.claim_session_generation(session_key)
+        persistent.run_generation = generation
+        return generation
 
     def _invalidate_session_run_generation(
         self, session_key: str, *, reason: str = ""
