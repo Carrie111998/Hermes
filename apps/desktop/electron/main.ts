@@ -32,9 +32,7 @@ import {
 import nodePty from 'node-pty'
 
 import { classifyActiveRuntime } from './active-runtime-state'
-import { collectBackendDrainTargets } from './backend-quit-drain'
 import { stopBackendChild as stopBackendChildImpl } from './backend-child'
-import { QuitBarrier } from './quit-barrier'
 import { dashboardFallbackArgs, sourceDeclaresServe } from './backend-command'
 import { createBackendConnectionState } from './backend-connection-state'
 import { buildDesktopBackendEnv, hermesManagedNodePathEntries, normalizeHermesHomeRoot } from './backend-env'
@@ -46,6 +44,7 @@ import {
   shouldTrustHermesOverride,
   verifyHermesCli
 } from './backend-probes'
+import { collectBackendDrainTargets } from './backend-quit-drain'
 import { waitForDashboardPortAnnouncement } from './backend-ready'
 import { shouldLatchBackendStartFailure, shouldLatchRemoteReauthFailure } from './backend-start-failure'
 import { detectRemoteDisplay, isWindowsBinaryPathInWsl, isWslEnvironment } from './bootstrap-platform'
@@ -161,6 +160,7 @@ import { rehomePrimaryConnection } from './primary-connection-rehome'
 import { decideProfileDeleteAction, profileNameFromDeleteRequest, resolveRouteProfile } from './profile-delete-routing'
 import { fetchPrimaryProfileSessions } from './profile-session-routing'
 import { createQuickEntryShortcut, quickEntryWindowBounds, sanitizeQuickEntrySettings } from './quick-entry'
+import { QuitBarrier } from './quit-barrier'
 import { type ActiveWork, mergeActiveWork, normalizeActiveWork, quitPromptFor } from './quit-guard'
 import * as remoteLifecycle from './remote-lifecycle'
 import {
@@ -12019,6 +12019,7 @@ app.on('before-quit', event => {
   // a quit with nothing running proceeds immediately (no artificial delay).
   if (!backendQuitDrainScheduled && drainTargets.length > 0) {
     backendQuitDrainScheduled = true
+
     for (const child of drainTargets) {
       quitBarrier.add(waitForBackendExit(child))
     }
@@ -12033,8 +12034,10 @@ app.on('before-quit', event => {
   // app.quit() cannot bypass another outstanding wait — the barrier re-quits
   // only after every promise has settled or reached its bound.
   const barrier = quitBarrier.arm()
+
   if (barrier) {
     event.preventDefault()
+
     // Cmd-Q should still feel instant even though the actual exit is deferred
     // for up to ~5s while the backend drains.
     for (const win of BrowserWindow.getAllWindows()) {

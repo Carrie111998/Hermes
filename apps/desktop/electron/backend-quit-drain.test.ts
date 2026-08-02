@@ -24,19 +24,23 @@ test('captures every live pooled backend even though the pool is about to be cle
   // snapshot up-front and keep those handles.
   const poolA = alive()
   const poolB = alive()
+
   const targets = collectBackendDrainTargets(undefined, [
     { process: poolA },
     { process: poolB },
   ])
+
   assert.deepEqual(targets, [poolA, poolB])
 })
 
 test('dedupes a primary that also appears in the pool snapshot', () => {
   const shared = alive()
+
   const targets = collectBackendDrainTargets(shared, [
     { process: shared },
     { process: alive() },
   ])
+
   assert.strictEqual(targets.length, 2)
 })
 

@@ -26,6 +26,7 @@ export class QuitBarrier {
       // snapshotted by the armed barrier.
       return
     }
+
     this.pending.push(work)
   }
 
@@ -45,9 +46,11 @@ export class QuitBarrier {
     if (this.armed || this.pending.length === 0) {
       return null
     }
+
     this.armed = true
     const batch = this.pending
     this.pending = []
+
     return Promise.allSettled(batch).then(() => undefined)
   }
 }

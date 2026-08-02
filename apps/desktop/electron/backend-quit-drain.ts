@@ -43,11 +43,14 @@ export function collectBackendDrainTargets(
     if (!child || seen.has(child)) {
       continue
     }
+
     seen.add(child)
+
     // Already-exited handles need no waiting; only live ones are targets.
     if (child.exitCode === null && child.signalCode === null) {
       out.push(child)
     }
   }
+
   return out
 }
