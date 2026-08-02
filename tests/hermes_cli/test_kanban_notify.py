@@ -62,7 +62,7 @@ def test_cli_create_autosubscribes_current_desktop_session(
     reset_session_vars()
     monkeypatch.setenv("HERMES_SESSION_SOURCE", "desktop")
     monkeypatch.setenv("HERMES_SESSION_ID", "desktop-session-1")
-    monkeypatch.delenv("HERMES_SESSION_KEY", raising=False)
+    monkeypatch.setenv("HERMES_SESSION_KEY", "desktop-poller-key-1")
     monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
     monkeypatch.delenv("HERMES_SESSION_CHAT_ID", raising=False)
 
@@ -80,8 +80,24 @@ def test_cli_create_autosubscribes_current_desktop_session(
     assert task.session_id == "desktop-session-1"
     assert len(subs) == 1
     assert subs[0]["platform"] == "tui"
-    assert subs[0]["chat_id"] == "desktop-session-1"
+    assert subs[0]["chat_id"] == "desktop-poller-key-1"
     assert subs[0]["notifier_profile"] == "default"
+
+    # Prove the row is addressed to the identity the live Desktop/TUI poller
+    # actually consumes, not merely present in the database.
+    conn = kb.connect()
+    try:
+        kb.complete_task(conn, task.id, summary="desktop delivery proof")
+    finally:
+        conn.close()
+    from tui_gateway.server import _collect_kanban_notifications
+
+    texts = _collect_kanban_notifications(
+        {"session_key": "desktop-poller-key-1"}
+    )
+    assert len(texts) == 1
+    assert task.id in texts[0]
+    assert "desktop delivery proof" in texts[0]
 
 
 def test_cli_create_autosubscribes_exact_buzz_thread(

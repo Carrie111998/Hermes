@@ -38,11 +38,9 @@ def maybe_auto_subscribe(
     """Subscribe the originating human conversation to terminal task events.
 
     Messaging platforms bind an explicit platform/chat/thread envelope.  The
-    Desktop/TUI uses a local poller keyed by ``HERMES_SESSION_KEY``.  Current
-    Desktop agent subprocesses may expose only ``source=desktop`` plus their
-    durable session id, so that source-specific id is a safe equivalent return
-    address.  It is deliberately *not* used for CLI, cron, tests, workers, or
-    other unattached sources.
+    Desktop/TUI uses a local poller keyed by ``HERMES_SESSION_KEY``.  The
+    durable ``HERMES_SESSION_ID`` is a different identity and must never be
+    substituted for that live poller address.
 
     Best effort: task creation must still succeed if notification bookkeeping
     fails.  Returns whether a subscription row was written.
@@ -63,22 +61,11 @@ def maybe_auto_subscribe(
     try:
         platform = _session_env("HERMES_SESSION_PLATFORM", "").strip()
         chat_id = _session_env("HERMES_SESSION_CHAT_ID", "").strip()
-        source = _session_env("HERMES_SESSION_SOURCE", "").strip().lower()
-
         if not platform or not chat_id:
             session_key = (
                 _session_env("HERMES_SESSION_KEY", "")
                 or os.environ.get("HERMES_SESSION_KEY", "")
             ).strip()
-            if not session_key and source == "desktop":
-                # Desktop is a persistent local UI with a Kanban notification
-                # poller. Unlike one-shot CLI/API contexts, its durable session
-                # id is a valid late-delivery address.
-                session_key = (
-                    session_id
-                    or _session_env("HERMES_SESSION_ID", "")
-                    or ""
-                ).strip()
             if not session_key:
                 return False
             platform = "tui"
