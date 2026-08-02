@@ -13,11 +13,13 @@ import json
 import os
 import re
 import sqlite3
+import stat
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Mapping, Sequence
 
+from hermes_cli import kanban_db as kb
 from hermes_cli.kanban_execution import (
     LeafSpec,
     get_workflow_controller_state,
@@ -31,6 +33,59 @@ _LOGICAL_KEY_RE = re.compile(r"[A-Za-z0-9_.-]+/v[1-9][0-9]*\Z")
 
 class PilotSafetyError(ValueError):
     """The pilot manifest or live repository violates a fail-closed control."""
+
+
+def _reject_aliased_storage(path: Path, kind: str) -> None:
+    if path.is_symlink():
+        raise PilotSafetyError(f"manifest board {kind} must not use a symlink")
+    if not path.exists():
+        return
+    metadata = path.stat()
+    if kind == "directory":
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise PilotSafetyError(
+                "manifest board directory must be an unaliased directory"
+            )
+        return
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+        raise PilotSafetyError(
+            f"manifest board {kind} must be an unaliased regular filesystem object"
+        )
+
+
+def ensure_pilot_board_storage(board: str, *, name: str) -> Path:
+    """Create an unaliased pilot DB path before SQLite may mutate it."""
+
+    if os.environ.get("HERMES_KANBAN_DB", "").strip():
+        raise PilotSafetyError(
+            "pilot preparation forbids the HERMES_KANBAN_DB database override"
+        )
+    root = kb.boards_root()
+    board_directory = kb.board_dir(board)
+    database = board_directory / "kanban.db"
+    metadata_path = board_directory / "board.json"
+    if root.is_symlink():
+        raise PilotSafetyError("manifest boards root must not use a symlink")
+    _reject_aliased_storage(board_directory, "directory")
+    _reject_aliased_storage(database, "database")
+    _reject_aliased_storage(metadata_path, "metadata")
+    board_directory.mkdir(parents=True, exist_ok=True)
+    _reject_aliased_storage(board_directory, "directory")
+    if not database.exists():
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            descriptor = os.open(database, flags, 0o600)
+        except FileExistsError:
+            pass
+        else:
+            os.close(descriptor)
+    _reject_aliased_storage(database, "database")
+    if not metadata_path.exists():
+        kb.write_board_metadata(board, name=name)
+    _reject_aliased_storage(metadata_path, "metadata")
+    return database
 
 
 def _text(value: object, name: str) -> str:
@@ -346,6 +401,10 @@ class PilotPlan:
         board = _text(campaign.get("board"), "campaign.board")
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", board):
             raise PilotSafetyError("campaign.board must be a safe board slug")
+        if board.lower() == kb.DEFAULT_BOARD:
+            raise PilotSafetyError(
+                "campaign.board must name a dedicated non-default board"
+            )
         return cls(
             repository=repository,
             issue=str(int(issue)),
@@ -438,6 +497,40 @@ def prepare_pilot(
 
     active_board = os.environ.get("HERMES_KANBAN_BOARD", "").strip()
     if active_board != plan.board:
+        raise PilotSafetyError(
+            "manifest board does not match the active Kanban board database"
+        )
+    if os.environ.get("HERMES_KANBAN_DB", "").strip():
+        raise PilotSafetyError(
+            "pilot preparation forbids the HERMES_KANBAN_DB database override"
+        )
+    board_directory = kb.board_dir(plan.board)
+    expected_database_path = board_directory / "kanban.db"
+    if board_directory.is_symlink() or expected_database_path.is_symlink():
+        raise PilotSafetyError("manifest board database path must not use a symlink")
+    database_rows = conn.execute("PRAGMA database_list").fetchall()
+    main_database_path = next(
+        (
+            Path(os.path.abspath(str(row[2])))
+            for row in database_rows
+            if row[1] == "main"
+        ),
+        None,
+    )
+    expected_lexical_path = Path(os.path.abspath(expected_database_path))
+    if main_database_path is None or main_database_path != expected_lexical_path:
+        raise PilotSafetyError(
+            "manifest board does not match the active Kanban board database"
+        )
+    try:
+        main_database = main_database_path.resolve(strict=True)
+        expected_database = expected_database_path.resolve(strict=True)
+        expected_stat = expected_database_path.stat()
+    except OSError as exc:
+        raise PilotSafetyError("manifest board database is not a stable file") from exc
+    if expected_stat.st_nlink != 1:
+        raise PilotSafetyError("manifest board database must not be hard-linked")
+    if main_database != expected_database:
         raise PilotSafetyError(
             "manifest board does not match the active Kanban board database"
         )

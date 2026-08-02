@@ -20,11 +20,21 @@ This prevents a reviewed runner from being silently replaced or locally patched
 between approval and the live preparation step.
 
 `prepare` is idempotent only for the exact same permit, manifest, pin, branch,
-worktree, immutable leaf identities, and safe manifest board slug. The
+worktree, immutable leaf identities, and safe dedicated non-default manifest
+board slug. The
 `HERMES_KANBAN_BOARD` environment must exactly equal that manifest board before
-the database is touched. Drift fails closed. It never enables
-dispatch, launches a worker, pushes, opens a PR, mutates a GitHub Project,
-merges, releases, or deploys.
+the database is touched. The CLI creates the named board when absent and passes
+that slug explicitly to database initialization and connection; the preparation
+kernel independently verifies the opened SQLite `main` path equals that board's
+canonical database path. Before any SQLite initialization or connection, the CLI
+preflights the boards root, manifest board directory, metadata, and database,
+then creates a missing database with `O_EXCL` and `O_NOFOLLOW`. Preparation
+rejects `HERMES_KANBAN_DB`, a symlinked board root, directory, metadata, or
+database, and a hard-linked database; its expected path is derived directly from
+the manifest board rather than any override-sensitive resolver. An unresolved or
+aliased board may never fall back to the default database. Drift fails closed. It
+never enables dispatch, launches a worker, pushes, opens a PR, mutates a GitHub
+Project, merges, releases, or deploys.
 
 Preparation is a controller mutation and therefore fails closed in delegated
 child contexts. Run it only from the authorized controller or scheduler

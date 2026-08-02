@@ -18,6 +18,7 @@ from hermes_cli.kanban_pilot_runner import (  # noqa: E402
     PilotPlan,
     PilotSafetyError,
     assert_runner_source,
+    ensure_pilot_board_storage,
     prepare_pilot,
 )
 
@@ -50,9 +51,14 @@ def main(argv: list[str] | None = None) -> int:
         if args.action == "prepare":
             # Board selection is explicit and manifest-owned. Preparation still
             # fails unless both durable launch gates are currently off.
+            if os.environ.get("HERMES_KANBAN_DB", "").strip():
+                raise PilotSafetyError(
+                    "pilot preparation forbids the HERMES_KANBAN_DB database override"
+                )
             os.environ["HERMES_KANBAN_BOARD"] = plan.board
-            kb.init_db()
-            with kb.connect() as conn:
+            ensure_pilot_board_storage(plan.board, name=f"Workflow pilot {plan.issue}")
+            kb.init_db(board=plan.board)
+            with kb.connect(board=plan.board) as conn:
                 prepared = prepare_pilot(conn, plan)
             result.update(
                 status="prepared",

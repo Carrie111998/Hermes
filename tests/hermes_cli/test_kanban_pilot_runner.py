@@ -13,6 +13,7 @@ from hermes_cli.kanban_pilot_runner import (
     PilotPlan,
     PilotSafetyError,
     assert_runner_source,
+    ensure_pilot_board_storage,
     prepare_pilot,
 )
 from hermes_cli.kanban_execution import (
@@ -148,21 +149,68 @@ def test_plan_rejects_unsafe_board_slug(pilot):
         PilotPlan.from_mapping(manifest)
 
 
+def test_manifest_rejects_default_board(pilot):
+    _repo, _pin, manifest = pilot
+    manifest["campaign"]["board"] = "default"
+    with pytest.raises(PilotSafetyError, match="dedicated non-default board"):
+        PilotPlan.from_mapping(manifest)
+
+
+def test_prepare_rejects_default_database_fallback_for_missing_manifest_board(pilot):
+    _repo, _pin, manifest = pilot
+    plan = PilotPlan.from_mapping(manifest)
+    # The env names a board that does not exist yet, so implicit resolution
+    # falls back to the default database. Preparation must detect that mismatch.
+    kb.init_db()
+    with kb.connect() as conn:
+        with pytest.raises(PilotSafetyError, match="active Kanban board database"):
+            prepare_pilot(conn, plan)
+
+
 def test_prepare_requires_manifest_board_to_match_active_database(pilot, monkeypatch):
     _repo, _pin, manifest = pilot
     plan = PilotPlan.from_mapping(manifest)
-    kb.init_db()
-    with kb.connect() as conn:
+    ensure_pilot_board_storage("pilot-test", name="Pilot test")
+    kb.init_db(board="pilot-test")
+    with kb.connect(board="pilot-test") as conn:
         monkeypatch.setenv("HERMES_KANBAN_BOARD", "different-board")
         with pytest.raises(PilotSafetyError, match="active Kanban board"):
             prepare_pilot(conn, plan)
 
 
+def test_prepare_rejects_database_path_override_even_with_explicit_board(
+    pilot, monkeypatch
+):
+    _repo, _pin, manifest = pilot
+    plan = PilotPlan.from_mapping(manifest)
+    kb.create_board("pilot-test")
+    default_database = kb.init_db(board="default")
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(default_database))
+    with kb.connect(board="pilot-test") as conn:
+        with pytest.raises(PilotSafetyError, match="database override"):
+            prepare_pilot(conn, plan)
+
+
+def test_prepare_rejects_manifest_board_database_symlink(pilot):
+    _repo, _pin, manifest = pilot
+    plan = PilotPlan.from_mapping(manifest)
+    kb.create_board("pilot-test")
+    default_database = kb.init_db(board="default")
+    pilot_database = kb.board_dir("pilot-test") / "kanban.db"
+    pilot_database.unlink()
+    pilot_database.symlink_to(default_database)
+    before = default_database.read_bytes()
+    with pytest.raises(PilotSafetyError, match="symlink"):
+        ensure_pilot_board_storage("pilot-test", name="Pilot test")
+    assert default_database.read_bytes() == before
+
+
 def test_prepare_registers_two_ready_candidates_and_one_dependency_blocked_leaf(pilot):
     repo, pin, manifest = pilot
     plan = PilotPlan.from_mapping(manifest)
-    kb.init_db()
-    with kb.connect() as conn:
+    ensure_pilot_board_storage("pilot-test", name="Pilot test")
+    kb.init_db(board="pilot-test")
+    with kb.connect(board="pilot-test") as conn:
         result = prepare_pilot(conn, plan)
         assert result.pin_sha == pin
         assert set(result.task_ids) == {"alpha/v1", "beta/v1", "dependent/v1"}
@@ -194,8 +242,9 @@ def test_prepare_registers_two_ready_candidates_and_one_dependency_blocked_leaf(
 def test_prepare_is_idempotent_and_refuses_source_or_permit_drift(pilot):
     _repo, _pin, manifest = pilot
     plan = PilotPlan.from_mapping(manifest)
-    kb.init_db()
-    with kb.connect() as conn:
+    ensure_pilot_board_storage("pilot-test", name="Pilot test")
+    kb.init_db(board="pilot-test")
+    with kb.connect(board="pilot-test") as conn:
         first = prepare_pilot(conn, plan)
         second = prepare_pilot(conn, plan)
         assert first.task_ids == second.task_ids
@@ -203,5 +252,8 @@ def test_prepare_is_idempotent_and_refuses_source_or_permit_drift(pilot):
 
     changed = json.loads(json.dumps(manifest))
     changed["controls"]["permit"] = "different-permit"
-    with kb.connect() as conn, pytest.raises(PilotSafetyError, match="permit"):
+    with (
+        kb.connect(board="pilot-test") as conn,
+        pytest.raises(PilotSafetyError, match="permit"),
+    ):
         prepare_pilot(conn, PilotPlan.from_mapping(changed))
