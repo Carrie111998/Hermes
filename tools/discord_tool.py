@@ -27,7 +27,6 @@ actionable guidance the model can relay to the user.
 
 import json
 import logging
-import os
 import re
 import threading
 import urllib.error
@@ -35,6 +34,7 @@ import urllib.parse
 import urllib.request
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
+from agent.secret_scope import get_secret
 from tools.registry import registry, tool_error
 
 if TYPE_CHECKING:
@@ -73,8 +73,8 @@ def _read_limited_response_body(source: Any, limit: int, *, label: str) -> bytes
 
 
 def _get_bot_token() -> Optional[str]:
-    """Resolve the Discord bot token from environment."""
-    return os.getenv("DISCORD_BOT_TOKEN", "").strip() or None
+    """Resolve the Discord bot token under the active profile secret scope."""
+    return (get_secret("DISCORD_BOT_TOKEN", "") or "").strip() or None
 
 
 def _writer_policy_required() -> bool:
