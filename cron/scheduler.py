@@ -48,6 +48,7 @@ from hermes_cli.config import (
 )
 from hermes_cli.fallback_config import get_fallback_chain
 from hermes_time import now as _hermes_now
+from tools.approval import reset_hermes_cron_context, set_hermes_cron_context
 
 logger = logging.getLogger(__name__)
 
@@ -2753,6 +2754,17 @@ def _guard_job_credential_exfil(job: dict) -> None:
 def run_job(
     job: dict, *, defer_agent_teardown: Optional[list] = None
 ) -> tuple[bool, str, str, Optional[str]]:
+    """Execute a single cron job with cron approval context bound."""
+    token = set_hermes_cron_context(True)
+    try:
+        return _run_job_impl(job, defer_agent_teardown=defer_agent_teardown)
+    finally:
+        reset_hermes_cron_context(token)
+
+
+def _run_job_impl(
+    job: dict, *, defer_agent_teardown: Optional[list] = None
+) -> tuple[bool, str, str, Optional[str]]:
     """
     Execute a single cron job.
 
@@ -3007,11 +3019,6 @@ def run_job(
     logger.info("Prompt: %s", prompt[:100])
 
     agent = None
-
-    # Mark this as a cron session so the approval system can apply cron_mode.
-    # This env var is process-wide and persists for the lifetime of the
-    # scheduler process — every job this process runs is a cron job.
-    os.environ["HERMES_CRON_SESSION"] = "1"
 
     # Use ContextVars for per-job session/delivery state so parallel jobs
     # don't clobber each other's targets (os.environ is process-global).
