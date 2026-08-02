@@ -128,6 +128,12 @@ class WorkflowNode:
     """Attachment name. References a declared attachment by name.
     E.g. "grill_artifact" picks the attachment with that key.
     If None, all attachments are attached (first layer) or none."""
+    inherit_workspace: bool = False
+    """When True and this node is a reviewer, inherit the work node's
+       workspace_kind and workspace_path so the reviewer starts in the
+       same project dir/worktree. Default (False) means blind review
+       in a scratch directory.
+    """
     reviews: list[str] = field(default_factory=list)
     """Sequential review pipeline. Each entry is a node ID that reviews
     this node's output. When the card moves to 'review' status, the
@@ -359,6 +365,7 @@ class WorkflowEngine:
                 reviews=node_data.get("reviews", []),
                 max_retries=node_data.get("max_retries"),
                 attachment=node_data.get("attachment"),
+                inherit_workspace=bool(node_data.get("inherit_workspace", False)),
             )
 
         return workflow
@@ -489,7 +496,9 @@ class WorkflowEngine:
                             states: Optional[dict] = None,
                             layers: Optional[list] = None,
                             initial_status: str = "ready",
-                            body_prefix: str = "") -> str:
+                            body_prefix: str = "",
+                            workspace_kind: str = "",
+                            workspace_path: str = "") -> str:
         """Create a kanban card for a workflow node. Returns card ID.
 
         Refuses to create a card for a synthetic gate node — those are
@@ -564,8 +573,8 @@ class WorkflowEngine:
                 parents=(),
                 tenant=self.kanban_board,
                 priority=2,
-                workspace_kind=self._workspace_kind(),
-                workspace_path=self._workspace_path(),
+                workspace_kind=workspace_kind or self._workspace_kind(),
+                workspace_path=workspace_path or self._workspace_path(),
                 project_id=None,
                 triage=node.triage if hasattr(node, 'triage') else False,
                 max_runtime_seconds=(
@@ -610,7 +619,9 @@ class WorkflowEngine:
     def dispatch_node(self, state: NodeState, node: WorkflowNode, context: dict,
                        workflow: "Workflow", states: dict, layers: list,
                        initial_status: str = "ready",
-                       body_prefix: str = "") -> Optional[str]:
+                       body_prefix: str = "",
+                       workspace_kind: str = "",
+                       workspace_path: str = "") -> Optional[str]:
         """Dispatch a node to kanban, or mark it done in-process.
 
         For ``scope: global`` workflows (maintenance, notifications, heartbeat)
@@ -637,6 +648,8 @@ class WorkflowEngine:
             workflow=workflow, states=states, layers=layers,
             initial_status=initial_status,
             body_prefix=body_prefix,
+            workspace_kind=workspace_kind,
+            workspace_path=workspace_path,
         )
 
     def _get_session_info(self) -> dict:
@@ -3465,10 +3478,21 @@ class WorkflowEngine:
                                             f"(task {_upstream_card}). Read the card body and "
                                             f"completion summary of that task to find the work.\n\n"
                                         )
+                                        # Check if reviewer inherits the work node's workspace.
+                                        # Blind reviews (default): reviewer runs in scratch.
+                                        # inherit_workspace: true on the reviewer node means
+                                        # the reviewer starts in the same project dir/worktree.
+                                        _rev_ws_kind = ""
+                                        _rev_ws_path = ""
+                                        if getattr(reviewer_node, "inherit_workspace", False):
+                                            _rev_ws_kind = states[nid].workspace_kind or ""
+                                            _rev_ws_path = states[nid].workspace_path or ""
                                         reviewer_card_id = self.dispatch_node(
                                             states[rev_id], reviewer_node, context,
                                             workflow=workflow, states=states, layers=layers,
                                             body_prefix=_review_header,
+                                            workspace_kind=_rev_ws_kind,
+                                            workspace_path=_rev_ws_path,
                                         )
                                         if reviewer_card_id:
                                             states[rev_id].kanban_card_id = reviewer_card_id
