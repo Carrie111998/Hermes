@@ -561,6 +561,12 @@ def _copy_dist_payload(
     ``preserve_config`` is False (fresh install or ``--force-config`` update).
     ``.env.template`` is renamed to ``.env.EXAMPLE`` in the target to avoid
     shadowing a real ``.env``.
+
+    When the manifest declares an explicit ``distribution_owned`` list, only
+    those paths are copied (path-aware: nested entries such as
+    ``skills/research`` or ``cron/digest.json`` are honoured).  When the list
+    is omitted the legacy behaviour is preserved: every staged entry outside
+    ``USER_OWNED_EXCLUDE`` is copied.
     """
     target.mkdir(parents=True, exist_ok=True)
     target_root = target.resolve()

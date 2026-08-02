@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, Callable, Dict, Optional, cast
+from typing import Any, Callable, Dict, Optional, Tuple, cast
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, SendResult
@@ -72,6 +72,11 @@ class RelayAdapter(BasePlatformAdapter):
         # recipient's author binding; we re-attach this user_id as
         # metadata.user_id on the outbound action so it can. See _capture_scope.
         self._dm_user_by_chat: Dict[str, str] = {}
+        # chat_id -> (thread_id, initial_name) of the auto-thread the CONNECTOR
+        # created for our most recent send into that chat (auto-thread routing
+        # feedback off SendResult — see send()). Consumed by the gateway's
+        # semantic thread-rename lane; bounded like the sibling caches.
+        self._auto_thread_by_chat: Dict[str, Tuple[str, str]] = {}
         # chat_id -> chat_type (e.g. "dm", "channel", "group") learned from the
         # inbound event. Used to reproduce native Slack's synthetic-DM-thread
         # suppression on the relay lane: a DM streaming reply carries
@@ -939,11 +944,40 @@ class RelayAdapter(BasePlatformAdapter):
             },
             platform=self._platform_by_chat.get(str(chat_id)),
         )
+        # Auto-thread routing feedback (contract §SendResult): when the
+        # connector's auto-thread egress policy routed this send into a
+        # thread it just created, the result carries thread_id (+ the
+        # initial name). The conversation was keyed on the PARENT channel —
+        # the thread didn't exist at ingest — so this is the only place the
+        # gateway learns where the reply landed. The semantic-rename lane
+        # (auto session title) reads it via auto_thread_info_for_chat.
+        try:
+            _at_thread = result.get("thread_id")
+            _at_name = result.get("auto_thread_name")
+            if _at_thread and _at_name:
+                self._auto_thread_by_chat[str(chat_id)] = (
+                    str(_at_thread),
+                    str(_at_name),
+                )
+                if len(self._auto_thread_by_chat) > 256:
+                    self._auto_thread_by_chat.pop(
+                        next(iter(self._auto_thread_by_chat)), None
+                    )
+        except Exception:  # noqa: BLE001 - feedback capture must never break send
+            pass
         return SendResult(
             success=bool(result.get("success")),
             message_id=result.get("message_id"),
             error=result.get("error"),
         )
+
+    def auto_thread_info_for_chat(
+        self, chat_id: str
+    ) -> Optional[Tuple[str, str]]:
+        """(thread_id, initial_name) of the auto-thread the connector created
+        for the most recent send into *chat_id*, if any. Consumed by the
+        gateway's semantic thread-rename lane (auto session title)."""
+        return self._auto_thread_by_chat.get(str(chat_id))
 
     def _resolve_reply_to_for_send(
         self,
@@ -2026,6 +2060,7 @@ class RelayAdapter(BasePlatformAdapter):
         name: str,
         *,
         only_if_current_name: Optional[str] = None,
+        prefer_connector_created: bool = False,
         parent_chat_id: Optional[str] = None,
     ) -> bool:
         """Best-effort thread rename via the connector's `thread_rename` op.
@@ -2034,10 +2069,15 @@ class RelayAdapter(BasePlatformAdapter):
         called by the SAME semantic-rename lane (run.py
         _rename_discord_auto_thread_for_session_title), which fires only for
         sources carrying the connector-stamped auto-thread markers.
-        ``only_if_current_name`` crosses the wire; the CONNECTOR enforces the
-        no-clobber guard (it owns the platform read), failing safe on
-        platforms that can't read the current name. ``parent_chat_id`` is
-        the containing chat where the caller knows it (Telegram needs it);
+
+        No-clobber guard: prefer ``prefer_connector_created=True``, which asks
+        the CONNECTOR to enforce the guard from ITS OWN created-name memory
+        (only_if_connector_created) — the gateway no longer has to reproduce
+        the thread's initial name byte-for-byte, which drifted on any
+        normalization difference and silently declined every relay rename.
+        ``only_if_current_name`` is the legacy string guard, kept for the
+        native-marker lane and older connectors. ``parent_chat_id`` is the
+        containing chat where the caller knows it (Telegram needs it);
         defaults to the thread id itself (Discord ignores chat_id).
         """
         if self._transport is None or not self.descriptor.supports_op("thread_rename"):
@@ -2053,7 +2093,9 @@ class RelayAdapter(BasePlatformAdapter):
             "thread_name": cleaned[:100],
             "metadata": self._with_scope(chat_id, None),
         }
-        if only_if_current_name is not None:
+        if prefer_connector_created:
+            action["only_if_connector_created"] = True
+        elif only_if_current_name is not None:
             action["only_if_current_name"] = str(only_if_current_name)
         try:
             result = await self._transport.send_outbound(
