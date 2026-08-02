@@ -43,8 +43,8 @@ def _clear_session_state():
     yield
     with mod._sessions_lock:
         mod._sessions.clear()
-    mod._vnc_url = None
-    mod._vnc_url_checked = False
+    mod._vnc_cache.clear()
+    mod._cmd_timeout_cache.clear()
 
 
 class TestManagedPersistenceToggle:
@@ -256,7 +256,102 @@ class TestConfiguredCamofoxIdentity:
         assert result is True
         import tools.browser_camofox as mod
         with mod._sessions_lock:
-            assert "task-1" not in mod._sessions
+            assert mod._session_cache_key("task-1") not in mod._sessions
+
+
+class TestCrossProfileCacheIsolation:
+    """#76574: session/VNC/timeout caches must not leak identity or endpoints
+    across profiles sharing the same in-process caller-chosen task_id."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_multiplex(self):
+        from agent import secret_scope as ss
+        ss.set_multiplex_active(False)
+        yield
+        ss.set_multiplex_active(False)
+
+    def test_same_task_id_different_profiles_get_isolated_sessions(self, tmp_path, monkeypatch):
+        from agent import secret_scope as ss
+        from gateway.run import _profile_runtime_scope
+
+        monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")
+        home_a = tmp_path / "profA"
+        home_a.mkdir()
+        home_b = tmp_path / "profB"
+        home_b.mkdir()
+
+        ss.set_multiplex_active(True)
+        try:
+            with _enable_persistence():
+                with _profile_runtime_scope(home_a):
+                    session_a = _get_session("shared-task")
+                with _profile_runtime_scope(home_b):
+                    session_b = _get_session("shared-task")
+        finally:
+            ss.set_multiplex_active(False)
+
+        assert session_a["user_id"] != session_b["user_id"]
+        assert session_a["session_key"] != session_b["session_key"]
+
+    def test_cleanup_of_one_profile_does_not_drop_another(self, tmp_path, monkeypatch):
+        from agent import secret_scope as ss
+        from gateway.run import _profile_runtime_scope
+
+        monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")
+        home_a = tmp_path / "profA"
+        home_a.mkdir()
+        home_b = tmp_path / "profB"
+        home_b.mkdir()
+
+        ss.set_multiplex_active(True)
+        try:
+            with _enable_persistence():
+                with _profile_runtime_scope(home_a):
+                    _get_session("shared-task")
+                with _profile_runtime_scope(home_b):
+                    _get_session("shared-task")
+                    camofox_soft_cleanup("shared-task")
+
+                import tools.browser_camofox as mod
+                with _profile_runtime_scope(home_a):
+                    key_a = mod._session_cache_key("shared-task")
+                with mod._sessions_lock:
+                    assert key_a in mod._sessions
+        finally:
+            ss.set_multiplex_active(False)
+
+    def test_vnc_url_isolated_per_profile_endpoint(self, tmp_path, monkeypatch):
+        from agent import secret_scope as ss
+        from gateway.run import _profile_runtime_scope
+
+        # CAMOFOX_URL is a profile secret under multiplex, so it comes from
+        # each profile's .env (loaded by build_profile_secret_scope), not the
+        # process env -- monkeypatch.setenv would be a scope miss here.
+        home_a = tmp_path / "profA"
+        home_a.mkdir()
+        (home_a / ".env").write_text("CAMOFOX_URL=http://profile-a:9377\n")
+        home_b = tmp_path / "profB"
+        home_b.mkdir()
+        (home_b / ".env").write_text("CAMOFOX_URL=http://profile-b:9377\n")
+
+        def _health_by_url(url, timeout=None):
+            if url.startswith("http://profile-a"):
+                return _mock_response(json_data={"vncPort": 5901})
+            return _mock_response(json_data={"vncPort": 5902})
+
+        ss.set_multiplex_active(True)
+        try:
+            with patch("tools.browser_camofox.requests.get", side_effect=_health_by_url):
+                with _profile_runtime_scope(home_a):
+                    vnc_a = get_vnc_url()
+                with _profile_runtime_scope(home_b):
+                    vnc_b = get_vnc_url()
+        finally:
+            ss.set_multiplex_active(False)
+
+        assert vnc_a == "http://profile-a:5901"
+        assert vnc_b == "http://profile-b:5902"
+        assert vnc_a != vnc_b
 
 
 class TestVncUrlDiscovery:
@@ -274,8 +369,7 @@ class TestVncUrlDiscovery:
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")
         import tools.browser_camofox as mod
-        mod._vnc_url = "http://localhost:6080"
-        mod._vnc_url_checked = True
+        mod._vnc_cache[(mod.check_fn_cache_scope(), "http://localhost:9377")] = "http://localhost:6080"
 
         with patch("tools.browser_camofox.requests.post", return_value=_mock_response(
             json_data={"tabId": "t1", "url": "https://example.com"}
@@ -301,7 +395,7 @@ class TestCamofoxSoftCleanup:
         # Session should have been dropped from in-memory store
         import tools.browser_camofox as mod
         with mod._sessions_lock:
-            assert "task-1" not in mod._sessions
+            assert mod._session_cache_key("task-1") not in mod._sessions
 
 
     def test_does_not_call_server_delete(self, tmp_path, monkeypatch):
