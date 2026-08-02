@@ -45,7 +45,7 @@ import {
   verifyHermesCli
 } from './backend-probes'
 import { waitForDashboardPortAnnouncement } from './backend-ready'
-import { restartLocalBackend } from './backend-restart'
+import { restartLocalBackend, waitForBackendExit } from './backend-restart'
 import { shouldLatchBackendStartFailure, shouldLatchRemoteReauthFailure } from './backend-start-failure'
 import { detectRemoteDisplay, isWindowsBinaryPathInWsl, isWslEnvironment } from './bootstrap-platform'
 import { decideBootstrapRepair } from './bootstrap-repair-guard'
@@ -7970,7 +7970,19 @@ async function teardownPrimaryBackendAndWait({ soft = false } = {}) {
 
   try {
     resetHermesConnection({ soft })
-    await waitForBackendExit(dying)
+    await waitForBackendExit(dying, {
+      onTimeout: () => {
+        try {
+          if (IS_WINDOWS && Number.isInteger(dying?.pid)) {
+            forceKillProcessTree(dying.pid)
+          } else {
+            dying?.kill('SIGKILL')
+          }
+        } catch {
+          // Already gone.
+        }
+      }
+    })
   } finally {
     if (soft) {
       softRehomeInProgress = false
@@ -7990,37 +8002,6 @@ function sendConnectionApplied(payload: { preserveSession?: boolean } = {}) {
   }
 
   webContents.send('hermes:connection:applied', payload)
-}
-
-async function waitForBackendExit(child, timeoutMs = 5000) {
-  if (!child) {
-    return
-  }
-
-  if (child.exitCode !== null || child.signalCode !== null) {
-    return
-  }
-
-  await new Promise<void>(resolve => {
-    const timer = setTimeout(() => {
-      try {
-        if (IS_WINDOWS && Number.isInteger(child.pid)) {
-          forceKillProcessTree(child.pid)
-        } else {
-          child.kill('SIGKILL')
-        }
-      } catch {
-        // Already gone.
-      }
-
-      resolve()
-    }, timeoutMs)
-
-    child.once('exit', () => {
-      clearTimeout(timer)
-      resolve()
-    })
-  })
 }
 
 // The profile the primary (window) backend runs as. readActiveDesktopProfile()
@@ -8337,7 +8318,19 @@ async function teardownPoolBackendAndWait(profile) {
 
   stopBackendChild(entry.process)
 
-  await waitForBackendExit(entry.process)
+  await waitForBackendExit(entry.process, {
+    onTimeout: () => {
+      try {
+        if (IS_WINDOWS && Number.isInteger(entry.process?.pid)) {
+          forceKillProcessTree(entry.process.pid)
+        } else {
+          entry.process?.kill('SIGKILL')
+        }
+      } catch {
+        // Already gone.
+      }
+    }
+  })
 }
 
 function stopAllPoolBackends() {
