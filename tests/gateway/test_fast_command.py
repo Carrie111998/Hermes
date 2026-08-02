@@ -1,5 +1,6 @@
 """Tests for gateway /fast support and Priority Processing routing."""
 
+import asyncio
 import sys
 import threading
 import types
@@ -398,6 +399,64 @@ async def test_adapter_title_propagation_does_not_overwrite_newer_manual_title(t
 
     adapter.on_session_title_changed.assert_not_awaited()
     session_db.close()
+
+
+@pytest.mark.asyncio
+async def test_adapter_title_propagation_stale_validated_write_cannot_overwrite_newer():
+    """A delayed older callback cannot apply after a newer scheduled title."""
+    runner = _make_runner()
+    runner._async_session_store = SimpleNamespace(
+        _store=runner.session_store,
+        get_or_create_session=AsyncMock(
+            return_value=SimpleNamespace(session_id="session-1")
+        ),
+    )
+    old_title_validating = asyncio.Event()
+    release_old_validation = asyncio.Event()
+    persisted_title = "Old Title"
+
+    async def get_session_title(_session_id):
+        if persisted_title == "Old Title":
+            old_title_validating.set()
+            await release_old_validation.wait()
+            return "Old Title"
+        return persisted_title
+
+    runner._session_db = SimpleNamespace(get_session_title=get_session_title)
+    applied = []
+    adapter = SimpleNamespace(
+        on_session_title_changed=AsyncMock(
+            side_effect=lambda _source, title: applied.append(title)
+        )
+    )
+    runner.adapters = {Platform.TELEGRAM: adapter}  # type: ignore[dict-item]
+
+    old_generation = runner._reserve_adapter_title_generation("session-1")
+    old_task = asyncio.create_task(
+        runner._propagate_session_title_to_adapter(
+            _make_source(), "session-1", "Old Title", old_generation
+        )
+    )
+    await old_title_validating.wait()
+
+    persisted_title = "New Title"
+    new_generation = runner._reserve_adapter_title_generation("session-1")
+    try:
+        await runner._propagate_session_title_to_adapter(
+            _make_source(), "session-1", "New Title", new_generation
+        )
+        release_old_validation.set()
+        await old_task
+    finally:
+        release_old_validation.set()
+        await old_task
+        runner._release_adapter_title_generation("session-1")
+        runner._release_adapter_title_generation("session-1")
+
+    assert applied == ["New Title"]
+    assert runner._adapter_title_generations == {}
+    assert runner._adapter_title_pending == {}
+    assert runner._adapter_title_apply_locks == {}
 
 
 @pytest.mark.asyncio

@@ -5702,6 +5702,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _shutdown_watchdog_done: Optional["threading.Event"] = None
     _platform_lock_takeover_on_start: bool = False
     _reconnect_watcher_task: Optional["asyncio.Task"] = None
+    _adapter_title_state_init_lock = threading.Lock()
 
     def __init__(self, config: Optional[GatewayConfig] = None):
         global _gateway_runner_ref
@@ -5818,6 +5819,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Set on gateway stop so the recreate-on-shutdown path can't resurrect
         # the pool during a real shutdown.
         self._executor_closing = False
+        # Title callbacks may be scheduled both on the gateway loop and from
+        # the auto-title worker thread.  Generations are therefore assigned
+        # under a synchronous lock before either caller can yield, while the
+        # actual adapter writes are serialized on the gateway loop.
+        self._adapter_title_state_lock = threading.Lock()
+        self._adapter_title_generations: Dict[str, int] = {}
+        self._adapter_title_pending: Dict[str, int] = {}
+        self._adapter_title_apply_locks: Dict[str, asyncio.Lock] = {}
         # ALL per-session state (turn / conversation / persistent scopes)
         # lives in one container — see gateway/session_state.py.  Access via
         # self._session_state(key) (get-or-create) or
@@ -19257,53 +19266,115 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             inspect.getattr_static(adapter, "on_session_title_changed", None)
         )
 
+    def _ensure_adapter_title_state(self) -> None:
+        """Lazily initialize title ordering state for partial test runners."""
+        if hasattr(self, "_adapter_title_state_lock"):
+            return
+        with self._adapter_title_state_init_lock:
+            if not hasattr(self, "_adapter_title_state_lock"):
+                self._adapter_title_state_lock = threading.Lock()
+                self._adapter_title_generations = {}
+                self._adapter_title_pending = {}
+                self._adapter_title_apply_locks = {}
+
+    def _reserve_adapter_title_generation(self, session_id: str) -> int:
+        self._ensure_adapter_title_state()
+        key = str(session_id)
+        with self._adapter_title_state_lock:
+            generation = self._adapter_title_generations.get(key, 0) + 1
+            self._adapter_title_generations[key] = generation
+            self._adapter_title_pending[key] = (
+                self._adapter_title_pending.get(key, 0) + 1
+            )
+            return generation
+
+    def _release_adapter_title_generation(self, session_id: str) -> None:
+        """Drop idle per-session ordering state after every task has exited."""
+        key = str(session_id)
+        with self._adapter_title_state_lock:
+            pending = self._adapter_title_pending.get(key, 0) - 1
+            if pending > 0:
+                self._adapter_title_pending[key] = pending
+                return
+            self._adapter_title_pending.pop(key, None)
+            self._adapter_title_generations.pop(key, None)
+            self._adapter_title_apply_locks.pop(key, None)
+
     async def _propagate_session_title_to_adapter(
         self,
         source: SessionSource,
         session_id: str,
         title: str,
+        generation: Optional[int] = None,
     ) -> None:
         """Best-effort title propagation through an adapter's optional hook."""
         if not title or not self._adapter_supports_session_title_propagation(source):
             return
+        owns_generation = generation is None
+        if generation is None:
+            generation = self._reserve_adapter_title_generation(session_id)
         try:
-            current_entry = await self.async_session_store.get_or_create_session(source)
-        except Exception:
-            logger.debug(
-                "Could not validate current session before adapter title propagation",
-                exc_info=True,
-            )
-            return
-        if str(getattr(current_entry, "session_id", "")) != str(session_id):
-            return
-        session_db = getattr(self, "_session_db", None)
-        if session_db is None:
-            return
-        try:
-            current_title = await session_db.get_session_title(session_id)
-        except Exception:
-            logger.debug(
-                "Could not validate current title before adapter title propagation",
-                exc_info=True,
-            )
-            return
-        if current_title != title:
-            return
-        adapter = self._adapter_for_source(source)
-        if adapter is None:
-            return
-        title_hook = getattr(adapter, "on_session_title_changed", None)
-        if not callable(title_hook):
-            return
-        try:
-            result = title_hook(source, title)
-            if inspect.isawaitable(result):
-                await result
-        except Exception:
-            logger.debug(
-                "Adapter session-title propagation failed",
-                exc_info=True,
-            )
+            try:
+                current_entry = await self.async_session_store.get_or_create_session(source)
+            except Exception:
+                logger.debug(
+                    "Could not validate current session before adapter title propagation",
+                    exc_info=True,
+                )
+                return
+            if str(getattr(current_entry, "session_id", "")) != str(session_id):
+                return
+            session_db = getattr(self, "_session_db", None)
+            if session_db is None:
+                return
+            try:
+                current_title = await session_db.get_session_title(session_id)
+            except Exception:
+                logger.debug(
+                    "Could not validate current title before adapter title propagation",
+                    exc_info=True,
+                )
+                return
+            if current_title != title:
+                return
+            try:
+                key = str(session_id)
+                with self._adapter_title_state_lock:
+                    apply_lock = self._adapter_title_apply_locks.setdefault(
+                        key, asyncio.Lock()
+                    )
+                async with apply_lock:
+                    with self._adapter_title_state_lock:
+                        if self._adapter_title_generations.get(key) != generation:
+                            return
+                    # Revalidate under the application lock.  These are the
+                    # authoritative checks immediately before the adapter write;
+                    # the earlier checks are only a cheap fast-fail path.
+                    current_entry = (
+                        await self.async_session_store.get_or_create_session(source)
+                    )
+                    if str(getattr(current_entry, "session_id", "")) != key:
+                        return
+                    current_title = await session_db.get_session_title(session_id)
+                    if current_title != title:
+                        return
+                    with self._adapter_title_state_lock:
+                        if self._adapter_title_generations.get(key) != generation:
+                            return
+                    adapter = self._adapter_for_source(source)
+                    if adapter is None:
+                        return
+                    title_hook = getattr(adapter, "on_session_title_changed", None)
+                    if not callable(title_hook):
+                        return
+                    result = title_hook(source, title)
+                    if inspect.isawaitable(result):
+                        await result
+            except Exception:
+                logger.debug("Adapter session-title propagation failed", exc_info=True)
+        finally:
+            if owns_generation:
+                self._release_adapter_title_generation(session_id)
 
     def _schedule_adapter_session_title_propagation(
         self,
@@ -19320,6 +19391,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             loop = getattr(self, "_gateway_loop", None)
         if loop is None or loop.is_closed():
             return
+        generation = self._reserve_adapter_title_generation(session_id)
         try:
             copied_source = dataclasses.replace(source)
         except Exception:
@@ -19329,12 +19401,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 copied_source,
                 session_id,
                 title,
+                generation,
             ),
             loop,
             logger=logger,
             log_message="Adapter session-title propagation failed to schedule",
         )
         if future is None:
+            self._release_adapter_title_generation(session_id)
             return
 
         def _log_rename_failure(fut) -> None:
@@ -19342,6 +19416,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 fut.result()
             except Exception:
                 logger.debug("Adapter session-title propagation failed", exc_info=True)
+            finally:
+                self._release_adapter_title_generation(session_id)
 
         future.add_done_callback(_log_rename_failure)
 
