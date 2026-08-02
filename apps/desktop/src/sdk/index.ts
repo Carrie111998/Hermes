@@ -23,7 +23,8 @@ import { atom, type ReadableAtom } from 'nanostores'
 import { $narrowViewport } from '@/components/pane-shell/tree/store'
 import { onGatewayEvent } from '@/contrib/events'
 import { getLogs, getStatus } from '@/hermes'
-import { $gateway } from '@/store/gateway'
+import { selectDesktopPaths } from '@/lib/desktop-fs'
+import { $gateway, requestGatewayForProfile } from '@/store/gateway'
 import { notify, notifyError } from '@/store/notifications'
 import { $activeGatewayProfile } from '@/store/profile'
 import { $activeSessionId, $currentCwd, $currentModel, $gatewayState } from '@/store/session'
@@ -53,6 +54,19 @@ if (typeof window !== 'undefined') {
   const refresh = () => $viewport.set(readViewport())
   window.addEventListener('resize', refresh)
   $narrowViewport.listen(refresh)
+}
+
+export interface SessionWorkspaceChange {
+  sessionId: string
+  cwd: string
+  profile?: string
+}
+
+export interface SessionWorkspaceResult {
+  session_id: string
+  cwd: string
+  profile?: string
+  live: boolean
 }
 
 export const host = {
@@ -98,6 +112,24 @@ export const host = {
   /** One-shot system status snapshot (platforms, versions, …). */
   status: async () => getStatus(),
 
+  /** Select one local or remote workspace directory through Desktop's native picker. */
+  selectWorkspaceDirectory: async (defaultPath?: string): Promise<string | null> => {
+    const paths = await selectDesktopPaths({
+      defaultPath: defaultPath || undefined,
+      directories: true,
+      multiple: false
+    })
+
+    return paths[0] ?? null
+  },
+
+  /** Persist a stored session's workspace without foregrounding its profile. */
+  setSessionWorkspace: async (change: SessionWorkspaceChange): Promise<SessionWorkspaceResult> =>
+    requestGatewayForProfile<SessionWorkspaceResult>(change.profile, 'session.workspace.set', {
+      session_id: change.sessionId,
+      cwd: change.cwd
+    }),
+
   /** Gateway JSON-RPC — sessions, config, skills, cron, kanban, everything
    *  the app itself uses. Lazy: resolves the LIVE socket per call. */
   request: async <T>(method: string, params: Record<string, unknown> = {}): Promise<T> => {
@@ -120,6 +152,11 @@ export { COMPOSER_AREAS, type ComposerAttachmentProvider, type ComposerMiddlewar
 
 // -- ui: the design language --------------------------------------------------
 
+export {
+  SESSION_ACTIONS_AREA,
+  type SessionActionContext,
+  type SessionActionContributionData
+} from '@/app/chat/sidebar/session-actions-contrib'
 export { PALETTE_AREA, type PaletteContribution } from '@/app/command-palette/contrib'
 export { type RouteContribution, ROUTES_AREA, SIDEBAR_NAV_AREA, type SidebarNavContribution } from '@/app/routes'
 /** THE model catalog menu — the same searchable, provider-grouped, family-

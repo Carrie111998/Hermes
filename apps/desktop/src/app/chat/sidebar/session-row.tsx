@@ -92,6 +92,7 @@ function SidebarSessionRowImpl({
 
   return (
     <SessionContextMenu
+      cwd={session.cwd}
       onArchive={onArchive}
       onBranch={onBranch}
       onDelete={onDelete}
@@ -110,6 +111,7 @@ function SidebarSessionRowImpl({
               </span>
             )}
             <SessionActionsMenu
+              cwd={session.cwd}
               onArchive={onArchive}
               onBranch={onBranch}
               onDelete={onDelete}

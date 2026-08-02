@@ -4,7 +4,12 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { SessionActionsMenu } from './session-actions-menu'
 
-afterEach(cleanup)
+const contributedAction = vi.hoisted(() => vi.fn())
+
+afterEach(() => {
+  cleanup()
+  contributedAction.mockReset()
+})
 
 // Exercises the real SessionActionsMenu end-to-end (no DropdownMenu mock) so
 // a broken asChild composition on the kebab trigger fails here — the menu
@@ -15,6 +20,19 @@ vi.mock('@/components/pane-shell/tree/store', () => ({
   closeOtherTreeTabs: vi.fn(),
   closeTreeTabsToRight: vi.fn(),
   treeTabCloseTargets: vi.fn(() => null)
+}))
+vi.mock('@/contrib/react/use-contributions', () => ({
+  useContributions: () => [
+    {
+      area: 'session.actions',
+      id: 'test:change-workspace',
+      data: {
+        icon: 'folder-opened',
+        label: 'Change workspace…',
+        onSelect: contributedAction
+      }
+    }
+  ]
 }))
 vi.mock('@/hermes', () => ({ renameSession: vi.fn() }))
 vi.mock('@/i18n', () => ({
@@ -73,7 +91,7 @@ vi.mock('@/store/windows', () => ({
 
 function renderMenu() {
   return render(
-    <SessionActionsMenu sessionId="s1" title="My session">
+    <SessionActionsMenu cwd="/work/project" profile="work" sessionId="s1" title="My session">
       <button aria-label="Session actions" type="button">
         ⋮
       </button>
@@ -99,5 +117,26 @@ describe('SessionActionsMenu', () => {
     expect(await screen.findByRole('menu')).toBeTruthy()
     expect(screen.getByRole('menuitem', { name: /rename/i })).toBeTruthy()
     expect(screen.getByRole('menuitem', { name: /archive/i })).toBeTruthy()
+    expect(screen.getByRole('menuitem', { name: /change workspace/i })).toBeTruthy()
+  })
+
+  it('invokes a contributed session action with durable row context', async () => {
+    renderMenu()
+    const trigger = screen.getByRole('button', { name: 'Session actions' })
+
+    fireEvent.pointerDown(trigger, { button: 0, pointerType: 'mouse' })
+    fireEvent.pointerUp(trigger, { button: 0, pointerType: 'mouse' })
+    fireEvent.click(trigger)
+    fireEvent.click(await screen.findByRole('menuitem', { name: /change workspace/i }))
+
+    await vi.waitFor(() =>
+      expect(contributedAction).toHaveBeenCalledWith({
+        cwd: '/work/project',
+        profile: 'work',
+        sessionId: 's1',
+        surface: 'row',
+        title: 'My session'
+      })
+    )
   })
 })

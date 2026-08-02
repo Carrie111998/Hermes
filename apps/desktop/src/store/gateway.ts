@@ -266,6 +266,32 @@ export async function openGatewayForProfile(profile: string): Promise<void> {
   }
 }
 
+/** Request a profile's gateway without changing the foreground profile. */
+export async function requestGatewayForProfile<T>(
+  profile: string | null | undefined,
+  method: string,
+  params: Record<string, unknown> = {}
+): Promise<T> {
+  const key = normKey(profile)
+
+  if (key === g.primaryProfile) {
+    if (!g.primaryGateway) {
+      throw new Error('Hermes gateway unavailable')
+    }
+
+    return g.primaryGateway.request<T>(method, params)
+  }
+
+  await openGatewayForProfile(key)
+  const gateway = g.secondaries.get(key)?.gateway
+
+  if (!gateway) {
+    throw new Error(`Hermes gateway unavailable for profile ${key}`)
+  }
+
+  return gateway.request<T>(method, params)
+}
+
 // Make `profile` the active gateway, lazily opening its socket if needed. The
 // primary is a no-op fast path. Background sockets are never closed here.
 export async function ensureGatewayForProfile(profile: string): Promise<void> {

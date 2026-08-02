@@ -22,6 +22,7 @@ import { ColorSwatches } from '@/components/ui/color-swatches'
 import { CopyButton } from '@/components/ui/copy-button'
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
+import { useContributions } from '@/contrib/react/use-contributions'
 import { renameSession } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { triggerHaptic } from '@/lib/haptics'
@@ -42,6 +43,12 @@ import { $sessionTiles } from '@/store/session-states'
 import { canOpenSessionWindow } from '@/store/windows'
 
 import type { SessionTitleResponse } from '../../types'
+
+import {
+  isSessionActionContributionData,
+  SESSION_ACTIONS_AREA,
+  type SessionActionContext
+} from './session-actions-contrib'
 
 // Rename a session, preferring the gateway's session.title RPC over REST.
 //
@@ -93,6 +100,7 @@ interface SessionActions {
   title: string
   pinned?: boolean
   profile?: string
+  cwd?: string | null
   onPin?: () => void
   onBranch?: () => void
   onArchive?: () => void
@@ -137,6 +145,7 @@ function useSessionActions({
   title,
   pinned = false,
   profile,
+  cwd,
   onPin,
   onBranch,
   onArchive,
@@ -151,6 +160,42 @@ function useSessionActions({
   const [renameOpen, setRenameOpen] = useState(false)
   const tiles = useStore($sessionTiles)
   const selectedStoredSessionId = useStore($selectedStoredSessionId)
+  const sessionActionContributions = useContributions(SESSION_ACTIONS_AREA)
+
+  const actionContext: SessionActionContext = { sessionId, title, profile, cwd, surface }
+
+  const contributedItems: ActionItemSpec[] = sessionActionContributions.flatMap(contribution => {
+    if (!isSessionActionContributionData(contribution.data)) {
+      return []
+    }
+    const data = contribution.data
+    let label: string
+    let disabled: boolean
+
+    try {
+      label = typeof data.label === 'function' ? data.label(actionContext) : data.label
+      disabled = typeof data.disabled === 'function' ? data.disabled(actionContext) : Boolean(data.disabled)
+    } catch (error) {
+      console.warn(`session action contribution ${contribution.id} failed to resolve`, error)
+
+      return []
+    }
+
+    return [
+      {
+        disabled: !sessionId || disabled,
+        icon: data.icon,
+        key: contribution.id,
+        label,
+        onSelect: () => {
+          triggerHaptic('selection')
+          void Promise.resolve()
+            .then(() => data.onSelect(actionContext))
+            .catch(error => notifyError(error, label))
+        }
+      }
+    ]
+  })
 
   // Already showing as a tab somewhere (a tile, or loaded in main — main IS
   // a tab): offering "Open in new tab" again is noise.
@@ -342,6 +387,12 @@ function useSessionActions({
       />
       <kit.Separator />
       {workItems.map(item => renderActionItem(kit, item))}
+      {contributedItems.length > 0 && (
+        <>
+          <kit.Separator />
+          {contributedItems.map(item => renderActionItem(kit, item))}
+        </>
+      )}
       {tabCloseItems.length > 0 && (
         <>
           <kit.Separator />

@@ -200,6 +200,7 @@ Import the area constants from the SDK; each area has its own `data` payload.
 | Full page | `ROUTES_AREA` | `data: { path }` + `render` |
 | Sidebar nav | `SIDEBAR_NAV_AREA` | `data: { path, label, codicon }` |
 | Status bar | `STATUSBAR_AREAS.left` / `.right` | `render` (or `data` as `StatusbarItem`) |
+| Session menu | `SESSION_ACTIONS_AREA` (`'session.actions'`) | `data: SessionActionContributionData` |
 | Title bar | `TITLEBAR_AREAS.left` / `.center` / `.right` | `data` as `TitlebarTool`, or a mount-scoped `<Contribute>` |
 | ⌘K palette | `PALETTE_AREA` | `data: PaletteContribution` |
 | Keybind | `KEYBINDS_AREA` | `data: KeybindContribution` |
@@ -265,6 +266,35 @@ ctx.registerMany([
 
 `codicon` is a [VS Code codicon](https://microsoft.github.io/vscode-codicons/dist/codicon.html)
 id. Navigate to a route from anywhere with `host.navigate('/my-page')`.
+
+### Session actions
+
+Session-action contributions render in both the session row's three-dot menu and
+its context menu. The callback receives the durable stored-session identity, its
+profile, current cwd, title, and surface. Core isolates sync and async callback
+failures and reports them as notifications.
+
+```javascript
+import { host, SESSION_ACTIONS_AREA } from '@hermes/plugin-sdk'
+
+ctx.register({
+  id: 'change-workspace',
+  area: SESSION_ACTIONS_AREA,
+  data: {
+    icon: 'folder-opened',
+    label: 'Change workspace…',
+    async onSelect(session) {
+      const cwd = await host.selectWorkspaceDirectory(session.cwd ?? undefined)
+      if (!cwd) return
+      await host.setSessionWorkspace({ sessionId: session.sessionId, profile: session.profile, cwd })
+    }
+  }
+})
+```
+
+Use the curated picker and workspace mutation above instead of importing Desktop
+filesystem or gateway internals. A busy live session rejects the mutation rather
+than changing its cwd mid-turn.
 
 ### Status bar and title bar
 
@@ -375,6 +405,8 @@ host.onEvent(type, fn)                     // gateway event stream ('*' = all); 
 host.logs(...)                             // tail an app log file
 host.status()                              // one-shot system status snapshot
 host.restartGateway()                      // restart the backend gateway
+host.selectWorkspaceDirectory(defaultPath?) // native local/remote directory picker
+host.setSessionWorkspace({ sessionId, profile?, cwd }) // durable profile-routed mutation
 host.request<T>(method, params?)           // gateway JSON-RPC — the real power
 ```
 
@@ -596,10 +628,10 @@ not treat this pipeline as a trust boundary.
 
 | Category | Exports |
 |----------|---------|
-| Host | `host` (`.state.*`, `.notify`, `.notifyError`, `.navigate`, `.onEvent`, `.logs`, `.status`, `.restartGateway`, `.request`) |
+| Host | `host` (`.state.*`, `.notify`, `.notifyError`, `.navigate`, `.onEvent`, `.logs`, `.status`, `.restartGateway`, `.selectWorkspaceDirectory`, `.setSessionWorkspace`, `.request`) |
 | Plugin contract | `HermesPlugin`, `PluginContext`, `PluginContribution`, `PluginStorage`, `PluginRestOptions`, `Contribution` |
-| Area constants | `PANES_AREA`, `ROUTES_AREA`, `SIDEBAR_NAV_AREA`, `STATUSBAR_AREAS`, `TITLEBAR_AREAS`, `PALETTE_AREA`, `KEYBINDS_AREA`, `THEMES_AREA`, `COMPOSER_AREAS` |
-| Area payloads | `RouteContribution`, `SidebarNavContribution`, `StatusbarItem`, `TitlebarTool`, `PaletteContribution`, `KeybindContribution`, `ComposerMiddleware`, `ComposerAttachmentProvider` |
+| Area constants | `PANES_AREA`, `ROUTES_AREA`, `SIDEBAR_NAV_AREA`, `SESSION_ACTIONS_AREA`, `STATUSBAR_AREAS`, `TITLEBAR_AREAS`, `PALETTE_AREA`, `KEYBINDS_AREA`, `THEMES_AREA`, `COMPOSER_AREAS` |
+| Area payloads | `RouteContribution`, `SidebarNavContribution`, `SessionActionContext`, `SessionActionContributionData`, `StatusbarItem`, `TitlebarTool`, `PaletteContribution`, `KeybindContribution`, `ComposerMiddleware`, `ComposerAttachmentProvider` |
 | React / state | `useValue`, `atom`, `computed`, `useQuery`, `useMutation`, `useQueryClient`, `queryClient`, `Contribute` |
 | UI kit | `Button`, `Input`, `Textarea`, `Select*`, `Switch`, `Checkbox`, `SegmentedControl`, `Tabs*`, `Dialog*`, `ConfirmDialog`, `DropdownMenu*`, `ContextMenu*`, `Popover*`, `Tip`/`Tooltip*`, `Badge`, `Kbd`/`KbdGroup`, `SearchField`, `ScrollArea`, `Separator`, `Skeleton`, `GlyphSpinner`, `Loader`, `EmptyState`, `ErrorState`, `CopyButton`, `StatusDot`, `LogView`, `Codicon`, `DecodeText` |
 | Helpers | `cn`, `icons`, `haptic`, `useI18n`, `profileColor`, `profileColorSoft`, `relativeTime`, `fmtDateTime`, `fmtDayTime`, `coarseElapsed`, `evaluateRuntimeReadiness` |
