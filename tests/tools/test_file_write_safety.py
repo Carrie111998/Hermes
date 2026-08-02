@@ -408,6 +408,111 @@ class TestCheckSensitivePathWindowsHostSemantics:
         assert "sensitive" in result["error"].lower()
         mock_get.assert_not_called()
 
+    def test_trailing_dot_and_space_aliases_blocked_on_windows_local(self, monkeypatch):
+        """Win32 lookup strips trailing dots/spaces in ordinary components."""
+        from tools import file_tools as mod
+
+        self._patch_windows_local_backslash_resolution(monkeypatch, mod)
+
+        assert mod._check_sensitive_path("/Etc./hosts") is not None
+        assert mod._check_sensitive_path("/etc /hosts") is not None
+        assert mod._check_sensitive_path("/boot./grub/grub.cfg") is not None
+        assert mod._check_sensitive_path("/private/etc./hosts") is not None
+        assert mod._check_sensitive_path("/var/run/docker.sock.") is not None
+        assert mod._check_sensitive_path("/run/docker.sock ") is not None
+
+    def test_trailing_alias_lookalikes_and_safe_paths_still_allowed(self, monkeypatch):
+        from tools import file_tools as mod
+
+        self._patch_windows_local_backslash_resolution(monkeypatch, mod)
+
+        assert mod._check_sensitive_path("/tmp/safe.txt") is None
+        assert mod._check_sensitive_path("/etc2/hosts") is None
+        assert mod._check_sensitive_path("/etc2./hosts") is None
+        assert mod._check_sensitive_path(r"C:\Users\test\file.txt") is None
+
+    def test_trailing_aliases_not_blocked_on_posix_or_container_backends(self, monkeypatch):
+        """POSIX/container backends must not apply Win32 component stripping."""
+        from tools import file_tools as mod
+
+        monkeypatch.setattr(mod.sys, "platform", "linux")
+        monkeypatch.setattr(
+            mod, "_terminal_env_type_for_task", lambda task_id="default": "docker"
+        )
+        assert mod._check_sensitive_path("/Etc./hosts") is None
+        assert mod._check_sensitive_path("/etc /hosts") is None
+        assert mod._check_sensitive_path("/var/run/docker.sock.") is None
+
+        monkeypatch.setattr(mod.sys, "platform", "win32")
+        monkeypatch.setattr(
+            mod, "_terminal_env_type_for_task", lambda task_id="default": "docker"
+        )
+        assert mod._check_sensitive_path("/Etc./hosts") is None
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_write_file_blocks_trailing_dot_alias_on_windows_local(
+        self, mock_get, monkeypatch
+    ):
+        from tools import file_tools as mod
+
+        self._patch_windows_local_backslash_resolution(monkeypatch, mod)
+
+        result = json.loads(mod.write_file_tool("/Etc./hosts", "evil"))
+        assert "error" in result
+        assert "sensitive system path" in result["error"]
+        mock_get.assert_not_called()
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_write_file_blocks_trailing_space_exact_on_windows_local(
+        self, mock_get, monkeypatch
+    ):
+        from tools import file_tools as mod
+
+        self._patch_windows_local_backslash_resolution(monkeypatch, mod)
+
+        result = json.loads(mod.write_file_tool("/run/docker.sock ", "evil"))
+        assert "error" in result
+        assert "sensitive system path" in result["error"]
+        mock_get.assert_not_called()
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_v4a_patch_blocks_trailing_dot_alias_on_windows_local(
+        self, mock_get, monkeypatch
+    ):
+        from tools import file_tools as mod
+
+        self._patch_windows_local_backslash_resolution(monkeypatch, mod)
+        patch_text = (
+            "*** Begin Patch\n"
+            "*** Update File: /Etc./hosts\n"
+            "@@ @@\n"
+            "-old\n"
+            "+new\n"
+            "*** End Patch\n"
+        )
+        result = json.loads(mod.patch_tool(mode="patch", patch=patch_text))
+        assert "error" in result
+        assert "sensitive" in result["error"].lower()
+        mock_get.assert_not_called()
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_v4a_patch_blocks_trailing_space_exact_on_windows_local(
+        self, mock_get, monkeypatch
+    ):
+        from tools import file_tools as mod
+
+        self._patch_windows_local_backslash_resolution(monkeypatch, mod)
+        patch_text = (
+            "*** Begin Patch\n"
+            "*** Add File: /var/run/docker.sock.\n"
+            "+evil\n"
+            "*** End Patch\n"
+        )
+        result = json.loads(mod.patch_tool(mode="patch", patch=patch_text))
+        assert "error" in result
+        assert "sensitive" in result["error"].lower()
+        mock_get.assert_not_called()
+
 
 class TestAtomicWrite:
     """write_file / patch land via a temp-file + atomic rename.
