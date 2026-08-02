@@ -45,7 +45,7 @@ Rollback: set `enabled: false` and restart the CLI/gateway. There is no runtime 
 
 - **Classic CLI status bar**: `spec:on` (armed) → `spec:✓` (a candidate was committed this session). Only visible when enabled.
 - **TUI**: `session_info.speculative_compression` is `"enabled" | "installed" | null` (typed on `SessionInfo`; the Pi status rule does not render it yet).
-- **Debug logs**: `hermes logs --level debug | grep speculative` — every state transition is logged with a `disposition`:
+- **Info logs**: `hermes logs | grep speculative` — every state transition is logged with a `disposition` (INFO level):
 
 | Disposition | Meaning |
 |---|---|
@@ -63,7 +63,7 @@ Rollback: set `enabled: false` and restart the CLI/gateway. There is no runtime 
 ## Troubleshooting runbook
 
 **Feature enabled but `spec:on` never becomes `spec:✓`**
-The session never reached `start_ratio` (check `context_percent` in the status bar), or scheduling is blocked (`blocked_*` dispositions in debug logs), or candidates are constantly `stale`. A `stale` loop with a healthy transcript usually means the boundary message changed every turn (rare); the synchronous path still compresses normally.
+The session never reached `start_ratio` (check `context_percent` in the status bar), or scheduling is blocked (`blocked_*` dispositions in logs), or candidates are constantly `stale`. A `stale` loop with a healthy transcript usually means the boundary message changed every turn (rare); the synchronous path still compresses normally.
 
 **Aux summary calls during a 429 cooldown**
 This was a shipped bug and is fixed: scheduling is gated on the live compressor's cooldown and anti-thrash state. If you see it again, the gate regressed — check `schedule_tool_wait_candidate` in `agent/speculative_compression.py` and its tests.
