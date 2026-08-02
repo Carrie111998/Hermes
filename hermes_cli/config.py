@@ -3361,11 +3361,6 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
                 # Fresh processes with no last-known-good keep the existing
                 # DEFAULT_CONFIG fallback.
                 lkg = _LAST_NORMALIZED_USER_CONFIG_BY_PATH.get(path_key)
-                if lkg is None:
-                    # Compatibility for in-process state created before this
-                    # layered LKG existed. New successful loads and save_config()
-                    # always populate the normalized user layer.
-                    lkg = _LAST_EXPANDED_CONFIG_BY_PATH.get(path_key)
                 _warn_config_parse_failure(
                     config_path,
                     e,
@@ -3575,6 +3570,12 @@ def save_config(
                 _LAST_EXPANDED_CONFIG_BY_PATH.get(str(config_path)),
             )
 
+        # Keep the complete user/default layer before stripping schema defaults
+        # for disk. This is the loader's in-process fallback if a later edit is
+        # temporarily malformed, so it must retain both defaults and ${VAR}
+        # templates for expansion against the environment at fallback time.
+        normalized_user_lkg = cast(Dict[str, Any], copy.deepcopy(normalized))
+
         # Strip schema-default values so the user's custom settings are not
         # silently reset on every save.  Keys the user explicitly set (paths
         # from the raw pre-normalisation config) are always preserved.
@@ -3618,7 +3619,7 @@ def save_config(
         _RAW_CONFIG_CACHE.pop(str(config_path), None)
         _LAST_EXPANDED_CONFIG_BY_PATH[str(config_path)] = copy.deepcopy(current_normalized)
         _LAST_NORMALIZED_USER_CONFIG_BY_PATH[str(config_path)] = copy.deepcopy(
-            current_normalized
+            normalized_user_lkg
         )
 
 

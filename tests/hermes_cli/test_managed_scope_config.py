@@ -108,6 +108,60 @@ def test_invalid_user_yaml_reapplies_current_managed_overlay(homes):
     assert load_config()["source"] == "user"
 
 
+def test_save_config_lkg_preserves_env_template_for_future_expansion(
+    homes, monkeypatch
+):
+    """The normalized user LKG must retain ``${VAR}``, not one old expansion."""
+    from hermes_cli import config as cfg
+    from hermes_cli.config import load_config, save_config
+
+    home, _managed = homes
+    user_path = home / "config.yaml"
+    env_name = "HERMES_TEST_LKG_TEMPLATE"
+    monkeypatch.setenv(env_name, "value-v1")
+    _write(user_path, f"lkg_probe: ${{{env_name}}}\n")
+
+    loaded = load_config()
+    assert loaded["lkg_probe"] == "value-v1"
+    save_config(loaded)
+
+    path_key = str(user_path)
+    assert f"${{{env_name}}}" in user_path.read_text(encoding="utf-8")
+    assert cfg._LAST_NORMALIZED_USER_CONFIG_BY_PATH[path_key]["lkg_probe"] == (
+        f"${{{env_name}}}"
+    )
+
+    # While the user file is temporarily malformed, the user LKG is expanded
+    # against the *current* environment rather than pinning value-v1 forever.
+    user_path.write_text("\tbroken-config:\n", encoding="utf-8")
+    monkeypatch.setenv(env_name, "value-v2")
+    assert load_config()["lkg_probe"] == "value-v2"
+
+
+def test_legacy_effective_lkg_is_never_reused_as_user_layer(homes):
+    """An old effective cache may contain obsolete managed pins; reject it."""
+    from hermes_cli import config as cfg
+
+    home, _managed = homes
+    user_path = home / "config.yaml"
+    user_path.write_text("\tbroken-config:\n", encoding="utf-8")
+    path_key = str(user_path)
+
+    cfg._LAST_NORMALIZED_USER_CONFIG_BY_PATH.pop(path_key, None)
+    cfg._LAST_EXPANDED_CONFIG_BY_PATH[path_key] = {
+        "source": "obsolete-managed-pin",
+    }
+    cfg._LOAD_CONFIG_CACHE.clear()
+    assert cfg.get_config_path() == user_path
+    assert cfg._LAST_NORMALIZED_USER_CONFIG_BY_PATH.get(path_key) is None
+    assert cfg._LAST_EXPANDED_CONFIG_BY_PATH[path_key]["source"] == (
+        "obsolete-managed-pin"
+    )
+
+    loaded = cfg.load_config()
+    assert "source" not in loaded
+
+
 def test_user_cannot_shadow_managed_literal_via_envref(homes, monkeypatch):
     """A managed literal must NOT be expandable via a ${VAR} the user controls.
 
