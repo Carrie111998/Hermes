@@ -3739,16 +3739,25 @@ def install_from_quarantine(
     # skill-plus-category directory; a later update or uninstall of the outer
     # skill would then rmtree the inner one — the sibling case of the
     # category-bucket wipe reported in issue #75983.
-    skills_root = _skills_dir().resolve()
-    ancestor = install_dir.parent
-    while ancestor != skills_root and ancestor.is_relative_to(skills_root):
-        if (ancestor / "SKILL.md").is_file():
+    _skills_root = _skills_dir().resolve()
+    _ancestor = install_dir.parent
+    while _ancestor != _skills_root and _ancestor.is_relative_to(_skills_root):
+        if (_ancestor / "SKILL.md").is_file():
             raise ValueError(
-                f"Refusing to install into '{ancestor.name}': it is an "
+                f"Refusing to install into '{_ancestor.name}': it is an "
                 f"existing skill directory, not a category. Choose a "
                 f"different category."
             )
-        ancestor = ancestor.parent
+        _ancestor = _ancestor.parent
+
+    if install_dir.exists() and not install_dir.is_dir():
+        # A stray regular file at the install path. rmtree() on a file raises
+        # NotADirectoryError (an uncaught traceback at the CLI); refuse with
+        # the same actionable ValueError contract the guards below use.
+        raise ValueError(
+            f"Refusing to install: '{install_dir.name}' already exists and "
+            f"is not a directory. Remove it or choose a different skill name."
+        )
 
     if install_dir.exists():
         # Guard against silent data loss when the install target collides with
