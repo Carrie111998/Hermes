@@ -1863,7 +1863,7 @@ class MoAChatCompletions:
             # Prepared requests must retain the acting aggregator's reasoning
             # policy exactly as the direct create() path does (#64187).
             reasoning_config=_aggregator_reasoning_config(aggregator),
-            is_cancelled=_agent_cancel_check(self._agent),
+            is_cancelled=_agent_cancel_check(getattr(self, "_agent", None)),
             **stream_kwargs,
             **agg_runtime,
         )

@@ -327,7 +327,9 @@ def _ensure_dependency_tree_is_untracked_and_ignored(
 
 
 def _install_command(project_dir: Path) -> list[str]:
-    executable = shutil.which("npm")
+    from hermes_constants import find_node_executable
+
+    executable = find_node_executable("npm")
     if not executable:
         raise RuntimeError(
             f"npm is required to provision Node dependencies in {project_dir}"
@@ -398,7 +400,9 @@ def _project_requires_lifecycle_scripts(project_dir: Path) -> bool:
 
 def _run_real_install(project_dir: Path) -> None:
     """Run one deterministic, script-free install in dispatcher context."""
-    env = os.environ.copy()
+    from tools.environments.local import build_subprocess_env
+
+    env = build_subprocess_env(scrub_secrets=False, inherit_profile_home=False)
     env.pop("HERMES_KANBAN_TASK", None)
     env.pop("HERMES_KANBAN_WORKSPACE", None)
     env["CI"] = "1"
