@@ -515,3 +515,61 @@ def test_colliding_repo_basenames_disambiguate_labels():
     labels = sorted(p["label"] for p in tree["projects"])
 
     assert labels == ["x/proj", "y/proj"]
+
+
+def test_sticky_project_id_keeps_session_when_cwd_leaves_folder():
+    """Explicit project membership survives cd into a non-project git root.
+
+    Repro: user opens a chat under Health Biohacking; agent cds into a
+    knowledge-vault git checkout (~/brain). Path matching alone would drop the
+    session from the project; sticky project_id must keep it.
+    """
+    health = "/home/me/Projects/health-biohacking-research"
+    vault = "/home/me/brain"
+    projects = [_project("p_health", "Health Biohacking", [health])]
+    # Session was opened under health, then terminal cwd moved to vault.
+    sticky = _session(
+        vault,
+        branch="main",
+        repo_root=vault,
+        project_id="p_health",
+        last_active=2000,
+    )
+    resolve = _resolver(
+        {
+            health: (health, health),
+            vault: (vault, vault),
+        }
+    )
+
+    tree = pt.build_tree(projects, [sticky], [], resolve, hydrate=True)
+
+    owned = next(p for p in tree["projects"] if p["id"] == "p_health")
+    assert sticky["id"] in {s["id"] for s in _sessions_of(owned)}
+    # Vault must not mint an auto project for the sticky-owned session.
+    assert vault not in _real_project_ids(tree)
+    assert "brain" not in [p["label"] for p in tree["projects"] if p["id"] != "p_health"]
+
+
+def test_path_match_still_owns_session_without_sticky_id():
+    health = "/home/me/Projects/health-biohacking-research"
+    projects = [_project("p_health", "Health Biohacking", [health])]
+    sess = _session(health, branch="main", repo_root=health)
+    resolve = _resolver({health: (health, health)})
+
+    tree = pt.build_tree(projects, [sess], [], resolve, hydrate=True)
+    owned = next(p for p in tree["projects"] if p["id"] == "p_health")
+    assert sess["id"] in {s["id"] for s in _sessions_of(owned)}
+
+
+def test_archived_sticky_project_id_is_ignored():
+    health = "/home/me/Projects/health-biohacking-research"
+    vault = "/home/me/brain"
+    projects = [_project("p_health", "Health Biohacking", [health], archived=True)]
+    sticky = _session(vault, branch="main", repo_root=vault, project_id="p_health")
+    resolve = _resolver({vault: (vault, vault)})
+
+    tree = pt.build_tree(projects, [sticky], [], resolve, hydrate=True)
+    # Archived projects are filtered out of active_projects; sticky falls through
+    # and vault becomes an auto project (or home if junk).
+    assert "p_health" not in _real_project_ids(tree)

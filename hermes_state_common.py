@@ -165,6 +165,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     cwd TEXT,
     git_branch TEXT,
     git_repo_root TEXT,
+    project_id TEXT,
     billing_provider TEXT,
     billing_base_url TEXT,
     billing_mode TEXT,

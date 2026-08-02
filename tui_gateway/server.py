@@ -2697,6 +2697,22 @@ def _persist_session_git_meta(session: dict, cwd: str) -> None:
     threading.Thread(target=_run, name="git-meta", daemon=True).start()
 
 
+def _resolve_project_id_for_path(path: str) -> str:
+    """Return sticky projects.db id for ``path``, or empty string."""
+    path = (path or "").strip()
+    if not path:
+        return ""
+    try:
+        from hermes_cli import projects_db as pdb
+
+        with pdb.connect_closing() as conn:
+            proj = pdb.project_for_path(conn, path)
+            return proj.id if proj is not None else ""
+    except Exception:
+        logger.debug("failed to resolve project_id for path %s", path, exc_info=True)
+        return ""
+
+
 def _set_session_cwd(session: dict, cwd: str) -> str:
     from hermes_constants import translate_cwd_for_wsl_backend
 
@@ -2712,13 +2728,23 @@ def _set_session_cwd(session: dict, cwd: str) -> str:
     # the terminal wandering must not move the workspace again.
     session["cwd_from_settle"] = False
     _register_session_cwd(session)
+    sticky = (session.get("project_id") or "").strip()
+    if not sticky:
+        sticky = _resolve_project_id_for_path(resolved)
+        if sticky:
+            session["project_id"] = sticky
     with _session_db(session) as db:
         if db is not None:
             try:
-                db.update_session_cwd(session.get("session_key", ""), resolved)
+                db.update_session_cwd(
+                    session.get("session_key", ""),
+                    resolved,
+                    project_id=sticky or None,
+                )
             except Exception:
                 logger.debug("failed to persist session cwd", exc_info=True)
     # Branch/repo-root probes are git subprocesses — capture them off the hot path.
+    # Does not clear sticky project_id (update_session_cwd leaves it when omitted).
     _persist_session_git_meta(session, resolved)
     try:
         from tools.terminal_tool import cleanup_vm
@@ -5580,10 +5606,18 @@ def _apply_project_workspace(task_id: str, path: str, _name: str = "") -> None:
     session["cwd_from_settle"] = False
     _register_session_cwd(session)
 
+    sticky_project_id = _resolve_project_id_for_path(resolved)
+    if sticky_project_id:
+        session["project_id"] = sticky_project_id
+
     with _session_db(session) as db:
         if db is not None:
             try:
-                db.update_session_cwd(session.get("session_key", ""), resolved)
+                db.update_session_cwd(
+                    session.get("session_key", ""),
+                    resolved,
+                    project_id=sticky_project_id or None,
+                )
             except Exception:
                 logger.debug("failed to persist project workspace cwd", exc_info=True)
 
@@ -11098,9 +11132,12 @@ def _(rid, params, pdb, conn) -> dict:
 
 
 def _is_repo_junk(root: str) -> bool:
-    """A git root we never auto-surface as a project: the bare home dir or
-    anything under HERMES_HOME (~/.hermes by default) — config/sessions/skills,
-    not a workspace. User-created projects pointing there are still honored."""
+    """A git root we never auto-surface as a project: the bare home dir,
+    anything under HERMES_HOME (~/.hermes by default), or paths listed in
+    ``desktop.repo_scan_exclude_paths`` (e.g. a knowledge-vault git checkout
+    that backs GBrain but is not a user Project). User-created projects
+    pointing at those paths are still honored via sticky project_id / folders.
+    """
     if not root:
         return True
 
@@ -11110,7 +11147,20 @@ def _is_repo_junk(root: str) -> bool:
     home = os.path.realpath(os.path.expanduser("~"))
     hermes_home = os.path.realpath(str(get_hermes_home()))
 
-    return real == home or real == hermes_home or real.startswith(hermes_home + os.sep)
+    if real == home or real == hermes_home or real.startswith(hermes_home + os.sep):
+        return True
+
+    try:
+        for raw in _repo_discovery_policy().get("exclude_paths") or []:
+            if not isinstance(raw, str) or not raw.strip():
+                continue
+            ex = os.path.realpath(os.path.expanduser(raw.strip()))
+            if real == ex or real.startswith(ex + os.sep):
+                return True
+    except Exception:
+        pass
+
+    return False
 
 
 def _is_session_cwd_junk(cwd: str) -> bool:
@@ -11317,6 +11367,7 @@ def _project_tree_row(r: dict) -> dict:
         "cwd": r.get("cwd"),
         "git_branch": r.get("git_branch"),
         "git_repo_root": r.get("git_repo_root"),
+        "project_id": r.get("project_id"),
     }
 
 

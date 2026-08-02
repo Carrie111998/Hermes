@@ -483,7 +483,23 @@ def _project_for_path(index: _FolderIndex, target: str) -> Optional[dict]:
     return index.match(target)[0]
 
 
-def _project_for_session(session: dict, index: _FolderIndex, resolve: Optional[Resolve]) -> Optional[dict]:
+def _project_for_session(
+    session: dict,
+    index: _FolderIndex,
+    resolve: Optional[Resolve],
+    projects_by_id: Optional[dict[str, dict]] = None,
+) -> Optional[dict]:
+    """Own a session: sticky project_id first, then longest folder-path match.
+
+    Sticky membership (set on project create/switch) survives incidental
+    terminal cwd moves into non-project git roots such as a knowledge vault.
+    """
+    sticky = (session.get("project_id") or "").strip()
+    if sticky and projects_by_id:
+        owned = projects_by_id.get(sticky)
+        if owned is not None and not owned.get("archived"):
+            return owned
+
     cwd = (session.get("cwd") or "").strip()
     if not cwd:
         return None
@@ -571,11 +587,12 @@ def build_tree(
     _junk_cwd = is_junk_cwd or (lambda _cwd: False)
     _exists = exists or (lambda _path: True)
     folder_index = _FolderIndex(active_projects)
+    projects_by_id = {p["id"]: p for p in active_projects if p.get("id")}
 
     by_project: dict[str, list[dict]] = {}
     unowned: list[dict] = []
     for session in sessions:
-        owner = _project_for_session(session, folder_index, resolve)
+        owner = _project_for_session(session, folder_index, resolve, projects_by_id)
         if owner:
             by_project.setdefault(owner["id"], []).append(session)
         else:

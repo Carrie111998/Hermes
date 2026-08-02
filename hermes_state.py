@@ -3303,7 +3303,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     f"Compression lease lost before publication: {parent_session_id}"
                 )
             parent = conn.execute(
-                """SELECT ended_at, cwd, git_branch, git_repo_root,
+                """SELECT ended_at, cwd, git_branch, git_repo_root, project_id,
                           user_id, session_key, chat_id, chat_type,
                           thread_id, display_name, origin_json, profile_name
                    FROM sessions WHERE id = ?""",
@@ -3319,10 +3319,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             conn.execute(
                 """INSERT INTO sessions (
                    id, source, model, model_config, system_prompt,
-                   parent_session_id, cwd, git_branch, git_repo_root,
+                   parent_session_id, cwd, git_branch, git_repo_root, project_id,
                    profile_name, user_id, session_key, chat_id, chat_type,
                    thread_id, display_name, origin_json, started_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     child_session_id,
                     source,
@@ -3333,6 +3333,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     cwd or parent["cwd"],
                     parent["git_branch"],
                     parent["git_repo_root"],
+                    parent["project_id"],
                     # Same inheritance contract as _insert_session_row's
                     # compression-fork backfill (#59527 / cross-profile jump
                     # fix): the child stays on the parent's profile and keeps
@@ -3445,7 +3446,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return False
 
     def update_session_cwd(
-        self, session_id: str, cwd: str, git_branch: str = None, git_repo_root: str = None
+        self,
+        session_id: str,
+        cwd: str,
+        git_branch: str = None,
+        git_repo_root: str = None,
+        project_id: str = None,
+        *,
+        clear_project_id: bool = False,
     ) -> None:
         """Persist the session working directory when a frontend knows it.
 
@@ -3455,17 +3463,22 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         (the main checkout's *current* branch is transient and would
         misattribute past sessions).
 
-        ``git_repo_root`` records the git repo this cwd belongs to — the
-        authoritative project key. Resolving it here, at the lowest level, means
-        every surface reads the same membership instead of re-probing git in the
-        GUI over a partial page. Each field is only written when non-empty so a
-        probe failure never clobbers a previously-captured value.
+        ``git_repo_root`` records the git repo this cwd belongs to. Each field is
+        only written when non-empty so a probe failure never clobbers a
+        previously-captured value.
+
+        ``project_id`` is the sticky Desktop Project membership (``p_<hex>`` from
+        projects.db). When set, the sidebar keeps the chat under that explicit
+        project even if the agent later ``cd``s into another git root (e.g. a
+        knowledge-vault checkout that is not a user Project). Omit to leave the
+        column unchanged; pass ``clear_project_id=True`` to detach.
         """
         if not session_id or not cwd:
             return
 
         branch = (git_branch or "").strip()
         repo_root = (git_repo_root or "").strip()
+        sticky = (project_id or "").strip() if project_id is not None else None
 
         sets = ["cwd = ?"]
         params: List[Any] = [cwd]
@@ -3475,6 +3488,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if repo_root:
             sets.append("git_repo_root = ?")
             params.append(repo_root)
+        if clear_project_id:
+            sets.append("project_id = NULL")
+        elif sticky:
+            sets.append("project_id = ?")
+            params.append(sticky)
         params.append(session_id)
 
         def _do(conn):
