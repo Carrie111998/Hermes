@@ -938,3 +938,110 @@ def test_same_provider_direct_alias_resolves_ollama_cloud_key(
     assert validation_calls
     for call in validation_calls:
         assert call["api_key"] == ollama_key
+
+
+def test_direct_alias_uses_matching_custom_provider_credentials_and_transport(
+    tmp_path, monkeypatch
+):
+    """A direct alias must recover B's configured custom-provider settings."""
+    import hermes_cli.model_switch as ms
+    from hermes_cli.model_switch import DirectAlias
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _clear_provider_env(monkeypatch)
+    monkeypatch.setenv("RELAY_B_KEY", "relay-b-config-key")
+    (tmp_path / "config.yaml").write_text(
+        "custom_providers:\n"
+        "- name: Relay B\n"
+        "  base_url: https://relay-b.example/v1\n"
+        "  key_env: RELAY_B_KEY\n"
+        "  api_mode: anthropic_messages\n"
+    )
+    monkeypatch.setattr(
+        ms,
+        "DIRECT_ALIASES",
+        {
+            "relay-model": DirectAlias(
+                "claude-compatible-model",
+                "custom",
+                "https://relay-b.example/v1",
+            ),
+        },
+    )
+    monkeypatch.setattr(
+        ms,
+        "resolve_alias",
+        lambda raw, prov: ("custom", "claude-compatible-model", "relay-model"),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.models.validate_requested_model",
+        lambda *a, **k: _MOCK_VALIDATION,
+    )
+    monkeypatch.setattr("hermes_cli.model_switch.get_model_info", lambda *a, **k: None)
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.get_model_capabilities", lambda *a, **k: None
+    )
+
+    result = switch_model(
+        raw_input="relay-model",
+        current_provider="custom",
+        current_model="model-a",
+        current_api_key="endpoint-a-key",
+        current_base_url="https://endpoint-a.example/v1",
+    )
+
+    assert result.success is True
+    assert result.base_url == "https://relay-b.example/v1"
+    assert result.api_key == "relay-b-config-key"
+    assert result.api_mode == "anthropic_messages"
+
+
+def test_same_provider_bare_custom_preserves_configured_api_mode(
+    tmp_path, monkeypatch
+):
+    """Explicit session URL resolution must retain the custom endpoint transport."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _clear_provider_env(monkeypatch)
+    (tmp_path / "config.yaml").write_text(
+        "model:\n"
+        "  provider: custom\n"
+        "  base_url: https://relay.example/v1\n"
+        "  api_mode: anthropic_messages\n"
+    )
+    monkeypatch.setattr(
+        "hermes_cli.models.validate_requested_model",
+        lambda *a, **k: _MOCK_VALIDATION,
+    )
+    monkeypatch.setattr("hermes_cli.model_switch.get_model_info", lambda *a, **k: None)
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.get_model_capabilities", lambda *a, **k: None
+    )
+
+    result = switch_model(
+        raw_input="model-b",
+        current_provider="custom",
+        current_model="model-a",
+        current_api_key="relay-session-key",
+        current_base_url="https://relay.example/v1",
+    )
+
+    assert result.success is True
+    assert result.api_mode == "anthropic_messages"
+
+
+def test_custom_provider_key_is_accepted_by_provider_resolution():
+    """A persisted providers: key remains a valid custom provider slug."""
+    pdef = resolve_provider_full(
+        "custom:stable-relay",
+        user_providers={},
+        custom_providers=[
+            {
+                "name": "Friendly Relay",
+                "provider_key": "stable-relay",
+                "base_url": "https://relay.example/v1",
+            },
+        ],
+    )
+
+    assert pdef is not None
+    assert pdef.id == "custom:stable-relay"

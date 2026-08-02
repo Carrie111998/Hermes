@@ -751,11 +751,18 @@ def resolve_custom_provider(
             first_valid = (display_name, api_url, tuple(env_vars))
 
         slug = custom_provider_slug(display_name)
-        if requested not in {display_name.lower(), slug}:
+        provider_key = (entry.get("provider_key") or "").strip()
+        provider_key_slug = custom_provider_slug(provider_key) if provider_key else ""
+        if requested not in {
+            display_name.lower(),
+            slug,
+            provider_key.lower(),
+            provider_key_slug,
+        }:
             continue
 
         return ProviderDef(
-            id=slug,
+            id=provider_key_slug if requested in {provider_key.lower(), provider_key_slug} else slug,
             name=display_name,
             transport="openai_chat",
             api_key_env_vars=tuple(env_vars),

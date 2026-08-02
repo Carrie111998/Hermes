@@ -1044,6 +1044,20 @@ def _resolve_named_custom_runtime(
             pass
     if requested_norm == "custom" and explicit_base_url:
         base_url = explicit_base_url.strip().rstrip("/")
+        # An alias only carries a resolved URL, while a matching configured
+        # custom provider also owns its key, transport, and request settings.
+        # Recover that identity before falling back to the URL-only path.
+        # Keep an explicit session key when supplied for the same endpoint;
+        # direct-alias host changes intentionally call this without one.
+        configured_identity = find_custom_provider_identity(base_url)
+        if configured_identity:
+            configured_runtime = _resolve_named_custom_runtime(
+                requested_provider=configured_identity,
+                explicit_api_key=explicit_api_key,
+                explicit_base_url=base_url,
+            )
+            if configured_runtime:
+                return configured_runtime
         # Check credential pool first — mirrors the named-custom-provider path
         # so bare `provider: custom` with a configured custom_providers entry
         # also gets its api_key from the pool instead of env var fallbacks.
@@ -1071,9 +1085,16 @@ def _resolve_named_custom_runtime(
             (c for c in api_key_candidates if has_usable_secret(c)),
             "",
         ) or "no-key-required"
+        model_cfg = _get_model_config()
+        configured_base_url = _normalize_base_url_for_match(model_cfg.get("base_url"))
+        api_mode = (
+            _resolve_plain_custom_api_mode(model_cfg, base_url)
+            if configured_base_url == _normalize_base_url_for_match(base_url)
+            else _detect_api_mode_for_url(base_url) or "chat_completions"
+        )
         return {
             "provider": "custom",
-            "api_mode": _detect_api_mode_for_url(base_url) or "chat_completions",
+            "api_mode": api_mode,
             "base_url": base_url,
             "api_key": api_key,
             "source": "direct-alias",
