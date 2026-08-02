@@ -3227,6 +3227,20 @@ class TestGetMessagesPagination:
         assert [m["content"] for m in page2] == ["msg-4", "msg-5", "msg-6", "msg-7"]
         assert [m["content"] for m in page3] == ["msg-8", "msg-9"]
 
+    def test_since_timestamp_filters_before_pagination(self, db):
+        self._seed(db, n=4)
+        rows = db.get_messages("s1")
+        for row, timestamp in zip(rows, (100.0, 200.0, 300.0, 400.0), strict=True):
+            db._conn.execute(
+                "UPDATE messages SET timestamp = ? WHERE id = ?",
+                (timestamp, row["id"]),
+            )
+        db._conn.commit()
+
+        page = db.get_messages("s1", limit=2, since_timestamp=200.0)
+
+        assert [message["content"] for message in page] == ["msg-1", "msg-2"]
+
 
 
 
