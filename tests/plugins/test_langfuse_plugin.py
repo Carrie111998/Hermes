@@ -5,6 +5,7 @@ import importlib
 import logging
 import sys
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -779,3 +780,113 @@ class TestUsageFromSanitizedResponse:
 
         assert seen["resp"] is resp
         assert captured["usage_details"] == {"input": 7, "output": 3}
+
+
+# ---------------------------------------------------------------------------
+# Auxiliary-LLM tracking (HERMES_LANGFUSE_TRACK_AUX)
+# ---------------------------------------------------------------------------
+
+class TestAuxTracking:
+
+    def _fresh_plugin(self, monkeypatch, track_aux="true"):
+        """Import the plugin module fresh with the aux-tracking env set."""
+        monkeypatch.setenv("HERMES_LANGFUSE_TRACK_AUX", track_aux)
+        mod_name = "plugins.observability.langfuse"
+        sys.modules.pop(mod_name, None)
+        return importlib.import_module(mod_name)
+
+    def _fake_client(self):
+        from types import SimpleNamespace
+
+        gen = MagicMock()
+        root_span = MagicMock()
+        root_span.start_observation = MagicMock(return_value=gen)
+        root_ctx = MagicMock()
+        root_ctx.__enter__ = MagicMock(return_value=root_span)
+        root_ctx.__exit__ = MagicMock(return_value=None)
+        client = SimpleNamespace(
+            create_trace_id=MagicMock(return_value="trace-aux-1"),
+            start_as_current_observation=MagicMock(return_value=root_ctx),
+        )
+        return client, root_span, gen
+
+    def test_track_aux_off_by_default(self, monkeypatch):
+        monkeypatch.delenv("HERMES_LANGFUSE_TRACK_AUX", raising=False)
+        mod = self._fresh_plugin(monkeypatch, "")
+        assert mod._TRACK_AUX is False
+
+    def test_track_aux_on_registers_observer(self, monkeypatch):
+        mod = self._fresh_plugin(monkeypatch, "true")
+        assert mod._TRACK_AUX is True
+
+        from agent import auxiliary_client as aux
+        for obs in list(aux._AUX_LLM_OBSERVERS):
+            aux.unregister_aux_llm_observer(obs)
+
+        class FakeCtx:
+            def __init__(self):
+                self.hooks = []
+
+            def register_hook(self, *a):
+                self.hooks.append(a)
+
+        mod.register(FakeCtx())
+        assert mod._on_aux_llm_call in aux._AUX_LLM_OBSERVERS
+        aux.unregister_aux_llm_observer(mod._on_aux_llm_call)
+
+    def test_aux_trace_start_end_records_usage(self, monkeypatch):
+        from types import SimpleNamespace
+
+        mod = self._fresh_plugin(monkeypatch, "true")
+        client, root_span, gen = self._fake_client()
+        monkeypatch.setattr(mod, "_get_langfuse", lambda: client)
+
+        class FakeUsage:
+            prompt_tokens = 1000
+            completion_tokens = 200
+            prompt_cache_hit_tokens = 600
+            prompt_cache_miss_tokens = 400
+            completion_tokens_details = SimpleNamespace(reasoning_tokens=50)
+
+        class FakeResp:
+            model = "deepseek-v4-flash"
+            usage = FakeUsage()
+            choices = [SimpleNamespace(message=SimpleNamespace(content="摘要输出"))]
+
+        mod._on_aux_llm_call("start", {
+            "task": "compression", "model": "deepseek-v4-flash",
+            "messages": [{"role": "user", "content": "hi"}],
+        })
+        assert client.create_trace_id.called
+        assert client.start_as_current_observation.called
+        assert root_span.start_observation.called
+
+        mod._on_aux_llm_call("end", {
+            "task": "compression", "model": "deepseek-v4-flash",
+            "response": FakeResp(),
+        })
+        # Token usage (incl. DeepSeek cache hit) lands on the generation span.
+        usage_calls = [c.kwargs for c in gen.update.call_args_list if "usage_details" in c.kwargs]
+        assert usage_calls, "no usage update recorded"
+        ud = usage_calls[0]["usage_details"]
+        assert ud["cache_read_input_tokens"] == 600
+        assert ud["input"] == 400          # DeepSeek cache-miss → input
+        assert ud["output"] == 200
+        gen.end.assert_called_once()
+
+    def test_aux_trace_error_marks_and_ends(self, monkeypatch):
+        mod = self._fresh_plugin(monkeypatch, "true")
+        client, root_span, gen = self._fake_client()
+        monkeypatch.setattr(mod, "_get_langfuse", lambda: client)
+
+        mod._on_aux_llm_call("start", {
+            "task": "vision", "messages": [{"role": "user", "content": "x"}],
+        })
+        mod._on_aux_llm_call("error", {
+            "task": "vision", "error": "provider timeout",
+        })
+        gen.end.assert_called_once()
+        # The chain is also closed.
+        assert root_span.end.called
+        # No dangling state.
+        assert mod._AUX_CALLS == {}
