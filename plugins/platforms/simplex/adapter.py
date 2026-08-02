@@ -1208,30 +1208,33 @@ async def _standalone_send(
                     [{"msgContent": {"type": "text", "text": message}}]
                 )
                 cmd_str = f"/_send #{group_id} json {composed}"
-            elif media_files:
-                # Structured /_send addresses by numeric contact ID and
-                # carries the file path + thumbnail in one payload.
-                numeric_id = chat_id.split("|")[0] if "|" in chat_id else chat_id
-                items = []
-                for media_path, _is_voice in media_files:
-                    thumb = _make_jpeg_thumb(media_path)
-                    items.append(
-                        {
-                            "filePath": media_path,
-                            "msgContent": {
-                                "type": "image",
-                                "image": thumb,
-                                "text": message or "",
-                            },
-                        }
-                    )
-                composed = json.dumps(items)
-                cmd_str = f"/_send @{numeric_id} json {composed}"
             else:
-                # Direct contacts are addressed by display name without
-                # brackets (the @ command rejects numeric IDs).
-                display_name = chat_id.split("|")[-1] if "|" in chat_id else chat_id
-                cmd_str = f"@{display_name} {message}"
+                # Structured /_send addresses by numeric contact ID and
+                # carries the file path + thumbnail in one payload. The
+                # numeric ID works for both text and media, and handles
+                # both static numeric targets (SIMPLEX_HOME_CHANNEL=<id>)
+                # and composite "id|displayName" chat_ids.
+                numeric_id = chat_id.split("|")[0] if "|" in chat_id else chat_id
+                if media_files:
+                    items = []
+                    for media_path, _is_voice in media_files:
+                        thumb = _make_jpeg_thumb(media_path)
+                        items.append(
+                            {
+                                "filePath": media_path,
+                                "msgContent": {
+                                    "type": "image",
+                                    "image": thumb,
+                                    "text": message or "",
+                                },
+                            }
+                        )
+                    composed = json.dumps(items)
+                else:
+                    composed = json.dumps(
+                        [{"msgContent": {"type": "text", "text": message}}]
+                    )
+                cmd_str = f"/_send @{numeric_id} json {composed}"
 
             payload = {
                 "corrId": f"{_CORR_PREFIX}snd-{int(time.time() * 1000)}",

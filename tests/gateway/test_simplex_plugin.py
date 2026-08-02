@@ -12,6 +12,7 @@ import json
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import websockets
 
 from tests.gateway._plugin_adapter_loader import load_plugin_adapter
 
@@ -201,6 +202,131 @@ async def test_standalone_send_missing_websockets(monkeypatch):
         sys.meta_path[:] = saved_meta
         if saved_websockets is not None:
             sys.modules["websockets"] = saved_websockets
+
+
+@pytest.mark.asyncio
+async def test_standalone_send_dm_text_uses_numeric_id(monkeypatch):
+    """DM text must go through ``/_send @<numeric-id> json``.
+
+    Bare ``@<numeric-id>`` is rejected by simplex-chat v6.5.6.1 with
+    contactNotFound (the @ command only accepts display names). The
+    structured form addresses by numeric ID, which also covers static
+    numeric targets (``SIMPLEX_HOME_CHANNEL=<contact-id>``).
+    """
+    sent = {}
+
+    class FakeWS:
+        def __init__(self):
+            self.closed = False
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            self.closed = True
+            return False
+
+        async def send(self, payload):
+            sent["payload"] = payload
+
+        async def recv(self):
+            return '{"resp": {"type": "newChatItems"}}'
+
+    class FakeWSClient:
+        @staticmethod
+        def connect(uri, **kw):
+            return FakeWS()
+
+    monkeypatch.setattr(websockets, "connect", FakeWSClient.connect)
+    pconfig = MagicMock()
+    pconfig.extra = {"ws_url": "ws://localhost:5225"}
+    result = await _standalone_send(pconfig, "5", "hello")
+    assert result == {"success": True, "platform": "simplex", "chat_id": "5"}
+    cmd = json.loads(sent["payload"])["cmd"]
+    assert cmd.startswith("/_send @5 json ")
+    msg_content = json.loads(cmd.split(" json ", 1)[1])[0]["msgContent"]
+    assert msg_content == {"type": "text", "text": "hello"}
+
+
+@pytest.mark.asyncio
+async def test_standalone_send_dm_text_composite_chat_id(monkeypatch):
+    """Composite ``id|displayName`` chat_id must resolve to the numeric ID."""
+    sent = {}
+
+    class FakeWS:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def send(self, payload):
+            sent["payload"] = payload
+
+        async def recv(self):
+            return '{"resp": {"type": "newChatItems"}}'
+
+    class FakeWSClient:
+        @staticmethod
+        def connect(uri, **kw):
+            return FakeWS()
+
+    monkeypatch.setattr(websockets, "connect", FakeWSClient.connect)
+    pconfig = MagicMock()
+    pconfig.extra = {"ws_url": "ws://localhost:5225"}
+    result = await _standalone_send(pconfig, "5|人可通_1", "hello")
+    assert result["success"] is True
+    cmd = json.loads(sent["payload"])["cmd"]
+    assert cmd.startswith("/_send @5 json ")
+
+
+@pytest.mark.asyncio
+async def test_standalone_send_media_unpacks_tuples(monkeypatch, tmp_path):
+    """media_files entries are (path, is_voice) tuples — the path must be
+    unpacked, not passed as a tuple (empty tuple-as-path would yield an
+    empty thumbnail and a false-success send). Also waits for the daemon's
+    newChatItems ack before closing (XFTP upload is async)."""
+    img = tmp_path / "test.png"
+    from PIL import Image
+
+    Image.new("RGB", (64, 64), (200, 30, 30)).save(img)
+
+    events = []
+
+    class FakeWS:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def send(self, payload):
+            events.append(("send", payload))
+
+        async def recv(self):
+            return '{"resp": {"type": "newChatItems"}}'
+
+    class FakeWSClient:
+        @staticmethod
+        def connect(uri, **kw):
+            return FakeWS()
+
+    monkeypatch.setattr(websockets, "connect", FakeWSClient.connect)
+    pconfig = MagicMock()
+    pconfig.extra = {"ws_url": "ws://localhost:5225"}
+    result = await _standalone_send(
+        pconfig, "5", "", media_files=[(str(img), False)]
+    )
+    assert result["success"] is True
+    send_events = [e for e in events if e[0] == "send"]
+    assert len(send_events) == 1
+    cmd = json.loads(send_events[0][1])["cmd"]
+    assert cmd.startswith("/_send @5 json ")
+    items = json.loads(cmd.split(" json ", 1)[1])
+    assert items[0]["filePath"] == str(img)
+    # Thumbnail must be a non-empty JPEG data URI (empty = false success).
+    assert items[0]["msgContent"]["image"].startswith("data:image/jpg;base64,")
+    assert len(items[0]["msgContent"]["image"]) > 100
 
 
 # ---------------------------------------------------------------------------
