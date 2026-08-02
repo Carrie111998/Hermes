@@ -38,8 +38,18 @@ def test_decompose_creates_children_and_promotes_root(kanban_home):
         assert kb.get_task(conn, tid).status == "triage"
 
     children = [
-        {"title": "research", "body": "look at prior art", "assignee": "researcher", "parents": []},
-        {"title": "build it", "body": "write code", "assignee": "engineer", "parents": [0]},
+        {
+            "title": "research",
+            "body": "look at prior art",
+            "assignee": "researcher",
+            "parents": [],
+        },
+        {
+            "title": "build it",
+            "body": "write code",
+            "assignee": "engineer",
+            "parents": [0],
+        },
     ]
     with kb.connect() as conn:
         child_ids = kb.decompose_triage_task(
@@ -88,5 +98,41 @@ def test_decompose_records_audit_comment_and_event(kanban_home):
     assert any(ev.kind == "decomposed" for ev in events)
 
 
+@pytest.mark.parametrize("malformed", [None, 0, False, "", {}])
+def test_decompose_db_rejects_falsy_non_list_parents(kanban_home, malformed):
+    with kb.connect() as conn:
+        tid = _create_triage(conn)
+        with pytest.raises(ValueError, match="parents must be a list"):
+            kb.decompose_triage_task(
+                conn,
+                tid,
+                root_assignee="orch",
+                children=[{"title": "task A", "parents": malformed}],
+            )
 
 
+def test_decompose_db_rejects_boolean_and_duplicate_parent_indices(kanban_home):
+    with kb.connect() as conn:
+        bool_tid = _create_triage(conn, title="bool parent")
+        with pytest.raises(ValueError, match="not a valid index"):
+            kb.decompose_triage_task(
+                conn,
+                bool_tid,
+                root_assignee="orch",
+                children=[
+                    {"title": "task A", "parents": []},
+                    {"title": "task B", "parents": [False]},
+                ],
+            )
+
+        duplicate_tid = _create_triage(conn, title="duplicate parent")
+        with pytest.raises(ValueError, match="duplicate parent index"):
+            kb.decompose_triage_task(
+                conn,
+                duplicate_tid,
+                root_assignee="orch",
+                children=[
+                    {"title": "task A", "parents": []},
+                    {"title": "task B", "parents": [0, 0]},
+                ],
+            )

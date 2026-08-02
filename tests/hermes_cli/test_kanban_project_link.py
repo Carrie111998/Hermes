@@ -64,3 +64,43 @@ def test_unlinked_task_unchanged(kanban_conn):
     assert task.branch_name is None
 
 
+def test_project_source_fallback_is_tenant_bound(kanban_conn, monkeypatch):
+    source_id = kb.create_task(kanban_conn, title="Tenant A source", tenant="tenant-a")
+    kanban_conn.execute(
+        "UPDATE tasks SET project_id = ?, workspace_kind = 'worktree', "
+        "workspace_path = ?, branch_name = ? WHERE id = ?",
+        (
+            "project-p",
+            f"/tmp/tenant-bound/.worktrees/{source_id}",
+            f"project-p/{source_id}-tenant-a-source",
+            source_id,
+        ),
+    )
+    kanban_conn.commit()
+    source = kb.get_task(kanban_conn, source_id)
+    assert source is not None
+    assert source.workspace_kind == "worktree"
+    monkeypatch.setattr(
+        pdb,
+        "connect_closing",
+        lambda: (_ for _ in ()).throw(OSError("project store unavailable")),
+    )
+    monkeypatch.setattr(
+        pdb,
+        "get_project",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            OSError("project store unavailable")
+        ),
+    )
+
+    with pytest.raises(ValueError, match="project not found or unavailable"):
+        kb.create_task(
+            kanban_conn,
+            title="Tenant B child",
+            tenant="tenant-b",
+            project_id="project-p",
+            project_source_task_id=source_id,
+            idempotency_key="must-not-be-queried-cross-tenant",
+        )
+
+    assert [task.id for task in kb.list_tasks(kanban_conn)] == [source_id]
