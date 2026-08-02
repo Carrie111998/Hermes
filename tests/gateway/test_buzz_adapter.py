@@ -470,6 +470,27 @@ class TestBuzzAdapterSend:
         assert args[args.index("--reply-to") + 1] == "metadata-root"
 
     @pytest.mark.asyncio
+    async def test_send_document_explicit_reply_overrides_metadata_thread(self, tmp_path):
+        document = tmp_path / "handoff.txt"
+        document.write_text("safe handoff", encoding="utf-8")
+        adapter = _make_adapter()
+        cli = _ScriptedCli()
+        cli.script("messages", "send", {"accepted": True, "event_id": "evt-explicit"})
+        adapter._run_cli = cli
+
+        result = await adapter.send_document(
+            CHANNEL,
+            str(document),
+            reply_to="explicit-root",
+            metadata={"thread_id": "metadata-root"},
+        )
+
+        assert result.success is True
+        args, _stdin_text = cli.calls[0]
+        assert args.count("--reply-to") == 1
+        assert args[args.index("--reply-to") + 1] == "explicit-root"
+
+    @pytest.mark.asyncio
     async def test_send_document_sanitizes_cli_error_path(self, tmp_path):
         document = tmp_path / "private" / "handoff.txt"
         document.parent.mkdir()
