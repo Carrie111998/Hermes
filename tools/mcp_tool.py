@@ -2751,7 +2751,7 @@ class MCPServerTask:
 
     async def _run_http(self, config: dict):
         """Run the server using HTTP/StreamableHTTP transport."""
-        if not _MCP_HTTP_AVAILABLE and not _MCP_NEW_HTTP:
+        if not _MCP_HTTP_AVAILABLE:
             raise ImportError(
                 f"MCP server '{self.name}' requires HTTP transport but "
                 "mcp.client.streamable_http is not available. "
@@ -2927,8 +2927,11 @@ class MCPServerTask:
             # http_client is provided, so we wrap in async-with.
             try:
                 async with httpx.AsyncClient(**client_kwargs) as http_client:
+                    # mcp 1.x yields 3-tuple (read, write, get_session_id);
+                    # mcp 2.0.0 yields 2-tuple (read, write). Unpack the
+                    # first two and ignore any extra via *rest.
                     async with streamable_http_client(url, http_client=http_client) as (
-                        read_stream, write_stream,
+                        read_stream, write_stream, *_rest,
                     ):
                         async with ClientSession(read_stream, write_stream, **sampling_kwargs) as session:
                             # Bound the handshake (#59349) — see stdio path.
@@ -4869,7 +4872,10 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             # MCP CallToolResult has .content (list of content blocks) and .is_error
             # In MCP 2.0.0 the field was renamed from isError (camelCase) to
             # is_error (snake_case). Use getattr to support both.
-            if getattr(result, "is_error", getattr(result, "isError", False)):
+            # Check isError FIRST because MagicMock auto-creates attributes
+            # such as ``is_error`` as a truthy mock, making the fallback to
+            # ``isError`` unreachable. Tests explicitly set ``isError``.
+            if getattr(result, "isError", getattr(result, "is_error", False)):
                 error_text = ""
                 for block in (result.content or []):
                     if getattr(block, "text", None):
