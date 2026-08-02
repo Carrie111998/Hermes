@@ -136,6 +136,10 @@ function jobProvider(job: CronJob): string {
   return asText(job.provider).trim()
 }
 
+function jobScriptTimeout(job: CronJob): null | number {
+  return typeof job.script_timeout_seconds === 'number' ? job.script_timeout_seconds : null
+}
+
 function cronParts(expr: string): null | string[] {
   const parts = expr.trim().replace(/\s+/g, ' ').split(' ')
 
@@ -432,6 +436,7 @@ export function CronView({ onClose, onOpenSession, setStatusbarItemGroup: _setSt
         schedule: values.schedule,
         name: values.name || undefined,
         deliver: values.deliver || DEFAULT_DELIVER,
+        ...(values.scriptTimeoutSeconds === null ? {} : { script_timeout_seconds: values.scriptTimeoutSeconds }),
         ...(values.model.trim() ? { model: values.model.trim(), provider: values.provider.trim() || undefined } : {})
       })
 
@@ -614,6 +619,7 @@ function CronJobDetail({
   const deliver = jobDeliver(job)
   const prompt = jobPrompt(job)
   const modelOverride = jobModel(job)
+  const scriptTimeout = jobScriptTimeout(job)
 
   return (
     <PanelDetail>
@@ -639,6 +645,14 @@ function CronJobDetail({
             { label: c.last.replace(/:$/, ''), value: formatTime(job.last_run_at) },
             { label: c.next.replace(/:$/, ''), value: formatTime(job.next_run_at) },
             { label: c.deliverLabel, value: c.deliveryLabels[deliver] ?? deliver },
+            ...(scriptTimeout === null
+              ? []
+              : [
+                  {
+                    label: c.scriptTimeoutLabel,
+                    value: scriptTimeout === 0 ? c.scriptTimeoutUnlimited : `${scriptTimeout}s`
+                  }
+                ]),
             ...(modelOverride ? [{ label: c.modelLabel, value: modelOverride }] : [])
           ]}
         />
@@ -835,6 +849,7 @@ function CronEditorDialog({
   const [schedule, setSchedule] = useState('')
   const [schedulePreset, setSchedulePreset] = useState('daily')
   const [deliver, setDeliver] = useState(DEFAULT_DELIVER)
+  const [scriptTimeout, setScriptTimeout] = useState('')
   // Per-job model override, encoded as `${providerSlug}:${model}` (split on the
   // first ':' when saving). MODEL_DEFAULT_VALUE = follow the global default.
   const [modelChoice, setModelChoice] = useState(MODEL_DEFAULT_VALUE)
@@ -891,6 +906,7 @@ function CronEditorDialog({
     setSchedule(initial ? jobScheduleExpr(initial) : (SCHEDULE_OPTIONS[0].expr ?? ''))
     setSchedulePreset(initial ? scheduleOptionForExpr(jobScheduleExpr(initial)).value : 'daily')
     setDeliver(initial ? jobDeliver(initial) : DEFAULT_DELIVER)
+    setScriptTimeout(initial && jobScriptTimeout(initial) !== null ? String(jobScriptTimeout(initial)) : '')
     setModelChoice(initial && jobModel(initial) ? `${jobProvider(initial)}:${jobModel(initial)}` : MODEL_DEFAULT_VALUE)
     setSlotValues({})
     setTemplateChoice(CUSTOM_TEMPLATE)
@@ -962,6 +978,14 @@ function CronEditorDialog({
     const overrideIndex = modelChoice === MODEL_DEFAULT_VALUE ? -1 : modelChoice.indexOf(':')
     const overrideProvider = overrideIndex >= 0 ? modelChoice.slice(0, overrideIndex) : ''
     const overrideModel = overrideIndex >= 0 ? modelChoice.slice(overrideIndex + 1) : ''
+    const trimmedScriptTimeout = scriptTimeout.trim()
+    const scriptTimeoutSeconds = trimmedScriptTimeout === '' ? null : Number(trimmedScriptTimeout)
+
+    if (scriptTimeoutSeconds !== null && (!Number.isFinite(scriptTimeoutSeconds) || scriptTimeoutSeconds < 0)) {
+      setError(c.scriptTimeoutInvalid)
+
+      return
+    }
 
     setSaving(true)
     setError(null)
@@ -973,7 +997,8 @@ function CronEditorDialog({
         name: name.trim(),
         prompt: prompt.trim(),
         provider: overrideProvider,
-        schedule: schedule.trim()
+        schedule: schedule.trim(),
+        scriptTimeoutSeconds
       })
     } catch (err) {
       setError(err instanceof Error ? err.message : c.failedSave)
@@ -1164,6 +1189,19 @@ function CronEditorDialog({
               </Field>
             )}
 
+            <Field htmlFor="cron-script-timeout" label={c.scriptTimeoutLabel} optional optionalLabel={c.optional}>
+              <Input
+                id="cron-script-timeout"
+                min="0"
+                onChange={event => setScriptTimeout(event.target.value)}
+                placeholder={c.scriptTimeoutPlaceholder}
+                step="any"
+                type="number"
+                value={scriptTimeout}
+              />
+              <FieldHint>{c.scriptTimeoutHint}</FieldHint>
+            </Field>
+
             {schedulePreset === 'custom' ? (
               <Field htmlFor="cron-schedule" label={c.customScheduleLabel}>
                 <Input
@@ -1217,6 +1255,8 @@ interface EditorValues {
   /** Provider slug for the model override ('' = none). */
   provider: string
   schedule: string
+  /** null follows the global timeout; 0 disables the wall-clock limit. */
+  scriptTimeoutSeconds: null | number
 }
 
 interface ScheduleOption {

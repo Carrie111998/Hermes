@@ -2193,6 +2193,8 @@ def _windows_cron_python_invocation(python_exe: str) -> tuple[str, dict[str, str
 def _run_job_script(
     script_path: str,
     workdir: Optional[str] = None,
+    *,
+    timeout_seconds: Any = None,
 ) -> tuple[bool, str]:
     """Execute a cron job's data-collection script and capture its output.
 
@@ -2225,6 +2227,9 @@ def _run_job_script(
             mutated, avoiding the global-side-effect bug where a cron
             job's ``os.chdir()`` leaks into concurrent gateway sessions
             (#69396).
+        timeout_seconds: Optional per-job override. ``0`` disables the
+            wall-clock limit for long-running scripts; ``None`` uses the
+            existing env/config/default timeout.
 
     Returns:
         (success, output) — on failure *output* contains the error message so the
@@ -2255,7 +2260,18 @@ def _run_job_script(
     if not path.is_file():
         return False, f"Script path is not a file: {path}"
 
-    script_timeout = _get_script_timeout()
+    script_timeout: int | float | None = _get_script_timeout()
+    if timeout_seconds is not None:
+        try:
+            from cron.jobs import normalize_script_timeout_seconds
+
+            configured_timeout = normalize_script_timeout_seconds(timeout_seconds)
+            script_timeout = None if configured_timeout == 0 else configured_timeout
+        except ValueError:
+            logger.warning(
+                "Invalid per-job script_timeout_seconds=%r; using global timeout",
+                timeout_seconds,
+            )
 
     # Pick an interpreter by extension.  Bash for .sh/.bash, Python for
     # everything else.  We deliberately do NOT honour the file's own
@@ -2338,6 +2354,30 @@ def _run_job_script(
         return False, f"Script execution failed: {exc}"
 
 
+def _run_job_script_for_job(
+    job: dict,
+    script_path: Optional[str] = None,
+    workdir: Optional[str] = None,
+) -> tuple[bool, str]:
+    """Run a job script while preserving legacy calls for jobs without overrides."""
+    resolved_path = script_path or job.get("script")
+    if "script_timeout_seconds" in job:
+        timeout_seconds = job.get("script_timeout_seconds")
+        if workdir is not None:
+            return _run_job_script(
+                resolved_path,
+                workdir=workdir,
+                timeout_seconds=timeout_seconds,
+            )
+        return _run_job_script(
+            resolved_path,
+            timeout_seconds=timeout_seconds,
+        )
+    if workdir is not None:
+        return _run_job_script(resolved_path, workdir=workdir)
+    return _run_job_script(resolved_path)
+
+
 def _run_job_script_with_claim_heartbeat(
     job: dict, script_path: str, workdir: Optional[str] = None,
 ) -> tuple[bool, str]:
@@ -2361,7 +2401,7 @@ def _run_job_script_with_claim_heartbeat(
         and schedule.get("kind") == "once"
         and owner
     ):
-        return _run_job_script(script_path, workdir=workdir)
+        return _run_job_script_for_job(job, script_path, workdir)
 
     job_id = str(job.get("id") or "")
     stop = threading.Event()
@@ -2392,10 +2432,10 @@ def _run_job_script_with_claim_heartbeat(
             job_id,
             exc_info=True,
         )
-        return _run_job_script(script_path, workdir=workdir)
+        return _run_job_script_for_job(job, script_path, workdir)
 
     try:
-        return _run_job_script(script_path, workdir=workdir)
+        return _run_job_script_for_job(job, script_path, workdir)
     finally:
         stop.set()
         # Event.wait() wakes immediately.  Keep completion bounded if the
@@ -2456,7 +2496,7 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
         if prerun_script is not None:
             success, script_output = prerun_script
         else:
-            success, script_output = _run_job_script(script_path)
+            success, script_output = _run_job_script_for_job(job)
         if success:
             if script_output:
                 prompt = (

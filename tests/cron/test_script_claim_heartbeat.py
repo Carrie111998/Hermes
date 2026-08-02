@@ -125,6 +125,7 @@ def test_script_heartbeat_uses_captured_claim_owner(tmp_path, monkeypatch):
         "script": "watchdog.py",
         "schedule": {"kind": "once", "run_at": original_timestamp},
         "run_claim": {"at": original_timestamp, "by": "original-owner"},
+        "script_timeout_seconds": 7,
     }
 
     with jobs.use_cron_store(profile_home):
@@ -147,6 +148,7 @@ def test_script_heartbeat_uses_captured_claim_owner(tmp_path, monkeypatch):
         return updated
 
     def _blocking_script(_script_path: str, **kwargs) -> tuple[bool, str]:
+        assert kwargs["timeout_seconds"] == 7
         assert heartbeat_seen.wait(timeout=2)
         return True, "done"
 

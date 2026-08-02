@@ -35,20 +35,37 @@ describe('cronEditorUpdates', () => {
   it('omits prompt when saving a script-only job with an empty prompt', () => {
     expect(
       cronEditorUpdates(
-        { deliver: 'local', model: '', name: 'Weekly', prompt: '', provider: '', schedule: '0 9 * * 1' },
+        {
+          deliver: 'local',
+          model: '',
+          name: 'Weekly',
+          prompt: '',
+          provider: '',
+          schedule: '0 9 * * 1',
+          scriptTimeoutSeconds: null
+        },
         { scriptOnlyJob: true }
       )
     ).toEqual({
       deliver: 'local',
       name: 'Weekly',
-      schedule: '0 9 * * 1'
+      schedule: '0 9 * * 1',
+      script_timeout_seconds: null
     })
   })
 
   it('includes prompt when the user typed one on a script-only job', () => {
     expect(
       cronEditorUpdates(
-        { deliver: 'email', model: '', name: 'Weekly', prompt: 'note', provider: '', schedule: '0 9 * * 1' },
+        {
+          deliver: 'email',
+          model: '',
+          name: 'Weekly',
+          prompt: 'note',
+          provider: '',
+          schedule: '0 9 * * 1',
+          scriptTimeoutSeconds: 0
+        },
         { scriptOnlyJob: true }
       ).prompt
     ).toBe('note')
@@ -62,7 +79,8 @@ describe('cronEditorUpdates', () => {
         name: 'Daily',
         prompt: 'go',
         provider: 'anthropic',
-        schedule: '0 9 * * *'
+        schedule: '0 9 * * *',
+        scriptTimeoutSeconds: 45
       },
       { scriptOnlyJob: false }
     )
@@ -73,7 +91,15 @@ describe('cronEditorUpdates', () => {
 
   it('clears a previous pin when the override is reset to default', () => {
     const updates = cronEditorUpdates(
-      { deliver: 'local', model: '', name: 'Daily', prompt: 'go', provider: '', schedule: '0 9 * * *' },
+      {
+        deliver: 'local',
+        model: '',
+        name: 'Daily',
+        prompt: 'go',
+        provider: '',
+        schedule: '0 9 * * *',
+        scriptTimeoutSeconds: null
+      },
       { scriptOnlyJob: false }
     )
 
@@ -83,11 +109,40 @@ describe('cronEditorUpdates', () => {
 
   it('never touches model fields on script-only jobs', () => {
     const updates = cronEditorUpdates(
-      { deliver: 'local', model: 'x', name: 'Weekly', prompt: '', provider: 'y', schedule: '0 9 * * 1' },
+      {
+        deliver: 'local',
+        model: 'x',
+        name: 'Weekly',
+        prompt: '',
+        provider: 'y',
+        schedule: '0 9 * * 1',
+        scriptTimeoutSeconds: 12
+      },
       { scriptOnlyJob: true }
     )
 
     expect('model' in updates).toBe(false)
     expect('provider' in updates).toBe(false)
+  })
+
+  it('persists positive, zero, and cleared timeout values', () => {
+    const base = {
+      deliver: 'local',
+      model: '',
+      name: 'Daily',
+      prompt: 'go',
+      provider: '',
+      schedule: '0 9 * * *'
+    }
+
+    expect(
+      cronEditorUpdates({ ...base, scriptTimeoutSeconds: 30 }, { scriptOnlyJob: false }).script_timeout_seconds
+    ).toBe(30)
+    expect(
+      cronEditorUpdates({ ...base, scriptTimeoutSeconds: 0 }, { scriptOnlyJob: false }).script_timeout_seconds
+    ).toBe(0)
+    expect(
+      cronEditorUpdates({ ...base, scriptTimeoutSeconds: null }, { scriptOnlyJob: false }).script_timeout_seconds
+    ).toBeNull()
   })
 })

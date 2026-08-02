@@ -143,6 +143,7 @@ function emptyCronJobForm(): CronJobEditorState {
     context_from: "",
     enabled_toolsets: [],
     workdir: "",
+    script_timeout_seconds: "",
     scheduleState: { ...DEFAULT_SCHEDULE_STATE },
   };
 }
@@ -285,6 +286,24 @@ function CronAdvancedFields({
             onChange={(e) => update("workdir", e.target.value)}
             placeholder="/absolute/project/path"
           />
+        </div>
+
+        <div className="grid gap-1">
+          <Label htmlFor={`${idPrefix}-script-timeout`}>
+            Script timeout (seconds)
+          </Label>
+          <Input
+            id={`${idPrefix}-script-timeout`}
+            type="number"
+            min="0"
+            step="any"
+            value={form.script_timeout_seconds}
+            onChange={(e) => update("script_timeout_seconds", e.target.value)}
+            placeholder="Global default"
+          />
+          <p className="text-xs text-muted-foreground">
+            Empty uses the global timeout; 0 disables the script wall-clock limit.
+          </p>
         </div>
 
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">

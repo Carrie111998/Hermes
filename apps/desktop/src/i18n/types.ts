@@ -1440,6 +1440,11 @@ export interface Translations {
     deliverNeedsHomeChannel: string
     modelLabel: string
     modelDefault: string
+    scriptTimeoutLabel: string
+    scriptTimeoutPlaceholder: string
+    scriptTimeoutHint: string
+    scriptTimeoutInvalid: string
+    scriptTimeoutUnlimited: string
     customScheduleLabel: string
     customPlaceholder: string
     customHint: string

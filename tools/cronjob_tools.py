@@ -16,6 +16,8 @@ from hermes_constants import display_hermes_home
 
 logger = logging.getLogger(__name__)
 
+_UNSET = object()
+
 # Import from cron module (will be available when properly installed)
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -568,6 +570,8 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         result["enabled_toolsets"] = job["enabled_toolsets"]
     if job.get("workdir"):
         result["workdir"] = job["workdir"]
+    if "script_timeout_seconds" in job:
+        result["script_timeout_seconds"] = job["script_timeout_seconds"]
     return result
 
 
@@ -647,6 +651,7 @@ def cronjob(
     workdir: Optional[str] = None,
     no_agent: Optional[bool] = None,
     attach_to_session: Optional[bool] = None,
+    script_timeout_seconds: Any = _UNSET,
     task_id: str = None,
 ) -> str:
     """Unified cron job management tool."""
@@ -720,6 +725,11 @@ def cronjob(
                 workdir=_normalize_optional_job_value(workdir),
                 no_agent=_no_agent,
                 attach_to_session=attach_to_session,
+                script_timeout_seconds=(
+                    None
+                    if script_timeout_seconds is _UNSET
+                    else script_timeout_seconds
+                ),
             )
             _notify_provider_jobs_changed_safe()
             _create_message = f"Cron job '{job['name']}' created."
@@ -899,6 +909,8 @@ def cronjob(
                 updates["enabled_toolsets"] = enabled_toolsets or None
             if attach_to_session is not None:
                 updates["attach_to_session"] = bool(attach_to_session)
+            if script_timeout_seconds is not _UNSET:
+                updates["script_timeout_seconds"] = script_timeout_seconds
             if workdir is not None:
                 # Empty string clears the field (restores old behaviour);
                 # otherwise pass raw — update_job() validates / normalizes.
@@ -1002,6 +1014,11 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
                 "type": "string",
                 "description": f"Optional path to a script that runs each tick. In the default mode its stdout is injected into the agent's prompt as context (data-collection / change-detection pattern). With no_agent=True, the script IS the job and its stdout is delivered verbatim (classic watchdog pattern). Relative paths resolve under {display_hermes_home()}/scripts/. ``.sh``/``.bash`` extensions run via bash, everything else via Python. On update, pass empty string to clear."
             },
+            "script_timeout_seconds": {
+                "type": ["number", "null"],
+                "minimum": 0,
+                "description": "Optional per-job wall-clock timeout for the script in seconds. Omit or pass null to use the global timeout, use a positive finite number for a job-specific limit, or exactly 0 for no wall-clock timeout. On update, null clears an existing override."
+            },
             "no_agent": {
                 "type": "boolean",
                 "default": False,
@@ -1099,6 +1116,7 @@ registry.register(
         # Programmatic callers of cronjob() itself retain the parameters.
         reason=args.get("reason"),
         script=args.get("script"),
+        script_timeout_seconds=args.get("script_timeout_seconds", _UNSET),
         context_from=args.get("context_from"),
         enabled_toolsets=args.get("enabled_toolsets"),
         workdir=args.get("workdir"),

@@ -780,6 +780,7 @@ export interface CronJob {
   schedule?: CronJobSchedule
   schedule_display?: null | string
   script?: null | string
+  script_timeout_seconds?: null | number
   state?: null | string
 }
 
@@ -790,6 +791,7 @@ export interface CronJobCreatePayload {
   prompt: string
   provider?: string
   schedule: string
+  script_timeout_seconds?: number
 }
 
 export interface CronJobSchedule {
@@ -806,6 +808,7 @@ export interface CronJobUpdates {
   prompt?: string
   provider?: null | string
   schedule?: string
+  script_timeout_seconds?: null | number
 }
 
 // A cron delivery target from GET /api/cron/delivery-targets — the single

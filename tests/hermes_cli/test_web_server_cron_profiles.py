@@ -169,6 +169,76 @@ def test_profile_call_cannot_retarget_ticker_store_mid_write(
 
 
 
+@pytest.mark.asyncio
+async def test_create_cron_job_persists_script_timeout(isolated_profiles):
+    from hermes_cli import web_server
+
+    job = await web_server.create_cron_job(
+        web_server.CronJobCreate(
+            prompt="summarize upstream status",
+            schedule="every 1h",
+            script_timeout_seconds=15,
+        ),
+        profile="worker_alpha",
+    )
+
+    assert job["script_timeout_seconds"] == 15
+
+
+@pytest.mark.asyncio
+async def test_dashboard_cron_timeout_update_and_invalid_values(
+    isolated_profiles,
+):
+    from hermes_cli import web_server
+
+    job = await web_server.create_cron_job(
+        web_server.CronJobCreate(
+            prompt="summarize status",
+            schedule="every 1h",
+        ),
+        profile="worker_alpha",
+    )
+
+    updated = await web_server.update_cron_job(
+        job["id"],
+        web_server.CronJobUpdate(
+            updates={"script_timeout_seconds": 0}
+        ),
+        profile="worker_alpha",
+    )
+    assert updated["script_timeout_seconds"] == 0
+
+    cleared = await web_server.update_cron_job(
+        job["id"],
+        web_server.CronJobUpdate(
+            updates={"script_timeout_seconds": None}
+        ),
+        profile="worker_alpha",
+    )
+    assert "script_timeout_seconds" not in cleared
+
+    for invalid in (-1, "30", True, float("nan"), float("inf")):
+        with pytest.raises(HTTPException) as exc:
+            await web_server.update_cron_job(
+                job["id"],
+                web_server.CronJobUpdate(
+                    updates={"script_timeout_seconds": invalid}
+                ),
+                profile="worker_alpha",
+            )
+        assert exc.value.status_code == 400
+        assert "script_timeout_seconds" in exc.value.detail
+
+    with pytest.raises(HTTPException) as create_exc:
+        await web_server.create_cron_job(
+            web_server.CronJobCreate(
+                prompt="bad timeout",
+                schedule="every 1h",
+                script_timeout_seconds=-1,
+            ),
+            profile="worker_alpha",
+        )
+    assert create_exc.value.status_code == 400
 
 
 @pytest.mark.asyncio

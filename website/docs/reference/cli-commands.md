@@ -563,8 +563,8 @@ hermes cron <list|create|edit|pause|resume|run|remove|status|tick>
 | Subcommand | Description |
 |------------|-------------|
 | `list` | Show scheduled jobs. |
-| `create` / `add` | Create a scheduled job from a prompt, optionally attaching one or more skills via repeated `--skill`. |
-| `edit` | Update a job's schedule, prompt, name, delivery, repeat count, or attached skills. Supports `--clear-skills`, `--add-skill`, and `--remove-skill`. |
+| `create` / `add` | Create a scheduled job from a prompt, optionally attaching one or more skills via repeated `--skill`. Attached scripts accept `--script-timeout-seconds`: positive values override the global timeout and `0` disables the wall-clock limit. |
+| `edit` | Update a job's schedule, prompt, name, delivery, repeat count, attached skills, or per-job script timeout. Supports `--clear-skills`, `--add-skill`, `--remove-skill`, and `--script-timeout-seconds`. |
 | `pause` | Pause a job without deleting it. |
 | `resume` | Resume a paused job and compute its next future run. |
 | `run` | Trigger a job on the next scheduler tick. |

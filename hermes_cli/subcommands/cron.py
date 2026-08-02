@@ -7,9 +7,27 @@ import ``main`` (cycle avoidance).
 
 from __future__ import annotations
 
+import argparse
+import math
 from typing import Callable
 
 from hermes_cli.subcommands._shared import add_accept_hooks_flag
+
+
+def _script_timeout_seconds(value: str) -> float | None:
+    if value.strip().lower() in {"default", "global"}:
+        return None
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "must be a finite number greater than or equal to 0"
+        ) from exc
+    if not math.isfinite(parsed) or parsed < 0:
+        raise argparse.ArgumentTypeError(
+            "must be a finite number greater than or equal to 0"
+        )
+    return parsed
 
 
 def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
@@ -69,6 +87,15 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     cron_create.add_argument(
         "--workdir",
         help="Absolute path for the job to run from. Injects AGENTS.md / CLAUDE.md / .cursorrules from that directory and uses it as the cwd for terminal/file/code_exec tools. Omit to preserve old behaviour (no project context files).",
+    )
+    cron_create.add_argument(
+        "--script-timeout-seconds",
+        type=_script_timeout_seconds,
+        default=argparse.SUPPRESS,
+        help=(
+            "Per-job script wall-clock timeout. Positive values override the "
+            "global timeout; 0 disables the wall-clock limit."
+        ),
     )
     cron_create.add_argument(
         "--model",
@@ -146,6 +173,16 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     cron_edit.add_argument(
         "--workdir",
         help="Absolute path for the job to run from (injects AGENTS.md etc. and sets terminal cwd). Pass empty string to clear.",
+    )
+    cron_edit.add_argument(
+        "--script-timeout-seconds",
+        type=_script_timeout_seconds,
+        default=argparse.SUPPRESS,
+        help=(
+            "Set the per-job script wall-clock timeout. Positive values "
+            "override the global timeout; 0 disables the wall-clock limit; "
+            "'default' clears an override."
+        ),
     )
     cron_edit.add_argument(
         "--model",

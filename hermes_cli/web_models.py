@@ -372,6 +372,9 @@ class CronJobCreate(BaseModel):
     enabled_toolsets: Optional[List[str]] = None
     workdir: Optional[str] = None
     no_agent: bool = False
+    # Keep the raw JSON type here. cron.jobs is the shared validation boundary
+    # and must reject booleans/strings instead of letting Pydantic coerce them.
+    script_timeout_seconds: Optional[Any] = None
 
 
 class CronJobUpdate(BaseModel):

@@ -102,7 +102,76 @@ class TestCronCommandLifecycle:
         assert jobs[0]["skills"] == ["blogwatcher", "maps"]
         assert jobs[0]["name"] == "Skill combo"
 
+    def test_create_edit_list_script_timeout_round_trip(
+        self, tmp_cron_dir, capsys
+    ):
+        cron_command(
+            Namespace(
+                cron_command="create",
+                schedule="every 1h",
+                prompt="Summarize script output",
+                name="timeout-job",
+                deliver=None,
+                repeat=None,
+                skill=None,
+                skills=None,
+                script="collector.py",
+                workdir=None,
+                no_agent=False,
+                script_timeout_seconds=45,
+            )
+        )
+        job = list_jobs()[0]
+        assert job["script_timeout_seconds"] == 45
 
+        cron_command(
+            Namespace(
+                cron_command="edit",
+                job_id=job["id"],
+                schedule=None,
+                prompt=None,
+                name=None,
+                deliver=None,
+                repeat=None,
+                skill=None,
+                skills=None,
+                clear_skills=False,
+                add_skills=None,
+                remove_skills=None,
+                script=None,
+                workdir=None,
+                no_agent=None,
+                script_timeout_seconds=0,
+            )
+        )
+        assert get_job(job["id"])["script_timeout_seconds"] == 0
+
+        cron_command(Namespace(cron_command="list", all=True))
+        output = capsys.readouterr().out
+        assert "Script timeout: 45s" in output
+        assert "Script timeout: unlimited" in output
+        assert "Timeout:   unlimited" in output
+
+        clear_args = Namespace(
+            cron_command="edit",
+            job_id=job["id"],
+            schedule=None,
+            prompt=None,
+            name=None,
+            deliver=None,
+            repeat=None,
+            skill=None,
+            skills=None,
+            clear_skills=False,
+            add_skills=None,
+            remove_skills=None,
+            script=None,
+            workdir=None,
+            no_agent=None,
+            script_timeout_seconds=None,
+        )
+        cron_command(clear_args)
+        assert "script_timeout_seconds" not in get_job(job["id"])
 
 class TestGatewayNotRunningWarning:
     """`cron create` / `cron list` must warn when the gateway (and thus the
