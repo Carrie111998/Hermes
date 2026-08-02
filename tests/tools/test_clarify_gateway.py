@@ -12,6 +12,8 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
+import pytest
+
 
 def _clear_clarify_state():
     """Reset module-level state between tests."""
@@ -41,6 +43,77 @@ class TestClarifyPrimitive:
         threading.Thread(target=resolver).start()
         result = cm.wait_for_response("id1", timeout=10.0)
         assert result == "B"
+
+    def test_only_one_concurrent_resolver_wins(self):
+        """The first terminal transition is atomic under concurrent replies."""
+        from tools import clarify_gateway as cm
+
+        cm.register("race", "sk-race", "Pick one", ["A", "B"])
+        responses = [f"answer-{i}" for i in range(16)]
+        start = threading.Barrier(len(responses))
+
+        def resolve(response):
+            start.wait()
+            return response, cm.resolve_gateway_clarify("race", response)
+
+        with ThreadPoolExecutor(len(responses)) as pool:
+            attempts = list(pool.map(resolve, responses))
+
+        winners = [response for response, accepted in attempts if accepted]
+        assert len(winners) == 1
+        assert cm.wait_for_response("race", timeout=1.0) == winners[0]
+        assert cm.resolve_gateway_clarify("race", "late") is False
+
+    def test_timeout_is_terminal_and_rejects_late_response(self):
+        """A response after the timeout transition cannot revive the request."""
+        from tools import clarify_gateway as cm
+
+        cm.register("timeout", "sk-timeout", "Q?", None)
+        assert cm.wait_for_response("timeout", timeout=0.01) is None
+        assert cm.resolve_gateway_clarify("timeout", "too late") is False
+
+    def test_exact_identity_fields_are_required_when_registered(self):
+        """Session, generation, and responder identity are exact protocol fields."""
+        from tools import clarify_gateway as cm
+
+        cm.register(
+            "identity",
+            "sk-identity",
+            "Q?",
+            ["A"],
+            generation=17,
+            responder_id="user-1",
+        )
+        exact = {
+            "session_key": "sk-identity",
+            "generation": 17,
+            "responder_id": "user-1",
+        }
+        assert cm.resolve_gateway_clarify(
+            "identity", "A", **{**exact, "session_key": "other"}
+        ) is False
+        assert cm.resolve_gateway_clarify(
+            "identity", "A", **{**exact, "generation": 18}
+        ) is False
+        assert cm.resolve_gateway_clarify(
+            "identity", "A", **{**exact, "responder_id": "user-2"}
+        ) is False
+        assert cm.resolve_gateway_clarify("identity", "A", **exact) is True
+        assert cm.wait_for_response("identity", timeout=1.0) == "A"
+
+    def test_duplicate_id_cannot_replace_live_request(self):
+        """A duplicate id cannot redirect a response into another request."""
+        from tools import clarify_gateway as cm
+
+        original = cm.register("duplicate", "sk-one", "First?", ["A"])
+        with pytest.raises(ValueError, match="already registered"):
+            cm.register("duplicate", "sk-two", "Second?", ["B"])
+        assert cm.get_pending_for_session(
+            "sk-one", include_choice_prompts=True
+        ) is original
+        assert cm.get_pending_for_session(
+            "sk-two", include_choice_prompts=True
+        ) is None
 
     def test_open_ended_auto_awaits_text(self):
         """Clarify with no choices is in text-capture mode immediately."""
@@ -90,6 +163,65 @@ class TestClarifyPrimitive:
             result = fut.result(timeout=10.0)
             # clear_session sets response="" then the wait returns it
             assert result == ""
+
+    def test_cancel_request_is_exact_and_preserves_sibling_prompt(self):
+        """Delivery failure for one id must not cancel its session sibling."""
+        from tools import clarify_gateway as cm
+
+        cm.register("failed", "shared", "First?", ["A"])
+        cm.register("sibling", "shared", "Second?", ["B"])
+
+        assert cm.cancel_request(
+            "failed",
+            session_key="shared",
+            delivery_failed=True,
+        ) is True
+        assert cm.cancel_request(
+            "failed",
+            session_key="shared",
+            delivery_failed=True,
+        ) is False
+        pending = cm.get_pending_for_session(
+            "shared", include_choice_prompts=True
+        )
+        assert pending is not None and pending.clarify_id == "sibling"
+        assert cm.resolve_gateway_clarify(
+            "sibling", "B", session_key="shared"
+        ) is True
+        assert cm.wait_for_response("sibling", timeout=1.0) == "B"
+
+    def test_answer_is_not_overwritten_by_session_cleanup(self):
+        """Cleanup loses to an answer that already made the terminal transition."""
+        from tools import clarify_gateway as cm
+
+        cm.register("answered", "shared", "Q?", ["A"])
+        assert cm.resolve_gateway_clarify("answered", "A") is True
+        assert cm.clear_session("shared") == 0
+        assert cm.wait_for_response("answered", timeout=1.0) == "A"
+
+    @pytest.mark.parametrize(
+        ("question", "choices", "answer"),
+        [
+            (
+                "Merge, deploy, delete, approve, and use sudo?",
+                ["production", "cancel"],
+                "production",
+            ),
+            (
+                "What colour should the local reversible draft use?",
+                ["blue", "green"],
+                "blue",
+            ),
+        ],
+    )
+    def test_state_machine_is_semantically_opaque(self, question, choices, answer):
+        """Protocol transitions preserve text without classifying its meaning."""
+        from tools import clarify_gateway as cm
+
+        clarify_id = f"opaque-{answer}"
+        cm.register(clarify_id, "opaque", question, choices)
+        assert cm.resolve_gateway_clarify(clarify_id, answer) is True
+        assert cm.wait_for_response(clarify_id, timeout=1.0) == answer
 
 
     def test_notify_register_unregister_clears_pending(self):

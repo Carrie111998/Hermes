@@ -39,6 +39,12 @@ from typing import Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
+_STATE_PENDING = "pending"
+_STATE_ANSWERED = "answered"
+_STATE_CANCELLED = "cancelled"
+_STATE_TIMED_OUT = "timed_out"
+_STATE_DELIVERY_FAILED = "delivery_failed"
+
 
 # =========================================================================
 # Module-level state
@@ -52,9 +58,12 @@ class _ClarifyEntry:
     question: str
     choices: Optional[List[str]]
     multi_select: bool = False
+    generation: Optional[int] = None
+    responder_id: Optional[str] = None
     event: threading.Event = field(default_factory=threading.Event)
     response: Optional[str] = None
     awaiting_text: bool = False  # set when user picked "Other" or clarify is open-ended
+    state: str = _STATE_PENDING
 
     def signature(self) -> Dict[str, object]:
         return {
@@ -83,6 +92,9 @@ def register(
     question: str,
     choices: Optional[List[str]],
     multi_select: bool = False,
+    *,
+    generation: Optional[int] = None,
+    responder_id: Optional[str] = None,
 ) -> _ClarifyEntry:
     """Register a pending clarify request and return the entry.
 
@@ -95,13 +107,66 @@ def register(
         question=question,
         choices=list(choices) if choices else None,
         multi_select=bool(multi_select) and bool(choices),
+        generation=generation,
+        responder_id=str(responder_id) if responder_id is not None else None,
         # Open-ended (no choices) → next message IS the response, no buttons needed.
         awaiting_text=not bool(choices),
     )
     with _lock:
+        if clarify_id in _entries:
+            raise ValueError(f"clarify_id is already registered: {clarify_id}")
         _entries[clarify_id] = entry
         _session_index.setdefault(session_key, []).append(clarify_id)
     return entry
+
+
+def _remove_from_indices_locked(entry: _ClarifyEntry) -> None:
+    """Remove ``entry`` from both indices while ``_lock`` is held."""
+    if _entries.get(entry.clarify_id) is entry:
+        _entries.pop(entry.clarify_id, None)
+    ids = _session_index.get(entry.session_key)
+    if ids and entry.clarify_id in ids:
+        ids.remove(entry.clarify_id)
+        if not ids:
+            _session_index.pop(entry.session_key, None)
+
+
+def _identity_matches_locked(
+    entry: _ClarifyEntry,
+    *,
+    session_key: Optional[str],
+    generation: Optional[int],
+    responder_id: Optional[str],
+) -> bool:
+    """Validate only exact request identity fields; never inspect prompt text."""
+    if session_key is not None and str(session_key) != entry.session_key:
+        return False
+    if entry.generation is not None and generation != entry.generation:
+        return False
+    if (
+        entry.responder_id is not None
+        and (responder_id is None or str(responder_id) != entry.responder_id)
+    ):
+        return False
+    return True
+
+
+def _transition_locked(
+    entry: _ClarifyEntry,
+    state: str,
+    response: Optional[str],
+    *,
+    remove: bool = False,
+) -> bool:
+    """Apply the first terminal transition for ``entry`` atomically."""
+    if entry.state != _STATE_PENDING:
+        return False
+    entry.state = state
+    entry.response = response
+    if remove:
+        _remove_from_indices_locked(entry)
+    entry.event.set()
+    return True
 
 
 def wait_for_response(clarify_id: str, timeout: float) -> Optional[str]:
@@ -146,22 +211,28 @@ def wait_for_response(clarify_id: str, timeout: float) -> Optional[str]:
             touch_activity_if_due(activity_state, "waiting for user clarify response")
 
     with _lock:
-        # Remove from indices regardless of resolution outcome.
-        _entries.pop(clarify_id, None)
-        ids = _session_index.get(entry.session_key)
-        if ids and clarify_id in ids:
-            ids.remove(clarify_id)
-            if not ids:
-                _session_index.pop(entry.session_key, None)
-
-    return entry.response
+        if entry.state == _STATE_PENDING:
+            _transition_locked(entry, _STATE_TIMED_OUT, None)
+        _remove_from_indices_locked(entry)
+        if entry.state == _STATE_ANSWERED:
+            return entry.response
+        if entry.state in {_STATE_CANCELLED, _STATE_DELIVERY_FAILED}:
+            return ""
+        return None
 
 
 # =========================================================================
 # Public API — gateway / adapter side
 # =========================================================================
 
-def resolve_gateway_clarify(clarify_id: str, response: str) -> bool:
+def resolve_gateway_clarify(
+    clarify_id: str,
+    response: str,
+    *,
+    session_key: Optional[str] = None,
+    generation: Optional[int] = None,
+    responder_id: Optional[str] = None,
+) -> bool:
     """Unblock the agent thread waiting on ``clarify_id``.
 
     Returns True if an entry was found and resolved, False otherwise
@@ -169,11 +240,45 @@ def resolve_gateway_clarify(clarify_id: str, response: str) -> bool:
     """
     with _lock:
         entry = _entries.get(clarify_id)
-        if entry is None:
+        if entry is None or not _identity_matches_locked(
+            entry,
+            session_key=session_key,
+            generation=generation,
+            responder_id=responder_id,
+        ):
             return False
-    entry.response = str(response) if response is not None else ""
-    entry.event.set()
-    return True
+        return _transition_locked(
+            entry,
+            _STATE_ANSWERED,
+            str(response) if response is not None else "",
+        )
+
+
+def cancel_request(
+    clarify_id: str,
+    *,
+    session_key: Optional[str] = None,
+    generation: Optional[int] = None,
+    responder_id: Optional[str] = None,
+    delivery_failed: bool = False,
+) -> bool:
+    """Cancel one exact pending clarify request and wake its waiter.
+
+    The first terminal transition wins.  A second cancellation, a late
+    response, or an identity mismatch returns ``False``.  The entry is
+    removed immediately so cancellation cannot affect a sibling prompt.
+    """
+    with _lock:
+        entry = _entries.get(clarify_id)
+        if entry is None or not _identity_matches_locked(
+            entry,
+            session_key=session_key,
+            generation=generation,
+            responder_id=responder_id,
+        ):
+            return False
+        state = _STATE_DELIVERY_FAILED if delivery_failed else _STATE_CANCELLED
+        return _transition_locked(entry, state, "", remove=True)
 
 
 def get_pending_for_session(
@@ -194,7 +299,7 @@ def get_pending_for_session(
         ids = _session_index.get(session_key) or []
         for cid in ids:
             entry = _entries.get(cid)
-            if entry is None:
+            if entry is None or entry.state != _STATE_PENDING:
                 continue
             if include_choice_prompts or entry.awaiting_text:
                 return entry
@@ -331,6 +436,7 @@ def resolve_text_response_for_session(session_key: str, response: str) -> bool:
     return resolve_gateway_clarify(
         entry.clarify_id,
         coerced,
+        session_key=session_key,
     )
 
 
@@ -341,7 +447,7 @@ def mark_awaiting_text(clarify_id: str) -> bool:
     """
     with _lock:
         entry = _entries.get(clarify_id)
-        if entry is None:
+        if entry is None or entry.state != _STATE_PENDING:
             return False
         entry.awaiting_text = True
         return True
@@ -351,7 +457,11 @@ def has_pending(session_key: str) -> bool:
     """Return True when this session has at least one pending clarify entry."""
     with _lock:
         ids = _session_index.get(session_key) or []
-        return any(_entries.get(cid) is not None for cid in ids)
+        return any(
+            (entry := _entries.get(cid)) is not None
+            and entry.state == _STATE_PENDING
+            for cid in ids
+        )
 
 
 def clear_session(session_key: str) -> int:
@@ -362,20 +472,18 @@ def clear_session(session_key: str) -> int:
     end of their session.  Returns the number of entries cancelled.
     """
     with _lock:
-        ids = list(_session_index.pop(session_key, []) or [])
-        entries = [_entries.pop(cid, None) for cid in ids]
-    cancelled = 0
-    for entry in entries:
-        if entry is None:
-            continue
-        # Empty string sentinel — agent code can distinguish from a real
-        # response by inspecting the wait_for_response return value
-        # alongside its own timeout deadline.  Most callers just treat any
-        # falsy result as "user did not respond".
-        entry.response = ""
-        entry.event.set()
-        cancelled += 1
-    return cancelled
+        ids = list(_session_index.get(session_key, []) or [])
+        cancelled = 0
+        for clarify_id in ids:
+            entry = _entries.get(clarify_id)
+            if entry is not None and _transition_locked(
+                entry,
+                _STATE_CANCELLED,
+                "",
+                remove=True,
+            ):
+                cancelled += 1
+        return cancelled
 
 
 # =========================================================================

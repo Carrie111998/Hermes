@@ -78,6 +78,28 @@ class ProgressCaptureAdapter(BasePlatformAdapter):
         return SendResult(success=True, message_id="clarify-1")
 
 
+class FailingClarifyAdapter(ProgressCaptureAdapter):
+    """Fails delivery so the gateway must cancel only the generated request."""
+
+    async def send_clarify(
+        self,
+        chat_id,
+        question,
+        choices,
+        clarify_id,
+        session_key,
+        metadata=None,
+    ) -> SendResult:
+        self.clarify_prompts.append(
+            {
+                "chat_id": chat_id,
+                "question": question,
+                "choices": choices,
+            }
+        )
+        return SendResult(success=False, error="delivery failed")
+
+
 class ClarifyThenToolAgent:
     """Emits a clarify tool.started (with raw args) then a normal tool."""
 
@@ -131,6 +153,26 @@ class DeployClarifyAgent:
         )
         return {
             "final_response": answer,
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
+class FailedDeliveryScopeAgent:
+    """Observes whether a sibling request survived clarify send failure."""
+
+    sibling_session_key = ""
+
+    def __init__(self, **kwargs):
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        answer = self.clarify_callback("Pick one", ["A", "B"])
+        from tools import clarify_gateway
+
+        sibling_survived = clarify_gateway.has_pending(self.sibling_session_key)
+        return {
+            "final_response": f"{answer}|sibling={sibling_survived}",
             "messages": [],
             "api_calls": 1,
         }
@@ -287,3 +329,53 @@ async def test_gateway_never_classifies_clarify_question_text(
         session_key,
         include_choice_prompts=True,
     ) is None
+
+
+@pytest.mark.asyncio
+async def test_failed_clarify_delivery_cancels_only_exact_request(
+    monkeypatch,
+    tmp_path,
+):
+    """A failed send cannot clear another pending prompt in the same session."""
+    from tools import clarify_gateway
+
+    with clarify_gateway._lock:
+        clarify_gateway._entries.clear()
+        clarify_gateway._session_index.clear()
+
+    adapter = FailingClarifyAdapter(platform=Platform.DISCORD)
+    runner = _make_runner(adapter, tmp_path)
+    gateway_run = _install_fakes(monkeypatch, "off")
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = FailedDeliveryScopeAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+
+    session_key = "agent:main:discord:dm:C1"
+    FailedDeliveryScopeAgent.sibling_session_key = session_key
+    clarify_gateway.register(
+        "existing-sibling",
+        session_key,
+        "Existing question?",
+        ["Keep waiting"],
+    )
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="C1",
+        chat_type="dm",
+        user_id="user-1",
+    )
+
+    result = await runner._run_agent(
+        message="start",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-failed-clarify-delivery",
+        session_key=session_key,
+    )
+
+    assert result["final_response"] == (
+        "[clarify prompt could not be delivered]|sibling=True"
+    )

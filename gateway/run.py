@@ -6255,7 +6255,11 @@ class TurnRunner:
                 # Couldn't deliver the prompt — clean up and return
                 # sentinel so the agent can fall back to a sensible
                 # default rather than hanging.
-                _clarify_mod.clear_session(ctx.session_key or "")
+                _clarify_mod.cancel_request(
+                    clarify_id,
+                    session_key=ctx.session_key or "",
+                    delivery_failed=True,
+                )
                 return "[clarify prompt could not be delivered]"
 
             timeout = _clarify_mod.get_clarify_timeout()
