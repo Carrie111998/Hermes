@@ -14,6 +14,10 @@ Resolution order for text tasks (auto mode):
   6. Direct API-key providers (z.ai/GLM, Kimi/Moonshot, MiniMax, MiniMax-CN)
   7. None
 
+OpenRouter fallback cost guard: ``auxiliary.free_only: true`` restricts the
+step-2 fallback to ``:free`` SKUs; ``auxiliary.openrouter_model`` overrides
+the default. A one-time WARNING is logged for non-``:free`` models.
+
 Resolution order for vision/multimodal tasks (auto mode):
   1. Selected main provider, if it is one of the supported vision backends below
   2. OpenRouter
@@ -2159,8 +2163,63 @@ def _resolve_api_key_provider() -> Tuple[Optional[OpenAI], Optional[str]]:
 # ── Provider resolution helpers ─────────────────────────────────────────────
 
 
+_paid_lane_warned: set = set()
+
+
+def _is_free_model(model: Optional[str]) -> bool:
+    """True when ``model`` is an OpenRouter free SKU (``:free`` suffix)."""
+    return bool(model) and str(model).strip().endswith(":free")
+
+
+def _aux_openrouter_settings() -> Tuple[bool, str]:
+    """Read free_only and openrouter_model from config in one pass.
+
+    Returns (free_only, model) — defaults (False, _OPENROUTER_MODEL) on any
+    config-read failure.
+    """
+    try:
+        from hermes_cli.config import cfg_get, load_config_readonly
+
+        cfg = load_config_readonly()
+        free_only = bool(cfg_get(cfg, "auxiliary", "free_only", default=False))
+        val = cfg_get(cfg, "auxiliary", "openrouter_model")
+        model = val.strip() if isinstance(val, str) and val.strip() else _OPENROUTER_MODEL
+        return free_only, model
+    except Exception:
+        return False, _OPENROUTER_MODEL
+
+
+def _warn_paid_lane_once(model: str) -> None:
+    """Log a WARNING the first time a non-:free OpenRouter model is engaged."""
+    if model in _paid_lane_warned:
+        return
+    _paid_lane_warned.add(model)
+    logger.warning(
+        "Auxiliary client: PAID lane engaged for auxiliary task — OpenRouter "
+        "fallback model %r is not a :free SKU and may incur real spend. Set "
+        "auxiliary.free_only: true to restrict auxiliary fallbacks to free "
+        "models, or auxiliary.openrouter_model to a :free model.",
+        model,
+    )
+
 
 def _try_openrouter(explicit_api_key: str = None, model: str = None) -> Tuple[Optional[OpenAI], Optional[str]]:
+    free_only, cfg_model = _aux_openrouter_settings()
+    or_model = model or cfg_model
+    if free_only and not _is_free_model(or_model):
+        logger.warning(
+            "Auxiliary client: auxiliary.free_only is enabled but the "
+            "OpenRouter fallback model %r is not a :free SKU — skipping the "
+            "OpenRouter fallback. Set auxiliary.openrouter_model to a :free "
+            "model (e.g. nvidia/nemotron-3-ultra-550b-a55b:free) or disable "
+            "auxiliary.free_only.",
+            or_model,
+        )
+        _mark_provider_unhealthy("openrouter", ttl=60)
+        return None, None
+    if not _is_free_model(or_model):
+        _warn_paid_lane_once(or_model)
+
     pool_present, entry = _select_pool_entry("openrouter")
     if pool_present:
         or_key = explicit_api_key or _pool_runtime_api_key(entry)
@@ -2168,7 +2227,7 @@ def _try_openrouter(explicit_api_key: str = None, model: str = None) -> Tuple[Op
             base_url = _pool_runtime_base_url(entry, OPENROUTER_BASE_URL) or OPENROUTER_BASE_URL
             logger.debug("Auxiliary client: OpenRouter via pool")
             return _create_openai_client(api_key=or_key, base_url=base_url,
-                           default_headers=build_or_headers()), model or _OPENROUTER_MODEL
+                           default_headers=build_or_headers()), or_model
         # Pool exists but is exhausted (no usable runtime key) — fall through to
         # the OPENROUTER_API_KEY env-var path rather than failing outright.
         logger.debug("Auxiliary client: OpenRouter pool exhausted, trying OPENROUTER_API_KEY")
@@ -2179,7 +2238,7 @@ def _try_openrouter(explicit_api_key: str = None, model: str = None) -> Tuple[Op
         return None, None
     logger.debug("Auxiliary client: OpenRouter")
     return _create_openai_client(api_key=or_key, base_url=OPENROUTER_BASE_URL,
-                   default_headers=build_or_headers()), model or _OPENROUTER_MODEL
+                   default_headers=build_or_headers()), or_model
 
 
 def _describe_openrouter_unavailable() -> str:
@@ -4181,6 +4240,27 @@ def _auth_refresh_provider_for_route(
     return normalized
 
 
+def _fallback_chain_entry(task: Optional[str], fb_label: str) -> Optional[Dict[str, Any]]:
+    """Resolve the configured ``fallback_chain`` entry a label points at.
+
+    Labels minted by :func:`_try_configured_fallback_chain` carry the entry
+    index in our own stable format (``fallback_chain[<i>](<provider>)``).
+    Returns ``None`` when the label is not a configured-chain candidate or
+    the index no longer resolves to a dict entry.
+    """
+    if not task or not fb_label:
+        return None
+    m = re.match(r"fallback_chain\[(\d+)\]", fb_label)
+    if not m:
+        return None
+    try:
+        chain = _get_auxiliary_task_config(task).get("fallback_chain")
+        entry = chain[int(m.group(1))] if isinstance(chain, list) else None
+    except Exception:
+        return None
+    return entry if isinstance(entry, dict) else None
+
+
 def _fallback_entry_timeout(task: Optional[str], fb_label: str) -> Optional[float]:
     """Resolve a per-entry ``timeout`` for a configured fallback candidate.
 
@@ -4192,24 +4272,13 @@ def _fallback_entry_timeout(task: Optional[str], fb_label: str) -> Optional[floa
     primary's 30s deadline every turn (#62452).
 
     Entries in ``auxiliary.<task>.fallback_chain`` may declare their own
-    ``timeout`` (seconds). This helper reads it by parsing the entry index
-    out of the label minted by :func:`_try_configured_fallback_chain`
-    (``fallback_chain[<i>](<provider>)`` — our own stable format). Returns
-    ``None`` when the label is not a configured-chain candidate, the entry
-    has no ``timeout``, or the value is invalid — callers then keep the
-    task-level timeout, preserving existing behavior.
+    ``timeout`` (seconds). Returns ``None`` when the label is not a
+    configured-chain candidate, the entry has no ``timeout``, or the value
+    is invalid — callers then keep the task-level timeout, preserving
+    existing behavior.
     """
-    if not task or not fb_label:
-        return None
-    m = re.match(r"fallback_chain\[(\d+)\]", fb_label)
-    if not m:
-        return None
-    try:
-        chain = _get_auxiliary_task_config(task).get("fallback_chain")
-        entry = chain[int(m.group(1))] if isinstance(chain, list) else None
-        raw = entry.get("timeout") if isinstance(entry, dict) else None
-    except Exception:
-        return None
+    entry = _fallback_chain_entry(task, fb_label)
+    raw = entry.get("timeout") if entry else None
     if isinstance(raw, (int, float)) and not isinstance(raw, bool) and raw > 0:
         return float(raw)
     return None
@@ -4284,15 +4353,9 @@ def _fallback_destination(
     api_mode = None
     model = fb_model
 
-    match = re.match(r"fallback_chain\[(\d+)\]", fb_label or "")
-    if match and task:
-        try:
-            chain = _get_auxiliary_task_config(task).get("fallback_chain")
-            entry = chain[int(match.group(1))] if isinstance(chain, list) else None
-        except Exception:
-            entry = None
-        if isinstance(entry, dict):
-            return _fallback_destination_from_entry(entry, fb_client, fb_model)
+    entry = _fallback_chain_entry(task, fb_label)
+    if entry is not None:
+        return _fallback_destination_from_entry(entry, fb_client, fb_model)
 
     return _complete_fallback_destination(provider, base_url, api_mode, model)
 
@@ -4304,42 +4367,16 @@ def _replan_synchronous_cache_sections(
     destination: _FallbackDestination,
 ) -> tuple[list, list]:
     """Strip source decoration and plan one synchronous destination locally."""
-    from agent.agent_runtime_helpers import (
-        _direct_native_anthropic_tool_cache_capability,
-        anthropic_prompt_cache_policy,
-    )
-    from agent.prompt_caching import (
-        build_prompt_cache_plan,
-        strip_anthropic_cache_control,
-        strip_anthropic_tool_cache_control,
-    )
+    from agent.agent_runtime_helpers import plan_cache_sections_for_destination
 
-    canonical_messages = copy.deepcopy(messages or [])
-    strip_anthropic_cache_control(canonical_messages)
-    canonical_tools = strip_anthropic_tool_cache_control(tools)
-    stub = SimpleNamespace(provider="", base_url="", api_mode="", model="")
-    should_cache, native_layout = anthropic_prompt_cache_policy(
-        stub,
+    return plan_cache_sections_for_destination(
+        messages,
+        tools,
         provider=destination.provider,
         base_url=destination.base_url,
         api_mode=destination.api_mode or "",
         model=destination.model or "",
     )
-    if not should_cache:
-        return canonical_messages, canonical_tools
-    plan = build_prompt_cache_plan(
-        canonical_messages,
-        canonical_tools,
-        native_anthropic=native_layout,
-        direct_native_tool_cache=_direct_native_anthropic_tool_cache_capability(
-            stub,
-            provider=destination.provider,
-            base_url=destination.base_url,
-            api_mode=destination.api_mode or "",
-            model=destination.model or "",
-        ),
-    )
-    return plan.messages, plan.tools
 
 
 def _call_fallback_candidate_sync(
@@ -4490,43 +4527,71 @@ async def _call_fallback_candidate_async(
             task or "call", fb_label, fb_timeout, effective_timeout,
         )
         effective_timeout = fb_timeout
-    fb_base = str(getattr(fb_client, "base_url", "") or "")
+    destination = _fallback_destination(task, fb_client, fb_model, fb_label)
+    fallback_messages, fallback_tools = _replan_synchronous_cache_sections(
+        messages,
+        tools,
+        destination=destination,
+    )
     fb_kwargs = _build_call_kwargs(
-        fb_label, fb_model, messages,
+        destination.provider, destination.model, fallback_messages,
         temperature=temperature, max_tokens=max_tokens,
-        tools=tools, timeout=effective_timeout,
+        tools=fallback_tools, timeout=effective_timeout,
         extra_body=effective_extra_body, reasoning_config=reasoning_config,
-        base_url=fb_base, task=task)
+        base_url=destination.base_url, task=task)
     try:
         return _validate_llm_response(
             await _relay_async_completion(
                 fb_client,
                 fb_kwargs,
-                provider=fb_label,
+                provider=destination.provider,
+                api_mode=destination.api_mode,
             ),
             task,
         )
     except Exception as fb_err:
         if not _is_auth_error(fb_err):
             raise
-        fb_provider = _auth_refresh_provider_for_route(fb_label, fb_base)
+        fb_provider = _auth_refresh_provider_for_route(
+            destination.provider, destination.base_url
+        )
         if fb_provider not in {"auto", "", None} and _refresh_provider_credentials(fb_provider):
             retry_client, retry_model = _get_cached_client(
-                fb_provider, fb_model, async_mode=True)
+                fb_provider,
+                destination.model,
+                async_mode=True,
+                base_url=destination.base_url or None,
+                api_mode=destination.api_mode,
+            )
             if retry_client is not None:
+                retry_destination = _FallbackDestination(
+                    fb_provider,
+                    destination.base_url
+                    or str(getattr(retry_client, "base_url", "") or ""),
+                    destination.api_mode,
+                    retry_model or destination.model,
+                )
+                retry_messages, retry_tools = _replan_synchronous_cache_sections(
+                    messages,
+                    tools,
+                    destination=retry_destination,
+                )
                 retry_kwargs = _build_call_kwargs(
-                    fb_provider, retry_model or fb_model, messages,
+                    retry_destination.provider,
+                    retry_destination.model,
+                    retry_messages,
                     temperature=temperature, max_tokens=max_tokens,
-                    tools=tools, timeout=effective_timeout,
+                    tools=retry_tools, timeout=effective_timeout,
                     extra_body=effective_extra_body,
                     reasoning_config=reasoning_config,
-                    base_url=str(getattr(retry_client, "base_url", "") or fb_base), task=task)
+                    base_url=retry_destination.base_url, task=task)
                 try:
                     return _validate_llm_response(
                         await _relay_async_completion(
                             retry_client,
                             retry_kwargs,
-                            provider=fb_provider,
+                            provider=retry_destination.provider,
+                            api_mode=retry_destination.api_mode,
                         ),
                         task,
                     )

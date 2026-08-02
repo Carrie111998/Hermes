@@ -1857,6 +1857,126 @@ def _direct_native_anthropic_tool_cache_capability(
     )
 
 
+def cache_ttl_means_disabled(ttl: Any) -> bool:
+    """Return True when a ``prompt_caching.cache_ttl`` value means caching off.
+
+    Single source of truth for the disable-synonym detection shared by
+    ``agent_init`` (live-agent ``_cache_disabled`` flag) and the stub policy
+    paths below. Keeping one predicate prevents the two sites from drifting
+    (a synonym added in only one place would recreate #76085).
+
+    Unknown values (e.g. ``"2h"``, integers) are NOT a disable — callers keep
+    caching enabled with the default TTL, matching ``agent_init``.
+    """
+    if ttl in ("5m", "1h"):
+        return False
+    if ttl is False or ttl is None:
+        return True
+    return str(ttl).lower() in ("off", "false", "disabled", "no", "none")
+
+
+def prompt_caching_disabled_from_config() -> bool:
+    """Return True when ``prompt_caching.cache_ttl`` is configured as off.
+
+    Same disable detection as ``agent_init`` (via ``cache_ttl_means_disabled``)
+    so stub-based policy paths (MoA slot decoration, auxiliary fallback
+    replan) honor the same config contract without holding a live
+    ``AIAgent`` (#76085 / #33555).
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        pc_cfg = load_config_readonly().get("prompt_caching", {}) or {}
+        ttl = pc_cfg.get("cache_ttl", "5m")
+    except Exception:
+        return False
+    return cache_ttl_means_disabled(ttl)
+
+
+def blank_cache_policy_stub(cache_disabled: Optional[bool] = None):
+    """Build the destination-identity-blank stub for ``anthropic_prompt_cache_policy``.
+
+    Single sanctioned constructor for that stub. Callers that resolve cache
+    policy against a destination identified out-of-band (not a live
+    ``AIAgent``) must go through here so ``_cache_disabled`` is never left
+    off a hand-rolled ``SimpleNamespace`` (#76085).
+
+    When ``cache_disabled`` is omitted, falls back to the global config so
+    stub paths without an agent snapshot still honor an operator disable.
+    """
+    from types import SimpleNamespace
+
+    if cache_disabled is None:
+        cache_disabled = prompt_caching_disabled_from_config()
+    return SimpleNamespace(
+        provider="",
+        base_url="",
+        api_mode="",
+        model="",
+        _cache_disabled=bool(cache_disabled),
+    )
+
+
+def plan_cache_sections_for_destination(
+    messages: list,
+    tools: Optional[list],
+    *,
+    provider: str,
+    base_url: str,
+    api_mode: str,
+    model: str,
+    cache_disabled: Optional[bool] = None,
+) -> Tuple[list, list]:
+    """Plan request-local cache sections for one resolved destination.
+
+    Shared core of the synchronous acting-aggregator (MoA) and auxiliary
+    fallback senders: resolve the cache policy for the destination's real
+    provider/base_url/api_mode/model, then either return stripped canonical
+    copies (non-caching route) or a :func:`build_prompt_cache_plan` layout
+    (caching route, with the direct-native tool marker when the destination
+    is api.anthropic.com on the Messages wire).
+
+    Never mutates ``messages`` or ``tools`` — both return values are
+    request-local copies.
+
+    ``cache_disabled`` threads the operator's ``prompt_caching.cache_ttl``
+    disable into the blank policy stub. When omitted, the live config is
+    consulted so MoA/auxiliary paths cannot re-enable markers after the
+    user turned caching off (#76085).
+    """
+    from agent.prompt_caching import (
+        build_prompt_cache_plan,
+        strip_anthropic_cache_control,
+        strip_anthropic_tool_cache_control,
+    )
+
+    stub = blank_cache_policy_stub(cache_disabled)
+    should_cache, native_layout = anthropic_prompt_cache_policy(
+        stub,
+        provider=provider,
+        base_url=base_url,
+        api_mode=api_mode,
+        model=model,
+    )
+    if not should_cache:
+        canonical_messages = copy.deepcopy(messages or [])
+        strip_anthropic_cache_control(canonical_messages)
+        return canonical_messages, strip_anthropic_tool_cache_control(tools)
+    plan = build_prompt_cache_plan(
+        messages,
+        tools,
+        native_anthropic=native_layout,
+        direct_native_tool_cache=_direct_native_anthropic_tool_cache_capability(
+            stub,
+            provider=provider,
+            base_url=base_url,
+            api_mode=api_mode,
+            model=model,
+        ),
+    )
+    return plan.messages, plan.tools
+
+
 def anthropic_prompt_cache_policy(
     agent,
     *,
@@ -3839,6 +3959,9 @@ __all__ = [
     "restore_primary_runtime",
     "extract_reasoning",
     "dump_api_request_debug",
+    "prompt_caching_disabled_from_config",
+    "blank_cache_policy_stub",
+    "plan_cache_sections_for_destination",
     "anthropic_prompt_cache_policy",
     "create_openai_client",
     "switch_model",

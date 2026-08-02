@@ -1490,11 +1490,22 @@ def _get_compute_host_supervisor(cfg: dict | None = None):
         return _compute_host_supervisor
 
 
-def _compute_host_turn_frame(rid: str, sid: str, session: dict, text: Any) -> dict:
+def _compute_host_turn_frame(
+    rid: str,
+    sid: str,
+    session: dict,
+    text: Any,
+    image_paths: list[str] | None = None,
+    queued_prompt_generation: int | None = None,
+) -> dict:
     with session["history_lock"]:
         history = list(session.get("history", []))
         history_version = int(session.get("history_version", 0))
-        attached_images = list(session.get("attached_images", []))
+        attached_images = (
+            list(image_paths)
+            if image_paths is not None
+            else list(session.get("attached_images", []))
+        )
     return {
         "type": "turn.start",
         "sid": sid,
@@ -1511,6 +1522,7 @@ def _compute_host_turn_frame(rid: str, sid: str, session: dict, text: Any) -> di
         "service_tier_override": session.get("create_service_tier_override"),
         "source": _session_source(session),
         "attached_images": attached_images,
+        "queued_prompt_generation": queued_prompt_generation,
     }
 
 
@@ -1581,9 +1593,23 @@ def _on_compute_host_turn_done(rid: str, sid: str, session: dict, frame: dict) -
     _drain_queued_prompt(rid, sid, session)
 
 
-def _submit_prompt_to_compute_host(rid: str, sid: str, session: dict, text: Any) -> dict:
+def _submit_prompt_to_compute_host(
+    rid: str,
+    sid: str,
+    session: dict,
+    text: Any,
+    image_paths: list[str] | None = None,
+    queued_prompt_generation: int | None = None,
+) -> dict:
     cfg = _load_dashboard_process_isolation_config()
-    frame = _compute_host_turn_frame(rid, sid, session, text)
+    frame = _compute_host_turn_frame(
+        rid,
+        sid,
+        session,
+        text,
+        image_paths=image_paths,
+        queued_prompt_generation=queued_prompt_generation,
+    )
 
     def _complete(done: dict) -> None:
         # submit_turn reports a synchronous pipe failure through the callback
@@ -1600,7 +1626,8 @@ def _submit_prompt_to_compute_host(rid: str, sid: str, session: dict, text: Any)
         return _err(rid, 5019, f"compute-host dispatch failed: {exc}")
     with session["history_lock"]:
         session["_compute_host_active"] = True
-        session["attached_images"] = []
+        if image_paths is None:
+            session["attached_images"] = []
     return _ok(rid, {"status": "streaming", "turn_isolation": True})
 
 
@@ -2319,13 +2346,24 @@ def _reconcile_session_cwd_from_terminal(session: dict | None) -> bool:
     A plain `cd` is deliberately NOT a workspace move (see
     ``_apply_project_workspace``): browsing to /tmp to read a log must not
     re-home the chat. What we adopt here is narrower — the session's recorded
-    cwd is in a DIFFERENT git working tree than its workspace. That is a
-    relocation by any reading, and it is the only shape this reconciles.
+    cwd is in a DIFFERENT working tree of the SAME repository (the shape
+    ``git worktree add`` produces). Everything else — a non-git workspace
+    stepping into a repo, or a git workspace visiting an unrelated repo — is
+    a browsing visit, and a user's explicitly chosen workspace is never
+    overridden at all.
 
     Local backends only: a remote/SSH cwd names a path on the host, which this
     gateway can neither stat nor probe with git.
     """
     if not session or not _is_local_terminal_backend():
+        return False
+
+    # A workspace the user (or GUI) explicitly chose is never overridden by
+    # where the agent's terminal happened to settle — only another explicit
+    # action (`_set_session_cwd`, a project switch) moves it. A cwd this very
+    # function adopted is marked `cwd_from_settle` so a session can keep
+    # following the agent through successive worktrees.
+    if session.get("explicit_cwd") and not session.get("cwd_from_settle"):
         return False
 
     try:
@@ -2346,13 +2384,33 @@ def _reconcile_session_cwd_from_terminal(session: dict | None) -> bool:
     # The worktree ROOT, not the common repo root: folding worktrees together
     # here is exactly what hides the move we're looking for.
     landed = _git_repo_root_for_cwd(resolved)
-    if not landed or landed == _git_repo_root_for_cwd(current):
+    current_root = _git_repo_root_for_cwd(current)
+    # A relocation is a move between two DIFFERENT git working trees. When the
+    # session's own workspace is not in a git repo, the agent stepping into one
+    # to read a file or run a command is a browsing visit, not a re-home:
+    # adopting it would hijack a non-git workspace onto whatever repo a tool
+    # call touched first (e.g. a home-directory session pinned to the checkout
+    # it read a file from).
+    if not landed or not current_root or landed == current_root:
+        return False
+
+    # And only between checkouts of the SAME repository — the shape a real
+    # `git worktree add` produces (linked worktrees share the common .git
+    # dir). Settling in an UNRELATED repo (`cd ~/other-project && git log`)
+    # is likewise a visit: adopting it would re-home the chat onto whatever
+    # foreign repo the terminal last touched.
+    landed_common = _git_common_repo_root_for_cwd(resolved)
+    current_common = _git_common_repo_root_for_cwd(current)
+    if not landed_common or landed_common != current_common:
         return False
 
     session["cwd"] = resolved
     # The session works here now, so this is its workspace — a desktop chat
-    # whose cwd was an unpersisted launch artifact earns a real row.
+    # whose cwd was an unpersisted launch artifact earns a real row. The
+    # settle marker keeps this adoption overridable by the NEXT settle while
+    # still yielding to a user's explicit choice (see the guard above).
     session["explicit_cwd"] = True
+    session["cwd_from_settle"] = True
     _register_session_cwd(session)
 
     with _session_db(session) as db:
@@ -2650,6 +2708,9 @@ def _set_session_cwd(session: dict, cwd: str) -> str:
     # An explicit user choice — persist it as the workspace (and let a later
     # lazy row creation persist it too, not the launch-dir fallback).
     session["explicit_cwd"] = True
+    # A user's choice supersedes any earlier settle-adopted cwd: from here on
+    # the terminal wandering must not move the workspace again.
+    session["cwd_from_settle"] = False
     _register_session_cwd(session)
     with _session_db(session) as db:
         if db is not None:
@@ -5515,6 +5576,8 @@ def _apply_project_workspace(task_id: str, path: str, _name: str = "") -> None:
 
     session["cwd"] = resolved
     session["explicit_cwd"] = True
+    # An explicit project switch supersedes any earlier settle-adopted cwd.
+    session["cwd_from_settle"] = False
     _register_session_cwd(session)
 
     with _session_db(session) as db:
@@ -5914,6 +5977,9 @@ def _reset_session_agent(sid: str, session: dict) -> dict:
     session["agent"] = new_agent
     session["config_model_seen"] = _config_model_target()
     session["attached_images"] = []
+    session["queued_prompt"] = None
+    session.pop("queued_prompts", None)
+    session["_queued_prompt_generation"] = int(session.get("_queued_prompt_generation", 0)) + 1
     session["edit_snapshots"] = {}
     session["image_counter"] = 0
     session["running"] = False
@@ -7095,24 +7161,41 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
     return {"attempt": attempt, "interrupted_at": marker["started_at"]}
 
 
-def _enqueue_prompt(session: dict, text: Any, transport: Any) -> None:
+def _enqueue_prompt(
+    session: dict,
+    text: Any,
+    transport: Any,
+    image_paths: list[str] | None = None,
+) -> None:
     """Stash a message to run as the very next turn once the live one ends.
 
-    Used when a prompt arrives mid-turn (see ``_handle_busy_submit``). A single
-    slot is kept; a second arrival is merged (lossless, mirroring the
-    consecutive-user merge in ``repair_message_sequence``) so nothing the user
-    typed is dropped. ``transport`` is pinned so the drained turn streams back to
-    the client that sent it even if the session transport is rebound meanwhile.
+    Used when a prompt arrives mid-turn (see ``_handle_busy_submit``). Text-only
+    arrivals share a slot and merge losslessly (mirroring the consecutive-user
+    merge in ``repair_message_sequence``). Image-bearing submissions stay as
+    separate envelopes, so their attachment ownership and chronology survive.
+    ``transport`` is pinned so the drained turn streams back to the client that
+    sent it even if the session transport is rebound meanwhile.
     """
+    image_paths = list(image_paths or [])
+    queued = {"text": text, "transport": transport}
+    if image_paths:
+        queued["image_paths"] = image_paths
     existing = session.get("queued_prompt")
     if (
         existing
         and isinstance(existing.get("text"), str)
         and isinstance(text, str)
+        and not existing.get("image_paths")
+        and not image_paths
+        and not session.get("queued_prompts")
     ):
         prev = existing["text"]
-        text = f"{prev}\n\n{text}" if prev and text else (prev or text)
-    session["queued_prompt"] = {"text": text, "transport": transport}
+        existing["text"] = f"{prev}\n\n{text}" if prev and text else (prev or text)
+        return
+    if existing:
+        session.setdefault("queued_prompts", []).append(queued)
+        return
+    session["queued_prompt"] = queued
 
 
 def _interrupt_busy_session(sid: str, session: dict, agent: Any) -> None:
@@ -7179,7 +7262,15 @@ def _handle_busy_submit(
             # The turn ended between prompt.submit's first busy check and this
             # helper. Let the caller retry and claim the now-idle session.
             return None
-    text_only = _is_text_only_busy_payload(text)
+    with session["history_lock"]:
+        if not session.get("running"):
+            return None
+        image_paths = list(session.get("attached_images", []))
+        if image_paths:
+            # Claim at submission time. A later paste must not be consumed by
+            # this prompt after the active turn finally yields.
+            session["attached_images"] = []
+    text_only = not image_paths and _is_text_only_busy_payload(text)
     plain_text = _coerce_message_text(text).strip() if text_only else ""
     if mode == "steer" and text_only and plain_text and agent is not None and hasattr(agent, "steer"):
         try:
@@ -7213,11 +7304,15 @@ def _handle_busy_submit(
     # can wait behind the very operation it is trying to cancel.
     with session["history_lock"]:
         if not session.get("running"):
+            if image_paths:
+                session["attached_images"] = image_paths + list(session.get("attached_images", []))
             return None
-        _enqueue_prompt(session, text, transport)
+        _enqueue_prompt(session, text, transport, image_paths=image_paths)
         session["last_active"] = time.time()
 
-    if mode != "queue":
+    # Attachments need a separate model invocation. Queue them without
+    # cancelling the active turn so the user gets both results in order.
+    if mode != "queue" and not image_paths:
         _interrupt_busy_session(sid, session, agent)
     return _ok(rid, {"status": "queued"})
 
@@ -7233,21 +7328,60 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
         queued = session.get("queued_prompt")
         if not queued or session.get("running"):
             return False
-        session["queued_prompt"] = None
+        queue_generation = int(session.get("_queued_prompt_generation", 0))
+        queued_prompts = session.get("queued_prompts") or []
+        session["queued_prompt"] = queued_prompts.pop(0) if queued_prompts else None
+        if not queued_prompts:
+            session.pop("queued_prompts", None)
         session["running"] = True
         if queued.get("transport") is not None:
             session["transport"] = queued["transport"]
+    use_compute_host = _session_uses_compute_host(session)
+    with session["history_lock"]:
+        if int(session.get("_queued_prompt_generation", 0)) != queue_generation:
+            session["running"] = False
+            return True
+    dispatch_failed = False
     try:
-        if _session_uses_compute_host(session):
-            resp = _submit_prompt_to_compute_host(rid, sid, session, queued["text"])
+        if use_compute_host:
+            if queued.get("image_paths"):
+                resp = _submit_prompt_to_compute_host(
+                    rid,
+                    sid,
+                    session,
+                    queued["text"],
+                    image_paths=queued["image_paths"],
+                    queued_prompt_generation=queue_generation,
+                )
+            else:
+                resp = _submit_prompt_to_compute_host(
+                    rid, sid, session, queued["text"], queued_prompt_generation=queue_generation
+                )
             if resp.get("error"):
                 message = str(((resp.get("error") or {}).get("message")) or "queued prompt failed")
                 with session["history_lock"]:
                     session["running"] = False
                     _clear_inflight_turn(session)
                 _emit("error", sid, {"message": message})
+                dispatch_failed = True
         else:
-            _run_prompt_submit(rid, sid, session, queued["text"])
+            if queued.get("image_paths"):
+                _run_prompt_submit(
+                    rid,
+                    sid,
+                    session,
+                    queued["text"],
+                    image_paths=queued["image_paths"],
+                    queued_prompt_generation=queue_generation,
+                )
+            else:
+                _run_prompt_submit(
+                    rid,
+                    sid,
+                    session,
+                    queued["text"],
+                    queued_prompt_generation=queue_generation,
+                )
     except Exception as exc:
         print(
             f"[tui_gateway] queued prompt dispatch failed: "
@@ -7256,6 +7390,14 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
         )
         with session["history_lock"]:
             session["running"] = False
+        dispatch_failed = True
+    if dispatch_failed:
+        with session["history_lock"]:
+            drain_next = bool(session.get("queued_prompt")) and not session.get(
+                "_turn_cancel_requested"
+            )
+        if drain_next:
+            _drain_queued_prompt(rid, sid, session)
     return True
 
 
@@ -9029,25 +9171,41 @@ def _start_notification_poller(sid: str, session: dict) -> threading.Event:
 
 
 def _run_prompt_submit(
-    rid, sid: str, session: dict, text: Any, *, display_kind: str | None = None,
+    rid,
+    sid: str,
+    session: dict,
+    text: Any,
+    *,
+    display_kind: str | None = None,
     display_metadata: dict | None = None,
+    image_paths: list[str] | None = None,
+    queued_prompt_generation: int | None = None,
 ) -> None:
     with session["history_lock"]:
+        if (
+            queued_prompt_generation is not None
+            and int(session.get("_queued_prompt_generation", 0)) != queued_prompt_generation
+        ):
+            session["running"] = False
+            return
         history = list(session["history"])
         history_version = int(session.get("history_version", 0))
-        images = list(session.get("attached_images", []))
-        session["attached_images"] = []
+        if image_paths is None:
+            images = list(session.get("attached_images", []))
+            session["attached_images"] = []
+        else:
+            images = list(image_paths)
         inflight = session.get("inflight_turn")
         # A retained failed turn (see _fail_inflight_turn) is a stale leftover
         # by the time a new turn starts — replace it, never append onto it.
         if not isinstance(inflight, dict) or inflight.get("status") == "error":
             _start_inflight_turn(session, text)
-    agent = session["agent"]
-    if hasattr(agent, "clear_interrupt"):
-        try:
-            agent.clear_interrupt()
-        except Exception:
-            pass
+        agent = session["agent"]
+        if hasattr(agent, "clear_interrupt"):
+            try:
+                agent.clear_interrupt()
+            except Exception:
+                pass
     _emit("message.start", sid)
 
     def run():
