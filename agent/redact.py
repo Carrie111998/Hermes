@@ -1045,4 +1045,13 @@ class RedactingFormatter(logging.Formatter):
         # exact-value pass so opaque credential values with no recognizable
         # prefix (e.g. MY_SERVICE_TOKEN=abc123randomstring, BWS_ACCESS_TOKEN)
         # are masked from log output too.
-        return _mask_known_env_values(redact_sensitive_text(original))
+        redacted = redact_sensitive_text(original)
+        # The exact-value pass must honor the same global opt-out as
+        # redact_sensitive_text: with `security.redact_secrets: false` (or
+        # HERMES_REDACT_SECRETS=false) the documented contract is that logs
+        # are NOT redacted, so skip the env-value pass too instead of
+        # masking around a redact_sensitive_text that already returned the
+        # original text.
+        if _REDACT_ENABLED:
+            redacted = _mask_known_env_values(redacted)
+        return redacted
