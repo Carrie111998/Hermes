@@ -640,7 +640,11 @@ def test_successor_source_snapshot_recovers_exact_incomplete_after_crash(
     with pytest.raises(KeyboardInterrupt):
         installer._install_for_test(**kwargs)
 
-    incomplete = roots.library_releases / revision / f".source.{revision}.incomplete"
+    incomplete_entries = list(
+        (roots.library_releases / revision).glob(".source.*.incomplete")
+    )
+    assert len(incomplete_entries) == 1
+    incomplete = incomplete_entries[0]
     assert crashed is True
     assert incomplete.is_dir()
     assert not (roots.library_releases / revision / "source").exists()

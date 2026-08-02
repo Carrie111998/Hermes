@@ -13,6 +13,7 @@ import argparse
 import ast
 import ctypes
 import errno
+import fcntl
 import grp
 import hashlib
 import json
@@ -274,7 +275,12 @@ def _git_command(source: Path, *arguments: str) -> tuple[str, ...]:
     )
 
 
-def _git(source: Path, *arguments: str, maximum: int = 64 * 1024 * 1024) -> bytes:
+def _git(
+    source: Path,
+    *arguments: str,
+    maximum: int = 64 * 1024 * 1024,
+    preserve_fd: int | None = None,
+) -> bytes:
     try:
         completed = subprocess.run(
             _git_command(source, *arguments),
@@ -284,6 +290,7 @@ def _git(source: Path, *arguments: str, maximum: int = 64 * 1024 * 1024) -> byte
             check=False,
             timeout=300,
             env=_git_environment(),
+            pass_fds=(() if preserve_fd is None else (preserve_fd,)),
         )
     except (OSError, subprocess.SubprocessError) as exc:
         _fail("rotation_stager_installer_git_invalid", exc)
@@ -313,11 +320,27 @@ def _install_exact_source_snapshot(
 ) -> bool:
     """Create one fixed, local-only Git source snapshot for the builder."""
 
+    intent = _source_snapshot_clone_intent(
+        source_root=source_root,
+        destination=destination,
+        release_revision=release_revision,
+        source_tree_oid=source_tree_oid,
+        expected_uid=expected_uid,
+        expected_gid=expected_gid,
+    )
+    intent_raw = _canonical(intent) + b"\n"
+    intent_sha256 = str(intent["intent_sha256"])
+    lock_path = destination.with_name(f".{destination.name}.clone.lock")
+    intent_path = destination.with_name(f".{destination.name}.clone-intent.json")
+    intent_pending = destination.with_name(f".{destination.name}.clone-intent.pending")
     incomplete = destination.with_name(
-        f".{destination.name}.{release_revision}.incomplete"
+        f".{destination.name}.{intent_sha256}.incomplete"
+    )
+    quarantine = destination.with_name(
+        f".{destination.name}.{intent_sha256}.quarantine"
     )
 
-    def validate(selected: Path) -> None:
+    def validate(selected: Path, *, preserve_fd: int) -> None:
         try:
             state = os.lstat(selected)
         except OSError as exc:
@@ -328,14 +351,91 @@ def _install_exact_source_snapshot(
             or state.st_uid != expected_uid
             or state.st_gid != expected_gid
             or stat.S_IMODE(state.st_mode) & 0o022
-            or _line(_git(selected, "rev-parse", "HEAD")) != release_revision
-            or _line(_git(selected, "rev-parse", "HEAD^{tree}")) != source_tree_oid
-            or _git(selected, "status", "--porcelain=v1", "--untracked-files=all")
+            or _line(_git(selected, "rev-parse", "HEAD", preserve_fd=preserve_fd))
+            != release_revision
+            or _line(
+                _git(
+                    selected,
+                    "rev-parse",
+                    "HEAD^{tree}",
+                    preserve_fd=preserve_fd,
+                )
+            )
+            != source_tree_oid
+            or _git(
+                selected,
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+                preserve_fd=preserve_fd,
+            )
         ):
             _fail("rotation_stager_installer_source_snapshot_invalid")
+        _validate_local_snapshot_tree(
+            selected,
+            expected_uid=expected_uid,
+            expected_gid=expected_gid,
+        )
 
-    created = False
-    if not os.path.lexists(destination):
+    lock_descriptor = _acquire_source_snapshot_lock(
+        lock_path,
+        expected_uid=expected_uid,
+        expected_gid=expected_gid,
+    )
+    try:
+        final_intent_exists = os.path.lexists(intent_path)
+        pending_intent_exists = os.path.lexists(intent_pending)
+        try:
+            reserved_transactions = {
+                entry.name
+                for entry in os.scandir(destination.parent)
+                if entry.name.startswith(f".{destination.name}.")
+                and entry.name.endswith((".incomplete", ".quarantine"))
+            }
+        except OSError as exc:
+            _fail("rotation_stager_installer_source_snapshot_invalid", exc)
+        allowed_transactions = {incomplete.name, quarantine.name}
+        if reserved_transactions - allowed_transactions:
+            _fail("rotation_stager_installer_source_snapshot_conflict")
+        if not final_intent_exists and (
+            os.path.lexists(destination)
+            or os.path.lexists(incomplete)
+            or os.path.lexists(quarantine)
+        ):
+            # The durable intent is published before any clone-side mutation.
+            # Without it, a same-named tree is foreign even if its bytes happen
+            # to look usable; preserve it for an owner to inspect.
+            _fail("rotation_stager_installer_source_snapshot_conflict")
+        if pending_intent_exists and os.path.lexists(destination):
+            _fail("rotation_stager_installer_source_snapshot_conflict")
+        _publish_clone_intent_exact(
+            intent_path,
+            intent_pending,
+            intent_raw,
+            expected_uid=expected_uid,
+            expected_gid=expected_gid,
+        )
+        created = False
+        if os.path.lexists(destination):
+            validate(destination, preserve_fd=lock_descriptor)
+            if os.path.lexists(incomplete) or os.path.lexists(quarantine):
+                _fail("rotation_stager_installer_source_snapshot_conflict")
+            return False
+
+        if os.path.lexists(quarantine):
+            _remove_quarantined_source_snapshot(
+                quarantine,
+                expected_uid=expected_uid,
+                expected_gid=expected_gid,
+            )
+        if os.path.lexists(incomplete):
+            _quarantine_and_remove_incomplete_source_snapshot(
+                incomplete,
+                quarantine,
+                expected_uid=expected_uid,
+                expected_gid=expected_gid,
+            )
+
         if not os.path.lexists(incomplete):
             try:
                 completed = subprocess.run(
@@ -345,6 +445,7 @@ def _install_exact_source_snapshot(
                         "protocol.file.allow=always",
                         "clone",
                         "--quiet",
+                        "--local",
                         "--no-hardlinks",
                         "--no-checkout",
                         "--",
@@ -357,10 +458,18 @@ def _install_exact_source_snapshot(
                     check=False,
                     timeout=300,
                     env=_git_environment(),
+                    pass_fds=(lock_descriptor,),
                 )
             except (OSError, subprocess.SubprocessError) as exc:
                 _fail("rotation_stager_installer_source_snapshot_invalid", exc)
             if completed.returncode != 0 or completed.stdout or completed.stderr:
+                if os.path.lexists(incomplete):
+                    _quarantine_and_remove_incomplete_source_snapshot(
+                        incomplete,
+                        quarantine,
+                        expected_uid=expected_uid,
+                        expected_gid=expected_gid,
+                    )
                 _fail("rotation_stager_installer_source_snapshot_invalid")
         try:
             state = os.lstat(incomplete)
@@ -381,14 +490,462 @@ def _install_exact_source_snapshot(
             "--force",
             "--detach",
             release_revision,
+            preserve_fd=lock_descriptor,
         )
-        validate(incomplete)
+        validate(incomplete, preserve_fd=lock_descriptor)
         _fsync_snapshot_tree(incomplete)
         _rename_directory_noreplace(incomplete, destination)
         _fsync_directory(destination.parent)
         created = True
-    validate(destination)
-    return created
+        validate(destination, preserve_fd=lock_descriptor)
+        return created
+    finally:
+        try:
+            fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(lock_descriptor)
+
+
+def _source_snapshot_clone_intent(
+    *,
+    source_root: Path,
+    destination: Path,
+    release_revision: str,
+    source_tree_oid: str,
+    expected_uid: int,
+    expected_gid: int,
+) -> Mapping[str, Any]:
+    unsigned = {
+        "schema": "muncho-release-source-snapshot-clone-intent.v1",
+        "source_root": str(source_root),
+        "destination": str(destination),
+        "release_revision": release_revision,
+        "source_tree_oid": source_tree_oid,
+        "expected_uid": expected_uid,
+        "expected_gid": expected_gid,
+        "clone_transport": "local-path-only",
+        "clone_no_hardlinks": True,
+        "clone_checkout": False,
+        "secret_material_recorded": False,
+        "secret_digest_recorded": False,
+    }
+    return {
+        **unsigned,
+        "intent_sha256": _sha256(_canonical(unsigned)),
+    }
+
+
+def _acquire_source_snapshot_lock(
+    path: Path,
+    *,
+    expected_uid: int,
+    expected_gid: int,
+) -> int:
+    descriptor: int | None = None
+    created = False
+    try:
+        try:
+            descriptor = os.open(
+                path,
+                os.O_RDWR
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+            created = True
+        except FileExistsError:
+            descriptor = os.open(
+                path,
+                os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+            )
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        state = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(state.st_mode)
+            or state.st_uid != expected_uid
+            or state.st_gid != expected_gid
+            or state.st_nlink != 1
+            or stat.S_IMODE(state.st_mode) != 0o600
+            or state.st_size != 0
+        ):
+            _fail("rotation_stager_installer_source_snapshot_lock_invalid")
+        if created:
+            os.fsync(descriptor)
+            _fsync_directory(path.parent)
+        return descriptor
+    except RotationStagerInstallerError:
+        if descriptor is not None:
+            os.close(descriptor)
+        raise
+    except OSError as exc:
+        if descriptor is not None:
+            os.close(descriptor)
+        _fail("rotation_stager_installer_source_snapshot_lock_invalid", exc)
+
+
+def _read_exact_regular_file(
+    path: Path,
+    *,
+    expected_uid: int,
+    expected_gid: int,
+    allowed_modes: frozenset[int],
+    maximum: int,
+) -> tuple[bytes, os.stat_result]:
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        state = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(state.st_mode)
+            or state.st_uid != expected_uid
+            or state.st_gid != expected_gid
+            or stat.S_IMODE(state.st_mode) not in allowed_modes
+            or state.st_size > maximum
+        ):
+            _fail("rotation_stager_installer_source_snapshot_intent_invalid")
+        chunks: list[bytes] = []
+        remaining = maximum + 1
+        while remaining > 0:
+            raw = os.read(descriptor, min(remaining, 64 * 1024))
+            if not raw:
+                break
+            chunks.append(raw)
+            remaining -= len(raw)
+        value = b"".join(chunks)
+        if len(value) > maximum:
+            _fail("rotation_stager_installer_source_snapshot_intent_invalid")
+        return value, state
+    except RotationStagerInstallerError:
+        raise
+    except OSError as exc:
+        _fail("rotation_stager_installer_source_snapshot_intent_invalid", exc)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _publish_clone_intent_exact(
+    path: Path,
+    pending: Path,
+    raw: bytes,
+    *,
+    expected_uid: int,
+    expected_gid: int,
+) -> None:
+    maximum = max(len(raw), 1)
+    try:
+        final_exists = os.path.lexists(path)
+        pending_exists = os.path.lexists(pending)
+    except OSError as exc:
+        _fail("rotation_stager_installer_source_snapshot_intent_invalid", exc)
+
+    if final_exists:
+        existing, final_state = _read_exact_regular_file(
+            path,
+            expected_uid=expected_uid,
+            expected_gid=expected_gid,
+            allowed_modes=frozenset({0o444}),
+            maximum=maximum,
+        )
+        if existing != raw:
+            _fail("rotation_stager_installer_source_snapshot_intent_conflict")
+        if not pending_exists:
+            if final_state.st_nlink != 1:
+                _fail("rotation_stager_installer_source_snapshot_intent_invalid")
+            return
+        staged, staged_state = _read_exact_regular_file(
+            pending,
+            expected_uid=expected_uid,
+            expected_gid=expected_gid,
+            allowed_modes=frozenset({0o444, 0o600}),
+            maximum=maximum,
+        )
+        if staged != raw:
+            _fail("rotation_stager_installer_source_snapshot_intent_conflict")
+        same_inode = (
+            final_state.st_dev == staged_state.st_dev
+            and final_state.st_ino == staged_state.st_ino
+        )
+        if same_inode:
+            if final_state.st_nlink != 2 or staged_state.st_nlink != 2:
+                _fail("rotation_stager_installer_source_snapshot_intent_invalid")
+        elif final_state.st_nlink != 1 or staged_state.st_nlink != 1:
+            _fail("rotation_stager_installer_source_snapshot_intent_invalid")
+        try:
+            os.unlink(pending)
+            _fsync_directory(path.parent)
+        except OSError as exc:
+            _fail("rotation_stager_installer_source_snapshot_intent_invalid", exc)
+        return
+
+    if not pending_exists:
+        descriptor: int | None = None
+        try:
+            descriptor = os.open(
+                pending,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+            os.fchmod(descriptor, 0o600)
+            os.fchown(descriptor, expected_uid, expected_gid)
+            os.fsync(descriptor)
+            _fsync_directory(path.parent)
+        except OSError as exc:
+            _fail("rotation_stager_installer_source_snapshot_intent_invalid", exc)
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+
+    staged, staged_state = _read_exact_regular_file(
+        pending,
+        expected_uid=expected_uid,
+        expected_gid=expected_gid,
+        allowed_modes=frozenset({0o444, 0o600}),
+        maximum=maximum,
+    )
+    if staged_state.st_nlink != 1:
+        _fail("rotation_stager_installer_source_snapshot_intent_invalid")
+    if stat.S_IMODE(staged_state.st_mode) == 0o600:
+        if not raw.startswith(staged):
+            _fail("rotation_stager_installer_source_snapshot_intent_conflict")
+        descriptor = None
+        try:
+            descriptor = os.open(
+                pending,
+                os.O_WRONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+            )
+            state = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(state.st_mode)
+                or state.st_uid != expected_uid
+                or state.st_gid != expected_gid
+                or state.st_nlink != 1
+                or stat.S_IMODE(state.st_mode) != 0o600
+            ):
+                _fail("rotation_stager_installer_source_snapshot_intent_invalid")
+            os.ftruncate(descriptor, 0)
+            view = memoryview(raw)
+            while view:
+                written = os.write(descriptor, view)
+                if written <= 0:
+                    _fail("rotation_stager_installer_source_snapshot_intent_invalid")
+                view = view[written:]
+            os.fsync(descriptor)
+            os.fchmod(descriptor, 0o444)
+            os.fsync(descriptor)
+        except RotationStagerInstallerError:
+            raise
+        except OSError as exc:
+            _fail("rotation_stager_installer_source_snapshot_intent_invalid", exc)
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+    elif staged != raw:
+        _fail("rotation_stager_installer_source_snapshot_intent_conflict")
+
+    try:
+        os.link(pending, path, follow_symlinks=False)
+        _fsync_directory(path.parent)
+        os.unlink(pending)
+        _fsync_directory(path.parent)
+    except FileExistsError:
+        _fail("rotation_stager_installer_source_snapshot_intent_conflict")
+    except OSError as exc:
+        _fail("rotation_stager_installer_source_snapshot_intent_invalid", exc)
+    existing, state = _read_exact_regular_file(
+        path,
+        expected_uid=expected_uid,
+        expected_gid=expected_gid,
+        allowed_modes=frozenset({0o444}),
+        maximum=maximum,
+    )
+    if existing != raw or state.st_nlink != 1:
+        _fail("rotation_stager_installer_source_snapshot_intent_invalid")
+
+
+def _validate_local_snapshot_tree(
+    root: Path,
+    *,
+    expected_uid: int,
+    expected_gid: int,
+) -> None:
+    if os.path.lexists(root / ".git/objects/info/alternates"):
+        _fail("rotation_stager_installer_source_snapshot_invalid")
+
+    def walk_error(cause: OSError) -> Never:
+        _fail("rotation_stager_installer_source_snapshot_invalid", cause)
+
+    try:
+        for current, names, files in os.walk(
+            root,
+            followlinks=False,
+            onerror=walk_error,
+        ):
+            selected = Path(current)
+            for name in (*names, *files):
+                state = os.lstat(selected / name)
+                if state.st_uid != expected_uid or state.st_gid != expected_gid:
+                    _fail("rotation_stager_installer_source_snapshot_invalid")
+                if stat.S_ISLNK(state.st_mode):
+                    continue
+                if not stat.S_ISREG(state.st_mode) and not stat.S_ISDIR(state.st_mode):
+                    _fail("rotation_stager_installer_source_snapshot_invalid")
+                if stat.S_IMODE(state.st_mode) & 0o022 or (
+                    stat.S_ISREG(state.st_mode) and state.st_nlink != 1
+                ):
+                    _fail("rotation_stager_installer_source_snapshot_invalid")
+    except RotationStagerInstallerError:
+        raise
+    except OSError as exc:
+        _fail("rotation_stager_installer_source_snapshot_invalid", exc)
+
+
+def _quarantine_and_remove_incomplete_source_snapshot(
+    incomplete: Path,
+    quarantine: Path,
+    *,
+    expected_uid: int,
+    expected_gid: int,
+) -> None:
+    _validate_owned_snapshot_directory(
+        incomplete,
+        expected_uid=expected_uid,
+        expected_gid=expected_gid,
+    )
+    if os.path.lexists(quarantine):
+        _fail("rotation_stager_installer_source_snapshot_conflict")
+    _rename_directory_noreplace(incomplete, quarantine)
+    _fsync_directory(incomplete.parent)
+    _remove_quarantined_source_snapshot(
+        quarantine,
+        expected_uid=expected_uid,
+        expected_gid=expected_gid,
+    )
+
+
+def _validate_owned_snapshot_directory(
+    path: Path,
+    *,
+    expected_uid: int,
+    expected_gid: int,
+) -> None:
+    try:
+        state = os.lstat(path)
+    except OSError as exc:
+        _fail("rotation_stager_installer_source_snapshot_invalid", exc)
+    if (
+        not stat.S_ISDIR(state.st_mode)
+        or stat.S_ISLNK(state.st_mode)
+        or state.st_uid != expected_uid
+        or state.st_gid != expected_gid
+        or stat.S_IMODE(state.st_mode) & 0o022
+    ):
+        _fail("rotation_stager_installer_source_snapshot_conflict")
+
+
+def _remove_quarantined_source_snapshot(
+    quarantine: Path,
+    *,
+    expected_uid: int,
+    expected_gid: int,
+) -> None:
+    _validate_owned_snapshot_directory(
+        quarantine,
+        expected_uid=expected_uid,
+        expected_gid=expected_gid,
+    )
+    parent_descriptor: int | None = None
+    directory_descriptor: int | None = None
+    try:
+        parent_descriptor = os.open(
+            quarantine.parent,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        directory_descriptor = os.open(
+            quarantine.name,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent_descriptor,
+        )
+        _clear_owned_directory_fd(
+            directory_descriptor,
+            expected_uid=expected_uid,
+            expected_gid=expected_gid,
+        )
+        os.close(directory_descriptor)
+        directory_descriptor = None
+        os.rmdir(quarantine.name, dir_fd=parent_descriptor)
+        os.fsync(parent_descriptor)
+    except RotationStagerInstallerError:
+        raise
+    except OSError as exc:
+        _fail("rotation_stager_installer_source_snapshot_cleanup_failed", exc)
+    finally:
+        if directory_descriptor is not None:
+            os.close(directory_descriptor)
+        if parent_descriptor is not None:
+            os.close(parent_descriptor)
+
+
+def _clear_owned_directory_fd(
+    descriptor: int,
+    *,
+    expected_uid: int,
+    expected_gid: int,
+) -> None:
+    try:
+        entries = tuple(os.scandir(descriptor))
+    except OSError as exc:
+        _fail("rotation_stager_installer_source_snapshot_cleanup_failed", exc)
+    for entry in entries:
+        try:
+            state = os.stat(entry.name, dir_fd=descriptor, follow_symlinks=False)
+        except OSError as exc:
+            _fail("rotation_stager_installer_source_snapshot_cleanup_failed", exc)
+        if state.st_uid != expected_uid or state.st_gid != expected_gid:
+            _fail("rotation_stager_installer_source_snapshot_conflict")
+        if stat.S_ISDIR(state.st_mode):
+            child = None
+            try:
+                child = os.open(
+                    entry.name,
+                    os.O_RDONLY
+                    | getattr(os, "O_CLOEXEC", 0)
+                    | getattr(os, "O_DIRECTORY", 0)
+                    | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=descriptor,
+                )
+                _clear_owned_directory_fd(
+                    child,
+                    expected_uid=expected_uid,
+                    expected_gid=expected_gid,
+                )
+            finally:
+                if child is not None:
+                    os.close(child)
+            os.rmdir(entry.name, dir_fd=descriptor)
+        else:
+            os.unlink(entry.name, dir_fd=descriptor)
+    try:
+        os.fsync(descriptor)
+    except OSError as exc:
+        _fail("rotation_stager_installer_source_snapshot_cleanup_failed", exc)
 
 
 def _fsync_directory(path: Path) -> None:
@@ -411,8 +968,16 @@ def _fsync_directory(path: Path) -> None:
 
 def _fsync_snapshot_tree(root: Path) -> None:
     directories: list[Path] = []
+
+    def walk_error(cause: OSError) -> Never:
+        _fail("rotation_stager_installer_source_snapshot_durability_failed", cause)
+
     try:
-        for current, names, files in os.walk(root, followlinks=False):
+        for current, names, files in os.walk(
+            root,
+            followlinks=False,
+            onerror=walk_error,
+        ):
             selected = Path(current)
             directories.append(selected)
             for name in (*names, *files):
