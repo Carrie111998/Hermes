@@ -485,7 +485,16 @@ def load_hermes_dotenv(
         _sanitize_env_file_if_needed(project_env_path)
 
     if user_env.exists():
+        # HERMES_DASHBOARD_SESSION_TOKEN is injected by the desktop shell at
+        # process spawn time. The user .env may contain a *stale* persisted
+        # value from a previous update. Loading with override=True would
+        # clobber the injected token, breaking the desktop↔gateway WebSocket
+        # auth handshake. Save/restore it around the .env load so the injected
+        # value (if present) always wins.
+        _desktop_session_token = os.environ.get("HERMES_DASHBOARD_SESSION_TOKEN")
         _load_dotenv_with_fallback(user_env, override=True)
+        if _desktop_session_token is not None:
+            os.environ["HERMES_DASHBOARD_SESSION_TOKEN"] = _desktop_session_token
         loaded.append(user_env)
         # Mirror reload_env() known-key cleanup so inherited Hermes keys
         # absent from this profile's .env do not leak into the runtime.
