@@ -105,13 +105,16 @@ export interface PluginRegistry {
  * well as React plugins (read the fields, ``subscribe`` inside a ``useEffect``).
  *
  * Freshness: the getters re-read the host's live store on each access, so a
- * consumer that RE-READS after a change sees the new value. Before
- * ``ProfileProvider`` mounts, the fields read a safe empty default
- * (``profile: ""``, ``currentProfile: ""``, ``profiles: []``) which is
- * indistinguishable from a genuine "no profiles / own-profile" state, so a
- * consumer that needs the live value MUST ``subscribe`` (or re-read after
- * first paint) rather than latch the initial read. ``profiles`` is returned
- * frozen; treat it as read-only (mutating it does not affect host state).
+ * consumer that RE-READS after a change sees the new value. Before the host
+ * provider mounts, the fields read a safe empty default (``profile: ""``,
+ * ``currentProfile: ""``, ``profiles: []``) which is indistinguishable from
+ * a genuine "no profiles / own-profile" state. Subscribing alone is
+ * sufficient to never latch that seed: ``subscribe`` fires the callback once
+ * immediately with whatever is current at subscribe time, and again on every
+ * later change, so there is no missable window for a consumer that loads
+ * after the host booted (plugin bundles load asynchronously). ``profiles``
+ * is returned frozen; treat it as read-only (mutating it does not affect
+ * host state).
  */
 export interface ProfileScopeValue {
   /** Profile every management surface reads/writes ("" = the dashboard's own). */
@@ -121,8 +124,10 @@ export interface ProfileScopeValue {
   /** Known profile names (frozen; treat as read-only). */
   readonly profiles: readonly string[];
   /**
-   * Register a zero-arg callback fired on any change to the fields above
-   * (the callback re-reads the getters); returns an unsubscribe thunk.
+   * Register a zero-arg callback; returns an unsubscribe thunk. The callback
+   * fires once immediately at subscribe time (bootstrap: read the getters
+   * inside it for the current state) and again on any change to the fields
+   * above. Call the returned thunk on plugin teardown.
    */
   subscribe(cb: () => void): () => void;
 }

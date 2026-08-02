@@ -11,7 +11,7 @@
  * `exposePluginSDK()` runs once at boot, outside any React render, so a value
  * read there would freeze and never reflect a switcher flip. `ProfileProvider`
  * writes into this store via an effect; the SDK getters read from it on access
- * and `subscribe(cb)` notifies on change.
+ * and `subscribe(cb)` fires once immediately (bootstrap) and then on change.
  *
  * This module is host-internal: it is imported only by `registry.ts` and
  * `ProfileProvider.tsx` and is never named in the public `sdk.d.ts` contract.
@@ -39,8 +39,9 @@ type Subscriber = () => void;
 // Internal mutable snapshot. Seeded with a safe empty default so a read before
 // `ProfileProvider` mounts never throws or returns undefined. The empty default
 // is indistinguishable from a genuine "no profiles / own-profile" state, so a
-// consumer that needs the live value must subscribe (or re-read after first
-// paint) rather than latch this seed.
+// consumer that needs the live value must subscribe; the bootstrap call plus
+// change notifications make subscribing alone sufficient (no polling, no
+// re-read-after-paint choreography).
 let _snapshot: { profile: string; currentProfile: string; profiles: string[] } = {
   profile: "",
   currentProfile: "",
@@ -103,9 +104,25 @@ export const profileBridge = {
     }
   },
 
-  /** Register a zero-arg callback; returns an idempotent unsubscribe thunk. */
+  /**
+   * Register a zero-arg callback; returns an idempotent unsubscribe thunk.
+   *
+   * Bootstrap delivery: the callback fires once, synchronously, at subscribe
+   * time. Plugin bundles load asynchronously (see `usePlugins.ts`), so a
+   * consumer can subscribe AFTER the provider's first `set()`; without the
+   * bootstrap call it would read nothing until the next switcher flip. Firing
+   * immediately makes "subscribe and read the getters in the callback" a
+   * complete consumption pattern with no missable window between a `get()`
+   * and a `subscribe()`. Same isolation as a change dispatch: a throwing
+   * callback is logged, never escapes, and stays registered.
+   */
   subscribe(cb: Subscriber): () => void {
     _subscribers.add(cb);
+    try {
+      cb();
+    } catch (err) {
+      console.error("[hermes] profileScope subscriber threw:", err);
+    }
     return () => {
       _subscribers.delete(cb);
     };

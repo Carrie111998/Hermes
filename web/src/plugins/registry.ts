@@ -168,7 +168,8 @@ export function exposePluginSDK() {
     useI18n,
 
     // Live, read-only view of the host's management-profile switcher, plus a
-    // subscribe(cb) to react when an operator flips it. An object with live
+    // subscribe(cb) that fires once immediately (bootstrap) and then on every
+    // operator flip. An object with live
     // getters (not a bare hook) so non-React consumers (plain-JS plugin
     // bundles that probe `typeof sdk.profileScope === "object"` and call
     // `.subscribe`) work too. Getters re-read the host-internal store at
