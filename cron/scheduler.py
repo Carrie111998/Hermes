@@ -3011,6 +3011,7 @@ def run_job(
     # Mark this as a cron session so the approval system can apply cron_mode.
     # This env var is process-wide and persists for the lifetime of the
     # scheduler process — every job this process runs is a cron job.
+    _prev_cron_session_flag = os.environ.get("HERMES_CRON_SESSION")
     os.environ["HERMES_CRON_SESSION"] = "1"
 
     # Use ContextVars for per-job session/delivery state so parallel jobs
@@ -3763,6 +3764,16 @@ def run_job(
         # clear_session_vars also clears _SESSION_CWD internally, so no
         # separate clear_session_cwd() call is needed.
         clear_session_vars(_ctx_tokens)
+
+        # Restore the cron-session flag. Without this, the process-global
+        # HERMES_CRON_SESSION=1 leaks into later live gateway turns and
+        # _is_gateway_approval_context() misclassifies them as cron,
+        # failing closed instead of rendering platform approval controls
+        # (#76748).
+        if _prev_cron_session_flag is None:
+            os.environ.pop("HERMES_CRON_SESSION", None)
+        else:
+            os.environ["HERMES_CRON_SESSION"] = _prev_cron_session_flag
         for _var_name in _cron_delivery_vars:
             _VAR_MAP[_var_name].set("")
         if _session_db:
