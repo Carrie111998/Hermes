@@ -139,7 +139,12 @@ def _capture_isolated_worker_baseline(agent: Any) -> None:
             getattr(agent, "_workspace_lease_authority", None)
             or getattr(agent, "session_id", None)
         )
-        receipt = isolated_worker_proof_status_for_authority(str(authority))
+        from agent.turn_context import _validate_runtime_effect_receipt
+
+        receipt = _validate_runtime_effect_receipt(
+            str(authority),
+            isolated_worker_proof_status_for_authority(str(authority)),
+        )
         generation = receipt.get("edit_generation")
         if type(generation) is not int:
             raise RuntimeError("isolated_worker_baseline_invalid")
@@ -152,260 +157,6 @@ def _capture_isolated_worker_baseline(agent: Any) -> None:
         changed = getattr(agent, "_turn_file_mutation_paths", None)
         if isinstance(changed, set):
             changed.add("/workspace")
-
-
-def _bounded_proof_gate_instruction(agent: Any) -> Optional[str]:
-    """Return the request-only proof instruction for an unverified code edit.
-
-    This is intentionally narrower than the legacy verification stop-loop:
-
-    * it is active only behind the existing ``verify_on_stop`` policy;
-    * it is driven only by landed, verifiable file mutations;
-    * callers append it to the API copy of the current user message, never to
-      the durable transcript; and
-    * the conversation loop permits at most one instruction-bearing
-      continuation before failing the turn truthfully.
-
-    ``build_verify_on_stop_nudge`` is the single owner of project detection,
-    documentation-path filtering, and fresh-evidence classification.  A
-    missing project/verification surface remains not-applicable rather than
-    turning every arbitrary file write into a blocked engineering turn.
-    """
-    changed_paths = getattr(agent, "_turn_file_mutation_paths", None)
-    if not isinstance(changed_paths, set):
-        changed_paths = set(changed_paths or ())
-        agent._turn_file_mutation_paths = changed_paths
-    _runtime_effect_active = bool(
-        getattr(
-            agent,
-            "_turn_isolated_worker_runtime_effect_active",
-            False,
-        )
-    )
-    _worker_selected = bool(
-        getattr(agent, "_isolated_worker_backend_selected", False)
-        or getattr(agent, "_turn_isolated_worker_proof_receipt", None)
-        is not None
-        or _runtime_effect_active
-    )
-    _live_worker_receipt = None
-    _worker_activity = bool(
-        getattr(
-            agent,
-            "_turn_isolated_worker_baseline_attempted",
-            False,
-        )
-        or getattr(agent, "_turn_isolated_worker_proof_receipt", None)
-        is not None
-        or getattr(agent, "_turn_isolated_worker_proof_error", None)
-        or changed_paths
-    )
-    if _worker_selected and _worker_activity:
-        try:
-            from tools.terminal_tool import (
-                isolated_worker_proof_status_for_authority,
-            )
-
-            _authority = (
-                getattr(agent, "_workspace_lease_authority", None)
-                or getattr(agent, "session_id", None)
-            )
-            _live_worker_receipt = (
-                isolated_worker_proof_status_for_authority(str(_authority))
-            )
-            _baseline = getattr(
-                agent,
-                "_turn_isolated_worker_baseline_generation",
-                None,
-            )
-            _generation = _live_worker_receipt.get("edit_generation")
-            if type(_baseline) is int and type(_generation) is int:
-                if _generation > _baseline:
-                    _pending = _live_worker_receipt.get("pending_paths")
-                    _delta_paths = (
-                        [
-                            str(path)
-                            for path in _pending
-                            if isinstance(path, str) and path
-                        ]
-                        if isinstance(_pending, list)
-                        else []
-                    )
-                    changed_paths.update(_delta_paths or ["/workspace"])
-                    agent._turn_isolated_worker_proof_receipt = dict(
-                        _live_worker_receipt
-                    )
-        except Exception as exc:
-            if changed_paths:
-                agent._turn_isolated_worker_proof_error = (
-                    "isolated_worker_live_status_failed:"
-                    f"{type(exc).__name__}"
-                )
-    if not changed_paths:
-        return None
-    try:
-        from agent.verification_stop import (
-            _filter_verifiable_paths,
-            build_verify_on_stop_nudge,
-            verify_on_stop_enabled,
-        )
-
-        if not _runtime_effect_active and not verify_on_stop_enabled():
-            return None
-        verifiable_paths = _filter_verifiable_paths(changed_paths)
-        if not verifiable_paths:
-            return None
-
-        # The isolated worker owns its proof epoch.  Parent-process SQLite may
-        # mirror receipts for UI/history, but it is never authoritative for
-        # this boundary.
-        if _worker_selected:
-            _proof_error = getattr(
-                agent,
-                "_turn_isolated_worker_proof_error",
-                None,
-            )
-            if (
-                _proof_error
-                and _runtime_effect_active
-                and bool(
-                    getattr(
-                        agent,
-                        "_turn_runtime_effect_uncertainty_recoverable",
-                        False,
-                    )
-                )
-                and bool(
-                    getattr(
-                        agent,
-                        "_turn_runtime_effect_fresh_proof_observed",
-                        False,
-                    )
-                )
-                and isinstance(_live_worker_receipt, dict)
-                and _live_worker_receipt.get("status") == "passed"
-                and _live_worker_receipt.get("verified_generation")
-                == _live_worker_receipt.get("edit_generation")
-            ):
-                # A fresh authoritative verification performed during the
-                # bounded continuation resolves dispatch-time uncertainty.
-                agent._turn_isolated_worker_proof_error = None
-                agent._turn_runtime_effect_uncertainty_recoverable = False
-            elif _proof_error:
-                raise RuntimeError("isolated_worker_proof_receipt_failed")
-            from gateway.isolated_worker import (
-                PROOF_RECEIPT_SCHEMA,
-                canonical_lease_id,
-            )
-            authority = (
-                getattr(agent, "_workspace_lease_authority", None)
-                or getattr(agent, "session_id", None)
-            )
-            if not authority:
-                raise RuntimeError("workspace_lease_authority_missing")
-            if _live_worker_receipt is None:
-                from tools.terminal_tool import (
-                    isolated_worker_proof_status_for_authority,
-                )
-
-                receipt = isolated_worker_proof_status_for_authority(
-                    str(authority)
-                )
-            else:
-                receipt = _live_worker_receipt
-            expected_lease = canonical_lease_id(str(authority))
-            if (
-                not isinstance(receipt, dict)
-                or receipt.get("schema") != PROOF_RECEIPT_SCHEMA
-                or receipt.get("lease_id") != expected_lease
-                or type(receipt.get("edit_generation")) is not int
-                or type(receipt.get("verified_generation")) is not int
-                or receipt["verified_generation"] > receipt["edit_generation"]
-                or receipt.get("status")
-                not in {"unverified", "passed", "failed", "stale"}
-                or receipt.get("applicability")
-                not in {"applicable", "not_applicable", "unknown"}
-            ):
-                raise RuntimeError("isolated_worker_proof_status_invalid")
-            agent._turn_isolated_worker_proof_receipt = dict(receipt)
-            if receipt["applicability"] == "not_applicable":
-                return None
-            if (
-                receipt["status"] == "passed"
-                and receipt["verified_generation"]
-                == receipt["edit_generation"]
-            ):
-                return None
-            return (
-                "[System: Code changed in this turn, but the isolated worker's "
-                "authoritative proof epoch is not fresh "
-                f"(status={receipt['status']}, "
-                f"edit_generation={receipt['edit_generation']}, "
-                f"verified_generation={receipt['verified_generation']}). "
-                "Run the most relevant focused test, lint, build, or explicit "
-                "probe now. A command that changes source cannot verify that "
-                "same source generation. If verification cannot run, report "
-                "the concrete blocker rather than claiming completion.]"
-            )
-        return build_verify_on_stop_nudge(
-            session_id=getattr(agent, "session_id", None),
-            changed_paths=verifiable_paths,
-            attempts=0,
-            max_attempts=1,
-        )
-    except Exception:
-        logger.debug("bounded proof-gate check failed", exc_info=True)
-        # Once policy is enabled and a landed edit exists, an unreadable proof
-        # ledger is not passing evidence.  Fail closed into the same single
-        # bounded continuation instead of silently upgrading uncertainty to
-        # success.  Project/not-applicable cases still return ``None`` normally
-        # from ``build_verify_on_stop_nudge`` above.
-        return (
-            "[System: Code changed in this turn, but the runtime could not read "
-            "fresh passing verification evidence. Run the most relevant focused "
-            "test, lint, build, or explicit probe now. If verification cannot "
-            "run, report the concrete blocker rather than claiming completion.]"
-        )
-
-
-def _bounded_proof_gate_failure_response(agent: Any) -> str:
-    """Build the mechanical partial receipt after the one proof retry."""
-    paths = sorted(
-        str(path)
-        for path in (getattr(agent, "_turn_file_mutation_paths", set()) or set())
-        if path
-    )
-    shown = paths[:8]
-    path_lines = "\n".join(f"- {path}" for path in shown)
-    if len(paths) > len(shown):
-        path_lines += f"\n- ... and {len(paths) - len(shown)} more"
-    if not path_lines:
-        path_lines = "- (changed paths unavailable)"
-    return (
-        "[RUNTIME PROOF RECEIPT — NOT MODEL-AUTHORED]\n"
-        "Status: PARTIAL / NOT VERIFIED\n"
-        "The engineering turn changed files but still had no fresh passing "
-        "verification evidence after its single bounded verification "
-        "continuation. The attempted completion was withheld and was not "
-        "persisted as a successful answer.\n"
-        "Changed paths:\n"
-        f"{path_lines}"
-    )
-
-
-def _record_bounded_proof_gate_failure(
-    agent: Any,
-    messages: List[Dict[str, Any]],
-) -> str:
-    """Append and announce the single mechanical proof-failure receipt."""
-    response = _bounded_proof_gate_failure_response(agent)
-    messages.append({"role": "assistant", "content": response})
-    agent._budget_grace_call = False
-    agent._emit_status(
-        "⚠️ Verification evidence is still missing after the bounded proof "
-        "continuation — returning a partial receipt"
-    )
-    return response
 
 
 def _apply_active_turn_redirect(agent: Any, messages: List[Dict[str, Any]], text: str) -> None:
@@ -1555,27 +1306,17 @@ def run_conversation(
     _last_preflight_pressure: Optional[int] = None
     _preflight_compression_blocked = _ctx.preflight_compression_blocked
     _turn_exit_reason = "unknown"  # Diagnostic: why the loop ended
-    # Last composed answer intentionally held back by a verification gate. If
-    # that continuation consumes the remaining budget, this is the best
-    # user-facing result available; it must not be confused with error or
-    # recovery text produced by unrelated exit paths.
-    _pending_verification_response = None
-    # Tracks whether the pending verification candidate was already streamed
+    # Last composed answer intentionally held back by a model-visible protocol
+    # continuation such as the Kanban completion contract. If that continuation
+    # consumes the remaining budget, this is the best user-facing result
+    # available; it must not be confused with unrelated recovery text.
+    _pending_continuation_response = None
+    # Tracks whether the pending continuation candidate was already streamed
     # to the user as interim content. The finalizer uses this to set
     # ``_response_was_previewed`` ONLY when the pending candidate is actually
     # reused as the final response — not merely because any interim was
     # streamed. (#65919 review: response-loss blocker)
-    _pending_verification_response_previewed = False
-    # Bounded proof-gate state.  The instruction is injected only into the
-    # request copy of the current user message, so the stored transcript and
-    # pre-turn historical cache prefix remain unchanged.  ``used`` never resets
-    # within the turn: even if the one continuation obtains evidence, a later
-    # edit cannot start a second verification loop.
-    _proof_gate_instruction: Optional[str] = None
-    _proof_gate_used = False
-    _proof_gate_continuation_dispatched = False
-    _proof_gate_instruction_for_iteration: Optional[str] = None
-    _hold_provisional_stream = False
+    _pending_continuation_response_previewed = False
     # If pre-API compression fires after MoA advisors have produced guidance,
     # retain that ephemeral output and rebase it onto the compacted transcript
     # on the next loop iteration. This prevents a second advisor fan-out.
@@ -1620,45 +1361,6 @@ def run_conversation(
                     f"User correction during the turn: {_redirect_text}"
                 )
             agent._persist_session(messages, conversation_history)
-
-        _proof_gate_instruction_for_iteration = _bounded_proof_gate_instruction(
-            agent
-        )
-        if (
-            _proof_gate_used
-            and _proof_gate_instruction_for_iteration
-            and (
-                _proof_gate_continuation_dispatched
-                or _proof_gate_instruction is None
-            )
-        ):
-            # The single instruction-bearing continuation returned tool output
-            # without producing fresh passing evidence, or fresh proof landed
-            # and a later edit made it stale again.  Stop before another
-            # provider call: no recursive nudges, no renewable-Todo escape hatch.
-            final_response = _record_bounded_proof_gate_failure(
-                agent, messages
-            )
-            failed = True
-            _turn_exit_reason = "bounded_proof_gate_unverified"
-            break
-        if (
-            _proof_gate_used
-            and _proof_gate_continuation_dispatched
-            and not _proof_gate_instruction_for_iteration
-        ):
-            # Fresh evidence landed during the continuation's tool call.  Allow
-            # one ordinary closing response, but keep ``used`` set so a later
-            # edit cannot open another proof loop in this turn.
-            _proof_gate_instruction = None
-            _proof_gate_continuation_dispatched = False
-
-        # Do not live-stream a candidate that the proof gate may have to
-        # withhold.  Tool calls still execute normally; only provisional text
-        # and reasoning delivery are held until evidence is fresh.
-        _hold_provisional_stream = bool(
-            _proof_gate_instruction_for_iteration
-        )
 
         # Reset per-turn checkpoint dedup so each iteration can take one snapshot
         agent._checkpoint_mgr.new_turn()
@@ -1999,19 +1701,6 @@ def run_conversation(
                     )
                     if _composed is not None:
                         api_msg["content"] = _composed
-                if _proof_gate_instruction:
-                    _proof_suffix = (
-                        "\n\n[RUNTIME BOUNDED PROOF GATE — REQUEST ONLY]\n"
-                        + _proof_gate_instruction
-                    )
-                    _proof_content = api_msg.get("content", "")
-                    if isinstance(_proof_content, str):
-                        api_msg["content"] = _proof_content + _proof_suffix
-                    elif isinstance(_proof_content, list):
-                        api_msg["content"] = [
-                            *_proof_content,
-                            {"type": "text", "text": _proof_suffix},
-                        ]
             elif (
                 isinstance(_api_content, str)
                 and _api_content
@@ -2833,38 +2522,14 @@ def run_conversation(
                     # request construction can never reach either streaming or
                     # non-streaming provider I/O.
                     attest_pinned_effective_config_projection()
-                    _saved_stream_delta = None
-                    _saved_stream_callback = None
-                    _saved_reasoning_callback = None
-                    if _hold_provisional_stream:
-                        # We know before dispatch that the workspace lacks fresh
-                        # proof.  Temporarily detach delivery sinks so a
-                        # premature "done" cannot escape token-by-token before
-                        # finalization classifies it.  The provider call still
-                        # streams internally for liveness and is restored in
-                        # ``finally`` for the verified closing response.
-                        _saved_stream_delta = agent.stream_delta_callback
-                        _saved_stream_callback = getattr(
-                            agent, "_stream_callback", None
+                    if _use_streaming:
+                        return agent._interruptible_streaming_api_call(
+                            next_api_kwargs, on_first_delta=_stop_spinner
                         )
-                        _saved_reasoning_callback = agent.reasoning_callback
-                        agent.stream_delta_callback = None
-                        agent._stream_callback = None
-                        agent.reasoning_callback = None
-                    try:
-                        if _use_streaming:
-                            return agent._interruptible_streaming_api_call(
-                                next_api_kwargs, on_first_delta=_stop_spinner
-                            )
-                        # The provider call is model-authoritative. Third-party
-                        # execution wrappers may observe via notification hooks,
-                        # but cannot rewrite the request or replace the response.
-                        return agent._interruptible_api_call(next_api_kwargs)
-                    finally:
-                        if _hold_provisional_stream:
-                            agent.stream_delta_callback = _saved_stream_delta
-                            agent._stream_callback = _saved_stream_callback
-                            agent.reasoning_callback = _saved_reasoning_callback
+                    # The provider call is model-authoritative. Third-party
+                    # execution wrappers may observe via notification hooks,
+                    # but cannot rewrite the request or replace the response.
+                    return agent._interruptible_api_call(next_api_kwargs)
 
                 from hermes_cli.middleware import run_llm_execution_middleware
 
@@ -3929,8 +3594,6 @@ def run_conversation(
                     outcome="success",
                 )
                 agent._touch_activity(f"API call #{api_call_count} completed")
-                if _proof_gate_instruction:
-                    _proof_gate_continuation_dispatched = True
                 break  # Success, exit retry loop
 
             except InterruptedError:
@@ -6935,60 +6598,21 @@ def run_conversation(
                         _isolated_suppression_receipt = False
 
                 if _isolated_suppression_receipt:
-                    _suppression_proof_instruction = (
-                        _bounded_proof_gate_instruction(agent)
+                    final_response = DELIVERY_SUPPRESSION_TOKEN
+                    _turn_exit_reason = (
+                        "text_response(structured_delivery_suppression)"
                     )
-                    if _suppression_proof_instruction:
-                        if (
-                            _proof_gate_used
-                            and (
-                                _proof_gate_continuation_dispatched
-                                or _proof_gate_instruction is None
-                            )
-                        ):
-                            final_response = (
-                                _record_bounded_proof_gate_failure(
-                                    agent, messages
-                                )
-                            )
-                            failed = True
-                            _turn_exit_reason = (
-                                "bounded_proof_gate_unverified"
-                            )
-                            break
-                        if not _proof_gate_used:
-                            _proof_gate_used = True
-                            _proof_gate_instruction = (
-                                _suppression_proof_instruction
-                            )
-                            logger.info(
-                                "structured delivery suppression deferred "
-                                "for one bounded proof continuation "
-                                "(session=%s turn=%s)",
-                                getattr(agent, "session_id", None) or "-",
-                                turn_id,
-                            )
-                            agent._emit_wait_notice(
-                                "↻ Code changed without fresh passing "
-                                "verification — running one bounded proof "
-                                "continuation"
-                            )
-                    else:
-                        final_response = DELIVERY_SUPPRESSION_TOKEN
-                        _turn_exit_reason = (
-                            "text_response(structured_delivery_suppression)"
-                        )
-                        messages.append(
-                            {"role": "assistant", "content": final_response}
-                        )
-                        logger.info(
-                            "structured delivery suppression completed turn "
-                            "without a follow-up provider call "
-                            "(session=%s turn=%s)",
-                            getattr(agent, "session_id", None) or "-",
-                            turn_id,
-                        )
-                        break
+                    messages.append(
+                        {"role": "assistant", "content": final_response}
+                    )
+                    logger.info(
+                        "structured delivery suppression completed turn "
+                        "without a follow-up provider call "
+                        "(session=%s turn=%s)",
+                        getattr(agent, "session_id", None) or "-",
+                        turn_id,
+                    )
+                    break
 
                 # Reset per-turn retry counters after successful tool
                 # execution so a single truncation doesn't poison the
@@ -7474,10 +7098,9 @@ def run_conversation(
                 agent._dropped_toolcall_retries = 0
 
                 # Pop thinking-only prefill and empty-response retry
-                # scaffolding before appending either a final response or a
-                # verification-stop follow-up. These internal turns are only
-                # for the next API retry and should not become durable
-                # transcript context.
+                # scaffolding before appending the model-authored final response.
+                # These internal turns are only for the next API retry and should
+                # not become durable transcript context.
                 while (
                     messages
                     and isinstance(messages[-1], dict)
@@ -7489,53 +7112,6 @@ def run_conversation(
                     )
                 ):
                     messages.pop()
-
-                # ── Bounded proof gate for engineering edits ──────────
-                # A landed code edit may not become a successful final answer
-                # without fresh passing evidence.  Unlike the removed legacy
-                # loop, this never appends an assistant/user synthetic pair:
-                # the candidate is withheld entirely and the instruction is
-                # carried only on the next request's copy of the existing user
-                # message.  One continuation is the hard limit.
-                _proof_gate_instruction_for_iteration = (
-                    _bounded_proof_gate_instruction(agent)
-                )
-                if _proof_gate_instruction_for_iteration:
-                    if (
-                        _proof_gate_used
-                        and (
-                            _proof_gate_continuation_dispatched
-                            or _proof_gate_instruction is None
-                        )
-                    ):
-                        final_response = _record_bounded_proof_gate_failure(
-                            agent, messages
-                        )
-                        failed = True
-                        _turn_exit_reason = "bounded_proof_gate_unverified"
-                        break
-                    if not _proof_gate_used:
-                        _proof_gate_used = True
-                        _proof_gate_instruction = (
-                            _proof_gate_instruction_for_iteration
-                        )
-                        final_response = None
-                        logger.info(
-                            "bounded proof-gate continuation armed "
-                            "(session=%s, changed_paths=%d)",
-                            getattr(agent, "session_id", None) or "-",
-                            len(
-                                getattr(
-                                    agent, "_turn_file_mutation_paths", set()
-                                )
-                                or set()
-                            ),
-                        )
-                        agent._emit_wait_notice(
-                            "↻ Code changed without fresh passing verification "
-                            "— running one bounded proof continuation"
-                        )
-                        continue
 
                 # ── Kanban worker terminal-tool stop guard ─────────────
                 # Workers must end with kanban_complete / kanban_block.
@@ -7576,12 +7152,11 @@ def run_conversation(
                         "⚠️ Kanban worker tried to exit without "
                         "kanban_complete/kanban_block — nudging to finish"
                     )
-                    # Same finalizer contract as verify-on-stop: clear
-                    # final_response while continuing so a later budget
-                    # exhaustion path does not treat the narrated stop as
-                    # a completed answer.
-                    _pending_verification_response = final_response
-                    _pending_verification_response_previewed = (
+                    # Clear final_response while continuing so a later budget
+                    # exhaustion path does not treat the narrated stop as a
+                    # completed answer.
+                    _pending_continuation_response = final_response
+                    _pending_continuation_response_previewed = (
                         agent._interim_content_was_streamed(final_response or "")
                     )
                     final_response = None
@@ -7714,8 +7289,8 @@ def run_conversation(
         original_user_message=original_user_message,
         _should_review_memory=_should_review_memory,
         _turn_exit_reason=_turn_exit_reason,
-        _pending_verification_response=_pending_verification_response,
-        _pending_verification_response_previewed=_pending_verification_response_previewed,
+        _pending_continuation_response=_pending_continuation_response,
+        _pending_continuation_response_previewed=_pending_continuation_response_previewed,
     )
 
 

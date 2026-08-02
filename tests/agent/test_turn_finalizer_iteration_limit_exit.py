@@ -94,7 +94,7 @@ def _finalize(
     final_response,
     exit_reason,
     api_call_count=60,
-    pending_verification_response=None,
+    pending_continuation_response=None,
 ):
     return finalize_turn(
         agent,
@@ -110,12 +110,12 @@ def _finalize(
         original_user_message="task",
         _should_review_memory=False,
         _turn_exit_reason=exit_reason,
-        _pending_verification_response=pending_verification_response,
+        _pending_continuation_response=pending_continuation_response,
     )
 
 
-def test_pending_verify_response_is_preserved_for_cron_delivery(monkeypatch):
-    """A held-back verification response survives last-turn exhaustion."""
+def test_pending_continuation_response_is_preserved_for_cron_delivery(monkeypatch):
+    """A held response survives last-turn exhaustion."""
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
     agent = _LimitAgent()
     report = "complete cron report body"
@@ -124,7 +124,7 @@ def test_pending_verify_response_is_preserved_for_cron_delivery(monkeypatch):
         agent,
         final_response=None,
         exit_reason="unknown",
-        pending_verification_response=report,
+        pending_continuation_response=report,
     )
 
     assert result["final_response"] == report
@@ -132,7 +132,7 @@ def test_pending_verify_response_is_preserved_for_cron_delivery(monkeypatch):
     assert agent._handle_max_iterations_called is False
 
 
-def test_pending_pre_verify_response_is_preserved_on_budget_exhaustion(monkeypatch):
+def test_pending_continuation_response_is_preserved_on_budget_exhaustion(monkeypatch):
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
     agent = _LimitAgent()
     report = "budget exhausted but complete"
@@ -141,7 +141,7 @@ def test_pending_pre_verify_response_is_preserved_on_budget_exhaustion(monkeypat
         agent,
         final_response=None,
         exit_reason="budget_exhausted",
-        pending_verification_response=report,
+        pending_continuation_response=report,
     )
 
     assert result["final_response"] == report
@@ -149,7 +149,7 @@ def test_pending_pre_verify_response_is_preserved_on_budget_exhaustion(monkeypat
     assert agent._handle_max_iterations_called is False
 
 
-def test_empty_pending_verification_response_uses_summary_fallback(monkeypatch):
+def test_empty_pending_continuation_response_uses_summary_fallback(monkeypatch):
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
     agent = _LimitAgent()
 
@@ -157,7 +157,7 @@ def test_empty_pending_verification_response_uses_summary_fallback(monkeypatch):
         agent,
         final_response=None,
         exit_reason="unknown",
-        pending_verification_response="",
+        pending_continuation_response="",
     )
 
     assert result["final_response"] == "summary from extra call"
@@ -175,7 +175,7 @@ def test_short_generated_summary_keeps_abnormal_turn_explainer(monkeypatch):
     assert result["final_response"] == "The\n\niteration-limit explanation"
 
 
-def test_short_preserved_verification_response_is_not_rewritten(monkeypatch):
+def test_short_preserved_continuation_response_is_not_rewritten(monkeypatch):
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
     agent = _LimitAgent(completion_explainer=True)
 
@@ -183,7 +183,7 @@ def test_short_preserved_verification_response_is_not_rewritten(monkeypatch):
         agent,
         final_response=None,
         exit_reason="unknown",
-        pending_verification_response="The",
+        pending_continuation_response="The",
     )
 
     assert result["final_response"] == "The"
@@ -298,7 +298,7 @@ def test_pending_response_does_not_mask_later_terminal_exit(
         original_user_message="task",
         _should_review_memory=False,
         _turn_exit_reason=exit_reason,
-        _pending_verification_response="stale premature report",
+        _pending_continuation_response="stale premature report",
     )
 
     assert result["final_response"] is None
@@ -320,7 +320,7 @@ def test_pending_response_records_kanban_timeout(monkeypatch):
         agent,
         final_response=None,
         exit_reason="unknown",
-        pending_verification_response="composed report",
+        pending_continuation_response="composed report",
     )
 
     assert result["turn_exit_reason"] == "max_iterations_reached(60/60)"
@@ -339,7 +339,7 @@ def test_pending_response_records_kanban_timeout(monkeypatch):
 
 
 def test_published_pending_candidate_is_not_duplicated_by_finalizer(monkeypatch):
-    """When budget exhaustion preserves a verification candidate that is
+    """When budget exhaustion preserves a continuation candidate that is
     already the tail assistant message, the finalizer must NOT append a
     duplicate. The content-comparison guard prevents this. (#65919 §7)
     """
@@ -365,7 +365,7 @@ def test_published_pending_candidate_is_not_duplicated_by_finalizer(monkeypatch)
         original_user_message="task",
         _should_review_memory=False,
         _turn_exit_reason="unknown",
-        _pending_verification_response=report,
+        _pending_continuation_response=report,
     )
 
     # The tail assistant already matches final_response — no duplicate appended.
@@ -377,8 +377,8 @@ def test_published_pending_candidate_is_not_duplicated_by_finalizer(monkeypatch)
     assert persisted_roles == ["user", "assistant"]
 
 
-def test_terminal_verification_failure_is_persisted_as_one_correction(monkeypatch):
-    """When verification fails terminally (nudge present but budget exhausted),
+def test_terminal_continuation_is_persisted_as_one_correction(monkeypatch):
+    """When a legacy nudge is present but budget is exhausted,
     the finalizer drops the synthetic nudge and the assistant candidate
     persists as a single correction. No duplicate assistant appended. (#65919 §7)
     """
@@ -405,7 +405,7 @@ def test_terminal_verification_failure_is_persisted_as_one_correction(monkeypatc
         original_user_message="task",
         _should_review_memory=False,
         _turn_exit_reason="unknown",
-        _pending_verification_response=report,
+        _pending_continuation_response=report,
     )
 
     # The nudge is dropped; the assistant candidate is the tail and matches

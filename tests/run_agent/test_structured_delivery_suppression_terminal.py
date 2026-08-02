@@ -340,80 +340,26 @@ def test_mixed_suppress_is_rejected_before_process_exiting_sibling(
     todo_agent.client.chat.completions.create.assert_called_once()
 
 
-def test_suppress_cannot_bypass_bounded_proof_gate(todo_agent, monkeypatch):
-    proof_instruction = "[System: run one focused verification.]"
-    checks = iter(
-        [
-            None,
-            proof_instruction,
-            proof_instruction,
-            None,
-        ]
-    )
-    monkeypatch.setattr(
-        "agent.conversation_loop._bounded_proof_gate_instruction",
-        lambda _agent: next(checks, None),
-    )
-    todo_agent.valid_tool_names = {"todo", "web_search"}
-    todo_agent.tools = _tool_definitions("todo", "web_search")
-    todo_agent.client.chat.completions.create.side_effect = [
-        _tool_response(
+def test_suppress_is_not_deferred_by_code_like_filename(todo_agent):
+    def model_call(**_kwargs):
+        todo_agent._turn_file_mutation_paths.add(
+            "src/test_delivery_suppression.py"
+        )
+        return _tool_response(
             action="suppress",
             reason="No user-facing update is needed.",
-        ),
-        _plain_tool_response("web_search"),
-        _text_response("Verification closure."),
-    ]
+        )
 
-    with patch("run_agent.handle_function_call", return_value="verification passed"):
+    todo_agent.client.chat.completions.create.side_effect = model_call
+
+    with patch(
+        "agent.verification_stop.build_verify_on_stop_nudge",
+        side_effect=AssertionError("semantic completion gate must not run"),
+    ):
         result = _run(todo_agent)
 
-    assert result["final_response"] == "Verification closure."
+    assert result["final_response"] == DELIVERY_SUPPRESSION_TOKEN
     assert result["failed"] is False
     assert result["completed"] is True
-    assert result["api_calls"] == 3
-    assert todo_agent.client.chat.completions.create.call_count == 3
-    second_request = (
-        todo_agent.client.chat.completions.create.call_args_list[1].kwargs
-    )
-    current_user = [
-        message
-        for message in second_request["messages"]
-        if message.get("role") == "user"
-    ][-1]["content"]
-    assert proof_instruction in current_user
-
-
-def test_last_budget_suppress_with_pending_proof_fails_closed(
-    todo_agent,
-    monkeypatch,
-):
-    proof_instruction = "[System: run one focused verification.]"
-    checks = iter([None, proof_instruction, proof_instruction])
-    monkeypatch.setattr(
-        "agent.conversation_loop._bounded_proof_gate_instruction",
-        lambda _agent: next(checks, proof_instruction),
-    )
-    todo_agent.max_iterations = 1
-    todo_agent.valid_tool_names = {"todo", "web_search"}
-    todo_agent.tools = _tool_definitions("todo", "web_search")
-    todo_agent.client.chat.completions.create.side_effect = [
-        _tool_response(
-            action="suppress",
-            reason="No user-facing update is needed.",
-        ),
-        _plain_tool_response("web_search"),
-    ]
-
-    with patch("run_agent.handle_function_call") as execute_tool:
-        result = _run(todo_agent)
-
-    assert result["failed"] is True
-    assert result["completed"] is False
-    assert result["final_response"] != DELIVERY_SUPPRESSION_TOKEN
-    assert (
-        result["turn_exit_reason"]
-        == "budget_exhausted_after_grace_tool_request"
-    )
-    assert result["delivery_outcome"]["action"] == "suppress"
-    execute_tool.assert_not_called()
+    assert result["api_calls"] == 1
+    todo_agent.client.chat.completions.create.assert_called_once()

@@ -115,8 +115,8 @@ def test_plan_is_read_only_and_binds_exact_target(tmp_path, monkeypatch):
     assert plan["after_sha256"] != plan["before_sha256"]
     assert plan["service_restart_performed"] is False
     assert plan["mutations"] == list(module.MUTATIONS)
-    assert "agent.verify_on_stop=true" in plan["mutations"]
-    assert "agent.verification_ledger_enabled=true" in plan["mutations"]
+    assert "agent.verify_on_stop=false" in plan["mutations"]
+    assert "agent.verification_ledger_enabled=false" in plan["mutations"]
     assert "agent.gateway_notify_interval=180" in plan["mutations"]
     assert "agent.reasoning_effort=medium" in plan["mutations"]
     assert "display.busy_input_mode=steer" in plan["mutations"]
@@ -155,8 +155,8 @@ def test_apply_requires_plan_and_writes_exact_backup(tmp_path, monkeypatch):
     }
     assert effective["agent"]["background_review_enabled"] is False
     assert effective["agent"]["tool_use_enforcement"] is True
-    assert effective["agent"]["verify_on_stop"] is True
-    assert effective["agent"]["verification_ledger_enabled"] is True
+    assert effective["agent"]["verify_on_stop"] is False
+    assert effective["agent"]["verification_ledger_enabled"] is False
     assert effective["agent"]["gateway_notify_interval"] == 180
     assert effective["agent"]["task_completion_guidance"] is True
     assert effective["agent"]["parallel_tool_call_guidance"] is True

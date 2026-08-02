@@ -69,8 +69,8 @@ MUTATIONS = (
     "agent.adaptive_reasoning={enabled:true,max_effort:max}",
     "agent.background_review_enabled=false",
     "agent.tool_use_enforcement=true",
-    "agent.verify_on_stop=true",
-    "agent.verification_ledger_enabled=true",
+    "agent.verify_on_stop=false",
+    "agent.verification_ledger_enabled=false",
     "agent.gateway_notify_interval=180",
     "agent.environment_hint.remove_stale_gpt_5_5_clause",
     "compression.abort_on_summary_failure=true",
@@ -330,8 +330,11 @@ def _target_mapping(value: Mapping[str, Any]) -> dict[str, Any]:
         and type(verification_ledger_source) is not bool
     ):
         raise ConfigGateError("config_verification_ledger_drifted")
-    agent["verify_on_stop"] = True
-    agent["verification_ledger_enabled"] = True
+    # The model decides whether its work and verification are sufficient.
+    # Production retains structural mutation receipts but disables the legacy
+    # filename/command classifier and its system-authored completion gate.
+    agent["verify_on_stop"] = False
+    agent["verification_ledger_enabled"] = False
     notify_interval_source = agent.get("gateway_notify_interval")
     if (
         notify_interval_source is not None
