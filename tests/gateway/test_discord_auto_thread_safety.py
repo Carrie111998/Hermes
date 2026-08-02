@@ -8,6 +8,7 @@ import discord
 import pytest
 
 from gateway.config import PlatformConfig
+from gateway.platforms.base import SendResult
 import plugins.platforms.discord.adapter as discord_platform
 from plugins.platforms.discord.adapter import DiscordAdapter
 
@@ -76,6 +77,8 @@ class _FakeThread(discord.Thread):
         self.name = "existing-post"
         self.guild = guild
         self.parent_id = parent.id
+        self.send = AsyncMock()
+        self.fetch_message = AsyncMock()
 
     def history(self, *args, **kwargs):
         async def _empty():
@@ -83,6 +86,17 @@ class _FakeThread(discord.Thread):
             yield  # pragma: no cover - make this an async generator
 
         return _empty()
+
+
+class _FakeForumChannel(discord.ForumChannel):
+    """Minimal real ``discord.ForumChannel`` subtype for routing checks."""
+
+    def __init__(self, channel_id: int, guild=None):
+        self.id = channel_id
+        self.name = "ideas"
+        self.guild = guild or SimpleNamespace(id=1, name="TestGuild")
+        self.type = discord.ChannelType.forum
+        self.create_thread = AsyncMock()
 
 
 def _message(channel, *, guild=None):
@@ -107,6 +121,7 @@ def _message(channel, *, guild=None):
 
 @pytest.fixture
 def adapter(monkeypatch):
+    monkeypatch.setenv("DISCORD_ALLOW_ALL_USERS", "true")
     monkeypatch.setattr(
         discord_platform.discord,
         "HTTPException",
@@ -152,7 +167,6 @@ async def test_missing_guild_context_is_resolved_before_auto_thread(
     authoritative_guild = SimpleNamespace(id=1, name="TestGuild")
     authoritative_channel = _FakeTextChannel(200, guild=authoritative_guild)
     adapter._client.fetch_channel.return_value = authoritative_channel
-    adapter._discord_message_admission = MagicMock(return_value=(True, False))
 
     message = _message(projected_channel, guild=None)
     thread = _FakeThread(
@@ -202,7 +216,6 @@ async def test_authoritative_thread_context_never_creates_nested_thread(
     projected_channel = _FakeTextChannel(200, guild=SimpleNamespace(id=1))
     authoritative_thread = _FakeThread(200, parent_type)
     adapter._client.fetch_channel.return_value = authoritative_thread
-    adapter._discord_message_admission = MagicMock(return_value=(True, False))
     adapter._auto_create_thread = AsyncMock()
 
     dispatched = await adapter._dispatch_discord_message(
@@ -231,9 +244,10 @@ async def test_recovered_projected_thread_resolves_before_thread_mention_gate(
     projected_channel = _FakeTextChannel(200, guild=SimpleNamespace(id=1))
     authoritative_thread = _FakeThread(200, discord.ChannelType.forum)
     adapter._client.fetch_channel.return_value = authoritative_thread
-    adapter._discord_message_admission = MagicMock(return_value=(True, False))
     adapter._auto_create_thread = AsyncMock()
     adapter._threads.mark("200")
+    claim = MagicMock(side_effect=adapter._dedup.is_duplicate)
+    adapter._dedup.is_duplicate = claim
 
     dispatched = await adapter._dispatch_recovered_message(
         _message(projected_channel, guild=projected_channel.guild)
@@ -245,6 +259,7 @@ async def test_recovered_projected_thread_resolves_before_thread_mention_gate(
     event = adapter.handle_message.await_args.args[0]
     assert event.source.chat_type == "thread"
     assert event.source.chat_id == "200"
+    claim.assert_called_once_with("12345")
 
 
 @pytest.mark.asyncio
@@ -272,12 +287,140 @@ async def test_authoritative_channel_resolution_is_cached(adapter):
 
 
 @pytest.mark.asyncio
-async def test_channel_resolution_runs_only_after_admission(adapter):
-    adapter._discord_message_admission = MagicMock(return_value=(False, False))
-
-    dispatched = await adapter._dispatch_discord_message(
-        _message(_FakeTextChannel(200, guild=None), guild=None)
+async def test_channel_update_invalidates_cached_parent_and_child(adapter):
+    guild = SimpleNamespace(id=1, name="TestGuild")
+    cached_parent = _FakeForumChannel(100, guild=guild)
+    cached_thread = _FakeThread(
+        200,
+        discord.ChannelType.forum,
+        parent_id=cached_parent.id,
+        guild_id=guild.id,
     )
+    adapter._cache_authoritative_message_channel(cached_parent)
+    adapter._cache_authoritative_message_channel(cached_thread)
+
+    # Mirrors the on_guild_channel_update/delete handlers: the provider
+    # event invalidates both the changed parent and cached child context.
+    adapter._invalidate_authoritative_channel(100, include_children=True)
+
+    assert 100 not in adapter._authoritative_message_channels
+    assert 200 not in adapter._authoritative_message_channels
+    refreshed_thread = _FakeThread(
+        200,
+        discord.ChannelType.forum,
+        parent_id=300,
+        guild_id=guild.id,
+    )
+    adapter._client.fetch_channel.return_value = refreshed_thread
+    resolved, authoritative = await adapter._resolve_authoritative_channel(
+        200,
+        _FakeTextChannel(200, guild=guild),
+        operation_name="post-update channel resolution",
+    )
+
+    assert authoritative is True
+    assert resolved is refreshed_thread
+    adapter._client.fetch_channel.assert_awaited_once_with(200)
+
+
+@pytest.mark.asyncio
+async def test_thread_parent_update_refetches_and_applies_new_channel_policy(
+    adapter,
+    monkeypatch,
+):
+    monkeypatch.delenv("DISCORD_ALLOW_ALL_USERS", raising=False)
+    monkeypatch.setenv("DISCORD_ALLOWED_CHANNELS", "100")
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+    old_thread = _FakeThread(
+        200,
+        discord.ChannelType.forum,
+        parent_id=100,
+    )
+    adapter._client.fetch_channel.return_value = old_thread
+    first = _message(_FakeTextChannel(200, guild=None), guild=None)
+
+    assert await adapter._dispatch_discord_message(first) is True
+
+    # Mirrors on_thread_update/raw_thread_update. The next event must use a
+    # new authoritative object rather than authorizing against parent 100.
+    adapter._invalidate_authoritative_channel(200)
+    new_thread = _FakeThread(
+        200,
+        discord.ChannelType.forum,
+        parent_id=300,
+    )
+    adapter._client.fetch_channel.return_value = new_thread
+    second = _message(_FakeTextChannel(200, guild=None), guild=None)
+    second.id = 12346
+
+    assert await adapter._dispatch_discord_message(second) is False
+    assert adapter._client.fetch_channel.await_count == 2
+    adapter.handle_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_stale_text_send_routes_authoritative_forum_and_reuses_cache(adapter):
+    projected_channel = _FakeTextChannel(200, guild=SimpleNamespace(id=1))
+    authoritative_forum = _FakeForumChannel(200, guild=projected_channel.guild)
+    adapter._client.get_channel.return_value = projected_channel
+    adapter._client.fetch_channel.return_value = authoritative_forum
+    adapter._send_to_forum = AsyncMock(
+        return_value=SendResult(success=True, message_id="777")
+    )
+
+    first = await adapter.send("200", "first")
+    second = await adapter.send("200", "second")
+
+    assert first.success is True
+    assert second.success is True
+    assert adapter._send_to_forum.await_count == 2
+    projected_channel.send.assert_not_awaited()
+    adapter._client.fetch_channel.assert_awaited_once_with(200)
+
+
+@pytest.mark.asyncio
+async def test_stale_text_send_routes_authoritative_thread(adapter):
+    projected_channel = _FakeTextChannel(200, guild=SimpleNamespace(id=1))
+    authoritative_thread = _FakeThread(200, discord.ChannelType.forum)
+    authoritative_thread.send.return_value = SimpleNamespace(id=777)
+    adapter._client.get_channel.return_value = projected_channel
+    adapter._client.fetch_channel.return_value = authoritative_thread
+
+    result = await adapter.send("200", "reply in the existing post")
+
+    assert result.success is True
+    authoritative_thread.send.assert_awaited_once()
+    projected_channel.send.assert_not_awaited()
+    adapter._client.fetch_channel.assert_awaited_once_with(200)
+
+
+@pytest.mark.asyncio
+async def test_definitive_thread_id_send_does_not_add_rest_lookup(adapter):
+    thread = _FakeThread(200, discord.ChannelType.text)
+    thread.send.return_value = SimpleNamespace(id=777)
+    adapter._client.get_channel.return_value = thread
+
+    first = await adapter.send("200", "first")
+    second = await adapter.send("200", "second")
+
+    assert first.success is True
+    assert second.success is True
+    assert thread.send.await_count == 2
+    adapter._client.fetch_channel.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rejection", ["self", "bot", "type"])
+async def test_provider_preflight_rejections_do_not_fetch(adapter, rejection):
+    message = _message(_FakeTextChannel(200, guild=None), guild=None)
+    if rejection == "self":
+        message.author = adapter._client.user
+    elif rejection == "bot":
+        message.author.bot = True
+    else:
+        message.type = object()
+
+    dispatched = await adapter._dispatch_discord_message(message)
 
     assert dispatched is False
     adapter._client.fetch_channel.assert_not_awaited()
@@ -285,16 +428,79 @@ async def test_channel_resolution_runs_only_after_admission(adapter):
 
 
 @pytest.mark.asyncio
-async def test_unresolved_channel_context_fails_closed_with_one_honest_notice(
+async def test_resolved_guild_context_applies_guild_role_policy(adapter, monkeypatch):
+    """A partial guild=None event must not be evaluated under DM role policy."""
+    monkeypatch.delenv("DISCORD_ALLOW_ALL_USERS", raising=False)
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
+    adapter._allowed_role_ids = {7}
+
+    projected_channel = _FakeTextChannel(200, guild=None)
+    authoritative_guild = SimpleNamespace(
+        id=1,
+        name="TestGuild",
+        get_member=lambda _user_id: None,
+    )
+    authoritative_channel = _FakeTextChannel(200, guild=authoritative_guild)
+    adapter._client.fetch_channel.return_value = authoritative_channel
+    message = _message(projected_channel, guild=None)
+    message.author.roles = [SimpleNamespace(id=7)]
+
+    dispatched = await adapter._dispatch_discord_message(message)
+
+    assert dispatched is True
+    assert message.guild is authoritative_guild
+    adapter.handle_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_resolved_thread_parent_is_used_by_channel_authorization(
     adapter,
     monkeypatch,
+):
+    monkeypatch.delenv("DISCORD_ALLOW_ALL_USERS", raising=False)
+    monkeypatch.setenv("DISCORD_ALLOWED_CHANNELS", "100")
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+    projected_channel = _FakeTextChannel(200, guild=None)
+    authoritative_thread = _FakeThread(
+        200,
+        discord.ChannelType.forum,
+        parent_id=100,
+    )
+    adapter._client.fetch_channel.return_value = authoritative_thread
+
+    dispatched = await adapter._dispatch_discord_message(
+        _message(projected_channel, guild=None)
+    )
+
+    assert dispatched is True
+    event = adapter.handle_message.await_args.args[0]
+    assert event.source.chat_id == "200"
+    assert event.source.parent_chat_id == "100"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "expected_fetches"),
+    [
+        (_http_error(403), 1),
+        (_http_error(500), 2),
+    ],
+    ids=["forbidden", "exhausted-5xx"],
+)
+async def test_unresolved_ambiguous_context_fails_before_authorization(
+    adapter,
+    monkeypatch,
+    error,
+    expected_fetches,
 ):
     monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
     monkeypatch.setenv("DISCORD_AUTO_THREAD", "true")
     monkeypatch.delenv("DISCORD_NO_THREAD_CHANNELS", raising=False)
     monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
-    adapter._discord_message_admission = MagicMock(return_value=(True, False))
-    adapter._client.fetch_channel.side_effect = _http_error(403)
+    monkeypatch.setattr(discord_platform.asyncio, "sleep", AsyncMock())
+    adapter._client.fetch_channel.side_effect = error
+    adapter._discord_message_context_admission = MagicMock()
     projected_channel = _FakeTextChannel(200, guild=None)
     message = _message(projected_channel, guild=None)
     message.create_thread = AsyncMock()
@@ -302,14 +508,32 @@ async def test_unresolved_channel_context_fails_closed_with_one_honest_notice(
     dispatched = await adapter._dispatch_discord_message(message)
 
     assert dispatched is False
-    adapter._client.fetch_channel.assert_awaited_once_with(200)
+    assert adapter._client.fetch_channel.await_count == expected_fetches
+    assert all(call.args == (200,) for call in adapter._client.fetch_channel.await_args_list)
+    adapter._discord_message_context_admission.assert_not_called()
     message.create_thread.assert_not_awaited()
     adapter.handle_message.assert_not_awaited()
-    projected_channel.send.assert_awaited_once()
-    notice = projected_channel.send.await_args.args[0]
-    assert "could not create" in notice.lower()
-    assert "thread" in notice.lower()
-    assert "thread created" not in notice.lower()
+    projected_channel.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_partial_type_value_is_not_trusted_without_authoritative_read(adapter):
+    partial = SimpleNamespace(
+        id=200,
+        type=discord.ChannelType.forum,
+        guild=SimpleNamespace(id=1),
+    )
+    adapter._client.fetch_channel.side_effect = _http_error(403)
+
+    resolved, authoritative = await adapter._resolve_authoritative_channel(
+        partial.id,
+        partial,
+        operation_name="partial forum resolution",
+    )
+
+    assert resolved is partial
+    assert authoritative is False
+    adapter._client.fetch_channel.assert_awaited_once_with(partial.id)
 
 
 @pytest.mark.asyncio
@@ -586,6 +810,7 @@ async def test_slash_uses_one_message_backed_path_and_cleans_permanent_orphan(
         channel_id=200,
         user=SimpleNamespace(display_name="Jezza"),
     )
+    adapter._client.fetch_channel.return_value = parent
 
     result = await adapter._create_thread(interaction, name="Planning")
 
@@ -597,6 +822,93 @@ async def test_slash_uses_one_message_backed_path_and_cleans_permanent_orphan(
     parent.create_thread.assert_not_awaited()
     seed.create_thread.assert_awaited_once()
     seed.delete.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_slash_stale_text_resolves_authoritative_forum(adapter):
+    projected_channel = _FakeTextChannel(200, guild=SimpleNamespace(id=1))
+    authoritative_forum = _FakeForumChannel(200, guild=projected_channel.guild)
+    thread = _FakeThread(
+        888,
+        discord.ChannelType.forum,
+        parent_id=authoritative_forum.id,
+        guild_id=authoritative_forum.guild.id,
+    )
+    authoritative_forum.create_thread.return_value = thread
+    adapter._client.fetch_channel.return_value = authoritative_forum
+    interaction = SimpleNamespace(
+        channel=projected_channel,
+        channel_id=projected_channel.id,
+        guild_id=projected_channel.guild.id,
+        user=SimpleNamespace(display_name="Jezza"),
+    )
+
+    result = await adapter._create_thread(interaction, name="Planning")
+
+    assert result == {
+        "success": True,
+        "thread_id": str(thread.id),
+        "thread_name": thread.name,
+    }
+    authoritative_forum.create_thread.assert_awaited_once()
+    projected_channel.send.assert_not_awaited()
+    adapter._client.fetch_channel.assert_awaited_once_with(projected_channel.id)
+
+
+@pytest.mark.asyncio
+async def test_slash_stale_text_resolves_existing_thread_and_rejects_nested(adapter):
+    projected_channel = _FakeTextChannel(200, guild=SimpleNamespace(id=1))
+    authoritative_thread = _FakeThread(200, discord.ChannelType.forum)
+    adapter._client.fetch_channel.return_value = authoritative_thread
+    interaction = SimpleNamespace(
+        channel=projected_channel,
+        channel_id=projected_channel.id,
+        guild_id=projected_channel.guild.id,
+        user=SimpleNamespace(display_name="Jezza"),
+    )
+
+    result = await adapter._create_thread(interaction, name="Nested")
+
+    assert "nested thread" in result["error"].lower()
+    projected_channel.send.assert_not_awaited()
+    authoritative_thread.send.assert_not_awaited()
+    adapter._client.fetch_channel.assert_awaited_once_with(projected_channel.id)
+
+
+@pytest.mark.asyncio
+async def test_slash_existing_thread_rejects_nested_without_rest(adapter):
+    thread = _FakeThread(200, discord.ChannelType.text)
+    interaction = SimpleNamespace(
+        channel=thread,
+        channel_id=thread.id,
+        guild_id=thread.guild.id,
+        user=SimpleNamespace(display_name="Jezza"),
+    )
+
+    result = await adapter._create_thread(interaction, name="Nested")
+
+    assert "nested thread" in result["error"].lower()
+    thread.send.assert_not_awaited()
+    adapter._client.fetch_channel.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_interaction_resolution_reuses_authoritative_channel_cache(adapter):
+    projected_channel = _FakeTextChannel(200, guild=SimpleNamespace(id=1))
+    authoritative_forum = _FakeForumChannel(200, guild=projected_channel.guild)
+    adapter._client.fetch_channel.return_value = authoritative_forum
+    interaction = SimpleNamespace(
+        channel=projected_channel,
+        channel_id=projected_channel.id,
+        guild_id=projected_channel.guild.id,
+    )
+
+    first = await adapter._resolve_interaction_channel(interaction)
+    second = await adapter._resolve_interaction_channel(interaction)
+
+    assert first is authoritative_forum
+    assert second is authoritative_forum
+    adapter._client.fetch_channel.assert_awaited_once_with(projected_channel.id)
 
 
 @pytest.mark.asyncio
@@ -624,6 +936,7 @@ async def test_slash_exhausted_429_is_sanitized_and_cleans_owned_seed(
         channel_id=parent.id,
         user=SimpleNamespace(display_name="Jezza"),
     )
+    adapter._client.fetch_channel.return_value = parent
 
     result = await adapter._create_thread(interaction, name="Planning")
 
@@ -633,7 +946,7 @@ async def test_slash_exhausted_429_is_sanitized_and_cleans_owned_seed(
     assert "RAW_SECOND_SLASH_429_SENTINEL" not in result["error"]
     assert seed.create_thread.await_count == 2
     seed.delete.assert_awaited_once()
-    adapter._client.fetch_channel.assert_not_awaited()
+    adapter._client.fetch_channel.assert_awaited_once_with(parent.id)
     sleep.assert_awaited_once_with(1.25)
 
 
@@ -646,12 +959,15 @@ async def test_slash_keeps_owned_seed_when_ambiguous_outcome_is_not_absent(adapt
         create_error=TimeoutError("RAW_TIMEOUT_SENTINEL"),
     )
     parent.send.return_value = seed
-    adapter._client.fetch_channel.return_value = _FakeThread(
-        seed.id,
-        discord.ChannelType.text,
-        parent_id=999,
-        guild_id=parent.guild.id,
-    )
+    adapter._client.fetch_channel.side_effect = [
+        parent,
+        _FakeThread(
+            seed.id,
+            discord.ChannelType.text,
+            parent_id=999,
+            guild_id=parent.guild.id,
+        ),
+    ]
     interaction = SimpleNamespace(
         channel=parent,
         channel_id=parent.id,
@@ -680,6 +996,7 @@ async def test_handoff_uses_one_message_backed_path_and_cleans_permanent_orphan(
     )
     parent.send.return_value = seed
     adapter._client.get_channel.return_value = parent
+    adapter._client.fetch_channel.return_value = parent
 
     result = await adapter.create_handoff_thread(str(parent.id), "Planning")
 
@@ -706,7 +1023,7 @@ async def test_handoff_reconciles_committed_thread_without_deleting_seed(adapter
         guild_id=parent.guild.id,
     )
     adapter._client.get_channel.return_value = parent
-    adapter._client.fetch_channel.return_value = thread
+    adapter._client.fetch_channel.side_effect = [parent, thread]
 
     result = await adapter.create_handoff_thread(str(parent.id), "Planning")
 
@@ -727,6 +1044,7 @@ async def test_handoff_forum_create_is_never_retried(adapter, monkeypatch):
         send=AsyncMock(),
     )
     adapter._client.get_channel.return_value = parent
+    adapter._client.fetch_channel.return_value = parent
     monkeypatch.setattr(adapter, "_is_forum_or_media_channel", lambda _channel: True)
 
     result = await adapter.create_handoff_thread(str(parent.id), "Planning")
@@ -760,6 +1078,7 @@ async def test_handoff_forum_create_retries_one_429(adapter, monkeypatch):
         send=AsyncMock(),
     )
     adapter._client.get_channel.return_value = parent
+    adapter._client.fetch_channel.return_value = parent
     monkeypatch.setattr(adapter, "_is_forum_or_media_channel", lambda _channel: True)
 
     result = await adapter.create_handoff_thread(str(parent.id), "Planning")

@@ -68,7 +68,7 @@ def _voice_adapter(reference_obj, *, native_result=None, native_error=None):
         request.side_effect = native_error
     adapter._client = SimpleNamespace(
         get_channel=lambda _chat_id: channel,
-        fetch_channel=AsyncMock(),
+        fetch_channel=AsyncMock(return_value=channel),
         http=SimpleNamespace(request=request),
     )
     return adapter, channel, request
@@ -98,12 +98,13 @@ async def test_send_retries_without_reference_when_reply_target_is_deleted():
         return sent_msgs[len(send_calls) - 2]
 
     channel = SimpleNamespace(
+        id=555,
         fetch_message=AsyncMock(return_value=ref_msg),
         send=AsyncMock(side_effect=fake_send),
     )
     adapter._client = SimpleNamespace(
         get_channel=lambda _chat_id: channel,
-        fetch_channel=AsyncMock(),
+        fetch_channel=AsyncMock(return_value=channel),
     )
 
     long_text = "A" * (adapter.MAX_MESSAGE_LENGTH + 50)
@@ -362,14 +363,14 @@ async def test_send_video_uses_path_based_files_kwarg(tmp_path, monkeypatch):
         attachments=[SimpleNamespace(filename="clip.mp4", url="https://cdn.example/clip.mp4")],
     )
     channel = SimpleNamespace(
+        id=555,
         send=AsyncMock(return_value=sent_msg),
         type=0,
     )
     adapter._client = SimpleNamespace(
         get_channel=lambda _chat_id: channel,
-        fetch_channel=AsyncMock(),
+        fetch_channel=AsyncMock(return_value=channel),
     )
-    monkeypatch.setattr(adapter, "_is_forum_parent", lambda _ch: False)
 
     result = await adapter.send_video("555", str(video))
 
@@ -400,12 +401,11 @@ async def test_send_video_fails_loud_when_message_has_no_attachments(tmp_path, m
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
     # Message id present, but no attachments — the silent-drop failure mode.
     sent_msg = SimpleNamespace(id=99, attachments=[])
-    channel = SimpleNamespace(send=AsyncMock(return_value=sent_msg), type=0)
+    channel = SimpleNamespace(id=555, send=AsyncMock(return_value=sent_msg), type=0)
     adapter._client = SimpleNamespace(
         get_channel=lambda _chat_id: channel,
-        fetch_channel=AsyncMock(),
+        fetch_channel=AsyncMock(return_value=channel),
     )
-    monkeypatch.setattr(adapter, "_is_forum_parent", lambda _ch: False)
 
     result = await adapter.send_video("555", str(video))
 
@@ -459,14 +459,14 @@ async def test_send_file_attachment_forum_uses_files_kwarg(tmp_path, monkeypatch
         ),
     )
     forum_channel = SimpleNamespace(
-        id=7,
+        id=555,
         create_thread=AsyncMock(return_value=created_thread),
     )
     adapter._client = SimpleNamespace(
         get_channel=lambda _chat_id: forum_channel,
-        fetch_channel=AsyncMock(),
+        fetch_channel=AsyncMock(return_value=forum_channel),
     )
-    monkeypatch.setattr(adapter, "_is_forum_parent", lambda _ch: True)
+    monkeypatch.setattr(adapter, "_is_forum_or_media_channel", lambda _ch: True)
 
     result = await adapter.send_video("555", str(video))
 

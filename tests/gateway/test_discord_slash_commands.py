@@ -322,6 +322,7 @@ async def test_handle_thread_create_slash_reports_success(adapter):
         followup=SimpleNamespace(send=AsyncMock()),
         response=SimpleNamespace(defer=AsyncMock()),
     )
+    adapter._client.fetch_channel.return_value = parent_channel
 
     await adapter._handle_thread_create_slash(interaction, "Planning", "Kickoff", 1440)
 
@@ -370,6 +371,7 @@ async def test_handle_thread_create_slash_uses_honest_default_seed(adapter):
         followup=SimpleNamespace(send=AsyncMock()),
         response=SimpleNamespace(defer=AsyncMock()),
     )
+    adapter._client.fetch_channel.return_value = channel
 
     await adapter._handle_thread_create_slash(interaction, "Planning", "", 1440)
 
@@ -468,11 +470,11 @@ async def test_auto_create_thread_strips_mention_syntax_from_name(adapter):
 
 @pytest.mark.asyncio
 async def test_rename_thread_edits_only_when_current_name_matches(adapter):
-    thread = SimpleNamespace(
-        id=999,
+    thread = _FakeThreadChannel(
+        channel_id=999,
         name="raw user prompt",
-        edit=AsyncMock(),
     )
+    thread.edit = AsyncMock()
     adapter._client.get_channel = lambda _id: thread
 
     result = await adapter.rename_thread(
@@ -639,4 +641,3 @@ def test_register_skill_command_payload_fits_discord_8kb_limit(adapter):
         f"Flat /skill command payload is ~{len(payload)} bytes — the whole "
         f"point of this design is that it stays small regardless of skill count"
     )
-

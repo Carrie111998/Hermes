@@ -90,7 +90,11 @@ def adapter(monkeypatch, tmp_path):
     config = PlatformConfig(enabled=True, token="fake-token")
     adapter = DiscordAdapter(config)
     bot_user = SimpleNamespace(id=999, bot=True, display_name="Hermes", name="hermes")
-    adapter._client = SimpleNamespace(user=bot_user, get_channel=lambda _id: None)
+    adapter._client = SimpleNamespace(
+        user=bot_user,
+        get_channel=lambda _id: None,
+        fetch_channel=AsyncMock(),
+    )
     adapter._ready_event.set()
     adapter._handle_message = AsyncMock(return_value=True)
     monkeypatch.setenv("DISCORD_MISSED_MESSAGE_BACKFILL", "true")
@@ -232,6 +236,7 @@ async def test_run_backfill_dispatches_unaddressed_messages(adapter, monkeypatch
     monkeypatch.setattr(adapter, "_missed_message_backfill_max_dispatches", lambda: 10)
     monkeypatch.setattr(adapter, "_missed_message_backfill_channels", lambda: {"123"})
     monkeypatch.setattr("asyncio.sleep", AsyncMock())
+    adapter._client.fetch_channel.return_value = message.channel
 
     await adapter._run_missed_message_backfill()
 
@@ -239,7 +244,7 @@ async def test_run_backfill_dispatches_unaddressed_messages(adapter, monkeypatch
         message,
         role_authorized=False,
         recovered=True,
-        channel_context_authoritative=False,
+        channel_context_authoritative=True,
     )
 
 
@@ -285,6 +290,7 @@ async def test_recovered_mention_reuses_live_auth_and_mention_gates(adapter, mon
         "_is_allowed_user",
         lambda user_id, *_a, **_kw: user_id == str(allowed.author.id),
     )
+    adapter._client.fetch_channel.return_value = denied.channel
 
     assert await adapter._dispatch_recovered_message(denied) is False
     assert await adapter._dispatch_recovered_message(allowed) is True
@@ -292,7 +298,7 @@ async def test_recovered_mention_reuses_live_auth_and_mention_gates(adapter, mon
         allowed,
         role_authorized=False,
         recovered=True,
-        channel_context_authoritative=False,
+        channel_context_authoritative=True,
     )
 
 
@@ -387,6 +393,7 @@ async def test_send_offloads_final_delivery_ledger_write(adapter, monkeypatch):
     channel.send = AsyncMock(return_value=SimpleNamespace(id=9011))
     channel.fetch_message = AsyncMock()
     adapter._client.get_channel = lambda _channel_id: channel
+    adapter._client.fetch_channel.return_value = channel
 
     def slow_record(**_kwargs):
         import time
@@ -458,4 +465,3 @@ async def test_iter_candidates_keeps_latest_messages_when_window_exceeds_limit(a
         got.append(msg.id)
 
     assert got == [2, 3, 4]
-

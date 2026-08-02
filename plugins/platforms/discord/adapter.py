@@ -1465,6 +1465,11 @@ class DiscordAdapter(BasePlatformAdapter):
             async def on_ready():
                 logger.info("[%s] Connected as %s", adapter_self.name, adapter_self._client.user)
 
+                # READY can run again after a non-resumable reconnect. Any
+                # REST-resolved permission/name/parent context from the prior
+                # Gateway lifecycle must not survive into the new snapshot.
+                adapter_self._authoritative_message_channels.clear()
+
                 # Resolve any usernames in the allowed list to numeric IDs
                 await adapter_self._resolve_allowed_usernames()
                 adapter_self._ready_event.set()
@@ -1480,6 +1485,65 @@ class DiscordAdapter(BasePlatformAdapter):
             @self._client.event
             async def on_message(message: DiscordMessage):
                 await adapter_self._dispatch_discord_message(message)
+
+            @self._client.event
+            async def on_guild_channel_update(before, after):
+                adapter_self._invalidate_authoritative_channel(
+                    getattr(after, "id", None) or getattr(before, "id", None),
+                    include_children=True,
+                )
+
+            @self._client.event
+            async def on_guild_channel_delete(channel):
+                adapter_self._invalidate_authoritative_channel(
+                    getattr(channel, "id", None),
+                    include_children=True,
+                )
+
+            @self._client.event
+            async def on_thread_update(before, after):
+                adapter_self._invalidate_authoritative_channel(
+                    getattr(after, "id", None) or getattr(before, "id", None)
+                )
+
+            @self._client.event
+            async def on_thread_delete(thread):
+                adapter_self._invalidate_authoritative_channel(
+                    getattr(thread, "id", None)
+                )
+
+            @self._client.event
+            async def on_thread_join(thread):
+                # discord.py dispatches THREAD_UPDATE as thread_join when the
+                # thread was absent from its Gateway cache. That is the exact
+                # partial-cache state this resolver repairs.
+                adapter_self._invalidate_authoritative_channel(
+                    getattr(thread, "id", None)
+                )
+
+            @self._client.event
+            async def on_thread_remove(thread):
+                adapter_self._invalidate_authoritative_channel(
+                    getattr(thread, "id", None)
+                )
+
+            @self._client.event
+            async def on_raw_thread_update(payload):
+                adapter_self._invalidate_authoritative_channel(
+                    getattr(payload, "thread_id", None)
+                )
+
+            @self._client.event
+            async def on_raw_thread_delete(payload):
+                adapter_self._invalidate_authoritative_channel(
+                    getattr(payload, "thread_id", None)
+                )
+
+            @self._client.event
+            async def on_guild_remove(guild):
+                adapter_self._invalidate_authoritative_guild(
+                    getattr(guild, "id", None)
+                )
 
             @self._client.event
             async def on_voice_state_update(member, before, after):
@@ -1554,48 +1618,66 @@ class DiscordAdapter(BasePlatformAdapter):
             self._release_platform_lock()
             return False
 
-    def _discord_message_admission(
+    def _discord_message_preflight(
         self,
         message: Any,
         *,
         claim: bool,
-    ) -> tuple[bool, bool]:
-        """Return ``(admitted, role_authorized)`` for one Discord event."""
+    ) -> bool:
+        """Reject context-free provider events before authoritative REST I/O."""
         message_id = str(getattr(message, "id", ""))
         if claim:
             if self._dedup.is_duplicate(message_id):
-                return False, False
+                return False
         elif self._dedup.contains(message_id):
-            return False, False
-        if message.author == self._client.user:
-            return False, False
-        if message.type not in {discord.MessageType.default, discord.MessageType.reply}:
-            return False, False
+            return False
 
-        role_authorized = False
-        if getattr(message.author, "bot", False):
+        author = getattr(message, "author", None)
+        client_user = getattr(self._client, "user", None) if self._client else None
+        if author is None or author == client_user:
+            return False
+        if getattr(message, "type", None) not in {
+            discord.MessageType.default,
+            discord.MessageType.reply,
+        }:
+            return False
+
+        if getattr(author, "bot", False):
             allow_bots = self._get_allow_bots()
             if allow_bots == "none":
-                return False, False
+                return False
             if allow_bots == "mentions" and not self._self_is_explicitly_mentioned(message):
-                return False, False
+                return False
             if (
                 self._discord_bots_require_inline_mention()
                 and not self._self_is_raw_mentioned(message)
             ):
-                return False, False
-        else:
+                return False
+        return True
+
+    def _discord_message_context_admission(
+        self,
+        message: Any,
+    ) -> tuple[bool, bool]:
+        """Authorize one preflighted event using its resolved channel context."""
+        channel = getattr(message, "channel", None)
+        author = getattr(message, "author", None)
+        if channel is None or author is None:
+            return False, False
+
+        role_authorized = False
+        if not getattr(author, "bot", False):
             msg_guild = getattr(message, "guild", None)
-            is_dm = isinstance(message.channel, discord.DMChannel) or msg_guild is None
+            is_dm = isinstance(channel, discord.DMChannel)
             msg_channel_ids = None
             if not is_dm:
-                msg_channel_ids = {str(message.channel.id)}
-                parent_id = self._get_parent_channel_id(message.channel)
+                msg_channel_ids = {str(channel.id)}
+                parent_id = self._get_parent_channel_id(channel)
                 if parent_id:
                     msg_channel_ids.add(parent_id)
             if not self._is_allowed_user(
-                str(message.author.id),
-                message.author,
+                str(author.id),
+                author,
                 guild=msg_guild,
                 is_dm=is_dm,
                 channel_ids=msg_channel_ids,
@@ -1605,7 +1687,7 @@ class DiscordAdapter(BasePlatformAdapter):
             role_authorized = bool(getattr(self, "_allowed_role_ids", set()))
 
         raw_self_mention = self._self_is_explicitly_mentioned(message)
-        if not isinstance(message.channel, discord.DMChannel) and (
+        if not isinstance(channel, discord.DMChannel) and (
             message.mentions or raw_self_mention
         ):
             other_bots_mentioned = any(
@@ -1619,8 +1701,8 @@ class DiscordAdapter(BasePlatformAdapter):
             ).lower() in {"true", "1", "yes"}
             if ignore_no_mention and not raw_self_mention and not other_bots_mentioned:
                 parent_id = None
-                if hasattr(message.channel, "parent_id") and message.channel.parent_id:
-                    parent_id = str(message.channel.parent_id)
+                if hasattr(channel, "parent_id") and channel.parent_id:
+                    parent_id = str(channel.parent_id)
                 free_channels = self._discord_free_response_channels()
                 channel_keys = self._discord_channel_keys(message, parent_id)
                 if "*" not in free_channels and not (channel_keys & free_channels):
@@ -1690,13 +1772,137 @@ class DiscordAdapter(BasePlatformAdapter):
             self._authoritative_message_channels.pop(oldest_channel_id, None)
         self._authoritative_message_channels[channel_id] = channel
 
+    def _invalidate_authoritative_channel(
+        self,
+        channel_id: Any,
+        *,
+        include_children: bool = False,
+    ) -> None:
+        """Invalidate REST context changed by a Discord channel event."""
+        try:
+            channel_id_int = int(channel_id)
+        except (TypeError, ValueError):
+            return
+        self._authoritative_message_channels.pop(channel_id_int, None)
+        if not include_children:
+            return
+        channel_id_str = str(channel_id_int)
+        for cached_id, cached_channel in list(
+            self._authoritative_message_channels.items()
+        ):
+            if self._get_parent_channel_id(cached_channel) == channel_id_str:
+                self._authoritative_message_channels.pop(cached_id, None)
+
+    def _invalidate_authoritative_guild(self, guild_id: Any) -> None:
+        """Invalidate every REST channel associated with a removed guild."""
+        try:
+            guild_id_int = int(guild_id)
+        except (TypeError, ValueError):
+            return
+        for cached_id, cached_channel in list(
+            self._authoritative_message_channels.items()
+        ):
+            guild = getattr(cached_channel, "guild", None) or getattr(
+                getattr(cached_channel, "parent", None),
+                "guild",
+                None,
+            )
+            if getattr(guild, "id", None) == guild_id_int:
+                self._authoritative_message_channels.pop(cached_id, None)
+
     @staticmethod
     def _attach_authoritative_message_channel(message: Any, channel: Any) -> None:
         """Attach a REST-resolved channel and guild to a discord.py message."""
         message.channel = channel
-        guild = getattr(channel, "guild", None)
-        if guild is not None:
-            message.guild = guild
+        message.guild = getattr(channel, "guild", None)
+
+    async def _resolve_authoritative_channel(
+        self,
+        channel_id: Any,
+        fallback_channel: Any = None,
+        *,
+        operation_name: str,
+    ) -> tuple[Any, bool]:
+        """Resolve one type-sensitive channel through the per-client authority.
+
+        Gateway cache objects with an unambiguous provider type (DM, thread,
+        forum, or media) are already safe for type routing. A text/partial
+        object is not: hosted Gateway projection can materialize a real
+        forum/media/thread ID as a synthetic ``TextChannel``. Resolve those
+        ambiguous objects through REST and cache the result for this client.
+        """
+        if self._client is None:
+            return fallback_channel, False
+        try:
+            channel_id_int = int(channel_id)
+        except (TypeError, ValueError):
+            return fallback_channel, False
+
+        cached = self._authoritative_message_channels.get(channel_id_int)
+        if cached is not None:
+            return cached, True
+
+        if fallback_channel is None:
+            get_channel = getattr(self._client, "get_channel", None)
+            if callable(get_channel):
+                try:
+                    fallback_channel = get_channel(channel_id_int)
+                except Exception:
+                    fallback_channel = None
+
+        definitive_channel_classes = tuple(
+            cls
+            for cls in (
+                getattr(discord, "DMChannel", None),
+                getattr(discord, "Thread", None),
+                getattr(discord, "ForumChannel", None),
+                getattr(discord, "MediaChannel", None),
+            )
+            if isinstance(cls, type)
+        )
+        fallback_id_matches = str(getattr(fallback_channel, "id", "")) == str(
+            channel_id_int
+        )
+        if (
+            definitive_channel_classes
+            and fallback_id_matches
+            and isinstance(fallback_channel, definitive_channel_classes)
+        ):
+            return fallback_channel, True
+
+        fetch_channel = getattr(self._client, "fetch_channel", None)
+        if not callable(fetch_channel):
+            return fallback_channel, False
+        try:
+            resolved = await self._call_discord_read_with_retry(
+                lambda: fetch_channel(channel_id_int),
+                operation_name=operation_name,
+            )
+        except Exception as error:
+            logger.warning(
+                "[%s] Could not resolve authoritative Discord channel %s "
+                "during %s: %s",
+                self.name,
+                channel_id_int,
+                operation_name,
+                error,
+            )
+            return fallback_channel, False
+        if resolved is None:
+            return fallback_channel, False
+        if str(getattr(resolved, "id", "")) != str(channel_id_int):
+            logger.warning(
+                "[%s] Authoritative Discord channel resolution for %s during %s "
+                "returned mismatched id %s; failing closed",
+                self.name,
+                channel_id_int,
+                operation_name,
+                getattr(resolved, "id", None),
+            )
+            return fallback_channel, False
+
+        self._cache_authoritative_message_channel(resolved)
+        return resolved, True
 
     async def _resolve_authoritative_message_channel(
         self,
@@ -1708,48 +1914,24 @@ class DiscordAdapter(BasePlatformAdapter):
         does not use ``MESSAGE_CREATE.channel_type`` to repair a partial cache.
         A projected or incomplete ``GUILD_CREATE`` can therefore materialize a
         real thread as ``TextChannel`` and can leave ``Message.guild`` unset.
-        Resolve the delivered channel ID through REST before deciding whether
-        auto-threading is legal. This runs only after admission authorization.
+        Resolve the delivered channel ID through REST before context-dependent
+        authorization or auto-thread routing. Context-free provider preflight
+        has already run, so rejected provider events do not cause REST I/O.
         """
         channel = getattr(message, "channel", None)
         if channel is None:
             return None, False
-        if isinstance(channel, (discord.DMChannel, discord.Thread)):
-            return channel, True
-        if self._client is None:
-            return channel, False
-
         try:
             channel_id = int(channel.id)
         except (AttributeError, TypeError, ValueError):
             return channel, False
-
-        cached = self._authoritative_message_channels.get(channel_id)
-        if cached is not None:
-            self._attach_authoritative_message_channel(message, cached)
-            return cached, True
-
-        fetch_channel = getattr(self._client, "fetch_channel", None)
-        if not callable(fetch_channel):
-            return channel, False
-
-        try:
-            resolved = await self._call_discord_read_with_retry(
-                lambda: fetch_channel(channel_id),
-                operation_name=f"channel {channel_id} resolution",
-            )
-        except Exception as error:
-            logger.warning(
-                "[%s] Could not resolve authoritative Discord channel %s: %s",
-                self.name,
-                channel_id,
-                error,
-            )
-            return channel, False
-        if resolved is None:
-            return channel, False
-
-        self._cache_authoritative_message_channel(resolved)
+        resolved, authoritative = await self._resolve_authoritative_channel(
+            channel_id,
+            channel,
+            operation_name=f"message channel {channel_id} resolution",
+        )
+        if not authoritative:
+            return resolved, False
         self._attach_authoritative_message_channel(message, resolved)
         return resolved, True
 
@@ -1760,14 +1942,22 @@ class DiscordAdapter(BasePlatformAdapter):
                 await asyncio.wait_for(self._ready_event.wait(), timeout=30.0)
             except asyncio.TimeoutError:
                 pass
-        admitted, role_authorized = self._discord_message_admission(
-            message, claim=True,
-        )
-        if not admitted:
+        if not self._discord_message_preflight(message, claim=True):
             return False
         _channel, channel_context_authoritative = (
             await self._resolve_authoritative_message_channel(message)
         )
+        if not channel_context_authoritative:
+            logger.warning(
+                "[%s] Refusing Discord message %s because authoritative "
+                "channel context could not be resolved",
+                self.name,
+                getattr(message, "id", "unknown"),
+            )
+            return False
+        admitted, role_authorized = self._discord_message_context_admission(message)
+        if not admitted:
+            return False
         return await self._handle_message(
             message,
             role_authorized=role_authorized,
@@ -2556,31 +2746,25 @@ class DiscordAdapter(BasePlatformAdapter):
 
     async def _dispatch_recovered_message(self, message: Any) -> bool:
         """Run one recovered message through the live Discord ingress gates."""
-        admitted, role_authorized = self._discord_message_admission(
-            message, claim=False,
-        )
-        if not admitted:
+        # The backfill scan performs only a non-claiming ``contains`` check.
+        # Claim exactly once here so a racing live Gateway event cannot dispatch
+        # the same message while this REST-recovered event is being authorized.
+        if not self._discord_message_preflight(message, claim=True):
             return False
         _channel, channel_context_authoritative = (
             await self._resolve_authoritative_message_channel(message)
         )
-        if not isinstance(message.channel, discord.DMChannel):
-            parent_id = self._get_parent_channel_id(message.channel)
-            channel_keys = self._discord_channel_keys(message, parent_id)
-            free_channels = self._discord_free_response_channels()
-            in_bot_thread = (
-                isinstance(message.channel, discord.Thread)
-                and str(message.channel.id) in self._threads
-                and not self._discord_thread_require_mention()
+        if not channel_context_authoritative:
+            logger.warning(
+                "[%s] Refusing recovered Discord message %s because authoritative "
+                "channel context could not be resolved",
+                self.name,
+                getattr(message, "id", "unknown"),
             )
-            if (
-                self._discord_require_mention()
-                and "*" not in free_channels
-                and not (channel_keys & free_channels)
-                and not in_bot_thread
-                and not self._self_is_explicitly_mentioned(message)
-            ):
-                return False
+            return False
+        admitted, role_authorized = self._discord_message_context_admission(message)
+        if not admitted:
+            return False
         return await self._handle_message(
             message,
             role_authorized=role_authorized,
@@ -3291,15 +3475,21 @@ class DiscordAdapter(BasePlatformAdapter):
                 if not channel:
                     return SendResult(success=False, error=f"Thread {thread_id} not found")
             else:
-                # Get the parent channel
-                channel = self._client.get_channel(int(chat_id))
-                if not channel:
-                    channel = await self._client.fetch_channel(int(chat_id))
-                if not channel:
-                    return SendResult(success=False, error=f"Channel {chat_id} not found")
+                # Parent IDs are type-sensitive: forum/media parents require a
+                # create-thread endpoint, while threads/text channels accept a
+                # normal message. Do not trust a projected TextChannel here.
+                channel, authoritative = await self._resolve_authoritative_channel(
+                    chat_id,
+                    operation_name=f"message target channel {chat_id} resolution",
+                )
+                if not authoritative or channel is None:
+                    return SendResult(
+                        success=False,
+                        error="Could not verify the Discord channel type. Please retry.",
+                    )
 
-            # Forum channels reject channel.send() — create a thread post instead.
-            if self._is_forum_parent(channel):
+            # Forum/media channels reject channel.send() — create a post instead.
+            if not thread_id and self._is_forum_or_media_channel(channel):
                 result = await self._send_to_forum(channel, content)
                 await asyncio.to_thread(
                     self._record_discord_response,
@@ -3815,11 +4005,15 @@ class DiscordAdapter(BasePlatformAdapter):
         if not os.path.isfile(file_path):
             return SendResult(success=False, error=f"File not found: {file_path}")
 
-        channel = self._client.get_channel(int(chat_id))
-        if not channel:
-            channel = await self._client.fetch_channel(int(chat_id))
-        if not channel:
-            return SendResult(success=False, error=f"Channel {chat_id} not found")
+        channel, authoritative = await self._resolve_authoritative_channel(
+            chat_id,
+            operation_name=f"file target channel {chat_id} resolution",
+        )
+        if not authoritative or channel is None:
+            return SendResult(
+                success=False,
+                error="Could not verify the Discord channel type. Please retry.",
+            )
 
         filename = file_name or os.path.basename(file_path)
         logger.info(
@@ -3833,7 +4027,7 @@ class DiscordAdapter(BasePlatformAdapter):
         # the working image-batch path. Prefer ``files=[...]`` over deprecated
         # singular ``file=`` for the same reason.
         discord_file = discord.File(file_path, filename=filename)
-        if self._is_forum_parent(channel):
+        if self._is_forum_or_media_channel(channel):
             result = await self._forum_post_file(
                 channel,
                 content=(caption or "").strip(),
@@ -3892,16 +4086,16 @@ class DiscordAdapter(BasePlatformAdapter):
             await super().send_multiple_images(chat_id, images, metadata, human_delay)
             return
 
-        try:
-            channel = self._client.get_channel(int(chat_id))
-            if not channel:
-                channel = await self._client.fetch_channel(int(chat_id))
-            if not channel:
-                logger.warning("[%s] Channel %s not found for multi-image send", self.name, chat_id)
-                return
-        except Exception as e:
-            logger.warning("[%s] Failed to resolve channel for multi-image send: %s", self.name, e)
-            await super().send_multiple_images(chat_id, images, metadata, human_delay)
+        channel, authoritative = await self._resolve_authoritative_channel(
+            chat_id,
+            operation_name=f"multi-image target channel {chat_id} resolution",
+        )
+        if not authoritative or channel is None:
+            logger.warning(
+                "[%s] Could not verify Discord channel %s for multi-image send",
+                self.name,
+                chat_id,
+            )
             return
 
         CHUNK = 10
@@ -3971,7 +4165,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     self.name, len(files), chunk_idx + 1, len(chunks),
                 )
 
-                if self._is_forum_parent(channel):
+                if self._is_forum_or_media_channel(channel):
                     await self._forum_post_file(
                         channel,
                         content=(content or "").strip(),
@@ -4024,11 +4218,15 @@ class DiscordAdapter(BasePlatformAdapter):
         try:
             import io
 
-            channel = self._client.get_channel(int(chat_id))
-            if not channel:
-                channel = await self._client.fetch_channel(int(chat_id))
-            if not channel:
-                return SendResult(success=False, error=f"Channel {chat_id} not found")
+            channel, authoritative = await self._resolve_authoritative_channel(
+                chat_id,
+                operation_name=f"voice target channel {chat_id} resolution",
+            )
+            if not authoritative or channel is None:
+                return SendResult(
+                    success=False,
+                    error="Could not verify the Discord channel type. Please retry.",
+                )
 
             if not os.path.exists(audio_path):
                 return SendResult(success=False, error=f"Audio file not found: {audio_path}")
@@ -4053,7 +4251,7 @@ class DiscordAdapter(BasePlatformAdapter):
             # native voice flag path also targets /messages so it would fail
             # too.  Create a thread post with the audio as the starter
             # attachment instead.
-            if self._is_forum_parent(channel):
+            if self._is_forum_or_media_channel(channel):
                 forum_file = discord.File(io.BytesIO(file_data), filename=filename)
                 return await self._forum_post_file(
                     channel,
@@ -5242,11 +5440,15 @@ class DiscordAdapter(BasePlatformAdapter):
         try:
             import aiohttp
 
-            channel = self._client.get_channel(int(chat_id))
-            if not channel:
-                channel = await self._client.fetch_channel(int(chat_id))
-            if not channel:
-                return SendResult(success=False, error=f"Channel {chat_id} not found")
+            channel, authoritative = await self._resolve_authoritative_channel(
+                chat_id,
+                operation_name=f"image target channel {chat_id} resolution",
+            )
+            if not authoritative or channel is None:
+                return SendResult(
+                    success=False,
+                    error="Could not verify the Discord channel type. Please retry.",
+                )
 
             # Download the image and send as a Discord file attachment
             # (Discord renders attachments inline, unlike plain URLs)
@@ -5276,7 +5478,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 import io
                 file = discord.File(io.BytesIO(image_data), filename=f"image.{ext}")
 
-                if self._is_forum_parent(channel):
+                if self._is_forum_or_media_channel(channel):
                     return await self._forum_post_file(
                         channel,
                         content=(caption or "").strip(),
@@ -5324,11 +5526,15 @@ class DiscordAdapter(BasePlatformAdapter):
         try:
             import aiohttp
 
-            channel = self._client.get_channel(int(chat_id))
-            if not channel:
-                channel = await self._client.fetch_channel(int(chat_id))
-            if not channel:
-                return SendResult(success=False, error=f"Channel {chat_id} not found")
+            channel, authoritative = await self._resolve_authoritative_channel(
+                chat_id,
+                operation_name=f"animation target channel {chat_id} resolution",
+            )
+            if not authoritative or channel is None:
+                return SendResult(
+                    success=False,
+                    error="Could not verify the Discord channel type. Please retry.",
+                )
 
             # Download the GIF and send as a Discord file attachment
             # (Discord renders .gif attachments as auto-playing animations inline)
@@ -5348,7 +5554,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 import io
                 file = discord.File(io.BytesIO(animation_data), filename="animation.gif")
 
-                if self._is_forum_parent(channel):
+                if self._is_forum_or_media_channel(channel):
                     return await self._forum_post_file(
                         channel,
                         content=(caption or "").strip(),
@@ -5482,12 +5688,12 @@ class DiscordAdapter(BasePlatformAdapter):
             return {"name": "Unknown", "type": "dm"}
 
         try:
-            channel = self._client.get_channel(int(chat_id))
-            if not channel:
-                channel = await self._client.fetch_channel(int(chat_id))
-
-            if not channel:
-                return {"name": str(chat_id), "type": "dm"}
+            channel, authoritative = await self._resolve_authoritative_channel(
+                chat_id,
+                operation_name=f"chat info channel {chat_id} resolution",
+            )
+            if not authoritative or channel is None:
+                return {"name": str(chat_id), "type": "unknown"}
 
             # Determine channel type
             if isinstance(channel, discord.DMChannel):
@@ -6938,22 +7144,31 @@ class DiscordAdapter(BasePlatformAdapter):
         return getattr(channel, "parent", None) or channel
 
     async def _resolve_interaction_channel(self, interaction: discord.Interaction) -> Optional[Any]:
-        """Return the interaction channel, fetching it if the payload is partial."""
+        """Return a type-safe interaction channel after slash authorization.
+
+        Guild interaction payload/cache objects can carry the same synthetic
+        ``TextChannel`` projection as message events. Resolve ambiguous channel
+        types through the shared per-client authority before choosing the
+        text-vs-forum/media creation protocol.
+        """
         channel = getattr(interaction, "channel", None)
-        if channel is not None:
+        if isinstance(channel, (discord.DMChannel, discord.Thread)):
             return channel
         if not self._client:
             return None
-        channel_id = getattr(interaction, "channel_id", None)
+        channel_id = getattr(interaction, "channel_id", None) or getattr(
+            channel,
+            "id",
+            None,
+        )
         if channel_id is None:
             return None
-        channel = self._client.get_channel(int(channel_id))
-        if channel is not None:
-            return channel
-        try:
-            return await self._client.fetch_channel(int(channel_id))
-        except Exception:
-            return None
+        resolved, authoritative = await self._resolve_authoritative_channel(
+            channel_id,
+            channel,
+            operation_name=f"interaction channel {channel_id} resolution",
+        )
+        return resolved if authoritative else None
 
     @staticmethod
     def _thread_from_create_result(result: Any) -> Optional[Any]:
@@ -7255,6 +7470,13 @@ class DiscordAdapter(BasePlatformAdapter):
             return {"error": "Could not resolve the current Discord channel."}
         if isinstance(channel, discord.DMChannel):
             return {"error": "Discord threads can only be created inside server text channels, not DMs."}
+        if isinstance(channel, discord.Thread):
+            return {
+                "error": (
+                    "Discord does not support creating a nested thread inside an "
+                    "existing thread. Run /thread in a server text, forum, or media channel."
+                )
+            }
 
         parent_channel = self._thread_parent_channel(channel)
         if parent_channel is None:
@@ -7436,12 +7658,16 @@ class DiscordAdapter(BasePlatformAdapter):
         if utf16_len(cleaned) > 80:
             cleaned = _prefix_within_utf16_limit(cleaned, 77).rstrip() + "..."
 
-        try:
-            thread = self._client.get_channel(thread_id_int)
-            if thread is None:
-                thread = await self._client.fetch_channel(thread_id_int)
-        except Exception:
-            logger.debug("[%s] Failed to resolve Discord thread %s for rename", self.name, thread_id, exc_info=True)
+        thread, authoritative = await self._resolve_authoritative_channel(
+            thread_id_int,
+            operation_name=f"thread {thread_id_int} rename resolution",
+        )
+        if not authoritative or not isinstance(thread, discord.Thread):
+            logger.debug(
+                "[%s] Failed to resolve authoritative Discord thread %s for rename",
+                self.name,
+                thread_id,
+            )
             return False
 
         current_name = getattr(thread, "name", None)
@@ -7488,14 +7714,15 @@ class DiscordAdapter(BasePlatformAdapter):
         except (TypeError, ValueError):
             return None
 
-        try:
-            parent = self._client.get_channel(parent_id)
-            if parent is None:
-                parent = await self._client.fetch_channel(parent_id)
-        except Exception as exc:
+        parent, authoritative = await self._resolve_authoritative_channel(
+            parent_id,
+            operation_name=f"handoff parent channel {parent_id} resolution",
+        )
+        if not authoritative or parent is None:
             logger.warning(
-                "[%s] Handoff thread: cannot resolve parent %s: %s",
-                self.name, parent_chat_id, exc,
+                "[%s] Handoff thread: cannot resolve authoritative parent %s",
+                self.name,
+                parent_chat_id,
             )
             return None
 

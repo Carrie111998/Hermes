@@ -227,6 +227,27 @@ async def test_reconnect_closes_previous_client_to_prevent_zombie_websocket(monk
     assert len(created) == 1
     first_bot = created[0]
     assert first_bot._closed is False, "first bot should still be open after connect()"
+    assert {
+        "on_guild_channel_update",
+        "on_guild_channel_delete",
+        "on_thread_update",
+        "on_thread_delete",
+        "on_thread_join",
+        "on_thread_remove",
+        "on_raw_thread_update",
+        "on_raw_thread_delete",
+        "on_guild_remove",
+    } <= first_bot._events.keys()
+    cached_parent = SimpleNamespace(id=100)
+    cached_thread = SimpleNamespace(id=200, parent_id=100)
+    adapter._cache_authoritative_message_channel(cached_parent)
+    adapter._cache_authoritative_message_channel(cached_thread)
+    await first_bot._events["on_guild_channel_update"](
+        cached_parent,
+        SimpleNamespace(id=100),
+    )
+    assert 100 not in adapter._authoritative_message_channels
+    assert 200 not in adapter._authoritative_message_channels
 
     # Second connect WITHOUT disconnect — simulates an in-process reconnect.
     # Without the fix, first_bot would remain open (zombie), and both would
@@ -621,4 +642,3 @@ class TestDiscordUnconfiguredNonRetryable:
         assert adapter.has_fatal_error is True
         assert adapter.fatal_error_retryable is False
         assert adapter.fatal_error_code == "missing_dependency"
-
