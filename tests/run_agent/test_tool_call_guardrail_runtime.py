@@ -8,6 +8,25 @@ from unittest.mock import MagicMock, patch
 from run_agent import AIAgent
 
 
+class _FakeMemoryStore:
+    def __init__(self, token: str):
+        self.token = token
+        self.stat_targets = []
+
+    def stat(self, target: str):
+        self.stat_targets.append(target)
+        return {"success": True, "store": target, "store_state_token": self.token}
+
+
+class _FailingMemoryStore:
+    def stat(self, target: str):
+        return {
+            "success": False,
+            "store": target,
+            "error": f"Could not read {target}",
+        }
+
+
 def _make_tool_defs(*names: str) -> list[dict]:
     return [
         {
@@ -238,9 +257,9 @@ def test_relay_rewrite_precedes_sequential_policy_approval_checkpoint_and_dispat
 
     original_before_call = agent._tool_guardrails.before_call
 
-    def observe_guardrail(name, args):
+    def observe_guardrail(name, args, **kwargs):
         observed["guardrail"].append((name, dict(args)))
-        return original_before_call(name, args)
+        return original_before_call(name, args, **kwargs)
 
     def relay_execute(name, args, callback, **kwargs):
         del name, args, kwargs
@@ -339,6 +358,90 @@ def test_plugin_pre_tool_block_wins_without_counting_as_toolguard_block():
     mock_hfc.assert_not_called()
     assert "plugin policy" in messages[0]["content"]
     assert agent._tool_guardrails.before_call("web_search", args).action == "allow"
+
+
+def test_sequential_memory_call_passes_current_store_state_token_to_guardrail():
+    agent = _make_agent("memory")
+    agent._memory_store = _FakeMemoryStore("opaque:seq")
+    before_call = MagicMock(wraps=agent._tool_guardrails.before_call)
+    agent._tool_guardrails.before_call = before_call
+    args = {
+        "target": "memory",
+        "operations": [{"action": "add", "content": "hello"}],
+    }
+    tc = _mock_tool_call("memory", json.dumps(args), "c-memory-seq")
+    messages = []
+
+    with patch("tools.memory_tool.memory_tool", return_value=json.dumps({"success": True})):
+        agent._execute_tool_calls_sequential(
+            SimpleNamespace(content="", tool_calls=[tc]), messages, "task-1"
+        )
+
+    assert agent._memory_store.stat_targets == ["memory"]
+    before_call.assert_called_once_with(
+        "memory", args, current_store_state_token="opaque:seq"
+    )
+
+
+def test_failed_memory_stat_passes_none_token_without_fabricating_empty_state():
+    from agent.tool_executor import _memory_current_state_token
+
+    agent = SimpleNamespace(_memory_store=_FailingMemoryStore())
+    assert _memory_current_state_token(
+        agent, "memory", {"target": "memory", "action": "add", "content": "x"}
+    ) is None
+
+
+def test_concurrent_memory_call_passes_current_store_state_token_to_guardrail():
+    agent = _make_agent("memory")
+    agent._memory_store = _FakeMemoryStore("opaque:conc")
+    before_call = MagicMock(wraps=agent._tool_guardrails.before_call)
+    agent._tool_guardrails.before_call = before_call
+    args = {"store": "user", "action": "add", "content": "hello"}
+    tc = _mock_tool_call("memory", json.dumps(args), "c-memory-conc")
+    messages = []
+
+    with patch.object(agent, "_invoke_tool", return_value=json.dumps({"success": True})):
+        agent._execute_tool_calls_concurrent(
+            SimpleNamespace(content="", tool_calls=[tc]), messages, "task-1"
+        )
+
+    assert agent._memory_store.stat_targets == ["user"]
+    before_call.assert_called_once_with(
+        "memory", args, current_store_state_token="opaque:conc"
+    )
+
+
+def test_same_state_memory_quota_retry_is_skipped_without_halting():
+    agent = _make_agent("memory")
+    agent._memory_store = _FakeMemoryStore("opaque:A")
+    args = {
+        "target": "memory",
+        "operations": [{"action": "add", "content": "oversized fact"}],
+    }
+    quota_result = json.dumps({
+        "success": False,
+        "store": "memory",
+        "store_state_token": "opaque:A",
+        "error": "Memory quota rejected this write.",
+        "error_code": "memory_quota_exceeded",
+        "error_details": {"code": "memory_quota_exceeded", "operation": "batch"},
+    })
+    agent._tool_guardrails.before_call(
+        "memory", args, current_store_state_token="opaque:A"
+    )
+    agent._tool_guardrails.after_call("memory", args, quota_result, failed=True)
+    tc = _mock_tool_call("memory", json.dumps(args), "c-memory-skip")
+    messages = []
+
+    with patch("tools.memory_tool.memory_tool", return_value="SHOULD_NOT_RUN") as memory_call:
+        agent._execute_tool_calls_sequential(
+            SimpleNamespace(content="", tool_calls=[tc]), messages, "task-1"
+        )
+
+    memory_call.assert_not_called()
+    assert "memory_quota_exceeded_non_retryable" in messages[0]["content"]
+    assert agent._tool_guardrail_halt_decision is None
 
 
 def test_default_run_conversation_warns_without_guardrail_halt():

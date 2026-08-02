@@ -165,6 +165,27 @@ def _ra():
     return run_agent
 
 
+def _memory_current_state_token(agent, function_name: str, function_args: dict) -> str | None:
+    if function_name != "memory":
+        return None
+    memory_store = getattr(agent, "_memory_store", None)
+    if memory_store is None or not hasattr(memory_store, "stat"):
+        return None
+    store = function_args.get("store") or function_args.get("target") or "memory"
+    try:
+        stat = memory_store.stat(store)
+    except Exception:
+        return None
+    # Only a successful, authentic token may refresh observed store state.
+    # Failed/empty fabricated stats must return None so before_call keeps the
+    # previously observed token (and any armed same-state skip).
+    if isinstance(stat, dict) and stat.get("success") is True:
+        token = stat.get("store_state_token")
+        if isinstance(token, str) and token:
+            return token
+    return None
+
+
 def _is_interpreter_shutdown_submit_error(exc: RuntimeError) -> bool:
     return "cannot schedule new futures after interpreter shutdown" in str(exc)
 
@@ -440,7 +461,11 @@ def _run_agent_tool_execution_middleware(
         guardrail_decision = None
         if block_message is None:
             guardrail_decision = agent._tool_guardrails.before_call(
-                function_name, final_args
+                function_name,
+                final_args,
+                current_store_state_token=_memory_current_state_token(
+                    agent, function_name, final_args
+                ),
             )
             if guardrail_decision.allows_execution:
                 guardrail_decision = None
