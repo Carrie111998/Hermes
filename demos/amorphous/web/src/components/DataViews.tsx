@@ -16,23 +16,36 @@ export function useComponentData(c: Component, proposalId?: string) {
   const [err, setErr] = useState<string>("");
   const [flash, setFlash] = useState(false);
   const firstLoad = useRef(true);
+  const failCount = useRef(0);
+  const retryTimer = useRef<any>(null);
   const refresh = async () => {
     try {
       const pv = proposalId ? `&proposal_id=${proposalId}` : "";
       setData(await api(`/api/component/${c.id}/data?user_id=${USER}${pv}`));
       setErr("");
+      failCount.current = 0;
       if (!firstLoad.current) { setFlash(true); setTimeout(() => setFlash(false), 900); }
       firstLoad.current = false;
     } catch (e: any) {
-      setErr(String(e.message || e));
+      // Network failures self-heal: exponential backoff retry (2s→30s cap)
+      // so a dropped tunnel/server restart recovers without a manual reload.
+      failCount.current += 1;
+      const wait = Math.min(2000 * 2 ** (failCount.current - 1), 30000);
+      const netErr = /failed to fetch|networkerror|load failed/i.test(String(e.message || e));
+      setErr(netErr
+        ? `Reconnecting… (attempt ${failCount.current})`
+        : String(e.message || e));
+      clearTimeout(retryTimer.current);
+      retryTimer.current = setTimeout(refresh, wait);
     }
   };
   useEffect(() => {
     firstLoad.current = true;
+    failCount.current = 0;
     refresh();
     const t = setInterval(refresh, refreshCadence(c));
     const off = onComponentRefresh(c.id, refresh);
-    return () => { clearInterval(t); off(); };
+    return () => { clearInterval(t); off(); clearTimeout(retryTimer.current); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [c.id, JSON.stringify(c.props), proposalId]);
   return { data, err, refresh, flash };
@@ -68,7 +81,17 @@ export function Skeleton({ rows = 3 }: { rows?: number }) {
 }
 
 export function DataView({ c, data, err }: { c: Component; data: any; err: string }) {
-  if (err) return <div className="text-red text-[13px] whitespace-pre-wrap">{err}</div>;
+  if (err) {
+    if (err.startsWith("Reconnecting")) {
+      return (
+        <div className="h-full flex flex-col items-center justify-center gap-2 text-ink-4 text-[12.5px]">
+          <LoaderCircle size={16} className="spin" />
+          {err}
+        </div>
+      );
+    }
+    return <div className="text-red text-[13px] whitespace-pre-wrap">{err}</div>;
+  }
   if (!data) return <Skeleton rows={Math.min(c.h * 2 + 1, 6)} />;
   switch (data.kind) {
     case "metric": return <MetricView data={data} />;

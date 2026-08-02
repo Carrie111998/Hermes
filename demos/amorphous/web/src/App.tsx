@@ -32,10 +32,16 @@ export default function App() {
   }, []);
 
   const load = useCallback(async () => {
-    const s = await api<StationState>(`/api/state?user_id=${USER}`);
-    setState(s);
-    if (s.onboarded) setDockPos((s.layout.chat_dock?.position as any) || "bottom");
-    return s;
+    try {
+      const s = await api<StationState>(`/api/state?user_id=${USER}`);
+      setState(s);
+      if (s.onboarded) setDockPos((s.layout.chat_dock?.position as any) || "bottom");
+      return s;
+    } catch (e) {
+      // network blip / tunnel drop: retry until the server is reachable again
+      setTimeout(() => load(), 3000);
+      return null;
+    }
   }, []);
 
   useEffect(() => {
