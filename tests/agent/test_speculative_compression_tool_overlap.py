@@ -5,6 +5,7 @@ import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import agent.conversation_loop as conversation_loop
 import agent.speculative_compression as speculative
 from agent.speculative_compression import (
     SpeculativeCandidate,
@@ -62,6 +63,26 @@ def _agent(manager):
         context_compressor=Compressor(),
         api_mode="chat_completions",
         session_id="session-1",
+    )
+
+
+def test_disabled_speculation_skips_request_token_estimation(monkeypatch):
+    agent = _agent(Manager())
+    agent.speculative_compression_enabled = False
+    agent.tools = []
+
+    def fail_estimate(*_args, **_kwargs):
+        raise AssertionError("disabled speculation must not estimate tokens")
+
+    monkeypatch.setattr(
+        conversation_loop, "estimate_request_tokens_rough", fail_estimate
+    )
+
+    assert (
+        conversation_loop._schedule_speculative_tool_wait(
+            agent, [{"role": "user", "content": "text"}], "system"
+        )
+        == "disabled"
     )
 
 

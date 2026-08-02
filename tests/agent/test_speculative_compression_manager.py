@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextvars
 import threading
 import time
 
@@ -461,4 +462,89 @@ def test_manager_reruns_coalesced_snapshot_with_new_fingerprint():
         assert len(calls) == 2
     finally:
         release.set()
+        manager.shutdown()
+
+
+def test_manager_worker_preserves_caller_contextvars():
+    marker = contextvars.ContextVar("speculative-manager-context", default="missing")
+    manager = SpeculativeCompressionManager(max_workers=1)
+    snapshot = _snapshot()
+    seen = []
+
+    class ContextWorker:
+        def compress(self, messages, **_kwargs):
+            seen.append(marker.get())
+            return [
+                {"role": "user", "content": "summary"},
+                *messages[snapshot.cut_index :],
+            ]
+
+    token = marker.set("caller-context")
+    try:
+        assert manager.maybe_start("session-1", snapshot, lambda: ContextWorker()) == "started"
+        assert manager.take_matching_candidate("session-1", _snapshot_messages(), wait_seconds=2) is not None
+        assert seen == ["caller-context"]
+    finally:
+        marker.reset(token)
+        manager.shutdown()
+
+
+def test_manager_invalidated_rerun_rechecks_before_provider_work():
+    manager = SpeculativeCompressionManager(max_workers=1)
+    snapshot = _snapshot()
+    newer = SpeculativeSnapshot(
+        session_id=snapshot.session_id,
+        messages=snapshot.messages,
+        source_fingerprint="deadbeef" + snapshot.source_fingerprint[8:],
+        boundary_fingerprint=snapshot.boundary_fingerprint,
+        compressor_fingerprint=snapshot.compressor_fingerprint,
+        cut_index=snapshot.cut_index,
+        compress_start=snapshot.compress_start,
+        original_count=snapshot.original_count,
+        request_tokens=snapshot.request_tokens,
+        captured_at=snapshot.captured_at,
+    )
+    first_started = threading.Event()
+    release_first = threading.Event()
+    rerun_factory_entered = threading.Event()
+    release_rerun_factory = threading.Event()
+    factory_calls = [0]
+    provider_calls = []
+
+    class Worker:
+        def __init__(self, run_number):
+            self.run_number = run_number
+
+        def compress(self, messages, **_kwargs):
+            provider_calls.append(self.run_number)
+            if self.run_number == 1:
+                first_started.set()
+                assert release_first.wait(2)
+            return [
+                {"role": "user", "content": "summary"},
+                *messages[snapshot.cut_index :],
+            ]
+
+    def factory():
+        factory_calls[0] += 1
+        run_number = factory_calls[0]
+        if run_number == 2:
+            rerun_factory_entered.set()
+            assert release_rerun_factory.wait(2)
+        return Worker(run_number)
+
+    try:
+        assert manager.maybe_start("session-1", snapshot, factory) == "started"
+        assert first_started.wait(1)
+        assert manager.maybe_start("session-1", newer, factory) == "coalesced"
+        release_first.set()
+        assert rerun_factory_entered.wait(2)
+        manager.invalidate_session("session-1")
+        release_rerun_factory.set()
+        manager.shutdown(wait=True)
+        assert provider_calls == [1]
+        assert "session-1" not in manager._entries
+    finally:
+        release_first.set()
+        release_rerun_factory.set()
         manager.shutdown()

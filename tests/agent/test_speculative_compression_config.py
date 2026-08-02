@@ -15,7 +15,7 @@ def test_runtime_defaults_are_disabled_and_match_checked_in_reference():
     settings = normalize_speculative_compression_settings({})
     assert settings == DEFAULT_SPECULATIVE_COMPRESSION_SETTINGS
     assert DEFAULT_CONFIG["compression"]["speculative"]["enabled"] is False
-    assert DEFAULT_CONFIG["compression"]["speculative"]["during_idle"] is False
+
 
 
 def test_invalid_ratios_warn_and_fall_back_to_safe_defaults(caplog):

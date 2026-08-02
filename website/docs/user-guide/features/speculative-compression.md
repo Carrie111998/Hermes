@@ -34,7 +34,7 @@ compression:
     max_age_seconds: 180  # discard candidates older than this (0 = immediate expiry)
     hard_wait_seconds: 2  # bounded foreground wait for a ready candidate
     during_tool_wait: true
-    during_idle: false    # reserved; v1 never schedules idle work
+
 ```
 
 Ratios apply to the **effective input budget** (`context_length − max_tokens` output reservation) of the **currently active model**. `compression.threshold_tokens` (absolute cap), when set below the ratio watermarks, caps the speculative triggers too. On small context windows where the minimum-window floor collapses the watermarks, speculation disables itself.
