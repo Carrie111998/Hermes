@@ -99,3 +99,43 @@ def test_empty_events_skipped(tmp_path):
 
     assert not registry._handlers
     assert not registry.loaded_hooks
+
+
+def test_empty_string_events_skipped(tmp_path):
+    """An empty-string scalar events must stay skipped, not become [""]."""
+    hermes_home = Path(os.environ["HERMES_HOME"])
+    hooks_dir = hermes_home / "hooks"
+    hooks_dir.mkdir()
+
+    _make_hook(
+        hooks_dir,
+        "empty_string_events_hook",
+        manifest_yaml='name: empty_string_events_hook\nevents: ""\n',
+        handler_py="def handle(event_type, context): pass\n",
+    )
+
+    registry = _fresh_registry()
+    registry.discover_and_load()
+
+    assert not registry._handlers
+    assert not registry.loaded_hooks
+
+
+def test_non_list_events_skipped(tmp_path):
+    """Non-list, non-string events values should be skipped."""
+    hermes_home = Path(os.environ["HERMES_HOME"])
+    hooks_dir = hermes_home / "hooks"
+    hooks_dir.mkdir()
+
+    _make_hook(
+        hooks_dir,
+        "non_list_events_hook",
+        manifest_yaml="name: non_list_events_hook\nevents: 42\n",
+        handler_py="def handle(event_type, context): pass\n",
+    )
+
+    registry = _fresh_registry()
+    registry.discover_and_load()
+
+    assert not registry._handlers
+    assert not registry.loaded_hooks
