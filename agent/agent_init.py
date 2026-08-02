@@ -1410,6 +1410,14 @@ def init_agent(
         agent._tool_snapshot_generation = _snapshot_registry._generation
     except Exception:
         agent._tool_snapshot_generation = 0
+    try:
+        if "tools.mcp_tool" in sys.modules:
+            from tools.mcp_tool import get_mcp_tool_generation
+            agent._mcp_tool_snapshot_generation = get_mcp_tool_generation()
+        else:
+            agent._mcp_tool_snapshot_generation = 0
+    except Exception:
+        agent._mcp_tool_snapshot_generation = 0
     agent.tools = _ra().get_tool_definitions(
         enabled_toolsets=enabled_toolsets,
         disabled_toolsets=disabled_toolsets,

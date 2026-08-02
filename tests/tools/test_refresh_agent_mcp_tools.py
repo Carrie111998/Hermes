@@ -8,6 +8,7 @@ rely on (name-based diff, in-place mutation, agent-scoped filtering) rather than
 freezing any particular tool list.
 """
 
+import json
 import threading
 import types
 
@@ -42,6 +43,111 @@ def test_refresh_adds_late_landing_tools(monkeypatch):
     assert added == {"mcp_granola_get_account_info"}
     assert "mcp_granola_get_account_info" in agent.valid_tool_names
     assert len(agent.tools) == 3
+
+
+def test_refresh_reads_live_registry_without_republishing_static_bridge(monkeypatch):
+    """Catalog edits change bridge results, never the model-facing prefix."""
+    import model_tools
+    from tools import tool_search
+    from tools.registry import registry
+
+    toolset = "mcp-pr72578-live"
+    alpha = "mcp_pr72578_live_alpha"
+    beta = "mcp_pr72578_live_beta"
+    config = tool_search.ToolSearchConfig.from_raw({"enabled": "on"})
+    monkeypatch.setattr(tool_search, "load_config", lambda: config)
+
+    def register(name, description, *, required=()):
+        registry.register(
+            name=name,
+            toolset=toolset,
+            schema={
+                "name": name,
+                "description": description,
+                "parameters": {
+                    "type": "object",
+                    "properties": {key: {"type": "string"} for key in required},
+                    "required": list(required),
+                },
+            },
+            handler=lambda args, **kwargs: json.dumps({"ok": True}),
+        )
+        mcp_tool._track_mcp_tool_server(name, "pr72578-live")
+
+    def remove(name):
+        registry.deregister(name)
+        mcp_tool._forget_mcp_tool_server(name)
+
+    try:
+        register(alpha, "First live capability.")
+        initial_defs = model_tools.get_tool_definitions(
+            enabled_toolsets=[toolset],
+            quiet_mode=True,
+        )
+        agent = _agent([], enabled=[toolset])
+        agent.tools = initial_defs
+        agent.valid_tool_names = {
+            tool["function"]["name"] for tool in initial_defs
+        }
+        original_tools = agent.tools
+
+        remove(alpha)
+        register(beta, "Replacement live capability.")
+        assert mcp_tool.refresh_agent_mcp_tools(agent) == set()
+        assert agent.tools is original_tools
+        assert (
+            agent._mcp_tool_snapshot_generation
+            == mcp_tool.get_mcp_tool_generation()
+        )
+        search = json.loads(model_tools.handle_function_call(
+            function_name="tool_search",
+            function_args={"query": "replacement"},
+            enabled_toolsets=[toolset],
+        ))
+        assert [match["name"] for match in search["matches"]] == [beta]
+
+        remove(beta)
+        register(beta, "Updated live capability.", required=("query",))
+        assert mcp_tool.refresh_agent_mcp_tools(agent) == set()
+        assert agent.tools is original_tools
+        described = json.loads(model_tools.handle_function_call(
+            function_name="tool_describe",
+            function_args={"name": beta},
+            enabled_toolsets=[toolset],
+        ))
+        assert described["description"] == "Updated live capability."
+        assert described["parameters"]["required"] == ["query"]
+
+        remove(beta)
+        assert mcp_tool.refresh_agent_mcp_tools(agent) == set()
+        assert agent.tools is original_tools
+        empty = json.loads(model_tools.handle_function_call(
+            function_name="tool_search",
+            function_args={"query": "anything"},
+            enabled_toolsets=[toolset],
+        ))
+        assert empty["total_available"] == 0
+    finally:
+        remove(alpha)
+        remove(beta)
+
+
+def test_refresh_removes_bridge_when_tool_search_is_disabled(monkeypatch):
+    """An explicit config disable overrides empty-catalog bridge preservation."""
+    import model_tools
+    from tools import tool_search
+
+    agent = _agent(sorted(tool_search.BRIDGE_TOOL_NAMES))
+    monkeypatch.setattr(model_tools, "get_tool_definitions", lambda **kw: [])
+    monkeypatch.setattr(
+        tool_search,
+        "load_config",
+        lambda: tool_search.ToolSearchConfig.from_raw({"enabled": "off"}),
+    )
+
+    assert mcp_tool.refresh_agent_mcp_tools(agent) == set()
+    assert agent.tools == []
+    assert agent.valid_tool_names == set()
 
 
 def test_refresh_preserves_memory_provider_and_context_engine_tools(monkeypatch):

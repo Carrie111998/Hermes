@@ -333,7 +333,84 @@ def test_between_turns_refresh_adds_late_tool_when_servers_registered():
     assert any(t["function"]["name"] == "mcp_x_tool" for t in agent.tools)
 
 
+def test_between_turns_refreshes_final_mcp_removal_by_generation():
+    """The empty live map must not hide an MCP 1 -> 0 transition."""
+    agent = _FakeAgent()
+    agent._mcp_tool_snapshot_generation = 1
 
+    with patch("tools.mcp_tool.has_registered_mcp_tools", return_value=False), \
+         patch("tools.mcp_tool.get_mcp_tool_generation", return_value=2), \
+         patch("tools.mcp_tool.refresh_agent_mcp_tools") as refresh:
+        _build(agent)
+
+    refresh.assert_called_once_with(agent, quiet_mode=True)
+
+
+def test_between_turns_removes_final_direct_mcp_schema_from_live_registry(monkeypatch):
+    """The real MCP generation closes the direct-schema 1 -> 0 boundary."""
+    import model_tools
+    from tools import mcp_tool, tool_search
+    from tools.registry import registry
+
+    toolset = "mcp-pr72578-final-removal"
+    name = "mcp_pr72578_final_removal_tool"
+    config = tool_search.ToolSearchConfig.from_raw({"enabled": "off"})
+    monkeypatch.setattr(tool_search, "load_config", lambda: config)
+
+    registry.register(
+        name=name,
+        toolset=toolset,
+        schema={
+            "name": name,
+            "description": "Temporary direct MCP capability.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+        handler=lambda args, **kwargs: "{}",
+    )
+    mcp_tool._track_mcp_tool_server(name, "pr72578-final-removal")
+    try:
+        agent = _FakeAgent()
+        agent.enabled_toolsets = [toolset]
+        agent.tools = model_tools.get_tool_definitions(
+            enabled_toolsets=[toolset],
+            quiet_mode=True,
+        )
+        agent.valid_tool_names = {
+            tool["function"]["name"] for tool in agent.tools
+        }
+        agent._tool_snapshot_generation = registry._generation
+        agent._mcp_tool_snapshot_generation = mcp_tool.get_mcp_tool_generation()
+        assert name in agent.valid_tool_names
+
+        before_removal = agent._mcp_tool_snapshot_generation
+        registry.deregister(name)
+        mcp_tool._forget_mcp_tool_server(name)
+        assert mcp_tool.get_mcp_tool_generation() > before_removal
+
+        _build(agent)
+
+        assert name not in agent.valid_tool_names
+        assert all(tool["function"]["name"] != name for tool in agent.tools)
+        assert (
+            agent._mcp_tool_snapshot_generation
+            == mcp_tool.get_mcp_tool_generation()
+        )
+    finally:
+        registry.deregister(name)
+        mcp_tool._forget_mcp_tool_server(name)
+
+
+def test_between_turns_ignores_unrelated_registry_changes_without_mcp_generation():
+    """A non-MCP registry mutation must not trigger MCP snapshot rebuilding."""
+    agent = _FakeAgent()
+    agent._mcp_tool_snapshot_generation = 2
+
+    with patch("tools.mcp_tool.has_registered_mcp_tools", return_value=False), \
+         patch("tools.mcp_tool.get_mcp_tool_generation", return_value=2), \
+         patch("tools.mcp_tool.refresh_agent_mcp_tools") as refresh:
+        _build(agent)
+
+    refresh.assert_not_called()
 
 
 
