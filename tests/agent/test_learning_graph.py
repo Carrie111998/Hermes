@@ -79,3 +79,40 @@ def test_full_payload_shape_and_edge_integrity(tmp_path):
     assert graph["stats"]["nodes"] == len(skill_nodes)
     assert graph["stats"]["memory_nodes"] == len(graph["memory"])
     assert all("timestamp" in n for n in graph["nodes"])
+
+
+def test_graph_projects_learning_candidates_without_changing_node_kinds(tmp_path):
+    from agent import learning_ledger
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    token = set_hermes_home_override(home)
+    try:
+        learning_ledger.create_candidate(
+            {
+                "candidate_id": "candidate-journey",
+                "subsystem": "skills",
+                "action": "patch",
+                "status": "active",
+                "payload_fingerprint": "sha256:p",
+                "dedup_key": "sha256:d",
+                "proposal": {"summary": "Improve retry guidance"},
+                "source": {"origin": "background_review"},
+                "evidence": {
+                    "status": "captured",
+                    "risk": "medium",
+                    "hypothesis": "Fewer repeated retry failures",
+                },
+                "precondition": {},
+            }
+        )
+        learning_ledger.record_outcome(
+            "candidate-journey", "verification_failed", detail={"reason": "fixture failed"}
+        )
+        graph = learning_graph.build_learning_graph()
+    finally:
+        reset_hermes_home_override(token)
+
+    assert {node["kind"] for node in graph["nodes"]} <= {"skill", "memory"}
+    assert graph["candidates"][0]["id"] == "candidate-journey"
+    assert graph["candidates"][0]["outcomes"][0]["outcome"] == "verification_failed"

@@ -11482,6 +11482,13 @@ def main():
     project_parser.set_defaults(func=cmd_project)
 
     # =========================================================================
+    # context command — deterministic health audit + compilation proposals
+    from hermes_cli.context_cmd import build_parser as _build_context_parser, cmd_context
+
+    context_parser = _build_context_parser(subparsers)
+    context_parser.set_defaults(func=cmd_context)
+
+    # =========================================================================
     # hooks command — shell-hook inspection and management
     # =========================================================================
     # hooks command  (parser built in hermes_cli/subcommands/hooks.py)

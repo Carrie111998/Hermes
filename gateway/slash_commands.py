@@ -3434,15 +3434,20 @@ class GatewaySlashCommandsMixin:
         Gate changes persist to config.yaml and evict the cached agent so the
         new setting takes effect on the next message.
         """
-        from gateway.run import _hermes_home
+        from hermes_constants import get_hermes_home
         from hermes_cli.write_approval_commands import handle_pending_subcommand
         from tools import write_approval as wa
         from tools.memory_tool import load_on_disk_store
 
         raw_args = event.get_command_args().strip()
         args = raw_args.split() if raw_args else []
+        if not self._resume_caller_is_admin(event.source):
+            return (
+                "Memory learning review is profile-global and requires an explicitly "
+                "configured slash-command admin. Use the local CLI or configure an admin ID."
+            )
         session_key = self._session_key_for_source(event.source)
-        config_path = _hermes_home / "config.yaml"
+        config_path = get_hermes_home() / "config.yaml"
 
         def _set_approval(enabled: bool):
             # Write-back round-trip: raw read is correct (merged defaults must
@@ -3483,18 +3488,27 @@ class GatewaySlashCommandsMixin:
         the write-approval ``diff <id>``; the CLI also has an unrelated
         ``hermes skills diff <name>`` that diffs a bundled skill vs stock.)
         """
-        from gateway.run import _hermes_home
+        from hermes_constants import get_hermes_home
         from hermes_cli.write_approval_commands import handle_pending_subcommand
         from tools import write_approval as wa
 
         raw_args = event.get_command_args().strip()
         args = raw_args.split() if raw_args else []
+        if not self._resume_caller_is_admin(event.source):
+            return (
+                "Skill learning review is profile-global and requires an explicitly "
+                "configured slash-command admin. Use the local CLI or configure an admin ID."
+            )
         session_key = self._session_key_for_source(event.source)
-        config_path = _hermes_home / "config.yaml"
+        config_path = get_hermes_home() / "config.yaml"
 
         gate_on = wa.write_approval_enabled(wa.SKILLS)
         wants_toggle = bool(args) and args[0].lower() in {"approval", "mode"}
-        if not gate_on and not wants_toggle and wa.pending_count(wa.SKILLS) == 0:
+        read_only_learning = bool(args) and args[0].lower() in {
+            "history", "ledger", "audit", "compile", "compilations", "eval", "evaluate",
+            "rollback",
+        }
+        if not gate_on and not wants_toggle and not read_only_learning and wa.pending_count(wa.SKILLS) == 0:
             return ("Skill write approval is off (skills.write_approval). "
                     "Enable it with /skills approval on, then review staged "
                     "writes here with /skills pending.")

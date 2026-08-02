@@ -251,6 +251,43 @@ def _skill_roots() -> list[tuple[str, Path]]:
     return [("base", repo / "skills"), ("profile", home_skills)]
 
 
+def _learning_candidates() -> list[dict[str, Any]]:
+    try:
+        from agent import learning_ledger
+
+        projected: list[dict[str, Any]] = []
+        for candidate in learning_ledger.list_candidates():
+            outcomes = []
+            for event in learning_ledger.list_events(candidate_id=candidate["candidate_id"]):
+                if not event["event"].startswith("outcome_"):
+                    continue
+                outcomes.append(
+                    {
+                        "outcome": event["event"].removeprefix("outcome_"),
+                        "detail": event.get("detail", {}),
+                        "timestamp": event.get("occurred_at"),
+                    }
+                )
+            projected.append(
+                {
+                    "id": candidate["candidate_id"],
+                    "subsystem": candidate["subsystem"],
+                    "action": candidate["action"],
+                    "status": candidate["status"],
+                    "summary": candidate.get("proposal", {}).get("summary", ""),
+                    "risk": candidate.get("evidence", {}).get("risk", "unknown"),
+                    "hypothesis": candidate.get("evidence", {}).get("hypothesis", ""),
+                    "source": candidate.get("source", {}),
+                    "createdAt": candidate.get("created_at"),
+                    "updatedAt": candidate.get("updated_at"),
+                    "outcomes": outcomes,
+                }
+            )
+        return projected
+    except Exception:
+        return []
+
+
 def build_learning_graph() -> dict[str, Any]:
     """Full payload for the desktop learning panel.
 
@@ -268,6 +305,7 @@ def build_learning_graph() -> dict[str, Any]:
     skill_edges = build_edges(learned_skills)
     memory_cards = _memory_cards()
     memory_edges = _memory_skill_edges(memory_cards, list(learned_skills.values()))
+    candidates = _learning_candidates()
 
     edges = skill_edges + memory_edges
     clusters: dict[str, int] = {}
@@ -314,11 +352,14 @@ def build_learning_graph() -> dict[str, Any]:
             for c, n in sorted(clusters.items(), key=lambda kv: -kv[1])
         ],
         "memory": memory_cards,
+        "candidates": candidates,
         "stats": {
             **density_stats(learned_skills, skill_edges),
             "memory_nodes": len(memory_cards),
             "memory_skill_edges": len(memory_edges),
             "learned_skills": len(learned_skills),
+            "learning_candidates": len(candidates),
+            "validated_candidates": sum(1 for candidate in candidates if candidate["status"] == "validated"),
         },
     }
 
