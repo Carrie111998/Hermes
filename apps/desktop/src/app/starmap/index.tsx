@@ -8,7 +8,9 @@ import type { StarmapGraph } from '@/types/hermes'
 
 import { Panel, PanelEmpty } from '../overlays/panel'
 
+import { LearningCandidates } from './learning-candidates'
 import { StarMap } from './star-map'
+import { hasStarmapContent } from './starmap-content'
 
 // Star map overlay: a top-down map of what Hermes has learned for a profile,
 // over a radial time axis. Data is fetched on demand into the $starmap* atoms;
@@ -43,15 +45,20 @@ export function StarmapView({ onClose }: { onClose: () => void }) {
         <PanelEmpty description={error} icon="warning" title={t.starmap.loadFailed} />
       ) : !shown && loading ? (
         <PageLoader aria-label={t.starmap.loading} className="min-h-0 flex-1" />
-      ) : shown && shown.nodes.length === 0 && !imported ? (
+      ) : shown && !hasStarmapContent(shown) && !imported ? (
         <PanelEmpty description={t.starmap.emptyDesc} icon="lightbulb" title={t.starmap.emptyTitle} />
       ) : shown ? (
-        <StarMap
-          graph={shown}
-          imported={imported !== null}
-          onImport={setImported}
-          onResetMap={() => setImported(null)}
-        />
+        <div className="flex min-h-0 flex-1 flex-col">
+          {!imported && <LearningCandidates graph={shown} />}
+          {shown.nodes.length > 0 ? (
+            <StarMap
+              graph={shown}
+              imported={imported !== null}
+              onImport={setImported}
+              onResetMap={() => setImported(null)}
+            />
+          ) : null}
+        </div>
       ) : null}
     </Panel>
   )

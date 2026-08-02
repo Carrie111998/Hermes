@@ -675,11 +675,31 @@ export interface StarmapMemoryCard {
   body: string
 }
 
+/** Read-only projection of one evidence-ledger candidate. */
+export interface StarmapLearningCandidate {
+  id: string
+  subsystem: string
+  action: string
+  status: string
+  summary: string
+  risk: string
+  hypothesis: string
+  source: Record<string, unknown>
+  createdAt?: null | string
+  updatedAt?: null | string
+  outcomes: Array<{
+    outcome: string
+    detail: Record<string, unknown>
+    timestamp?: null | string
+  }>
+}
+
 export interface StarmapGraph {
   nodes: StarmapNode[]
   edges: StarmapEdge[]
   clusters: StarmapCluster[]
   memory: StarmapMemoryCard[]
+  candidates?: StarmapLearningCandidate[]
   stats: Record<string, unknown>
 }
 
