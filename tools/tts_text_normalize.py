@@ -209,12 +209,37 @@ def smooth_whitespace_for_tts(text: str) -> str:
     return text.strip()
 
 
-# Reasoning blocks: models with ``/reasoning show`` enabled emit
-# ``<think>...</think>`` blocks in the final assistant message.  Users want to
-# SEE reasoning, not hear it read aloud (#34213).
-_THINK_BLOCK_RE = re.compile(r"<think[\s>].*?</think>", flags=re.DOTALL | re.IGNORECASE)
+# Reasoning blocks: models with ``/reasoning show`` enabled emit reasoning
+# blocks in the final assistant message.  Users want to SEE reasoning, not
+# hear it read aloud (#34213).  Cover every tag variant the canonical scrubber
+# recognises (``agent/think_scrubber.py`` ``_OPEN_TAG_NAMES``) — not just
+# ``<think>`` — so a model that emits ``<thinking>`` / ``<reasoning>`` /
+# ``<thought>`` (Gemini, Gemma, GLM, …) doesn't get its raw reasoning spoken.
+REASONING_TAG_NAMES = ("think", "thinking", "reasoning", "thought", "REASONING_SCRATCHPAD")
+# One closed-pair pattern per tag so an open ``<think>`` can't be paired with a
+# stray ``</reasoning>``.  Case-insensitive so ``<THINK>`` / ``<Thinking>`` match.
+_THINK_BLOCK_RES = tuple(
+    re.compile(rf"<{_name}[\s>].*?</{_name}>", flags=re.DOTALL | re.IGNORECASE)
+    for _name in REASONING_TAG_NAMES
+)
 # An unterminated block (streaming cut-off) should still not be spoken.
-_THINK_BLOCK_OPEN_RE = re.compile(r"<think[\s>].*\Z", flags=re.DOTALL | re.IGNORECASE)
+_THINK_BLOCK_OPEN_RE = re.compile(
+    rf"<(?:{'|'.join(REASONING_TAG_NAMES)})[\s>].*\Z",
+    flags=re.DOTALL | re.IGNORECASE,
+)
+
+
+def has_unclosed_reasoning_tag(text: str) -> bool:
+    """True when *text* holds a reasoning open tag with no matching close.
+
+    Lets a streaming caller hold a delta back until the closing tag arrives,
+    instead of speaking the opener. Covers every canonical reasoning variant.
+    """
+    low = text.lower()
+    return any(
+        f"<{_name.lower()}" in low and f"</{_name.lower()}>" not in low
+        for _name in REASONING_TAG_NAMES
+    )
 
 # Turn-end file-mutation verifier footer appended by run_agent.py
 # (``_format_file_mutation_failure_footer``).  It's a UI affordance — reading
@@ -230,12 +255,13 @@ _VERIFIER_FOOTER_RE = re.compile(
 def strip_nonspoken_blocks(text: str) -> str:
     """Remove blocks that must never reach a speech provider.
 
-    Currently: ``<think>`` reasoning blocks and the end-of-turn
-    file-mutation verifier footer.
+    Reasoning blocks (every canonical tag variant, closed or unterminated)
+    and the end-of-turn file-mutation verifier footer.
     """
     if not text:
         return ""
-    text = _THINK_BLOCK_RE.sub(" ", text)
+    for _think_re in _THINK_BLOCK_RES:
+        text = _think_re.sub(" ", text)
     text = _THINK_BLOCK_OPEN_RE.sub(" ", text)
     text = _VERIFIER_FOOTER_RE.sub(" ", text)
     return text
