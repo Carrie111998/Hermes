@@ -32,6 +32,8 @@ from agent.prompt_builder import (
     MEMORY_GUIDANCE,
     SESSION_SEARCH_GUIDANCE,
     PLATFORM_HINTS,
+    KANBAN_GUIDANCE,
+    kanban_guidance_for_session,
     WSL_ENVIRONMENT_HINT,
 )
 from hermes_cli.nous_subscription import NousFeatureState, NousSubscriptionFeatures
@@ -53,6 +55,21 @@ class TestGuidanceConstants:
     def test_session_search_guidance_is_simple_cross_session_recall(self):
         assert "relevant cross-session context exists" in SESSION_SEARCH_GUIDANCE
         assert "recent turns of the current session" not in SESSION_SEARCH_GUIDANCE
+
+    def test_kanban_guidance_uses_durable_routing_continuation(self):
+        assert "child_id=$HERMES_KANBAN_TASK" in KANBAN_GUIDANCE
+        assert "kanban_block(kind=\"dependency\")" in KANBAN_GUIDANCE
+        assert "implementation worker completes normally" in KANBAN_GUIDANCE
+        assert "complete your own task with a summary of the decomposition" not in KANBAN_GUIDANCE
+        assert "review-required" not in KANBAN_GUIDANCE
+
+    def test_kanban_guidance_requires_dispatcher_task_env(self, monkeypatch):
+        monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+        assert kanban_guidance_for_session({"kanban_show"}) == ""
+
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_root")
+        assert kanban_guidance_for_session({"kanban_show"}) == KANBAN_GUIDANCE
+        assert kanban_guidance_for_session({"kanban_create"}) == ""
 
 
 # =========================================================================

@@ -317,28 +317,34 @@ kanban_complete(
 )
 ```
 
-An **orchestrator** worker fans out instead:
+An **orchestrator** worker keeps its own card as the durable continuation:
 
 ```
 kanban_show()
-kanban_create(
+research = kanban_create(
     title="research ICP funding 2024-2026",
-    assignee="researcher-a",
-    body="focus on seed + series A, North America, AI-adjacent",
+    assignee="researcher",
+    body="focus on seed + series A; cite every material claim",
 )
-# → returns {"task_id": "t_r1", ...}
-kanban_create(title="research ICP funding — EU angle", assignee="researcher-b", body="…")
-# → returns {"task_id": "t_r2", ...}
-kanban_create(
+draft = kanban_create(
     title="synthesize findings into launch brief",
     assignee="writer",
-    parents=["t_r1", "t_r2"],                     # promotes to ready when both complete
+    parents=[research["task_id"]],
     body="one-pager, 300 words, neutral tone",
 )
-kanban_complete(summary="decomposed into 2 research tasks + 1 writer; linked dependencies")
+kanban_link(
+    parent_id=draft["task_id"],
+    child_id=$HERMES_KANBAN_TASK,
+)
+kanban_block(
+    reason="waiting for research and final draft",
+    kind="dependency",
+)
+# The dispatcher starts this same orchestrator card again after the draft is done.
+# On continuation: kanban_show(), inspect handoffs, then correct or complete.
 ```
 
-The "(Orchestrators)" tools — `kanban_list`, `kanban_create`, `kanban_link`, `kanban_unblock`, and `kanban_comment` on foreign tasks — are available through the same toolset; the convention (encoded in the auto-injected kanban guidance) is that worker profiles don't fan out or route unrelated work, and orchestrator profiles don't execute implementation work. Dispatcher-spawned workers are still task-scoped for destructive lifecycle operations and cannot mutate unrelated tasks.
+The routing tools — `kanban_list`, `kanban_create`, `kanban_link`, and `kanban_unblock` — require the active profile to explicitly enable `kanban` in `platform_toolsets.cli`. Ordinary dispatcher workers still receive their task lifecycle tools automatically, but cannot fan out or rewrite the graph.
 
 ### Why tools instead of shelling to `hermes kanban`
 
@@ -500,30 +506,30 @@ Use it for open-ended, multi-step, or "keep going until X is true" cards. Skip i
 
 ### How the orchestrator behaves
 
-A **well-behaved orchestrator does not do the work itself.** It decomposes the user's goal into tasks, links them, assigns each to one of the profiles you've set up, and steps back. The orchestrator guidance — anti-temptation rules, a Step-0 profile-discovery prompt (the dispatcher silently fails on unknown assignee names, so the orchestrator must ground every card in profiles that actually exist on your machine), and a decomposition playbook keyed on `kanban_create` / `kanban_link` / `kanban_comment` — is injected into the worker's system prompt automatically; there is nothing to install.
+A **well-behaved orchestrator does not do the implementation itself.** It decomposes the user's goal, assigns registered profiles, models implementation → review dependencies, and keeps its own card as a durable finalization checkpoint. Unknown assignees are rejected by `kanban_create` instead of being silently parked.
 
-A canonical orchestrator turn (two parallel researchers handing off to a writer):
+A canonical orchestrator turn (two parallel researchers handing off to a writer) is:
 
 ```
-# Goal from user: "draft a launch post on the ICP funding landscape"
-kanban_create(title="research ICP funding, NA angle",  assignee="researcher-a", body="…")  # → t_r1
-kanban_create(title="research ICP funding, EU angle",  assignee="researcher-b", body="…")  # → t_r2
-kanban_create(
-    title="synthesize ICP funding research into launch post draft",
+# Current routing card: $HERMES_KANBAN_TASK
+r1 = kanban_create(title="research funding, NA angle", assignee="researcher", body="…")
+r2 = kanban_create(title="research funding, EU angle", assignee="researcher", body="…")
+writer = kanban_create(
+    title="synthesize research into launch post",
     assignee="writer",
-    parents=["t_r1", "t_r2"],        # promoted to 'ready' when both researchers complete
+    parents=[r1["task_id"], r2["task_id"]],
     body="one-pager, neutral tone, cite sources inline",
-)                                     # → t_w1
-# Optional: add cross-cutting deps discovered later without re-creating tasks
-kanban_link(parent_id="t_r1", child_id="t_followup")
-kanban_complete(
-    summary="decomposed into 2 parallel research tasks → 1 synthesis task; writer starts when both researchers finish",
 )
+kanban_link(
+    parent_id=writer["task_id"],
+    child_id=$HERMES_KANBAN_TASK,
+)
+kanban_block(reason="waiting for specialist handoffs", kind="dependency")
 ```
 
-The orchestrator guidance ships in the worker's system prompt automatically — there is nothing to install or sync per profile.
+When the writer completes, dependency promotion returns the same orchestrator card to `ready`. Its next run reads the parent handoff with `kanban_show`, creates correction cards if necessary, or calls `kanban_complete` when the original acceptance criteria are satisfied. This lifecycle is injected only into dispatcher-scoped workers; a normal chat with Kanban tools does not receive a fictitious task assignment.
 
-For best results, pair it with a profile whose toolsets are restricted to board operations (`kanban`, `gateway`, `memory`) so the orchestrator literally cannot execute implementation tasks even if it tries.
+For best results, restrict the orchestrator profile's CLI toolsets to `kanban` so it can route and supervise the board but cannot execute implementation tasks.
 
 ## Dashboard (GUI)
 
@@ -578,7 +584,7 @@ Config knobs (all under `kanban:` in `~/.hermes/config.yaml`):
 | `auto_decompose` | `true` | Dispatcher auto-runs the decomposer every tick. |
 | `auto_decompose_per_tick` | `3` | Cap on decompositions per dispatcher tick. Excess defers to the next tick. |
 | `orchestrator_profile` | `""` | Profile assigned to the root/orchestration task after decomposition. Empty = fall back to active default profile. |
-| `default_assignee` | `""` | Where a child task lands when the LLM picks an unknown profile. Empty = fall back to active default. |
+| `default_assignee` | `""` | Profile assigned to otherwise unassigned ready tasks. Empty leaves them unassigned for explicit routing. |
 | `auto_subscribe_on_create` | `true` | When a worker calls `kanban_create` from inside a session with a persistent delivery channel (messaging gateway or TUI), the originating session is auto-subscribed to the new task's completion/block events. The dispatcher still drives the delivery — this only changes whether the caller's chat/key shows up in the notify-sub table. Set to `false` to require explicit `kanban_notify-subscribe` calls per task. |
 
 And the two auxiliary LLM slots:

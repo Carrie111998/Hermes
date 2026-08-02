@@ -14,7 +14,7 @@ If you're writing the worker code itself — the agent that runs *inside* a lane
 ```text
 Hermes Kanban  =  canonical task lifecycle + audit trail
 Worker lane    =  implementation executor for one assigned card
-Reviewer       =  human or human-proxy that gates "done"
+Reviewer       =  dependent verification card before final judgment
 GitHub PR      =  upstreamable artifact (optional, for code lanes)
 ```
 
@@ -50,21 +50,24 @@ For non-Hermes lanes (registered via a plugin), the plugin supplies its own `spa
 
 Every claim must end in exactly one of:
 
-- `kanban_complete(summary=..., metadata=...)` — task succeeds, status flips to `done`.
-- `kanban_block(reason=...)` — task waits for human input, status flips to `blocked`. The dispatcher respawns when `kanban_unblock` runs.
-- The worker process exits without a tool call. The kernel reaps it and emits `crashed` (PID died) or `gave_up` (consecutive-failure breaker tripped) or `timed_out` (max_runtime exceeded). This is the failure path; healthy workers don't end here.
+- `kanban_complete(summary=..., metadata=...)` — the assigned card succeeds and moves to `done`.
+- `kanban_block(reason=...)` — the card waits for human input or a missing capability and moves to `blocked`.
+- `kanban_block(reason=..., kind="dependency")` — the card waits in `todo` until its parent cards finish, then automatically returns to `ready`.
+- The worker process exits without a tool call. The kernel reaps it and emits `crashed` (PID died), `gave_up` (consecutive-failure breaker tripped), or `timed_out` (max runtime exceeded). This is the failure path; healthy workers don't end here.
 
-The kanban kernel enforces that exactly one of these terminates each run. A worker that calls neither and exits normally is treated as crashed.
+The kanban kernel enforces that exactly one terminator ends each run. A worker that calls neither and exits normally is treated as crashed.
 
-## Outputs and the review-required convention
+## Outputs and review dependencies
 
-For most code-changing tasks, the work isn't truly *done* the moment the worker finishes — it needs a human reviewer. The kanban kernel doesn't enforce this distinction (a "code-changing task" is fuzzy and forcing block-instead-of-complete on every code worker would break flows where no review is wanted). It's a convention layered on top:
+When implementation requires independent review, model it as two cards rather than blocking the implementation card:
 
-- **Block instead of complete**, with `reason` prefixed `review-required: ` so the dashboard / `hermes kanban show` surfaces the row as awaiting review.
-- **Drop structured metadata into a `kanban_comment` first** since `kanban_block` only carries the human-readable `reason`. Comments are the durable annotation channel — every audit-relevant field (changed_files, tests_run, diff_path or PR url, decisions) belongs there.
-- **Reviewer either approves and unblocks**, which respawns the worker with the comment thread for follow-ups; or asks for changes via another comment, which the next worker run sees as part of `kanban_show`'s context.
+1. The orchestrator creates the implementation card.
+2. It creates a Reviewer card with the implementation card as a parent.
+3. The implementation worker completes with its evidence.
+4. The Reviewer card promotes to `ready`, verifies the result, and completes with a verdict.
+5. The orchestrator's durable routing card resumes after the Reviewer and makes the final judgment.
 
-The injected `KANBAN_GUIDANCE` covers both `kanban_complete` (truly terminal tasks — typo fixes, docs changes, research writeups) and the `review-required` block pattern.
+This avoids a dependency cycle where a Coder waits for review while the Reviewer waits for the Coder to be done. `kanban_block` remains for actual blockers, not a generic review request.
 
 ## Logs and audit trail
 
@@ -86,7 +89,7 @@ When you create profiles for your fleet, choose names that match the *role* you 
 
 ### Orchestrator profile lane
 
-A specialisation of the profile lane: an orchestrator is a Hermes profile whose toolset includes `kanban` but excludes `terminal` / `file` / `code` / `web` for implementation. Its job is decomposing a high-level goal into child tasks via `kanban_create` + `kanban_link` and stepping back. The orchestrator skill encodes the anti-temptation rules.
+A specialisation of the profile lane: an orchestrator is a Hermes profile whose CLI toolsets explicitly include `kanban` but exclude `terminal` / `file` / `code` / `web` implementation tools. It decomposes a high-level goal, creates specialist and review dependencies, then links each terminal card as a parent of its own routing card. It blocks that routing card with `kind="dependency"` so the dispatcher resumes it after the work finishes; only then does it inspect handoffs, request corrections, or complete the original request.
 
 ## Adding an external CLI worker lane
 
