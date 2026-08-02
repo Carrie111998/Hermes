@@ -3,6 +3,7 @@
 import builtins
 import importlib
 import logging
+import subprocess
 import sys
 
 import pytest
@@ -35,6 +36,15 @@ from agent.prompt_builder import (
     WSL_ENVIRONMENT_HINT,
 )
 from hermes_cli.nous_subscription import NousFeatureState, NousSubscriptionFeatures
+
+
+def _init_git(path):
+    subprocess.run(
+        ["git", "init", "--quiet", str(path)],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
 
 
 # =========================================================================
@@ -836,7 +846,7 @@ class TestBuildContextFilesPrompt:
     def test_hermes_md_parent_dir_discovery(self, tmp_path):
         """Walks parent dirs up to git root."""
         # Simulate a git repo root
-        (tmp_path / ".git").mkdir()
+        _init_git(tmp_path)
         (tmp_path / ".hermes.md").write_text("Root project rules.")
         sub = tmp_path / "src" / "components"
         sub.mkdir(parents=True)
@@ -849,7 +859,7 @@ class TestBuildContextFilesPrompt:
         (tmp_path / ".hermes.md").write_text("Parent rules.")
         child = tmp_path / "repo"
         child.mkdir()
-        (child / ".git").mkdir()
+        _init_git(child)
         result = build_context_files_prompt(cwd=str(child))
         assert "Parent rules" not in result
 
@@ -959,7 +969,7 @@ class TestFindHermesMd:
         assert _find_hermes_md(tmp_path) == tmp_path / ".hermes.md"
 
     def test_walks_to_git_root(self, tmp_path):
-        (tmp_path / ".git").mkdir()
+        _init_git(tmp_path)
         (tmp_path / ".hermes.md").write_text("root rules")
         sub = tmp_path / "a" / "b"
         sub.mkdir(parents=True)
@@ -973,7 +983,7 @@ class TestFindHermesMd:
         (tmp_path / ".hermes.md").write_text("outside")
         repo = tmp_path / "repo"
         repo.mkdir()
-        (repo / ".git").mkdir()
+        _init_git(repo)
         assert _find_hermes_md(repo) is None
 
     def test_no_git_root_checks_cwd_only(self, tmp_path):
@@ -1016,11 +1026,11 @@ class TestFindHermesMd:
 
 class TestFindGitRoot:
     def test_finds_git_dir(self, tmp_path):
-        (tmp_path / ".git").mkdir()
+        _init_git(tmp_path)
         assert _find_git_root(tmp_path) == tmp_path
 
     def test_finds_from_subdirectory(self, tmp_path):
-        (tmp_path / ".git").mkdir()
+        _init_git(tmp_path)
         sub = tmp_path / "src" / "lib"
         sub.mkdir(parents=True)
         assert _find_git_root(sub) == tmp_path

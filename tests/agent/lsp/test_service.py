@@ -8,6 +8,7 @@ on.
 from __future__ import annotations
 
 import sys
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -61,10 +62,14 @@ def _install_mock_server(monkeypatch, script: str = "errors", server_id: str = "
 
 @pytest.fixture
 def mock_pyright(monkeypatch, tmp_path):
-    """Install the mock as ``pyright`` and create a fake git workspace."""
+    """Install the mock as ``pyright`` and create a real git workspace."""
     repo = tmp_path / "repo"
-    repo.mkdir()
-    (repo / ".git").mkdir()
+    subprocess.run(
+        ["git", "init", "--quiet", str(repo)],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
     (repo / "pyproject.toml").write_text("")  # so pyright's root resolver finds it
     monkeypatch.chdir(str(repo))
     gen = _install_mock_server(monkeypatch, "errors", "pyright")

@@ -3,6 +3,28 @@
 from unittest.mock import patch
 
 
+def _reset_model_metadata_caches(mm):
+    """Clear process caches without replacing the module object.
+
+    Reloading ``agent.model_metadata`` invalidates collection-time imports in
+    later tests, so patches can target a different module object than the
+    functions under test.
+    """
+    for name in (
+        "_model_metadata_cache",
+        "_novita_metadata_cache",
+        "_endpoint_model_metadata_cache",
+        "_endpoint_model_metadata_cache_time",
+        "_endpoint_probe_path_cache",
+        "_LOCAL_CTX_PROBE_CACHE",
+    ):
+        cache = getattr(mm, name, None)
+        if isinstance(cache, dict):
+            cache.clear()
+    for name in ("_model_metadata_cache_time", "_novita_metadata_cache_time"):
+        setattr(mm, name, 0)
+
+
 class TestMinimaxContextLengths:
     """Verify context length entries match official docs.
 
@@ -48,9 +70,8 @@ class TestMinimaxM3StaleCacheGuard:
 
     def test_stale_m3_cache_dropped_and_reresolves(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-        import importlib
         import agent.model_metadata as mm
-        importlib.reload(mm)
+        _reset_model_metadata_caches(mm)
         base = "https://api.minimaxi.com/anthropic"
         mm.save_context_length("MiniMax-M3", base, 204_800)
         ctx = mm.get_model_context_length(
@@ -66,9 +87,8 @@ class TestMinimaxM3StaleCacheGuard:
 
     def test_correct_m3_cache_preserved(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-        import importlib
         import agent.model_metadata as mm
-        importlib.reload(mm)
+        _reset_model_metadata_caches(mm)
         base = "https://api.minimaxi.com/anthropic"
         mm.save_context_length("MiniMax-M3", base, 1_000_000)
         ctx = mm.get_model_context_length(
@@ -78,9 +98,8 @@ class TestMinimaxM3StaleCacheGuard:
 
     def test_m2_cache_not_clobbered(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-        import importlib
         import agent.model_metadata as mm
-        importlib.reload(mm)
+        _reset_model_metadata_caches(mm)
         base = "https://api.minimaxi.com/anthropic"
         # 204,800 is the CORRECT value for M2.x — guard must not touch it.
         for slug in ("MiniMax-M2.7", "MiniMax-M2.5", "MiniMax-M2.1"):

@@ -41,7 +41,16 @@ def clear_verify_env(monkeypatch):
         "HERMES_SESSION_SOURCE",
     ):
         monkeypatch.delenv(var, raising=False)
-    return monkeypatch
+    from gateway.session_context import reset_session_vars
+
+    # Session ContextVars can outlive an earlier gateway/E2E test in the
+    # process; clearing os.environ alone does not clear their authoritative
+    # values.
+    reset_session_vars()
+    try:
+        yield monkeypatch
+    finally:
+        reset_session_vars()
 
 
 def test_verify_on_stop_default_is_auto(clear_verify_env):

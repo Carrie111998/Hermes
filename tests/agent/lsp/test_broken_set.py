@@ -15,6 +15,7 @@ This module verifies:
 from __future__ import annotations
 
 from pathlib import Path
+import subprocess
 from unittest.mock import patch
 
 import pytest
@@ -33,8 +34,12 @@ def _clear_workspace_cache():
 def _make_git_workspace(tmp_path: Path) -> Path:
     """Build a minimal git repo with a pyproject so pyright's root resolver fires."""
     repo = tmp_path / "repo"
-    repo.mkdir()
-    (repo / ".git").mkdir()
+    subprocess.run(
+        ["git", "init", "--quiet", str(repo)],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
     (repo / "pyproject.toml").write_text("[project]\nname='t'\n")
     return repo
 
@@ -118,8 +123,12 @@ def test_unrelated_project_not_affected_by_broken(tmp_path, monkeypatch):
     """Marking pyright broken for project A must NOT affect project B."""
     repo_a = _make_git_workspace(tmp_path)
     repo_b = tmp_path / "repo-b"
-    repo_b.mkdir()
-    (repo_b / ".git").mkdir()
+    subprocess.run(
+        ["git", "init", "--quiet", str(repo_b)],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
     (repo_b / "pyproject.toml").write_text("[project]\nname='b'\n")
     a_src = repo_a / "x.py"
     a_src.write_text("")

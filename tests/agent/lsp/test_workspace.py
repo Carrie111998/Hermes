@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -23,6 +24,15 @@ def _clear():
     clear_cache()
 
 
+def _init_git_repo(repo: Path) -> None:
+    subprocess.run(
+        ["git", "init", "--quiet", str(repo)],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
 def test_find_git_worktree_returns_none_outside_repo(tmp_path: Path):
     sub = tmp_path / "sub"
     sub.mkdir()
@@ -31,18 +41,45 @@ def test_find_git_worktree_returns_none_outside_repo(tmp_path: Path):
 
 def test_find_git_worktree_finds_dotgit(tmp_path: Path):
     repo = tmp_path / "repo"
-    repo.mkdir()
-    (repo / ".git").mkdir()
+    _init_git_repo(repo)
     sub = repo / "src" / "deep"
     sub.mkdir(parents=True)
     assert find_git_worktree(str(sub)) == str(repo)
 
 
+def test_find_git_worktree_ignores_invalid_dotgit_marker(tmp_path: Path):
+    """An arbitrary ``.git`` directory must not make its parent a workspace."""
+    not_a_repo = tmp_path / "not-a-repo"
+    (not_a_repo / ".git").mkdir(parents=True)
+    src = not_a_repo / "src" / "orphan.py"
+    src.parent.mkdir()
+    src.write_text("")
+
+    assert find_git_worktree(str(src)) is None
+
+
 def test_find_git_worktree_handles_dotgit_file(tmp_path: Path):
-    """``.git`` can also be a file (gitfile pointing into a worktree)."""
+    """A real linked worktree with a ``.git`` file is accepted."""
+    source = tmp_path / "source"
+    _init_git_repo(source)
+    subprocess.run(
+        [
+            "git", "-C", str(source), "-c", "user.name=Test",
+            "-c", "user.email=test@example.invalid", "commit", "--quiet",
+            "--allow-empty", "-m", "init",
+        ],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
     repo = tmp_path / "repo"
-    repo.mkdir()
-    (repo / ".git").write_text("gitdir: /elsewhere\n")
+    subprocess.run(
+        ["git", "-C", str(source), "worktree", "add", "--quiet", str(repo)],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    assert (repo / ".git").is_file()
     assert find_git_worktree(str(repo)) == str(repo)
 
 
@@ -97,7 +134,7 @@ def test_nearest_root_returns_none_when_no_marker(tmp_path: Path):
 
 def test_resolve_workspace_for_file_uses_cwd_first(tmp_path: Path, monkeypatch):
     repo = tmp_path / "repo"
-    (repo / ".git").mkdir(parents=True)
+    _init_git_repo(repo)
     file_path = repo / "x.py"
     file_path.write_text("")
     # cwd is inside the repo
@@ -124,7 +161,7 @@ def test_resolve_workspace_falls_back_to_file_location(tmp_path: Path, monkeypat
     monkeypatch.chdir(str(not_a_repo))
 
     repo = tmp_path / "actual-repo"
-    (repo / ".git").mkdir(parents=True)
+    _init_git_repo(repo)
     f = repo / "x.py"
     f.write_text("")
 

@@ -53,8 +53,9 @@ logger = logging.getLogger(__name__)
 _DEFAULT_API_URL = "https://api.hindsight.vectorize.io"
 _DEFAULT_LOCAL_URL = "http://localhost:8888"
 # Keep in sync with tools/lazy_deps.py ("memory.hindsight") and plugin.yaml.
-_MIN_CLIENT_VERSION = "0.6.1"
+_MIN_CLIENT_VERSION = "0.8.6"
 _DEFAULT_TIMEOUT = 120  # seconds — cloud API can take 30-40s per request
+_PREFETCH_WAIT_TIMEOUT_S = 0.25  # advisory result handoff; never block a turn
 _DEFAULT_IDLE_TIMEOUT = 300  # seconds — Hindsight embedded daemon default
 # Mirrors hindsight-integrations/openclaw — Hindsight 0.5.0 added
 # `update_mode='append'` semantics on retain (vectorize-io/hindsight#932).
@@ -302,8 +303,11 @@ def _run_sync(coro, timeout: float = _DEFAULT_TIMEOUT):
 RETAIN_SCHEMA = {
     "name": "hindsight_retain",
     "description": (
-        "Store information to long-term memory. Hindsight automatically "
-        "extracts structured facts, resolves entities, and indexes for retrieval."
+        "Store a curated durable memory. Use this for stable user preferences, "
+        "confirmed facts, project decisions, or concise session summaries — not "
+        "raw debugging transcripts or temporary verification output. Hindsight "
+        "automatically extracts structured facts, resolves entities, and indexes "
+        "for retrieval."
     ),
     "parameters": {
         "type": "object",
@@ -654,6 +658,7 @@ class HindsightMemoryProvider(MemoryProvider):
         self._prefetch_method = "recall"  # "recall" or "reflect"
         self._retain_tags: List[str] = []
         self._retain_source = ""
+        self._memory_scope = ""
         self._retain_user_prefix = "User"
         self._retain_assistant_prefix = "Assistant"
         self._platform = ""
@@ -1006,6 +1011,7 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "retain_tags", "description": "Default tags applied to retained memories (comma-separated)", "default": ""},
             {"key": "observation_scopes", "description": "How observations are scoped during consolidation: 'combined' (default — one pass over all tags), 'per_tag' (one isolated observation per tag), 'all_combinations' (every tag subset — expensive), or a JSON list of tag-lists for explicit custom scopes. Empty uses Hindsight's 'combined' default.", "default": ""},
             {"key": "retain_source", "description": "Metadata source value attached to retained memories", "default": ""},
+            {"key": "memory_scope", "description": "Scope label for retained memories (for example shared, profile, or workspace)", "default": ""},
             {"key": "retain_user_prefix", "description": "Label used before user turns in retained transcripts", "default": "User"},
             {"key": "retain_assistant_prefix", "description": "Label used before assistant turns in retained transcripts", "default": "Assistant"},
             {"key": "recall_tags", "description": "Tags to filter when searching memories (comma-separated)", "default": ""},
@@ -1338,6 +1344,9 @@ class HindsightMemoryProvider(MemoryProvider):
         self._retain_source = str(
             self._config.get("retain_source") or os.environ.get("HINDSIGHT_RETAIN_SOURCE", "")
         ).strip()
+        self._memory_scope = _sanitize_bank_segment(
+            str(self._config.get("memory_scope") or "").strip()
+        )
         self._retain_user_prefix = str(
             self._config.get("retain_user_prefix") or os.environ.get("HINDSIGHT_RETAIN_USER_PREFIX", "User")
         ).strip() or "User"
@@ -1481,7 +1490,7 @@ class HindsightMemoryProvider(MemoryProvider):
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         if self._prefetch_thread and self._prefetch_thread.is_alive():
             logger.debug("Prefetch: waiting for background thread to complete")
-            self._prefetch_thread.join(timeout=3.0)
+            self._prefetch_thread.join(timeout=_PREFETCH_WAIT_TIMEOUT_S)
         with self._prefetch_lock:
             result = self._prefetch_result
             self._prefetch_result = ""
@@ -1562,6 +1571,9 @@ class HindsightMemoryProvider(MemoryProvider):
             "message_count": str(message_count),
             "turn_index": str(turn_index),
         }
+        memory_scope = getattr(self, "_memory_scope", "")
+        if memory_scope:
+            metadata["memory_scope"] = memory_scope
         if self._retain_source:
             metadata["source"] = self._retain_source
         if self._session_id:
@@ -1606,6 +1618,20 @@ class HindsightMemoryProvider(MemoryProvider):
         if retain_async is not None:
             kwargs["retain_async"] = retain_async
         merged_tags = _normalize_retain_tags(self._retain_tags)
+        memory_scope = getattr(self, "_memory_scope", "")
+        if memory_scope:
+            scope_tag = f"scope:{memory_scope}"
+            if scope_tag not in merged_tags:
+                merged_tags.append(scope_tag)
+            for label, value in (
+                ("profile", self._agent_identity),
+                ("workspace", self._agent_workspace),
+                ("platform", self._platform),
+            ):
+                segment = _sanitize_bank_segment(value)
+                tag = f"{label}:{segment}" if segment else ""
+                if tag and tag not in merged_tags:
+                    merged_tags.append(tag)
         for tag in _normalize_retain_tags(tags):
             if tag not in merged_tags:
                 merged_tags.append(tag)
@@ -1663,6 +1689,17 @@ class HindsightMemoryProvider(MemoryProvider):
         content = "[" + ",".join(turns_to_retain) + "]"
 
         lineage_tags: list[str] = []
+        memory_scope = getattr(self, "_memory_scope", "")
+        if memory_scope:
+            lineage_tags.append(f"scope:{memory_scope}")
+            for label, value in (
+                ("profile", self._agent_identity),
+                ("workspace", self._agent_workspace),
+                ("platform", self._platform),
+            ):
+                segment = _sanitize_bank_segment(value)
+                if segment:
+                    lineage_tags.append(f"{label}:{segment}")
         if self._session_id:
             lineage_tags.append(f"session:{self._session_id}")
         if self._parent_session_id:

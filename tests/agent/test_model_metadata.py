@@ -1201,13 +1201,18 @@ class TestBedrockContextResolution:
     """
 
     @patch("agent.model_metadata.fetch_endpoint_model_metadata")
-    def test_bedrock_provider_returns_static_table_before_probe(self, mock_fetch):
+    def test_bedrock_provider_returns_static_table_before_probe(self, mock_fetch, tmp_path):
         """provider='bedrock' resolves via static table, bypasses /models probe."""
-        ctx = get_model_context_length(
-            "anthropic.claude-opus-4-v1:0",
-            provider="bedrock",
-            base_url="https://bedrock-runtime.us-east-1.amazonaws.com",
-        )
+        cache_file = tmp_path / "context_length_cache.yaml"
+        with (
+            patch("agent.model_metadata._get_context_cache_path", return_value=cache_file),
+            patch("agent.bedrock_adapter.probe_bedrock_context_length", return_value=None),
+        ):
+            ctx = get_model_context_length(
+                "anthropic.claude-opus-4-v1:0",
+                provider="bedrock",
+                base_url="https://bedrock-runtime.us-east-1.amazonaws.com",
+            )
         # Must return the static Bedrock table value (200K for Claude),
         # NOT DEFAULT_FALLBACK_CONTEXT (128K).
         assert ctx == 200000

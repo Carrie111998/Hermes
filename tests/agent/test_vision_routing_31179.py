@@ -51,8 +51,14 @@ def isolated_home(monkeypatch):
         if k.endswith("_API_KEY") or k.endswith("_TOKEN"):
             monkeypatch.delenv(k, raising=False)
 
-    yield hermes_home
-    shutil.rmtree(test_home, ignore_errors=True)
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    home_token = set_hermes_home_override(hermes_home)
+    try:
+        yield hermes_home
+    finally:
+        reset_hermes_home_override(home_token)
+        shutil.rmtree(test_home, ignore_errors=True)
 
 
 def _write_config(home: str, text: str) -> None:
@@ -64,8 +70,8 @@ def _fresh_modules():
     """Drop cached hermes modules so each test reloads against current env."""
     for mod in list(sys.modules.keys()):
         if mod.startswith(("agent.auxiliary_client", "agent.image_routing",
-                           "tools.vision_tools", "tools.browser_tool",
-                           "hermes_cli.config")):
+                           "agent.models_dev", "tools.vision_tools",
+                           "tools.browser_tool", "hermes_cli.config")):
             del sys.modules[mod]
 
 

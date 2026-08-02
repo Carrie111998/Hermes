@@ -20,9 +20,10 @@ import pytest
 
 
 def _fresh_run_agent(hermes_home):
-    for mod in list(sys.modules):
-        if mod == "run_agent" or mod.startswith("agent.") or mod.startswith("tools.") or mod.startswith("hermes_"):
-            del sys.modules[mod]
+    # Refresh only run_agent. Purging every agent.* module invalidates
+    # collection-time imports in later tests and makes patches target stale
+    # module objects after the reload.
+    sys.modules.pop("run_agent", None)
     import run_agent  # noqa: F401
     return sys.modules["run_agent"]
 

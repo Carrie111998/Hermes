@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import os
+import subprocess
 from pathlib import Path
 from typing import Iterable, Optional, Tuple
 
@@ -42,13 +43,16 @@ def normalize_path(path: str) -> str:
 
 
 def find_git_worktree(start: str) -> Optional[str]:
-    """Walk up from ``start`` looking for a ``.git`` entry (file or dir).
+    """Walk up from ``start`` looking for a valid Git worktree.
 
-    Returns the directory containing ``.git``, or ``None`` if no git
+    Returns the directory containing ``.git``, or ``None`` if no Git
     root is found before hitting the filesystem root.
 
-    A ``.git`` *file* (not directory) means we're inside a git
-    worktree set up via ``git worktree add`` — both forms count.
+    A ``.git`` *file* (not directory) means we're inside a Git worktree
+    set up via ``git worktree add`` — both forms count when Git itself
+    can validate the worktree.  Merely finding a directory named
+    ``.git`` is not sufficient: shared temp directories and build
+    sandboxes can contain unrelated marker names.
     """
     try:
         start_path = Path(normalize_path(start))
@@ -73,18 +77,27 @@ def find_git_worktree(start: str) -> Optional[str]:
         git_marker = cur / ".git"
         try:
             if git_marker.exists():
-                resolved = str(cur)
-                _workspace_cache[str(start_path)] = (resolved, True)
-                return resolved
-        except OSError:
-            # Permission error on a parent dir — bail out cleanly.
-            break
+                result = subprocess.run(
+                    ["git", "-C", str(cur), "rev-parse", "--show-toplevel"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                    timeout=2.0,
+                )
+                if result.returncode == 0:
+                    resolved = str(cur)
+                    _workspace_cache[str(start_path)] = (resolved, True)
+                    return resolved
+        except (OSError, subprocess.SubprocessError):
+            # Git may be unavailable, the marker may be malformed, or
+            # the command may be interrupted.  Treat all of those as a
+            # non-worktree and continue the bounded parent walk.
+            pass
         parent = cur.parent
         if parent == cur:
             break
         cur = parent
 
-    _workspace_cache[str(start_path)] = (None, False)
     return None
 
 

@@ -134,11 +134,10 @@ def agent_env():
     prev_home = os.environ.get("HERMES_HOME")
     os.environ["HERMES_HOME"] = os.path.join(test_home, ".hermes")
 
-    # Import fresh so the patched conversation_loop is exercised even when the
-    # module was imported earlier in the same worker.
-    for mod in list(sys.modules):
-        if mod == "run_agent" or mod.startswith("agent.") or mod.startswith("tools.") or mod.startswith("hermes_"):
-            del sys.modules[mod]
+    # Refresh only run_agent. Removing every agent.* module invalidates
+    # collection-time imports held by later tests (for example, ContextCompressor
+    # and file-safety helpers), so their patches target a different module object.
+    sys.modules.pop("run_agent", None)
     from run_agent import AIAgent
 
     agent = AIAgent(

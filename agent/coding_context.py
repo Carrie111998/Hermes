@@ -61,6 +61,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from hermes_cli._subprocess_compat import bounded_git_probe
+from agent.lsp.workspace import find_git_worktree
 
 logger = logging.getLogger("hermes.coding_context")
 
@@ -388,11 +389,8 @@ def _resolve_cwd(cwd: Optional[str | Path]) -> Path:
 
 
 def _git_root(cwd: Path) -> Optional[Path]:
-    current = cwd.resolve()
-    for parent in [current, *current.parents]:
-        if (parent / ".git").exists():
-            return parent
-    return None
+    root = find_git_worktree(str(cwd))
+    return Path(root) if root is not None else None
 
 
 def _home() -> Optional[Path]:

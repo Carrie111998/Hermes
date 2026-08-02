@@ -17,6 +17,7 @@ from hermes_constants import get_hermes_home, get_skills_dir, is_wsl
 from typing import Optional
 
 from agent.runtime_cwd import resolve_agent_cwd
+from agent.lsp.workspace import find_git_worktree
 from agent.skill_utils import (
     EXCLUDED_SKILL_DIRS,
     SKILL_SUPPORT_DIRS,
@@ -75,16 +76,13 @@ def _scan_context_content(content: str, filename: str) -> str:
 
 
 def _find_git_root(start: Path) -> Optional[Path]:
-    """Walk *start* and its parents looking for a ``.git`` directory.
+    """Walk *start* and its parents looking for a valid Git worktree.
 
-    Returns the directory containing ``.git``, or ``None`` if we hit the
-    filesystem root without finding one.
+    Returns the directory containing a validated ``.git`` marker, or
+    ``None`` if Git rejects every candidate before the filesystem root.
     """
-    current = start.resolve()
-    for parent in [current, *current.parents]:
-        if (parent / ".git").exists():
-            return parent
-    return None
+    root = find_git_worktree(str(start))
+    return Path(root) if root is not None else None
 
 
 _HERMES_MD_NAMES = (".hermes.md", "HERMES.md")

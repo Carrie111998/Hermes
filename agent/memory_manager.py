@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import inspect
 import threading
@@ -44,7 +45,10 @@ logger = logging.getLogger(__name__)
 # teardown indefinitely — the worker threads are daemon, so anything still
 # running past this window dies with the interpreter.
 _SYNC_DRAIN_TIMEOUT_S = 5.0
-_EXTERNAL_PREFETCH_TIMEOUT_S = 8.0
+# External semantic memory is advisory. It must never make an interactive
+# turn wait on a remote LLM/vector search. A caller can override this for
+# diagnostics, but production defaults to a one-second budget.
+_EXTERNAL_PREFETCH_TIMEOUT_S = 1.0
 
 
 def normalize_tool_schema(schema: Any) -> Optional[Dict[str, Any]]:
@@ -372,11 +376,22 @@ class MemoryManager:
         self._providers: List[MemoryProvider] = []
         self._tool_to_provider: Dict[str, MemoryProvider] = {}
         self._has_external: bool = False  # True once a non-builtin provider is added
-        self._external_prefetch_timeout = (
-            _EXTERNAL_PREFETCH_TIMEOUT_S
-            if external_prefetch_timeout is None
-            else float(external_prefetch_timeout)
-        )
+        if external_prefetch_timeout is None:
+            configured_timeout = os.environ.get("HERMES_EXTERNAL_PREFETCH_TIMEOUT", "")
+            try:
+                external_prefetch_timeout = (
+                    float(configured_timeout)
+                    if configured_timeout.strip()
+                    else _EXTERNAL_PREFETCH_TIMEOUT_S
+                )
+            except ValueError:
+                logger.warning(
+                    "Invalid HERMES_EXTERNAL_PREFETCH_TIMEOUT=%r; using %.1fs",
+                    configured_timeout,
+                    _EXTERNAL_PREFETCH_TIMEOUT_S,
+                )
+                external_prefetch_timeout = _EXTERNAL_PREFETCH_TIMEOUT_S
+        self._external_prefetch_timeout = float(external_prefetch_timeout)
         if self._external_prefetch_timeout <= 0:
             raise ValueError("external_prefetch_timeout must be positive")
         self._external_prefetch_threads: Dict[str, threading.Thread] = {}

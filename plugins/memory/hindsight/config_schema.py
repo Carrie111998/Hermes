@@ -1,6 +1,7 @@
 """Hindsight's declared config surface — rendered by the generic desktop panel."""
 
 from plugins.memory.config_schema import (
+    KIND_BOOL,
     KIND_SECRET,
     KIND_SELECT,
     KIND_TEXT,
@@ -57,6 +58,38 @@ CONFIG_SCHEMA = ProviderConfigSchema(
             kind=KIND_TEXT,
             default="hermes",
             aliases=("bankId",),
+            inline=True,
+        ),
+        ProviderField(
+            key="memory_scope",
+            label="Memory scope",
+            kind=KIND_TEXT,
+            default="shared",
+            description="Scope label attached to retained memories for provenance and filtering.",
+            inline=True,
+        ),
+        ProviderField(
+            key="recall_tags",
+            label="Recall tags",
+            kind=KIND_TEXT,
+            default="",
+            description="Only recall memories carrying these tags; leave blank for unfiltered recall.",
+            inline=True,
+        ),
+        ProviderField(
+            key="auto_recall",
+            label="Automatic recall",
+            kind=KIND_BOOL,
+            default="true",
+            description="Inject ready semantic context before a turn when available.",
+            inline=True,
+        ),
+        ProviderField(
+            key="auto_retain",
+            label="Automatic retention",
+            kind=KIND_BOOL,
+            default="false",
+            description="Retain every conversation turn automatically. Prefer curated tool-based retention.",
             inline=True,
         ),
         ProviderField(

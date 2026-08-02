@@ -20,6 +20,7 @@ The contract under test:
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -208,8 +209,12 @@ def _install_mock_server(script: str, server_id: str = "pyright"):
 @pytest.fixture
 def stale_repo(monkeypatch, tmp_path):
     repo = tmp_path / "repo"
-    repo.mkdir()
-    (repo / ".git").mkdir()
+    subprocess.run(
+        ["git", "init", "--quiet", str(repo)],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
     (repo / "pyproject.toml").write_text("")
     monkeypatch.chdir(str(repo))
     idx, original = _install_mock_server("stale")

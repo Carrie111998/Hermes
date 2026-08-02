@@ -17,6 +17,10 @@ def test_hindsight_is_declared():
         "api_key",
         "api_url",
         "bank_id",
+        "memory_scope",
+        "recall_tags",
+        "auto_recall",
+        "auto_retain",
         "recall_budget",
     }
 

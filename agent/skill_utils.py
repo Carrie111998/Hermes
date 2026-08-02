@@ -5,6 +5,7 @@ heavy dependency chain.  It is safe to import at module level without triggering
 tool registration or provider resolution.
 """
 
+import hashlib
 import logging
 import os
 import re
@@ -325,7 +326,7 @@ def skill_matches_environment(frontmatter: Dict[str, Any]) -> bool:
 # ── Disabled skills ───────────────────────────────────────────────────────
 
 
-_RAW_CONFIG_CACHE: Dict[Tuple[str, int, int], Dict[str, Any]] = {}
+_RAW_CONFIG_CACHE: Dict[Tuple[str, int, int, str], Dict[str, Any]] = {}
 
 
 def _raw_config_cache_clear() -> None:
@@ -334,7 +335,7 @@ def _raw_config_cache_clear() -> None:
 
 
 def _load_raw_config() -> Dict[str, Any]:
-    """Read config.yaml with a shared mtime+size keyed cache.
+    """Read config.yaml with a shared metadata+content keyed cache.
 
     This module intentionally avoids importing ``hermes_cli.config`` on the
     skill prompt/build path. A tiny local cache gives the same repeated-read
@@ -344,10 +345,13 @@ def _load_raw_config() -> Dict[str, Any]:
     if not config_path.exists():
         return {}
     try:
+        text = config_path.read_text(encoding="utf-8")
         stat = config_path.stat()
-        cache_key = (str(config_path), stat.st_mtime_ns, stat.st_size)
+        content_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        cache_key = (str(config_path), stat.st_mtime_ns, stat.st_size, content_hash)
     except OSError:
         cache_key = None
+        text = None
 
     if cache_key is not None:
         cached = _RAW_CONFIG_CACHE.get(cache_key)
@@ -355,7 +359,7 @@ def _load_raw_config() -> Dict[str, Any]:
             return cached
 
     try:
-        parsed = yaml_load(config_path.read_text(encoding="utf-8"))
+        parsed = yaml_load(text if text is not None else config_path.read_text(encoding="utf-8"))
     except Exception as e:
         logger.debug("Could not read skill config %s: %s", config_path, e)
         return {}
