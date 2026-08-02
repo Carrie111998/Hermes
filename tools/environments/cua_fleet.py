@@ -1,4 +1,4 @@
-"""Cua Fleet compute provider backed by the public ``cua-fleet`` SDK."""
+"""CUA Fleet compute provider backed by the public ``cua-sandbox`` API."""
 
 from __future__ import annotations
 
@@ -8,10 +8,6 @@ import json
 import logging
 import os
 import threading
-import time
-import urllib.error
-import urllib.request
-import urllib.parse
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
@@ -60,10 +56,8 @@ class CuaFleetConfig:
 
 @dataclass
 class _FleetState:
-    client: Any
-    http_client: Any
     pool: Any
-    claim: Any
+    claim_context: Any
     sandbox: Any
 
 
@@ -91,59 +85,9 @@ class _AsyncWorker:
         self._loop.close()
 
 
-class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, request, file_pointer, code, message, headers, new_url):
-        return None
-
-
-class _UrlLibHttpClient:
-    """Build the SDK's HttpClient callback without depending on cua-sandbox."""
-
-    def __init__(self, sdk: Any, timeout: float, allowed_hosts: Sequence[str]):
-        self._sdk = sdk
-        self._timeout = timeout
-        self._allowed_hosts = frozenset(allowed_hosts)
-
-    async def execute(self, request: Any) -> Any:
-        return await asyncio.to_thread(self._execute, request)
-
-    def _execute(self, request: Any) -> Any:
-        parsed = urllib.parse.urlparse(request.url)
-        if parsed.scheme != "https" or parsed.hostname not in self._allowed_hosts:
-            raise ValueError(
-                f"Cua Fleet SDK attempted a request to an unexpected URL: {request.url!r}"
-            )
-        native = urllib.request.Request(
-            request.url,
-            data=request.body,
-            method=request.method,
-            headers={header.name: header.value for header in request.headers},
-        )
-        opener = urllib.request.build_opener(_NoRedirectHandler())
-        try:
-            with opener.open(native, timeout=self._timeout) as response:
-                return self._response(
-                    response.status, response.headers.items(), response.read()
-                )
-        except urllib.error.HTTPError as error:
-            return self._response(error.code, error.headers.items(), error.read())
-
-    def _response(self, status: int, headers: Any, body: bytes) -> Any:
-        return self._sdk.HttpResponse(
-            status=status,
-            headers=[
-                self._sdk.HttpHeader(name=name, value=value) for name, value in headers
-            ],
-            body=body,
-        )
-
-
 class _FleetMcpTransport(CuaToolTransport):
-    def __init__(
-        self, state: _FleetState, sdk: Any, worker: _AsyncWorker, timeout: float
-    ):
+    def __init__(self, state: _FleetState, worker: _AsyncWorker, timeout: float):
         self._state = state
-        self._sdk = sdk
         self._worker = worker
         self._timeout = timeout
         self._started = False
@@ -184,39 +128,23 @@ class _FleetMcpTransport(CuaToolTransport):
 
     def _request(self, method: str, params: Mapping[str, Any]) -> Mapping[str, Any]:
         self._request_id += 1
-        payload = json.dumps(
-            {
-                "jsonrpc": "2.0",
-                "id": self._request_id,
-                "method": method,
-                "params": params,
-            },
-            separators=(",", ":"),
-        ).encode()
+        payload = {
+            "jsonrpc": "2.0",
+            "id": self._request_id,
+            "method": method,
+            "params": params,
+        }
         response = self._worker.run(
-            self._state.client.service_request(
-                self._state.sandbox,
-                "mcp",
-                "/mcp",
-                self._sdk.HttpRequest(
-                    method="POST",
-                    url="https://service.invalid/mcp",
-                    headers=[
-                        self._sdk.HttpHeader(
-                            name="accept", value="application/json, text/event-stream"
-                        ),
-                        self._sdk.HttpHeader(
-                            name="content-type", value="application/json"
-                        ),
-                    ],
-                    body=payload,
-                ),
+            self._state.sandbox.services.request(
+                "mcp", method="POST", path="/mcp", json=payload
             ),
             self._timeout,
         )
-        if not 200 <= response.status < 300:
-            raise RuntimeError(f"Fleet MCP request failed with HTTP {response.status}")
-        parsed = _parse_mcp_response(response.body)
+        if not 200 <= response.status_code < 300:
+            raise RuntimeError(
+                f"Fleet MCP request failed with HTTP {response.status_code}"
+            )
+        parsed = _parse_mcp_response(response.content)
         if "error" in parsed:
             error = parsed["error"]
             raise RuntimeError(
@@ -266,14 +194,12 @@ class CuaFleetEnvironment(BaseEnvironment):
         *,
         compute_lease: ComputeLease,
         state: _FleetState,
-        sdk: Any,
         config: CuaFleetConfig,
         worker: _AsyncWorker,
         release_callback: Any,
     ):
         self._compute_lease = compute_lease
         self._state = state
-        self._sdk = sdk
         self._fleet_config = config
         self._worker = worker
         self._release_callback = release_callback
@@ -290,7 +216,7 @@ class CuaFleetEnvironment(BaseEnvironment):
             from tools.environments.modal_desktop import _TransportComputerBackend
 
             transport = _FleetMcpTransport(
-                self._state, self._sdk, self._worker, self._fleet_config.request_timeout
+                self._state, self._worker, self._fleet_config.request_timeout
             )
             self._computer_backend = _TransportComputerBackend(transport)
             self._computer_backend.start()
@@ -342,24 +268,14 @@ class CuaFleetEnvironment(BaseEnvironment):
     async def _service_json(
         self, service: str, path: str, payload: Mapping[str, Any]
     ) -> Mapping[str, Any]:
-        response = await self._state.client.service_request(
-            self._state.sandbox,
-            service,
-            path,
-            self._sdk.HttpRequest(
-                method="POST",
-                url=f"https://service.invalid{path}",
-                headers=[
-                    self._sdk.HttpHeader(name="content-type", value="application/json")
-                ],
-                body=json.dumps(payload, separators=(",", ":")).encode(),
-            ),
+        response = await self._state.sandbox.services.request(
+            service, method="POST", path=path, json=dict(payload)
         )
-        if not 200 <= response.status < 300:
+        if not 200 <= response.status_code < 300:
             raise RuntimeError(
-                f"Fleet service {service!r} failed with HTTP {response.status}"
+                f"Fleet service {service!r} failed with HTTP {response.status_code}"
             )
-        return _parse_service_response(response.body)
+        return _parse_service_response(response.content)
 
     def cleanup(self) -> None:
         if self._computer_backend is not None:
@@ -379,21 +295,15 @@ def _shell_quote(value: str) -> str:
 class CuaFleetDesktopProvider:
     name = "cua_fleet"
 
-    def __init__(self, config: CuaFleetConfig | None = None, *, sdk_module: Any = None):
+    def __init__(
+        self, config: CuaFleetConfig | None = None, *, sandbox_module: Any = None
+    ):
         self.config = config or CuaFleetConfig()
-        self._sdk = sdk_module
+        self._sandbox_module = sandbox_module
         self._states: dict[str, _FleetState] = {}
         self._workers: dict[str, _AsyncWorker] = {}
         self._lock = threading.RLock()
         self._reconcile_lock = threading.Lock()
-        self._shared_worker: _AsyncWorker | None = None
-        self._shared_client: Any = None
-        self._shared_http_client: Any = None
-
-    @staticmethod
-    def _http_client_type(http_client_base: type) -> type:
-        # Concrete callback first: generated HttpClient.execute is abstract.
-        return type("FleetHttpClient", (_UrlLibHttpClient, http_client_base), {})
 
     def acquire(
         self,
@@ -419,33 +329,46 @@ class CuaFleetDesktopProvider:
                 "Cua Fleet requires CUA_CLIENT_ID and CUA_CLIENT_SECRET (a ukey credential)"
             )
 
-        sdk = self._load_sdk()
-        worker, client, http_client = self._shared_connection(
-            sdk, client_id, client_secret
+        sandbox_api = self._load_sandbox_api()
+        sandbox_api.configure(
+            fleet_base_url=self.config.base_url,
+            token_url=self.config.token_url,
+            client_id=client_id,
+            client_secret=client_secret,
         )
+        worker = _AsyncWorker()
         lease_id = uuid.uuid4().hex
-        namespace = self.config.pool
-        pool = claim = None
+        pool = claim_context = None
+        entered_claim = False
         try:
             with self._reconcile_lock:
-                pool = self._reconcile_pool(
-                    worker, client, sdk, namespace, image or self.config.image
+                pool = worker.run(
+                    sandbox_api.Pool.reconcile({
+                        "name": self.config.pool,
+                        "image": sandbox_api.Image.from_registry(
+                            image or self.config.image
+                        ),
+                        "replicas": self.config.replicas,
+                        "services": dict(self.config.services),
+                    }),
+                    self.config.request_timeout,
                 )
-            pool = self._wait_pool(worker, client, pool)
-            claim = worker.run(
-                client.create_claim(sdk.CreateClaimRequest(pool=pool, spec=None)),
-                self.config.request_timeout,
-            )
-            sandbox = worker.run(client.wait_claim(claim), self.config.ready_timeout)
+            claim_context = pool.claim()
+            sandbox = worker.run(claim_context.__aenter__(), self.config.ready_timeout)
+            entered_claim = True
         except BaseException:
-            if claim is not None:
+            if entered_claim:
                 try:
-                    worker.run(client.delete_claim(claim), self.config.request_timeout)
+                    worker.run(
+                        claim_context.__aexit__(None, None, None),
+                        self.config.request_timeout,
+                    )
                 except Exception:
                     logger.warning("Failed to roll back Fleet claim", exc_info=True)
+            worker.stop()
             raise
 
-        state = _FleetState(client, http_client, pool, claim, sandbox)
+        state = _FleetState(pool, claim_context, sandbox)
         with self._lock:
             self._states[lease_id] = state
             self._workers[lease_id] = worker
@@ -456,12 +379,7 @@ class CuaFleetDesktopProvider:
             image=image or self.config.image,
             capabilities=enabled,
             endpoint=self.config.base_url,
-            metadata={
-                "namespace": pool.metadata.namespace,
-                "pool": pool.metadata.name,
-                "claim": claim.metadata.name,
-                "sandbox": sandbox.name,
-            },
+            metadata={"pool": pool.name, "sandbox": sandbox.name},
         )
 
     def create_environment(self, lease: ComputeLease) -> CuaFleetEnvironment:
@@ -481,7 +399,6 @@ class CuaFleetDesktopProvider:
         return CuaFleetEnvironment(
             compute_lease=lease,
             state=state,
-            sdk=self._load_sdk(),
             config=config,
             worker=worker,
             release_callback=lambda: self.release(lease),
@@ -493,165 +410,27 @@ class CuaFleetDesktopProvider:
             worker = self._workers.get(lease.lease_id)
         if state is None or worker is None:
             return
-        worker.run(state.client.delete_claim(state.claim), self.config.request_timeout)
+        worker.run(
+            state.claim_context.__aexit__(None, None, None),
+            self.config.request_timeout,
+        )
         with self._lock:
             self._states.pop(lease.lease_id, None)
             self._workers.pop(lease.lease_id, None)
+        worker.stop()
 
-    def _shared_connection(
-        self, sdk: Any, client_id: str, client_secret: str
-    ) -> tuple[_AsyncWorker, Any, Any]:
-        with self._lock:
-            if self._shared_worker is not None:
-                return (
-                    self._shared_worker,
-                    self._shared_client,
-                    self._shared_http_client,
-                )
-            worker = _AsyncWorker()
-            http_client_type = self._http_client_type(sdk.HttpClient)
-            allowed_hosts = {
-                urllib.parse.urlparse(self.config.base_url).hostname,
-                urllib.parse.urlparse(self.config.token_url).hostname,
-            }
-            http_client = http_client_type(
-                sdk,
-                self.config.request_timeout,
-                tuple(host for host in allowed_hosts if host),
-            )
-            client = sdk.CyclopsClient.connect(
-                sdk.CyclopsConfiguration(
-                    base_url=self.config.base_url,
-                    token_url=self.config.token_url,
-                    credentials=sdk.CyclopsCredentials(client_id, client_secret),
-                    pool_poll_interval_ms=max(
-                        1, int(self.config.ready_poll_interval * 1000)
-                    ),
-                    pool_poll_limit=max(
-                        1,
-                        int(
-                            self.config.ready_timeout
-                            / max(self.config.ready_poll_interval, 0.001)
-                        ),
-                    ),
-                    claim_poll_interval_ms=max(
-                        1, int(self.config.ready_poll_interval * 1000)
-                    ),
-                    claim_poll_limit=max(
-                        1,
-                        int(
-                            self.config.ready_timeout
-                            / max(self.config.ready_poll_interval, 0.001)
-                        ),
-                    ),
-                ),
-                http_client,
-            )
-            self._shared_worker = worker
-            self._shared_client = client
-            self._shared_http_client = http_client
-            return worker, client, http_client
-
-    def _load_sdk(self) -> Any:
-        if self._sdk is not None:
-            return self._sdk
+    def _load_sandbox_api(self) -> Any:
+        if self._sandbox_module is not None:
+            return self._sandbox_module
         try:
             from tools.lazy_deps import ensure
 
             ensure("terminal.cua_fleet", prompt=False)
-            import cyclops_sdk
+            import cua_sandbox
         except Exception as exc:
-            raise ImportError(f"Cua Fleet SDK unavailable: {exc}") from exc
-        self._sdk = cyclops_sdk
-        return self._sdk
-
-    def _pool_request(self, sdk: Any, namespace: str, image: str) -> Any:
-        services = [
-            sdk.SandboxService(name=name, target_port=port, protocol=None)
-            for name, port in self.config.services.items()
-        ]
-        probes = None
-        if hasattr(sdk, "PreservedJson") and "server" in self.config.services:
-            probes = sdk.PreservedJson.from_json(
-                json.dumps({
-                    "readinessProbe": {
-                        "tcpSocket": {"port": self.config.services["server"]}
-                    }
-                })
-            )
-        return sdk.CreatePoolRequest(
-            namespace=namespace,
-            spec=sdk.PoolSpec(
-                replicas=self.config.replicas,
-                services=services,
-                template=sdk.PoolTemplate(
-                    runtime=None,
-                    runtime_class_name=None,
-                    node_selector=None,
-                    tolerations=None,
-                    command=None,
-                    container_disk_image=image,
-                    image_pull_secret=self.config.image_pull_secret or None,
-                    cpu_cores=self.config.cpu,
-                    memory=self.config.memory,
-                    firmware=None,
-                    probes=probes,
-                    oidc=None,
-                ),
-                autoscaling=None,
-            ),
-        )
-
-    def _reconcile_pool(
-        self,
-        worker: _AsyncWorker,
-        client: Any,
-        sdk: Any,
-        namespace: str,
-        image: str,
-    ) -> Any:
-        desired = self._pool_request(sdk, namespace, image)
-        try:
-            current = worker.run(
-                client.get_pool(namespace), self.config.request_timeout
-            )
-        except BaseException as error:
-            if not self._is_missing_pool_error(sdk, error):
-                raise
-            try:
-                return worker.run(
-                    client.create_pool(desired), self.config.request_timeout
-                )
-            except BaseException:
-                # Creation may have committed remotely before a local timeout.
-                return worker.run(
-                    client.get_pool(namespace), self.config.request_timeout
-                )
-        if current.spec != desired.spec:
-            current.spec = desired.spec
-            return worker.run(client.update_pool(current), self.config.request_timeout)
-        return current
-
-    @staticmethod
-    def _is_missing_pool_error(sdk: Any, error: BaseException) -> bool:
-        status_error = getattr(getattr(sdk, "SdkError", None), "Status", None)
-        return status_error is not None and isinstance(error, status_error) and error.status == 404
-
-    def _wait_pool(self, worker: _AsyncWorker, client: Any, pool: Any) -> Any:
-        deadline = time.monotonic() + self.config.ready_timeout
-        while True:
-            current = worker.run(client.get_pool(pool.metadata.name), self.config.request_timeout)
-            status = getattr(current, "status", None)
-            if (
-                status is not None
-                and (getattr(status, "available_count", 0) or 0) >= self.config.replicas
-            ):
-                return current
-            if time.monotonic() >= deadline:
-                raise TimeoutError(
-                    f"Timed out waiting for Fleet pool {pool.metadata.name!r}"
-                )
-            time.sleep(self.config.ready_poll_interval)
+            raise ImportError(f"CUA Sandbox API unavailable: {exc}") from exc
+        self._sandbox_module = cua_sandbox
+        return self._sandbox_module
 
 
 def _provider_from_config(compute_config: Mapping[str, Any] | None = None) -> Any:
