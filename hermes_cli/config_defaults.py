@@ -3637,8 +3637,17 @@ OPTIONAL_ENV_VARS = {
         "password": False,
         "category": "tool",
     },
+    "CAMOFOX_ACCESS_KEY": {
+        "description": "Optional global bearer token for authenticated Camofox browser routes",
+        "prompt": "Camofox access key",
+        "url": "https://github.com/jo-inc/camofox-browser",
+        "tools": ["browser_navigate", "browser_click"],
+        "password": True,
+        "category": "tool",
+        "advanced": True,
+    },
     "CAMOFOX_API_KEY": {
-        "description": "Optional bearer token sent as Authorization header to a remote/authenticated Camofox server",
+        "description": "Legacy Camofox browser-route bearer fallback; upstream uses this for cookie import only",
         "prompt": "Camofox API key",
         "url": "https://github.com/jo-inc/camofox-browser",
         "tools": ["browser_navigate", "browser_click"],

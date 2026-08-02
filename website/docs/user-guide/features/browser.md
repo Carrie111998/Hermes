@@ -183,6 +183,8 @@ Then set in `~/.hermes/.env`:
 
 ```bash
 CAMOFOX_URL=http://localhost:9377
+# Required only when the Camofox server is started with CAMOFOX_ACCESS_KEY.
+CAMOFOX_ACCESS_KEY=your-access-key
 ```
 
 If Camofox is running in Docker and you want it to open web apps served from the host machine, enable loopback rewriting. `CAMOFOX_URL` should still point at the host-published control API, but page URLs such as `http://127.0.0.1:3000` must be opened from inside the container as `http://host.docker.internal:3000`:

@@ -82,8 +82,16 @@ def _get_command_timeout() -> int:
 
 
 def _auth_headers() -> Dict[str, str]:
-    """Return Authorization header when CAMOFOX_API_KEY is set."""
-    key = (get_secret("CAMOFOX_API_KEY", "") or "").strip()
+    """Return Authorization header for Camofox browser routes.
+
+    Camofox's global route gate uses ``CAMOFOX_ACCESS_KEY``.  Keep
+    ``CAMOFOX_API_KEY`` as a fallback for older Hermes setups that used it as
+    the bearer token before camofox-browser split access-key and API-key auth.
+    """
+    key = (
+        (get_secret("CAMOFOX_ACCESS_KEY", "") or "").strip()
+        or (get_secret("CAMOFOX_API_KEY", "") or "").strip()
+    )
     if key:
         return {"Authorization": f"Bearer {key}"}
     return {}
@@ -948,6 +956,5 @@ def camofox_console(clear: bool = False, task_id: Optional[str] = None) -> str:
         "note": "Console log capture is not available with the Camofox backend. "
                 "Use browser_snapshot or browser_vision to inspect page state.",
     })
-
 
 

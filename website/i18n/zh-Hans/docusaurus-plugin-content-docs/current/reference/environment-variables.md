@@ -135,6 +135,8 @@ description: "Hermes Agent 使用的所有环境变量完整参考"
 | `FIRECRAWL_BROWSER_TTL` | Firecrawl 浏览器会话 TTL（秒，默认：300） |
 | `BROWSER_CDP_URL` | 本地浏览器的 Chrome DevTools Protocol（CDP）URL（通过 `/browser connect` 设置，例如 `ws://localhost:9222`） |
 | `CAMOFOX_URL` | Camofox 本地反检测浏览器 URL（默认：`http://localhost:9377`） |
+| `CAMOFOX_ACCESS_KEY` | 发送到已启用认证的 Camofox 浏览器路由的可选全局 Bearer 令牌 |
+| `CAMOFOX_API_KEY` | 旧版 Camofox 浏览器路由 Bearer 备用项；上游仅将其用于 cookie 导入 |
 | `CAMOFOX_USER_ID` | 可选的外部管理 Camofox 用户 ID，用于共享可见会话 |
 | `CAMOFOX_SESSION_KEY` | 为 `CAMOFOX_USER_ID` 创建标签页时使用的可选 Camofox 会话密钥 |
 | `CAMOFOX_ADOPT_EXISTING_TAB` | 设为 `true` 可在创建新标签页前复用现有 Camofox 标签页 |

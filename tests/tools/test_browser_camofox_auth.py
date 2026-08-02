@@ -1,4 +1,4 @@
-"""Tests that Camofox browser sends Authorization header when CAMOFOX_API_KEY is set.
+"""Tests that Camofox browser sends Authorization header when a bearer key is set.
 
 Regression test for https://github.com/NousResearch/hermes-agent/issues/20476
 """
@@ -35,20 +35,37 @@ class TestAuthHeaders:
     """Unit tests for _auth_headers() helper."""
 
     def test_empty_when_no_key(self, monkeypatch):
+        monkeypatch.delenv("CAMOFOX_ACCESS_KEY", raising=False)
         monkeypatch.delenv("CAMOFOX_API_KEY", raising=False)
         assert _auth_headers() == {}
 
 
     def test_empty_when_key_blank(self, monkeypatch):
+        monkeypatch.setenv("CAMOFOX_ACCESS_KEY", "   ")
         monkeypatch.setenv("CAMOFOX_API_KEY", "   ")
         assert _auth_headers() == {}
+
+    def test_access_key_is_global_browser_route_bearer(self, monkeypatch):
+        monkeypatch.setenv("CAMOFOX_ACCESS_KEY", "access-key")
+        monkeypatch.delenv("CAMOFOX_API_KEY", raising=False)
+        assert _auth_headers() == {"Authorization": "Bearer access-key"}
+
+    def test_access_key_wins_over_legacy_api_key(self, monkeypatch):
+        monkeypatch.setenv("CAMOFOX_ACCESS_KEY", "access-key")
+        monkeypatch.setenv("CAMOFOX_API_KEY", "legacy-api-key")
+        assert _auth_headers() == {"Authorization": "Bearer access-key"}
+
+    def test_legacy_api_key_still_works_as_fallback(self, monkeypatch):
+        monkeypatch.delenv("CAMOFOX_ACCESS_KEY", raising=False)
+        monkeypatch.setenv("CAMOFOX_API_KEY", "legacy-api-key")
+        assert _auth_headers() == {"Authorization": "Bearer legacy-api-key"}
 
     def test_multiplex_scope_key_wins_over_process_environment(self, monkeypatch):
         from agent import secret_scope
 
-        monkeypatch.setenv("CAMOFOX_API_KEY", "default-profile-key")
+        monkeypatch.setenv("CAMOFOX_ACCESS_KEY", "default-profile-key")
         secret_scope.set_multiplex_active(True)
-        token = secret_scope.set_secret_scope({"CAMOFOX_API_KEY": "secondary-profile-key"})
+        token = secret_scope.set_secret_scope({"CAMOFOX_ACCESS_KEY": "secondary-profile-key"})
         try:
             assert _auth_headers() == {"Authorization": "Bearer secondary-profile-key"}
         finally:
@@ -58,7 +75,7 @@ class TestAuthHeaders:
     def test_multiplex_scope_missing_key_fails_closed(self, monkeypatch):
         from agent import secret_scope
 
-        monkeypatch.setenv("CAMOFOX_API_KEY", "default-profile-key")
+        monkeypatch.setenv("CAMOFOX_ACCESS_KEY", "default-profile-key")
         secret_scope.set_multiplex_active(True)
         token = secret_scope.set_secret_scope({})
         try:
@@ -71,12 +88,12 @@ class TestAuthHeaders:
         from agent import secret_scope
 
         monkeypatch.setenv("CAMOFOX_URL", "https://default.example")
-        monkeypatch.setenv("CAMOFOX_API_KEY", "default-profile-key")
+        monkeypatch.setenv("CAMOFOX_ACCESS_KEY", "default-profile-key")
         secret_scope.set_multiplex_active(True)
         token = secret_scope.set_secret_scope(
             {
                 "CAMOFOX_URL": "https://secondary.example/",
-                "CAMOFOX_API_KEY": "secondary-profile-key",
+                "CAMOFOX_ACCESS_KEY": "secondary-profile-key",
             }
         )
         try:
@@ -90,19 +107,19 @@ class TestAuthHeaders:
 
 
 class TestAuthHeadersSent:
-    """Verify all HTTP call sites include auth headers when CAMOFOX_API_KEY is set."""
+    """Verify all HTTP call sites include auth headers when CAMOFOX_ACCESS_KEY is set."""
 
     @pytest.fixture(autouse=True)
     def _set_key(self, monkeypatch):
         monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")
-        monkeypatch.setenv("CAMOFOX_API_KEY", "my-api-key")
+        monkeypatch.setenv("CAMOFOX_ACCESS_KEY", "my-access-key")
 
     @patch("tools.browser_camofox.requests.post")
     def test_ensure_tab_sends_auth(self, mock_post):
         mock_post.return_value = _mock_response(json_data={"tabId": "t1"})
         camofox_navigate("https://example.com", task_id="auth_test_1")
         _, kwargs = mock_post.call_args
-        assert kwargs["headers"] == {"Authorization": "Bearer my-api-key"}
+        assert kwargs["headers"] == {"Authorization": "Bearer my-access-key"}
 
 
     @patch("tools.browser_camofox.requests.post")
@@ -113,15 +130,16 @@ class TestAuthHeadersSent:
         mock_delete.return_value = _mock_response(json_data={"ok": True})
         camofox_close(task_id="auth_test_4")
         _, kwargs = mock_delete.call_args
-        assert kwargs["headers"] == {"Authorization": "Bearer my-api-key"}
+        assert kwargs["headers"] == {"Authorization": "Bearer my-access-key"}
 
 
-class TestNoAuthHeadersWhenKeyUnset:
-    """Verify HTTP calls send empty headers when CAMOFOX_API_KEY is not set."""
+class TestNoAuthHeadersWhenKeysUnset:
+    """Verify HTTP calls send empty headers when no Camofox bearer key is set."""
 
     @pytest.fixture(autouse=True)
     def _unset_key(self, monkeypatch):
         monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")
+        monkeypatch.delenv("CAMOFOX_ACCESS_KEY", raising=False)
         monkeypatch.delenv("CAMOFOX_API_KEY", raising=False)
 
     @patch("tools.browser_camofox.requests.post")
