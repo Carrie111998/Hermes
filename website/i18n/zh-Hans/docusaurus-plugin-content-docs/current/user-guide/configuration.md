@@ -482,14 +482,14 @@ hermes config set skills.config.myplugin.path ~/myplugin-data
 
 ### Agent 创建技能写入的守卫
 
-当 agent 使用 `skill_manage` 创建、编辑、修补或删除技能时，Hermes 可以选择扫描新/更新的内容以查找危险关键字模式（凭据收集、明显的 prompt 注入、数据外泄指令）。扫描器**默认关闭** —— 合法触及 `~/.ssh/` 或提及 `$OPENAI_API_KEY` 的真实 agent 工作流触发启发式规则过于频繁。如果您希望扫描器在 agent 的技能写入落地前提示您，请重新开启：
+当 agent 使用 `skill_manage` 创建、编辑、修补或删除技能时，可以要求所有者审查写入。语义判断属于 LLM 模型；运行时不使用危险关键字、正则表达式分类器或路由器解释内容。启用守卫后，写入会在落地前进入显式审查：
 
 ```yaml
 skills:
   guard_agent_created: true   # 默认：false
 ```
 
-开启后，任何被标记的 `skill_manage` 写入都会以审批提示的形式出现，并附带扫描器的理由。接受的写入落地；拒绝的写入向 agent 返回解释性错误。
+开启后，`skill_manage` 写入会以审批提示的形式出现。接受的写入落地；拒绝的写入向 agent 返回解释性错误。
 
 ## 内存配置
 
@@ -1559,15 +1559,11 @@ discord:
 
 ## 安全
 
-预执行安全扫描和机密脱敏：
+机密脱敏和网络边界：
 
 ```yaml
 security:
   redact_secrets: false          # 在工具输出和日志中脱敏 API 密钥模式（默认关闭）
-  tirith_enabled: true           # 为终端命令启用 Tirith 安全扫描
-  tirith_path: "tirith"          # tirith 二进制文件路径（默认：$PATH 中的 "tirith"）
-  tirith_timeout: 5              # 等待 tirith 扫描的秒数
-  tirith_fail_open: true         # 如果 tirith 不可用，允许命令执行
   website_blocklist:             # 参见下方网站黑名单部分
     enabled: false
     domains: []
@@ -1575,11 +1571,6 @@ security:
 ```
 
 - `redact_secrets` —— 为 `true` 时，自动检测并脱敏工具输出中看起来像 API 密钥、token 和密码的模式，然后再进入对话上下文和日志。**默认关闭** —— 如果您经常在工具输出中处理真实凭据并希望有安全网，请启用。显式设置为 `true` 以开启。
-- `tirith_enabled` —— 为 `true` 时，终端命令在执行前由 [Tirith](https://github.com/sheeki03/tirith) 扫描以检测潜在危险操作。
-- `tirith_path` —— tirith 二进制文件的路径。如果 tirith 安装在非标准位置，请设置此项。
-- `tirith_timeout` —— 等待 tirith 扫描的最大秒数。如果扫描超时，命令继续执行。
-- `tirith_fail_open` —— 为 `true`（默认）时，如果 tirith 不可用或失败，允许命令执行。设置为 `false` 以在 tirith 无法验证时阻止命令。
-
 ## 网站黑名单
 
 阻止 agent 的 web 和浏览器工具访问特定域名：
@@ -1607,9 +1598,9 @@ security:
 
 策略缓存 30 秒，因此配置更改无需重启即可快速生效。
 
-## 危险命令审批
+## 精确终端授权
 
-控制 Hermes 如何处理潜在危险命令：
+Hermes 不根据关键字、正则表达式或命令路由器解释终端文本。LLM 模型是唯一语义解释主体；运行时只验证结构化 capability。配置控制是否要求所有者为精确调用签发一次性 capability：
 
 ```yaml
 approvals:
@@ -1618,13 +1609,13 @@ approvals:
 
 | 模式 | 行为 |
 |------|----------|
-| `manual`（默认） | 在执行任何被标记的命令之前提示用户。在 CLI 中显示交互式审批对话框。在消息中排队待处理的审批请求。 |
-| `off` | 跳过所有审批检查。等同于 `HERMES_YOLO_MODE=true`。**谨慎使用。** |
+| `manual`（默认） | 对缺少结构化权限的每个精确调用提示用户。 |
+| `off` | 跳过所有者提示；调用权限仍精确绑定、单次使用且不可重放。等同于 `HERMES_YOLO_MODE=true`。**谨慎使用。** |
 
 旧配置中的 `approvals.mode: smart` 会迁移为 `manual`。授权仍由用户作出，不会委托给辅助 LLM。
 
 :::warning
-设置 `approvals.mode: off` 会禁用终端命令的所有安全检查。仅在受信任的沙箱环境中使用。
+设置 `approvals.mode: off` 会禁用终端所有者提示。仅在受信任并具有适当结构隔离的环境中使用。
 :::
 
 ## 检查点

@@ -332,16 +332,16 @@ See [Context Length Detection](../integrations/providers.md#context-length-detec
 
 ### Terminal Issues
 
-#### Command blocked as dangerous
+#### Terminal operation waiting for authorization
 
-**Cause:** Hermes detected a potentially destructive command (e.g., `rm -rf`, `DROP TABLE`). This is a safety feature.
+**Cause:** The exact pending operation has no consumable structural capability. Hermes did not reach this decision by classifying command words or examples.
 
-**Solution:** When prompted, review the command and type `y` to approve it. You can also:
+**Solution:** When prompted, review the complete operation and approve that exact execution once. You can also:
 - Ask the agent to use a safer alternative
-- See the full list of dangerous patterns in the [Security docs](../user-guide/security.md)
+- Read about exact terminal authority in the [Security docs](../user-guide/security.md)
 
 :::tip
-This is working as intended — Hermes never silently runs destructive commands. The approval prompt shows you exactly what will execute.
+This is working as intended. The prompt shows the exact operation; its opaque capability is single-use and non-replayable.
 :::
 
 #### `sudo` not working via messaging gateway

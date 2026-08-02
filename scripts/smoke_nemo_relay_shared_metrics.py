@@ -190,8 +190,6 @@ def _write_config(home: Path, port: int) -> None:
   base_url: http://127.0.0.1:{port}/v1
   api_mode: chat_completions
   api_key: no-key-required
-security:
-  tirith_enabled: false
 telemetry:
   shared_metrics:
     enabled: true

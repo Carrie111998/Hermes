@@ -75,7 +75,7 @@ DELEGATE_BLOCKED_TOOLS = frozenset(
 # because they resolve approvals via tools/approval.py's per-session queue,
 # not through these TLS callbacks.
 def _subagent_auto_deny(command: str, description: str, **kwargs) -> str:
-    """Auto-deny dangerous commands in subagent threads (safe default).
+    """Deny non-exact approval requests in subagent worker threads.
 
     Returns 'deny' so the subagent sees a refusal it can recover from, and
     never calls input() (which would deadlock the parent TUI).
@@ -2206,7 +2206,7 @@ def _run_single_child(
         _timeout_executor = DaemonThreadPoolExecutor(
             max_workers=1,
             # Install a non-interactive approval callback in the worker thread
-            # so dangerous-command prompts from the subagent don't fall back to
+            # so non-exact approval prompts from the subagent don't fall back to
             # input() and deadlock the parent's prompt_toolkit TUI.
             # Broad subagent auto-approval does not exist. Exact capability
             # consumption resolves before this compatibility callback.

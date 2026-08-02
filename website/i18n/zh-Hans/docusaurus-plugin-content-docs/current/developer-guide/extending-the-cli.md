@@ -154,7 +154,7 @@ def _build_tui_layout_children(self, *, sudo_widget, secret_widget,
     Window(height=0),       # anchor
     sudo_widget,            # sudo password prompt (conditional)
     secret_widget,          # secret input prompt (conditional)
-    approval_widget,        # dangerous command approval (conditional)
+    approval_widget,        # exact terminal invocation approval (conditional)
     clarify_widget,         # clarify question UI (conditional)
     model_picker_widget,    # model picker overlay (conditional)
     spinner_widget,         # thinking spinner (conditional)

@@ -206,7 +206,6 @@ from agent.trajectory import (
 )
 from agent.tool_dispatch_helpers import (
     _should_parallelize_tool_batch,  # noqa: F401  # re-exported for tests that `from run_agent import _should_parallelize_tool_batch`
-    _is_destructive_command,  # noqa: F401  # re-exported for tests that access `run_agent._is_destructive_command`
     _extract_parallel_scope_path,  # noqa: F401  # re-exported for tests that `from run_agent import _extract_parallel_scope_path`
     _paths_overlap,  # noqa: F401  # re-exported for tests that `from run_agent import _paths_overlap`
     _is_multimodal_tool_result,
@@ -2482,7 +2481,9 @@ class AIAgent:
             isinstance(error, ValueError)
             and "expected ident at line" in raw.lower()
         ):
-            return f"Malformed provider streaming response: {raw[:300]}"
+            return redact_sensitive_text(
+                f"Malformed provider streaming response: {raw[:300]}", force=True
+            )
 
         # Cloudflare / proxy HTML pages: grab the <title> for a clean summary
         if "<!DOCTYPE" in raw or "<html" in raw:
@@ -2498,14 +2499,14 @@ class AIAgent:
             parts.append(title)
             if ray_id:
                 parts.append(f"Ray {ray_id}")
-            return " — ".join(parts)
+            return redact_sensitive_text(" — ".join(parts), force=True)
 
         # GeminiAPIError (agent/gemini_native_adapter.py) already composes a
         # clean one-liner and may have appended actionable guidance (free-tier
         # 429, legacy Standard-key 401). Prefer its message over re-extracting
         # the raw response body below, which would strip that guidance.
         if type(error).__name__ == "GeminiAPIError":
-            return redact_sensitive_text(raw[:1000])
+            return redact_sensitive_text(raw[:1000], force=True)
 
         # JSON body errors from OpenAI/Anthropic SDKs
         body = getattr(error, "body", None)
@@ -2515,7 +2516,10 @@ class AIAgent:
                 status_code = getattr(error, "status_code", None)
                 prefix = f"HTTP {status_code}: " if status_code else ""
                 msg = AIAgent._coerce_api_error_detail(msg)
-                return AIAgent._decorate_xai_entitlement_error(f"{prefix}{msg[:300]}")
+                return redact_sensitive_text(
+                    AIAgent._decorate_xai_entitlement_error(f"{prefix}{msg[:300]}"),
+                    force=True,
+                )
 
         # SDK may leave body empty while httpx still has the payload (#36109).
         # Redact before returning: the raw provider/proxy error body is
@@ -2538,15 +2542,22 @@ class AIAgent:
                 if isinstance(payload, dict):
                     err = payload.get("error")
                     if isinstance(err, dict) and err.get("message"):
-                        return redact_sensitive_text(f"{prefix}{str(err['message'])[:300]}")
+                        return redact_sensitive_text(
+                            f"{prefix}{str(err['message'])[:300]}", force=True
+                        )
                     if payload.get("message"):
-                        return redact_sensitive_text(f"{prefix}{str(payload['message'])[:300]}")
-                return redact_sensitive_text(f"{prefix}{snippet[:300]}")
+                        return redact_sensitive_text(
+                            f"{prefix}{str(payload['message'])[:300]}", force=True
+                        )
+                return redact_sensitive_text(f"{prefix}{snippet[:300]}", force=True)
 
         # Fallback: truncate the raw string but give more room than 200 chars
         status_code = getattr(error, "status_code", None)
         prefix = f"HTTP {status_code}: " if status_code else ""
-        return AIAgent._decorate_xai_entitlement_error(f"{prefix}{raw[:500]}")
+        return redact_sensitive_text(
+            AIAgent._decorate_xai_entitlement_error(f"{prefix}{raw[:500]}"),
+            force=True,
+        )
 
     def _mask_api_key_for_logs(self, key: Any) -> Optional[str]:
         # Azure Foundry Entra ID bearer providers are callables — never

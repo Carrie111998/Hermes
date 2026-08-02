@@ -2897,7 +2897,7 @@ class CLICommandsMixin:
             pass
 
     def _handle_approvals_command(self, cmd_original: str) -> None:
-        """Show or persist the profile-wide dangerous-command approval mode."""
+        """Show or persist the profile-wide operation approval mode."""
         from cli import _cprint
         from hermes_cli.approval_mode import run_approval_mode_command
 

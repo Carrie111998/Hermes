@@ -85,7 +85,7 @@ hermes [flags] [command]
   --worktree, -w            Isolated git worktree mode (parallel agents)
   --skills, -s SKILL        Preload skills (comma-separate or repeat)
   --profile, -p NAME        Use a named profile
-  --yolo                    Skip dangerous command approval
+  --yolo                    Skip owner prompts for exact terminal calls
   --pass-session-id         Include session ID in system prompt
 ```
 
@@ -372,7 +372,7 @@ Profiles 使用 `~/.hermes/profiles/<name>/`，布局相同。
 | `stt` | `enabled`, `provider` (local/groq/openai/mistral) |
 | `tts` | `provider` (edge/elevenlabs/openai/minimax/mistral/neutts) |
 | `memory` | `memory_enabled`, `user_profile_enabled`, `provider` |
-| `security` | `tirith_enabled`, `website_blocklist` |
+| `security` | `redact_secrets`, `website_blocklist` |
 | `delegation` | `model`, `provider`, `base_url`, `api_key`, `max_iterations` (50), `reasoning_effort` |
 | `checkpoints` | `enabled`, `max_snapshots` (50) |
 
@@ -480,16 +480,16 @@ hermes config set privacy.redact_pii true    # 启用
 hermes config set privacy.redact_pii false   # 禁用（默认）
 ```
 
-### 命令审批提示
+### 精确终端授权
 
-默认情况下（`approvals.mode: manual`），Hermes 会要求用户明确审批被标记为破坏性的 shell 命令（`rm -rf`、`git reset --hard` 等）。模式如下：
+Hermes 不通过关键字、正则表达式或命令路由器解释终端文本。LLM 模型是唯一语义解释主体；运行时只验证结构化 capability。默认情况下（`approvals.mode: manual`），每个缺少权限的精确终端调用都需要用户授权：
 
-- `manual` — 始终提示（默认）
-- `off` — 跳过所有审批提示（等同于 `--yolo`）
+- `manual` — 为每个精确调用提示（默认）
+- `off` — 跳过所有者提示，但权限仍绑定单次调用且不可重放（等同于 `--yolo`）
 
 ```bash
-hermes config set approvals.mode manual      # 保留明确的用户授权
-hermes config set approvals.mode off         # 绕过一切（不推荐）
+hermes config set approvals.mode manual      # 保留精确的用户授权
+hermes config set approvals.mode off         # 绕过所有者提示（不推荐）
 ```
 
 旧配置中的 `approvals.mode: smart` 会迁移为 `manual`。

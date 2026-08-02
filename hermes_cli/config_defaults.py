@@ -1961,13 +1961,13 @@ DEFAULT_CONFIG = {
         "allowed_rooms": "",           # If set, bot ONLY responds in these room IDs (whitelist)
     },
 
-    # Approval mode for dangerous commands:
+    # Approval mode for terminal and code-execution operations:
     #   manual — always prompt the user
     #   off    — skip all approval prompts (equivalent to --yolo)
     #
-    # cron_mode — what to do when a cron job hits a dangerous command:
-    #   deny    — block the command and let the agent find another way (default, safe)
-    #   approve — auto-approve all dangerous commands in cron jobs
+    # cron_mode — whole-surface authority for scheduled terminal/code execution:
+    #   deny    — block the surface and let the model find another way (default)
+    #   approve — authorize the whole surface for scheduled jobs
     #
     # timeout — seconds to wait for the user's approve/deny before failing
     # closed (deny). Shared by the CLI prompt and gateway/messaging waits.
@@ -1978,16 +1978,6 @@ DEFAULT_CONFIG = {
         "mode": "manual",
         "timeout": 300,
         "cron_mode": "deny",
-        # User-defined deny rules: fnmatch globs matched against terminal
-        # commands. A match blocks the command unconditionally — BEFORE the
-        # --yolo / /yolo / mode=off bypass — making this the user-editable
-        # counterpart to the code-shipped hardline blocklist. Patterns are
-        # case-insensitive and must be quoted in YAML when they start with
-        # * or contain {}/!/: sequences. Example:
-        #   deny:
-        #     - "git push --force*"
-        #     - "*curl*|*sh*"
-        "deny": [],
         # When true, /reload-mcp asks the user to confirm before rebuilding
         # the MCP tool set for the active session.  Reloading invalidates
         # the provider prompt cache (tool schemas are baked into the system
@@ -2013,8 +2003,6 @@ DEFAULT_CONFIG = {
         "gateway_authorized_labels": [],
     },
 
-    # Permanently allowed dangerous command patterns (added via "always" approval)
-    "command_allowlist": [],
     # User-defined quick commands that bypass the agent loop (type: exec only)
     "quick_commands": {},
 
@@ -2053,14 +2041,9 @@ DEFAULT_CONFIG = {
     # Or dict format: {"name": {"description": "...", "system_prompt": "...", "tone": "...", "style": "..."}}
     "personalities": {},
 
-    # Pre-exec security scanning via tirith
     "security": {
         "allow_private_urls": False,  # Allow requests to private/internal IPs (for OpenWrt, proxies, VPNs)
         "redact_secrets": True,
-        "tirith_enabled": True,
-        "tirith_path": "tirith",
-        "tirith_timeout": 5,
-        "tirith_fail_open": True,
         "website_blocklist": {
             "enabled": False,
             "domains": [],

@@ -1,4 +1,4 @@
-"""Regression tests for Tirith-safe GitHub credential extraction (#22722)."""
+"""Regression tests for safe GitHub credential extraction (#22722)."""
 
 from pathlib import Path
 import subprocess

@@ -629,18 +629,18 @@ For details on declaring config settings in your own skills, see [Creating Skill
 
 ### Guard on agent-created skill writes
 
-When the agent uses `skill_manage` to create, edit, patch, or delete a skill, Hermes can optionally scan the new/updated content for dangerous keyword patterns (credential harvesting, obvious prompt injection, exfil instructions). The scanner is **off by default** — real agent workflows that legitimately touch `~/.ssh/` or mention `$OPENAI_API_KEY` were tripping the heuristic too often. Turn it back on if you want the scanner to prompt you before the agent's skill writes land:
+When the agent uses `skill_manage` to create, edit, patch, or delete a skill, Hermes can require owner review before the write lands. Semantic judgment belongs to the active LLM; this runtime gate does not interpret content through keyword or regex classifiers. Enable it to stage agent-authored skill changes for an explicit decision:
 
 ```yaml
 skills:
   guard_agent_created: true   # default: false
 ```
 
-When on, any flagged `skill_manage` write surfaces as an approval prompt with the scanner's rationale. Accepted writes land; denied writes return an explanatory error to the agent.
+When on, `skill_manage` writes surface as approval prompts. Accepted writes land; denied writes return an explanatory error to the agent.
 
 ### Write approval for skill writes
 
-Independent of the content scanner above, `skills.write_approval` gates **every** agent skill write (create / edit / patch / delete / supporting files) behind your explicit approval — the same approve/deny mechanism as dangerous commands:
+`skills.write_approval` gates **every** agent skill write (create / edit / patch / delete / supporting files) behind your explicit approval. This write-review queue is separate from exact terminal authority:
 
 ```yaml
 skills:
@@ -2081,15 +2081,11 @@ discord:
 
 ## Security
 
-Pre-execution security scanning and secret redaction:
+Secret redaction and web boundaries:
 
 ```yaml
 security:
   redact_secrets: true           # Redact API key patterns in tool output and logs (on by default)
-  tirith_enabled: true           # Enable Tirith security scanning for terminal commands
-  tirith_path: "tirith"          # Path to tirith binary (default: "tirith" in $PATH)
-  tirith_timeout: 5              # Seconds to wait for tirith scan before timing out
-  tirith_fail_open: true         # Allow command execution if tirith is unavailable
   website_blocklist:             # See Website Blocklist section below
     enabled: false
     domains: []
@@ -2097,11 +2093,6 @@ security:
 ```
 
 - `redact_secrets` — when `true`, automatically detects and redacts patterns that look like API keys, tokens, and passwords in tool output before it enters the conversation context and logs. **On by default**. Set to `false` explicitly only when you need raw credential-like strings for debugging or redactor development.
-- `tirith_enabled` — when `true`, terminal commands are scanned by [Tirith](https://github.com/sheeki03/tirith) before execution to detect potentially dangerous operations.
-- `tirith_path` — path to the tirith binary. Set this if tirith is installed in a non-standard location.
-- `tirith_timeout` — maximum seconds to wait for a tirith scan. Commands proceed if the scan times out.
-- `tirith_fail_open` — when `true` (default), commands are allowed to execute if tirith is unavailable or fails. Set to `false` to block commands when tirith cannot verify them.
-
 ## Website Blocklist
 
 Block specific domains from being accessed by the agent's web and browser tools:
@@ -2129,9 +2120,9 @@ Shared files contain one domain rule per line (blank lines and `#` comments are 
 
 The policy is cached for 30 seconds, so config changes take effect quickly without restart.
 
-## Command Approvals
+## Exact Terminal Authorization
 
-Control how Hermes handles potentially dangerous commands:
+Hermes does not interpret terminal text through keywords, regular expressions, or command routers. The active LLM is the sole semantic authority; the runtime verifies only structural capabilities. This setting controls whether the owner must issue a once-only capability for an exact operation:
 
 ```yaml
 approvals:
@@ -2140,27 +2131,14 @@ approvals:
 
 | Mode | Behavior |
 |------|----------|
-| `manual` (default) | Prompt the owner before executing any flagged command. In the CLI, this shows an interactive approval dialog. In messaging, it queues a pending approval request. |
-| `off` | Skip all approval checks. Equivalent to `HERMES_YOLO_MODE=true`. **Use with caution.** |
+| `manual` (default) | Prompt the owner for each exact operation that lacks structural authority. |
+| `off` | Skip owner prompts; operation authority remains exact, single-use, and non-replayable. Equivalent to `HERMES_YOLO_MODE=true`. **Use with caution.** |
 
 Legacy `smart` values are migrated to `manual`; an auxiliary model never decides authorization for the primary agent.
 
 :::warning
-Setting `approvals.mode: off` disables all safety checks for terminal commands. Only use this in trusted, sandboxed environments.
+Setting `approvals.mode: off` disables terminal owner prompts. Use it only in trusted environments with an appropriate structural isolation boundary.
 :::
-
-### Deny rules
-
-`approvals.deny` is a list of glob patterns that block matching terminal commands unconditionally — even under `--yolo`, `/yolo`, or `mode: off`. It's the user-editable counterpart to the built-in hardline blocklist:
-
-```yaml
-approvals:
-  deny:
-    - "git push --force*"
-    - "*curl*|*sh*"
-```
-
-Patterns are case-insensitive fnmatch globs and must be quoted in YAML (a bare leading `*` is a parse error). See [Security — User-Defined Deny Rules](/user-guide/security#user-defined-deny-rules-approvalsdeny) for details.
 
 ## Checkpoints
 

@@ -17,16 +17,9 @@ def _base_config(tmp_path):
     }
 
 
-def test_command_requires_pipe_stdin_detects_gh_with_token():
-    assert terminal_tool_module._command_requires_pipe_stdin(
-        "gh auth login --hostname github.com --git-protocol https --with-token"
-    ) is True
-    assert terminal_tool_module._command_requires_pipe_stdin(
-        "gh auth login --web"
-    ) is False
-
-
-def test_terminal_background_keeps_pty_for_regular_interactive_commands(monkeypatch, tmp_path):
+def test_terminal_background_keeps_requested_pty_for_opaque_command_bytes(
+    monkeypatch, tmp_path
+):
     config = _base_config(tmp_path)
     dummy_env = SimpleNamespace(env={})
     captured = {}
@@ -45,7 +38,10 @@ def test_terminal_background_keeps_pty_for_regular_interactive_commands(monkeypa
     try:
         result = json.loads(
             terminal_tool_module.terminal_tool(
-                command="python3 -c \"print(input())\"",
+                command=(
+                    "gh auth login --hostname github.com "
+                    "--git-protocol https --with-token"
+                ),
                 background=True,
                 pty=True,
             )

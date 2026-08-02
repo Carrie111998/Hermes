@@ -106,9 +106,16 @@ class TestCodeExecutionTZ:
         monkeypatch.setenv("TERMINAL_ENV", "local")
         try:
             from tools.code_execution_tool import execute_code
+            from tools.terminal_tool import set_approval_callback
             self._execute_code = execute_code
+            # The subject of these tests is the child environment, not the
+            # interactive approval surface.  Grant this one exact script in
+            # the same thread so execute_code still exercises its real guard.
+            set_approval_callback(lambda *_args, **_kwargs: "once")
         except ImportError:
             pytest.skip("tools.code_execution_tool not importable (missing deps)")
+        yield
+        set_approval_callback(None)
 
     def teardown_method(self):
         os.environ.pop("HERMES_TIMEZONE", None)

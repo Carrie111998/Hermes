@@ -1496,7 +1496,6 @@ async def test_run_local_authority_cannot_survive_stable_session_key_boundary(
     adapter = APIServerAdapter(PlatformConfig(enabled=True))
     stable_key = "stable-api-authority-test"
     session_id = "stable-api-session"
-    pattern_key = "dangerous-pattern"
     observed_epochs: list[str] = []
     observed_run_keys: list[str] = []
     call_count = 0
@@ -1522,20 +1521,15 @@ async def test_run_local_authority_cannot_survive_stable_session_key_boundary(
             observed_epochs.append(envelope["capability_epoch_sha256"])
             observed_run_keys.append(run_key)
             if call_count == 0:
-                assert approval.approve_session(run_key, pattern_key) is True
                 assert approval.enable_session_yolo(run_key) is True
-                approval.submit_pending(run_key, {"command": "dangerous"})
                 with approval._lock:
                     approval._plan_capabilities[run_key] = {
                         "plan-1": {"state": "granted"}
                     }
-                assert approval.is_approved(run_key, pattern_key) is True
                 assert approval.is_session_yolo_enabled(run_key) is True
             else:
-                assert approval.is_approved(run_key, pattern_key) is False
                 assert approval.is_session_yolo_enabled(run_key) is False
                 with approval._lock:
-                    assert run_key not in approval._pending
                     assert run_key not in approval._plan_capabilities
             call_count += 1
             return {"final_response": "done"}
@@ -1556,9 +1550,7 @@ async def test_run_local_authority_cannot_survive_stable_session_key_boundary(
         )
         first_run_key = observed_run_keys[0]
         with approval._lock:
-            assert first_run_key not in approval._session_approved
             assert first_run_key not in approval._session_yolo
-            assert first_run_key not in approval._pending
             assert first_run_key not in approval._plan_capabilities
             assert (first_run_key, observed_epochs[0]) in (
                 approval._retired_session_capability_epochs

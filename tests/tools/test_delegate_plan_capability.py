@@ -126,9 +126,6 @@ class _CapabilityProbeChild:
             ),
             "parent_yolo_visible": approval.is_session_yolo_enabled(SESSION_KEY),
             "child_yolo_granted": approval.enable_session_yolo(SESSION_KEY),
-            "child_session_approval_granted": approval.approve_session(
-                SESSION_KEY, "recursive delete"
-            ),
         }
         try:
             approval.grant_plan_capability(
@@ -254,7 +251,6 @@ def test_single_child_consumes_exact_parent_capability_without_minting(
             "mismatch_plan_id": None,
             "parent_yolo_visible": False,
             "child_yolo_granted": False,
-            "child_session_approval_granted": False,
             "grant_error": "delegated execution cannot grant or broaden plan authority",
             "exact_guard_approved": True,
             "exact_plan_id": PLAN_ID,

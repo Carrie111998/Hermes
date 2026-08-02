@@ -24,7 +24,7 @@ os.environ["TERMINAL_ENV"] = "local"
 
 
 @pytest.fixture(autouse=True)
-def _force_local_terminal(monkeypatch):
+def _force_local_terminal(monkeypatch, request):
     """Re-set TERMINAL_ENV=local before every test.
 
     The module-level assignment above covers import time, but under xdist
@@ -32,6 +32,21 @@ def _force_local_terminal(monkeypatch):
     ensures each test starts (and ends) with the correct value.
     """
     monkeypatch.setenv("TERMINAL_ENV", "local")
+    from tools.approval import (
+        disable_session_yolo,
+        enable_session_yolo,
+        reset_current_session_key,
+        set_current_session_key,
+    )
+
+    session_key = f"test-code-execution:{request.node.nodeid}"
+    token = set_current_session_key(session_key)
+    assert enable_session_yolo(session_key) is True
+    try:
+        yield
+    finally:
+        disable_session_yolo(session_key)
+        reset_current_session_key(token)
 import sys
 import threading
 import unittest

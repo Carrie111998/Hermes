@@ -23,7 +23,7 @@ import { notifyError } from '@/store/notifications'
 import { clearSecretRequest, clearSudoRequest, sessionSecretRequest, sessionSudoRequest } from '@/store/prompts'
 
 // Renders the modal mid-turn prompts the gateway raises and waits on: sudo
-// password and skill secret capture. Dangerous-command / execute_code approval
+// password and skill secret capture. Exact terminal / execute_code approval
 // prefers the pending tool row, but also has a chat-level fallback when no row
 // is mounted (remote gateway sessions can raise the request before the matching
 // tool call is visible). Each Python-side caller blocks the agent thread until

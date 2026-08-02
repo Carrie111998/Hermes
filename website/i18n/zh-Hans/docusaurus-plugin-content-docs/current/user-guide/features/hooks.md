@@ -383,7 +383,7 @@ def register(ctx):
 | [`on_session_reset`](#on_session_reset) | Gateway 换入新会话 key（如 `/new`、`/reset`） | 忽略 |
 | [`subagent_stop`](#subagent_stop) | `delegate_task` 子 agent 退出 | 忽略 |
 | [`pre_gateway_dispatch`](#pre_gateway_dispatch) | Gateway 收到用户消息，认证和分发前 | `{"action": "skip" \| "rewrite" \| "allow", ...}` 用于影响流程 |
-| [`pre_approval_request`](#pre_approval_request) | 危险命令需要用户审批，提示/通知发送前 | 忽略 |
+| [`pre_approval_request`](#pre_approval_request) | 精确终端调用缺少 capability，提示/通知发送前 | 忽略 |
 | [`post_approval_response`](#post_approval_response) | 用户响应审批提示（或超时） | 忽略 |
 | [`transform_tool_result`](#transform_tool_result) | 任意工具返回后，结果交还给模型前 | `str` 替换结果，`None` 保持不变 |
 | [`transform_terminal_output`](#transform_terminal_output) | `terminal` 工具内部，截断/ANSI 剥离/脱敏前 | `str` 替换原始输出，`None` 保持不变 |
@@ -938,9 +938,9 @@ def my_callback(
 | 参数 | 类型 | 描述 |
 |-----|------|------|
 | `command` | `str` | 等待审批的 shell 命令 |
-| `description` | `str` | 命令被标记的人类可读原因（多个模式匹配时合并） |
-| `pattern_key` | `str` | 触发审批的主要模式键（如 `"rm_rf"`、`"sudo"`） |
-| `pattern_keys` | `list[str]` | 所有匹配的模式键 |
+| `description` | `str` | 等待结构化权限的精确操作的人类可读描述 |
+| `pattern_key` | `str` | 兼容命名的精确 execution-subject 键（如 `"exact:terminal:<sha256>"`）；它不是语义模式 |
+| `pattern_keys` | `list[str]` | 包含精确 execution-subject 身份的兼容列表，不是关键字匹配结果 |
 | `session_key` | `str` | 会话标识符，用于按聊天限定通知范围 |
 | `surface` | `str` | 交互式 CLI/TUI 提示为 `"cli"`，异步平台审批为 `"gateway"` |
 
@@ -990,7 +990,7 @@ def my_callback(
 
 | 参数 | 类型 | 描述 |
 |-----|------|------|
-| `choice` | `str` | `"once"`、`"session"`、`"always"`、`"deny"` 或 `"timeout"` 之一 |
+| `choice` | `str` | 精确终端授权中的 `"once"`、`"deny"` 或 `"timeout"` |
 
 **返回值：** 忽略。
 
@@ -1188,7 +1188,7 @@ hooks_auto_accept: false         # See "Consent model" below
 {
   "hook_event_name": "pre_tool_call",
   "tool_name":       "terminal",
-  "tool_input":      {"command": "rm -rf /"},
+  "tool_input":      {"command": "./project-maintenance --target /srv/project"},
   "session_id":      "sess_abc123",
   "cwd":             "/home/user/project",
   "extra":           {"task_id": "...", "tool_call_id": "..."}
@@ -1201,8 +1201,8 @@ hooks_auto_accept: false         # See "Consent model" below
 
 ```jsonc
 // Block a pre_tool_call (both shapes accepted; normalised internally):
-{"decision": "block", "reason":  "Forbidden: rm -rf"}   // Claude-Code style
-{"action":   "block", "message": "Forbidden: rm -rf"}   // Hermes-canonical
+{"decision": "block", "reason":  "This profile is read-only"}   // Claude-Code style
+{"action":   "block", "message": "This profile is read-only"}   // Hermes-canonical
 
 // Inject context for pre_llm_call:
 {"context": "Today is Friday, 2026-04-17"}
@@ -1235,27 +1235,24 @@ printf '{}\n'
 
 Agent 的上下文内文件视图**不会**自动重新读取——重新格式化仅影响磁盘上的文件。后续的 `read_file` 调用会读取格式化后的版本。
 
-#### 2. 阻断破坏性 `terminal` 命令
+#### 2. 将 profile 设为结构化只读
 
 ```yaml
 hooks:
   pre_tool_call:
     - matcher: "terminal"
-      command: "~/.hermes/agent-hooks/block-rm-rf.sh"
+      command: "~/.hermes/agent-hooks/read-only-profile.sh"
       timeout: 5
 ```
 
 ```bash
 #!/usr/bin/env bash
-# ~/.hermes/agent-hooks/block-rm-rf.sh
-payload="$(cat -)"
-cmd=$(echo "$payload" | jq -r '.tool_input.command // empty')
-if echo "$cmd" | grep -qE 'rm[[:space:]]+-rf?[[:space:]]+/'; then
-  printf '{"decision": "block", "reason": "blocked: rm -rf / is not permitted"}\n'
-else
-  printf '{}\n'
-fi
+# ~/.hermes/agent-hooks/read-only-profile.sh
+cat >/dev/null
+printf '{"decision": "block", "reason": "terminal is disabled for this read-only profile"}\n'
 ```
+
+这是结构化的 whole-surface 策略，不检查或分类命令文本。语义判断由活动 LLM 负责，终端执行使用精确 capability 流程。
 
 #### 3. 向每轮注入 `git status`（Claude-Code `UserPromptSubmit` 等效）
 

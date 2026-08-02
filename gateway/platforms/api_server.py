@@ -2923,9 +2923,6 @@ class APIServerAdapter(BasePlatformAdapter):
         )
 
         def _notify(approval_data: Dict[str, Any]) -> None:
-            from agent.redact import redact_sensitive_text
-            from gateway.run import _redact_approval_command
-
             approval_id = str(approval_data.get("approval_id", "") or "")
             if re.fullmatch(r"[0-9a-f]{32}", approval_id) is None:
                 raise RuntimeError("approval core returned an invalid request ID")
@@ -2958,21 +2955,15 @@ class APIServerAdapter(BasePlatformAdapter):
             if allow_session and not allow_permanent:
                 choices.remove("always")
             pattern_keys = [
-                redact_sensitive_text(str(value))
-                for value in (approval_data.get("pattern_keys") or [])
+                str(value) for value in (approval_data.get("pattern_keys") or [])
             ]
-            redacted_command = _redact_approval_command(
-                str(approval_data.get("command", "") or "")
-            )
             state = {
                 "id": approval_id,
                 "object": "hermes.approval",
                 "status": "pending",
                 "session_id": session_id,
-                "command": redacted_command,
-                "description": redact_sensitive_text(
-                    str(approval_data.get("description", "") or "")
-                ),
+                "command": str(approval_data.get("command", "") or ""),
+                "description": str(approval_data.get("description", "") or ""),
                 "pattern_keys": pattern_keys,
                 "allow_permanent": allow_permanent,
                 "allow_session": allow_session,
@@ -12265,16 +12256,6 @@ class APIServerAdapter(BasePlatformAdapter):
                         raise RuntimeError(
                             "run approval core returned invalid binding metadata"
                         )
-                    # Redact credentials from the command before it enters the
-                    # SSE/API event stream — same egress bug as #48456, second
-                    # transport: API/desktop clients would otherwise receive the
-                    # raw command Tirith flagged. Reuse the gateway seam.
-                    from gateway.run import _redact_approval_command
-
-                    redacted_command = _redact_approval_command(
-                        (approval_data or {}).get("command", "")
-                    )
-
                     allow_permanent = bool(
                         (approval_data or {}).get("allow_permanent", False)
                     )
@@ -12294,17 +12275,10 @@ class APIServerAdapter(BasePlatformAdapter):
                         "session_id": session_id,
                         "approval_id": approval_id,
                         "timestamp": time.time(),
-                        "command": redacted_command,
-                        "description": redact_sensitive_text(
-                            str(
-                                (approval_data or {}).get(
-                                    "description", ""
-                                )
-                                or ""
-                            )
-                        ),
+                        "command": str((approval_data or {}).get("command", "") or ""),
+                        "description": str((approval_data or {}).get("description", "") or ""),
                         "pattern_keys": [
-                            redact_sensitive_text(str(value))
+                            str(value)
                             for value in (
                                 (approval_data or {}).get("pattern_keys") or []
                             )

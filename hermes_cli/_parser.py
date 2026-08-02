@@ -220,7 +220,7 @@ def build_top_level_parser():
         "--yolo",
         action="store_true",
         default=False,
-        help="Bypass all dangerous command approval prompts (use at your own risk)",
+        help="Authorize terminal/code-execution surfaces for this process",
     )
     _inherited_flag(
         parser,
@@ -412,7 +412,7 @@ def build_top_level_parser():
         "--yolo",
         action="store_true",
         default=argparse.SUPPRESS,
-        help="Bypass all dangerous command approval prompts (use at your own risk)",
+        help="Authorize terminal/code-execution surfaces for this process",
     )
     _inherited_flag(
         chat_parser,

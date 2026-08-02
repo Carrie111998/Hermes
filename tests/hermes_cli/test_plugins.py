@@ -492,10 +492,8 @@ class TestResolvePreToolBlock:
     """Plugin directives cannot reach the owner approval gate."""
 
 
-    def test_approve_passes_plugin_rule_key_to_gate(self, monkeypatch):
+    def test_approve_rule_key_remains_observation_only(self, monkeypatch):
         from hermes_cli.plugins import resolve_pre_tool_block
-
-        seen = {}
 
         monkeypatch.setattr(
             "hermes_cli.plugins.invoke_hook",
@@ -508,16 +506,7 @@ class TestResolvePreToolBlock:
             ],
         )
 
-        def _approve(tool_name, reason, **kwargs):
-            seen["tool_name"] = tool_name
-            seen["reason"] = reason
-            seen["rule_key"] = kwargs.get("rule_key")
-            return {"approved": True, "message": None}
-
-        monkeypatch.setattr("tools.approval.request_tool_approval", _approve)
-
         assert resolve_pre_tool_block("write_file", {}) is None
-        assert seen == {}
 
 
     def test_approve_gate_is_not_called(self, monkeypatch):
@@ -526,9 +515,6 @@ class TestResolvePreToolBlock:
             "hermes_cli.plugins.invoke_hook",
             lambda hook_name, **kwargs: [{"action": "approve", "message": "why"}],
         )
-        def _boom(*a, **k):
-            raise RuntimeError("gate crashed")
-        monkeypatch.setattr("tools.approval.request_tool_approval", _boom)
         assert resolve_pre_tool_block("terminal", {}) is None
 
 

@@ -179,28 +179,11 @@ When a tool handler is async, `_run_async()` bridges it to the sync dispatch pat
 - **Gateway path (running loop)** — spins up a disposable thread with `asyncio.run()`
 - **Worker threads (parallel tools)** — uses per-thread persistent loops stored in thread-local storage
 
-## The DANGEROUS_PATTERNS approval flow
+## Exact terminal authority
 
-The terminal tool integrates a dangerous-command approval system defined in `tools/approval.py`:
+The terminal boundary in `tools/approval.py` does not interpret command text. It accepts only structural authority: an isolated backend, an exact one-operation owner approval, an exact bounded plan capability, an explicit whole-surface session/cron grant, or `approvals.mode: off`.
 
-1. **Pattern detection** — `DANGEROUS_PATTERNS` is a list of `(regex, description)` tuples covering destructive operations:
-   - Recursive deletes (`rm -rf`)
-   - Filesystem formatting (`mkfs`, `dd`)
-   - SQL destructive operations (`DROP TABLE`, `DELETE FROM` without `WHERE`)
-   - System config overwrites (`> /etc/`)
-   - Service manipulation (`systemctl stop`)
-   - Remote code execution (`curl | sh`)
-   - Fork bombs, process kills, etc.
-
-2. **Detection** — before executing any terminal command, `detect_dangerous_command(command)` checks against all patterns.
-
-3. **Approval prompt** — if a match is found:
-   - **CLI mode** — an interactive prompt asks the user to approve, deny, or allow permanently
-   - **Gateway mode** — an async approval callback sends the request to the messaging platform
-
-4. **Session state** — approvals are tracked per-session. Once you approve "recursive delete" for a session, subsequent `rm -rf` commands don't re-prompt.
-
-5. **Permanent allowlist** — the "allow permanently" option writes the pattern to `config.yaml`'s `command_allowlist`, persisting across sessions.
+Capabilities are bound to the current session epoch, expire, carry exact use counts, and are consumed atomically. Delegated workers can consume inherited exact entries but cannot mint or broaden authority. A byte mismatch or missing capability fails closed and prompts the owner by opaque approval ID.
 
 ## Terminal/runtime environments
 
@@ -219,7 +202,7 @@ It also supports:
 - per-task cwd overrides
 - background process management
 - PTY mode
-- approval callbacks for dangerous commands
+- approval callbacks for exact terminal operations
 
 ## Concurrency
 

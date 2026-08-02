@@ -10,7 +10,6 @@ the first 6 and last 4 characters for debuggability.
 import logging
 import os
 import re
-import shlex
 from urllib.parse import unquote_plus
 
 logger = logging.getLogger(__name__)
@@ -905,64 +904,22 @@ def redact_sensitive_text(
     return text
 
 
-# Commands whose stdout is an environment-variable dump (KEY=value lines),
-# NOT source code. For these, terminal-output redaction must run the
-# ENV-assignment pass (code_file=False) so opaque tokens with no recognized
-# vendor prefix (e.g. ``MY_SERVICE_TOKEN=abc123randomstring``) are still
-# masked. For all other commands, code_file=True is used to avoid mangling
-# legitimate source/config dumps (``MAX_TOKENS=100``, ``"apiKey": "x"``
-# fixtures, ``postgresql://{user}`` f-string templates). See issue #43025.
-_ENV_DUMP_COMMANDS = frozenset({"env", "printenv", "set", "export", "declare"})
-
-
-def is_env_dump_command(command: str | None) -> bool:
-    """Return True if ``command`` dumps environment variables to stdout.
-
-    Detects ``env`` / ``printenv`` / ``set`` / ``export`` / ``declare`` as the
-    first token of any segment in a pipeline or sequence (``;`` / ``&&`` /
-    ``||`` / ``|``). Conservative: a parse failure or anything unrecognized
-    returns False (callers then fall back to the safer code_file=True path,
-    which still masks prefix-shaped keys).
-    """
-    if not command or not isinstance(command, str):
-        return False
-    # Split on shell separators, then inspect the first token of each segment.
-    segments = re.split(r"[|;&]+", command)
-    for seg in segments:
-        seg = seg.strip()
-        if not seg:
-            continue
-        try:
-            tokens = shlex.split(seg)
-        except ValueError:
-            tokens = seg.split()
-        if tokens and tokens[0] in _ENV_DUMP_COMMANDS:
-            return True
-    return False
-
-
-def redact_terminal_output(
-    output: str, command: str | None = None, *, force: bool = False
-) -> str:
+def redact_terminal_output(output: str, *, force: bool = False) -> str:
     """Redact secrets from terminal/process stdout.
 
     Single redaction policy for ALL terminal-output surfaces — foreground
-    ``terminal`` results AND background ``process(action=poll/log/wait)``
-    output — so they can't diverge. Picks ``code_file`` based on whether
-    ``command`` is an environment dump:
-
-    - env-dump command (``env``/``printenv``/``set``/``export``/``declare``)
-      → ``code_file=False`` so the ENV-assignment pass masks opaque tokens.
-    - anything else (or unknown command) → ``code_file=True`` to avoid
-      false positives on source/config dumps.
+    ``terminal`` results AND background ``process(action=poll/log/wait)``.
+    The policy is deliberately uniform and never interprets command text:
+    identical output receives identical redaction regardless of which shell
+    command produced it. ``code_file=False`` keeps opaque assignment-shaped
+    credentials protected at this structurally proven runtime egress.
 
     ``force=True`` bypasses the global ``security.redact_secrets`` preference
     for safety boundaries that must never emit raw credentials.
     """
     if not output:
         return output
-    code_file = not is_env_dump_command(command or "")
-    return redact_sensitive_text(output, force=force, code_file=code_file)
+    return redact_sensitive_text(output, force=force, code_file=False)
 
 
 # Substrings used to gate ``_PREFIX_RE`` execution. If none of these appear in

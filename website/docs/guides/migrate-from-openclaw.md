@@ -159,7 +159,7 @@ TTS settings are read from **two** OpenClaw config locations with this priority:
 | What | OpenClaw path | Hermes path | Notes |
 |------|-------------|-------------|-------|
 | Approval mode | `approvals.exec.mode` | `config.yaml` → `approvals.mode` | "auto"→"off", "always"→"manual", "smart"→"manual" |
-| Command allowlist | `exec-approvals.json` | `config.yaml` → `command_allowlist` | Patterns merged and deduped |
+| Command-text approval patterns | `exec-approvals.json` | Not imported | Hermes uses exact opaque execution capabilities |
 | Browser CDP URL | `browser.cdpUrl` | `config.yaml` → `browser.cdp_url` | |
 | Browser headless | `browser.headless` | `config.yaml` → `browser.headless` | |
 | Brave search key | `tools.web.search.brave.apiKey` | `.env` → `BRAVE_API_KEY` | Requires `--migrate-secrets` |

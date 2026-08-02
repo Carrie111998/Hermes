@@ -5454,9 +5454,9 @@ def matches_name_filter(tool_name: str, patterns: set[str]) -> bool:
     """True if ``tool_name`` matches any entry in ``patterns``.
 
     Exact names match literally; entries containing fnmatch metacharacters
-    (``*``, ``?``, ``[``) match as case-sensitive globs — the same pattern
-    semantics as ``approvals.deny``. Exact membership is checked first so
-    large literal lists stay O(1).
+    (``*``, ``?``, ``[``) match as case-sensitive globs. This is a configured
+    MCP tool-name visibility filter, not terminal-command authorization.
+    Exact membership is checked first so large literal lists stay O(1).
     """
     if not patterns:
         return False

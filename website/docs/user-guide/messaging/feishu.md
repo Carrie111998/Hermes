@@ -287,7 +287,7 @@ Gateway-driven update prompts use a native Feishu `Yes` / `No` card instead of f
 
 Card action events are dispatched with `MessageType.COMMAND`, so they flow through the normal command processing pipeline.
 
-This is also how **command approval** works — when the agent needs to run a dangerous command, it sends an interactive card with Allow Once / Session / Always / Deny buttons. The user clicks a button, and the card action callback delivers the approval decision back to the agent.
+This is also how **exact terminal authorization** works — when an operation lacks structural authority, the agent sends an interactive card with Allow This Exact Operation Once / Deny choices. The card action callback delivers the decision back to the agent. If an older client displays session/always labels, Hermes still narrows a positive response to the current exact operation once.
 
 ### Required Feishu App Configuration
 

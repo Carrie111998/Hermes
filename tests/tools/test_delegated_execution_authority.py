@@ -48,24 +48,9 @@ def _reset_delegated_session(session_token, delegated_token) -> None:
 
 
 def test_isolated_worker_is_approval_free_without_content_inspection(monkeypatch):
-    def semantic_inspection_forbidden(*_args, **_kwargs):
-        raise AssertionError("semantic command inspection must not run")
-
-    monkeypatch.setattr(
-        approval,
-        "detect_hardline_command",
-        semantic_inspection_forbidden,
-    )
-    monkeypatch.setattr(
-        approval,
-        "detect_dangerous_command",
-        semantic_inspection_forbidden,
-    )
-    monkeypatch.setattr(
-        approval,
-        "_match_user_deny_rule",
-        semantic_inspection_forbidden,
-    )
+    assert not hasattr(approval, "detect_hardline_command")
+    assert not hasattr(approval, "detect_dangerous_command")
+    assert not hasattr(approval, "_match_user_deny_rule")
     session_token, delegated_token = _bind_delegated_session()
     try:
         terminal_result = approval.check_all_command_guards(
@@ -97,24 +82,9 @@ def test_nonisolated_child_requires_exact_typed_capabilities_before_semantics(
         max_uses_per_command=1,
     )
 
-    def semantic_inspection_forbidden(*_args, **_kwargs):
-        raise AssertionError("delegated authority must resolve before semantics")
-
-    monkeypatch.setattr(
-        approval,
-        "detect_hardline_command",
-        semantic_inspection_forbidden,
-    )
-    monkeypatch.setattr(
-        approval,
-        "detect_dangerous_command",
-        semantic_inspection_forbidden,
-    )
-    monkeypatch.setattr(
-        approval,
-        "_match_user_deny_rule",
-        semantic_inspection_forbidden,
-    )
+    assert not hasattr(approval, "detect_hardline_command")
+    assert not hasattr(approval, "detect_dangerous_command")
+    assert not hasattr(approval, "_match_user_deny_rule")
 
     session_token, delegated_token = _bind_delegated_session()
     try:

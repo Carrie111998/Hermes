@@ -25,7 +25,7 @@ hermes [global-options] <command> [subcommand/options]
 | `--resume <session>`, `-r <session>` | 通过 ID 或标题恢复之前的会话。 |
 | `--continue [name]`, `-c [name]` | 恢复最近的会话，或恢复最近一个匹配标题的会话。 |
 | `--worktree`, `-w` | 在隔离的 git worktree 中启动，用于并行 agent 工作流。 |
-| `--yolo` | 跳过危险命令的审批提示。 |
+| `--yolo` | 跳过精确终端调用的所有者提示；权限仍绑定单次调用且不可重放。 |
 | `--pass-session-id` | 在 agent 的 system prompt（系统提示词）中包含会话 ID。 |
 | `--ignore-user-config` | 忽略 `~/.hermes/config.yaml`，回退到内置默认值。`.env` 中的凭据仍会加载。 |
 | `--ignore-rules` | 跳过 `AGENTS.md`、`SOUL.md`、`.cursorrules`、memory（记忆）和预加载 skill 的自动注入。 |

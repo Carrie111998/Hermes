@@ -94,7 +94,7 @@ hermes-agent/
 │
 ├── tools/                    # 工具实现（每个工具一个文件）
 │   ├── registry.py           # 中央工具注册表
-│   ├── approval.py           # 危险命令检测
+│   ├── approval.py           # 精确终端 capability 验证
 │   ├── terminal_tool.py      # 终端编排
 │   ├── process_registry.py   # 后台进程管理
 │   ├── file_tools.py         # read_file、write_file、patch、search_files

@@ -157,12 +157,12 @@ platforms:
 
 ### 交互式审批卡片
 
-当 Agent 需要执行可能存在风险的命令时，它会发送一张带有四个按钮的 Adaptive Card，而不是要求你输入 `/approve`：
+当 Agent 的精确终端调用缺少结构化权限时，它会发送 Adaptive Card，而不是要求你输入 `/approve`：
 
-- **Allow Once**——仅批准此次特定命令
-- **Allow Session**——在本次会话期间批准此模式
-- **Always Allow**——永久批准此模式
-- **Deny**——拒绝该命令
+- **Allow Once**——仅批准当前精确调用一次
+- **Deny**——拒绝当前精确调用
+
+如果 Teams 协议或旧卡片仍显示 session/always 标签，Hermes 会将任意肯定响应收窄为当前精确调用一次，不会创建模式授权。
 
 点击按钮即可内联完成审批，卡片会被替换为决策结果。
 

@@ -1,7 +1,7 @@
 ---
 sidebar_position: 9
 title: "Import from Other Agents"
-description: "One-command import of a Claude Code (~/.claude) or OpenAI Codex CLI (~/.codex) setup into Hermes — instructions, allowlists, MCP servers, skills, and memories."
+description: "One-command import of a Claude Code (~/.claude) or OpenAI Codex CLI (~/.codex) setup into Hermes — instructions, MCP servers, skills, and memories."
 ---
 
 # Import from Other Agents
@@ -24,13 +24,11 @@ hermes import-agent claude-code --overwrite --yes  # replace conflicts, skip pro
 | Claude Code | Hermes |
 |---|---|
 | `CLAUDE.md` (global instructions) | Memory entries in `~/.hermes/memories/MEMORY.md` |
-| `settings.json` → `permissions.allow` (`Bash(...)` rules) | `command_allowlist` in `config.yaml` |
-| `settings.json` → `permissions.deny` (`Bash(...)` rules) | `approvals.deny` in `config.yaml` |
 | `mcpServers` (from `~/.claude.json` and `settings.json`) | `mcp_servers` in `config.yaml` |
 | `skills/<name>/` (dirs with `SKILL.md`) | `~/.hermes/skills/claude-code-imports/<name>/` |
 | `commands/*.md` (slash commands) | Skipped with a note — convert them into skills |
 
-Claude's `Bash(npm run test:*)` prefix rules become `npm run test*` globs. Non-`Bash` permission rules (`Read(...)`, `WebFetch`, ...) gate Claude-specific tools and are reported as unmapped rather than imported.
+Claude command-text permission rules are deliberately not imported. Hermes authorization uses exact opaque execution capabilities rather than semantic command patterns.
 
 ### Codex CLI (`~/.codex`)
 
@@ -48,7 +46,7 @@ Claude's `Bash(npm run test:*)` prefix rules become `npm run test*` globs. Non-`
 ## Behavior notes
 
 - **Preview first, always.** The command prints the full plan before applying; in non-interactive sessions it stops at the preview unless you pass `--yes`.
-- **Merges, not replaces.** Memory entries are deduplicated against your existing `MEMORY.md`; allowlist/denylist patterns merge with what's already in `config.yaml`.
+- **Merges, not replaces.** Memory entries are deduplicated against your existing `MEMORY.md`; MCP server entries merge with what's already in `config.yaml`.
 - **Conflicts are skipped by default.** An MCP server or skill that already exists in Hermes is reported as a conflict; pass `--overwrite` to replace it.
 - **Malformed files don't abort the run.** A broken `settings.json` or `config.toml` becomes a per-item error in the report while everything else still imports.
 - Coming from OpenClaw instead? Use [`hermes claw migrate`](../guides/migrate-from-openclaw.md).

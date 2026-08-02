@@ -155,14 +155,10 @@ def test_terminal_output_transform_still_runs_strip_and_redact(monkeypatch, tmp_
     )
 
     assert "\x1b" not in result["output"]
-    # Terminal output now passes code_file=True: ENV-assignment redaction is
-    # skipped (so code constants like MAX_TOKENS=100 aren't corrupted), but a
-    # real sk-/ghp_/JWT-shaped value is STILL masked by _PREFIX_RE. The full
-    # secret never survives; only the leading prefix marker remains. (#33801)
+    # Terminal output uses one uniform boundary policy independent of command
+    # text. Assignment-shaped credentials are fully masked. (#33801)
     assert secret not in result["output"]
-    assert "OPENAI_API_KEY=" in result["output"]
-    assert "sk-pro" in result["output"]  # prefix marker from _mask_token
-    assert "abc123def456" not in result["output"]  # secret body is gone
+    assert result["output"] == "OPENAI_API_KEY=***"
 
 
 def test_large_process_output_is_bounded_before_sudo_and_plugin_hooks(
@@ -236,7 +232,7 @@ def test_terminal_output_transform_hook_exception_falls_back(monkeypatch, tmp_pa
     assert result["error"] is None
 
 
-def test_terminal_output_transform_does_not_change_approval_or_exit_code_meaning(monkeypatch, tmp_path):
+def test_terminal_output_transform_does_not_add_command_semantics(monkeypatch, tmp_path):
     approval = {
         "approved": True,
         "user_approved": True,
@@ -256,7 +252,7 @@ def test_terminal_output_transform_does_not_change_approval_or_exit_code_meaning
     assert result["approval"] == (
         "Command required approval (dangerous command) and was approved by the user."
     )
-    assert result["exit_code_meaning"] == "No matches found (not an error)"
+    assert "exit_code_meaning" not in result
 
 
 def test_terminal_output_transform_real_plugin_is_observer_only(monkeypatch, tmp_path):

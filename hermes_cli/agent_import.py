@@ -11,16 +11,14 @@ Follows the OpenClaw migration pattern (``hermes claw migrate`` /
 ``optional-skills/migration/openclaw-migration/scripts/openclaw_to_hermes.py``):
 detect → parse → map → apply, with a mandatory preview phase, per-item
 imported/skipped/conflict/error records, and a ``--dry-run`` that writes
-nothing.  The memory-entry merge and allowlist-merge primitives here are
-self-contained ports of the openclaw script's equivalents so this command
-works even when the optional migration skill is not installed.
+nothing.  The memory-entry merge primitives here are self-contained ports of
+the openclaw script's equivalents so this command works even when the optional
+migration skill is not installed.
 
 Mappings
 --------
 claude-code (~/.claude):
     CLAUDE.md                       → memory entries in HERMES_HOME/memories/MEMORY.md
-    settings.json permissions.allow → config.yaml command_allowlist (Bash(...) rules)
-    settings.json permissions.deny  → config.yaml approvals.deny (Bash(...) rules)
     mcpServers (~/.claude.json or settings.json) → config.yaml mcp_servers
     skills/<name>/SKILL.md          → HERMES_HOME/skills/claude-code-imports/<name>/
 
@@ -323,35 +321,6 @@ def merge_entries(
 
 
 # ---------------------------------------------------------------------------
-# Claude Code permission rules → Hermes command patterns
-# ---------------------------------------------------------------------------
-
-_BASH_RULE_RE = re.compile(r"^Bash\((?P<inner>.*)\)$")
-
-
-def claude_rule_to_command_pattern(rule: str) -> Optional[str]:
-    """Convert a Claude Code ``Bash(...)`` permission rule into a Hermes glob.
-
-    ``Bash(npm run build)``   → ``npm run build``
-    ``Bash(npm run test:*)``  → ``npm run test*``  (Claude ':*' prefix match)
-    ``Bash(git diff *)``      → ``git diff *``
-    ``Bash``                  → None (blanket rule, too broad to import)
-    Non-Bash rules (``Read(...)``, ``WebFetch(...)``, ...) → None: they gate
-    Claude-specific tools with no command-allowlist equivalent.
-    """
-    rule = (rule or "").strip()
-    m = _BASH_RULE_RE.match(rule)
-    if not m:
-        return None
-    inner = m.group("inner").strip()
-    if not inner:
-        return None
-    if inner.endswith(":*"):
-        inner = inner[:-2] + "*"
-    return inner
-
-
-# ---------------------------------------------------------------------------
 # Detection
 # ---------------------------------------------------------------------------
 
@@ -476,8 +445,6 @@ class AgentImporter:
     def _run_claude_code(self) -> None:
         settings = self._load_claude_settings()
         self.import_context_file(self.source_root / "CLAUDE.md", kind="claude-md")
-        self.import_permission_allowlist(settings)
-        self.import_permission_denylist(settings)
         self.import_mcp_servers(self._claude_mcp_servers(settings), kind="mcp-servers")
         self.import_skills(self.source_root / "skills")
         commands_dir = self.source_root / "commands"
@@ -632,108 +599,6 @@ class AgentImporter:
         else:
             self.record(kind, source, destination, "imported",
                         "Would merge entries", **details)
-
-    def import_permission_allowlist(self, settings: Dict[str, Any]) -> None:
-        """settings.json permissions.allow → config.yaml command_allowlist."""
-        destination = self.target_root / "config.yaml"
-        permissions = settings.get("permissions")
-        allow = permissions.get("allow") if isinstance(permissions, dict) else None
-        if not isinstance(allow, list) or not allow:
-            self.record("command-allowlist", None, destination, "skipped",
-                        "No permissions.allow rules found")
-            return
-
-        patterns: List[str] = []
-        skipped_rules: List[str] = []
-        for rule in allow:
-            if not isinstance(rule, str):
-                continue
-            pattern = claude_rule_to_command_pattern(rule)
-            if pattern:
-                patterns.append(pattern)
-            else:
-                skipped_rules.append(rule)
-        patterns = sorted(dict.fromkeys(patterns))
-        if not patterns:
-            self.record("command-allowlist", None, destination, "skipped",
-                        "No Bash(...) allow rules to import",
-                        unmapped_rules=skipped_rules)
-            return
-
-        config = self.load_target_config(
-            "command-allowlist", "settings.json permissions.allow", destination)
-        if config is None:
-            return
-        current = config.get("command_allowlist", [])
-        if not isinstance(current, list):
-            current = []
-        merged = sorted(dict.fromkeys(list(current) + patterns))
-        added = [p for p in merged if p not in current]
-        if not added:
-            self.record("command-allowlist", "settings.json permissions.allow",
-                        destination, "skipped", "All patterns already present")
-            return
-        details: Dict[str, Any] = {"added_patterns": added}
-        if skipped_rules:
-            details["unmapped_rules"] = skipped_rules
-        if self.execute:
-            config["command_allowlist"] = merged
-            dump_yaml_file(destination, config)
-            self.record("command-allowlist", "settings.json permissions.allow",
-                        destination, "imported", **details)
-        else:
-            self.record("command-allowlist", "settings.json permissions.allow",
-                        destination, "imported", "Would merge patterns", **details)
-
-    def import_permission_denylist(self, settings: Dict[str, Any]) -> None:
-        """settings.json permissions.deny → config.yaml approvals.deny."""
-        destination = self.target_root / "config.yaml"
-        permissions = settings.get("permissions")
-        deny = permissions.get("deny") if isinstance(permissions, dict) else None
-        if not isinstance(deny, list) or not deny:
-            self.record("command-denylist", None, destination, "skipped",
-                        "No permissions.deny rules found")
-            return
-
-        patterns: List[str] = []
-        for rule in deny:
-            if not isinstance(rule, str):
-                continue
-            pattern = claude_rule_to_command_pattern(rule)
-            if pattern:
-                patterns.append(pattern)
-        patterns = sorted(dict.fromkeys(patterns))
-        if not patterns:
-            self.record("command-denylist", None, destination, "skipped",
-                        "No Bash(...) deny rules to import")
-            return
-
-        config = self.load_target_config(
-            "command-denylist", "settings.json permissions.deny", destination)
-        if config is None:
-            return
-        approvals = config.get("approvals")
-        if not isinstance(approvals, dict):
-            approvals = {}
-        current = approvals.get("deny", [])
-        if not isinstance(current, list):
-            current = []
-        merged = sorted(dict.fromkeys(list(current) + patterns))
-        added = [p for p in merged if p not in current]
-        if not added:
-            self.record("command-denylist", "settings.json permissions.deny",
-                        destination, "skipped", "All patterns already present")
-            return
-        if self.execute:
-            approvals["deny"] = merged
-            config["approvals"] = approvals
-            dump_yaml_file(destination, config)
-            self.record("command-denylist", "settings.json permissions.deny",
-                        destination, "imported", added_patterns=added)
-        else:
-            self.record("command-denylist", "settings.json permissions.deny",
-                        destination, "imported", "Would merge patterns",
-                        added_patterns=added)
 
     def import_mcp_servers(self, servers: Dict[str, Any], kind: str) -> None:
         """mcpServers / [mcp_servers.*] → config.yaml mcp_servers."""

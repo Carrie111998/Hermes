@@ -179,28 +179,11 @@ registry.dispatch(name, args, **kwargs)
 - **Gateway 路径（有运行中的事件循环）** — 使用 `asyncio.run()` 启动一个一次性线程
 - **工作线程（并行工具）** — 使用存储在线程本地存储中的每线程持久化循环
 
-## DANGEROUS_PATTERNS 审批流程
+## 精确终端权限
 
-终端工具集成了定义在 `tools/approval.py` 中的危险命令审批系统：
+`tools/approval.py` 不解释命令文本。它不使用关键字、正则表达式、分类器或路由器；LLM 模型是唯一的语义解释主体。运行时只接受结构化权限：隔离后端、精确一次性 owner approval、精确 bounded-plan capability、显式 whole-surface session/cron grant，或 `approvals.mode: off`。
 
-1. **模式检测** — `DANGEROUS_PATTERNS` 是一个 `(regex, description)` 元组列表，涵盖破坏性操作：
-   - 递归删除（`rm -rf`）
-   - 文件系统格式化（`mkfs`、`dd`）
-   - SQL 破坏性操作（`DROP TABLE`、不带 `WHERE` 的 `DELETE FROM`）
-   - 系统配置覆写（`> /etc/`）
-   - 服务操控（`systemctl stop`）
-   - 远程代码执行（`curl | sh`）
-   - Fork bomb、进程终止等
-
-2. **检测** — 在执行任何终端命令之前，`detect_dangerous_command(command)` 会对所有模式进行检查。
-
-3. **审批提示** — 若发现匹配：
-   - **CLI 模式** — 交互式提示要求用户批准、拒绝或永久允许
-   - **Gateway 模式** — 异步审批回调将请求发送至消息平台
-
-4. **会话状态** — 审批按会话跟踪。一旦在某个会话中批准了"递归删除"，后续的 `rm -rf` 命令不会再次提示。
-
-5. **永久允许列表** — "永久允许"选项会将该模式写入 `config.yaml` 的 `command_allowlist`，跨会话持久化。
+Capability 绑定会话 epoch、精确命令字节、有效期和使用次数，并以原子方式消费。被委派的 agent 可以消费继承的精确 capability，但不能自行创建、扩大或重放它。缺失、过期、已消费或字节不匹配都会故障关闭，并通过不透明 approval ID 请求所有者批准。
 
 ## 终端/运行时环境
 
@@ -219,7 +202,7 @@ registry.dispatch(name, args, **kwargs)
 - 按任务的 cwd 覆盖
 - 后台进程管理
 - PTY 模式
-- 危险命令的审批回调
+- 精确终端调用的授权回调
 
 ## 并发
 

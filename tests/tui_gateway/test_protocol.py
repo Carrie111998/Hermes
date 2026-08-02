@@ -965,7 +965,6 @@ def test_session_resume_reuses_existing_live_session(server, monkeypatch):
     )
 
     fake_approval = types.SimpleNamespace(
-        load_permanent_allowlist=lambda: None,
         register_gateway_notify=lambda *_args, **_kwargs: None,
     )
 
@@ -1182,7 +1181,6 @@ def test_session_resume_live_payload_uses_current_history_with_ancestors(server,
     )
 
     fake_approval = types.SimpleNamespace(
-        load_permanent_allowlist=lambda: None,
         register_gateway_notify=lambda *_args, **_kwargs: None,
     )
 

@@ -61,6 +61,28 @@ class ProgressCaptureAdapter(BasePlatformAdapter):
         )
         return SendResult(success=True, message_id="progress-1")
 
+    async def send_exact_exec_approval(
+        self,
+        chat_id,
+        command,
+        *,
+        approval_id,
+        command_sha256,
+        command_prefix="/",
+        metadata=None,
+    ) -> SendResult:
+        self.sent.append(
+            {
+                "chat_id": chat_id,
+                "command": command,
+                "approval_id": approval_id,
+                "command_sha256": command_sha256,
+                "command_prefix": command_prefix,
+                "metadata": metadata,
+            }
+        )
+        return SendResult(success=True, message_id="exact-approval-1")
+
     async def edit_message(self, chat_id, message_id, content) -> SendResult:
         self.edits.append(
             {
@@ -393,6 +415,8 @@ class ApprovalSourceCaptureAgent:
             {
                 "command": "safe-test-command",
                 "description": "source capture regression",
+                "approval_id": "b" * 32,
+                "exact_execution": True,
             }
         )
         return {
@@ -854,7 +878,9 @@ async def test_gateway_approval_callback_uses_lexically_captured_source(
     assert result["final_response"] == "done"
     assert observed_sources == [source]
     assert adapter.sent
-    assert "Dangerous command requires approval" in adapter.sent[-1]["content"]
+    assert adapter.sent[-1]["command"] == "safe-test-command"
+    assert adapter.sent[-1]["approval_id"] == "b" * 32
+    assert adapter.sent[-1]["command_prefix"] == "/"
 
 
 @pytest.mark.asyncio

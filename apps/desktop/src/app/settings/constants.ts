@@ -677,7 +677,6 @@ export const SECTIONS: DesktopConfigSection[] = [
       'approvals.mode',
       'approvals.timeout',
       'approvals.mcp_reload_confirm',
-      'command_allowlist',
       'security.redact_secrets',
       'security.allow_private_urls',
       'browser.allow_private_urls',

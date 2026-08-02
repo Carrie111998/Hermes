@@ -94,10 +94,7 @@ def test_shell_exec_uses_utf8_replace():
     (#53137)."""
     handler = server._methods["shell.exec"]
     with patch("subprocess.run", return_value=_make_completed_process()) as mock_run:
-        # A harmless, non-dangerous command that passes the approval gate.
-        with patch("tools.approval.detect_hardline_command", return_value=(False, "")), \
-             patch("tools.approval.detect_dangerous_command", return_value=(False, None, "")):
-            resp = handler(1, {"command": "echo hello"})
+        resp = handler(1, {"command": "echo hello"})
         assert mock_run.called, "subprocess.run was not invoked"
         kwargs = mock_run.call_args[1]
         assert kwargs.get("encoding") == "utf-8", (

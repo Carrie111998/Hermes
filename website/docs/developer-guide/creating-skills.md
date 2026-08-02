@@ -417,18 +417,18 @@ Users can then search and install from your repository.
 
 ## Security Scanning
 
-All hub-installed skills go through a security scanner that checks for:
+All hub-installed skills go through a model-authoritative security review for:
 
 - Data exfiltration patterns
 - Prompt injection attempts
-- Destructive commands
+- Unsafe operational intent
 - Shell injection
 
 Trust levels:
 - `builtin` — ships with Hermes (always trusted)
 - `official` — from `optional-skills/` in the repo (built-in trust, no third-party warning)
 - `trusted` — from openai/skills, anthropics/skills, huggingface/skills
-- `community` — non-dangerous findings can be overridden with `--force`; `dangerous` verdicts remain blocked
+- `community` — overridable findings require explicit `--force`; non-overridable trust failures remain blocked
 
 Hermes can now consume third-party skills from multiple external discovery models:
 - direct GitHub identifiers (for example `openai/skills/k8s`)

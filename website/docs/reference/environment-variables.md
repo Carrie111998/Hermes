@@ -781,7 +781,7 @@ Advanced per-platform knobs for throttling the outbound message batcher. Most us
 |----------|-------------|
 | `HERMES_MAX_ITERATIONS` | Max tool-calling iterations per conversation (default: 500) |
 | `HERMES_INFERENCE_MODEL` | Override model name at process level (takes priority over `config.yaml` for the session). Also settable via `-m`/`--model` flag. |
-| `HERMES_YOLO_MODE` | Set to `1` to bypass dangerous-command approval prompts. Equivalent to `--yolo`. |
+| `HERMES_YOLO_MODE` | Set to `1` to skip owner prompts for exact terminal operations; authority remains invocation-bound and non-replayable. Equivalent to `--yolo`. |
 | `HERMES_ACCEPT_HOOKS` | Auto-approve any unseen shell hooks declared in `config.yaml` without a TTY prompt. Equivalent to `--accept-hooks` or `hooks_auto_accept: true`. |
 | `HERMES_IGNORE_USER_CONFIG` | Skip `~/.hermes/config.yaml` and use built-in defaults (credentials in `.env` still load). Equivalent to `--ignore-user-config`. |
 | `HERMES_IGNORE_RULES` | Skip auto-injection of `AGENTS.md`, `SOUL.md`, `.cursorrules`, memory, and preloaded skills. Equivalent to `--ignore-rules`. |
@@ -831,7 +831,7 @@ Advanced per-platform knobs for throttling the outbound message batcher. Most us
 
 ### HERMES_WRITE_SAFE_ROOT {#hermes_write_safe_root}
 
-When this variable is set, `write_file` and `patch` may only target paths inside the listed directory prefix(es). Any path outside those roots is **rejected immediately** — the write does not go through the dangerous-command approval system and there is no prompt to override it.
+When this variable is set, `write_file` and `patch` may only target paths inside the listed directory prefix(es). Any path outside those roots is **rejected immediately** by the file boundary and no terminal approval can override it.
 
 The official Docker image sets `HERMES_WRITE_SAFE_ROOT=/opt/data` alongside `HERMES_HOME=/opt/data` so the agent cannot escape the mounted data volume.
 

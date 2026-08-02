@@ -203,7 +203,7 @@ def test_apply_requires_plan_and_writes_exact_backup(tmp_path, monkeypatch):
         "owner_target_type": "guild_channel",
     }
     assert effective["goals"] == {"max_turns": 0}
-    assert effective["command_allowlist"] == []
+    assert "command_allowlist" not in effective
     assert effective["display"]["busy_input_mode"] == "steer"
     assert effective["display"]["show_commentary"] is True
     assert effective["display"]["platforms"]["discord"] == {

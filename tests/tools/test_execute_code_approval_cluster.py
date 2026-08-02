@@ -148,14 +148,17 @@ def test_guard_isolated_backend_approved():
     assert A.check_execute_code_guard("import os", "docker")["approved"] is True
 
 
-def test_guard_headless_local_approved(monkeypatch):
-    # Documented #30882 limitation: no approval surface → preserve auto-run.
+def test_guard_headless_local_manual_requires_exact_authority(monkeypatch):
     monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
     monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
     monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
     monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
     monkeypatch.setattr(A, "_get_approval_mode", lambda: "manual")
-    assert A.check_execute_code_guard("import os", "local")["approved"] is True
+
+    result = A.check_execute_code_guard("import os", "local")
+
+    assert result["approved"] is False
+    assert result["outcome"] == "exact_plan_capability_required"
 
 
 def test_guard_cron_deny_blocks(monkeypatch):
@@ -170,64 +173,34 @@ def test_guard_cron_deny_blocks(monkeypatch):
         res = A.check_execute_code_guard("import os", "local")
         assert res["approved"] is False
         assert res["outcome"] == "blocked"
+        assert res["error_code"] == "cron_execute_code_not_authorized"
     finally:
         clear_session_vars(tokens)
 
 
 def test_guard_gateway_user_approves_is_one_shot(gw_session):
     _register_resolver(gw_session, "once")
-    res = A.check_execute_code_guard("import os; print(1)", "local")
-    assert res["approved"] is True
-    assert res.get("user_approved") is True
-    # One-shot: approval must NOT persist to future scripts.
-    assert A.is_approved(gw_session, "execute_code") is False
+    first = A.check_execute_code_guard("import os; print(1)", "local")
+    assert first["approved"] is True
+    assert first.get("user_approved") is True
+    assert first.get("exact_one_operation") is True
+
+    _register_resolver(gw_session, "deny")
+    second = A.check_execute_code_guard("import os; print(2)", "local")
+    assert second["approved"] is False
+    assert second["outcome"] == "denied"
 
 
-def test_guard_gateway_user_approves_session_persists(gw_session):
-    """'Approve session' stores session-level approval (#39275)."""
-    _register_resolver(gw_session, "session")
-    res = A.check_execute_code_guard("import os; print(1)", "local")
-    assert res["approved"] is True
-    assert res.get("user_approved") is True
-    # Session approval should now be stored.
-    assert A.is_approved(gw_session, "execute_code") is True
-    # Subsequent calls should auto-approve without prompting.
-    res2 = A.check_execute_code_guard("import os; print(2)", "local")
-    assert res2["approved"] is True
-    # Cleanup
-    with A._lock:
-        s = A._session_approved.get(gw_session, set())
-        s.discard("execute_code")
+@pytest.mark.parametrize("choice", ("session", "always"))
+def test_guard_gateway_rejects_broad_approval_scopes(gw_session, choice):
+    _register_resolver(gw_session, choice)
 
+    result = A.check_execute_code_guard("import os; print(1)", "local")
 
-def test_guard_gateway_user_approves_always_persists(gw_session):
-    """'Always' stores permanent approval (#39275)."""
-    _register_resolver(gw_session, "always")
-    res = A.check_execute_code_guard("import os; print(1)", "local")
-    assert res["approved"] is True
-    assert res.get("user_approved") is True
-    # Permanent approval should now be stored.
-    assert A.is_approved(gw_session, "execute_code") is True
-    # Cleanup
-    with A._lock:
-        A._permanent_approved.discard("execute_code")
-        s = A._session_approved.get(gw_session, set())
-        s.discard("execute_code")
-
-
-def test_guard_session_approval_short_circuits_prompt(gw_session):
-    """Once session-approved, execute_code skips the approval prompt (#39275)."""
-    # Manually set session approval.
-    A.approve_session(gw_session, "execute_code")
-    try:
-        # Even with a denier registered, the is_approved check short-circuits.
-        _register_resolver(gw_session, "deny")
-        res = A.check_execute_code_guard("import os", "local")
-        assert res["approved"] is True
-    finally:
-        with A._lock:
-            s = A._session_approved.get(gw_session, set())
-            s.discard("execute_code")
+    assert result["approved"] is False
+    assert result["outcome"] == "denied"
+    assert not hasattr(A, "_session_approved")
+    assert not hasattr(A, "_permanent_approved")
 
 
 def test_guard_gateway_user_denies_blocks(gw_session):
@@ -249,7 +222,6 @@ def test_guard_gateway_user_denies_blocks(gw_session):
 def test_guard_gateway_wait_uses_canonical_timeout(
     gw_session, monkeypatch, approval_config
 ):
-    # Register a callback that never resolves; force an immediate timeout.
     with A._lock:
         A._gateway_notify_cbs[gw_session] = lambda _d: None
     monkeypatch.setattr(A, "_get_approval_config", lambda: approval_config)
@@ -258,11 +230,12 @@ def test_guard_gateway_wait_uses_canonical_timeout(
     assert res["outcome"] == "timeout"
 
 
-def test_guard_gateway_missing_notify_is_pending(gw_session):
-    # No notify callback registered → backward-compat pending approval.
-    res = A.check_execute_code_guard("import os", "local")
-    assert res["approved"] is False
-    assert res["status"] == "pending_approval"
+def test_guard_gateway_missing_notify_requires_exact_capability(gw_session):
+    result = A.check_execute_code_guard("import os", "local")
+
+    assert result["approved"] is False
+    assert result["status"] == "blocked"
+    assert result["outcome"] == "exact_plan_capability_required"
 
 
 def test_guard_session_yolo_bypasses(gw_session):

@@ -87,13 +87,14 @@ asyncio.run_coroutine_threadsafe(...)
 
 ### Permission bridge
 
-`acp_adapter/permissions.py` adapts dangerous terminal approval prompts into ACP permission requests.
+`acp_adapter/permissions.py` adapts exact terminal-authorization prompts into ACP permission requests.
 
 Mapping:
 
-- `allow_once` -> Hermes `once`
-- `allow_always` -> Hermes `always`
+- any affirmative response -> a once-only capability for the current exact operation
 - reject options -> Hermes `deny`
+
+Even when an ACP host exposes labels such as `allow_session` or `allow_always`, Hermes narrows the affirmative response to this exact operation once. Protocol labels do not create broader or persistent command-pattern authority inside Hermes.
 
 Timeouts and bridge failures deny by default.
 

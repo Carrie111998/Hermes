@@ -489,7 +489,7 @@ patch / delete / write_file / remove_file) is **staged** instead of committed �
 a SKILL.md is too large to review inline, so staging applies regardless of
 whether the write came from a foreground turn or the background review.
 Staged writes survive restarts under `~/.hermes/pending/skills/` and are
-reviewed with the same familiar approve/deny flow as dangerous commands:
+reviewed through its own explicit approve/deny write queue:
 
 ```
 /skills pending             # list staged skill writes + a one-line gist each
@@ -504,9 +504,9 @@ The review surface works in the interactive CLI and on messaging platforms
 in the pending JSON file). Memory writes have the same gate under
 `memory.write_approval` — see [Controlling memory writes](/user-guide/features/memory#controlling-memory-writes-write_approval).
 
-> The separate `skills.guard_agent_created` setting is a content scanner
-> (dangerous-pattern heuristics), not an approval gate — the two are
-> independent. See [Guard on agent-created skill writes](/user-guide/configuration#guard-on-agent-created-skill-writes).
+> The separate `skills.guard_agent_created` setting also requests owner review
+> for agent-created skill changes. It does not classify content by keyword and
+> is independent from exact terminal authority. See [Guard on agent-created skill writes](/user-guide/configuration#guard-on-agent-created-skill-writes).
 
 ## Skills Hub
 
@@ -697,7 +697,7 @@ Trust level is always `community` — the same security scan runs as for every o
 
 ### Security scanning and `--force`
 
-All hub-installed skills go through a **security scanner** that checks for data exfiltration, prompt injection, destructive commands, supply-chain signals, and other threats.
+Hub-installed skills go through a **model-authoritative security review** for data exfiltration, prompt injection, supply-chain risk, and other threats. The runtime does not make semantic decisions from keyword matches.
 
 `hermes skills inspect ...` now also surfaces upstream metadata when available:
 - repo URL

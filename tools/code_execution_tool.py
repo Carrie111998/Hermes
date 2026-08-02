@@ -1257,8 +1257,8 @@ def execute_code(
     env_type = _env_config["env_type"]
 
     # execute_code runs arbitrary Python (subprocess/os.system/...) that never
-    # passes through terminal()/DANGEROUS_PATTERNS, so guard the whole script
-    # here before either dispatch path spawns it. Runs synchronously in the
+    # passes through terminal authority, so guard the whole script here before
+    # either dispatch path spawns it. Runs synchronously in the
     # caller (tool-executor) thread, which holds the session context (#30882).
     # A Docker sandbox with host bind mounts is no longer isolated, so its
     # script does not get the container fast-path.
@@ -1375,7 +1375,7 @@ def execute_code(
 
         # Wrapped so the thread inherits the turn's approval context + callbacks
         # (see tools.thread_context) — else gateway sandbox tool calls silently
-        # auto-approve dangerous commands (#33057, #30882).
+        # auto-authorize nested terminal operations (#33057, #30882).
         rpc_thread = threading.Thread(
             target=propagate_context_to_thread(_rpc_server_loop),
             args=(

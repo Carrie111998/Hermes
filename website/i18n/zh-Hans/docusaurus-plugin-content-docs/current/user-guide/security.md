@@ -1,7 +1,7 @@
 ---
 sidebar_position: 8
 title: "安全"
-description: "安全模型、危险命令审批、用户授权、容器隔离及生产部署最佳实践"
+description: "安全模型、精确终端授权、用户授权、容器隔离及生产部署最佳实践"
 ---
 
 # 安全
@@ -13,16 +13,18 @@ Hermes Agent 采用纵深防御安全模型。本页涵盖所有安全边界—�
 安全模型共有七层：
 
 1. **用户授权** — 谁可以与 Agent 通信（允许列表、DM 配对）
-2. **危险命令审批** — 针对破坏性操作的人工审核环节
+2. **精确终端授权** — 对每个终端调用进行结构化、不可重放的授权
 3. **容器隔离** — Docker/Singularity/Modal 沙箱及加固配置
 4. **MCP 凭据过滤** — MCP 子进程的环境变量隔离
 5. **上下文文件扫描** — 检测项目文件中的 prompt（提示词）注入
 6. **跨会话隔离** — 会话之间无法访问彼此的数据或状态；cron 任务存储路径已针对路径遍历攻击进行加固
 7. **输入清理** — 终端工具后端中的工作目录参数会经过允许列表验证，以防止 shell 注入
 
-## 危险命令审批
+## 精确终端授权
 
-在执行任何命令之前，Hermes 会将其与一份精心维护的危险模式列表进行比对。若匹配，用户必须明确批准。
+Hermes 不使用关键字、正则表达式、命令分类器或路由器解释终端文本。LLM 模型是唯一的语义解释主体；运行时只验证该次调用是否拥有结构化权限。
+
+交互式授权会生成不透明的、仅可使用一次的 capability。它绑定精确命令字节、会话 epoch、有效期和使用次数，不能授权相似命令、不能重放，也不会升级为会话级或永久的命令模式授权。隔离后端、精确 bounded-plan capability，以及明确授予整个执行面的 session/cron 权限，是其他结构化权限来源。
 
 ### 审批模式
 
@@ -36,18 +38,18 @@ approvals:
 
 | 模式 | 行为 |
 |------|----------|
-| **manual**（默认） | 始终提示用户审批危险命令。 |
-| **off** | 禁用所有审批检查——等同于使用 `--yolo` 运行。所有命令无需提示即可执行。 |
+| **manual**（默认） | 每个缺少结构化权限的精确调用都提示用户。 |
+| **off** | 跳过用户提示，但运行时权限仍绑定到精确调用、单次使用且不可重放。 |
 
 旧配置中的 `approvals.mode: smart` 会在加载时迁移为 `manual`；不会调用辅助模型替用户作出授权决定。
 
 :::warning
-设置 `approvals.mode: off` 将禁用所有安全提示。仅在受信任的环境（CI/CD、容器等）中使用。
+设置 `approvals.mode: off` 会跳过所有终端授权提示。仅在受信任并具有合适结构隔离的环境中使用。
 :::
 
 ### YOLO 模式
 
-YOLO 模式会绕过当前会话中**所有**危险命令审批提示。可通过以下三种方式激活：
+YOLO 模式会绕过当前会话中的终端所有者提示，但不会引入命令文本判断，也不会创建可重放或可泛化的权限。可通过以下三种方式激活：
 
 1. **CLI 标志**：使用 `hermes --yolo` 或 `hermes chat --yolo` 启动会话
 2. **斜杠命令**：在会话中输入 `/yolo` 以切换开/关
@@ -57,10 +59,10 @@ YOLO 模式会绕过当前会话中**所有**危险命令审批提示。可通�
 
 ```
 > /yolo
-  ⚡ YOLO mode ON — all commands auto-approved. Use with caution.
+  ⚡ YOLO mode ON — owner prompts are skipped; exact authority still applies.
 
 > /yolo
-  ⚠ YOLO mode OFF — dangerous commands will require approval.
+  ⚠ YOLO mode OFF — exact terminal calls require owner approval.
 ```
 
 YOLO 模式在 CLI 和 gateway 会话中均可使用。在内部，它会设置 `HERMES_YOLO_MODE` 环境变量，该变量在每次命令执行前都会被检查。
@@ -71,36 +73,26 @@ YOLO 模式在 CLI 和 gateway 会话中均可使用。在内部，它会设置 
 - 状态栏中所有宽度层级均显示 `⚠ YOLO` 片段，随着 YOLO 的切换实时更新（富文本渲染器和纯文本回退均支持）。
 
 :::danger
-YOLO 模式会禁用会话中**所有**危险命令安全检查——**但硬性黑名单除外**（见下文）。仅在完全信任所生成命令的情况下使用（例如，在一次性环境中经过充分测试的自动化脚本）。
+YOLO 模式会跳过所有者提示，因此只应在受信任且结构隔离合适的环境中使用。它不会改变 capability 的精确绑定、单次消费、有效期或不可重放属性。
 :::
 
 对于破坏性会话斜杠命令（`/clear`、`/new` / `/reset`、`/undo`、`/exit --delete`），CLI 在执行前也会提示确认。参见[斜杠命令——破坏性命令的确认提示](../reference/slash-commands.md#confirmation-prompts-for-destructive-commands)。
 
-### 硬性黑名单（始终生效的底线）
+### 结构化安全边界
 
-某些命令极具破坏性——不可逆的文件系统清除、fork 炸弹、直接写入块设备——无论以下任何情况，Hermes 都**拒绝**执行：
+Hermes 的运行时不会根据命令含义决定许可或拒绝。执行权限只能来自明确的结构化边界：
 
-- `--yolo` / `/yolo` 已开启
-- `approvals.mode: off`
-- Cron 任务以无头 `approve` 模式运行
-- 用户明确点击"始终允许"
+- 隔离终端后端；
+- 所有者对该精确调用的一次性批准；
+- 绑定精确操作的 bounded-plan capability；
+- 明确授予整个终端执行面的 session/cron 权限；
+- `approvals.mode: off` 或 YOLO 对所有者提示的显式关闭。
 
-黑名单是 `--yolo` 之下的底线。它在审批层看到命令**之前**就会触发，且没有任何覆盖标志。当前涵盖的模式（非详尽列表；与 `tools/approval.py::UNRECOVERABLE_BLOCKLIST` 保持同步）：
-
-| 模式 | 为何列为硬性规则 |
-|---|---|
-| `rm -rf /` 及明显变体 | 清除文件系统根目录 |
-| `rm -rf --no-preserve-root /` | 明确表示"我就是要删根目录"的变体 |
-| `:(){ :\|:& };:` （bash fork 炸弹） | 使主机挂起直至重启 |
-| `mkfs.*` 作用于已挂载的根设备 | 格式化运行中的系统 |
-| `dd if=/dev/zero of=/dev/sd*` | 清零物理磁盘 |
-| 将不受信任的 URL 通过管道传给 `sh`（作用于根文件系统顶层） | 远程代码执行攻击面过大，无法批准 |
-
-若触发黑名单，工具调用会向 Agent 返回一条说明性错误，且不执行任何操作。如果某个合法工作流确实需要这些命令（例如，你是一个清除并重装流水线的操作者），请在 Agent 外部运行。
+缺少 capability、命令字节不匹配、epoch 不匹配、已过期或已消费时都会故障关闭。被委派的 agent 可以消费继承的精确 capability，但不能自行创建、扩大或重放它。
 
 ### 审批超时
 
-当危险命令提示出现时，用户有一段可配置的时间来响应。若在超时内未响应，命令将**默认被拒绝**（故障关闭）。
+当精确终端授权提示出现时，用户有一段可配置的时间来响应。若在超时内未响应，调用将**默认被拒绝**（故障关闭）。
 
 在 `~/.hermes/config.yaml` 中配置超时：
 
@@ -109,90 +101,40 @@ approvals:
   timeout: 300  # 秒（默认：300）
 ```
 
-### 触发审批的条件
+### 何时需要所有者批准
 
-以下模式会触发审批提示（定义于 `tools/approval.py`）：
-
-| 模式 | 描述 |
-|---------|-------------|
-| `rm -r` / `rm --recursive` | 递归删除 |
-| `rm ... /` | 在根路径下删除 |
-| `chmod 777/666` / `o+w` / `a+w` | 全局/其他用户可写权限 |
-| `chmod --recursive` 配合不安全权限 | 递归全局/其他用户可写（长标志） |
-| `chown -R root` / `chown --recursive root` | 递归 chown 为 root |
-| `mkfs` | 格式化文件系统 |
-| `dd if=` | 磁盘复制 |
-| `> /dev/sd` | 写入块设备 |
-| `DROP TABLE/DATABASE` | SQL DROP |
-| `DELETE FROM`（不含 WHERE） | 不含 WHERE 的 SQL DELETE |
-| `TRUNCATE TABLE` | SQL TRUNCATE |
-| `> /etc/` | 覆盖系统配置 |
-| `systemctl stop/restart/disable/mask` | 停止/重启/禁用系统服务 |
-| `kill -9 -1` | 杀死所有进程 |
-| `pkill -9` | 强制杀死进程 |
-| Fork 炸弹模式 | Fork 炸弹 |
-| `bash -c` / `sh -c` / `zsh -c` / `ksh -c` | 通过 `-c` 标志执行 shell 命令（包括组合标志如 `-lc`） |
-| `python -e` / `perl -e` / `ruby -e` / `node -c` | 通过 `-e`/`-c` 标志执行脚本 |
-| `curl ... \| sh` / `wget ... \| sh` | 将远程内容通过管道传给 shell |
-| `bash <(curl ...)` / `sh <(wget ...)` | 通过进程替换执行远程脚本 |
-| `tee` 写入 `/etc/`、`~/.ssh/`、`~/.hermes/.env` | 通过 tee 覆盖敏感文件 |
-| `>` / `>>` 写入 `/etc/`、`~/.ssh/`、`~/.hermes/.env` | 通过重定向覆盖敏感文件 |
-| `xargs rm` | xargs 配合 rm |
-| `find -exec rm` / `find -delete` | find 配合破坏性操作 |
-| `cp`/`mv`/`install` 写入 `/etc/` | 复制/移动文件到系统配置目录 |
-| `sed -i` / `sed --in-place` 作用于 `/etc/` | 就地编辑系统配置 |
-| `pkill`/`killall` hermes/gateway | 防止自我终止 |
-| `gateway run` 配合 `&`/`disown`/`nohup`/`setsid` | 防止在服务管理器外启动 gateway |
-
-:::info
-**容器绕过**：在 `docker`、`singularity`、`modal`、`daytona` 或 `vercel_sandbox` 后端运行时，危险命令检查会被**跳过**，因为容器本身就是安全边界。容器内的破坏性命令不会危害宿主机。
-:::
+当终端调用既不在隔离执行面中，也没有精确 capability、bounded-plan capability、显式 whole-surface grant，且审批模式不是 `off` 时，Hermes 会请求所有者批准。这个决定完全由结构状态产生，不读取或解释命令文本。
 
 ### 审批流程（CLI）
 
-在交互式 CLI 中，危险命令会显示内联审批提示：
+在交互式 CLI 中，缺少结构权限的精确调用会显示内联审批提示：
 
 ```
-  ⚠️  DANGEROUS COMMAND: recursive delete
-      rm -rf /tmp/old-project
+  ⚠️  TERMINAL APPROVAL REQUIRED
+      ./project-maintenance --target /tmp/old-project
 
-      [o]nce  |  [s]ession  |  [a]lways  |  [d]eny
+      [o]nce  |  [d]eny
 
-      Choice [o/s/a/D]:
+      Choice [o/D]:
 ```
 
-四个选项：
+两个选项：
 
-- **once** — 仅允许本次执行
-- **session** — 在本次会话剩余时间内允许此模式
-- **always** — 添加到永久允许列表（保存至 `config.yaml`）
-- **deny**（默认） — 阻止该命令
+- **once** — 为这个精确调用签发一次性 capability
+- **deny**（默认） — 拒绝这个精确调用
 
 ### 审批流程（Gateway/消息平台）
 
-在消息平台上，Agent 会将危险命令详情发送到聊天中，并等待用户回复：
+在消息平台上，Agent 会将精确终端调用详情和不透明 approval ID 发送到聊天中，并等待用户回复：
 
 - 回复 **yes**、**y**、**approve**、**ok** 或 **go** 以批准
 - 回复 **no**、**n**、**deny** 或 **cancel** 以拒绝
 
 运行 gateway 时，`HERMES_EXEC_ASK=1` 环境变量会自动设置。
 
-### 永久允许列表
+### 不存在命令模式允许列表
 
-通过"always"批准的命令会保存到 `~/.hermes/config.yaml`：
-
-```yaml
-# 永久允许的危险命令模式
-command_allowlist:
-  - rm
-  - systemctl
-```
-
-这些模式在启动时加载，并在所有后续会话中静默批准。
-
-:::tip
-使用 `hermes config edit` 查看或删除永久允许列表中的模式。
-:::
+Hermes 不保存 session/always 命令文本模式，也不从旧系统导入这类模式。每个交互式 capability 都绑定一个精确调用，在一次成功消费、超时或会话 epoch 结束后失效。
 
 ## 用户授权（Gateway）
 
@@ -341,7 +283,7 @@ terminal:
 - **临时模式**（`container_persistent: false`）：工作区使用 tmpfs——清理后所有内容丢失
 
 :::tip
-对于生产 gateway 部署，使用 `docker`、`modal`、`daytona` 或 `vercel_sandbox` 后端，将 Agent 命令与宿主机系统隔离。这样可以完全消除危险命令审批的需要。
+对于生产 gateway 部署，使用 `docker`、`modal`、`daytona` 或 `vercel_sandbox` 后端，将 Agent 命令与宿主机系统隔离。隔离是独立的结构化安全边界，而不是命令文本分类的替代品。
 :::
 
 :::warning
@@ -350,15 +292,15 @@ terminal:
 
 ## 终端后端安全对比
 
-| 后端 | 隔离 | 危险命令检查 | 适用场景 |
+| 后端 | 隔离 | 结构化权限边界 | 适用场景 |
 |---------|-----------|-------------------|----------|
-| **local** | 无——在宿主机上运行 | ✅ 是 | 开发、受信任用户 |
-| **ssh** | 远程机器 | ✅ 是 | 在独立服务器上运行 |
-| **docker** | 容器 | ❌ 跳过（容器即边界） | 生产 gateway |
-| **singularity** | 容器 | ❌ 跳过 | HPC 环境 |
-| **modal** | 云沙箱 | ❌ 跳过 | 可扩展的云隔离 |
-| **daytona** | 云沙箱 | ❌ 跳过 | 持久化云工作区 |
-| **vercel_sandbox** | 云微虚拟机 | ❌ 跳过 | 带快照持久化的云执行 |
+| **local** | 无——在宿主机上运行 | 需要精确 capability 或显式 whole-surface grant | 开发、受信任用户 |
+| **ssh** | 远程机器 | 需要精确 capability 或显式 whole-surface grant | 在独立服务器上运行 |
+| **docker** | 容器 | 容器定义隔离执行面 | 生产 gateway |
+| **singularity** | 容器 | 容器定义隔离执行面 | HPC 环境 |
+| **modal** | 云沙箱 | 沙箱定义隔离执行面 | 可扩展的云隔离 |
+| **daytona** | 云沙箱 | 沙箱定义隔离执行面 | 持久化云工作区 |
+| **vercel_sandbox** | 云微虚拟机 | 沙箱定义隔离执行面 | 带快照持久化的云执行 |
 
 ## 环境变量透传 {#environment-variable-passthrough}
 
@@ -524,31 +466,6 @@ security:
 
 主机子字符串防护（即使底层 IP 是公共的，也能阻止 Unicode 同形字域名欺骗）无论此设置如何均保持开启。
 
-### Tirith 预执行安全扫描
-
-Hermes 集成了 [tirith](https://github.com/sheeki03/tirith) 用于在执行前进行内容级命令扫描。Tirith 能检测单纯模式匹配所遗漏的威胁：
-
-- 同形字 URL 欺骗（国际化域名攻击）
-- 管道传解释器模式（`curl | bash`、`wget | sh`）
-- 终端注入攻击
-
-Tirith 在首次使用时从 GitHub Releases 自动安装，并进行 SHA-256 校验和验证（若 cosign 可用，还会进行 cosign 来源验证）。
-
-```yaml
-# 在 ~/.hermes/config.yaml 中
-security:
-  tirith_enabled: true       # 启用/禁用 tirith 扫描（默认：true）
-  tirith_path: "tirith"      # tirith 二进制路径（默认：PATH 查找）
-  tirith_timeout: 5          # 子进程超时（秒）
-  tirith_fail_open: true     # tirith 不可用时允许执行（默认：true）
-```
-
-当 `tirith_fail_open` 为 `true`（默认）时，若 tirith 未安装或超时，命令照常执行。在高安全性环境中，将其设置为 `false` 可在 tirith 不可用时阻止命令执行。
-
-Tirith 为 Linux（x86_64 / aarch64）和 macOS（x86_64 / arm64）提供预构建二进制文件。在没有预构建二进制文件的平台（Windows 等）上，tirith 会被静默跳过——模式匹配防护仍然运行，CLI 不会显示"不可用"横幅。若要在 Windows 上使用 tirith，请在 WSL 下运行 Hermes。
-
-Tirith 的判定与审批流程集成：安全命令直接通过，可疑和被阻止的命令会触发用户审批，并附上完整的 tirith 发现（严重性、标题、描述、更安全的替代方案）。用户可以批准或拒绝——默认选择为拒绝，以确保无人值守场景的安全。
-
 ### 上下文文件注入防护
 
 上下文文件（AGENTS.md、.cursorrules、SOUL.md）在被纳入系统 prompt 之前会扫描 prompt 注入。扫描器检查以下内容：
@@ -574,7 +491,7 @@ Tirith 的判定与审批流程集成：安全命令直接通过，可疑和被�
 3. **限制资源上限** — 设置合适的 CPU、内存和磁盘限制
 4. **安全存储密钥** — 将 API 密钥保存在具有适当文件权限的 `~/.hermes/.env` 中
 5. **启用 DM 配对** — 尽可能使用配对码，而非硬编码用户 ID
-6. **审查命令允许列表** — 定期审计 config.yaml 中的 `command_allowlist`
+6. **审查活动 capability** — 确认终端权限均为精确、限时、限次且不可重放
 7. **设置 `MESSAGING_CWD`** — 不要让 Agent 在敏感目录中操作
 8. **以非 root 用户运行** — 切勿以 root 身份运行 gateway
 9. **监控日志** — 检查 `~/.hermes/logs/` 中的未授权访问尝试

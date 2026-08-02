@@ -204,16 +204,16 @@ $OutputEncoding = [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 
 这样可以让 PowerShell 和子进程统一使用 UTF-8，避免仅在 Windows 上出现的失败。
 
-### 谨慎选择"始终允许"
+### 精确授权，不授予命令模式
 
-当 agent 触发危险命令审批（`rm -rf`、`DROP TABLE` 等）时，你有四个选项：**once（仅此一次）**、**session（本次会话）**、**always（始终允许）**、**deny（拒绝）**。选择"always"前请仔细考虑——它会永久将该模式加入白名单。在熟悉之前，先用"session"。
+所有者批准时，只授权当前等待中的精确终端调用。Hermes 不创建 session/always 命令文本模式授权，也不根据关键字判断命令含义。LLM 模型负责语义解释；运行时只验证不透明 capability 的精确字节、使用次数、有效期和会话 epoch。
 
-### 命令审批是你的安全防线
+### 结构隔离是独立的安全边界
 
-Hermes 在执行每条命令前都会与一份精心维护的危险模式列表进行比对，包括递归删除、SQL DROP、curl 管道到 shell 等。不要在生产环境中禁用此功能——它的存在有充分的理由。
+生产工作负载优先使用隔离后端。容器或沙箱的安全性来自其结构隔离，而不是运行时对命令文本进行分类。
 
 :::warning
-在容器后端（Docker、Singularity、Modal、Daytona）中运行时，危险命令检查会被**跳过**，因为容器本身就是安全边界。请确保你的容器镜像已妥善加固。
+在容器后端（Docker、Singularity、Modal、Daytona）中运行时，隔离执行面本身提供结构边界。请确保你的容器镜像已妥善加固。
 :::
 
 ### 为消息 Bot 使用白名单

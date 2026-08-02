@@ -644,7 +644,7 @@ registry.register(
   })
 )
 
-// YOLO (dangerous-command approval bypass) is a status-bar zap and a /yolo
+// YOLO (terminal/code execution authority) is a status-bar zap and a /yolo
 // command; ⌘K is the third door onto the SAME store function, so a user who
 // lives in the palette never has to hunt for the pill.
 registry.register(

@@ -1,3 +1,4 @@
+import json
 import queue
 import threading
 import time
@@ -69,6 +70,42 @@ def _make_background_cli_stub():
 
 
 class TestCliApprovalUi:
+    def test_exact_callback_requires_full_review_before_positive_choice(self):
+        cli = _make_cli_stub()
+        command = "  first\n" + ("x" * 500) + "\nlast  "
+        result = {}
+
+        def _run_callback():
+            result["value"] = cli._approval_callback(
+                command,
+                "exact operation",
+                allow_permanent=False,
+                allow_session=False,
+                approval_id="a" * 32,
+                exact_execution=True,
+            )
+
+        with patch.object(cli_module, "_cprint") as printed:
+            thread = threading.Thread(target=_run_callback, daemon=True)
+            thread.start()
+            deadline = time.time() + 2
+            while cli._approval_state is None and time.time() < deadline:
+                time.sleep(0.01)
+
+            assert cli._approval_state is not None
+            assert cli._approval_state["choices"] == ["view", "deny"]
+            cli._approval_state["selected"] = 0
+            cli._handle_approval_selection()
+
+            assert cli._approval_state["choices"] == ["once", "deny"]
+            review_text = printed.call_args.args[0]
+            assert json.dumps(command, ensure_ascii=False) in review_text
+            assert command[-100:] in json.loads(review_text.splitlines()[2])
+            cli._approval_state["response_queue"].put("deny")
+            thread.join(timeout=2)
+
+        assert result["value"] == "deny"
+
     def test_non_permanent_callback_preserves_session_choice(self):
         cli = _make_cli_stub()
         result = {}
@@ -186,9 +223,9 @@ class TestCliApprovalUi:
         lines = rendered.splitlines()
 
         assert lines[0].startswith("╭")
-        assert "Dangerous Command" not in lines[0]
-        assert any("Dangerous Command" in line for line in lines[1:3])
-        assert "Show full command" in rendered
+        assert "Operation Approval" not in lines[0]
+        assert any("Operation Approval" in line for line in lines[1:3])
+        assert "Show full operation" in rendered
         assert "githubcli-archive-" in rendered
         assert "keyring.gpg" in rendered
         assert "status=progress" in rendered
@@ -241,7 +278,7 @@ class TestCliApprovalUi:
         assert "status=progress" in rendered
 
     def test_approval_display_preserves_command_and_choices_with_long_description(self):
-        """Regression: long tirith descriptions used to push approve/deny off-screen.
+        """Long descriptions must not push approve/deny off-screen.
 
         The panel must always render the command and every choice, even when
         the description would otherwise wrap into 10+ lines. The description
@@ -282,7 +319,7 @@ class TestCliApprovalUi:
         # getting clipped off the bottom of the panel.
         assert "Allow once" in rendered
         assert "Allow for this session" in rendered
-        assert "Add to permanent allowlist" in rendered
+        assert "Always allow this action scope" in rendered
         assert "Deny" in rendered
 
         # The bottom border must render (i.e. the panel is self-contained).
@@ -322,7 +359,7 @@ class TestCliApprovalUi:
         for label in (
             "Allow once",
             "Allow for this session",
-            "Add to permanent allowlist",
+            "Always allow this action scope",
             "Deny",
         ):
             assert label in rendered, f"choice {label!r} missing"
@@ -359,7 +396,7 @@ class TestCliApprovalUi:
         for label in (
             "Allow once",
             "Allow for this session",
-            "Add to permanent allowlist",
+            "Always allow this action scope",
             "Deny",
         ):
             assert label in rendered, f"choice {label!r} missing"
@@ -651,7 +688,7 @@ class TestPersistPromptSummary:
         summary = "\n".join(printed)
         assert "Approval" in summary
         assert "rm -rf /tmp/scratch" in summary
-        assert "allowed for session" in summary
+        assert "allowed for this action scope" in summary
 
     def test_approval_summary_truncates_long_command(self):
         cli = _make_cli_stub()

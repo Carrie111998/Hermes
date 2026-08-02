@@ -12,6 +12,7 @@ Uses discord.py library for:
 import asyncio
 import datetime as dt
 import hashlib
+import io
 import inspect
 import json
 import logging
@@ -8309,6 +8310,64 @@ class DiscordAdapter(BasePlatformAdapter):
 
         except Exception as e:
             return SendResult(success=False, error=str(e))
+
+    async def send_exact_exec_approval(
+        self,
+        chat_id: str,
+        command: str,
+        *,
+        approval_id: str,
+        command_sha256: str,
+        command_prefix: str = "/",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Attach the canonical UTF-8 operation bytes without chat rewriting."""
+        if not self._client or not DISCORD_AVAILABLE:
+            return SendResult(success=False, error="Not connected")
+        if re.fullmatch(r"[0-9a-f]{32}", str(approval_id or "")) is None:
+            return SendResult(success=False, error="invalid opaque approval ID")
+
+        payload = str(command or "").encode("utf-8")
+        observed_sha256 = hashlib.sha256(payload).hexdigest()
+        if observed_sha256 != str(command_sha256 or ""):
+            return SendResult(success=False, error="exact operation digest mismatch")
+
+        try:
+            target_id = str(
+                (metadata or {}).get("thread_id") or chat_id
+            )
+            channel = self._client.get_channel(int(target_id))
+            if not channel:
+                channel = await self._client.fetch_channel(int(target_id))
+            if not channel:
+                return SendResult(
+                    success=False,
+                    error=f"Channel {target_id} not found",
+                )
+            public_target_error = _discord_policy_public_target_error(channel)
+            if public_target_error:
+                return SendResult(success=False, error=public_target_error)
+
+            filename = f"hermes-exact-operation-{approval_id}.txt"
+            caption = (
+                "⚠️ **Exact operation requires approval**\n"
+                f"Canonical UTF-8 bytes are attached as `{filename}`.\n"
+                f"SHA-256: `{observed_sha256}`\n"
+                f"Reply `{command_prefix}approve {approval_id}` to execute only "
+                f"these bytes, or `{command_prefix}deny {approval_id}` to cancel."
+            )
+            discord_file = discord.File(io.BytesIO(payload), filename=filename)
+            msg = await channel.send(content=caption, files=[discord_file])
+            attachments = getattr(msg, "attachments", None) or []
+            if not attachments:
+                return SendResult(
+                    success=False,
+                    error="Discord accepted exact approval without its attachment",
+                    message_id=str(getattr(msg, "id", "") or "") or None,
+                )
+            return SendResult(success=True, message_id=str(msg.id))
+        except Exception as exc:
+            return SendResult(success=False, error=str(exc))
 
     async def send_slash_confirm(
         self, chat_id: str, title: str, message: str, session_key: str,

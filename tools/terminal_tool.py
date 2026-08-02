@@ -258,7 +258,7 @@ def set_sudo_password_callback(cb):
 
 
 def set_approval_callback(cb):
-    """Register a callback for dangerous command approval prompts.
+    """Register a callback for operation approval prompts.
 
     Per-thread scope — ACP sessions that run concurrently in a
     ThreadPoolExecutor each have their own callback slot. See
@@ -322,10 +322,10 @@ def _reset_cached_sudo_passwords() -> None:
         _sudo_password_cache.clear()
 
 # =============================================================================
-# Dangerous Command Approval System
+# Operation Approval Transport
 # =============================================================================
 
-# Dangerous command detection + approval now consolidated in tools/approval.py
+# Exact structural authority and approval transport live in tools/approval.py.
 from tools.approval import (
     check_exact_execution_authority as _check_exact_execution_authority_impl,
     check_all_command_guards as _check_all_guards_impl,
@@ -361,7 +361,7 @@ def _check_all_guards(command: str, env_type: str,
                       effective_cwd: str = "",
                       session_key: str = "",
                       exact_authority: Optional[dict] = None) -> dict:
-    """Delegate to consolidated guard (tirith + dangerous cmd) with CLI callback."""
+    """Delegate to exact, structurally-scoped execution authority."""
     return _check_all_guards_impl(command, env_type,
                                   approval_callback=_get_approval_callback(),
                                   has_host_access=has_host_access,
@@ -2279,93 +2279,6 @@ def _atexit_cleanup():
 atexit.register(_atexit_cleanup)
 
 
-# =============================================================================
-# Exit Code Context for Common CLI Tools
-# =============================================================================
-# Many Unix commands use non-zero exit codes for informational purposes, not
-# to indicate failure.  The model sees a raw exit_code=1 from `grep` and
-# wastes a turn investigating something that just means "no matches".
-# This lookup adds a human-readable note so the agent can move on.
-
-def _interpret_exit_code(command: str, exit_code: int) -> str | None:
-    """Return a human-readable note when a non-zero exit code is non-erroneous.
-
-    Returns None when the exit code is 0 or genuinely signals an error.
-    The note is appended to the tool result so the model doesn't waste
-    turns investigating expected exit codes.
-    """
-    if exit_code == 0:
-        return None
-
-    # Extract the last command in a pipeline/chain — that determines the
-    # exit code.  Handles  `cmd1 && cmd2`, `cmd1 | cmd2`, `cmd1; cmd2`.
-    # Deliberately simple: split on shell operators and take the last piece.
-    segments = re.split(r'\s*(?:\|\||&&|[|;])\s*', command)
-    last_segment = (segments[-1] if segments else command).strip()
-
-    # Get base command name (first word), stripping env var assignments
-    # like  VAR=val cmd ...
-    words = last_segment.split()
-    base_cmd = ""
-    for w in words:
-        if "=" in w and not w.startswith("-"):
-            continue  # skip VAR=val
-        base_cmd = w.split("/")[-1]  # handle /usr/bin/grep -> grep
-        break
-
-    if not base_cmd:
-        return None
-
-    # Command-specific semantics
-    semantics: dict[str, dict[int, str]] = {
-        # grep/rg/ag/ack: 1=no matches found (normal), 2+=real error
-        "grep":  {1: "No matches found (not an error)"},
-        "egrep": {1: "No matches found (not an error)"},
-        "fgrep": {1: "No matches found (not an error)"},
-        "rg":    {1: "No matches found (not an error)"},
-        "ag":    {1: "No matches found (not an error)"},
-        "ack":   {1: "No matches found (not an error)"},
-        # diff: 1=files differ (expected), 2+=real error
-        "diff":  {1: "Files differ (expected, not an error)"},
-        "colordiff": {1: "Files differ (expected, not an error)"},
-        # find: 1=some dirs inaccessible but results may still be valid
-        "find":  {1: "Some directories were inaccessible (partial results may still be valid)"},
-        # test/[: 1=condition is false (expected)
-        "test":  {1: "Condition evaluated to false (expected, not an error)"},
-        "[":     {1: "Condition evaluated to false (expected, not an error)"},
-        # curl: common non-error codes
-        "curl":  {
-            6: "Could not resolve host",
-            7: "Failed to connect to host",
-            22: "HTTP response code indicated error (e.g. 404, 500)",
-            28: "Operation timed out",
-        },
-        # git: 1 is context-dependent but often normal (e.g. git diff with changes)
-        "git":   {1: "Non-zero exit (often normal — e.g. 'git diff' returns 1 when files differ)"},
-    }
-
-    cmd_semantics = semantics.get(base_cmd)
-    if cmd_semantics and exit_code in cmd_semantics:
-        return cmd_semantics[exit_code]
-
-    return None
-
-
-def _command_requires_pipe_stdin(command: str) -> bool:
-    """Return True when PTY mode would break stdin-driven commands.
-
-    Some CLIs change behavior when stdin is a TTY. In particular,
-    `gh auth login --with-token` expects the token to arrive via piped stdin and
-    waits for EOF; when we launch it under a PTY, `process.submit()` only sends a
-    newline, so the command appears to hang forever with no visible progress.
-    """
-    normalized = " ".join(command.lower().split())
-    return (
-        normalized.startswith("gh auth login")
-        and "--with-token" in normalized
-    )
-
-
 def _resolve_notification_flag_conflict(
     *,
     notify_on_complete: bool,
@@ -2434,7 +2347,7 @@ def terminal_tool(
         timeout: Command timeout in seconds (default: from config)
         task_id: Unique identifier for environment isolation (optional)
         session_id: Conversation/session identifier for durable observability
-        force: If True, skip dangerous command check (use after user confirms)
+        force: If True, use caller-supplied whole-operation authority.
         workdir: Working directory for this command (optional, uses session cwd if not set)
         pty: If True, use pseudo-terminal for interactive CLI tools (local backend only)
         notify_on_complete: If True and background=True, you'll be notified exactly once when the process exits. The right choice for almost every long task. MUTUALLY EXCLUSIVE with watch_patterns.
@@ -2718,12 +2631,10 @@ def terminal_tool(
                 "status": "blocked",
             }, ensure_ascii=False)
 
-        # Exact model-authored plan authority is resolved before the legacy
-        # command-content compatibility guards below.  A hit is final and a
-        # miss inside exact-plan topology is returned without letting regex,
-        # deny/allow lists, lifecycle string parsing, Tirith, or YOLO override
-        # it. ``force`` remains an internal replay path for an already-resolved
-        # interactive prompt.
+        # Exact model-authored plan authority is resolved before the opaque
+        # approval-mode boundary. No command prose is classified here.
+        # ``force`` remains an internal replay path for an already-resolved
+        # exact interactive prompt.
         exact_authority = None
         if not force:
             exact_authority = _check_exact_authority(
@@ -2749,85 +2660,9 @@ def terminal_tool(
                     "error_code": exact_authority.get("error_code"),
                 }, ensure_ascii=False)
 
-        # Hard-block: gateway lifecycle commands (systemctl/launchctl/hermes
-        # restart|stop targeting hermes-gateway) must never run inside the
-        # gateway process itself. The restart would SIGTERM the gateway, which
-        # kills this very subprocess before it can complete — the service may
-        # never restart. This mirrors the `hermes gateway restart` guard in
-        # hermes_cli/gateway.py and the cron-path guard in hermes_cli/cron.py,
-        # but applies unconditionally (force=True cannot help here).
-        if (
-            exact_authority is None
-            and os.environ.get("_HERMES_GATEWAY") == "1"
-        ):
-            from cron.lifecycle_guard import (
-                contains_gateway_lifecycle_command_or_referenced_script,
-                contains_launchctl_submit_command,
-            )
-            if contains_launchctl_submit_command(command):
-                return json.dumps({
-                    "output": "",
-                    "exit_code": 1,
-                    "error": (
-                        "Blocked: launchctl submit/bootstrap registers a persistent "
-                        "KeepAlive job and is unsafe from inside the gateway process. "
-                        "Use Hermes cron for one-shot delayed work, or install an "
-                        "explicit LaunchAgent from a separate shell."
-                    ),
-                    "status": "error",
-                }, ensure_ascii=False)
-            guard_cwd = effective_cwd
-
-            def _read_script_in_env(script_path: str) -> Optional[str]:
-                """Best-effort script read; uses env.execute only when local read fails.
-
-                For local backends the script path is on the host filesystem. For
-                SSH/Modal/Daytona the same path is remote; the local read misses, so we
-                fall back to ``env.execute('cat ...')``.
-                """
-                if env is None:
-                    return None
-                try:
-                    local_path = Path(script_path).expanduser()
-                    if not local_path.is_absolute():
-                        local_path = Path(guard_cwd) / local_path
-                    if local_path.is_file():
-                        metadata = local_path.stat()
-                        if stat.S_ISREG(metadata.st_mode) and metadata.st_size <= 1024 * 1024:
-                            data = local_path.read_bytes()
-                            if len(data) <= 1024 * 1024:
-                                return data.decode("utf-8", errors="replace")
-                except Exception:
-                    pass
-                # Remote / sandboxed backend: read via the environment's shell.
-                try:
-                    result = env.execute(f"cat {shlex.quote(script_path)}")
-                    if result.get("returncode", -1) == 0:
-                        return result.get("output", "")
-                except Exception:
-                    pass
-                return None
-
-            if contains_gateway_lifecycle_command_or_referenced_script(
-                command,
-                cwd=guard_cwd,
-                read_remote_script=_read_script_in_env,
-            ):
-                return json.dumps({
-                    "output": "",
-                    "exit_code": 1,
-                    "error": (
-                        "Blocked: command or referenced script cannot restart or stop "
-                        "the gateway from inside the gateway process. The gateway would "
-                        "kill this command before it could complete (SIGTERM propagates "
-                        "to child processes). Run `hermes gateway restart` from a "
-                        "separate shell outside the running gateway."
-                    ),
-                    "status": "error",
-                }, ensure_ascii=False)
-
-        # Pre-exec security checks (tirith + dangerous command detection)
-        # Skip check if force=True (user has confirmed they want to run it)
+        # Resolve exact structural authority or the explicit profile mode.
+        # Skip the check only for an internal replay of an already-resolved
+        # exact interactive approval.
         approval_note = None
         # True when the user explicitly approved this run (or pre-confirmed via
         # force).  Drives the clean-interrupt-slate clear before env.execute so
@@ -2881,18 +2716,6 @@ def terminal_tool(
                 )
                 _approved_run = True
 
-        # Prepare command for execution
-        pty_disabled_reason = None
-        effective_pty = pty
-        if pty and _command_requires_pipe_stdin(command):
-            effective_pty = False
-            pty_disabled_reason = (
-                "PTY disabled for this command because it expects piped stdin/EOF "
-                "(for example gh auth login --with-token). For local background "
-                "processes, call process(action='close') after writing so it receives "
-                "EOF."
-            )
-
         # The session key is already computed above the gateway guard.
         if background:
             # Spawn a tracked background process via the process registry.
@@ -2909,7 +2732,7 @@ def terminal_tool(
                         owner_task_id=task_id or "",
                         session_key=session_key,
                         env_vars=env.env if hasattr(env, 'env') else None,
-                        use_pty=effective_pty,
+                        use_pty=pty,
                     )
                 else:
                     proc_session = process_registry.spawn_via_env(
@@ -2933,9 +2756,6 @@ def terminal_tool(
                 # cannot occur here and this note never co-occurs with rc=130.
                 if approval_note:
                     result_data["approval"] = approval_note
-                if pty_disabled_reason:
-                    result_data["pty_note"] = pty_disabled_reason
-
                 # Nudge: background=True without notify_on_complete=True OR
                 # watch_patterns is a silent process. The agent has NO way to
                 # learn it finished short of calling process(action="poll"/"wait")
@@ -2961,85 +2781,6 @@ def terminal_tool(
                         "Only ignore this hint for genuine long-lived processes "
                         "that never exit (servers, watchers, daemons)."
                     )
-
-                # Nudge: homebrewed CI watcher built from `gh pr view`
-                # `--json statusCheckRollup` or `gh pr checks` piped through
-                # `jq` is the #1 cause of silent CI-watcher failures in
-                # hermes-agent dev work. May 2026 PRs that surfaced this
-                # exact failure mode: #31329, #31448, #31695, #31709, #31745,
-                # #32264, #33131. Failure modes seen:
-                #   * `gh pr view --json statusCheckRollup --jq ...` with
-                #     `from_entries` choking on null `conclusion` keys, loop
-                #     silently exits with empty status, never terminates.
-                #   * `for i in $(seq 1 60); do ... 2>&1` block-buffered stdout
-                #     never flushed to background-process capture; SIGTERM
-                #     cuts the buffer before flush; `process(action='log')`
-                #     returns total_lines=0 forever.
-                #   * conclusion vs. status field confusion: filtering for
-                #     `PENDING` in `.conclusion` while in-progress checks have
-                #     empty conclusion → poller declares all-green while 18/23
-                #     checks still IN_PROGRESS.
-                #   * grepping for TTY-only banners ("All checks were
-                #     successful") that never appear when stdout is piped.
-                # The canonical patterns in the green-ci-policy skill avoid
-                # every one of these — drive the loop off exit codes or on
-                # tab-separated `awk -F"\t" "$2==\"pending\""` (column 2).
-                # The detector here is deliberately narrow: it flags the
-                # statusCheckRollup JSON-API path and the `gh pr checks` +
-                # jq combination, but NOT the canonical column-2 awk
-                # poller (which uses awk on tabs, not as a generic
-                # stdout parser). When we detect the homebrew shape, point
-                # the agent at the canonical snippet rather than letting
-                # it ship another broken poller.
-                if background and command:
-                    _gh = ("gh pr view" in command or "gh pr checks" in command)
-                    _has_jq = (
-                        " jq " in command or "| jq" in command or "$(jq" in command
-                    )
-                    _bad_shape = (
-                        # The JSON-API anti-pattern. Even without jq, going
-                        # through `--json statusCheckRollup` + parsing puts
-                        # you in conclusion-vs-status field hell.
-                        "statusCheckRollup" in command
-                        # gh pr checks piped to jq is also wrong — `gh pr
-                        # checks` doesn't emit JSON, so any `| jq` here is
-                        # confused intent. The canonical column-2 poller
-                        # uses awk-on-tabs, not jq.
-                        or (_gh and _has_jq)
-                    )
-                    if _bad_shape:
-                        existing = result_data.get("hint", "")
-                        canonical_hint = (
-                            "This looks like a homebrewed CI poller built from "
-                            "`gh pr view --json statusCheckRollup` and/or "
-                            "`gh pr checks | jq`. That shape has burned us "
-                            "repeatedly in hermes-agent dev work (PRs #31329, "
-                            "#31448, #31695, #31709, #31745, #32264, #33131) — "
-                            "stdout buffering kills output capture, jq null-key "
-                            "edge cases silently exit the loop, conclusion-vs-"
-                            "status field confusion exits early with bogus "
-                            "all-green verdicts, TTY-only summary banners "
-                            "never appear when piped. Use the canonical "
-                            "snippets in the green-ci-policy skill instead: "
-                            "the exit-code-driven `gh pr checks $PR >/dev/null` "
-                            "(rc 0 = green, 8 = pending, else fail) for "
-                            "exit-on-first-fail behavior, or the column-2 "
-                            "awk-on-tabs poller "
-                            "(`awk -F\"\\t\" \"$2==\\\"pending\\\"\"`) for "
-                            "sharded matrices. Load skill_view("
-                            "name='github/hermes-agent-dev', "
-                            "file_path='references/green-ci-policy.md') for "
-                            "the verbatim snippets. If you must roll a custom "
-                            "loop with rich structured output, write each tick "
-                            "to a known file (`tee -a /tmp/ci.log`) and rely "
-                            "on `process(action='log')` to read THAT file — "
-                            "do not rely on background-process stdout capture "
-                            "for line-buffered shell loops."
-                        )
-                        result_data["hint"] = (
-                            existing + "\n\n" + canonical_hint if existing
-                            else canonical_hint
-                        )
 
                 # Populate routing metadata on the session so that
                 # watch-pattern and completion notifications can be
@@ -3272,21 +3013,10 @@ def terminal_tool(
             from tools.ansi_strip import strip_ansi
             output = strip_ansi(output)
 
-            # Redact secrets from command output. For source/config dumps
-            # (MAX_TOKENS=100, "apiKey": "x" fixtures, postgresql:// f-string
-            # templates) the ENV/JSON/template passes are skipped to avoid
-            # false positives (code_file=True). But for env-dump commands
-            # (env/printenv/set/export/declare) the output IS a KEY=value
-            # credential dump, so redact_terminal_output runs the ENV pass
-            # (code_file=False) to mask opaque tokens with no vendor prefix.
-            # Real prefixes, auth headers, JWTs, private keys are masked in
-            # both modes. See issue #43025.
+            # Redact secrets at the structurally proven terminal-output
+            # boundary. The policy is uniform and never inspects command text.
             from agent.redact import redact_terminal_output
-            output = redact_terminal_output(output.strip(), command) if output else ""
-
-            # Interpret non-zero exit codes that aren't real errors
-            # (e.g. grep=1 means "no matches", diff=1 means "files differ")
-            exit_note = _interpret_exit_code(command, returncode)
+            output = redact_terminal_output(output.strip()) if output else ""
 
             result_dict = {
                 "output": output,
@@ -3358,8 +3088,6 @@ def terminal_tool(
                     result_dict["approval"] = approval_note.rstrip(".") + ", then interrupted."
                 else:
                     result_dict["approval"] = approval_note
-            if exit_note:
-                result_dict["exit_code_meaning"] = exit_note
             if sudo_auth_failed:
                 result_dict["sudo_auth_failed"] = True
             if sudo_cache_cleared:

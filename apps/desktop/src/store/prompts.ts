@@ -72,11 +72,26 @@ function keyedPromptStore<T extends KeyedPrompt>(): PromptStore<T> {
 // This is distinct from sudo/secret's _block()-style requestId.
 export interface ApprovalRequest extends KeyedPrompt {
   approvalId?: string
-  // false when the backend won't honor a permanent allow (tirith warning) → hide "Always allow".
+  // Exact requests must be reviewed in-app byte-for-byte. Native OS
+  // notifications may focus the session or deny, but can never approve them.
+  exactExecution?: boolean
+  // false when the exact request does not expose a persistent scope.
   allowPermanent?: boolean
   choices?: string[]
   command: string
   description: string
+}
+
+const EXACT_APPROVAL_ID = /^[0-9a-f]{32}$/i
+
+export function isExactApprovalId(value: unknown): value is string {
+  return typeof value === 'string' && EXACT_APPROVAL_ID.test(value)
+}
+
+export function isExactApprovalRequest(
+  request: null | Pick<ApprovalRequest, 'approvalId' | 'exactExecution'>
+): boolean {
+  return Boolean(request && (request.exactExecution === true || isExactApprovalId(request.approvalId)))
 }
 
 export interface SudoRequest extends KeyedPrompt {

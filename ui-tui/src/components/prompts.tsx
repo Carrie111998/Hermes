@@ -9,12 +9,11 @@ import { chipRowProps } from './overlayPrimitives.js'
 import { TextInput } from './textInput.js'
 
 const APPROVAL_OPTS = ['once', 'session', 'always', 'deny'] as const
-// tirith warning present → backend downgrades "always" to session scope, so drop it.
+// Exact requests may omit persistent authority, so hide that choice when false.
 const APPROVAL_OPTS_NO_ALWAYS = APPROVAL_OPTS.filter(o => o !== 'always')
 const LABELS = { always: 'Always allow', deny: 'Deny', once: 'Allow once', session: 'Allow this session' } as const
-const CMD_PREVIEW_LINES = 10
-
 type ApprovalChoice = 'always' | 'deny' | 'once' | 'session'
+type ApprovalUiChoice = ApprovalChoice | 'next' | 'previous' | 'review'
 
 export function approvalOptions(req: ApprovalReq): readonly ApprovalChoice[] {
   if (req.choices) {
@@ -24,6 +23,49 @@ export function approvalOptions(req: ApprovalReq): readonly ApprovalChoice[] {
   return req.allowPermanent === false ? APPROVAL_OPTS_NO_ALWAYS : APPROVAL_OPTS
 }
 
+export function approvalCommandDisplay(req: ApprovalReq): string {
+  return req.approvalId ? JSON.stringify(req.command) : req.command
+}
+
+export function approvalCommandPages(req: ApprovalReq, cols: number, pageSize: number): string[][] {
+  const innerWidth = Math.max(20, cols - 8)
+  const lines = wrapAnsi(approvalCommandDisplay(req), innerWidth, { hard: true, trim: false }).split('\n')
+  const pages: string[][] = []
+
+  for (let offset = 0; offset < lines.length; offset += pageSize) {
+    pages.push(lines.slice(offset, offset + pageSize))
+  }
+
+  return pages.length ? pages : [['']]
+}
+
+export function exactApprovalReviewOptions(
+  pageIndex: number,
+  pageCount: number,
+  reviewed: boolean,
+  decisions: readonly ApprovalChoice[]
+): readonly ApprovalUiChoice[] {
+  if (reviewed) {
+    return decisions
+  }
+
+  const options: ApprovalUiChoice[] = []
+
+  if (pageIndex >= pageCount - 1) {
+    options.push('review')
+  } else {
+    options.push('next')
+  }
+
+  if (pageIndex > 0) {
+    options.push('previous')
+  }
+
+  options.push('deny')
+
+  return options
+}
+
 type ApprovalKey = {
   downArrow?: boolean
   escape?: boolean
@@ -31,7 +73,7 @@ type ApprovalKey = {
   upArrow?: boolean
 }
 
-type ApprovalAction = { kind: 'choose'; choice: ApprovalChoice } | { kind: 'move'; delta: -1 | 1 } | { kind: 'noop' }
+type ApprovalAction = { kind: 'choose'; choice: ApprovalUiChoice } | { kind: 'move'; delta: -1 | 1 } | { kind: 'noop' }
 
 /**
  * Pure key-dispatch for the approval prompt — exported so the regression
@@ -48,7 +90,7 @@ export function approvalAction(
   ch: string,
   key: ApprovalKey,
   sel: number,
-  opts: readonly ApprovalChoice[] = APPROVAL_OPTS
+  opts: readonly ApprovalUiChoice[] = APPROVAL_OPTS
 ): ApprovalAction {
   if (key.escape) {
     return { kind: 'choose', choice: 'deny' }
@@ -75,31 +117,41 @@ export function approvalAction(
   return { kind: 'noop' }
 }
 
-export function ApprovalPrompt({ cols = 80, onChoice, req, t }: ApprovalPromptProps) {
+export function ApprovalPrompt({ cols = 80, onChoice, pageSize = 10, req, t }: ApprovalPromptProps) {
   const [sel, setSel] = useState(0)
-  const opts = approvalOptions(req)
+  const [exactReviewed, setExactReviewed] = useState(false)
+  const [exactPage, setExactPage] = useState(0)
+  const exactRequest = Boolean(req.approvalId)
+  const exactPageSize = Math.max(3, pageSize - 8)
+  const exactPages = approvalCommandPages(req, cols, exactPageSize)
+  const decisions = approvalOptions(req)
+
+  const opts: readonly ApprovalUiChoice[] = exactRequest
+    ? exactApprovalReviewOptions(exactPage, exactPages.length, exactReviewed, decisions)
+    : decisions
 
   useInput((ch, key) => {
     const action = approvalAction(ch, key, sel, opts)
 
     if (action.kind === 'choose') {
-      onChoice(action.choice)
+      if (action.choice === 'next') {
+        setExactPage(page => Math.min(page + 1, exactPages.length - 1))
+        setSel(0)
+      } else if (action.choice === 'previous') {
+        setExactPage(page => Math.max(page - 1, 0))
+        setSel(0)
+      } else if (action.choice === 'review' && exactPage === exactPages.length - 1) {
+        setExactReviewed(true)
+        setSel(0)
+      } else {
+        onChoice(action.choice)
+      }
     } else if (action.kind === 'move') {
       setSel(s => s + action.delta)
     }
   })
 
-  // Wrap long single-line commands to the panel width instead of clipping the
-  // tail (mirrors the CLI approval panel fix — the full command must be
-  // reviewable before approving). Border + paddingX + inner padding ≈ 8 cols.
-  const innerWidth = Math.max(20, cols - 8)
-
-  const rawLines = req.command
-    .split('\n')
-    .flatMap(line => wrapAnsi(line, innerWidth, { hard: true, trim: false }).split('\n'))
-
-  const shown = rawLines.slice(0, CMD_PREVIEW_LINES)
-  const overflow = rawLines.length - shown.length
+  const displayedLines = exactRequest ? exactPages[exactPage]! : [approvalCommandDisplay(req)]
 
   return (
     <Box borderColor={t.color.warn} borderStyle="double" flexDirection="column" paddingX={1}>
@@ -108,17 +160,16 @@ export function ApprovalPrompt({ cols = 80, onChoice, req, t }: ApprovalPromptPr
       </Text>
 
       <Box flexDirection="column" paddingLeft={1}>
-        {shown.map((line, i) => (
-          <Text color={t.color.text} key={i} wrap="truncate-end">
+        {exactRequest ? (
+          <Text color={t.color.muted}>
+            Canonical UTF-8 JSON string · page {exactPage + 1}/{exactPages.length}:
+          </Text>
+        ) : null}
+        {displayedLines.map((line, index) => (
+          <Text color={t.color.text} key={index}>
             {line || ' '}
           </Text>
         ))}
-
-        {overflow > 0 ? (
-          <Text color={t.color.muted}>
-            … +{overflow} more line{overflow === 1 ? '' : 's'} (full text above)
-          </Text>
-        ) : null}
       </Box>
 
       <Text />
@@ -127,7 +178,14 @@ export function ApprovalPrompt({ cols = 80, onChoice, req, t }: ApprovalPromptPr
         <Text key={o}>
           <Text color={t.color.muted} {...chipRowProps(t, sel === i)}>
             {sel === i ? '▸ ' : '  '}
-            {i + 1}. {LABELS[o]}
+            {i + 1}.{' '}
+            {o === 'review'
+              ? 'I reviewed every exact byte'
+              : o === 'next'
+                ? 'Next review page'
+                : o === 'previous'
+                  ? 'Previous review page'
+                  : LABELS[o]}
           </Text>
         </Text>
       ))}
@@ -287,6 +345,7 @@ export function ConfirmPrompt({ onCancel, onConfirm, req, t }: ConfirmPromptProp
 interface ApprovalPromptProps {
   cols?: number
   onChoice: (s: string) => void
+  pageSize?: number
   req: ApprovalReq
   t: Theme
 }

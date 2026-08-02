@@ -2508,7 +2508,8 @@ export const en: Translations = {
         tokenSummary: (used, max) => `${used} / ${max} Tokens`
       },
       session: 'Session',
-      yoloOn: 'YOLO on — auto-approving dangerous commands. Shift+click toggles globally.',
+      yoloOn:
+        'YOLO on — skipping owner prompts for exact terminal calls. Invocation-bound authority still applies. Shift+click toggles globally.',
       yoloOff: 'YOLO off. Shift+click toggles globally.',
       modelNone: 'none',
       noModel: 'no model',
@@ -2741,14 +2742,14 @@ export const en: Translations = {
       run: 'Run',
       command: 'Command',
       moreOptions: 'More approval options',
-      allowSession: 'Allow this session',
-      alwaysAllowMenu: 'Always allow…',
+      allowSession: 'Run this exact call once',
+      alwaysAllowMenu: 'Run exact call…',
       jumpToApproval: 'Approval needed',
       reject: 'Reject',
-      alwaysTitle: 'Always allow this command?',
-      alwaysDescription: pattern =>
-        `This adds the “${pattern}” pattern to your permanent allowlist (~/.hermes/config.yaml). Hermes won’t ask again for commands like this — in this session or any future one.`,
-      alwaysAllow: 'Always allow'
+      alwaysTitle: 'Run this exact terminal call?',
+      alwaysDescription: command =>
+        `Authorization is bound to this exact invocation of “${command}”, is consumed once, and cannot authorize similar commands or future sessions.`,
+      alwaysAllow: 'Run exact call once'
     },
     clarify: {
       notReady: 'Clarify request is not ready yet',

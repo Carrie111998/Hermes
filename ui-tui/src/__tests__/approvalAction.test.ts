@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'vitest'
 
-import { approvalAction, approvalOptions } from '../components/prompts.js'
+import {
+  approvalAction,
+  approvalCommandDisplay,
+  approvalCommandPages,
+  approvalOptions,
+  exactApprovalReviewOptions
+} from '../components/prompts.js'
 
 describe('approvalAction — pure key dispatch for ApprovalPrompt', () => {
   it('maps Esc to deny — parity with global Ctrl+C cancellation', () => {
@@ -70,5 +76,40 @@ describe('approvalAction — pure key dispatch for ApprovalPrompt', () => {
     expect(opts).toEqual(['once', 'deny'])
     expect(approvalAction('2', {}, 0, opts)).toEqual({ kind: 'choose', choice: 'deny' })
     expect(approvalAction('3', {}, 0, opts)).toEqual({ kind: 'noop' })
+  })
+
+  it('renders every exact character with whitespace boundaries unambiguous', () => {
+    const command = `  first\n${'x'.repeat(500)}\nlast  `
+
+    const rendered = approvalCommandDisplay({
+      approvalId: 'a'.repeat(32),
+      command,
+      description: 'exact operation'
+    })
+
+    expect(rendered).toBe(JSON.stringify(command))
+    expect(rendered).toContain('first\\n')
+    expect(rendered).toContain('last  "')
+  })
+
+  it('requires paging through the entire exact operation before review can complete', () => {
+    const req = {
+      approvalId: 'a'.repeat(32),
+      choices: ['once', 'deny'],
+      command: `  first\n${'x'.repeat(500)}\nlast  `,
+      description: 'exact operation'
+    }
+
+    const pages = approvalCommandPages(req, 30, 3)
+
+    expect(pages.length).toBeGreaterThan(1)
+    expect(pages.flat().join('')).toBe(JSON.stringify(req.command))
+    expect(exactApprovalReviewOptions(0, pages.length, false, ['once', 'deny'])).toEqual(['next', 'deny'])
+    expect(exactApprovalReviewOptions(pages.length - 1, pages.length, false, ['once', 'deny'])).toEqual([
+      'review',
+      'previous',
+      'deny'
+    ])
+    expect(exactApprovalReviewOptions(pages.length - 1, pages.length, true, ['once', 'deny'])).toEqual(['once', 'deny'])
   })
 })

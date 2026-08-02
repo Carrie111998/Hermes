@@ -48,24 +48,21 @@ def _grant(*, command: str, code: str = "") -> None:
     )
 
 
-def _forbid_semantic_authority(monkeypatch) -> None:
-    def forbidden(*_args, **_kwargs):
-        raise AssertionError("semantic execution authority must not run")
-
+def _assert_semantic_authority_absent() -> None:
     for name in (
         "detect_hardline_command",
         "detect_dangerous_command",
         "_match_user_deny_rule",
         "_command_matches_permanent_allowlist",
     ):
-        monkeypatch.setattr(approval, name, forbidden)
+        assert not hasattr(approval, name)
 
 
 def test_top_level_exact_hit_and_miss_never_reach_semantic_authority(monkeypatch):
     command = "printf 'exact terminal bytes'"
     code = "print('exact code bytes')\n"
     _grant(command=command, code=code)
-    _forbid_semantic_authority(monkeypatch)
+    _assert_semantic_authority_absent()
 
     mismatch = approval.check_all_command_guards(command + " ", "local")
     terminal_hit = approval.check_all_command_guards(command, "local")
@@ -79,7 +76,7 @@ def test_top_level_exact_hit_and_miss_never_reach_semantic_authority(monkeypatch
 def test_exact_subject_binds_backend_resource_and_raw_input(monkeypatch):
     command = "printf exact"
     _grant(command=command)
-    _forbid_semantic_authority(monkeypatch)
+    _assert_semantic_authority_absent()
 
     backend_miss = approval.check_all_command_guards(
         command,
@@ -188,7 +185,7 @@ def test_plan_capability_rejects_same_command_under_different_cwd(
     terminal_tool.record_session_cwd(SESSION_KEY, str(base))
     command = "printf cwd-bound"
     _grant(command=command)
-    _forbid_semantic_authority(monkeypatch)
+    _assert_semantic_authority_absent()
 
     mismatch = approval.check_all_command_guards(
         command,
@@ -314,7 +311,7 @@ def test_explicit_tool_worker_session_binding_does_not_fall_back_to_default():
 
 def test_exact_miss_uses_one_operation_transport_without_semantics(monkeypatch):
     _grant(command="printf planned")
-    _forbid_semantic_authority(monkeypatch)
+    _assert_semantic_authority_absent()
     seen = []
 
     def approve_once(command, description, **kwargs):
@@ -332,7 +329,7 @@ def test_exact_miss_uses_one_operation_transport_without_semantics(monkeypatch):
     assert seen[0][2]["allow_permanent"] is False
 
 
-def test_terminal_exact_hit_precedes_gateway_lifecycle_text_parser(
+def test_terminal_exact_hit_needs_no_gateway_lifecycle_text_parser(
     monkeypatch,
     tmp_path,
 ):
@@ -353,18 +350,7 @@ def test_terminal_exact_hit_precedes_gateway_lifecycle_text_parser(
     monkeypatch.setattr(terminal_tool, "_session_cwd", {})
     terminal_tool.record_session_cwd(SESSION_KEY, str(tmp_path))
     _grant(command=command)
-    monkeypatch.setattr(
-        "cron.lifecycle_guard.contains_gateway_lifecycle_command_or_referenced_script",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("lifecycle text parser must not run")
-        ),
-    )
-    monkeypatch.setattr(
-        "cron.lifecycle_guard.contains_launchctl_submit_command",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("lifecycle text parser must not run")
-        ),
-    )
+    assert not hasattr(terminal_tool, "_contains_gateway_lifecycle_command")
 
     result = json.loads(
         terminal_tool.terminal_tool(

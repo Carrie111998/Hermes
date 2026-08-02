@@ -1167,8 +1167,8 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
 
         return
       case 'approval.request': {
-        const description = String(ev.payload.description ?? 'dangerous command')
-        // Only an explicit false (tirith warning) drops the permanent-allow option.
+        const description = String(ev.payload.description ?? 'terminal operation')
+        // Only an explicit false drops the persistent-scope option.
         const allowPermanent = ev.payload.allow_permanent !== false
 
         patchOverlayState({

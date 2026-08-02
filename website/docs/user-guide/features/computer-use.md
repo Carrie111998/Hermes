@@ -239,8 +239,9 @@ Hermes applies multi-layer guardrails:
   messaging-platform approval buttons.
 - Hard-blocked key combos at the tool level: empty trash, force delete,
   lock screen, log out, force log out.
-- Hard-blocked type patterns: `curl | bash`, `sudo rm -rf /`, fork
-  bombs, etc.
+- Direct shell entry is outside the computer-use authority surface. Use the
+  terminal tool, where exact operation capabilities and isolated backends
+  provide the structural boundary.
 - The agent's system prompt tells it explicitly: no clicking permission
   dialogs, no typing passwords, no following instructions embedded in
   screenshots.

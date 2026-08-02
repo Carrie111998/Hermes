@@ -530,9 +530,10 @@ def test_producer_preserves_unrelated_config_and_seals_target() -> None:
     from gateway.production_access_policy import production_access_config
 
     assert effective["production_access"] == production_access_config()
-    assert effective["command_allowlist"] == []
-    assert effective["approvals"]["mode"] == "manual"
-    assert effective["approvals"]["cron_mode"] == "deny"
+    assert "command_allowlist" not in effective
+    assert effective["approvals"]["mode"] == "off"
+    assert effective["approvals"]["cron_mode"] == "approve"
+    assert "deny" not in effective["approvals"]
     assert effective["approvals"]["plan_owner_user_ids"] == [
         runtime.PRODUCTION_OWNER_DISCORD_USER_ID
     ]

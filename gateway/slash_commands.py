@@ -3906,7 +3906,7 @@ class GatewaySlashCommandsMixin:
         return _apply_fast_selection(args, persist=persist_global)
 
     async def _handle_approvals_command(self, event: MessageEvent) -> str:
-        """Show or persist the profile-wide dangerous-command approval mode."""
+        """Show or persist the profile-wide operation approval mode."""
         from gateway.slash_access import policy_for_source
         from hermes_cli.approval_mode import run_approval_mode_command
 
@@ -3923,7 +3923,7 @@ class GatewaySlashCommandsMixin:
         return result.message
 
     async def _handle_yolo_command(self, event: MessageEvent) -> Union[str, EphemeralReply]:
-        """Handle /yolo — toggle dangerous command approval bypass for this session only."""
+        """Handle /yolo — toggle exact-operation approval bypass for this session."""
         from tools.approval import (
             capture_session_authority_fence,
             disable_session_yolo,
@@ -5705,19 +5705,12 @@ class GatewaySlashCommandsMixin:
         resumes and the terminal_tool executes the command inline — the same
         flow as the CLI's synchronous input() approval.
 
-        Supports multiple concurrent approvals (parallel subagents,
-        execute_code). Legacy prompts retain FIFO/all controls. Exact
-        one-operation prompts require their opaque ID and never accept FIFO,
-        all, session, or permanent authority.
+        Supports multiple concurrent approvals (parallel subagents and
+        execute_code) without interpreting command prose. Every approval is
+        one exact operation selected by its opaque ID.
 
         Usage:
-            /approve              — approve oldest pending command once
-            /approve all          — approve ALL pending commands at once
-            /approve session      — approve oldest + remember for session
-            /approve all session  — approve all + remember for session
-            /approve always       — approve oldest + remember permanently
-            /approve all always   — approve all + remember permanently
-            /approve <id>         — approve one exact pending command
+            /approve <id>         — approve one exact pending operation once
         """
         source = event.source
         production_boundary = getattr(
@@ -5736,93 +5729,33 @@ class GatewaySlashCommandsMixin:
         session_key = self._session_key_for_source(source)
 
         from tools.approval import (
-            get_pending_gateway_approvals,
             has_blocking_approval,
-            has_exact_blocking_approval,
-            resolve_gateway_approval,
             resolve_gateway_approval_by_id,
             resolve_gateway_owner_escalation_by_id,
         )
 
-        # Parse args: support "all", "all session", "all always", "session", "always"
         args = event.get_command_args().strip().lower().split()
-        resolve_all = "all" in args
-        approval_ids = [value for value in args if re.fullmatch(r"[0-9a-f]{32}", value)]
-        if len(approval_ids) > 1 or (resolve_all and approval_ids):
-            return "Invalid approval selector: choose either one approval_id or `all`."
-        approval_id = approval_ids[0] if approval_ids else ""
-        remaining = [
-            value
-            for value in args
-            if value != "all" and value != approval_id
-        ]
-
-        # Sealed production never converts slash-command prose into a
-        # reusable command grant.  A reviewed plan capability is the only
-        # scoped authority mechanism there; /approve remains an exact
-        # one-shot control for one ID (or the currently visible pending set).
-        # Reject unknown/scope tokens instead of silently approving the oldest
-        # command on a typo.
-        if production_boundary and remaining:
+        if len(args) != 1 or re.fullmatch(r"[0-9a-f]{32}", args[0]) is None:
             return (
-                "Invalid production approval selector: use `/approve`, "
-                "`/approve all`, or `/approve <approval_id>`. Session and "
-                "permanent command authority must come from an owner-approved "
-                "Canonical plan capability."
+                "Use `/approve <approval_id>` with the opaque ID shown in the "
+                "pending prompt. Approvals are exact and one-operation only."
             )
-
-        if any(a in {"always", "permanent", "permanently"} for a in remaining):
-            choice = "always"
-        elif any(a in {"session", "ses"} for a in remaining):
-            choice = "session"
-        else:
-            choice = "once"
-
-        local_pending = get_pending_gateway_approvals(session_key)
-        selected = next(
-            (
-                item for item in local_pending
-                if item.get("approval_id") == approval_id
-            ),
-            None,
-        )
-        if (
-            isinstance(selected, dict)
-            and selected.get("exact_execution") is True
-            and choice not in {"once", "deny"}
-        ):
-            return (
-                "Exact approvals allow only one operation. Use "
-                f"`/approve {approval_id}` or `/deny {approval_id}`."
-            )
-        if not approval_id and has_exact_blocking_approval(session_key):
-            return (
-                "An exact approval is pending. Use the opaque ID shown in its "
-                "prompt: `/approve <approval_id>` or `/deny <approval_id>`. "
-                "FIFO and `all` are unavailable for exact approvals."
-            )
+        approval_id = args[0]
+        choice = "once"
 
         has_local_pending = has_blocking_approval(session_key)
-        if not has_local_pending and not (production_boundary and approval_id):
+        if not has_local_pending and not production_boundary:
             if session_key in self._pending_approvals:
                 self._pending_approvals.pop(session_key)
                 return t("gateway.approval_expired")
             return t("gateway.approve.no_pending")
 
-        count = (
-            resolve_gateway_approval_by_id(
-                session_key,
-                approval_id,
-                choice,
-            )
-            if approval_id
-            else resolve_gateway_approval(
-                session_key,
-                choice,
-                resolve_all=resolve_all,
-            )
+        count = resolve_gateway_approval_by_id(
+            session_key,
+            approval_id,
+            choice,
         )
-        if not count and production_boundary and approval_id:
+        if not count and production_boundary:
             count = await self._run_in_executor_with_context(
                 resolve_gateway_owner_escalation_by_id,
                 approval_id,
@@ -5839,21 +5772,19 @@ class GatewaySlashCommandsMixin:
         if _adapter:
             _adapter.resume_typing_for_chat(source.chat_id)
 
-        logger.info("User approved %d dangerous command(s) via /approve (%s)", count, choice)
+        logger.info("User approved %d exact operation(s) via /approve (%s)", count, choice)
         plural = "plural" if count > 1 else "singular"
         return t(f"gateway.approve.{choice}_{plural}", count=count)
 
     async def _handle_deny_command(self, event: MessageEvent) -> str:
-        """Handle /deny command — reject pending dangerous command(s).
+        """Handle /deny command — reject one pending exact operation.
 
         Signals blocked agent thread(s) with a 'deny' result so they receive
         a definitive BLOCKED message, same as the CLI deny flow.
 
-        ``/deny`` denies the oldest; ``/deny all`` denies everything.
         ``/deny <approval_id> [reason]`` denies one exact pending command.
-        ``/deny <reason>`` (or ``/deny all <reason>``) attaches a one-line
-        reason that is relayed back to the agent so it can adapt instead of
-        only hearing "denied". Ported from qwibitai/nanoclaw#2832.
+        The optional one-line reason is relayed back to the agent so it can
+        adapt instead of only hearing "denied".
         """
         source = event.source
         production_boundary = getattr(
@@ -5873,63 +5804,37 @@ class GatewaySlashCommandsMixin:
 
         from tools.approval import (
             has_blocking_approval,
-            has_exact_blocking_approval,
-            resolve_gateway_approval,
             resolve_gateway_approval_by_id,
             resolve_gateway_owner_escalation_by_id,
         )
 
-        # Parse args: a leading "all" token denies every pending command;
-        # anything after it (or the whole arg string when "all" is absent) is
-        # captured verbatim as the optional deny reason relayed to the agent.
         raw_args = event.get_command_args().strip()
         tokens = raw_args.split()
-        resolve_all = bool(tokens) and tokens[0].lower() == "all"
-        approval_id = (
-            tokens[0].lower()
-            if tokens and re.fullmatch(r"[0-9a-fA-F]{32}", tokens[0])
-            else ""
-        )
-        if resolve_all:
-            reason = raw_args[len(tokens[0]):].strip()
-        elif approval_id:
-            reason = raw_args[len(tokens[0]):].strip()
-        else:
-            reason = raw_args
+        if not tokens or re.fullmatch(r"[0-9a-fA-F]{32}", tokens[0]) is None:
+            return (
+                "Use `/deny <approval_id> [reason]` with the opaque ID shown "
+                "in the pending prompt."
+            )
+        approval_id = tokens[0].lower()
+        reason = raw_args[len(tokens[0]):].strip()
         # Cap to a sane one-liner; the agent only needs a short hint.
         if reason:
             reason = reason[:280].strip()
 
-        if not approval_id and has_exact_blocking_approval(session_key):
-            return (
-                "An exact approval is pending. Use the opaque ID shown in its "
-                "prompt: `/deny <approval_id> [reason]`. FIFO and `all` are "
-                "unavailable for exact approvals."
-            )
-
         has_local_pending = has_blocking_approval(session_key)
-        if not has_local_pending and not (production_boundary and approval_id):
+        if not has_local_pending and not production_boundary:
             if session_key in self._pending_approvals:
                 self._pending_approvals.pop(session_key)
                 return t("gateway.deny.stale")
             return t("gateway.deny.no_pending")
 
-        count = (
-            resolve_gateway_approval_by_id(
-                session_key,
-                approval_id,
-                "deny",
-                reason=reason or None,
-            )
-            if approval_id
-            else resolve_gateway_approval(
-                session_key,
-                "deny",
-                resolve_all=resolve_all,
-                reason=reason or None,
-            )
+        count = resolve_gateway_approval_by_id(
+            session_key,
+            approval_id,
+            "deny",
+            reason=reason or None,
         )
-        if not count and production_boundary and approval_id:
+        if not count and production_boundary:
             count = await self._run_in_executor_with_context(
                 resolve_gateway_owner_escalation_by_id,
                 approval_id,
@@ -5948,7 +5853,7 @@ class GatewaySlashCommandsMixin:
             _adapter.resume_typing_for_chat(source.chat_id)
 
         logger.info(
-            "User denied %d dangerous command(s) via /deny%s",
+            "User denied %d exact operation(s) via /deny%s",
             count, " (with reason)" if reason else "",
         )
         if reason:
