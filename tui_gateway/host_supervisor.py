@@ -139,6 +139,7 @@ class HostSupervisor:
         cwd: str | Path | None = None,
         env: dict[str, str] | None = None,
         rpc_sink: Callable[[dict], None] | None = None,
+        interactive_sink: Callable[[dict], None] | None = None,
         respawn_max: int = 3,
         heartbeat_secs: int = 15,
         expected_build_sha: str | None = None,
@@ -150,6 +151,7 @@ class HostSupervisor:
         self.cwd = Path(cwd) if cwd is not None else _repo_root()
         self.env = env
         self.rpc_sink = rpc_sink or (lambda _obj: None)
+        self.interactive_sink = interactive_sink or (lambda _frame: None)
         self.respawn_max = max(0, int(respawn_max))
         self.heartbeat_secs = max(1, int(heartbeat_secs))
         self.expected_build_sha = expected_build_sha if expected_build_sha is not None else _build_sha()
@@ -166,6 +168,8 @@ class HostSupervisor:
         self._stopped_respawning = False
         self._restart_times: list[float] = []
         self._pending_turns: dict[str, tuple[str, Callable[[dict], None] | None]] = {}
+        self._pending_turn_accepts: dict[str, queue.Queue[dict]] = {}
+        self._accepted_turns: set[str] = set()
         self._pending_controls: dict[str, queue.Queue[dict]] = {}
         self._stderr_tail: list[str] = []
         self._last_progress_counter = 0
@@ -199,6 +203,9 @@ class HostSupervisor:
             self._closing = True
             proc = self._proc
         if proc is None:
+            self._fail_pending_turns(
+                reason="shutdown", message="compute host is not running"
+            )
             return
         try:
             if proc.poll() is None and proc.stdin is not None:
@@ -207,7 +214,24 @@ class HostSupervisor:
         except Exception:
             self._terminate_process(proc)
         finally:
-            self._remove_registry()
+            # Only verified process termination may settle outstanding turns
+            # and release parent capacity leases. If terminate/kill itself
+            # fails, _wait_for_exit performs this handoff when the process
+            # really does stop.
+            if proc.poll() is not None:
+                self._fail_pending_turns(
+                    reason="shutdown", message="compute host shut down"
+                )
+                self._fail_pending_controls(
+                    reason="shutdown", message="compute host shut down"
+                )
+                self._remove_registry()
+            else:
+                logger.warning(
+                    "compute host shutdown did not terminate pid=%s; "
+                    "retaining pending turn ownership",
+                    proc.pid,
+                )
 
     def reconcile_startup_orphan(self) -> str:
         """Terminate a stale registered host, guarding against PID reuse."""
@@ -240,20 +264,32 @@ class HostSupervisor:
         frame: dict[str, Any],
         *,
         on_complete: Callable[[dict], None] | None = None,
-    ) -> str:
+        accept_timeout: float = 30.0,
+    ) -> dict[str, Any]:
+        """Submit a turn and wait for the child's durable acceptance.
+
+        ``turn.accepted`` means the child validated the request reservation and
+        committed all first-turn persistence. A pre-accept ``turn.error`` is
+        returned synchronously to the caller and is never delivered through
+        the terminal callback, because no child turn was started.
+        """
         self.start()
         request_id = str(frame.get("request_id") or uuid.uuid4().hex)
         sid = str(frame.get("sid") or "")
         payload = dict(frame)
         payload["type"] = "turn.start"
         payload["request_id"] = request_id
+        accepted: queue.Queue[dict] = queue.Queue(maxsize=1)
         with self._lock:
             self._pending_turns[request_id] = (sid, on_complete)
+            self._pending_turn_accepts[request_id] = accepted
         try:
             self._send_frame(payload)
         except Exception as exc:
             with self._lock:
                 self._pending_turns.pop(request_id, None)
+                self._pending_turn_accepts.pop(request_id, None)
+                self._accepted_turns.discard(request_id)
             err = {
                 "type": "turn.error",
                 "sid": sid,
@@ -264,11 +300,49 @@ class HostSupervisor:
             if on_complete is not None:
                 on_complete(err)
             raise
-        return request_id
+        try:
+            return accepted.get(timeout=max(0.0, float(accept_timeout)))
+        except queue.Empty as exc:
+            # A missing acknowledgement cannot be treated as a failed send:
+            # the child may already own work. Interrupt and require a verified
+            # terminal before allowing the parent to roll admission back.
+            settled = self.interrupt_and_wait(
+                sid, timeout=_SHUTDOWN_TIMEOUT_SECS
+            )
+            if not settled:
+                raise RuntimeError(
+                    "compute host turn acceptance timed out; child ownership "
+                    "could not be settled"
+                ) from exc
+            raise RuntimeError("compute host turn acceptance timed out") from exc
+        finally:
+            with self._lock:
+                self._pending_turn_accepts.pop(request_id, None)
 
     def interrupt(self, sid: str, *, request_id: str | None = None) -> None:
         self.start()
         self._send_frame({"type": "interrupt", "sid": sid, "request_id": request_id or uuid.uuid4().hex})
+
+    def wait_for_turn(self, sid: str, *, timeout: float) -> bool:
+        """Wait until no submitted turn for ``sid`` remains child-owned."""
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        while True:
+            with self._lock:
+                pending = any(
+                    pending_sid == sid
+                    for pending_sid, _callback in self._pending_turns.values()
+                )
+            if not pending:
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(0.01, remaining))
+
+    def interrupt_and_wait(self, sid: str, *, timeout: float = _SHUTDOWN_TIMEOUT_SECS) -> bool:
+        """Request cancellation and wait for the child's terminal turn frame."""
+        self.interrupt(sid, request_id=f"close-{uuid.uuid4().hex}")
+        return self.wait_for_turn(sid, timeout=timeout)
 
     def reload_mcp(self, sid: str, *, request_id: str | None = None) -> dict:
         return self.control(
@@ -277,6 +351,52 @@ class HostSupervisor:
             payload={"type": "reload_mcp", "sid": sid, "request_id": request_id or uuid.uuid4().hex},
             wait=True,
         )
+
+    def respond_interactive(
+        self,
+        sid: str,
+        *,
+        request_id: str,
+        method: str,
+        params: dict[str, Any] | None = None,
+        wait: bool = True,
+        timeout: float = 30.0,
+    ) -> dict:
+        """Resolve one child-owned interactive waiter over the control pipe.
+
+        ``request_id`` is the stable id allocated by the child waiter.  The
+        envelope gets its own id so retries remain idempotent without aliasing
+        the pending-control queue entry for an earlier attempt.
+        """
+        self.start()
+        control_id = uuid.uuid4().hex
+        frame = {
+            "type": "interactive.response",
+            "sid": str(sid or ""),
+            "request_id": control_id,
+            "interactive_request_id": str(request_id or ""),
+            "method": str(method or ""),
+            "params": dict(params or {}),
+        }
+        q: queue.Queue[dict] | None = None
+        if wait:
+            q = queue.Queue(maxsize=1)
+            with self._lock:
+                self._pending_controls[control_id] = q
+        try:
+            self._send_frame(frame)
+        except Exception:
+            if wait:
+                with self._lock:
+                    self._pending_controls.pop(control_id, None)
+            raise
+        if not wait or q is None:
+            return {"status": "sent", "request_id": control_id}
+        try:
+            return q.get(timeout=timeout)
+        finally:
+            with self._lock:
+                self._pending_controls.pop(control_id, None)
 
     def control(
         self,
@@ -427,10 +547,37 @@ class HostSupervisor:
             if isinstance(message, dict):
                 self.rpc_sink(message)
             return
+        if ftype in {"interactive.request", "interactive.complete"}:
+            try:
+                self.interactive_sink(frame)
+            except Exception:
+                logger.exception("compute host interactive frame sink failed")
+            return
         if ftype in {"turn.end", "turn.error"}:
             self._complete_turn(frame)
             return
-        if ftype in {"control.ack", "control.error", "interrupt.ack", "reload_mcp.ack", "shutdown.ack"}:
+        if ftype == "turn.accepted":
+            request_id = str(frame.get("request_id") or "")
+            with self._lock:
+                pending = self._pending_turns.get(request_id)
+                q = self._pending_turn_accepts.get(request_id)
+                if pending is not None:
+                    self._accepted_turns.add(request_id)
+            if pending is not None and q is not None:
+                try:
+                    q.put_nowait(frame)
+                except queue.Full:
+                    pass
+            return
+        if ftype in {
+            "control.ack",
+            "control.error",
+            "interactive.response.ack",
+            "interactive.response.error",
+            "interrupt.ack",
+            "reload_mcp.ack",
+            "shutdown.ack",
+        }:
             request_id = str(frame.get("request_id") or "")
             with self._lock:
                 q = self._pending_controls.get(request_id)
@@ -453,19 +600,50 @@ class HostSupervisor:
     def _complete_turn(self, frame: dict[str, Any]) -> None:
         request_id = str(frame.get("request_id") or "")
         with self._lock:
-            pending = self._pending_turns.pop(request_id, None)
+            pending = self._pending_turns.get(request_id)
+            accepted = request_id in self._accepted_turns
+            accept_waiter = self._pending_turn_accepts.get(request_id)
         if pending is None:
             return
+        if not accepted:
+            # Validation/persistence failed before model ownership began.
+            # Wake submit_turn synchronously; the parent prompt transaction is
+            # the only code allowed to roll back its lease/rewind candidate.
+            with self._lock:
+                if self._pending_turns.get(request_id) is pending:
+                    self._pending_turns.pop(request_id, None)
+                self._accepted_turns.discard(request_id)
+            if accept_waiter is not None:
+                try:
+                    accept_waiter.put_nowait(frame)
+                except queue.Full:
+                    pass
+            return
         _sid, cb = pending
-        if cb is not None:
-            try:
+        try:
+            if cb is not None:
                 cb(frame)
-            except Exception:
-                logger.exception("compute host turn completion callback failed")
+        except Exception:
+            logger.exception("compute host turn completion callback failed")
+        finally:
+            # Keep the request pending until its parent callback has published
+            # terminal state. interrupt_and_wait therefore proves both child
+            # shutdown and completion of the lease-owning parent transition.
+            with self._lock:
+                if self._pending_turns.get(request_id) is pending:
+                    self._pending_turns.pop(request_id, None)
+                self._accepted_turns.discard(request_id)
 
     def _wait_for_exit(self, proc: subprocess.Popen[str]) -> None:
         code = proc.wait()
         if self._closing:
+            self._fail_pending_turns(
+                reason="shutdown", message=f"compute host exited with code {code}"
+            )
+            self._fail_pending_controls(
+                reason="shutdown", message=f"compute host exited with code {code}"
+            )
+            self._remove_registry()
             return
         with self._lock:
             if self._proc is not proc:
@@ -473,12 +651,19 @@ class HostSupervisor:
             self._proc = None
         self._remove_registry()
         self._fail_pending_turns(reason="crash", message=f"compute host exited with code {code}")
+        self._fail_pending_controls(
+            reason="crash", message=f"compute host exited with code {code}"
+        )
         self._maybe_respawn_after_crash()
 
     def _fail_pending_turns(self, *, reason: str, message: str) -> None:
         with self._lock:
             pending = self._pending_turns
             self._pending_turns = {}
+            accepted = self._accepted_turns
+            self._accepted_turns = set()
+            accept_waiters = self._pending_turn_accepts
+            self._pending_turn_accepts = {}
         for request_id, (sid, cb) in pending.items():
             frame = {
                 "type": "turn.error",
@@ -487,6 +672,14 @@ class HostSupervisor:
                 "reason": reason,
                 "message": message,
             }
+            if request_id not in accepted:
+                q = accept_waiters.get(request_id)
+                if q is not None:
+                    try:
+                        q.put_nowait(frame)
+                    except queue.Full:
+                        pass
+                continue
             self.rpc_sink(
                 {
                     "jsonrpc": "2.0",
@@ -503,6 +696,23 @@ class HostSupervisor:
                     cb(frame)
                 except Exception:
                     logger.exception("compute host error callback failed")
+
+    def _fail_pending_controls(self, *, reason: str, message: str) -> None:
+        """Wake synchronous control callers when the child disappears."""
+        with self._lock:
+            pending = list(self._pending_controls.items())
+        for request_id, q in pending:
+            try:
+                q.put_nowait(
+                    {
+                        "type": "control.error",
+                        "request_id": request_id,
+                        "reason": reason,
+                        "message": message,
+                    }
+                )
+            except queue.Full:
+                pass
 
     def _maybe_respawn_after_crash(self) -> None:
         now = time.monotonic()

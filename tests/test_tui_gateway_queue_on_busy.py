@@ -12,6 +12,7 @@ path retained as a compatibility fallback.
 import threading
 import time
 import types
+from contextlib import contextmanager
 
 import tools.async_delegation as ad
 from tui_gateway import server
@@ -29,6 +30,19 @@ def _session(agent=None, **extra):
         "attached_images": [],
         **extra,
     }
+
+
+@contextmanager
+def _live_session(session, sid="sid"):
+    previous = server._sessions.get(sid)
+    server._sessions[sid] = session
+    try:
+        yield
+    finally:
+        if previous is None:
+            server._sessions.pop(sid, None)
+        else:
+            server._sessions[sid] = previous
 
 
 # ── _enqueue_prompt ────────────────────────────────────────────────────────
@@ -252,11 +266,12 @@ def test_drain_fires_queued_prompt_and_claims_running(monkeypatch):
     )
     session = _session(queued_prompt={"text": "go", "transport": "ws-9"})
 
-    assert server._drain_queued_prompt("r1", "sid", session) is True
-    assert fired == {"rid": "r1", "sid": "sid", "text": "go"}
-    assert session["running"] is True
-    assert session["queued_prompt"] is None
-    assert session["transport"] == "ws-9"
+    with _live_session(session):
+        assert server._drain_queued_prompt("r1", "sid", session) is True
+        assert fired == {"rid": "r1", "sid": "sid", "text": "go"}
+        assert session["running"] is True
+        assert session["queued_prompt"] is None
+        assert session["transport"] == "ws-9"
 
 
 def test_drain_compute_host_forwards_queued_image_paths(monkeypatch):
@@ -274,13 +289,14 @@ def test_drain_compute_host_forwards_queued_image_paths(monkeypatch):
         queued_prompt={"text": "inspect", "image_paths": ["/tmp/b.png"], "transport": "ws-9"}
     )
 
-    assert server._drain_queued_prompt("r1", "sid", session) is True
-    assert captured == {
-        "rid": "r1",
-        "sid": "sid",
-        "text": "inspect",
-        "image_paths": ["/tmp/b.png"],
-    }
+    with _live_session(session):
+        assert server._drain_queued_prompt("r1", "sid", session) is True
+        assert captured == {
+            "rid": "r1",
+            "sid": "sid",
+            "text": "inspect",
+            "image_paths": ["/tmp/b.png"],
+        }
 
 
 
@@ -293,9 +309,10 @@ def test_drain_releases_running_on_dispatch_failure(monkeypatch):
     monkeypatch.setattr(server, "_run_prompt_submit", _boom)
     session = _session(queued_prompt={"text": "go", "transport": None})
 
-    assert server._drain_queued_prompt("r1", "sid", session) is True
-    # Failure must not leave the session wedged as running.
-    assert session["running"] is False
+    with _live_session(session):
+        assert server._drain_queued_prompt("r1", "sid", session) is True
+        # Failure must not leave the session wedged as running.
+        assert session["running"] is False
 
 
 def test_drain_does_not_dispatch_a_prompt_cancelled_after_claim(monkeypatch):
@@ -311,8 +328,9 @@ def test_drain_does_not_dispatch_a_prompt_cancelled_after_claim(monkeypatch):
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not dispatch")),
     )
 
-    assert server._drain_queued_prompt("r1", "sid", session) is True
-    assert session["running"] is False
+    with _live_session(session):
+        assert server._drain_queued_prompt("r1", "sid", session) is True
+        assert session["running"] is False
 
 
 def test_drain_does_not_clear_stop_after_its_final_generation_check(monkeypatch):
@@ -333,9 +351,10 @@ def test_drain_does_not_clear_stop_after_its_final_generation_check(monkeypatch)
     monkeypatch.setattr(server, "_session_uses_compute_host", lambda _session: False)
     monkeypatch.setattr(server, "_run_prompt_submit", stop_before_run)
 
-    assert server._drain_queued_prompt("r1", "sid", session) is True
-    assert agent.clear_calls == 0
-    assert session["running"] is False
+    with _live_session(session):
+        assert server._drain_queued_prompt("r1", "sid", session) is True
+        assert agent.clear_calls == 0
+        assert session["running"] is False
 
 
 def test_drain_continues_with_later_queued_prompt_after_dispatch_failure(monkeypatch):
@@ -353,9 +372,9 @@ def test_drain_continues_with_later_queued_prompt_after_dispatch_failure(monkeyp
         queued_prompts=[{"text": "next", "image_paths": ["/tmp/next.png"], "transport": None}],
     )
 
-    assert server._drain_queued_prompt("r1", "sid", session) is True
-    assert calls == ["broken", "next"]
-    assert session["queued_prompt"] is None
-    assert session.get("queued_prompts") is None
-
+    with _live_session(session):
+        assert server._drain_queued_prompt("r1", "sid", session) is True
+        assert calls == ["broken", "next"]
+        assert session["queued_prompt"] is None
+        assert session.get("queued_prompts") is None
 
