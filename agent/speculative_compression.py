@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 _DB_PERSISTED_MARKER = "_db_persisted"
 _TAIL_MARKER = "_speculative_tail_marker"
 _STATUS_PREFIX = "[speculative:"
+_SPECULATIVE_FENCE_INIT_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -227,9 +228,13 @@ def _apply_speculative_settings(agent: Any, settings: SpeculativeCompressionSett
     if eligible:
         try:
             setattr(agent, "_speculative_compression_manager", get_default_manager())
+            fence = getattr(agent, "_speculative_commit_fence", None)
+            if fence is None or bool(getattr(fence, "_cancelled", False)):
+                setattr(agent, "_speculative_commit_fence", _new_speculative_commit_fence())
         except Exception:
             setattr(agent, "speculative_compression_enabled", False)
             setattr(agent, "_speculative_compression_manager", None)
+            setattr(agent, "_speculative_commit_fence", None)
     else:
         setattr(agent, "_speculative_compression_manager", None)
     return bool(getattr(agent, "speculative_compression_enabled", False))
@@ -244,6 +249,54 @@ def _ensure_speculative_epoch(agent: Any) -> None:
 def _bump_speculative_epoch(agent: Any) -> None:
     _ensure_speculative_epoch(agent)
     agent._speculative_epoch += 1
+
+
+def _new_speculative_commit_fence() -> Any:
+    """Construct the narrow fence used only by speculative installs."""
+    from agent.conversation_compression import CompressionCommitFence
+
+    return CompressionCommitFence()
+
+
+def _get_speculative_commit_fence(agent: Any) -> Any:
+    """Return the agent-local speculative commit fence, creating it safely."""
+    fence = getattr(agent, "_speculative_commit_fence", None)
+    if fence is not None:
+        return fence
+    # Agent construction initializes this field. This narrow initialization
+    # lock keeps older already-running agents safe when installer and
+    # /speculative off race during lazy initialization; it is not held during
+    # candidate preparation or session mutation.
+    with _SPECULATIVE_FENCE_INIT_LOCK:
+        fence = getattr(agent, "_speculative_commit_fence", None)
+        if fence is None:
+            fence = _new_speculative_commit_fence()
+            setattr(agent, "_speculative_commit_fence", fence)
+    return fence
+
+
+def _get_speculative_state_lock(agent: Any) -> threading.Lock:
+    """Return the per-agent lock that serializes runtime switch generations."""
+    lock = getattr(agent, "_speculative_state_lock", None)
+    if lock is not None:
+        return lock
+    with _SPECULATIVE_FENCE_INIT_LOCK:
+        lock = getattr(agent, "_speculative_state_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            setattr(agent, "_speculative_state_lock", lock)
+    return lock
+
+
+def _cancel_speculative_commit_fence(agent: Any) -> None:
+    # Lazily create the same fence an older already-running agent would use in
+    # the installer. This closes the initialization race where /speculative off
+    # could otherwise return before a concurrent installer published its fence.
+    fence = _get_speculative_commit_fence(agent)
+    try:
+        fence.cancel_before_commit()
+    except Exception:
+        logger.debug("speculative commit fence cancellation failed", exc_info=True)
 
 
 def _invalidate_speculative_session(manager: Any, agent: Any) -> None:
@@ -263,12 +316,14 @@ def _invalidate_speculative_session(manager: Any, agent: Any) -> None:
 def reset_speculative_compression_to_config(agent: Any) -> bool:
     """Clear the session override and restore config-driven wiring."""
 
-    setattr(agent, "_speculative_runtime_override", None)
-    manager = getattr(agent, "_speculative_compression_manager", None)
-    setattr(agent, "speculative_compression_enabled", False)
-    _bump_speculative_epoch(agent)
-    _invalidate_speculative_session(manager, agent)
-    return _apply_speculative_settings(agent, _config_speculative_settings())
+    with _get_speculative_state_lock(agent):
+        setattr(agent, "_speculative_runtime_override", None)
+        manager = getattr(agent, "_speculative_compression_manager", None)
+        setattr(agent, "speculative_compression_enabled", False)
+        _bump_speculative_epoch(agent)
+        _cancel_speculative_commit_fence(agent)
+        _invalidate_speculative_session(manager, agent)
+        return _apply_speculative_settings(agent, _config_speculative_settings())
 
 
 def configure_speculative_compression(agent: Any, enabled: bool) -> bool:
@@ -281,26 +336,28 @@ def configure_speculative_compression(agent: Any, enabled: bool) -> bool:
     config.yaml.
     """
 
-    _ensure_speculative_epoch(agent)
-    manager = getattr(agent, "_speculative_compression_manager", None)
-    setattr(agent, "_speculative_runtime_override", bool(enabled))
-    if not enabled:
-        # Clear the flag before cancelling work so a racing foreground or
-        # tool-wait path cannot start more speculative work during invalidation.
-        setattr(agent, "speculative_compression_enabled", False)
-        _bump_speculative_epoch(agent)
-        _invalidate_speculative_session(manager, agent)
-        return False
+    with _get_speculative_state_lock(agent):
+        _ensure_speculative_epoch(agent)
+        manager = getattr(agent, "_speculative_compression_manager", None)
+        setattr(agent, "_speculative_runtime_override", bool(enabled))
+        if not enabled:
+            # Clear the flag before cancelling work so a racing foreground or
+            # tool-wait path cannot start more speculative work during invalidation.
+            setattr(agent, "speculative_compression_enabled", False)
+            _bump_speculative_epoch(agent)
+            _cancel_speculative_commit_fence(agent)
+            _invalidate_speculative_session(manager, agent)
+            return False
 
-    settings = _config_speculative_settings()
-    raw_settings = dict(vars(settings))
-    raw_settings = dict(raw_settings) if isinstance(raw_settings, Mapping) else {}
-    # A runtime ``/speculative on`` is an explicit session override.  Keep all
-    # configured thresholds/gates, but do not require the persisted opt-in bit
-    # to be true for this session.
-    raw_settings["enabled"] = True
-    settings = normalize_speculative_compression_settings(raw_settings)
-    return _apply_speculative_settings(agent, settings)
+        settings = _config_speculative_settings()
+        raw_settings = dict(vars(settings))
+        raw_settings = dict(raw_settings) if isinstance(raw_settings, Mapping) else {}
+        # A runtime ``/speculative on`` is an explicit session override.  Keep all
+        # configured thresholds/gates, but do not require the persisted opt-in bit
+        # to be true for this session.
+        raw_settings["enabled"] = True
+        settings = normalize_speculative_compression_settings(raw_settings)
+        return _apply_speculative_settings(agent, settings)
 
 
 def speculative_compression_status(agent: Any) -> str:
@@ -804,27 +861,33 @@ def schedule_tool_wait_candidate(
             int(request_tokens),
             session_id,
         )
-        if (
-            not getattr(agent, "speculative_compression_enabled", False)
-            or bool(getattr(agent, "speculative_compression_enabled", False))
-            != _enabled_before
-            or getattr(agent, "_speculative_epoch", 0) != _epoch_before
-        ):
-            return "blocked_off"
-        _emit_speculative_status(
-            agent,
-            "queued",
-            "Speculative compaction queued — "
-            + _pressure_status(
-                settings, int(request_tokens), soft_trigger, _hard_trigger
-            ),
-        )
-        disposition = manager.maybe_start(
-            session_id,
-            snapshot,
-            lambda source=compressor: clone_builtin_compressor(source),
-            max_age_seconds=settings.max_age_seconds,
-        )
+        # The runtime switch must serialize the final epoch check with
+        # maybe_start(). Without this, /speculative off can return after the
+        # check but before the worker is launched; a later on could then accept
+        # that old-generation candidate. Snapshot capture remains outside this
+        # narrow lock because it is pure and potentially expensive.
+        with _get_speculative_state_lock(agent):
+            if (
+                not getattr(agent, "speculative_compression_enabled", False)
+                or bool(getattr(agent, "speculative_compression_enabled", False))
+                != _enabled_before
+                or getattr(agent, "_speculative_epoch", 0) != _epoch_before
+            ):
+                return "blocked_off"
+            _emit_speculative_status(
+                agent,
+                "queued",
+                "Speculative compaction queued — "
+                + _pressure_status(
+                    settings, int(request_tokens), soft_trigger, _hard_trigger
+                ),
+            )
+            disposition = manager.maybe_start(
+                session_id,
+                snapshot,
+                lambda source=compressor: clone_builtin_compressor(source),
+                max_age_seconds=settings.max_age_seconds,
+            )
         if disposition in {"started", "coalesced"}:
             _emit_speculative_status(
                 agent,

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import threading
 import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import agent.speculative_compression as speculative
 from agent.speculative_compression import (
     SpeculativeCandidate,
     SpeculativeCompressionManager,
@@ -82,7 +84,101 @@ def test_tool_wait_schedules_when_soft_pressure_is_reached(monkeypatch):
     assert len(manager.calls) == 1
 
 
+def test_tool_wait_epoch_fence_drops_snapshot_before_manager_start(monkeypatch):
+    manager = Manager()
+    agent = _agent(manager)
+    monkeypatch.setattr(
+        "agent.speculative_compression.is_builtin_compression_eligible",
+        lambda **_kwargs: True,
+    )
+    messages = [
+        {"role": "user", "content": "old"},
+        {"role": "user", "content": "tail"},
+    ]
+    capture_started = threading.Event()
+    release_capture = threading.Event()
+    real_capture = speculative.capture_snapshot
+
+    def blocked_capture(*args, **kwargs):
+        capture_started.set()
+        agent.speculative_compression_enabled = False
+        agent._speculative_epoch = 1
+        assert release_capture.wait(2)
+        return real_capture(*args, **kwargs)
+
+    monkeypatch.setattr(speculative, "capture_snapshot", blocked_capture)
+    result = []
+
+    thread = threading.Thread(
+        target=lambda: result.append(
+            schedule_tool_wait_candidate(agent, messages, 800)
+        )
+    )
+    thread.start()
+    assert capture_started.wait(2)
+    release_capture.set()
+    thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    assert result == ["blocked_off"]
+    assert manager.calls == []
+
+
+def test_off_waits_for_scheduler_already_at_manager_start(monkeypatch):
+    """Off must serialize with the final scheduler start, not merely snapshot capture."""
+    manager = Manager()
+    agent = _agent(manager)
+    monkeypatch.setattr(
+        "agent.speculative_compression.is_builtin_compression_eligible",
+        lambda **_kwargs: True,
+    )
+    start_entered = threading.Event()
+    release_start = threading.Event()
+    off_returned = threading.Event()
+
+    def blocked_start(*args, **kwargs):
+        start_entered.set()
+        assert release_start.wait(2)
+        return "started"
+
+    manager.maybe_start = blocked_start
+    scheduled = []
+    scheduler = threading.Thread(
+        target=lambda: scheduled.append(
+            schedule_tool_wait_candidate(
+                agent,
+                [
+                    {"role": "user", "content": "old"},
+                    {"role": "user", "content": "tail"},
+                ],
+                800,
+            )
+        )
+    )
+    scheduler.start()
+    assert start_entered.wait(2)
+
+    off_thread = threading.Thread(
+        target=lambda: (
+            configure_speculative_compression(agent, False), off_returned.set()
+        )
+    )
+    off_thread.start()
+    assert not off_returned.wait(0.1)
+
+    release_start.set()
+    scheduler.join(timeout=2)
+    off_thread.join(timeout=2)
+
+    assert not scheduler.is_alive()
+    assert not off_thread.is_alive()
+    assert scheduled == ["started"]
+    assert off_returned.is_set()
+    assert agent.speculative_compression_enabled is False
+
+
 def test_hard_pressure_without_candidate_requests_synchronous_fallback(monkeypatch):
+
     manager = Manager()
     agent = _agent(manager)
     monkeypatch.setattr(
@@ -112,6 +208,34 @@ def test_candidate_commit_rejection_falls_back_without_installing(monkeypatch):
     messages = [{"role": "user", "content": "current"}]
     result = _try_install_speculative_candidate(agent, messages, "sys", 900, "task-1")
     assert result == (messages, None, False, True)
+
+
+def test_claimed_epoch_is_forwarded_and_cleared_around_install(monkeypatch):
+    class ReadyCandidate:
+        def is_expired(self, _max_age):
+            return False
+
+    manager = Manager(ReadyCandidate())
+    agent = _agent(manager)
+    claimed_epochs = []
+
+    def install(*args, **kwargs):
+        claimed_epochs.append(getattr(agent, "_speculative_epoch_claimed", None))
+        agent._speculative_install_status = "installed"
+        return ["compressed"], "sys"
+
+    agent._compress_context = install
+    monkeypatch.setattr(
+        "agent.speculative_compression.is_builtin_compression_eligible",
+        lambda **_kwargs: True,
+    )
+    messages = [{"role": "user", "content": "current"}]
+
+    result = _try_install_speculative_candidate(agent, messages, "sys", 900, "task-1")
+
+    assert result == (["compressed"], "sys", True, True)
+    assert claimed_epochs == [0]
+    assert agent._speculative_epoch_claimed is None
 
 
 def test_candidate_taken_before_off_is_dropped_without_restoring(monkeypatch):

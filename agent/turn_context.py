@@ -77,6 +77,7 @@ def _try_install_speculative_candidate(
     try:
         from agent.speculative_compression import (
             _emit_speculative_status,
+            _get_speculative_commit_fence,
             is_builtin_compression_eligible,
             speculative_thresholds,
         )
@@ -152,14 +153,22 @@ def _try_install_speculative_candidate(
         "Speculative compaction active — installing the prepared candidate and "
         "committing the compacted context.",
     )
+    commit_fence = _get_speculative_commit_fence(agent)
+    if not commit_fence.begin_commit():
+        setattr(agent, "_speculative_install_status", "rejected")
+        return messages, None, False, force_sync
+    setattr(agent, "_speculative_epoch_claimed", _epoch_before)
     try:
-        compressed, active_system_prompt = agent._compress_context(
-            messages,
-            system_message,
-            approx_tokens=approx_tokens,
-            task_id=task_id,
-            speculative_candidate=candidate,
-        )
+        try:
+            compressed, active_system_prompt = agent._compress_context(
+                messages,
+                system_message,
+                approx_tokens=approx_tokens,
+                task_id=task_id,
+                speculative_candidate=candidate,
+            )
+        finally:
+            setattr(agent, "_speculative_epoch_claimed", None)
     except Exception:
         # Any install failure (candidate splice, durable commit, system-prompt
         # rebuild) degrades to the unchanged synchronous path — the optional
@@ -174,6 +183,8 @@ def _try_install_speculative_candidate(
             "fallback.",
         )
         return messages, None, False, force_sync
+    finally:
+        commit_fence.finish_commit()
     if getattr(agent, "_speculative_install_status", None) != "installed":
         # Only a lock-contended install is worth requeuing: the candidate is
         # still valid and a later attempt can reclaim it without re-running

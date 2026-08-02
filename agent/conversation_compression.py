@@ -480,6 +480,10 @@ class CompressionCommitFence:
         self._lock_release_guard = threading.Lock()
         self._cancelled_lock_release: Optional[Callable[[], None]] = None
         self._cancelled_lock_release_requested = False
+        # Completion marker: a commit that ran to completion disables this
+        # fence generation, so a later speculative attempt cannot reuse it
+        # (cancel_before_commit on a completed fence cancels it).
+        self._commit_completed = False
         # Forward-progress telemetry: the compression worker touches this
         # whenever the streamed summary call produces a token (see
         # ContextCompressor._call_summary_llm). Waiters use it to distinguish
@@ -512,6 +516,12 @@ class CompressionCommitFence:
                 if cancel_event is not None:
                     cancel_event.set()
                 return False
+            if self._commit_completed:
+                # A completed commit is already past the cancellation point.
+                # Keep the fence cancelled so a later speculative attempt
+                # cannot reuse this disabled generation.
+                self._cancelled = True
+                return False
             self._cancelled = True
             if cancel_event is not None:
                 cancel_event.set()
@@ -527,6 +537,9 @@ class CompressionCommitFence:
             return None
         try:
             if self._commit_started:
+                return False
+            if self._commit_completed:
+                self._cancelled = True
                 return False
             self._cancelled = True
             return True
@@ -554,11 +567,14 @@ class CompressionCommitFence:
         # Set while the fence lock is held so observers can never see
         # commit_in_flight=True for a commit that lost to cancellation.
         self._commit_phase.set()
+        self._commit_completed = False
         return True
 
     def finish_commit(self) -> None:
         """Leave a commit boundary entered by :meth:`begin_commit`."""
         self._commit_phase.clear()
+        self._commit_started = False
+        self._commit_completed = True
         self._lock.release()
         if self._admission_revoked:
             # Round-2 #1: a revoke that arrived while THIS commit was in
@@ -2882,9 +2898,6 @@ def compress_context(
                     messages, agent.session_id
                 )
                 live_compressor = agent.context_compressor
-                live_compressor.compression_count = (
-                    int(getattr(live_compressor, "compression_count", 0) or 0) + 1
-                )
                 # Mirror the worker's real verdicts instead of assuming
                 # progress: a no-op candidate (e.g. everything already inside
                 # the tail budget) must feed the anti-thrash accounting the
@@ -3188,6 +3201,13 @@ def compress_context(
         # rotate or rewrite the session.
         if compressed == messages_before_compression:
             if speculative_candidate is not None:
+                # A no-progress candidate is still a real compression attempt:
+                # preserve the anti-thrash accounting used by the synchronous
+                # path, even though it is rejected as a boundary install.
+                live_compressor = agent.context_compressor
+                live_compressor.compression_count = (
+                    int(getattr(live_compressor, "compression_count", 0) or 0) + 1
+                )
                 agent._speculative_install_status = "rejected"
             if messages != messages_before_compression:
                 messages[:] = copy.deepcopy(messages_before_compression)
@@ -3378,6 +3398,8 @@ def compress_context(
             agent._cached_system_prompt = new_system_prompt
 
         _session_commit_succeeded = False
+        _in_place_archive_committed = False
+
         split_status = "not_applicable"
         if agent._session_db:
             split_status = "pending"
@@ -3408,6 +3430,15 @@ def compress_context(
                     # WITHOUT destroying history, unlike a hard replace_messages).
                     # See #38763.
                     agent._session_db.archive_and_compact(agent.session_id, compressed)
+                    # archive_and_compact is the atomic durable compaction
+                    # boundary. A later best-effort prompt write can fail, but
+                    # must not relabel this already-published candidate as
+                    # rejected or skip its foreground accounting.
+                    _in_place_archive_committed = True
+                    _session_commit_succeeded = True
+                    agent._last_flushed_db_idx = 0
+
+
                     split_status = "in_place_committed"
                     # Reset the flush identity set so the next turn's appends are
                     # diffed against the COMPACTED transcript: the compacted dicts
@@ -3522,7 +3553,6 @@ def compress_context(
                     agent._session_db.update_system_prompt(
                         agent.session_id, new_system_prompt
                     )
-                    agent._last_flushed_db_idx = 0
                 else:
                     agent._last_flushed_db_idx = len(compressed)
                     agent._flushed_db_message_session_id = agent.session_id
@@ -3544,17 +3574,27 @@ def compress_context(
                     messages[:] = copy.deepcopy(messages_before_compression)
                     compressed = messages
                     _compression_made_progress = False
-                split_status = (
-                    "aborted"
-                    if locals().get("old_session_id") is None and not in_place
-                    else "failed_not_indexed"
-                )
+                if in_place and _in_place_archive_committed:
+                    split_status = "in_place_committed_prompt_update_failed"
+                else:
+                    split_status = (
+                        "aborted"
+                        if locals().get("old_session_id") is None and not in_place
+                        else "failed_not_indexed"
+                    )
                 # If the rotation rolled back to the parent (orphan-avoidance
                 # above), agent.session_id is the still-indexed parent and
                 # old_session_id was cleared — so this is recovery, not an
                 # un-indexed orphan. Otherwise an earlier step failed before the
                 # child was created and the warning's original meaning holds.
-                if locals().get("old_session_id") is None and not in_place:
+                if in_place and _in_place_archive_committed:
+                    logger.warning(
+                        "Session DB system-prompt update failed after durable "
+                        "in-place compaction for session %s: %s",
+                        agent.session_id or "?",
+                        e,
+                    )
+                elif locals().get("old_session_id") is None and not in_place:
                     logger.warning(
                         "Compression rotation aborted and rolled back to the "
                         "parent session (%s): %s", agent.session_id or "?", e,
@@ -3568,6 +3608,14 @@ def compress_context(
                 if agent._session_db is None or _session_commit_succeeded
                 else "rejected"
             )
+            if agent._speculative_install_status == "installed":
+                # Count speculative work only after the candidate has crossed
+                # the durable session boundary. Rejected assembly/fence paths
+                # and failed publication must not look committed in status/UI.
+                live_compressor = agent.context_compressor
+                live_compressor.compression_count = (
+                    int(getattr(live_compressor, "compression_count", 0) or 0) + 1
+                )
             if agent._speculative_install_status == "installed":
                 logger.info(
                     "speculative compression session=%s disposition=installed "
@@ -3754,7 +3802,18 @@ def compress_context(
             agent.session_id or "none", _pre_msg_count, len(compressed),
             f"{_compressed_est:,}",
         )
-        _commit_status = "committed" if split_status in {"not_applicable", "in_place_committed", "rotated_committed"} else "aborted"
+        _commit_status = (
+            "committed"
+            if split_status
+            in {
+                "not_applicable",
+                "in_place_committed",
+                "in_place_committed_prompt_update_failed",
+                "rotated_committed",
+            }
+            else "aborted"
+        )
+
         _emit_compression_attempt_telemetry(
             agent,
             started_at=_attempt_started_at,

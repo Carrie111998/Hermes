@@ -329,6 +329,37 @@ describe('StatusRule credits notice render priority', () => {
       turnStartedAt: Date.now()
     })
 
+describe('StatusRule', () => {
+  it('shows compression count alongside Pi context after a compaction', () => {
+    const rendered = textContent(StatusRule({ ...baseProps, usage: { ...baseProps.usage, compressions: 3 } }))
+
+    expect(rendered).toContain('opus 4.8 high')
+    expect(rendered).toContain('50k/200k')
+    expect(rendered).toContain('cmp 3')
+    expect(rendered).not.toContain('ready')
+    expect(rendered).not.toContain('~/repo')
+    expect(rendered).not.toContain('90% used')
+    expect(rendered).not.toContain('background')
+    expect(rendered).not.toContain('[')
+  })
+
+  it('hides the Pi compression count before the first compaction', () => {
+    const rendered = textContent(StatusRule({ ...baseProps, usage: { ...baseProps.usage, compressions: 0 } }))
+
+    expect(rendered).not.toContain('cmp ')
+  })
+
+  it('drops the Pi compression count before it can truncate narrow context', () => {
+    const rendered = textContent(StatusRule({ ...baseProps, cols: 79 }))
+
+    expect(rendered).toContain('50k/200k')
+    expect(rendered).not.toContain('cmp 3')
+  })
+
+  it('keeps a WaterTicker mounted for both busy and idle states so idle freezes the last frame', () => {
+    const idle = findWaterTicker(StatusRule(baseProps))
+    const busy = findWaterTicker(StatusRule({ ...baseProps, busy: true }))
+
     const rendered = textContent(element)
 
     // Notice must NOT render while busy.
