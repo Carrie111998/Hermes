@@ -625,11 +625,28 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
 
 
 def _codex_thread_meta_key(agent) -> Optional[str]:
-    """state_meta key holding the codex thread id for this Hermes session."""
+    """state_meta key holding the codex thread id for this conversation.
+
+    Keyed on the LINEAGE ROOT rather than the raw session_id. Context
+    compression rotates session_id to a fresh segment linked by
+    parent_session_id, so keying on the tip would open a new — empty —
+    codex thread every time compression fired, which is precisely the
+    amnesia this exists to prevent. A genuinely new session (daily reset,
+    idle expiry) has no parent, so it is its own root and correctly starts
+    a fresh thread.
+    """
     session_id = getattr(agent, "session_id", None)
     if not session_id:
         return None
-    return f"codex_app_server:thread:{session_id}"
+    root = session_id
+    resolver = getattr(getattr(agent, "_session_db", None),
+                       "get_conversation_root", None)
+    if callable(resolver):
+        try:
+            root = resolver(session_id) or session_id
+        except Exception:
+            logger.debug("conversation-root lookup failed", exc_info=True)
+    return f"codex_app_server:thread:{root}"
 
 
 def _load_codex_thread_id(agent) -> Optional[str]:
