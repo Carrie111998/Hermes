@@ -68,7 +68,13 @@ async def test_attach_replays_buffer_then_streams_live():
     bridge = FakeBridge([b"hello ", b"world", None])
     s = PtySession("k", bridge, buffer_cap=1024, read_timeout=0.01)
     await s.start()
-    await asyncio.sleep(0.05)                      # drain consumes "hello world"
+    deadline = asyncio.get_running_loop().time() + 2.0
+    while (
+        s.buffer.snapshot() != b"hello world"
+        and asyncio.get_running_loop().time() < deadline
+    ):
+        await asyncio.sleep(0.005)
+    assert s.buffer.snapshot() == b"hello world"
     ws = FakeWS()
     await s.attach(ws)
     replay = b"".join(p for kind, p in ws.sent if kind == "bytes")

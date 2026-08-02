@@ -817,10 +817,17 @@ def test_terminal_task_cwd_ssh_sentinel_cwd_falls_back_to_session(monkeypatch):
 
 
 class _ChunkyStdout:
-    def __init__(self):
+    def __init__(self, *, accept_marker: str | None = None):
         self.parts: list[str] = []
+        self.accept_marker = accept_marker
 
     def write(self, text: str) -> int:
+        # A few earlier gateway tests intentionally leave daemon writers alive.
+        # A probe-specific sink keeps those unrelated frames from contaminating
+        # this lock test while retaining deliberately slow, character-at-a-time
+        # writes for every frame under test.
+        if self.accept_marker and self.accept_marker not in text:
+            return len(text)
         for ch in text:
             self.parts.append(ch)
             time.sleep(0.0001)
@@ -839,7 +846,7 @@ class _BrokenStdout:
 
 
 def test_write_json_serializes_concurrent_writes(monkeypatch):
-    out = _ChunkyStdout()
+    out = _ChunkyStdout(accept_marker='"serialization_probe"')
     monkeypatch.setattr(server, "_real_stdout", out)
 
     threads = [
@@ -856,12 +863,10 @@ def test_write_json_serializes_concurrent_writes(monkeypatch):
     for t in threads:
         t.join()
 
-    records = [json.loads(line) for line in "".join(out.parts).splitlines()]
-    probes = [record for record in records if "serialization_probe" in record]
+    probes = [json.loads(line) for line in "".join(out.parts).splitlines()]
 
-    # Other tests may leave legitimate background gateway writers alive. Every
-    # line must still parse independently, and all eight probe frames must be
-    # present exactly once without byte-level interleaving.
+    # All eight probe frames must parse independently and be present exactly
+    # once without byte-level interleaving.
     assert len(probes) == 8
     assert {record["serialization_probe"] for record in probes} == set(range(8))
 
@@ -4610,6 +4615,10 @@ def test_run_prompt_submit_requeues_all_unstarted_notifications_with_real_thread
     nested_started = threading.Event()
     release_nested = threading.Event()
     turns = []
+    token = str(time.time_ns())
+    session_id = f"sid-real-thread-{token}"
+    session_key = f"session-real-thread-{token}"
+    process_ids = [f"proc-real-thread-{token}-{index}" for index in range(1, 4)]
 
     def _recording_thread(*args, **kwargs):
         thread = real_thread_class(*args, **kwargs)
@@ -4619,7 +4628,7 @@ def test_run_prompt_submit_requeues_all_unstarted_notifications_with_real_thread
     class _BlockingNotificationAgent(_RecordingAgent):
         def run_conversation(self, prompt, conversation_history=None, stream_callback=None, **_kwargs):
             turns.append(prompt)
-            if "proc_batch_1" in prompt:
+            if process_ids[0] in prompt:
                 nested_started.set()
                 # The parent test releases this gate in ``finally``. Avoid a
                 # wall-clock timeout here: under a saturated full-suite worker,
@@ -4630,29 +4639,29 @@ def test_run_prompt_submit_requeues_all_unstarted_notifications_with_real_thread
 
     monkeypatch.setattr(server.threading, "Thread", _recording_thread)
     session = _session(
-        session_key="session-a",
+        session_key=session_key,
         agent=_BlockingNotificationAgent(turns),
         running=True,
     )
     events = [
         {
             "type": "completion",
-            "session_id": f"proc_batch_{index}",
-            "session_key": "session-a",
+            "session_id": process_id,
+            "session_key": session_key,
             "command": "safe-test-command",
             "exit_code": 0,
             "output": f"owned-{index}",
         }
-        for index in range(1, 4)
+        for index, process_id in enumerate(process_ids, start=1)
     ]
     isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
     for event in events:
         isolated_queue.put(event)
     monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
-    server._sessions["sid_a"] = session
+    server._sessions[session_id] = session
 
     try:
-        server._run_prompt_submit("rid-a", "sid_a", session, "session-a-turn")
+        server._run_prompt_submit("rid-a", session_id, session, "session-a-turn")
 
         assert nested_started.wait(timeout=30)
         threads[0].join(timeout=30)
@@ -4666,22 +4675,20 @@ def test_run_prompt_submit_requeues_all_unstarted_notifications_with_real_thread
         # with a deadline (an event may be transiently held by a poller
         # mid-cycle) and assert exactly {batch_2, batch_3} come back.
         queued: dict = {}
+        expected_queued = set(process_ids[1:])
         deadline = time.time() + 30.0
-        while time.time() < deadline and set(queued) != {
-            "proc_batch_2",
-            "proc_batch_3",
-        }:
+        while time.time() < deadline and set(queued) != expected_queued:
             try:
                 evt = isolated_queue.get(timeout=0.1)
             except _queue_mod.Empty:
                 continue
             queued[evt["session_id"]] = evt
-        assert set(queued) == {"proc_batch_2", "proc_batch_3"}
+        assert set(queued) == expected_queued
     finally:
         release_nested.set()
         for thread in threads:
             thread.join(timeout=30)
-        server._sessions.pop("sid_a", None)
+        server._sessions.pop(session_id, None)
         while not isolated_queue.empty():
             isolated_queue.get_nowait()
         for event in events:
