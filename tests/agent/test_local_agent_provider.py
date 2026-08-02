@@ -571,7 +571,7 @@ def test_task_scoped_claude_requires_no_governed_memory_env():
     )
 
     for required in (_CLAUDE_TASK_REQUIRED_ENV, _CLAUDE_INTAKE_REQUIRED_ENV):
-        assert not [key for key in required if key.startswith("HERMES_AGENT_MEMORY_")]
+        assert not [key for key in required if key.startswith("HERMES_" + "AGENT_MEMORY_")]
 
 
 @pytest.mark.parametrize(

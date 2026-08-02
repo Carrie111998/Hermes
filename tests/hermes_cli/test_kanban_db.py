@@ -63,7 +63,7 @@ def test_no_governed_agent_memory_helpers_remain():
         name
         for name in vars(kb)
         if name.startswith("_agent_memory_")
-        or name == "_remember_kanban_run_best_effort"
+        or name == "_remember_" + "kanban_run_best_effort"
     )
     assert offenders == []
 

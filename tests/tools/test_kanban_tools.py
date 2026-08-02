@@ -117,36 +117,6 @@ def test_resolver_worker_gets_only_readonly_surface_and_resolve(monkeypatch, tmp
     assert not leaked, f"mutation tools leaked into resolver surface: {leaked}"
 
 
-def test_ordinary_developer_worker_hides_resolver_memory_tools(monkeypatch, tmp_path):
-    """The narrow Agent Memory handoff tools are resolver-only.
-
-    An ordinary dispatcher-spawned worker (developer profile) must never see
-    ``kanban_agent_memory_recall`` / ``kanban_agent_memory_write`` — those exist
-    solely so the read-only Resolver can produce canonical receipts. Ordinary
-    workers use the ``hermes agent-memory`` CLI instead.
-    """
-    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_dev")
-    monkeypatch.setenv("HERMES_PROFILE", "developer")
-    home = tmp_path / ".hermes"
-    home.mkdir()
-    monkeypatch.setenv("HERMES_HOME", str(home))
-
-    import tools.kanban_tools  # ensure registered
-    from model_tools import _clear_tool_defs_cache, get_tool_definitions
-    from tools.registry import invalidate_check_fn_cache
-
-    invalidate_check_fn_cache()
-    _clear_tool_defs_cache()
-    schema = get_tool_definitions(
-        enabled_toolsets=["terminal"],
-        quiet_mode=True,
-    )
-    names = {s["function"].get("name") for s in schema if "function" in s}
-    assert "kanban_complete" in names
-    assert "kanban_agent_memory_recall" not in names
-    assert "kanban_agent_memory_write" not in names
-
-
 def test_model_tool_cache_separates_task_and_work_inbox_surfaces(
     monkeypatch, tmp_path,
 ):
@@ -1375,26 +1345,6 @@ def _make_product_worker_env(monkeypatch, tmp_path):
     return tid
 
 
-def _make_product_memory_worker_env(monkeypatch, tmp_path):
-    from hermes_cli import kanban_db as kb
-
-    tid = _make_product_worker_env(monkeypatch, tmp_path)
-    kb.ensure_product_board_defaults("prod")
-    vault = tmp_path / "Agent Memory"
-    vault.mkdir()
-    monkeypatch.setenv("HERMES_AGENT_MEMORY_VAULT", str(vault))
-    with kb.connect(board="prod") as conn:
-        with kb.authorized_governance_write(), kb.write_txn(conn):
-            conn.execute(
-                "UPDATE tasks SET idempotency_key=? WHERE id=?",
-                (f"memory-{tid}", tid),
-            )
-        claimed = kb.claim_task(conn, tid, board="prod")
-        assert claimed is not None and claimed.current_run_id is not None
-        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
-    return tid
-
-
 def test_product_block_requires_attempted_resolutions(monkeypatch, tmp_path):
     from tools import kanban_tools as kt
     from hermes_cli import kanban_db as kb
@@ -2264,7 +2214,6 @@ def test_bounded_preflight_keeps_normal_values_exact_with_oversized_metadata():
         "hermes_assignee": "resolver",
         "step_key": "development",
         "resume_status": "ready",
-        "memory_capture_id": "capture-1",
         "reason": reason,
         "attempted_resolutions": attempts,
         "metadata": {
