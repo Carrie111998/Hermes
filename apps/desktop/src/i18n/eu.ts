@@ -590,7 +590,7 @@ export const eu = defineLocale({
       unavailableTitle: 'Gateway ezarpenak ez daude erabilgarri',
       unavailableDesc: 'Mahaigaineko IPC zubiak ez ditu gateway ezarpenak erakusten.',
       title: 'Gateway konexioa',
-      envOverride: 'ingurunearen override-a',
+      envOverride: 'env override-a',
       intro:
         'Lokala lehenetsia. Erabili urrunekoa aplikazio honek Hermes backend-a beste nonbait gidatu behar duenean. Profil bakoitzeko override-ak behean.',
       appliesTo: 'Non aplikatzen den',
@@ -598,9 +598,9 @@ export const eu = defineLocale({
       defaultConnection: 'Override-ik ez duen profil bakoitzarentzako konexio lehenetsia.',
       profileConnection: profile =>
         `"${profile}" profila aktibo dagoenean soilik erabiltzen den konexioa. Aukeratu Erabili gateway lehenetsia bere override-a kentzeko.`,
-      envOverrideTitle: 'Ingurune-aldagaiek mahaigaineko saio hau kontrolatzen ari dira.',
+      envOverrideTitle: 'env aldagaiek mahaigaineko saio hau kontrolatzen ari dira.',
       envOverrideDesc:
-        'Kendu HERMES_DESKTOP_REMOTE_URL eta HERMES_DESKTOP_REMOTE_TOKEN beheko ezarpena erabiltzeko.',
+        'Kendu HERMES_DESKTOP_REMOTE_URL eta HERMES_DESKTOP_REMOTE_TOKEN beheko env ezarpena erabiltzeko.',
       modeTitle: 'Konexio-modua',
       localTitle: 'Gateway lokala',
       localDesc: 'Hasi Hermes backend pribatu bat localhost-en. Hau da lehenetsia eta lineaz kanpo funtzionatzen du.',
@@ -687,7 +687,7 @@ export const eu = defineLocale({
       saveFailed: 'Ezin izan dira gateway ezarpenak gorde',
       sshTitle: 'Konektatu SSH bidez',
       sshDesc:
-        'Hermes urrutian abiarazten da SSH bidez eta tunel bidez konektatzen da aplikazio honetara — ezer hasi edo agerrarazi beharrik gabe. Gakoetan oinarritutako SSH sarbidea behar du ostalarira.',
+        'Hermes urrutiko makina batean abiarazten da SSH bidez eta tunel bidez aplikazio honetara konektatzen da — ez duzu ezer abiarazi edo kanpotik ireki behar. Ostalarirako gakoetan oinarritutako SSH sarbidea behar da.',
       sshTrustHint: 'Aurkezten den lehen ostalari gakoa fidagarritzat hartu eta ainguratzen da; geroko aldaketek huts egiten dute.',
       sshHostTitle: 'Ostalaria',
       sshHostDesc: 'user@host, edo ~/.ssh/config-eko Host alias bat.',
@@ -732,7 +732,7 @@ export const eu = defineLocale({
       loading: 'MCP zerbitzariak kargatzen...',
       failedLoad: 'MCP konfigurazioa kargatzeak huts egin du',
       nameRequiredTitle: 'Izena behar da',
-      nameRequiredMessage: 'Emadazu MCP zerbitzari honi konfigurazio-gako bat.',
+      nameRequiredMessage: 'Esleitu konfigurazio-gako bat MCP zerbitzari honi.',
       objectRequired: 'Zerbitzariaren konfigurazioa JSON objektu bat izan behar da',
       invalidJson: 'MCP JSON baliogabea',
       saveFailed: 'Gordetzeak huts egin du',
@@ -804,9 +804,9 @@ export const eu = defineLocale({
       reasoning: 'Arrazoitzea',
       reasoningOff: 'Itzalita',
       defaultsFailed: 'Modelo lehenetsiak gordetzeak huts egin du',
-      auxiliaryTitle: 'Modelo laguntzaileak',
+      auxiliaryTitle: 'Modelo osagarriak',
       resetAllToMain: 'Berrezarri guztiak nagusira',
-      auxiliaryDesc: 'Laguntza-zereginak modelo nagusian exekutatzen dira lehenetsita. Esleitu modelo dedikatu bat edozein zeregineri override-a egiteko.',
+      auxiliaryDesc: 'Zeregin osagarriak modelo nagusian exekutatzen dira lehenetsita. Esleitu modelo dedikatu bat edozein zeregineri override-a egiteko.',
       setToMain: 'Ezarri nagusi gisa',
       change: 'Aldatu',
       autoUseMain: 'auto · erabili modelo nagusia',
@@ -816,12 +816,44 @@ export const eu = defineLocale({
       notInCatalog: "ez dago hornitzaile honen modelo zerrendan — deiak ordezko batera eror daitezke.",
       tasks: {
         vision: { label: 'Ikusmena', hint: 'Irudien analisia' },
-        web_extract: { label: 'Web ateratzea', hint: 'Orrien laburpena' },
+        web_extract: { label: 'Web erauzketa', hint: 'Orrien laburpena' },
         compression: { label: 'Konpresioa', hint: 'Testuinguruaren trinkotzea' },
         skills_hub: { label: 'Skills hub', hint: 'Trebetasunen bilaketa' },
         approval: { label: 'Onarpena', hint: 'Onarpen adimenduna' },
-        mcp: { label: 'MCP', hint: 'MCP tresnen bideratzea' }
+        mcp: { label: 'MCP', hint: 'MCP tresnen bideratzea' },
+        title_generation: { label: 'Izenburuen sorrera', hint: 'Saioen izenburuak' },
+        curator: { label: 'Curator', hint: 'Skill-erabileraren berrikuspena' }
       }
+    },
+    providers: {
+      connectAccount: 'Konektatu kontu bat',
+      haveApiKey: 'Ba al duzu API gako bat?',
+      intro:
+        'Hasi saioa harpidetza batekin — ez dago API gakorik kopiatu beharrik. Hermes-ek nabigatzaileko saio-hasiera egiten du zuretzat, hemen aplikazioan bertan.',
+      connected: 'Konektatuta',
+      collapse: 'Tolestu',
+      connectAnother: 'Konektatu beste hornitzaile bat',
+      otherProviders: 'Beste hornitzaileak',
+      disconnect: 'Deskonektatu',
+      disconnectInTerminal: 'Deskonektatu (kentze-komandoa terminalean exekutatzen du)',
+      removeConfirm: provider => `Kendu ${provider}?`,
+      removeExternalGeneric: provider => `${provider} bere CLI propioa du — kendu hortik.`,
+      removeKeyManaged: provider => `${provider} API gako batetik konfiguratuta dago. Kendu API gakoen ataletik.`,
+      removeTerminalConfirm: (provider, command) =>
+        `Deskonektatu ${provider}? Honek "${command}" exekutatzen du terminalean kredentziala garbitzeko.`,
+      removeTerminalRunning: provider => `${provider} deskonexioa terminalean exekutatzen…`,
+      removedTitle: 'Kontua kenduta',
+      removedMessage: provider => `${provider} kendu da.`,
+      failedRemove: provider => `Ezin izan da ${provider} kendu`,
+      noProviderKeys: 'Ez dago hornitzaileen API gakorik erabilgarri.',
+      searchKeys: 'Bilatu hornitzaileak…',
+      noKeysMatch: 'Ez dago hornitzailerik zure bilaketarekin bat egiten duenik.',
+      localEndpoint: {
+        title: 'Lokal / endpoint pertsonalizatua',
+        description:
+          'Zuzendu Hermes OpenAI-rekin bateragarria den edozein endpoint-era (Zyphra, vLLM, llama.cpp, Ollama, etab.).'
+      },
+      loading: 'Hornitzaileak kargatzen...'
     }
   }
 })
