@@ -168,8 +168,9 @@ def test_cold_profile_hydrates_external_source_without_global_env(
 
 def test_homeassistant_explicit_disable_in_multiplex_config(monkeypatch, tmp_path):
     """Secondary profiles with platforms.homeassistant.enabled: false must remain
-    disabled even when HASS_TOKEN is present in os.environ."""
+    disabled even when HASS_TOKEN is present in os.environ or scoped secrets."""
     import yaml
+    from agent import secret_scope as ss
     from gateway.config import load_gateway_config, Platform
     from gateway.run import _profile_runtime_scope
 
@@ -183,10 +184,26 @@ def test_homeassistant_explicit_disable_in_multiplex_config(monkeypatch, tmp_pat
         yaml.dump({"platforms": {"homeassistant": {"enabled": False}}})
     )
 
+    # 1. Standard env override check
     with _profile_runtime_scope(p):
         cfg = load_gateway_config()
         ha_cfg = cfg.platforms.get(Platform.HOMEASSISTANT)
         assert ha_cfg is not None
         assert ha_cfg.enabled is False
+
+    # 2. Multiplex active check with scoped secrets
+    ss.set_multiplex_active(True)
+    with _profile_runtime_scope(p):
+        tok = ss.set_secret_scope(
+            {"HASS_TOKEN": "mock_token", "HASS_URL": "http://ha.local:8123"}
+        )
+        try:
+            cfg = load_gateway_config()
+            ha_cfg = cfg.platforms.get(Platform.HOMEASSISTANT)
+            assert ha_cfg is not None
+            assert ha_cfg.enabled is False
+        finally:
+            ss.reset_secret_scope(tok)
+
 
 
