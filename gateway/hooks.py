@@ -111,6 +111,15 @@ class HookRegistry:
 
                 hook_name = manifest.get("name", hook_dir.name)
                 events = manifest.get("events", [])
+                # A single-event shorthand (`events: agent:start`) is a YAML
+                # scalar, not a list. Wrap it so it isn't iterated
+                # character-by-character (which would register the handler under
+                # 'a','g','e',… and silently never fire).
+                if isinstance(events, str):
+                    events = [events]
+                if not isinstance(events, list):
+                    print(f"[hooks] Skipping {hook_name}: 'events' must be a string or list", flush=True)
+                    continue
                 if not events:
                     print(f"[hooks] Skipping {hook_name}: no events declared", flush=True)
                     continue

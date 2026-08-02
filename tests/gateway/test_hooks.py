@@ -46,6 +46,23 @@ class TestDiscoverAndLoad:
         assert "agent:start" in reg.loaded_hooks[0]["events"]
 
 
+    def test_loads_hook_with_scalar_events(self, tmp_path):
+        # `events: agent:start` (a single-event YAML scalar, not a list) must
+        # register the handler under the whole event name — not iterated
+        # character-by-character under 'a','g','e',… (which silently never fires).
+        _create_hook(tmp_path, "scalar-hook", "agent:start",
+                      "def handle(event_type, context):\n    pass\n")
+
+        reg = HookRegistry()
+        with patch("gateway.hooks.HOOKS_DIR", tmp_path), _patch_no_builtins(reg):
+            reg.discover_and_load()
+
+        assert len(reg.loaded_hooks) == 1
+        assert "agent:start" in reg._handlers
+        assert "a" not in reg._handlers  # not registered per-character
+        assert reg.loaded_hooks[0]["events"] == ["agent:start"]
+
+
     def test_skips_no_events(self, tmp_path):
         hook_dir = tmp_path / "empty-hook"
         hook_dir.mkdir()
