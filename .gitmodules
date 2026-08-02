@@ -1,37 +1,37 @@
 [submodule "vendor/openclaw-mirror/AI-Scientist"]
 	path = vendor/openclaw-mirror/AI-Scientist
-	url = https://github.com/SakanaAI/AI-Scientist.git
+	url = https://github.com/zapabob/AI-Scientist.git
 [submodule "vendor/openclaw-mirror/ATLAS"]
 	path = vendor/openclaw-mirror/ATLAS
 	url = https://github.com/zapabob/ATLAS.git
 [submodule "vendor/openclaw-mirror/ShinkaEvolve"]
 	path = vendor/openclaw-mirror/ShinkaEvolve
-	url = https://github.com/SakanaAI/ShinkaEvolve.git
+	url = https://github.com/zapabob/ShinkaEvolve.git
 [submodule "vendor/neuro-sdk"]
 	path = vendor/neuro-sdk
-	url = https://github.com/VedalAI/neuro-sdk.git
+	url = https://github.com/zapabob/neuro-sdk.git
 [submodule "vendor/openmanus"]
 	path = vendor/openmanus
-	url = https://github.com/FoundationAgents/OpenManus.git
+	url = https://github.com/zapabob/OpenManus.git
 [submodule "vendor/SillyTavern"]
 	path = vendor/SillyTavern
-	url = https://github.com/SillyTavern/SillyTavern.git
+	url = https://github.com/zapabob/SillyTavern.git
 	branch = release
 [submodule "vendor/shinka-osint"]
 	path = vendor/shinka-osint
 	url = https://github.com/zapabob/ShinkaEvolve-OSINT.git
 [submodule "vendor/buzz"]
 	path = vendor/buzz
-	url = https://github.com/block/buzz.git
+	url = https://github.com/zapabob/buzz.git
 [submodule "vendor/officecli"]
 	path = vendor/officecli
-	url = https://github.com/iOfficeAI/OfficeCLI.git
+	url = https://github.com/zapabob/OfficeCLI.git
 [submodule "vendor/akari-video"]
 	path = vendor/akari-video
-	url = https://github.com/zapabob/akari-video
+	url = https://github.com/zapabob/akari-video.git
 [submodule "vendor/cloakbrowser"]
 	path = vendor/cloakbrowser
-	url = https://github.com/CloakHQ/cloakbrowser.git
+	url = https://github.com/zapabob/cloakbrowser.git
 [submodule "vendor/airi"]
 	path = vendor/airi
 	url = https://github.com/zapabob/airi.git

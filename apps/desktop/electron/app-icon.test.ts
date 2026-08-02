@@ -21,21 +21,40 @@ test('windows candidates prefer resources then assets .ico over apple-touch', ()
   )
 })
 
-test('darwin includes icns before png favicon fallback', () => {
+test('darwin prefers native icns/.png ahead of the packaged .ico', () => {
   const candidates = appIconCandidates({
     appRoot: '/Applications/Hermes.app/Contents/Resources/app.asar',
     resourcesPath: '/Applications/Hermes.app/Contents/Resources',
     platform: 'darwin'
   })
 
-  assert.equal(candidates[0], path.join('/Applications/Hermes.app/Contents/Resources', 'icon.ico'))
-  assert.ok(candidates.includes(path.join('/Applications/Hermes.app/Contents/Resources', 'icon.icns')))
+  // extraResources always ships resources/icon.ico (the Windows PE-stamp
+  // source) on every platform, so the macOS-native .icns/.png must be ordered
+  // ahead of it; otherwise .ico would win first-pick on Darwin even when a
+  // proper .icns exists.
+  assert.equal(candidates[0], path.join('/Applications/Hermes.app/Contents/Resources', 'icon.icns'))
+  assert.equal(candidates[1], path.join('/Applications/Hermes.app/Contents/Resources', 'icon.png'))
+  assert.equal(candidates[2], path.join('/Applications/Hermes.app/Contents/Resources', 'icon.ico'))
   assert.ok(
     candidates.indexOf(path.join('/Applications/Hermes.app/Contents/Resources/app.asar', 'assets', 'icon.icns')) <
       candidates.indexOf(
         path.join('/Applications/Hermes.app/Contents/Resources/app.asar', 'public', 'apple-touch-icon.png')
       )
   )
+})
+
+test('resolveAppIconPath prefers icns when Darwin resources include icns and ico', () => {
+  const resourcesPath = '/Applications/Hermes.app/Contents/Resources'
+  const icnsPath = path.join(resourcesPath, 'icon.icns')
+  const icoPath = path.join(resourcesPath, 'icon.ico')
+  const existing = new Set([icnsPath, icoPath])
+
+  const resolved = resolveAppIconPath(
+    { appRoot: '/Applications/Hermes.app/Contents/Resources/app.asar', resourcesPath, platform: 'darwin' },
+    filePath => existing.has(filePath)
+  )
+
+  assert.equal(resolved, icnsPath)
 })
 
 test('resolveAppIconPath returns first existing candidate', () => {

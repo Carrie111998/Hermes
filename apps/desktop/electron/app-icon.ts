@@ -33,22 +33,27 @@ export function appIconCandidates({
 
   // 1) Packaged extraResources copy — byte-identical to the PE stamp source.
   if (resourcesPath) {
-    out.push(path.join(resourcesPath, 'icon.ico'))
-
     if (platform === 'darwin') {
+      // extraResources always ships resources/icon.ico (the Windows PE-stamp
+      // source) on every platform, so without this reorder the .ico candidate
+      // would win first-pick on Darwin even though a native .icns/.png exists.
+      // Prefer macOS-native formats so the dock icon stays crisp.
       out.push(path.join(resourcesPath, 'icon.icns'))
       out.push(path.join(resourcesPath, 'icon.png'))
     }
+
+    out.push(path.join(resourcesPath, 'icon.ico'))
   }
 
   // 2) Dev / asar-packaged assets next to the app (files: assets/**).
   for (const root of roots) {
-    out.push(path.join(root, 'assets', 'icon.ico'))
-
     if (platform === 'darwin') {
+      // Same reasoning as the extraResources block: keep .icns ahead of .ico on
+      // macOS so the native format is selected when both are present.
       out.push(path.join(root, 'assets', 'icon.icns'))
     }
 
+    out.push(path.join(root, 'assets', 'icon.ico'))
     out.push(path.join(root, 'assets', 'icon.png'))
   }
 
