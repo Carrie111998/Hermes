@@ -120,6 +120,12 @@ If a skill is missing from this list but present in the repo, the catalog is reg
 | [`polymarket`](/docs/user-guide/skills/bundled/research/research-polymarket) | Query Polymarket: markets, prices, orderbooks, history. | `research/polymarket` |
 | [`research-paper-writing`](/docs/user-guide/skills/bundled/research/research-research-paper-writing) | Write ML papers for NeurIPS/ICML/ICLR: design→submit. | `research/research-paper-writing` |
 
+## security
+
+| Skill | Description | Path |
+|-------|-------------|------|
+| [`bitwarden-secrets`](/docs/user-guide/skills/bundled/security/security-bitwarden-secrets) | Authoritative Bitwarden Secrets Manager (bws) protocol for Hermes — encrypted-only cache, no plaintext at rest, masked output, child-process env hygiene. | `security/bitwarden-secrets` |
+
 ## smart-home
 
 | Skill | Description | Path |
