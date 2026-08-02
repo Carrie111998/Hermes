@@ -3025,24 +3025,81 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         self._execute_write(_do)
 
-    def replace_gateway_routing_entries(
-        self, entries: Dict[str, str], *, scope: str = ""
-    ) -> None:
-        """Atomically replace the routing index for *scope* with *entries*.
+    def insert_gateway_routing_entry_if_absent(
+        self, session_key: str, entry_json: str, *, scope: str = ""
+    ) -> str:
+        """Seed a routing key once and return its authoritative stored value.
 
-        Mirrors the sessions.json full-rewrite semantics: keys absent from
-        *entries* are removed (pruned/reset sessions disappear from the
-        index).  Runs as a single write transaction.  Other scopes are
-        untouched.
+        The insert and read share one ``BEGIN IMMEDIATE`` transaction so a
+        legacy importer that loses the insert race observes the competing
+        canonical row instead of overwriting it with its stale candidate.
         """
-        now = time.time()
+        if not session_key or not entry_json:
+            raise ValueError("session_key and entry_json are required")
 
         def _do(conn):
-            conn.execute("DELETE FROM gateway_routing WHERE scope = ?", (scope,))
+            conn.execute(
+                """INSERT INTO gateway_routing (scope, session_key, entry_json, updated_at)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT(scope, session_key) DO NOTHING""",
+                (scope, session_key, entry_json, time.time()),
+            )
+            row = conn.execute(
+                "SELECT entry_json FROM gateway_routing "
+                "WHERE scope = ? AND session_key = ?",
+                (scope, session_key),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("gateway routing insert did not produce a row")
+            return str(row["entry_json"])
+
+        return self._execute_write(_do)
+
+    def replace_gateway_routing_entries(
+        self,
+        entries: Dict[str, str],
+        *,
+        scope: str = "",
+        delete_expected: Optional[Dict[str, str]] = None,
+    ) -> None:
+        """Reconcile the routing index for *scope* in one write transaction.
+
+        Upserts every ``session_key -> entry_json`` in *entries*.  For each
+        ``session_key -> expected_json`` in *delete_expected* the row is
+        deleted only when its stored ``entry_json`` still equals
+        *expected_json* — a compare-and-delete guard.  A sibling writer that
+        changed that same key after the caller's snapshot no longer matches, so
+        its newer route survives and the caller's stale delete becomes a no-op
+        (#9006 concurrency follow-up).  Rows for keys the caller does not name
+        are left untouched, so a whole-index save also never deletes a sibling's
+        concurrent insert into the same scope.  Other scopes are untouched.
+
+        A key present in both *entries* and *delete_expected* is upserted (the
+        live index wins); the delete is skipped for it.  ``delete_expected=None``
+        (the default) upserts *entries* without removing anything.  Deletes and
+        upserts share one transaction so the reconcile is atomic.
+        """
+        now = time.time()
+        to_delete = [
+            (k, expected)
+            for k, expected in (delete_expected or {}).items()
+            if k and expected is not None and k not in entries
+        ]
+
+        def _do(conn):
+            if to_delete:
+                conn.executemany(
+                    "DELETE FROM gateway_routing "
+                    "WHERE scope = ? AND session_key = ? AND entry_json = ?",
+                    [(scope, k, expected) for k, expected in to_delete],
+                )
             if entries:
                 conn.executemany(
-                    "INSERT INTO gateway_routing (scope, session_key, entry_json, updated_at) "
-                    "VALUES (?, ?, ?, ?)",
+                    """INSERT INTO gateway_routing (scope, session_key, entry_json, updated_at)
+                       VALUES (?, ?, ?, ?)
+                       ON CONFLICT(scope, session_key) DO UPDATE SET
+                           entry_json = excluded.entry_json,
+                           updated_at = excluded.updated_at""",
                     [(scope, k, v, now) for k, v in entries.items() if k and v],
                 )
 

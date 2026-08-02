@@ -1470,6 +1470,21 @@ class TestGatewayRoutingTable:
             user_id=user_id,
         )
 
+    def _entry_data(self, session_key, session_id):
+        return {
+            "session_key": session_key,
+            "session_id": session_id,
+            "created_at": "2026-01-01T00:00:00",
+            "updated_at": "2026-01-01T00:00:00",
+        }
+
+    def _write_legacy_entry(self, tmp_path, session_key, session_id):
+        entry_data = self._entry_data(session_key, session_id)
+        (tmp_path / "sessions.json").write_text(
+            json.dumps({session_key: entry_data}), encoding="utf-8"
+        )
+        return entry_data
+
     def test_index_survives_restart_without_sessions_json(self, tmp_path):
         """Full SessionEntry state rehydrates from state.db alone."""
         config = GatewayConfig()
@@ -1492,6 +1507,27 @@ class TestGatewayRoutingTable:
         assert rehydrated.model_override == {"model": "test-model"}
         restarted._db.close()
 
+    def test_mixed_json_mapping_keys_persist_to_canonical_store(self, tmp_path):
+        """Change detection accepts every mapping the JSON encoder accepts."""
+        config = GatewayConfig(write_sessions_json=False)
+        store = SessionStore(sessions_dir=tmp_path, config=config)
+        entry = store.get_or_create_session(self._source())
+
+        assert store.set_session_metadata(
+            entry.session_key,
+            "mixed_mapping",
+            {1: "integer key", "2": "string key"},
+        )
+        assert store._db is not None
+        store._db.close()
+
+        restarted = SessionStore(sessions_dir=tmp_path, config=config)
+        assert restarted.get_session_metadata(
+            entry.session_key, "mixed_mapping"
+        ) == {"1": "integer key", "2": "string key"}
+        assert restarted._db is not None
+        restarted._db.close()
+
     def test_write_sessions_json_false_stops_producing_file(self, tmp_path):
         config = GatewayConfig(write_sessions_json=False)
         store = SessionStore(sessions_dir=tmp_path, config=config)
@@ -1505,4 +1541,580 @@ class TestGatewayRoutingTable:
         assert recovered.session_id == entry.session_id
         restarted._db.close()
 
+    def test_successful_empty_canonical_load_preserves_live_entry(self, tmp_path):
+        key = "agent:main:telegram:group:-100:42"
+        live = SessionEntry.from_dict(self._entry_data(key, "live-session"))
+        store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+        store._entries[key] = live
+
+        store._ensure_loaded()
+
+        assert store._entries[key] is live
+        assert store._entries[key].session_id == "live-session"
+        store._db.close()
+
+    def test_canonical_row_overwrites_conflicting_live_entry(self, tmp_path):
+        import hermes_state
+
+        key = "agent:main:telegram:group:-100:42"
+        canonical = self._entry_data(key, "canonical-session")
+        db = hermes_state.SessionDB()
+        db.save_gateway_routing_entry(
+            key, json.dumps(canonical), scope=str(tmp_path.resolve())
+        )
+        db.close()
+
+        store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+        store._entries[key] = SessionEntry.from_dict(
+            self._entry_data(key, "live-stale-session")
+        )
+        store._ensure_loaded()
+
+        assert store._entries[key].session_id == "canonical-session"
+        store._db.close()
+
+    def test_canonical_load_failure_retains_live_entry_for_retry(self, tmp_path):
+        key = "agent:main:telegram:group:-100:42"
+        live = SessionEntry.from_dict(self._entry_data(key, "live-session"))
+        store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+        store._entries[key] = live
+        store._db.load_gateway_routing_entries = MagicMock(
+            side_effect=RuntimeError("canonical unavailable")
+        )
+
+        with pytest.raises(RuntimeError, match="canonical unavailable"):
+            store._ensure_loaded()
+
+        assert store._loaded is False
+        assert store._entries[key] is live
+        store._db.close()
+
+    def test_transient_canonical_load_failure_fails_closed_then_retries(self, tmp_path):
+        """A failed DB read must not make the legacy mirror authoritative."""
+        import hermes_state
+
+        key = "agent:main:telegram:dm:chat-1"
+        canonical = self._entry_data(key, "canonical-session")
+        self._write_legacy_entry(tmp_path, key, "stale-legacy-session")
+
+        db = hermes_state.SessionDB()
+        scope = str(tmp_path.resolve())
+        db.save_gateway_routing_entry(key, json.dumps(canonical), scope=scope)
+        db.close()
+
+        store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+        real_load = store._db.load_gateway_routing_entries
+        calls = 0
+
+        def fail_once(*, scope):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("transient routing read failure")
+            return real_load(scope=scope)
+
+        store._db.load_gateway_routing_entries = fail_once
+        with pytest.raises(RuntimeError, match="transient routing read failure"):
+            store._ensure_loaded()
+
+        assert store._loaded is False
+        assert store._entries == {}
+        assert json.loads(real_load(scope=scope)[key]) == canonical
+
+        store._ensure_loaded()
+        assert store._entries[key].session_id == "canonical-session"
+        assert calls == 2
+        store._db.close()
+
+    def test_transient_canonical_parse_failure_preserves_row_and_retries(
+        self, tmp_path
+    ):
+        """A parse failure cannot authorize sessions.json to replace the DB row."""
+        import hermes_state
+
+        key = "agent:main:telegram:dm:chat-1"
+        canonical = self._entry_data(key, "canonical-session")
+        self._write_legacy_entry(tmp_path, key, "stale-legacy-session")
+
+        db = hermes_state.SessionDB()
+        scope = str(tmp_path.resolve())
+        db.save_gateway_routing_entry(key, json.dumps(canonical), scope=scope)
+        db.close()
+
+        store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+        real_json_loads = json.loads
+        calls = 0
+
+        def fail_once(payload, *args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise ValueError("transient canonical parse failure")
+            return real_json_loads(payload, *args, **kwargs)
+
+        with patch("gateway.session.json.loads", side_effect=fail_once):
+            with pytest.raises(ValueError, match="transient canonical parse failure"):
+                store._ensure_loaded()
+            assert store._loaded is False
+            assert store._entries == {}
+            store._ensure_loaded()
+
+        assert store._entries[key].session_id == "canonical-session"
+        assert real_json_loads(
+            store._db.load_gateway_routing_entries(scope=scope)[key]
+        ) == canonical
+        store._db.close()
+
+    def test_absent_legacy_key_is_seeded_once_during_successful_load(self, tmp_path):
+        """A proven-empty canonical slot is seeded immediately and only once."""
+        key = "agent:main:telegram:dm:chat-1"
+        self._write_legacy_entry(tmp_path, key, "legacy-session")
+
+        store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+        store._ensure_loaded()
+        scope = store._routing_scope()
+        stored = store._db.load_gateway_routing_entries(scope=scope)
+        assert json.loads(stored[key])["session_id"] == "legacy-session"
+        store._db.close()
+
+        self._write_legacy_entry(tmp_path, key, "later-stale-session")
+        restarted = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+        restarted._ensure_loaded()
+        assert restarted._entries[key].session_id == "legacy-session"
+        restarted._db.close()
+
+    def test_legacy_seed_persists_only_sanitized_entry_data(self, tmp_path):
+        key = "agent:main:telegram:dm:chat-1"
+        entry_data = self._entry_data(key, "legacy-session")
+        entry_data["model_override"] = {
+            "model": "safe-model",
+            "api_key": "must-not-persist",
+            "api_mode": "responses",
+        }
+        (tmp_path / "sessions.json").write_text(
+            json.dumps({key: entry_data}), encoding="utf-8"
+        )
+
+        store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+        store._ensure_loaded()
+
+        persisted = store._db.load_gateway_routing_entries(
+            scope=store._routing_scope()
+        )[key]
+        assert "must-not-persist" not in persisted
+        assert json.loads(persisted)["model_override"] == {"model": "safe-model"}
+        store._db.close()
+
+    def test_non_object_legacy_json_does_not_block_canonical_load(self, tmp_path):
+        import hermes_state
+
+        key = "agent:main:telegram:dm:chat-1"
+        canonical = self._entry_data(key, "canonical-session")
+        (tmp_path / "sessions.json").write_text("[]", encoding="utf-8")
+
+        db = hermes_state.SessionDB()
+        db.save_gateway_routing_entry(
+            key, json.dumps(canonical), scope=str(tmp_path.resolve())
+        )
+        db.close()
+
+        store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+        store._ensure_loaded()
+        assert store._entries[key].session_id == "canonical-session"
+        store._db.close()
+
+    def test_legacy_import_cas_failure_is_retryable_and_idempotent(self, tmp_path):
+        key = "agent:main:telegram:dm:chat-1"
+        self._write_legacy_entry(tmp_path, key, "legacy-session")
+
+        store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+        real_insert = store._db.insert_gateway_routing_entry_if_absent
+        calls = 0
+
+        def fail_once(session_key, entry_json, *, scope=""):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("transient routing CAS failure")
+            return real_insert(session_key, entry_json, scope=scope)
+
+        store._db.insert_gateway_routing_entry_if_absent = fail_once
+        with pytest.raises(RuntimeError, match="transient routing CAS failure"):
+            store._ensure_loaded()
+        assert store._loaded is False
+        assert store._entries == {}
+
+        store._ensure_loaded()
+        store._ensure_loaded()
+        assert calls == 2
+        assert store._entries[key].session_id == "legacy-session"
+        assert len(store._db.load_gateway_routing_entries(scope=store._routing_scope())) == 1
+        store._db.close()
+
+    def test_competing_writer_wins_legacy_import_cas(self, tmp_path):
+        """Import adopts the canonical winner when another writer fills the slot."""
+        import hermes_state
+
+        key = "agent:main:telegram:dm:chat-1"
+        self._write_legacy_entry(tmp_path, key, "legacy-session")
+
+        store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+        scope = store._routing_scope()
+        competitor = hermes_state.SessionDB()
+        competing = self._entry_data(key, "competing-session")
+        real_insert = store._db.insert_gateway_routing_entry_if_absent
+        raced = False
+
+        def insert_after_competitor(session_key, entry_json, *, scope=""):
+            nonlocal raced
+            if not raced:
+                raced = True
+                competitor.save_gateway_routing_entry(
+                    session_key, json.dumps(competing), scope=scope
+                )
+            return real_insert(session_key, entry_json, scope=scope)
+
+        store._db.insert_gateway_routing_entry_if_absent = insert_after_competitor
+        store._ensure_loaded()
+
+        assert raced is True
+        assert store._entries[key].session_id == "competing-session"
+        persisted = store._db.load_gateway_routing_entries(scope=scope)
+        assert json.loads(persisted[key]) == competing
+        competitor.close()
+        store._db.close()
+
+    def test_competing_writer_key_mismatch_fails_closed(self, tmp_path):
+        """When legacy seeding loses the insert-if-absent race, the authoritative
+        canonical winner must still satisfy the table-key/session_key invariant.
+        A raced writer that filled the slot with a payload claiming a different
+        key fails the load closed rather than routing under a disclaimed key."""
+        import hermes_state
+
+        key = "agent:main:telegram:dm:chat-1"
+        self._write_legacy_entry(tmp_path, key, "legacy-session")
+
+        store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+        competitor = hermes_state.SessionDB()
+        # Poison payload: table key is `key`, but session_key claims another.
+        poison = self._entry_data("agent:main:telegram:dm:other", "poison-session")
+        real_insert = store._db.insert_gateway_routing_entry_if_absent
+        raced = False
+
+        def insert_after_competitor(session_key, entry_json, *, scope=""):
+            nonlocal raced
+            if not raced:
+                raced = True
+                competitor.save_gateway_routing_entry(
+                    session_key, json.dumps(poison), scope=scope
+                )
+            return real_insert(session_key, entry_json, scope=scope)
+
+        store._db.insert_gateway_routing_entry_if_absent = insert_after_competitor
+        with pytest.raises(ValueError, match="does not match entry session_key"):
+            store._ensure_loaded()
+
+        assert raced is True
+        assert store._loaded is False
+        assert store._entries == {}
+        competitor.close()
+        store._db.close()
+
+    def test_construction_failure_with_present_store_fails_closed(self, tmp_path):
+        """An existing canonical store that fails to open must NOT authorize the
+        legacy sessions.json mirror — construction failure fails closed."""
+        import hermes_state
+
+        key = "agent:main:telegram:dm:chat-1"
+        canonical = self._entry_data(key, "canonical-session")
+        self._write_legacy_entry(tmp_path, key, "stale-legacy-session")
+
+        db = hermes_state.SessionDB()
+        db.save_gateway_routing_entry(
+            key, json.dumps(canonical), scope=str(tmp_path.resolve())
+        )
+        db.close()
+        assert (tmp_path / "state.db").exists()
+
+        # SessionDB construction/schema/open now fails while state.db is present.
+        with patch(
+            "hermes_state.SessionDB",
+            side_effect=hermes_state.sqlite3.DatabaseError("schema migration failed"),
+        ):
+            store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+
+        assert store._db is None
+        assert store._canonical_store_open_failed is True
+
+        with pytest.raises(RuntimeError, match="present but failed to open"):
+            store._ensure_loaded()
+        assert store._loaded is False
+        # The stale legacy entry never became authoritative.
+        assert store._entries == {}
+
+    def test_construction_failure_without_store_allows_legacy_fallback(self, tmp_path):
+        """A genuinely absent canonical store keeps the historical JSONL
+        fallback — proving the fail-closed path is distinguishable from an
+        unavailable store."""
+        import hermes_state
+
+        key = "agent:main:telegram:dm:chat-1"
+        self._write_legacy_entry(tmp_path, key, "legacy-session")
+        assert not (tmp_path / "state.db").exists()
+
+        with patch(
+            "hermes_state.SessionDB",
+            side_effect=hermes_state.sqlite3.DatabaseError("sqlite unavailable"),
+        ):
+            store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+
+        assert store._db is None
+        assert store._canonical_store_open_failed is False
+
+        store._ensure_loaded()
+        assert store._entries[key].session_id == "legacy-session"
+
+    def test_concurrent_foreign_row_survives_save_but_owned_removal_deletes(
+        self, tmp_path
+    ):
+        """A sibling writer's insert/update after our load must survive the next
+        whole-index save, while an owned key removed from the index is still
+        deleted (reconcile, not blank-replace) (#9006 concurrency follow-up)."""
+        import hermes_state
+
+        scope = str(tmp_path.resolve())
+        key_a = "agent:main:telegram:dm:chatA"
+        key_b = "agent:main:telegram:dm:chatB"
+
+        db = hermes_state.SessionDB()
+        db.save_gateway_routing_entry(
+            key_a, json.dumps(self._entry_data(key_a, "sessionA")), scope=scope
+        )
+        db.close()
+
+        store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+        store._ensure_loaded()
+        assert set(store._entries) == {key_a}
+
+        competitor = hermes_state.SessionDB()
+        # Foreign INSERT after our load snapshot.
+        competitor.save_gateway_routing_entry(
+            key_b, json.dumps(self._entry_data(key_b, "sessionB")), scope=scope
+        )
+        store._save()
+        rows = store._db.load_gateway_routing_entries(scope=scope)
+        assert set(rows) == {key_a, key_b}
+        assert json.loads(rows[key_b])["session_id"] == "sessionB"
+
+        # Foreign UPDATE of the same different row after our load.
+        competitor.save_gateway_routing_entry(
+            key_b, json.dumps(self._entry_data(key_b, "sessionB2")), scope=scope
+        )
+        store._save()
+        rows = store._db.load_gateway_routing_entries(scope=scope)
+        assert json.loads(rows[key_b])["session_id"] == "sessionB2"  # not reverted
+
+        # An OWNED key removed from the in-memory index is still deleted.
+        del store._entries[key_a]
+        store._save()
+        rows = store._db.load_gateway_routing_entries(scope=scope)
+        assert set(rows) == {key_b}
+        competitor.close()
+        store._db.close()
+
+    def test_loaded_sibling_row_update_survives_ordinary_save(self, tmp_path):
+        """A row included in the canonical load snapshot must not be re-upserted
+        unchanged: a sibling's concurrent update to that row survives the next
+        whole-index save, while a genuine local edit to another loaded row still
+        persists and an owned removal still deletes (#9006 concurrency
+        follow-up)."""
+        import hermes_state
+
+        scope = str(tmp_path.resolve())
+        key_a = "agent:main:telegram:dm:chatA"
+        key_b = "agent:main:telegram:dm:chatB"
+
+        db = hermes_state.SessionDB()
+        db.save_gateway_routing_entry(
+            key_a, json.dumps(self._entry_data(key_a, "sessionA")), scope=scope
+        )
+        db.save_gateway_routing_entry(
+            key_b, json.dumps(self._entry_data(key_b, "sessionB")), scope=scope
+        )
+        db.close()
+
+        store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+        store._ensure_loaded()
+        # Both rows are part of the load snapshot (unlike a post-load foreign
+        # insert), so both sit in the stale in-memory index.
+        assert set(store._entries) == {key_a, key_b}
+
+        # A sibling updates B AFTER our load; our in-memory B is now stale.
+        competitor = hermes_state.SessionDB()
+        competitor.save_gateway_routing_entry(
+            key_b, json.dumps(self._entry_data(key_b, "sessionB2")), scope=scope
+        )
+
+        # A genuine local edit to A triggers a whole-index save.
+        store._entries[key_a].session_id = "sessionA2"
+        store._save()
+
+        rows = store._db.load_gateway_routing_entries(scope=scope)
+        # The sibling's B update survives — unchanged B was not re-upserted...
+        assert json.loads(rows[key_b])["session_id"] == "sessionB2"
+        # ...while the genuine local change to A is persisted.
+        assert json.loads(rows[key_a])["session_id"] == "sessionA2"
+
+        # An owned key removed from the index is still deleted, and B still
+        # keeps the sibling value across the delete-driven save.
+        del store._entries[key_a]
+        store._save()
+        rows = store._db.load_gateway_routing_entries(scope=scope)
+        assert set(rows) == {key_b}
+        assert json.loads(rows[key_b])["session_id"] == "sessionB2"
+        competitor.close()
+        store._db.close()
+
+    def test_sibling_same_key_update_survives_owned_removal(self, tmp_path):
+        """A sibling's concurrent update to the SAME key we own must survive when
+        we remove that key locally and save. The delete has to be CAS-guarded on
+        the payload this store observed — an unconditional key-only delete would
+        erase the sibling's newer route (#9006 concurrency follow-up)."""
+        import hermes_state
+
+        scope = str(tmp_path.resolve())
+        key = "agent:main:telegram:dm:chatA"
+
+        db = hermes_state.SessionDB()
+        db.save_gateway_routing_entry(
+            key, json.dumps(self._entry_data(key, "sessionA")), scope=scope
+        )
+        db.close()
+
+        store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+        store._ensure_loaded()
+        assert set(store._entries) == {key}
+
+        # A sibling updates the SAME key AFTER our load; our in-memory copy of
+        # that key is now stale, and so is the payload we believe the DB holds.
+        competitor = hermes_state.SessionDB()
+        competitor.save_gateway_routing_entry(
+            key, json.dumps(self._entry_data(key, "sessionA2")), scope=scope
+        )
+
+        # We drop the owned key locally and save. The delete must not clobber the
+        # sibling's newer value the store never observed.
+        del store._entries[key]
+        store._save()
+
+        rows = store._db.load_gateway_routing_entries(scope=scope)
+        assert set(rows) == {key}  # NOT deleted — payload no longer ours
+        assert json.loads(rows[key])["session_id"] == "sessionA2"
+        competitor.close()
+        store._db.close()
+
+    def test_sibling_same_key_update_survives_stale_prune(self, tmp_path):
+        """The hourly ``prune_old_entries`` path must also CAS-guard same-key
+        deletes: a sibling's newer route for a key we prune on a stale
+        ``updated_at`` survives instead of being erased."""
+        import hermes_state
+
+        scope = str(tmp_path.resolve())
+        key = "agent:main:telegram:dm:chatA"
+
+        db = hermes_state.SessionDB()
+        db.save_gateway_routing_entry(
+            key, json.dumps(self._entry_data(key, "sessionA")), scope=scope
+        )
+        db.close()
+
+        store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+        store._ensure_loaded()
+
+        competitor = hermes_state.SessionDB()
+        competitor.save_gateway_routing_entry(
+            key, json.dumps(self._entry_data(key, "sessionA2")), scope=scope
+        )
+
+        # _entry_data's updated_at is far older than one day, so this key prunes.
+        removed = store.prune_old_entries(max_age_days=1)
+        assert removed == 1  # locally pruned
+
+        rows = store._db.load_gateway_routing_entries(scope=scope)
+        assert json.loads(rows[key])["session_id"] == "sessionA2"  # sibling wins
+        competitor.close()
+        store._db.close()
+
+    def test_unchanged_owned_key_still_deletes_on_removal(self, tmp_path):
+        """CAS-guarding must not over-preserve: an owned key whose DB payload is
+        still exactly what we observed is deleted when removed locally."""
+        import hermes_state
+
+        scope = str(tmp_path.resolve())
+        key = "agent:main:telegram:dm:chatA"
+
+        db = hermes_state.SessionDB()
+        db.save_gateway_routing_entry(
+            key, json.dumps(self._entry_data(key, "sessionA")), scope=scope
+        )
+        db.close()
+
+        store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+        store._ensure_loaded()
+        assert set(store._entries) == {key}
+
+        # No sibling touched the row: the DB still holds exactly our payload.
+        del store._entries[key]
+        store._save()
+
+        rows = store._db.load_gateway_routing_entries(scope=scope)
+        assert rows == {}
+        store._db.close()
+
+    def test_canonical_key_session_key_mismatch_fails_closed(self, tmp_path):
+        """A canonical row whose payload session_key disagrees with its table
+        key is inconsistent and must fail the load closed, not route under a key
+        the entry does not claim."""
+        import hermes_state
+
+        scope = str(tmp_path.resolve())
+        table_key = "agent:main:telegram:dm:chatX"
+        payload = self._entry_data("agent:main:telegram:dm:chatY", "sessionX")
+
+        db = hermes_state.SessionDB()
+        db.save_gateway_routing_entry(table_key, json.dumps(payload), scope=scope)
+        db.close()
+
+        store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+        with pytest.raises(ValueError, match="does not match entry session_key"):
+            store._ensure_loaded()
+        assert store._loaded is False
+        assert store._entries == {}
+        store._db.close()
+
+    def test_legacy_key_session_key_mismatch_is_skipped_not_seeded(self, tmp_path):
+        """An inconsistent legacy entry is skipped, so it never seeds a poison
+        canonical row that would later fail every load closed."""
+        good = "agent:main:telegram:dm:chatGood"
+        bad_key = "agent:main:telegram:dm:chatBad"
+        (tmp_path / "sessions.json").write_text(
+            json.dumps(
+                {
+                    good: self._entry_data(good, "good-session"),
+                    bad_key: self._entry_data(
+                        "agent:main:telegram:dm:other", "bad-session"
+                    ),
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+        store._ensure_loaded()
+
+        assert store._entries[good].session_id == "good-session"
+        assert bad_key not in store._entries
+        rows = store._db.load_gateway_routing_entries(scope=store._routing_scope())
+        assert set(rows) == {good}
+        store._db.close()
 

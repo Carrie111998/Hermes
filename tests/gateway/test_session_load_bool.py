@@ -57,30 +57,32 @@ class TestSessionLoadBoolCorruption:
 
     def test_bool_entry_skipped_not_fatal(self, tmp_path):
         """A bool entry must not crash the loop or block other sessions."""
+        valid_key = "agent:main:telegram:dm:123456"
         data = {
             "_README": "test sentinel",
             "corrupted_key": True,
-            "valid_key": self._valid_entry(),
+            valid_key: self._valid_entry(),
         }
         store = self._make_store(tmp_path, data)
         store._ensure_loaded()
 
         # The valid entry must still be loaded
-        assert "valid_key" in store._entries
-        assert store._entries["valid_key"].session_id == "20260101_120000_abc12345"
+        assert valid_key in store._entries
+        assert store._entries[valid_key].session_id == "20260101_120000_abc12345"
         # The corrupted entry must NOT be loaded
         assert "corrupted_key" not in store._entries
 
     def test_string_entry_skipped(self, tmp_path):
         """A string entry must also be skipped without crashing."""
+        valid_key = "agent:main:telegram:dm:123456"
         data = {
             "bad_string": "not a dict",
-            "valid_key": self._valid_entry("20260101_130000_def67890"),
+            valid_key: self._valid_entry("20260101_130000_def67890"),
         }
         store = self._make_store(tmp_path, data)
         store._ensure_loaded()
 
-        assert "valid_key" in store._entries
+        assert valid_key in store._entries
         assert "bad_string" not in store._entries
 
 
