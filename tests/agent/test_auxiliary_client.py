@@ -4168,12 +4168,16 @@ class TestCustomEndpointApiKeyInheritance:
         assert captured.get("api_key") == "no-key-required"
 
 
-class TestMoaAggregatorStreamingBypass:
-    def test_moa_aggregator_stream_bypasses_relay_for_codex_auxiliary_client(self, monkeypatch):
-        """The MoA facade owns the streaming contract. For Codex Responses-shim
-        clients (openai-codex, xai-oauth), call_llm must return the provider's
-        direct create() result instead of routing through Relay's managed
-        stream, which cannot iterate a completed SimpleNamespace (#74903).
+class TestMoaAggregatorStreamingLifecycle:
+    def test_codex_auxiliary_completed_stream_survives_lifecycle_adapter(
+        self, monkeypatch
+    ):
+        """The lifecycle adapter unwraps a completed Codex shim response.
+
+        Codex Responses-shim clients consume their provider stream internally
+        and return a completed response. The common auxiliary stream boundary
+        must return it directly without iteration or a special lifecycle
+        bypass (#74903).
         """
 
         completed = SimpleNamespace(
@@ -4193,9 +4197,6 @@ class TestMoaAggregatorStreamingBypass:
             "agent.auxiliary_client._get_cached_client",
             lambda *args, **kwargs: (client, "gpt-5.6-sol"),
         )
-        relay_stream = MagicMock(side_effect=AssertionError("_relay_sync_stream must not be used"))
-        monkeypatch.setattr("agent.auxiliary_client._relay_sync_stream", relay_stream)
-
         result = call_llm(
             task="moa_aggregator",
             provider="openai-codex",
@@ -4206,7 +4207,6 @@ class TestMoaAggregatorStreamingBypass:
 
         assert result is completed
         direct_create.assert_called_once()
-        relay_stream.assert_not_called()
 
 
 class TestSynchronousFallbackCachePlans:

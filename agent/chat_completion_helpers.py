@@ -471,44 +471,68 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
             client=request_client,
             on_first_delta=getattr(agent, "_codex_on_first_delta", None),
         )
-    if agent.api_mode == "anthropic_messages":
-        # #67142: use a request-local Anthropic client so the stale/interrupt
-        # watchdog aborts sockets from the stranger thread while the worker
-        # owns the SDK close — never closing the shared client mid-flight.
-        request_client = make_client(
-            "anthropic_messages_request", kind="anthropic_messages"
-        )
-        return agent._anthropic_messages_create(api_kwargs, client=request_client)
-    if agent.api_mode == "bedrock_converse":
-        # Bedrock uses boto3 directly — no OpenAI client needed.
-        # normalize_converse_response produces an OpenAI-compatible
-        # SimpleNamespace so the rest of the agent loop can treat
-        # bedrock responses like chat_completions responses.
-        from agent.bedrock_adapter import (
-            _get_bedrock_runtime_client,
-            invalidate_runtime_client,
-            is_stale_connection_error,
-            normalize_converse_response,
-        )
-        region = api_kwargs.pop("__bedrock_region__", "us-east-1")
-        api_kwargs.pop("__bedrock_converse__", None)
-        client = _get_bedrock_runtime_client(region)
-        try:
-            raw_response = client.converse(**api_kwargs)
-        except Exception as _bedrock_exc:
-            # Evict the cached client on stale-connection failures
-            # so the outer retry loop builds a fresh client/pool.
-            if is_stale_connection_error(_bedrock_exc):
-                invalidate_runtime_client(region)
-            raise
-        return normalize_converse_response(raw_response)
-    if agent.provider == "moa":
-        # MoA is a virtual chat-completions provider backed by the
-        # in-process MoAClient facade. Do not rebuild a request-local
-        # OpenAI client from the virtual runtime metadata.
-        return agent.client.chat.completions.create(**api_kwargs)
-    request_client = make_client("chat_completion_request")
-    return request_client.chat.completions.create(**api_kwargs)
+
+    def _provider_call(request: dict):
+        """Issue the one authoritative provider call for this attempt."""
+        if agent.api_mode == "anthropic_messages":
+            # #67142: use a request-local Anthropic client so the
+            # stale/interrupt watchdog aborts sockets from the stranger thread
+            # while the worker owns the SDK close.
+            request_client = make_client(
+                "anthropic_messages_request", kind="anthropic_messages"
+            )
+            return agent._anthropic_messages_create(request, client=request_client)
+        if agent.api_mode == "bedrock_converse":
+            # Bedrock uses boto3 directly — no OpenAI client needed.
+            from agent.bedrock_adapter import (
+                _get_bedrock_runtime_client,
+                invalidate_runtime_client,
+                is_stale_connection_error,
+                normalize_converse_response,
+            )
+
+            region = request.pop("__bedrock_region__", "us-east-1")
+            request.pop("__bedrock_converse__", None)
+            client = _get_bedrock_runtime_client(region)
+            try:
+                raw_response = client.converse(**request)
+            except Exception as _bedrock_exc:
+                if is_stale_connection_error(_bedrock_exc):
+                    invalidate_runtime_client(region)
+                raise
+            return normalize_converse_response(raw_response)
+        if agent.provider == "moa":
+            # MoA is a virtual chat-completions provider backed by the
+            # in-process MoAClient facade.
+            return agent.client.chat.completions.create(**request)
+        request_client = make_client("chat_completion_request")
+        return request_client.chat.completions.create(**request)
+
+    from agent import relay_llm
+
+    return relay_llm.execute(
+        api_kwargs,
+        _provider_call,
+        session_id=str(getattr(agent, "session_id", "") or ""),
+        name=str(getattr(agent, "provider", "") or "provider"),
+        model_name=str(
+            getattr(agent, "model", "") or api_kwargs.get("model") or ""
+        ),
+        metadata={
+            "api_request_id": str(
+                getattr(agent, "_current_api_request_id", "") or ""
+            ),
+            "call_role": (
+                "delegated"
+                if getattr(agent, "is_subagent", False)
+                else "fallback"
+                if int(getattr(agent, "_fallback_index", 0) or 0) > 0
+                else "primary"
+            ),
+            "api_mode": str(getattr(agent, "api_mode", "") or "unknown"),
+        },
+        defer_logical_completion=True,
+    )
 
 
 def should_use_direct_api_call(agent) -> bool:
@@ -2296,6 +2320,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         if is_stale_connection_error(_bedrock_exc):
                             invalidate_runtime_client(region)
                         raise
+                    writer_token["value"] = claim_stream_writer(agent)
                     return raw_response.get("stream", [])
 
                 def _on_text(text):
@@ -2311,9 +2336,6 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     _fire_first()
                     agent._fire_reasoning_delta(text)
 
-                def _bedrock_stream_created(_stream: Any) -> None:
-                    writer_token["value"] = claim_stream_writer(agent)
-
                 def _accept_bedrock_event(_event: Any) -> bool:
                     token = writer_token["value"]
                     return token is None or stream_writer_is_current(agent, token)
@@ -2321,7 +2343,6 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 stream = relay_llm.provider_stream(
                     dict(api_kwargs),
                     _open_bedrock_stream,
-                    on_stream_created=_bedrock_stream_created,
                     accept_chunk=_accept_bedrock_event,
                     lifecycle_metadata={
                         "api_request_id": getattr(
@@ -2750,15 +2771,20 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             attempt_request_client["value"] = request_client
             last_chunk_time["t"] = time.time()
             agent._touch_activity("waiting for provider response (streaming)")
-            return request_client.chat.completions.create(**stream_kwargs)
-
-        def _stream_created(raw_stream: Any) -> None:
+            raw_stream = request_client.chat.completions.create(**stream_kwargs)
             response = getattr(raw_stream, "response", None)
-            agent._capture_rate_limits(response)
-            agent._capture_credits(response)
-            agent._stream_diag_capture_response(_diag, response)
-            agent._check_openrouter_cache_status(response)
+            try:
+                agent._capture_rate_limits(response)
+                agent._capture_credits(response)
+                agent._stream_diag_capture_response(_diag, response)
+                agent._check_openrouter_cache_status(response)
+            except Exception:
+                logger.debug(
+                    "Provider stream diagnostics failed; preserving stream",
+                    exc_info=True,
+                )
             _writer_token["value"] = claim_stream_writer(agent)
+            return raw_stream
 
         def _accept_stream_chunk(_chunk: Any) -> bool:
             # A stale-attempt fence can win while the provider adapter is handing an
@@ -2797,7 +2823,6 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             relay_llm.provider_stream(
                 api_kwargs,
                 _open_stream,
-                on_stream_created=_stream_created,
                 accept_chunk=_accept_stream_chunk,
                 lifecycle_metadata={
                     "api_request_id": getattr(
@@ -3222,9 +3247,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             )
             manager = request_client.messages.stream(**final_kwargs)
             _stream_context["manager"] = manager
-            return manager.__enter__()
-
-        def _anthropic_stream_created(raw_stream: Any) -> None:
+            raw_stream = manager.__enter__()
             _stream_context["stream"] = raw_stream
             # The Anthropic SDK exposes the raw httpx response on
             # ``stream.response``. Snapshot diagnostics immediately so they
@@ -3237,6 +3260,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             except Exception:
                 pass
             _writer_token["value"] = claim_stream_writer(agent)
+            return raw_stream
 
         def _accept_anthropic_event(_event: Any) -> bool:
             token = _writer_token["value"]
@@ -3254,7 +3278,6 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             relay_llm.provider_stream(
                 api_kwargs,
                 _open_anthropic_stream,
-                on_stream_created=_anthropic_stream_created,
                 on_provider_chunk=accumulator.observe,
                 accept_chunk=_accept_anthropic_event,
                 lifecycle_metadata={

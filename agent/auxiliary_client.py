@@ -7943,10 +7943,10 @@ def _create_with_progress(
     rather than as a total budget, and outer liveness watchdogs see tokens
     moving. ``force_stream=True`` (stream-only providers such as Tencent
     Copilot — credit @kudi88, PR #60686) takes the same streamed path even
-    without a hook. Providers that reject the streamed request fall back to
-    the plain non-streaming call — except under ``force_stream``, where a
-    stream-only provider rejects the plain call by definition, so the
-    original error is surfaced to the normal recovery chains instead.
+    without a hook. A physical attempt invokes the provider exactly once.
+    Providers that reject streaming surface that original error to the normal
+    recovery chains; retrying the same logical attempt as non-streaming would
+    execute the model twice and violate the exact-once authority boundary.
     """
     _notify_aux_progress()  # request dispatched counts as progress
     if (not _aux_progress_active() and not force_stream) or _client_streams_internally(client):
@@ -7956,30 +7956,7 @@ def _create_with_progress(
     stream_kwargs = dict(kwargs)
     stream_kwargs["stream"] = True
     stream_kwargs["stream_options"] = {"include_usage": True}
-    try:
-        chunks = client.chat.completions.create(**stream_kwargs)
-    except Exception as exc:
-        # Genuine provider failures (auth, credit, rate limit, network) are
-        # not streaming's fault — surface them unchanged so the existing
-        # recovery chains (credential refresh, pool rotation, provider
-        # fallback) see the same error they would on a plain call.
-        if (
-            force_stream
-            or _is_transient_transport_error(exc)
-            or _is_auth_error(exc)
-            or _is_payment_error(exc)
-            or _is_rate_limit_error(exc)
-        ):
-            raise
-        # Anything else may be a streaming-specific rejection (explicit
-        # "stream not supported", stream_options 400, or an idiosyncratic
-        # 4xx). Retry non-streaming once; if the request itself is bad the
-        # plain call reproduces the real error for the normal except-chains.
-        logger.debug(
-            "Auxiliary %s: streamed request failed (%s); retrying "
-            "non-streaming", task or "call", exc,
-        )
-        return client.chat.completions.create(**kwargs)
+    chunks = client.chat.completions.create(**stream_kwargs)
 
     # Some shims (MoA virtual provider under quiet mode, defensive adapters)
     # return a complete response even when stream=True was requested.
@@ -8354,16 +8331,6 @@ def call_llm(
         kwargs["stream"] = True
         if stream_options:
             kwargs["stream_options"] = stream_options
-        if task == "moa_aggregator" and isinstance(client, CodexAuxiliaryClient):
-            # CodexAuxiliaryClient (openai-codex, xai-oauth, and any other
-            # Responses-shim provider) consumes the provider stream internally
-            # and returns a completed response object. Routing that nested MoA
-            # stream through the generic iterator compatibility view makes the
-            # manager iterate the completed SimpleNamespace itself (#55933).
-            # Return the provider call directly; the MoA facade converts a
-            # completed response into a one-chunk delta iterator at its
-            # boundary.
-            return client.chat.completions.create(**kwargs)
         return _relay_sync_stream(
             client,
             kwargs,

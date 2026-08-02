@@ -133,14 +133,20 @@ def stream_current(
     without the unwrap the response stays trapped as ``final_response`` on the
     inner compatibility view and the outer consumer sees an empty stream.
     """
-    del name, model_name, finalizer, defer_logical_completion
+    del finalizer, defer_logical_completion
 
     # Preserve the historical raw-stream contract unless an already-active
     # Relay runtime has explicitly retained lifecycle observation.  Relay is
     # never placed between Hermes and the provider: even in the observed case
     # below, the provider factory is called directly and its chunks remain the
     # authoritative objects returned to the consumer.
-    logical = _begin_logical_notification(metadata)
+    logical = _begin_logical_notification(
+        _execution_notification_metadata(
+            metadata,
+            name=name,
+            model_name=model_name,
+        )
+    )
     if logical is None:
         return stream_factory(request)
 
@@ -164,7 +170,6 @@ def provider_stream(
     request: dict[str, Any],
     stream_factory: Callable[[dict[str, Any]], Any],
     *,
-    on_stream_created: Callable[[Any], None] | None = None,
     on_provider_chunk: Callable[[Any], None] | None = None,
     observer: Callable[[Any], None] | None = None,
     accept_chunk: Callable[[Any], bool] | None = None,
@@ -192,7 +197,6 @@ def provider_stream(
     return ProviderLlmStream(
         request,
         stream_factory,
-        on_stream_created=on_stream_created,
         on_provider_chunk=on_provider_chunk,
         observer=observer,
         accept_chunk=accept_chunk,
@@ -209,7 +213,6 @@ def stream(
     name: str,
     model_name: str,
     finalizer: Callable[[], Any],
-    on_stream_created: Callable[[Any], None] | None = None,
     on_chunk: Callable[[Any], None] | None = None,
     chunk_adapter: Callable[[Any], Any] | None = None,
     accept_chunk: Callable[[Any], bool] | None = None,
@@ -222,7 +225,7 @@ def stream(
     The historical Relay-shaped arguments are accepted for compatibility but
     are notification metadata only; they never participate in execution.
     """
-    del session_id, name, model_name, finalizer, chunk_adapter, metadata
+    del finalizer, chunk_adapter
     # Historical Relay/plugin callers cannot install a stop predicate.  Only
     # trusted core call sites can use ``provider_stream(accept_chunk=...)`` for
     # exact single-writer/stale-attempt fencing.
@@ -231,8 +234,13 @@ def stream(
     return provider_stream(
         request,
         stream_factory,
-        on_stream_created=on_stream_created,
         observer=on_chunk,
+        lifecycle_metadata=_execution_notification_metadata(
+            metadata,
+            name=name,
+            model_name=model_name,
+        ),
+        lifecycle_session_id=session_id,
         completed_response_predicate=completed_response_predicate,
     )
 
@@ -254,7 +262,6 @@ class ProviderLlmStream(Iterator[Any]):
         request: dict[str, Any],
         stream_factory: Callable[[dict[str, Any]], Any],
         *,
-        on_stream_created: Callable[[Any], None] | None,
         on_provider_chunk: Callable[[Any], None] | None,
         observer: Callable[[Any], None] | None,
         accept_chunk: Callable[[Any], bool] | None,
@@ -291,8 +298,6 @@ class ProviderLlmStream(Iterator[Any]):
                 self._notify_terminal("success")
                 return
 
-            if on_stream_created is not None:
-                on_stream_created(raw_stream)
             self._stream = iter(raw_stream)
         except BaseException:
             self._close()

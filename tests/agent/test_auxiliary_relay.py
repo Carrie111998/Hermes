@@ -299,6 +299,132 @@ def test_auxiliary_stream_unwraps_completed_response(relay_turn):
     assert run("moa_aggregator") is completed
 
 
+def test_codex_auxiliary_stream_has_detached_lifecycle_and_exact_chunks(
+    relay_turn,
+    monkeypatch,
+):
+    relay, turn = relay_turn
+    consumer = "test.codex-auxiliary-stream-lifecycle"
+    turn.lease.host.retain_managed_execution(consumer)
+    pushes = []
+    outcomes = []
+    original_push = relay.scope.push
+    original_pop = relay.scope.pop
+
+    def record_push(*args, **kwargs):
+        pushes.append((args, kwargs))
+        return original_push(*args, **kwargs)
+
+    def record_pop(*args, **kwargs):
+        outcomes.append((kwargs.get("output") or {}).get("outcome"))
+        return original_pop(*args, **kwargs)
+
+    monkeypatch.setattr(relay.scope, "push", record_push)
+    monkeypatch.setattr(relay.scope, "pop", record_pop)
+    chunks = [SimpleNamespace(delta="codex-one"), SimpleNamespace(delta="codex-two")]
+    provider_calls = []
+
+    def create(**kwargs):
+        provider_calls.append(kwargs)
+        return iter(chunks)
+
+    client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+    )
+
+    @auxiliary_client._relay_auxiliary_call
+    def run(task):
+        auxiliary_client._set_relay_auxiliary_route(
+            "openai-codex",
+            "gpt-codex",
+            "codex_responses",
+        )
+        return auxiliary_client._relay_sync_stream(
+            client,
+            {"model": "gpt-codex", "messages": [], "stream": True},
+        )
+
+    try:
+        stream = run("compression")
+        received = list(stream)
+        assert len(provider_calls) == 1
+        assert received == chunks
+        assert all(actual is expected for actual, expected in zip(received, chunks))
+        assert len(pushes) == 1
+        assert outcomes == ["success"]
+        assert turn.logical_llm_calls == {}
+    finally:
+        turn.lease.host.release_managed_execution(consumer)
+
+
+def test_codex_auxiliary_completed_stream_keeps_lifecycle_without_iteration(
+    relay_turn,
+    monkeypatch,
+):
+    relay, turn = relay_turn
+    consumer = "test.codex-auxiliary-completed-stream-lifecycle"
+    turn.lease.host.retain_managed_execution(consumer)
+    pushes = []
+    outcomes = []
+    original_push = relay.scope.push
+    original_pop = relay.scope.pop
+
+    def record_push(*args, **kwargs):
+        pushes.append((args, kwargs))
+        return original_push(*args, **kwargs)
+
+    def record_pop(*args, **kwargs):
+        outcomes.append((kwargs.get("output") or {}).get("outcome"))
+        return original_pop(*args, **kwargs)
+
+    monkeypatch.setattr(relay.scope, "push", record_push)
+    monkeypatch.setattr(relay.scope, "pop", record_pop)
+    completed = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(content="codex-complete"),
+                finish_reason="stop",
+            )
+        ],
+        model="gpt-codex",
+    )
+    provider_calls = []
+
+    def create(**kwargs):
+        provider_calls.append(kwargs)
+        return completed
+
+    client = object.__new__(auxiliary_client.CodexAuxiliaryClient)
+    client.chat = SimpleNamespace(completions=SimpleNamespace(create=create))
+    client.base_url = "https://chatgpt.com/backend-api/codex"
+    client.api_key = "oauth"
+    client._real_client = SimpleNamespace()
+    monkeypatch.setattr(
+        auxiliary_client,
+        "_get_cached_client",
+        lambda *args, **kwargs: (client, "gpt-codex"),
+    )
+
+    try:
+        result = auxiliary_client.call_llm(
+            "moa_aggregator",
+            provider="openai-codex",
+            model="gpt-codex",
+            api_key="oauth",
+            api_mode="codex_responses",
+            messages=[{"role": "user", "content": "sensitive"}],
+            stream=True,
+        )
+
+        assert result is completed
+        assert len(provider_calls) == 1
+        assert len(pushes) == 1
+        assert outcomes == ["success"]
+        assert turn.logical_llm_calls == {}
+    finally:
+        turn.lease.host.release_managed_execution(consumer)
+
+
 
 def test_call_llm_stream_unwraps_completed_response(relay_turn, monkeypatch):
     """Outermost seam: ``call_llm(stream=True)`` — decorated with

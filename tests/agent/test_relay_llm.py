@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import inspect
 import json
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -12,6 +14,7 @@ import pytest
 pytest.importorskip("nemo_relay")
 
 from agent import relay_llm, relay_runtime
+from agent.chat_completion_helpers import _dispatch_nonstreaming_api_request
 
 
 @pytest.fixture()
@@ -206,6 +209,170 @@ def test_primary_stream_restores_only_detached_lifecycle_observation(
     assert "sensitive-provider-chunk" not in lifecycle_payload
     assert "trusted-provider" in lifecycle_payload
     assert "trusted-model" in lifecycle_payload
+
+
+def test_stream_creation_has_no_raw_resource_observer_and_chunk_observer_is_fail_open(
+    relay_turn,
+):
+    """No extension callback can consume, close, or retain the live stream."""
+    del relay_turn
+    assert "on_stream_created" not in inspect.signature(
+        relay_llm.provider_stream
+    ).parameters
+    assert "on_stream_created" not in inspect.signature(relay_llm.stream).parameters
+
+    raw_chunk = SimpleNamespace(delta="provider-owned")
+    observed = []
+
+    def malicious_observer(snapshot):
+        observed.append(snapshot)
+        snapshot["delta"] = "mutated"
+        raise RuntimeError("observer tried to take authority")
+
+    stream = relay_llm.provider_stream(
+        {"model": "trusted-model", "messages": []},
+        lambda _request: iter([raw_chunk]),
+        observer=malicious_observer,
+    )
+
+    received = list(stream)
+    assert received == [raw_chunk]
+    assert received[0] is raw_chunk
+    assert raw_chunk.delta == "provider-owned"
+    assert observed == [{"delta": "mutated"}]
+
+
+def test_main_nonstream_dispatch_emits_scalar_lifecycle_without_payload_access(
+    relay_turn,
+    monkeypatch,
+):
+    relay, turn = relay_turn
+    pushes = []
+    pops = []
+    original_push = relay.scope.push
+    original_pop = relay.scope.pop
+
+    def record_push(*args, **kwargs):
+        pushes.append((args, kwargs))
+        return original_push(*args, **kwargs)
+
+    def record_pop(*args, **kwargs):
+        pops.append((kwargs.get("output") or {}).get("outcome"))
+        return original_pop(*args, **kwargs)
+
+    monkeypatch.setattr(relay.scope, "push", record_push)
+    monkeypatch.setattr(relay.scope, "pop", record_pop)
+
+    invalid_response = SimpleNamespace(content="invalid-provider-response")
+    response = SimpleNamespace(content="provider-owned-response")
+    responses = iter([invalid_response, response])
+    provider_calls = []
+
+    def create(**kwargs):
+        provider_calls.append(kwargs)
+        return next(responses)
+
+    client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+    )
+    agent = SimpleNamespace(
+        api_mode="chat_completions",
+        provider="trusted-provider",
+        model="trusted-model",
+        session_id="session-1",
+        _current_api_request_id="main-nonstream-1",
+        is_subagent=False,
+        _fallback_index=0,
+    )
+    request = {
+        "model": "trusted-model",
+        "messages": [{"role": "user", "content": "sensitive-prompt"}],
+        "extra_headers": {"authorization": "Bearer secret"},
+    }
+
+    result_holder = []
+    caller_context = contextvars.copy_context()
+
+    def dispatch_from_worker():
+        for _attempt in range(2):
+            result_holder.append(
+                caller_context.run(
+                    _dispatch_nonstreaming_api_request,
+                    agent,
+                    request,
+                    make_client=lambda *_args, **_kwargs: client,
+                )
+            )
+
+    worker = threading.Thread(target=dispatch_from_worker)
+    worker.start()
+    worker.join()
+    relay_llm.complete_logical_call("main-nonstream-1", outcome="success")
+
+    assert result_holder == [invalid_response, response]
+    assert result_holder[0] is invalid_response
+    assert result_holder[1] is response
+    assert provider_calls == [request, request]
+    assert len(pushes) == 1
+    assert pops == ["success"]
+    assert turn.logical_llm_calls == {}
+    lifecycle_payload = json.dumps(pushes, default=str)
+    assert "sensitive-prompt" not in lifecycle_payload
+    assert "Bearer secret" not in lifecycle_payload
+    assert "provider-owned-response" not in lifecycle_payload
+    assert "trusted-provider" in lifecycle_payload
+
+
+def test_legacy_stream_emits_lifecycle_and_preserves_exact_provider_chunks(
+    relay_turn,
+    monkeypatch,
+):
+    relay, turn = relay_turn
+    pushes = []
+    outcomes = []
+    original_push = relay.scope.push
+    original_pop = relay.scope.pop
+
+    def record_push(*args, **kwargs):
+        pushes.append((args, kwargs))
+        return original_push(*args, **kwargs)
+
+    def record_pop(*args, **kwargs):
+        outcomes.append((kwargs.get("output") or {}).get("outcome"))
+        return original_pop(*args, **kwargs)
+
+    monkeypatch.setattr(relay.scope, "push", record_push)
+    monkeypatch.setattr(relay.scope, "pop", record_pop)
+    chunks = [SimpleNamespace(delta="one"), SimpleNamespace(delta="two")]
+    provider_calls = []
+
+    def provider(request):
+        provider_calls.append(request)
+        return iter(chunks)
+
+    request = {"model": "legacy-model", "messages": []}
+    stream = relay_llm.stream(
+        request,
+        provider,
+        session_id="session-1",
+        name="legacy-provider",
+        model_name="legacy-model",
+        finalizer=dict,
+        metadata={
+            "api_request_id": "legacy-stream-1",
+            "api_mode": "chat_completions",
+            "call_role": "auxiliary:legacy",
+        },
+    )
+
+    received = list(stream)
+    assert provider_calls == [request]
+    assert provider_calls[0] is request
+    assert received == chunks
+    assert all(actual is expected for actual, expected in zip(received, chunks))
+    assert len(pushes) == 1
+    assert outcomes == ["success"]
+    assert turn.logical_llm_calls == {}
 
 
 

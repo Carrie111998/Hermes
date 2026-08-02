@@ -1288,12 +1288,11 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
         def _open_codex_stream(next_api_kwargs: dict[str, Any]):
             stream_kwargs = dict(next_api_kwargs)
             stream_kwargs["stream"] = True
-            return active_client.responses.create(**stream_kwargs)
-
-        def _codex_stream_created(_raw_stream: Any) -> None:
+            raw_stream = active_client.responses.create(**stream_kwargs)
             # Claim the delta sink for THIS physical attempt. A newer attempt
             # supersedes this token and fences late deltas out of the turn.
             writer_token["value"] = claim_stream_writer(agent)
+            return raw_stream
 
         def _accept_codex_chunk(_chunk: Any) -> bool:
             token = writer_token["value"]
@@ -1311,7 +1310,6 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
             event_stream = relay_llm.provider_stream(
                 dict(api_kwargs),
                 _open_codex_stream,
-                on_stream_created=_codex_stream_created,
                 accept_chunk=_accept_codex_chunk,
                 lifecycle_metadata={
                     "api_request_id": getattr(
