@@ -3,6 +3,7 @@ export type GatewayEventName =
   | 'session.info'
   | 'message.start'
   | 'message.delta'
+  | 'message.interim'
   | 'message.complete'
   | 'thinking.delta'
   | 'reasoning.delta'
@@ -286,7 +287,11 @@ export class JsonRpcGatewayClient {
         pending.timer = setTimeout(() => {
           if (this.pending.delete(id)) {
             detach()
-            reject(new Error(`request timed out: ${method}`))
+            // Include the configured timeout so a caller (or a user looking
+            // at an error toast) can tell whether the default 30s window
+            // fired or a per-call override — e.g. /compress opts into 120s.
+            const seconds = Math.round(timeoutMs / 1000)
+            reject(new Error(`request timed out after ${seconds}s: ${method}`))
           }
         }, timeoutMs)
       }
