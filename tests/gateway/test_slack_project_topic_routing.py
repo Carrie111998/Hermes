@@ -68,14 +68,22 @@ def _response(route: str, confidence: float):
     )
 
 
-def test_explicit_new_topic_skips_model_call():
+@pytest.mark.parametrize(
+    "text",
+    [
+        "题外话，这个单独聊：帮我检查服务器磁盘。",
+        "开 Thread：验证项目专题分流和处理状态",
+        "建一个 thread 单独处理这个问题",
+    ],
+)
+def test_explicit_new_topic_skips_model_call(text):
     def fail_call(**_kwargs):
         raise AssertionError("explicit routing must not call the model")
 
     decision = classify_project_topic(
         channel_name="travel-japan-202609",
         channel_prompt="Plan the Japan trip.",
-        text="题外话，这个单独聊：帮我检查服务器磁盘。",
+        text=text,
         call_fn=fail_call,
     )
 
