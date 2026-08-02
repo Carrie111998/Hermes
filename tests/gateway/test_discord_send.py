@@ -149,20 +149,28 @@ class TestIsForumParent:
 
 
 @pytest.mark.asyncio
-async def test_forum_text_create_ambiguous_failure_is_not_retried_or_leaked():
+@pytest.mark.parametrize("with_file", [False, True], ids=["text", "file"])
+async def test_forum_create_ambiguous_failure_is_not_retried_or_leaked(with_file):
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
     forum_channel = _discord_mod.ForumChannel()
     forum_channel.id = 999
     forum_channel.create_thread = AsyncMock(
-        side_effect=TimeoutError("RAW_FORUM_TEXT_SENTINEL")
+        side_effect=TimeoutError("RAW_FORUM_CREATE_SENTINEL")
     )
 
-    result = await adapter._send_to_forum(forum_channel, "planning notes")
+    if with_file:
+        result = await adapter._forum_post_file(
+            forum_channel,
+            content="planning diagram",
+            file=SimpleNamespace(filename="diagram.png"),
+        )
+    else:
+        result = await adapter._send_to_forum(forum_channel, "planning notes")
 
     assert result.success is False
     assert "may have succeeded" in (result.error or "")
     assert "not retried" in (result.error or "")
-    assert "RAW_FORUM_TEXT_SENTINEL" not in (result.error or "")
+    assert "RAW_FORUM_CREATE_SENTINEL" not in (result.error or "")
     forum_channel.create_thread.assert_awaited_once()
 
 
@@ -174,7 +182,7 @@ async def test_forum_text_create_retries_one_429(monkeypatch):
     thread = SimpleNamespace(
         id=777,
         message=SimpleNamespace(id=800),
-        send=AsyncMock(),
+        send=AsyncMock(side_effect=RuntimeError("RAW_FOLLOWUP_SENTINEL")),
     )
     forum_channel = _discord_mod.ForumChannel()
     forum_channel.id = 999
@@ -185,10 +193,14 @@ async def test_forum_text_create_retries_one_429(monkeypatch):
         ]
     )
 
-    result = await adapter._send_to_forum(forum_channel, "planning notes")
+    result = await adapter._send_to_forum(
+        forum_channel,
+        "x" * (adapter.MAX_MESSAGE_LENGTH + 1),
+    )
 
     assert result.success is True
     assert forum_channel.create_thread.await_count == 2
+    assert "RAW_FOLLOWUP_SENTINEL" not in result.raw_response["warnings"][0]
     sleep.assert_awaited_once_with(2.5)
 
 
@@ -253,28 +265,6 @@ async def test_forum_post_file_creates_thread_with_attachment():
     assert call_kwargs["content"] == "here is a photo"
     # Thread name derived from content's first line
     assert call_kwargs["name"] == "here is a photo"
-
-
-@pytest.mark.asyncio
-async def test_forum_file_create_ambiguous_failure_is_not_retried_or_leaked():
-    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
-    forum_channel = _discord_mod.ForumChannel()
-    forum_channel.id = 999
-    forum_channel.create_thread = AsyncMock(
-        side_effect=TimeoutError("RAW_FORUM_FILE_SENTINEL")
-    )
-
-    result = await adapter._forum_post_file(
-        forum_channel,
-        content="planning diagram",
-        file=SimpleNamespace(filename="diagram.png"),
-    )
-
-    assert result.success is False
-    assert "may have succeeded" in (result.error or "")
-    assert "not retried" in (result.error or "")
-    assert "RAW_FORUM_FILE_SENTINEL" not in (result.error or "")
-    forum_channel.create_thread.assert_awaited_once()
 
 
 @pytest.mark.asyncio

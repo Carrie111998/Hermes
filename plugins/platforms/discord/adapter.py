@@ -247,16 +247,19 @@ def _is_retryable_discord_read_error(error: Exception) -> bool:
     )
 
 
-def _discord_rest_retry_delay(error: Exception) -> float:
+def _discord_rest_retry_delay(
+    error: Optional[Exception] = None,
+    headers: Any = None,
+) -> float:
     """Return Discord's requested retry delay, or the short default backoff."""
-    candidates = [getattr(error, "retry_after", None)]
+    candidates = [getattr(error, "retry_after", None)] if error else []
     response = getattr(error, "response", None)
-    headers = getattr(response, "headers", None)
-    if headers:
-        candidates.extend((
-            headers.get("Retry-After"),
-            headers.get("X-RateLimit-Reset-After"),
-        ))
+    for source in (getattr(response, "headers", None), headers):
+        if source:
+            candidates.extend((
+                source.get("Retry-After"),
+                source.get("X-RateLimit-Reset-After"),
+            ))
 
     for raw_delay in candidates:
         if raw_delay is None:
@@ -270,79 +273,41 @@ def _discord_rest_retry_delay(error: Exception) -> float:
     return _DISCORD_REST_RETRY_DELAY_SECONDS
 
 
-def _discord_retry_delay_from_headers(headers: Any) -> float:
-    """Return a standalone response's retry delay, or the short default."""
-    if headers:
-        for key in ("Retry-After", "X-RateLimit-Reset-After"):
-            try:
-                raw_delay = headers.get(key)
-                delay = float(raw_delay)
-            except (AttributeError, TypeError, ValueError):
-                continue
-            if math.isfinite(delay) and delay >= 0:
-                return delay
-    return _DISCORD_REST_RETRY_DELAY_SECONDS
-
-
 def _non_idempotent_discord_write_failure(
     operation_name: str,
-    error: Exception,
+    error: Optional[Exception] = None,
+    *,
+    status: Optional[int] = None,
+    headers: Any = None,
 ) -> str:
-    """Return a user-safe category for a write that cannot be reconciled."""
-    if _is_discord_rate_limit_error(error):
-        delay = _discord_rest_retry_delay(error)
+    """Return one user-safe category for SDK and standalone writes."""
+    status = _discord_http_status(error) if error is not None else status
+    if status == 429 or (
+        error is not None and _is_discord_rate_limit_error(error)
+    ):
+        delay = _discord_rest_retry_delay(error, headers)
         return (
             f"{operation_name} remained rate limited after one retry. "
             f"Retry after {delay:g} seconds."
         )
-    if _is_ambiguous_discord_write_error(error):
+    if (error is not None and _is_discord_transport_error(error)) or (
+        isinstance(status, int) and 500 <= status < 600
+    ):
         return (
             f"{operation_name} may have succeeded, but Discord did not confirm it. "
             "It was not retried to avoid creating a duplicate."
-        )
-    status = _discord_http_status(error)
-    if status in {401, 403}:
-        return (
-            f"{operation_name} was rejected. Check the bot's channel and thread "
-            "permissions."
-        )
-    if _is_permanent_discord_write_error(error):
-        return (
-            f"{operation_name} was rejected. Check the channel type, thread "
-            "settings, and bot permissions."
-        )
-    return (
-        f"{operation_name} could not be confirmed and was not retried to avoid "
-        "creating a duplicate."
-    )
-
-
-def _non_idempotent_discord_http_failure(
-    operation_name: str,
-    status: int,
-    headers: Any,
-) -> str:
-    """Return a user-safe category for a standalone non-idempotent POST."""
-    if status == 429:
-        retry_after = _discord_retry_delay_from_headers(headers)
-        return (
-            f"{operation_name} remained rate limited after one retry. "
-            f"Retry after {retry_after:g} seconds."
         )
     if status in {401, 403}:
         return (
             f"{operation_name} was rejected. Check the bot's channel and thread "
             "permissions."
         )
-    if 400 <= status < 500:
+    if (
+        error is not None and isinstance(error, (TypeError, ValueError))
+    ) or (isinstance(status, int) and 400 <= status < 500):
         return (
             f"{operation_name} was rejected. Check the channel type, thread "
             "settings, and bot permissions."
-        )
-    if 500 <= status < 600:
-        return (
-            f"{operation_name} may have succeeded, but Discord did not confirm it. "
-            "It was not retried to avoid creating a duplicate."
         )
     return (
         f"{operation_name} could not be confirmed and was not retried to avoid "
@@ -1501,22 +1466,8 @@ class DiscordAdapter(BasePlatformAdapter):
                 )
 
             @self._client.event
-            async def on_thread_update(before, after):
-                adapter_self._invalidate_authoritative_channel(
-                    getattr(after, "id", None) or getattr(before, "id", None)
-                )
-
-            @self._client.event
-            async def on_thread_delete(thread):
-                adapter_self._invalidate_authoritative_channel(
-                    getattr(thread, "id", None)
-                )
-
-            @self._client.event
             async def on_thread_join(thread):
-                # discord.py dispatches THREAD_UPDATE as thread_join when the
-                # thread was absent from its Gateway cache. That is the exact
-                # partial-cache state this resolver repairs.
+                # THREAD_LIST_SYNC can replace a thread without a raw update.
                 adapter_self._invalidate_authoritative_channel(
                     getattr(thread, "id", None)
                 )
@@ -1541,6 +1492,14 @@ class DiscordAdapter(BasePlatformAdapter):
 
             @self._client.event
             async def on_guild_remove(guild):
+                adapter_self._invalidate_authoritative_guild(
+                    getattr(guild, "id", None)
+                )
+
+            @self._client.event
+            async def on_guild_unavailable(guild):
+                # A later GUILD_CREATE refreshes discord.py's cache, but not
+                # REST objects retained by the adapter during the outage.
                 adapter_self._invalidate_authoritative_guild(
                     getattr(guild, "id", None)
                 )
@@ -1621,15 +1580,10 @@ class DiscordAdapter(BasePlatformAdapter):
     def _discord_message_preflight(
         self,
         message: Any,
-        *,
-        claim: bool,
     ) -> bool:
-        """Reject context-free provider events before authoritative REST I/O."""
+        """Atomically claim and reject context-free provider events."""
         message_id = str(getattr(message, "id", ""))
-        if claim:
-            if self._dedup.is_duplicate(message_id):
-                return False
-        elif self._dedup.contains(message_id):
+        if self._dedup.is_duplicate(message_id):
             return False
 
         author = getattr(message, "author", None)
@@ -1810,18 +1764,13 @@ class DiscordAdapter(BasePlatformAdapter):
             if getattr(guild, "id", None) == guild_id_int:
                 self._authoritative_message_channels.pop(cached_id, None)
 
-    @staticmethod
-    def _attach_authoritative_message_channel(message: Any, channel: Any) -> None:
-        """Attach a REST-resolved channel and guild to a discord.py message."""
-        message.channel = channel
-        message.guild = getattr(channel, "guild", None)
-
     async def _resolve_authoritative_channel(
         self,
         channel_id: Any,
         fallback_channel: Any = None,
         *,
         operation_name: str,
+        raise_transient_errors: bool = False,
     ) -> tuple[Any, bool]:
         """Resolve one type-sensitive channel through the per-client authority.
 
@@ -1887,6 +1836,8 @@ class DiscordAdapter(BasePlatformAdapter):
                 operation_name,
                 error,
             )
+            if raise_transient_errors and _is_retryable_discord_read_error(error):
+                raise
             return fallback_channel, False
         if resolved is None:
             return fallback_channel, False
@@ -1904,64 +1855,62 @@ class DiscordAdapter(BasePlatformAdapter):
         self._cache_authoritative_message_channel(resolved)
         return resolved, True
 
-    async def _resolve_authoritative_message_channel(
+    async def _dispatch_discord_message(
         self,
         message: Any,
-    ) -> tuple[Any, bool]:
-        """Resolve reliable guild/channel context for an admitted message.
-
-        discord.py builds ``Message.channel`` from its Gateway guild cache and
-        does not use ``MESSAGE_CREATE.channel_type`` to repair a partial cache.
-        A projected or incomplete ``GUILD_CREATE`` can therefore materialize a
-        real thread as ``TextChannel`` and can leave ``Message.guild`` unset.
-        Resolve the delivered channel ID through REST before context-dependent
-        authorization or auto-thread routing. Context-free provider preflight
-        has already run, so rejected provider events do not cause REST I/O.
-        """
-        channel = getattr(message, "channel", None)
-        if channel is None:
-            return None, False
-        try:
-            channel_id = int(channel.id)
-        except (AttributeError, TypeError, ValueError):
-            return channel, False
-        resolved, authoritative = await self._resolve_authoritative_channel(
-            channel_id,
-            channel,
-            operation_name=f"message channel {channel_id} resolution",
-        )
-        if not authoritative:
-            return resolved, False
-        self._attach_authoritative_message_channel(message, resolved)
-        return resolved, True
-
-    async def _dispatch_discord_message(self, message: Any) -> bool:
-        """Apply Discord ingress policy and dispatch one live event."""
+        *,
+        recovered: bool = False,
+    ) -> bool:
+        """Resolve, authorize, and dispatch one claimed Discord event."""
         if not self._ready_event.is_set():
             try:
                 await asyncio.wait_for(self._ready_event.wait(), timeout=30.0)
             except asyncio.TimeoutError:
                 pass
-        if not self._discord_message_preflight(message, claim=True):
+        if not self._discord_message_preflight(message):
             return False
-        _channel, channel_context_authoritative = (
-            await self._resolve_authoritative_message_channel(message)
-        )
-        if not channel_context_authoritative:
+
+        message_id = str(getattr(message, "id", ""))
+        fallback_channel = getattr(message, "channel", None)
+        try:
+            channel_id = int(fallback_channel.id)
+        except (AttributeError, TypeError, ValueError):
+            channel_id = None
+        try:
+            channel, authoritative = await self._resolve_authoritative_channel(
+                channel_id,
+                fallback_channel,
+                operation_name=f"message channel {channel_id} resolution",
+                raise_transient_errors=True,
+            )
+        except asyncio.CancelledError:
+            self._dedup.discard(message_id)
+            raise
+        except Exception:
+            # Keep the reservation while REST is in flight so a racing live or
+            # recovery delivery cannot dispatch twice. Exhausted 429, 5xx, and
+            # transport failures are recoverable, so release it only now.
+            self._dedup.discard(message_id)
+            return False
+        if not authoritative:
             logger.warning(
-                "[%s] Refusing Discord message %s because authoritative "
-                "channel context could not be resolved",
+                "[%s] Refusing %sDiscord message %s because authoritative "
+                "channel context could not be resolved; keeping terminal claim",
                 self.name,
-                getattr(message, "id", "unknown"),
+                "recovered " if recovered else "",
+                message_id or "unknown",
             )
             return False
+
+        message.channel = channel
+        message.guild = getattr(channel, "guild", None)
         admitted, role_authorized = self._discord_message_context_admission(message)
         if not admitted:
             return False
         return await self._handle_message(
             message,
             role_authorized=role_authorized,
-            channel_context_authoritative=channel_context_authoritative,
+            recovered=recovered,
         )
 
     async def _cancel_bot_task(self) -> None:
@@ -2746,31 +2695,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
     async def _dispatch_recovered_message(self, message: Any) -> bool:
         """Run one recovered message through the live Discord ingress gates."""
-        # The backfill scan performs only a non-claiming ``contains`` check.
-        # Claim exactly once here so a racing live Gateway event cannot dispatch
-        # the same message while this REST-recovered event is being authorized.
-        if not self._discord_message_preflight(message, claim=True):
-            return False
-        _channel, channel_context_authoritative = (
-            await self._resolve_authoritative_message_channel(message)
-        )
-        if not channel_context_authoritative:
-            logger.warning(
-                "[%s] Refusing recovered Discord message %s because authoritative "
-                "channel context could not be resolved",
-                self.name,
-                getattr(message, "id", "unknown"),
-            )
-            return False
-        admitted, role_authorized = self._discord_message_context_admission(message)
-        if not admitted:
-            return False
-        return await self._handle_message(
-            message,
-            role_authorized=role_authorized,
-            recovered=True,
-            channel_context_authoritative=channel_context_authoritative,
-        )
+        return await self._dispatch_discord_message(message, recovered=True)
 
     async def _iter_missed_message_backfill_candidates(self, channel_ids: set[str]):
         if not self._client:
@@ -3578,7 +3503,13 @@ class DiscordAdapter(BasePlatformAdapter):
 
         except Exception as e:  # pragma: no cover - defensive logging
             logger.error("[%s] Failed to send Discord message: %s", self.name, e, exc_info=True)
-            result = SendResult(success=False, error=str(e))
+            result = SendResult(
+                success=False,
+                error=_non_idempotent_discord_write_failure(
+                    "Discord message send",
+                    e,
+                ),
+            )
             await asyncio.to_thread(
                 self._record_discord_response,
                 reply_to=reply_to,
@@ -3649,8 +3580,16 @@ class DiscordAdapter(BasePlatformAdapter):
                 msg = await thread_channel.send(content=chunk)
                 message_ids.append(str(msg.id))
             except Exception as e:
-                warning = f"Failed to send follow-up chunk to forum thread {thread_id}: {e}"
-                logger.warning("[%s] %s", self.name, warning)
+                logger.warning(
+                    "[%s] Failed to send follow-up chunk to forum thread %s: %s",
+                    self.name,
+                    thread_id,
+                    e,
+                )
+                warning = (
+                    f"Discord forum thread {thread_id} was created, but a "
+                    "follow-up chunk could not be delivered."
+                )
                 warnings.append(warning)
 
         raw_response: Dict[str, Any] = {"message_ids": message_ids, "thread_id": thread_id}
@@ -5719,7 +5658,11 @@ class DiscordAdapter(BasePlatformAdapter):
             }
         except Exception as e:  # pragma: no cover - defensive logging
             logger.error("[%s] Failed to get chat info for %s: %s", self.name, chat_id, e, exc_info=True)
-            return {"name": str(chat_id), "type": "dm", "error": str(e)}
+            return {
+                "name": str(chat_id),
+                "type": "unknown",
+                "error": "Could not retrieve Discord channel information.",
+            }
 
     async def _resolve_allowed_usernames(self) -> None:
         """
@@ -8472,7 +8415,6 @@ class DiscordAdapter(BasePlatformAdapter):
         role_authorized: bool = False,
         *,
         recovered: bool = False,
-        channel_context_authoritative: bool = True,
     ) -> bool:
         """Handle one Discord message and report whether it reached dispatch."""
         # In server channels (not DMs), require the bot to be @mentioned
@@ -8576,11 +8518,7 @@ class DiscordAdapter(BasePlatformAdapter):
             auto_thread = os.getenv("DISCORD_AUTO_THREAD", "true").lower() in {"true", "1", "yes"}
             is_reply_message = getattr(message, "type", None) == discord.MessageType.reply
             if auto_thread and not skip_thread and not is_voice_linked_channel and not is_reply_message:
-                thread = (
-                    await self._auto_create_thread(message)
-                    if channel_context_authoritative
-                    else None
-                )
+                thread = await self._auto_create_thread(message)
                 if thread:
                     parent_channel_id = str(message.channel.id)
                     is_thread = True
@@ -10263,22 +10201,6 @@ def _derive_forum_thread_name(message: str) -> str:
     return first_line[:100]
 
 
-def _standalone_sanitize_error(text) -> str:
-    """Local copy of tools.send_message_tool._sanitize_error_text — strips bot
-    tokens from any error payload before bubbling it up.  Inlined so the
-    plugin doesn't introduce a hard dependency on send_message_tool internals.
-    """
-    s = str(text)
-    # Mask anything that looks like a Bot token in an Authorization header.
-    import re as _re_san
-    return _re_san.sub(
-        r"(Authorization:\s*Bot\s+)\S+",
-        r"\1***",
-        s,
-        flags=_re_san.IGNORECASE,
-    )
-
-
 def _standalone_close_response(resp: Any) -> None:
     close = getattr(resp, "close", None)
     if callable(close):
@@ -10372,10 +10294,10 @@ async def _standalone_non_idempotent_http_error(
         body,
     )
     return {
-        "error": _non_idempotent_discord_http_failure(
+        "error": _non_idempotent_discord_write_failure(
             operation_name,
-            status,
-            getattr(resp, "headers", None),
+            status=status,
+            headers=getattr(resp, "headers", None),
         )
     }
 
@@ -10403,8 +10325,8 @@ async def _standalone_forum_post_with_rate_limit_retry(
                     resp,
                     _DISCORD_STANDALONE_ERROR_BODY_LIMIT_BYTES,
                 )
-                delay = _discord_retry_delay_from_headers(
-                    getattr(resp, "headers", None)
+                delay = _discord_rest_retry_delay(
+                    headers=getattr(resp, "headers", None)
                 )
                 logger.warning(
                     "%s was rate limited; replaying once in %.3fs: %s",
@@ -10637,11 +10559,10 @@ async def _standalone_send(
             if message.strip() or not media_files:
                 async with session.post(url, headers=json_headers, json={"content": message}, **_req_kw) as resp:
                     if resp.status not in {200, 201}:
-                        body = await _standalone_read_text_limited(
+                        return await _standalone_non_idempotent_http_error(
+                            "Discord message send",
                             resp,
-                            _DISCORD_STANDALONE_ERROR_BODY_LIMIT_BYTES,
                         )
-                        return {"error": f"Discord API error ({resp.status}): {body}"}
                     last_data = await _standalone_read_json_limited(
                         resp,
                         _DISCORD_STANDALONE_JSON_BODY_LIMIT_BYTES,
@@ -10687,22 +10608,29 @@ async def _standalone_send(
                         form.add_field("files[0]", f, filename=filename)
                         async with session.post(url, headers=auth_headers, data=form, **_req_kw) as resp:
                             if resp.status not in {200, 201}:
-                                body = await _standalone_read_text_limited(
+                                media_error = await _standalone_non_idempotent_http_error(
+                                    "Discord media send",
                                     resp,
-                                    _DISCORD_STANDALONE_ERROR_BODY_LIMIT_BYTES,
                                 )
-                                warning = _standalone_sanitize_error(f"Failed to send media {media_path}: Discord API error ({resp.status}): {body}")
-                                logger.error(warning)
-                                warnings.append(warning)
+                                warnings.append(media_error["error"])
                                 continue
                             last_data = await _standalone_read_json_limited(
                                 resp,
                                 _DISCORD_STANDALONE_JSON_BODY_LIMIT_BYTES,
                             )
                 except Exception as e:
-                    warning = _standalone_sanitize_error(f"Failed to send media {media_path}: {e}")
-                    logger.error(warning)
-                    warnings.append(warning)
+                    logger.error(
+                        "Discord media send failed for %s: %s",
+                        media_path,
+                        e,
+                        exc_info=True,
+                    )
+                    warnings.append(
+                        _non_idempotent_discord_write_failure(
+                            "Discord media send",
+                            e,
+                        )
+                    )
 
         if last_data is None:
             error = "No deliverable text or media remained after processing"
@@ -10715,7 +10643,13 @@ async def _standalone_send(
             result["warnings"] = warnings
         return result
     except Exception as e:
-        return {"error": _standalone_sanitize_error(f"Discord send failed: {e}")}
+        logger.error("Discord standalone send failed: %s", e, exc_info=True)
+        return {
+            "error": _non_idempotent_discord_write_failure(
+                "Discord send",
+                e,
+            )
+        }
 
 
 # ── Plugin entry point ────────────────────────────────────────────────────────

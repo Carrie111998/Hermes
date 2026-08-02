@@ -13,6 +13,8 @@ import tempfile
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
 from plugins.platforms.discord.adapter import _remember_channel_is_forum, _standalone_send
 
 
@@ -134,9 +136,10 @@ def test_no_caption_non_forum_keeps_separate_text():
         os.unlink(img)
 
 
-def test_standalone_forum_ambiguous_create_is_not_retried_or_leaked():
+@pytest.mark.parametrize("is_forum", [False, True], ids=["message", "forum"])
+def test_standalone_ambiguous_write_is_not_retried_or_leaked(is_forum):
     chat_id = "999000333"
-    _remember_channel_is_forum(chat_id, True)
+    _remember_channel_is_forum(chat_id, is_forum)
     session_ctx, calls = _session_with(
         [_resp(500, text_data="RAW_STANDALONE_FORUM_SENTINEL")]
     )
@@ -156,9 +159,18 @@ def test_standalone_forum_ambiguous_create_is_not_retried_or_leaked():
     assert "RAW_STANDALONE_FORUM_SENTINEL" not in result["error"]
 
 
-def test_standalone_forum_rate_limit_retries_once_after_retry_after():
+@pytest.mark.parametrize("exhausted", [False, True], ids=["success", "exhausted"])
+def test_standalone_forum_rate_limit_is_bounded_and_sanitized(exhausted):
     chat_id = "999000444"
     _remember_channel_is_forum(chat_id, True)
+    second = _resp(
+        429,
+        text_data="RAW_SECOND_RATE_LIMIT_SENTINEL",
+        headers={"Retry-After": "3.5"},
+    ) if exhausted else _resp(
+        201,
+        json_data={"id": "thread-1", "message": {"id": "message-1"}},
+    )
     session_ctx, calls = _session_with(
         [
             _resp(
@@ -166,10 +178,7 @@ def test_standalone_forum_rate_limit_retries_once_after_retry_after():
                 text_data="RAW_RATE_LIMIT_SENTINEL",
                 headers={"Retry-After": "2.25"},
             ),
-            _resp(
-                201,
-                json_data={"id": "thread-1", "message": {"id": "message-1"}},
-            ),
+            second,
         ]
     )
     sleep = AsyncMock()
@@ -186,49 +195,16 @@ def test_standalone_forum_rate_limit_retries_once_after_retry_after():
             )
         )
 
-    assert result["success"] is True
-    assert result["thread_id"] == "thread-1"
     assert len(calls) == 2
     sleep.assert_awaited_once_with(2.25)
-
-
-def test_standalone_forum_exhausted_rate_limit_is_bounded_and_sanitized():
-    chat_id = "999000555"
-    _remember_channel_is_forum(chat_id, True)
-    session_ctx, calls = _session_with(
-        [
-            _resp(
-                429,
-                text_data="RAW_FIRST_RATE_LIMIT_SENTINEL",
-                headers={"Retry-After": "1.25"},
-            ),
-            _resp(
-                429,
-                text_data="RAW_SECOND_RATE_LIMIT_SENTINEL",
-                headers={"Retry-After": "3.5"},
-            ),
-        ]
-    )
-    sleep = AsyncMock()
-
-    with patch("aiohttp.ClientSession", return_value=session_ctx), patch(
-        "plugins.platforms.discord.adapter.asyncio.sleep",
-        new=sleep,
-    ):
-        result = asyncio.run(
-            _standalone_send(
-                _pconfig(),
-                chat_id,
-                "forum planning notes",
-            )
-        )
-
-    assert len(calls) == 2
-    assert "remained rate limited after one retry" in result["error"]
-    assert "3.5 seconds" in result["error"]
-    assert "RAW_FIRST_RATE_LIMIT_SENTINEL" not in result["error"]
-    assert "RAW_SECOND_RATE_LIMIT_SENTINEL" not in result["error"]
-    sleep.assert_awaited_once_with(1.25)
+    if exhausted:
+        assert "remained rate limited after one retry" in result["error"]
+        assert "3.5 seconds" in result["error"]
+        assert "RAW_RATE_LIMIT_SENTINEL" not in result["error"]
+        assert "RAW_SECOND_RATE_LIMIT_SENTINEL" not in result["error"]
+    else:
+        assert result["success"] is True
+        assert result["thread_id"] == "thread-1"
 
 
 def test_standalone_forum_media_429_rebuilds_multipart_for_replay():

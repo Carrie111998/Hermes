@@ -230,16 +230,16 @@ async def test_reconnect_closes_previous_client_to_prevent_zombie_websocket(monk
     assert {
         "on_guild_channel_update",
         "on_guild_channel_delete",
-        "on_thread_update",
-        "on_thread_delete",
         "on_thread_join",
         "on_thread_remove",
         "on_raw_thread_update",
         "on_raw_thread_delete",
         "on_guild_remove",
+        "on_guild_unavailable",
     } <= first_bot._events.keys()
-    cached_parent = SimpleNamespace(id=100)
-    cached_thread = SimpleNamespace(id=200, parent_id=100)
+    guild = SimpleNamespace(id=1)
+    cached_parent = SimpleNamespace(id=100, guild=guild)
+    cached_thread = SimpleNamespace(id=200, parent_id=100, guild=guild)
     adapter._cache_authoritative_message_channel(cached_parent)
     adapter._cache_authoritative_message_channel(cached_thread)
     await first_bot._events["on_guild_channel_update"](
@@ -248,6 +248,10 @@ async def test_reconnect_closes_previous_client_to_prevent_zombie_websocket(monk
     )
     assert 100 not in adapter._authoritative_message_channels
     assert 200 not in adapter._authoritative_message_channels
+    adapter._cache_authoritative_message_channel(cached_parent)
+    adapter._cache_authoritative_message_channel(cached_thread)
+    await first_bot._events["on_guild_unavailable"](guild)
+    assert adapter._authoritative_message_channels == {}
 
     # Second connect WITHOUT disconnect — simulates an in-process reconnect.
     # Without the fix, first_bot would remain open (zombie), and both would
