@@ -643,6 +643,50 @@ class TestLifecycleGuardModule:
         with pytest.raises(GatewayLifecycleBlocked):
             check_gateway_lifecycle("daily", "restart.sh")
 
+    @pytest.mark.parametrize("line", [
+        # `punctuation_chars` makes `()` a segment break, so the remainder of
+        # each of these lines starts with a bare `/` token that the reference
+        # scanner reads as a path — the root directory. A directory is not a
+        # script, so it must not fail the scan closed.
+        'HERMES_SCRIPTS = Path.home() / ".hermes/scripts"',
+        'MISSING = Path.home() / "zzz-nonexistent"',
+        "pct = len(items) / total",
+        "ratio = (a + b) / 2",
+    ])
+    def test_python_path_and_division_lines_do_not_block(self, tmp_path, line):
+        """Python source is not shell, but the scanner tokenizes it as if it
+        were. Inline path/division expressions must not read as a reference to
+        `/` that fails closed (the error names a gateway command the script
+        does not contain)."""
+        from cron.lifecycle_guard import check_gateway_lifecycle
+        script = tmp_path / "job.py"
+        script.write_text(f"from pathlib import Path\n{line}\n")
+        check_gateway_lifecycle("daily maintenance job", str(script))
+
+    def test_python_script_with_real_command_still_blocks(self, tmp_path):
+        """Negative control for the case above: the same Python shape carrying
+        an actual lifecycle command must still be rejected."""
+        from cron.lifecycle_guard import GatewayLifecycleBlocked, check_gateway_lifecycle
+        script = tmp_path / "job.py"
+        script.write_text(
+            "from pathlib import Path\n"
+            'HERMES_SCRIPTS = Path.home() / ".hermes/scripts"\n'
+            'subprocess.run("launchctl kickstart -k gui/501/ai.hermes.gateway")\n'
+        )
+        with pytest.raises(GatewayLifecycleBlocked):
+            check_gateway_lifecycle("daily maintenance job", str(script))
+
+    def test_referenced_script_recursion_still_blocks(self, tmp_path):
+        """Second negative control: ignoring directories must not disable the
+        referenced-script scanner itself."""
+        from cron.lifecycle_guard import GatewayLifecycleBlocked, check_gateway_lifecycle
+        inner = tmp_path / "inner.sh"
+        inner.write_text("launchctl kickstart -k gui/501/ai.hermes.gateway\n")
+        outer = tmp_path / "outer.sh"
+        outer.write_text(f"#!/bin/bash\nsource {inner}\n")
+        with pytest.raises(GatewayLifecycleBlocked):
+            check_gateway_lifecycle("clean prompt", str(outer))
+
 
 # ---------------------------------------------------------------------------
 # Defense 2 (chokepoint): cron.jobs.create_job blocks the AGENT model-tool path
