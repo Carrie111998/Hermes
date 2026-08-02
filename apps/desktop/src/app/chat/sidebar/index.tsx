@@ -93,6 +93,8 @@ import {
   $sessionProfilesTruncated,
   $sessions,
   $sessionsLoading,
+  $unreadFinishedSessionIds,
+  markAllSessionsRead,
   sessionPinId,
   setCurrentCwd
 } from '@/store/session'
@@ -303,6 +305,7 @@ export function ChatSidebar({
   const sessionsLoading = useStore($sessionsLoading)
   const sessionProfilesTruncated = useStore($sessionProfilesTruncated)
   const workingSessionIds = useStore($workingSessionIds)
+  const unreadCount = useStore($unreadFinishedSessionIds).length
   const profiles = useStore($profiles)
   const profileScope = useStore($profileScope)
   // Only surface the profile switcher when more than one profile exists, so
@@ -1332,7 +1335,24 @@ export function ChatSidebar({
                 forceEmptyState={showSessionSkeletons}
                 groups={displayAgentGroups}
                 headerAction={
-                  inProject && enteredProject ? (
+                  <>
+                    {unreadCount > 0 && (
+                      <Tip label={s.markAllRead}>
+                        <Button
+                          aria-label={s.markAllRead}
+                          className={HEADER_ACTION_BTN}
+                          onClick={event => {
+                            event.stopPropagation()
+                            markAllSessionsRead()
+                          }}
+                          size="icon-xs"
+                          variant="ghost"
+                        >
+                          <Codicon name="check-all" size="0.75rem" />
+                        </Button>
+                      </Tip>
+                    )}
+                    {inProject && enteredProject ? (
                     <div className="group/workspace flex shrink-0 items-center gap-0.5">
                       {enteredProject.path && (
                         <StartWorkButton onStarted={onNewSessionInWorkspace} repoPath={enteredProject.path} />
@@ -1409,7 +1429,8 @@ export function ChatSidebar({
                         ) : null}
                       </div>
                     </div>
-                  )
+                  )}
+                  </>
                 }
                 label={sessionsLabel}
                 labelMeta={
