@@ -20,7 +20,7 @@ import { usePointerQuiet } from '@/components/ui/keyboard-first'
 import { Skeleton } from '@/components/ui/skeleton'
 import type { HermesGateway } from '@/hermes'
 import { useI18n } from '@/i18n'
-import { modelOptionsQueryKey, requestModelOptions } from '@/lib/model-options'
+import { isProviderReady, modelOptionsQueryKey, requestModelOptions } from '@/lib/model-options'
 import { displayModelName, modelDisplayParts } from '@/lib/model-status-label'
 import { DEFAULT_REASONING_EFFORT, reasoningEffortLabel } from '@/lib/reasoning-effort'
 import { normalize } from '@/lib/text'
@@ -355,6 +355,7 @@ export function ModelCatalogMenu({
         <div className={cn('max-h-[max(150px,30dvh)] overflow-y-auto py-0.5', quietRows)} ref={listRef}>
           {groups.map(group => {
             const slug = group.provider.slug
+            const providerReady = isProviderReady(group.provider)
 
             // Collapsed when the user stored it (and not while searching, which
             // spans every model regardless of collapse state).
@@ -373,6 +374,11 @@ export function ModelCatalogMenu({
                   <span className="truncate">
                     <HighlightMatches query={search} text={group.provider.name} />
                   </span>
+                  {!providerReady ? (
+                    <span className="ml-auto truncate text-(--ui-text-tertiary)">
+                      {group.provider.warning || 'Setup required'}
+                    </span>
+                  ) : null}
                   <DisclosureCaret
                     className="shrink-0 text-(--ui-text-tertiary) opacity-0 transition group-hover/label:opacity-100"
                     open={!collapsed}
@@ -418,6 +424,10 @@ export function ModelCatalogMenu({
                     // submenu (reasoning/fast) is reached by HOVER, so you can
                     // tweak those without the click dismissing everything.
                     const activate = () => {
+                      if (!providerReady) {
+                        return
+                      }
+
                       if (!isCurrent) {
                         void selectFamily(family, group.provider)
                       }
@@ -428,6 +438,8 @@ export function ModelCatalogMenu({
                     return (
                       <DropdownMenuSub key={`${group.provider.slug}:${family.id}`}>
                         <DropdownMenuSubTrigger
+                          className={dropdownMenuRow}
+                          disabled={!providerReady}
                           hideChevron
                           onClick={activate}
                           onKeyDown={event => {

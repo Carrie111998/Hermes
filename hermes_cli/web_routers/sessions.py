@@ -41,6 +41,7 @@ _cron_profile_home = late("_cron_profile_home")
 _import_sessions_for_profile = late("_import_sessions_for_profile")
 _maybe_auto_archive_for_profile = late("_maybe_auto_archive_for_profile")
 _open_session_db_for_profile = late("_open_session_db_for_profile")
+_run_session_db_io = late("_run_session_db_io")
 _prune_sessions = late("_prune_sessions")
 _read_session_import_body = late("_read_session_import_body")
 _session_latest_descendant = late("_session_latest_descendant")
@@ -162,6 +163,25 @@ def get_sessions(
 
 @search_router.get("/api/sessions/search")
 async def search_sessions(
+    q: str = "",
+    limit: int = 20,
+    profile: Optional[str] = None,
+    source: str = None,
+    sources: str = None,
+    exclude_sources: str = None,
+):
+    return await _run_session_db_io(
+        _search_sessions_payload,
+        q,
+        limit,
+        profile,
+        source,
+        sources,
+        exclude_sources,
+    )
+
+
+def _search_sessions_payload(
     q: str = "",
     limit: int = 20,
     profile: Optional[str] = None,
@@ -312,14 +332,22 @@ async def search_sessions(
             # logs, or another Hermes surface. FTS can't find those unless the
             # id happens to appear in message text. search_sessions_by_id is
             # SQL-bounded, so this stays cheap even with thousands of sessions.
-            for row in db.search_sessions_by_id(
-                q,
-                limit=safe_limit,
-                include_archived=True,
-                source=source_filter,
-                sources=source_list or None,
-                exclude_sources=exclude_list or None,
-            ):
+            try:
+                id_matches = db.search_sessions_by_id(
+                    q,
+                    limit=safe_limit,
+                    include_archived=True,
+                    source=source_filter,
+                    sources=source_list or None,
+                    exclude_sources=exclude_list or None,
+                )
+            except TypeError:
+                # Keep compatibility with older/fork test doubles and
+                # SessionDB implementations that predate source filters.
+                id_matches = db.search_sessions_by_id(
+                    q, limit=safe_limit, include_archived=True
+                )
+            for row in id_matches:
                 sid = row.get("id")
                 preview = (row.get("preview") or "").strip()
                 snippet = preview or f"Session ID: {sid}"
@@ -427,7 +455,7 @@ async def bulk_delete_sessions_endpoint(body: BulkDeleteSessions):
         finally:
             db.close()
 
-    deleted = await asyncio.to_thread(_delete)
+    deleted = await _run_session_db_io(_delete)
     return {"ok": True, "deleted": deleted}
 
 
@@ -448,7 +476,7 @@ async def import_sessions_endpoint(request: Request):
         raise HTTPException(status_code=400, detail="Invalid session import payload") from exc
 
     try:
-        result = await asyncio.to_thread(_import_sessions_for_profile, body.profile, body.sessions)
+        result = await _run_session_db_io(_import_sessions_for_profile, body.profile, body.sessions)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -472,7 +500,7 @@ async def count_empty_sessions_endpoint(profile: Optional[str] = None):
         finally:
             db.close()
 
-    return {"count": await asyncio.to_thread(_count)}
+    return {"count": await _run_session_db_io(_count)}
 
 
 @manage_router.delete("/api/sessions/empty")
@@ -502,7 +530,7 @@ async def delete_empty_sessions_endpoint(profile: Optional[str] = None):
         finally:
             db.close()
 
-    deleted = await asyncio.to_thread(_delete)
+    deleted = await _run_session_db_io(_delete)
     return {"ok": True, "deleted": deleted}
 
 
@@ -527,7 +555,17 @@ async def get_session_stats(profile: Optional[str] = None):
                     exclude_children=True,
                 )
             except Exception:
-                pass
+                # Older/fork SessionDB implementations expose only the rich
+                # row listing; retain that compatibility while using the
+                # upstream aggregate query when available.
+                try:
+                    for row in db.list_sessions_rich(
+                        limit=10000, include_archived=True, compact_rows=True
+                    ):
+                        source = str(row.get("source") or "cli")
+                        by_source[source] = by_source.get(source, 0) + 1
+                except Exception:
+                    pass
             return {
                 "total": total,
                 "active_store": active_store,
@@ -538,30 +576,33 @@ async def get_session_stats(profile: Optional[str] = None):
         finally:
             db.close()
 
-    return await asyncio.to_thread(_stats)
+    return await _run_session_db_io(_stats)
 
 
 @manage_router.get("/api/sessions/{session_id}")
 async def get_session_detail(session_id: str, profile: Optional[str] = None):
-    db = _open_session_db_for_profile(profile)
-    try:
-        sid = db.resolve_session_id(session_id)
-        session = db.get_session(sid) if sid else None
-        if not session:
-            raise HTTPException(status_code=404, detail="Session not found")
-        # Always stamp the owning profile — the serving profile is known even
-        # when the request carries no ``?profile=`` (it's this process's own
-        # profile). Stamping only on explicit ``?profile=`` left rows for the
-        # default/primary profile systematically unowned, so multi-profile
-        # clients resolved them to whichever gateway happened to be active
-        # (cross-profile open asymmetry, #67603 family).
-        session["profile"] = (
-            _cron_profile_home(profile)[0] if profile else _cron_default_profile()
-        )
-        session["is_default_profile"] = session["profile"] == "default"
-        return session
-    finally:
-        db.close()
+    def _detail():
+        db = _open_session_db_for_profile(profile)
+        try:
+            sid = db.resolve_session_id(session_id)
+            session = db.get_session(sid) if sid else None
+            if not session:
+                raise HTTPException(status_code=404, detail="Session not found")
+            # Always stamp the owning profile — the serving profile is known even
+            # when the request carries no ``?profile=`` (it's this process's own
+            # profile). Stamping only on explicit ``?profile=`` left rows for the
+            # default/primary profile systematically unowned, so multi-profile
+            # clients resolved them to whichever gateway happened to be active
+            # (cross-profile open asymmetry, #67603 family).
+            session["profile"] = (
+                _cron_profile_home(profile)[0] if profile else _cron_default_profile()
+            )
+            session["is_default_profile"] = session["profile"] == "default"
+            return session
+        finally:
+            db.close()
+
+    return await _run_session_db_io(_detail)
 
 
 @manage_router.get("/api/sessions/{session_id}/latest-descendant")
@@ -576,7 +617,7 @@ async def get_session_latest_descendant(
         finally:
             db.close()
 
-    latest, path = await asyncio.to_thread(_lookup)
+    latest, path = await _run_session_db_io(_lookup)
     if not latest:
         raise HTTPException(status_code=404, detail="Session not found")
     return {
@@ -607,7 +648,7 @@ async def get_session_messages(
         finally:
             db.close()
 
-    result = await asyncio.to_thread(_read)
+    result = await _run_session_db_io(_read)
     if result is None:
         raise HTTPException(status_code=404, detail="Session not found")
     sid, _limit, messages = result
@@ -647,7 +688,7 @@ async def delete_session_endpoint(session_id: str, profile: Optional[str] = None
         finally:
             db.close()
 
-    return await asyncio.to_thread(_delete)
+    return await _run_session_db_io(_delete)
 
 
 @manage_router.patch("/api/sessions/{session_id}")
@@ -659,34 +700,37 @@ async def rename_session_endpoint(session_id: str, body: SessionRename):
     session from the auto-archive sweep). Any field may be omitted. ``profile``
     targets another profile's session.
     """
-    db = _open_session_db_for_profile(body.profile)
-    try:
-        sid = db.resolve_session_id(session_id)
-        if not sid:
-            raise HTTPException(status_code=404, detail="Session not found")
-        if body.title is None and body.archived is None and body.pinned is None:
-            raise HTTPException(
-                status_code=400,
-                detail="Nothing to update; provide 'title', 'archived', and/or 'pinned'.",
-            )
-        if body.title is not None:
-            try:
-                db.set_session_title(sid, body.title or "")
-            except ValueError as e:
-                # Title too long, invalid characters, or already in use.
-                raise HTTPException(status_code=400, detail=str(e))
-        if body.archived is not None:
-            db.set_session_archived(sid, body.archived)
-        if body.pinned is not None:
-            db.set_session_pinned(sid, body.pinned)
-        result = {"ok": True, "title": db.get_session_title(sid) or ""}
-        if body.archived is not None:
-            result["archived"] = bool(body.archived)
-        if body.pinned is not None:
-            result["pinned"] = bool(body.pinned)
-        return result
-    finally:
-        db.close()
+    def _rename():
+        db = _open_session_db_for_profile(body.profile)
+        try:
+            sid = db.resolve_session_id(session_id)
+            if not sid:
+                raise HTTPException(status_code=404, detail="Session not found")
+            if body.title is None and body.archived is None and body.pinned is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Nothing to update; provide 'title', 'archived', and/or 'pinned'.",
+                )
+            if body.title is not None:
+                try:
+                    db.set_session_title(sid, body.title or "")
+                except ValueError as e:
+                    # Title too long, invalid characters, or already in use.
+                    raise HTTPException(status_code=400, detail=str(e))
+            if body.archived is not None:
+                db.set_session_archived(sid, body.archived)
+            if body.pinned is not None:
+                db.set_session_pinned(sid, body.pinned)
+            result = {"ok": True, "title": db.get_session_title(sid) or ""}
+            if body.archived is not None:
+                result["archived"] = bool(body.archived)
+            if body.pinned is not None:
+                result["pinned"] = bool(body.pinned)
+            return result
+        finally:
+            db.close()
+
+    return await _run_session_db_io(_rename)
 
 
 @manage_router.get("/api/sessions/{session_id}/export")
@@ -700,7 +744,7 @@ async def export_session_endpoint(session_id: str, profile: Optional[str] = None
         finally:
             db.close()
 
-    data = await asyncio.to_thread(_export)
+    data = await _run_session_db_io(_export)
     if data is None:
         raise HTTPException(status_code=404, detail="Session not found")
     return data
@@ -709,4 +753,4 @@ async def export_session_endpoint(session_id: str, profile: Optional[str] = None
 @manage_router.post("/api/sessions/prune")
 async def prune_sessions_endpoint(body: SessionPrune):
     """Delete ended sessions matching filters without blocking the event loop."""
-    return await asyncio.to_thread(_prune_sessions, body)
+    return await _run_session_db_io(_prune_sessions, body)

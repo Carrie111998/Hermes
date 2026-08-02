@@ -17,6 +17,9 @@ TARGET_HANDLERS = {
     "delete_session_endpoint",
     "export_session_endpoint",
     "prune_sessions_endpoint",
+    "search_sessions",
+    "get_session_detail",
+    "rename_session_endpoint",
     "get_usage_analytics",
     "get_models_analytics",
 }
