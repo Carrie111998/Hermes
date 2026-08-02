@@ -7,7 +7,8 @@ Contract:
 - First run: record all IDs from the fetched batch, emit nothing.
 - Subsequent runs: emit items whose ID isn't in the stored set.
 - Bounded: keep at most `max_seen` IDs (default 500), evicting the
-  least-recently-seen ones first.
+  oldest stored IDs first (FIFO by insertion order — seeing an ID again
+  does not move it back to the newest end).
 - Atomic: write to a .tmp file and rename, so a crashed script can't
   leave a half-written state file that permanently breaks dedup.
 
