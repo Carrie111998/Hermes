@@ -26,6 +26,7 @@ from hermes_cli.middleware import (
     VALID_MIDDLEWARE,
     apply_llm_request_middleware,
     apply_tool_request_middleware,
+    run_llm_execution_middleware,
     run_tool_execution_middleware,
 )
 
@@ -113,12 +114,8 @@ class TestPluginDiscovery:
         assert "llm_request" in VALID_MIDDLEWARE
         assert "tool_request" in VALID_MIDDLEWARE
         assert set(mgr._plugins["mw_plugin"].middleware_registered) == {"llm_request", "tool_request"}
-        assert mgr.invoke_middleware("llm_request", request={"messages": []}) == [
-            {"request": {"messages": [], "mw": True}}
-        ]
-        assert mgr.invoke_middleware("tool_request", args={"path": "README.md"}) == [
-            {"args": {"path": "README.md", "mw": True}}
-        ]
+        assert mgr.invoke_middleware("llm_request", request={"messages": []}) == []
+        assert mgr.invoke_middleware("tool_request", args={"path": "README.md"}) == []
         assert mgr.has_middleware("llm_request") is True
 
 
@@ -142,6 +139,72 @@ class TestPluginDiscovery:
         assert tool_result.trace == []
         assert run_tool_execution_middleware("terminal", args, lambda payload: payload) is args
         assert has_middleware("tool_request") is False
+
+    def test_middleware_is_notification_only_under_mutation_return_and_error(self, monkeypatch):
+        manager = PluginManager()
+        observed_phases = []
+
+        def mutate_request(**kwargs):
+            kwargs["request"]["messages"][0]["content"] = "plugin mutation"
+            return {"request": {"messages": [{"role": "user", "content": "replacement"}]}}
+
+        def mutate_execution(**kwargs):
+            observed_phases.append(kwargs["phase"])
+            kwargs["args"]["path"] = "plugin-path"
+            if kwargs["phase"] == "after":
+                kwargs["result"]["source"] = "plugin"
+            return {"source": "replacement"}
+
+        def broken(**_kwargs):
+            raise RuntimeError("plugin failed")
+
+        manager._middleware = {
+            "llm_request": [mutate_request, broken],
+            "tool_execution": [mutate_execution, broken],
+        }
+        monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", lambda: manager)
+
+        request = {"messages": [{"role": "user", "content": "model request"}]}
+        request_result = apply_llm_request_middleware(request)
+        assert request_result.payload is request
+        assert request == {"messages": [{"role": "user", "content": "model request"}]}
+        assert request_result.changed is False
+        assert request_result.trace == []
+
+        calls = []
+        args = {"path": "model-path"}
+
+        def execute(payload):
+            calls.append(payload.copy())
+            return {"source": "tool"}
+
+        result = run_tool_execution_middleware("read_file", args, execute)
+        assert calls == [{"path": "model-path"}]
+        assert args == {"path": "model-path"}
+        assert result == {"source": "tool"}
+        assert observed_phases == ["before", "after"]
+
+    def test_llm_execution_observer_cannot_skip_or_replace_provider_call(self, monkeypatch):
+        manager = PluginManager()
+        manager._middleware = {
+            "llm_execution": [
+                lambda **kwargs: {"response": "forged", "request": kwargs["request"]},
+                lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("observer error")),
+            ]
+        }
+        monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", lambda: manager)
+
+        request = {"messages": [{"role": "user", "content": "unchanged"}]}
+        calls = []
+        response = object()
+
+        def provider(payload):
+            calls.append(payload)
+            return response
+
+        assert run_llm_execution_middleware(request, provider) is response
+        assert calls == [request]
+        assert request["messages"][0]["content"] == "unchanged"
 
 
 
@@ -308,8 +371,8 @@ class TestPluginHooks:
 
 
 
-    def test_pre_gateway_dispatch_collects_action_dicts(self, tmp_path, monkeypatch):
-        """pre_gateway_dispatch callbacks return action dicts (skip/rewrite/allow)."""
+    def test_pre_gateway_dispatch_action_is_observation_only(self, tmp_path, monkeypatch):
+        """A plugin cannot skip or rewrite an incoming model request."""
         plugins_dir = tmp_path / "hermes_test" / "plugins"
         _make_plugin_dir(
             plugins_dir, "predispatch_plugin",
@@ -329,8 +392,7 @@ class TestPluginHooks:
             gateway=object(),
             session_store=object(),
         )
-        assert len(results) == 1
-        assert results[0] == {"action": "skip", "reason": "test"}
+        assert results == []
 
 
 
@@ -367,17 +429,49 @@ class TestPluginHooks:
         )
         assert results == [{"seen": 2, "mc": 5, "tc": 3}]
 
+    def test_hook_callbacks_receive_independent_detached_snapshots(self):
+        manager = PluginManager()
+        second_observation = []
+
+        def hostile_observer(**kwargs):
+            kwargs["request"]["body"]["messages"][0]["content"] = "mutated"
+            kwargs["assistant_message"].content = "forged"
+            return {"replacement": True}
+
+        def record_observer(**kwargs):
+            second_observation.append(
+                (
+                    kwargs["request"]["body"]["messages"][0]["content"],
+                    kwargs["assistant_message"].content,
+                )
+            )
+
+        manager._hooks["pre_api_request"] = [hostile_observer, record_observer]
+        request = {
+            "body": {"messages": [{"role": "user", "content": "original"}]}
+        }
+        assistant_message = types.SimpleNamespace(content="model output")
+
+        assert manager.invoke_hook(
+            "pre_api_request",
+            request=request,
+            assistant_message=assistant_message,
+        ) == [{"replacement": True}]
+        assert request["body"]["messages"][0]["content"] == "original"
+        assert assistant_message.content == "model output"
+        assert second_observation == [("original", "model output")]
+
 
 
 class TestPreToolCallBlocking:
-    """Tests for the pre_tool_call block directive helper."""
+    """Legacy pre-tool directives are notification-only."""
 
     def test_block_message_returned_for_valid_directive(self, monkeypatch):
         monkeypatch.setattr(
             "hermes_cli.plugins.invoke_hook",
             lambda hook_name, **kwargs: [{"action": "block", "message": "blocked by plugin"}],
         )
-        assert get_pre_tool_call_block_message("todo", {}, task_id="t1") == "blocked by plugin"
+        assert get_pre_tool_call_block_message("todo", {}, task_id="t1") is None
 
 
 class TestPreToolCallDirective:
@@ -385,18 +479,17 @@ class TestPreToolCallDirective:
 
 
     def test_approve_without_message_is_valid(self, monkeypatch):
-        """approve may omit a message (block may not)."""
+        """Plugin approval requests cannot escalate a model-authored call."""
         from hermes_cli.plugins import get_pre_tool_call_directive
         monkeypatch.setattr(
             "hermes_cli.plugins.invoke_hook",
             lambda hook_name, **kwargs: [{"action": "approve"}],
         )
-        assert get_pre_tool_call_directive("write_file", {}) == ("approve", None)
+        assert get_pre_tool_call_directive("write_file", {}) == (None, None)
 
 
 class TestResolvePreToolBlock:
-    """Tests for the single dispatch-site chokepoint that resolves a
-    directive (incl. the approve→gate escalation) to a block message."""
+    """Plugin directives cannot reach the owner approval gate."""
 
 
     def test_approve_passes_plugin_rule_key_to_gate(self, monkeypatch):
@@ -424,14 +517,10 @@ class TestResolvePreToolBlock:
         monkeypatch.setattr("tools.approval.request_tool_approval", _approve)
 
         assert resolve_pre_tool_block("write_file", {}) is None
-        assert seen == {
-            "tool_name": "write_file",
-            "reason": "why",
-            "rule_key": "write_file:ssh",
-        }
+        assert seen == {}
 
 
-    def test_approve_gate_exception_fails_closed(self, monkeypatch):
+    def test_approve_gate_is_not_called(self, monkeypatch):
         from hermes_cli.plugins import resolve_pre_tool_block
         monkeypatch.setattr(
             "hermes_cli.plugins.invoke_hook",
@@ -440,8 +529,7 @@ class TestResolvePreToolBlock:
         def _boom(*a, **k):
             raise RuntimeError("gate crashed")
         monkeypatch.setattr("tools.approval.request_tool_approval", _boom)
-        msg = resolve_pre_tool_block("terminal", {})
-        assert msg is not None and "gate failed" in msg  # fail-closed
+        assert resolve_pre_tool_block("terminal", {}) is None
 
 
 class TestGetPreVerifyContinueMessage:
@@ -804,12 +892,7 @@ class TestPluginManagerList:
 
 
 class TestPreLlmCallTargetRouting:
-    """Tests for pre_llm_call hook return format with target-aware routing.
-
-    The routing logic lives in run_agent.py, but the return format is collected
-    by invoke_hook(). These tests verify the return format works correctly and
-    that downstream code can route based on the 'target' key.
-    """
+    """pre_llm_call remains observable but cannot inject prompt context."""
 
     def _make_pre_llm_plugin(self, plugins_dir, name, return_expr):
         """Create a plugin that returns a specific value from pre_llm_call."""
@@ -820,8 +903,8 @@ class TestPreLlmCallTargetRouting:
             ),
         )
 
-    def test_context_dict_returned(self, tmp_path, monkeypatch):
-        """Plugin returning a context dict is collected by invoke_hook."""
+    def test_context_dict_is_not_returned(self, tmp_path, monkeypatch):
+        """A plugin return cannot alter the current user message."""
         plugins_dir = tmp_path / "hermes_test" / "plugins"
         self._make_pre_llm_plugin(
             plugins_dir, "basic_plugin",
@@ -836,17 +919,10 @@ class TestPreLlmCallTargetRouting:
             "pre_llm_call", session_id="s1", user_message="hi",
             conversation_history=[], is_first_turn=True, model="test",
         )
-        assert len(results) == 1
-        assert results[0]["context"] == "basic context"
-        assert "target" not in results[0]
+        assert results == []
 
 
-    def test_routing_logic_all_to_user_message(self, tmp_path, monkeypatch):
-        """Simulate the routing logic from run_agent.py.
-
-        All plugin context — dicts and plain strings — ends up in a single
-        user message context string. There is no system_prompt target.
-        """
+    def test_callback_context_cannot_reach_user_message(self, tmp_path, monkeypatch):
         plugins_dir = tmp_path / "hermes_test" / "plugins"
         self._make_pre_llm_plugin(
             plugins_dir, "aaa_mem",
@@ -878,11 +954,9 @@ class TestPreLlmCallTargetRouting:
             elif isinstance(r, str) and r.strip():
                 _ctx_parts.append(r)
 
-        assert _ctx_parts == ["memory A", "rule B", "plain text C"]
+        assert _ctx_parts == []
         _plugin_user_context = "\n\n".join(_ctx_parts)
-        assert "memory A" in _plugin_user_context
-        assert "rule B" in _plugin_user_context
-        assert "plain text C" in _plugin_user_context
+        assert _plugin_user_context == ""
 
 
 # ── TestPluginCommands ────────────────────────────────────────────────────

@@ -302,46 +302,6 @@ class _ManagedToolResult:
     blocked: bool
 
 
-class _ConcurrentToolAuthorizationGate:
-    """Serialize policy prompts and exclude their queue from batch deadlines."""
-
-    def __init__(self) -> None:
-        self._serialization_lock = threading.Lock()
-        self._state_lock = threading.Lock()
-        self._pending = 0
-        self._window_started: float | None = None
-        self._excluded_seconds = 0.0
-
-    def run(self, callback):
-        now = time.monotonic()
-        with self._state_lock:
-            if self._pending == 0:
-                self._window_started = now
-            self._pending += 1
-        try:
-            with self._serialization_lock:
-                return callback()
-        finally:
-            now = time.monotonic()
-            with self._state_lock:
-                self._pending -= 1
-                if self._pending == 0:
-                    if self._window_started is not None:
-                        self._excluded_seconds += max(
-                            0.0, now - self._window_started
-                        )
-                    self._window_started = None
-
-    def excluded_seconds(self) -> float:
-        """Return completed plus currently active authorization wait time."""
-        now = time.monotonic()
-        with self._state_lock:
-            excluded = self._excluded_seconds
-            if self._window_started is not None:
-                excluded += max(0.0, now - self._window_started)
-            return excluded
-
-
 def _managed_values(
     outcome: _ManagedToolResult,
 ) -> tuple[Any, dict[str, Any], list[dict[str, Any]], bool]:
@@ -365,10 +325,8 @@ def _run_agent_tool_execution_middleware(
     display_index: int | None = None,
     middleware_trace: list[dict[str, Any]] | None = None,
     begin_execution=None,
-    authorization_gate: _ConcurrentToolAuthorizationGate | None = None,
 ) -> _ManagedToolResult:
-    """Run Relay rewrites before Hermes policy and dispatch exactly once."""
-    from agent import relay_tools
+    """Observe the model-authored call, then authorize and dispatch once."""
     from agent.model_authored_tool_args import (
         capture_model_authored_tool_args,
         restore_model_authored_tool_args,
@@ -422,32 +380,27 @@ def _run_agent_tool_execution_middleware(
 
         block_message = scope_block
         block_error_type = "tool_scope_block"
+        # Preserve the legacy event for observers, but never interpret a
+        # plugin return as block/approval authority. The callback receives a
+        # detached snapshot via PluginManager.invoke_hook().
         if block_message is None:
-            block_error_type = "plugin_block"
+            try:
+                from hermes_cli.lifecycle import invoke_hook
 
-            def _resolve_pre_tool_block():
-                try:
-                    from hermes_cli.plugins import resolve_pre_tool_block
-
-                    return resolve_pre_tool_block(
-                        function_name,
-                        final_args,
-                        task_id=effective_task_id or "",
-                        session_id=getattr(agent, "session_id", "") or "",
-                        tool_call_id=tool_call_id or "",
-                        turn_id=getattr(agent, "_current_turn_id", "") or "",
-                        api_request_id=getattr(agent, "_current_api_request_id", "")
-                        or "",
-                        middleware_trace=list(state["middleware_trace"]),
-                    )
-                except Exception:
-                    return None
-
-            block_message = (
-                _resolve_pre_tool_block()
-                if authorization_gate is None
-                else authorization_gate.run(_resolve_pre_tool_block)
-            )
+                invoke_hook(
+                    "pre_tool_call",
+                    tool_name=function_name,
+                    args=final_args,
+                    task_id=effective_task_id or "",
+                    session_id=getattr(agent, "session_id", "") or "",
+                    tool_call_id=tool_call_id or "",
+                    turn_id=getattr(agent, "_current_turn_id", "") or "",
+                    api_request_id=getattr(agent, "_current_api_request_id", "")
+                    or "",
+                    middleware_trace=list(state["middleware_trace"]),
+                )
+            except Exception:
+                pass
 
         guardrail_decision = None
         if block_message is None:
@@ -531,18 +484,7 @@ def _run_agent_tool_execution_middleware(
             api_request_id=getattr(agent, "_current_api_request_id", "") or "",
         )
 
-    result, _relay_args = relay_tools.execute(
-        function_name,
-        function_args,
-        _hermes_pipeline,
-        session_id=getattr(agent, "session_id", "") or "",
-        metadata={
-            "task_id": effective_task_id or "",
-            "turn_id": getattr(agent, "_current_turn_id", "") or "",
-            "api_request_id": getattr(agent, "_current_api_request_id", "") or "",
-            "tool_call_id": tool_call_id or "",
-        },
-    )
+    result = _hermes_pipeline(function_args)
     return _ManagedToolResult(
         result=result,
         args=state["args"],
@@ -768,8 +710,6 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
 
     start_condition = threading.Condition()
     next_start_order = 0
-    authorization_gate = _ConcurrentToolAuthorizationGate()
-
     def _begin_in_order(order: int, callback=None) -> None:
         nonlocal next_start_order
         with start_condition:
@@ -864,7 +804,6 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     display_index=index + 1,
                     middleware_trace=middleware_trace,
                     begin_execution=_advance_start,
-                    authorization_gate=authorization_gate,
                 )
                 result = managed.result
                 function_args = managed.args
@@ -1024,10 +963,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 while True:
                     wait_timeout = 5.0
                     if deadline is not None:
-                        effective_deadline = (
-                            deadline + authorization_gate.excluded_seconds()
-                        )
-                        remaining = effective_deadline - time.monotonic()
+                        remaining = deadline - time.monotonic()
                         if remaining <= 0:
                             done, not_done = set(), {
                                 f for f in futures if not f.done()
@@ -1044,11 +980,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     if not not_done:
                         break
 
-                    if (
-                        deadline is not None
-                        and time.monotonic()
-                        >= deadline + authorization_gate.excluded_seconds()
-                    ):
+                    if deadline is not None and time.monotonic() >= deadline:
                         abandon_executor = True
                         timed_out_indices = {
                             future_to_index[f]

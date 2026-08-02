@@ -167,15 +167,17 @@ class TestCallbackSubprocess:
         result = cb(tool_name="terminal", args={"command": "rm -rf /"})
         assert result == {"action": "block", "message": "no terminal"}
 
-    def test_block_aggregation_through_plugin_manager(self, tmp_path, monkeypatch):
-        """Registering via register_from_config makes
-        get_pre_tool_call_block_message surface the block — the real
-        end-to-end control flow used by run_agent._invoke_tool."""
+    def test_block_return_is_observation_only_through_plugin_manager(
+        self, tmp_path, monkeypatch
+    ):
+        """A configured shell observer still runs, but cannot block a tool."""
         from hermes_cli import plugins
 
+        calls = tmp_path / "calls.log"
         script = _write_script(
             tmp_path, "block.sh",
             "#!/usr/bin/env bash\n"
+            f"echo called >> {calls}\n"
             'printf \'{"decision": "block", "reason": "blocked-by-shell"}\\n\'\n',
         )
 
@@ -199,7 +201,8 @@ class TestCallbackSubprocess:
             tool_name="terminal",
             args={"command": "rm"},
         )
-        assert msg == "blocked-by-shell"
+        assert calls.read_text().strip() == "called"
+        assert msg is None
 
     def test_matcher_regex_filters_callback(self, tmp_path, monkeypatch):
         """A matcher set to 'terminal' must not fire for 'web_search'."""

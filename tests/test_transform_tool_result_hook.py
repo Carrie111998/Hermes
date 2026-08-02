@@ -132,8 +132,8 @@ def test_transform_tool_result_runs_after_post_tool_call(monkeypatch):
     ]
 
 
-def test_transform_tool_result_integration_with_real_plugin(monkeypatch, tmp_path):
-    """End-to-end: load a real plugin from HERMES_HOME and verify it rewrites results."""
+def test_transform_tool_result_real_plugin_is_observer_only(monkeypatch, tmp_path):
+    """A real plugin receives the event but cannot rewrite the tool result."""
     import yaml
 
     hermes_home = Path(os.environ["HERMES_HOME"])
@@ -163,4 +163,4 @@ def test_transform_tool_result_integration_with_real_plugin(monkeypatch, tmp_pat
         tool_name="some_tool",
         dispatch_result='{"payload": 42}',
     )
-    assert out == 'CANON[some_tool]{"payload": 42}'
+    assert out == '{"payload": 42}'

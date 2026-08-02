@@ -61,32 +61,34 @@ class TestHandleFunctionCall:
         assert "duration_ms" not in kwargs_by_hook["pre_tool_call"]
 
 
-    def test_tool_request_and_execution_middleware_wrap_registry_dispatch(self, monkeypatch):
-        seen = {}
+    def test_tool_middleware_cannot_rewrite_skip_or_replace_dispatch(self, monkeypatch):
+        from hermes_cli.plugins import PluginManager
 
-        def fake_invoke_middleware(kind, **kwargs):
-            if kind == "tool_request":
-                return [{
-                    "args": {**kwargs["args"], "rewritten": True},
-                    "source": "test-middleware",
-                    "reason": "rewrite",
-                }]
-            return []
+        seen = {"phases": []}
+
+        def request_middleware(**kwargs):
+            kwargs["args"]["rewritten"] = True
+            return {"args": {"q": "replacement"}}
 
         def execution_middleware(**kwargs):
-            seen["execution_args"] = kwargs["args"]
-            return kwargs["next_call"]({**kwargs["args"], "wrapped": True})
+            seen["phases"].append(kwargs["phase"])
+            kwargs["args"]["wrapped"] = True
+            if kwargs["phase"] == "after":
+                kwargs["result"] = "forged"
+            return "replacement-result"
+
+        def broken_middleware(**_kwargs):
+            raise RuntimeError("observer failed")
 
         def fake_dispatch(tool_name, args, **kwargs):
             seen["dispatch"] = (tool_name, args, kwargs)
             return json.dumps({"ok": True, "args": args})
 
-        manager = type(
-            "Manager",
-            (),
-            {"_middleware": {"tool_request": [fake_invoke_middleware], "tool_execution": [execution_middleware]}},
-        )()
-        monkeypatch.setattr("hermes_cli.plugins.invoke_middleware", fake_invoke_middleware)
+        manager = PluginManager()
+        manager._middleware = {
+            "tool_request": [request_middleware, broken_middleware],
+            "tool_execution": [execution_middleware, broken_middleware],
+        }
         monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", lambda: manager)
         hook_calls = []
         monkeypatch.setattr(
@@ -106,14 +108,13 @@ class TestHandleFunctionCall:
             )
         )
 
-        assert seen["execution_args"] == {"q": "test", "rewritten": True}
-        assert seen["dispatch"][1] == {"q": "test", "rewritten": True, "wrapped": True}
-        assert result["args"] == {"q": "test", "rewritten": True, "wrapped": True}
-        expected_trace = [{"source": "test-middleware", "reason": "rewrite"}]
+        assert seen["phases"] == ["before", "after"]
+        assert seen["dispatch"][1] == {"q": "test"}
+        assert result["args"] == {"q": "test"}
         pre_call = next(call for call in hook_calls if call[0] == "pre_tool_call")
         post_call = next(call for call in hook_calls if call[0] == "post_tool_call")
-        assert pre_call[1]["middleware_trace"] == expected_trace
-        assert post_call[1]["middleware_trace"] == expected_trace
+        assert pre_call[1]["middleware_trace"] == []
+        assert post_call[1]["middleware_trace"] == []
 
     def test_skipped_execution_middleware_dispatches_inside_runtime_effect_scope(
         self, monkeypatch
@@ -173,13 +174,13 @@ class TestAgentLoopTools:
 
 
 # =========================================================================
-# Pre-tool-call blocking via plugin hooks
+# Pre-tool-call plugin observations
 # =========================================================================
 
 class TestPreToolCallBlocking:
-    """Verify that pre_tool_call hooks can block tool execution."""
+    """Verify that pre_tool_call hook returns cannot block execution."""
 
-    def test_blocked_tool_returns_error_and_skips_dispatch(self, monkeypatch):
+    def test_block_directive_is_ignored_and_dispatch_runs(self, monkeypatch):
         hook_calls = []
 
         def fake_invoke_hook(hook_name, **kwargs):
@@ -188,28 +189,22 @@ class TestPreToolCallBlocking:
                 return [{"action": "block", "message": "Blocked by policy"}]
             return []
 
-        dispatch_called = False
-        _orig_dispatch = None
-
         def fake_dispatch(*args, **kwargs):
-            nonlocal dispatch_called
-            dispatch_called = True
-            raise AssertionError("dispatch should not run when blocked")
+            return json.dumps({"ok": True})
 
         monkeypatch.setattr("hermes_cli.plugins.invoke_hook", fake_invoke_hook)
         monkeypatch.setattr("hermes_cli.plugins.has_hook", lambda name: True)
         monkeypatch.setattr("model_tools.registry.dispatch", fake_dispatch)
 
         result = json.loads(handle_function_call("read_file", {"path": "test.txt"}, task_id="t1"))
-        assert result == {"error": "Blocked by policy"}
-        assert not dispatch_called
+        assert result == {"ok": True}
         post_call = next(call for call in hook_calls if call[0] == "post_tool_call")
-        assert post_call[1]["status"] == "blocked"
-        assert post_call[1]["error_type"] == "plugin_block"
-        assert post_call[1]["error_message"] == "Blocked by policy"
-        assert post_call[1]["duration_ms"] == 0
+        assert post_call[1]["status"] == "ok"
+        assert post_call[1]["error_type"] is None
+        assert post_call[1]["error_message"] is None
+        assert post_call[1]["duration_ms"] >= 0
 
-    def test_blocked_tool_skips_read_loop_notification(self, monkeypatch):
+    def test_block_directive_does_not_skip_read_loop_notification(self, monkeypatch):
         notifications = []
 
         def fake_invoke_hook(hook_name, **kwargs):
@@ -219,13 +214,13 @@ class TestPreToolCallBlocking:
 
         monkeypatch.setattr("hermes_cli.plugins.invoke_hook", fake_invoke_hook)
         monkeypatch.setattr("model_tools.registry.dispatch",
-                            lambda *a, **kw: (_ for _ in ()).throw(AssertionError("should not run")))
+                            lambda *a, **kw: json.dumps({"ok": True}))
         monkeypatch.setattr("tools.file_tools.notify_other_tool_call",
                             lambda task_id: notifications.append(task_id))
 
         result = json.loads(handle_function_call("web_search", {"q": "test"}, task_id="t1"))
-        assert result == {"error": "Blocked"}
-        assert notifications == []
+        assert result == {"ok": True}
+        assert notifications == ["t1"]
 
     def test_invalid_hook_returns_do_not_block(self, monkeypatch):
         """Malformed hook returns should be ignored — tool executes normally."""
@@ -246,7 +241,7 @@ class TestPreToolCallBlocking:
         assert result == {"ok": True}
 
 
-    def test_relay_rewrite_is_visible_to_pre_tool_authorization(self, monkeypatch):
+    def test_request_intercept_cannot_rewrite_model_tool_args(self, monkeypatch):
         observed = {}
 
         def rewrite(**kwargs):
@@ -277,8 +272,8 @@ class TestPreToolCallBlocking:
             session_id="s1",
         )
 
-        assert observed["pre_tool_args"]["path"] == "approved.txt"
-        assert observed["dispatch_args"]["path"] == "approved.txt"
+        assert observed["pre_tool_args"]["path"] == "original.txt"
+        assert observed["dispatch_args"]["path"] == "original.txt"
 
 
 

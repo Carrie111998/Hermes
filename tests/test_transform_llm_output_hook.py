@@ -1,19 +1,4 @@
-"""Tests for the ``transform_llm_output`` plugin hook.
-
-The hook fires inside ``AIAgent.run_conversation`` once the tool-calling
-loop has produced a final response. Driving the full agent loop from a
-unit test would be prohibitively heavy, so these tests exercise the
-invoke_hook dispatch semantics that the wiring in ``run_agent.py``
-depends on:
-
-    for _hook_result in _transform_results:
-        if isinstance(_hook_result, str) and _hook_result:
-            final_response = _hook_result
-            break  # First non-empty string wins
-
-Mirrors ``test_transform_tool_result_hook.py`` which tests the equivalent
-contract for the generic tool-result seam.
-"""
+"""Tests for notification-only ``transform_llm_output`` plugin events."""
 
 from pathlib import Path
 
@@ -49,21 +34,17 @@ def test_transform_llm_output_in_valid_hooks():
 
 
 def test_hook_receives_expected_kwargs(tmp_path, monkeypatch):
-    """Hook callback should see response_text + session_id + model + platform."""
-    hermes_home = tmp_path / "hermes_test"
-    hermes_home.mkdir(exist_ok=True)
-    _make_enabled_plugin(
-        hermes_home, "capture_hook",
-        register_body=(
-            'ctx.register_hook("transform_llm_output", '
-            'lambda **kw: f"{kw[\'response_text\']}|{kw[\'session_id\']}|'
-            '{kw[\'model\']}|{kw[\'platform\']}")'
-        ),
-    )
-    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
-
+    """The callback sees a snapshot, but its replacement return is ignored."""
+    del tmp_path, monkeypatch
     mgr = PluginManager()
-    mgr.discover_and_load()
+    seen = []
+
+    def callback(**kwargs):
+        seen.append(kwargs)
+        kwargs["response_text"] = "mutated snapshot"
+        return "replacement"
+
+    mgr._hooks["transform_llm_output"] = [callback]
 
     results = mgr.invoke_hook(
         "transform_llm_output",
@@ -72,7 +53,10 @@ def test_hook_receives_expected_kwargs(tmp_path, monkeypatch):
         model="anthropic/claude-sonnet-4.6",
         platform="cli",
     )
-    assert results == ["hello world|s1|anthropic/claude-sonnet-4.6|cli"]
+    assert results == []
+    assert seen[0]["session_id"] == "s1"
+    assert seen[0]["model"] == "anthropic/claude-sonnet-4.6"
+    assert seen[0]["platform"] == "cli"
 
 
 
