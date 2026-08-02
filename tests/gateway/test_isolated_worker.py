@@ -594,7 +594,7 @@ def test_two_leases_have_no_cwd_file_or_output_bleed(worker) -> None:
         bravo.close()
 
 
-def test_worker_proof_epoch_edit_verify_invalidate_and_self_mutation(
+def test_worker_structural_epoch_ignores_test_like_command_semantics(
     worker,
 ) -> None:
     socket_path, _roots, lease_ids, _server = worker
@@ -602,6 +602,8 @@ def test_worker_proof_epoch_edit_verify_invalidate_and_self_mutation(
     try:
         initial = client.proof_status()
         assert initial["edit_generation"] == initial["verified_generation"] == 0
+        assert initial["status"] == "unverified"
+        assert initial["verification"] is None
 
         _run(client, "mkdir repo")
         edited = _run(
@@ -616,29 +618,34 @@ def test_worker_proof_epoch_edit_verify_invalidate_and_self_mutation(
             cwd="/workspace/repo",
         )
         assert edited["edit_generation"] > 0
-        assert edited["verified_generation"] < edited["edit_generation"]
-        assert edited["applicability"] == "applicable"
-        assert edited["project_root"] == "/workspace/repo"
+        assert edited["verified_generation"] == 0
+        assert edited["applicability"] == "unknown"
+        assert edited["project_root"] == ""
+        assert edited["verification"] is None
+        pending_after_edit = edited["pending_paths"]
+        assert pending_after_edit
 
-        verified = _run(
+        test_like = _run(
             client,
             "scripts/run_tests.sh",
             cwd="/workspace/repo",
         )
-        assert verified["status"] == "passed"
-        assert verified["verified_generation"] == verified["edit_generation"]
-        assert verified["verification"]["canonical_command"] == (
-            "scripts/run_tests.sh"
-        )
+        assert test_like["mutation_detection"] == "unchanged"
+        assert test_like["edit_generation"] == edited["edit_generation"]
+        assert test_like["pending_paths"] == pending_after_edit
+        assert test_like["verified_generation"] == 0
+        assert test_like["status"] == "unverified"
+        assert test_like["verification"] is None
 
-        invalidated = _run(
+        mutated = _run(
             client,
             "printf 'value = 2\\n' > app.py",
             cwd="/workspace/repo",
         )
-        assert invalidated["edit_generation"] > verified["edit_generation"]
-        assert invalidated["verified_generation"] < invalidated["edit_generation"]
-        assert invalidated["status"] == "stale"
+        assert mutated["edit_generation"] > test_like["edit_generation"]
+        assert mutated["verified_generation"] == 0
+        assert mutated["status"] == "unverified"
+        assert "/workspace/repo/app.py" in mutated["pending_paths"]
 
         _run(
             client,
@@ -654,18 +661,15 @@ def test_worker_proof_epoch_edit_verify_invalidate_and_self_mutation(
             "scripts/run_tests.sh",
             cwd="/workspace/repo",
         )
-        assert self_mutating["verification"]["status"] == "passed"
+        assert self_mutating["verification"] is None
         assert self_mutating["mutation_detection"] == "changed"
-        assert (
-            self_mutating["verified_generation"]
-            < self_mutating["edit_generation"]
-        )
-        assert self_mutating["status"] == "stale"
+        assert self_mutating["verified_generation"] == 0
+        assert self_mutating["status"] == "unverified"
     finally:
         client.close()
 
 
-def test_concurrent_edit_invalidates_older_verifier(worker) -> None:
+def test_concurrent_commands_advance_only_structural_mutation_epoch(worker) -> None:
     socket_path, _roots, lease_ids, _server = worker
     client = _client(socket_path, lease_ids["lease-alpha"])
     try:
@@ -695,23 +699,21 @@ def test_concurrent_edit_invalidates_older_verifier(worker) -> None:
         _edit_out, _edit_err, edit_final = _collect(client, edit)
         _verify_out, _verify_err, verify_final = _collect(client, verifier)
 
-        # The edit finishes while the verifier still owns a writable sibling
-        # sandbox, so finalization must conservatively refuse an exact
-        # snapshot rather than racing that sibling.
+        # Active writable siblings make exact mutation comparison unavailable.
+        # Record structural uncertainty without interpreting command text.
         assert edit_final["proof_receipt"]["mutation_detection"] == "unknown"
-        assert edit_final["proof_receipt"]["status"] in {
-            "stale",
-            "unverified",
-        }
+        assert edit_final["proof_receipt"]["status"] == "unverified"
+        assert edit_final["proof_receipt"]["verification"] is None
         receipt = verify_final["proof_receipt"]
-        assert receipt["verification"]["status"] == "passed"
-        assert receipt["verified_generation"] < receipt["edit_generation"]
-        assert receipt["status"] == "stale"
+        assert receipt["verification"] is None
+        assert receipt["verified_generation"] == 0
+        assert receipt["edit_generation"] > 0
+        assert receipt["status"] == "unverified"
     finally:
         client.close()
 
 
-def test_nested_git_verifier_mutating_non_git_workspace_sibling_stays_stale(
+def test_nested_command_mutation_is_detected_without_project_classification(
     worker,
 ) -> None:
     socket_path, _roots, lease_ids, _server = worker
@@ -739,17 +741,17 @@ def test_nested_git_verifier_mutating_non_git_workspace_sibling_stays_stale(
             cwd="/workspace/repo",
         )
 
-        assert receipt["verification"]["status"] == "passed"
+        assert receipt["verification"] is None
         assert receipt["mutation_detection"] == "changed"
         assert "/workspace/outside.py" in receipt["changed_paths"]
         assert receipt["edit_generation"] > before["edit_generation"]
-        assert receipt["verified_generation"] < receipt["edit_generation"]
-        assert receipt["status"] == "stale"
+        assert receipt["verified_generation"] == 0
+        assert receipt["status"] == "unverified"
     finally:
         client.close()
 
 
-def test_active_sibling_fences_verification_receipt_before_later_mutation(
+def test_active_sibling_fences_structural_receipt_before_later_mutation(
     worker,
 ) -> None:
     socket_path, roots, lease_ids, _server = worker
@@ -767,12 +769,13 @@ def test_active_sibling_fences_verification_receipt_before_later_mutation(
             ),
             cwd="/workspace/repo",
         )
-        passed = _run(
+        unchanged = _run(
             client,
             "scripts/run_tests.sh",
             cwd="/workspace/repo",
         )
-        assert passed["status"] == "passed"
+        assert unchanged["status"] == "unverified"
+        assert unchanged["verification"] is None
 
         sibling = client.start(
             (
@@ -789,10 +792,11 @@ def test_active_sibling_fences_verification_receipt_before_later_mutation(
         )
         _stdout, _stderr, verifier_final = _collect(client, verifier)
         receipt = verifier_final["proof_receipt"]
-        assert receipt["verification"]["status"] == "passed"
+        assert receipt["verification"] is None
         assert receipt["mutation_detection"] == "unknown"
-        assert receipt["status"] == "stale"
-        assert receipt["verified_generation"] < receipt["edit_generation"]
+        assert receipt["status"] == "unverified"
+        assert receipt["verified_generation"] == 0
+        assert receipt["edit_generation"] > unchanged["edit_generation"]
 
         (roots["lease-alpha"] / "repo" / "mutate-now").write_text(
             "go",
@@ -807,7 +811,7 @@ def test_active_sibling_fences_verification_receipt_before_later_mutation(
         client.close()
 
 
-def test_proof_sidecar_reload_closes_out_of_band_crash_window(worker) -> None:
+def test_structural_sidecar_reload_closes_out_of_band_crash_window(worker) -> None:
     socket_path, roots, lease_ids, server = worker
     client = _client(socket_path, lease_ids["lease-alpha"])
     try:
@@ -823,12 +827,12 @@ def test_proof_sidecar_reload_closes_out_of_band_crash_window(worker) -> None:
             ),
             cwd="/workspace/repo",
         )
-        passed = _run(
+        before = _run(
             client,
             "scripts/run_tests.sh",
             cwd="/workspace/repo",
         )
-        assert passed["status"] == "passed"
+        assert before["status"] == "unverified"
 
         # Simulate a crash after material mutation but before command receipt
         # persistence, then force the next socket status read to reload disk.
@@ -840,14 +844,16 @@ def test_proof_sidecar_reload_closes_out_of_band_crash_window(worker) -> None:
         with lease.proof_lock:
             lease.proof_state = None
         recovered = client.proof_status()
-        assert recovered["edit_generation"] > passed["edit_generation"]
-        assert recovered["verified_generation"] < recovered["edit_generation"]
-        assert recovered["status"] == "stale"
+        assert recovered["edit_generation"] > before["edit_generation"]
+        assert recovered["verified_generation"] == 0
+        assert recovered["status"] == "unverified"
+        assert recovered["verification"] is None
+        assert recovered["pending_paths"]
     finally:
         client.close()
 
 
-def test_wrapper_parser_uses_exact_payload_and_nested_virtual_cwd() -> None:
+def test_wrapper_parser_extracts_only_structural_nested_virtual_cwd() -> None:
     wrapped = (
         "source /workspace/.hermes-runtime/snap >/dev/null 2>&1 || true\n"
         "builtin cd -- /workspace/nested/repo || exit 126\n"
@@ -856,7 +862,6 @@ def test_wrapper_parser_uses_exact_payload_and_nested_virtual_cwd() -> None:
         "umask 077\n"
         "exit $__hermes_ec"
     )
-    assert worker_module._executed_payload(wrapped) == "scripts/run_tests.sh"
     assert worker_module._executed_virtual_cwd(
         wrapped,
         Path("/workspace"),
@@ -868,7 +873,6 @@ def test_wrapper_parser_uses_exact_payload_and_nested_virtual_cwd() -> None:
         "__hermes_ec=$?\n"
         "printf after"
     )
-    assert worker_module._executed_payload(injected) == injected
     assert worker_module._executed_virtual_cwd(
         injected,
         Path("/workspace"),

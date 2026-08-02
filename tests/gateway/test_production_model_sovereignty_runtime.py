@@ -482,8 +482,8 @@ def test_producer_preserves_unrelated_config_and_seals_target() -> None:
         "max_effort": "max",
     }
     assert effective["agent"]["background_review_enabled"] is False
-    assert effective["agent"]["verify_on_stop"] is True
-    assert effective["agent"]["verification_ledger_enabled"] is True
+    assert effective["agent"]["verify_on_stop"] is False
+    assert effective["agent"]["verification_ledger_enabled"] is False
     assert effective["agent"]["gateway_notify_interval"] == 180
     assert effective["display"]["busy_input_mode"] == "steer"
     assert effective["display"]["show_commentary"] is True
@@ -920,8 +920,8 @@ def test_rendered_unit_is_the_normal_sha_pinned_production_contract() -> None:
         (("delegation", "subagent_auto_approve"), True, "delegation_route"),
         (("kanban", "dispatch_in_gateway"), True, "kanban"),
         (("curator", "enabled"), True, "curator"),
-        (("agent", "verify_on_stop"), False, "agent_policy"),
-        (("agent", "verification_ledger_enabled"), False, "agent_policy"),
+        (("agent", "verify_on_stop"), True, "agent_policy"),
+        (("agent", "verification_ledger_enabled"), True, "agent_policy"),
         (
             ("approvals", "plan_owner_user_ids"),
             ["1282940574533423125"],
@@ -1036,15 +1036,15 @@ def test_overlay_rejects_unreviewed_proof_gate_source_drift(
         runtime.overlay_production_gateway_config(source)
 
 
-def test_overlay_migrates_prior_sealed_proof_gate_contract() -> None:
+def test_overlay_keeps_retired_semantic_proof_gate_disabled() -> None:
     source = _source_mapping()
     source["agent"]["verify_on_stop"] = False
     source["agent"]["verification_ledger_enabled"] = False
 
     effective = runtime.overlay_production_gateway_config(source)
 
-    assert effective["agent"]["verify_on_stop"] is True
-    assert effective["agent"]["verification_ledger_enabled"] is True
+    assert effective["agent"]["verify_on_stop"] is False
+    assert effective["agent"]["verification_ledger_enabled"] is False
 
 
 def test_overlay_pins_discord_steering_commentary_and_preserves_unrelated_display() -> None:

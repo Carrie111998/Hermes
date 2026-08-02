@@ -12331,30 +12331,14 @@ def test_session_most_recent_handles_db_unavailable(monkeypatch):
 # ── verification.status ──────────────────────────────────────────────
 
 
-def test_verification_status_returns_recorded_evidence(tmp_path, monkeypatch):
+def test_verification_status_preserves_retired_wire_shape(tmp_path, monkeypatch):
     profile_home = tmp_path / "profiles" / "verify"
     profile_home.mkdir(parents=True)
     monkeypatch.setattr(server, "_profile_home", lambda p: profile_home if p == "verify" else None)
     token = set_hermes_home_override(profile_home)
     project = tmp_path / "project"
     project.mkdir()
-    (project / ".git").mkdir()
-    (project / "package.json").write_text(
-        json.dumps({"scripts": {"test": "vitest"}}),
-        encoding="utf-8",
-    )
-    (project / "pnpm-lock.yaml").write_text("", encoding="utf-8")
     try:
-        from agent.verification_evidence import record_terminal_result
-
-        record_terminal_result(
-            command="pnpm run test",
-            cwd=project,
-            session_id="sid",
-            exit_code=0,
-            output="green",
-        )
-
         resp = server.handle_request(
             {
                 "id": "1",
@@ -12366,9 +12350,8 @@ def test_verification_status_returns_recorded_evidence(tmp_path, monkeypatch):
         reset_hermes_home_override(token)
 
     verification = resp["result"]["verification"]
-    assert verification["status"] == "passed"
-    assert verification["evidence"]["canonical_command"] == "pnpm run test"
-    assert verification["evidence"]["scope"] == "full"
+    assert verification == {"status": "not_applicable", "evidence": None}
+    assert not (profile_home / "verification_evidence.db").exists()
 
 
 def test_verification_status_outside_workspace_is_not_applicable(monkeypatch, tmp_path):

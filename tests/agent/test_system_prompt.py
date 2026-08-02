@@ -92,13 +92,26 @@ def _init_code_repo(path):
 
 
 class TestCodingContextBlock:
-    def test_injected_when_active(self, monkeypatch, tmp_path):
+    def test_injected_only_when_explicitly_active(self, monkeypatch, tmp_path):
         _init_code_repo(tmp_path)
         monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
         agent = _make_agent(valid_tool_names=["read_file"], platform="cli")
-        parts = _prompt_parts(agent)
+        with patch("agent.coding_context._coding_mode", return_value="on"):
+            parts = _prompt_parts(agent)
         assert "coding agent" in parts["stable"]
         assert "Workspace" in parts["context"]
+
+    def test_auto_does_not_route_from_repository_contents(
+        self, monkeypatch, tmp_path
+    ):
+        _init_code_repo(tmp_path)
+        monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
+        agent = _make_agent(valid_tool_names=["read_file"], platform="cli")
+
+        parts = _prompt_parts(agent)
+
+        assert "coding agent" not in parts["stable"]
+        assert "Workspace" not in parts["context"]
 
     def test_absent_when_off(self, monkeypatch, tmp_path):
         _init_code_repo(tmp_path)
@@ -128,6 +141,28 @@ def test_build_system_prompt_records_stable_prefix():
 
     assert prompt.startswith(agent._cached_system_prompt_static)
     assert prompt[len(agent._cached_system_prompt_static):].startswith("\n\ncontext")
+
+
+def test_model_identity_compatibility_does_not_restore_behavioral_routing():
+    from agent.prompt_builder import (
+        GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
+        OPENAI_MODEL_EXECUTION_GUIDANCE,
+        TOOL_USE_ENFORCEMENT_GUIDANCE,
+    )
+
+    stable = _stable_prompt(
+        _make_agent(
+            valid_tool_names=["terminal"],
+            provider="alibaba",
+            model="alibaba/qwen3.6-plus",
+            _tool_use_enforcement="auto",
+        )
+    )
+
+    assert "The exact model ID is alibaba/qwen3.6-plus" in stable
+    assert TOOL_USE_ENFORCEMENT_GUIDANCE not in stable
+    assert OPENAI_MODEL_EXECUTION_GUIDANCE not in stable
+    assert GOOGLE_MODEL_OPERATIONAL_GUIDANCE not in stable
 
 
 def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):

@@ -1,4 +1,4 @@
-"""Model-sovereignty and bounded verification-continuation coverage."""
+"""Model-sovereignty and notification-only continuation coverage."""
 
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -57,39 +57,24 @@ def _assert_model_response_stays_sovereign(agent, result):
     ]
 
 
-def test_verify_on_stop_returns_partial_receipt_at_budget_limit(agent, monkeypatch):
+def test_code_like_path_does_not_replace_model_report_at_budget_limit(agent):
     def model_call(_api_kwargs):
-        agent._turn_file_mutation_paths = {"changed.py"}
+        agent._turn_file_mutation_paths = {"src/test_changed.py"}
         return _response()
 
     agent._interruptible_api_call = model_call
     agent._handle_max_iterations = MagicMock(return_value="replacement summary")
-    monkeypatch.setenv("HERMES_VERIFY_ON_STOP", "1")
 
     with (
-        patch("agent.verification_stop.build_verify_on_stop_nudge", return_value="verify it"),
+        patch(
+            "agent.verification_stop.build_verify_on_stop_nudge",
+            side_effect=AssertionError("semantic completion gate must not run"),
+        ),
         patch("hermes_cli.plugins.invoke_hook", return_value=[]),
     ):
-        result = agent.run_conversation("edit changed.py")
+        result = agent.run_conversation("edit src/test_changed.py")
 
-    assert result["completed"] is False
-    assert result["failed"] is True
-    assert result["partial"] is True
-    assert result["error"] == "verification_evidence_missing"
-    assert result["turn_exit_reason"] == "bounded_proof_gate_unverified"
-    assert "PARTIAL / NOT VERIFIED" in result["final_response"]
-    assert "composed report" not in "\n".join(
-        str(message.get("content") or "") for message in result["messages"]
-    )
-    assert [message["role"] for message in result["messages"]] == [
-        "user",
-        "assistant",
-    ]
-    agent._handle_max_iterations.assert_not_called()
-    assert all(
-        "_verification_stop_synthetic" not in message
-        for message in result["messages"]
-    )
+    _assert_model_response_stays_sovereign(agent, result)
 
 
 def test_pre_verify_preserves_composed_report_at_budget_limit(agent, monkeypatch):
@@ -136,18 +121,17 @@ def test_free_text_ack_is_not_keyword_classified_or_synthetically_continued(agen
     agent._handle_max_iterations.assert_not_called()
 
 
-def test_runtime_does_not_synthetically_replace_model_report(agent, monkeypatch):
+def test_runtime_does_not_synthetically_replace_model_report(agent):
     agent.max_iterations = 2
     agent.iteration_budget.max_total = 2
     answers = iter([_response("premature report"), _response("verified final report")])
     agent._interruptible_api_call = lambda _kwargs: next(answers)
     agent._handle_max_iterations = MagicMock(return_value="replacement summary")
-    monkeypatch.setenv("HERMES_VERIFY_ON_STOP", "1")
 
     with (
         patch(
             "agent.verification_stop.build_verify_on_stop_nudge",
-            side_effect=["verify it", None],
+            side_effect=AssertionError("semantic completion gate must not run"),
         ),
         patch("hermes_cli.plugins.invoke_hook", return_value=[]),
     ):

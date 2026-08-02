@@ -29,6 +29,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
+from pathlib import PurePosixPath
 from typing import Any, Dict, List, Mapping, Optional
 
 from agent.conversation_compression import (
@@ -359,17 +360,12 @@ def _should_idle_compact(
 def _runtime_effect_failure(
     agent: Any,
     reason: str,
-    *,
-    recoverable_with_fresh_proof: bool = False,
 ) -> None:
-    """Arm the bounded proof gate for an unreadable cross-turn effect."""
+    """Record unreadable structural metadata without deciding completion."""
 
     agent._turn_isolated_worker_runtime_effect_active = True
     agent._turn_isolated_worker_baseline_attempted = True
     agent._turn_isolated_worker_proof_error = reason
-    agent._turn_runtime_effect_uncertainty_recoverable = bool(
-        recoverable_with_fresh_proof
-    )
     changed = getattr(agent, "_turn_file_mutation_paths", None)
     if isinstance(changed, set):
         changed.add("/workspace")
@@ -379,30 +375,52 @@ def _validate_runtime_effect_receipt(
     authority: str,
     receipt: Any,
 ) -> dict[str, Any]:
-    """Validate the worker-owned proof receipt used by a runtime effect."""
+    """Validate only worker-owned structural receipt facts.
+
+    The worker may carry model-facing verification annotations for backwards
+    protocol compatibility.  Completion code must not interpret them.  This
+    boundary accepts only identity, generation, mutation detection, and
+    normalized workspace paths as runtime facts.
+    """
 
     from gateway.isolated_worker import (
         PROOF_RECEIPT_SCHEMA,
         canonical_lease_id,
     )
 
+    if not isinstance(receipt, Mapping):
+        raise ValueError("runtime_effect_receipt_invalid")
     if (
-        not isinstance(receipt, Mapping)
-        or receipt.get("schema") != PROOF_RECEIPT_SCHEMA
+        receipt.get("schema") != PROOF_RECEIPT_SCHEMA
         or receipt.get("lease_id") != canonical_lease_id(authority)
         or type(receipt.get("edit_generation")) is not int
         or receipt["edit_generation"] < 0
-        or type(receipt.get("verified_generation")) is not int
-        or receipt["verified_generation"] < 0
-        or receipt["verified_generation"] > receipt["edit_generation"]
-        or receipt.get("status")
-        not in {"unverified", "passed", "failed", "stale"}
-        or receipt.get("applicability")
-        not in {"applicable", "not_applicable", "unknown"}
-        or not isinstance(receipt.get("pending_paths"), list)
+        or receipt.get("mutation_detection")
+        not in {"unchanged", "changed", "unknown", "explicit", "status"}
     ):
         raise ValueError("runtime_effect_proof_receipt_invalid")
-    return dict(receipt)
+    for field in ("changed_paths", "pending_paths"):
+        paths = receipt.get(field)
+        if not isinstance(paths, list):
+            raise ValueError("runtime_effect_proof_receipt_invalid")
+        for path in paths:
+            candidate = PurePosixPath(path) if isinstance(path, str) else None
+            if (
+                not isinstance(path, str)
+                or not (path == "/workspace" or path.startswith("/workspace/"))
+                or not candidate.is_absolute()
+                or any(part in {".", ".."} for part in candidate.parts)
+                or str(candidate) != path
+            ):
+                raise ValueError("runtime_effect_proof_receipt_invalid")
+    return {
+        "schema": receipt["schema"],
+        "lease_id": receipt["lease_id"],
+        "edit_generation": receipt["edit_generation"],
+        "mutation_detection": receipt["mutation_detection"],
+        "changed_paths": list(receipt["changed_paths"]),
+        "pending_paths": list(receipt["pending_paths"]),
+    }
 
 
 def _apply_runtime_effect(
@@ -411,7 +429,7 @@ def _apply_runtime_effect(
     *,
     isolated_worker_selected: bool,
 ) -> None:
-    """Seed current-turn proof state from trusted cross-turn metadata."""
+    """Seed current-turn mutation generation from trusted metadata."""
 
     if runtime_effect is None:
         return
@@ -456,7 +474,6 @@ def _apply_runtime_effect(
         _runtime_effect_failure(
             agent,
             f"runtime_effect_proof_status_failed:{type(exc).__name__}",
-            recoverable_with_fresh_proof=True,
         )
         return
 
@@ -472,7 +489,6 @@ def _apply_runtime_effect(
         _runtime_effect_failure(
             agent,
             "runtime_effect_baseline_unavailable",
-            recoverable_with_fresh_proof=True,
         )
         return
     if current_generation < observed_generation:
@@ -1495,8 +1511,6 @@ def build_turn_context(
     agent._turn_isolated_worker_baseline_generation = None
     agent._turn_isolated_worker_baseline_attempted = False
     agent._turn_isolated_worker_runtime_effect_active = False
-    agent._turn_runtime_effect_uncertainty_recoverable = False
-    agent._turn_runtime_effect_fresh_proof_observed = False
     if _isolated_worker_selected:
         # Session creation and preflight compression have completed by this
         # point. Revalidate the trusted authority against the now-durable row,

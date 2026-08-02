@@ -1721,77 +1721,52 @@ class TestToolUseEnforcementConfig:
             a.client = MagicMock()
             return a
 
-    def test_auto_injects_for_gpt(self):
-        from agent.prompt_builder import TOOL_USE_ENFORCEMENT_GUIDANCE
-        agent = self._make_agent(model="openai/gpt-4.1", tool_use_enforcement="auto")
-        prompt = agent._build_system_prompt()
-        assert TOOL_USE_ENFORCEMENT_GUIDANCE in prompt
-
-    def test_auto_injects_for_codex(self):
-        from agent.prompt_builder import TOOL_USE_ENFORCEMENT_GUIDANCE
-        agent = self._make_agent(model="openai/codex-mini", tool_use_enforcement="auto")
-        prompt = agent._build_system_prompt()
-        assert TOOL_USE_ENFORCEMENT_GUIDANCE in prompt
-
-    def test_auto_skips_for_claude(self):
-        from agent.prompt_builder import TOOL_USE_ENFORCEMENT_GUIDANCE
-        agent = self._make_agent(model="anthropic/claude-sonnet-4", tool_use_enforcement="auto")
-        prompt = agent._build_system_prompt()
-        assert TOOL_USE_ENFORCEMENT_GUIDANCE not in prompt
-
-    def test_auto_injects_for_grok(self):
-        """xAI Grok / xai-oauth models hit the same enforcement path as GPT."""
-        from agent.prompt_builder import TOOL_USE_ENFORCEMENT_GUIDANCE
-        agent = self._make_agent(model="x-ai/grok-4.3", tool_use_enforcement="auto")
-        prompt = agent._build_system_prompt()
-        assert TOOL_USE_ENFORCEMENT_GUIDANCE in prompt
-
-    def test_auto_injects_for_qwen(self):
-        """Qwen models default to chatty/hallucinatory tool use without enforcement."""
-        from agent.prompt_builder import TOOL_USE_ENFORCEMENT_GUIDANCE
-        agent = self._make_agent(model="qwen/qwen-plus", tool_use_enforcement="auto")
-        prompt = agent._build_system_prompt()
-        assert TOOL_USE_ENFORCEMENT_GUIDANCE in prompt
-
-    def test_auto_injects_for_deepseek(self):
-        """DeepSeek models default to chatty/hallucinatory tool use without enforcement."""
-        from agent.prompt_builder import TOOL_USE_ENFORCEMENT_GUIDANCE
-        agent = self._make_agent(model="deepseek/deepseek-r1", tool_use_enforcement="auto")
-        prompt = agent._build_system_prompt()
-        assert TOOL_USE_ENFORCEMENT_GUIDANCE in prompt
-
-    def test_auto_injects_execution_guidance_for_grok(self):
-        """Grok also gets OPENAI_MODEL_EXECUTION_GUIDANCE (verification,
-        mandatory_tool_use, act_dont_ask). Same failure modes as GPT in
-        practice — claims completion without tool calls, suggests workarounds
-        instead of using existing tools.
-        """
-        from agent.prompt_builder import OPENAI_MODEL_EXECUTION_GUIDANCE
-        agent = self._make_agent(model="x-ai/grok-4.3", tool_use_enforcement="auto")
-        prompt = agent._build_system_prompt()
-        assert OPENAI_MODEL_EXECUTION_GUIDANCE in prompt
-
-    def test_auto_injects_execution_guidance_for_xai_oauth_model(self):
-        """xai-oauth bare model names (no slash) also match the grok pattern."""
-        from agent.prompt_builder import OPENAI_MODEL_EXECUTION_GUIDANCE
-        agent = self._make_agent(model="grok-4.3", tool_use_enforcement="auto")
-        prompt = agent._build_system_prompt()
-        assert OPENAI_MODEL_EXECUTION_GUIDANCE in prompt
-
-    def test_auto_does_not_inject_execution_guidance_for_claude(self):
-        """Sanity: execution guidance stays off for non-targeted families."""
-        from agent.prompt_builder import OPENAI_MODEL_EXECUTION_GUIDANCE
-        agent = self._make_agent(
-            model="anthropic/claude-sonnet-4", tool_use_enforcement="auto"
+    @pytest.mark.parametrize(
+        "model",
+        [
+            "openai/gpt-4.1",
+            "openai/codex-mini",
+            "anthropic/claude-sonnet-4",
+            "x-ai/grok-4.3",
+            "qwen/qwen-plus",
+            "deepseek/deepseek-r1",
+            "google/gemini-3-pro",
+            "contains-gpt-codex-grok-gemini-deepseek",
+        ],
+    )
+    def test_auto_never_routes_behavior_from_model_name(self, model):
+        from agent.prompt_builder import (
+            GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
+            OPENAI_MODEL_EXECUTION_GUIDANCE,
+            TOOL_USE_ENFORCEMENT_GUIDANCE,
         )
+
+        agent = self._make_agent(model=model, tool_use_enforcement="auto")
         prompt = agent._build_system_prompt()
+
+        assert TOOL_USE_ENFORCEMENT_GUIDANCE not in prompt
         assert OPENAI_MODEL_EXECUTION_GUIDANCE not in prompt
+        assert GOOGLE_MODEL_OPERATIONAL_GUIDANCE not in prompt
 
     def test_true_forces_for_all_models(self):
-        from agent.prompt_builder import TOOL_USE_ENFORCEMENT_GUIDANCE
+        from agent.prompt_builder import (
+            GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
+            OPENAI_MODEL_EXECUTION_GUIDANCE,
+            TOOL_USE_ENFORCEMENT_GUIDANCE,
+        )
         agent = self._make_agent(model="anthropic/claude-sonnet-4", tool_use_enforcement=True)
         prompt = agent._build_system_prompt()
         assert TOOL_USE_ENFORCEMENT_GUIDANCE in prompt
+        assert OPENAI_MODEL_EXECUTION_GUIDANCE not in prompt
+        assert GOOGLE_MODEL_OPERATIONAL_GUIDANCE not in prompt
+
+        renamed = self._make_agent(
+            model="gpt-codex-grok-gemini-gemma",
+            tool_use_enforcement=True,
+        )._build_system_prompt()
+        assert TOOL_USE_ENFORCEMENT_GUIDANCE in renamed
+        assert OPENAI_MODEL_EXECUTION_GUIDANCE not in renamed
+        assert GOOGLE_MODEL_OPERATIONAL_GUIDANCE not in renamed
 
     def test_string_true_forces_for_all_models(self):
         from agent.prompt_builder import TOOL_USE_ENFORCEMENT_GUIDANCE
@@ -1817,32 +1792,24 @@ class TestToolUseEnforcementConfig:
         prompt = agent._build_system_prompt()
         assert TOOL_USE_ENFORCEMENT_GUIDANCE not in prompt
 
-    def test_custom_list_matches(self):
+    @pytest.mark.parametrize(
+        ("model", "patterns"),
+        [
+            ("deepseek/deepseek-r1", ["deepseek", "gemini"]),
+            ("anthropic/claude-sonnet-4", ["deepseek", "gemini"]),
+            ("openai/GPT-4.1", ["GPT", "Codex"]),
+        ],
+    )
+    def test_legacy_model_substring_lists_cannot_route_guidance(
+        self, model, patterns
+    ):
         from agent.prompt_builder import TOOL_USE_ENFORCEMENT_GUIDANCE
         agent = self._make_agent(
-            model="deepseek/deepseek-r1",
-            tool_use_enforcement=["deepseek", "gemini"],
-        )
-        prompt = agent._build_system_prompt()
-        assert TOOL_USE_ENFORCEMENT_GUIDANCE in prompt
-
-    def test_custom_list_no_match(self):
-        from agent.prompt_builder import TOOL_USE_ENFORCEMENT_GUIDANCE
-        agent = self._make_agent(
-            model="anthropic/claude-sonnet-4",
-            tool_use_enforcement=["deepseek", "gemini"],
+            model=model,
+            tool_use_enforcement=patterns,
         )
         prompt = agent._build_system_prompt()
         assert TOOL_USE_ENFORCEMENT_GUIDANCE not in prompt
-
-    def test_custom_list_case_insensitive(self):
-        from agent.prompt_builder import TOOL_USE_ENFORCEMENT_GUIDANCE
-        agent = self._make_agent(
-            model="openai/GPT-4.1",
-            tool_use_enforcement=["GPT", "Codex"],
-        )
-        prompt = agent._build_system_prompt()
-        assert TOOL_USE_ENFORCEMENT_GUIDANCE in prompt
 
     def test_no_tools_never_injects(self):
         """Even with enforcement=true, no injection when agent has no tools."""

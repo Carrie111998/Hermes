@@ -69,8 +69,8 @@ MUTATIONS = (
     "agent.adaptive_reasoning={enabled:true,max_effort:max}",
     "agent.background_review_enabled=false",
     "agent.tool_use_enforcement=true",
-    "agent.verify_on_stop=true",
-    "agent.verification_ledger_enabled=true",
+    "agent.verify_on_stop=false",
+    "agent.verification_ledger_enabled=false",
     "agent.gateway_notify_interval=180",
     "agent.environment_hint.remove_stale_gpt_5_5_clause",
     "compression.abort_on_summary_failure=true",
@@ -330,8 +330,11 @@ def _target_mapping(value: Mapping[str, Any]) -> dict[str, Any]:
         and type(verification_ledger_source) is not bool
     ):
         raise ConfigGateError("config_verification_ledger_drifted")
-    agent["verify_on_stop"] = True
-    agent["verification_ledger_enabled"] = True
+    # The model decides whether its work and verification are sufficient.
+    # Production retains structural mutation receipts but disables the legacy
+    # filename/command classifier and its system-authored completion gate.
+    agent["verify_on_stop"] = False
+    agent["verification_ledger_enabled"] = False
     notify_interval_source = agent.get("gateway_notify_interval")
     if (
         notify_interval_source is not None
@@ -461,10 +464,9 @@ def _transform(raw: bytes) -> bytes:
         raise ConfigGateError("config_background_review_source_drifted")
     if agent.get("tool_use_enforcement") != "auto":
         raise ConfigGateError("config_tool_use_source_drifted")
-    if agent.get("verify_on_stop") is not None:
-        raise ConfigGateError("config_verify_on_stop_source_drifted")
-    if agent.get("verification_ledger_enabled") is not None:
-        raise ConfigGateError("config_verification_ledger_source_drifted")
+    # This retirement migration is intentionally idempotent: it accepts the
+    # legacy enabled state, an already-disabled state, or absent keys. Type
+    # validation remains in ``_target_mapping`` and output is always false.
     if _STALE_MODEL_SENTENCE not in str(agent.get("environment_hint") or ""):
         raise ConfigGateError("config_environment_hint_source_drifted")
     kanban = _required_mapping(source, "kanban")

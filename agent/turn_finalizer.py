@@ -81,8 +81,8 @@ def finalize_turn(
     original_user_message,
     _should_review_memory,
     _turn_exit_reason,
-    _pending_verification_response=None,
-    _pending_verification_response_previewed=False,
+    _pending_continuation_response=None,
+    _pending_continuation_response_previewed=False,
 ):
     """Run the post-loop finalization and return the turn ``result`` dict.
 
@@ -93,9 +93,6 @@ def finalize_turn(
 
     execution_lease_exhausted = (
         str(_turn_exit_reason) == "execution_lease_exhausted"
-    )
-    bounded_proof_gate_unverified = (
-        str(_turn_exit_reason) == "bounded_proof_gate_unverified"
     )
     if execution_lease_exhausted and final_response is None:
         lease = getattr(agent, "execution_lease", None)
@@ -138,29 +135,29 @@ def finalize_turn(
     )
     continuation_budget_exhausted = (
         final_response is None
-        and bool(_pending_verification_response)
+        and bool(_pending_continuation_response)
         and budget_fallback_eligible
     )
 
     iteration_limit_fallback = False
-    preserved_verification_fallback = False
+    preserved_continuation_fallback = False
     if continuation_budget_exhausted:
-        # A verification/continuation gate deliberately withheld a composed
+        # A model-visible protocol continuation deliberately withheld a composed
         # answer, then consumed the remaining budget before producing a newer
         # one. Preserve that exact answer instead of replacing it with another
         # fallible model call. The explicit pending value is the provenance
         # guard: unrelated error/recovery exits can never enter this branch.
-        final_response = _pending_verification_response
+        final_response = _pending_continuation_response
         # Mark the turn as previewed only when the reused candidate was
         # actually streamed to the user as interim content. (#65919 review:
         # response-loss blocker)
-        if _pending_verification_response_previewed:
+        if _pending_continuation_response_previewed:
             agent._response_was_previewed = True
         _turn_exit_reason = (
             f"max_iterations_reached({_budget_used}/{_budget_max})"
         )
         iteration_limit_fallback = True
-        preserved_verification_fallback = True
+        preserved_continuation_fallback = True
     elif final_response is None and budget_fallback_eligible:
         # The in-loop continuation rail could not obtain a model-authored
         # closing response. Report the mechanical boundary truthfully. This
@@ -239,9 +236,8 @@ def finalize_turn(
 
     _runtime_boundary_receipt = (
         execution_lease_exhausted
-        or bounded_proof_gate_unverified
         or (
-            not preserved_verification_fallback
+            not preserved_continuation_fallback
             and str(_turn_exit_reason).startswith("max_iterations_reached(")
         )
     ) or (
@@ -588,7 +584,7 @@ def finalize_turn(
                 # truncated partial (the "The" case from #34452).
                 _is_partial_fragment = (
                     not _is_empty_terminal
-                    and not preserved_verification_fallback
+                    and not preserved_continuation_fallback
                     and not str(_turn_exit_reason).startswith("text_response")
                     and len(_stripped) <= 24
                     and _stripped[-1:] not in {".", "!", "?", "。", "！", "？", "`", ")"}
@@ -758,8 +754,6 @@ def finalize_turn(
     }
     if execution_lease_exhausted:
         result["error"] = "execution_lease_exhausted"
-    elif bounded_proof_gate_unverified:
-        result["error"] = "verification_evidence_missing"
     elif _runtime_boundary_receipt:
         result["error"] = "iteration_budget_exhausted"
     if agent._tool_guardrail_halt_decision is not None:

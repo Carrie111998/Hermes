@@ -3354,8 +3354,11 @@ class AIAgent:
                     getattr(self, "_workspace_lease_authority", None)
                     or self.session_id
                 )
-                receipt = isolated_worker_proof_status_for_authority(
-                    str(authority)
+                from agent.turn_context import _validate_runtime_effect_receipt
+
+                receipt = _validate_runtime_effect_receipt(
+                    str(authority),
+                    isolated_worker_proof_status_for_authority(str(authority)),
                 )
                 generation = receipt.get("edit_generation")
                 baseline = getattr(
@@ -3412,53 +3415,17 @@ class AIAgent:
                     return
                 if not isinstance(receipt, dict):
                     raise ValueError("proof_receipt_not_mapping")
-                from gateway.isolated_worker import (
-                    PROOF_RECEIPT_SCHEMA,
-                    canonical_lease_id,
-                )
+                from agent.turn_context import _validate_runtime_effect_receipt
 
                 authority = (
                     getattr(self, "_workspace_lease_authority", None)
                     or self.session_id
                 )
-                expected_lease = canonical_lease_id(str(authority))
-                if (
-                    receipt.get("schema") != PROOF_RECEIPT_SCHEMA
-                    or receipt.get("lease_id") != expected_lease
-                    or type(receipt.get("edit_generation")) is not int
-                    or type(receipt.get("verified_generation")) is not int
-                    or receipt["verified_generation"] > receipt["edit_generation"]
-                    or receipt.get("status")
-                    not in {"unverified", "passed", "failed", "stale"}
-                    or receipt.get("applicability")
-                    not in {"applicable", "not_applicable", "unknown"}
-                    or receipt.get("mutation_detection")
-                    not in {"unchanged", "changed", "unknown", "explicit", "status"}
-                    or not isinstance(receipt.get("changed_paths"), list)
-                ):
-                    raise ValueError("proof_receipt_invalid")
+                receipt = _validate_runtime_effect_receipt(
+                    str(authority),
+                    receipt,
+                )
                 self._turn_isolated_worker_proof_receipt = dict(receipt)
-                verification = receipt.get("verification")
-                command = args.get("command")
-                if (
-                    not is_error
-                    and isinstance(command, str)
-                    and isinstance(verification, dict)
-                    and verification.get("status") == "passed"
-                    and isinstance(
-                        verification.get("canonical_command"),
-                        str,
-                    )
-                ):
-                    from agent.verification_evidence import (
-                        _find_canonical_match,
-                    )
-
-                    if _find_canonical_match(
-                        command,
-                        [verification["canonical_command"]],
-                    ) is not None:
-                        self._turn_runtime_effect_fresh_proof_observed = True
                 if receipt["mutation_detection"] in {
                     "changed",
                     "unknown",
