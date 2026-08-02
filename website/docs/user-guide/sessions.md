@@ -413,6 +413,43 @@ hermes sessions export --format md --session-id 20250305_091523_a1b2c3d4 --delet
 
 Markdown/QMD export writes one `.md` or `.qmd` file per exported session plus a `manifest.jsonl` with the file path, message count, lineage ids, and SHA-256. Bulk export requires at least one filter; a bare bulk export is refused. `--delete-after-verified` is intentionally limited to `--session-id` and requires `--yes`. Because deleting a parent session also removes its delegate/subagent sessions, this mode exports and verifies each delegate in a separate file before deleting anything. If the delegate set changes during export, deletion is refused. `--redact` scrubs secrets (API keys, tokens, credentials) from message content and tool output before writing — recommended for any export you plan to share.
 
+### Importing External Sessions
+
+`hermes sessions import` brings another coding agent's session transcripts into Hermes as native sessions, so they show up in `hermes sessions list`/`browse` and are searchable via FTS immediately. Currently supports Claude Code (`~/.claude/projects/*.jsonl`):
+
+```bash
+# Import every Claude Code session found under ~/.claude/projects
+hermes sessions import claude-code ~/.claude/projects --host homelab
+
+# Preview what would be imported/updated without writing anything
+hermes sessions import claude-code ~/.claude/projects --dry-run
+
+# Import into a copy of state.db instead of the live one
+hermes sessions import claude-code ~/.claude/projects --db /tmp/state-copy.db
+
+# Also import subagent/delegate transcripts (skipped by default)
+hermes sessions import claude-code ~/.claude/projects --include-subagents
+```
+
+Imported sessions get `source=claude_code` and a deterministic id
+(`claude_<host>_<session-uuid>`), so re-running the same command is
+idempotent — safe to run from cron. `--host` labels the store so sessions
+from several machines (e.g. desktop + a homelab VPS) coexist without id
+collisions; it's metadata only, not a Hermes profile.
+
+Claude Code's `text`/`thinking`/`tool_use`/`tool_result` blocks map to
+Hermes's `user`/`assistant`/`tool` roles, preserving reasoning, tool calls,
+and original timestamps. Titles come from Claude's `summary`/`ai-title`
+records when present, and only ever fill in a session that doesn't already
+have one — a title you set manually is never overwritten by a later
+import.
+
+If the source JSONL grows between runs (Claude Code still running, or the
+session was reopened), the stored transcript is atomically replaced —
+never duplicated. A later re-run also picks up a title or end-of-session
+state that arrived after the message count stopped changing (e.g. Claude
+Code writing its summary after the last turn).
+
 ### Delete a Session
 
 ```bash
