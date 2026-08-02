@@ -432,6 +432,13 @@ describe('preserveLocalPendingTurnMessages', () => {
     expect(preserveLocalPendingTurnMessages(next, previous)).toBe(next)
   })
 
+  it('does not resurrect a completed stream bubble after persisted history catches up', () => {
+    const next = [msg('1-user-stored', 'user', 'question'), msg('2-assistant-stored', 'assistant', 'answer')]
+    const completedLocalStream = msg('assistant-stream-runtime-1', 'assistant', 'answer', { pending: false })
+
+    expect(preserveLocalPendingTurnMessages(next, [...next, completedLocalStream])).toBe(next)
+  })
+
   it('drops stale optimistic history after compression and keeps only the live tail', () => {
     const compressedAuthority = [
       msg('stored-user', 'user', 'first turn that survived compression'),
