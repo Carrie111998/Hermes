@@ -391,6 +391,10 @@ export const $messagingTruncated = atom<boolean>(false)
 // "is there another page?" is what pagination actually needs and comes free
 // from the row count the query already returned.
 export const $sessionProfilesTruncated = atom<Record<string, boolean>>({})
+// Durable recents pins owned by profiles outside the active concrete scope.
+// Kept as a summary rather than session rows because cloned profiles may share
+// ids and the Desktop's persisted pin keys are intentionally unqualified.
+export const $hiddenPinnedSessionCount = atom(0)
 export const $sessionsLoading = atom(true)
 export const $activeSessionId = atom<string | null>(null)
 export const $selectedStoredSessionId = atom<string | null>(null)
@@ -475,6 +479,7 @@ export const setMessagingPlatformTotals = (next: Updater<Record<string, number>>
 export const setMessagingTruncated = (next: Updater<boolean>) => updateAtom($messagingTruncated, next)
 export const setSessionProfilesTruncated = (next: Updater<Record<string, boolean>>) =>
   updateAtom($sessionProfilesTruncated, next)
+export const setHiddenPinnedSessionCount = (next: Updater<number>) => updateAtom($hiddenPinnedSessionCount, next)
 export const setSessionsLoading = (next: Updater<boolean>) => updateAtom($sessionsLoading, next)
 export const setActiveSessionId = (next: Updater<string | null>) => updateAtom($activeSessionId, next)
 export const setActiveSessionStoredIdRotation = (next: Updater<ActiveSessionStoredIdRotation | null>) =>

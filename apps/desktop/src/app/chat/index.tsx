@@ -39,9 +39,9 @@ import {
   $sessions,
   resolveComposerSessionKey,
   sessionMatchesStoredId,
-  sessionPinId,
   shouldMigrateComposerScope
 } from '@/store/session'
+import { createSessionPinKey, sessionPinKey } from '@/store/session-pin-key'
 import { isSecondaryWindow, isWatchWindow } from '@/store/windows'
 import type { ModelOptionsResponse } from '@/types/hermes'
 
@@ -110,6 +110,7 @@ function ChatHeader({
   const sessions = useStore($sessions)
   const pinnedSessionIds = useStore($pinnedSessionIds)
   const profiles = useStore($profiles)
+  const activeGatewayProfile = useStore($activeGatewayProfile)
 
   const activeStoredSession =
     (selectedSessionId && sessions.find(session => sessionMatchesStoredId(session, selectedSessionId))) || null
@@ -124,11 +125,13 @@ function ChatHeader({
   // Pins live on the durable lineage-root id, but selectedSessionId is the live
   // (tip) id — resolve through the loaded row so the menu reflects the pin
   // state after auto-compression rotates the id.
-  const selectedIsPinned = activeStoredSession
-    ? pinnedSessionIds.includes(sessionPinId(activeStoredSession))
+  const selectedPinKey = activeStoredSession
+    ? sessionPinKey(activeStoredSession)
     : selectedSessionId
-      ? pinnedSessionIds.includes(selectedSessionId)
-      : false
+      ? createSessionPinKey(activeGatewayProfile, selectedSessionId)
+      : null
+
+  const selectedIsPinned = Boolean(selectedPinKey && pinnedSessionIds.includes(selectedPinKey))
 
   // Secondary windows (new-session scratch, subagent watch, cmd-click pop-out)
   // are compact side panels — they drop the session-actions header + border

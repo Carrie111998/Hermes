@@ -11,6 +11,7 @@ import {
   setActiveSessionId,
   setCronSessions,
   setFreshDraftReady,
+  setHiddenPinnedSessionCount,
   setMessages,
   setMessagingPlatformTotals,
   setMessagingSessions,
@@ -45,6 +46,7 @@ export function wipeSessionListsForGatewaySwitch(): void {
   resetSidebarBatchCapability()
   setSessions([])
   setSessionProfilesTruncated({})
+  setHiddenPinnedSessionCount(0)
   setCronSessions([])
   setMessagingSessions([])
   setMessagingPlatformTotals({})

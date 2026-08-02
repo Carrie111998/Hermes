@@ -8,7 +8,7 @@ import { useI18n } from '@/i18n'
 import { type SidebarListRow } from '@/lib/session-date-groups'
 import { sessionBucketLabel } from '@/lib/time'
 import { cn } from '@/lib/utils'
-import { sessionPinId } from '@/store/session'
+import { sessionPinKey, sessionScopedId } from '@/store/session-pin-key'
 
 import { SidebarDateDivider } from './chrome'
 import { SidebarSessionRow } from './session-row'
@@ -35,7 +35,7 @@ interface VirtualSessionListProps {
   onBranchSession?: (sessionId: string, profile?: string) => void
   onDeleteSession: (sessionId: string) => void
   onResumeSession: (sessionId: string) => void
-  onTogglePin: (sessionId: string) => void
+  onTogglePin: (session: SessionInfo) => void
   pinned: boolean
   showProfileTags?: boolean
   sortable: boolean
@@ -69,7 +69,7 @@ export const VirtualSessionList: FC<VirtualSessionListProps> = ({
     getItemKey: index => {
       const row = listRows[index]
 
-      return row ? (row.kind === 'divider' ? row.key : row.entry.session.id) : index
+      return row ? (row.kind === 'divider' ? row.key : sessionScopedId(row.entry.session)) : index
     },
     getScrollElement: () => scrollerRef.current,
     // jsdom-friendly default; the real rect takes over on first observe.
@@ -112,7 +112,7 @@ export const VirtualSessionList: FC<VirtualSessionListProps> = ({
       onArchive: () => onArchiveSession(session.id),
       onBranch: onBranchSession ? () => onBranchSession(session.id, session.profile) : undefined,
       onDelete: () => onDeleteSession(session.id),
-      onPin: () => onTogglePin(sessionPinId(session)),
+      onPin: () => onTogglePin(session),
       onResume: () => onResumeSession(session.id),
       reorderable,
       showProfile: showProfileTags
@@ -121,16 +121,17 @@ export const VirtualSessionList: FC<VirtualSessionListProps> = ({
     return reorderable ? (
       <VirtualSortableRow
         index={virtualItem.index}
-        key={session.id}
+        key={sessionScopedId(session)}
         measureRef={virtualizer.measureElement}
         rowProps={commonProps}
         session={session}
+        sortableId={pinned ? sessionPinKey(session) : session.id}
       />
     ) : (
       <SidebarSessionRow
         {...commonProps}
         data-index={virtualItem.index}
-        key={session.id}
+        key={sessionScopedId(session)}
         ref={virtualizer.measureElement}
         session={session}
       />
@@ -157,10 +158,11 @@ interface VirtualSortableRowProps {
   measureRef: (node: Element | null) => void
   rowProps: SessionRowCommonProps
   session: SessionInfo
+  sortableId: string
 }
 
-function VirtualSortableRow({ index, measureRef, rowProps, session }: VirtualSortableRowProps) {
-  const { attributes, isDragging, listeners, setNodeRef, transform, transition } = useSortable({ id: session.id })
+function VirtualSortableRow({ index, measureRef, rowProps, session, sortableId }: VirtualSortableRowProps) {
+  const { attributes, isDragging, listeners, setNodeRef, transform, transition } = useSortable({ id: sortableId })
 
   // Merge dnd-kit's setNodeRef with the virtualizer's measureElement so
   // the row participates in both DnD hit-testing and TanStack height

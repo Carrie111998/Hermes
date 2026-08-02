@@ -7125,6 +7125,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         archived_only: bool = False,
         exclude_children: bool = False,
         exclude_sources: List[str] = None,
+        pinned_only: bool = False,
     ) -> int:
         """Count sessions, optionally filtered by source.
 
@@ -7139,6 +7140,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         (e.g. ``["cron"]`` so the recents "load more" total matches a
         cron-excluded ``list_sessions_rich`` page and doesn't keep "load more"
         stuck on for buried scheduler sessions).
+
+        Pass ``pinned_only=True`` for a cheap durable-pin summary without
+        hydrating full session rows and previews.
         """
         where_clauses = []
         params = []
@@ -7165,6 +7169,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if min_message_count > 0:
             where_clauses.append("s.message_count >= ?")
             params.append(min_message_count)
+        if pinned_only:
+            where_clauses.append("s.pinned = 1")
         if archived_only:
             where_clauses.append("s.archived = 1")
         elif not include_archived:

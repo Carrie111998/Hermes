@@ -167,6 +167,7 @@ import {
   revalidatePooledRemoteBackends,
   revalidateRemoteConnection
 } from './remote-liveness'
+import { countCrossProfilePins, windowSessionsIncludingPins } from './session-window'
 import {
   buildSessionWindowUrl,
   chatWindowWebPreferences,
@@ -10079,6 +10080,20 @@ async function interceptSessionRequestForRemote(request) {
       recentsSp.set('exclude_sources', recentsExclude)
     }
 
+    // A concrete recents scope intentionally omits sibling-profile history,
+    // but the renderer still needs durable sibling pins to disclose that those
+    // conversations exist. LIMIT 1 is enough because every list endpoint
+    // back-fills pinned rows beyond its ordinary recency window.
+    const crossProfilePinsSp = recentsProfile === 'all' ? null : sliceParams('recents_limit', '1', { profile: 'all' })
+
+    if (crossProfilePinsSp) {
+      crossProfilePinsSp.set('limit', '1')
+
+      if (recentsExclude) {
+        crossProfilePinsSp.set('exclude_sources', recentsExclude)
+      }
+    }
+
     const cronSp = sliceParams('cron_limit', '50', { profile: 'all', source: 'cron' })
 
     const messagingSp = sliceParams('messaging_limit', '100', { profile: 'all' })
@@ -10088,14 +10103,16 @@ async function interceptSessionRequestForRemote(request) {
       messagingSp.set('exclude_sources', messagingExclude)
     }
 
-    const [recents, cron, messaging] = await Promise.all([
+    const [recents, crossProfilePins, cron, messaging] = await Promise.all([
       fetchProfilesSessionSlice(recentsSp, remoteProfiles),
+      crossProfilePinsSp ? fetchProfilesSessionSlice(crossProfilePinsSp, remoteProfiles) : Promise.resolve(null),
       fetchProfilesSessionSlice(cronSp, remoteProfiles),
       fetchProfilesSessionSlice(messagingSp, remoteProfiles)
     ])
 
     return {
       recents: {
+        hidden_pinned_count: crossProfilePins ? countCrossProfilePins(rowsOf(crossProfilePins), recentsProfile) : 0,
         sessions: rowsOf(recents),
         total: Number(recents?.total) || 0,
         profile_totals: recents?.profile_totals || {}
@@ -10235,7 +10252,12 @@ async function mergeRemoteProfileSessions(searchParams, remoteProfiles) {
   const recency = s => s?.[order] ?? s?.started_at ?? 0
   merged.sort((a, b) => recency(b) - recency(a))
 
-  return { ...(base as any), sessions: merged.slice(offset, offset + limit), total, profile_totals: profileTotals }
+  return {
+    ...(base as any),
+    sessions: windowSessionsIncludingPins(merged, offset, limit),
+    total,
+    profile_totals: profileTotals
+  }
 }
 
 ipcMain.handle('hermes:api', async (_event, request) => {

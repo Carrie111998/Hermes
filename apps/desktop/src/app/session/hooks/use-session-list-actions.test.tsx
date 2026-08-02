@@ -2,16 +2,20 @@ import { act, renderHook } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { SessionInfo, SidebarSessionsResponse } from '@/hermes'
+import { $pinnedSessionIds } from '@/store/layout'
 import {
   $cronSessions,
+  $hiddenPinnedSessionCount,
   $messagingSessions,
   $sessions,
   $sessionsLoading,
   setCronSessions,
+  setHiddenPinnedSessionCount,
   setMessagingSessions,
   setSessions,
   setSessionsLoading
 } from '@/store/session'
+import { createSessionPinKey } from '@/store/session-pin-key'
 
 import { useSessionListActions } from './use-session-list-actions'
 
@@ -43,11 +47,19 @@ const row = (id: string, over: Partial<SessionInfo> = {}): SessionInfo =>
 // separate listAllProfileSessions calls (each of which reopened every profile
 // DB) — #66377-adjacent perf work from the desktop audit canvas.
 const sidebar = (
-  recents: { sessions: SessionInfo[]; profiles_truncated?: Record<string, boolean> },
+  recents: {
+    sessions: SessionInfo[]
+    hidden_pinned_count?: number
+    profiles_truncated?: Record<string, boolean>
+  },
   cron: SessionInfo[] = [],
   messaging: SessionInfo[] = []
 ): SidebarSessionsResponse => ({
-  recents: { sessions: recents.sessions, profiles_truncated: recents.profiles_truncated },
+  recents: {
+    hidden_pinned_count: recents.hidden_pinned_count,
+    profiles_truncated: recents.profiles_truncated,
+    sessions: recents.sessions
+  },
   cron: { sessions: cron },
   messaging: { sessions: messaging }
 })
@@ -76,18 +88,35 @@ beforeEach(() => {
   removed.ids = new Set()
   setSessions([])
   setCronSessions([])
+  setHiddenPinnedSessionCount(0)
   setMessagingSessions([])
+  $pinnedSessionIds.set([])
   setSessionsLoading(false)
 })
 
 afterEach(() => {
   setSessions([])
   setCronSessions([])
+  setHiddenPinnedSessionCount(0)
   setMessagingSessions([])
+  $pinnedSessionIds.set([])
   setSessionsLoading(false)
 })
 
 describe('refreshSessions identity + loading hygiene', () => {
+  it('preserves only scoped pinned rows when a concrete-profile page omits them', async () => {
+    setSessions([row('kept', { profile: 'work' }), row('sibling-only', { profile: 'default' })])
+    $pinnedSessionIds.set([createSessionPinKey('work', 'kept'), createSessionPinKey('default', 'sibling-only')])
+    listSidebarSessions.mockResolvedValue(sidebar({ sessions: [] }))
+    const { result } = renderHook(() => useSessionListActions({ profileScope: 'work' }))
+
+    await act(async () => {
+      await result.current.refreshSessions()
+    })
+
+    expect($sessions.get().map(session => session.id)).toEqual(['kept'])
+  })
+
   it('keeps the previous $sessions array when the refresh is content-identical', async () => {
     const rows = [row('a'), row('b')]
     listSidebarSessions.mockResolvedValue(sidebar({ sessions: rows }))
@@ -209,6 +238,18 @@ describe('refreshSessions batches slices into one request', () => {
     expect($sessions.get().map(s => s.id)).toEqual(['a', 'b'])
     expect($cronSessions.get().map(s => s.id)).toEqual(['c1'])
     expect($messagingSessions.get().map(s => s.id)).toEqual(['m1'])
+  })
+
+  it('stores the number of durable pins hidden by the concrete profile scope', async () => {
+    listSidebarSessions.mockResolvedValue(sidebar({ hidden_pinned_count: 2, sessions: [row('a')] }))
+
+    const { result } = renderHook(() => useSessionListActions({ profileScope: 'default' }))
+
+    await act(async () => {
+      await result.current.refreshSessions()
+    })
+
+    expect($hiddenPinnedSessionCount.get()).toBe(2)
   })
 
   it('forwards the active profile scope + section limits to the batched call', async () => {

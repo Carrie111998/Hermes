@@ -74,6 +74,8 @@ export const $sidebarWidth: ReadableAtom<number> = computed($paneStates, states 
   return typeof override === 'number' ? override : SIDEBAR_DEFAULT_WIDTH
 })
 
+// Ordered `profile\0lineage-root-id` keys. The storage key stays stable so
+// session-pin-sync.ts can migrate legacy id-only values in place.
 export const $pinnedSessionIds = persistentAtom(SIDEBAR_PINNED_STORAGE_KEY, [] as string[], Codecs.stringArray)
 export const $sidebarSessionOrderIds = persistentAtom(
   SIDEBAR_SESSION_ORDER_STORAGE_KEY,
@@ -403,16 +405,19 @@ export function setSidebarResizing(resizing: boolean) {
   $isSidebarResizing.set(resizing)
 }
 
-export function pinSession(sessionId: string, index?: number) {
+export function pinSession(sessionKey: string, index?: number) {
   const prev = $pinnedSessionIds.get()
 
-  setOrderIds($pinnedSessionIds, insertUniqueId(prev, sessionId, index ?? prev.filter(id => id !== sessionId).length))
-}
-
-export function unpinSession(sessionId: string) {
   setOrderIds(
     $pinnedSessionIds,
-    $pinnedSessionIds.get().filter(id => id !== sessionId)
+    insertUniqueId(prev, sessionKey, index ?? prev.filter(key => key !== sessionKey).length)
+  )
+}
+
+export function unpinSession(sessionKey: string) {
+  setOrderIds(
+    $pinnedSessionIds,
+    $pinnedSessionIds.get().filter(key => key !== sessionKey)
   )
 }
 

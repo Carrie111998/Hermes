@@ -59,11 +59,11 @@ import {
   $selectedStoredSessionId,
   $sessions,
   sessionMatchesStoredId,
-  sessionPinId,
   setAwaitingResponse,
   setBusy,
   setMessages
 } from '@/store/session'
+import { createSessionPinKey, sessionPinKey } from '@/store/session-pin-key'
 import { clearSessionTodos, setSessionTodos, todosForHydration } from '@/store/todos'
 import { armWakeWord } from '@/store/wake-word'
 import { isSecondaryWindow } from '@/store/windows'
@@ -793,12 +793,12 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     }
 
     const session = $sessions.get().find(s => sessionMatchesStoredId(s, sessionId))
-    const pinId = session ? sessionPinId(session) : sessionId
+    const pinKey = session ? sessionPinKey(session) : createSessionPinKey($activeGatewayProfile.get(), sessionId)
 
-    if ($pinnedSessionIds.get().includes(pinId)) {
-      unpinSession(pinId)
+    if ($pinnedSessionIds.get().includes(pinKey)) {
+      unpinSession(pinKey)
     } else {
-      pinSession(pinId)
+      pinSession(pinKey)
     }
   }, [])
 
