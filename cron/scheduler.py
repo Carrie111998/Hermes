@@ -3008,11 +3008,6 @@ def run_job(
 
     agent = None
 
-    # Mark this as a cron session so the approval system can apply cron_mode.
-    # This env var is process-wide and persists for the lifetime of the
-    # scheduler process — every job this process runs is a cron job.
-    os.environ["HERMES_CRON_SESSION"] = "1"
-
     # Use ContextVars for per-job session/delivery state so parallel jobs
     # don't clobber each other's targets (os.environ is process-global).
     from gateway.session_context import set_session_vars, clear_session_vars, _VAR_MAP
@@ -3110,12 +3105,17 @@ def run_job(
     else:
         _terminal_cwd_lock.acquire_read()
 
+    _cron_flag_token = None
+
     # Everything after the acquire MUST live inside this try, so the finally
     # below always releases the lock even if the env override or any later
     # statement raises.  A leaked writer would deadlock the whole scheduler
     # (every future job blocks on acquire_*); a leaked reader blocks all
     # future writers.  Acquire itself can't leak (it either blocks or returns).
     try:
+        from gateway.session_context import HERMES_CRON_SESSION_CONTEXTVAR
+
+        _cron_flag_token = HERMES_CRON_SESSION_CONTEXTVAR.set(True)
         if _job_workdir:
             os.environ["TERMINAL_CWD"] = _job_workdir
             logger.info("Job '%s': using workdir %s", job_id, _job_workdir)
@@ -3745,6 +3745,8 @@ def run_job(
         return False, output, "", error_msg
 
     finally:
+        if _cron_flag_token is not None:
+            HERMES_CRON_SESSION_CONTEXTVAR.reset(_cron_flag_token)
         # Restore TERMINAL_CWD to whatever it was before this job ran.  We
         # only ever mutate it when the job has a workdir; see the setup block
         # at the top of run_job for the serialization guarantee.

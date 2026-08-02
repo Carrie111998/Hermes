@@ -190,7 +190,7 @@ def _iter_referenced_shell_scripts(
         executable = segment[index]
         executable_name = Path(executable).name
 
-        if executable_name in {".", "source"}:
+        if executable in {".", "source"} or executable_name == "source":
             if len(segment) > index + 1:
                 yield _resolve_terminal_script_path(segment[index + 1], cwd)
             continue
@@ -219,8 +219,12 @@ def _iter_referenced_shell_scripts(
                 yield _resolve_terminal_script_path(arguments[arg_index], cwd)
             continue
 
-        if "/" in executable or executable.endswith((".sh", ".bash", ".zsh")):
+        if executable.endswith((".sh", ".bash", ".zsh")):
             yield _resolve_terminal_script_path(executable, cwd)
+        elif "/" in executable:
+            candidate = _resolve_terminal_script_path(executable, cwd)
+            if candidate.suffix in (".sh", ".bash", ".zsh") or _is_shell_script_file(candidate):
+                yield candidate
 
 
 def _iter_shell_command_payloads(command: str) -> Iterator[str]:
@@ -252,7 +256,7 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
     try:
         descriptor = os.open(path, flags)
-    except OSError:
+    except (OSError, ValueError):
         return None, False
     try:
         metadata = os.fstat(descriptor)
@@ -268,6 +272,28 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
     if len(data) > _MAX_REFERENCED_SCRIPT_BYTES:
         return None, True
     return data.decode("utf-8", errors="replace"), False
+
+
+def _is_shell_script_file(path: Path) -> bool:
+    """Return whether *path* is a bounded-read POSIX shell script file."""
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except (OSError, ValueError):
+        return False
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            return False
+        data = os.read(descriptor, 512)
+    except OSError:
+        return False
+    finally:
+        os.close(descriptor)
+    if not data.startswith(b"#!"):
+        return False
+    shebang = data.splitlines()[0].decode("utf-8", errors="replace")
+    return bool(re.search(r"(?i)(?<![A-Za-z0-9_])(sh|bash|dash|ksh|zsh)(?![A-Za-z0-9_])", shebang))
 
 
 def _contains_unsafe_gateway_action(
@@ -298,7 +324,7 @@ def _contains_unsafe_gateway_action(
     for script_path in _iter_referenced_shell_scripts(command, cwd=cwd):
         try:
             resolved = script_path.resolve(strict=False)
-        except OSError:
+        except (OSError, ValueError):
             resolved = script_path
         if resolved in visited:
             continue

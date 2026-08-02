@@ -95,6 +95,10 @@ _SESSION_MESSAGE_ID: ContextVar = ContextVar("HERMES_SESSION_MESSAGE_ID", defaul
 
 _SESSION_PROFILE: ContextVar = ContextVar("HERMES_SESSION_PROFILE", default=_UNSET)
 
+HERMES_CRON_SESSION_CONTEXTVAR: ContextVar[bool] = ContextVar(
+    "hermes_cron_session_contextvar", default=False
+)
+
 # Whether the current session's delivery channel can route an ASYNC completion
 # back to the agent AFTER the current turn ends (i.e. wake a fresh turn).
 #
