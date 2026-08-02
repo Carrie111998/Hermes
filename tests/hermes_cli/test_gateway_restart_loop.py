@@ -16,6 +16,7 @@ from hermes_cli.cron import (
     _contains_gateway_lifecycle_command,
     cron_command,
 )
+from cron.lifecycle_guard import _iter_referenced_shell_scripts
 
 
 # ---------------------------------------------------------------------------
@@ -805,3 +806,6 @@ class TestCronCreateLifecycleBlockExtra:
         assert rc == 1
         out = capsys.readouterr().out
         assert "Blocked" in out
+
+    def test_pathlib_absolute_operand_is_not_shell_script(self):
+        assert list(_iter_referenced_shell_scripts('Path("/tmp") / "x"')) == []

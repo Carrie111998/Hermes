@@ -223,9 +223,13 @@ def _iter_referenced_shell_scripts(
         # such as ``Path.home() / ".hermes"``.  It is not an executable path;
         # treating it as one makes the scanner resolve ``/`` and fail closed
         # on every ordinary pathlib-based Python cron script.
-        if (executable != "/" and "/" in executable) or executable.endswith(
-            (".sh", ".bash", ".zsh")
-        ):
+        # Bare path-like tokens are not enough to identify shell scripts:
+        # Python expressions such as ``Path("/tmp") / "x"`` tokenize into
+        # ``/tmp`` and ``/`` and must not be treated as executable paths.
+        # Shell scripts without an explicit interpreter are still recognized
+        # by their conventional shell suffixes; explicit ``bash ./script``
+        # invocations are handled above.
+        if executable.endswith((".sh", ".bash", ".zsh")):
             yield _resolve_terminal_script_path(executable, cwd)
 
 
