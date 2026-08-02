@@ -13,6 +13,13 @@ These tests pin down:
 
 * Worker / operator-initiated blocks are sticky and survive
   ``recompute_ready``.
+* ``create_task(initial_status='blocked')`` is also sticky: the
+  explicit human parking decision gets a ``blocked`` event at creation,
+  so the next dispatcher ``recompute_ready`` cannot silently promote it
+  after an assignment or dependency tick.  The ``blocked`` event is the
+  only signal ``_has_sticky_block`` needs — no extra status or
+  ``block_kind`` mutation is required, which keeps ``unblock_task`` /
+  ``reclaim_task`` semantics unchanged.
 * Circuit-breaker blocks (``gave_up`` event, status flipped via
   ``_record_task_failure``) still auto-recover — the original intent
   of #40c1decb3 is preserved.
@@ -76,9 +83,19 @@ def test_worker_block_is_not_auto_promoted_by_recompute_ready(kanban_home: Path)
             assert kb.get_task(conn, tid).status == "blocked"
 
 
+# ---------------------------------------------------------------------------
+# create_task(initial_status='blocked') must be sticky
+# ---------------------------------------------------------------------------
+
+
 def test_initial_blocked_task_is_sticky_after_assignment(kanban_home: Path) -> None:
     """An explicitly parked task must not be mistaken for a recoverable
-    circuit-breaker block after a later assignment or dispatcher tick."""
+    circuit-breaker block after a later assignment or dispatcher tick.
+
+    The parking decision is recorded as a ``blocked`` event at creation
+    (with ``kind: needs_input``), which is the same signal the sticky
+    guard uses for worker-initiated ``kanban_block`` calls.
+    """
     with kb.connect() as conn:
         tid = kb.create_task(
             conn,
@@ -88,7 +105,6 @@ def test_initial_blocked_task_is_sticky_after_assignment(kanban_home: Path) -> N
         task = kb.get_task(conn, tid)
         assert task is not None
         assert task.status == "blocked"
-        assert task.block_kind == "needs_input"
 
         # Assignment is a normal operator action and must not release the
         # initial human-review parking decision.
@@ -105,156 +121,61 @@ def test_initial_blocked_task_is_sticky_after_assignment(kanban_home: Path) -> N
             (tid,),
         ).fetchone()
         assert event is not None
-        assert '"kind": "needs_input"' in event["payload"]
+        assert "needs_input" in event["payload"]
 
 
+def test_initial_blocked_task_unblock_returns_to_ready(kanban_home: Path) -> None:
+    """``unblock_task`` is the only way out of an initial parking block.
 
-
-# ---------------------------------------------------------------------------
-# Historical untyped blocked cards
-# ---------------------------------------------------------------------------
-
-
-def test_legacy_blocked_task_can_be_migrated_to_typed_sticky_block(
-    kanban_home: Path,
-) -> None:
-    """A pre-typed blocked card must have an explicit migration path.
-
-    Historical sync cards can carry only status=blocked.  The normal
-    block_task call used to return False for that row, leaving the card
-    vulnerable to assign -> recompute_ready -> ready promotion.
+    After unblock the task may return to ``ready`` (no unfinished
+    parents), and a later ``recompute_ready`` may promote it normally —
+    the sticky guard must not keep suppressing a task the operator has
+    explicitly released.
     """
-    with kb.connect() as conn:
-        tid = kb.create_task(conn, title='legacy blocked guardrail')
-        conn.execute(
-            'UPDATE tasks SET status = "blocked", block_kind = NULL, '
-            'block_recurrences = 0 WHERE id = ?',
-            (tid,),
-        )
-        conn.commit()
-
-        assert kb.block_task(
-            conn,
-            tid,
-            reason='legacy asset-pack review shell',
-            kind='needs_input',
-        )
-        task = kb.get_task(conn, tid)
-        assert task is not None
-        assert task.status == 'blocked'
-        assert task.block_kind == 'needs_input'
-
-        assert kb.assign_task(conn, tid, 'default')
-        assert kb.assign_task(conn, tid, None)
-        assert kb.recompute_ready(conn) == 0
-        task_after_assignment = kb.get_task(conn, tid)
-        assert task_after_assignment is not None
-        assert task_after_assignment.status == 'blocked'
-
-        event = conn.execute(
-            'SELECT payload FROM task_events '
-            'WHERE task_id = ? AND kind = "blocked" '
-            'ORDER BY id DESC LIMIT 1',
-            (tid,),
-        ).fetchone()
-        assert event is not None
-        assert 'needs_input' in event['payload']
-
-
-def test_reclaim_preserves_existing_typed_gate(kanban_home: Path) -> None:
-    """Reclaiming a wrongly running gated card must not return it to ready."""
     with kb.connect() as conn:
         tid = kb.create_task(
             conn,
-            title='reclaim must preserve human gate',
-            initial_status='blocked',
+            title="initially parked then released",
+            initial_status="blocked",
+        )
+        assert kb.get_task(conn, tid).status == "blocked"
+
+        assert kb.unblock_task(conn, tid)
+        assert kb.get_task(conn, tid).status == "ready"
+
+        # A released task is dispatchable again: the next tick may pick
+        # it up (recompute_ready has nothing to promote here, but the
+        # sticky guard must not error or keep it parked either).
+        assert kb.recompute_ready(conn) == 0
+        assert kb.get_task(conn, tid).status == "ready"
+
+
+def test_initial_blocked_task_unblock_claim_reclaim_goes_ready(
+    kanban_home: Path,
+) -> None:
+    """Reclaim semantics are unchanged for an unblocked initial-parked
+    card: unblock → claim → reclaim returns the task to ``ready`` (not
+    back to ``blocked``), preserving the pre-existing reset-to-ready
+    behaviour of ``reclaim_task``.
+    """
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="initial park then full lifecycle",
+            initial_status="blocked",
         )
         assert kb.unblock_task(conn, tid)
         assert kb.claim_task(conn, tid)
+        assert kb.get_task(conn, tid).status == "running"
 
         assert kb.reclaim_task(
             conn,
             tid,
-            reason='operator abort preserves needs_input gate',
+            reason="operator abort after unblock",
         )
         task = kb.get_task(conn, tid)
         assert task is not None
-        assert task.status == 'blocked'
-        assert task.block_kind == 'needs_input'
-        assert kb.recompute_ready(conn) == 0
-
-        assert kb.assign_task(conn, tid, None)
-        task_after_unassign = kb.get_task(conn, tid)
-        assert task_after_unassign is not None
-        assert task_after_unassign.status == 'blocked'
-
-        event = conn.execute(
-            'SELECT kind, payload FROM task_events '
-            'WHERE task_id = ? AND kind = "blocked" '
-            'ORDER BY id DESC LIMIT 1',
-            (tid,),
-        ).fetchone()
-        assert event is not None
-        assert event['kind'] == 'blocked'
-        assert 'reclaim_preserved_sticky_block' in event['payload']
-
-
-def test_triage_gate_can_be_repaired_to_sticky_block(kanban_home: Path) -> None:
-    """A loop-breaker triage card can be explicitly returned to blocked."""
-    with kb.connect() as conn:
-        tid = kb.create_task(conn, title='triage repair guardrail')
-        conn.execute(
-            'UPDATE tasks SET status = "triage", block_kind = "needs_input", '
-            'block_recurrences = 2 WHERE id = ?',
-            (tid,),
-        )
-        conn.commit()
-
-        assert kb.repair_blocked_task(
-            conn,
-            tid,
-            reason='human gate confirmed after loop triage',
-            kind='needs_input',
-        )
-        task = kb.get_task(conn, tid)
-        assert task is not None
-        assert task.status == 'blocked'
-        assert task.block_kind == 'needs_input'
-        assert task.block_recurrences == 1
-        assert kb.assign_task(conn, tid, 'default')
-        assert kb.recompute_ready(conn) == 0
-
-
-def test_todo_typed_gate_is_not_promoted_and_can_be_repaired(
-    kanban_home: Path,
-) -> None:
-    """A decomposed ``todo`` row with a typed gate must stay non-dispatchable."""
-    with kb.connect() as conn:
-        tid = kb.create_task(conn, title='todo typed gate guardrail')
-        conn.execute(
-            'UPDATE tasks SET status = "todo", block_kind = "needs_input", '
-            'block_recurrences = 2 WHERE id = ?',
-            (tid,),
-        )
-        conn.commit()
-
-        assert kb.recompute_ready(conn) == 0
-        task = kb.get_task(conn, tid)
-        assert task is not None
-        assert task.status == 'todo'
-
-        assert kb.repair_blocked_task(
-            conn,
-            tid,
-            reason='decomposition left a human gate in todo',
-            kind='needs_input',
-        )
-        task = kb.get_task(conn, tid)
-        assert task is not None
-        assert task.status == 'blocked'
-        assert task.block_kind == 'needs_input'
-        assert task.block_recurrences == 1
-        assert kb.assign_task(conn, tid, 'default')
+        assert task.status == "ready"
         assert kb.recompute_ready(conn) == 0
 
 
@@ -268,6 +189,7 @@ def test_todo_typed_gate_is_not_promoted_and_can_be_repaired(
 # ---------------------------------------------------------------------------
 # unblock_task clears the sticky state
 # ---------------------------------------------------------------------------
+
 
 
 # ---------------------------------------------------------------------------

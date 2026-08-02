@@ -3271,17 +3271,12 @@ def create_task(
                     },
                 )
                 if task_status == "blocked":
-                    # ``initial_status='blocked'`` is an explicit human-ops
-                    # parking decision, not a circuit-breaker failure.  Mark
-                    # it as a typed sticky block so the next dispatcher
-                    # ``recompute_ready`` cannot silently promote it after an
-                    # assignment or dependency tick.  Without this event,
-                    # ``_has_sticky_block`` has no way to distinguish an
-                    # initial blocked card from a recoverable gave-up card.
-                    conn.execute(
-                        "UPDATE tasks SET block_kind = 'needs_input' WHERE id = ?",
-                        (task_id,),
-                    )
+                    # An explicit human parking decision, not a
+                    # circuit-breaker failure.  Record the ``blocked``
+                    # event so ``_has_sticky_block`` sees it and the next
+                    # dispatcher ``recompute_ready`` cannot silently
+                    # promote the card after an assignment or dependency
+                    # tick.  ``unblock_task`` remains the only way out.
                     _append_event(
                         conn,
                         task_id,
@@ -3289,7 +3284,6 @@ def create_task(
                         {
                             "reason": "initial_status=blocked",
                             "kind": "needs_input",
-                            "recurrences": 1,
                         },
                     )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
@@ -3541,60 +3535,6 @@ def set_reasoning_effort(
             conn, task_id, "reasoning_effort_set", {"reasoning_effort": effort}
         )
         return True
-
-
-def update_task_body(
-    conn: sqlite3.Connection,
-    task_id: str,
-    body: str,
-    *,
-    author: Optional[str] = None,
-) -> Optional[dict[str, Any]]:
-    """Atomically refresh a task's canonical body and audit the change.
-
-    Returns ``None`` when ``task_id`` does not exist.  Otherwise returns a
-    small metadata dict with ``changed`` plus old/new body hashes and lengths.
-    Repeating the same update is a no-op and does not append an event.  The
-    operation deliberately changes only ``tasks.body`` and its audit event;
-    it never recomputes readiness or mutates assignment/status fields.
-
-    Body contents are not copied into the event payload.  Hashes and lengths
-    are enough to prove what changed without duplicating potentially sensitive
-    task text in the event log.
-    """
-    if not isinstance(body, str):
-        raise ValueError("task body must be a string")
-    actor = (author or "").strip() or None
-    new_sha256 = hashlib.sha256(body.encode("utf-8")).hexdigest()
-    with write_txn(conn):
-        row = conn.execute(
-            "SELECT body FROM tasks WHERE id = ?", (task_id,)
-        ).fetchone()
-        if not row:
-            return None
-        old_body = row["body"] or ""
-        old_sha256 = hashlib.sha256(old_body.encode("utf-8")).hexdigest()
-        changed = old_body != body
-        if changed:
-            conn.execute(
-                "UPDATE tasks SET body = ? WHERE id = ?",
-                (body, task_id),
-            )
-            payload = {
-                "author": actor,
-                "old_sha256": old_sha256,
-                "new_sha256": new_sha256,
-                "old_length": len(old_body),
-                "new_length": len(body),
-            }
-            _append_event(conn, task_id, "body_updated", payload)
-        return {
-            "changed": changed,
-            "old_sha256": old_sha256,
-            "new_sha256": new_sha256,
-            "old_length": len(old_body),
-            "new_length": len(body),
-        }
 
 
 # ---------------------------------------------------------------------------
@@ -4244,17 +4184,12 @@ def recompute_ready(
     promoted = 0
     with write_txn(conn):
         todo_rows = conn.execute(
-            "SELECT id, status, block_kind, consecutive_failures, max_retries "
+            "SELECT id, status, consecutive_failures, max_retries "
             "FROM tasks WHERE status IN ('todo', 'blocked')"
         ).fetchall()
         for row in todo_rows:
             task_id = row["id"]
             cur_status = row["status"]
-            if row["block_kind"] in {"needs_input", "capability"}:
-                # A typed human/capability gate is non-dispatchable even if
-                # an older writer left the row in ``todo`` (for example after
-                # decomposition).  Only explicit repair/unblock may move it.
-                continue
             if cur_status == "blocked" and _has_sticky_block(conn, task_id):
                 # Worker / operator asked for human review — do not
                 # silently auto-recover.  ``unblock_task`` is the only
@@ -4697,8 +4632,7 @@ def reclaim_task(
     reclaimable state (not running, or doesn't exist).
     """
     row = conn.execute(
-        "SELECT status, claim_lock, worker_pid, block_kind "
-        "FROM tasks WHERE id = ?",
+        "SELECT status, claim_lock, worker_pid FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if not row:
@@ -4707,18 +4641,16 @@ def reclaim_task(
         # Nothing to reclaim — already ready / blocked / done.
         return False
     prev_lock = row["claim_lock"]
-    preserve_blocked = row["block_kind"] in {"needs_input", "capability"}
-    reclaim_status = "blocked" if preserve_blocked else "ready"
     termination = _terminate_reclaimed_worker(
         row["worker_pid"], prev_lock, signal_fn=signal_fn,
     )
     with write_txn(conn):
         cur = conn.execute(
-            "UPDATE tasks SET status = ?, claim_lock = NULL, "
+            "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
             "claim_expires = NULL, worker_pid = NULL "
             "WHERE id = ? AND status IN ('running', 'ready', 'blocked') "
             "AND claim_lock IS ?",
-            (reclaim_status, task_id, prev_lock),
+            (task_id, prev_lock),
         )
         if cur.rowcount != 1:
             return False
@@ -4742,18 +4674,6 @@ def reclaim_task(
             payload,
             run_id=run_id,
         )
-        if preserve_blocked:
-            _append_event(
-                conn,
-                task_id,
-                "blocked",
-                {
-                    "reason": reason or "reclaim preserved typed block",
-                    "kind": row["block_kind"],
-                    "migration": "reclaim_preserved_sticky_block",
-                },
-                run_id=run_id,
-            )
     # Operator intervention — they've looked at the task, so the
     # consecutive-failures counter is now stale. Give the next retry
     # a fresh budget. (_clear_failure_counter opens its own write_txn,
@@ -5711,85 +5631,6 @@ def edit_completed_task_result(
     return True
 
 
-def repair_blocked_task(
-    conn: sqlite3.Connection,
-    task_id: str,
-    *,
-    reason: Optional[str] = None,
-    kind: str = 'needs_input',
-    expected_run_id: Optional[int] = None,
-) -> bool:
-    """Migrate a legacy ``blocked``/``triage``/``todo`` row to a typed human gate.
-
-    Older automation cards may have ``status='blocked'`` without a typed
-    ``blocked`` event.  Calling :func:`block_task` on such a row used to be a
-    no-op, leaving ``recompute_ready`` free to promote it after an assignment
-    change.  This helper is deliberately narrow: it only repairs an already
-    blocked, triage, or todo task and never releases it or resets dispatcher failure
-    state.
-
-    Repeating the repair for the same existing sticky kind is idempotent.
-    """
-    if kind not in VALID_BLOCK_KINDS:
-        raise ValueError(
-            f'legacy blocked repair kind must be one of '
-            f'{sorted(VALID_BLOCK_KINDS - {"dependency"})}'
-        )
-    if kind == 'dependency':
-        return False
-    with write_txn(conn):
-        row = conn.execute(
-            'SELECT status, block_kind, block_recurrences, current_run_id '
-            'FROM tasks WHERE id = ?',
-            (task_id,),
-        ).fetchone()
-        if row is None or row['status'] not in {'blocked', 'triage', 'todo'}:
-            return False
-        if (
-            expected_run_id is not None
-            and row['current_run_id'] != int(expected_run_id)
-        ):
-            return False
-
-        previous_kind = row['block_kind']
-        if row['status'] == 'blocked' and previous_kind == kind and _has_sticky_block(conn, task_id):
-            return True
-        # This is an explicit human repair, not another loop iteration.
-        # Preserve the historical events but reset the live counter so the
-        # next ordinary sync does not immediately trip the loop breaker.
-        recurrences = 1
-        cur = conn.execute(
-            'UPDATE tasks SET status = "blocked", block_kind = ?, '
-            'block_recurrences = ?, claim_lock = NULL, '
-            'claim_expires = NULL, worker_pid = NULL '
-            'WHERE id = ? AND status IN ("blocked", "triage", "todo")',
-            (kind, recurrences, task_id),
-        )
-        if cur.rowcount != 1:
-            return False
-        _append_event(
-            conn,
-            task_id,
-            'blocked',
-            {
-                'reason': reason,
-                'kind': kind,
-                'recurrences': recurrences,
-                'migration': 'human_gate_repair',
-            },
-        )
-        repaired_task = get_task(conn, task_id)
-    _fire_kanban_lifecycle_hook(
-        'kanban_task_blocked',
-        task_id,
-        board=get_current_board(),
-        assignee=repaired_task.assignee if repaired_task else None,
-        run_id=None,
-        reason=reason,
-    )
-    return True
-
-
 def block_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5829,14 +5670,6 @@ def block_task(
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
-    if kind is not None and repair_blocked_task(
-        conn,
-        task_id,
-        reason=reason,
-        kind=kind,
-        expected_run_id=expected_run_id,
-    ):
-        return True
     recurrences = 0
     with write_txn(conn):
         cur_row = conn.execute(
