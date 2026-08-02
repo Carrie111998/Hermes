@@ -1035,5 +1035,6 @@ export {
   resolveInstallScript,
   resolveLocalInstallScript,
   resolveMarkerPinnedCommit,
-  runBootstrap
+  runBootstrap,
+  spawnPowerShell
 }
