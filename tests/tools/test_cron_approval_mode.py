@@ -1,8 +1,11 @@
 """Tests for approvals.cron_mode — configurable approval behavior for cron jobs."""
 
+from contextlib import contextmanager
+
 import pytest
 
 import tools.approval as approval_module
+from gateway.session_context import reset_cron_session, set_cron_session
 from tools.approval import (
     _get_cron_approval_mode,
     check_all_command_guards,
@@ -20,6 +23,15 @@ def _clear_approval_state():
     approval_module._permanent_approved.clear()
     approval_module.clear_session("default")
     approval_module.clear_session("test-session")
+
+
+@contextmanager
+def _active_cron_context():
+    token = set_cron_session()
+    try:
+        yield
+    finally:
+        reset_cron_session(token)
 
 
 # ---------------------------------------------------------------------------
@@ -189,11 +201,7 @@ class TestCronDenyModeAllGuards:
             assert "BLOCKED" in result["message"]
 
     def test_inherited_ask_mode_cannot_bypass_cron_deny(self, monkeypatch):
-        """A gateway parent may export HERMES_EXEC_ASK into a cron worker.
-
-        Cron identity must win: no human is attached to the unattended run, so
-        the inherited ask surface cannot turn cron_mode=deny into approval.
-        """
+        """A cron ContextVar must outrank inherited gateway ask mode."""
         monkeypatch.setenv("HERMES_CRON_SESSION", "1")
         monkeypatch.setenv("HERMES_EXEC_ASK", "1")
         monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
@@ -201,7 +209,11 @@ class TestCronDenyModeAllGuards:
         monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
 
         from unittest.mock import patch as mock_patch
-        with mock_patch("tools.approval._get_cron_approval_mode", return_value="deny"):
+
+        with (
+            _active_cron_context(),
+            mock_patch("tools.approval._get_cron_approval_mode", return_value="deny"),
+        ):
             result = check_all_command_guards("rm -rf /tmp/stuff", "local")
         assert not result["approved"]
         assert "cron jobs run without a user present" in result["message"]
@@ -215,10 +227,30 @@ class TestCronDenyModeAllGuards:
         monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
 
         from unittest.mock import patch as mock_patch
-        with mock_patch("tools.approval._get_cron_approval_mode", return_value="approve"):
+
+        with (
+            _active_cron_context(),
+            mock_patch("tools.approval._get_cron_approval_mode", return_value="approve"),
+        ):
             result = check_all_command_guards("rm -rf /tmp/stuff", "local")
         assert result["approved"]
         assert result.get("status") != "approval_required"
+
+    def test_stale_process_cron_env_cannot_bypass_gateway_approval(self, monkeypatch):
+        """A leaked process-global marker is not authoritative in ask mode."""
+        monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+        monkeypatch.setenv("HERMES_EXEC_ASK", "1")
+        monkeypatch.setenv("_HERMES_GATEWAY", "1")
+        monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+        monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+        monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
+
+        from unittest.mock import patch as mock_patch
+
+        with mock_patch("tools.approval._get_cron_approval_mode", return_value="approve"):
+            result = check_all_command_guards("rm -rf /tmp/stuff", "local")
+        assert not result["approved"]
+        assert result.get("status") == "pending_approval"
 
     def test_safe_command_allowed_in_combined_guard(self, monkeypatch):
         monkeypatch.setenv("HERMES_CRON_SESSION", "1")

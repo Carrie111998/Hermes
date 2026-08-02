@@ -2680,14 +2680,15 @@ def run_job(
 
     agent = None
 
-    # Mark this as a cron session so the approval system can apply cron_mode.
-    # This env var is process-wide and persists for the lifetime of the
-    # scheduler process — every job this process runs is a cron job.
-    os.environ["HERMES_CRON_SESSION"] = "1"
-
-    # Use ContextVars for per-job session/delivery state so parallel jobs
-    # don't clobber each other's targets (os.environ is process-global).
-    from gateway.session_context import set_session_vars, clear_session_vars, _VAR_MAP
+    # Use ContextVars for per-job session, delivery, and cron provenance so
+    # parallel gateway requests cannot inherit unattended approval semantics.
+    from gateway.session_context import (
+        _VAR_MAP,
+        clear_session_vars,
+        reset_cron_session,
+        set_cron_session,
+        set_session_vars,
+    )
 
     # Cron execution is an internal scheduler context, not a live inbound
     # gateway message. Do not seed HERMES_SESSION_* contextvars from the
@@ -2762,10 +2763,10 @@ def run_job(
         _terminal_cwd_lock.acquire_read()
 
     # Everything after the acquire MUST live inside this try, so the finally
-    # below always releases the lock even if the env override or any later
-    # statement raises.  A leaked writer would deadlock the whole scheduler
-    # (every future job blocks on acquire_*); a leaked reader blocks all
-    # future writers.  Acquire itself can't leak (it either blocks or returns).
+    # below always releases the lock and restores task-local cron provenance.
+    # A leaked writer would deadlock the whole scheduler; leaked cron context
+    # would misclassify later work spawned from this task.
+    _cron_context_token = set_cron_session()
     try:
         if _job_workdir:
             os.environ["TERMINAL_CWD"] = _job_workdir
@@ -3267,6 +3268,7 @@ def run_job(
         return False, output, "", error_msg
 
     finally:
+        reset_cron_session(_cron_context_token)
         # Restore TERMINAL_CWD to whatever it was before this job ran.  We
         # only ever mutate it when the job has a workdir; see the setup block
         # at the top of run_job for the serialization guarantee.

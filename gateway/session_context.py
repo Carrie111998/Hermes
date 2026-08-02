@@ -120,6 +120,47 @@ _CRON_AUTO_DELIVER_PLATFORM: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_P
 _CRON_AUTO_DELIVER_CHAT_ID: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_CHAT_ID", default=_UNSET)
 _CRON_AUTO_DELIVER_THREAD_ID: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_THREAD_ID", default=_UNSET)
 
+# Authoritative cron provenance for in-process scheduled-agent execution. Unlike
+# HERMES_CRON_SESSION in os.environ, this value cannot leak from a scheduler
+# task into an interactive gateway request running concurrently in the same
+# process.
+_CRON_SESSION: ContextVar[bool] = ContextVar("HERMES_CRON_SESSION_CONTEXT", default=False)
+
+
+def set_cron_session():
+    """Mark the current task/thread context as scheduled-agent execution."""
+    return _CRON_SESSION.set(True)
+
+
+def reset_cron_session(token) -> None:
+    """Restore cron provenance to its previous task-local value."""
+    _CRON_SESSION.reset(token)
+
+
+def is_cron_session() -> bool:
+    """Return whether approval policy should use unattended cron semantics.
+
+    The ContextVar is authoritative in long-lived in-process hosts. A bare
+    HERMES_CRON_SESSION environment marker remains a compatibility fallback
+    only for legacy single-purpose processes; it is deliberately ignored when
+    gateway/ask identity is present because process-global environment can be
+    stale or concurrently contaminated.
+    """
+    if _CRON_SESSION.get():
+        return True
+
+    import os
+
+    raw = os.getenv("HERMES_CRON_SESSION", "").strip().lower()
+    if raw not in {"1", "true", "yes", "on"}:
+        return False
+    for marker in ("HERMES_EXEC_ASK", "HERMES_GATEWAY_SESSION", "_HERMES_GATEWAY"):
+        value = os.getenv(marker, "").strip().lower()
+        if value in {"1", "true", "yes", "on"}:
+            return False
+    return True
+
+
 _VAR_MAP = {
     "HERMES_SESSION_PLATFORM": _SESSION_PLATFORM,
     "HERMES_SESSION_SOURCE": _SESSION_SOURCE,

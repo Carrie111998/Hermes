@@ -176,6 +176,21 @@ def _get_session_platform() -> str:
         return os.getenv("HERMES_SESSION_PLATFORM", "") or ""
 
 
+def _is_cron_approval_context() -> bool:
+    """Return task-local cron provenance with a safe legacy fallback."""
+    try:
+        from gateway.session_context import is_cron_session
+
+        return is_cron_session()
+    except Exception:
+        return (
+            env_var_enabled("HERMES_CRON_SESSION")
+            and not env_var_enabled("HERMES_EXEC_ASK")
+            and not env_var_enabled("HERMES_GATEWAY_SESSION")
+            and not env_var_enabled("_HERMES_GATEWAY")
+        )
+
+
 def _is_gateway_approval_context() -> bool:
     """True when this call is inside a gateway/API session.
 
@@ -190,7 +205,7 @@ def _is_gateway_approval_context() -> bool:
     fall through to the gateway branch would submit a pending approval
     with no listener and block the job indefinitely.
     """
-    if env_var_enabled("HERMES_CRON_SESSION"):
+    if _is_cron_approval_context():
         return False
     if env_var_enabled("HERMES_GATEWAY_SESSION"):
         return True
@@ -2069,7 +2084,7 @@ def _run_approval_gate(
 
     if not is_cli and not is_gateway:
         # Cron sessions: respect cron_mode config
-        if env_var_enabled("HERMES_CRON_SESSION"):
+        if _is_cron_approval_context():
             if _get_cron_approval_mode() == "deny":
                 return {
                     "approved": False,
@@ -2661,7 +2676,7 @@ def check_all_command_guards(command: str, env_type: str,
 
     # Cron identity outranks inherited gateway/ask context. A scheduler worker
     # has no human approval surface even if its parent exported HERMES_EXEC_ASK.
-    if env_var_enabled("HERMES_CRON_SESSION"):
+    if _is_cron_approval_context():
         return _check_cron_command_guards(command)
 
     is_cli = _is_interactive_cli()
@@ -3004,7 +3019,7 @@ def check_execute_code_guard(code: str, env_type: str,
     is_ask = env_var_enabled("HERMES_EXEC_ASK")
 
     # Cron: no user is present to approve arbitrary code.
-    if env_var_enabled("HERMES_CRON_SESSION"):
+    if _is_cron_approval_context():
         if _get_cron_approval_mode() == "deny":
             return {
                 "approved": False,

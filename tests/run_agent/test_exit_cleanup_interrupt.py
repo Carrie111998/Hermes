@@ -60,6 +60,41 @@ class TestCronJobCleanup:
         mock_db.end_session.assert_called_once()
         mock_db.close.assert_called_once()
 
+    def test_cron_provenance_is_worker_local_and_restored(self, monkeypatch):
+        """run_job propagates cron identity to its worker without env leakage."""
+        from cron import scheduler
+        from gateway.session_context import is_cron_session
+
+        monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
+        observed = []
+        mock_db = MagicMock()
+        job = {
+            "id": "test-job-cron-context",
+            "name": "test cron context",
+            "prompt": "hello",
+            "schedule": "0 9 * * *",
+            "model": "test/model",
+        }
+
+        def _run(_prompt):
+            observed.append(is_cron_session())
+            raise RuntimeError("stop after context observation")
+
+        with (
+            patch("hermes_state.SessionDB", return_value=mock_db),
+            patch.object(scheduler, "_build_job_prompt", return_value="hello"),
+            patch.object(scheduler, "_resolve_origin", return_value=None),
+            patch.object(scheduler, "_resolve_delivery_target", return_value=None),
+            patch("dotenv.load_dotenv", return_value=None),
+            patch("run_agent.AIAgent") as mock_agent,
+        ):
+            mock_agent.return_value.run_conversation.side_effect = _run
+            scheduler.run_job(job)
+
+        assert observed == [True]
+        assert is_cron_session() is False
+        assert "HERMES_CRON_SESSION" not in __import__("os").environ
+
     def test_keyboard_interrupt_in_close_does_not_propagate(self):
         """If close() raises KeyboardInterrupt, it must not escape run_job."""
         mock_db = MagicMock()
