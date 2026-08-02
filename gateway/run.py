@@ -10060,7 +10060,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 exc_info=(type(exc), exc, exc.__traceback__),
             )
 
-    async def _redeliver_pending_obligations(self) -> int:
+    async def _redeliver_pending_obligations(
+        self,
+        *,
+        platform: Optional[Platform] = None,
+    ) -> int:
         """Redeliver final responses recorded in the delivery ledger by a
         previous (now dead) gateway process.
 
@@ -10091,7 +10095,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # holds a platform only after its connect() succeeded, and each
             # claim spends one of the row's three redelivery attempts.
             _deliverable = {
-                getattr(p, "value", str(p)) for p in self.adapters
+                getattr(p, "value", str(p))
+                for p in self.adapters
+                if platform is None or p == platform
             }
             claimed = await asyncio.to_thread(
                 sweep_recoverable, None, deliverable_platforms=_deliverable
@@ -10124,7 +10130,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 {"thread_id": row["thread_id"]} if row.get("thread_id") else None
             )
             try:
-                result = await adapter.send(
+                result = await adapter._send_with_retry(
                     chat_id=row["chat_id"],
                     content=content,
                     metadata=metadata,
@@ -10135,8 +10141,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     row["obligation_id"], send_err,
                 )
                 result = None
-            try:
-                if result is not None and getattr(result, "success", False):
+            if result is not None and getattr(result, "success", False):
+                try:
                     mark_delivered(row["obligation_id"])
                     redelivered += 1
                     logger.info(
@@ -10145,13 +10151,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         row["platform"], row["chat_id"],
                         row["obligation_id"], row["attempts"],
                     )
-                else:
+                except Exception:
+                    logger.debug("delivery ledger update failed", exc_info=True)
+            else:
+                reconnectable = bool(
+                    result is not None
+                    and adapter._is_reconnectable_delivery_failure(result)
+                )
+                try:
                     mark_failed(
                         row["obligation_id"],
                         str(getattr(result, "error", "") or "send failed"),
+                        recoverable=reconnectable,
                     )
-            except Exception:
-                logger.debug("delivery ledger update failed", exc_info=True)
+                except Exception:
+                    logger.debug("delivery ledger update failed", exc_info=True)
+                if result is not None:
+                    try:
+                        await adapter._promote_retryable_delivery_failure(result)
+                    except Exception:
+                        logger.debug(
+                            "delivery reconnect promotion failed", exc_info=True
+                        )
 
             # The answer reached (or was owed to) this session — don't ALSO
             # re-run the turn via the resume path.
@@ -11935,6 +11956,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             error_message=None,
                         )
                         logger.info("✓ %s reconnected successfully", platform.value)
+
+                        try:
+                            await self._redeliver_pending_obligations(platform=platform)
+                        except Exception:
+                            logger.debug(
+                                "delivery redelivery after %s reconnect failed",
+                                platform.value,
+                                exc_info=True,
+                            )
+                        if self.adapters.get(platform) is not adapter:
+                            continue
 
                         # Rebuild channel directory with the new adapter
                         try:

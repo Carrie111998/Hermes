@@ -1853,11 +1853,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # read-only connections so they never queue behind writer flushes on
         # self._lock. See _read_ctx().
         self._read_local = threading.local()
-        # Strong set of all live read connections across all threads.  We
+        # Strong map of open read connections and their last owner threads. We
         # hold a reference so short-lived reader threads' connections are
-        # not GC'd without close() — that would leak tracked fds in
-        # _live_connections.  close() drains this set.
-        self._read_conns: "set[sqlite3.Connection]" = set()
+        # reassigned on the next checkout instead of accumulating until shutdown.
+        self._read_conns: "dict[sqlite3.Connection, threading.Thread]" = {}
         self._read_conns_lock = threading.Lock()
         # Set when close() begins.  _get_read_conn checks this under the
         # lock so a reader that finishes opening after the drain finds the
@@ -2111,11 +2110,24 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return conn
         if getattr(self._read_local, "failed", False):
             return None
+        current_thread = threading.current_thread()
+        with self._read_conns_lock:
+            if self._read_conns_closed:
+                self._read_local.failed = True
+                return None
+            # Reuse rather than close: POSIX close() cancels this process's
+            # SQLite locks on the same file, including an in-flight writer.
+            for pooled_conn, owner in self._read_conns.items():
+                if not owner.is_alive():
+                    self._read_conns[pooled_conn] = current_thread
+                    self._read_local.conn = pooled_conn
+                    return pooled_conn
         try:
             conn = _connect_tracked_db(
                 f"file:{self.db_path}?mode=ro",
                 tracking_path=self.db_path,
                 uri=True,
+                check_same_thread=False,
                 timeout=5.0,
                 isolation_level=None,
             )
@@ -2133,7 +2145,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     conn.close()
                     self._read_local.failed = True
                     return None
-                self._read_conns.add(conn)
+                self._read_conns[conn] = current_thread
         except sqlite3.Error:
             # Mark this thread failed so we don't retry the open on every
             # query; the locked writer connection still serves reads.
@@ -2670,8 +2682,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # Close all read-only connections across all threads.  Per-thread
         # connections live in threading.local() and would otherwise be GC'd
         # without calling close(), leaking tracked fds in _live_connections.
-        # The strong set holds references so short-lived reader threads'
-        # connections survive until close() drains them.  Setting the closed
+        # The strong map holds references so short-lived reader threads'
+        # connections can be reused until close() drains them. Setting the closed
         # flag under the lock prevents a reader from registering a new
         # connection after the drain.
         with self._read_conns_lock:

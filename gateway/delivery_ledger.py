@@ -219,17 +219,42 @@ def mark_delivered(obligation_id: str) -> None:
     _update_state(obligation_id, "delivered")
 
 
-def mark_failed(obligation_id: str, error: str = "") -> None:
-    _update_state(obligation_id, "failed", error=error)
+def mark_failed(
+    obligation_id: str,
+    error: str = "",
+    *,
+    recoverable: bool = False,
+) -> None:
+    _update_state(
+        obligation_id,
+        "failed",
+        error=error,
+        release_owner=recoverable,
+    )
 
 
-def _update_state(obligation_id: str, state: str, error: str = "") -> None:
+def _update_state(
+    obligation_id: str,
+    state: str,
+    error: str = "",
+    *,
+    release_owner: bool = False,
+) -> None:
     with _DB_LOCK, _transaction() as conn:
         conn.execute(
             """UPDATE delivery_obligations
-               SET state=?, updated_at=?, last_error=?
+               SET state=?, updated_at=?, last_error=?,
+                   owner_pid=CASE WHEN ? THEN NULL ELSE owner_pid END,
+                   owner_started_at=CASE WHEN ? THEN NULL ELSE owner_started_at END
                WHERE obligation_id=?""",
-            (state, time.time(), error[:500] if error else None, obligation_id),
+            (
+                state,
+                time.time(),
+                error[:500] if error else None,
+                release_owner,
+                release_owner,
+                obligation_id,
+            ),
         )
 
 

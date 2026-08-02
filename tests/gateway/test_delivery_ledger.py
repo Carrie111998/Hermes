@@ -83,6 +83,22 @@ class TestSweep:
         _record()  # owner = this (live) process
         assert dl.sweep_recoverable() == []
 
+    def test_failed_live_owner_row_is_recoverable(self):
+        _record()
+        dl.mark_failed("ob-1", "dns unavailable", recoverable=True)
+
+        claimed = dl.sweep_recoverable(deliverable_platforms={"slack"})
+
+        assert len(claimed) == 1
+        assert claimed[0]["needs_marker"] is True
+
+    def test_permanent_failed_live_owner_row_is_not_recoverable(self):
+        _record()
+        dl.mark_failed("ob-1", "invalid payload")
+
+        assert dl.sweep_recoverable(deliverable_platforms={"slack"}) == []
+        assert _row("ob-1")["owner_pid"] is not None
+
     def test_dead_owner_pending_claimed_without_marker(self):
         _record()
         _orphan("ob-1")
@@ -134,7 +150,7 @@ class TestGatewayRedeliverySweep:
     @staticmethod
     def _adapter(success=True):
         adapter = MagicMock()
-        adapter.send = AsyncMock(
+        adapter._send_with_retry = AsyncMock(
             return_value=MagicMock(success=success, error="" if success else "nope")
         )
         return adapter
@@ -149,7 +165,7 @@ class TestGatewayRedeliverySweep:
         n = await runner._redeliver_pending_obligations()
 
         assert n == 1
-        sent = adapter.send.call_args.kwargs
+        sent = adapter._send_with_retry.call_args.kwargs
         assert sent["content"] == "the final answer"  # no marker
         assert sent["metadata"] == {"thread_id": "171.001"}
         assert _row("ob-1")["state"] == "delivered"
@@ -167,9 +183,33 @@ class TestGatewayRedeliverySweep:
 
         await runner._redeliver_pending_obligations()
 
-        sent = adapter.send.call_args.kwargs
+        sent = adapter._send_with_retry.call_args.kwargs
         assert sent["content"].startswith(dl.RECOVERED_MARKER)
         assert sent["content"].endswith("the final answer")
+
+    @pytest.mark.asyncio
+    async def test_ledger_failure_does_not_block_reconnect_promotion(self):
+        _record()
+        _orphan("ob-1")
+        result = MagicMock(
+            success=False,
+            error="Cannot connect to host discord.com:443",
+        )
+        adapter = self._adapter()
+        adapter._send_with_retry.return_value = result
+        adapter._is_reconnectable_delivery_failure = MagicMock(return_value=True)
+        adapter._promote_retryable_delivery_failure = AsyncMock()
+        runner = self._runner(adapter)
+
+        with patch.object(dl, "mark_failed", side_effect=OSError("fd exhausted")) as failed:
+            await runner._redeliver_pending_obligations()
+
+        failed.assert_called_once_with(
+            "ob-1",
+            "Cannot connect to host discord.com:443",
+            recoverable=True,
+        )
+        adapter._promote_retryable_delivery_failure.assert_awaited_once_with(result)
 
 
 class TestAttemptsOnlySpentOnRealSends:
