@@ -1644,8 +1644,6 @@ export interface Translations {
       continueOnPhoneBrowserAuthDesc: string
       continueOnPhoneTicketFailedTitle: string
       continueOnPhoneTicketFailedDesc: string
-      continueOnPhoneUnavailableTitle: string
-      continueOnPhoneUnavailableDesc: string
       continueOnPhoneCopyLink: string
       continueOnPhoneOpenBrowser: string
       continueOnPhoneOpenFailed: string

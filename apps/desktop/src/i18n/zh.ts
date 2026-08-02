@@ -2138,8 +2138,6 @@ export const zh: Translations = {
       continueOnPhoneBrowserAuthDesc: '此仪表板使用仅令牌访问。请配置浏览器登录以在手机上继续。',
       continueOnPhoneTicketFailedTitle: '无法创建手机代码',
       continueOnPhoneTicketFailedDesc: '请重试以创建新的单次使用代码。',
-      continueOnPhoneUnavailableTitle: '远程继续尚未就绪',
-      continueOnPhoneUnavailableDesc: '请配置支持浏览器登录（OAuth）的 HTTPS 仪表板公共 URL，然后重试。令牌认证的仪表板无法在手机浏览器中打开。',
       continueOnPhoneCopyLink: '复制链接',
       continueOnPhoneOpenBrowser: '在浏览器中打开',
       continueOnPhoneOpenFailed: '无法打开继续链接',

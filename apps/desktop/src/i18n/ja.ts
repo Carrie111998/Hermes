@@ -1782,9 +1782,6 @@ export const ja = defineLocale({
       continueOnPhoneBrowserAuthDesc: 'このダッシュボードはトークン専用アクセスを使用しています。スマートフォンで続けるにはブラウザサインインを設定してください。',
       continueOnPhoneTicketFailedTitle: 'スマートフォン用コードを作成できませんでした',
       continueOnPhoneTicketFailedDesc: 'もう一度試して、新しい使い捨てコードを作成してください。',
-      continueOnPhoneUnavailableTitle: 'リモートでの続行を利用できません',
-      continueOnPhoneUnavailableDesc:
-        'OAuth によるブラウザサインインに対応した HTTPS ダッシュボード公開 URL を設定してから、もう一度お試しください。トークン認証のダッシュボードはスマートフォンのブラウザから開けません。',
       continueOnPhoneCopyLink: 'リンクをコピー',
       continueOnPhoneOpenBrowser: 'ブラウザで開く',
       continueOnPhoneOpenFailed: '続行リンクを開けませんでした',

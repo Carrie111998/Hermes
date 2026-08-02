@@ -153,6 +153,18 @@ describe('ContinueOnPhoneDialog', () => {
     }
   })
 
+  it('clears the current code as soon as the dialog is closed', async () => {
+    const onOpenChange = vi.fn()
+
+    renderDialog({ onOpenChange })
+
+    expect(await screen.findByRole('img', { name: 'QR code for this Hermes session' })).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'Close' }))
+
+    expect(onOpenChange).toHaveBeenCalledWith(false)
+    expect(screen.queryByRole('img', { name: 'QR code for this Hermes session' })).toBeNull()
+  })
+
   it('restarts cleanly after close and ignores an old request result', async () => {
     let firstResolve: (value: ContinueOnPhoneResult) => void = () => undefined
 

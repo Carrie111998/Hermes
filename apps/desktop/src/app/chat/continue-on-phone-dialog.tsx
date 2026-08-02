@@ -124,6 +124,15 @@ export function ContinueOnPhoneDialog({
 
   const createNewCode = () => setRequestAttempt(value => value + 1)
 
+  const handleOpenChange = (nextOpen: boolean) => {
+    if (!nextOpen) {
+      setState({ phase: 'idle' })
+      setNow(Date.now())
+    }
+
+    onOpenChange(nextOpen)
+  }
+
   const errorCopy = (reason: ContinueOnPhoneFailureReason) => {
     switch (reason) {
       case 'not-configured':
@@ -166,7 +175,7 @@ export function ContinueOnPhoneDialog({
   const error = state.phase === 'error' ? errorCopy(state.reason) : null
 
   return (
-    <Dialog onOpenChange={onOpenChange} open={open}>
+    <Dialog onOpenChange={handleOpenChange} open={open}>
       <DialogContent className="max-w-md">
         <DialogHeader>
           <DialogTitle>{copy.continueOnPhoneTitle}</DialogTitle>

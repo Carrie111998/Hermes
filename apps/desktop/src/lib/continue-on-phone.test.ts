@@ -130,20 +130,23 @@ describe('resolveContinueOnPhoneUrl', () => {
     expect(result).toEqual({ ok: false, reason: 'handoff-failed' })
   })
 
-  it('rejects an invalid ticket lifetime instead of presenting a code that may be stale', async () => {
-    const result = await resolveContinueOnPhoneUrl(
-      'session-42',
-      'work',
-      dependencies({
-        mintHandoffTicket: vi.fn().mockResolvedValue({
-          ticket: 'handoff-ticket-abc',
-          ttl_seconds: 0,
-          session_id: 'session-42',
-          profile: 'work'
+  it.each([0, -1, 1.5, 301, Number.NaN])(
+    'rejects invalid ticket lifetime %s instead of presenting a stale code',
+    async ttlSeconds => {
+      const result = await resolveContinueOnPhoneUrl(
+        'session-42',
+        'work',
+        dependencies({
+          mintHandoffTicket: vi.fn().mockResolvedValue({
+            ticket: 'handoff-ticket-abc',
+            ttl_seconds: ttlSeconds,
+            session_id: 'session-42',
+            profile: 'work'
+          })
         })
-      })
-    )
+      )
 
-    expect(result).toEqual({ ok: false, reason: 'handoff-failed' })
-  })
+      expect(result).toEqual({ ok: false, reason: 'handoff-failed' })
+    }
+  )
 })

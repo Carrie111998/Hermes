@@ -1724,8 +1724,6 @@ export const zhHant = defineLocale({
       continueOnPhoneBrowserAuthDesc: '此儀表板使用僅權杖存取。請設定瀏覽器登入以在手機上繼續。',
       continueOnPhoneTicketFailedTitle: '無法建立手機代碼',
       continueOnPhoneTicketFailedDesc: '請重試以建立新的單次使用代碼。',
-      continueOnPhoneUnavailableTitle: '遠端繼續尚未就緒',
-      continueOnPhoneUnavailableDesc: '請設定支援瀏覽器登入（OAuth）的 HTTPS 儀表板公開 URL，然後重試。Token 驗證的儀表板無法在手機瀏覽器中開啟。',
       continueOnPhoneCopyLink: '複製連結',
       continueOnPhoneOpenBrowser: '在瀏覽器中開啟',
       continueOnPhoneOpenFailed: '無法開啟繼續連結',

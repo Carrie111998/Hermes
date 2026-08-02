@@ -1646,8 +1646,6 @@ export const ar = defineLocale({
       continueOnPhoneBrowserAuthDesc: 'تستخدم لوحة التحكم هذه وصولا بالرمز فقط. اضبط تسجيل الدخول في المتصفح للمتابعة على الهاتف.',
       continueOnPhoneTicketFailedTitle: 'تعذر إنشاء رمز للهاتف',
       continueOnPhoneTicketFailedDesc: 'حاول مجددا لإنشاء رمز جديد للاستخدام لمرة واحدة.',
-      continueOnPhoneUnavailableTitle: 'المتابعة عن بُعد غير جاهزة',
-      continueOnPhoneUnavailableDesc: 'عيّن عنوان URL عام للوحة تحكم HTTPS مع تسجيل دخول في المتصفح، ثم حاول مجددا.',
       continueOnPhoneCopyLink: 'نسخ الرابط',
       continueOnPhoneOpenBrowser: 'فتح في المتصفح',
       continueOnPhoneOpenFailed: 'تعذر فتح رابط المتابعة',

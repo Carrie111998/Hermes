@@ -29,8 +29,15 @@ const DEFAULT_DEPENDENCIES: ContinueOnPhoneDependencies = {
   probe: publicUrl => window.hermesDesktop.probeConnectionConfig(publicUrl)
 }
 
+const MAX_HANDOFF_TTL_SECONDS = 5 * 60
+
 function handoffExpiresAt(ttlSeconds: number, now: number): number | null {
-  if (!Number.isSafeInteger(ttlSeconds) || ttlSeconds <= 0 || !Number.isSafeInteger(now)) {
+  if (
+    !Number.isSafeInteger(ttlSeconds) ||
+    ttlSeconds <= 0 ||
+    ttlSeconds > MAX_HANDOFF_TTL_SECONDS ||
+    !Number.isSafeInteger(now)
+  ) {
     return null
   }
 

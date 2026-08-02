@@ -1946,9 +1946,6 @@ export const en: Translations = {
       continueOnPhoneBrowserAuthDesc: 'This dashboard uses token-only access. Configure browser sign-in to continue on a phone.',
       continueOnPhoneTicketFailedTitle: 'Could not create a phone code',
       continueOnPhoneTicketFailedDesc: 'Try again to create a new, single-use code.',
-      continueOnPhoneUnavailableTitle: 'Remote continuation is not ready',
-      continueOnPhoneUnavailableDesc:
-        'Configure an HTTPS dashboard public_url with the auth gate engaged, then try again. Token-only (no browser login) dashboards cannot be opened from a phone browser.',
       continueOnPhoneCopyLink: 'Copy link',
       continueOnPhoneOpenBrowser: 'Open in browser',
       continueOnPhoneOpenFailed: 'Could not open the continuation link',
