@@ -5981,6 +5981,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Dispatcher socket path and commands come from config.yaml
         # (dispatcher: section). When configured, eagerly create the
         # client so the forward path is ready at first slash-command.
+        # When not configured, clear _DISPATCHER_FORWARD_COMMANDS so
+        # dispatcher commands are handled locally instead of forwarded.
         _disp_socket = getattr(self.config, "dispatcher_socket", None)
         if _disp_socket:
             self._dispatcher_client = DispatcherClient(
@@ -5990,6 +5992,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Explicit empty list disables forwarding; None uses defaults.
             if _disp_cmds is not None and isinstance(_disp_cmds, list):
                 self._DISPATCHER_FORWARD_COMMANDS = frozenset(_disp_cmds)
+        else:
+            # No dispatcher configured — disable forwarding entirely.
+            self._DISPATCHER_FORWARD_COMMANDS = frozenset()
 
         # Track running agents per session for interrupt support
         # Key: session_key, Value: AIAgent instance
@@ -15341,7 +15346,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _denied = self._check_slash_access(source, command)
             if _denied is not None:
                 return _denied
-            return await self._forward_to_dispatcher(event, command)
+            _result = await self._forward_to_dispatcher(event, command)
+            if _result is not None:
+                return _result
+            # Fall through to quick-commands and agent loop when
+            # dispatcher is unavailable or not configured.
 
         # User-defined quick commands (bypass agent loop, no LLM call)
         if command:

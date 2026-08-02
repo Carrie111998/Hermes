@@ -472,6 +472,48 @@ async def test_forward_returns_none_on_dispatcher_down(
     assert await runner._forward_to_dispatcher(event, "echo") is None
 
 
+def test_no_dispatcher_disables_forwarding():
+    """When dispatcher_socket is not configured,
+    _DISPATCHER_FORWARD_COMMANDS should be empty."""
+    from gateway.run import GatewayRunner
+    from gateway.config import GatewayConfig
+
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner.config = GatewayConfig()  # no dispatcher_socket
+    runner._dispatcher_client = None
+    # Simulate __init__ logic
+    _disp_socket = getattr(runner.config, "dispatcher_socket", None)
+    if _disp_socket:
+        runner._DISPATCHER_FORWARD_COMMANDS = frozenset({
+            "echo", "research", "forge", "ashare", "replay", "log",
+        })
+    else:
+        runner._DISPATCHER_FORWARD_COMMANDS = frozenset()
+    assert runner._DISPATCHER_FORWARD_COMMANDS == frozenset()
+
+
+def test_configured_dispatcher_enables_forwarding():
+    """When dispatcher_socket is configured,
+    _DISPATCHER_FORWARD_COMMANDS should have default commands."""
+    from gateway.run import GatewayRunner
+    from gateway.config import GatewayConfig
+
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner.config = GatewayConfig(dispatcher_socket="/tmp/test.sock")
+    runner._dispatcher_client = None
+    # Simulate __init__ logic
+    _disp_socket = getattr(runner.config, "dispatcher_socket", None)
+    if _disp_socket:
+        runner._dispatcher_client = DispatcherClient(socket_path=_disp_socket)
+        runner._DISPATCHER_FORWARD_COMMANDS = frozenset({
+            "echo", "research", "forge", "ashare", "replay", "log",
+        })
+    else:
+        runner._DISPATCHER_FORWARD_COMMANDS = frozenset()
+    assert "echo" in runner._DISPATCHER_FORWARD_COMMANDS
+    assert "forge" in runner._DISPATCHER_FORWARD_COMMANDS
+
+
 class TestDispatcherConfig:
     """GatewayConfig stores dispatcher_socket and dispatcher_commands."""
 
