@@ -974,26 +974,10 @@ def speak_text(text: str, stop_event: Optional[threading.Event] = None) -> None:
         except Exception as e:
             _debug(f"speak_text: streaming dispatch unavailable ({e}); using sync path")
 
-        # Shared cleaner (tools/tts_text_normalize): markdown, emoji,
-        # <think> blocks, verifier footer, units, newline flattening.
-        try:
-            from tools.tts_text_normalize import prepare_spoken_text
-            tts_text = prepare_spoken_text(text, max_chars=4000)
-        except Exception:
-            # Legacy fallback pipeline — keep speak_text best-effort.
-            tts_text = text[:4000] if len(text) > 4000 else text
-            tts_text = re.sub(r'```[\s\S]*?```', ' ', tts_text)             # fenced code blocks
-            tts_text = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', tts_text)    # [text](url) → text
-            tts_text = re.sub(r'https?://\S+', '', tts_text)                # bare URLs
-            tts_text = re.sub(r'\*\*(.+?)\*\*', r'\1', tts_text)            # bold
-            tts_text = re.sub(r'\*(.+?)\*', r'\1', tts_text)                # italic
-            tts_text = re.sub(r'`(.+?)`', r'\1', tts_text)                  # inline code
-            tts_text = re.sub(r'^#+\s*', '', tts_text, flags=re.MULTILINE)  # headers
-            tts_text = re.sub(r'^\s*[-*]\s+', '', tts_text, flags=re.MULTILINE)  # list bullets
-            tts_text = re.sub(r'---+', '', tts_text)                        # horizontal rules
-            tts_text = re.sub(r'\n{3,}', '\n\n', tts_text)                  # excess newlines
-            tts_text = tts_text.strip()
-        if not tts_text:
+        # Pass the complete raw response so protected blocks are removed before
+        # the historical 4,000-character final-spoken-text cap is applied.
+        tts_text = text
+        if not tts_text.strip():
             return
 
         # MP3 output path, pre-chosen so we can play the MP3 directly even
@@ -1007,7 +991,9 @@ def speak_text(text: str, stop_event: Optional[threading.Event] = None) -> None:
         )
 
         _debug(f"speak_text: synthesizing {len(tts_text)} chars -> {mp3_path}")
-        raw_result = text_to_speech_tool(text=tts_text, output_path=mp3_path)
+        raw_result = text_to_speech_tool(
+            text=tts_text, output_path=mp3_path, _max_chars=4000
+        )
         try:
             tts_result = json.loads(raw_result) if isinstance(raw_result, str) else {}
         except Exception:

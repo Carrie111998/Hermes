@@ -18880,10 +18880,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         audio_path = None
         actual_path = None
         try:
-            from tools.tts_tool import text_to_speech_tool, _strip_markdown_for_tts
+            from tools.tts_tool import text_to_speech_tool
 
-            tts_text = _strip_markdown_for_tts(text[:4000])
-            if not tts_text:
+            # Keep the complete raw response intact through central cleanup so
+            # protected blocks crossing character 4,000 cannot leak. The
+            # historical cap applies to final provider-bound speech.
+            tts_text = text
+            if not tts_text or not tts_text.strip():
                 return
 
             # Platform-aware output path: platforms whose native voice
@@ -18894,7 +18897,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             audio_path = build_auto_tts_output_path(event.source.platform)
 
             result_json = await asyncio.to_thread(
-                text_to_speech_tool, text=tts_text, output_path=audio_path
+                text_to_speech_tool,
+                text=tts_text,
+                output_path=audio_path,
+                _max_chars=4000,
             )
             try:
                 result = json.loads(result_json)

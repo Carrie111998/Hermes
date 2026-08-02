@@ -296,8 +296,11 @@ class TestVoiceSpeakResponseReal:
         mock_tts.side_effect = fake_tts
 
         cli = _make_voice_cli(_voice_tts=True)
-        cli._voice_speak_response("Hello world")
+        raw_reply = "Our **R&D** team shipped." + ("x" * 5000)
+        cli._voice_speak_response(raw_reply)
 
+        assert mock_tts.call_args.kwargs["text"] == raw_reply
+        assert mock_tts.call_args.kwargs["_max_chars"] == 4000
         requested_path = mock_tts.call_args.kwargs["output_path"]
         mock_play.assert_called_once_with(requested_path)
 

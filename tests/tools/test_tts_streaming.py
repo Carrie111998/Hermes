@@ -30,8 +30,128 @@ class TestSentenceChunker:
 
     def test_think_blocks_are_stripped_even_across_deltas(self):
         c = ts.SentenceChunker()
-        assert c.feed("<think>secret reason") == []
-        assert c.feed("ing</think>The actual spoken answer. ") == ["The actual spoken answer. "]
+        assert c.feed("<THINK>secret reason.") == []
+        assert c.feed(" More.</ThInK>The actual spoken answer. ") == [
+            "The actual spoken answer. "
+        ]
+
+    def test_partial_think_opener_is_held_across_deltas(self):
+        c = ts.SentenceChunker()
+        assert c.feed("This visible answer is long enough. <thi") == []
+        assert c.holding_protected_text is True
+        out = c.feed("nk>secret reason.</think>Another visible answer follows. ")
+        assert "secret" not in "".join(out)
+        assert "This visible answer is long enough." in "".join(out)
+        assert c.holding_protected_text is False
+
+    def test_fenced_code_is_held_across_deltas_and_not_used_as_boundary(self):
+        c = ts.SentenceChunker()
+        assert c.feed("```python\nsecret = 'do not speak'.") == []
+        assert c.feed("\n```The actual spoken answer. ") == [
+            "```python\nsecret = 'do not speak'.\n```The actual spoken answer. "
+        ]
+
+    def test_partial_fence_opener_is_held_across_deltas(self):
+        c = ts.SentenceChunker()
+        assert c.feed("This visible answer is long enough. ``") == []
+        assert c.holding_protected_text is True
+        out = c.feed("`python\nsecret.\n```Another visible answer follows. ")
+        assert "secret" in "".join(out)  # retained for display; stripped before speech
+        assert c.holding_protected_text is False
+
+    def test_verifier_footer_and_later_deltas_are_never_spoken(self):
+        c = ts.SentenceChunker()
+        assert c.feed(
+            "The public answer is ready. ⚠️ File-mutation verifier: hidden. "
+        ) == ["The public answer is ready. "]
+        assert c.feed("More private verifier instructions. ") == []
+        assert c.flush() == []
+
+    def test_verifier_literal_inside_fenced_code_does_not_discard_visible_tail(self):
+        c = ts.SentenceChunker()
+        raw = (
+            "```text\n"
+            "⚠️ File-mutation verifier: literal documentation sample.\n"
+            "```The actual visible answer follows."
+        )
+        assert c.feed(raw) == []
+        assert c.flush() == [raw]
+
+    @pytest.mark.parametrize(
+        "partial",
+        ["⚠️ File-mut", "⚠ File-mut", "File-muta", "Fıle-muta", "Fİle-muta"],
+    )
+    def test_partial_verifier_header_is_held_across_deltas(self, partial):
+        c = ts.SentenceChunker()
+        assert c.feed(f"This visible answer is long enough.\n{partial}") == []
+        assert c.holding_protected_text is True
+        continuation = (
+            "ation verifier: hidden. More hidden details. "
+            if partial.endswith("mut")
+            else "tion verifier: hidden. More hidden details. "
+        )
+        out = c.feed(continuation)
+        assert [item.strip() for item in out] == ["This visible answer is long enough."]
+        assert c.holding_protected_text is False
+
+    def test_pronunciation_phrase_can_span_sentence_boundary_and_unicode_case_delta(self):
+        c = ts.SentenceChunker(
+            pronunciation_substitutions={"Dr. Ipek": "Doctor Ipek"},
+        )
+        assert c.feed("Please book an appointment with Dr. ") == []
+        assert c.holding_pronunciation_lookahead is True
+        assert c.feed("ıpek tomorrow. ") == [
+            "Please book an appointment with Dr. ıpek tomorrow. "
+        ]
+        assert c.holding_pronunciation_lookahead is False
+
+    def test_pronunciation_tail_holds_until_right_word_boundary_is_known(self):
+        c = ts.SentenceChunker(
+            pronunciation_substitutions={"Dr. Ipek": "Doctor Ipek"},
+        )
+        prefix = "Visible ordinary words " * 6
+        assert c.feed(prefix + "Dr. Ipek") == []
+        assert c.holding_pronunciation_lookahead is True
+
+        output = c.feed("son arrives. ")
+        assert "".join(output + c.flush()) == prefix + "Dr. Ipekson arrives."
+        assert c.holding_pronunciation_lookahead is False
+
+    def test_idle_flush_retains_left_word_boundary_context(self):
+        c = ts.SentenceChunker(
+            pronunciation_substitutions={"Ipek": "EE-peck"},
+        )
+        prefix = "Visible ordinary words " * 6
+        assert c.feed(prefix + "my") == []
+        ready = c.flush_for_idle()
+        assert "".join(ready) + c.buf == prefix + "my"
+        assert c.buf == "my"
+
+        output = c.feed("Ipek arrives. ")
+        assert "".join(ready + output + c.flush()) == prefix + "myIpek arrives."
+
+    def test_idle_flush_retains_punctuation_source_before_trailing_word(self):
+        c = ts.SentenceChunker(
+            pronunciation_substitutions={"C++": "C plus plus"},
+        )
+        prefix = "Visible ordinary words " * 6
+        assert c.feed(prefix + "C++s") == []
+        ready = c.flush_for_idle()
+        assert "".join(ready) + c.buf == prefix + "C++s"
+        assert c.buf == "C++s"
+
+        output = c.feed("on concludes. ")
+        assert "".join(ready + output + c.flush()) == prefix + "C++son concludes."
+
+    def test_unicode_ignorecase_partial_think_opener_is_held(self):
+        c = ts.SentenceChunker()
+        prefix = "Visible ordinary words " * 6
+        assert c.feed(prefix + "<thı") == []
+        assert c.holding_protected_text is True
+        assert c.feed("nk>SECRET reasoning.</thınk>Final visible answer. ") == [
+            prefix + "Final visible answer. "
+        ]
+        assert c.holding_protected_text is False
 
 
     def test_paragraph_break_is_a_boundary(self):
@@ -162,6 +282,29 @@ def _drain_queue(sentences):
     return q
 
 
+_IDLE = object()
+
+
+class _IdleOnceQueue:
+    """Queue stub that inserts one producer-idle timeout between deltas."""
+
+    def __init__(self, items):
+        self._items = list(items)
+
+    def get(self, timeout=None):
+        if not self._items:
+            raise queue.Empty
+        item = self._items.pop(0)
+        if item is _IDLE:
+            raise queue.Empty
+        return item
+
+    def get_nowait(self):
+        if not self._items:
+            raise queue.Empty
+        return self._items.pop(0)
+
+
 def _sd_mock():
     sd = MagicMock()
     out = MagicMock()
@@ -169,7 +312,450 @@ def _sd_mock():
     return sd, out
 
 
+def test_streamer_path_applies_symbol_bearing_pronunciation_before_normalization(monkeypatch):
+    from tools import tts_tool
+
+    seen = []
+    displayed = []
+
+    class _Fake(ts.StreamingTTSProvider):
+        sample_rate = 24000
+        channels = 1
+
+        @staticmethod
+        def available():
+            return True
+
+        def stream(self, text):
+            seen.append(text)
+            yield b"\x01\x00" * 10
+
+    sd, _ = _sd_mock()
+    raw_reply = (
+        "```text\n"
+        "⚠️ File-mutation verifier: literal documentation sample.\n"
+        "<think>literal unclosed documentation example.\n"
+        "```Our R&D team shipped."
+    )
+    q = _drain_queue([raw_reply])
+    stop, done = threading.Event(), threading.Event()
+    config = {
+        "provider": "openai",
+        "pronunciation": {
+            "substitutions": {
+                "R&D": "Research and Development",
+                "Research and Development": "WRONG",
+            },
+        },
+    }
+
+    with (
+        patch.object(tts_tool, "_load_tts_config", return_value=config),
+        patch(
+            "tools.tts_streaming.resolve_streaming_provider",
+            return_value=_Fake({}, {}),
+        ),
+        patch.object(tts_tool, "_import_sounddevice", return_value=sd),
+        patch.object(tts_tool.platform, "system", return_value="Linux"),
+    ):
+        tts_tool.stream_tts_to_speaker(
+            q,
+            stop,
+            done,
+            display_callback=displayed.append,
+        )
+
+    assert seen == ["Our Research and Development team shipped."]
+    assert displayed == [raw_reply]
+    assert done.is_set()
+
+
+def test_streamer_pronunciation_collision_does_not_suppress_raw_display(monkeypatch):
+    from tools import tts_tool
+
+    spoken = []
+    displayed = []
+
+    class _Fake(ts.StreamingTTSProvider):
+        sample_rate = 24000
+        channels = 1
+
+        @staticmethod
+        def available():
+            return True
+
+        def stream(self, text):
+            spoken.append(text)
+            yield b"\x01\x00" * 10
+
+    sd, _ = _sd_mock()
+    q = _drain_queue(["Alpha is definitely here. Beta is definitely here."])
+    stop, done = threading.Event(), threading.Event()
+    config = {
+        "provider": "openai",
+        "pronunciation": {
+            "substitutions": {"Alpha": "Same", "Beta": "Same"},
+        },
+    }
+
+    with (
+        patch.object(tts_tool, "_load_tts_config", return_value=config),
+        patch(
+            "tools.tts_streaming.resolve_streaming_provider",
+            return_value=_Fake({}, {}),
+        ),
+        patch.object(tts_tool, "_import_sounddevice", return_value=sd),
+        patch.object(tts_tool.platform, "system", return_value="Linux"),
+    ):
+        tts_tool.stream_tts_to_speaker(
+            q,
+            stop,
+            done,
+            display_callback=displayed.append,
+        )
+
+    assert spoken == ["Same is definitely here."]
+    assert displayed == ["Alpha is definitely here. ", "Beta is definitely here."]
+    assert done.is_set()
+
+
 # ── Dispatch: universal per-sentence sync fallback ───────────────────────
+
+
+def test_sync_fallback_preserves_symbols_for_single_pronunciation_pass(monkeypatch):
+    from tools import tts_tool
+
+    config = {
+        "provider": "openai",
+        "openai": {},
+        "pronunciation": {
+            "substitutions": {
+                "R&D": "Research and Development",
+                "Research and Development": "WRONG",
+            },
+        },
+    }
+    generated = MagicMock()
+    q = _drain_queue(["Our R&D team shipped."])
+    stop, done = threading.Event(), threading.Event()
+
+    with (
+        patch.object(tts_tool, "_load_tts_config", return_value=config),
+        patch.object(tts_tool, "_get_provider", return_value="openai"),
+        patch.object(tts_tool, "_resolve_command_provider_config", return_value=None),
+        patch.object(tts_tool, "_resolve_max_text_length", return_value=4096),
+        patch.object(tts_tool, "_generate_openai_tts", generated),
+        patch("tools.tts_streaming.resolve_streaming_provider", return_value=None),
+        patch("gateway.session_context.get_session_env", return_value=""),
+    ):
+        tts_tool.stream_tts_to_speaker(q, stop, done)
+
+    assert generated.call_args[0][0] == "Our Research and Development team shipped."
+    assert done.is_set()
+
+
+def test_sync_fallback_keeps_unicode_ignorecase_pronunciation_across_queue_deltas(monkeypatch):
+    from tools import tts_tool
+
+    config = {
+        "provider": "openai",
+        "openai": {},
+        "pronunciation": {
+            "substitutions": {"Dr. Ipek": "Doctor Ipek"},
+        },
+    }
+    generated = MagicMock()
+    q = _drain_queue([
+        "Please book an appointment with Dr. ",
+        "ıpek tomorrow.",
+    ])
+    stop, done = threading.Event(), threading.Event()
+
+    with (
+        patch.object(tts_tool, "_load_tts_config", return_value=config),
+        patch.object(tts_tool, "_get_provider", return_value="openai"),
+        patch.object(tts_tool, "_resolve_command_provider_config", return_value=None),
+        patch.object(tts_tool, "_resolve_max_text_length", return_value=4096),
+        patch.object(tts_tool, "_generate_openai_tts", generated),
+        patch("tools.tts_streaming.resolve_streaming_provider", return_value=None),
+        patch("gateway.session_context.get_session_env", return_value=""),
+    ):
+        tts_tool.stream_tts_to_speaker(q, stop, done)
+
+    assert generated.call_args[0][0] == (
+        "Please book an appointment with Doctor Ipek tomorrow."
+    )
+    assert done.is_set()
+
+
+def test_sync_fallback_does_not_idle_flush_incomplete_pronunciation(monkeypatch):
+    from tools import tts_tool
+
+    config = {
+        "provider": "openai",
+        "openai": {},
+        "pronunciation": {
+            "substitutions": {"Dr. Smith": "Doctor Smith"},
+        },
+    }
+    generated = MagicMock()
+    prefix = "Please book " + ("a very important appointment " * 5) + "with Dr. "
+    q = _IdleOnceQueue([prefix, _IDLE, "Smith tomorrow.", None])
+    stop, done = threading.Event(), threading.Event()
+
+    with (
+        patch.object(tts_tool, "_load_tts_config", return_value=config),
+        patch.object(tts_tool, "_get_provider", return_value="openai"),
+        patch.object(tts_tool, "_resolve_command_provider_config", return_value=None),
+        patch.object(tts_tool, "_resolve_max_text_length", return_value=4096),
+        patch.object(tts_tool, "_generate_openai_tts", generated),
+        patch("tools.tts_streaming.resolve_streaming_provider", return_value=None),
+        patch("gateway.session_context.get_session_env", return_value=""),
+    ):
+        tts_tool.stream_tts_to_speaker(q, stop, done)
+
+    generated.assert_called_once()
+    assert generated.call_args[0][0].endswith("with Doctor Smith tomorrow.")
+    assert done.is_set()
+
+
+def test_sync_idle_waits_for_pronunciation_right_word_boundary(monkeypatch):
+    from tools import tts_tool
+
+    config = {
+        "provider": "openai",
+        "openai": {},
+        "pronunciation": {
+            "substitutions": {"Dr. Ipek": "Doctor Ipek"},
+        },
+    }
+    generated = MagicMock()
+    prefix = ("Visible ordinary words " * 6) + "Dr. Ipek"
+    q = _IdleOnceQueue([prefix, _IDLE, "son arrives.", None])
+    stop, done = threading.Event(), threading.Event()
+
+    with (
+        patch.object(tts_tool, "_load_tts_config", return_value=config),
+        patch.object(tts_tool, "_get_provider", return_value="openai"),
+        patch.object(tts_tool, "_resolve_command_provider_config", return_value=None),
+        patch.object(tts_tool, "_resolve_max_text_length", return_value=4096),
+        patch.object(tts_tool, "_generate_openai_tts", generated),
+        patch("tools.tts_streaming.resolve_streaming_provider", return_value=None),
+        patch("gateway.session_context.get_session_env", return_value=""),
+    ):
+        tts_tool.stream_tts_to_speaker(q, stop, done)
+
+    spoken = " ".join(call.args[0] for call in generated.call_args_list)
+    assert "Doctor Ipek" not in spoken
+    assert "Dr. Ipekson arrives." in spoken
+    assert done.is_set()
+
+
+def test_sync_idle_preserves_pronunciation_left_word_boundary(monkeypatch):
+    from tools import tts_tool
+
+    config = {
+        "provider": "openai",
+        "openai": {},
+        "pronunciation": {
+            "substitutions": {"Ipek": "EE-peck"},
+        },
+    }
+    generated = MagicMock()
+    prefix = ("Visible ordinary words " * 6) + "my"
+    q = _IdleOnceQueue([prefix, _IDLE, "Ipek arrives.", None])
+    stop, done = threading.Event(), threading.Event()
+
+    with (
+        patch.object(tts_tool, "_load_tts_config", return_value=config),
+        patch.object(tts_tool, "_get_provider", return_value="openai"),
+        patch.object(tts_tool, "_resolve_command_provider_config", return_value=None),
+        patch.object(tts_tool, "_resolve_max_text_length", return_value=4096),
+        patch.object(tts_tool, "_generate_openai_tts", generated),
+        patch("tools.tts_streaming.resolve_streaming_provider", return_value=None),
+        patch("gateway.session_context.get_session_env", return_value=""),
+    ):
+        tts_tool.stream_tts_to_speaker(q, stop, done)
+
+    spoken = " ".join(call.args[0] for call in generated.call_args_list)
+    assert "EE-peck" not in spoken
+    assert "myIpek arrives." in spoken
+    assert done.is_set()
+
+
+def test_sync_idle_preserves_punctuation_source_right_word_boundary(monkeypatch):
+    from tools import tts_tool
+
+    config = {
+        "provider": "openai",
+        "openai": {},
+        "pronunciation": {
+            "substitutions": {"C++": "C plus plus"},
+        },
+    }
+    generated = MagicMock()
+    prefix = ("Visible ordinary words " * 6) + "C++s"
+    q = _IdleOnceQueue([prefix, _IDLE, "on concludes.", None])
+    stop, done = threading.Event(), threading.Event()
+
+    with (
+        patch.object(tts_tool, "_load_tts_config", return_value=config),
+        patch.object(tts_tool, "_get_provider", return_value="openai"),
+        patch.object(tts_tool, "_resolve_command_provider_config", return_value=None),
+        patch.object(tts_tool, "_resolve_max_text_length", return_value=4096),
+        patch.object(tts_tool, "_generate_openai_tts", generated),
+        patch("tools.tts_streaming.resolve_streaming_provider", return_value=None),
+        patch("gateway.session_context.get_session_env", return_value=""),
+    ):
+        tts_tool.stream_tts_to_speaker(q, stop, done)
+
+    spoken = " ".join(call.args[0] for call in generated.call_args_list)
+    assert "C plus plus" not in spoken
+    assert "C++son concludes." in spoken
+    assert done.is_set()
+
+
+@pytest.mark.parametrize(
+    ("partial", "continuation", "expected_tail"),
+    [
+        ("<thi", "nk>SECRET reasoning.</think>Final visible answer.", "Final visible answer."),
+        ("<thı", "nk>SECRET reasoning.</thınk>Final visible answer.", "Final visible answer."),
+        ("``", "`SECRET code.\n```Final visible answer.", "Final visible answer."),
+        ("File-muta", "tion verifier: SECRET verifier.", "Visible ordinary words"),
+        ("Fıle-muta", "tion verifier: SECRET verifier.", "Visible ordinary words"),
+    ],
+)
+def test_sync_fallback_does_not_idle_flush_partial_protected_opener(
+    monkeypatch,
+    partial,
+    continuation,
+    expected_tail,
+):
+    from tools import tts_tool
+
+    config = {"provider": "openai", "openai": {}}
+    generated = MagicMock()
+    prefix = ("Visible ordinary words " * 6) + partial
+    q = _IdleOnceQueue([
+        prefix,
+        _IDLE,
+        continuation,
+        None,
+    ])
+    stop, done = threading.Event(), threading.Event()
+
+    with (
+        patch.object(tts_tool, "_load_tts_config", return_value=config),
+        patch.object(tts_tool, "_get_provider", return_value="openai"),
+        patch.object(tts_tool, "_resolve_command_provider_config", return_value=None),
+        patch.object(tts_tool, "_resolve_max_text_length", return_value=4096),
+        patch.object(tts_tool, "_generate_openai_tts", generated),
+        patch("tools.tts_streaming.resolve_streaming_provider", return_value=None),
+        patch("gateway.session_context.get_session_env", return_value=""),
+    ):
+        tts_tool.stream_tts_to_speaker(q, stop, done)
+
+    generated.assert_called_once()
+    spoken = generated.call_args[0][0]
+    assert "SECRET" not in spoken
+    assert expected_tail in spoken
+    assert done.is_set()
+
+
+def test_true_streamer_uses_resolved_streamer_provider_cap(monkeypatch):
+    from tools import tts_tool
+
+    spoken = []
+
+    class _OpenAIStreamer(ts.StreamingTTSProvider):
+        provider_name = "openai"
+
+        @staticmethod
+        def available():
+            return True
+
+        def stream(self, text):
+            spoken.append(text)
+            yield b"\x01\x00" * 10
+
+    sd, _ = _sd_mock()
+    config = {
+        "provider": "edge",
+        "streaming": {"provider": "openai"},
+    }
+    q = _drain_queue([("x" * 5000) + "."])
+    stop, done = threading.Event(), threading.Event()
+
+    with (
+        patch.object(tts_tool, "_load_tts_config", return_value=config),
+        patch.object(
+            tts_tool,
+            "_resolve_max_text_length",
+            side_effect=lambda provider, _cfg: 4096 if provider == "openai" else 5000,
+        ),
+        patch(
+            "tools.tts_streaming.resolve_streaming_provider",
+            return_value=_OpenAIStreamer(config, {}),
+        ),
+        patch.object(tts_tool, "_import_sounddevice", return_value=sd),
+        patch.object(tts_tool.platform, "system", return_value="Linux"),
+    ):
+        tts_tool.stream_tts_to_speaker(q, stop, done)
+
+    assert len(spoken) == 1
+    assert len(spoken[0]) == 4096
+    assert done.is_set()
+
+
+def test_true_elevenlabs_streamer_uses_streaming_model_cap():
+    from tools import tts_tool
+
+    section = {
+        "model_id": "eleven_flash_v2_5",
+        "streaming_model_id": "eleven_v3",
+    }
+    assert ts.ElevenLabsStreamer({}, section).model_id == "eleven_v3"
+
+    spoken = []
+
+    class _ElevenLabsStreamer(ts.StreamingTTSProvider):
+        provider_name = "elevenlabs"
+        model_id = "eleven_v3"
+
+        @staticmethod
+        def available():
+            return True
+
+        def stream(self, text):
+            spoken.append(text)
+            yield b"\x01\x00" * 10
+
+    sd, _ = _sd_mock()
+    config = {
+        "provider": "edge",
+        "streaming": {"provider": "elevenlabs"},
+        "elevenlabs": {
+            "model_id": "eleven_flash_v2_5",
+            "streaming_model_id": "eleven_v3",
+        },
+    }
+    q = _drain_queue([("x" * 6000) + "."])
+    stop, done = threading.Event(), threading.Event()
+
+    with (
+        patch.object(tts_tool, "_load_tts_config", return_value=config),
+        patch(
+            "tools.tts_streaming.resolve_streaming_provider",
+            return_value=_ElevenLabsStreamer(config, config["elevenlabs"]),
+        ),
+        patch.object(tts_tool, "_import_sounddevice", return_value=sd),
+        patch.object(tts_tool.platform, "system", return_value="Linux"),
+    ):
+        tts_tool.stream_tts_to_speaker(q, stop, done)
+
+    assert len(spoken) == 1
+    assert len(spoken[0]) == 5000
+    assert done.is_set()
 
 
 # ── tts.streaming.provider config knob (salvaged from PR #47588) ─────────

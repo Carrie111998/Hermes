@@ -66,6 +66,7 @@ class StreamingTTSConsumer:
         audio_format: Optional[AudioFormat] = None,
     ) -> None:
         from tools.tts_streaming import SentenceChunker, resolve_streaming_provider
+        from tools.tts_tool import _get_provider, _resolve_max_text_length
 
         self._adapter = adapter
         self._chat_id = chat_id
@@ -73,10 +74,32 @@ class StreamingTTSConsumer:
         self._loop = loop
         self._metadata = metadata
 
+        from tools.tts_text_normalize import get_pronunciation_substitutions
+        self._pronunciation_substitutions = get_pronunciation_substitutions(tts_config)
+
         # Resolve the streaming provider once. If unavailable, the consumer is
         # inactive and the gateway falls back to whole-file TTS.
         self._streamer = resolve_streaming_provider(tts_config)
-        self._chunker = SentenceChunker()
+        stream_provider = (
+            getattr(self._streamer, "provider_name", "")
+            or _get_provider(tts_config)
+        )
+        if self._streamer is not None:
+            stream_model_id = getattr(self._streamer, "model_id", None)
+            self._stream_max_len = (
+                _resolve_max_text_length(
+                    stream_provider,
+                    tts_config,
+                    model_id=stream_model_id,
+                )
+                if stream_model_id
+                else _resolve_max_text_length(stream_provider, tts_config)
+            )
+        else:
+            self._stream_max_len = 0
+        self._chunker = SentenceChunker(
+            pronunciation_substitutions=self._pronunciation_substitutions,
+        )
 
         if self._streamer is not None:
             self._audio_format = AudioFormat(
@@ -101,9 +124,6 @@ class StreamingTTSConsumer:
         self._suppress_whole_file = False
         self._task: Optional[asyncio.Task] = None
         self._lock = threading.Lock()
-
-        # Pre-allocate the strip-markdown helper lazily to avoid import cycles.
-        self._strip_markdown = None
 
     # ------------------------------------------------------------------
     # Public properties
@@ -319,9 +339,20 @@ class StreamingTTSConsumer:
         if self._handle is None or self._handle.aborted:
             return
 
-        cleaned = self._strip_markdown_for_tts(clause)
+        # The chunker removed protected blocks and kept configured phrases
+        # intact across sentence boundaries. Apply pronunciation once, then
+        # finish shared Markdown/symbol cleanup.
+        from tools.tts_text_normalize import prepare_spoken_text
+        cleaned = prepare_spoken_text(
+            clause,
+            max_chars=None,
+            pronunciation_substitutions=self._pronunciation_substitutions,
+        )
         if not cleaned or not cleaned.strip():
             return
+
+        if self._stream_max_len and len(cleaned) > self._stream_max_len:
+            cleaned = cleaned[:self._stream_max_len]
 
         if self._streamer is None:
             return
@@ -354,16 +385,6 @@ class StreamingTTSConsumer:
             return True, next(iterator)
         except StopIteration:
             return False, None
-
-    def _strip_markdown_for_tts(self, text: str) -> str:
-        """Lazy-import and apply the TTS markdown stripper."""
-        if self._strip_markdown is None:
-            try:
-                from tools.tts_tool import _strip_markdown_for_tts as _strip
-                self._strip_markdown = _strip
-            except ImportError:
-                self._strip_markdown = lambda t: t  # noqa: E731
-        return self._strip_markdown(text).strip()
 
     async def _safe_abort(self, reason: str) -> None:
         """Abort the adapter stream, swallowing errors (idempotent)."""

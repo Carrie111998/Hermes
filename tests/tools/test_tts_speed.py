@@ -243,6 +243,59 @@ class TestToolLevelSpeed:
         config_passed = call_args[0][2]  # (text, output_path, tts_config)
         assert config_passed["speed"] == 0.7
 
+    def test_pronunciation_config_is_applied_before_provider_dispatch(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+        config = {
+            "provider": "openai",
+            "openai": {},
+            "pronunciation": {"substitutions": {"C++": r"C:\voices\cpp"}},
+        }
+
+        with patch("tools.tts_tool._load_tts_config", return_value=config), \
+             patch("tools.tts_tool._get_provider", return_value="openai"), \
+             patch("tools.tts_tool._resolve_command_provider_config", return_value=None), \
+             patch("tools.tts_tool._resolve_max_text_length", return_value=4096), \
+             patch("tools.tts_tool._generate_openai_tts") as mock_gen, \
+             patch("gateway.session_context.get_session_env", return_value=""):
+            from tools.tts_tool import text_to_speech_tool
+            text_to_speech_tool("Use C++", str(tmp_path / "out.mp3"))
+
+        assert mock_gen.call_args[0][0] == r"Use C:\voices\cpp"
+
+    def test_final_spoken_cap_applies_after_cleanup_and_substitution(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+        config = {
+            "provider": "openai",
+            "openai": {},
+            "pronunciation": {"substitutions": {"word": "expanded phrase"}},
+        }
+        raw = (
+            ("word " * 790)
+            + "```private secret crosses character 4000."
+            + ("x" * 200)
+            + "```Visible ending."
+        )
+
+        with patch("tools.tts_tool._load_tts_config", return_value=config), \
+             patch("tools.tts_tool._get_provider", return_value="openai"), \
+             patch("tools.tts_tool._resolve_command_provider_config", return_value=None), \
+             patch("tools.tts_tool._resolve_max_text_length", return_value=4096), \
+             patch("tools.tts_tool._generate_openai_tts") as mock_gen, \
+             patch("gateway.session_context.get_session_env", return_value=""):
+            from tools.tts_tool import text_to_speech_tool
+            text_to_speech_tool(
+                raw,
+                str(tmp_path / "out.mp3"),
+                _max_chars=4000,
+            )
+
+        provider_text = mock_gen.call_args[0][0]
+        assert len(provider_text) == 4000
+        assert "expanded phrase" in provider_text
+        assert "private secret" not in provider_text
+
     def test_speed_clamped_range(self, tmp_path, monkeypatch):
         """Speed values outside 0.25-4.0 are clamped."""
         monkeypatch.setenv("OPENAI_API_KEY", "test-key")

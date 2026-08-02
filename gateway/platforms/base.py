@@ -5951,9 +5951,10 @@ class BasePlatformAdapter(ABC):
                         from tools.tts_tool import text_to_speech_tool, check_tts_requirements
                         if check_tts_requirements():
                             import json as _json
-                            speech_text = self.prepare_tts_text(text_content)
-                            if not speech_text:
-                                raise ValueError("Empty text after markdown cleanup")
+                            # Preserve the complete raw response through central
+                            # cleanup so protected blocks crossing character 4,000
+                            # cannot leak. The cap applies to final spoken text.
+                            speech_text = text_content
                             # Pass an explicit platform-aware output path: the
                             # HERMES_SESSION_PLATFORM contextvar the tool would
                             # otherwise consult is already cleared by the time
@@ -5967,6 +5968,7 @@ class BasePlatformAdapter(ABC):
                                 text_to_speech_tool,
                                 text=speech_text,
                                 output_path=_tts_requested_path,
+                                _max_chars=4000,
                             )
                             tts_data = _json.loads(tts_result_str)
                             if tts_data.get("success", True):

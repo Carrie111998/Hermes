@@ -409,6 +409,8 @@ MAX_TEXT_LENGTH = FALLBACK_MAX_TEXT_LENGTH
 def _resolve_max_text_length(
     provider: Optional[str],
     tts_config: Optional[Dict[str, Any]] = None,
+    *,
+    model_id: Optional[str] = None,
 ) -> int:
     """Return the input-character cap for *provider*.
 
@@ -416,7 +418,8 @@ def _resolve_max_text_length(
       1. ``tts.<provider>.max_text_length`` (user override in config.yaml)
       2. ``tts.providers.<provider>.max_text_length`` for user-declared
          command providers
-      3. ElevenLabs model-aware table (keyed on configured ``model_id``)
+      3. ElevenLabs model-aware table (keyed on the active model when supplied,
+         otherwise the configured ``model_id``)
       4. ``PROVIDER_MAX_TEXT_LENGTH`` default
       5. ``DEFAULT_COMMAND_TTS_MAX_TEXT_LENGTH`` when the provider is a
          command-type user provider without an explicit cap
@@ -440,8 +443,12 @@ def _resolve_max_text_length(
         return override
 
     if key == "elevenlabs":
-        model_id = (prov_cfg or {}).get("model_id") or DEFAULT_ELEVENLABS_MODEL_ID
-        mapped = ELEVENLABS_MODEL_MAX_TEXT_LENGTH.get(str(model_id).strip())
+        active_model_id = (
+            model_id
+            or (prov_cfg or {}).get("model_id")
+            or DEFAULT_ELEVENLABS_MODEL_ID
+        )
+        mapped = ELEVENLABS_MODEL_MAX_TEXT_LENGTH.get(str(active_model_id).strip())
         if mapped:
             return mapped
 
@@ -2784,6 +2791,7 @@ def text_to_speech_tool(
     speed: Optional[float] = None,
     instructions: Optional[str] = None,
     provider: Optional[str] = None,
+    _max_chars: Optional[int] = None,
 ) -> str:
     """
     Convert text to speech audio.
@@ -2811,6 +2819,10 @@ def text_to_speech_tool(
             from ``tts.providers.<name>``, or plugin-registered provider
             names.  When ``None`` (the default), the configured provider
             from ``tts.provider`` in config.yaml is used.
+        _max_chars: Internal per-call cap for the final provider-bound spoken
+            text, applied after protected-content removal, pronunciation
+            substitutions, and normalization. The provider's own lower limit
+            still takes precedence.
 
     Returns:
         str: JSON result with success, file_path, and optionally MEDIA tag.
@@ -2818,15 +2830,21 @@ def text_to_speech_tool(
     if not text or not text.strip():
         return tool_error("Text is required", success=False)
 
+    tts_config = _load_tts_config()
+
+    # Extract and validate pronunciation substitutions before cleanup.  Invalid
+    # user config is a no-op rather than disabling all TTS normalization.
     try:
-        from tools.tts_text_normalize import prepare_spoken_text
-        text = prepare_spoken_text(text, max_chars=None)
+        from tools.tts_text_normalize import (
+            get_pronunciation_substitutions,
+            prepare_spoken_text,
+        )
+        substitutions = get_pronunciation_substitutions(tts_config)
+        text = prepare_spoken_text(text, max_chars=None, pronunciation_substitutions=substitutions)
     except Exception:
         text = text.strip()
     if not text:
         return tool_error("Text is empty after TTS cleanup", success=False)
-
-    tts_config = _load_tts_config()
 
     # When the model supplies a speed parameter, inject it into the config
     # so all downstream provider functions pick it up uniformly.
@@ -2850,6 +2868,12 @@ def text_to_speech_tool(
     # Truncate very long text with a warning. The cap is per-provider
     # (OpenAI 4096, xAI 15k, MiniMax 10k, ElevenLabs model-aware, etc.).
     max_len = _resolve_max_text_length(provider, tts_config)
+    if _max_chars is not None:
+        try:
+            requested_max = max(1, int(_max_chars))
+        except (TypeError, ValueError):
+            return tool_error("_max_chars must be a positive integer", success=False)
+        max_len = min(max_len, requested_max)
     if len(text) > max_len:
         logger.warning(
             "TTS text too long for provider %s (%d chars), truncating to %d",
@@ -3380,6 +3404,12 @@ def stream_tts_to_speaker(
         _audio_queue = None  # type: ignore[assignment]
         _prefetch_threads = []
         tts_config = _load_tts_config()
+        from tools.tts_text_normalize import (
+            get_pronunciation_substitutions,
+            prepare_spoken_text,
+        )
+
+        streaming_pronunciation = get_pronunciation_substitutions(tts_config)
 
         # Prefer a chunked streamer for low time-to-first-audio; fall back to
         # per-sentence sync synthesis (universal — edge + every non-streamer).
@@ -3389,9 +3419,23 @@ def stream_tts_to_speaker(
         stream_max_len = 0
         if streamer is not None:
             try:
-                stream_max_len = _resolve_max_text_length(
-                    provider or _get_provider(tts_config), tts_config
+                stream_provider = (
+                    getattr(streamer, "provider_name", "")
+                    or provider
+                    or _get_provider(tts_config)
                 )
+                stream_model_id = getattr(streamer, "model_id", None)
+                if stream_model_id:
+                    stream_max_len = _resolve_max_text_length(
+                        stream_provider,
+                        tts_config,
+                        model_id=stream_model_id,
+                    )
+                else:
+                    stream_max_len = _resolve_max_text_length(
+                        stream_provider,
+                        tts_config,
+                    )
             except Exception:
                 stream_max_len = 0
             # On macOS, skip the sounddevice OutputStream entirely: PortAudio/
@@ -3417,7 +3461,9 @@ def stream_tts_to_speaker(
                     logger.warning("sounddevice OutputStream failed: %s", exc)
                     output_stream = None
 
-        chunker = SentenceChunker()
+        chunker = SentenceChunker(
+            pronunciation_substitutions=streaming_pronunciation,
+        )
         long_flush_len = 100
         queue_timeout = 0.5
         _spoken_sentences: list[str] = []  # track spoken sentences to skip duplicates
@@ -3628,7 +3674,24 @@ def stream_tts_to_speaker(
             """Display sentence and route to the appropriate audio path."""
             if stop_event.is_set():
                 return
-            cleaned = _strip_markdown_for_tts(sentence).strip()
+            # Display the raw clause before speech-only cleanup and duplicate
+            # suppression. Distinct visible sentences may intentionally map to
+            # the same pronunciation, and fenced code may have no spoken form.
+            if display_callback is not None:
+                display_callback(sentence)
+            # The chunker keeps configured phrases intact across boundaries on
+            # the direct-streamer path. Apply pronunciation once during the
+            # speech-only cleanup, while display_callback still receives the
+            # original visible clause. The sync fallback deliberately keeps raw
+            # text for the central whole-file tool to process once.
+            if streamer is None:
+                cleaned = _strip_markdown_for_tts(sentence).strip()
+            else:
+                cleaned = prepare_spoken_text(
+                    sentence,
+                    max_chars=None,
+                    pronunciation_substitutions=streaming_pronunciation,
+                ).strip()
             if not cleaned:
                 return
             # Skip duplicate/near-duplicate sentences (LLM repetition)
@@ -3637,12 +3700,9 @@ def stream_tts_to_speaker(
                 if prev.lower().rstrip(".!,") == cleaned_lower:
                     return
             _spoken_sentences.append(cleaned)
-            # Display raw sentence on screen before TTS processing
-            if display_callback is not None:
-                display_callback(sentence)
             # No chunked streamer → per-sentence sync synthesis (universal).
             if streamer is None:
-                _speak_via_sync(cleaned)
+                _speak_via_sync(sentence)
                 return
             # Truncate very long sentences to the provider's per-request cap.
             if stream_max_len and len(cleaned) > stream_max_len:
@@ -3732,8 +3792,12 @@ def stream_tts_to_speaker(
                 delta = text_queue.get(timeout=queue_timeout)
             except queue.Empty:
                 # Idle producer: flush a long buffer instead of sitting on it
-                if len(chunker.buf) > long_flush_len:
-                    for sentence in chunker.flush():
+                if (
+                    len(chunker.buf) > long_flush_len
+                    and not chunker.holding_protected_text
+                    and not chunker.holding_pronunciation_lookahead
+                ):
+                    for sentence in chunker.flush_for_idle():
                         _speak_sentence(sentence)
                 continue
 

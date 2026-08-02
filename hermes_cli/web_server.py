@@ -4588,20 +4588,35 @@ async def speak_stream_ws(ws: "WebSocket") -> None:
     loop = asyncio.get_running_loop()
 
     def _resolve():
+        from tools.tts_text_normalize import get_pronunciation_substitutions
         from tools.tts_streaming import resolve_streaming_provider
         from tools.tts_tool import _get_provider, _load_tts_config, _resolve_max_text_length
 
         with _config_profile_scope(profile):
             cfg = _load_tts_config()
             streamer = resolve_streaming_provider(cfg)
-            cap = _resolve_max_text_length(_get_provider(cfg), cfg) if streamer else 0
-        return streamer, cap
+            stream_provider = (
+                getattr(streamer, "provider_name", "") or _get_provider(cfg)
+                if streamer
+                else ""
+            )
+            stream_model_id = getattr(streamer, "model_id", None) if streamer else None
+            if streamer and stream_model_id:
+                cap = _resolve_max_text_length(
+                    stream_provider,
+                    cfg,
+                    model_id=stream_model_id,
+                )
+            else:
+                cap = _resolve_max_text_length(stream_provider, cfg) if streamer else 0
+            pronunciation = get_pronunciation_substitutions(cfg)
+        return streamer, cap, pronunciation
 
     try:
-        streamer, cap = await loop.run_in_executor(None, _resolve)
+        streamer, cap, pronunciation = await loop.run_in_executor(None, _resolve)
     except Exception:
         _log.exception("speak-stream provider resolution failed")
-        streamer, cap = None, 0
+        streamer, cap, pronunciation = None, 0, {}
     if streamer is None:
         with contextlib.suppress(Exception):
             await ws.send_json({"type": "fallback"})
@@ -4618,9 +4633,11 @@ async def speak_stream_ws(ws: "WebSocket") -> None:
 
     def _produce():
         from tools.tts_streaming import SentenceChunker
-        from tools.tts_tool import _strip_markdown_for_tts
+        from tools.tts_text_normalize import prepare_spoken_text
 
-        chunker = SentenceChunker()
+        chunker = SentenceChunker(
+            pronunciation_substitutions=pronunciation,
+        )
 
         # The session stays open for a whole agent turn, and the client only
         # sends `done` when the turn ends. During tool execution no text
@@ -4641,10 +4658,14 @@ async def speak_stream_ws(ws: "WebSocket") -> None:
                 except queue.Empty:
                     idle_polls += 1
                     buffered = chunker.buf.strip()
-                    if not buffered or ("<think" in chunker.buf and "</think>" not in chunker.buf):
+                    if (
+                        not buffered
+                        or chunker.holding_protected_text
+                        or chunker.holding_pronunciation_lookahead
+                    ):
                         continue
                     if buffered.endswith((".", "!", "?", "…", ":")) or idle_polls >= idle_polls_before_force_flush:
-                        yield from chunker.flush()
+                        yield from chunker.flush_for_idle()
                     continue
                 idle_polls = 0
                 if delta is None:
@@ -4654,7 +4675,11 @@ async def speak_stream_ws(ws: "WebSocket") -> None:
 
         try:
             for sentence in _sentences():
-                cleaned = _strip_markdown_for_tts(sentence)
+                cleaned = prepare_spoken_text(
+                    sentence,
+                    max_chars=None,
+                    pronunciation_substitutions=pronunciation,
+                )
                 if not cleaned:
                     continue
                 for piece in _split_text_for_speak_stream(cleaned, cap):

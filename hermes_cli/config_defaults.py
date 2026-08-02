@@ -1497,6 +1497,13 @@ DEFAULT_CONFIG = {
             "voice": "default",
             # "base_url": "",  # override DEEPINFRA_BASE_URL for TTS only
         },
+        "pronunciation": {
+            # Map of term -> phonetic replacement. Applied to TTS text before
+            # sending to any provider. Case-insensitive literal match when the
+            # term is not adjacent to a word character.
+            # Example: {"Tahlia": "Tarlia"}
+            "substitutions": {},
+        },
     },
 
     "stt": {

@@ -35,8 +35,10 @@ class FakeStreamer:
         self.channels = channels
         self.sample_width = sample_width
         self._clause_count = 0
+        self.spoken_texts: list[str] = []
 
     def stream(self, text: str):
+        self.spoken_texts.append(text)
         self._clause_count += 1
         if self.fail_on_clause and self._clause_count >= self.fail_on_clause:
             raise RuntimeError(f"fake streamer failure on clause {self._clause_count}")
@@ -172,6 +174,7 @@ def _make_consumer(adapter, chat_id, loop, streamer):
     consumer._adapter = adapter
     consumer._chat_id = chat_id
     consumer._tts_config = {}
+    consumer._pronunciation_substitutions = {}
     consumer._loop = loop
     consumer._metadata = None
     consumer._audio_format = AudioFormat(
@@ -180,6 +183,7 @@ def _make_consumer(adapter, chat_id, loop, streamer):
         sample_width=int(getattr(streamer, "sample_width", 2)) if streamer is not None else 2,
     )
     consumer._streamer = streamer  # type: ignore[assignment]
+    consumer._stream_max_len = 0
     consumer._chunker = SentenceChunker()
     consumer._queue = queue.Queue(maxsize=256)
     consumer._handle = None
@@ -192,7 +196,6 @@ def _make_consumer(adapter, chat_id, loop, streamer):
     consumer._suppress_whole_file = False
     consumer._task = None
     consumer._lock = threading.Lock()
-    consumer._strip_markdown = None
     return consumer
 
 
@@ -350,6 +353,144 @@ class TestStreamerFormatAndLooping:
         finally:
             tts_streaming.resolve_streaming_provider = original_resolve
             loop.close()
+
+    def test_pronunciation_config_reaches_streaming_provider_without_rechunking(self):
+        async def run(loop):
+            streamer = FakeStreamer(chunks_per_clause=1)
+            adapter = FakeVoiceAdapter()
+            import tools.tts_streaming as tts_streaming
+
+            original_resolve = tts_streaming.resolve_streaming_provider
+            tts_streaming.resolve_streaming_provider = lambda *_args, **_kwargs: streamer
+            try:
+                protected = "```secret code```"
+                config = {
+                    "pronunciation": {
+                        "substitutions": {
+                            "C++": "C plus plus",
+                            "alpha": "beta",
+                            protected: "LEAK",
+                        },
+                    },
+                }
+                consumer = StreamingTTSConsumer(adapter, "chat1", config, loop)
+                consumer.start()
+                consumer.on_delta(f"{protected} Use C++ first. Then alpha second. ")
+                consumer.finish()
+
+                assert await consumer.wait_complete(timeout=5.0) is True
+                assert streamer.spoken_texts == [
+                    "Use C plus plus first.",
+                    "Then beta second.",
+                ]
+            finally:
+                tts_streaming.resolve_streaming_provider = original_resolve
+
+        _run_test(run)
+
+    def test_provider_cap_applies_after_pronunciation_expansion(self, monkeypatch):
+        import tools.tts_streaming as tts_streaming
+        import tools.tts_tool as tts_tool
+
+        streamer = FakeStreamer(chunks_per_clause=1)
+        streamer.provider_name = "openai"
+        resolved_providers = []
+        monkeypatch.setattr(
+            tts_streaming,
+            "resolve_streaming_provider",
+            lambda *_args, **_kwargs: streamer,
+        )
+        monkeypatch.setattr(
+            tts_tool,
+            "_resolve_max_text_length",
+            lambda provider, _cfg: resolved_providers.append(provider) or 64,
+        )
+
+        async def run(loop):
+            adapter = FakeVoiceAdapter()
+            config = {
+                "provider": "edge",
+                "streaming": {"provider": "openai"},
+                "pronunciation": {
+                    "substitutions": {"word": "expanded phrase"},
+                },
+            }
+            consumer = StreamingTTSConsumer(adapter, "chat1", config, loop)
+            consumer.start()
+            consumer.on_delta(("word " * 50) + ".")
+            consumer.finish()
+
+            assert await consumer.wait_complete(timeout=5.0) is True
+
+        _run_test(run)
+        assert resolved_providers == ["openai"]
+        assert len(streamer.spoken_texts) == 1
+        assert len(streamer.spoken_texts[0]) == 64
+
+    def test_elevenlabs_cap_uses_actual_streaming_model(self, monkeypatch):
+        import tools.tts_streaming as tts_streaming
+
+        streamer = FakeStreamer(chunks_per_clause=1)
+        streamer.provider_name = "elevenlabs"
+        streamer.model_id = "eleven_v3"
+        monkeypatch.setattr(
+            tts_streaming,
+            "resolve_streaming_provider",
+            lambda *_args, **_kwargs: streamer,
+        )
+
+        async def run(loop):
+            adapter = FakeVoiceAdapter()
+            config = {
+                "provider": "edge",
+                "streaming": {"provider": "elevenlabs"},
+                "elevenlabs": {
+                    "model_id": "eleven_flash_v2_5",
+                    "streaming_model_id": "eleven_v3",
+                },
+                "pronunciation": {
+                    "substitutions": {"word": "expandedword"},
+                },
+            }
+            consumer = StreamingTTSConsumer(adapter, "chat1", config, loop)
+            consumer.start()
+            consumer.on_delta(("word " * 1000) + ".")
+            consumer.finish()
+
+            assert await consumer.wait_complete(timeout=5.0) is True
+
+        _run_test(run)
+        assert len(streamer.spoken_texts) == 1
+        assert len(streamer.spoken_texts[0]) == 5000
+
+    def test_unicode_ignorecase_pronunciation_survives_gateway_delta_boundary(self):
+        async def run(loop):
+            streamer = FakeStreamer(chunks_per_clause=1)
+            adapter = FakeVoiceAdapter()
+            import tools.tts_streaming as tts_streaming
+
+            original_resolve = tts_streaming.resolve_streaming_provider
+            tts_streaming.resolve_streaming_provider = lambda *_args, **_kwargs: streamer
+            try:
+                config = {
+                    "pronunciation": {
+                        "substitutions": {"Dr. Ipek": "Doctor Ipek"},
+                    },
+                }
+                consumer = StreamingTTSConsumer(adapter, "chat1", config, loop)
+                consumer.start()
+                consumer.on_delta("Please book an appointment with Dr. ")
+                consumer.on_delta("ıpek tomorrow. ")
+                consumer.finish()
+
+                assert await consumer.wait_complete(timeout=5.0) is True
+                assert streamer.spoken_texts == [
+                    "Please book an appointment with Doctor Ipek tomorrow.",
+                ]
+            finally:
+                tts_streaming.resolve_streaming_provider = original_resolve
+
+        _run_test(run)
 
 
 class TestGatewayIntegrationSeam:

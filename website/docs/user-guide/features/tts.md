@@ -103,6 +103,8 @@ tts:
     # noise_w_scale: 0.8
     # volume: 1.0                               # 0.5 = half as loud
     # normalize_audio: true
+  pronunciation:
+    substitutions: {}  # Word -> phonetic replacement, e.g. {Tahlia: Tarlia}
 ```
 
 MiniMax TTS selects its region, endpoint, and credential together:
@@ -146,6 +148,26 @@ The rewrite uses `auxiliary.tts_audio_tags` and defaults to your main chat model
 
 **Language (OpenAI-compatible endpoints)**: `tts.openai.language` is forwarded to the endpoint as a `lang_code` request parameter. It is intended for OpenAI-compatible TTS servers that support `lang_code` — for example [Kokoro-FastAPI](https://github.com/remsky/Kokoro-FastAPI), where `language: "es"` selects the Spanish phonemizer instead of the English default. Leave it unset when using the official OpenAI API, which does not accept this parameter. When unset, nothing extra is sent.
 
+
+### Pronunciation Substitutions
+
+Hermes can replace specific words in TTS text before sending them to any provider. This is useful for names or terms that TTS engines mispronounce — for example, "Tahlia" should be spoken as "Tarlia".
+
+Substitutions use case-insensitive literal matching and only match terms that are not adjacent to a word character. Thus `Tahlia`, `tahlia`, and `TAHLIA` all get replaced, but `Tahlias` does not; punctuation-bearing terms such as `C++` and `.NET` are also supported. Replacement text is inserted literally, including backslashes.
+
+```yaml
+# In ~/.hermes/config.yaml
+tts:
+  pronunciation:
+    substitutions:
+      Tahlia: Tarlia
+      Siobhan: Shi-vaun
+      Notre: No-tra
+```
+
+Pronunciation substitutions are currently a YAML-only advanced setting because the generic desktop settings form does not yet provide a safe key/value map editor.
+
+Protected non-spoken blocks are removed before substitutions, so a configured term cannot alter private reasoning or verifier markers. Substitutions then run before Markdown stripping and provider dispatch, so they still work on formatted text across synchronous and streaming TTS paths.
 
 ### Input length limits
 

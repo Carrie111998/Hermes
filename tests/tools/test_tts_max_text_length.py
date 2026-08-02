@@ -47,6 +47,40 @@ class TestResolveMaxTextLength:
 
     # --- ElevenLabs model-aware ---
 
+    def test_elevenlabs_streaming_model_overrides_sync_model_for_cap(self):
+        config = {
+            "elevenlabs": {
+                "model_id": "eleven_flash_v2_5",
+                "streaming_model_id": "eleven_v3",
+            },
+        }
+        assert _resolve_max_text_length("elevenlabs", config) == 40000
+        assert (
+            _resolve_max_text_length(
+                "elevenlabs",
+                config,
+                model_id="eleven_v3",
+            )
+            == 5000
+        )
+
+    def test_elevenlabs_explicit_cap_still_wins_over_active_model(self):
+        config = {
+            "elevenlabs": {
+                "model_id": "eleven_flash_v2_5",
+                "streaming_model_id": "eleven_v3",
+                "max_text_length": 1234,
+            },
+        }
+        assert (
+            _resolve_max_text_length(
+                "elevenlabs",
+                config,
+                model_id="eleven_v3",
+            )
+            == 1234
+        )
+
 
     # --- Sanity: the table covers every provider listed in the schema ---
 
