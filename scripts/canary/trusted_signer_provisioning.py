@@ -1443,7 +1443,14 @@ def _find_private_key_predecessor(
     *,
     existing_public_raw: bytes,
 ) -> tuple[SignerLayout, Mapping[str, Any], Mapping[str, Any], bytes]:
-    """Bind an installed old seed to exactly one signed predecessor release."""
+    """Bind an installed old seed to one canonical signed predecessor.
+
+    A signer identity may have been intentionally replayed by several exact
+    immutable releases.  Every matching receipt is still validated against
+    its own release authority; the lexicographically first revision is merely
+    the deterministic representative of that cryptographically equivalent
+    lineage for the crash-replay intent.
+    """
 
     if len(existing_public_raw) != 32:
         _stable_error("trusted_signer_private_key_rollover_invalid")
@@ -1478,7 +1485,7 @@ def _find_private_key_predecessor(
             authority=authority,
         )
         matches.append((candidate, authority, receipt, receipt_raw))
-    if len(matches) != 1:
+    if not matches:
         _stable_error("trusted_signer_private_key_rollover_invalid")
     return matches[0]
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from dataclasses import replace
 from pathlib import Path
 from typing import Mapping
 
@@ -1062,6 +1063,114 @@ def test_private_key_rollover_replaces_only_proven_predecessor_without_digest(
     assert hashlib.sha256(current_seed).hexdigest().encode("ascii") not in intent_raw
     assert hashlib.sha256(previous_seed).hexdigest().encode("ascii") not in intent_raw
     assert not provisioning._private_key_rollover_stage_path(layout).exists()
+
+
+def test_private_key_rollover_selects_canonical_equivalent_predecessor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    layout, _authority, previous_seed, _current_seed = (
+        _private_key_rollover_case(tmp_path, monkeypatch)
+    )
+    first_revision = "b" * 40
+    later_revision = "c" * 40
+    later_layout = provisioning._projection_layout(
+        later_revision,
+        role="host",
+    )
+    first_release = later_layout.release_base / first_revision
+    first_release.mkdir()
+    first_layout = replace(
+        later_layout,
+        release=first_release,
+        authority_manifest=first_release / "package-manifest.json",
+        pinned_public_key=first_release / "host.pub",
+        receipt=(
+            later_layout.receipt.parent
+            / f"host-signer-{first_revision}.json"
+        ),
+        sudoers_template=first_release / "sudoers.in",
+    )
+    first_layout.receipt.write_bytes(b"first signed predecessor receipt")
+    first_layout.receipt.chmod(0o444)
+    previous_public = (
+        Ed25519PrivateKey.from_private_bytes(previous_seed)
+        .public_key()
+        .public_bytes_raw()
+    )
+    later_authority = provisioning._validate_release_and_authority(
+        later_layout
+    )
+    first_authority = {
+        **later_authority,
+        "package_sha256": "8" * 64,
+        "manifest_sha256": "9" * 64,
+        "runtime": {"release": first_revision},
+    }
+    receipts = {
+        first_revision: (
+            {
+                "release_revision": first_revision,
+                "receipt_sha256": "a" * 64,
+            },
+            b"first signed predecessor receipt",
+        ),
+        later_revision: (
+            {
+                "release_revision": later_revision,
+                "receipt_sha256": "7" * 64,
+            },
+            b"immutable signed predecessor receipt",
+        ),
+    }
+
+    monkeypatch.setattr(
+        provisioning,
+        "_projection_layout",
+        lambda revision, *, role: (
+            first_layout
+            if revision == first_revision and role == "host"
+            else (
+                later_layout
+                if revision == later_revision and role == "host"
+                else (_ for _ in ()).throw(
+                    AssertionError("unexpected signer release")
+                )
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        provisioning,
+        "_validate_release_and_authority",
+        lambda selected: (
+            first_authority
+            if selected is first_layout
+            else (
+                later_authority
+                if selected is later_layout
+                else (_ for _ in ()).throw(
+                    AssertionError("unexpected signer layout")
+                )
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        provisioning,
+        "_validated_historical_signer_receipt",
+        lambda selected, *, authority: receipts[selected.release.name],
+    )
+
+    selected, selected_authority, receipt, receipt_raw = (
+        provisioning._find_private_key_predecessor(
+            layout,
+            existing_public_raw=previous_public,
+        )
+    )
+
+    assert selected is first_layout
+    assert selected_authority is first_authority
+    assert receipt == receipts[first_revision][0]
+    assert receipt_raw == receipts[first_revision][1]
 
 
 @pytest.mark.parametrize("crash_window", ("after_stage", "after_replace"))
