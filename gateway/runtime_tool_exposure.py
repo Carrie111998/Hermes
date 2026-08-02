@@ -9,7 +9,8 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass
+import threading
+from dataclasses import dataclass, field
 from typing import Any
 
 from tools.tool_search import (
@@ -17,7 +18,6 @@ from tools.tool_search import (
     CatalogEntry,
     bridge_tool_schemas,
     build_catalog,
-    estimate_tokens_from_schemas,
     search_catalog,
 )
 
@@ -29,42 +29,45 @@ _DIRECT_PLATFORM_TOOLS = frozenset({
 })
 _DEFAULT_SEARCH_LIMIT = 5
 _MAX_SEARCH_LIMIT = 20
-_AUTO_DEFER_THRESHOLD_TOKENS = 20_000
 
 
-@dataclass(frozen=True)
+@dataclass
 class RuntimeToolExposure:
     direct_schemas: tuple[dict[str, Any], ...]
     deferred_catalog: tuple[CatalogEntry, ...]
     deferred_names: frozenset[str]
     hidden_names: frozenset[str]
+    activated_names: set[str] = field(default_factory=set)
+    _lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
 
     @property
     def model_schemas(self) -> list[dict[str, Any]]:
         visible = [dict(schema) for schema in self.direct_schemas]
+        with self._lock:
+            activated = set(self.activated_names)
+        visible.extend(
+            dict(entry.schema)
+            for entry in self.deferred_catalog
+            if entry.name in activated
+        )
         if self.deferred_catalog:
-            bridge = bridge_tool_schemas(len(self.deferred_catalog))
-            for schema in bridge:
-                function = schema.get("function") or {}
-                if function.get("name") == "tool_search":
-                    query = (
-                        (function.get("parameters") or {})
-                        .get("properties", {})
-                        .get("query", {})
-                    )
-                    query["description"] = (
-                        "English capability keywords or an exact Tool name."
-                    )
-                elif function.get("name") == "tool_describe":
-                    function["description"] = (
-                        "Load the full JSON schema for a deferred Tool. If a Skill "
-                        "or task already supplies its exact Tool name, describe it "
-                        "directly without searching first."
-                    )
-            visible.extend(bridge)
+            search_schema = bridge_tool_schemas(len(self.deferred_catalog))[0]
+            function = search_schema.get("function") or {}
+            function["description"] = (
+                f"Search {len(self.deferred_catalog)} additional Tools available "
+                "to this Run. Matching real Tool schemas are loaded into the "
+                "model's Tool surface and become directly callable on the next step."
+            )
+            query = (
+                (function.get("parameters") or {})
+                .get("properties", {})
+                .get("query", {})
+            )
+            query["description"] = "English capability keywords or an exact Tool name."
+            visible.append(search_schema)
         return visible
 
-    def search(self, args: dict[str, Any]) -> str:
+    def search_and_activate(self, args: dict[str, Any]) -> str:
         query = str(args.get("query") or "").strip()
         if not query:
             return _error("query is required")
@@ -88,6 +91,12 @@ class RuntimeToolExposure:
             query,
             limit,
         )
+        matched_names = [entry.name for entry in matches]
+        with self._lock:
+            already_loaded = [
+                name for name in matched_names if name in self.activated_names
+            ]
+            self.activated_names.update(matched_names)
         return json.dumps({
             "query": query,
             "total_available": len(self.deferred_catalog),
@@ -99,42 +108,22 @@ class RuntimeToolExposure:
                 }
                 for entry in matches
             ],
+            "loaded_tools": matched_names,
+            "already_loaded": already_loaded,
+            "callable_on_next_step": bool(matched_names),
         }, ensure_ascii=False, separators=(",", ":"))
 
-    def describe(self, args: dict[str, Any]) -> str:
-        name = str(args.get("name") or "").strip()
-        if not name:
-            return _error("name is required")
-        for entry in self.deferred_catalog:
-            if entry.name == name:
-                function = entry.schema.get("function") or {}
-                return json.dumps({
-                    "name": name,
-                    "description": function.get("description", ""),
-                    "parameters": function.get("parameters", {}),
-                }, ensure_ascii=False, separators=(",", ":"))
-        return _error(f"'{name}' is not a deferred Tool available to this Run")
+    def activate_names(self, names: set[str]) -> None:
+        with self._lock:
+            self.activated_names.update(names & self.deferred_names)
 
-    def resolve_call(
-        self,
-        args: dict[str, Any],
-    ) -> tuple[str | None, dict[str, Any], str | None]:
-        name = str(args.get("name") or "").strip()
-        if not name:
-            return None, {}, "tool_call requires a name"
-        if name in BRIDGE_TOOL_NAMES:
-            return None, {}, "tool_call cannot invoke another bridge Tool"
-        if name not in self.deferred_names:
-            return None, {}, f"'{name}' is not a deferred Tool available to this Run"
-        arguments = args.get("arguments", {})
-        if isinstance(arguments, str):
-            try:
-                arguments = json.loads(arguments)
-            except json.JSONDecodeError:
-                return None, {}, "tool_call arguments must be valid JSON"
-        if not isinstance(arguments, dict):
-            return None, {}, "tool_call arguments must be an object"
-        return name, dict(arguments), None
+    def is_callable(self, name: str) -> bool:
+        direct_names = {
+            str((schema.get("function") or {}).get("name") or "")
+            for schema in self.direct_schemas
+        }
+        with self._lock:
+            return name in direct_names or name in self.activated_names
 
 
 def build_runtime_tool_exposure(
@@ -144,7 +133,6 @@ def build_runtime_tool_exposure(
     if len(definitions) != len(schemas):
         raise ValueError("Tool definitions and schemas differ")
     classified: list[tuple[str, dict[str, Any]]] = []
-    automatic: list[dict[str, Any]] = []
     direct: list[dict[str, Any]] = []
     deferred: list[dict[str, Any]] = []
     hidden: set[str] = set()
@@ -165,26 +153,18 @@ def build_runtime_tool_exposure(
         elif requested == "deferred":
             classified.append(("deferred", schema))
         else:
-            classified.append(("automatic", schema))
-            automatic.append(schema)
-    automatic_tokens = estimate_tokens_from_schemas(automatic)
-    defer_automatic = automatic_tokens >= _AUTO_DEFER_THRESHOLD_TOKENS
+            classified.append(("direct", schema))
     for classification, schema in classified:
-        if classification == "direct" or (
-            classification == "automatic" and not defer_automatic
-        ):
+        if classification == "direct":
             direct.append(schema)
-        elif classification == "deferred" or classification == "automatic":
+        elif classification == "deferred":
             deferred.append(schema)
     catalog = build_catalog(deferred)
     logger.info(
-        "runtime Tool exposure: direct=%d deferred=%d hidden=%d "
-        "automatic_schema_tokens=%d automatic_deferred=%s",
+        "runtime Tool exposure: direct=%d deferred=%d hidden=%d",
         len(direct),
         len(catalog),
         len(hidden),
-        automatic_tokens,
-        defer_automatic,
     )
     return RuntimeToolExposure(
         direct_schemas=tuple(direct),

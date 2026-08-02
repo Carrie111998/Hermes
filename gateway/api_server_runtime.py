@@ -29,8 +29,6 @@ from gateway.runtime_tool_exposure import (
     build_runtime_tool_exposure,
 )
 from tools.tool_search import (
-    TOOL_CALL_NAME,
-    TOOL_DESCRIBE_NAME,
     TOOL_SEARCH_NAME,
 )
 
@@ -46,7 +44,14 @@ logger = logging.getLogger(__name__)
 _SESSIONS: dict[str, "RuntimeBridgeSession"] = {}
 _SESSIONS_LOCK = threading.RLock()
 _REGISTERED_MANAGERS: set[int] = set()
-_LOCAL_ACTIVITY_TOOLS = {"skill_view", "image_analyze", "video_analyze", "web_search", "web_extract"}
+_LOCAL_ACTIVITY_TOOLS = {
+    "skill_view",
+    "tool_search",
+    "image_analyze",
+    "video_analyze",
+    "web_search",
+    "web_extract",
+}
 _MAX_ARGUMENT_CORRECTIONS = 1
 _FAILED_ALLOWED_STRING_FIELDS = {"media_type", "model", "provider"}
 _FAILED_ALLOWED_STRING_LIST_FIELDS = {"aspect_ratios", "resolutions"}
@@ -219,7 +224,10 @@ def _pin_run_model(agent: Any, requested_model: Any) -> str:
 def _activity_arguments(tool_name: str, args: Any) -> dict[str, str]:
     if not isinstance(args, dict):
         return {}
-    allowed = {"skill_view": ("name", "file_path")}
+    allowed = {
+        "skill_view": ("name", "file_path"),
+        "tool_search": ("query",),
+    }
     return {
         key: str(args[key])
         for key in allowed.get(tool_name, ())
@@ -710,31 +718,25 @@ def _runtime_tool_middleware(**kwargs: Any) -> Any:
         session = _SESSIONS.get(session_id)
     if session is None:
         return next_call(args) if callable(next_call) else args
-    if tool_name in session.direct_tool_names:
+    if tool_name == TOOL_SEARCH_NAME:
+        return session.search_and_activate_tools(args)
+    if session.tool_exposure.is_callable(tool_name):
         return session.invoke_platform_tool(
             tool_name,
             args,
             str(kwargs.get("tool_call_id") or ""),
         )
-    if tool_name == TOOL_SEARCH_NAME:
-        return session.tool_exposure.search(args)
-    if tool_name == TOOL_DESCRIBE_NAME:
-        return session.tool_exposure.describe(args)
-    if tool_name == TOOL_CALL_NAME:
-        name, underlying_args, error = session.tool_exposure.resolve_call(args)
-        if error or name is None:
-            return json.dumps({
-                "error": {
-                    "code": "invalid_tool_request",
-                    "message": error or "deferred Tool is unavailable",
-                },
-            }, ensure_ascii=False, separators=(",", ":"))
-        return session.invoke_platform_tool(
-            name,
-            underlying_args,
-            str(kwargs.get("tool_call_id") or ""),
-            checkpoint_tool_name=TOOL_CALL_NAME,
-        )
+    if tool_name in session.tool_names:
+        return json.dumps({
+            "error": {
+                "code": "tool_not_loaded",
+                "message": (
+                    f"Tool '{tool_name}' is available to this Run but must be "
+                    "loaded with tool_search before it can be called."
+                ),
+                "retryable": False,
+            },
+        }, ensure_ascii=False, separators=(",", ":"))
     if tool_name == "skill_view":
         requested = str(args.get("name") or args.get("skill") or "").strip()
         if not session.is_skill_allowed(requested):
@@ -847,10 +849,7 @@ class RuntimeBridgeSession:
             definitions,
             _tool_schemas(definitions),
         )
-        self.direct_tool_names = {
-            str((schema.get("function") or {}).get("name") or "")
-            for schema in self.tool_exposure.direct_schemas
-        }
+        self.native_tool_schemas: list[dict[str, Any]] = []
         self.allowed_skill_names = (
             set(allowed_skill_names)
             if allowed_skill_names is not None
@@ -880,6 +879,32 @@ class RuntimeBridgeSession:
         self.finished = threading.Event()
         self.finished_async = asyncio.Event()
         self.finished_at: float | None = None
+
+    def bind_agent(self, agent: Any, native_tool_schemas: list[dict[str, Any]]) -> None:
+        self.agent_ref[0] = agent
+        self.native_tool_schemas = [dict(schema) for schema in native_tool_schemas]
+        self._refresh_agent_tools()
+
+    def _refresh_agent_tools(self) -> None:
+        agent = self.agent_ref[0]
+        if agent is None:
+            return
+        with self.lock:
+            agent.tools = [
+                *self.native_tool_schemas,
+                *self.tool_exposure.model_schemas,
+            ]
+            agent.valid_tool_names = {
+                str((tool.get("function") or {}).get("name") or "")
+                for tool in agent.tools
+            }
+
+    def search_and_activate_tools(self, args: dict[str, Any]) -> str:
+        result = self.tool_exposure.search_and_activate(args)
+        parsed = json.loads(result)
+        if "error" not in parsed:
+            self._refresh_agent_tools()
+        return result
 
     def is_skill_allowed(self, name: str) -> bool:
         return bool(name) and name in self.allowed_skill_names
@@ -1035,8 +1060,6 @@ class RuntimeBridgeSession:
         name: str,
         args: dict[str, Any],
         call_id: str,
-        *,
-        checkpoint_tool_name: str | None = None,
     ) -> str:
         if not call_id:
             return json.dumps({"error": {"code": "invalid_tool_request", "message": "tool call id is required"}})
@@ -1059,7 +1082,7 @@ class RuntimeBridgeSession:
         try:
             checkpoint = self._checkpoint_message(
                 call_id,
-                checkpoint_tool_name or name,
+                name,
                 name,
                 args,
             )
@@ -1295,6 +1318,17 @@ class APIServerRuntimeMixin:
                 ]
             if resuming:
                 history = _resume_runtime_history(normalized_messages, runtime_checkpoint, tool_results)
+                checkpoint_message = runtime_checkpoint.get("message")
+                checkpoint_calls = (
+                    checkpoint_message.get("tool_calls")
+                    if isinstance(checkpoint_message, dict)
+                    else []
+                )
+                tool_exposure.activate_names({
+                    str((call.get("function") or {}).get("name") or "")
+                    for call in checkpoint_calls or []
+                    if isinstance(call, dict)
+                })
                 user_message = ""
             else:
                 history = normalized_messages[:-1]
@@ -1363,8 +1397,7 @@ class APIServerRuntimeMixin:
                 for tool in native
             ):
                 native.append(_native_video_tool_definition())
-            agent.tools = native + tool_exposure.model_schemas
-            agent.valid_tool_names = {tool["function"]["name"] for tool in agent.tools}
+            session.bind_agent(agent, native)
             _pin_run_model(agent, body.get("model"))
             agent.ephemeral_system_prompt = None
             agent._cached_system_prompt = instructions
@@ -1381,7 +1414,6 @@ class APIServerRuntimeMixin:
             # other value agent_init accepts) for these runs only; the global
             # default and ~/.hermes/config.yaml stay untouched.
             agent._cache_ttl = "1h"
-            session.agent_ref[0] = agent
 
         def on_tool_start(tool_call_id: str, function_name: str, function_args: Any) -> None:
             session.start_local_activity(tool_call_id, function_name, function_args)

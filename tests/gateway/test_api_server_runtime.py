@@ -159,8 +159,6 @@ class _RuntimeAdapter(APIServerRuntimeMixin):
             "ask_user_question",
             "image_analyze",
             "skill_view",
-            "tool_call",
-            "tool_describe",
             "tool_search",
             "web_extract",
             "web_search",
@@ -222,27 +220,39 @@ class _RuntimeAdapter(APIServerRuntimeMixin):
             "error": "Skill 'tv-ad' is not available for this run.",
         }
 
+        unloaded = json.loads(_runtime_tool_middleware(
+            tool_name="ultra_media_job_create",
+            args={"operation": "image.generate", "prompt": "test"},
+            session_id=kwargs["session_id"],
+            tool_call_id="unloaded_01",
+            next_call=lambda _args: pytest.fail("unloaded platform tool reached native dispatch"),
+        ))
+        assert unloaded["error"]["code"] == "tool_not_loaded"
+
+        search_args = {"query": "create media"}
+        kwargs["tool_start_callback"]("search_01", "tool_search", search_args)
         search_result = json.loads(_runtime_tool_middleware(
             tool_name="tool_search",
-            args={"query": "create media"},
+            args=search_args,
             session_id=kwargs["session_id"],
             tool_call_id="search_01",
         ))
+        kwargs["tool_complete_callback"](
+            "search_01",
+            "tool_search",
+            search_args,
+            json.dumps(search_result),
+        )
         assert [match["name"] for match in search_result["matches"]] == [
             "ultra_media_job_create",
         ]
-        described = json.loads(_runtime_tool_middleware(
-            tool_name="tool_describe",
-            args={"name": "ultra_media_job_create"},
-            session_id=kwargs["session_id"],
-            tool_call_id="describe_01",
-        ))
-        assert described["name"] == "ultra_media_job_create"
+        assert search_result["loaded_tools"] == ["ultra_media_job_create"]
+        assert search_result["callable_on_next_step"] is True
+        assert "ultra_media_job_create" in agent.valid_tool_names
+        assert "tool_call" not in agent.valid_tool_names
+        assert "tool_describe" not in agent.valid_tool_names
 
-        delegated_args = {
-            "name": "ultra_media_job_create",
-            "arguments": {"operation": "image.generate", "prompt": "test"},
-        }
+        delegated_args = {"operation": "image.generate", "prompt": "test"}
         agent._runtime_checkpoint_message = {
             "role": "assistant",
             "content": None,
@@ -250,22 +260,27 @@ class _RuntimeAdapter(APIServerRuntimeMixin):
                 "id": "call_01",
                 "type": "function",
                 "function": {
-                    "name": "tool_call",
+                    "name": "ultra_media_job_create",
                     "arguments": json.dumps(delegated_args),
                 },
             }],
         }
-        kwargs["tool_start_callback"]("call_01", "tool_call", delegated_args)
+        kwargs["tool_start_callback"]("call_01", "ultra_media_job_create", delegated_args)
         tool_result = await asyncio.to_thread(
             _runtime_tool_middleware,
-            tool_name="tool_call",
+            tool_name="ultra_media_job_create",
             args=delegated_args,
             session_id=kwargs["session_id"],
             tool_call_id="call_01",
             next_call=lambda _args: pytest.fail("platform tool executed inside Hermes"),
         )
         assert json.loads(tool_result) == {"job_id": "job_01"}
-        kwargs["tool_complete_callback"]("call_01", "tool_call", delegated_args, tool_result)
+        kwargs["tool_complete_callback"](
+            "call_01",
+            "ultra_media_job_create",
+            delegated_args,
+            tool_result,
+        )
         return {"final_response": "asset://image/01"}, {"total_tokens": 3}
 
 
@@ -836,6 +851,26 @@ async def test_runtime_driver_streams_tool_request_and_waits_for_result(monkeypa
                 },
             },
         }
+        search_started = json.loads(await response.content.readline())
+        assert search_started == {
+            "run_id": "run_test",
+            "type": "activity_started",
+            "payload": {
+                "call_id": "search_01",
+                "name": "tool_search",
+                "arguments": {"query": "create media"},
+            },
+        }
+        search_completed = json.loads(await response.content.readline())
+        assert search_completed == {
+            "run_id": "run_test",
+            "type": "activity_completed",
+            "payload": {
+                "call_id": "search_01",
+                "name": "tool_search",
+                "status": "completed",
+            },
+        }
         checkpoint = json.loads(await response.content.readline())
         assert checkpoint["type"] == "checkpoint"
         assert checkpoint["payload"]["message"]["tool_calls"][0]["id"] == "call_01"
@@ -1052,6 +1087,8 @@ async def test_runtime_resume_wiring_reaches_agent_without_new_user_message():
             agent = SimpleNamespace(tools=[], valid_tool_names=set(), model="configured-model")
             kwargs["agent_configurator"](agent)
             assert agent._resume_from_tool_results is True
+            assert "media.generate_image" in agent.valid_tool_names
+            assert "tool_search" in agent.valid_tool_names
             assert kwargs["user_message"] == ""
             assert [message["role"] for message in kwargs["conversation_history"]] == [
                 "user", "assistant", "tool",
@@ -1094,6 +1131,12 @@ async def test_runtime_resume_wiring_reaches_agent_without_new_user_message():
                 "tool_call_id": "call_media",
                 "status": "succeeded",
                 "output": {"batch_status": "succeeded"},
+            }],
+            "tools": [{
+                "name": "media.generate_image",
+                "description": "generate an image",
+                "input_schema": {"type": "object", "properties": {}},
+                "exposure": "deferred",
             }],
         })
         assert response.status == 200
