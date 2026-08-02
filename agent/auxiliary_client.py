@@ -7080,7 +7080,29 @@ def _resolve_task_provider_model(
         try:
             from hermes_cli.providers import get_provider
 
-            return get_provider(normalized) is not None
+            if get_provider(normalized) is not None:
+                return True
+            # #76602 — also preserve when *normalized* names a user-defined
+            # provider from the ``providers:`` section of config.yaml.
+            # Without this, an explicit provider + base_url (the shape the
+            # auxiliary vision path passes after resolving the task config)
+            # falls through to the anonymous ``"custom"`` downgrade, the
+            # downstream ``resolve_provider_client`` named-custom-provider
+            # branch never runs, and the call lands with ``no-key-required``
+            # → 401 from any auth-required provider (e.g. agnes-ai.cn,
+            # nvidia-nim with key_env, etc.). Mirrors the keep-naming
+            # behavior ``call_llm`` uses for main-runtime resolution.
+            try:
+                from hermes_cli.runtime_provider import _get_named_custom_provider
+
+                if _get_named_custom_provider(normalized) is not None:
+                    return True
+            except Exception:
+                # Config not loaded yet (early import paths, tests) — fall
+                # back to the hardcoded allowlist below; never widen a True
+                # just because the import failed.
+                pass
+            return False
         except Exception:
             # Keep the high-risk provider-backed routes safe even if provider
             # catalog loading is unavailable during early import/test paths.
