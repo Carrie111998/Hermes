@@ -488,7 +488,8 @@ class WorkflowEngine:
                             *, workflow: Optional["Workflow"] = None,
                             states: Optional[dict] = None,
                             layers: Optional[list] = None,
-                            initial_status: str = "ready") -> str:
+                            initial_status: str = "ready",
+                            body_prefix: str = "") -> str:
         """Create a kanban card for a workflow node. Returns card ID.
 
         Refuses to create a card for a synthetic gate node — those are
@@ -524,7 +525,8 @@ class WorkflowEngine:
             # contains its own braces that the resolver would otherwise
             # chew on.
             task_with_context = self._build_task_body(
-                node, workflow, states, layers, context
+                node, workflow, states, layers, context,
+                body_prefix=body_prefix,
             )
         else:
             # Backward-compat path: direct callers that pass only
@@ -607,7 +609,8 @@ class WorkflowEngine:
 
     def dispatch_node(self, state: NodeState, node: WorkflowNode, context: dict,
                        workflow: "Workflow", states: dict, layers: list,
-                       initial_status: str = "ready") -> Optional[str]:
+                       initial_status: str = "ready",
+                       body_prefix: str = "") -> Optional[str]:
         """Dispatch a node to kanban, or mark it done in-process.
 
         For ``scope: global`` workflows (maintenance, notifications, heartbeat)
@@ -633,6 +636,7 @@ class WorkflowEngine:
             node, context,
             workflow=workflow, states=states, layers=layers,
             initial_status=initial_status,
+            body_prefix=body_prefix,
         )
 
     def _get_session_info(self) -> dict:
@@ -1223,7 +1227,8 @@ class WorkflowEngine:
     def _build_task_body(self, node: WorkflowNode, workflow: "Workflow",
                           states: dict[str, "NodeState"],
                           layers: list[list[str]],
-                          context: Optional[dict] = None) -> str:
+                          context: Optional[dict] = None,
+                          body_prefix: str = "") -> str:
         """Compose the final card body for a workflow node.
 
         Steps:
@@ -1243,6 +1248,8 @@ class WorkflowEngine:
             workflow, states, layers, context
         )
         resolved_task = self._resolve_template(node.task, lookup)
+        if body_prefix:
+            resolved_task = body_prefix + resolved_task
 
         # ── Post-resolution diagnostics ──
         # Count how many template variables survived unresolved
@@ -3433,28 +3440,35 @@ class WorkflowEngine:
                                             # Already running or ready — keep polling
                                             print(f"   ⏳ {nid} — {rev_id} already in-flight (status: {rev_state.status})")
                                     else:
-                                        # First time — create the reviewer card
-                                        try:
-                                            reviewer_card_id = self.dispatch_node(
-                                                states[rev_id], reviewer_node, context,
-                                                workflow=workflow, states=states, layers=layers,
+                                        # First time — create the reviewer card.
+                                        # Prepend review context so the reviewer
+                                        # knows what to review without the YAML
+                                        # having to spell it out.
+                                        _upstream_card = states[nid].kanban_card_id or "unknown"
+                                        _review_header = (
+                                            f"You are reviewing the output of node '{nid}' "
+                                            f"(task {_upstream_card}). Read the card body and "
+                                            f"completion summary of that task to find the work.\n\n"
+                                        )
+                                        reviewer_card_id = self.dispatch_node(
+                                            states[rev_id], reviewer_node, context,
+                                            workflow=workflow, states=states, layers=layers,
+                                            body_prefix=_review_header,
+                                        )
+                                        if reviewer_card_id:
+                                            states[rev_id].kanban_card_id = reviewer_card_id
+                                            states[rev_id].status = "running"
+                                            states[rev_id].started_at = datetime.now(timezone.utc).isoformat()
+                                            state.review_counts[rev_id] = state.review_counts.get(rev_id, 0) + 1
+                                            pending.add(rev_id)
+                                            # Save state so the has_active_review check
+                                            # can find the reviewer card ID.
+                                            self._save_state(
+                                                workflow.name, states, results,
+                                                0, layers,
+                                                run_id=workflow.run_id, context=context,
                                             )
-                                            if reviewer_card_id:
-                                                states[rev_id].kanban_card_id = reviewer_card_id
-                                                states[rev_id].status = "running"
-                                                states[rev_id].started_at = datetime.now(timezone.utc).isoformat()
-                                                state.review_counts[rev_id] = state.review_counts.get(rev_id, 0) + 1
-                                                pending.add(rev_id)
-                                                # Save state so the has_active_review check
-                                                # can find the reviewer card ID.
-                                                self._save_state(
-                                                    workflow.name, states, results,
-                                                    0, layers,
-                                                    run_id=workflow.run_id, context=context,
-                                                )
-                                                print(f"   📋 {nid} pending review → created {rev_id} (card {reviewer_card_id})")
-                                        except Exception as e:
-                                            print(f"   ⚠  Failed to create reviewer card: {e}")
+                                            print(f"   📋 {nid} pending review → created {rev_id} (card {reviewer_card_id})")
                                     break  # One reviewer at a time
                             else:
                                 # No reviews attribute — but check if this node is
