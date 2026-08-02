@@ -132,6 +132,10 @@ done
 # which legitimately reads the operator HOME.  Pytest collection and every
 # child process receive the isolated HOME/HERMES_HOME below; this closes the
 # gap before the per-test fixture starts.
+# Preserve the operator home for tests that verify the sandbox boundary. The
+# child environment intentionally replaces HOME with TEST_HOME below, so
+# Path.home() inside a test cannot identify the home that was protected.
+TEST_OPERATOR_HOME="${HOME:-}"
 TEST_HOME="$(mktemp -d "${TMPDIR:-/tmp}/hermes-test-home.XXXXXX")"
 # Normalize TMPDIR spelling once. On macOS TMPDIR commonly ends in "/" and
 # traverses the /var -> /private/var symlink; preserving either spelling makes
@@ -165,6 +169,7 @@ env -i \
   PATH="$PATH" \
   HOME="$TEST_HOME" \
   HERMES_HOME="$TEST_HOME/.hermes" \
+  HERMES_TEST_REAL_HOME="$TEST_OPERATOR_HOME" \
   ${WIN_ENV[@]+"${WIN_ENV[@]}"} \
   TZ=UTC \
   LANG=C.UTF-8 \

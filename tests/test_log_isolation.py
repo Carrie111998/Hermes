@@ -27,7 +27,11 @@ import pytest
 
 def _real_hermes_home() -> Path:
     """Where the operator's logs live, ignoring any test sandboxing."""
-    return Path.home() / ".hermes"
+    # The canonical runner deliberately replaces HOME for the child process;
+    # use the captured operator home when it is available. Direct pytest runs
+    # retain the old Path.home() fallback.
+    real_home = os.environ.get("HERMES_TEST_REAL_HOME")
+    return Path(real_home) / ".hermes" if real_home else Path.home() / ".hermes"
 
 
 def _all_file_destinations() -> list[str]:
