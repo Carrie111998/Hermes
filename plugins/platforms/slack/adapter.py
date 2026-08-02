@@ -1314,6 +1314,67 @@ class SlackAdapter(BasePlatformAdapter):
             )
         return lock
 
+    async def _collect_socket_recovery_pages(
+        self,
+        fetch_page: Callable[..., Any],
+        *,
+        item_key: str,
+        request: Dict[str, Any],
+        description: str,
+    ) -> Tuple[List[dict], bool]:
+        """Collect every cursor page, retaining the recovery cursor if incomplete.
+
+        Slack may return a truncated page even when it contains fewer than the
+        requested number of items.  Advancing a timestamp cursor after only
+        that page would permanently skip older unseen events, so callers only
+        commit their timestamp cursor when this method reaches the end.
+        """
+        items: List[dict] = []
+        page_cursor: Optional[str] = None
+        seen_cursors: set[str] = set()
+
+        while True:
+            page_request = dict(request)
+            if page_cursor:
+                page_request["cursor"] = page_cursor
+            response = await fetch_page(**page_request)
+            response_get = getattr(response, "get", None)
+            if not callable(response_get):
+                logger.warning(
+                    "[Slack] Socket Mode recovery left %s incomplete: "
+                    "Slack returned a response without mapping access",
+                    description,
+                )
+                return items, False
+            items.extend(
+                item for item in response_get(item_key, ()) if isinstance(item, dict)
+            )
+
+            metadata = response_get("response_metadata") or {}
+            metadata_get = getattr(metadata, "get", None)
+            next_cursor = str(
+                (metadata_get("next_cursor") if callable(metadata_get) else "") or ""
+            ).strip()
+            if not next_cursor:
+                if response_get("has_more"):
+                    logger.warning(
+                        "[Slack] Socket Mode recovery left %s incomplete: "
+                        "Slack reported more results without a next cursor",
+                        description,
+                    )
+                    return items, False
+                return items, True
+            if next_cursor in seen_cursors:
+                logger.warning(
+                    "[Slack] Socket Mode recovery left %s incomplete: "
+                    "Slack repeated cursor %s",
+                    description,
+                    next_cursor,
+                )
+                return items, False
+            seen_cursors.add(next_cursor)
+            page_cursor = next_cursor
+
     async def _recover_thread_messages_before_dispatch(
         self, event: dict, payload: Optional[dict] = None
     ) -> None:
@@ -1335,11 +1396,17 @@ class SlackAdapter(BasePlatformAdapter):
             key, self._socket_recovery_since
         )
         try:
-            response = await client.conversations_replies(
-                channel=channel_id,
-                ts=thread_ts,
-                limit=self._socket_recovery_history_limit,
-                inclusive=True,
+            messages, complete = await self._collect_socket_recovery_pages(
+                client.conversations_replies,
+                item_key="messages",
+                request={
+                    "channel": channel_id,
+                    "ts": thread_ts,
+                    "oldest": cursor,
+                    "limit": self._socket_recovery_history_limit,
+                    "inclusive": True,
+                },
+                description=f"thread {thread_ts} in {channel_id}",
             )
         except Exception as exc:
             logger.debug(
@@ -1352,11 +1419,7 @@ class SlackAdapter(BasePlatformAdapter):
 
         latest = cursor
         for message in sorted(
-            (
-                item
-                for item in (response or {}).get("messages", ())
-                if isinstance(item, dict)
-            ),
+            messages,
             key=lambda item: self._slack_timestamp_sort_key(item.get("ts", "")),
         ):
             message_ts = str(message.get("ts") or "")
@@ -1373,7 +1436,7 @@ class SlackAdapter(BasePlatformAdapter):
             if self._slack_timestamp_sort_key(message_ts) > self._slack_timestamp_sort_key(latest):
                 latest = message_ts
 
-        if self._slack_timestamp_sort_key(latest) > self._slack_timestamp_sort_key(cursor):
+        if complete and self._slack_timestamp_sort_key(latest) > self._slack_timestamp_sort_key(cursor):
             self._socket_thread_recovery_cursors[key] = latest
             self._trim_oldest_dict_entries(
                 self._socket_thread_recovery_cursors,
@@ -1398,8 +1461,15 @@ class SlackAdapter(BasePlatformAdapter):
             for team_id, client in tuple(self._team_clients.items()):
                 bot_user_id = self._team_bot_user_ids.get(team_id, self._bot_user_id)
                 try:
-                    conversations = await client.conversations_list(
-                        types="im", exclude_archived=True, limit=200
+                    conversations, complete = await self._collect_socket_recovery_pages(
+                        client.conversations_list,
+                        item_key="channels",
+                        request={
+                            "types": "im",
+                            "exclude_archived": True,
+                            "limit": 200,
+                        },
+                        description=f"DM list for workspace {team_id}",
                     )
                 except Exception as exc:
                     logger.warning(
@@ -1409,7 +1479,10 @@ class SlackAdapter(BasePlatformAdapter):
                     )
                     continue
 
-                for conversation in (conversations or {}).get("channels", ()):
+                if not complete:
+                    continue
+
+                for conversation in conversations:
                     channel_id = str((conversation or {}).get("id") or "")
                     if not channel_id:
                         continue
@@ -1418,9 +1491,16 @@ class SlackAdapter(BasePlatformAdapter):
                         key, self._socket_recovery_since
                     )
                     try:
-                        history = await client.conversations_history(
-                            channel=channel_id,
-                            limit=self._socket_recovery_history_limit,
+                        messages, complete = await self._collect_socket_recovery_pages(
+                            client.conversations_history,
+                            item_key="messages",
+                            request={
+                                "channel": channel_id,
+                                "oldest": cursor,
+                                "limit": self._socket_recovery_history_limit,
+                                "inclusive": True,
+                            },
+                            description=f"DM history for {channel_id}",
                         )
                     except Exception as exc:
                         logger.debug(
@@ -1430,13 +1510,10 @@ class SlackAdapter(BasePlatformAdapter):
                         )
                         continue
 
+                    channel_complete = complete
                     latest = cursor
                     messages = sorted(
-                        (
-                            message
-                            for message in (history or {}).get("messages", ())
-                            if isinstance(message, dict)
-                        ),
+                        messages,
                         key=lambda message: self._slack_timestamp_sort_key(message.get("ts", "")),
                     )
                     for message in messages:
@@ -1463,11 +1540,17 @@ class SlackAdapter(BasePlatformAdapter):
                         if not latest_reply or self._slack_timestamp_sort_key(latest_reply) <= self._slack_timestamp_sort_key(cursor):
                             continue
                         try:
-                            replies = await client.conversations_replies(
-                                channel=channel_id,
-                                ts=message_ts,
-                                limit=self._socket_recovery_history_limit,
-                                inclusive=True,
+                            replies, replies_complete = await self._collect_socket_recovery_pages(
+                                client.conversations_replies,
+                                item_key="messages",
+                                request={
+                                    "channel": channel_id,
+                                    "ts": message_ts,
+                                    "oldest": cursor,
+                                    "limit": self._socket_recovery_history_limit,
+                                    "inclusive": True,
+                                },
+                                description=f"thread {message_ts} in {channel_id}",
                             )
                         except Exception as exc:
                             logger.debug(
@@ -1476,13 +1559,12 @@ class SlackAdapter(BasePlatformAdapter):
                                 channel_id,
                                 exc,
                             )
+                            channel_complete = False
                             continue
+                        if not replies_complete:
+                            channel_complete = False
                         for reply in sorted(
-                            (
-                                item
-                                for item in (replies or {}).get("messages", ())
-                                if isinstance(item, dict)
-                            ),
+                            replies,
                             key=lambda item: self._slack_timestamp_sort_key(item.get("ts", "")),
                         ):
                             reply_ts = str(reply.get("ts") or "")
@@ -1511,7 +1593,11 @@ class SlackAdapter(BasePlatformAdapter):
                             if self._slack_timestamp_sort_key(reply_ts) > self._slack_timestamp_sort_key(latest):
                                 latest = reply_ts
 
-                    if self._slack_timestamp_sort_key(latest) > self._slack_timestamp_sort_key(cursor):
+                    if (
+                        channel_complete
+                        and self._slack_timestamp_sort_key(latest)
+                        > self._slack_timestamp_sort_key(cursor)
+                    ):
                         self._socket_recovery_cursors[key] = latest
                         self._trim_oldest_dict_entries(
                             self._socket_recovery_cursors, self._SOCKET_RECOVERY_CURSOR_MAX

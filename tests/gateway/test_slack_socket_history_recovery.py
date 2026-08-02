@@ -42,6 +42,16 @@ from gateway.config import PlatformConfig  # noqa: E402
 from plugins.platforms.slack.adapter import SlackAdapter  # noqa: E402
 
 
+class _SlackResponseLike:
+    """Minimal Slack SDK response stand-in: mapping access without dict inheritance."""
+
+    def __init__(self, data: dict) -> None:
+        self._data = data
+
+    def get(self, key: str, default=None):
+        return self._data.get(key, default)
+
+
 @pytest.fixture
 def adapter() -> SlackAdapter:
     instance = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-test"))
@@ -141,6 +151,56 @@ async def test_thread_history_is_replayed_oldest_first_and_cursor_advances(adapt
 
 
 @pytest.mark.asyncio
+async def test_thread_history_recovery_drains_all_cursor_pages(adapter):
+    client = MagicMock()
+    client.conversations_replies = AsyncMock(
+        side_effect=[
+            {
+                "messages": [{"ts": "4.000", "user": "U4"}],
+                "response_metadata": {"next_cursor": "thread-page-2"},
+            },
+            {
+                "messages": [
+                    {"ts": "3.000", "user": "U3"},
+                    {"ts": "1.000", "user": "U1"},
+                    {"ts": "2.000", "user": "U2"},
+                ]
+            },
+        ]
+    )
+    adapter._team_clients["T1"] = client
+    adapter._socket_recovery_since = "0.000"
+    adapter._handle_slack_message_inner = AsyncMock()
+
+    event = {"channel": "D1", "thread_ts": "1.000", "team": "T1", "ts": "4.000"}
+    await adapter._recover_thread_messages_before_dispatch(event, {"team_id": "T1"})
+
+    assert [
+        call.args[0]["ts"]
+        for call in adapter._handle_slack_message_inner.await_args_list
+    ] == ["1.000", "2.000", "3.000", "4.000"]
+    assert client.conversations_replies.await_count == 2
+    assert client.conversations_replies.await_args_list[1].kwargs["cursor"] == "thread-page-2"
+    assert adapter._socket_thread_recovery_cursors[("T1", "D1", "1.000")] == "4.000"
+
+
+@pytest.mark.asyncio
+async def test_thread_recovery_retains_cursor_when_slack_omits_next_cursor(adapter):
+    client = MagicMock()
+    client.conversations_replies = AsyncMock(
+        return_value={"messages": [{"ts": "2.000", "user": "U2"}], "has_more": True}
+    )
+    adapter._team_clients["T1"] = client
+    adapter._socket_recovery_since = "0.000"
+    adapter._handle_slack_message_inner = AsyncMock()
+
+    event = {"channel": "D1", "thread_ts": "1.000", "team": "T1", "ts": "2.000"}
+    await adapter._recover_thread_messages_before_dispatch(event, {"team_id": "T1"})
+
+    assert ("T1", "D1", "1.000") not in adapter._socket_thread_recovery_cursors
+
+
+@pytest.mark.asyncio
 async def test_dm_history_recovery_preserves_timestamp_order(adapter):
     client = MagicMock()
     client.conversations_list = AsyncMock(return_value={"channels": [{"id": "D1"}]})
@@ -164,6 +224,124 @@ async def test_dm_history_recovery_preserves_timestamp_order(adapter):
     replayed = [call.args[0]["ts"] for call in adapter._handle_slack_message.await_args_list]
     assert replayed == ["1.000", "2.000", "3.000"]
     assert adapter._socket_recovery_cursors[("T1", "D1")] == "3.000"
+
+
+@pytest.mark.asyncio
+async def test_dm_history_recovery_drains_all_cursor_pages(adapter):
+    client = MagicMock()
+    client.conversations_list = AsyncMock(return_value={"channels": [{"id": "D1"}]})
+    client.conversations_history = AsyncMock(
+        side_effect=[
+            {
+                "messages": [{"ts": "4.000", "user": "U4"}],
+                "response_metadata": {"next_cursor": "history-page-2"},
+            },
+            {
+                "messages": [
+                    {"ts": "3.000", "user": "U3"},
+                    {"ts": "1.000", "user": "U1"},
+                    {"ts": "2.000", "user": "U2"},
+                ]
+            },
+        ]
+    )
+    adapter._team_clients["T1"] = client
+    adapter._socket_recovery_since = "0.000"
+    adapter._socket_recovery_interval_s = 0
+    adapter._handle_slack_message = AsyncMock()
+
+    recovered = await adapter._recover_missed_socket_messages()
+
+    assert recovered == 4
+    assert [call.args[0]["ts"] for call in adapter._handle_slack_message.await_args_list] == [
+        "1.000",
+        "2.000",
+        "3.000",
+        "4.000",
+    ]
+    assert client.conversations_history.await_count == 2
+    assert client.conversations_history.await_args_list[1].kwargs["cursor"] == "history-page-2"
+    assert adapter._socket_recovery_cursors[("T1", "D1")] == "4.000"
+
+
+@pytest.mark.asyncio
+async def test_dm_history_recovery_accepts_slack_sdk_response_like(adapter):
+    client = MagicMock()
+    client.conversations_list = AsyncMock(
+        return_value=_SlackResponseLike({"channels": [{"id": "D1"}]})
+    )
+    client.conversations_history = AsyncMock(
+        return_value=_SlackResponseLike({"messages": [{"ts": "1.000", "user": "U1"}]})
+    )
+    adapter._team_clients["T1"] = client
+    adapter._socket_recovery_since = "0.000"
+    adapter._socket_recovery_interval_s = 0
+    adapter._handle_slack_message = AsyncMock()
+
+    assert await adapter._recover_missed_socket_messages() == 1
+    assert adapter._socket_recovery_cursors[("T1", "D1")] == "1.000"
+
+
+@pytest.mark.asyncio
+async def test_dm_thread_recovery_drains_all_cursor_pages_before_advancing(adapter):
+    client = MagicMock()
+    client.conversations_list = AsyncMock(return_value={"channels": [{"id": "D1"}]})
+    client.conversations_history = AsyncMock(
+        return_value={
+            "messages": [
+                {"ts": "1.000", "user": "U1", "latest_reply": "4.000"}
+            ]
+        }
+    )
+    client.conversations_replies = AsyncMock(
+        side_effect=[
+            {
+                "messages": [{"ts": "4.000", "user": "U4"}],
+                "response_metadata": {"next_cursor": "reply-page-2"},
+            },
+            {
+                "messages": [
+                    {"ts": "3.000", "user": "U3"},
+                    {"ts": "1.000", "user": "U1"},
+                    {"ts": "2.000", "user": "U2"},
+                ]
+            },
+        ]
+    )
+    adapter._team_clients["T1"] = client
+    adapter._socket_recovery_since = "0.000"
+    adapter._socket_recovery_interval_s = 0
+    adapter._handle_slack_message = AsyncMock()
+
+    recovered = await adapter._recover_missed_socket_messages()
+
+    assert recovered == 4
+    assert [call.args[0]["ts"] for call in adapter._handle_slack_message.await_args_list] == [
+        "1.000",
+        "2.000",
+        "3.000",
+        "4.000",
+    ]
+    assert client.conversations_replies.await_count == 2
+    assert client.conversations_replies.await_args_list[1].kwargs["cursor"] == "reply-page-2"
+    assert adapter._socket_recovery_cursors[("T1", "D1")] == "4.000"
+
+
+@pytest.mark.asyncio
+async def test_dm_recovery_retains_cursor_when_slack_omits_next_cursor(adapter):
+    client = MagicMock()
+    client.conversations_list = AsyncMock(return_value={"channels": [{"id": "D1"}]})
+    client.conversations_history = AsyncMock(
+        return_value={"messages": [{"ts": "2.000", "user": "U2"}], "has_more": True}
+    )
+    adapter._team_clients["T1"] = client
+    adapter._socket_recovery_since = "0.000"
+    adapter._socket_recovery_interval_s = 0
+    adapter._handle_slack_message = AsyncMock()
+
+    await adapter._recover_missed_socket_messages()
+
+    assert ("T1", "D1") not in adapter._socket_recovery_cursors
 
 
 @pytest.mark.asyncio
