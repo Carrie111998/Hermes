@@ -2205,7 +2205,12 @@ def compress_context(
     )
 
     if speculative_candidate is not None:
-        _epoch_before = getattr(agent, "_speculative_epoch", 0)
+        _claimed_epoch = getattr(agent, "_speculative_epoch_claimed", None)
+        _epoch_before = (
+            _claimed_epoch
+            if _claimed_epoch is not None
+            else getattr(agent, "_speculative_epoch", 0)
+        )
         if not getattr(agent, "speculative_compression_enabled", False):
             agent._speculative_install_status = "rejected"
             existing_prompt = getattr(agent, "_cached_system_prompt", None)
@@ -3032,6 +3037,20 @@ def compress_context(
                 with aux_progress_hook(_progress_hook), aux_interrupt_protection(
                     cancel_event=_hard_cancel_event
                 ):
+                    if (
+                        speculative_candidate is not None
+                        and (
+                            not getattr(agent, "speculative_compression_enabled", False)
+                            or getattr(agent, "_speculative_epoch", 0)
+                            != _epoch_before
+                        )
+                    ):
+                        agent._speculative_install_status = "rejected"
+                        _release_lock()
+                        existing_prompt = getattr(agent, "_cached_system_prompt", None)
+                        if not existing_prompt:
+                            existing_prompt = agent._build_system_prompt(system_message)
+                        return messages, existing_prompt
                     compressed = compress_fn(messages, **compress_kwargs)
                     # Freeze a hard stop that arrived after the final provider
                     # attempt unwound but before this transaction can rotate
@@ -3549,6 +3568,20 @@ def compress_context(
                 if agent._session_db is None or _session_commit_succeeded
                 else "rejected"
             )
+            if agent._speculative_install_status == "installed":
+                logger.info(
+                    "speculative compression session=%s disposition=installed "
+                    "fingerprint=%s tokens=%s",
+                    agent.session_id or "none",
+                    speculative_candidate.source_fingerprint[:12],
+                    getattr(speculative_candidate, "source_tokens", None),
+                )
+            else:
+                logger.info(
+                    "speculative compression session=%s disposition=rejected "
+                    "(durable commit failed)",
+                    agent.session_id or "none",
+                )
 
         # Compaction-boundary bookkeeping, computed once. `old_session_id` is only
         # bound in the rotation branch; in-place leaves it unset. `_boundary_parent`

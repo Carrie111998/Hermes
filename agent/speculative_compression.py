@@ -760,6 +760,8 @@ def schedule_tool_wait_candidate(
         )
     ):
         return "disabled"
+    _epoch_before = getattr(agent, "_speculative_epoch", 0)
+    _enabled_before = bool(getattr(agent, "speculative_compression_enabled", False))
     soft_trigger, _hard_trigger = speculative_thresholds(compressor, settings)
     if int(request_tokens or 0) < soft_trigger:
         return "below_soft_trigger"
@@ -772,6 +774,10 @@ def schedule_tool_wait_candidate(
     if callable(_cooldown_fn):
         try:
             if _cooldown_fn():
+                logger.info(
+                    "speculative compression session=%s disposition=blocked_cooldown",
+                    session_id,
+                )
                 return "blocked_cooldown"
         except Exception:
             pass
@@ -784,6 +790,10 @@ def schedule_tool_wait_candidate(
     if callable(_blocked_fn):
         try:
             if _blocked_fn():
+                logger.info(
+                    "speculative compression session=%s disposition=blocked_ineffective",
+                    session_id,
+                )
                 return "blocked_ineffective"
         except Exception:
             pass
@@ -794,6 +804,13 @@ def schedule_tool_wait_candidate(
             int(request_tokens),
             session_id,
         )
+        if (
+            not getattr(agent, "speculative_compression_enabled", False)
+            or bool(getattr(agent, "speculative_compression_enabled", False))
+            != _enabled_before
+            or getattr(agent, "_speculative_epoch", 0) != _epoch_before
+        ):
+            return "blocked_off"
         _emit_speculative_status(
             agent,
             "queued",
@@ -973,7 +990,7 @@ class SpeculativeCompressionManager:
             if existing is not None and not existing.future.done():
                 existing.rerun_snapshot = snapshot
                 existing.rerun_factory = compressor_factory
-                logger.debug(
+                logger.info(
                     "speculative compression session=%s disposition=coalesced fingerprint=%s",
                     session_id,
                     snapshot.source_fingerprint[:12],
@@ -1014,7 +1031,7 @@ class SpeculativeCompressionManager:
                 max_age_seconds=max_age_seconds,
             )
             self._entries[str(session_id)] = job
-            logger.debug(
+            logger.info(
                 "speculative compression session=%s disposition=started fingerprint=%s source_tokens=%s",
                 session_id,
                 snapshot.source_fingerprint[:12],
@@ -1054,20 +1071,20 @@ class SpeculativeCompressionManager:
             try:
                 job.candidate = future.result()
                 job.error = None
-                logger.debug(
+                logger.info(
                     "speculative compression session=%s disposition=ready fingerprint=%s",
                     session_id,
                     job.candidate.source_fingerprint[:12],
                 )
             except CancelledError:
                 job.error = None
-                logger.debug(
+                logger.info(
                     "speculative compression session=%s disposition=cancelled",
                     session_id,
                 )
             except BaseException as exc:
                 job.error = exc
-                logger.debug(
+                logger.info(
                     "speculative compression session=%s disposition=failed (%s: %s)",
                     session_id,
                     type(exc).__name__,
@@ -1132,7 +1149,7 @@ class SpeculativeCompressionManager:
                 next_future.add_done_callback(
                     lambda done, sid=session_id: self._finish_job(sid, done)
                 )
-                logger.debug(
+                logger.info(
                     "speculative compression session=%s disposition=rerun fingerprint=%s",
                     session_id,
                     rerun_snapshot.source_fingerprint[:12],
@@ -1177,13 +1194,13 @@ class SpeculativeCompressionManager:
                 return None
             if candidate.is_expired(max_age_seconds, now=self._clock()):
                 self._entries.pop(sid, None)
-                logger.debug(
+                logger.info(
                     "speculative compression session=%s disposition=stale", sid
                 )
                 return None
             if not candidate.matches(messages, sid):
                 self._entries.pop(sid, None)
-                logger.debug(
+                logger.info(
                     "speculative compression session=%s disposition=stale", sid
                 )
                 return None
@@ -1199,7 +1216,7 @@ class SpeculativeCompressionManager:
                 return
             job.cancel_event.set()
             job.future.cancel()
-            logger.debug(
+            logger.info(
                 "speculative compression session=%s disposition=cancelled", sid
             )
 
@@ -1236,7 +1253,7 @@ class SpeculativeCompressionManager:
             )
             restored_job.published.set()
             self._entries[sid] = restored_job
-            logger.debug(
+            logger.info(
                 "speculative compression session=%s disposition=restored fingerprint=%s",
                 sid,
                 candidate.source_fingerprint[:12],
