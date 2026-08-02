@@ -446,6 +446,11 @@ export const $currentFastMode = atom(storedBoolean(COMPOSER_FAST_KEY, false))
 // reflection of the truth the gateway reports rather than its own store.
 export const $yoloActive = atom(false)
 export const $currentCwd = atom(getRememberedWorkspaceCwd())
+// Terminal execution backend (local | docker | ssh | ...) mirrored from the
+// gateway (session.info). Drives attachment upload decisions: container
+// backends have their own filesystem, so a dropped host path must be uploaded
+// as bytes and staged into a bind-mounted cache dir (#76577).
+export const $terminalBackend = atom('')
 export const $newChatWorkspaceTarget = atom<NewChatWorkspaceTarget>(undefined)
 export const $newChatWorkspaceTargetGeneration = atom(0)
 export const $currentBranch = atom('')
@@ -566,6 +571,8 @@ export const setCurrentCwd = (next: Updater<string>) => {
   updateAtom($currentCwd, next)
   persistString(workspaceCwdKey(), $currentCwd.get().trim() || null)
 }
+
+export const setTerminalBackend = (next: Updater<string>) => updateAtom($terminalBackend, next)
 
 export const setCurrentCwdTransient = (next: Updater<string>) => updateAtom($currentCwd, next)
 

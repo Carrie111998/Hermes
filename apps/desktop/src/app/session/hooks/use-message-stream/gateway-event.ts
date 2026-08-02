@@ -56,6 +56,7 @@ import {
   setCurrentUsage,
   setMessages,
   setSessions,
+  setTerminalBackend,
   setTurnStartedAt,
   setYoloActive
 } from '@/store/session'
@@ -414,6 +415,10 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
 
           if (typeof payload?.branch === 'string') {
             setCurrentBranch(payload.branch)
+          }
+
+          if (typeof payload?.terminal_backend === 'string') {
+            setTerminalBackend(payload.terminal_backend)
           }
 
           if (typeof payload?.personality === 'string') {
