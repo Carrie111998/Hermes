@@ -610,7 +610,9 @@ prompt_caching:
 #     download_timeout: 30   # Image HTTP download timeout (seconds)
 #                            # Increase for slow connections or self-hosted image servers
 #     reasoning_effort: ""   # Per-task thinking level: none, minimal, low, medium,
-#                            # high, xhigh, max, ultra. Empty = provider default.
+#                            # high, xhigh, max, ultra. Empty = provider default,
+#                            # except curator, which inherits the effective agent
+#                            # reasoning for its selected model before that default.
 #                            # Works on every auxiliary task block (vision,
 #                            # web_extract, compression, title_generation, curator,
 #                            # background_review, moa_reference, ...). Example: run
@@ -636,6 +638,14 @@ prompt_caching:
 #     model: ""
 #     timeout: 30
 #     language: ""           # empty = match the user's language; or e.g. "English"
+#
+#   # Curator LLM consolidation/review fork
+#   curator:
+#     provider: "auto"       # inherit the main chat provider/model
+#     model: ""
+#     timeout: 600            # reviews can take several minutes
+#     reasoning_effort: ""    # inherit agent.reasoning_effort, then provider default
+#                             # set "none" to disable reasoning for this fork
 #
 #   # Session search — summarizes matching past sessions
 #   session_search:

@@ -1096,7 +1096,12 @@ def resolve_per_model_reasoning_effort(model: str, overrides: dict | None) -> di
     return None
 
 
-def resolve_reasoning_config(cfg: dict | None, model: str = "") -> dict | None:
+def resolve_reasoning_config(
+    cfg: dict | None,
+    model: str = "",
+    *,
+    warn_invalid: bool = True,
+) -> dict | None:
     """Resolve the effective reasoning config for *model* from a config dict.
 
     Single chokepoint for reasoning-effort resolution, shared by every
@@ -1118,6 +1123,9 @@ def resolve_reasoning_config(cfg: dict | None, model: str = "") -> dict | None:
         model: The effective model for this surface/session. When empty,
                it is derived from the config's ``model`` section (string
                form, or a dict's ``default``/``model`` keys).
+        warn_invalid: Emit the invalid-global-effort warning. Callers doing a
+                      silent recomputation can disable it after the original
+                      configuration read has already logged the problem.
 
     Returns:
         The parsed reasoning config dict, or None when unset/unrecognized
@@ -1149,7 +1157,7 @@ def resolve_reasoning_config(cfg: dict | None, model: str = "") -> dict | None:
     # who explicitly disabled it.
     effort = agent_cfg.get("reasoning_effort", "")
     result = parse_reasoning_effort(effort)
-    if effort and str(effort).strip() and result is None:
+    if warn_invalid and effort and str(effort).strip() and result is None:
         import logging
         logging.getLogger(__name__).warning(
             "Unknown reasoning_effort '%s', using default (medium)", effort
