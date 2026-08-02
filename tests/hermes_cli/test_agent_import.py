@@ -548,9 +548,7 @@ class TestExistingConfigPreserved:
         """A permission problem is the other half of the same root cause."""
         import os
 
-        if os.name != "posix":
-            pytest.skip("chmod-based permission denial is POSIX-only")
-        if getattr(os, "geteuid", lambda: 1)() == 0:
+        if os.geteuid() == 0:
             pytest.skip("root bypasses file permissions")
         config_path.write_text(EXISTING_CONFIG, encoding="utf-8")
         before = config_path.read_bytes()
@@ -667,7 +665,7 @@ class TestExistingConfigPreserved:
         def boom(*_args, **_kwargs):
             raise OSError("no space left on device")
 
-        monkeypatch.setattr(agent_import, "atomic_yaml_write", boom)
+        monkeypatch.setattr(agent_import, "atomic_write_text", boom)
         with pytest.raises(OSError):
             agent_import.dump_yaml_file(config_path, {"model": "replacement"})
 
