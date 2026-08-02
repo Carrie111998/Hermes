@@ -202,6 +202,13 @@ class TestScanFile:
         assert not any(fi.pattern_id == "invisible_unicode" for fi in findings)
 
 
+    def test_zwj_with_emoji_on_one_side_still_detected_in_skill(self, tmp_path):
+        f = tmp_path / "bad.md"
+        f.write_text("A\u200d\U0001F3C4\n")  # emoji on one side only — not a sequence
+        findings = scan_file(f, "bad.md")
+        assert any(fi.pattern_id == "invisible_unicode" for fi in findings)
+
+
     def test_bare_zwj_still_detected_in_skill(self, tmp_path):
         f = tmp_path / "bad.md"
         f.write_text("normal text\u200d hidden\n")

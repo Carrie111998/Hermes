@@ -221,6 +221,17 @@ class TestInvisibleUnicode:
         assert any(f.startswith("invisible_unicode_U+200D") for f in findings)
 
 
+    def test_zwj_with_emoji_on_one_side_only_still_detected(self):
+        # A ZWJ with an emoji on only ONE side (``A\u200d🏄`` / ``🏄\u200dA``)
+        # is not an emoji ZWJ sequence — both sides must be emoji bases.
+        base = "\U0001F3C4"  # 🏄
+        for text in (f"A\u200d{base}", f"{base}\u200dA"):
+            findings = scan_for_threats(text, scope="all")
+            assert any(
+                f.startswith("invisible_unicode_U+200D") for f in findings
+            ), (text, findings)
+
+
     def test_other_invisible_chars_unaffected_by_emoji_zwj(self):
         # The emoji exception is scoped to U+200D only — a zero-width space
         # next to an emoji is still flagged.
