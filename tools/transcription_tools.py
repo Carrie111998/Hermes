@@ -127,6 +127,103 @@ SUPPORTED_FORMATS = {".mp3", ".mp4", ".mpeg", ".mpga", ".m4a", ".wav", ".webm", 
 LOCAL_NATIVE_AUDIO_FORMATS = {".wav", ".aiff", ".aif"}
 MAX_FILE_SIZE = 25 * 1024 * 1024  # 25 MB
 
+STT_FAILURE_MESSAGE = "Speech transcription failed"
+
+
+class _STTFailure(dict):
+    """Marker subclass for failures created by the privacy boundary."""
+
+
+def _safe_stt_metadata_token(value: Any, fallback: str) -> str:
+    """Return a bounded identifier safe for result metadata and logs."""
+    token = str(value or "").strip()
+    if re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", token):
+        return token
+    return fallback
+
+
+def log_stt_failure(provider: str, stage: str, error_type: str) -> None:
+    """Log only bounded STT failure metadata, never exception content."""
+    logger.warning(
+        "STT provider failure provider=%s stage=%s type=%s",
+        _safe_stt_metadata_token(provider, "unknown"),
+        _safe_stt_metadata_token(stage, "unknown"),
+        _safe_stt_metadata_token(error_type, "STTError"),
+    )
+
+
+def make_stt_failure(
+    *,
+    error_code: str,
+    provider: str,
+    stage: str,
+    error_type: str,
+    no_speech: bool = False,
+) -> Dict[str, Any]:
+    """Build the only failure envelope allowed to cross an STT boundary.
+
+    Dynamic exception messages, provider bodies, command output, transcripts,
+    and paths are deliberately not accepted by this API.
+    """
+    result: Dict[str, Any] = _STTFailure({
+        "success": False,
+        "transcript": "",
+        "error": STT_FAILURE_MESSAGE,
+        "error_code": _safe_stt_metadata_token(error_code, "stt_failed"),
+        "provider": _safe_stt_metadata_token(provider, "unknown"),
+        "stage": _safe_stt_metadata_token(stage, "unknown"),
+        "error_type": _safe_stt_metadata_token(error_type, "STTError"),
+    })
+    if no_speech:
+        result["no_speech"] = True
+    return result
+
+
+def normalize_stt_result(
+    result: Any,
+    *,
+    provider: str,
+    stage: str = "transcribe",
+    error_code: str = "provider_failure",
+    error_type: str = "ProviderError",
+) -> Dict[str, Any]:
+    """Preserve successes and replace every untrusted failure with safe data."""
+    safe_provider = _safe_stt_metadata_token(provider, "unknown")
+    if isinstance(result, dict) and result.get("success") is True:
+        normalized = dict(result)
+        normalized.setdefault("provider", safe_provider)
+        return normalized
+    if isinstance(result, _STTFailure):
+        return result
+    return make_stt_failure(
+        error_code=error_code,
+        provider=safe_provider,
+        stage=stage,
+        error_type=error_type,
+    )
+
+
+def _call_stt_provider(provider: str, callback: Any) -> Dict[str, Any]:
+    """Execute one provider and enforce the result boundary at its exit."""
+    try:
+        result = callback()
+    except Exception as exc:  # noqa: BLE001 - provider boundary
+        error_type = type(exc).__name__
+        log_stt_failure(provider, "dispatch", error_type)
+        return make_stt_failure(
+            error_code="provider_dispatch_failed",
+            provider=provider,
+            stage="dispatch",
+            error_type=error_type,
+        )
+    return normalize_stt_result(
+        result,
+        provider=provider,
+        stage="transcribe",
+        error_code="provider_result_failure",
+        error_type="ProviderError",
+    )
+
 # Known model sets for auto-correction
 OPENAI_MODELS = {"whisper-1", "gpt-4o-mini-transcribe", "gpt-4o-transcribe", "gpt-transcribe"}
 GROQ_MODELS = {"whisper-large-v3", "whisper-large-v3-turbo", "distil-whisper-large-v3-en"}
@@ -243,12 +340,11 @@ def _transcode_audio_for_stt(file_path: str, work_dir: str) -> tuple[Optional[st
         subprocess.run(command, check=True, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120, stdin=subprocess.DEVNULL, creationflags=windows_hide_flags())
         return converted_path, None
     except subprocess.CalledProcessError as exc:
-        details = exc.stderr.strip() or exc.stdout.strip() or str(exc)
-        logger.error("ffmpeg STT transcode failed for %s: %s", file_path, details)
-        return None, f"failed to transcode audio for the STT API: {details}"
+        log_stt_failure("unknown", "transcode", type(exc).__name__)
+        return None, "audio_transcode_failed"
     except Exception as exc:  # noqa: BLE001 - transcode is best-effort
-        logger.error("unexpected STT transcode failure for %s: %s", file_path, exc, exc_info=True)
-        return None, f"failed to transcode audio for the STT API: {exc}"
+        log_stt_failure("unknown", "transcode", type(exc).__name__)
+        return None, "audio_transcode_failed"
 
 
 def _find_whisper_binary() -> Optional[str]:
@@ -331,13 +427,13 @@ def _try_lazy_install_stt() -> bool:
         )
     except Exception as exc:
         logger.warning(
-            "Lazy install of faster-whisper failed: %s. "
+            "Lazy install of faster-whisper failed (type=%s). "
             "This is often a permission issue: the Hermes process user cannot "
             "write to the virtual environment. Try running manually as the "
             "venv owner: `stat -c '%%u' '$(dirname $(dirname $(which python3)))'` "
             "then `su - <owner> -c 'VIRTUAL_ENV=/opt/hermes/.venv "
             "uv pip install faster-whisper==1.2.1'`",
-            exc,
+            _safe_stt_metadata_token(type(exc).__name__, "STTError"),
         )
     return False
 
@@ -870,21 +966,21 @@ def _transcribe_command_stt(
     """
     command_template = str(config.get("command") or "").strip()
     if not command_template:
-        return {
-            "success": False,
-            "transcript": "",
-            "provider": provider_name,
-            "error": f"stt.providers.{provider_name}.command is not configured",
-        }
+        return make_stt_failure(
+            error_code="command_not_configured",
+            provider=provider_name,
+            stage="configuration",
+            error_type="ConfigurationError",
+        )
 
     audio = Path(file_path).expanduser()
     if not audio.exists():
-        return {
-            "success": False,
-            "transcript": "",
-            "provider": provider_name,
-            "error": f"Audio file not found: {file_path}",
-        }
+        return make_stt_failure(
+            error_code="file_not_found",
+            provider=provider_name,
+            stage="validation",
+            error_type="FileNotFoundError",
+        )
 
     timeout = _get_command_stt_timeout(config)
     output_format = _get_command_stt_output_format(config)
@@ -908,8 +1004,8 @@ def _transcribe_command_stt(
             }
             command = _render_command_stt_template(command_template, placeholders)
             logger.info(
-                "Transcribing %s via command STT provider '%s'...",
-                audio.name, provider_name,
+                "Transcribing via command STT provider '%s'...",
+                provider_name,
             )
             try:
                 result = _run_command_stt(
@@ -917,56 +1013,52 @@ def _transcribe_command_stt(
                     timeout,
                     env_passthrough=_command_stt_env_passthrough(config),
                 )
-            except subprocess.TimeoutExpired:
-                return {
-                    "success": False,
-                    "transcript": "",
-                    "provider": provider_name,
-                    "error": (
-                        f"STT command provider '{provider_name}' timed out after "
-                        f"{timeout:g}s"
-                    ),
-                }
+            except subprocess.TimeoutExpired as exc:
+                error_type = type(exc).__name__
+                log_stt_failure(provider_name, "command", error_type)
+                return make_stt_failure(
+                    error_code="command_timeout",
+                    provider=provider_name,
+                    stage="command",
+                    error_type=error_type,
+                )
             except subprocess.CalledProcessError as exc:
-                detail_parts = []
-                if exc.stderr:
-                    detail_parts.append(f"stderr: {exc.stderr.strip()}")
-                if exc.stdout:
-                    detail_parts.append(f"stdout: {exc.stdout.strip()}")
-                detail = "; ".join(detail_parts) or "no command output"
-                return {
-                    "success": False,
-                    "transcript": "",
-                    "provider": provider_name,
-                    "error": (
-                        f"STT command provider '{provider_name}' exited with code "
-                        f"{exc.returncode}: {detail}"
-                    ),
-                }
+                error_type = type(exc).__name__
+                log_stt_failure(provider_name, "command", error_type)
+                return make_stt_failure(
+                    error_code="command_failed",
+                    provider=provider_name,
+                    stage="command",
+                    error_type=error_type,
+                )
 
             try:
                 transcript_text = _read_command_stt_output(
                     output_path, result.stdout or "", output_format,
                 )
             except RuntimeError as exc:
-                return {
-                    "success": False,
-                    "transcript": "",
-                    "provider": provider_name,
-                    "error": str(exc),
-                }
+                error_type = type(exc).__name__
+                log_stt_failure(provider_name, "read_output", error_type)
+                return make_stt_failure(
+                    error_code="command_output_failed",
+                    provider=provider_name,
+                    stage="read_output",
+                    error_type=error_type,
+                )
 
     except OSError as exc:
-        return {
-            "success": False,
-            "transcript": "",
-            "provider": provider_name,
-            "error": f"STT command provider '{provider_name}' failed: {exc}",
-        }
+        error_type = type(exc).__name__
+        log_stt_failure(provider_name, "command", error_type)
+        return make_stt_failure(
+            error_code="command_failed",
+            provider=provider_name,
+            stage="command",
+            error_type=error_type,
+        )
 
     logger.info(
-        "Transcribed %s via command STT provider '%s' (%d chars)",
-        audio.name, provider_name, len(transcript_text),
+        "Transcribed via command STT provider '%s' (%d chars)",
+        provider_name, len(transcript_text),
     )
     return {
         "success": True,
@@ -1115,19 +1207,12 @@ def _get_provider(stt_config: dict) -> str:
 
 
 def _unregistered_stt_provider_error(provider: str) -> Dict[str, Any]:
-    key = str(provider or "").strip()
-    return {
-        "success": False,
-        "transcript": "",
-        "provider": key,
-        "error_type": "provider_not_registered",
-        "error": (
-            f"stt.provider='{key}' is set but no built-in, command, or plugin "
-            "provider registered that name. Run `hermes plugins list` to see "
-            "installed STT plugins, or configure a command provider under "
-            f"`stt.providers.{key}.command`."
-        ),
-    }
+    return make_stt_failure(
+        error_code="provider_not_registered",
+        provider=provider,
+        stage="selection",
+        error_type="ProviderNotRegisteredError",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1206,8 +1291,14 @@ def _dispatch_to_plugin_provider(
             _ensure_plugins_discovered(force=True)
             plugin_provider = get_provider(key)
     except Exception as exc:  # noqa: BLE001 — discovery failure is non-fatal
-        logger.debug("STT plugin dispatch skipped (discovery failed): %s", exc)
-        return None
+        error_type = type(exc).__name__
+        log_stt_failure(key, "discovery", error_type)
+        return make_stt_failure(
+            error_code="plugin_discovery_failed",
+            provider=key,
+            stage="discovery",
+            error_type=error_type,
+        )
     if plugin_provider is None:
         return None
 
@@ -1225,25 +1316,25 @@ def _dispatch_to_plugin_provider(
     try:
         available = plugin_provider.is_available()
     except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "STT plugin provider '%s' is_available() raised: %s — "
-            "treating as unavailable", key, exc, exc_info=True,
+        error_type = type(exc).__name__
+        log_stt_failure(key, "availability", error_type)
+        return make_stt_failure(
+            error_code="plugin_availability_failed",
+            provider=key,
+            stage="availability",
+            error_type=error_type,
         )
-        available = False
     if not available:
         logger.info(
             "STT plugin provider '%s' reports not available; returning "
             "unavailability envelope.", key,
         )
-        return {
-            "success": False,
-            "transcript": "",
-            "error": (
-                f"STT plugin '{key}' is not available — check that its "
-                "required credentials / dependencies are configured."
-            ),
-            "provider": key,
-        }
+        return make_stt_failure(
+            error_code="plugin_unavailable",
+            provider=key,
+            stage="availability",
+            error_type="ProviderUnavailableError",
+        )
 
     logger.info("Transcribing with plugin STT provider '%s'...", key)
     try:
@@ -1253,31 +1344,32 @@ def _dispatch_to_plugin_provider(
             language=language,
         )
     except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "STT provider failure provider=%s stage=transcribe type=%s",
-            key,
-            type(exc).__name__,
+        error_type = type(exc).__name__
+        log_stt_failure(key, "transcribe", error_type)
+        return make_stt_failure(
+            error_code="plugin_transcription_failed",
+            provider=key,
+            stage="transcribe",
+            error_type=error_type,
         )
-        return {
-            "success": False,
-            "transcript": "",
-            "error": f"STT plugin '{key}' failed",
-            "provider": key,
-        }
 
     # Defensive: plugins should return a dict matching the contract. If
     # they don't, surface a clear error envelope rather than leaking a
     # weird object back to the gateway.
     if not isinstance(result, dict):
-        return {
-            "success": False,
-            "transcript": "",
-            "error": f"STT plugin '{key}' returned a non-dict result",
-            "provider": key,
-        }
-    # Stamp provider if the plugin forgot to.
-    result.setdefault("provider", key)
-    return result
+        return make_stt_failure(
+            error_code="plugin_invalid_result",
+            provider=key,
+            stage="transcribe",
+            error_type="InvalidResultError",
+        )
+    return normalize_stt_result(
+        result,
+        provider=key,
+        stage="transcribe",
+        error_code="plugin_result_failure",
+        error_type="ProviderError",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1285,18 +1377,27 @@ def _dispatch_to_plugin_provider(
 # ---------------------------------------------------------------------------
 
 
-def _validate_audio_file_size(audio_path: Path) -> Optional[Dict[str, Any]]:
+def _validate_audio_file_size(
+    audio_path: Path,
+    provider: str = "unknown",
+) -> Optional[Dict[str, Any]]:
     """Return an error when *audio_path* exceeds the remote upload cap."""
     try:
         file_size = audio_path.stat().st_size
-    except OSError as e:
-        return {"success": False, "transcript": "", "error": f"Failed to access file: {e}"}
+    except OSError as exc:
+        return make_stt_failure(
+            error_code="file_access_failed",
+            provider=provider,
+            stage="validation",
+            error_type=type(exc).__name__,
+        )
     if file_size > MAX_FILE_SIZE:
-        return {
-            "success": False,
-            "transcript": "",
-            "error": f"File too large: {file_size / (1024*1024):.1f}MB (max {MAX_FILE_SIZE / (1024*1024):.0f}MB)",
-        }
+        return make_stt_failure(
+            error_code="file_too_large",
+            provider=provider,
+            stage="validation",
+            error_type="FileTooLargeError",
+        )
     return None
 
 
@@ -1309,17 +1410,37 @@ def _validate_audio_source_file(
     audio_path = Path(file_path)
 
     if os.path.islink(audio_path):
-        return {"success": False, "transcript": "", "error": f"Path is a symbolic link: {file_path}"}
+        return make_stt_failure(
+            error_code="symbolic_link_rejected",
+            provider="unknown",
+            stage="validation",
+            error_type="PathSafetyError",
+        )
     if not audio_path.exists():
-        return {"success": False, "transcript": "", "error": f"Audio file not found: {file_path}"}
+        return make_stt_failure(
+            error_code="file_not_found",
+            provider="unknown",
+            stage="validation",
+            error_type="FileNotFoundError",
+        )
     if not audio_path.is_file():
-        return {"success": False, "transcript": "", "error": f"Path is not a file: {file_path}"}
+        return make_stt_failure(
+            error_code="not_a_file",
+            provider="unknown",
+            stage="validation",
+            error_type="FileTypeError",
+        )
     if enforce_size_limit:
         return _validate_audio_file_size(audio_path)
     try:
         audio_path.stat()
-    except OSError as e:
-        return {"success": False, "transcript": "", "error": f"Failed to access file: {e}"}
+    except OSError as exc:
+        return make_stt_failure(
+            error_code="file_access_failed",
+            provider="unknown",
+            stage="validation",
+            error_type=type(exc).__name__,
+        )
     return None
 
 
@@ -1337,11 +1458,12 @@ def _validate_audio_file(
 
     audio_path = Path(file_path)
     if audio_path.suffix.lower() not in SUPPORTED_FORMATS:
-        return {
-            "success": False,
-            "transcript": "",
-            "error": f"Unsupported format: {audio_path.suffix}. Supported: {', '.join(sorted(SUPPORTED_FORMATS))}",
-        }
+        return make_stt_failure(
+            error_code="unsupported_audio_format",
+            provider="unknown",
+            stage="validation",
+            error_type="UnsupportedFormatError",
+        )
     return None
 
 
@@ -1361,11 +1483,12 @@ def _prepare_audio_for_transcription(
         except Exception:
             pass
         if not _safe_find_spec("pilk"):
-            return None, None, {
-                "success": False,
-                "transcript": "",
-                "error": "Unsupported format: .silk. Install the optional 'pilk' dependency to enable WeChat voice transcription.",
-            }
+            return None, None, make_stt_failure(
+                error_code="silk_dependency_unavailable",
+                provider="unknown",
+                stage="preprocess",
+                error_type="DependencyUnavailableError",
+            )
 
     temp_dir = tempfile.mkdtemp(prefix="hermes-silk-")
     converted_path = os.path.join(temp_dir, f"{audio_path.stem}.wav")
@@ -1378,12 +1501,14 @@ def _prepare_audio_for_transcription(
         return converted_path, temp_dir, None
     except Exception as exc:
         shutil.rmtree(temp_dir, ignore_errors=True)
-        logger.error("Failed to convert .silk audio %s: %s", file_path, exc, exc_info=True)
-        return None, None, {
-            "success": False,
-            "transcript": "",
-            "error": f"Failed to convert .silk audio for transcription: {exc}",
-        }
+        error_type = type(exc).__name__
+        log_stt_failure("unknown", "preprocess", error_type)
+        return None, None, make_stt_failure(
+            error_code="audio_preprocess_failed",
+            provider="unknown",
+            stage="preprocess",
+            error_type=error_type,
+        )
 
 # ---------------------------------------------------------------------------
 # Provider: local (faster-whisper)
@@ -1499,9 +1624,8 @@ def _load_local_whisper_model(model_name: str, device: str = "auto", compute_typ
         if not _looks_like_cuda_lib_error(exc):
             raise
         logger.warning(
-            "faster-whisper CUDA load failed (%s) — falling back to CPU (int8). "
-            "Install the NVIDIA CUDA runtime (libcublas/libcudnn) to use GPU.",
-            exc,
+            "faster-whisper CUDA load failed — falling back to CPU (int8). "
+            "Install the NVIDIA CUDA runtime (libcublas/libcudnn) to use GPU."
         )
         return WhisperModel(model_name, device="cpu", compute_type="int8")
 
@@ -1607,8 +1731,7 @@ def _join_confident_segments(segments: Any, local_cfg: Dict[str, Any]) -> str:
     for segment in segments:
         if _is_hallucinated_segment(segment, no_speech_threshold, logprob_threshold):
             logger.debug(
-                "Dropping probable hallucinated segment %r (no_speech_prob=%.3f, avg_logprob=%.3f)",
-                getattr(segment, "text", ""),
+                "Dropping probable hallucinated segment (no_speech_prob=%.3f, avg_logprob=%.3f)",
                 getattr(segment, "no_speech_prob", float("nan")),
                 getattr(segment, "avg_logprob", float("nan")),
             )
@@ -1623,7 +1746,12 @@ def _transcribe_local(file_path: str, model_name: str) -> Dict[str, Any]:
 
     if not _HAS_FASTER_WHISPER:
         if not _try_lazy_install_stt():
-            return {"success": False, "transcript": "", "error": "faster-whisper not installed"}
+            return make_stt_failure(
+                error_code="local_dependency_unavailable",
+                provider="local",
+                stage="dependency",
+                error_type="DependencyUnavailableError",
+            )
 
     try:
         local_cfg = _load_stt_config().get("local") or {}
@@ -1665,9 +1793,8 @@ def _transcribe_local(file_path: str, model_name: str) -> Dict[str, Any]:
             if not _looks_like_cuda_lib_error(exc):
                 raise
             logger.warning(
-                "faster-whisper CUDA runtime failed mid-transcribe (%s) — "
-                "evicting cached model and retrying on CPU (int8).",
-                exc,
+                "faster-whisper CUDA runtime failed mid-transcribe — "
+                "evicting cached model and retrying on CPU (int8)."
             )
             _local_model = None
             _local_model_name = None
@@ -1678,22 +1805,21 @@ def _transcribe_local(file_path: str, model_name: str) -> Dict[str, Any]:
             transcript = _join_confident_segments(segments, local_config)
 
         logger.info(
-            "Transcribed %s via local whisper (%s, lang=%s, %.1fs audio)",
-            Path(file_path).name, model_name, info.language, info.duration,
+            "Transcribed via local whisper (%s, lang=%s, %.1fs audio, %d chars)",
+            model_name, info.language, info.duration, len(transcript),
         )
 
         return {"success": True, "transcript": transcript, "provider": "local"}
 
     except Exception as exc:
-        logger.error(
-            "STT provider failure provider=local stage=transcribe type=%s",
-            type(exc).__name__,
+        error_type = type(exc).__name__
+        log_stt_failure("local", "transcribe", error_type)
+        return make_stt_failure(
+            error_code="local_transcription_failed",
+            provider="local",
+            stage="transcribe",
+            error_type=error_type,
         )
-        return {
-            "success": False,
-            "transcript": "",
-            "error": "Local transcription failed",
-        }
 
 
 def _prepare_local_audio(file_path: str, work_dir: str) -> tuple[Optional[str], Optional[str]]:
@@ -1713,12 +1839,11 @@ def _prepare_local_audio(file_path: str, work_dir: str) -> tuple[Optional[str], 
         subprocess.run(command, check=True, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=300, stdin=subprocess.DEVNULL, creationflags=windows_hide_flags())
         return converted_path, None
     except subprocess.TimeoutExpired:
-        logger.error("ffmpeg conversion timed out for %s", file_path)
-        return None, "Audio conversion for local STT timed out"
+        log_stt_failure("local_command", "preprocess", "TimeoutExpired")
+        return None, "audio_transcode_timeout"
     except subprocess.CalledProcessError as e:
-        details = e.stderr.strip() or e.stdout.strip() or str(e)
-        logger.error("ffmpeg conversion failed for %s: %s", file_path, details)
-        return None, f"Failed to convert audio for local STT: {details}"
+        log_stt_failure("local_command", "preprocess", type(e).__name__)
+        return None, "audio_transcode_failed"
 
 
 def _convert_caf_to_wav(file_path: str) -> Optional[str]:
@@ -1734,7 +1859,7 @@ def _convert_caf_to_wav(file_path: str) -> Optional[str]:
                 creationflags=windows_hide_flags())
             return wav_path
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-            logger.warning("ffmpeg CAF to WAV failed for %s: %s", file_path, e)
+            log_stt_failure("unknown", "preprocess", type(e).__name__)
     afconvert = shutil.which("afconvert")
     if afconvert:
         try:
@@ -1743,7 +1868,7 @@ def _convert_caf_to_wav(file_path: str) -> Optional[str]:
                 timeout=300, stdin=subprocess.DEVNULL)
             return wav_path
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-            logger.warning("afconvert CAF to WAV failed for %s: %s", file_path, e)
+            log_stt_failure("unknown", "preprocess", type(e).__name__)
     return None
 
 
@@ -1751,13 +1876,12 @@ def _transcribe_local_command(file_path: str, model_name: str) -> Dict[str, Any]
     """Run the configured local STT command template and read back a .txt transcript."""
     command_template = _get_local_command_template()
     if not command_template:
-        return {
-            "success": False,
-            "transcript": "",
-            "error": (
-                f"{LOCAL_STT_COMMAND_ENV} not configured and no local whisper binary was found"
-            ),
-        }
+        return make_stt_failure(
+            error_code="local_command_unavailable",
+            provider="local_command",
+            stage="configuration",
+            error_type="ConfigurationError",
+        )
 
     # Language: stt.local.language > stt.language > env var > "en" default.
     language = _resolve_stt_language("local") or DEFAULT_LOCAL_STT_LANGUAGE
@@ -1767,7 +1891,12 @@ def _transcribe_local_command(file_path: str, model_name: str) -> Dict[str, Any]
         with tempfile.TemporaryDirectory(prefix="hermes-local-stt-") as output_dir:
             prepared_input, prep_error = _prepare_local_audio(file_path, output_dir)
             if prep_error:
-                return {"success": False, "transcript": "", "error": prep_error}
+                return make_stt_failure(
+                    error_code=prep_error,
+                    provider="local_command",
+                    stage="preprocess",
+                    error_type="AudioPreprocessError",
+                )
 
             command = command_template.format(
                 input_path=shlex.quote(prepared_input),
@@ -1796,34 +1925,48 @@ def _transcribe_local_command(file_path: str, model_name: str) -> Dict[str, Any]
 
             txt_files = sorted(Path(output_dir).glob("*.txt"))
             if not txt_files:
-                return {
-                    "success": False,
-                    "transcript": "",
-                    "error": "Local STT command completed but did not produce a .txt transcript",
-                }
+                return make_stt_failure(
+                    error_code="local_command_output_missing",
+                    provider="local_command",
+                    stage="read_output",
+                    error_type="OutputMissingError",
+                )
 
             transcript_text = txt_files[0].read_text(encoding="utf-8").strip()
             logger.info(
-                "Transcribed %s via local STT command (%s, %d chars)",
-                Path(file_path).name,
+                "Transcribed via local STT command (%s, %d chars)",
                 normalized_model,
                 len(transcript_text),
             )
             return {"success": True, "transcript": transcript_text, "provider": "local_command"}
 
     except KeyError as e:
-        return {
-            "success": False,
-            "transcript": "",
-            "error": f"Invalid {LOCAL_STT_COMMAND_ENV} template, missing placeholder: {e}",
-        }
+        error_type = type(e).__name__
+        log_stt_failure("local_command", "configuration", error_type)
+        return make_stt_failure(
+            error_code="local_command_template_invalid",
+            provider="local_command",
+            stage="configuration",
+            error_type=error_type,
+        )
     except subprocess.CalledProcessError as e:
-        details = e.stderr.strip() or e.stdout.strip() or str(e)
-        logger.error("Local STT command failed for %s: %s", file_path, details)
-        return {"success": False, "transcript": "", "error": f"Local STT failed: {details}"}
+        error_type = type(e).__name__
+        log_stt_failure("local_command", "command", error_type)
+        return make_stt_failure(
+            error_code="local_command_failed",
+            provider="local_command",
+            stage="command",
+            error_type=error_type,
+        )
     except Exception as e:
-        logger.error("Unexpected error during local command transcription: %s", e, exc_info=True)
-        return {"success": False, "transcript": "", "error": f"Local transcription failed: {e}"}
+        error_type = type(e).__name__
+        log_stt_failure("local_command", "transcribe", error_type)
+        return make_stt_failure(
+            error_code="local_command_failed",
+            provider="local_command",
+            stage="transcribe",
+            error_type=error_type,
+        )
 
 # ---------------------------------------------------------------------------
 # Provider: groq (Whisper API — free tier)
@@ -1840,10 +1983,20 @@ def _transcribe_groq(file_path: str, model_name: str) -> Dict[str, Any]:
     """
     api_key = _resolve_provider_key("GROQ_API_KEY", "groq")
     if not api_key:
-        return {"success": False, "transcript": "", "error": "GROQ_API_KEY not set"}
+        return make_stt_failure(
+            error_code="credentials_unavailable",
+            provider="groq",
+            stage="configuration",
+            error_type="CredentialsUnavailableError",
+        )
 
     if not _HAS_OPENAI:
-        return {"success": False, "transcript": "", "error": "openai package not installed"}
+        return make_stt_failure(
+            error_code="provider_dependency_unavailable",
+            provider="groq",
+            stage="dependency",
+            error_type="DependencyUnavailableError",
+        )
 
     # Auto-correct model if caller passed an OpenAI-only model
     if model_name in OPENAI_MODELS:
@@ -1869,8 +2022,10 @@ def _transcribe_groq(file_path: str, model_name: str) -> Dict[str, Any]:
                 )
 
             transcript_text = str(transcription).strip()
-            logger.info("Transcribed %s via Groq API (%s, lang=%s, %d chars)",
-                         Path(file_path).name, model_name, language or "auto", len(transcript_text))
+            logger.info(
+                "Transcribed via Groq API (%s, lang=%s, %d chars)",
+                model_name, language or "auto", len(transcript_text),
+            )
 
             return {"success": True, "transcript": transcript_text, "provider": "groq"}
         finally:
@@ -1878,17 +2033,51 @@ def _transcribe_groq(file_path: str, model_name: str) -> Dict[str, Any]:
             if callable(close):
                 close()
 
-    except PermissionError:
-        return {"success": False, "transcript": "", "error": f"Permission denied: {file_path}"}
-    except APIConnectionError as e:
-        return {"success": False, "transcript": "", "error": f"Connection error: {e}"}
-    except APITimeoutError as e:
-        return {"success": False, "transcript": "", "error": f"Request timeout: {e}"}
-    except APIError as e:
-        return {"success": False, "transcript": "", "error": f"API error: {e}"}
-    except Exception as e:
-        logger.error("Groq transcription failed: %s", e, exc_info=True)
-        return {"success": False, "transcript": "", "error": f"Transcription failed: {e}"}
+    except PermissionError as exc:
+        error_type = type(exc).__name__
+        log_stt_failure("groq", "read_audio", error_type)
+        return make_stt_failure(
+            error_code="audio_access_denied",
+            provider="groq",
+            stage="read_audio",
+            error_type=error_type,
+        )
+    except APIConnectionError as exc:
+        error_type = type(exc).__name__
+        log_stt_failure("groq", "request", error_type)
+        return make_stt_failure(
+            error_code="provider_connection_failed",
+            provider="groq",
+            stage="request",
+            error_type=error_type,
+        )
+    except APITimeoutError as exc:
+        error_type = type(exc).__name__
+        log_stt_failure("groq", "request", error_type)
+        return make_stt_failure(
+            error_code="provider_timeout",
+            provider="groq",
+            stage="request",
+            error_type=error_type,
+        )
+    except APIError as exc:
+        error_type = type(exc).__name__
+        log_stt_failure("groq", "request", error_type)
+        return make_stt_failure(
+            error_code="provider_api_error",
+            provider="groq",
+            stage="request",
+            error_type=error_type,
+        )
+    except Exception as exc:
+        error_type = type(exc).__name__
+        log_stt_failure("groq", "transcribe", error_type)
+        return make_stt_failure(
+            error_code="provider_transcription_failed",
+            provider="groq",
+            stage="transcribe",
+            error_type=error_type,
+        )
 
 # ---------------------------------------------------------------------------
 # Provider: openai (Whisper API)
@@ -1915,7 +2104,12 @@ def _transcribe_openai(
         try:
             api_key, fallback_base = _resolve_openai_audio_client_config()
         except ValueError as exc:
-            return {"success": False, "transcript": "", "error": str(exc)}
+            return make_stt_failure(
+                error_code="credentials_unavailable",
+                provider=provider_label,
+                stage="configuration",
+                error_type=type(exc).__name__,
+            )
         base_url = base_url or fallback_base
 
     # Language: stt.<provider>.language > stt.language > env > auto-detect.
@@ -1923,7 +2117,12 @@ def _transcribe_openai(
     language = _resolve_stt_language(provider_label)
 
     if not _HAS_OPENAI:
-        return {"success": False, "transcript": "", "error": "openai package not installed"}
+        return make_stt_failure(
+            error_code="provider_dependency_unavailable",
+            provider=provider_label,
+            stage="dependency",
+            error_type="DependencyUnavailableError",
+        )
 
     # Auto-correct model if caller passed a Groq-only model. Only applies
     # to the native OpenAI path — third-party endpoints may legitimately
@@ -1973,17 +2172,23 @@ def _transcribe_openai(
                     # to a compact .m4a and retry once.
                     converted_path, transcode_error = _transcode_audio_for_stt(file_path, work_dir)
                     if transcode_error:
-                        return {"success": False, "transcript": "", "error": transcode_error}
+                        return make_stt_failure(
+                            error_code=transcode_error,
+                            provider=provider_label,
+                            stage="transcode",
+                            error_type="AudioTranscodeError",
+                        )
                     logger.info(
-                        "Retrying %s STT after transcoding %s to m4a (API rejected the original container)",
-                        provider_label, Path(file_path).name,
+                        "Retrying %s STT after transcoding to m4a "
+                        "(API rejected the original container)",
+                        provider_label,
                     )
                     transcription = _create_transcription(converted_path)
 
             transcript_text = _extract_transcript_text(transcription)
             logger.info(
-                "Transcribed %s via %s (%s, %d chars)",
-                Path(file_path).name, provider_label, model_name, len(transcript_text),
+                "Transcribed via %s (%s, %d chars)",
+                provider_label, model_name, len(transcript_text),
             )
 
             return {"success": True, "transcript": transcript_text, "provider": provider_label}
@@ -1992,25 +2197,51 @@ def _transcribe_openai(
             if callable(close):
                 close()
 
-    except PermissionError:
-        return {"success": False, "transcript": "", "error": f"Permission denied: {file_path}"}
-    except APIConnectionError as e:
-        return {"success": False, "transcript": "", "error": f"Connection error: {e}"}
-    except APITimeoutError as e:
-        return {"success": False, "transcript": "", "error": f"Request timeout: {e}"}
-    except APIError as e:
-        return {"success": False, "transcript": "", "error": f"API error: {e}"}
-    except Exception as exc:
-        logger.error(
-            "STT provider failure provider=%s stage=transcribe type=%s",
-            provider_label,
-            type(exc).__name__,
+    except PermissionError as exc:
+        error_type = type(exc).__name__
+        log_stt_failure(provider_label, "read_audio", error_type)
+        return make_stt_failure(
+            error_code="audio_access_denied",
+            provider=provider_label,
+            stage="read_audio",
+            error_type=error_type,
         )
-        return {
-            "success": False,
-            "transcript": "",
-            "error": "Transcription failed",
-        }
+    except APIConnectionError as exc:
+        error_type = type(exc).__name__
+        log_stt_failure(provider_label, "request", error_type)
+        return make_stt_failure(
+            error_code="provider_connection_failed",
+            provider=provider_label,
+            stage="request",
+            error_type=error_type,
+        )
+    except APITimeoutError as exc:
+        error_type = type(exc).__name__
+        log_stt_failure(provider_label, "request", error_type)
+        return make_stt_failure(
+            error_code="provider_timeout",
+            provider=provider_label,
+            stage="request",
+            error_type=error_type,
+        )
+    except APIError as exc:
+        error_type = type(exc).__name__
+        log_stt_failure(provider_label, "request", error_type)
+        return make_stt_failure(
+            error_code="provider_api_error",
+            provider=provider_label,
+            stage="request",
+            error_type=error_type,
+        )
+    except Exception as exc:
+        error_type = type(exc).__name__
+        log_stt_failure(provider_label, "transcribe", error_type)
+        return make_stt_failure(
+            error_code="provider_transcription_failed",
+            provider=provider_label,
+            stage="transcribe",
+            error_type=error_type,
+        )
 
 # ---------------------------------------------------------------------------
 # Provider: mistral (Voxtral Transcribe API)
@@ -2025,7 +2256,12 @@ def _transcribe_mistral(file_path: str, model_name: str) -> Dict[str, Any]:
     """
     api_key = _resolve_provider_key("MISTRAL_API_KEY", "mistral")
     if not api_key:
-        return {"success": False, "transcript": "", "error": "MISTRAL_API_KEY not set"}
+        return make_stt_failure(
+            error_code="credentials_unavailable",
+            provider="mistral",
+            stage="configuration",
+            error_type="CredentialsUnavailableError",
+        )
 
     try:
         try:
@@ -2049,16 +2285,29 @@ def _transcribe_mistral(file_path: str, model_name: str) -> Dict[str, Any]:
 
             transcript_text = _extract_transcript_text(result)
             logger.info(
-                "Transcribed %s via Mistral API (%s, %d chars)",
-                Path(file_path).name, model_name, len(transcript_text),
+                "Transcribed via Mistral API (%s, %d chars)",
+                model_name, len(transcript_text),
             )
             return {"success": True, "transcript": transcript_text, "provider": "mistral"}
 
-    except PermissionError:
-        return {"success": False, "transcript": "", "error": f"Permission denied: {file_path}"}
-    except Exception as e:
-        logger.error("Mistral transcription failed: %s", e, exc_info=True)
-        return {"success": False, "transcript": "", "error": f"Mistral transcription failed: {type(e).__name__}"}
+    except PermissionError as exc:
+        error_type = type(exc).__name__
+        log_stt_failure("mistral", "read_audio", error_type)
+        return make_stt_failure(
+            error_code="audio_access_denied",
+            provider="mistral",
+            stage="read_audio",
+            error_type=error_type,
+        )
+    except Exception as exc:
+        error_type = type(exc).__name__
+        log_stt_failure("mistral", "request", error_type)
+        return make_stt_failure(
+            error_code="provider_sdk_error",
+            provider="mistral",
+            stage="request",
+            error_type=error_type,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -2092,11 +2341,12 @@ def _transcribe_xai(file_path: str, model_name: str) -> Dict[str, Any]:
         creds = resolve_xai_http_credentials()
     api_key = str(creds.get("api_key") or "").strip()
     if not api_key:
-        return {
-            "success": False,
-            "transcript": "",
-            "error": "No xAI credentials found. Configure xAI OAuth in `hermes model` or set XAI_API_KEY",
-        }
+        return make_stt_failure(
+            error_code="credentials_unavailable",
+            provider="xai",
+            stage="configuration",
+            error_type="CredentialsUnavailableError",
+        )
 
     stt_config = _load_stt_config()
     xai_config = stt_config.get("xai") or {}
@@ -2171,51 +2421,62 @@ def _transcribe_xai(file_path: str, model_name: str) -> Dict[str, Any]:
                         _resolve_base_url(refreshed_creds),
                     )
             except Exception as retry_exc:
-                logger.warning(
-                    "xAI STT OAuth refresh-and-retry after HTTP %d failed: %s",
-                    response.status_code,
-                    retry_exc,
+                log_stt_failure(
+                    "xai", "credential_refresh", type(retry_exc).__name__
                 )
 
         if response.status_code != 200:
-            detail = ""
-            try:
-                err_body = response.json()
-                detail = err_body.get("error", {}).get("message", "") or response.text[:300]
-            except Exception:
-                detail = response.text[:300]
-            return {
-                "success": False,
-                "transcript": "",
-                "error": f"xAI STT API error (HTTP {response.status_code}): {detail}",
-            }
+            logger.warning(
+                "STT provider failure provider=xai stage=request "
+                "type=HTTPError status=%s",
+                response.status_code,
+            )
+            return make_stt_failure(
+                error_code="provider_http_error",
+                provider="xai",
+                stage="request",
+                error_type="HTTPError",
+            )
 
         result = response.json()
         transcript_text = result.get("text", "").strip()
 
         if not transcript_text:
-            return {
-                "success": False,
-                "transcript": "",
-                "error": "xAI STT returned empty transcript",
-                "no_speech": True,
-            }
+            return make_stt_failure(
+                error_code="empty_transcript",
+                provider="xai",
+                stage="parse_response",
+                error_type="EmptyTranscriptError",
+                no_speech=True,
+            )
 
         logger.info(
-            "Transcribed %s via xAI Grok STT (lang=%s, %.1fs audio, %d chars)",
-            Path(file_path).name,
-            result.get("language", language),
+            "Transcribed via xAI Grok STT (lang=%s, %.1fs audio, %d chars)",
+            _safe_stt_metadata_token(result.get("language", language), "unknown"),
             result.get("duration", 0),
             len(transcript_text),
         )
 
         return {"success": True, "transcript": transcript_text, "provider": "xai"}
 
-    except PermissionError:
-        return {"success": False, "transcript": "", "error": f"Permission denied: {file_path}"}
-    except Exception as e:
-        logger.error("xAI STT transcription failed: %s", e, exc_info=True)
-        return {"success": False, "transcript": "", "error": f"xAI STT transcription failed: {e}"}
+    except PermissionError as exc:
+        error_type = type(exc).__name__
+        log_stt_failure("xai", "read_audio", error_type)
+        return make_stt_failure(
+            error_code="audio_access_denied",
+            provider="xai",
+            stage="read_audio",
+            error_type=error_type,
+        )
+    except Exception as exc:
+        error_type = type(exc).__name__
+        log_stt_failure("xai", "request", error_type)
+        return make_stt_failure(
+            error_code="provider_request_failed",
+            provider="xai",
+            stage="request",
+            error_type=error_type,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -2227,7 +2488,12 @@ def _transcribe_elevenlabs(file_path: str, model_name: str) -> Dict[str, Any]:
     """Transcribe using ElevenLabs Scribe STT API."""
     api_key = _resolve_provider_key("ELEVENLABS_API_KEY", "elevenlabs")
     if not api_key:
-        return {"success": False, "transcript": "", "error": "ELEVENLABS_API_KEY not set"}
+        return make_stt_failure(
+            error_code="credentials_unavailable",
+            provider="elevenlabs",
+            stage="configuration",
+            error_type="CredentialsUnavailableError",
+        )
 
     stt_config = _load_stt_config()
     elevenlabs_config = stt_config.get("elevenlabs") or {}
@@ -2263,48 +2529,54 @@ def _transcribe_elevenlabs(file_path: str, model_name: str) -> Dict[str, Any]:
             )
 
         if response.status_code != 200:
-            detail = ""
-            try:
-                err_body = response.json()
-                error_value = err_body.get("detail") or err_body.get("error")
-                if isinstance(error_value, dict):
-                    detail = str(error_value.get("message") or error_value)
-                elif error_value:
-                    detail = str(error_value)
-                else:
-                    detail = response.text[:300]
-            except Exception:
-                detail = response.text[:300]
-            return {
-                "success": False,
-                "transcript": "",
-                "error": f"ElevenLabs STT API error (HTTP {response.status_code}): {detail}",
-            }
+            logger.warning(
+                "STT provider failure provider=elevenlabs stage=request "
+                "type=HTTPError status=%s",
+                response.status_code,
+            )
+            return make_stt_failure(
+                error_code="provider_http_error",
+                provider="elevenlabs",
+                stage="request",
+                error_type="HTTPError",
+            )
 
         result = response.json()
         transcript_text = _extract_transcript_text(result)
         if not transcript_text:
-            return {
-                "success": False,
-                "transcript": "",
-                "error": "ElevenLabs STT returned empty transcript",
-                "no_speech": True,
-            }
+            return make_stt_failure(
+                error_code="empty_transcript",
+                provider="elevenlabs",
+                stage="parse_response",
+                error_type="EmptyTranscriptError",
+                no_speech=True,
+            )
 
         logger.info(
-            "Transcribed %s via ElevenLabs Scribe (%s, %d chars)",
-            Path(file_path).name,
-            model_name,
-            len(transcript_text),
+            "Transcribed via ElevenLabs Scribe (%s, %d chars)",
+            model_name, len(transcript_text),
         )
 
         return {"success": True, "transcript": transcript_text, "provider": "elevenlabs"}
 
-    except PermissionError:
-        return {"success": False, "transcript": "", "error": f"Permission denied: {file_path}"}
-    except Exception as e:
-        logger.error("ElevenLabs STT transcription failed: %s", e, exc_info=True)
-        return {"success": False, "transcript": "", "error": f"ElevenLabs STT transcription failed: {e}"}
+    except PermissionError as exc:
+        error_type = type(exc).__name__
+        log_stt_failure("elevenlabs", "read_audio", error_type)
+        return make_stt_failure(
+            error_code="audio_access_denied",
+            provider="elevenlabs",
+            stage="read_audio",
+            error_type=error_type,
+        )
+    except Exception as exc:
+        error_type = type(exc).__name__
+        log_stt_failure("elevenlabs", "request", error_type)
+        return make_stt_failure(
+            error_code="provider_request_failed",
+            provider="elevenlabs",
+            stage="request",
+            error_type=error_type,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -2323,7 +2595,12 @@ def _transcribe_deepinfra(file_path: str, model_name: str) -> Dict[str, Any]:
     """
     api_key = _resolve_provider_key("DEEPINFRA_API_KEY", "deepinfra")
     if not api_key:
-        return {"success": False, "transcript": "", "error": "DEEPINFRA_API_KEY not set"}
+        return make_stt_failure(
+            error_code="credentials_unavailable",
+            provider="deepinfra",
+            stage="configuration",
+            error_type="CredentialsUnavailableError",
+        )
 
     from hermes_cli.models import deepinfra_base_url, deepinfra_model_ids
 
@@ -2339,16 +2616,12 @@ def _transcribe_deepinfra(file_path: str, model_name: str) -> Dict[str, Any]:
     if not model_name:
         candidates = deepinfra_model_ids("stt")
         if not candidates:
-            return {
-                "success": False,
-                "transcript": "",
-                "error": (
-                    "No DeepInfra STT model available. Pin one in "
-                    "config.yaml under stt.deepinfra.model, or check "
-                    "connectivity to api.deepinfra.com so the live catalog "
-                    "can be fetched."
-                ),
-            }
+            return make_stt_failure(
+                error_code="provider_model_unavailable",
+                provider="deepinfra",
+                stage="configuration",
+                error_type="ModelUnavailableError",
+            )
         model_name = candidates[0]
 
     return _transcribe_openai(
@@ -2521,30 +2794,29 @@ def _transcribe_prepared_audio(file_path: str, model: Optional[str] = None) -> D
         return _unregistered_stt_provider_error(provider_key)
 
     # No provider available
-    return {
-        "success": False,
-        "transcript": "",
-        "error": (
-            "No STT provider available. Install faster-whisper for free local "
-            f"transcription, configure {LOCAL_STT_COMMAND_ENV} or install a local whisper CLI, "
-            "set GROQ_API_KEY for free Groq Whisper, set MISTRAL_API_KEY for Mistral "
-            "Voxtral Transcribe, configure xAI OAuth or set XAI_API_KEY for xAI Grok STT, "
-            "set ELEVENLABS_API_KEY for ElevenLabs Scribe, or set VOICE_TOOLS_OPENAI_KEY "
-            "or OPENAI_API_KEY for the OpenAI Whisper API."
-        ),
-    }
+    return make_stt_failure(
+        error_code="provider_unavailable",
+        provider="none",
+        stage="selection",
+        error_type="ProviderUnavailableError",
+    )
 
 
 def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, Any]:
-    """Safely validate, preprocess supported inputs, and dispatch transcription."""
+    """Validate, preprocess, dispatch, and privacy-normalize transcription."""
     # Refuse to feed a credential / secret store (auth.json, .env, OAuth
-    # tokens, mcp-tokens/, ...) to an STT provider — before ANY validation or
-    # preprocessing, so the refusal names the real reason rather than a
-    # format error. Mirrors the image-gen / video-gen read guards.
+    # tokens, mcp-tokens/, ...) to an STT provider — before ANY preprocessing.
+    # The raw guard message can contain a sensitive path, so expose only the
+    # stable validation code across the public STT boundary.
     from agent.file_safety import get_read_block_error
     blocked = get_read_block_error(file_path)
     if blocked:
-        return {"success": False, "transcript": "", "error": blocked}
+        return make_stt_failure(
+            error_code="path_read_blocked",
+            provider="unknown",
+            stage="validation",
+            error_type="PathSafetyError",
+        )
 
     # Cap .silk sources before the decoder runs (decoder safety). For all
     # other inputs the remote-upload size cap is provider-scoped and enforced
@@ -2552,23 +2824,65 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
     is_silk = Path(file_path).suffix.lower() == ".silk"
     source_error = _validate_audio_source_file(file_path, enforce_size_limit=is_silk)
     if source_error:
-        return source_error
+        return normalize_stt_result(
+            source_error,
+            provider="unknown",
+            stage="validation",
+            error_code="source_validation_failed",
+            error_type="ValidationError",
+        )
 
     prepared_path, cleanup_dir, prep_error = _prepare_audio_for_transcription(file_path)
     if prep_error:
-        return prep_error
+        return normalize_stt_result(
+            prep_error,
+            provider="unknown",
+            stage="preprocess",
+            error_code="audio_preprocess_failed",
+            error_type="PreprocessError",
+        )
     if prepared_path is None:
-        return {
-            "success": False,
-            "transcript": "",
-            "error": "Audio preprocessing did not produce a file for transcription.",
-        }
+        return make_stt_failure(
+            error_code="audio_preprocess_failed",
+            provider="unknown",
+            stage="preprocess",
+            error_type="PreprocessError",
+        )
 
+    # Resolve only bounded provider metadata for the final defensive envelope.
+    # The actual provider dispatch remains owned by _transcribe_prepared_audio.
+    provider = _safe_stt_metadata_token(
+        _get_provider(_load_stt_config()),
+        "unknown",
+    )
     try:
         prepared_error = _validate_audio_file(prepared_path, enforce_size_limit=False)
         if prepared_error:
-            return prepared_error
-        return _transcribe_prepared_audio(prepared_path, model)
+            return normalize_stt_result(
+                prepared_error,
+                provider=provider,
+                stage="validation",
+                error_code="prepared_validation_failed",
+                error_type="ValidationError",
+            )
+        try:
+            result = _transcribe_prepared_audio(prepared_path, model)
+        except Exception as exc:  # noqa: BLE001 - final provider boundary
+            error_type = type(exc).__name__
+            log_stt_failure(provider, "dispatch", error_type)
+            return make_stt_failure(
+                error_code="provider_dispatch_failed",
+                provider=provider,
+                stage="dispatch",
+                error_type=error_type,
+            )
+        return normalize_stt_result(
+            result,
+            provider=provider,
+            stage="transcribe",
+            error_code="provider_result_failure",
+            error_type="ProviderError",
+        )
     finally:
         if cleanup_dir:
             shutil.rmtree(cleanup_dir, ignore_errors=True)
@@ -2618,21 +2932,27 @@ def transcribe_audio_local_fallback(
     local_model = model or local_cfg.get("model", DEFAULT_LOCAL_MODEL)
 
     if _HAS_FASTER_WHISPER:
-        return _transcribe_local(
-            file_path,
-            _normalize_local_model(local_model),
+        return _call_stt_provider(
+            "local",
+            lambda: _transcribe_local(
+                file_path,
+                _normalize_local_model(local_model),
+            ),
         )
     if _has_local_command():
-        return _transcribe_local_command(
-            file_path,
-            _normalize_local_command_model(local_model),
+        return _call_stt_provider(
+            "local_command",
+            lambda: _transcribe_local_command(
+                file_path,
+                _normalize_local_command_model(local_model),
+            ),
         )
-    return {
-        "success": False,
-        "transcript": "",
-        "error": "No installed local STT backend is available.",
-        "provider": "local",
-    }
+    return make_stt_failure(
+        error_code="local_backend_unavailable",
+        provider="local",
+        stage="selection",
+        error_type="BackendUnavailableError",
+    )
 
 
 def _resolve_openai_audio_client_config() -> tuple[str, str]:
