@@ -328,7 +328,7 @@ export const zh: Translations = {
     resetFailed: '重置失败',
     desktopLoginItem: {
       title: '登录时启动 Hermes Desktop',
-      description: '登录 Windows 时打开 Hermes Desktop 应用。这与后台网关自动启动功能分开。'
+      description: '登录电脑时打开 Hermes Desktop 应用。这与后台网关自动启动功能分开。'
     },
     nav: {
       providers: '提供方',

@@ -438,20 +438,33 @@ function AttachmentSizeSetting() {
 export function LoginItemSetting() {
   const { t } = useI18n()
   const [openAtLogin, setOpenAtLogin] = useState(false)
+  const [supported, setSupported] = useState(true)
   const [busy, setBusy] = useState(false)
 
   useEffect(() => {
+    const api = window.hermesDesktop?.loginItem
+
+    if (!api?.get) {
+      setSupported(false)
+
+      return
+    }
+
     let cancelled = false
 
-    void window.hermesDesktop?.loginItem
-      ?.get()
+    void api
+      .get()
       .then(settings => {
         if (!cancelled) {
+          setSupported(settings?.supported ?? true)
           setOpenAtLogin(settings?.openAtLogin ?? false)
         }
       })
       .catch(() => {
         // The login-item API is unavailable outside a supported desktop build.
+        if (!cancelled) {
+          setSupported(false)
+        }
       })
 
     return () => {
@@ -460,14 +473,32 @@ export function LoginItemSetting() {
   }, [])
 
   const handleChange = async (checked: boolean) => {
+    if (!window.hermesDesktop?.loginItem) {
+      setSupported(false)
+
+      return
+    }
+
+    const previous = openAtLogin
     setBusy(true)
 
     try {
-      await window.hermesDesktop?.loginItem?.set({ openAtLogin: checked })
-      setOpenAtLogin(checked)
+      const state = await window.hermesDesktop.loginItem.set({ openAtLogin: checked })
+
+      // `set` returns Electron's authoritative state: only reflect what
+      // actually landed, and never claim success for a rejected write.
+      setSupported(state?.supported ?? true)
+      setOpenAtLogin(state?.openAtLogin ?? previous)
+    } catch {
+      // A failed or unsupported write must not flip the toggle.
+      setOpenAtLogin(previous)
     } finally {
       setBusy(false)
     }
+  }
+
+  if (!supported) {
+    return null
   }
 
   return (
