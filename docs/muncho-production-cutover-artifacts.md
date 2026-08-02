@@ -473,6 +473,21 @@ packaged rail manifest; a blanket inert migration is non-executable. The
 cutover authority refuses to stop production unless the reviewed continuity
 plan is explicitly executable.
 
+If the four installed rail units still point at already-retired immutable
+release roots, use only the public `owner-run` successor path in
+`scripts.canary.upstream_sync_rail_successor_rebind`. It accepts the exact
+target and predecessor revisions plus the reviewed package, Stage-C host
+manifest, Stage-C release publication, and rebind-runtime SHA-256 identities.
+It accepts no paths, commands, JSON document, prose, secret, or alternate
+target. The release-pinned owner runtime carries one framed request over the
+fixed production IAP identity. Root first verifies the fixed Stage-C public
+files, package, release sources, runtime byte identity, predecessor unit bytes,
+systemd state, and missing retired roots in memory. Only then may it create the
+fixed root-owned authority and preflight files; the existing rebind/verify
+journal remains the sole runtime mutation path. Exact replay resumes a partial
+stage or transaction, while foreign bytes, ownership, mode, symlink, or
+hard-link drift fail closed.
+
 ## Live prerequisites
 
 Packaging closes the missing executable boundary but does not fabricate live

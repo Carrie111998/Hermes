@@ -1,0 +1,116 @@
+#!/bin/sh
+set -eu
+
+fixed_wrapper=/usr/libexec/muncho-release-foundation-exec-v4
+runtime_base=/usr/lib/muncho-successor-rebind-runtime
+library_base=/usr/lib/muncho-release-updater-releases
+
+if [ "$#" -ne 9 ]; then
+  exit 2
+fi
+
+revision=$1
+operation=$2
+expected_wrapper_sha256=$3
+expected_manifest_sha256=$4
+expected_tree_sha256=$5
+expected_interpreter_sha256=$6
+expected_attestation_sha256=$7
+expected_preexec_sha256=$8
+launch_authority_sha256=$9
+
+if [ "${#revision}" -ne 40 ]; then
+  exit 2
+fi
+for digest in \
+  "$expected_wrapper_sha256" \
+  "$expected_manifest_sha256" \
+  "$expected_tree_sha256" \
+  "$expected_interpreter_sha256" \
+  "$expected_attestation_sha256" \
+  "$expected_preexec_sha256" \
+  "$launch_authority_sha256"
+do
+  if [ "${#digest}" -ne 64 ]; then
+    exit 2
+  fi
+done
+case "$revision$expected_wrapper_sha256$expected_manifest_sha256$expected_tree_sha256$expected_interpreter_sha256$expected_attestation_sha256$expected_preexec_sha256$launch_authority_sha256" in
+  *[!0-9a-f]*) exit 2 ;;
+esac
+if [ "$operation" != successor-rebind-owner-apply ]; then
+  exit 2
+fi
+
+# The transport may select only this exact installed wrapper revision/digest.
+# Symlinked, replaced, writable, non-root, or multiply-linked launchers fail
+# before the sealed runtime reads the framed owner request from stdin.
+if [ "$0" != "$fixed_wrapper" ] || [ -L "$fixed_wrapper" ]; then
+  exit 2
+fi
+if [ "$(/usr/bin/stat --format='%u:%g:%a:%h' -- "$fixed_wrapper")" != "0:0:555:1" ]; then
+  exit 2
+fi
+observed_wrapper_sha256=$(
+  /usr/bin/sha256sum -- "$fixed_wrapper" | /usr/bin/cut -d ' ' -f 1
+)
+if [ "$observed_wrapper_sha256" != "$expected_wrapper_sha256" ]; then
+  exit 2
+fi
+
+runtime_root="$runtime_base/$revision"
+python="$runtime_root/venv/bin/python"
+manifest="$runtime_root/production-owner-runtime-manifest.json"
+library="$library_base/$revision"
+scripts_root="$library/scripts"
+canary_root="$scripts_root/canary"
+verifier="$canary_root/production_successor_rebind_owner_runtime_preexec.py"
+if [ -L "$runtime_base" ] || [ -L "$runtime_root" ] || [ -L "$python" ] || [ -L "$manifest" ]; then
+  exit 2
+fi
+if [ "$(/usr/bin/stat --format='%u:%g:%a' -- "$runtime_base")" != "0:0:755" ]; then
+  exit 2
+fi
+if [ "$(/usr/bin/stat --format='%u:%g:%a' -- "$runtime_root")" != "0:0:555" ]; then
+  exit 2
+fi
+if [ "$(/usr/bin/stat --format='%u:%g:%a:%h' -- "$python")" != "0:0:555:1" ]; then
+  exit 2
+fi
+if [ "$(/usr/bin/stat --format='%u:%g:%a:%h' -- "$manifest")" != "0:0:444:1" ]; then
+  exit 2
+fi
+if [ -L "$library_base" ] || [ -L "$library" ] || [ -L "$scripts_root" ] || [ -L "$canary_root" ] || [ -L "$verifier" ]; then
+  exit 2
+fi
+if [ "$(/usr/bin/stat --format='%u:%g:%a' -- "$library_base")" != "0:0:755" ]; then
+  exit 2
+fi
+if [ "$(/usr/bin/stat --format='%u:%g:%a' -- "$library")" != "0:0:555" ]; then
+  exit 2
+fi
+if [ "$(/usr/bin/stat --format='%u:%g:%a' -- "$scripts_root")" != "0:0:555" ]; then
+  exit 2
+fi
+if [ "$(/usr/bin/stat --format='%u:%g:%a' -- "$canary_root")" != "0:0:555" ]; then
+  exit 2
+fi
+if [ "$(/usr/bin/stat --format='%u:%g:%a:%h' -- "$verifier")" != "0:0:444:1" ]; then
+  exit 2
+fi
+observed_preexec_sha256=$(
+  /usr/bin/sha256sum -- "$verifier" | /usr/bin/cut -d ' ' -f 1
+)
+if [ "$observed_preexec_sha256" != "$expected_preexec_sha256" ]; then
+  exit 2
+fi
+
+exec /usr/bin/python3 -I -S -B -c \
+  'import runpy,sys; path=sys.argv[1]; sys.argv=sys.argv[2:]; runpy.run_path(path,run_name="__main__")' \
+  "$verifier" muncho-successor-rebind-owner-runtime-preexec \
+  "$revision" \
+  "$expected_manifest_sha256" \
+  "$expected_tree_sha256" \
+  "$expected_interpreter_sha256" \
+  "$expected_attestation_sha256" \
+  "$launch_authority_sha256"

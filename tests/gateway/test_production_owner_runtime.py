@@ -227,3 +227,9 @@ def test_required_module_set_imports_crypto_and_every_mutating_launcher() -> Non
     )
     assert "gateway.production_cron_cutover_runtime" in runtime.REQUIRED_MODULES
     assert "gateway.operational_edge_readiness" in runtime.REQUIRED_MODULES
+    assert "scripts.canary.production_release_update_stage0" in (
+        runtime.REQUIRED_MODULES
+    )
+    assert "scripts.canary.upstream_sync_rail_successor_rebind" in (
+        runtime.REQUIRED_MODULES
+    )

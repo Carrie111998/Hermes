@@ -4141,8 +4141,34 @@ def main(argv: Sequence[str] | None = None) -> int:
     resume.add_argument("--revision", required=True)
     resume.add_argument("--workspace", type=Path, required=True)
     resume.add_argument("--output", type=Path, required=True)
+    successor_rebind = subparsers.add_parser(
+        "upstream-sync-successor-owner-apply"
+    )
+    successor_rebind.add_argument("--revision", required=True)
+    successor_rebind.add_argument(
+        "--launch-authority-sha256",
+        required=True,
+    )
     arguments = parser.parse_args(argv)
     try:
+        if arguments.command == "upstream-sync-successor-owner-apply":
+            if (
+                _SHA256.fullmatch(arguments.launch_authority_sha256 or "")
+                is None
+            ):
+                parser.error("--launch-authority-sha256 must be 64 lowercase hex")
+            _active_owner_runtime_attestation(arguments.revision)
+            from scripts.canary import (
+                upstream_sync_rail_successor_rebind as successor_rebind_runtime,
+            )
+
+            result = successor_rebind_runtime.owner_apply_framed_stdin(
+                expected_launch_authority_sha256=(
+                    arguments.launch_authority_sha256
+                )
+            )
+            print(_canonical(result).decode("ascii"))
+            return 0
         if not arguments.output.is_absolute():
             raise OwnerCutoverError("owner_cutover_output_path_invalid")
         runtime_attestation = _active_owner_runtime_attestation(

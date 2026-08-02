@@ -28,6 +28,7 @@ from scripts.canary import production_cutover_public_stager as stager
 from scripts.canary import production_cutover_activation_lock as authority_lock
 from scripts.canary import production_cutover_unit_input_rotation as rotation
 from scripts.canary import production_storage_growth_installer as storage_installer
+from scripts.canary import upstream_sync_rail_successor_rebind as successor_rebind
 from tests.gateway.test_canonical_writer_production_cutover import (
     MemoryJournal,
     NOW,
@@ -4280,3 +4281,85 @@ def test_stopped_release_transport_rejects_excessive_output_limit_before_runner(
         )
 
     assert runner_calls == []
+
+
+def test_successor_rebind_owner_action_is_closed_and_runtime_gated(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    launch_authority_sha256 = "5" * 64
+    calls: list[tuple[str, str]] = []
+    result = {"schema": "fixed-successor-result", "ok": True}
+    monkeypatch.setattr(
+        owner,
+        "_active_owner_runtime_attestation",
+        lambda revision: calls.append(("runtime", revision)) or {"ok": True},
+    )
+    monkeypatch.setattr(
+        successor_rebind,
+        "owner_apply_framed_stdin",
+        lambda *, expected_launch_authority_sha256: (
+            calls.append(("dispatch", expected_launch_authority_sha256))
+            or result
+        ),
+    )
+
+    assert owner.main(
+        (
+            "upstream-sync-successor-owner-apply",
+            "--revision",
+            REVISION,
+            "--launch-authority-sha256",
+            launch_authority_sha256,
+        )
+    ) == 0
+
+    assert calls == [
+        ("runtime", REVISION),
+        ("dispatch", launch_authority_sha256),
+    ]
+    assert json.loads(capsys.readouterr().out) == result
+
+
+@pytest.mark.parametrize(
+    "extra",
+    (
+        (),
+        ("--launch-authority-sha256", "not-a-sha256"),
+        ("--launch-authority-sha256", "A" * 64),
+    ),
+    ids=("missing", "malformed", "uppercase"),
+)
+def test_successor_rebind_owner_action_requires_exact_launch_authority(
+    monkeypatch: pytest.MonkeyPatch,
+    extra: tuple[str, ...],
+) -> None:
+    monkeypatch.setattr(
+        owner,
+        "_active_owner_runtime_attestation",
+        lambda _revision: pytest.fail("runtime gate must not run"),
+    )
+    with pytest.raises(SystemExit):
+        owner.main(
+            (
+                "upstream-sync-successor-owner-apply",
+                "--revision",
+                REVISION,
+                *extra,
+            )
+        )
+
+
+def test_successor_rebind_owner_action_rejects_any_extra_argument() -> None:
+    with pytest.raises(SystemExit):
+        owner.main(
+            (
+                "upstream-sync-successor-owner-apply",
+                "--revision",
+                REVISION,
+                "--launch-authority-sha256",
+                "5" * 64,
+                "--path",
+                "/tmp/forbidden",
+            )
+        )
