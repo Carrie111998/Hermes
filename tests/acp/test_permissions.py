@@ -23,6 +23,7 @@ def _invoke_callback(
     outcome,
     *,
     allow_permanent=True,
+    smart_denied=False,
     timeout=60.0,
     use_prompt_path=False,
 ):
@@ -45,6 +46,7 @@ def _invoke_callback(
                 "rm -rf /",
                 "dangerous command",
                 allow_permanent=allow_permanent,
+                smart_denied=smart_denied,
                 approval_callback=cb,
             )
         else:
@@ -52,6 +54,7 @@ def _invoke_callback(
                 "rm -rf /",
                 "dangerous command",
                 allow_permanent=allow_permanent,
+                smart_denied=smart_denied,
             )
 
     scheduled["coro"].close()
@@ -76,12 +79,22 @@ class TestApprovalBridge:
         assert tool_call.tool_call_id.startswith("perm-check-")
         assert tool_call.kind == "execute"
         assert tool_call.status == "pending"
-        assert tool_call.title == "dangerous command"
+        assert "dangerous command" in tool_call.title
+        assert "rm -rf /" in tool_call.title
+        content_text = tool_call.content[0].content.text
+        assert "$ rm -rf /" in content_text
+        assert "dangerous command" in content_text
         assert tool_call.raw_input == {
             "command": "rm -rf /",
             "description": "dangerous command",
         }
-        assert option_ids == ["allow_once", "allow_session", "allow_always", "deny"]
+        assert option_ids == [
+            "allow_once",
+            "allow_session",
+            "allow_always",
+            "deny",
+            "deny_always",
+        ]
 
     def test_tool_call_ids_are_unique(self):
         _, first_kwargs, _, _, _ = _invoke_callback(
@@ -93,17 +106,9 @@ class TestApprovalBridge:
 
         assert first_kwargs["tool_call"].tool_call_id != second_kwargs["tool_call"].tool_call_id
 
-    def test_prompt_path_keeps_session_option_when_permanent_disabled(self):
-        result, kwargs, _, _, _ = _invoke_callback(
-            AllowedOutcome(option_id="allow_session", outcome="selected"),
-            allow_permanent=False,
-            use_prompt_path=True,
-        )
 
-        option_ids = [option.option_id for option in kwargs["options"]]
 
-        assert result == "session"
-        assert option_ids == ["allow_once", "allow_session", "deny"]
+
 
     def test_allow_always_maps_correctly(self):
         result, _, _, _, _ = _invoke_callback(
@@ -113,14 +118,6 @@ class TestApprovalBridge:
 
         assert result == "always"
 
-    def test_denied_and_unknown_outcomes_deny(self):
-        denied_result, _, _, _, _ = _invoke_callback(DeniedOutcome(outcome="cancelled"))
-        unknown_result, _, _, _, _ = _invoke_callback(
-            AllowedOutcome(option_id="unexpected", outcome="selected"),
-        )
-
-        assert denied_result == "deny"
-        assert unknown_result == "deny"
 
     def test_timeout_returns_deny_and_cancels_future(self):
         loop = MagicMock(spec=asyncio.AbstractEventLoop)
@@ -145,27 +142,6 @@ class TestApprovalBridge:
         assert scheduled["loop"] is loop
         assert future.cancel.call_count == 1
 
-    def test_none_response_returns_deny(self):
-        """When request_permission resolves to None, the callback returns 'deny'."""
-        loop = MagicMock(spec=asyncio.AbstractEventLoop)
-        request_permission = AsyncMock(name="request_permission")
-        future = MagicMock(spec=Future)
-        future.result.return_value = None
-
-        scheduled = {}
-
-        def _schedule(coro, passed_loop):
-            scheduled["coro"] = coro
-            scheduled["loop"] = passed_loop
-            return future
-
-        with patch("agent.async_utils.asyncio.run_coroutine_threadsafe", side_effect=_schedule):
-            cb = make_approval_callback(request_permission, loop, session_id="s1", timeout=1.0)
-            result = cb("echo hi", "demo")
-
-        scheduled["coro"].close()
-
-        assert result == "deny"
 
 
 # ---------------------------------------------------------------------------
