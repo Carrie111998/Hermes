@@ -843,7 +843,10 @@ def test_write_json_serializes_concurrent_writes(monkeypatch):
     monkeypatch.setattr(server, "_real_stdout", out)
 
     threads = [
-        threading.Thread(target=server.write_json, args=({"seq": i, "text": "x" * 24},))
+        threading.Thread(
+            target=server.write_json,
+            args=({"serialization_probe": i, "text": "x" * 24},),
+        )
         for i in range(8)
     ]
 
@@ -853,10 +856,14 @@ def test_write_json_serializes_concurrent_writes(monkeypatch):
     for t in threads:
         t.join()
 
-    lines = "".join(out.parts).splitlines()
+    records = [json.loads(line) for line in "".join(out.parts).splitlines()]
+    probes = [record for record in records if "serialization_probe" in record]
 
-    assert len(lines) == 8
-    assert {json.loads(line)["seq"] for line in lines} == set(range(8))
+    # Other tests may leave legitimate background gateway writers alive. Every
+    # line must still parse independently, and all eight probe frames must be
+    # present exactly once without byte-level interleaving.
+    assert len(probes) == 8
+    assert {record["serialization_probe"] for record in probes} == set(range(8))
 
 
 def test_write_json_returns_false_on_broken_pipe(monkeypatch):
