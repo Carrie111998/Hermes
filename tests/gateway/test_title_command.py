@@ -32,10 +32,16 @@ def _make_runner(session_db=None):
     runner = object.__new__(GatewayRunner)
     runner.adapters = {}
     runner._voice_mode = {}
+    runner._schedule_telegram_topic_title_rename = MagicMock()
+    runner._schedule_adapter_session_title_propagation = MagicMock()
+    runner._schedule_adapter_semantic_base_refresh = MagicMock()
     # Gateway holds the async facade; the slash handlers await it.
     if session_db is not None:
-        from hermes_state import AsyncSessionDB
-        session_db = AsyncSessionDB(session_db)
+        session_db = SimpleNamespace(
+            get_session_title=AsyncMock(side_effect=session_db.get_session_title),
+            create_session=AsyncMock(side_effect=session_db.create_session),
+            set_session_title=AsyncMock(side_effect=session_db.set_session_title),
+        )
     runner._session_db = session_db
 
     # Mock session_store that returns a session entry with a known session_id
@@ -45,6 +51,10 @@ def _make_runner(session_db=None):
     mock_store = MagicMock()
     mock_store.get_or_create_session.return_value = mock_session_entry
     runner.session_store = mock_store
+    runner._async_session_store = SimpleNamespace(
+        _store=mock_store,
+        get_or_create_session=AsyncMock(return_value=mock_session_entry),
+    )
 
     return runner
 
@@ -107,6 +117,89 @@ class TestHandleTitleCommand:
         runner._schedule_telegram_topic_title_rename.assert_called_once_with(
             event.source, "test_session_123", "My Topic Name"
         )
+        db.close()
+
+    @pytest.mark.asyncio
+    async def test_set_title_propagates_to_matrix_room_rename(self, tmp_path):
+        """/title <name> also updates an enabled Matrix DM room name."""
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        db.create_session("test_session_123", "matrix")
+
+        runner = _make_runner(session_db=db)
+        runner.adapters[Platform.MATRIX] = SimpleNamespace(
+            on_session_semantic_base_changed=AsyncMock()
+        )
+        runner._schedule_adapter_semantic_base_refresh = MagicMock()
+
+        event = _make_event(
+            text="/title Matrix Task Name",
+            platform=Platform.MATRIX,
+            user_id="@user:matrix.org",
+            chat_id="!room:matrix.org",
+        )
+        result = await runner._handle_title_command(event)
+
+        assert "Matrix Task Name" in result
+        runner._schedule_adapter_semantic_base_refresh.assert_called_once_with(
+            event.source, "test_session_123"
+        )
+        db.close()
+
+    @pytest.mark.asyncio
+    async def test_set_title_propagates_to_legacy_only_adapter(self, tmp_path):
+        """Legacy adapters receive the sanitized title through their title hook."""
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        db.create_session("test_session_123", "discord")
+
+        runner = _make_runner(session_db=db)
+        runner.adapters[Platform.DISCORD] = SimpleNamespace(
+            on_session_title_changed=AsyncMock()
+        )
+        event = _make_event(
+            text="/title Legacy\x00 Room",
+            platform=Platform.DISCORD,
+        )
+
+        result = await runner._handle_title_command(event)
+
+        assert "Legacy Room" in result
+        runner._schedule_adapter_session_title_propagation.assert_called_once_with(
+            event.source, "test_session_123", "Legacy Room"
+        )
+        runner._schedule_adapter_semantic_base_refresh.assert_not_called()
+        db.close()
+
+    @pytest.mark.asyncio
+    async def test_set_title_prefers_semantic_hook_over_legacy_hook(self, tmp_path):
+        """Semantic refresh wins so an active goal remains the visible base."""
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        db.create_session("test_session_123", "matrix")
+
+        runner = _make_runner(session_db=db)
+        runner.adapters[Platform.MATRIX] = SimpleNamespace(
+            on_session_semantic_base_changed=AsyncMock(),
+            on_session_title_changed=AsyncMock(),
+        )
+        event = _make_event(
+            text="/title Matrix Session Title",
+            platform=Platform.MATRIX,
+            user_id="@user:matrix.org",
+            chat_id="!room:matrix.org",
+        )
+
+        result = await runner._handle_title_command(event)
+
+        assert "Matrix Session Title" in result
+        runner._schedule_adapter_semantic_base_refresh.assert_called_once_with(
+            event.source, "test_session_123"
+        )
+        runner._schedule_adapter_session_title_propagation.assert_not_called()
         db.close()
 
     @pytest.mark.asyncio

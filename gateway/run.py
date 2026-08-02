@@ -5532,6 +5532,14 @@ class TurnRunner:
                         effective_session_id,
                         title,
                     )
+                elif self._runner._adapter_supports_semantic_base_refresh(ctx.source):
+                    maybe_auto_title_kwargs["title_callback"] = lambda title: self._runner._schedule_adapter_semantic_base_refresh(
+                        ctx.source, effective_session_id
+                    )
+                elif self._runner._adapter_supports_session_title_propagation(ctx.source):
+                    maybe_auto_title_kwargs["title_callback"] = lambda title: self._runner._schedule_adapter_session_title_propagation(
+                        ctx.source, effective_session_id, title
+                    )
                 maybe_auto_title(
                     getattr(self._runner._session_db, "_db", self._runner._session_db),
                     effective_session_id,
@@ -5696,6 +5704,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _shutdown_watchdog_done: Optional["threading.Event"] = None
     _platform_lock_takeover_on_start: bool = False
     _reconnect_watcher_task: Optional["asyncio.Task"] = None
+    _adapter_title_state_init_lock = threading.Lock()
 
     def __init__(self, config: Optional[GatewayConfig] = None):
         global _gateway_runner_ref
@@ -5812,6 +5821,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Set on gateway stop so the recreate-on-shutdown path can't resurrect
         # the pool during a real shutdown.
         self._executor_closing = False
+        # Title callbacks may be scheduled both on the gateway loop and from
+        # the auto-title worker thread.  Generations are therefore assigned
+        # under a synchronous lock before either caller can yield, while the
+        # actual adapter writes are serialized on the gateway loop.
+        self._adapter_title_state_lock = threading.Lock()
+        self._adapter_title_generations: Dict[str, int] = {}
+        self._adapter_title_pending: Dict[str, int] = {}
+        self._adapter_title_apply_locks: Dict[str, asyncio.Lock] = {}
         # ALL per-session state (turn / conversation / persistent scopes)
         # lives in one container — see gateway/session_state.py.  Access via
         # self._session_state(key) (get-or-create) or
@@ -15848,7 +15865,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         context = build_session_context(source, self.config, session_entry)
         
         # Set session context variables for tools (task-local, concurrency-safe)
-        _session_env_tokens = self._set_session_env(context)
+        _session_env_tokens = self._set_session_env(context, run_generation)
         
         # Read privacy.redact_pii from config (re-read per message)
         _redact_pii = False
@@ -18159,6 +18176,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             user_initiated=True,
             background_processes=_bg_procs,
         )
+        if not mgr.is_active() and source is not None:
+            self._schedule_adapter_semantic_base_refresh(source, sid)
         msg = decision.get("message") or ""
 
         # Defer the status line until after the adapter has delivered the
@@ -19237,6 +19256,466 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 fut.result()
             except Exception:
                 logger.debug("Discord semantic thread rename failed", exc_info=True)
+
+        future.add_done_callback(_log_rename_failure)
+
+    def _adapter_supports_session_title_propagation(
+        self,
+        source: SessionSource,
+    ) -> bool:
+        """Return whether the source adapter exposes the optional title hook."""
+        adapter = self._adapter_for_source(source)
+        if adapter is None:
+            return False
+        # Static lookup keeps permissive mocks from inventing the hook while
+        # still allowing adapters to install a concrete per-instance callback.
+        return callable(
+            inspect.getattr_static(adapter, "on_session_title_changed", None)
+        )
+
+    def _adapter_supports_semantic_base_refresh(self, source: SessionSource) -> bool:
+        adapter = self._adapter_for_source(source)
+        if adapter is None or not callable(
+            inspect.getattr_static(adapter, "on_session_semantic_base_changed", None)
+        ):
+            return False
+        capability = inspect.getattr_static(
+            adapter, "supports_session_semantic_base_refresh", None
+        )
+        if callable(capability):
+            try:
+                return bool(adapter.supports_session_semantic_base_refresh(source))
+            except Exception:
+                logger.debug("Adapter semantic-base capability check failed", exc_info=True)
+                return False
+        return True
+
+    def _make_current_chat_rename_callback(
+        self,
+        source: SessionSource,
+        session_key: str,
+        session_id: str,
+        run_generation: Optional[int],
+    ):
+        """Bind a synchronous tool callback to one live gateway turn."""
+        if not self._adapter_supports_semantic_base_refresh(source):
+            return None
+        try:
+            copied_source = dataclasses.replace(source)
+        except Exception:
+            copied_source = source
+
+        def _rename(title: str) -> dict:
+            loop = getattr(self, "_gateway_loop", None)
+            if loop is None or loop.is_closed() or not loop.is_running():
+                return {
+                    "success": False,
+                    "error": "The gateway event loop is not available; the current chat was not renamed.",
+                }
+            generation = self._reserve_adapter_title_generation(session_id)
+            future = safe_schedule_threadsafe(
+                self._rename_current_gateway_chat(
+                    copied_source,
+                    session_key,
+                    session_id,
+                    run_generation,
+                    title,
+                    generation,
+                ),
+                loop,
+                logger=logger,
+                log_message="Current gateway chat rename failed to schedule",
+            )
+            if future is None:
+                self._release_adapter_title_generation(session_id)
+                return {
+                    "success": False,
+                    "error": "The current gateway chat rename could not be scheduled.",
+                }
+            try:
+                return future.result()
+            except Exception as exc:
+                logger.debug("Current gateway chat rename failed", exc_info=True)
+                return {
+                    "success": False,
+                    "error": f"Current gateway chat rename failed: {exc}",
+                }
+            finally:
+                self._release_adapter_title_generation(session_id)
+
+        return _rename
+
+    async def _rename_current_gateway_chat(
+        self,
+        source: SessionSource,
+        session_key: str,
+        session_id: str,
+        run_generation: Optional[int],
+        title: str,
+        generation: int,
+    ) -> dict:
+        """Persist and apply a current-chat semantic title on the gateway loop."""
+        title = str(title or "").strip()
+        if not title:
+            return {"success": False, "error": "A non-empty title is required."}
+        key = str(session_id)
+        with self._adapter_title_state_lock:
+            apply_lock = self._adapter_title_apply_locks.setdefault(key, asyncio.Lock())
+        async with apply_lock:
+            def _generation_is_current() -> bool:
+                with self._adapter_title_state_lock:
+                    return self._adapter_title_generations.get(key) == generation
+
+            async def _resolve_current_source() -> Optional[SessionSource]:
+                if not _generation_is_current():
+                    return None
+                if run_generation is not None and not self._is_session_run_current(
+                    session_key, run_generation
+                ):
+                    return None
+                try:
+                    current_source = self._get_cached_session_source(session_key) or source
+                    if self._session_key_for_source(current_source) != session_key:
+                        return None
+                    entry = await self.async_session_store.get_or_create_session(
+                        current_source
+                    )
+                except Exception:
+                    return None
+                if str(getattr(entry, "session_id", "")) != key:
+                    return None
+                return current_source
+
+            current_source = await _resolve_current_source()
+            if current_source is None:
+                return {
+                    "success": False,
+                    "error": "The originating gateway session is no longer current; no rename was applied.",
+                }
+            adapter = self._adapter_for_source(current_source)
+            hook = getattr(adapter, "on_session_semantic_base_changed", None)
+            if not callable(hook) or self._session_db is None:
+                return {
+                    "success": False,
+                    "error": "The current gateway platform does not support chat renaming.",
+                }
+
+            # Authoritative revalidation immediately before persistence.
+            current_source = await _resolve_current_source()
+            if current_source is None:
+                return {
+                    "success": False,
+                    "error": "The originating gateway session changed before persistence; no rename was applied.",
+                }
+            try:
+                persisted = await self._session_db.set_session_title(key, title)
+            except Exception as exc:
+                return {"success": False, "error": f"Session title persistence failed: {exc}"}
+            if not persisted:
+                return {"success": False, "error": "The current session no longer exists."}
+
+            # An active goal remains the visible semantic base.  The explicit
+            # title is still persisted as the fallback used once that goal is
+            # paused or completed.
+            base = title
+            try:
+                from hermes_cli.goals import GoalManager
+                manager = GoalManager(session_id=key)
+                if manager.is_active() and manager.state is not None:
+                    base = manager.state.goal
+            except Exception:
+                logger.debug("Could not resolve active goal during chat rename", exc_info=True)
+
+            # Revalidate again immediately before the live adapter update.
+            current_source = await _resolve_current_source()
+            if current_source is None:
+                return {
+                    "success": False,
+                    "error": "The originating gateway session changed after title persistence; live chat rename was not applied.",
+                }
+            try:
+                # Re-resolve the adapter as well: multiplex profile routing can
+                # replace the live adapter while an older turn is still alive.
+                adapter = self._adapter_for_source(current_source)
+                hook = getattr(adapter, "on_session_semantic_base_changed", None)
+                if not callable(hook):
+                    return {
+                        "success": False,
+                        "error": "The current gateway platform no longer supports chat renaming.",
+                    }
+                applied = hook(current_source, base)
+                if inspect.isawaitable(applied):
+                    applied = await applied
+            except Exception as exc:
+                return {"success": False, "error": f"Live chat rename failed: {exc}"}
+            if not applied:
+                return {
+                    "success": False,
+                    "error": "The platform declined the live chat rename; the session title was persisted.",
+                }
+            if not _generation_is_current():
+                return {
+                    "success": False,
+                    "error": "This rename was superseded by a newer rename request.",
+                }
+            return {"success": True, "title": title, "visible_base": base}
+
+    async def _refresh_adapter_semantic_base(
+        self,
+        source: SessionSource,
+        session_id: str,
+        generation: int,
+    ) -> None:
+        """Resolve goal > title > adapter recovery and apply it race-safely."""
+        key = str(session_id)
+        try:
+            current_entry = await self.async_session_store.get_or_create_session(source)
+            if str(getattr(current_entry, "session_id", "")) != key:
+                return
+            with self._adapter_title_state_lock:
+                apply_lock = self._adapter_title_apply_locks.setdefault(key, asyncio.Lock())
+            async with apply_lock:
+                with self._adapter_title_state_lock:
+                    if self._adapter_title_generations.get(key) != generation:
+                        return
+                current_entry = await self.async_session_store.get_or_create_session(source)
+                if str(getattr(current_entry, "session_id", "")) != key:
+                    return
+                base = None
+                try:
+                    from hermes_cli.goals import GoalManager
+                    mgr = GoalManager(session_id=key)
+                    if mgr.is_active() and mgr.state is not None:
+                        base = mgr.state.goal
+                except Exception:
+                    logger.debug("Could not resolve active goal for semantic base", exc_info=True)
+                if not base and self._session_db is not None:
+                    try:
+                        base = await self._session_db.get_session_title(key)
+                    except Exception:
+                        logger.debug("Could not resolve session title for semantic base", exc_info=True)
+                with self._adapter_title_state_lock:
+                    if self._adapter_title_generations.get(key) != generation:
+                        return
+                adapter = self._adapter_for_source(source)
+                hook = getattr(adapter, "on_session_semantic_base_changed", None)
+                if callable(hook):
+                    result = hook(source, base)
+                    if inspect.isawaitable(result):
+                        await result
+        except Exception:
+            logger.debug("Adapter semantic-base refresh failed", exc_info=True)
+
+    def _schedule_adapter_semantic_base_refresh(
+        self, source: SessionSource, session_id: str
+    ) -> None:
+        """Schedule a fresh persisted semantic-base resolution on gateway loop."""
+        if not self._adapter_supports_semantic_base_refresh(source):
+            return
+        gateway_loop = getattr(self, "_gateway_loop", None)
+        if gateway_loop is not None and gateway_loop.is_running() and not gateway_loop.is_closed():
+            loop = gateway_loop
+        else:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+        if loop is None or loop.is_closed():
+            return
+        generation = self._reserve_adapter_title_generation(session_id)
+        try:
+            copied_source = dataclasses.replace(source)
+        except Exception:
+            copied_source = source
+        future = safe_schedule_threadsafe(
+            self._refresh_adapter_semantic_base(copied_source, session_id, generation),
+            loop, logger=logger,
+            log_message="Adapter semantic-base refresh failed to schedule",
+        )
+        if future is None:
+            self._release_adapter_title_generation(session_id)
+            return
+        def _done(fut) -> None:
+            try:
+                fut.result()
+            except Exception:
+                logger.debug("Adapter semantic-base refresh failed", exc_info=True)
+            finally:
+                self._release_adapter_title_generation(session_id)
+        future.add_done_callback(_done)
+
+    def _ensure_adapter_title_state(self) -> None:
+        """Lazily initialize title ordering state for partial test runners."""
+        if hasattr(self, "_adapter_title_state_lock"):
+            return
+        with self._adapter_title_state_init_lock:
+            if not hasattr(self, "_adapter_title_state_lock"):
+                self._adapter_title_state_lock = threading.Lock()
+                self._adapter_title_generations = {}
+                self._adapter_title_pending = {}
+                self._adapter_title_apply_locks = {}
+
+    def _reserve_adapter_title_generation(self, session_id: str) -> int:
+        self._ensure_adapter_title_state()
+        key = str(session_id)
+        with self._adapter_title_state_lock:
+            generation = self._adapter_title_generations.get(key, 0) + 1
+            self._adapter_title_generations[key] = generation
+            self._adapter_title_pending[key] = (
+                self._adapter_title_pending.get(key, 0) + 1
+            )
+            return generation
+
+    def _release_adapter_title_generation(self, session_id: str) -> None:
+        """Drop idle per-session ordering state after every task has exited."""
+        key = str(session_id)
+        with self._adapter_title_state_lock:
+            pending = self._adapter_title_pending.get(key, 0) - 1
+            if pending > 0:
+                self._adapter_title_pending[key] = pending
+                return
+            self._adapter_title_pending.pop(key, None)
+            self._adapter_title_generations.pop(key, None)
+            self._adapter_title_apply_locks.pop(key, None)
+
+    async def _propagate_session_title_to_adapter(
+        self,
+        source: SessionSource,
+        session_id: str,
+        title: str,
+        generation: Optional[int] = None,
+    ) -> None:
+        """Best-effort title propagation through an adapter's optional hook.
+
+        Production callers must enter through
+        ``_schedule_adapter_session_title_propagation`` so all per-session
+        apply locks are created and acquired on the canonical gateway loop.
+        Direct awaits are reserved for partial runners/tests without a live
+        gateway loop.
+        """
+        if not title or not self._adapter_supports_session_title_propagation(source):
+            return
+        owns_generation = generation is None
+        if generation is None:
+            generation = self._reserve_adapter_title_generation(session_id)
+        try:
+            try:
+                current_entry = await self.async_session_store.get_or_create_session(source)
+            except Exception:
+                logger.debug(
+                    "Could not validate current session before adapter title propagation",
+                    exc_info=True,
+                )
+                return
+            if str(getattr(current_entry, "session_id", "")) != str(session_id):
+                return
+            session_db = getattr(self, "_session_db", None)
+            if session_db is None:
+                return
+            try:
+                current_title = await session_db.get_session_title(session_id)
+            except Exception:
+                logger.debug(
+                    "Could not validate current title before adapter title propagation",
+                    exc_info=True,
+                )
+                return
+            if current_title != title:
+                return
+            try:
+                key = str(session_id)
+                with self._adapter_title_state_lock:
+                    apply_lock = self._adapter_title_apply_locks.setdefault(
+                        key, asyncio.Lock()
+                    )
+                async with apply_lock:
+                    with self._adapter_title_state_lock:
+                        if self._adapter_title_generations.get(key) != generation:
+                            return
+                    # Revalidate under the application lock.  These are the
+                    # authoritative checks immediately before the adapter write;
+                    # the earlier checks are only a cheap fast-fail path.
+                    current_entry = (
+                        await self.async_session_store.get_or_create_session(source)
+                    )
+                    if str(getattr(current_entry, "session_id", "")) != key:
+                        return
+                    current_title = await session_db.get_session_title(session_id)
+                    if current_title != title:
+                        return
+                    with self._adapter_title_state_lock:
+                        if self._adapter_title_generations.get(key) != generation:
+                            return
+                    adapter = self._adapter_for_source(source)
+                    if adapter is None:
+                        return
+                    title_hook = getattr(adapter, "on_session_title_changed", None)
+                    if not callable(title_hook):
+                        return
+                    result = title_hook(source, title)
+                    if inspect.isawaitable(result):
+                        await result
+            except Exception:
+                logger.debug("Adapter session-title propagation failed", exc_info=True)
+        finally:
+            if owns_generation:
+                self._release_adapter_title_generation(session_id)
+
+    def _schedule_adapter_session_title_propagation(
+        self,
+        source: SessionSource,
+        session_id: str,
+        title: str,
+    ) -> None:
+        """Schedule an optional adapter title hook from any caller thread."""
+        if not title or not self._adapter_supports_session_title_propagation(source):
+            return
+        gateway_loop = getattr(self, "_gateway_loop", None)
+        if (
+            gateway_loop is not None
+            and gateway_loop.is_running()
+            and not gateway_loop.is_closed()
+        ):
+            # Adapter instances and their per-session apply locks belong to
+            # the canonical gateway loop, even when this callback arrives
+            # from another running loop/thread.
+            loop = gateway_loop
+        else:
+            # Partial runners and startup tests may not have established the
+            # canonical loop yet.  In that case only, use the caller's loop.
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+        if loop is None or loop.is_closed():
+            return
+        generation = self._reserve_adapter_title_generation(session_id)
+        try:
+            copied_source = dataclasses.replace(source)
+        except Exception:
+            copied_source = source
+        future = safe_schedule_threadsafe(
+            self._propagate_session_title_to_adapter(
+                copied_source,
+                session_id,
+                title,
+                generation,
+            ),
+            loop,
+            logger=logger,
+            log_message="Adapter session-title propagation failed to schedule",
+        )
+        if future is None:
+            self._release_adapter_title_generation(session_id)
+            return
+
+        def _log_rename_failure(fut) -> None:
+            try:
+                fut.result()
+            except Exception:
+                logger.debug("Adapter session-title propagation failed", exc_info=True)
+            finally:
+                self._release_adapter_title_generation(session_id)
 
         future.add_done_callback(_log_rename_failure)
 
@@ -20546,7 +21025,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         return delivered
 
-    def _set_session_env(self, context: SessionContext) -> list:
+    def _set_session_env(
+        self, context: SessionContext, run_generation: Optional[int] = None
+    ) -> list:
         """Set session context variables for the current async task.
 
         Uses ``contextvars`` instead of ``os.environ`` so that concurrent
@@ -20580,6 +21061,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             message_id=str(context.source.message_id) if context.source.message_id else "",
             profile=getattr(context.source, "profile", "") or "",
             async_delivery=_async_delivery,
+            current_chat_rename_callback=self._make_current_chat_rename_callback(
+                context.source,
+                context.session_key,
+                context.session_id,
+                run_generation,
+            ),
         )
 
     def _clear_session_env(self, tokens: list) -> None:

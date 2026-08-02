@@ -201,7 +201,7 @@ async def _send_telegram_message_with_retry(bot, *, attempts: int = 3, **kwargs)
 SEND_MESSAGE_SCHEMA = {
     "name": "send_message",
     "description": (
-        "Send a message to a connected messaging platform, or list available targets.\n\n"
+        "Send a message to a connected messaging platform or list available targets.\n\n"
         "IMPORTANT: When the user asks to send to a specific channel or person "
         "(not just a bare platform name), call send_message(action='list') FIRST to see "
         "available targets, then send to the correct one.\n"
@@ -231,7 +231,7 @@ SEND_MESSAGE_SCHEMA = {
             "message_id": {
                 "type": "string",
                 "description": "For action='react'/'unreact': id of the message to react to. Omit to target the most recent message received in that chat (usually the one being replied to)."
-            }
+            },
         },
         "required": []
     }

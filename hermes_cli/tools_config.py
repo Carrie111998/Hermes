@@ -209,6 +209,7 @@ def _homeassistant_credentials_present() -> bool:
 # server admin, Slack workspace admin, etc.).  Keeps every other platform's
 # checklist from filling up with irrelevant toggles.
 _TOOLSET_PLATFORM_RESTRICTIONS: Dict[str, Set[str]] = {
+    "chat_title": {"matrix"},
     "discord": {"discord"},
     "discord_admin": {"discord"},
 }
@@ -2474,6 +2475,14 @@ def _get_platform_tools(
             enabled_toolsets.update(enabled_mcp_servers)
     else:
         enabled_toolsets.update(explicit_mcp_servers)
+
+    # Apply platform restrictions to recovered and explicitly-passed-through
+    # non-configurable toolsets too.  In particular, chat_title is a narrow
+    # Matrix-native capability and must not be enabled by naming it on another
+    # platform.
+    enabled_toolsets = {
+        ts for ts in enabled_toolsets if _toolset_allowed_for_platform(ts, platform)
+    }
 
     # Honor agent.disabled_toolsets from config.yaml — allows users to
     # globally suppress specific toolsets (e.g. "memory") across all

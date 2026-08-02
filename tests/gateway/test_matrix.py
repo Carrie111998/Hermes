@@ -5,6 +5,7 @@ import stat
 import sys
 import time
 import types
+
 import pytest
 from unittest.mock import MagicMock, patch, AsyncMock
 
@@ -1143,6 +1144,9 @@ class TestMatrixPasswordLoginDeviceId:
                 "user_id": "@bot:example.org",
                 "password": "secret",
                 "device_id": "STABLE_PW_DEVICE",
+                # This test covers password login/device identity, not E2EE.
+                # Keep it independent of locally installed crypto extras.
+                "encryption": False,
             },
         )
         adapter = MatrixAdapter(config)
@@ -1661,11 +1665,15 @@ class TestMatrixDisconnect:
         fake_client = MagicMock()
         fake_client.api = mock_api
         adapter._client = fake_client
+        adapter._dynamic_room_name_terminal_external_checks.add("!room:ex")
+        adapter._dynamic_room_name_superseded_sent["!room:ex"] = {"🟡 Old"}
 
         await adapter.disconnect()
 
         mock_session.close.assert_awaited_once()
         assert adapter._client is None
+        assert not adapter._dynamic_room_name_terminal_external_checks
+        assert not adapter._dynamic_room_name_superseded_sent
 
 
 # ---------------------------------------------------------------------------
@@ -1751,6 +1759,560 @@ class TestMatrixLinkSanitization:
         result = MatrixAdapter._sanitize_link_url('http://x"y')
         assert '"' not in result
         assert "&quot;" in result
+
+
+# ---------------------------------------------------------------------------
+# Dynamic room names
+# ---------------------------------------------------------------------------
+
+
+class TestMatrixDynamicRoomNames:
+    def setup_method(self):
+        self.adapter = _make_adapter()
+        self.adapter._reactions_enabled = False
+        self.adapter._dynamic_room_name_enabled = True
+        self.adapter._client = MagicMock()
+        self.adapter._client.send_state_event = AsyncMock(return_value="$room-name")
+
+    @staticmethod
+    def _event(chat_type="dm"):
+        from gateway.platforms.base import MessageEvent, MessageType
+
+        source = MagicMock()
+        source.chat_id = "!room:ex"
+        source.chat_type = chat_type
+        return MessageEvent(
+            text="add dynamic Matrix room names",
+            message_type=MessageType.TEXT,
+            source=source,
+            raw_message={},
+            message_id="$msg1",
+        )
+
+    async def _drain_room_name_tasks(self):
+        while self.adapter._dynamic_room_name_tasks:
+            await asyncio.gather(
+                *tuple(self.adapter._dynamic_room_name_tasks),
+                return_exceptions=True,
+            )
+
+    @pytest.mark.asyncio
+    async def test_processing_and_semantic_title_update_room_name(self):
+        from gateway.platforms.base import ProcessingOutcome
+
+        event = self._event()
+
+        await self.adapter.on_processing_start(event)
+        await self._drain_room_name_tasks()
+        await self.adapter.on_session_title_changed(
+            event.source, "Add dynamic Matrix room names"
+        )
+        await self.adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+        await self._drain_room_name_tasks()
+
+        names = [
+            call.args[2]["name"]
+            for call in self.adapter._client.send_state_event.await_args_list
+        ]
+        assert names == ["🟡 Add dynamic Matrix room names", "✅ Add dynamic Matrix room names"]
+
+    @pytest.mark.asyncio
+    async def test_restart_preserves_existing_semantic_room_name(self):
+        from gateway.platforms.base import ProcessingOutcome
+
+        self.adapter._client.get_state_event = AsyncMock(
+            return_value={"name": "✅ Existing semantic title"}
+        )
+        event = self._event()
+
+        await self.adapter.on_processing_start(event)
+        await self._drain_room_name_tasks()
+        await self.adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+        await self._drain_room_name_tasks()
+
+        names = [
+            call.args[2]["name"]
+            for call in self.adapter._client.send_state_event.await_args_list
+        ]
+        assert names == [
+            "🟡 Existing semantic title",
+            "✅ Existing semantic title",
+        ]
+        assert self.adapter._client.get_state_event.await_count == 2
+        self.adapter._client.get_state_event.assert_awaited_with(
+            "!room:ex", "m.room.name"
+        )
+
+    @pytest.mark.asyncio
+    async def test_manual_external_rename_is_adopted_on_completion(self):
+        from gateway.platforms.base import ProcessingOutcome
+
+        event = self._event()
+        self.adapter._dynamic_room_name_bases["!room:ex"] = "Hermes"
+        self.adapter._dynamic_room_name_initialized.add("!room:ex")
+        self.adapter._dynamic_room_name_last_sent["!room:ex"] = "🟡 Hermes"
+        self.adapter._dynamic_room_name_active_turns.add(("!room:ex", "$msg1"))
+        self.adapter._dynamic_room_name_active["!room:ex"] = 1
+        self.adapter._client.get_state_event = AsyncMock(
+            return_value={"name": "🟡 Fortress"}
+        )
+
+        await self.adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+        await self._drain_room_name_tasks()
+
+        assert self.adapter._client.send_state_event.await_args.args[2]["name"] == (
+            "✅ Fortress"
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_external_rename_keeps_existing_base_on_completion(self):
+        from gateway.platforms.base import ProcessingOutcome
+
+        event = self._event()
+        self.adapter._dynamic_room_name_bases["!room:ex"] = "Hermes"
+        self.adapter._dynamic_room_name_initialized.add("!room:ex")
+        self.adapter._dynamic_room_name_last_sent["!room:ex"] = "🟡 Hermes"
+        self.adapter._dynamic_room_name_active_turns.add(("!room:ex", "$msg1"))
+        self.adapter._dynamic_room_name_active["!room:ex"] = 1
+        self.adapter._client.get_state_event = AsyncMock(
+            return_value={"name": "🟡 Hermes"}
+        )
+
+        await self.adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+        await self._drain_room_name_tasks()
+
+        assert self.adapter._client.send_state_event.await_args.args[2]["name"] == "✅ Hermes"
+
+    @pytest.mark.asyncio
+    async def test_stale_state_after_tool_title_does_not_roll_back_on_completion(self):
+        from gateway.platforms.base import ProcessingOutcome
+
+        event = self._event()
+        self.adapter._dynamic_room_name_bases["!room:ex"] = "Old"
+        self.adapter._dynamic_room_name_initialized.add("!room:ex")
+        self.adapter._dynamic_room_name_last_sent["!room:ex"] = "🟡 Old"
+        self.adapter._dynamic_room_name_active_turns.add(("!room:ex", "$msg1"))
+        self.adapter._dynamic_room_name_active["!room:ex"] = 1
+
+        assert await self.adapter.on_session_semantic_base_changed(
+            event.source, "New"
+        )
+        self.adapter._client.get_state_event = AsyncMock(
+            return_value={"name": "🟡 Old"}
+        )
+        await self.adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+        await self._drain_room_name_tasks()
+
+        assert self.adapter._client.send_state_event.await_args.args[2]["name"] == "✅ New"
+        assert self.adapter._dynamic_room_name_bases["!room:ex"] == "New"
+
+    @pytest.mark.asyncio
+    async def test_stale_echo_from_full_rename_chain_is_consumed_once(self):
+        from gateway.platforms.base import ProcessingOutcome
+
+        event = self._event()
+        room_id = "!room:ex"
+        self.adapter._dynamic_room_name_bases[room_id] = "A"
+        self.adapter._dynamic_room_name_initialized.add(room_id)
+        self.adapter._dynamic_room_name_last_sent[room_id] = "🟡 A"
+        self.adapter._dynamic_room_name_active_turns.add((room_id, "$msg1"))
+        self.adapter._dynamic_room_name_active[room_id] = 1
+        self.adapter._dynamic_room_name_status[room_id] = "working"
+
+        assert await self.adapter.on_session_semantic_base_changed(event.source, "B")
+        assert await self.adapter.on_session_semantic_base_changed(event.source, "C")
+        assert self.adapter._dynamic_room_name_superseded_sent[room_id] == {
+            "🟡 A",
+            "🟡 B",
+        }
+
+        self.adapter._client.get_state_event = AsyncMock(return_value={"name": "🟡 A"})
+        await self.adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+        await self._drain_room_name_tasks()
+
+        assert self.adapter._client.send_state_event.await_args.args[2]["name"] == "✅ C"
+        assert self.adapter._dynamic_room_name_bases[room_id] == "C"
+        assert room_id not in self.adapter._dynamic_room_name_superseded_sent
+        assert room_id not in self.adapter._dynamic_room_name_terminal_external_checks
+
+        later = self._event()
+        later.message_id = "$msg2"
+        await self.adapter.on_processing_start(later)
+        await self._drain_room_name_tasks()
+        self.adapter._client.get_state_event = AsyncMock(
+            return_value={"name": "🟡 Fortress"}
+        )
+        await self.adapter.on_processing_complete(later, ProcessingOutcome.SUCCESS)
+        await self._drain_room_name_tasks()
+
+        assert self.adapter._client.send_state_event.await_args.args[2]["name"] == (
+            "✅ Fortress"
+        )
+        assert self.adapter._dynamic_room_name_bases[room_id] == "Fortress"
+
+    @pytest.mark.asyncio
+    async def test_delayed_external_read_cannot_overwrite_newer_tool_base(self):
+        from gateway.platforms.base import ProcessingOutcome
+
+        event = self._event()
+        self.adapter._dynamic_room_name_bases["!room:ex"] = "Hermes"
+        self.adapter._dynamic_room_name_initialized.add("!room:ex")
+        self.adapter._dynamic_room_name_last_sent["!room:ex"] = "🟡 Hermes"
+        self.adapter._dynamic_room_name_active_turns.add(("!room:ex", "$msg1"))
+        self.adapter._dynamic_room_name_active["!room:ex"] = 1
+        read_started = asyncio.Event()
+        release_read = asyncio.Event()
+
+        async def delayed_external_name(*_args):
+            read_started.set()
+            await release_read.wait()
+            return {"name": "🟡 External stale base"}
+
+        self.adapter._client.get_state_event = AsyncMock(side_effect=delayed_external_name)
+        await self.adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+        await read_started.wait()
+        authoritative = asyncio.create_task(
+            self.adapter.on_session_semantic_base_changed(
+                event.source, "New authoritative base"
+            )
+        )
+        release_read.set()
+        await self._drain_room_name_tasks()
+        assert await authoritative
+
+        names = [
+            call.args[2]["name"]
+            for call in self.adapter._client.send_state_event.await_args_list
+        ]
+        assert names[-1] == "✅ New authoritative base"
+        assert self.adapter._dynamic_room_name_bases["!room:ex"] == (
+            "New authoritative base"
+        )
+
+    @pytest.mark.asyncio
+    async def test_initial_room_name_read_failure_does_not_rename(self):
+        self.adapter._client.get_state_event = AsyncMock(
+            side_effect=PermissionError("forbidden")
+        )
+
+        await self.adapter.on_processing_start(self._event())
+        await self._drain_room_name_tasks()
+
+        names = [
+            call.args[2]["name"]
+            for call in self.adapter._client.send_state_event.await_args_list
+        ]
+        assert names == []
+
+    @pytest.mark.asyncio
+    async def test_initial_room_name_read_timeout_does_not_block_lifecycle(self):
+        from gateway.platforms.base import ProcessingOutcome
+
+        read_started = asyncio.Event()
+        read_cancelled = asyncio.Event()
+
+        async def never_returning_room_name(*args, **kwargs):
+            read_started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                read_cancelled.set()
+
+        self.adapter._dynamic_room_name_timeout_seconds = 0.01
+        self.adapter._client.get_state_event = AsyncMock(
+            side_effect=never_returning_room_name
+        )
+        event = self._event()
+
+        await asyncio.wait_for(self.adapter.on_processing_start(event), timeout=0.05)
+        await asyncio.wait_for(read_started.wait(), timeout=0.05)
+        await asyncio.wait_for(self._drain_room_name_tasks(), timeout=0.1)
+
+        assert read_cancelled.is_set()
+        assert "!room:ex" not in self.adapter._dynamic_room_name_bases
+
+        await self.adapter.on_session_title_changed(event.source, "Semantic title")
+        await self.adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+        await asyncio.wait_for(self._drain_room_name_tasks(), timeout=0.1)
+
+        names = [
+            call.args[2]["name"]
+            for call in self.adapter._client.send_state_event.await_args_list
+        ]
+        assert names == ["🟡 Semantic title", "✅ Semantic title"]
+
+    @pytest.mark.asyncio
+    async def test_newer_semantic_title_wins_over_delayed_initial_state_read(self):
+        initial_read_started = asyncio.Event()
+        release_initial_read = asyncio.Event()
+
+        async def delayed_room_name(*args, **kwargs):
+            initial_read_started.set()
+            await release_initial_read.wait()
+            return {"name": "✅ Stale persisted title"}
+
+        self.adapter._client.get_state_event = AsyncMock(side_effect=delayed_room_name)
+        event = self._event()
+
+        newer_title = asyncio.create_task(
+            self.adapter.on_session_semantic_base_changed(
+                event.source, "Newer authoritative epic"
+            )
+        )
+        await asyncio.wait_for(initial_read_started.wait(), timeout=0.05)
+        release_initial_read.set()
+        await newer_title
+
+        names = [
+            call.args[2]["name"]
+            for call in self.adapter._client.send_state_event.await_args_list
+        ]
+        assert names == ["Newer authoritative epic"]
+        assert self.adapter._dynamic_room_name_bases["!room:ex"] == (
+            "Newer authoritative epic"
+        )
+        assert self.adapter._dynamic_room_name_recovered_bases["!room:ex"] == (
+            "Stale persisted title"
+        )
+
+    @pytest.mark.asyncio
+    async def test_cleared_authoritative_base_restores_preexisting_room_title(self):
+        self.adapter._client.get_state_event = AsyncMock(
+            return_value={"name": "Original Matrix room"}
+        )
+        source = self._event().source
+
+        assert await self.adapter.on_session_semantic_base_changed(
+            source, "Active epic"
+        )
+        assert await self.adapter.on_session_semantic_base_changed(source, None)
+
+        names = [
+            call.args[2]["name"]
+            for call in self.adapter._client.send_state_event.await_args_list
+        ]
+        assert names == ["Active epic", "Original Matrix room"]
+        assert self.adapter._dynamic_room_name_bases["!room:ex"] == (
+            "Original Matrix room"
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "room_state",
+        [None, PermissionError("forbidden")],
+        ids=["untitled", "unreadable"],
+    )
+    async def test_cleared_authoritative_base_leaves_unrecoverable_room_unchanged(
+        self, room_state
+    ):
+        if isinstance(room_state, Exception):
+            self.adapter._client.get_state_event = AsyncMock(side_effect=room_state)
+        else:
+            self.adapter._client.get_state_event = AsyncMock(return_value=room_state)
+        source = self._event().source
+
+        assert await self.adapter.on_session_semantic_base_changed(
+            source, "Active epic"
+        )
+        self.adapter._client.send_state_event.reset_mock()
+
+        assert not await self.adapter.on_session_semantic_base_changed(source, None)
+        self.adapter._client.send_state_event.assert_not_awaited()
+        assert "!room:ex" not in self.adapter._dynamic_room_name_bases
+
+    @pytest.mark.asyncio
+    async def test_failure_and_cancelled_share_unsuccessful_terminal_state(self):
+        from gateway.platforms.base import ProcessingOutcome
+
+        event = self._event()
+        self.adapter._dynamic_room_name_bases["!room:ex"] = "Existing epic"
+        await self.adapter.on_processing_start(event)
+        await self._drain_room_name_tasks()
+        await self.adapter.on_processing_complete(event, ProcessingOutcome.FAILURE)
+        await self._drain_room_name_tasks()
+        await self.adapter.on_processing_start(event)
+        await self._drain_room_name_tasks()
+        await self.adapter.on_processing_complete(event, ProcessingOutcome.CANCELLED)
+        await self._drain_room_name_tasks()
+
+        names = [
+            call.args[2]["name"]
+            for call in self.adapter._client.send_state_event.await_args_list
+        ]
+        assert names == [
+            "🟡 Existing epic", "🔴 Existing epic",
+            "🟡 Existing epic", "🔴 Existing epic",
+        ]
+
+    def test_title_sanitization_strips_lifecycle_prefixes_and_truncates(self):
+        sanitize = self.adapter._sanitize_dynamic_room_name
+
+        assert sanitize("🟡 ✅ 🔴 ❌ ⏹ Task title") == "Task title"
+        title = "界" * 61
+        sanitized = sanitize(title)
+        assert sanitized == ("界" * 57) + "..."
+        assert len(sanitized) == 60
+
+    @pytest.mark.asyncio
+    async def test_truncated_base_stays_stable_across_lifecycle_transitions(self):
+        from gateway.platforms.base import ProcessingOutcome
+
+        event = self._event()
+        title = "Task " + ("界" * 80)
+        expected_base = self.adapter._sanitize_dynamic_room_name(title)
+
+        await self.adapter.on_session_title_changed(event.source, title)
+        await self.adapter.on_processing_start(event)
+        await self._drain_room_name_tasks()
+        await self.adapter.on_processing_complete(event, ProcessingOutcome.FAILURE)
+        await self._drain_room_name_tasks()
+
+        names = [
+            call.args[2]["name"]
+            for call in self.adapter._client.send_state_event.await_args_list
+        ]
+        assert names == [expected_base, f"🟡 {expected_base}", f"🔴 {expected_base}"]
+        assert len(expected_base) == 60
+
+    @pytest.mark.asyncio
+    async def test_disabled_or_group_room_does_not_rename(self):
+        event = self._event(chat_type="group")
+        await self.adapter.on_processing_start(event)
+        self.adapter._client.send_state_event.assert_not_awaited()
+
+        self.adapter._dynamic_room_name_enabled = False
+        event.source.chat_type = "dm"
+        await self.adapter.on_processing_start(event)
+        self.adapter._client.send_state_event.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_title_hook_is_limited_to_opted_in_dms(self):
+        event = self._event(chat_type="group")
+        assert not await self.adapter.on_session_title_changed(event.source, "Group")
+        self.adapter._client.send_state_event.assert_not_awaited()
+
+        self.adapter._dynamic_room_name_enabled = False
+        event.source.chat_type = "dm"
+        assert not await self.adapter.on_session_title_changed(event.source, "DM")
+        self.adapter._client.send_state_event.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_state_updates_are_deduplicated_for_overlapping_turns(self):
+        from gateway.platforms.base import ProcessingOutcome
+
+        async def delayed_send(*args, **kwargs):
+            await asyncio.sleep(0.01)
+            return "$room-name"
+
+        self.adapter._client.send_state_event.side_effect = delayed_send
+        event = self._event()
+        self.adapter._dynamic_room_name_bases["!room:ex"] = "Existing epic"
+        await asyncio.gather(
+            self.adapter.on_processing_start(event),
+            self.adapter.on_processing_start(event),
+        )
+        await self._drain_room_name_tasks()
+        await asyncio.gather(
+            self.adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS),
+            self.adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS),
+        )
+        await self._drain_room_name_tasks()
+
+        names = [
+            call.args[2]["name"]
+            for call in self.adapter._client.send_state_event.await_args_list
+        ]
+        assert names == ["🟡 Existing epic", "✅ Existing epic"]
+
+    @pytest.mark.asyncio
+    async def test_state_event_failure_is_best_effort(self):
+        self.adapter._client.send_state_event.side_effect = PermissionError("forbidden")
+        self.adapter._dynamic_room_name_bases["!room:ex"] = "Existing epic"
+
+        await self.adapter.on_processing_start(self._event())
+        await self._drain_room_name_tasks()
+
+        self.adapter._client.send_state_event.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_cancelled_completion_retry_is_idempotent_with_two_turns(self):
+        from gateway.platforms.base import ProcessingOutcome
+
+        first = self._event()
+        second = self._event()
+        second.message_id = "$msg2"
+        await self.adapter.on_processing_start(first)
+        await self.adapter.on_processing_start(second)
+
+        release_completion_write = asyncio.Event()
+
+        async def hanging_completion_write(*args, **kwargs):
+            await release_completion_write.wait()
+            return "$room-name"
+
+        self.adapter._dynamic_room_name_last_sent["!room:ex"] = "stale"
+        self.adapter._client.send_state_event.side_effect = hanging_completion_write
+
+        await asyncio.wait_for(
+            self.adapter.on_processing_complete(first, ProcessingOutcome.CANCELLED),
+            timeout=0.05,
+        )
+        await self.adapter.on_processing_complete(first, ProcessingOutcome.CANCELLED)
+
+        assert self.adapter._dynamic_room_name_active["!room:ex"] == 1
+        assert self.adapter._dynamic_room_name_status["!room:ex"] == "working"
+
+        await self.adapter.on_processing_complete(second, ProcessingOutcome.SUCCESS)
+        assert self.adapter._dynamic_room_name_active["!room:ex"] == 0
+        release_completion_write.set()
+        await self._drain_room_name_tasks()
+
+    @pytest.mark.asyncio
+    async def test_processing_room_name_writes_are_detached_and_latest_wins(self):
+        from gateway.platforms.base import ProcessingOutcome
+
+        first_send_started = asyncio.Event()
+        release_first_send = asyncio.Event()
+
+        async def hanging_first_send(*args, **kwargs):
+            if not first_send_started.is_set():
+                first_send_started.set()
+                await release_first_send.wait()
+            return "$room-name"
+
+        self.adapter._client.send_state_event.side_effect = hanging_first_send
+        event = self._event()
+        self.adapter._dynamic_room_name_bases["!room:ex"] = "Existing epic"
+
+        await asyncio.wait_for(self.adapter.on_processing_start(event), timeout=0.05)
+        await asyncio.wait_for(first_send_started.wait(), timeout=0.05)
+        await asyncio.wait_for(
+            self.adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS),
+            timeout=0.05,
+        )
+        release_first_send.set()
+        await self._drain_room_name_tasks()
+
+        names = [
+            call.args[2]["name"]
+            for call in self.adapter._client.send_state_event.await_args_list
+        ]
+        assert names == ["🟡 Existing epic", "✅ Existing epic"]
+
+    def test_yaml_config_bridge_enables_feature(self, monkeypatch):
+        from plugins.platforms.matrix.adapter import MatrixAdapter, _apply_yaml_config
+
+        monkeypatch.delenv("HERMES_MATRIX_DYNAMIC_ROOM_NAME", raising=False)
+        _apply_yaml_config({}, {"dynamic_room_name": True})
+
+        adapter = MatrixAdapter(
+            PlatformConfig(
+                enabled=True,
+                token="syt_test_token",
+                extra={"homeserver": "https://matrix.example.org"},
+            )
+        )
+        assert adapter._dynamic_room_name_enabled is True
 
 
 # ---------------------------------------------------------------------------

@@ -47,6 +47,10 @@ Environment variables:
                               when requester metadata is available (default: true)
     MATRIX_APPROVAL_TIMEOUT_SECONDS
                               Reaction approval/model-picker timeout (default: 300)
+    HERMES_MATRIX_DYNAMIC_ROOM_NAME
+                              Internal config bridge for matrix.dynamic_room_name.
+                              When enabled, DM room names follow processing state
+                              and the generated semantic session title.
 """
 
 from __future__ import annotations
@@ -127,6 +131,7 @@ except ImportError:
     TrustState = _TrustStateStub  # type: ignore[misc,assignment]
 
 from gateway.config import Platform, PlatformConfig
+from gateway.session import SessionSource
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -1000,6 +1005,8 @@ class MatrixAdapter(BasePlatformAdapter):
     # overrides both from _resolve_max_message_length().
     max_message_length = DEFAULT_MAX_MESSAGE_LENGTH
     _split_threshold = DEFAULT_MAX_MESSAGE_LENGTH - 100
+    _dynamic_room_name_enabled = False
+    _dynamic_room_name_timeout_seconds = 2.0
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.MATRIX)
@@ -1130,6 +1137,35 @@ class MatrixAdapter(BasePlatformAdapter):
         # if that changes, add a config.yaml entry rather than an env var.
         self._reaction_redaction_delay_seconds = 5.0
         self._reaction_redaction_tasks: Set[asyncio.Task] = set()
+
+        # Optional Element-visible task state. This is deliberately DM-only:
+        # renaming a shared project room on every turn would be surprising and
+        # would create noisy room-state history for every participant.
+        dynamic_room_name = config.extra.get("dynamic_room_name")
+        if dynamic_room_name is None:
+            dynamic_room_name = os.getenv("HERMES_MATRIX_DYNAMIC_ROOM_NAME", "false")
+        if isinstance(dynamic_room_name, str):
+            self._dynamic_room_name_enabled = dynamic_room_name.lower() in {
+                "true",
+                "1",
+                "yes",
+                "on",
+            }
+        else:
+            self._dynamic_room_name_enabled = bool(dynamic_room_name)
+        self._dynamic_room_name_bases: Dict[str, str] = {}
+        self._dynamic_room_name_recovered_bases: Dict[str, str] = {}
+        self._dynamic_room_name_initialized: Set[str] = set()
+        self._dynamic_room_name_status: Dict[str, str] = {}
+        self._dynamic_room_name_active: Dict[str, int] = {}
+        self._dynamic_room_name_active_turns: Set[tuple[str, str]] = set()
+        self._dynamic_room_name_last_sent: Dict[str, str] = {}
+        self._dynamic_room_name_superseded_sent: Dict[str, Set[str]] = {}
+        self._dynamic_room_name_terminal_external_checks: Set[str] = set()
+        self._dynamic_room_name_locks: Dict[str, asyncio.Lock] = {}
+        self._dynamic_room_name_tasks: Set[asyncio.Task] = set()
+        self._dynamic_room_name_room_tasks: Dict[str, asyncio.Task] = {}
+        self._dynamic_room_name_timeout_seconds = 2.0
 
         # Proxy support — resolve once at init, reuse for all HTTP traffic.
         self._proxy_url: str | None = resolve_proxy_url(platform_env_var="MATRIX_PROXY")
@@ -1783,6 +1819,17 @@ class MatrixAdapter(BasePlatformAdapter):
         if redaction_tasks:
             await asyncio.gather(*redaction_tasks, return_exceptions=True)
         self._reaction_redaction_tasks.clear()
+
+        room_name_tasks = list(self._dynamic_room_name_tasks)
+        for task in room_name_tasks:
+            if not task.done():
+                task.cancel()
+        if room_name_tasks:
+            await asyncio.gather(*room_name_tasks, return_exceptions=True)
+        self._dynamic_room_name_tasks.clear()
+        self._dynamic_room_name_room_tasks.clear()
+        self._dynamic_room_name_terminal_external_checks.clear()
+        self._dynamic_room_name_superseded_sent.clear()
 
         # Close the SQLite crypto store database.
         if hasattr(self, "_crypto_db") and self._crypto_db:
@@ -3542,7 +3589,9 @@ class MatrixAdapter(BasePlatformAdapter):
         task.add_done_callback(self._reaction_redaction_tasks.discard)
 
     async def on_processing_start(self, event: MessageEvent) -> None:
-        """Add eyes reaction when the agent starts processing a message."""
+        """Mark a DM busy and add an eyes reaction for the inbound message."""
+        if not await self._update_dynamic_room_name_for_start(event):
+            return
         if not self._reactions_enabled:
             return
         msg_id = event.message_id
@@ -3557,7 +3606,9 @@ class MatrixAdapter(BasePlatformAdapter):
         event: MessageEvent,
         outcome: ProcessingOutcome,
     ) -> None:
-        """Replace eyes with checkmark (success) or cross (failure)."""
+        """Mark a DM complete and replace the processing reaction."""
+        if not await self._update_dynamic_room_name_for_completion(event, outcome):
+            return
         if not self._reactions_enabled:
             return
         msg_id = event.message_id
@@ -3579,6 +3630,283 @@ class MatrixAdapter(BasePlatformAdapter):
             msg_id,
             "\u2705" if outcome == ProcessingOutcome.SUCCESS else "\u274c",
         )
+
+    @staticmethod
+    def _sanitize_dynamic_room_name(title: str) -> str:
+        """Return a short, stable Matrix room name without nested status icons."""
+        cleaned = re.sub(r"\s+", " ", str(title or "")).strip()
+        cleaned = re.sub(r"^(?:[🟡✅🔴❌⏹]\s*)+", "", cleaned).strip()
+        if not cleaned:
+            return ""
+        if len(cleaned) > 60:
+            cleaned = cleaned[:57].rstrip() + "..."
+        return cleaned
+
+    def _dynamic_room_name_allowed(self, event: MessageEvent) -> bool:
+        """Limit automatic room-state changes to explicitly enabled Matrix DMs."""
+        return bool(
+            self._dynamic_room_name_enabled
+            and self._client
+            and event.source.chat_id
+            and str(event.source.chat_type).lower() == "dm"
+        )
+
+    def _dynamic_room_name_base(self, room_id: str) -> str | None:
+        return self._dynamic_room_name_bases.get(room_id) or None
+
+    async def _initialize_dynamic_room_name_base(self, room_id: str) -> None:
+        """Recover the stable base from room state on the first render."""
+        if room_id in self._dynamic_room_name_initialized:
+            return
+        base = ""
+        try:
+            current_name = await asyncio.wait_for(
+                self._get_room_name(room_id),
+                timeout=self._dynamic_room_name_timeout_seconds,
+            )
+            if current_name:
+                base = self._sanitize_dynamic_room_name(current_name)
+        except Exception:
+            logger.debug(
+                "Matrix: failed to initialize dynamic room name for %s",
+                room_id,
+                exc_info=True,
+            )
+        self._dynamic_room_name_initialized.add(room_id)
+        if base:
+            self._dynamic_room_name_recovered_bases[room_id] = base
+            self._dynamic_room_name_bases.setdefault(room_id, base)
+
+    async def _send_dynamic_room_name(self, room_id: str, name: str) -> bool:
+        """Best-effort, deduplicated ``m.room.name`` state update."""
+        if not self._client or not self._dynamic_room_name_enabled:
+            return False
+        if self._dynamic_room_name_last_sent.get(room_id) == name:
+            return True
+        try:
+            await asyncio.wait_for(
+                self._client.send_state_event(
+                    RoomID(room_id),
+                    EventType.ROOM_NAME,
+                    {"name": name},
+                ),
+                timeout=self._dynamic_room_name_timeout_seconds,
+            )
+        except Exception as exc:
+            logger.debug("Matrix: dynamic room rename failed for %s: %s", room_id, exc)
+            return False
+        self._dynamic_room_name_last_sent[room_id] = name
+        return True
+
+    async def _render_dynamic_room_name(self, room_id: str) -> bool:
+        # Serialize each room's state writes. Recompute after acquiring the lock
+        # so a delayed working update cannot overwrite a newer terminal state.
+        lock = self._dynamic_room_name_locks.setdefault(room_id, asyncio.Lock())
+        async with lock:
+            await self._initialize_dynamic_room_name_base(room_id)
+            return await self._render_dynamic_room_name_locked(room_id)
+
+    async def _render_dynamic_room_name_locked(self, room_id: str) -> bool:
+        """Render while the caller holds this room's dynamic-name lock."""
+        status = self._dynamic_room_name_status.get(room_id, "idle")
+        # Immediately before a terminal render, notice a human/client rename
+        # that happened while Hermes was working.  Only a value different from
+        # our last successful write is external.  This read runs under the same
+        # room lock as authoritative semantic-base updates, so a delayed read
+        # can never overwrite a newer tool rename: the newer update either ran
+        # first (and is observed as last_sent) or runs after and wins.
+        if room_id in self._dynamic_room_name_terminal_external_checks:
+            self._dynamic_room_name_terminal_external_checks.discard(room_id)
+            superseded_sent = self._dynamic_room_name_superseded_sent.pop(
+                room_id, set()
+            )
+            try:
+                current_name = await asyncio.wait_for(
+                    self._get_room_name(room_id),
+                    timeout=self._dynamic_room_name_timeout_seconds,
+                )
+            except Exception:
+                current_name = None
+            if (
+                current_name
+                and current_name != self._dynamic_room_name_last_sent.get(room_id)
+                and current_name not in superseded_sent
+            ):
+                external_base = self._sanitize_dynamic_room_name(current_name)
+                if external_base:
+                    self._dynamic_room_name_bases[room_id] = external_base
+                    self._dynamic_room_name_recovered_bases[room_id] = external_base
+        base = self._dynamic_room_name_base(room_id)
+        if not base:
+            return False
+        prefix = {
+            "working": "🟡",
+            "success": "✅",
+            "failure": "🔴",
+            "cancelled": "🔴",
+        }.get(status)
+        name = f"{prefix} {base}" if prefix else base
+        return await self._send_dynamic_room_name(room_id, name)
+
+    def _schedule_dynamic_room_name_render(self, room_id: str) -> None:
+        """Queue a best-effort room-state write without blocking message intake."""
+        previous = self._dynamic_room_name_room_tasks.get(room_id)
+
+        async def _render_after_previous() -> None:
+            if previous is not None:
+                try:
+                    await previous
+                except (asyncio.CancelledError, Exception):
+                    pass
+            await self._render_dynamic_room_name(room_id)
+
+        task = asyncio.create_task(_render_after_previous())
+        self._dynamic_room_name_tasks.add(task)
+        self._dynamic_room_name_room_tasks[room_id] = task
+
+        def _finished(done: asyncio.Task) -> None:
+            self._dynamic_room_name_tasks.discard(done)
+            if self._dynamic_room_name_room_tasks.get(room_id) is done:
+                self._dynamic_room_name_room_tasks.pop(room_id, None)
+            try:
+                done.result()
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.debug(
+                    "Matrix: detached dynamic room rename failed for %s",
+                    room_id,
+                    exc_info=True,
+                )
+
+        task.add_done_callback(_finished)
+
+    @staticmethod
+    def _dynamic_room_name_turn_key(event: MessageEvent) -> tuple[str, str]:
+        room_id = str(event.source.chat_id)
+        message_id = event.message_id or f"event:{id(event)}"
+        return room_id, str(message_id)
+
+    async def _update_dynamic_room_name_for_start(self, event: MessageEvent) -> bool:
+        if not self._dynamic_room_name_allowed(event):
+            return True
+        room_id = str(event.source.chat_id)
+        turn_key = self._dynamic_room_name_turn_key(event)
+        if turn_key in self._dynamic_room_name_active_turns:
+            return False
+        self._dynamic_room_name_active_turns.add(turn_key)
+        self._dynamic_room_name_active[room_id] = (
+            self._dynamic_room_name_active.get(room_id, 0) + 1
+        )
+        self._dynamic_room_name_status[room_id] = "working"
+        self._schedule_dynamic_room_name_render(room_id)
+        return True
+
+    async def _update_dynamic_room_name_for_completion(
+        self,
+        event: MessageEvent,
+        outcome: ProcessingOutcome,
+    ) -> bool:
+        if not self._dynamic_room_name_allowed(event):
+            return True
+        room_id = str(event.source.chat_id)
+        turn_key = self._dynamic_room_name_turn_key(event)
+        if turn_key not in self._dynamic_room_name_active_turns:
+            return False
+        self._dynamic_room_name_active_turns.remove(turn_key)
+        remaining = max(0, self._dynamic_room_name_active.get(room_id, 1) - 1)
+        self._dynamic_room_name_active[room_id] = remaining
+        if remaining:
+            self._dynamic_room_name_status[room_id] = "working"
+        elif outcome == ProcessingOutcome.SUCCESS:
+            self._dynamic_room_name_status[room_id] = "success"
+        elif outcome == ProcessingOutcome.CANCELLED:
+            self._dynamic_room_name_status[room_id] = "cancelled"
+        else:
+            self._dynamic_room_name_status[room_id] = "failure"
+        if not remaining:
+            self._dynamic_room_name_terminal_external_checks.add(room_id)
+        self._schedule_dynamic_room_name_render(room_id)
+        return True
+
+    async def set_semantic_room_name(self, room_id: str, title: str) -> bool:
+        """Apply an auto-generated session title while preserving task status."""
+        if not self._dynamic_room_name_enabled or not room_id:
+            return False
+        room_id = str(room_id)
+        base = self._sanitize_dynamic_room_name(title)
+        lock = self._dynamic_room_name_locks.setdefault(room_id, asyncio.Lock())
+        async with lock:
+            await self._initialize_dynamic_room_name_base(room_id)
+            if base:
+                self._dynamic_room_name_bases[room_id] = base
+            return await self._render_dynamic_room_name_locked(room_id)
+
+    async def on_session_semantic_base_changed(
+        self,
+        source: SessionSource,
+        base: str | None,
+    ) -> bool:
+        """Apply the gateway-resolved goal/title base to an opted-in DM."""
+        if not (
+            self._dynamic_room_name_enabled
+            and source.chat_id
+            and str(source.chat_type).lower() == "dm"
+        ):
+            return False
+        room_id = str(source.chat_id)
+        sanitized = self._sanitize_dynamic_room_name(base) if base else ""
+        lock = self._dynamic_room_name_locks.setdefault(room_id, asyncio.Lock())
+        async with lock:
+            # Capture the pre-authoritative room base before the first goal/title
+            # replaces it. The read is bounded by the normal Matrix timeout.
+            await self._initialize_dynamic_room_name_base(room_id)
+            if sanitized:
+                previous_sent = self._dynamic_room_name_last_sent.get(room_id)
+                if (
+                    previous_sent
+                    and sanitized != self._dynamic_room_name_base(room_id)
+                ):
+                    # Matrix state reads can briefly return any preceding write
+                    # from a chain of authoritative tool-driven semantic
+                    # updates. Remember the whole superseded chain until the
+                    # single terminal reconciliation consumes it, so no stale
+                    # echo can be mistaken for a human rename.
+                    self._dynamic_room_name_superseded_sent.setdefault(
+                        room_id, set()
+                    ).add(previous_sent)
+                self._dynamic_room_name_bases[room_id] = sanitized
+            else:
+                recovered = self._dynamic_room_name_recovered_bases.get(room_id)
+                if recovered:
+                    self._dynamic_room_name_bases[room_id] = recovered
+                else:
+                    self._dynamic_room_name_bases.pop(room_id, None)
+                    return False
+            return await self._render_dynamic_room_name_locked(room_id)
+
+    def supports_session_semantic_base_refresh(self, source: SessionSource) -> bool:
+        """Declare whether this Matrix session opted into live room renames."""
+        return bool(
+            self._dynamic_room_name_enabled
+            and self._client
+            and source.chat_id
+            and str(source.chat_type).lower() == "dm"
+        )
+
+    async def on_session_title_changed(
+        self,
+        source: SessionSource,
+        title: str,
+    ) -> bool:
+        """Propagate a session title to an opted-in Matrix DM room."""
+        if not (
+            self._dynamic_room_name_enabled
+            and source.chat_id
+            and str(source.chat_type).lower() == "dm"
+        ):
+            return False
+        return await self.set_semantic_room_name(str(source.chat_id), title)
 
     async def _on_reaction(self, event: Any) -> None:
         """Handle incoming reaction events."""
@@ -4974,6 +5302,12 @@ def _apply_yaml_config(yaml_cfg: dict, matrix_cfg: dict) -> dict | None:
         os.environ["MATRIX_DM_MENTION_THREADS"] = str(matrix_cfg["dm_mention_threads"]).lower()
     if "max_message_length" in matrix_cfg and not os.getenv("MATRIX_MAX_MESSAGE_LENGTH"):
         os.environ["MATRIX_MAX_MESSAGE_LENGTH"] = str(matrix_cfg["max_message_length"])
+    if "dynamic_room_name" in matrix_cfg and not os.getenv(
+        "HERMES_MATRIX_DYNAMIC_ROOM_NAME"
+    ):
+        os.environ["HERMES_MATRIX_DYNAMIC_ROOM_NAME"] = str(
+            matrix_cfg["dynamic_room_name"]
+        ).lower()
     return None
 
 
