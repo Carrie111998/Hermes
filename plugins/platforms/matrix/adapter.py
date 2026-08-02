@@ -3386,8 +3386,23 @@ class MatrixAdapter(BasePlatformAdapter):
             "1",
             "yes",
         }
-        if not allow_all and not (
-            self._allowed_user_ids and inviter in self._allowed_user_ids
+        # Self-invites happen when the bot creates a room (homeserver sends
+        # the creator an auto-invite for them to confirm join). These are
+        # safe to accept regardless of allowlist because they originate from
+        # the bot's own session and are cryptographically signed by it.
+        #
+        # _is_self_sender() applies the adapter's usual MXID normalization
+        # (trim + lowercase) so a homeserver that echoes a differently-cased
+        # localpart still matches. It deliberately fails OPEN when our own ID
+        # is unresolved — correct for echo-loop suppression, but here it would
+        # be an allowlist bypass, so both IDs must be non-empty first.
+        is_self_invite = bool(
+            inviter and self._user_id and self._is_self_sender(inviter)
+        )
+        if (
+            not allow_all
+            and not is_self_invite
+            and not (self._allowed_user_ids and inviter in self._allowed_user_ids)
         ):
             logger.warning(
                 "Matrix: rejecting invite to %s from unauthorized user %s",

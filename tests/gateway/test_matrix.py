@@ -2862,3 +2862,106 @@ class TestMatrixDispatchSyncIsolation:
 
         assert ran["ok"] is True  # the sibling handler still ran
         assert "event handler failed" in caplog.text  # failure surfaced, not swallowed
+
+
+# ---------------------------------------------------------------------------
+# Invite allowlist gate — self-invite bypass
+# ---------------------------------------------------------------------------
+
+class TestMatrixInviteAllowlist:
+    """_on_invite must always accept the homeserver's own auto-invite to the
+    room creator (self-invite), even under a strict allowlist, while still
+    rejecting invites from other unauthorized users."""
+
+    def setup_method(self):
+        self.adapter = _make_adapter()
+        self.adapter._user_id = "@bot:example.org"
+        self.adapter._allowed_user_ids = {"@alice:example.org"}
+        self.adapter._schedule_invite_join = MagicMock()
+
+    def _invite_event(self, sender: str, is_direct: bool = False):
+        return types.SimpleNamespace(
+            room_id="!room:example.org",
+            content=types.SimpleNamespace(is_direct=is_direct),
+            sender=sender,
+        )
+
+    @pytest.mark.asyncio
+    async def test_rejects_invite_from_unauthorized_user(self, caplog, monkeypatch):
+        import logging
+        monkeypatch.delenv("GATEWAY_ALLOW_ALL_USERS", raising=False)
+
+        with caplog.at_level(logging.WARNING):
+            await self.adapter._on_invite(self._invite_event("@eve:evil.example"))
+
+        self.adapter._schedule_invite_join.assert_not_called()
+        assert "rejecting invite" in caplog.text
+        assert "@eve:evil.example" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_accepts_invite_from_allowlisted_user(self, monkeypatch):
+        monkeypatch.delenv("GATEWAY_ALLOW_ALL_USERS", raising=False)
+
+        await self.adapter._on_invite(self._invite_event("@alice:example.org"))
+
+        self.adapter._schedule_invite_join.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_accepts_self_invite_even_when_not_allowlisted(self, monkeypatch):
+        """The homeserver auto-invites the room creator when the bot itself
+        creates a room. This must be accepted even though the bot's own
+        mxid is (deliberately) not on its own allowlist."""
+        monkeypatch.delenv("GATEWAY_ALLOW_ALL_USERS", raising=False)
+        assert "@bot:example.org" not in self.adapter._allowed_user_ids
+
+        await self.adapter._on_invite(self._invite_event("@bot:example.org"))
+
+        self.adapter._schedule_invite_join.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_empty_sender_is_not_treated_as_self_invite(self, monkeypatch):
+        """An invite event with no resolvable sender must not accidentally
+        match the self-invite bypass (falsy inviter == falsy comparison)."""
+        monkeypatch.delenv("GATEWAY_ALLOW_ALL_USERS", raising=False)
+        self.adapter._user_id = ""
+
+        await self.adapter._on_invite(self._invite_event(""))
+
+        self.adapter._schedule_invite_join.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_accepts_self_invite_with_different_casing(self, monkeypatch):
+        """Homeservers normalize localpart case differently across API
+        surfaces, so the self-invite check must use the adapter's usual
+        trim+lowercase MXID normalization rather than byte equality."""
+        monkeypatch.delenv("GATEWAY_ALLOW_ALL_USERS", raising=False)
+
+        await self.adapter._on_invite(self._invite_event(" @Bot:Example.org "))
+
+        self.adapter._schedule_invite_join.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_unresolved_own_user_id_does_not_bypass_allowlist(
+        self, caplog, monkeypatch
+    ):
+        """_is_self_sender() fails OPEN when our own mxid is unresolved, which
+        is right for echo-loop suppression but would be an allowlist bypass
+        here. With _user_id empty, an unauthorized inviter must still be
+        rejected."""
+        import logging
+        monkeypatch.delenv("GATEWAY_ALLOW_ALL_USERS", raising=False)
+        self.adapter._user_id = ""
+
+        with caplog.at_level(logging.WARNING):
+            await self.adapter._on_invite(self._invite_event("@eve:evil.example"))
+
+        self.adapter._schedule_invite_join.assert_not_called()
+        assert "rejecting invite" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_allow_all_env_accepts_any_inviter(self, monkeypatch):
+        monkeypatch.setenv("GATEWAY_ALLOW_ALL_USERS", "true")
+
+        await self.adapter._on_invite(self._invite_event("@stranger:example.org"))
+
+        self.adapter._schedule_invite_join.assert_called_once()
