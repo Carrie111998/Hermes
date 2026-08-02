@@ -368,6 +368,13 @@ class TestStripThinkBlocks:
 
 
 
+    def test_invoke_payload_removed(self, agent):
+        result = agent._strip_think_blocks(
+            'before\n<invoke name="terminal">secret</invoke>\nafter'
+        )
+        assert "<invoke" not in result
+        assert "secret" not in result
+
     def test_single_block_removed(self, agent):
         result = agent._strip_think_blocks("<think>reasoning</think> answer")
         assert "reasoning" not in result
