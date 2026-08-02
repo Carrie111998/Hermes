@@ -140,6 +140,70 @@ async def test_durable_replay_claim_context_reaches_turn_owner():
     assert observed == claim_context
 
 
+@pytest.mark.asyncio
+async def test_durable_claim_normal_early_return_commits_terminal(monkeypatch):
+    runner = _make_runner()
+    event = _make_event(text="plugin-handled")
+    claim_context = (build_session_key(event.source), event.source, "claim-normal")
+    setattr(event, "_hermes_busy_queue_claim_context", claim_context)
+    finalize = MagicMock(return_value=True)
+
+    async def early_return(_event, _context, _guard):
+        return None
+
+    monkeypatch.setattr(runner, "_handle_message_impl", early_return)
+    monkeypatch.setattr(runner, "_busy_queue_finalize_claim", finalize)
+
+    assert await runner._handle_message(event) is None
+    finalize.assert_called_once_with(
+        *claim_context,
+        runner._busy_queue_terminal_discard_result(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_durable_claim_exception_before_handoff_rolls_back(monkeypatch):
+    runner = _make_runner()
+    event = _make_event(text="prehook failure")
+    claim_context = (build_session_key(event.source), event.source, "claim-error")
+    setattr(event, "_hermes_busy_queue_claim_context", claim_context)
+    adapter = object()
+    rollback = MagicMock(return_value=True)
+
+    async def fail_before_handoff(_event, _context, _guard):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(runner, "_handle_message_impl", fail_before_handoff)
+    monkeypatch.setattr(runner, "_adapter_for_source", lambda _source: adapter)
+    monkeypatch.setattr(runner, "_busy_queue_rollback_claim", rollback)
+
+    with pytest.raises(RuntimeError, match="boom"):
+        await runner._handle_message(event)
+    rollback.assert_called_once_with(*claim_context, adapter)
+
+
+@pytest.mark.asyncio
+async def test_durable_claim_handoff_leaves_finalization_to_turn_owner(monkeypatch):
+    runner = _make_runner()
+    event = _make_event(text="turn-owned")
+    claim_context = (build_session_key(event.source), event.source, "claim-turn")
+    setattr(event, "_hermes_busy_queue_claim_context", claim_context)
+    finalize = MagicMock(return_value=True)
+    rollback = MagicMock(return_value=True)
+
+    async def handoff(_event, _context, guard):
+        guard["handed_off"] = True
+        return "started"
+
+    monkeypatch.setattr(runner, "_handle_message_impl", handoff)
+    monkeypatch.setattr(runner, "_busy_queue_finalize_claim", finalize)
+    monkeypatch.setattr(runner, "_busy_queue_rollback_claim", rollback)
+
+    assert await runner._handle_message(event) == "started"
+    finalize.assert_not_called()
+    rollback.assert_not_called()
+
+
 # ------------------------------------------------------------------
 # Test 2: Sentinel is cleaned up after _handle_message_with_agent
 # ------------------------------------------------------------------

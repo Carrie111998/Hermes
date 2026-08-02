@@ -46,12 +46,18 @@ def test_startup_fast_import_weight():
         "import hermes_cli._startup_fast\n"
         "print(json.dumps(sorted(sys.modules.keys())))\n"
     )
+    env = dict(os.environ)
+    # The suite's subprocess sitecustomize intentionally imports managed-scope
+    # code (and therefore yaml). This guard measures the production fast path,
+    # so disable only that tests-only bootstrap for this child.
+    env.pop("_HERMES_TEST_MANAGED_DEFAULT", None)
     result = subprocess.run(
         [sys.executable, "-c", probe],
         capture_output=True,
         text=True,
         timeout=30,
         cwd=REPO_ROOT,
+        env=env,
     )
     assert result.returncode == 0, result.stderr
     loaded = set(json.loads(result.stdout))

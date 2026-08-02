@@ -347,11 +347,74 @@ async def test_late_smart_classification_wakes_idle_session_without_new_inbound(
     release_classifier.set()
     assert await route_task is True
 
+    for _ in range(50):
+        await asyncio.sleep(0)
+        if adapter.handle_message.await_count:
+            break
     adapter.handle_message.assert_awaited_once()
     dispatched = adapter.handle_message.await_args.args[0]
     assert dispatched.text == event.text
     assert getattr(dispatched, "_hermes_busy_queue_claim_context", None)
     assert sk not in adapter._pending_messages
+
+
+@pytest.mark.asyncio
+async def test_stop_cancels_registered_late_smart_replay_before_dispatch_finishes(
+    tmp_path,
+):
+    runner, agent = _runner_and_agent()
+    event = _event("cancel the late replay")
+    sk = build_session_key(event.source)
+    runner._running_agents[sk] = agent
+    classifier_started = asyncio.Event()
+    release_classifier = asyncio.Event()
+    dispatch_started = asyncio.Event()
+    dispatch_block = asyncio.Event()
+
+    async def classify(*_args, **_kwargs):
+        classifier_started.set()
+        await release_classifier.wait()
+        return await _decision(ROUTE_DEPENDENT, event.text)
+
+    async def blocked_dispatch(_event):
+        dispatch_started.set()
+        await dispatch_block.wait()
+
+    adapter = MagicMock()
+    adapter._active_sessions = {}
+    adapter._pending_messages = {}
+    adapter.handle_message = AsyncMock(side_effect=blocked_dispatch)
+    runner._classify_smart_busy_message = classify
+    runner._adapter_for_source = MagicMock(return_value=adapter)
+    runner._send_smart_busy_ack = AsyncMock()
+    runner._busy_queue_root_override = tmp_path / "profile"
+    runner._busy_queue_lock = threading.RLock()
+    runner._busy_queue_uncertain_sessions = set()
+    runner._busy_queue_uncertain_digests = set()
+    runner._busy_queue_uncertain_paths = set()
+    runner._busy_queue_active_claims = {}
+    runner._busy_queue_claimed_events = {}
+    runner._busy_queue_cancelled_claim_tokens = set()
+    runner._busy_queue_finalized_claim_tokens = set()
+
+    route_task = asyncio.create_task(
+        runner._handle_smart_busy_message(event, sk, agent, adapter)
+    )
+    await classifier_started.wait()
+    assert runner._running_agents.pop(sk) is agent
+    release_classifier.set()
+    assert await route_task is True
+    await dispatch_started.wait()
+
+    replay_task = runner._busy_queue_replay_tasks[sk]
+    assert runner._busy_queue_cancel_session(sk, event.source, adapter)
+    with pytest.raises(asyncio.CancelledError):
+        await replay_task
+
+    assert sk not in runner._busy_queue_replay_tasks
+    assert sk not in runner._busy_queue_uncertain_sessions
+    assert sk not in runner._busy_queue_active_claims
+    assert not list((tmp_path / "profile").rglob("*.json"))
 
 
 @pytest.mark.asyncio

@@ -8046,16 +8046,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
 
             # Classification can outlive the predecessor's terminal drain. If
-            # durable admission completed after that owner disappeared, claim
-            # and launch the FIFO head now; otherwise no future inbound message
-            # is guaranteed to wake the accepted work.
+            # durable admission completed after that owner disappeared, register
+            # an ordinary replay task now so /stop can cancel it before dispatch.
             if (
                 accepted is True
                 and self._running_agents.get(session_key) is None
             ):
-                await self._run_busy_queue_replay(
-                    session_key,
-                    event.source,
+                self.__dict__.setdefault(
+                    "_busy_queue_restored_sources", {}
+                )[session_key] = event.source
+                self._schedule_busy_queue_replays(
+                    [session_key],
                     startup_restore=False,
                 )
 
@@ -14309,26 +14310,59 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return "Agent is running — use /goal status / pause / clear / wait mid-run, or /stop before setting a new goal."
 
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
-        """
-        Handle an incoming message from any platform.
-        
-        This is the core message processing pipeline:
-        1. Check user authorization
-        2. Check for commands (/new, /reset, etc.)
-        3. Check for running agent and interrupt if needed
-        4. Get or create session
-        5. Build context for agent
-        6. Run agent conversation
-        7. Return response
-        """
-        # Durable replay/handoff events carry a transient claim sidecar. Capture
-        # it before pre-hooks can replace the dataclass instance, then pass it to
-        # the turn that owns terminal commit/rollback.
-        busy_queue_claim_context = getattr(
+        """Run the message pipeline while owning any durable replay claim."""
+        claim_context = getattr(
             event,
             "_hermes_busy_queue_claim_context",
             None,
         )
+        if not (
+            isinstance(claim_context, tuple)
+            and len(claim_context) == 3
+            and isinstance(claim_context[0], str)
+            and isinstance(claim_context[1], SessionSource)
+            and isinstance(claim_context[2], str)
+        ):
+            return await self._handle_message_impl(event, None, None)
+
+        claim_guard = {"handed_off": False}
+        claim_key, claim_source, claim_token = claim_context
+        try:
+            result = await self._handle_message_impl(
+                event,
+                claim_context,
+                claim_guard,
+            )
+        except BaseException:
+            if not claim_guard["handed_off"]:
+                adapter = self._adapter_for_source(claim_source)
+                if adapter is not None:
+                    self._busy_queue_rollback_claim(
+                        claim_key,
+                        claim_source,
+                        claim_token,
+                        adapter,
+                    )
+            raise
+
+        if not claim_guard["handed_off"]:
+            self._busy_queue_finalize_claim(
+                claim_key,
+                claim_source,
+                claim_token,
+                self._busy_queue_terminal_discard_result(),
+            )
+        return result
+
+    async def _handle_message_impl(
+        self,
+        event: MessageEvent,
+        busy_queue_claim_context: Optional[
+            tuple[str, SessionSource, str]
+        ] = None,
+        busy_queue_claim_guard: Optional[Dict[str, bool]] = None,
+    ) -> Optional[str]:
+        """Core message pipeline, with claim ownership supplied by the wrapper."""
         source = event.source
 
         # 🔴 Cross-session leak guard. This handler runs inside a per-message
@@ -15681,6 +15715,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 isinstance(busy_queue_claim_context, tuple)
                 and len(busy_queue_claim_context) == 3
             ):
+                if busy_queue_claim_guard is not None:
+                    busy_queue_claim_guard["handed_off"] = True
                 _agent_result = await self._handle_message_with_agent(
                     event,
                     source,
@@ -26883,6 +26919,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return
 
+        claim_lock = self.__dict__.get("_busy_queue_lock")
+        if claim_lock is None:
+            return
+        with claim_lock:
+            active_token = self.__dict__.setdefault(
+                "_busy_queue_active_claims", {}
+            ).get(session_key)
+            cancelled = token in self.__dict__.setdefault(
+                "_busy_queue_cancelled_claim_tokens", set()
+            )
+        if active_token != token or cancelled:
+            return
+
         try:
             # BasePlatformAdapter.handle_message is only a launcher. The claim
             # intentionally survives this await and is finalized by the actual
@@ -26910,8 +26959,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if isinstance(exc, asyncio.CancelledError):
                 raise
 
-    def _schedule_busy_queue_replays(self, session_keys: List[str]) -> int:
-        """Schedule restored heads asynchronously, at most once per session."""
+    def _schedule_busy_queue_replays(
+        self,
+        session_keys: List[str],
+        *,
+        startup_restore: bool = True,
+    ) -> int:
+        """Schedule durable heads asynchronously, at most once per session."""
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -26929,9 +26983,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             source = restored_sources.get(session_key)
             if not isinstance(source, SessionSource):
                 continue
-            task = loop.create_task(
+            replay_coro = (
                 self._run_busy_queue_replay(session_key, source)
+                if startup_restore
+                else self._run_busy_queue_replay(
+                    session_key,
+                    source,
+                    startup_restore=False,
+                )
             )
+            task = loop.create_task(replay_coro)
             replay_tasks[session_key] = task
             if getattr(self, "_startup_restore_in_progress", False):
                 startup_tasks = self.__dict__.setdefault(
