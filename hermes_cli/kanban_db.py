@@ -4264,6 +4264,22 @@ def claim_task(
                 {"reason": "parents_not_done"},
             )
             return None
+        # ``claim_task`` is also a public/manual path. Keep a recent PR from
+        # being bypassed by callers that do not enter through dispatch_once.
+        # Check the active-PR predicate independently from the guard's priority
+        # ordering so blocker_auth/recent_success cannot mask it. An explicit
+        # revision intent may bypass only active_pr; if any other guard still
+        # applies, the revision claim remains blocked. Ordinary manual claims
+        # without revision intent retain their historical semantics for the
+        # non-PR guards.
+        revision_event = _active_revision_event(conn, task_id)
+        if _active_pr_is_guarded(conn, task_id):
+            return None
+        if (
+            revision_event is not None
+            and check_respawn_guard(conn, task_id) is not None
+        ):
+            return None
         # Defensive: if a prior run somehow leaked (invariant violation from
         # an unknown code path), close it as 'reclaimed' so we don't strand
         # it when the CAS resets the pointer below. No-op when the invariant
@@ -4334,6 +4350,14 @@ def claim_task(
             {"lock": lock, "expires": expires, "run_id": run_id},
             run_id=run_id,
         )
+        if revision_event is not None:
+            _append_event(
+                conn,
+                task_id,
+                "revision_consumed",
+                {"revision_event_id": int(revision_event["id"]), "run_id": run_id},
+                run_id=run_id,
+            )
         claimed = get_task(conn, task_id)
     _fire_kanban_lifecycle_hook(
         "kanban_task_claimed",
@@ -5898,7 +5922,13 @@ def promote_task(
     return True, None
 
 
-def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
+def unblock_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    revision: bool = False,
+    actor: Optional[str] = None,
+) -> bool:
     """Transition ``blocked``/``scheduled`` -> ready or todo.
 
     Defensively closes any stale ``current_run_id`` pointer before flipping
@@ -5914,6 +5944,23 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
             "SELECT current_run_id FROM tasks WHERE id = ? AND status IN ('blocked', 'scheduled')",
             (task_id,),
         ).fetchone()
+        prior_run = None
+        if revision:
+            if stale is None:
+                return False
+            prior_run = conn.execute(
+                "SELECT id, ended_at FROM task_runs WHERE task_id = ? "
+                "ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if (
+                prior_run is None
+                or prior_run["ended_at"] is None
+                or stale["current_run_id"] is not None
+            ):
+                raise ValueError(
+                    "revision unblock requires a terminal prior run and no active writer"
+                )
         if stale and stale["current_run_id"]:
             conn.execute(
                 """
@@ -5947,20 +5994,51 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         # triage at ``BLOCK_RECURRENCE_LIMIT``. It is reset to 0 only on a
         # successful completion (see ``complete_task``). ``consecutive_failures``
         # (the *dispatcher* spawn/crash/timeout counter — a different signal) is
-        # still reset here, which is correct: a deliberate unblock is a fresh
-        # start for the dispatcher's retry budget.
+        # still reset for a generic unblock, which is correct: a deliberate
+        # generic restart is a fresh start for the dispatcher's retry budget.
+        # A revision intent is narrower: it bypasses only active_pr, so it
+        # must retain the failure evidence used by the other respawn guards.
+        reset_failures = "" if revision else (
+            ", consecutive_failures = 0, last_failure_error = NULL"
+        )
         cur = conn.execute(
-            "UPDATE tasks SET status = ?, current_run_id = NULL, "
-            "consecutive_failures = 0, last_failure_error = NULL "
+            "UPDATE tasks SET status = ?, current_run_id = NULL"
+            f"{reset_failures} "
             "WHERE id = ? AND status IN ('blocked', 'scheduled')",
             (new_status, task_id),
         )
         if cur.rowcount != 1:
             return False
+        unblocked_payload: dict[str, Any] = (
+            {"status": new_status} if new_status != "ready" else {}
+        )
+        if revision:
+            unblocked_payload["revision"] = True
         _append_event(
             conn, task_id, "unblocked",
-            {"status": new_status} if new_status != "ready" else None,
+            unblocked_payload or None,
         )
+        if revision:
+            assert prior_run is not None
+            # Timestamps are only second-resolution. Record the newest PR
+            # comment identity seen at the operator action instead of making
+            # up a future timestamp. A same-second PR added later has a larger
+            # comment id and cannot be authorized by this revision intent.
+            latest_pr = _latest_pr_comment(
+                conn, task_id, now - _RESPAWN_GUARD_PR_WINDOW,
+            )
+            _append_event(
+                conn,
+                task_id,
+                "revision_requested",
+                {
+                    "prior_run_id": int(prior_run["id"]),
+                    "actor": actor,
+                    "after_pr_comment_id": (
+                        int(latest_pr["id"]) if latest_pr is not None else None
+                    ),
+                },
+            )
         return True
 
 
@@ -8009,6 +8087,82 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
 _clear_spawn_failures = _clear_failure_counter
 
 
+def _latest_pr_comment(conn: sqlite3.Connection, task_id: str, cutoff: int):
+    for comment in conn.execute(
+        "SELECT id, body, created_at FROM task_comments "
+        "WHERE task_id = ? AND created_at >= ? ORDER BY created_at DESC, id DESC",
+        (task_id, cutoff),
+    ).fetchall():
+        if comment["body"] and _RESPAWN_GUARD_PR_URL_RE.search(comment["body"]):
+            return comment
+    return None
+
+
+def _active_revision_event(conn: sqlite3.Connection, task_id: str):
+    revision = conn.execute(
+        "SELECT id, payload, created_at FROM task_events "
+        "WHERE task_id = ? AND kind = 'revision_requested' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if revision is None:
+        return None
+    consumed_rows = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'revision_consumed' AND id > ?",
+        (task_id, int(revision["id"])),
+    ).fetchall()
+    for event in consumed_rows:
+        try:
+            payload = json.loads(event["payload"] or "{}")
+        except (TypeError, ValueError):
+            continue
+        if payload.get("revision_event_id") == int(revision["id"]):
+            return None
+    later_attempt = conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? AND id > ? "
+        "AND kind IN ('claimed', 'spawned') LIMIT 1",
+        (task_id, int(revision["id"])),
+    ).fetchone()
+    return None if later_attempt else revision
+
+
+def _revision_authorizes_pr_comment(
+    revision: sqlite3.Row, pr_comment: sqlite3.Row,
+) -> bool:
+    """Return whether ``revision`` explicitly followed this PR comment.
+
+    Comment and event timestamps both have only second precision, so ordering
+    by time alone cannot distinguish a reviewer click from another PR comment
+    in the same second. The revision event records the newest PR comment id it
+    observed; a subsequent comment necessarily has a larger id.
+    """
+    try:
+        payload = json.loads(revision["payload"] or "{}")
+        return int(payload["after_pr_comment_id"]) == int(pr_comment["id"])
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def _active_pr_is_guarded(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Return whether a recent PR still lacks valid revision authorization.
+
+    This predicate is intentionally independent of ``check_respawn_guard``'s
+    priority order so public/manual claims cannot hide an active PR behind a
+    higher-priority auth or recent-success reason.
+    """
+    latest_pr = _latest_pr_comment(
+        conn, task_id, int(time.time()) - _RESPAWN_GUARD_PR_WINDOW,
+    )
+    if latest_pr is None:
+        return False
+    revision = _active_revision_event(conn, task_id)
+    return (
+        revision is None
+        or not _revision_authorizes_pr_comment(revision, latest_pr)
+    )
+
+
 def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
     """Return a guard reason if ``task_id`` should NOT be re-spawned, else None.
 
@@ -8122,26 +8276,99 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     ).fetchone()
     if recent_completed:
         completed_at = int(recent_completed["ended_at"] or 0)
-        requeued_after = conn.execute(
-            "SELECT 1 FROM task_events "
+        requeue_events = conn.execute(
+            "SELECT kind, payload FROM task_events "
             "WHERE task_id = ? AND created_at >= ? "
             "AND kind IN ('status', 'promoted', 'unblocked', 'reclaimed') "
-            "LIMIT 1",
+            "ORDER BY id ASC",
             (task_id, completed_at),
-        ).fetchone()
+        ).fetchall()
+        requeued_after = any(
+            event["kind"] != "unblocked"
+            or not _event_is_revision_unblock(event["payload"])
+            for event in requeue_events
+        )
         if not requeued_after:
             return "recent_success"
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
-    pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
-    for c in conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
-        (task_id, pr_cutoff),
-    ).fetchall():
-        if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
-            return "active_pr"
+    if _active_pr_is_guarded(conn, task_id):
+        return "active_pr"
 
     return None
+
+
+def get_respawn_guard_state(
+    conn: sqlite3.Connection, task_id: str,
+) -> Optional[dict[str, Any]]:
+    """Return the current guard reason and the time its source appeared."""
+    reason = check_respawn_guard(conn, task_id)
+    if reason is None:
+        return None
+    guarded_at: Optional[int] = None
+    if reason == "active_pr":
+        comment = _latest_pr_comment(
+            conn, task_id, int(time.time()) - _RESPAWN_GUARD_PR_WINDOW,
+        )
+        if comment is not None:
+            guarded_at = int(comment["created_at"])
+    elif reason == "recent_success":
+        row = conn.execute(
+            "SELECT MAX(ended_at) AS at FROM task_runs "
+            "WHERE task_id = ? AND outcome = 'completed'",
+            (task_id,),
+        ).fetchone()
+        if row and row["at"] is not None:
+            guarded_at = int(row["at"])
+    if guarded_at is None:
+        guarded_at = _guard_episode_started_at(conn, task_id)
+    return {"reason": reason, "guarded_at": guarded_at}
+
+
+_RESPAWN_GUARD_EPISODE_BOUNDARIES = (
+    "status", "promoted", "promoted_manual", "unblocked", "reclaimed",
+    "revision_requested", "revision_consumed", "claimed", "spawned",
+    "completed", "blocked", "crashed", "timed_out", "spawn_failed",
+    "gave_up", "rate_limited",
+)
+
+
+def _event_is_revision_unblock(payload: Optional[str]) -> bool:
+    try:
+        return bool(json.loads(payload or "{}").get("revision"))
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
+def _guard_episode_started_at(conn: sqlite3.Connection, task_id: str) -> int:
+    """Find the current fallback guard episode start without ticking it."""
+    placeholders = ", ".join("?" for _ in _RESPAWN_GUARD_EPISODE_BOUNDARIES)
+    row = conn.execute(
+        "SELECT kind, created_at FROM task_events WHERE task_id = ? "
+        f"AND kind IN ('respawn_guarded', {placeholders}) "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id, *_RESPAWN_GUARD_EPISODE_BOUNDARIES),
+    ).fetchone()
+    return int(row["created_at"]) if row is not None else int(time.time())
+
+
+def _should_emit_respawn_guard_event(
+    conn: sqlite3.Connection, task_id: str, reason: str,
+) -> bool:
+    placeholders = ", ".join("?" for _ in _RESPAWN_GUARD_EPISODE_BOUNDARIES)
+    latest = conn.execute(
+        "SELECT id, kind, payload FROM task_events WHERE task_id = ? "
+        f"AND kind IN ('respawn_guarded', {placeholders}) "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id, *_RESPAWN_GUARD_EPISODE_BOUNDARIES),
+    ).fetchone()
+    if latest is None or latest["kind"] != "respawn_guarded":
+        return True
+    try:
+        payload = json.loads(latest["payload"] or "{}")
+    except (TypeError, ValueError):
+        return True
+    return payload.get("reason") != reason
 
 
 def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
@@ -8159,7 +8386,7 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     the warning still fires in degraded environments.
     """
     rows = conn.execute(
-        "SELECT DISTINCT assignee FROM tasks "
+        "SELECT id, assignee FROM tasks "
         "WHERE status = 'ready' AND assignee IS NOT NULL "
         "    AND claim_lock IS NULL"
     ).fetchall()
@@ -8171,7 +8398,10 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
         # Can't introspect — assume spawnable, preserve legacy behavior.
         return True
     for row in rows:
-        if profile_exists(row["assignee"]):
+        if (
+            profile_exists(row["assignee"])
+            and check_respawn_guard(conn, row["id"]) is None
+        ):
             return True
     return False
 
@@ -8510,11 +8740,14 @@ def _dispatch_once_locked(
             # Emit an event so operators can see why the task was
             # skipped when reading `hermes kanban tail` — without
             # this the task appears stuck in ready with no diagnosis.
-            if not dry_run:
+            if not dry_run and _should_emit_respawn_guard_event(
+                conn, row["id"], guard_reason,
+            ):
                 with write_txn(conn):
                     _append_event(
                         conn, row["id"], "respawn_guarded",
-                        {"reason": guard_reason},
+                        get_respawn_guard_state(conn, row["id"])
+                        or {"reason": guard_reason},
                     )
             continue
         if dry_run:

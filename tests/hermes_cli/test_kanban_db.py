@@ -1583,3 +1583,183 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
     # Still usable after with-block exit (the leak).
     conn.execute("SELECT 1").fetchone()
     conn.close()  # explicit close to avoid leaking THIS test
+
+
+# ---------------------------------------------------------------------------
+# One-shot active-PR revision intent
+# ---------------------------------------------------------------------------
+
+
+def _blocked_task_with_terminal_run(conn, *, title="review-fix"):
+    task_id = kb.create_task(conn, title=title, assignee="alice")
+    claimed = kb.claim_task(conn, task_id, claimer="test:writer")
+    assert claimed is not None
+    assert kb.block_task(conn, task_id, reason="review-required")
+    return task_id
+
+
+def test_generic_unblock_does_not_bypass_active_pr_guard(kanban_home):
+    with kb.connect() as conn:
+        task_id = _blocked_task_with_terminal_run(conn)
+        kb.add_comment(conn, task_id, "worker", "https://github.com/nousresearch/hermes-agent/pull/1")
+        assert kb.unblock_task(conn, task_id)
+        assert kb.check_respawn_guard(conn, task_id) == "active_pr"
+
+
+def test_direct_claim_cannot_bypass_active_pr_guard(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="manual-claim", assignee="alice")
+        kb.add_comment(
+            conn, task_id, "worker",
+            "https://github.com/nousresearch/hermes-agent/pull/10",
+        )
+        assert kb.check_respawn_guard(conn, task_id) == "active_pr"
+        assert kb.claim_task(conn, task_id, claimer="manual:operator") is None
+        assert kb.get_task(conn, task_id).status == "ready"
+
+
+def test_revision_intent_bypasses_only_active_pr(kanban_home):
+    with kb.connect() as conn:
+        task_id = _blocked_task_with_terminal_run(conn)
+        conn.execute(
+            "UPDATE tasks SET consecutive_failures = 2, last_failure_error = ? WHERE id = ?",
+            ("authentication failed: invalid credentials", task_id),
+        )
+        kb.add_comment(
+            conn, task_id, "worker",
+            "https://github.com/nousresearch/hermes-agent/pull/11",
+        )
+        assert kb.unblock_task(conn, task_id, revision=True, actor="reviewer")
+        task = kb.get_task(conn, task_id)
+        assert task.consecutive_failures == 2
+        assert task.last_failure_error == "authentication failed: invalid credentials"
+        assert kb.check_respawn_guard(conn, task_id) == "blocker_auth"
+        assert kb.claim_task(conn, task_id, claimer="manual:operator") is None
+        assert not [
+            event for event in kb.list_events(conn, task_id)
+            if event.kind == "revision_consumed"
+        ]
+
+
+def test_direct_claim_cannot_hide_active_pr_behind_higher_priority_guard(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="masked-active-pr", assignee="alice")
+        kb.add_comment(
+            conn, task_id, "worker",
+            "https://github.com/nousresearch/hermes-agent/pull/12",
+        )
+        conn.execute(
+            "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+            ("authentication failed: invalid credentials", task_id),
+        )
+        assert kb.check_respawn_guard(conn, task_id) == "blocker_auth"
+        assert kb.claim_task(conn, task_id, claimer="manual:operator") is None
+
+
+def test_revision_unblock_does_not_bypass_recent_success(kanban_home, monkeypatch):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="recent-success", assignee="alice")
+        now = int(time.time())
+        monkeypatch.setattr(kb.time, "time", lambda: now)
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at) "
+            "VALUES (?, 'done', 'completed', ?, ?)",
+            (task_id, now - 60, now - 1),
+        )
+        conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (task_id,))
+        assert kb.unblock_task(conn, task_id, revision=True, actor="reviewer")
+        assert kb.check_respawn_guard(conn, task_id) == "recent_success"
+        assert kb.claim_task(conn, task_id, claimer="manual:operator") is None
+
+
+def test_revision_unblock_allows_exactly_one_claim(kanban_home, monkeypatch):
+    with kb.connect() as conn:
+        task_id = _blocked_task_with_terminal_run(conn)
+        now = int(time.time())
+        monkeypatch.setattr(kb.time, "time", lambda: now)
+        kb.add_comment(
+            conn, task_id, "worker",
+            "https://github.com/nousresearch/hermes-agent/pull/2",
+        )
+        assert kb.unblock_task(conn, task_id, revision=True, actor="reviewer")
+        assert kb.check_respawn_guard(conn, task_id) is None
+        first = kb.claim_task(conn, task_id, claimer="test:revision")
+        assert first is not None
+        assert kb.claim_task(conn, task_id, claimer="test:duplicate") is None
+        events = kb.list_events(conn, task_id)
+        requested = [e for e in events if e.kind == "revision_requested"]
+        consumed = [e for e in events if e.kind == "revision_consumed"]
+        assert len(requested) == len(consumed) == 1
+        assert consumed[0].payload["revision_event_id"] == requested[0].id
+        assert consumed[0].run_id == first.current_run_id
+
+
+def test_revision_same_second_uses_pr_comment_identity(kanban_home, monkeypatch):
+    with kb.connect() as conn:
+        task_id = _blocked_task_with_terminal_run(conn)
+        now = int(time.time())
+        monkeypatch.setattr(kb.time, "time", lambda: now)
+        kb.add_comment(
+            conn, task_id, "worker",
+            "https://github.com/nousresearch/hermes-agent/pull/20",
+        )
+        assert kb.unblock_task(conn, task_id, revision=True, actor="reviewer")
+        assert kb.check_respawn_guard(conn, task_id) is None
+        kb.add_comment(
+            conn, task_id, "worker",
+            "https://github.com/nousresearch/hermes-agent/pull/21",
+        )
+        assert kb.check_respawn_guard(conn, task_id) == "active_pr"
+
+
+def test_revision_unblock_rejects_live_prior_run(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="live-writer", assignee="alice")
+        assert kb.claim_task(conn, task_id, claimer="test:live") is not None
+        conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (task_id,))
+        with pytest.raises(ValueError, match="terminal prior run"):
+            kb.unblock_task(conn, task_id, revision=True, actor="reviewer")
+
+
+def test_revision_with_unfinished_parent_cannot_claim(kanban_home):
+    with kb.connect() as conn:
+        parent_id = kb.create_task(conn, title="parent", assignee="alice")
+        task_id = _blocked_task_with_terminal_run(conn, title="child")
+        kb.link_tasks(conn, parent_id=parent_id, child_id=task_id)
+        assert kb.unblock_task(conn, task_id, revision=True, actor="reviewer")
+        assert kb.get_task(conn, task_id).status == "todo"
+        assert kb.claim_task(conn, task_id, claimer="test:duplicate") is None
+
+
+def test_respawn_guard_event_deduplicates_per_lifecycle_episode(
+    kanban_home, all_assignees_spawnable, monkeypatch,
+):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="guard-event", assignee="alice")
+        now = int(time.time())
+        monkeypatch.setattr(kb.time, "time", lambda: now)
+        conn.execute(
+            "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+            ("authentication failed", task_id),
+        )
+        kb.dispatch_once(conn, spawn_fn=lambda task, ws: None)
+        kb.dispatch_once(conn, spawn_fn=lambda task, ws: None)
+        events = [e for e in kb.list_events(conn, task_id) if e.kind == "respawn_guarded"]
+        assert len(events) == 1
+
+        kb._append_event(conn, task_id, "claimed", {"run_id": 99}, run_id=99)
+        monkeypatch.setattr(kb.time, "time", lambda: now + 10)
+        kb.dispatch_once(conn, spawn_fn=lambda task, ws: None)
+        kb.dispatch_once(conn, spawn_fn=lambda task, ws: None)
+        events = [e for e in kb.list_events(conn, task_id) if e.kind == "respawn_guarded"]
+        assert len(events) == 2
+
+
+def test_guarded_only_ready_queue_is_not_spawnable(kanban_home, all_assignees_spawnable):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="guarded-health", assignee="alice")
+        kb.add_comment(conn, task_id, "worker", "https://github.com/nousresearch/hermes-agent/pull/6")
+        assert kb.has_spawnable_ready(conn) is False
+        state = kb.get_respawn_guard_state(conn, task_id)
+        assert state["reason"] == "active_pr"
+        assert isinstance(state["guarded_at"], int)

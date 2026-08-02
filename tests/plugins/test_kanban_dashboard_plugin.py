@@ -708,3 +708,36 @@ def test_specify_happy_path(client, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+def test_dashboard_revision_unblock_and_guard_visibility(client, monkeypatch):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="dashboard-revision", assignee="alice")
+        assert kb.claim_task(conn, task_id, claimer="test:writer") is not None
+        assert kb.block_task(conn, task_id, reason="review-required")
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, 'worker', ?, ?)",
+            (task_id, "https://github.com/nousresearch/hermes-agent/pull/7", now - 2),
+        )
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task_id}",
+        json={"status": "ready", "revision": True, "actor": "dashboard-reviewer"},
+    )
+    assert response.status_code == 200, response.text
+    detail = client.get(f"/api/plugins/kanban/tasks/{task_id}").json()
+    assert detail["task"]["respawn_guard"] is None
+
+    with kb.connect() as conn:
+        guarded_id = kb.create_task(conn, title="dashboard-guarded", assignee="alice")
+        kb.add_comment(
+            conn,
+            guarded_id,
+            "worker",
+            "https://github.com/nousresearch/hermes-agent/pull/8",
+        )
+    board = client.get("/api/plugins/kanban/board").json()
+    ready = next(col for col in board["columns"] if col["name"] == "ready")["tasks"]
+    guarded = next(task for task in ready if task["id"] == guarded_id)
+    assert guarded["respawn_guard"]["reason"] == "active_pr"
+    assert isinstance(guarded["respawn_guard"]["guarded_at"], int)

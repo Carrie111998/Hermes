@@ -166,3 +166,24 @@ def test_run_slash_reclaim_running_task(kanban_home):
 # ---------------------------------------------------------------------------
 
 
+def test_run_slash_revision_unblock_and_guarded_list_show(kanban_home):
+    with kb.connect() as conn:
+        revision_id = kb.create_task(conn, title="revision", assignee="alice")
+        assert kb.claim_task(conn, revision_id, claimer="test:writer") is not None
+        assert kb.block_task(conn, revision_id, reason="review-required")
+        guarded_id = kb.create_task(conn, title="guarded", assignee="alice")
+        kb.add_comment(
+            conn,
+            guarded_id,
+            "worker",
+            "https://github.com/nousresearch/hermes-agent/pull/9",
+        )
+
+    assert "Revision requested" in kc.run_slash(
+        f"unblock --revision {revision_id} --reason 'review fixes'"
+    )
+    listed = kc.run_slash("list --status ready")
+    shown = kc.run_slash(f"show {guarded_id}")
+    assert "guarded: active_pr" in listed
+    assert "Respawn guard: active_pr" in shown
+    assert "since" in shown

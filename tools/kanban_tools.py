@@ -466,6 +466,7 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
         "current_run_id": task.current_run_id,
         "model_override": task.model_override,
         "provider_override": task.provider_override,
+        "respawn_guard": kb.get_respawn_guard_state(conn, task.id),
         "parents": parents,
         "children": children,
         "parent_count": len(parents),
@@ -512,6 +513,7 @@ def _handle_show(args: dict, **kw) -> str:
                     "current_run_id": t.current_run_id,
                     "model_override": t.model_override,
                     "provider_override": t.provider_override,
+                    "respawn_guard": kb.get_respawn_guard_state(conn, t.id),
                 }
 
             def _run_dict(r):
@@ -1477,7 +1479,12 @@ def _handle_unblock(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
-            ok = kb.unblock_task(conn, str(tid))
+            ok = kb.unblock_task(
+                conn,
+                str(tid),
+                revision=bool(args.get("revision", False)),
+                actor=args.get("actor") or os.getenv("HERMES_PROFILE"),
+            )
             if not ok:
                 return tool_error(f"could not unblock {tid} (not blocked or unknown)")
             task = kb.get_task(conn, str(tid))
@@ -2096,6 +2103,17 @@ KANBAN_UNBLOCK_SCHEMA = {
             "task_id": {
                 "type": "string",
                 "description": "Blocked task id to move to ready or parent-gated todo.",
+            },
+            "revision": {
+                "type": "boolean",
+                "description": (
+                    "Request one auditable review-revision continuation. Requires "
+                    "a terminal prior run and bypasses only the active-PR respawn guard."
+                ),
+            },
+            "actor": {
+                "type": "string",
+                "description": "Optional operator identity recorded with revision intent.",
             },
             "board": _board_schema_prop(),
         },

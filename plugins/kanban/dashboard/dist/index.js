@@ -2866,6 +2866,13 @@
                   title: tx(i18n, "needsAssigneeHint", "Dependencies are satisfied, but the dispatcher skips this task until you assign a profile."),
                 }, tx(i18n, "needsAssignee", "Needs assignee"))
               : null,
+            t.respawn_guard
+              ? h(Badge, {
+                  variant: "outline",
+                  className: "hermes-kanban-respawn-guard",
+                  title: `Ready but guarded since ${new Date(t.respawn_guard.guarded_at * 1000).toLocaleString()}`,
+                }, `Guarded: ${t.respawn_guard.reason}`)
+              : null,
           ),
           h("div", { className: "hermes-kanban-card-title" },
             t.title || tx(i18n, "untitled", "(untitled)")),
@@ -4401,6 +4408,11 @@
           task.status === "running" || task.status === "ready",
           getDestructiveConfirm(t, "blocked")),
         b(tx(t, "unblock", "Unblock"),   { status: "ready" },    task.status === "blocked"),
+        b("Request revision", {
+          status: "ready",
+          revision: true,
+          actor: "dashboard",
+        }, task.status === "blocked" && task.respawn_guard?.reason === "active_pr"),
         b(tx(t, "complete", "Complete"),  { status: "done" },
           task.status === "running" || task.status === "ready" || task.status === "blocked",
           getDestructiveConfirm(t, "done")),

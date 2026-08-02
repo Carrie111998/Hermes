@@ -1023,3 +1023,48 @@ def test_attach_url_happy_path_public_host(worker_env, default_url_guard, monkey
         assert Path(atts[0].stored_path).read_bytes() == payload
     finally:
         conn.close()
+
+
+def test_unblock_revision_intent_is_forwarded(monkeypatch, worker_env):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="revision", assignee="worker")
+        claimed = kb.claim_task(conn, tid, claimer="test:writer")
+        assert claimed is not None
+        assert kb.block_task(conn, tid, reason="review-required")
+    finally:
+        conn.close()
+
+    from tools import kanban_tools as kt
+    out = kt._handle_unblock({"task_id": tid, "revision": True, "actor": "reviewer"})
+    assert json.loads(out)["ok"] is True
+    conn = kb.connect()
+    try:
+        assert any(e.kind == "revision_requested" for e in kb.list_events(conn, tid))
+    finally:
+        conn.close()
+
+
+def test_list_and_show_surface_ready_guard_reason(monkeypatch, worker_env):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="guarded", assignee="worker")
+        kb.add_comment(
+            conn,
+            tid,
+            "worker",
+            "https://github.com/nousresearch/hermes-agent/pull/21",
+        )
+    finally:
+        conn.close()
+
+    from tools import kanban_tools as kt
+    listed = json.loads(kt._handle_list({"status": "ready"}))
+    task = next(item for item in listed["tasks"] if item["id"] == tid)
+    shown = json.loads(kt._handle_show({"task_id": tid}))
+    assert task["respawn_guard"]["reason"] == "active_pr"
+    assert shown["task"]["respawn_guard"]["reason"] == "active_pr"

@@ -49,14 +49,17 @@ def _fmt_ts(ts: Optional[int]) -> str:
     return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
 
 
-def _fmt_task_line(t: kb.Task) -> str:
+def _fmt_task_line(t: kb.Task, guard: Optional[dict[str, Any]] = None) -> str:
     icon = _STATUS_ICONS.get(t.status, "?")
     assignee = t.assignee or "(unassigned)"
     tenant = f" [{t.tenant}]" if t.tenant else ""
-    return f"{icon} {t.id}  {t.status:8s}  {assignee:20s}{tenant}  {t.title}"
+    guarded = f" [guarded: {guard['reason']}]" if guard else ""
+    return f"{icon} {t.id}  {t.status:8s}  {assignee:20s}{tenant}  {t.title}{guarded}"
 
 
-def _task_to_dict(t: kb.Task) -> dict[str, Any]:
+def _task_to_dict(
+    t: kb.Task, guard: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
     return {
         "id": t.id,
         "title": t.title,
@@ -81,6 +84,7 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "session_id": t.session_id,
         "workflow_template_id": t.workflow_template_id,
         "current_step_key": t.current_step_key,
+        "respawn_guard": guard,
     }
 
 
@@ -652,6 +656,14 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "--reason",
         default=None,
         help="Optional reason/note — recorded as a comment before unblocking. Quote multi-word reasons.",
+    )
+    p_unblock.add_argument(
+        "--revision",
+        action="store_true",
+        help=(
+            "Request one auditable review-revision continuation after a terminal run; "
+            "bypasses only the active-PR respawn guard."
+        ),
     )
     p_unblock.add_argument("task_ids", nargs="+")
 
@@ -1590,8 +1602,15 @@ def _cmd_list(args: argparse.Namespace) -> int:
             workflow_template_id=args.workflow_template_id,
             current_step_key=args.current_step_key,
         )
+        guards = {
+            task.id: kb.get_respawn_guard_state(conn, task.id)
+            for task in tasks
+            if task.status == "ready"
+        }
     if getattr(args, "json", False):
-        print(json.dumps([_task_to_dict(t) for t in tasks], indent=2, ensure_ascii=False))
+        print(json.dumps([
+            _task_to_dict(t, guards.get(t.id)) for t in tasks
+        ], indent=2, ensure_ascii=False))
         return 0
     # Passive discoverability: when the user has multiple boards, surface
     # which one they're looking at in the list header. Single-board users
@@ -1612,7 +1631,7 @@ def _cmd_list(args: argparse.Namespace) -> int:
         print("(no matching tasks)")
         return 0
     for t in tasks:
-        print(_fmt_task_line(t))
+        print(_fmt_task_line(t, guards.get(t.id)))
     return 0
 
 
@@ -1638,10 +1657,11 @@ def _cmd_show(args: argparse.Namespace) -> int:
         # ``result=``. Surfacing the latest summary here keeps ``show`` from
         # looking like a no-op when the worker actually did real work.
         latest_summary = kb.latest_summary(conn, args.task_id)
+        guard = kb.get_respawn_guard_state(conn, args.task_id)
 
     if getattr(args, "json", False):
         payload = {
-            "task": _task_to_dict(task),
+            "task": _task_to_dict(task, guard),
             "latest_summary": latest_summary,
             "parents": parents,
             "children": children,
@@ -1680,6 +1700,11 @@ def _cmd_show(args: argparse.Namespace) -> int:
 
     print(f"Task {task.id}: {task.title}")
     print(f"  status:    {task.status}")
+    if guard:
+        print(
+            f"  Respawn guard: {guard['reason']} "
+            f"(since {_fmt_ts(int(guard['guarded_at']))})"
+        )
     print(f"  assignee:  {task.assignee or '-'}")
     if task.tenant:
         print(f"  tenant:    {task.tenant}")
@@ -2328,11 +2353,17 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
         for tid in ids:
             if reason:
                 kb.add_comment(conn, tid, author, f"UNBLOCK: {reason}")
-            if not kb.unblock_task(conn, tid):
+            if not kb.unblock_task(
+                conn,
+                tid,
+                revision=bool(getattr(args, "revision", False)),
+                actor=_profile_author(),
+            ):
                 failed.append(tid)
                 print(f"cannot unblock {tid} (not blocked/scheduled?)", file=sys.stderr)
             else:
-                print(f"Unblocked {tid}" + (f": {reason}" if reason else ""))
+                prefix = "Revision requested; unblocked" if args.revision else "Unblocked"
+                print(f"{prefix} {tid}" + (f": {reason}" if reason else ""))
     return 0 if not failed else 1
 
 
