@@ -371,6 +371,16 @@ class TestFailureAttribution:
 
     def _make_pool(self, tmp_path, monkeypatch, entries):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+        # Keep the dev machine's live ~/.claude credentials from seeding a
+        # claude_code singleton entry into this pool (same isolation as the
+        # other anthropic pool tests in test_credential_pool.py). Without it,
+        # load_pool() auto-seeds a second entry from ~/.claude/.credentials.json
+        # on developer machines, silently changing the pool size the tests
+        # assume (e.g. test_unmatched_key_does_not_retry_only_pool_entry
+        # expects a single-entry pool) and making the suite host-dependent.
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.read_claude_code_credentials", lambda: None
+        )
         hermes_home = tmp_path / "hermes"
         hermes_home.mkdir(parents=True, exist_ok=True)
         (hermes_home / "auth.json").write_text(
