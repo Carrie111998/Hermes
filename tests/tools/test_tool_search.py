@@ -364,6 +364,49 @@ class TestHandleFunctionCallIntegration:
         # dispatch path completed without error.
         assert "matches" in parsed or "error" in parsed
 
+    def test_tool_search_allows_run_scoped_execution_middleware(self, monkeypatch):
+        """A Runtime session can replace the process-global search catalog."""
+        import model_tools
+        from hermes_cli import middleware
+
+        observed = {}
+
+        def run_scoped_search(
+            tool_name,
+            args,
+            next_call,
+            **context,
+        ):
+            observed.update({
+                "tool_name": tool_name,
+                "args": args,
+                "session_id": context["session_id"],
+            })
+            return json.dumps({
+                "total_available": 1,
+                "loaded_tools": ["media.generate_video"],
+            })
+
+        monkeypatch.setattr(
+            middleware,
+            "run_tool_execution_middleware",
+            run_scoped_search,
+        )
+
+        result = model_tools.handle_function_call(
+            function_name="tool_search",
+            function_args={"query": "media.generate_video"},
+            session_id="runtime-session",
+            tool_call_id="search-1",
+        )
+
+        assert json.loads(result)["loaded_tools"] == ["media.generate_video"]
+        assert observed == {
+            "tool_name": "tool_search",
+            "args": {"query": "media.generate_video"},
+            "session_id": "runtime-session",
+        }
+
 
 class TestRegression_OpenClawCron84141:
     """Regression guard for the OpenClaw cron-tool-loss class of bug.
@@ -535,4 +578,3 @@ class TestRegression_ToolsetScoping:
         assert "mcp_helper_op" in names
         # core tools are never deferrable
         assert "terminal" not in names
-

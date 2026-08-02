@@ -977,8 +977,29 @@ def handle_function_call(
         except Exception:
             current_defs = []
         if function_name == _ts_mod.TOOL_SEARCH_NAME:
-            return _ts_mod.dispatch_tool_search(function_args or {},
-                                                current_tool_defs=current_defs)
+            def _dispatch_search(next_args: Dict[str, Any]) -> Any:
+                return _ts_mod.dispatch_tool_search(
+                    next_args or {},
+                    current_tool_defs=current_defs,
+                )
+
+            # Runtime sessions supply a run-scoped Tool Search catalog through
+            # tool-execution middleware. Keep the process-global catalog as
+            # the fallback for ordinary Hermes sessions, but give the scoped
+            # runtime middleware a chance to handle the same literal tool name.
+            from hermes_cli.middleware import run_tool_execution_middleware
+
+            return run_tool_execution_middleware(
+                function_name,
+                function_args,
+                _dispatch_search,
+                original_args=function_args,
+                task_id=task_id or "",
+                session_id=session_id or "",
+                tool_call_id=tool_call_id or "",
+                turn_id=turn_id or "",
+                api_request_id=api_request_id or "",
+            )
         if function_name == _ts_mod.TOOL_DESCRIBE_NAME:
             return _ts_mod.dispatch_tool_describe(function_args or {},
                                                   current_tool_defs=current_defs)
