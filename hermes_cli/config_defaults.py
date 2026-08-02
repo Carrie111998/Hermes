@@ -1657,6 +1657,20 @@ DEFAULT_CONFIG = {
         # "hindsight", "holographic", "retaindb", "byterover".
         # Only ONE external provider is allowed at a time.
         "provider": "",
+        # Reversible memory mutations: evicted entries (remove/replace and
+        # /journey delete on memory nodes) are appended to
+        # ~/.hermes/memories/ARCHIVE.jsonl before the main file rewrite, so
+        # consolidation can never destroy distilled content irreversibly.
+        #   archive_user: false (default) — USER.md evictions are NOT archived
+        #                 (data minimization for profile data). MEMORY.md is
+        #                 always archived. Set true to archive both stores.
+        #   archive_on_failure: "warn" (default) — archive write failed: the
+        #                 mutation still proceeds and the tool result carries
+        #                 "archive_status": "degraded". "abort" restores strict
+        #                 behavior (mutation refused) but can deadlock the
+        #                 memory-full consolidation path, hence the default.
+        "archive_user": False,
+        "archive_on_failure": "warn",
     },
 
     # Subagent delegation — override the provider:model used by delegate_task

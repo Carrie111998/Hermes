@@ -26,6 +26,7 @@ Design:
 import json
 import logging
 import time
+import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from hermes_constants import get_hermes_home
@@ -86,6 +87,97 @@ from tools.threat_patterns import first_threat_message as _first_threat_message
 def _scan_memory_content(content: str) -> Optional[str]:
     """Scan memory content for injection/exfil patterns. Returns error string if blocked."""
     return _first_threat_message(content, scope="strict")
+
+
+# ---------------------------------------------------------------------------
+# Reversible mutations — local eviction archive (ARCHIVE.jsonl)
+#
+# remove/replace/apply_batch (and ``/journey delete`` on memory nodes) append
+# the evicted entry to ``~/.hermes/memories/ARCHIVE.jsonl`` before the main
+# file rewrite, so consolidation can never destroy distilled content
+# irreversibly. Zero-dependency, provider-independent, per-profile (the file
+# lives under get_memory_dir(), which is already profile-scoped).
+#
+# Semantics:
+#   - At-least-once: a crash between archive-append and main rewrite leaves a
+#     ghost record (reconcilable by ``id``) but never loses content.
+#   - Failure degradation: an archive write failure is retried once; if it
+#     still fails the mutation proceeds by default and the tool result carries
+#     ``"archive_status": "degraded"``. ``memory.archive_on_failure: "abort"``
+#     restores strict behavior (mutation refused) at the cost of being able to
+#     deadlock the memory-full consolidation path.
+#   - Privacy: MEMORY.md evictions are archived by default; USER.md is not
+#     (``memory.archive_user: false``) — data minimization for profile data.
+# ---------------------------------------------------------------------------
+
+ARCHIVE_FILENAME = "ARCHIVE.jsonl"
+
+
+def _archive_path() -> Path:
+    return get_memory_dir() / ARCHIVE_FILENAME
+
+
+def _read_memory_archive_config() -> Dict[str, Any]:
+    """Read the ``memory.archive_*`` keys through the sanctioned config loader.
+
+    Uses ``hermes_cli.config.load_config_readonly()`` — the canonical owner
+    of config.yaml reads (the config-read guard forbids raw ``yaml.safe_load``
+    here), so the managed-scope overlay, ``${ENV_VAR}`` expansion, and
+    profile-aware pathing all apply. Only consulted at mutation time (not at
+    import), so config edits apply immediately (the loader's cache is keyed on
+    the file's mtime/size). A missing/unreadable config degrades to defaults.
+    """
+    cfg: Dict[str, Any] = {"archive_user": False, "archive_on_failure": "warn"}
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        memory_cfg = load_config_readonly().get("memory") or {}
+        if isinstance(memory_cfg, dict):
+            if "archive_user" in memory_cfg:
+                cfg["archive_user"] = bool(memory_cfg["archive_user"])
+            if "archive_on_failure" in memory_cfg:
+                cfg["archive_on_failure"] = str(memory_cfg["archive_on_failure"])
+    except Exception:
+        logger.debug("Memory archive config unreadable — using defaults", exc_info=True)
+    return cfg
+
+
+def _should_archive_target(target: str) -> bool:
+    """MEMORY.md always archives; USER.md only when configured in."""
+    if target == "user":
+        return bool(_read_memory_archive_config()["archive_user"])
+    return True
+
+
+def _archive_abort_on_failure() -> bool:
+    return _read_memory_archive_config().get("archive_on_failure") == "abort"
+
+
+def archive_entry(target: str, action: str, entry: str) -> Tuple[Optional[str], Optional[str]]:
+    """Append one evicted entry to ARCHIVE.jsonl.
+
+    Returns ``(record_id, None)`` on success, ``(None, error)`` after one
+    retry when the write keeps failing. Never raises.
+    """
+    record = {
+        "id": uuid.uuid4().hex,
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "store": target,
+        "action": action,  # "removed" | "superseded"
+        "entry": entry,
+    }
+    line = json.dumps(record, ensure_ascii=False) + "\n"
+    path = _archive_path()
+    last_error: Optional[str] = None
+    for _ in (1, 2):  # one retry, then degrade per config
+        try:
+            get_memory_dir().mkdir(parents=True, exist_ok=True)
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(line)
+            return record["id"], None
+        except OSError as exc:
+            last_error = str(exc)
+    return None, last_error
 
 
 def _drift_error(path: "Path", bak_path: str) -> Dict[str, Any]:
@@ -511,11 +603,26 @@ class MemoryStore:
                     "usage": f"{current:,}/{limit:,}",
                 })
 
+            evicted = entries[idx]
+            archived_id = archived_error = None
+            if _should_archive_target(target):
+                archived_id, archived_error = archive_entry(target, "superseded", evicted)
+                if archived_error:
+                    if _archive_abort_on_failure():
+                        return {
+                            "success": False,
+                            "error": (
+                                f"Archive write failed ({archived_error}) and "
+                                "memory.archive_on_failure=abort — replacement not applied."
+                            ),
+                        }
+                    logger.warning("Memory archive write failed (degraded): %s", archived_error)
             entries[idx] = new_content
             self._set_entries(target, entries)
             self.save_to_disk(target)
 
-        return self._success_response(target, "Entry replaced.")
+        result = self._success_response(target, "Entry replaced.")
+        return self._attach_archive(result, target, "superseded", evicted, archived_id, archived_error)
 
     def remove(self, target: str, old_text: str) -> Dict[str, Any]:
         """Remove the entry containing old_text substring."""
@@ -553,11 +660,26 @@ class MemoryStore:
                 # All identical -- safe to remove just the first
 
             idx = matches[0][0]
+            evicted = entries[idx]
+            archived_id = archived_error = None
+            if _should_archive_target(target):
+                archived_id, archived_error = archive_entry(target, "removed", evicted)
+                if archived_error:
+                    if _archive_abort_on_failure():
+                        return {
+                            "success": False,
+                            "error": (
+                                f"Archive write failed ({archived_error}) and "
+                                "memory.archive_on_failure=abort — removal not applied."
+                            ),
+                        }
+                    logger.warning("Memory archive write failed (degraded): %s", archived_error)
             entries.pop(idx)
             self._set_entries(target, entries)
             self.save_to_disk(target)
 
-        return self._success_response(target, "Entry removed.")
+        result = self._success_response(target, "Entry removed.")
+        return self._attach_archive(result, target, "removed", evicted, archived_id, archived_error)
 
     def apply_batch(self, target: str, operations: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Apply a sequence of add/replace/remove ops to one target atomically.
@@ -595,6 +717,7 @@ class MemoryStore:
             # Work on a copy; only commit if the whole batch validates.
             working: List[str] = list(self._entries_for(target))
             limit = self._char_limit(target)
+            evicted: List[Tuple[str, str]] = []  # (action, entry) — archived at commit
 
             for i, op in enumerate(operations):
                 op = op or {}
@@ -626,6 +749,7 @@ class MemoryStore:
                             target,
                             f"{pos}: '{old_text}' matched multiple distinct entries -- be more specific.",
                         )
+                    evicted.append(("superseded", working[matches[0]]))
                     working[matches[0]] = content
 
                 elif act == "remove":
@@ -639,6 +763,7 @@ class MemoryStore:
                             target,
                             f"{pos}: '{old_text}' matched multiple distinct entries -- be more specific.",
                         )
+                    evicted.append(("removed", working[matches[0]]))
                     working.pop(matches[0])
 
                 else:
@@ -662,11 +787,44 @@ class MemoryStore:
                     "usage": f"{current:,}/{limit:,}",
                 })
 
+            # Archive evicted entries at the commit point — a failed batch
+            # never touches the archive. MEMORY.md always archives; USER.md
+            # only when configured in.
+            archives: List[Dict[str, Any]] = []
+            degraded = False
+            if evicted and _should_archive_target(target):
+                for action, entry in evicted:
+                    archived_id, archived_error = archive_entry(target, action, entry)
+                    if archived_error:
+                        if _archive_abort_on_failure():
+                            return {
+                                "success": False,
+                                "error": (
+                                    f"Archive write failed ({archived_error}) and "
+                                    "memory.archive_on_failure=abort — batch not applied."
+                                ),
+                            }
+                        logger.warning("Memory archive write failed (degraded): %s", archived_error)
+                        degraded = True
+                    else:
+                        archives.append(
+                            {"file": ARCHIVE_FILENAME, "id": archived_id, "store": target, "action": action, "entry": entry}
+                        )
+
             # Commit.
             self._set_entries(target, working)
             self.save_to_disk(target)
 
-        return self._success_response(target, f"Applied {len(operations)} operation(s).")
+        result = self._success_response(target, f"Applied {len(operations)} operation(s).")
+        if archives:
+            result["archived"] = archives
+            result["message"] = (result.get("message") or "") + (
+                f" {len(archives)} evicted entr{'y' if len(archives) == 1 else 'ies'}"
+                f" archived to {ARCHIVE_FILENAME} (reversible)."
+            )
+        if degraded:
+            result["archive_status"] = "degraded"
+        return result
 
     def _batch_error(self, target: str, message: str) -> Dict[str, Any]:
         """Build a batch-abort error that reports live (uncommitted) state."""
@@ -727,6 +885,37 @@ class MemoryStore:
             resp["message"] = message
         resp["note"] = "Write saved. This update is complete — do not repeat it."
         return resp
+
+    @staticmethod
+    def _attach_archive(
+        result: Dict[str, Any],
+        target: str,
+        action: str,
+        entry: str,
+        archived_id: Optional[str],
+        archived_error: Optional[str],
+    ) -> Dict[str, Any]:
+        """Attach archive bookkeeping to a mutation's success result.
+
+        Successful archive → ``archived`` block (id + evicted entry, so the
+        model sees exactly what was captured at the moment of the mutation —
+        zero standing prompt cost). Failed archive → ``archive_status:
+        "degraded"``; the mutation itself already proceeded.
+        """
+        if archived_id:
+            result["archived"] = {
+                "file": ARCHIVE_FILENAME,
+                "id": archived_id,
+                "store": target,
+                "action": action,
+                "entry": entry,
+            }
+            result["message"] = (result.get("message") or "") + (
+                f" Evicted content archived to {ARCHIVE_FILENAME}#{archived_id} (reversible)."
+            )
+        elif archived_error:
+            result["archive_status"] = "degraded"
+        return result
 
     def _render_block(self, target: str, entries: List[str]) -> str:
         """Render a system prompt block with header and usage indicator."""

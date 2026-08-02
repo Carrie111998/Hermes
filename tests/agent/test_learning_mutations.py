@@ -91,3 +91,29 @@ def test_memory_writes_match_memory_tool_format(home):
 
     assert entries == ["alpha rewritten", "beta note"]
     assert path.read_text(encoding="utf-8") == ENTRY_DELIMITER.join(entries)
+
+
+def test_delete_memory_archives_evicted_chunk(home):
+    """/journey delete on a memory node archives the evicted chunk to
+    ARCHIVE.jsonl before the rewrite — the same reversible-delete semantics
+    as the memory tool's remove() (#76883)."""
+    import json
+
+    res = lm.delete_node("memory:memory:0")
+    assert res["ok"]
+    assert "ARCHIVE.jsonl" in res["message"]
+
+    archive = home / "memories" / "ARCHIVE.jsonl"
+    assert archive.exists()
+    records = [
+        json.loads(line)
+        for line in archive.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(records) == 1
+    assert records[0]["store"] == "memory"
+    assert records[0]["action"] == "removed"
+    assert records[0]["entry"] == "alpha note\nline two"
+
+    # The delete itself still happened.
+    assert (home / "memories" / "MEMORY.md").read_text(encoding="utf-8") == "beta note"

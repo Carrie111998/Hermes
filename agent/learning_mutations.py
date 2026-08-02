@@ -145,10 +145,31 @@ def _delete_memory(node_id: str) -> dict[str, Any]:
     source, gidx = _parse_memory_id(node_id)
     path, chunks, local = _locate_memory(source, gidx)
 
+    evicted = chunks[local]
+
+    # Reversible deletion: archive the evicted chunk before the rewrite, same
+    # ARCHIVE.jsonl as the memory tool's remove/replace (store="memory",
+    # action="removed"). Failure degrades (mutation proceeds + note) rather
+    # than blocking a user-initiated delete.
+    archived_id = None
+    try:
+        from tools.memory_tool import archive_entry
+
+        archived_id, archived_error = archive_entry("memory", "removed", evicted)
+        if archived_error:
+            archived_id = None
+    except Exception as exc:  # pragma: no cover - import/IO edge
+        archived_error = str(exc)
+
     del chunks[local]
     _write_memory(path, chunks)
 
-    return {"ok": True, "message": f"deleted memory from {path.name}"}
+    message = f"deleted memory from {path.name}"
+    if archived_id:
+        message += f" — evicted content archived to ARCHIVE.jsonl#{archived_id} (reversible)"
+    elif archived_error:
+        message += f" — note: archive write failed ({archived_error}), content is gone"
+    return {"ok": True, "message": message}
 
 
 # ── Edit ────────────────────────────────────────────────────────────────────

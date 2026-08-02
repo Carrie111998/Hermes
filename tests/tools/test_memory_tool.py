@@ -4,6 +4,8 @@ import json
 import pytest
 from pathlib import Path
 
+from hermes_constants import get_hermes_home
+
 from tools.memory_tool import (
     MemoryStore,
     memory_tool,
@@ -627,3 +629,119 @@ class TestLoadTimeSnapshotSanitization:
         # Block marker appears exactly once, not nested
         assert snapshot.count("[BLOCKED:") == 1
         assert "Clean fact" in snapshot
+
+
+# =========================================================================
+# Reversible mutations — eviction archive (ARCHIVE.jsonl)
+# =========================================================================
+
+
+def _read_archive(tmp_path):
+    path = tmp_path / "ARCHIVE.jsonl"
+    if not path.exists():
+        return []
+    return [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+
+class TestMemoryArchive:
+    def test_remove_archives_evicted_entry(self, store, tmp_path):
+        store.add("memory", "Retired fact about the old stack")
+        result = store.remove("memory", "Retired fact")
+        assert result["success"] is True
+        records = _read_archive(tmp_path)
+        assert len(records) == 1
+        assert records[0]["store"] == "memory"
+        assert records[0]["action"] == "removed"
+        assert records[0]["entry"] == "Retired fact about the old stack"
+        assert "archived" in result
+        assert result["archived"]["id"] == records[0]["id"]
+        assert "ARCHIVE.jsonl" in result["message"]
+
+    def test_replace_archives_superseded_entry(self, store, tmp_path):
+        store.add("memory", "Python 3.11 project")
+        result = store.replace("memory", "3.11", "Python 3.12 project")
+        assert result["success"] is True
+        records = _read_archive(tmp_path)
+        assert len(records) == 1
+        assert records[0]["action"] == "superseded"
+        assert records[0]["entry"] == "Python 3.11 project"
+        assert result["archived"]["action"] == "superseded"
+
+    def test_user_target_not_archived_by_default(self, store, tmp_path):
+        store.add("user", "Name: Alice")
+        result = store.remove("user", "Name: Alice")
+        assert result["success"] is True
+        assert "archived" not in result
+        assert _read_archive(tmp_path) == []
+
+    def test_user_target_archived_when_configured(self, store, tmp_path, monkeypatch):
+        # Config is read through the sanctioned loader (hermes_cli.config),
+        # which resolves the sandboxed session HERMES_HOME — write there.
+        (get_hermes_home() / "config.yaml").write_text(
+            "memory:\n  archive_user: true\n", encoding="utf-8"
+        )
+        store.add("user", "Name: Alice")
+        result = store.remove("user", "Name: Alice")
+        assert result["success"] is True
+        records = _read_archive(tmp_path)
+        assert len(records) == 1
+        assert records[0]["store"] == "user"
+
+    def test_apply_batch_archives_evicted_entries_on_commit(self, store, tmp_path):
+        store.add("memory", "Entry one")
+        store.add("memory", "Entry two")
+        result = store.apply_batch(
+            "memory",
+            [
+                {"action": "replace", "old_text": "Entry one", "content": "Entry one v2"},
+                {"action": "remove", "old_text": "Entry two"},
+            ],
+        )
+        assert result["success"] is True
+        records = _read_archive(tmp_path)
+        assert [r["action"] for r in records] == ["superseded", "removed"]
+        assert len(result["archived"]) == 2
+
+    def test_failed_batch_never_archives(self, store, tmp_path):
+        store.add("memory", "Keep me")
+        result = store.apply_batch(
+            "memory",
+            [
+                {"action": "remove", "old_text": "Keep me"},
+                {"action": "replace", "old_text": "no such entry", "content": "x"},
+            ],
+        )
+        assert result["success"] is False
+        assert _read_archive(tmp_path) == []
+        assert "Keep me" in store.memory_entries
+
+    def test_archive_write_failure_degrades_by_default(self, store, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            "tools.memory_tool.archive_entry", lambda *a, **k: (None, "disk full")
+        )
+        store.add("memory", "Doomed entry")
+        result = store.remove("memory", "Doomed entry")
+        assert result["success"] is True
+        assert result["archive_status"] == "degraded"
+        assert "Doomed entry" not in store.memory_entries
+
+    def test_archive_write_failure_aborts_when_configured(
+        self, store, tmp_path, monkeypatch
+    ):
+        # Config is read through the sanctioned loader (hermes_cli.config),
+        # which resolves the sandboxed session HERMES_HOME — write there.
+        (get_hermes_home() / "config.yaml").write_text(
+            "memory:\n  archive_on_failure: abort\n", encoding="utf-8"
+        )
+        monkeypatch.setattr(
+            "tools.memory_tool.archive_entry", lambda *a, **k: (None, "disk full")
+        )
+        store.add("memory", "Precious entry")
+        result = store.remove("memory", "Precious entry")
+        assert result["success"] is False
+        assert "abort" in result["error"]
+        assert "Precious entry" in store.memory_entries
