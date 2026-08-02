@@ -1,0 +1,7 @@
+name: team-memory
+version: 0.2.0
+description: "Scoped SQLite + FTS5 shared memory for cooperating Hermes agents."
+author: Xinxiang
+kind: standalone
+provides_tools:
+  - team_memory_search

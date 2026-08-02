@@ -1,5 +1,11 @@
 # Hermes Agent 记忆机制优化分析报告
 
+> **基线说明（2026-08-02）**：本文是前期生态调研和长期候选方案，不是当前
+> Stage 1 的实施承诺。当前已落地的范围是独立的 `team-memory` SQLite + FTS5
+> 可选插件；知识图谱、向量检索、NER/RE、自动整合和多 provider 编排均未实现，
+> 需要按 [INCREMENTAL_ROLLOUT_PLAN.md](INCREMENTAL_ROLLOUT_PLAN.md) 的数据门槛
+> 重新评估。本文中的成本、ROI、容量和性能数字是待验证假设，不应作为生产结论。
+
 **生成日期**: 2026-08-02  
 **分析范围**: Hermes Agent 各个agent的记忆机制  
 **目标**: 评估当前实现并提出下一步优化方向

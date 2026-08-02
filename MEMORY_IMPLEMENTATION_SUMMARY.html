@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Hermes Stage 1 记忆改进实施总结</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #17212b;
+      --muted: #5d6b78;
+      --line: #d9e1e7;
+      --paper: #ffffff;
+      --wash: #f4f7f9;
+      --green: #176b52;
+      --amber: #8a5a00;
+      --red: #9d2b2b;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      color: var(--ink);
+      background: var(--wash);
+      font: 15px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    main { max-width: 1180px; margin: 0 auto; padding: 42px 24px 72px; }
+    header, section { background: var(--paper); border: 1px solid var(--line); }
+    header { padding: 30px 34px; border-top: 5px solid var(--green); }
+    section { margin-top: 18px; padding: 26px 30px; }
+    h1 { margin: 0 0 8px; font-size: 30px; line-height: 1.25; }
+    h2 { margin: 0 0 14px; font-size: 21px; }
+    h3 { margin: 22px 0 8px; font-size: 16px; }
+    p { margin: 8px 0; }
+    .meta { color: var(--muted); }
+    .status { display: inline-block; margin-top: 14px; padding: 4px 10px;
+      border: 1px solid #9acbb9; color: var(--green); background: #eef9f4; }
+    .warning { border-left: 4px solid var(--amber); padding: 10px 14px;
+      background: #fff8e8; }
+    .danger { border-left: 4px solid var(--red); padding: 10px 14px;
+      background: #fff1f1; }
+    code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    code { background: #eef2f5; padding: 1px 4px; }
+    pre { overflow-x: auto; margin: 12px 0 0; padding: 14px 16px;
+      background: #18232c; color: #edf4f7; }
+    table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+    th, td { text-align: left; vertical-align: top; border-bottom: 1px solid var(--line);
+      padding: 10px 9px; }
+    th { background: #edf2f5; }
+    td:first-child { width: 34%; word-break: break-word; }
+    .ok { color: var(--green); font-weight: 600; }
+    .pending { color: var(--amber); font-weight: 600; }
+    .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+    .metric { border: 1px solid var(--line); padding: 15px; background: #fbfcfd; }
+    .metric strong { display: block; font-size: 24px; }
+    ul { margin: 8px 0 0 20px; padding: 0; }
+    @media (max-width: 760px) {
+      main { padding: 18px 12px 42px; }
+      header, section { padding: 20px 18px; }
+      .grid { grid-template-columns: 1fr; }
+      h1 { font-size: 25px; }
+      table { display: block; overflow-x: auto; white-space: normal; }
+      th, td { min-width: 220px; }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Hermes Stage 1 记忆改进实施总结</h1>
+    <p class="meta">项目：芯相多 Agent 协作记忆 · 工作树：<code>/Users/xinxin/AI/hermes/.claude/worktrees/fervent-cannon-3b0909</code> · 日期：2026-08-02</p>
+    <span class="status">代码已落地，生产未启用，真实模型 A/B 待运行</span>
+    <p>本次改动将共享记忆做成独立、可选、可回滚的 Hermes 插件。它只为 Frontend、Backend、DevOps Agent 提供经过人工审阅的架构决策、API 契约和工程规范检索，不替换 Hermes 个人 memory provider，也不修改任何 Agent Markdown 文件。</p>
+  </header>
+
+  <section>
+    <h2>一、当前边界</h2>
+    <div class="grid">
+      <div class="metric"><strong>1</strong>个可选插件<br><span class="meta">team-memory</span></div>
+      <div class="metric"><strong>1</strong>个 Agent 工具<br><span class="meta">team_memory_search，只读</span></div>
+      <div class="metric"><strong>40</strong>默认 A/B 配对运行<br><span class="meta">20 任务 × 2 repetition</span></div>
+    </div>
+    <div class="warning"><strong>没有做的事情：</strong>当前没有知识图谱、向量数据库、NER/RE 训练、消息队列、自动写入、APM 深度关联、多模态统一查询或活跃会话热切换。旧设计文档中的这些内容已标记为长期候选方案。</div>
+  </section>
+
+  <section>
+    <h2>二、具体文件与内容</h2>
+    <table>
+      <thead><tr><th>文件路径</th><th>内容和改动</th><th>状态</th></tr></thead>
+      <tbody>
+        <tr><td><code>plugins/team_memory/plugin.yaml</code></td><td>Hermes 原生 standalone 插件清单；声明 <code>team_memory_search</code>。</td><td class="ok">新增</td></tr>
+        <tr><td><code>plugins/team_memory/__init__.py</code></td><td>通过 <code>register(ctx)</code>、<code>ctx.register_tool()</code> 和 <code>ctx.register_cli_command()</code> 注册能力；没有向核心工具注册表写重复条目。</td><td class="ok">新增</td></tr>
+        <tr><td><code>plugins/team_memory/storage.py</code></td><td>SQLite + FTS5 存储、schema version 3、旧候选库迁移、external-content FTS rebuild、workspace/project/review/source/expiry 过滤、CJK fallback、结果限制、WAL/busy timeout、独立 metrics DB、删除和卸载。</td><td class="ok">新增/核心实现</td></tr>
+        <tr><td><code>plugins/team_memory/tool.py</code></td><td>Agent 侧只读搜索工具；feature flag 和合法 workspace gate；搜索失败与 metrics 失败均不会暴露 SQL/路径或阻断主任务。</td><td class="ok">新增</td></tr>
+        <tr><td><code>plugins/team_memory/cli.py</code></td><td><code>hermes team-memory init/status/search/list/add/delete/migrate/metrics/uninstall</code>；写入和删除都是 operator 操作，删除/卸载需要 <code>--yes</code>；支持 <code>--include-expired</code> 审计历史契约。</td><td class="ok">新增</td></tr>
+        <tr><td><code>plugins/team_memory/README.md</code></td><td>启用、共享边界、初始化和回滚说明。</td><td class="ok">新增</td></tr>
+        <tr><td><code>tools/team_memory_storage.py</code><br><code>tools/team_memory_tool.py</code></td><td>兼容导出路径；只 re-export 插件实现，不再自行向 registry 注册，避免重复工具和死代码。</td><td class="ok">兼容层</td></tr>
+        <tr><td><code>tests/plugins/test_team_memory_plugin.py</code></td><td>真实 PluginManager discovery、registry dispatch、CLI parser、feature flag、workspace 隔离、英文/中文查询、FTS 更新/删除、过期和旧库迁移。</td><td class="ok">新增</td></tr>
+        <tr><td><code>tests/experiments/test_team_memory_ab_test.py</code></td><td>A/B 任务矩阵、样本门槛、指标分析、baseline/enhanced 配置隔离和凭据清理回归测试。</td><td class="ok">新增</td></tr>
+        <tr><td><code>experiments/team_memory_ab_test/scripts/run_experiment.py</code></td><td>真实 Hermes 子进程 A/B；显式 <code>--source-home</code>；每 arm 独立临时 HERMES_HOME；默认 20×2=40 对；arm 顺序确定性轮换；记录 API calls/tokens/time/实际 memory calls/关键词 oracle/response hash；少于 30 对只输出 <code>insufficient_sample</code>；退出后清理 auth。</td><td class="ok">修复/重写</td></tr>
+        <tr><td><code>experiments/team_memory_ab_test/shared_memory_seed/seed_data.py</code></td><td>10 条芯相业务场景种子，稳定 <code>memory_key</code>，可重复加载；不作为 Agent 写入通道。</td><td class="ok">新增/修复</td></tr>
+        <tr><td><code>experiments/team_memory_ab_test/scripts/quick_test.sh</code></td><td>临时 HERMES_HOME 的 CLI smoke；初始化、seed、英文/中文查询、status；不会调用模型或接触生产配置。</td><td class="ok">新增</td></tr>
+        <tr><td><code>INCREMENTAL_ROLLOUT_PLAN.md</code><br><code>MVP_SPEC.md</code><br><code>RESPONSE_TO_REVIEW.md</code></td><td>三阶段路线、Stage 1 实际契约和对过度工程化评审的落地回应；明确后续功能必须数据驱动。</td><td class="ok">新增/更新</td></tr>
+        <tr><td><code>AGENT_AB_TESTING.md</code><br><code>STAGE1_EVALUATION_FRAMEWORK.md</code></td><td>真实 Agent A/B 的任务、指标、40 对默认样本、30 对决策门槛和回滚演练。</td><td class="ok">新增/更新</td></tr>
+        <tr><td><code>MEMORY_OPTIMIZATION_ANALYSIS.md</code><br><code>XINXIANG_MEMORY_OPTIMIZATION.md</code></td><td>旧生态调研和长期架构愿景；顶部新增“候选/未验证”声明，防止把 Neo4j、NER、ROI 预测误读为生产事实。</td><td class="ok">状态澄清</td></tr>
+        <tr><td><code>PR_DESCRIPTION.md</code></td><td>重写为当前实际 Stage 1 插件实现、验证范围和安全说明。</td><td class="ok">更新</td></tr>
+        <tr><td><code>.gitignore</code></td><td>忽略本地 backups、实验 data/results 和运行产物；备份目录不允许提交。</td><td class="ok">更新</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>三、运行机制</h2>
+    <pre>Agent conversation
+        │  tool schema 只有在 enabled=true 且 workspace_id 合法时出现
+        ▼
+team_memory_search(query, category)
+        │
+        ├─ SQLite FTS5：英文/数字 prefix + BM25
+        ├─ CJK fallback：有界 LIKE，仍受 workspace/project/review/expiry 过滤
+        └─ 独立 metrics.db：记录 variant、latency、result count、session/task id
+
+Operator CLI ── add/replace/delete/migrate ──► reviewed shared_memory.db
+                                             ▲
+Frontend / Backend / DevOps profiles 只有显式相同 database_path + workspace_id 才共享</pre>
+    <p>工具 schema 在会话创建时确定。关闭 flag 后，新 Hermes 进程不会暴露工具；不会热修改正在运行会话的工具表，因此不破坏 prompt cache 前缀和工具快照稳定性。</p>
+  </section>
+
+  <section>
+    <h2>四、回滚方式</h2>
+    <ol>
+      <li>在相关 profile 的 <code>config.yaml</code> 中设置 <code>team_memory.enabled: false</code>，启动新 Hermes 进程。</li>
+      <li>确认新进程的工具 schema 中不存在 <code>team_memory_search</code>；不重建正在运行的会话，不重启无关 gateway。</li>
+      <li>如需清除 Stage 1 数据，执行 <code>hermes team-memory uninstall --yes</code>。这只删除当前解析到的 team-memory DB 和 metrics DB。</li>
+      <li>配置恢复前先解析 YAML，再执行 <code>hermes dump</code> 和插件/CLI smoke。</li>
+    </ol>
+    <p>本次本地备份目录：<code>/Users/xinxin/AI/hermes/.claude/worktrees/fervent-cannon-3b0909/backups/hermes_config_20260802_183945/</code>，包含 <code>config.yaml</code>、<code>models.json</code>、<code>auth.json</code>，已被 Git 忽略，不能 stage。</p>
+    <div class="danger"><strong>生产状态：</strong>本次没有启用生产 profile，没有重启生产 gateway，没有运行真实模型 A/B。当前只能确认代码和临时环境行为，不能宣称记忆增强已带来生产效率提升。</div>
+  </section>
+
+  <section>
+    <h2>五、验证证据</h2>
+    <ul>
+      <li><span class="ok">9 passed</span>：插件、存储、迁移、过期、删除、A/B 分析和配置隔离 focused tests。</li>
+      <li><span class="ok">通过</span>：真实 Hermes PluginManager discovery、registry tool dispatch 和 CLI registration。</li>
+      <li><span class="ok">通过</span>：临时 HERMES_HOME 的 <code>quick_test.sh</code>，加载 10 条 seed，英文 JWT、中文错误处理和 status 查询。</li>
+      <li><span class="ok">通过</span>：Python compile、<code>git diff --check</code>。</li>
+      <li><span class="pending">待完成</span>：使用明确批准的 source profile 运行真实模型 A/B，人工抽样检索质量，并对原始配对样本做独立统计复核。</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>六、下一步决策门</h2>
+    <p>只有真实 A/B 达到至少 30 对、Enhanced 成功率不低于 baseline、检索结果人工相关性达标，并完成成本/延迟复核，才进入 Stage 2 的 profile/project 过滤。只有 FTS、标签和反向链接无法满足稳定的多跳查询时，才另行评估关系表或图存储。每个后续能力继续保持独立开关、迁移和回滚。</p>
+  </section>
+</main>
+</body>
+</html>

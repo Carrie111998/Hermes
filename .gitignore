@@ -190,6 +190,13 @@ infographics/
 infograficos/
 infografico/
 native/fts5_cjk/*.so
+
+# Local Stage 1 memory experiments and the Hermes configuration backup. The
+# backup contains auth.json and is for local rollback drills only.
+/backups/
+/test_data/
+/experiments/team_memory_ab_test/data/
+/experiments/team_memory_ab_test/results/
 # Runtime marker written by hermes update when a lazy dependency refresh is
 # interrupted; consumed by launch-time recovery. Never commit it (was tracked
 # by accident via 3a69e34702, removed in the #72002 salvage).
