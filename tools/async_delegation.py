@@ -224,6 +224,23 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
              record.get("origin_session_id", "")),
         )
     _prune_durable_records()
+    _auto_link_scope(record.get("delegation_id", ""))
+
+
+def _auto_link_scope(delegation_id: str) -> None:
+    """Best-effort: link a dispatched delegation to the current thread's
+    scope, if one has already been created. Never raises, never creates a
+    scope implicitly. See hermes_scope.py / docs/design/thread-scope-isolation.md."""
+    if not delegation_id:
+        return
+    try:
+        import hermes_scope
+
+        scope_id = hermes_scope.resolve_current_scope_id()
+        if scope_id:
+            hermes_scope.link_artifact(scope_id, "delegation_ids", delegation_id)
+    except Exception:
+        logger.debug("Scope auto-link skipped for delegation_id=%s", delegation_id, exc_info=True)
 
 
 def _delete_durable_delegation(delegation_id: str) -> None:

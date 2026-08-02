@@ -215,6 +215,27 @@ class ProcessRegistry:
         self.on_close = None
 
     @staticmethod
+    def _auto_link_scope(session_key: str) -> None:
+        """Best-effort: link a freshly spawned tmux/terminal session to the
+        current thread's scope, if one has already been created.
+
+        Never raises and never creates a scope implicitly — scope creation
+        is a deliberate ``hermes scope create``/``/scope create`` action.
+        This only records ownership when a scope already exists for the
+        live identity of the session that spawned the process.
+        """
+        if not session_key:
+            return
+        try:
+            import hermes_scope
+
+            scope_id = hermes_scope.resolve_current_scope_id()
+            if scope_id:
+                hermes_scope.link_artifact(scope_id, "tmux_session_keys", session_key)
+        except Exception:
+            logger.debug("Scope auto-link skipped for session_key=%s", session_key, exc_info=True)
+
+    @staticmethod
     def _clean_shell_noise(text: str) -> str:
         """Strip shell startup warnings from the beginning of output."""
         lines = text.split("\n")
@@ -760,6 +781,7 @@ class ProcessRegistry:
                     self._running[session.id] = session
 
                 self._write_checkpoint()
+                self._auto_link_scope(session.session_key)
                 return session
 
             except ImportError:
@@ -812,6 +834,7 @@ class ProcessRegistry:
                 self._running[session.id] = session
 
             self._write_checkpoint()
+            self._auto_link_scope(session.session_key)
         except Exception:
             # Post-Popen setup failed — kill the orphaned subprocess (and any
             # descendants spawned via setsid) before re-raising so they do not
@@ -931,6 +954,7 @@ class ProcessRegistry:
                 self._running[session.id] = session
 
         if not session.exited:
+            self._auto_link_scope(session.session_key)
             self._write_checkpoint()
 
         return session

@@ -414,3 +414,53 @@ def owns(scope_id: str, category: str, value: str, hermes_home: Optional[Path] =
         return False
     bucket = manifest.get("owned", {}).get(category, [])
     return value in bucket
+
+
+# ---------------------------------------------------------------------------
+# Live-session identity bridge
+# ---------------------------------------------------------------------------
+
+
+def identity_from_session_env() -> Optional[dict]:
+    """Normalize the current turn's identity from ``HERMES_SESSION_*``.
+
+    Mirrors ``tools/cronjob_tools.py::_origin_from_env`` -- the same
+    ContextVar/env-var bridge (``gateway.session_context.get_session_env``)
+    already used to carry live session identity across tool-call boundaries.
+    Returns None (fail closed) when the required fields aren't resolvable
+    (e.g. a bare CLI/TUI session with no messaging origin) rather than
+    guessing at a scope.
+    """
+    try:
+        from gateway.session_context import get_session_env
+    except Exception:
+        return None
+
+    platform = get_session_env("HERMES_SESSION_PLATFORM") or None
+    chat_id = get_session_env("HERMES_SESSION_CHAT_ID") or None
+    profile = get_session_env("HERMES_SESSION_PROFILE") or "main"
+    if not platform or not chat_id:
+        return None
+
+    try:
+        return normalize_scope_identity(
+            profile=profile,
+            platform=platform,
+            chat_id=chat_id,
+            thread_id=get_session_env("HERMES_SESSION_THREAD_ID") or None,
+        )
+    except ScopeIdentityError:
+        return None
+
+
+def resolve_current_scope_id(hermes_home: Optional[Path] = None) -> Optional[str]:
+    """Resolve (never create) the scope owning the current turn, if any.
+
+    Fail-closed: returns None on any missing/ambiguous identity or absent
+    scope -- callers must treat that as "scope unknown," never fall back
+    to unscoped behavior silently.
+    """
+    identity = identity_from_session_env()
+    if identity is None:
+        return None
+    return resolve_scope_id(identity, hermes_home=hermes_home)

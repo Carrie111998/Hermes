@@ -1438,7 +1438,26 @@ def create_job(
         jobs.append(job)
         save_jobs(jobs)
 
+    _auto_link_scope(job["id"])
     return job
+
+
+def _auto_link_scope(job_id: str) -> None:
+    """Best-effort: link a newly created cron job to the current thread's
+    scope, if one has already been created. Never raises, never creates a
+    scope implicitly. See hermes_scope.py / docs/design/thread-scope-isolation.md."""
+    if not job_id:
+        return
+    try:
+        import hermes_scope
+
+        scope_id = hermes_scope.resolve_current_scope_id()
+        if scope_id:
+            hermes_scope.link_artifact(scope_id, "cron_job_ids", job_id)
+    except Exception:
+        logging.getLogger(__name__).debug(
+            "Scope auto-link skipped for cron job_id=%s", job_id, exc_info=True
+        )
 
 
 def get_job(job_id: str) -> Optional[Dict[str, Any]]:
