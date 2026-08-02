@@ -125,39 +125,27 @@ MATRIX_ALLOW_ROOM_MENTIONS=false
 Hermes sends structured Matrix user mentions for explicit Matrix IDs such as `@alice:example.org`. Room-wide `@room` notifications are disabled by default; set `MATRIX_ALLOW_ROOM_MENTIONS=true` only in rooms where the bot is allowed to notify everyone.
 :::
 
-### Dynamic Element Room Names
+### Dynamic DM Room Names
 
-Set `matrix.dynamic_room_name: true` to make a Matrix DM's Element-visible room
-name follow the current Hermes task:
+Set `matrix.dynamic_room_name: true` to show the current Hermes activity in
+Matrix DM room names. This setting defaults to `false` and applies only to DMs.
+Hermes adds a status icon to the title:
 
 - `🟡` while Hermes is processing
 - `✅` after success
-- `🔴` after any unsuccessful terminal outcome (failure or cancellation)
+- `🔴` after failure or cancellation
 
-The active persisted goal/epic is the authoritative room-name text. When there
-is no active goal (including paused or done goals), the persisted session title
-is used; if that is absent, Hermes recovers the existing Matrix room name.
-You can also ask the agent to rename the current chat. It uses the dedicated
-gateway-bound `set_chat_title` tool and needs no Matrix credentials or custom
-API script. This tool is exposed only to Matrix gateway conversations whose
-current room supports semantic-title refresh; it is not part of the CLI or
-other platform toolsets. The supplied title is the semantic base only; Hermes
-adds the lifecycle icon. While a goal is active, that goal remains visible and
-the requested title is persisted as the fallback for after the goal ends.
-When none of those sources can be read, Hermes leaves the room name unchanged.
-Any
-current or legacy lifecycle prefix (`🟡`, `✅`, `🔴`, `❌`, or `⏹`) is stripped
-to prevent nesting. The stable title base is deterministically truncated to at
-most 60 Unicode code points, including a trailing `...` when truncation occurs,
-and is retained unchanged across lifecycle transitions.
-If you rename the room manually in Matrix while Hermes is processing, the
-terminal lifecycle update adopts that sanitized name (for example,
-`🟡 Fortress Google CAPTCHA` becomes `✅ Fortress Google CAPTCHA`). A newer
-authoritative agent rename always wins over a delayed room-state read.
-Updates are deduplicated and limited to DMs so shared project rooms do not gain
-noisy room-state history. The bot account must have permission to send the
-`m.room.name` state event; a permission failure is logged and does not fail the
-agent turn.
+Hermes chooses the title from the active goal first, then the session title,
+and finally the existing room name. If none is available, the room name stays
+unchanged. For example, a successful chat might be named
+`✅ Project planning`. Long names may be shortened.
+
+You can also ask Hermes to rename the current chat; provide the meaningful
+title and Hermes will add the appropriate status icon. Meaningful names you set
+manually are respected rather than replaced unnecessarily.
+
+The bot must have permission to change the room name. If it does not, the agent
+turn continues normally and the room name remains unchanged.
 
 :::note
 If you are upgrading from a version that did not have `MATRIX_REQUIRE_MENTION`, the bot previously responded to all messages in rooms. To preserve that behavior, set `MATRIX_REQUIRE_MENTION=false`.
