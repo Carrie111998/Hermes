@@ -2174,6 +2174,64 @@ class TestSanitizerStripsOrphanedToolCalls:
         assert len(tool_msgs) == 1
         assert tool_msgs[0]["tool_call_id"] == "tc_valid"
 
+    def test_sanitizer_dedupes_reappended_tool_results(self, compressor):
+        """Duplicate tool results sharing one tool_call_id are collapsed.
+
+        A single tool_call_id can only ever have one result; a second row
+        with the same id means the transcript was re-appended (identity-
+        broken re-append after in-place compaction / reload / repair).
+        Keeping both rows doubles that exchange in every subsequent API
+        request, and because compression re-runs on the inflated
+        transcript the duplication feeds on itself across compaction
+        cycles (exponential input-token inflation, #76806). The newest
+        occurrence is kept so no data is lost.
+        """
+        msgs = [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "tc_1", "function": {"name": "read_file", "arguments": "{}"}},
+                ],
+            },
+            {"role": "tool", "tool_call_id": "tc_1", "content": "v1"},
+            # Re-appended copy of the same exchange (duplicate tool result)
+            {"role": "tool", "tool_call_id": "tc_1", "content": "v2"},
+            {"role": "user", "content": "continue"},
+        ]
+
+        sanitized = compressor._sanitize_tool_pairs(msgs)
+
+        tool_msgs = [m for m in sanitized if m.get("role") == "tool"]
+        assert len(tool_msgs) == 1, "duplicate tool result must be collapsed"
+        # Newest copy wins — the content is preserved, not lost.
+        assert tool_msgs[0]["content"] == "v2"
+        # The valid tool_call/result pair and the user turn survive.
+        asst = next(m for m in sanitized if m.get("role") == "assistant")
+        assert len(asst["tool_calls"]) == 1
+        assert any(m.get("role") == "user" for m in sanitized)
+
+    def test_sanitizer_keeps_distinct_tool_results(self, compressor):
+        """Tool results with different tool_call_ids are never collapsed."""
+        msgs = [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "tc_1", "function": {"name": "read_file", "arguments": "{}"}},
+                    {"id": "tc_2", "function": {"name": "search", "arguments": "{}"}},
+                ],
+            },
+            {"role": "tool", "tool_call_id": "tc_1", "content": "v1"},
+            {"role": "tool", "tool_call_id": "tc_2", "content": "v2"},
+        ]
+
+        sanitized = compressor._sanitize_tool_pairs(msgs)
+
+        tool_msgs = [m for m in sanitized if m.get("role") == "tool"]
+        assert len(tool_msgs) == 2
+        assert {m["tool_call_id"] for m in tool_msgs} == {"tc_1", "tc_2"}
+
     def test_sanitizer_strips_orphaned_preserves_text_content(self, compressor):
         """When an assistant has text content AND orphaned tool_calls,
         the text is preserved and only tool_calls are stripped.  #51218"""

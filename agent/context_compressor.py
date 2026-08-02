@@ -4526,6 +4526,56 @@ This compaction should PRIORITISE preserving all information related to the focu
                 if cid:
                     result_call_ids.add(cid)
 
+        # 0. Deduplicate tool results that share a tool_call_id. A single
+        # tool_call_id can only ever have ONE result; a second row with the
+        # same id means the transcript was re-appended (identity-broken
+        # re-append after in-place compaction, reload/repair that rebuilt
+        # dicts without persistence markers, or a legacy duplicated flush).
+        # Keeping both rows doubles that exchange in every subsequent API
+        # request and — because compression re-runs on the inflated
+        # transcript — lets the duplication feed on itself across
+        # compaction cycles (exponential input-token inflation, #76806).
+        # Keep the LAST occurrence (the newest copy) so no data is lost.
+        seen_result_ids: set = set()
+        duplicated_result_ids: set = set()
+        for msg in messages:
+            if msg.get("role") == "tool":
+                cid = msg.get("tool_call_id")
+                if not cid:
+                    continue
+                if cid in seen_result_ids:
+                    duplicated_result_ids.add(cid)
+                else:
+                    seen_result_ids.add(cid)
+        if duplicated_result_ids:
+            # Keep only the LAST row for each duplicated tool_call_id.
+            last_seen_index: dict = {}
+            for idx, msg in enumerate(messages):
+                if msg.get("role") == "tool" and msg.get("tool_call_id") in duplicated_result_ids:
+                    last_seen_index[msg.get("tool_call_id")] = idx
+            messages = [
+                msg for idx, msg in enumerate(messages)
+                if not (
+                    msg.get("role") == "tool"
+                    and msg.get("tool_call_id") in duplicated_result_ids
+                    and last_seen_index.get(msg.get("tool_call_id")) != idx
+                )
+            ]
+            # Rebuild the result-id set from the deduplicated list so the
+            # orphan/strip passes below reason about the same rows.
+            result_call_ids = set()
+            for msg in messages:
+                if msg.get("role") == "tool":
+                    cid = msg.get("tool_call_id")
+                    if cid:
+                        result_call_ids.add(cid)
+            if not self.quiet_mode:
+                logger.info(
+                    "Compression sanitizer: collapsed %d duplicate tool result(s) "
+                    "(same tool_call_id re-appended — #76806 inflation guard)",
+                    len(duplicated_result_ids),
+                )
+
         # 1. Remove tool results whose call_id has no matching assistant tool_call
         orphaned_results = result_call_ids - surviving_call_ids
         if orphaned_results:
