@@ -517,10 +517,10 @@ export const zhHant = defineLocale({
         }
       },
       memory: {
-        memoryEnabled: '持久記憶',
-        userProfileEnabled: '使用者設定檔',
-        memoryCharLimit: '記憶預算',
-        userCharLimit: '設定檔預算',
+        memoryEnabled: '智能體記憶',
+        memoryCharLimit: '智能體記憶預算',
+        userProfileEnabled: '使用者設定檔記憶',
+        userCharLimit: '使用者設定檔記憶預算',
         provider: '記憶提供方'
       },
       context: {
@@ -583,7 +583,9 @@ export const zhHant = defineLocale({
       },
       memory: {
         memoryEnabled: '儲存有助於未來工作階段的持久記憶。',
-        userProfileEnabled: '維護一份精簡的使用者偏好設定檔。'
+        memoryCharLimit: '每個工作階段的智能體記憶最大字元數。',
+        userProfileEnabled: '維護一份精簡的使用者偏好設定檔。',
+        userCharLimit: '使用者設定檔的最大字元數。'
       },
       context: {
         engine: '長對話接近上下文上限時的管理策略。'

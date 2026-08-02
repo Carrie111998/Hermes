@@ -526,10 +526,10 @@ export const FIELD_LABELS: Record<string, string> = defineFieldCopy({
     }
   },
   memory: {
-    memoryEnabled: 'Persistent Memory',
-    userProfileEnabled: 'User Profile',
-    memoryCharLimit: 'Memory Budget',
-    userCharLimit: 'Profile Budget',
+    memoryEnabled: 'Agent Memory',
+    memoryCharLimit: 'Agent Memory Budget',
+    userProfileEnabled: 'User Profile Memory',
+    userCharLimit: 'User Profile Memory Budget',
     provider: 'Memory Provider'
   },
   context: {
@@ -597,7 +597,9 @@ export const FIELD_DESCRIPTIONS: Record<string, string> = defineFieldCopy({
   },
   memory: {
     memoryEnabled: 'Save durable memories that can help future sessions.',
-    userProfileEnabled: 'Maintain a compact profile of user preferences.'
+    memoryCharLimit: 'Maximum characters for agent memory per session.',
+    userProfileEnabled: 'Maintain a compact profile of user preferences.',
+    userCharLimit: 'Maximum characters for the user profile.'
   },
   context: {
     engine: 'Strategy for managing long conversations near the context limit.'
@@ -692,8 +694,8 @@ export const SECTIONS: DesktopConfigSection[] = [
     icon: Brain,
     keys: [
       'memory.memory_enabled',
-      'memory.user_profile_enabled',
       'memory.memory_char_limit',
+      'memory.user_profile_enabled',
       'memory.user_char_limit',
       'memory.provider'
     ]
