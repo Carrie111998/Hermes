@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import json
 from pathlib import Path
 from urllib.error import HTTPError
@@ -83,3 +84,50 @@ def test_http_error_does_not_include_authorization(monkeypatch, tmp_path):
         core.synthesize_text("hello", output_path=tmp_path / "x.mp3")
     assert "test-secret" not in str(exc.value)
     assert "HTTP 401" in str(exc.value)
+
+
+class FakePluginContext:
+    def __init__(self) -> None:
+        self.tools = {}
+        self.tts_providers = {}
+        self.cli_commands = {}
+
+    def register_tts_provider(self, provider) -> None:
+        self.tts_providers[provider.name] = provider
+
+    def register_tool(self, name, handler, **kwargs) -> None:
+        self.tools[name] = {"handler": handler, "kwargs": kwargs}
+
+    def register_cli_command(self, name, **kwargs) -> None:
+        self.cli_commands[name] = kwargs
+
+
+def test_synthesize_handler_accepts_tool_argument_mapping(monkeypatch) -> None:
+    plugin = importlib.import_module("plugins.fish_audio_tts")
+    captured = {}
+
+    def fake_synthesize_text(**kwargs):
+        captured.update(kwargs)
+        return {"ok": True, "file_path": "test.mp3"}
+
+    monkeypatch.setattr(plugin, "synthesize_text", fake_synthesize_text)
+    result = plugin._synthesize_handler(
+        {
+            "text": "こんにちは、ボブにゃん！",
+            "output_path": "test.mp3",
+            "voice": "hakua",
+            "model": "s2.1-pro-free",
+            "format": "mp3",
+            "speed": 1.1,
+        }
+    )
+
+    assert json.loads(result)["ok"] is True
+    assert captured == {
+        "text": "こんにちは、ボブにゃん！",
+        "output_path": "test.mp3",
+        "voice": "hakua",
+        "model": "s2.1-pro-free",
+        "output_format": "mp3",
+        "speed": 1.1,
+    }

@@ -63,7 +63,7 @@ for candidate in "$REPO_ROOT/.venv" "$REPO_ROOT/venv" "$HOME/.hermes/hermes-agen
   if [ -n "$candidate_python" ]; then
     if "$candidate_python" -c 'import pytest' 2>/dev/null; then
       VENV="$candidate"
-      VENV_PYTHON="$candidate/bin/python"
+      VENV_PYTHON="$candidate_python"
       break
     fi
     SKIPPED_VENVS="$SKIPPED_VENVS $candidate"

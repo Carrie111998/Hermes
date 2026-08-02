@@ -10,22 +10,19 @@ def _status_handler(_: Any = None, **__: Any) -> str:
     return json.dumps(status_payload(), ensure_ascii=False, indent=2)
 
 
-def _synthesize_handler(
-    text: str,
-    output_path: str | None = None,
-    voice: str | None = None,
-    model: str | None = None,
-    format: str | None = None,
-    speed: float | None = None,
-    **_: Any,
-) -> str:
+def _tool_args(args: Any) -> dict[str, Any]:
+    return args if isinstance(args, dict) else {}
+
+
+def _synthesize_handler(args: Any = None, **_: Any) -> str:
+    data = _tool_args(args)
     result = synthesize_text(
-        text=text,
-        output_path=output_path,
-        voice=voice,
-        model=model,
-        output_format=format,
-        speed=speed,
+        text=str(data.get("text") or ""),
+        output_path=data.get("output_path"),
+        voice=data.get("voice"),
+        model=data.get("model"),
+        output_format=data.get("format"),
+        speed=data.get("speed"),
     )
     return json.dumps(result, ensure_ascii=False, indent=2)
 
