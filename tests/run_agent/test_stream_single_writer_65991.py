@@ -137,20 +137,20 @@ class TestSingleWriterLoop:
         assert "".join(delivered) == "first"
         assert "-stale-tail" not in "".join(delivered)
 
-    def test_chat_parser_failure_closes_managed_stream(self):
+    def test_chat_parser_failure_closes_provider_stream(self):
         agent = _make_agent()
-        managed_stream = MagicMock()
-        managed_stream.__iter__.return_value = iter([object()])
-        managed_stream.final_response = None
+        provider_stream = MagicMock()
+        provider_stream.__iter__.return_value = iter([object()])
+        provider_stream.final_response = None
 
         with patch(
-            "agent.relay_llm.stream",
-            return_value=managed_stream,
+            "agent.relay_llm.provider_stream",
+            return_value=provider_stream,
         ):
             with pytest.raises(AttributeError):
                 agent._interruptible_streaming_api_call({})
 
-        managed_stream.close.assert_called_once()
+        provider_stream.close.assert_called_once()
 
 
 class TestCodexSingleWriter:

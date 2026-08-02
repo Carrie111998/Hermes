@@ -8357,8 +8357,8 @@ def call_llm(
         if task == "moa_aggregator" and isinstance(client, CodexAuxiliaryClient):
             # CodexAuxiliaryClient (openai-codex, xai-oauth, and any other
             # Responses-shim provider) consumes the provider stream internally
-            # and returns a completed response object. Routing that nested
-            # MoA stream through Relay's generic managed stream makes the
+            # and returns a completed response object. Routing that nested MoA
+            # stream through the generic iterator compatibility view makes the
             # manager iterate the completed SimpleNamespace itself (#55933).
             # Return the provider call directly; the MoA facade converts a
             # completed response into a one-chunk delta iterator at its

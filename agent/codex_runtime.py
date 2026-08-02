@@ -1283,7 +1283,6 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
         if agent._interrupt_requested:
             raise InterruptedError("Agent interrupted before Codex stream retry")
 
-        intercepted_events = []
         writer_token = {"value": None}
 
         def _open_codex_stream(next_api_kwargs: dict[str, Any]):
@@ -1308,40 +1307,15 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
             )
             return False
 
-        def _finalize_codex_stream() -> Any:
-            return _consume_codex_event_stream(
-                list(intercepted_events),
-                model=api_kwargs.get("model"),
-            )
-
         try:
-            event_stream = relay_llm.stream(
+            event_stream = relay_llm.provider_stream(
                 dict(api_kwargs),
                 _open_codex_stream,
-                session_id=str(getattr(agent, "session_id", "") or ""),
-                name=str(getattr(agent, "provider", "") or "codex"),
-                model_name=str(api_kwargs.get("model") or ""),
-                finalizer=_finalize_codex_stream,
                 on_stream_created=_codex_stream_created,
-                on_chunk=intercepted_events.append,
-                chunk_adapter=lambda chunk: chunk,
                 accept_chunk=_accept_codex_chunk,
                 completed_response_predicate=lambda response: bool(
                     hasattr(response, "output") and not hasattr(response, "__iter__")
                 ),
-                metadata={
-                    "api_mode": "codex_responses",
-                    "api_request_id": getattr(agent, "_current_api_request_id", None),
-                    "call_role": (
-                        "delegated"
-                        if getattr(agent, "is_subagent", False)
-                        else "fallback"
-                        if int(getattr(agent, "_fallback_index", 0) or 0) > 0
-                        else "primary"
-                    ),
-                    "retry_count": attempt,
-                },
-                defer_logical_completion=True,
             )
         except (
             _httpx.RemoteProtocolError,
@@ -1400,10 +1374,10 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
 
             # A terminal response has already been assembled at this point
             # (``final`` is built), so a transport error while draining the
-            # rest of the iterator — done only to let Relay run its response
-            # finalizer — must NOT discard it or trigger a new physical
-            # request. Record it as a non-fatal finalization warning and
-            # still return the already-completed, already-billed response.
+            # rest of the provider iterator to release its connection must NOT
+            # discard it or trigger a new physical request. Record it as a
+            # non-fatal finalization warning and still return the already-
+            # completed, already-billed response.
             if not agent._interrupt_requested:
                 try:
                     for _ignored in event_stream:

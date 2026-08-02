@@ -2264,7 +2264,6 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     normalize_converse_response,
                     stream_converse_with_callbacks,
                 )
-                intercepted_events = []
                 writer_token = {"value": None}
 
                 def _open_bedrock_stream(next_api_kwargs: dict[str, Any]):
@@ -2276,8 +2275,8 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         raw_response = client.converse_stream(**final_kwargs)
                     except Exception as _bedrock_exc:
                         # InvokeModel-only policies cannot open a stream. Keep
-                        # the fallback inside the same managed Relay attempt so
-                        # the real provider request and terminal response still
+                        # the fallback inside the same physical provider
+                        # attempt so the request and terminal response still
                         # share one lifecycle boundary.
                         if is_streaming_access_denied_error(_bedrock_exc):
                             agent._disable_streaming = True
@@ -2312,11 +2311,6 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     _fire_first()
                     agent._fire_reasoning_delta(text)
 
-                def _finalize_bedrock_stream():
-                    return stream_converse_with_callbacks(
-                        {"stream": list(intercepted_events)}
-                    )
-
                 def _bedrock_stream_created(_stream: Any) -> None:
                     writer_token["value"] = claim_stream_writer(agent)
 
@@ -2324,34 +2318,14 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     token = writer_token["value"]
                     return token is None or stream_writer_is_current(agent, token)
 
-                stream = relay_llm.stream(
+                stream = relay_llm.provider_stream(
                     dict(api_kwargs),
                     _open_bedrock_stream,
-                    session_id=str(getattr(agent, "session_id", "") or ""),
-                    name=str(getattr(agent, "provider", "") or "bedrock"),
-                    model_name=str(getattr(agent, "model", "") or ""),
-                    finalizer=_finalize_bedrock_stream,
                     on_stream_created=_bedrock_stream_created,
-                    on_chunk=intercepted_events.append,
-                    chunk_adapter=lambda chunk: chunk,
                     accept_chunk=_accept_bedrock_event,
                     completed_response_predicate=lambda response: bool(
                         getattr(response, "choices", None)
                     ),
-                    metadata={
-                        "api_mode": "custom",
-                        "api_request_id": getattr(
-                            agent, "_current_api_request_id", None
-                        ),
-                        "call_role": (
-                            "delegated"
-                            if getattr(agent, "is_subagent", False)
-                            else "fallback"
-                            if int(getattr(agent, "_fallback_index", 0) or 0) > 0
-                            else "primary"
-                        ),
-                    },
-                    defer_logical_completion=True,
                 )
                 streamed_response = stream_converse_with_callbacks(
                     {"stream": stream},
@@ -2582,14 +2556,14 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         "discarded_chunks": 0,
         "discarded_bytes": 0,
     }
-    managed_stream_holder = {"stream": None}
+    provider_stream_holder = {"stream": None}
 
-    def _set_managed_stream(stream: Any) -> Any:
-        managed_stream_holder["stream"] = stream
+    def _set_provider_stream(stream: Any) -> Any:
+        provider_stream_holder["stream"] = stream
         return stream
 
-    def _close_managed_stream() -> None:
-        stream = managed_stream_holder.pop("stream", None)
+    def _close_provider_stream() -> None:
+        stream = provider_stream_holder.pop("stream", None)
         if stream is None:
             return
         close = getattr(stream, "close", None)
@@ -2597,7 +2571,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             try:
                 close()
             except Exception:
-                logger.debug("Managed provider stream cleanup failed", exc_info=True)
+                logger.debug("Provider stream cleanup failed", exc_info=True)
 
     def _start_stream_attempt() -> int:
         with stream_attempt_lock:
@@ -2767,7 +2741,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             _writer_token["value"] = claim_stream_writer(agent)
 
         def _accept_stream_chunk(_chunk: Any) -> bool:
-            # A stale-attempt fence can win while Relay is handing an
+            # A stale-attempt fence can win while the provider adapter is handing an
             # already-received tool-call chunk back to Hermes. Preserve only
             # the fact that a tool call was in flight so retry policy does not
             # misclassify the attempt as a partial text response. The chunk
@@ -2790,61 +2764,27 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     api_kwargs.get("model", "unknown"),
                 )
                 return False
-            # Record provider activity before Relay processes the chunk. This
+            # Record provider activity before Hermes processes the chunk. This
             # prevents the stale watchdog from cancelling a live stream while
             # an interceptor or codec is still handling an already-received
             # event.
             last_chunk_time["t"] = time.time()
             return True
 
-        def _relay_final_response() -> dict[str, Any]:
-            tool_calls = [tool_calls_acc[index] for index in sorted(tool_calls_acc)]
-            return {
-                "model": model_name,
-                "choices": [
-                    {
-                        "message": {
-                            "role": role,
-                            "content": "".join(content_parts) or None,
-                            "reasoning_content": "".join(reasoning_parts) or None,
-                            "tool_calls": tool_calls or None,
-                        },
-                        "finish_reason": finish_reason or "stop",
-                    }
-                ],
-                "usage": usage_obj,
-            }
-
         from agent import relay_llm
 
-        stream = _set_managed_stream(
-            relay_llm.stream(
+        stream = _set_provider_stream(
+            relay_llm.provider_stream(
                 api_kwargs,
                 _open_stream,
-                session_id=str(getattr(agent, "session_id", "") or ""),
-                name=str(getattr(agent, "provider", "") or "provider"),
-                model_name=str(getattr(agent, "model", "") or ""),
-                finalizer=_relay_final_response,
                 on_stream_created=_stream_created,
                 accept_chunk=_accept_stream_chunk,
                 completed_response_predicate=lambda value: hasattr(value, "choices"),
-                metadata={
-                    "api_mode": "chat_completions",
-                    "api_request_id": getattr(agent, "_current_api_request_id", None),
-                    "call_role": (
-                        "delegated"
-                        if getattr(agent, "is_subagent", False)
-                        else "fallback"
-                        if int(getattr(agent, "_fallback_index", 0) or 0) > 0
-                        else "primary"
-                    ),
-                },
-                defer_logical_completion=True,
             )
         )
         if agent.provider == "moa":
-            # Hermes interrupts the managed stream; Relay retains sole
-            # ownership of closing the underlying provider stream.
+            # Hermes interrupts the compatibility stream view, which owns
+            # closing the underlying provider stream exactly once.
             _set_request_stream_handle(stream)
         for chunk in stream:
             last_chunk_time["t"] = time.time()
@@ -3021,7 +2961,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             if hasattr(chunk, "usage") and chunk.usage:
                 usage_obj = chunk.usage
 
-        _close_managed_stream()
+        _close_provider_stream()
 
         if _stream_attempt_was_cancelled(stream_attempt_id):
             raise _httpx.RemoteProtocolError(
@@ -3029,8 +2969,8 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             )
 
         # Some OpenAI-compatible adapters accept ``stream=True`` but return a
-        # completed response. Relay records that attempt while Hermes preserves
-        # its existing switch-to-non-streaming behavior for later calls.
+        # completed response. Hermes preserves its existing switch-to-
+        # non-streaming behavior for later calls.
         if stream.final_response is not None:
             final_response = stream.final_response
             logger.info(
@@ -3270,29 +3210,13 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             )
             return False
 
-        stream = _set_managed_stream(
-            relay_llm.stream(
+        stream = _set_provider_stream(
+            relay_llm.provider_stream(
                 api_kwargs,
                 _open_anthropic_stream,
-                session_id=str(getattr(agent, "session_id", "") or ""),
-                name=str(getattr(agent, "provider", "") or "anthropic"),
-                model_name=str(getattr(agent, "model", "") or ""),
-                finalizer=accumulator.finalize,
                 on_stream_created=_anthropic_stream_created,
-                on_chunk=accumulator.observe,
+                on_provider_chunk=accumulator.observe,
                 accept_chunk=_accept_anthropic_event,
-                metadata={
-                    "api_mode": "anthropic_messages",
-                    "api_request_id": getattr(agent, "_current_api_request_id", None),
-                    "call_role": (
-                        "delegated"
-                        if getattr(agent, "is_subagent", False)
-                        else "fallback"
-                        if int(getattr(agent, "_fallback_index", 0) or 0) > 0
-                        else "primary"
-                    ),
-                },
-                defer_logical_completion=True,
             )
         )
         try:
@@ -3348,7 +3272,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         raise
         finally:
             try:
-                _close_managed_stream()
+                _close_provider_stream()
             finally:
                 manager = _stream_context["manager"]
                 if manager is not None:
@@ -3411,7 +3335,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         result["response"] = _call_chat_completions(stream_attempt_id)
                     return  # success
                 except Exception as e:
-                    _close_managed_stream()
+                    _close_provider_stream()
                     # If the main poll loop force-closed this request because
                     # of an interrupt, the resulting transport error is the
                     # expected consequence of our own close — NOT a transient
@@ -3700,7 +3624,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             result["error"] = e
             return
         finally:
-            _close_managed_stream()
+            _close_provider_stream()
             # Reuse reason only on a clean stream; any other outcome (error,
             # cancel-swallow) really closes so the next attempt builds a
             # fresh pool (see _REQUEST_CLIENT_REUSE_REASONS).

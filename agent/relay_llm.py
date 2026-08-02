@@ -1,4 +1,4 @@
-"""Core NeMo Relay adapters for physical Hermes provider attempts."""
+"""Relay compatibility and notification adapters for Hermes model attempts."""
 
 from __future__ import annotations
 
@@ -247,14 +247,6 @@ async def execute_current_async(
     )
 
 
-def _has_running_event_loop() -> bool:
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        return False
-    return True
-
-
 def stream_current(
     request: dict[str, Any],
     stream_factory: Callable[[dict[str, Any]], Any],
@@ -266,7 +258,7 @@ def stream_current(
     defer_logical_completion: bool = False,
     completed_response_predicate: Callable[[Any], bool] | None = None,
 ) -> Any:
-    """Run a provider stream under the inherited Hermes turn when present.
+    """Open a direct provider stream through the historical current-turn API.
 
     When ``completed_response_predicate`` is set and the stream_factory returns
     a complete response instead of an iterator (e.g. AnthropicAuxiliaryClient
@@ -275,42 +267,41 @@ def stream_current(
     ``call_llm(stream=True)`` returned the raw response and the consumer's
     own ``hasattr(stream, "choices")`` check handled it (#11732, #55933) —
     without the unwrap the response stays trapped as ``final_response`` on the
-    inner ManagedLlmStream and the outer consumer sees an empty stream.
+    inner compatibility view and the outer consumer sees an empty stream.
     """
-    turn = relay_runtime.active_turn()
-    if turn is None:
-        return stream_factory(request)
-    if _has_running_event_loop():
-        # Managed provider callbacks execute on the Relay session's event
-        # loop. A nested ManagedLlmStream built here would be synchronously
-        # iterated on that same loop thread, which asyncio forbids
-        # ("Cannot run the event loop while another loop is running").
-        # Return the raw factory result instead: the outer managed stream
-        # already provides Relay tracking for the enclosing attempt, and its
-        # own completed_response_predicate traps a completed response (e.g.
-        # the MoA facade's auxiliary ``call_llm(stream=True)`` returning a
-        # full response when an adapter ignores ``stream=True``).
-        return stream_factory(request)
-    managed = stream(
+    del name, model_name, finalizer, metadata, defer_logical_completion
+    direct = provider_stream(
         request,
         stream_factory,
-        session_id=turn.lease.session_id,
-        name=name,
-        model_name=model_name,
-        finalizer=finalizer,
-        metadata=metadata,
-        defer_logical_completion=defer_logical_completion,
         completed_response_predicate=completed_response_predicate,
     )
-    # In the non-managed path the factory already ran eagerly during __init__,
-    # so a completed response is visible immediately and must surface raw.
-    # In the managed path the factory runs lazily on first pull, so
-    # final_response is still None here and the managed stream is returned.
     if completed_response_predicate is not None:
-        completed = getattr(managed, "final_response", None)
+        completed = direct.final_response
         if completed is not None:
             return completed
-    return managed
+    return direct
+
+
+def provider_stream(
+    request: dict[str, Any],
+    stream_factory: Callable[[dict[str, Any]], Any],
+    *,
+    on_stream_created: Callable[[Any], None] | None = None,
+    on_provider_chunk: Callable[[Any], None] | None = None,
+    observer: Callable[[Any], None] | None = None,
+    accept_chunk: Callable[[Any], bool] | None = None,
+    completed_response_predicate: Callable[[Any], bool] | None = None,
+) -> "ProviderLlmStream":
+    """Open one direct, model-authoritative provider stream."""
+    return ProviderLlmStream(
+        request,
+        stream_factory,
+        on_stream_created=on_stream_created,
+        on_provider_chunk=on_provider_chunk,
+        observer=observer,
+        accept_chunk=accept_chunk,
+        completed_response_predicate=completed_response_predicate,
+    )
 
 
 def stream(
@@ -329,361 +320,143 @@ def stream(
     metadata: dict[str, Any] | None = None,
     defer_logical_completion: bool = False,
 ) -> "ManagedLlmStream":
-    """Return a synchronous view of one Relay-managed provider stream."""
-    return ManagedLlmStream(
+    """Return a model-authoritative synchronous provider stream view.
+
+    The historical Relay-shaped arguments are accepted for compatibility but
+    are notification metadata only; they never participate in execution.
+    """
+    del session_id, name, model_name, finalizer, chunk_adapter, metadata
+    # Historical Relay/plugin callers cannot install a stop predicate.  Only
+    # trusted core call sites can use ``provider_stream(accept_chunk=...)`` for
+    # exact single-writer/stale-attempt fencing.
+    del accept_chunk
+    del defer_logical_completion
+    return provider_stream(
         request,
         stream_factory,
-        session_id=session_id,
-        name=name,
-        model_name=model_name,
-        finalizer=finalizer,
         on_stream_created=on_stream_created,
-        on_chunk=on_chunk,
-        chunk_adapter=chunk_adapter,
-        accept_chunk=accept_chunk,
+        observer=on_chunk,
         completed_response_predicate=completed_response_predicate,
-        metadata=metadata,
-        defer_logical_completion=defer_logical_completion,
     )
 
 
-class ManagedLlmStream(Iterator[Any]):
-    """Drive Relay's async stream from Hermes's provider worker thread."""
+class ProviderLlmStream(Iterator[Any]):
+    """Pass through one model-authoritative provider stream.
+
+    ``ManagedLlmStream`` remains as a compatibility surface for callers that
+    expect ``final_response``/``output_modified`` and explicit ``close()``.
+    Relay is deliberately *not* in the execution path: it cannot rewrite the
+    request, invoke the provider zero or multiple times, replace chunks, stop
+    iteration early, or synthesize a final response.  Lifecycle/middleware
+    observers are notified by the surrounding agent boundary with detached
+    snapshots; this adapter only preserves the provider's exact stream.
+    """
 
     def __init__(
         self,
         request: dict[str, Any],
         stream_factory: Callable[[dict[str, Any]], Any],
         *,
-        session_id: str,
-        name: str,
-        model_name: str,
-        finalizer: Callable[[], Any],
         on_stream_created: Callable[[Any], None] | None,
-        on_chunk: Callable[[Any], None] | None,
-        chunk_adapter: Callable[[Any], Any] | None,
+        on_provider_chunk: Callable[[Any], None] | None,
+        observer: Callable[[Any], None] | None,
         accept_chunk: Callable[[Any], bool] | None,
         completed_response_predicate: Callable[[Any], bool] | None,
-        metadata: dict[str, Any] | None,
-        defer_logical_completion: bool,
     ) -> None:
         self.final_response: Any = None
-        self._loop: asyncio.AbstractEventLoop | None = None
-        self._stream: Any = None
-        self._raw_stream_resource: Any = None
+        self.output_modified = False
         self._closed = False
         self._close_error: BaseException | None = None
-        self._callback_error: BaseException | None = None
-        self._logical: tuple[relay_runtime.RelayTurnContext, Any, str] | None = None
-        self._defer_logical_completion = defer_logical_completion
-        self._on_chunk = on_chunk
-        self._chunk_adapter = chunk_adapter or _namespace
+        self._on_provider_chunk = on_provider_chunk
+        self._observer = observer
         self._accept_chunk = accept_chunk
-        self._relay_observes_chunks = False
-        self._provider_completed = False
-        self._raw_chunks: list[tuple[Any, Any]] = []
-        self.output_modified = False
-        callback_context = contextvars.copy_context()
+        self._stream: Any = None
+        self._raw_stream_resource: Any = None
 
-        def run_callback(callback: Callable[..., Any], *args: Any) -> Any:
-            # Relay can invoke stream surfaces while another callback still
-            # owns the captured Context. A fresh copy is safe to enter.
-            return callback_context.copy().run(callback, *args)
-
-        runtime, session, parent = relay_runtime.resolve_execution_context(session_id)
-        if (
-            runtime is None
-            or session is None
-            or not runtime.managed_execution_enabled()
+        raw_stream = stream_factory(request)
+        if completed_response_predicate is not None and completed_response_predicate(
+            raw_stream
         ):
-            raw_stream = stream_factory(request)
-            if completed_response_predicate is not None and completed_response_predicate(
-                raw_stream
-            ):
-                self.final_response = raw_stream
-                self._stream = iter(())
-            else:
-                self._raw_stream_resource = raw_stream
-                if on_stream_created is not None:
-                    on_stream_created(raw_stream)
-                self._stream = iter(raw_stream)
+            self.final_response = raw_stream
+            self._stream = iter(())
             return
 
-        self._logical = _logical_parent(runtime, session, parent, metadata)
-        if self._logical is not None:
-            parent = self._logical[1]
-        relay_request_body = _relay_request_body(request, metadata)
-        relay_request = runtime.relay.LLMRequest({}, relay_request_body)
-        codec_baseline_body = _codec_round_trip_request_body(
-            runtime.relay,
-            relay_request,
-            relay_request_body=relay_request_body,
-            metadata=metadata,
-        )
+        self._raw_stream_resource = raw_stream
+        if on_stream_created is not None:
+            on_stream_created(raw_stream)
+        self._stream = iter(raw_stream)
 
-        async def provider_stream(next_request: Any):
-            raw_stream = None
-            try:
-                raw_stream = run_callback(
-                    stream_factory,
-                    _provider_request(
-                        request,
-                        next_request,
-                        relay_request_body=relay_request_body,
-                        codec_baseline_body=codec_baseline_body,
-                        metadata=metadata,
-                    )
-                )
-                if (
-                    completed_response_predicate is not None
-                    and run_callback(
-                        completed_response_predicate,
-                        raw_stream,
-                    )
-                ):
-                    self.final_response = raw_stream
-                    self._provider_completed = True
-                    return
-                if on_stream_created is not None:
-                    run_callback(on_stream_created, raw_stream)
-                raw_iterator = run_callback(iter, raw_stream)
-                while True:
-                    try:
-                        chunk = run_callback(next, raw_iterator)
-                    except StopIteration:
-                        break
-                    if self._accept_chunk is not None and not run_callback(
-                        self._accept_chunk,
-                        chunk,
-                    ):
-                        break
-                    encoded_chunk = _jsonable(chunk)
-                    self._raw_chunks.append((encoded_chunk, chunk))
-                    yield encoded_chunk
-                self._provider_completed = True
-            except BaseException as exc:
-                self._callback_error = exc
-                raise
-            finally:
-                close = getattr(raw_stream, "close", None)
-                if callable(close):
-                    try:
-                        run_callback(close)
-                    except BaseException as exc:
-                        self._close_error = exc
-                        raise
-
-        def observe_chunk(chunk: Any) -> None:
-            if self._on_chunk is not None:
-                run_callback(self._on_chunk, _jsonable(chunk))
-
-        def relay_finalizer() -> Any:
-            # Relay can invoke the finalizer while unwinding a provider-stream
-            # failure. Preserve that original callback error instead of
-            # replacing it with a secondary "missing terminal response" error.
-            if self._callback_error is not None:
-                return None
-            try:
-                if self.final_response is not None:
-                    return _jsonable(self.final_response)
-                return _jsonable(run_callback(finalizer))
-            except BaseException as exc:
-                self._callback_error = exc
-                raise
-
-        loop = asyncio.new_event_loop()
-        self._loop = loop
-        self._relay_observes_chunks = True
-        try:
-            self._stream = loop.run_until_complete(
-                runtime.run_in_session_async(
-                    session,
-                    runtime.relay.llm.stream_execute,
-                    name,
-                    relay_request,
-                    provider_stream,
-                    observe_chunk,
-                    relay_finalizer,
-                    handle=parent,
-                    metadata=_jsonable(metadata or {}),
-                    model_name=model_name,
-                    codec=_codec(runtime.relay, metadata),
-                    response_codec=_codec(runtime.relay, metadata),
-                )
-            )
-        except BaseException as exc:
-            if (
-                isinstance(exc, Exception)
-                and self._provider_completed
-                and self._callback_error is None
-            ):
-                logger.warning(
-                    "NeMo Relay stream post-processing failed after provider success; "
-                    "preserving the provider result",
-                    exc_info=True,
-                )
-                self._preserve_pending_provider_chunks()
-                return
-            if not self._defer_logical_completion:
-                _complete_logical(
-                    self._logical,
-                    outcome="cancelled" if _is_cancellation(exc) else "failed",
-                )
-                self._logical = None
-            loop.close()
-            self._loop = None
-            raise
-
-    def __iter__(self) -> "ManagedLlmStream":
+    def __iter__(self) -> "ProviderLlmStream":
         return self
 
     def __next__(self) -> Any:
         if self._closed:
             raise StopIteration
-        if self._loop is None:
-            try:
-                chunk = next(self._stream)
-            except StopIteration:
-                self._close(logical_outcome="cancelled")
-                raise
-            if self._accept_chunk is not None and not self._accept_chunk(chunk):
-                self._close(logical_outcome="cancelled")
-                raise StopIteration
-            return chunk
-
-        async def next_chunk() -> Any:
-            return await anext(self._stream)
-
         try:
-            chunk = self._loop.run_until_complete(next_chunk())
-        except StopAsyncIteration:
-            if self._raw_chunks:
-                self.output_modified = True
-            if not self._defer_logical_completion:
-                _complete_logical(self._logical, outcome="success")
-                self._logical = None
-            self._close(logical_outcome="cancelled")
-            raise StopIteration from None
-        except BaseException as exc:
-            callback_error = self._callback_error
-            if (
-                callback_error is not None
-                and relay_runtime._is_relay_wrapped_callback_error(exc, callback_error)
-            ):
-                self._close(logical_outcome="failed")
-                raise callback_error
-            if (
-                isinstance(exc, Exception)
-                and self._provider_completed
-                and callback_error is None
-            ):
+            chunk = next(self._stream)
+        except StopIteration:
+            self._close()
+            raise
+
+        if self._accept_chunk is not None and not self._accept_chunk(chunk):
+            self._close()
+            raise StopIteration
+
+        if self._on_provider_chunk is not None:
+            # Trusted core parsing is part of the exact provider-response
+            # boundary.  A parse/accumulation failure must be visible; silently
+            # continuing could fabricate an incomplete final response.
+            self._on_provider_chunk(chunk)
+
+        if self._observer is not None:
+            try:
+                # A detached JSON-compatible snapshot prevents observers from
+                # retaining or mutating the provider-owned chunk.  Notification
+                # failure is fail-open and never changes the stream.
+                self._observer(_jsonable(chunk))
+            except Exception:
                 logger.warning(
-                    "NeMo Relay stream post-processing failed after provider success; "
-                    "preserving the provider result",
+                    "Provider stream observer failed; preserving provider chunk",
                     exc_info=True,
                 )
-                self._preserve_pending_provider_chunks()
-                return next(self)
-            self._close(
-                logical_outcome="cancelled" if _is_cancellation(exc) else "failed"
-            )
-            raise
-        if not self._relay_observes_chunks and self._on_chunk is not None:
-            self._on_chunk(chunk)
-        for index, (encoded, raw) in enumerate(self._raw_chunks):
-            if _json_equal(chunk, encoded):
-                if index > 0:
-                    self.output_modified = True
-                del self._raw_chunks[: index + 1]
-                return raw
-        self.output_modified = True
-        return self._chunk_adapter(chunk)
+        return chunk
 
     def close(self) -> None:
-        """Close an explicitly abandoned stream and cancel its logical call."""
-        self._close(logical_outcome="cancelled")
+        """Close an explicitly abandoned provider stream exactly once."""
+        self._close()
         close_error = self._close_error
         self._close_error = None
         if close_error is not None:
             raise close_error
 
-    def _preserve_pending_provider_chunks(self) -> None:
-        """Switch a failed Relay stream to its undelivered provider chunks."""
-        pending = [raw for _encoded, raw in self._raw_chunks]
-        self._raw_chunks.clear()
-        loop = self._loop
-        relay_stream = self._stream
-        self._loop = None
-        self._stream = iter(pending)
-        self._raw_stream_resource = None
-        self._accept_chunk = None
-        if loop is not None:
-            close = getattr(relay_stream, "aclose", None)
-            if callable(close):
-
-                async def close_stream() -> None:
-                    await close()
-
-                try:
-                    loop.run_until_complete(close_stream())
-                except Exception:
-                    logger.debug(
-                        "Relay stream cleanup failed during provider fallback",
-                        exc_info=True,
-                    )
-            loop.close()
-        if not self._defer_logical_completion:
-            _complete_logical(self._logical, outcome="success")
-            self._logical = None
-
-    def _close(self, *, logical_outcome: str) -> None:
+    def _close(self) -> None:
         if self._closed:
             return
         self._closed = True
-        loop = self._loop
-        self._loop = None
-        if loop is None:
-            resources = (self._stream, self._raw_stream_resource)
-            self._stream = None
-            self._raw_stream_resource = None
-            closed_ids: set[int] = set()
-            for resource in resources:
-                if resource is None or id(resource) in closed_ids:
-                    continue
-                closed_ids.add(id(resource))
-                close = getattr(resource, "close", None)
-                if callable(close):
-                    try:
-                        close()
-                    except Exception as exc:
-                        if self._close_error is None:
-                            self._close_error = exc
-                        logger.debug(
-                            "Provider stream cleanup failed",
-                            exc_info=True,
-                        )
-            if not self._defer_logical_completion:
-                _complete_logical(self._logical, outcome=logical_outcome)
-                self._logical = None
-            return
-        close = getattr(self._stream, "aclose", None)
-        if callable(close):
-
-            async def close_stream() -> None:
-                await close()
-
+        resources = (self._stream, self._raw_stream_resource)
+        self._stream = None
+        self._raw_stream_resource = None
+        closed_ids: set[int] = set()
+        for resource in resources:
+            if resource is None or id(resource) in closed_ids:
+                continue
+            closed_ids.add(id(resource))
+            close = getattr(resource, "close", None)
+            if not callable(close):
+                continue
             try:
-                loop.run_until_complete(close_stream())
+                close()
             except Exception as exc:
                 if self._close_error is None:
                     self._close_error = exc
-        if not self._defer_logical_completion:
-            _complete_logical(self._logical, outcome=logical_outcome)
-            self._logical = None
-        loop.close()
+                logger.debug("Provider stream cleanup failed", exc_info=True)
 
     def __del__(self) -> None:
-        self._close(logical_outcome="cancelled")
+        self._close()
+
+
+# Backward-compatible name for extensions that imported the historical type.
+ManagedLlmStream = ProviderLlmStream
 
 
 class AnthropicStreamAccumulator:

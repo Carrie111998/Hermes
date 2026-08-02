@@ -1,4 +1,4 @@
-"""Tests for the core Relay-managed physical LLM attempt adapter."""
+"""Contracts for Relay compatibility around physical LLM attempts."""
 
 from __future__ import annotations
 
@@ -39,7 +39,7 @@ def relay_turn(tmp_path, monkeypatch):
         relay_runtime._reset_for_tests()
 
 
-def test_stream_uses_rewritten_request_and_post_intercept_chunks(relay_turn):
+def test_stream_ignores_request_and_chunk_intercepts(relay_turn):
     relay, turn = relay_turn
     captured_requests = []
 
@@ -134,12 +134,12 @@ def test_stream_uses_rewritten_request_and_post_intercept_chunks(relay_turn):
         relay.intercepts.deregister_llm_stream_execution("hermes-test-stream")
         relay.intercepts.deregister_llm_request("hermes-test-request")
 
-    assert captured_requests[0]["temperature"] == 0.25
+    assert "temperature" not in captured_requests[0]
     assert captured_requests[0]["extra_headers"] == {
         "authorization": "Bearer provider-token"
     }
-    assert chunks[0].choices[0].delta.content == "HELLO"
-    assert stream.output_modified is True
+    assert chunks[0].choices[0].delta.content == "hello"
+    assert stream.output_modified is False
     assert turn.logical_llm_calls == {}
 
 
@@ -506,7 +506,7 @@ def test_stream_flushes_buffered_provider_chunks_after_relay_failure(
 
 
 
-def test_bypassed_stream_still_honors_chunk_acceptance(relay_turn):
+def test_trusted_provider_stream_honors_structural_chunk_acceptance(relay_turn):
     _relay, turn = relay_turn
     turn.lease.host.release_managed_execution("test.relay_llm")
     provider_closed = []
@@ -519,13 +519,9 @@ def test_bypassed_stream_still_honors_chunk_acceptance(relay_turn):
         finally:
             provider_closed.append(True)
 
-    stream = relay_llm.stream(
+    stream = relay_llm.provider_stream(
         {"model": "test-model", "messages": []},
         provider_stream,
-        session_id="session-1",
-        name="test-provider",
-        model_name="test-model",
-        finalizer=dict,
         accept_chunk=lambda chunk: chunk["delta"] != "rejected",
     )
 

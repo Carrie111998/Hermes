@@ -95,6 +95,7 @@ class TestStreamingAccumulator:
         assert response.choices[0].finish_reason == "stop"
         assert response.usage is not None
         assert response.usage.completion_tokens == 3
+        mock_client.chat.completions.create.assert_called_once()
 
     @patch("run_agent.AIAgent._create_request_openai_client")
     @patch("run_agent.AIAgent._close_request_openai_client")
@@ -728,8 +729,10 @@ class TestAnthropicStreamCallbacks:
         # it to the test mock so .messages.stream is exercised.
         agent._create_request_anthropic_client = lambda *a, **k: agent._anthropic_client
 
-        agent._interruptible_streaming_api_call({})
+        response = agent._interruptible_streaming_api_call({})
 
+        assert response is final_message
+        agent._anthropic_client.messages.stream.assert_called_once()
         assert touch_calls.count("receiving stream response") == len(events)
         mock_stream.close.assert_called_once()
 
@@ -1605,6 +1608,7 @@ class TestBedrockStreamLivenessWatchdog:
             )
 
         assert response.choices[0].message.content == "hi"
+        client.converse_stream.assert_called_once()
         assert agent._consecutive_stale_streams == 0
 
 
@@ -1634,4 +1638,3 @@ class TestBedrockReasoningStaleFloor:
         from agent.chat_completion_helpers import _bedrock_reasoning_stale_floor
 
         assert _bedrock_reasoning_stale_floor(model_id) == expected
-
