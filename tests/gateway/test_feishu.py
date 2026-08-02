@@ -1517,11 +1517,20 @@ class TestPendingInboundQueue(unittest.TestCase):
 class TestWebhookSecurity(unittest.TestCase):
     """Tests for webhook signature verification, rate limiting, and body size limits."""
 
+    def setUp(self):
+        self._hermes_home = tempfile.TemporaryDirectory()
+        self.addCleanup(self._hermes_home.cleanup)
+
     def _make_adapter(self, encrypt_key: str = "") -> "FeishuAdapter":
         from gateway.config import PlatformConfig
         from plugins.platforms.feishu.adapter import FeishuAdapter
 
-        with patch.dict(os.environ, {"FEISHU_APP_ID": "cli", "FEISHU_APP_SECRET": "sec", "FEISHU_ENCRYPT_KEY": encrypt_key}, clear=True):
+        with patch.dict(os.environ, {
+            "HERMES_HOME": self._hermes_home.name,
+            "FEISHU_APP_ID": "cli",
+            "FEISHU_APP_SECRET": "sec",
+            "FEISHU_ENCRYPT_KEY": encrypt_key,
+        }, clear=True):
             return FeishuAdapter(PlatformConfig())
 
     def test_signature_valid_passes(self):
@@ -1536,6 +1545,82 @@ class TestWebhookSecurity(unittest.TestCase):
         sig = hashlib.sha256(content.encode("utf-8")).hexdigest()
         headers = {"x-lark-request-timestamp": timestamp, "x-lark-request-nonce": nonce, "x-lark-signature": sig}
         self.assertTrue(adapter._is_webhook_signature_valid(headers, body))
+
+    def test_signed_encrypted_webhook_is_decrypted_and_dispatched(self):
+        import hashlib
+
+        adapter = self._make_adapter("test_secret")
+        encrypted = (
+            "AAECAwQFBgcICQoLDA0OD0+Gb/yr067+r5mghNBcHHlX3lVwaTGGWW6oYloTartRjkvPVXeY/"
+            "p2DFkUzR4uOv8JAv2gzln5OaPZzEdik+iz4w4zj+YeGptP3dByWbkcu5dc+2pojAriILtOYe"
+            "GKkU4xmY17oHPwwEsmWDsa7f9mQC/gPy5rJglr6dKQPK6D7"
+        )
+        body = json.dumps({"encrypt": encrypted}, separators=(",", ":")).encode()
+        timestamp = "1700000000"
+        nonce = "encrypted-event"
+        signature = hashlib.sha256(
+            timestamp.encode() + nonce.encode() + b"test_secret" + body
+        ).hexdigest()
+        request = SimpleNamespace(
+            remote="127.0.0.1",
+            content_length=None,
+            headers={
+                "x-lark-request-timestamp": timestamp,
+                "x-lark-request-nonce": nonce,
+                "x-lark-signature": signature,
+            },
+            content=_FakeRequestContent(body),
+        )
+
+        with patch.object(adapter, "_on_message_event") as dispatch:
+            response = asyncio.run(adapter._handle_webhook_request(request))
+
+        self.assertEqual(response.status, 200)
+        dispatch.assert_called_once()
+        event = dispatch.call_args.args[0]
+        self.assertEqual(event.header.event_type, "im.message.receive_v1")
+        self.assertEqual(event.event.message.message_id, "om_encrypted")
+
+    def test_encrypted_webhook_without_key_is_rejected(self):
+        adapter = self._make_adapter()
+        body = json.dumps({"encrypt": "not-used-without-a-key"}).encode()
+        request = SimpleNamespace(
+            remote="127.0.0.1",
+            content_length=None,
+            headers={},
+            content=_FakeRequestContent(body),
+        )
+
+        response = asyncio.run(adapter._handle_webhook_request(request))
+
+        self.assertEqual(response.status, 400)
+        self.assertIn(b"encrypt key not configured", response.body)
+
+    def test_signed_webhook_with_bad_ciphertext_is_rejected(self):
+        import hashlib
+
+        adapter = self._make_adapter("test_secret")
+        body = json.dumps({"encrypt": "not-valid-ciphertext"}, separators=(",", ":")).encode()
+        timestamp = "1700000000"
+        nonce = "bad-ciphertext"
+        signature = hashlib.sha256(
+            timestamp.encode() + nonce.encode() + b"test_secret" + body
+        ).hexdigest()
+        request = SimpleNamespace(
+            remote="127.0.0.1",
+            content_length=None,
+            headers={
+                "x-lark-request-timestamp": timestamp,
+                "x-lark-request-nonce": nonce,
+                "x-lark-signature": signature,
+            },
+            content=_FakeRequestContent(body),
+        )
+
+        response = asyncio.run(adapter._handle_webhook_request(request))
+
+        self.assertEqual(response.status, 400)
+        self.assertIn(b"decryption failed", response.body)
 
 
     def test_rate_limit_resets_after_window_expires(self):

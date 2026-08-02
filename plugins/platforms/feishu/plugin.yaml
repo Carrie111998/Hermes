@@ -23,8 +23,8 @@ requires_env:
     password: true
 optional_env:
   - name: FEISHU_DOMAIN
-    description: "Domain: 'feishu' (China) or 'lark' (International)"
-    prompt: "Domain (feishu/lark)"
+    description: "Domain: 'feishu' (China), 'lark' (International), or a full private deployment URL"
+    prompt: "Domain (feishu/lark/https://...)"
     password: false
   - name: FEISHU_ALLOWED_USERS
     description: "Comma-separated Feishu user IDs allowed to talk to the bot"

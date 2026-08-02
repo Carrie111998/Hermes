@@ -158,6 +158,7 @@ FEISHU_HOME_CHANNEL=oc_xxx
 
 - `feishu` for Feishu China
 - `lark` for Lark international
+- A full `https://` base URL, such as `https://open.example.com`, for a private deployment
 
 ## Step 4: Start the Gateway
 
@@ -191,7 +192,7 @@ If you leave the allowlist empty, anyone who can reach the bot may be able to us
 
 ### Webhook Encryption Key
 
-When running in webhook mode, set an encryption key to enable signature verification of inbound webhook payloads:
+When running in webhook mode, set an encryption key to enable signature verification and decryption of inbound webhook payloads:
 
 ```bash
 FEISHU_ENCRYPT_KEY=your-encrypt-key
@@ -203,7 +204,7 @@ This key is found in the **Event Subscriptions** section of your Feishu app conf
 SHA256(timestamp + nonce + encrypt_key + body)
 ```
 
-The computed hash is compared against the `x-lark-signature` header using timing-safe comparison. Requests with invalid or missing signatures are rejected with HTTP 401.
+The computed hash is compared against the `x-lark-signature` header using timing-safe comparison before the payload is decrypted. Requests with invalid or missing signatures are rejected with HTTP 401. Encrypted event and URL-verification payloads are decrypted with the official Feishu SDK before token validation and dispatch.
 
 :::tip
 In WebSocket mode, signature verification is handled by the SDK itself, so `FEISHU_ENCRYPT_KEY` is optional. In webhook mode, it is strongly recommended for production.
@@ -542,7 +543,7 @@ Inbound messages are deduplicated using message IDs with a 24-hour TTL. The dedu
 |----------|----------|---------|-------------|
 | `FEISHU_APP_ID` | ✅ | — | Feishu/Lark App ID |
 | `FEISHU_APP_SECRET` | ✅ | — | Feishu/Lark App Secret |
-| `FEISHU_DOMAIN` | — | `feishu` | `feishu` (China) or `lark` (international) |
+| `FEISHU_DOMAIN` | — | `feishu` | `feishu` (China), `lark` (international), or a full private deployment URL |
 | `FEISHU_CONNECTION_MODE` | — | `websocket` | `websocket` or `webhook` |
 | `FEISHU_ALLOWED_USERS` | — | _(empty)_ | Comma-separated open_id list for user allowlist |
 | `FEISHU_ALLOW_BOTS` | — | `none` | Accept messages from other bots: `none`, `mentions`, or `all` |
