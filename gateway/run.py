@@ -18159,6 +18159,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     await _err_adapter.stop_typing(source.chat_id)
             except Exception:
                 pass
+            # A durable replay claim is still owned by the outer dispatch
+            # wrapper until `_run_agent` publishes handoff at the decorated
+            # turn boundary. Converting a preparatory failure into a friendly
+            # response here would make that wrapper commit the claim as a
+            # terminal discard even though no turn ran. Fail closed instead:
+            # the wrapper rolls the claim back so the obligation remains
+            # replayable.
+            if busy_queue_claim is not None and not bool(
+                (busy_queue_claim_guard or {}).get("handed_off")
+            ):
+                raise
             logger.exception("Agent error in session %s", session_key)
             # Crash-resilience for failures that happen before AIAgent enters
             # run_conversation() (for example: provider/httpx client init

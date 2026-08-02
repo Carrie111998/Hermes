@@ -207,6 +207,57 @@ async def test_pre_turn_session_store_failure_rolls_back_durable_claim(
 
 
 @pytest.mark.asyncio
+async def test_agent_start_failure_rolls_back_claim_instead_of_discard(
+    monkeypatch,
+):
+    runner = _make_runner()
+    event = _make_event(text="agent-start failure")
+    claim_context = (
+        build_session_key(event.source),
+        event.source,
+        "claim-agent-start-failure",
+    )
+    setattr(event, "_hermes_busy_queue_claim_context", claim_context)
+
+    session_entry = MagicMock()
+    session_entry.session_id = "session-agent-start-failure"
+    session_entry.message_count = 0
+    monkeypatch.setattr(
+        runner.session_store,
+        "get_or_create_session",
+        MagicMock(return_value=session_entry),
+    )
+    monkeypatch.setattr(
+        runner.session_store,
+        "load_transcript",
+        MagicMock(return_value=[]),
+    )
+
+    async def fail_agent_start(event_name, _context):
+        if event_name == "agent:start":
+            raise RuntimeError("agent-start preparation failed")
+
+    monkeypatch.setattr(
+        runner.hooks,
+        "emit",
+        AsyncMock(side_effect=fail_agent_start),
+    )
+    rollback = MagicMock(return_value=True)
+    finalize = MagicMock(return_value=True)
+    monkeypatch.setattr(runner, "_busy_queue_rollback_claim", rollback)
+    monkeypatch.setattr(runner, "_busy_queue_finalize_claim", finalize)
+
+    with pytest.raises(RuntimeError, match="agent-start preparation failed"):
+        await runner._handle_message(event)
+
+    rollback.assert_called_once_with(
+        *claim_context,
+        runner.adapters[Platform.TELEGRAM],
+    )
+    finalize.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_claim_handoff_publishes_at_terminal_turn_boundary(monkeypatch):
     runner = _make_runner()
     event = _make_event(text="terminal boundary")
