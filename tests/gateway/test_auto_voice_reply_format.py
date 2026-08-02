@@ -120,3 +120,40 @@ def _make_event(platform: Platform, chat_id: str = "123", message_type: MessageT
         message_type=message_type,
         message_id="456",
     )
+
+
+class TestAutoVoiceReplyMediaStrip:
+    """#76620: auto-TTS must not read MEDIA:<path> attachment directives
+    aloud — the internal local path leaks into the synthesized voice reply."""
+
+    @pytest.mark.asyncio
+    async def test_media_directive_stripped_before_synthesis(self):
+        runner = _make_runner()
+        adapter = _make_adapter(Platform.TELEGRAM)
+        runner.adapters[Platform.TELEGRAM] = adapter
+        event = _make_event(Platform.TELEGRAM)
+        synthesized_texts = []
+
+        def fake_tts(*, text, output_path):
+            synthesized_texts.append(text)
+            Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+            Path(output_path).write_bytes(b"fake audio")
+            return json.dumps({
+                "success": True,
+                "file_path": output_path,
+                "provider": "edge",
+                "voice_compatible": True,
+            })
+
+        with patch("tools.tts_tool.text_to_speech_tool", side_effect=fake_tts):
+            await runner._send_voice_reply(
+                event,
+                r"MEDIA:C:\Users\someone\AppData\Local\Temp\shot.png" + "\n\nCapture ready.",
+            )
+
+        assert synthesized_texts
+        synthesized = synthesized_texts[0]
+        assert "MEDIA:" not in synthesized
+        assert "shot.png" not in synthesized
+        assert "Capture ready." in synthesized
+        adapter.send_voice.assert_awaited_once()

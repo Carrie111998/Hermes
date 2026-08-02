@@ -18289,7 +18289,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         try:
             from tools.tts_tool import text_to_speech_tool, _strip_markdown_for_tts
 
-            tts_text = _strip_markdown_for_tts(text[:4000])
+            # Strip MEDIA:<path> attachment directives before synthesis so
+            # the voice reply never reads the internal local path aloud
+            # (#76620). Attachment delivery is handled separately by the
+            # final-text path.
+            _clean_text = _TOOL_MEDIA_RE.sub("", text)
+            tts_text = _strip_markdown_for_tts(_clean_text[:4000])
             if not tts_text:
                 return
 
