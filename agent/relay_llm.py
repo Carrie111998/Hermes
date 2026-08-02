@@ -269,10 +269,24 @@ def stream_current(
     without the unwrap the response stays trapped as ``final_response`` on the
     inner compatibility view and the outer consumer sees an empty stream.
     """
-    del name, model_name, finalizer, metadata, defer_logical_completion
+    del name, model_name, finalizer, defer_logical_completion
+
+    # Preserve the historical raw-stream contract unless an already-active
+    # Relay runtime has explicitly retained lifecycle observation.  Relay is
+    # never placed between Hermes and the provider: even in the observed case
+    # below, the provider factory is called directly and its chunks remain the
+    # authoritative objects returned to the consumer.
+    logical = _begin_logical_notification(metadata)
+    if logical is None:
+        return stream_factory(request)
+
+    def notify_terminal(outcome: str) -> None:
+        _complete_logical(logical, outcome=outcome)
+
     direct = provider_stream(
         request,
         stream_factory,
+        on_terminal=notify_terminal,
         completed_response_predicate=completed_response_predicate,
     )
     if completed_response_predicate is not None:
@@ -290,6 +304,7 @@ def provider_stream(
     on_provider_chunk: Callable[[Any], None] | None = None,
     observer: Callable[[Any], None] | None = None,
     accept_chunk: Callable[[Any], bool] | None = None,
+    on_terminal: Callable[[str], None] | None = None,
     completed_response_predicate: Callable[[Any], bool] | None = None,
 ) -> "ProviderLlmStream":
     """Open one direct, model-authoritative provider stream."""
@@ -300,6 +315,7 @@ def provider_stream(
         on_provider_chunk=on_provider_chunk,
         observer=observer,
         accept_chunk=accept_chunk,
+        on_terminal=on_terminal,
         completed_response_predicate=completed_response_predicate,
     )
 
@@ -361,6 +377,7 @@ class ProviderLlmStream(Iterator[Any]):
         on_provider_chunk: Callable[[Any], None] | None,
         observer: Callable[[Any], None] | None,
         accept_chunk: Callable[[Any], bool] | None,
+        on_terminal: Callable[[str], None] | None,
         completed_response_predicate: Callable[[Any], bool] | None,
     ) -> None:
         self.final_response: Any = None
@@ -370,21 +387,36 @@ class ProviderLlmStream(Iterator[Any]):
         self._on_provider_chunk = on_provider_chunk
         self._observer = observer
         self._accept_chunk = accept_chunk
+        self._on_terminal = on_terminal
+        self._terminal_outcome: str | None = None
         self._stream: Any = None
         self._raw_stream_resource: Any = None
 
-        raw_stream = stream_factory(request)
-        if completed_response_predicate is not None and completed_response_predicate(
-            raw_stream
-        ):
-            self.final_response = raw_stream
-            self._stream = iter(())
-            return
+        try:
+            raw_stream = stream_factory(request)
+        except BaseException:
+            self._notify_terminal("failed")
+            raise
 
         self._raw_stream_resource = raw_stream
-        if on_stream_created is not None:
-            on_stream_created(raw_stream)
-        self._stream = iter(raw_stream)
+        try:
+            if (
+                completed_response_predicate is not None
+                and completed_response_predicate(raw_stream)
+            ):
+                self.final_response = raw_stream
+                self._raw_stream_resource = None
+                self._stream = iter(())
+                self._notify_terminal("success")
+                return
+
+            if on_stream_created is not None:
+                on_stream_created(raw_stream)
+            self._stream = iter(raw_stream)
+        except BaseException:
+            self._close()
+            self._notify_terminal("failed")
+            raise
 
     def __iter__(self) -> "ProviderLlmStream":
         return self
@@ -396,17 +428,28 @@ class ProviderLlmStream(Iterator[Any]):
             chunk = next(self._stream)
         except StopIteration:
             self._close()
+            self._notify_terminal("success")
+            raise
+        except BaseException:
+            self._close()
+            self._notify_terminal("failed")
             raise
 
         if self._accept_chunk is not None and not self._accept_chunk(chunk):
             self._close()
+            self._notify_terminal("cancelled")
             raise StopIteration
 
         if self._on_provider_chunk is not None:
             # Trusted core parsing is part of the exact provider-response
             # boundary.  A parse/accumulation failure must be visible; silently
             # continuing could fabricate an incomplete final response.
-            self._on_provider_chunk(chunk)
+            try:
+                self._on_provider_chunk(chunk)
+            except BaseException:
+                self._close()
+                self._notify_terminal("failed")
+                raise
 
         if self._observer is not None:
             try:
@@ -424,6 +467,7 @@ class ProviderLlmStream(Iterator[Any]):
     def close(self) -> None:
         """Close an explicitly abandoned provider stream exactly once."""
         self._close()
+        self._notify_terminal("cancelled")
         close_error = self._close_error
         self._close_error = None
         if close_error is not None:
@@ -451,8 +495,24 @@ class ProviderLlmStream(Iterator[Any]):
                     self._close_error = exc
                 logger.debug("Provider stream cleanup failed", exc_info=True)
 
+    def _notify_terminal(self, outcome: str) -> None:
+        """Emit one fail-open lifecycle observation after provider outcome."""
+        if self._terminal_outcome is not None:
+            return
+        self._terminal_outcome = outcome
+        if self._on_terminal is None:
+            return
+        try:
+            self._on_terminal(outcome)
+        except Exception:
+            logger.warning(
+                "Provider stream terminal observer failed; preserving provider outcome",
+                exc_info=True,
+            )
+
     def __del__(self) -> None:
         self._close()
+        self._notify_terminal("cancelled")
 
 
 # Backward-compatible name for extensions that imported the historical type.
@@ -584,6 +644,45 @@ def _logical_parent(
                 )
                 turn.logical_llm_calls[request_id] = handle
     return turn, handle, request_id
+
+
+def _begin_logical_notification(
+    metadata: dict[str, Any] | None,
+) -> tuple[relay_runtime.RelayTurnContext, Any, str] | None:
+    """Open an optional Relay lifecycle scope without mediating execution.
+
+    This function reads only structural turn state.  It never passes the
+    provider request, stream factory, chunks, or response through Relay.  A
+    missing runtime, disabled observer, or notification failure therefore
+    falls back to the provider's raw stream contract.
+    """
+    turn = relay_runtime.active_turn()
+    request_id = str((metadata or {}).get("api_request_id") or "")
+    if turn is None or not request_id:
+        return None
+    lease = turn.lease
+    runtime = lease.host
+    session = lease.session
+    if (
+        not isinstance(runtime, relay_runtime.RelayRuntime)
+        or session is None
+        or not runtime.managed_execution_enabled()
+    ):
+        return None
+    try:
+        return _logical_parent(
+            runtime,
+            session,
+            turn.handle or session.handle,
+            metadata,
+        )
+    except Exception:
+        logger.warning(
+            "Hermes Relay logical LLM notification start failed; "
+            "returning the raw provider stream",
+            exc_info=True,
+        )
+        return None
 
 
 def _complete_logical(

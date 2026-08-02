@@ -147,6 +147,63 @@ def test_trusted_provider_chunk_parser_failure_is_visible() -> None:
         next(stream)
 
 
+def test_terminal_observer_cannot_replace_provider_stream_failure() -> None:
+    class ProviderError(Exception):
+        pass
+
+    provider_error = ProviderError("exact provider failure")
+    provider_chunk = {"delta": "exact"}
+    outcomes: list[str] = []
+
+    def provider(_request):
+        yield provider_chunk
+        raise provider_error
+
+    def broken_terminal_observer(outcome: str) -> None:
+        outcomes.append(outcome)
+        raise RuntimeError("notification failed")
+
+    stream = relay_llm.provider_stream(
+        {"model": "trusted-model", "messages": []},
+        provider,
+        on_terminal=broken_terminal_observer,
+    )
+
+    assert next(stream) is provider_chunk
+    with pytest.raises(ProviderError) as caught:
+        next(stream)
+
+    assert caught.value is provider_error
+    assert outcomes == ["failed"]
+    stream.close()
+    assert outcomes == ["failed"]
+
+
+def test_terminal_observer_cannot_replace_provider_stream_open_failure() -> None:
+    class ProviderOpenError(Exception):
+        pass
+
+    provider_error = ProviderOpenError("exact provider open failure")
+    outcomes: list[str] = []
+
+    def provider(_request):
+        raise provider_error
+
+    def broken_terminal_observer(outcome: str) -> None:
+        outcomes.append(outcome)
+        raise RuntimeError("notification failed")
+
+    with pytest.raises(ProviderOpenError) as caught:
+        relay_llm.provider_stream(
+            {"model": "trusted-model", "messages": []},
+            provider,
+            on_terminal=broken_terminal_observer,
+        )
+
+    assert caught.value is provider_error
+    assert outcomes == ["failed"]
+
+
 def test_relay_compatibility_cannot_supply_early_stop_predicate() -> None:
     chunks = [{"delta": "first"}, {"delta": "second"}]
     accept_calls: list[dict] = []
@@ -484,10 +541,12 @@ def test_stream_current_preserves_iterator_without_finalizer_assembly() -> None:
     finalizer_calls = 0
     chunks = [b"aux-first", b"aux-second"]
 
+    raw_stream = iter(chunks)
+
     def provider(_request):
         nonlocal provider_calls
         provider_calls += 1
-        return iter(chunks)
+        return raw_stream
 
     def forbidden_finalizer():
         nonlocal finalizer_calls
@@ -503,6 +562,7 @@ def test_stream_current_preserves_iterator_without_finalizer_assembly() -> None:
         completed_response_predicate=lambda value: hasattr(value, "choices"),
     )
 
+    assert stream is raw_stream
     received = list(stream)
     assert provider_calls == 1
     assert finalizer_calls == 0
