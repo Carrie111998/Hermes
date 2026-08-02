@@ -80,6 +80,26 @@ def test_show_defaults_to_env_task_id(worker_env):
     assert "runs" in d
 
 
+def test_show_without_task_id_guides_orchestrator_to_list(monkeypatch):
+    """A direct/orchestrator mistake is guidance, not a noisy tool error."""
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    from tools import kanban_tools as kt
+
+    out = json.loads(kt._handle_show({}))
+
+    assert out == {
+        "ok": False,
+        "needs_task_id": True,
+        "next_tool": "kanban_list",
+        "message": (
+            "kanban_show needs a task_id. Call kanban_list to select the "
+            "task, then call kanban_show with that id. Dispatcher workers "
+            "may omit task_id because HERMES_KANBAN_TASK is set."
+        ),
+    }
+    assert "error" not in out
+
+
 def test_list_filters_tasks(monkeypatch, worker_env):
     """kanban_list gives orchestrators filtered board discovery."""
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)

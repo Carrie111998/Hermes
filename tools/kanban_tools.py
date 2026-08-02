@@ -482,9 +482,21 @@ def _handle_show(args: dict, **kw) -> str:
     runs (attempt history), and the last N events."""
     tid = _default_task_id(args.get("task_id"))
     if not tid:
-        return tool_error(
-            "task_id is required (or set HERMES_KANBAN_TASK in the env)"
-        )
+        # Orchestrators occasionally ask to "show the board" without first
+        # selecting a task. Treat that as a recoverable routing mistake rather
+        # than a tool failure: workers still resolve their dispatcher-owned
+        # task from HERMES_KANBAN_TASK, while direct sessions receive an exact
+        # next action and do not pollute gateway error logs.
+        return json.dumps({
+            "ok": False,
+            "needs_task_id": True,
+            "next_tool": "kanban_list",
+            "message": (
+                "kanban_show needs a task_id. Call kanban_list to select the "
+                "task, then call kanban_show with that id. Dispatcher workers "
+                "may omit task_id because HERMES_KANBAN_TASK is set."
+            ),
+        })
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
