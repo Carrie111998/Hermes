@@ -1240,6 +1240,24 @@ def _pinned_checkout_matches(
     return True
 
 
+def _stash_apply_failed_only_on_existing_untracked(stderr: str) -> bool:
+    """True when stash apply failed only on untracked files already present."""
+    lines = [ln.strip() for ln in (stderr or "").splitlines() if ln.strip()]
+    if not lines:
+        return False
+    saw_untracked_error = False
+    for line in lines:
+        if "already exists, no checkout" in line:
+            saw_untracked_error = True
+        elif "could not restore untracked files from stash" in line:
+            saw_untracked_error = True
+        elif line.startswith(("warning:", "hint:")):
+            continue
+        else:
+            return False
+    return saw_untracked_error
+
+
 def _restore_stashed_changes(
     git_cmd: list[str],
     cwd: Path,
