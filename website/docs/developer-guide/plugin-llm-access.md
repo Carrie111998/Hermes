@@ -94,6 +94,65 @@ model couldn't produce valid JSON, `result.parsed` is `None` and
   default posture is "use what the user is using." Operators opt in
   to specific overrides, per plugin, in `config.yaml`.
 
+## Execution modes
+
+The default mode keeps Hermes' existing resilient behavior: host-owned route
+resolution, transient retry, credential recovery, and provider/model fallback.
+It remains the recommended mode for most plugins, and callers that omit
+`execution_mode` behave exactly as before.
+
+Audit-sensitive workflows can opt into a separate client-side contract:
+
+```python
+from agent.plugin_llm import LlmExecutionMode
+
+result = ctx.llm.complete_structured(
+    instructions="Extract one typed result.",
+    input=[{"type": "text", "text": body}],
+    json_schema=SCHEMA,
+    provider="test-provider",
+    model="test-model",
+    execution_mode=LlmExecutionMode.STRICT_SINGLE_ATTEMPT,
+    purpose="evaluation.single-route",
+)
+```
+
+`strict_single_attempt` requires an explicit provider and model. Both values
+must still pass the existing per-plugin trust gate; strict mode does not add or
+bypass any trust permission. The host then initiates at most one outbound
+provider invocation on that exact route. It does not perform a same-provider
+retry, provider or model fallback, post-failure credential rotation,
+unsupported-parameter retry, response-format downgrade, or repair LLM call.
+Local JSON parsing and schema validation still run after a successful response.
+
+This is not a provider-side exactly-once guarantee. A provider may accept a
+request before the client observes a timeout or broken connection, so those
+failures are reported with `delivery_ambiguous=True` and are never retried
+automatically.
+
+Strict support is transport-specific. OpenAI-compatible clients, native
+Anthropic, and the OpenAI Codex transport are accepted only when the host can
+verify that SDK retries are disabled. OAuth and custom endpoints are supported
+when they resolve to one of those verified transports without changing the
+requested provider/model. External-process, virtual, or other adapters that
+cannot prove a single physical invocation raise `StrictExecutionUnsupported`
+before outbound dispatch.
+
+Every strict result adds these stable fields to `result.audit`:
+
+| Field | Meaning |
+|---|---|
+| `execution_mode` | `strict_single_attempt` for this contract |
+| `requested_provider`, `requested_model` | Explicit route supplied by the plugin |
+| `dispatched_provider`, `dispatched_model` | Route verified immediately before dispatch |
+| `response_provider`, `response_model` | Provider/model attribution returned or observed |
+| `attempt_count` | Host outbound invocation count; never greater than one |
+| `fallback_used` | Whether host fallback ran; always false in strict mode |
+| `credential_rotation_used` | Whether post-failure rotation ran; always false in strict mode |
+| `route_changed` | Whether resolution changed the requested route |
+| `delivery_ambiguous` | Whether transport failure may have followed provider receipt |
+| `strict_contract_satisfied` | Whether the host honored the strict execution policy |
+
 ## Quick start
 
 Two complete plugins below — one chat, one structured. Both ship
@@ -223,6 +282,7 @@ result = ctx.llm.complete(
     agent_id=None,         # optional, gated
     profile=None,          # optional, gated — explicit auth-profile name
     purpose="optional-audit-string",
+    execution_mode="default", # or LlmExecutionMode.STRICT_SINGLE_ATTEMPT
 )
 # → PluginLlmCompleteResult(text, provider, model, agent_id, usage, audit)
 ```
@@ -260,6 +320,7 @@ result = ctx.llm.complete_structured(
     agent_id=None,
     profile=None,
     purpose=None,
+    execution_mode="default",
 )
 # → PluginLlmStructuredResult(text, provider, model, agent_id,
 #                             usage, parsed, content_type, audit)
@@ -297,7 +358,7 @@ class PluginLlmCompleteResult:
     model: str                   # whatever the provider returned for this call
     agent_id: str                # whose model/auth was used
     usage: PluginLlmUsage        # tokens + cache + cost estimate
-    audit: Dict[str, Any]        # plugin_id, purpose, profile
+    audit: Dict[str, Any]        # plugin metadata + execution audit fields
 
 @dataclass
 class PluginLlmStructuredResult:
@@ -408,7 +469,7 @@ don't have to:
 * **Vision routing.** When image input is supplied and the user's
   active text model is text-only, the host falls back to the
   configured vision model automatically.
-* **Fallback chain.** If the user's primary provider 5xxs or 429s,
+* **Fallback chain (default mode).** If the user's primary provider 5xxs or 429s,
   the request goes through Hermes' usual aggregator-aware fallback
   before it returns an error to the plugin.
 * **Timeout.** Honours your `timeout=` argument, falling back to
@@ -432,7 +493,10 @@ don't have to:
   empty inputs and on schema-validation failure. `PluginLlmTrustError`
   fires when the trust gate denies an override. Anything else
   (provider 5xx, no credentials configured, timeout) raises whatever
-  `auxiliary_client.call_llm()` raises.
+  `auxiliary_client.call_llm()` raises. Strict configuration, unsupported
+  transports, and route changes raise `StrictExecutionConfigurationError`,
+  `StrictExecutionUnsupported`, and `StrictExecutionRouteMismatch`
+  respectively, before an unverified outbound call.
 * **Cost.** Every call runs against the user's paid provider. Don't
   loop on `complete()` for every gateway message without thinking
   about token spend.
