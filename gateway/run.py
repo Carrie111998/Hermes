@@ -92,6 +92,7 @@ def render_account_usage_lines(*args: Any, **kwargs: Any) -> Any:
 
 from agent.async_utils import consume_detached_task_result, safe_schedule_threadsafe
 from agent.i18n import t
+from agent.interrupt_compat import request_hard_interrupt
 from agent.terminal_outcome import TerminalOutcomeKind, normalize_terminal_outcome
 from hermes_cli.config import (
     PINNED_EFFECTIVE_CONFIG_WRITE_BLOCKED,
@@ -3383,9 +3384,9 @@ def _abandon_timed_out_gateway_turn(
         timeout_fired.set()
 
     agent = agent_holder[0] if agent_holder else None
-    if agent is not None and hasattr(agent, "interrupt"):
+    if agent is not None:
         try:
-            agent.interrupt(_INTERRUPT_REASON_TIMEOUT)
+            request_hard_interrupt(agent, _INTERRUPT_REASON_TIMEOUT)
         except Exception:
             logger.debug("Timed-out agent interrupt failed", exc_info=True)
 
@@ -11643,7 +11644,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if agent is _AGENT_PENDING_SENTINEL:
                 continue
             try:
-                agent.interrupt(reason)
+                request_hard_interrupt(agent, reason)
                 logger.debug(
                     "Interrupted running agent for session %s during shutdown",
                     session_key,
@@ -29797,7 +29798,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 running_agent, "_gateway_turn_process_baseline", None
             )
             try:
-                running_agent.interrupt(interrupt_reason)
+                request_hard_interrupt(running_agent, interrupt_reason)
             except Exception:
                 logger.debug(
                     "Failed to interrupt running agent for %s",
@@ -32290,8 +32291,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
                 # Interrupt the agent if it's still running so the thread
                 # pool worker is freed.
-                if _timed_out_agent and hasattr(_timed_out_agent, "interrupt"):
-                    _timed_out_agent.interrupt(_INTERRUPT_REASON_TIMEOUT)
+                if _timed_out_agent:
+                    request_hard_interrupt(_timed_out_agent, _INTERRUPT_REASON_TIMEOUT)
 
                 _timeout_mins = int(_agent_timeout // 60) or 1
 

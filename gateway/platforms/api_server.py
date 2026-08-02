@@ -119,6 +119,7 @@ from gateway.platforms.base import (
     validate_media_delivery_path,
 )
 from agent.redact import redact_sensitive_text
+from agent.interrupt_compat import request_hard_interrupt
 from gateway.readiness import collect_runtime_readiness
 from gateway import systemd_credentials as systemd_credentials_module
 from gateway.systemd_credentials import (
@@ -9677,6 +9678,10 @@ class APIServerAdapter(BasePlatformAdapter):
         except asyncio.CancelledError:
             agent = agent_ref[0] if agent_ref else None
             if agent is not None:
+                # Same abandonment as a client disconnect: the run will never
+                # be resumed, so reap the background processes it created
+                # (#76115). Epoch-gated; no-op when the turn already
+                # finished and cleared its markers.
                 _reap_disconnected_agent_processes(
                     agent, source="api_server_sse_cancelled"
                 )
@@ -11286,7 +11291,7 @@ class APIServerAdapter(BasePlatformAdapter):
         agent = agent_ref[0] if agent_ref else None
         if agent is not None:
             try:
-                agent.interrupt(reason)
+                request_hard_interrupt(agent, reason)
             except Exception:
                 pass
             # interrupt() cannot wake a thread blocked in Event.wait().  Cancel
@@ -13155,7 +13160,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         if agent is not None:
             try:
-                agent.interrupt("Stop requested via API")
+                request_hard_interrupt(agent, "Stop requested via API")
             except Exception:
                 pass
             # Stop abandons model execution: reap only this run's process
