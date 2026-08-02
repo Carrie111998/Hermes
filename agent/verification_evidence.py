@@ -465,6 +465,7 @@ def record_terminal_result(
     session_id: str | None,
     exit_code: int,
     output: str = "",
+    candidate_id: str | None = None,
 ) -> Optional[dict[str, Any]]:
     """Record a foreground terminal result when it is verification evidence."""
 
@@ -520,7 +521,39 @@ def record_terminal_result(
             _prune_old_events(conn, session_id=evidence.session_id, root=evidence.root)
             conn.commit()
 
-    return {"id": event_id, **evidence.__dict__, "created_at": created_at}
+    result = {
+        "id": event_id,
+        **evidence.__dict__,
+        "created_at": created_at,
+        "candidate_outcome_recorded": False,
+    }
+    # Closed-loop receipts require an explicit candidate identity and durable
+    # outcome linkage. Session coincidence is not causal linkage: one session
+    # can contain many unrelated memory, skill, and coding tasks.
+    if not candidate_id:
+        return result
+    from agent import learning_ledger
+
+    if not learning_ledger.ledger_exists():
+        raise RuntimeError("learning ledger is unavailable for candidate verification")
+    outcome = "verification_succeeded" if evidence.status == "passed" else "verification_failed"
+    candidate = learning_ledger.get_candidate(candidate_id)
+    if candidate is None or candidate.get("status") != "active":
+        raise RuntimeError("learning candidate is no longer active")
+    recorded = learning_ledger.record_outcome(
+        candidate_id,
+        outcome,
+        detail={
+            "verification_event_id": event_id,
+            "kind": evidence.kind,
+            "scope": evidence.scope,
+        },
+        attempt_id=f"verification:{event_id}",
+    )
+    if recorded is None:
+        raise RuntimeError("learning candidate outcome was not persisted")
+    result["candidate_outcome_recorded"] = True
+    return result
 
 
 def mark_workspace_edited(

@@ -179,6 +179,75 @@ def test_recording_expires_old_edit_only_state(tmp_path, monkeypatch):
     assert status["changed_paths"] == []
 
 
+def test_verification_receipt_validates_linked_active_candidate(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    _python_project(tmp_path)
+    from agent import learning_ledger
+
+    learning_ledger.create_candidate(
+        {
+            "candidate_id": "linked-candidate",
+            "subsystem": "memory",
+            "action": "add",
+            "status": "active",
+            "payload_fingerprint": "sha256:payload",
+            "dedup_key": "sha256:dedup",
+            "proposal": {},
+            "source": {"session_id": "session-linked"},
+            "evidence": {"status": "captured", "source_trust": "user_explicit"},
+            "precondition": {},
+        }
+    )
+
+    result = record_terminal_result(
+        command="pytest",
+        cwd=tmp_path,
+        session_id="session-linked",
+        exit_code=0,
+        output="passed",
+        candidate_id="linked-candidate",
+    )
+
+    assert result is not None
+    candidate = learning_ledger.get_candidate("linked-candidate")
+    assert candidate is not None
+    assert candidate["status"] == "validated"
+    assert learning_ledger.list_events(candidate_id="linked-candidate")[-1]["event"] == "outcome_verification_succeeded"
+
+
+def test_session_coincidence_does_not_validate_unrelated_candidate(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    _python_project(tmp_path)
+    from agent import learning_ledger
+
+    learning_ledger.create_candidate(
+        {
+            "candidate_id": "unrelated-candidate",
+            "subsystem": "memory",
+            "action": "add",
+            "status": "active",
+            "payload_fingerprint": "sha256:payload",
+            "dedup_key": "sha256:unrelated",
+            "proposal": {},
+            "source": {"session_id": "shared-session"},
+            "evidence": {},
+            "precondition": {},
+        }
+    )
+
+    record_terminal_result(
+        command="pytest",
+        cwd=tmp_path,
+        session_id="shared-session",
+        exit_code=0,
+        output="passed",
+    )
+
+    candidate = learning_ledger.get_candidate("unrelated-candidate")
+    assert candidate is not None
+    assert candidate["status"] == "active"
+
+
 def test_windows_backslash_ad_hoc_script_path_is_matched(tmp_path, monkeypatch):
     """Ad-hoc verification scripts with Windows backslash paths must be
     matched by ``_find_ad_hoc_match`` trying ``posix=False`` in addition to
