@@ -460,7 +460,7 @@ def test_real_binding_shares_plugin_configuration_across_two_profiles(
         original_clear()
 
 
-def test_relay_tool_request_rewrite_precedes_hermes_authorization_boundary(
+def test_relay_tool_request_intercept_cannot_rewrite_model_authority(
     tmp_path,
     monkeypatch,
 ):
@@ -478,7 +478,6 @@ def test_relay_tool_request_rewrite_precedes_hermes_authorization_boundary(
         tool_call_id="tool-1",
     )
 
-    assert result.payload == {"intercepted": True, "value": 1}
-    assert result.trace[0] == {"source": "nemo_relay"}
-
+    assert result.payload == {"value": 1}
+    assert result.trace == []
 

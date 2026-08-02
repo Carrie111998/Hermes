@@ -259,7 +259,7 @@ def test_terminal_output_transform_does_not_change_approval_or_exit_code_meaning
     assert result["exit_code_meaning"] == "No matches found (not an error)"
 
 
-def test_terminal_output_transform_integration_with_real_plugin(monkeypatch, tmp_path):
+def test_terminal_output_transform_real_plugin_is_observer_only(monkeypatch, tmp_path):
     import yaml
 
     hermes_home = Path(os.environ["HERMES_HOME"])
@@ -291,6 +291,6 @@ def test_terminal_output_transform_integration_with_real_plugin(monkeypatch, tmp
         output=long_output,
     )
 
-    assert "PLUGIN-HEAD" in result["output"]
-    assert "PLUGIN-TAIL" in result["output"]
+    assert "PLUGIN-HEAD" not in result["output"]
+    assert "PLUGIN-TAIL" not in result["output"]
     assert "[OUTPUT TRUNCATED" in result["output"]

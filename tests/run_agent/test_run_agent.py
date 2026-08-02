@@ -3971,8 +3971,8 @@ class TestConcurrentToolExecution:
 
         assert json.loads(result) == {"error": "Blocked"}
 
-    def test_sequential_blocked_tool_skips_checkpoints_and_callbacks(self, agent, monkeypatch):
-        """Sequential path: blocked tool should not trigger checkpoints or start callbacks."""
+    def test_sequential_plugin_block_return_cannot_skip_execution(self, agent, monkeypatch):
+        """Sequential path treats pre-tool plugin returns as observation only."""
         tool_call = _mock_tool_call(name="write_file",
                                     arguments='{"path":"test.txt","content":"hello"}',
                                     call_id="c1")
@@ -3984,24 +3984,22 @@ class TestConcurrentToolExecution:
             lambda *args, **kwargs: "Blocked by policy",
         )
         agent._checkpoint_mgr.enabled = True
-        agent._checkpoint_mgr.ensure_checkpoint = MagicMock(
-            side_effect=AssertionError("checkpoint should not run")
-        )
+        agent._checkpoint_mgr.ensure_checkpoint = MagicMock()
 
         starts = []
         agent.tool_start_callback = lambda *a: starts.append(a)
 
-        with patch("run_agent.handle_function_call", side_effect=AssertionError("should not run")):
+        with patch("run_agent.handle_function_call", return_value='{"ok":true}'):
             agent._execute_tool_calls_sequential(mock_msg, messages, "task-1")
 
-        agent._checkpoint_mgr.ensure_checkpoint.assert_not_called()
-        assert starts == []
+        agent._checkpoint_mgr.ensure_checkpoint.assert_called_once()
+        assert len(starts) == 1
         assert len(messages) == 1
         assert messages[0]["role"] == "tool"
-        assert json.loads(messages[0]["content"]) == {"error": "Blocked by policy"}
+        assert json.loads(messages[0]["content"]) == {"ok": True}
 
-    def test_sequential_blocked_tool_emits_terminal_post_tool_hook(self, agent, monkeypatch):
-        """Blocked pre_tool_call decisions still terminate observer tool spans."""
+    def test_sequential_plugin_block_return_cannot_forge_blocked_result(self, agent, monkeypatch):
+        """Ignored plugin directives do not forge a blocked tool receipt."""
         tool_call = _mock_tool_call(name="write_file",
                                     arguments='{"path":"test.txt","content":"hello"}',
                                     call_id="c1")
@@ -4019,15 +4017,13 @@ class TestConcurrentToolExecution:
         )
         monkeypatch.setattr("hermes_cli.plugins.has_hook", lambda name: True)
 
-        with patch("run_agent.handle_function_call", side_effect=AssertionError("should not run")):
+        with patch("run_agent.handle_function_call", return_value='{"ok":true}'):
             agent._execute_tool_calls_sequential(mock_msg, messages, "task-1")
 
-        post_call = next(call for call in hook_calls if call[0] == "post_tool_call")
-        assert post_call[1]["tool_name"] == "write_file"
-        assert post_call[1]["tool_call_id"] == "c1"
-        assert post_call[1]["status"] == "blocked"
-        assert post_call[1]["error_type"] == "plugin_block"
-        assert post_call[1]["error_message"] == "Blocked by policy"
+        assert json.loads(messages[-1]["content"]) == {"ok": True}
+        pre_call = next(call for call in hook_calls if call[0] == "pre_tool_call")
+        assert pre_call[1]["tool_name"] == "write_file"
+        assert pre_call[1]["tool_call_id"] == "c1"
 
     def test_sequential_agent_level_tool_emits_terminal_post_tool_hook(self, agent, monkeypatch):
         """Sequential built-in tool paths should also close observer tool spans."""
@@ -4164,6 +4160,8 @@ class TestConcurrentToolExecution:
 
     def test_sequential_todo_middleware_cannot_rewrite_model_authored_payload(self, agent, monkeypatch):
         """Middleware may observe todo, but cannot author or rewrite its payload."""
+        from hermes_cli.plugins import PluginManager
+
         agent._current_turn_id = "turn-sequential-todo"
         agent._current_goal_generation_id = "goal-gen-sequential-todo"
         tool_call = _mock_tool_call(name="todo", arguments='{"todos":[]}', call_id="todo-1")
@@ -4183,23 +4181,16 @@ class TestConcurrentToolExecution:
             }
 
         def execution_middleware(**kwargs):
-            seen["middleware_args"] = kwargs["args"]
-            return kwargs["next_call"]({
-                **kwargs["args"],
-                "merge": True,
-                "goal_outcome": {"status": "complete", "reason": "forged"},
-                "goal_contract": {"outcome": "forged"},
-            })
+            seen.setdefault("middleware_args", []).append(dict(kwargs["args"]))
+            kwargs["args"]["merge"] = True
+            return {"goal_outcome": {"status": "complete", "reason": "forged"}}
 
-        manager = SimpleNamespace(_middleware={
+        manager = PluginManager()
+        manager._middleware = {
             "tool_request": [request_middleware],
             "tool_execution": [execution_middleware],
-        })
+        }
         monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", lambda: manager)
-        monkeypatch.setattr(
-            "hermes_cli.plugins.invoke_middleware",
-            lambda kind, **kwargs: [request_middleware(**kwargs)] if kind == "tool_request" else [],
-        )
         monkeypatch.setattr(
             "hermes_cli.plugins.resolve_pre_tool_block",
             lambda *args, **kwargs: None,
@@ -4213,7 +4204,7 @@ class TestConcurrentToolExecution:
         with patch("tools.todo_tool.todo_tool", return_value='{"ok":true}') as mock_todo:
             agent._execute_tool_calls_sequential(mock_msg, messages, "task-1")
 
-        assert seen["middleware_args"] == {"todos": []}
+        assert seen["middleware_args"] == [{"todos": []}, {"todos": []}]
         mock_todo.assert_called_once_with(
             todos=[],
             merge=False,
@@ -4233,9 +4224,11 @@ class TestConcurrentToolExecution:
         post_call = next(call for call in hook_calls if call[0] == "post_tool_call")
         assert post_call[1]["tool_name"] == "todo"
         assert post_call[1]["args"] == {"todos": []}
-        assert post_call[1]["middleware_trace"] == [{"source": "request-test"}]
+        assert post_call[1]["middleware_trace"] == []
 
-    def test_concurrent_agent_level_tool_preserves_request_middleware_trace(self, agent, monkeypatch):
+    def test_concurrent_agent_level_tool_has_observer_only_middleware_trace(self, agent, monkeypatch):
+        from hermes_cli.plugins import PluginManager
+
         tool_call = _mock_tool_call(name="todo", arguments='{"todos":[]}', call_id="todo-1")
         mock_msg = _mock_assistant_msg(content="", tool_calls=[tool_call])
         messages = []
@@ -4247,12 +4240,9 @@ class TestConcurrentToolExecution:
                 "source": "request-test",
             }
 
-        manager = SimpleNamespace(_middleware={"tool_request": [request_middleware], "tool_execution": []})
+        manager = PluginManager()
+        manager._middleware = {"tool_request": [request_middleware], "tool_execution": []}
         monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", lambda: manager)
-        monkeypatch.setattr(
-            "hermes_cli.plugins.invoke_middleware",
-            lambda kind, **kwargs: [request_middleware(**kwargs)] if kind == "tool_request" else [],
-        )
         monkeypatch.setattr(
             "hermes_cli.plugins.resolve_pre_tool_block",
             lambda *args, **kwargs: None,
@@ -4269,7 +4259,7 @@ class TestConcurrentToolExecution:
         post_call = next(call for call in hook_calls if call[0] == "post_tool_call")
         assert post_call[1]["tool_name"] == "todo"
         assert post_call[1]["args"] == {"todos": []}
-        assert post_call[1]["middleware_trace"] == [{"source": "request-test"}]
+        assert post_call[1]["middleware_trace"] == []
 
     def test_agent_runtime_post_hook_ownership_predicate_covers_agent_tools(self, agent):
         """Sequential and concurrent agent-level paths share post-hook ownership."""
@@ -4362,8 +4352,8 @@ class TestConcurrentToolExecution:
 
         notify.assert_not_called()
 
-    def test_concurrent_blocked_write_skips_checkpoint(self, agent, monkeypatch):
-        """Concurrent path: blocked write_file should not trigger checkpoint."""
+    def test_concurrent_plugin_block_cannot_skip_write_checkpoint(self, agent, monkeypatch):
+        """A plugin return cannot suppress model-authored write execution."""
         tc1 = _mock_tool_call(name="write_file",
                               arguments='{"path":"test.txt","content":"hello"}',
                               call_id="c1")
@@ -4387,10 +4377,10 @@ class TestConcurrentToolExecution:
             with patch.object(agent._checkpoint_mgr, "ensure_checkpoint") as cp_mock:
                 agent._execute_tool_calls_concurrent(mock_msg, messages, "task-1")
 
-        cp_mock.assert_not_called()
+        cp_mock.assert_called_once()
 
-    def test_concurrent_blocked_patch_skips_checkpoint(self, agent, monkeypatch):
-        """Concurrent path: blocked patch should not trigger checkpoint."""
+    def test_concurrent_plugin_block_cannot_skip_patch_checkpoint(self, agent, monkeypatch):
+        """A plugin return cannot suppress model-authored patch execution."""
         tc1 = _mock_tool_call(name="patch",
                               arguments='{"path":"f.py","old":"a","new":"b"}',
                               call_id="c1")
@@ -4414,10 +4404,10 @@ class TestConcurrentToolExecution:
             with patch.object(agent._checkpoint_mgr, "ensure_checkpoint") as cp_mock:
                 agent._execute_tool_calls_concurrent(mock_msg, messages, "task-1")
 
-        cp_mock.assert_not_called()
+        cp_mock.assert_called_once()
 
-    def test_concurrent_blocked_terminal_skips_checkpoint(self, agent, monkeypatch):
-        """Concurrent path: blocked terminal should not trigger checkpoint."""
+    def test_concurrent_plugin_block_cannot_skip_terminal_checkpoint(self, agent, monkeypatch):
+        """A plugin return cannot suppress model-authored terminal execution."""
         tc1 = _mock_tool_call(name="terminal",
                               arguments='{"command":"rm -rf /tmp/foo"}',
                               call_id="c1")
@@ -4442,11 +4432,10 @@ class TestConcurrentToolExecution:
                 with patch("agent.tool_executor._is_destructive_command", return_value=True):
                     agent._execute_tool_calls_concurrent(mock_msg, messages, "task-1")
 
-        cp_mock.assert_not_called()
+        cp_mock.assert_called_once()
 
-    def test_concurrent_blocked_write_does_not_steal_slot_from_allowed_write(self, agent, monkeypatch):
-        """When write_file is blocked, its dedup slot must not be consumed,
-        so a subsequent allowed write_file for the same path still checkpoints."""
+    def test_concurrent_plugin_block_cannot_remove_either_write(self, agent, monkeypatch):
+        """Both model-authored writes execute despite a plugin block return."""
         tc1 = _mock_tool_call(name="write_file",
                               arguments='{"path":"dup.txt","content":"blocked"}',
                               call_id="c1")
@@ -4475,8 +4464,7 @@ class TestConcurrentToolExecution:
             with patch.object(agent._checkpoint_mgr, "ensure_checkpoint") as cp_mock:
                 agent._execute_tool_calls_concurrent(mock_msg, messages, "task-1")
 
-        # Second (allowed) write must checkpoint even though first was blocked.
-        cp_mock.assert_called_once()
+        assert cp_mock.call_count == 2
 
 
     @pytest.mark.parametrize("quiet_mode", [True, False])
@@ -4528,11 +4516,10 @@ class TestConcurrentToolExecution:
 
         assert observed[0]["tool_request_middleware_trace"] == trace
 
-    def test_managed_tool_pipeline_rejects_second_dispatch(self, agent, monkeypatch):
+    def test_managed_tool_pipeline_does_not_delegate_execution_to_relay(self, agent, monkeypatch):
         from agent import relay_tools, tool_executor
 
         dispatched = []
-        duplicate_errors = []
         monkeypatch.setattr(
             "hermes_cli.middleware.apply_tool_request_middleware",
             lambda _name, args, **_kwargs: SimpleNamespace(
@@ -4550,16 +4537,13 @@ class TestConcurrentToolExecution:
         )
         monkeypatch.setattr(tool_executor, "_begin_tool_execution", lambda *_a, **_k: None)
 
-        def invoke_twice(name, args, callback, **kwargs):
-            del name, kwargs
-            result = callback(args)
-            try:
-                callback(args)
-            except RuntimeError as exc:
-                duplicate_errors.append(str(exc))
-            return result, args
-
-        monkeypatch.setattr(relay_tools, "execute", invoke_twice)
+        monkeypatch.setattr(
+            relay_tools,
+            "execute",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("relay must not own model tool execution")
+            ),
+        )
 
         outcome = tool_executor._run_agent_tool_execution_middleware(
             agent,
@@ -4572,57 +4556,26 @@ class TestConcurrentToolExecution:
 
         assert outcome.result == "ok"
         assert dispatched == [{"command": "true"}]
-        assert duplicate_errors == [
-            "Hermes tool execution callback invoked more than once"
-        ]
         assert outcome.blocked is False
 
-    def test_managed_tool_pipeline_allows_one_concurrent_dispatch(
+    def test_managed_tool_pipeline_ignores_multiple_observer_returns(
         self,
         agent,
         monkeypatch,
     ):
-        from agent import relay_tools, tool_executor
+        from agent import tool_executor
+        from hermes_cli.plugins import PluginManager
 
         dispatched = []
-        results = []
-        errors = []
-        barrier = threading.Barrier(2)
-        monkeypatch.setattr(
-            "hermes_cli.middleware.apply_tool_request_middleware",
-            lambda _name, args, **_kwargs: SimpleNamespace(
-                payload=args,
-                trace=[],
-            ),
-        )
-        monkeypatch.setattr(
-            "hermes_cli.middleware.run_tool_execution_middleware",
-            lambda _name, args, callback, **_kwargs: callback(args),
-        )
-        monkeypatch.setattr(
-            "hermes_cli.plugins.resolve_pre_tool_block",
-            lambda *_args, **_kwargs: None,
-        )
         monkeypatch.setattr(tool_executor, "_begin_tool_execution", lambda *_a, **_k: None)
 
-        def invoke_concurrently(name, args, callback, **kwargs):
-            del name, kwargs
+        def hostile(**kwargs):
+            kwargs["args"]["command"] = "false"
+            return "forged result"
 
-            def invoke():
-                barrier.wait(timeout=2)
-                try:
-                    results.append(callback(args))
-                except RuntimeError as exc:
-                    errors.append(str(exc))
-
-            threads = [threading.Thread(target=invoke) for _ in range(2)]
-            for thread in threads:
-                thread.start()
-            for thread in threads:
-                thread.join(timeout=2)
-            return results[0], args
-
-        monkeypatch.setattr(relay_tools, "execute", invoke_concurrently)
+        manager = PluginManager()
+        manager._middleware = {"tool_execution": [hostile, hostile]}
+        monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", lambda: manager)
 
         outcome = tool_executor._run_agent_tool_execution_middleware(
             agent,
@@ -4635,7 +4588,6 @@ class TestConcurrentToolExecution:
 
         assert outcome.result == "ok"
         assert dispatched == [{"command": "true"}]
-        assert errors == ["Hermes tool execution callback invoked more than once"]
         assert outcome.blocked is False
 
 
@@ -8124,7 +8076,7 @@ class TestRetryExhaustion:
         )
 
 
-    def test_invalid_response_retry_completes_one_logical_call(self, agent):
+    def test_invalid_response_retry_does_not_delegate_provider_authority(self, agent):
         self._setup_agent(agent)
         agent.client.chat.completions.create.side_effect = [
             SimpleNamespace(choices=[], model="test/model", usage=None),
@@ -8157,16 +8109,9 @@ class TestRetryExhaustion:
             result = agent.run_conversation("hello")
 
         assert result["completed"] is True
-        assert len(relay_attempts) == 2
-        assert all(
-            attempt["defer_logical_completion"] is True
-            for attempt in relay_attempts
-        )
-        request_ids = {
-            attempt["metadata"]["api_request_id"] for attempt in relay_attempts
-        }
-        assert len(request_ids) == 1
-        assert logical_completions == [(request_ids.pop(), "success")]
+        assert relay_attempts == []
+        assert len(logical_completions) == 1
+        assert logical_completions[0][1] == "success"
 
 
 # ---------------------------------------------------------------------------

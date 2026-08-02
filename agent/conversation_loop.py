@@ -2654,12 +2654,9 @@ def run_conversation(
                 )
 
                 # Capture the verified model/reasoning authority before any
-                # middleware receives a request object. Request middleware is
-                # intentionally allowed to inspect and mutate its historical
-                # ``original_request`` argument, so that object cannot also be
-                # the authority used to restore the model-authored decision.
-                # The helper deep-copies only the protected fields on the exact
-                # verified route and remains a no-op for every other route.
+                # observer receives a detached request snapshot.  The helper
+                # deep-copies only the protected fields on the exact verified
+                # route and remains a no-op for every other route.
                 _verified_reasoning_authority = preserve_verified_reasoning_payload(
                     agent,
                     api_kwargs,
@@ -2693,14 +2690,11 @@ def run_conversation(
                     _verified_reasoning_authority,
                     api_kwargs,
                 )
-                # Execution middleware receives ``api_kwargs`` by reference and
-                # may mutate it in place before invoking the transport closure.
-                # Keep an independent, minimal authority snapshot so a nested
-                # mutation (for example ``reasoning["effort"] = "low"``) cannot
-                # rewrite the verified model-authored decision before the final
-                # dispatch boundary.  ``preserve_verified_reasoning_payload``
-                # deep-copies the protected values and is a no-op off the exact
-                # verified GPT-5.6 Codex route.
+                # Keep the independent authority snapshot through the final
+                # transport boundary. Notification middleware receives only
+                # detached copies, but this re-attestation also protects
+                # against unrelated in-process drift. The helper is a no-op
+                # off the exact verified GPT-5.6 Codex route.
                 try:
                     from hermes_cli.lifecycle import (
                         has_hook,
@@ -2835,10 +2829,9 @@ def run_conversation(
                             is_github_responses=agent._is_copilot_url(),
                             sanitize_harmony_tokens=agent._is_codex_backend(),
                         )
-                    # Execution middleware may perform arbitrary work before
-                    # invoking this closure. Re-attest at the final transport
-                    # boundary so drift after request construction can never
-                    # reach either streaming or non-streaming provider I/O.
+                    # Re-attest at the final transport boundary so drift after
+                    # request construction can never reach either streaming or
+                    # non-streaming provider I/O.
                     attest_pinned_effective_config_projection()
                     _saved_stream_delta = None
                     _saved_stream_callback = None
@@ -2863,31 +2856,10 @@ def run_conversation(
                             return agent._interruptible_streaming_api_call(
                                 next_api_kwargs, on_first_delta=_stop_spinner
                             )
-                        from agent import relay_llm
-
-                        return relay_llm.execute(
-                            next_api_kwargs,
-                            agent._interruptible_api_call,
-                            session_id=agent.session_id or "",
-                            name=agent.provider or "",
-                            model_name=agent.model or "",
-                            metadata={
-                                "api_mode": agent.api_mode,
-                                "api_request_id": api_request_id,
-                                "call_role": (
-                                    "delegated"
-                                    if getattr(agent, "is_subagent", False)
-                                    else "fallback"
-                                    if int(
-                                        getattr(agent, "_fallback_index", 0) or 0
-                                    )
-                                    > 0
-                                    else "primary"
-                                ),
-                                "retry_count": retry_count,
-                            },
-                            defer_logical_completion=True,
-                        )
+                        # The provider call is model-authoritative. Third-party
+                        # execution wrappers may observe via notification hooks,
+                        # but cannot rewrite the request or replace the response.
+                        return agent._interruptible_api_call(next_api_kwargs)
                     finally:
                         if _hold_provisional_stream:
                             agent.stream_delta_callback = _saved_stream_delta

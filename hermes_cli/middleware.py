@@ -1,8 +1,10 @@
-"""Hermes middleware contract helpers.
+"""Hermes middleware notification helpers.
 
-Observer hooks report what happened. Middleware can change what happens by
-rewriting a request or wrapping the actual execution callback. Keep the small
-contract helpers here so agent-loop call sites and plugins share one vocabulary.
+The trusted model is the sole semantic authority for model requests and tool
+calls.  Plugin middleware therefore observes immutable snapshots; it cannot
+rewrite requests or arguments, wrap/skip execution, or replace results.  The
+legacy names remain available so existing observer plugins keep receiving
+events without retaining behavioral authority.
 """
 
 from __future__ import annotations
@@ -15,7 +17,7 @@ from typing import Any, Callable, Dict, List
 logger = logging.getLogger(__name__)
 
 OBSERVER_SCHEMA_VERSION = "hermes.observer.v1"
-MIDDLEWARE_SCHEMA_VERSION = "hermes.middleware.v1"
+MIDDLEWARE_SCHEMA_VERSION = "hermes.middleware.v2.notification-only"
 
 TOOL_REQUEST_MIDDLEWARE = "tool_request"
 TOOL_EXECUTION_MIDDLEWARE = "tool_execution"
@@ -36,7 +38,7 @@ VALID_MIDDLEWARE: set[str] = {
 
 @dataclass
 class RequestMiddlewareResult:
-    """Result of applying request middleware to a mutable payload."""
+    """Compatibility result for a notification-only request event."""
 
     payload: Any
     original_payload: Any
@@ -56,33 +58,21 @@ def middleware_payload(**kwargs: Any) -> Dict[str, Any]:
 
 
 def _safe_copy(payload: Any) -> Any:
-    """Deep-copy a request payload, tolerating non-deepcopyable members.
+    """Return a detached observer snapshot.
 
-    Request payloads are normally plain JSON-shaped dicts, but an LLM request
-    can occasionally carry non-deepcopyable objects (clients, callbacks, file
-    handles). A hard ``deepcopy`` failure there would otherwise abort the whole
-    request-middleware pass. Fall back to a shallow ``dict`` copy so middleware
-    still runs and the original nested objects are shared by reference rather
-    than corrupting the live payload.
+    A shallow-copy fallback would leak nested live objects to plugins, so a
+    value that cannot be copied is not deliverable as an observer event.  The
+    caller catches this and skips notification while the model/tool operation
+    continues unchanged.
     """
-    try:
-        return deepcopy(payload)
-    except Exception as exc:  # pragma: no cover - exercised via fallback test
-        logger.debug("deepcopy failed for request payload (%s); using shallow copy", exc)
-        if isinstance(payload, dict):
-            return dict(payload)
-        return payload
+    return deepcopy(payload)
 
 
 def apply_llm_request_middleware(
     request: Dict[str, Any],
     **context: Any,
 ) -> RequestMiddlewareResult:
-    """Apply registered LLM request middleware.
-
-    Middleware may return ``{"request": {...}}`` to replace the effective
-    provider kwargs before Hermes sends them.
-    """
+    """Notify middleware of an LLM request without granting mutation rights."""
     if not _has_middleware(LLM_REQUEST_MIDDLEWARE):
         return RequestMiddlewareResult(
             payload=request,
@@ -91,29 +81,24 @@ def apply_llm_request_middleware(
             trace=[],
         )
 
-    original_request = _safe_copy(request)
-    current_request = _safe_copy(original_request)
-    trace: List[Dict[str, Any]] = []
-
-    for result in _invoke_middleware(
-        LLM_REQUEST_MIDDLEWARE,
-        request=current_request,
-        original_request=original_request,
-        **context,
-    ):
-        if not isinstance(result, dict):
-            continue
-        next_request = result.get("request")
-        if not isinstance(next_request, dict):
-            continue
-        current_request = _safe_copy(next_request)
-        trace.append(_trace_entry(result))
+    try:
+        original_request = _safe_copy(request)
+        _invoke_middleware(
+            LLM_REQUEST_MIDDLEWARE,
+            phase="before",
+            request=original_request,
+            original_request=original_request,
+            **context,
+        )
+    except Exception as exc:
+        logger.warning("LLM request observer snapshot failed: %s", exc)
+        original_request = request
 
     return RequestMiddlewareResult(
-        payload=current_request,
+        payload=request,
         original_payload=original_request,
-        changed=bool(trace),
-        trace=trace,
+        changed=False,
+        trace=[],
     )
 
 
@@ -122,57 +107,38 @@ def apply_tool_request_middleware(
     args: Dict[str, Any],
     **context: Any,
 ) -> RequestMiddlewareResult:
-    """Apply registered tool request middleware.
-
-    Middleware may return ``{"args": {...}}`` to replace the effective tool
-    arguments before hooks, guardrails, approvals, and execution see them.
-    """
-    original_args = _safe_copy(args)
-    current_args = _safe_copy(original_args)
-    trace: List[Dict[str, Any]] = []
-
-    session_id = str(context.get("session_id") or "")
-    skip_relay = bool(context.pop("skip_relay", False))
-    if session_id and not skip_relay:
-        from agent import relay_runtime
-
-        relay_args = relay_runtime.apply_tool_request_intercepts(
-            session_id=session_id,
-            tool_name=tool_name,
-            args=current_args,
-        )
-        if relay_args != current_args:
-            current_args = _safe_copy(relay_args)
-            trace.append({"source": "nemo_relay"})
+    """Notify middleware of model-authored tool arguments without rewriting."""
+    # Retained as a compatibility kwarg only.  It can no longer activate a
+    # second semantic-authority path through request intercepts.
+    context.pop("skip_relay", None)
 
     if not _has_middleware(TOOL_REQUEST_MIDDLEWARE):
         return RequestMiddlewareResult(
-            payload=args if not trace else current_args,
+            payload=args,
             original_payload=args,
-            changed=bool(trace),
-            trace=trace,
+            changed=False,
+            trace=[],
         )
 
-    for result in _invoke_middleware(
-        TOOL_REQUEST_MIDDLEWARE,
-        tool_name=tool_name,
-        args=current_args,
-        original_args=original_args,
-        **context,
-    ):
-        if not isinstance(result, dict):
-            continue
-        next_args = result.get("args")
-        if not isinstance(next_args, dict):
-            continue
-        current_args = _safe_copy(next_args)
-        trace.append(_trace_entry(result))
+    try:
+        original_args = _safe_copy(args)
+        _invoke_middleware(
+            TOOL_REQUEST_MIDDLEWARE,
+            phase="before",
+            tool_name=tool_name,
+            args=original_args,
+            original_args=original_args,
+            **context,
+        )
+    except Exception as exc:
+        logger.warning("Tool request observer snapshot failed: %s", exc)
+        original_args = args
 
     return RequestMiddlewareResult(
-        payload=current_args,
+        payload=args,
         original_payload=original_args,
-        changed=bool(trace),
-        trace=trace,
+        changed=False,
+        trace=[],
     )
 
 
@@ -189,13 +155,9 @@ def run_llm_execution_middleware(
     next_call: Callable[[Dict[str, Any]], Any],
     **context: Any,
 ) -> Any:
-    """Run provider execution through registered LLM execution middleware."""
-    callbacks = _get_middleware_callbacks(LLM_EXECUTION_MIDDLEWARE)
-    if not callbacks:
-        return next_call(request)
-    return _run_execution_chain(
+    """Execute the provider exactly once and emit detached before/after events."""
+    return _run_observed_execution(
         LLM_EXECUTION_MIDDLEWARE,
-        callbacks,
         next_call,
         request=request,
         original_request=context.pop("original_request", request),
@@ -209,13 +171,9 @@ def run_tool_execution_middleware(
     next_call: Callable[[Dict[str, Any]], Any],
     **context: Any,
 ) -> Any:
-    """Run tool execution through registered tool execution middleware."""
-    callbacks = _get_middleware_callbacks(TOOL_EXECUTION_MIDDLEWARE)
-    if not callbacks:
-        return next_call(args)
-    return _run_execution_chain(
+    """Execute the tool exactly once and emit detached before/after events."""
+    return _run_observed_execution(
         TOOL_EXECUTION_MIDDLEWARE,
-        callbacks,
         next_call,
         tool_name=tool_name,
         args=args,
@@ -245,83 +203,37 @@ def _has_middleware(kind: str) -> bool:
     return has_middleware(kind)
 
 
-def _get_middleware_callbacks(kind: str) -> List[Callable]:
-    from hermes_cli.plugins import get_plugin_manager
-
-    return list(get_plugin_manager()._middleware.get(kind, []))
-
-
-def _run_execution_chain(
+def _run_observed_execution(
     kind: str,
-    callbacks: List[Callable],
     terminal_call: Callable[[Any], Any],
     **kwargs: Any,
 ) -> Any:
     payload_key = "request" if "request" in kwargs else "args"
+    payload = kwargs[payload_key]
 
-    class _DownstreamExecutionError(Exception):
-        def __init__(self, original: BaseException) -> None:
-            super().__init__(str(original))
-            self.original = original
+    if _has_middleware(kind):
+        _invoke_middleware(kind, phase="before", **kwargs)
 
-    def call_at(index: int, payload: Any) -> Any:
-        if index >= len(callbacks):
-            return terminal_call(payload)
-
-        callback = callbacks[index]
-        next_called = False
-        next_succeeded = False
-        next_result: Any = None
-
-        def next_call(next_payload: Any = None) -> Any:
-            nonlocal next_called, next_succeeded, next_result
-            # ``next_call`` is single-use per middleware frame. Calling it more
-            # than once would re-run the downstream provider/tool, so a second
-            # invocation is a contract violation rather than a retry. Surface it
-            # instead of silently executing the terminal call twice.
-            if next_called:
-                raise RuntimeError(
-                    f"Middleware '{kind}' callback "
-                    f"{getattr(callback, '__name__', repr(callback))} called "
-                    "next_call() more than once; downstream execution is single-use"
-                )
-            next_called = True
-            try:
-                next_result = call_at(index + 1, payload if next_payload is None else next_payload)
-                next_succeeded = True
-                return next_result
-            except Exception as exc:
-                raise _DownstreamExecutionError(exc) from exc
-
-        call_kwargs = middleware_payload(**kwargs)
-        call_kwargs[payload_key] = payload
-        call_kwargs["next_call"] = next_call
-        try:
-            return callback(**call_kwargs)
-        except _DownstreamExecutionError as exc:
-            raise exc.original
-        except Exception as exc:
-            logger.warning(
-                "Middleware '%s' callback %s raised: %s",
+    try:
+        result = terminal_call(payload)
+    except BaseException as exc:
+        if _has_middleware(kind):
+            _invoke_middleware(
                 kind,
-                getattr(callback, "__name__", repr(callback)),
-                exc,
+                phase="after",
+                outcome="error",
+                error_type=type(exc).__name__,
+                error_message=str(exc),
+                **kwargs,
             )
-            if next_succeeded:
-                return next_result
-            if next_called:
-                raise
-            return call_at(index + 1, payload)
+        raise
 
-    return call_at(0, kwargs[payload_key])
-
-
-def _trace_entry(result: Dict[str, Any]) -> Dict[str, Any]:
-    entry: Dict[str, Any] = {}
-    for key in ("source", "reason", "name"):
-        value = result.get(key)
-        if isinstance(value, str) and value:
-            entry[key] = value
-    if not entry:
-        entry["source"] = "plugin"
-    return entry
+    if _has_middleware(kind):
+        _invoke_middleware(
+            kind,
+            phase="after",
+            outcome="ok",
+            result=result,
+            **kwargs,
+        )
+    return result

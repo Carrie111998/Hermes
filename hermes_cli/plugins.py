@@ -43,6 +43,7 @@ import re
 import sys
 import threading
 import types
+from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Union
@@ -138,22 +139,12 @@ VALID_HOOKS: Set[str] = {
     "post_tool_call",
     "transform_terminal_output",
     "transform_tool_result",
-    # Transform LLM output before it's returned to the user.
-    # Plugins return a string to replace the response text, or None/empty to leave unchanged.
-    # First non-None string wins. Useful for vocabulary/personality transformation.
+    # Legacy transformation event; callback returns are notification-only.
     "transform_llm_output",
     "pre_llm_call",
     "post_llm_call",
-    # Verification-loop gate. Fired once per turn when the agent has edited code
-    # and is about to verify/finish (after the verify-on-stop guard). A callback
-    # may keep the agent going — run a check, defer it, tidy the diff — instead
-    # of stopping by returning:
-    #   {"action": "continue", "message": "<follow-up instruction>"}
-    # The Claude-Code Stop shape {"decision": "block", "reason": "..."} (block
-    # the stop == keep going) is accepted too. Anything else lets the turn
-    # finish. Hermes' shipped guidance lives in the evidence-based
-    # verification-stop nudge; this hook is for user/plugin policy and is
-    # bounded by agent.max_verify_nudges.
+    # Verification observation fired at the legacy pre-verify seam. Callback
+    # returns cannot keep a turn running or override stop/verification.
     "pre_verify",
     "pre_api_request",
     "post_api_request",
@@ -164,13 +155,8 @@ VALID_HOOKS: Set[str] = {
     "on_session_reset",
     "subagent_start",
     "subagent_stop",
-    # Gateway pre-dispatch hook. Fired once per incoming MessageEvent
-    # after the internal-event guard but BEFORE auth/pairing and agent
-    # dispatch. Plugins may return a dict to influence flow:
-    #   {"action": "skip",    "reason": "..."}  -> drop message (no reply)
-    #   {"action": "rewrite", "text": "..."}    -> replace event.text, continue
-    #   {"action": "allow"}  /  None             -> normal dispatch
-    # Kwargs: event: MessageEvent, gateway: GatewayRunner, session_store.
+    # Gateway pre-dispatch observation. Callback returns cannot skip/rewrite
+    # the incoming message. Kwargs are delivered as detached snapshots.
     "pre_gateway_dispatch",
     # Approval lifecycle hooks. Fired by tools/approval.py when a dangerous
     # command needs an approval decision -- fires for CLI-interactive prompts,
@@ -213,9 +199,46 @@ VALID_HOOKS: Set[str] = {
     "kanban_task_blocked",
 }
 
+# These legacy hooks historically let plugin return values change model/tool
+# semantics.  They remain deliverable as observer events for compatibility,
+# but their return values are never surfaced to the runtime.  This keeps
+# trusted-model decisions authoritative while preserving useful telemetry.
+_NOTIFICATION_ONLY_HOOKS: frozenset[str] = frozenset(
+    {
+        "pre_tool_call",
+        "transform_terminal_output",
+        "transform_tool_result",
+        "transform_llm_output",
+        "pre_llm_call",
+        "pre_verify",
+        "pre_gateway_dispatch",
+    }
+)
+
 ENTRY_POINTS_GROUP = "hermes_agent.plugins"
 
 _NS_PARENT = "hermes_plugins"
+
+
+@dataclass(frozen=True)
+class _OpaqueObserverValue:
+    """Safe placeholder for a live object that cannot be deep-copied."""
+
+    type_name: str
+
+
+def _observer_snapshot(kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    """Detach every callback argument without leaking uncopyable live state."""
+    snapshot: Dict[str, Any] = {}
+    for key, value in kwargs.items():
+        try:
+            snapshot[key] = deepcopy(value)
+        except Exception:
+            value_type = type(value)
+            snapshot[key] = _OpaqueObserverValue(
+                type_name=f"{value_type.__module__}.{value_type.__qualname__}"
+            )
+    return snapshot
 
 
 def _env_enabled(name: str) -> bool:
@@ -1204,12 +1227,12 @@ class PluginContext:
     # -- middleware registration -------------------------------------------
 
     def register_middleware(self, kind: str, callback: Callable) -> None:
-        """Register a behavior-changing middleware callback.
+        """Register a notification-only middleware callback.
 
-        Middleware is separate from observer hooks: request middleware may
-        rewrite the effective payload, and execution middleware may wrap the
-        real callback. Unknown kinds are stored for forward compatibility but
-        warned so plugin authors can catch typos.
+        Callbacks receive detached request/execution snapshots. Their return
+        values and exceptions are ignored; they cannot rewrite model/tool
+        inputs, wrap or skip execution, or replace results. Unknown kinds are
+        stored for forward compatibility but warned so authors catch typos.
         """
         if kind not in VALID_MIDDLEWARE:
             logger.warning(
@@ -2044,30 +2067,32 @@ class PluginManager:
     def invoke_hook(self, hook_name: str, **kwargs: Any) -> List[Any]:
         """Call all registered callbacks for *hook_name*.
 
-        Each callback is wrapped in its own try/except so a misbehaving
-        plugin cannot break the core agent loop.
+        Each callback receives its own deep-copied snapshot and is wrapped in
+        its own try/except, so a plugin cannot mutate live runtime objects or
+        break the core agent loop.
 
         Returns a list of non-``None`` return values from callbacks.
 
-        For ``pre_llm_call``, callbacks may return a dict describing
-        context to inject into the current turn's user message::
-
-            {"context": "recalled text..."}
-            "recalled text..."          # plain string, equivalent
-
-        Context is ALWAYS injected into the user message, never the
-        system prompt.  This preserves the prompt cache prefix — the
-        system prompt stays identical across turns so cached tokens
-        are reused.  All injected context is ephemeral — never
-        persisted to session DB.
+        Hooks listed in ``_NOTIFICATION_ONLY_HOOKS`` retain event delivery but
+        never surface callback return values to semantic runtime paths.
         """
         kwargs.setdefault("telemetry_schema_version", OBSERVER_SCHEMA_VERSION)
         callbacks = self._hooks.get(hook_name, [])
         results: List[Any] = []
         for cb in callbacks:
             try:
-                ret = cb(**kwargs)
-                if ret is not None:
+                callback_kwargs = _observer_snapshot(kwargs)
+            except Exception as exc:
+                logger.warning(
+                    "Hook '%s' observer snapshot for %s failed: %s",
+                    hook_name,
+                    getattr(cb, "__name__", repr(cb)),
+                    exc,
+                )
+                continue
+            try:
+                ret = cb(**callback_kwargs)
+                if ret is not None and hook_name not in _NOTIFICATION_ONLY_HOOKS:
                     results.append(ret)
             except Exception as exc:
                 logger.warning(
@@ -2087,19 +2112,25 @@ class PluginManager:
         return bool(self._middleware.get(kind))
 
     def invoke_middleware(self, kind: str, **kwargs: Any) -> List[Any]:
-        """Call registered middleware callbacks for *kind*.
+        """Deliver detached middleware observer snapshots for *kind*.
 
-        Each callback is isolated so one plugin cannot break the base runtime
-        path. Middleware that wants to change behavior must return the shape
-        documented by the caller-specific contract.
+        Callback return values are intentionally discarded.  A callback can
+        neither mutate the live payload nor acquire an execution continuation.
         """
         callbacks = self._middleware.get(kind, [])
-        results: List[Any] = []
         for cb in callbacks:
             try:
-                ret = cb(**kwargs)
-                if ret is not None:
-                    results.append(ret)
+                callback_kwargs = _observer_snapshot(kwargs)
+            except Exception as exc:
+                logger.warning(
+                    "Middleware '%s' observer snapshot for %s failed: %s",
+                    kind,
+                    getattr(cb, "__name__", repr(cb)),
+                    exc,
+                )
+                continue
+            try:
+                cb(**callback_kwargs)
             except Exception as exc:
                 logger.warning(
                     "Middleware '%s' callback %s raised: %s",
@@ -2107,7 +2138,7 @@ class PluginManager:
                     getattr(cb, "__name__", repr(cb)),
                     exc,
                 )
-        return results
+        return []
 
     # -----------------------------------------------------------------------
     # Slack action handler accessor
@@ -2214,10 +2245,7 @@ def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
 
 
 def invoke_middleware(kind: str, **kwargs: Any) -> List[Any]:
-    """Invoke registered middleware callbacks.
-
-    Returns a list of non-``None`` return values from middleware callbacks.
-    """
+    """Deliver middleware observer snapshots; callback returns are discarded."""
     return get_plugin_manager().invoke_middleware(kind, **kwargs)
 
 
@@ -2267,31 +2295,10 @@ def _get_pre_tool_call_directive_details(
     api_request_id: str = "",
     middleware_trace: Optional[List[Dict[str, Any]]] = None,
 ) -> _PreToolCallDirective:
-    """Check ``pre_tool_call`` hooks for a blocking or approval directive.
+    """Deliver ``pre_tool_call`` as observation and return no plugin directive.
 
-    Plugins that need to enforce policy (rate limiting, security
-    restrictions, approval workflows) can return one of::
-
-        {"action": "block",   "message": "Reason the tool was blocked"}
-        {"action": "approve", "message": "Why this needs human confirmation"}
-        {"action": "approve", "message": "...", "rule_key": "write_file:ssh"}
-
-    from their ``pre_tool_call`` callback.
-
-    - ``block`` vetoes the tool call outright (the message becomes the tool
-      result the model sees).
-    - ``approve`` ESCALATES to the existing human-approval gate
-      (``prompt_dangerous_approval`` on CLI, the approval callback on the
-      gateway) — the same mechanism Tier-2 dangerous shell patterns use.
-      This lets a plugin require a human ``[o]nce/[s]ession/[a]lways/[d]eny``
-      decision on ANY tool, not just terminal command strings. The caller is
-      responsible for invoking the gate (see
-      :func:`tools.approval.request_tool_approval`).
-    - ``rule_key`` is optional and only honored for ``approve`` directives. It
-      lets plugins choose the allowlist grain for `[a]lways` approvals.
-
-    The first valid directive wins. Invalid or irrelevant hook return values
-    are silently ignored so existing observer-only hooks are unaffected.
+    The thread tool whitelist is a host-created structural capability scope,
+    not plugin semantic authority, so it remains enforceable here.
     """
     allowed = getattr(_thread_tool_whitelist, "allowed", None)
     if allowed is not None and tool_name not in allowed:
@@ -2301,7 +2308,7 @@ def _get_pre_tool_call_directive_details(
             message=fmt.format(tool_name=tool_name),
         )
 
-    hook_results = invoke_hook(
+    invoke_hook(
         "pre_tool_call",
         tool_name=tool_name,
         args=args if isinstance(args, dict) else {},
@@ -2312,24 +2319,6 @@ def _get_pre_tool_call_directive_details(
         api_request_id=api_request_id,
         middleware_trace=list(middleware_trace or []),
     )
-
-    for result in hook_results:
-        if not isinstance(result, dict):
-            continue
-        action = result.get("action")
-        if action not in ("block", "approve"):
-            continue
-        message = result.get("message")
-        message = message if isinstance(message, str) and message else None
-        # A block directive requires a message (it becomes the tool result);
-        # an approve directive can carry an optional reason.
-        if action == "block" and not message:
-            continue
-        rule_key = result.get("rule_key") if action == "approve" else None
-        rule_key = rule_key.strip() if isinstance(rule_key, str) else None
-        if not rule_key:
-            rule_key = None
-        return _PreToolCallDirective(action=action, message=message, rule_key=rule_key)
 
     return _PreToolCallDirective()
 
@@ -2344,12 +2333,10 @@ def get_pre_tool_call_directive(
     api_request_id: str = "",
     middleware_trace: Optional[List[Dict[str, Any]]] = None,
 ) -> tuple[Optional[str], Optional[str]]:
-    """Check ``pre_tool_call`` hooks for a blocking or approval directive.
+    """Compatibility helper for observer-only pre-tool events.
 
-    Backward-compatible public helper: returns ``(directive, message)`` where
-    ``directive`` is ``"block"``, ``"approve"``, or ``None``. Internal callers
-    that need approve-specific metadata use
-    :func:`_get_pre_tool_call_directive_details`.
+    Plugin returns always resolve to ``(None, None)``. A host-created thread
+    capability scope may still produce a structural ``block`` result.
     """
     details = _get_pre_tool_call_directive_details(
         tool_name, args, task_id=task_id, session_id=session_id,
@@ -2369,13 +2356,7 @@ def get_pre_tool_call_block_message(
     api_request_id: str = "",
     middleware_trace: Optional[List[Dict[str, Any]]] = None,
 ) -> Optional[str]:
-    """Back-compat shim: return only a ``block`` message (or ``None``).
-
-    Deprecated in favor of :func:`get_pre_tool_call_directive`, which also
-    surfaces the ``approve`` escalation directive. Kept so any external caller
-    importing the old name keeps working; ``approve`` directives are invisible
-    to this shim (it only reports blocks).
-    """
+    """Back-compat shim for structural scope blocks; plugin returns are inert."""
     directive, message = get_pre_tool_call_directive(
         tool_name, args, task_id=task_id, session_id=session_id,
         tool_call_id=tool_call_id, turn_id=turn_id,
@@ -2394,20 +2375,7 @@ def resolve_pre_tool_block(
     api_request_id: str = "",
     middleware_trace: Optional[List[Dict[str, Any]]] = None,
 ) -> Optional[str]:
-    """Resolve the pre_tool_call directive to a final block message (or None).
-
-    Single entry point for every tool-dispatch site: fetches the plugin
-    directive and, for an ``approve`` escalation, invokes the human-approval
-    gate (:func:`tools.approval.request_tool_approval`). Returns the message
-    the tool result should carry when the call is blocked, or ``None`` when
-    the call may proceed.
-
-    Centralizing this keeps the security-critical fail-closed logic in ONE
-    place instead of copy-pasted across the concurrent/sequential/helper
-    dispatch paths: an ``approve`` directive whose gate errors, denies, or
-    times out is fail-closed to a block; ``block`` blocks with its message;
-    anything else proceeds.
-    """
+    """Notify pre-tool observers and return only structural-scope blocks."""
     details = _get_pre_tool_call_directive_details(
         tool_name, args, task_id=task_id, session_id=session_id,
         tool_call_id=tool_call_id, turn_id=turn_id,
@@ -2415,23 +2383,6 @@ def resolve_pre_tool_block(
     )
     if details.action == "block":
         return details.message
-    if details.action == "approve":
-        try:
-            from tools.approval import request_tool_approval
-            result = request_tool_approval(
-                tool_name,
-                details.message or "",
-                rule_key=details.rule_key or tool_name,
-            )
-        except Exception:
-            # Fail-closed: if the gate itself errors, block rather than
-            # silently execute an action a plugin flagged for approval.
-            return f"BLOCKED: plugin approval gate failed for {tool_name}"
-        if not result.get("approved"):
-            return str(
-                result.get("message")
-                or f"BLOCKED: plugin approval required for {tool_name}"
-            )
     return None
 
 
@@ -2445,24 +2396,8 @@ def get_pre_verify_continue_message(
     final_response: str = "",
     changed_paths: Optional[List[str]] = None,
 ) -> Optional[str]:
-    """Check user ``pre_verify`` hooks for a directive to keep the agent going.
-
-    Fired once per turn when the agent edited code and is about to verify/finish.
-    A hook keeps the turn going (run a check, defer it, tidy the diff) by
-    returning::
-
-        {"action": "continue", "message": "<follow-up for the model>"}
-
-    The Claude-Code Stop shape ``{"decision": "block", "reason": "..."}`` (block
-    the stop == keep going) is accepted too. The first directive carrying a
-    non-empty message wins; any other return lets the turn finish. Mirrors
-    :func:`get_pre_tool_call_block_message` — the call site stays a one-liner.
-
-    ``coding`` / ``attempt`` let a hook scope itself (``if not coding`` …) and
-    self-throttle (``if attempt`` …), the same way a ``pre_tool_call`` hook
-    scopes on ``tool_name``.
-    """
-    hook_results = invoke_hook(
+    """Notify verification observers without granting stop/continue authority."""
+    invoke_hook(
         "pre_verify",
         session_id=session_id,
         platform=platform,
@@ -2472,16 +2407,6 @@ def get_pre_verify_continue_message(
         final_response=final_response,
         changed_paths=list(changed_paths or []),
     )
-
-    for result in hook_results:
-        if not isinstance(result, dict):
-            continue
-        action = str(result.get("action") or result.get("decision") or "").strip().lower()
-        if action not in ("continue", "block"):
-            continue
-        message = result.get("message") or result.get("reason")
-        if isinstance(message, str) and message.strip():
-            return message.strip()
 
     return None
 
