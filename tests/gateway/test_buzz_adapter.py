@@ -693,6 +693,7 @@ class TestDurableCursor:
     @pytest.mark.asyncio
     async def test_cursor_commits_only_after_processing_complete_success(self, tmp_path):
         adapter = _make_adapter({"observer_mode": True, "response_authority": True})
+        adapter._resolve_user_name = AsyncMock(return_value="Other")
         adapter._cursor_path = tmp_path / "cursor.json"
         adapter._channel_state[CHANNEL] = {
             "chat_type": "group",
@@ -845,6 +846,7 @@ class TestDurableCursor:
     @pytest.mark.asyncio
     async def test_legacy_mode_commits_on_receipt_without_completion_cursor(self):
         adapter = _make_adapter({"observer_mode": False})
+        adapter._resolve_user_name = AsyncMock(return_value="Other")
         adapter._channel_state[CHANNEL] = {
             "chat_type": "group",
             "last_ts": 5,
@@ -871,6 +873,7 @@ class TestDurableCursor:
     @pytest.mark.asyncio
     async def test_failed_processing_keeps_event_retryable(self, tmp_path):
         adapter = _make_adapter({"observer_mode": True, "response_authority": True})
+        adapter._resolve_user_name = AsyncMock(return_value="Other")
         adapter._cursor_path = tmp_path / "cursor.json"
         adapter._channel_state[CHANNEL] = {
             "chat_type": "group",
