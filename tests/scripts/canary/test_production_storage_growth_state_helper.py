@@ -777,27 +777,80 @@ open(survived_path, "w").write("survived")
         assert path.stat().st_mode & 0o777 == mode
 
 
-def test_predecessor_pid_reuse_before_pidfd_revalidation_fails_closed() -> None:
+def test_predecessor_pid_reuse_before_pidfd_revalidation_is_skipped() -> None:
     discovered = _predecessor_identity(4242, start_time_ticks=100)
     reused = _predecessor_identity(4242, start_time_ticks=101)
     signals: list[tuple[int, int, object, int]] = []
     closed: list[int] = []
+    observations = iter(((discovered,), (), ()))
 
-    with pytest.raises(
-        installer.ProductionStorageInstallerError,
-        match="production_storage_predecessor_identity_changed",
-    ):
-        installer._quiesce_predecessor_helpers(
-            authorized_client_uid=os.getuid(),
-            process_lister=lambda: (discovered,),
-            identity_reader=lambda _pid: reused,
-            pidfd_opener=lambda _pid, _flags: 99,
-            pidfd_signaler=lambda *args: signals.append(args),
-            fd_closer=closed.append,
-            sleeper=lambda _seconds: None,
-        )
+    installer._quiesce_predecessor_helpers(
+        authorized_client_uid=os.getuid(),
+        process_lister=lambda: next(observations),
+        identity_reader=lambda _pid: reused,
+        pidfd_opener=lambda _pid, _flags: 99,
+        pidfd_signaler=lambda *args: signals.append(args),
+        fd_closer=closed.append,
+        sleeper=lambda _seconds: None,
+    )
     assert signals == []
     assert closed == [99]
+
+
+def test_stable_helper_is_killed_when_sibling_pid_is_reused() -> None:
+    stable = _predecessor_identity(4242, start_time_ticks=100)
+    replaced = _predecessor_identity(4343, start_time_ticks=200)
+    reused = _predecessor_identity(4343, start_time_ticks=201)
+    alive_helpers = {stable}
+    observations: list[tuple[installer._ProcessIdentity, ...]] = []
+    pidfd_targets = {91: stable, 92: replaced}
+    signals: list[tuple[int, int, installer._ProcessIdentity]] = []
+    closed: list[int] = []
+    first_observation = True
+
+    def list_processes() -> tuple[installer._ProcessIdentity, ...]:
+        nonlocal first_observation
+        if first_observation:
+            first_observation = False
+            result = (stable, replaced)
+        else:
+            result = tuple(sorted(alive_helpers, key=lambda item: item.pid))
+        observations.append(result)
+        return result
+
+    def read_identity(pid: int) -> installer._ProcessIdentity | None:
+        if pid == stable.pid and stable in alive_helpers:
+            return stable
+        if pid == replaced.pid:
+            return reused
+        return None
+
+    def signal_pidfd(
+        descriptor: int, signum: int, _info: object, _flags: int
+    ) -> None:
+        target = pidfd_targets[descriptor]
+        signals.append((descriptor, signum, target))
+        if target == stable and signum == installer.signal.SIGKILL:
+            alive_helpers.discard(stable)
+
+    installer._quiesce_predecessor_helpers(
+        authorized_client_uid=os.getuid(),
+        process_lister=list_processes,
+        identity_reader=read_identity,
+        pidfd_opener=lambda pid, _flags: 91 if pid == stable.pid else 92,
+        pidfd_signaler=signal_pidfd,
+        fd_closer=closed.append,
+        sleeper=lambda _seconds: None,
+    )
+
+    assert signals == [
+        (91, installer.signal.SIGTERM, stable),
+        (91, installer.signal.SIGKILL, stable),
+    ]
+    assert all(target != replaced for _, _, target in signals)
+    assert closed == [92, 91]
+    assert observations == [(stable, replaced), (), ()]
+    assert alive_helpers == set()
 
 
 def test_predecessor_quiescence_fails_closed_without_pidfd(

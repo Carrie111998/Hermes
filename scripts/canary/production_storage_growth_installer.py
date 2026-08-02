@@ -833,6 +833,7 @@ def _quiesce_predecessor_helpers(
             continue
         empty_observations = 0
         handles: list[tuple[_ProcessIdentity, int]] = []
+        batch_error: ProductionStorageInstallerError | None = None
         try:
             for identity in identities:
                 try:
@@ -840,35 +841,52 @@ def _quiesce_predecessor_helpers(
                 except ProcessLookupError:
                     continue
                 except OSError:
-                    raise ProductionStorageInstallerError(
-                        "production_storage_predecessor_pidfd_invalid"
-                    ) from None
+                    if batch_error is None:
+                        batch_error = ProductionStorageInstallerError(
+                            "production_storage_predecessor_pidfd_invalid"
+                        )
+                    continue
+                retained = False
                 try:
                     current = identity_reader(identity.pid)
-                    if current != identity:
-                        raise ProductionStorageInstallerError(
-                            "production_storage_predecessor_identity_changed"
-                        )
+                    if current is None or current != identity:
+                        # The numeric PID disappeared or was reused after the
+                        # pidfd was opened.  This descriptor is unconfirmed,
+                        # so never signal it; a fresh discovery pass decides
+                        # whether the replacement is itself an exact helper.
+                        continue
                     _validate_predecessor_identity(
                         current,
                         authorized_client_uid=authorized_client_uid,
                     )
+                    handles.append((identity, descriptor))
+                    retained = True
+                except ProcessLookupError:
+                    continue
+                except ProductionStorageInstallerError as error:
+                    if batch_error is None:
+                        batch_error = error
                 except Exception:
-                    try:
-                        fd_closer(descriptor)
-                    except OSError:
-                        pass
-                    raise
-                handles.append((identity, descriptor))
+                    if batch_error is None:
+                        batch_error = ProductionStorageInstallerError(
+                            "production_storage_predecessor_quiescence_invalid"
+                        )
+                finally:
+                    if not retained:
+                        try:
+                            fd_closer(descriptor)
+                        except OSError:
+                            pass
             for _identity, descriptor in handles:
                 try:
                     signaler(descriptor, signal.SIGTERM, None, 0)
                 except ProcessLookupError:
                     pass
                 except OSError:
-                    raise ProductionStorageInstallerError(
-                        "production_storage_predecessor_pidfd_invalid"
-                    ) from None
+                    if batch_error is None:
+                        batch_error = ProductionStorageInstallerError(
+                            "production_storage_predecessor_pidfd_invalid"
+                        )
             sleeper(0.05)
             for _identity, descriptor in handles:
                 try:
@@ -876,15 +894,18 @@ def _quiesce_predecessor_helpers(
                 except ProcessLookupError:
                     pass
                 except OSError:
-                    raise ProductionStorageInstallerError(
-                        "production_storage_predecessor_pidfd_invalid"
-                    ) from None
+                    if batch_error is None:
+                        batch_error = ProductionStorageInstallerError(
+                            "production_storage_predecessor_pidfd_invalid"
+                        )
         finally:
             for _identity, descriptor in handles:
                 try:
                     fd_closer(descriptor)
                 except OSError:
                     pass
+        if batch_error is not None:
+            raise batch_error
         sleeper(0.05)
     raise ProductionStorageInstallerError(
         "production_storage_predecessor_quiescence_timeout"
