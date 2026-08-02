@@ -79,6 +79,24 @@ def _owner_binding(helper_payload: bytes = b"fixed helper") -> dict:
     )
 
 
+def _predecessor_identity(
+    pid: int,
+    *,
+    start_time_ticks: int = 100,
+) -> installer._ProcessIdentity:
+    return installer._ProcessIdentity(
+        pid=pid,
+        owner_uid=os.getuid(),
+        start_time_ticks=start_time_ticks,
+        executable_device=11,
+        executable_inode=12,
+        argv=(
+            b"/usr/bin/python3",
+            str(installer.OWNER_STATE_HELPER).encode(),
+        ),
+    )
+
+
 def _machine(tmp_path: Path, *, now: int = NOW) -> helper.RootStateMachine:
     tmp_path.chmod(0o700)
     machine = helper.RootStateMachine(
@@ -535,6 +553,140 @@ def test_owner_publish_transaction_restores_all_four_artifacts(
             assert not path.exists()
 
 
+def test_rollback_restores_predecessor_before_sudo_admission(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    helper_path = tmp_path / "helper"
+    sudoers_path = tmp_path / "sudoers"
+    receipt_path = tmp_path / "receipt"
+    public_path = tmp_path / "public"
+    old_payloads = {
+        helper_path: b"old helper",
+        sudoers_path: b"old sudoers\n",
+        receipt_path: b"old receipt\n",
+        public_path: b"old public\n",
+    }
+    modes = {
+        helper_path: 0o555,
+        sudoers_path: 0o440,
+        receipt_path: 0o600,
+        public_path: 0o444,
+    }
+    for path, payload in old_payloads.items():
+        path.write_bytes(payload)
+        path.chmod(modes[path])
+
+    original_write = installer._write_atomic
+    restore_order: list[Path] = []
+    sudo_admitted = threading.Event()
+    observed_at_admission: list[tuple[bytes, bytes]] = []
+
+    def observed_write(path: Path, payload: bytes, **kwargs) -> None:
+        original_write(path, payload, **kwargs)
+        if payload == old_payloads.get(path):
+            restore_order.append(path)
+            if path == sudoers_path:
+                sudo_admitted.set()
+
+    def concurrent_invocation() -> None:
+        if sudo_admitted.wait(timeout=2):
+            observed_at_admission.append((
+                helper_path.read_bytes(), receipt_path.read_bytes()
+            ))
+
+    monkeypatch.setattr(installer, "_write_atomic", observed_write)
+    watcher = threading.Thread(target=concurrent_invocation)
+    watcher.start()
+    lock = installer._acquire_owner_execution_lock(
+        tmp_path, uid=os.getuid(), gid=os.getgid()
+    )
+    try:
+        with pytest.raises(
+            installer.ProductionStorageInstallerError,
+            match="simulated_public_attestation_failure",
+        ):
+            installer._publish_owner_installation_transaction(
+                state_helper_path=helper_path,
+                state_helper_payload=b"new helper",
+                sudoers_path=sudoers_path,
+                sudoers_payload=b"new sudoers\n",
+                receipt_path=receipt_path,
+                receipt_payload=b"new receipt\n",
+                public_readiness_path=public_path,
+                build_public_readiness=lambda: {"schema": "new"},
+                attest_public_readiness=lambda: (_ for _ in ()).throw(
+                    installer.ProductionStorageInstallerError(
+                        "simulated_public_attestation_failure"
+                    )
+                ),
+                quiesce_predecessors=lambda: None,
+                uid=os.getuid(),
+                gid=os.getgid(),
+                sudoers_validator=lambda command, **_kwargs: (
+                    subprocess.CompletedProcess(command, 0, b"", b"")
+                ),
+            )
+    finally:
+        installer._release_owner_execution_lock(lock)
+    watcher.join(timeout=2)
+    assert not watcher.is_alive()
+    assert restore_order == [
+        public_path, receipt_path, helper_path, sudoers_path
+    ]
+    assert observed_at_admission == [(b"old helper", b"old receipt\n")]
+
+
+@pytest.mark.parametrize(
+    ("reader_start_times", "expected_signals"),
+    (
+        ((101,), ()),
+        ((100, 101), ((4242, installer.signal.SIGTERM),)),
+    ),
+)
+def test_predecessor_pid_reuse_fails_closed_before_every_signal(
+    reader_start_times: tuple[int, ...],
+    expected_signals: tuple[tuple[int, int], ...],
+) -> None:
+    discovered = _predecessor_identity(4242, start_time_ticks=100)
+    identities = iter(
+        _predecessor_identity(4242, start_time_ticks=value)
+        for value in reader_start_times
+    )
+    signals: list[tuple[int, int]] = []
+
+    with pytest.raises(
+        installer.ProductionStorageInstallerError,
+        match="production_storage_predecessor_identity_changed",
+    ):
+        installer._quiesce_predecessor_helpers(
+            authorized_client_uid=os.getuid(),
+            process_lister=lambda: (discovered,),
+            identity_reader=lambda _pid: next(identities),
+            terminator=lambda pid, signum: signals.append((pid, signum)),
+            sleeper=lambda _seconds: None,
+        )
+    assert tuple(signals) == expected_signals
+
+
+def test_execution_lock_release_closes_fd_without_leak(tmp_path: Path) -> None:
+    descriptor_root = (
+        Path("/proc/self/fd")
+        if Path("/proc/self/fd").is_dir() else Path("/dev/fd")
+    )
+    before = len(tuple(descriptor_root.iterdir()))
+    for _ in range(32):
+        descriptor = installer._acquire_owner_execution_lock(
+            tmp_path, uid=os.getuid(), gid=os.getgid()
+        )
+        installer._release_owner_execution_lock(descriptor)
+        installer._release_owner_execution_lock(descriptor)
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+    after = len(tuple(descriptor_root.iterdir()))
+    assert after == before
+
+
 def test_successor_quiesces_864c239_predecessor_cached_before_lock(
     tmp_path: Path,
 ) -> None:
@@ -599,6 +751,7 @@ open(continued_path, "w").write(cached_authority)
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
+    predecessor_identity = _predecessor_identity(predecessor.pid)
     public = {"schema": "successor-public"}
 
     def accept(command, **_kwargs):
@@ -628,8 +781,13 @@ open(continued_path, "w").write(cached_authority)
                 installer._quiesce_predecessor_helpers(
                     authorized_client_uid=os.getuid(),
                     process_lister=lambda: (
-                        (predecessor.pid,)
+                        (predecessor_identity,)
                         if predecessor.poll() is None else ()
+                    ),
+                    identity_reader=lambda pid: (
+                        predecessor_identity
+                        if pid == predecessor.pid
+                        and predecessor.poll() is None else None
                     ),
                 )
             ),

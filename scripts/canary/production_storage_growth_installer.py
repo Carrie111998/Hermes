@@ -20,6 +20,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
@@ -637,64 +638,150 @@ def _release_owner_execution_lock(descriptor: int) -> None:
         fcntl.flock(descriptor, fcntl.LOCK_UN)
     except OSError:
         pass
+    try:
+        os.close(descriptor)
+    except OSError:
+        pass
 
 
-def _list_predecessor_helper_processes(
-    *,
-    authorized_client_uid: int,
-) -> tuple[int, ...]:
-    """List only exact in-flight invocations of the fixed root helper."""
+@dataclass(frozen=True)
+class _ProcessIdentity:
+    pid: int
+    owner_uid: int
+    start_time_ticks: int
+    executable_device: int
+    executable_inode: int
+    argv: tuple[bytes, ...]
 
-    proc_root = Path("/proc")
-    if not proc_root.is_dir():
-        raise ProductionStorageInstallerError(
-            "production_storage_predecessor_quiescence_invalid"
-        )
+
+def _exact_predecessor_argv() -> frozenset[tuple[bytes, ...]]:
     helper = str(OWNER_STATE_HELPER).encode()
-    exact_argv = {
+    return frozenset({
         (helper,),
         (b"/usr/bin/python3", helper),
         (
             b"/usr/bin/sudo", b"--non-interactive", b"--", helper,
         ),
         (b"sudo", b"--non-interactive", b"--", helper),
-    }
-    found: list[int] = []
+    })
+
+
+def _read_process_identity(pid: int) -> _ProcessIdentity | None:
+    if type(pid) is not int or pid <= 1:
+        raise ProductionStorageInstallerError(
+            "production_storage_predecessor_quiescence_invalid"
+        )
+    entry = Path("/proc") / str(pid)
     try:
-        entries = tuple(proc_root.iterdir())
+        owner_uid = entry.stat().st_uid
+        cmdline = (entry / "cmdline").read_bytes()
+        raw_stat = (entry / "stat").read_bytes()
+        executable = (entry / "exe").stat()
+    except FileNotFoundError:
+        return None
     except OSError:
         raise ProductionStorageInstallerError(
             "production_storage_predecessor_quiescence_invalid"
         ) from None
-    for entry in entries:
-        if not entry.name.isascii() or not entry.name.isdigit():
+    try:
+        stat_tail = raw_stat.rsplit(b") ", 1)[1].split()
+        start_time_ticks = int(stat_tail[19])
+    except (IndexError, ValueError):
+        raise ProductionStorageInstallerError(
+            "production_storage_predecessor_quiescence_invalid"
+        ) from None
+    argv = tuple(part for part in cmdline.split(b"\0") if part)
+    if (
+        len(cmdline) > 64 * 1024
+        or len(raw_stat) > 64 * 1024
+        or start_time_ticks <= 0
+        or not stat.S_ISREG(executable.st_mode)
+        or executable.st_ino <= 0
+    ):
+        raise ProductionStorageInstallerError(
+            "production_storage_predecessor_quiescence_invalid"
+        )
+    return _ProcessIdentity(
+        pid=pid,
+        owner_uid=owner_uid,
+        start_time_ticks=start_time_ticks,
+        executable_device=executable.st_dev,
+        executable_inode=executable.st_ino,
+        argv=argv,
+    )
+
+
+def _validate_predecessor_identity(
+    identity: _ProcessIdentity,
+    *,
+    authorized_client_uid: int,
+) -> _ProcessIdentity:
+    if (
+        not isinstance(identity, _ProcessIdentity)
+        or type(identity.pid) is not int
+        or identity.pid <= 1
+        or type(identity.owner_uid) is not int
+        or identity.owner_uid < 0
+        or type(identity.start_time_ticks) is not int
+        or identity.start_time_ticks <= 0
+        or type(identity.executable_device) is not int
+        or identity.executable_device < 0
+        or type(identity.executable_inode) is not int
+        or identity.executable_inode <= 0
+        or not isinstance(identity.argv, tuple)
+        or any(not isinstance(part, bytes) or not part for part in identity.argv)
+        or identity.pid == os.getpid()
+        or identity.owner_uid not in {0, authorized_client_uid}
+        or identity.argv not in _exact_predecessor_argv()
+    ):
+        raise ProductionStorageInstallerError(
+            "production_storage_predecessor_quiescence_invalid"
+        )
+    return identity
+
+
+def _list_predecessor_helper_processes(
+    *,
+    authorized_client_uid: int,
+) -> tuple[_ProcessIdentity, ...]:
+    """List only stable identities of exact fixed-helper invocations."""
+
+    proc_root = Path("/proc")
+    if not proc_root.is_dir():
+        raise ProductionStorageInstallerError(
+            "production_storage_predecessor_quiescence_invalid"
+        )
+    try:
+        pids = tuple(
+            int(entry.name)
+            for entry in proc_root.iterdir()
+            if entry.name.isascii() and entry.name.isdigit()
+            and int(entry.name) > 1
+            and int(entry.name) != os.getpid()
+        )
+    except OSError:
+        raise ProductionStorageInstallerError(
+            "production_storage_predecessor_quiescence_invalid"
+        ) from None
+    found: list[_ProcessIdentity] = []
+    exact_argv = _exact_predecessor_argv()
+    for pid in pids:
+        identity = _read_process_identity(pid)
+        if identity is None or identity.argv not in exact_argv:
             continue
-        pid = int(entry.name)
-        if pid == os.getpid():
-            continue
-        try:
-            owner_uid = entry.stat().st_uid
-            raw = (entry / "cmdline").read_bytes()
-        except FileNotFoundError:
-            continue
-        except OSError:
-            raise ProductionStorageInstallerError(
-                "production_storage_predecessor_quiescence_invalid"
-            ) from None
-        argv = tuple(part for part in raw.split(b"\0") if part)
-        if argv in exact_argv:
-            if owner_uid not in {0, authorized_client_uid}:
-                raise ProductionStorageInstallerError(
-                    "production_storage_predecessor_quiescence_invalid"
-                )
-            found.append(pid)
-    return tuple(sorted(found))
+        found.append(_validate_predecessor_identity(
+            identity, authorized_client_uid=authorized_client_uid
+        ))
+    return tuple(sorted(found, key=lambda item: item.pid))
 
 
 def _quiesce_predecessor_helpers(
     *,
     authorized_client_uid: int,
-    process_lister: Callable[[], Sequence[int]] | None = None,
+    process_lister: Callable[[], Sequence[_ProcessIdentity]] | None = None,
+    identity_reader: Callable[[int], _ProcessIdentity | None] = (
+        _read_process_identity
+    ),
     terminator: Callable[[int, int], None] = os.kill,
     monotonic: Callable[[], float] = time.monotonic,
     sleeper: Callable[[float], None] = time.sleep,
@@ -710,42 +797,74 @@ def _quiesce_predecessor_helpers(
     empty_observations = 0
     while monotonic() < deadline:
         try:
-            pids = tuple(sorted(set(lister())))
+            identities = tuple(
+                sorted(set(lister()), key=lambda item: item.pid)
+            )
         except ProductionStorageInstallerError:
             raise
         except Exception:
             raise ProductionStorageInstallerError(
                 "production_storage_predecessor_quiescence_invalid"
             ) from None
-        if any(type(pid) is not int or pid <= 1 for pid in pids):
+        identities = tuple(
+            _validate_predecessor_identity(
+                identity,
+                authorized_client_uid=authorized_client_uid,
+            )
+            for identity in identities
+        )
+        if len({identity.pid for identity in identities}) != len(identities):
             raise ProductionStorageInstallerError(
                 "production_storage_predecessor_quiescence_invalid"
             )
-        if not pids:
+        if not identities:
             empty_observations += 1
             if empty_observations >= 2:
                 return
             sleeper(0.05)
             continue
         empty_observations = 0
-        for pid in pids:
+        for identity in identities:
             try:
-                terminator(pid, signal.SIGTERM)
+                current = identity_reader(identity.pid)
+                if current is None:
+                    continue
+                if current != identity:
+                    raise ProductionStorageInstallerError(
+                        "production_storage_predecessor_identity_changed"
+                    )
+                _validate_predecessor_identity(
+                    current,
+                    authorized_client_uid=authorized_client_uid,
+                )
+                terminator(identity.pid, signal.SIGTERM)
             except ProcessLookupError:
                 pass
+            except ProductionStorageInstallerError:
+                raise
             except OSError:
                 raise ProductionStorageInstallerError(
                     "production_storage_predecessor_quiescence_invalid"
                 ) from None
         sleeper(0.05)
-        survivors = set(lister())
-        for pid in pids:
-            if pid not in survivors:
+        for identity in identities:
+            current = identity_reader(identity.pid)
+            if current is None:
                 continue
+            if current != identity:
+                raise ProductionStorageInstallerError(
+                    "production_storage_predecessor_identity_changed"
+                )
             try:
-                terminator(pid, signal.SIGKILL)
+                _validate_predecessor_identity(
+                    current,
+                    authorized_client_uid=authorized_client_uid,
+                )
+                terminator(identity.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
+            except ProductionStorageInstallerError:
+                raise
             except OSError:
                 raise ProductionStorageInstallerError(
                     "production_storage_predecessor_quiescence_invalid"
@@ -754,10 +873,6 @@ def _quiesce_predecessor_helpers(
     raise ProductionStorageInstallerError(
         "production_storage_predecessor_quiescence_timeout"
     )
-    try:
-        os.close(descriptor)
-    except OSError:
-        pass
 
 
 def _remove_new_fixed_file(
@@ -786,11 +901,25 @@ def _remove_new_fixed_file(
 def _rollback_owner_installation(
     snapshots: Sequence[tuple[Path, int, bytes | None]],
     *,
+    sudoers_path: Path,
     uid: int,
     gid: int,
 ) -> None:
+    sudoers_snapshot = tuple(
+        item for item in snapshots if item[0] == sudoers_path
+    )
+    non_sudoers = tuple(
+        item for item in snapshots if item[0] != sudoers_path
+    )
+    if len(sudoers_snapshot) != 1:
+        raise ProductionStorageInstallerError(
+            "production_storage_owner_install_rollback_failed"
+        )
     try:
-        for path, mode, payload in reversed(snapshots):
+        for path, mode, payload in (
+            *reversed(non_sudoers),
+            sudoers_snapshot[0],
+        ):
             if payload is None:
                 if path.exists():
                     _remove_new_fixed_file(
@@ -882,7 +1011,12 @@ def _publish_owner_installation_transaction(
         )
         return public
     except Exception as error:
-        _rollback_owner_installation(snapshots, uid=uid, gid=gid)
+        _rollback_owner_installation(
+            snapshots,
+            sudoers_path=sudoers_path,
+            uid=uid,
+            gid=gid,
+        )
         if isinstance(error, ProductionStorageInstallerError):
             raise
         raise ProductionStorageInstallerError(
