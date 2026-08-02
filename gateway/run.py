@@ -5673,6 +5673,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # HANDLER that doesn't shadow a local hermes command.
     # (Phase 2.6: dispatcher-unique commands only; /status,
     # /health, /help stay hermes-local to avoid behavior drift.)
+    #
+    # NOTE: config.yaml dispatcher.commands REPLACES this set
+    # entirely (not additive).  An empty list disables forwarding.
+    # Omit the key to use these defaults.
     _DISPATCHER_FORWARD_COMMANDS: frozenset[str] = frozenset({
         "echo", "research", "forge", "ashare", "replay", "log",
     })
@@ -5983,7 +5987,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 socket_path=_disp_socket,
             )
             _disp_cmds = getattr(self.config, "dispatcher_commands", None)
-            if _disp_cmds and isinstance(_disp_cmds, list):
+            # Explicit empty list disables forwarding; None uses defaults.
+            if _disp_cmds is not None and isinstance(_disp_cmds, list):
                 self._DISPATCHER_FORWARD_COMMANDS = frozenset(_disp_cmds)
 
         # Track running agents per session for interrupt support
@@ -15717,16 +15722,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Return the lazy-initialized dispatcher client. Creates
         one on first call from the configured socket path. Always
         returns the same instance for the lifetime of this
-        GatewayRunner."""
+        GatewayRunner. Falls back to HERMES_DISPATCHER_SOCKET env
+        var or compiled default when dispatcher_socket is not set."""
         if self._dispatcher_client is None:
             _disp_socket = getattr(self.config, "dispatcher_socket", None)
-            if not _disp_socket:
-                raise DispatcherConnectionError(
-                    "dispatcher not configured: set dispatcher.socket "
-                    "in config.yaml"
-                )
+            # Pass socket_path to DispatcherClient. When None,
+            # DispatcherClient falls back to HERMES_DISPATCHER_SOCKET
+            # env var or DEFAULT_DISPATCHER_SOCKET.
             self._dispatcher_client = DispatcherClient(
-                socket_path=_disp_socket,
+                socket_path=_disp_socket or None,
             )
         return self._dispatcher_client
 

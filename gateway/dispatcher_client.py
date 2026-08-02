@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from typing import Optional
 
 from .dispatcher_protocol import (
@@ -70,11 +71,16 @@ class DispatcherClient:
 
     def __init__(
         self,
-        socket_path: str,
+        socket_path: Optional[str] = None,
         timeout_s: float = DEFAULT_DISPATCHER_TIMEOUT_S,
         max_retries: int = DEFAULT_MAX_RETRIES,
     ) -> None:
-        self._path = socket_path
+        # Priority: explicit arg > env var > default constant.
+        self._path = (
+            socket_path
+            or os.environ.get("HERMES_DISPATCHER_SOCKET")
+            or DEFAULT_DISPATCHER_SOCKET
+        )
         self._timeout_s = timeout_s
         self._max_retries = max_retries
         # Lazy: opened on first dispatch() call.
