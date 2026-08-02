@@ -3797,6 +3797,44 @@ class GatewaySlashCommandsMixin:
                 example = t("gateway.footer.example_line", preview=preview)
         return t("gateway.footer.saved", state=state, example=example)
 
+    async def _handle_speculative_command(self, event: MessageEvent) -> str:
+        """Report or change speculative compression on the session agent."""
+        args = (event.get_command_args() or "").strip().lower()
+        if args not in {"", "on", "off"}:
+            return "Usage: /speculative [on|off]"
+
+        from gateway.run import _AGENT_PENDING_SENTINEL
+
+        session_key = self._session_key_for_source(event.source)
+        running = getattr(self, "_running_agents", {}) or {}
+        agent = running.get(session_key) if hasattr(running, "get") else None
+        if agent is _AGENT_PENDING_SENTINEL:
+            agent = None
+        if agent is None:
+            cache_lock = getattr(self, "_agent_cache_lock", None)
+            cache = getattr(self, "_agent_cache", None)
+            if cache_lock is not None and cache is not None:
+                try:
+                    with cache_lock:
+                        cached = cache.get(session_key)
+                    if cached:
+                        agent = cached[0] if isinstance(cached, tuple) else cached
+                except Exception:
+                    agent = None
+
+        if args and agent is not None:
+            try:
+                from agent.speculative_compression import configure_speculative_compression
+
+                configure_speculative_compression(agent, args == "on")
+            except Exception as exc:
+                logger.debug("speculative compression switch failed", exc_info=True)
+                return f"Speculative compression switch failed: {exc}"
+
+        from agent.speculative_compression import speculative_compression_status
+
+        return speculative_compression_status(agent)
+
     async def _handle_compress_command(self, event: MessageEvent) -> str:
         """Profile-scoping wrapper around manual /compress.
 

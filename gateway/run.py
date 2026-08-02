@@ -14017,6 +14017,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "profile": self._handle_profile_command,
                 "update": self._handle_update_command,
                 "version": self._handle_version_command,
+                "speculative": self._handle_speculative_command,
             }.get(name)
             if plain is not None:
                 return await plain(event)
@@ -15051,6 +15052,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "footer":
             return await self._handle_footer_command(event)
+
+        if canonical == "speculative":
+            return await self._handle_speculative_command(event)
 
         if canonical == "yolo":
             return await self._handle_yolo_command(event)
@@ -22223,6 +22227,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         ("model", "context_length"),
         ("model", "max_tokens"),
         ("compression", "enabled"),
+        ("compression", "speculative"),
         ("compression", "progress_notices"),
         ("compression", "threshold"),
         ("compression", "model_thresholds"),

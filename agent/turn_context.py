@@ -136,6 +136,13 @@ def _try_install_speculative_candidate(
                 "compaction fallback.",
             )
         return messages, None, False, force_sync
+    # The slash-command kill switch may have fired while the bounded candidate
+    # claim was waiting.  Do not let a candidate claimed before the switch cross
+    # into the install path; put it back so the next enable can reuse it.
+    if not getattr(agent, "speculative_compression_enabled", False):
+        setattr(agent, "_speculative_install_status", "rejected")
+        _restore_speculative_candidate(agent, candidate)
+        return messages, None, False, force_sync
     _emit_speculative_status(
         agent,
         "active",

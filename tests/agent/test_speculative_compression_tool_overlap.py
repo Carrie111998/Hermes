@@ -30,6 +30,7 @@ class Manager:
     def __init__(self, candidate=None):
         self.candidate = candidate
         self.calls = []
+        self.restored = []
 
     def maybe_start(self, session_id, snapshot, factory, **kwargs):
         self.calls.append((session_id, snapshot, factory, kwargs))
@@ -38,6 +39,9 @@ class Manager:
     def take_matching_candidate(self, session_id, messages, **kwargs):
         self.calls.append((session_id, messages, kwargs))
         return self.candidate
+
+    def restore_candidate(self, session_id, candidate):
+        self.restored.append((session_id, candidate))
 
 
 def _agent(manager):
@@ -102,6 +106,36 @@ def test_candidate_commit_rejection_falls_back_without_installing(monkeypatch):
     messages = [{"role": "user", "content": "current"}]
     result = _try_install_speculative_candidate(agent, messages, "sys", 900, "task-1")
     assert result == (messages, None, False, True)
+
+
+def test_candidate_taken_before_off_is_restored_without_installing(monkeypatch):
+    class ReadyCandidate:
+        def is_expired(self, _max_age):
+            return False
+
+    manager = Manager(ReadyCandidate())
+    agent = _agent(manager)
+
+    def take_and_disable(*args, **kwargs):
+        candidate = Manager.take_matching_candidate(manager, *args, **kwargs)
+        agent.speculative_compression_enabled = False
+        return candidate
+
+    manager.take_matching_candidate = take_and_disable
+    agent._compress_context = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        AssertionError("disabled candidate must not reach the install path")
+    )
+    monkeypatch.setattr(
+        "agent.speculative_compression.is_builtin_compression_eligible",
+        lambda **_kwargs: True,
+    )
+    messages = [{"role": "user", "content": "current"}]
+
+    result = _try_install_speculative_candidate(agent, messages, "sys", 900, "task-1")
+
+    assert result == (messages, None, False, True)
+    assert manager.restored == [("session-1", manager.candidate)]
+    assert agent._speculative_install_status != "installed"
 
 
 def test_anti_thrash_ineffective_still_installs_ready_candidate(monkeypatch):

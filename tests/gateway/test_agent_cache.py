@@ -89,6 +89,39 @@ class TestAgentConfigSignature:
         )
         assert sig1 != sig2
 
+    def test_speculative_enabled_change_rebuilds_once_then_reuses(self):
+        """A speculative config edit rebuilds the cached agent exactly once."""
+        from gateway.run import GatewayRunner
+
+        runtime = {"api_key": "k", "base_url": "u", "provider": "p"}
+        session_key = "telegram:12345"
+        cache = {}
+        created = []
+
+        def cached_agent(user_config):
+            cache_keys = GatewayRunner._extract_cache_busting_config(user_config)
+            signature = GatewayRunner._agent_config_signature(
+                "m", runtime, [], "", cache_keys=cache_keys,
+            )
+            cached = cache.get(session_key)
+            if cached is not None and cached[1] == signature:
+                return cached[0]
+            agent = object()
+            created.append(agent)
+            cache[session_key] = (agent, signature)
+            return agent
+
+        disabled = {"compression": {"speculative": {"enabled": False}}}
+        enabled = {"compression": {"speculative": {"enabled": True}}}
+
+        first = cached_agent(disabled)
+        rebuilt = cached_agent(enabled)
+        reused = cached_agent(enabled)
+
+        assert first is not rebuilt
+        assert rebuilt is reused
+        assert len(created) == 2
+
 
     def test_cache_keys_key_order_does_not_matter(self):
         """Signature must be stable regardless of dict key insertion order."""
@@ -123,6 +156,7 @@ class TestExtractCacheBustingConfig:
                     "target_ratio": 0.3,
                     "protect_last_n": 25,
                     "codex_app_server_auto": "hermes",
+                    "speculative": {"enabled": False},
                     "some_other_key": "ignored",
                 }
             }
@@ -133,6 +167,7 @@ class TestExtractCacheBustingConfig:
         assert out["compression.target_ratio"] == 0.3
         assert out["compression.protect_last_n"] == 25
         assert out["compression.codex_app_server_auto"] == "hermes"
+        assert out["compression.speculative"] == {"enabled": False}
 
 
     def test_missing_keys_yield_none(self):
@@ -1061,4 +1096,3 @@ class TestCrossProcessInvalidationDefersCleanup:
         # Stale entry was popped, hard-teardown path never used.
         assert "telegram:s1" not in runner._agent_cache
         runner._cleanup_agent_resources.assert_not_called()
-

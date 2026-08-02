@@ -2205,6 +2205,12 @@ def compress_context(
     )
 
     if speculative_candidate is not None:
+        if not getattr(agent, "speculative_compression_enabled", False):
+            agent._speculative_install_status = "rejected"
+            existing_prompt = getattr(agent, "_cached_system_prompt", None)
+            if not existing_prompt:
+                existing_prompt = agent._build_system_prompt(system_message)
+            return messages, existing_prompt
         try:
             from agent.speculative_compression import is_builtin_compression_eligible
 

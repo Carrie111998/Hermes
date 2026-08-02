@@ -9920,6 +9920,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self.show_toolsets()
         elif canonical == "config":
             self.show_config()
+        elif canonical == "speculative":
+            self._handle_speculative_command(cmd_original)
         elif canonical == "redraw":
             # Manual recovery for terminal buffer drift from multiplexer
             # tab switches, subshell ``clear``, SSH window restores, etc.
@@ -10815,6 +10817,29 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     logging.debug("goal continuation enqueue failed: %s", exc)
 
 
+
+    def _handle_speculative_command(self, cmd_original: str = "") -> None:
+        """Report or change speculative compression for the live CLI agent."""
+        parts = cmd_original.split(None, 1)
+        raw_arg = parts[1].strip().lower() if len(parts) > 1 else ""
+        if raw_arg not in {"", "on", "off"}:
+            _cprint("  Usage: /speculative [on|off]")
+            return
+
+        agent = getattr(self, "agent", None)
+        if raw_arg and agent is not None:
+            try:
+                from agent.speculative_compression import configure_speculative_compression
+
+                configure_speculative_compression(agent, raw_arg == "on")
+            except Exception as exc:
+                logging.debug("speculative compression switch failed", exc_info=True)
+                _cprint(f"  Speculative compression switch failed: {exc}")
+                return
+
+        from agent.speculative_compression import speculative_compression_status
+
+        _cprint(f"  {speculative_compression_status(agent)}")
 
     def _toggle_verbose(self):
         """Cycle tool progress mode: off → new → all → verbose → off.

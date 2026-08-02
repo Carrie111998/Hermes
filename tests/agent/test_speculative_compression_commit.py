@@ -28,6 +28,7 @@ def _agent_with_candidate_db(tmp_path):
     agent.speculative_compression_settings = SpeculativeCompressionSettings(
         enabled=True
     )
+    agent.speculative_compression_enabled = True
     agent._emit_status = lambda *_args, **_kwargs: None
     agent._emit_warning = lambda *_args, **_kwargs: None
     return agent, db, session_id
@@ -79,6 +80,23 @@ def test_candidate_uses_existing_lock_and_commits_atomically(tmp_path):
     assert agent._speculative_install_status == "installed"
     assert compressed[0]["content"] == "prepared summary"
     assert compressed[1:] == messages[1:]
+    assert db.get_compression_lock_holder(session_id) is None
+
+
+def test_disabled_candidate_is_rejected_before_compression(tmp_path):
+    agent, db, session_id = _agent_with_candidate_db(tmp_path)
+    agent.speculative_compression_enabled = False
+    messages = _messages()
+
+    returned, _prompt = agent._compress_context(
+        messages,
+        "sys",
+        approx_tokens=100,
+        speculative_candidate=_candidate(messages, session_id),
+    )
+
+    assert agent._speculative_install_status == "rejected"
+    assert returned == messages
     assert db.get_compression_lock_holder(session_id) is None
 
 

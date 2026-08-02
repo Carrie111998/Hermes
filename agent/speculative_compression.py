@@ -197,6 +197,98 @@ def is_builtin_compression_eligible(
         return False
 
 
+def configure_speculative_compression(agent: Any, enabled: bool) -> bool:
+    """Apply the runtime speculative-compression switch to *agent*.
+
+    Enabling mirrors the construction-time wiring: normalize the current
+    ``compression.speculative`` settings, require ordinary compression and
+    built-in-compressor eligibility, then attach the process manager.  The
+    slash-command switch is intentionally session-local; it does not write
+    config.yaml.
+    """
+
+    manager = getattr(agent, "_speculative_compression_manager", None)
+    if not enabled:
+        # Clear the flag before cancelling work so a racing foreground or
+        # tool-wait path cannot start more speculative work during invalidation.
+        setattr(agent, "speculative_compression_enabled", False)
+        invalidate = getattr(manager, "invalidate_session", None)
+        if callable(invalidate):
+            try:
+                invalidate(str(getattr(agent, "session_id", "") or ""))
+            except Exception:
+                logger.debug(
+                    "speculative compression invalidation failed for session=%s",
+                    getattr(agent, "session_id", ""),
+                    exc_info=True,
+                )
+        return False
+
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        config = load_config_readonly()
+    except Exception:
+        config = {}
+    compression = config.get("compression", {}) if isinstance(config, Mapping) else {}
+    raw_settings = compression.get("speculative", {}) if isinstance(compression, Mapping) else {}
+    raw_settings = dict(raw_settings) if isinstance(raw_settings, Mapping) else {}
+    # A runtime ``/speculative on`` is an explicit session override.  Keep all
+    # configured thresholds/gates, but do not require the persisted opt-in bit
+    # to be true for this session.
+    raw_settings["enabled"] = True
+    settings = normalize_speculative_compression_settings(raw_settings)
+    setattr(agent, "speculative_compression_settings", settings)
+
+    eligible = bool(
+        getattr(agent, "compression_enabled", False)
+        and settings.enabled
+        and is_builtin_compression_eligible(
+            api_mode=getattr(agent, "api_mode", None),
+            context_engine=getattr(agent, "context_compressor", None),
+        )
+    )
+    setattr(agent, "speculative_compression_enabled", eligible)
+    if eligible:
+        try:
+            setattr(agent, "_speculative_compression_manager", get_default_manager())
+        except Exception:
+            setattr(agent, "speculative_compression_enabled", False)
+            setattr(agent, "_speculative_compression_manager", None)
+    else:
+        setattr(agent, "_speculative_compression_manager", None)
+    return bool(getattr(agent, "speculative_compression_enabled", False))
+
+
+def speculative_compression_status(agent: Any) -> str:
+    """Return the authoritative operator-facing runtime switch state."""
+
+    if agent is None:
+        return (
+            "Speculative compression: enabled=False; eligible=False "
+            "(api_mode=uninitialized, context_engine=uninitialized); "
+            "install_status=uninitialized"
+        )
+    api_mode = str(getattr(agent, "api_mode", None) or "unknown")
+    context_engine = getattr(agent, "context_compressor", None)
+    engine_name = type(context_engine).__name__ if context_engine is not None else "none"
+    try:
+        eligible = is_builtin_compression_eligible(
+            api_mode=api_mode,
+            context_engine=context_engine,
+        )
+    except Exception:
+        eligible = False
+    install_status = getattr(agent, "_speculative_install_status", None)
+    if not isinstance(install_status, str) or not install_status:
+        install_status = "none"
+    return (
+        f"Speculative compression: enabled={bool(getattr(agent, 'speculative_compression_enabled', False))}; "
+        f"eligible={bool(eligible)} (api_mode={api_mode}, context_engine={engine_name}); "
+        f"install_status={install_status}"
+    )
+
+
 def _canonical_value(value: Any, *, top_level: bool = False) -> Any:
     if isinstance(value, Mapping):
         return {
@@ -1141,11 +1233,13 @@ __all__ = [
     "build_candidate",
     "capture_snapshot",
     "clone_builtin_compressor",
+    "configure_speculative_compression",
     "fingerprint_messages",
     "get_default_manager",
     "is_builtin_compression_eligible",
     "normalize_speculative_compression_settings",
     "schedule_tool_wait_candidate",
+    "speculative_compression_status",
     "shutdown_default_manager",
     "speculative_thresholds",
 ]
