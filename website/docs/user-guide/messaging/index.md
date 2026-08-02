@@ -162,6 +162,32 @@ hermes gateway status       # Check default service status
 hermes gateway status --system         # Linux only: inspect the system service explicitly
 ```
 
+### Optional Linux systemd scope
+
+When one machine hosts multiple Hermes roots that use the same profile name, set a
+unique `gateway.systemd_scope` in each root's `config.yaml`:
+
+```yaml title="~/.hermes/config.yaml"
+gateway:
+  systemd_scope: team_a
+```
+
+The value must be 1–128 characters, start with a lowercase letter or digit, and
+contain only lowercase letters, digits, `_`, or `-`. Hermes uses it
+deterministically in the user-service name:
+`hermes-gateway-<scope>[-<profile>]`. An omitted or `null` scope preserves the
+existing service name, and the setting is read from YAML configuration only.
+
+Scoped services are supported only as systemd user services. A scoped
+`--system` installation is rejected. Before writing, controlling, or removing an
+existing scoped unit, Hermes verifies that its persisted `HERMES_HOME` resolves to
+the active root. If another root owns the unit, the operation is refused without
+changing it, preventing cross-root collisions.
+
+To change an installed scope, first restore the old scope and run
+`hermes gateway uninstall`, then set the new scope and run
+`hermes gateway install`.
+
 ### Optional Linux event-loop watchdog
 
 A systemd-managed gateway can opt into process recovery when Python's asyncio

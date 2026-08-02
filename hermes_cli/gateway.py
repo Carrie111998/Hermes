@@ -8,6 +8,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -94,8 +95,8 @@ class ProfileGatewayProcess:
     pid: int
 
 
-def _get_service_pids() -> set:
-    """Return PIDs currently managed by systemd or launchd gateway services.
+def _discover_service_pids() -> tuple[set, bool]:
+    """Return service-managed gateway PIDs and whether discovery was complete.
 
     Used to avoid killing freshly-restarted service processes when sweeping
     for stale manual gateway processes after a service restart.  Relies on the
@@ -103,6 +104,7 @@ def _get_service_pids() -> set:
     returns (true for both systemd and launchd in practice).
     """
     pids: set = set()
+    complete = True
 
     # --- systemd (Linux): user and system scopes ---
     if supports_systemd_services():
@@ -121,9 +123,13 @@ def _get_service_pids() -> set:
                     text=True, encoding='utf-8', errors='replace',
                     timeout=5,
                 )
+                if result.returncode != 0:
+                    complete = False
+                    continue
                 for line in result.stdout.strip().splitlines():
                     parts = line.split()
                     if not parts or not parts[0].endswith(".service"):
+                        complete = False
                         continue
                     svc = parts[0]
                     try:
@@ -133,13 +139,16 @@ def _get_service_pids() -> set:
                             text=True, encoding='utf-8', errors='replace',
                             timeout=5,
                         )
+                        if show.returncode != 0:
+                            complete = False
+                            continue
                         pid = int(show.stdout.strip())
                         if pid > 0:
                             pids.add(pid)
                     except (ValueError, subprocess.TimeoutExpired):
-                        pass
+                        complete = False
             except (FileNotFoundError, subprocess.TimeoutExpired):
-                pass
+                complete = False
 
     # --- launchd (macOS) ---
     if is_macos():
@@ -152,25 +161,45 @@ def _get_service_pids() -> set:
                 timeout=5,
             )
             if result.returncode == 0:
-                # Try plist format first (macOS 26+): "PID" = <N>;
-                pid = _parse_launchd_pid_from_list_output(result.stdout)
-                if pid is not None and pid > 0:
-                    pids.add(pid)
+                output = result.stdout.strip()
+                if not output:
+                    complete = False
                 else:
-                    # Fall back to legacy tab-separated format:
-                    # "PID\tStatus\tLabel"
-                    for line in result.stdout.strip().splitlines():
-                        parts = line.split()
-                        if len(parts) >= 3 and parts[2] == label:
-                            try:
-                                pid = int(parts[0])
-                                if pid > 0:
-                                    pids.add(pid)
-                            except ValueError:
-                                pass
+                    # Try plist format first (macOS 26+): "PID" = <N>;
+                    pid = _parse_launchd_pid_from_list_output(output)
+                    if pid is not None and pid > 0:
+                        pids.add(pid)
+                    else:
+                        # Fall back to legacy tab-separated format:
+                        # "PID\tStatus\tLabel"
+                        matched_label = False
+                        for line in output.splitlines():
+                            parts = line.split()
+                            if len(parts) >= 3 and parts[2] == label:
+                                matched_label = True
+                                try:
+                                    pid = int(parts[0])
+                                    if pid > 0:
+                                        pids.add(pid)
+                                except ValueError:
+                                    if parts[0] != "-":
+                                        complete = False
+                        if (
+                            not matched_label
+                            and f'"Label" = "{label}"' not in output
+                        ):
+                            complete = False
+            elif result.returncode not in (3, 113):
+                complete = False
         except (FileNotFoundError, subprocess.TimeoutExpired):
-            pass
+            complete = False
 
+    return pids, complete
+
+
+def _get_service_pids() -> set:
+    """Return the service-managed PIDs found by the best-effort discovery view."""
+    pids, _ = _discover_service_pids()
     return pids
 
 
@@ -588,7 +617,9 @@ def _filter_venv_launcher_stubs(pids: list[int]) -> list[int]:
 
 
 def find_gateway_pids(
-    exclude_pids: set | None = None, all_profiles: bool = False
+    exclude_pids: set | None = None,
+    all_profiles: bool = False,
+    known_service_pids: set | None = None,
 ) -> list:
     """Find PIDs of running gateway processes.
 
@@ -600,6 +631,8 @@ def find_gateway_pids(
             needs this because a code update affects every profile.
             When ``False`` (default), only PIDs belonging to the current
             Hermes profile are returned.
+        known_service_pids: A complete service-manager snapshot already
+            collected by the caller, avoiding a redundant discovery probe.
     """
     _exclude = set(exclude_pids or set())
     pids: list[int] = []
@@ -610,7 +643,10 @@ def find_gateway_pids(
             _append_unique_pid(pids, get_running_pid(), _exclude)
         except Exception:
             pass
-    for pid in _get_service_pids():
+    service_pids = (
+        _get_service_pids() if known_service_pids is None else known_service_pids
+    )
+    for pid in service_pids or ():
         _append_unique_pid(pids, pid, _exclude)
     try:
         include_restart_managers = not supports_systemd_services()
@@ -982,6 +1018,47 @@ def _hermes_home_from_systemd_unit_file(system: bool = False) -> str | None:
             value = body.split("=", 1)[1].strip().strip('"')
             return value or None
     return None
+
+
+def _assert_scoped_systemd_unit_owner(system: bool = False) -> None:
+    """Return unless a scoped unit exists and its persisted home mismatches."""
+    if _resolve_systemd_scope() is None:
+        return
+
+    unit_path = get_systemd_unit_path(system=system)
+    if not unit_path.exists() and not unit_path.is_symlink():
+        return
+
+    persisted_home = _hermes_home_from_systemd_unit_file(system=system)
+    active_home = Path(get_hermes_home()).resolve()
+    if not persisted_home:
+        raise ScopedSystemdUnitOwnershipError(
+            f"Refusing to use scoped gateway unit {unit_path}: it has no "
+            "persisted HERMES_HOME. Uninstall the old unit before changing "
+            "gateway.systemd_scope."
+        )
+
+    try:
+        persisted_path = Path(persisted_home).expanduser().resolve()
+    except (OSError, ValueError):
+        persisted_path = None
+    if persisted_path != active_home:
+        raise ScopedSystemdUnitOwnershipError(
+            f"Refusing to use scoped gateway unit {unit_path}: its persisted "
+            f"HERMES_HOME ({persisted_home}) does not match the active home "
+            f"({active_home}). Uninstall the old unit before changing "
+            "gateway.systemd_scope."
+        )
+
+
+def _assert_scoped_systemd_user_scope(
+    system: bool, scope: str | None = None
+) -> None:
+    if system and (scope if scope is not None else _resolve_systemd_scope()) is not None:
+        raise ScopedSystemdRequiresUserError(
+            "gateway.systemd_scope is supported only with user-systemd services. "
+            "Remove the setting before using --system, or use a user service."
+        )
 
 
 def _sync_hermes_home_from_systemd_unit(system: bool) -> None:
@@ -1475,7 +1552,10 @@ def _gateway_list() -> None:
 
 
 def kill_gateway_processes(
-    force: bool = False, exclude_pids: set | None = None, all_profiles: bool = False
+    force: bool = False,
+    exclude_pids: set | None = None,
+    all_profiles: bool = False,
+    standalone_only: bool = False,
 ) -> int:
     """Kill any running gateway processes. Returns count killed.
 
@@ -1485,11 +1565,38 @@ def kill_gateway_processes(
             restarted and should not be killed).
         all_profiles: When ``True``, kill across all profiles.  Passed
             through to :func:`find_gateway_pids`.
+        standalone_only: Exclude service-managed PIDs and require complete
+            discovery snapshots before scanning and terminating candidates.
     """
-    pids = find_gateway_pids(exclude_pids=exclude_pids, all_profiles=all_profiles)
+    protected_service_pids: set = set()
+    if standalone_only:
+        service_pids, complete = _discover_service_pids()
+        if not complete:
+            return 0
+        protected_service_pids.update(service_pids)
+        exclude_pids = set(exclude_pids or set()) | service_pids
+    if standalone_only:
+        pids = find_gateway_pids(
+            exclude_pids=exclude_pids,
+            all_profiles=all_profiles,
+            known_service_pids=service_pids,
+        )
+    else:
+        pids = find_gateway_pids(
+            exclude_pids=exclude_pids,
+            all_profiles=all_profiles,
+        )
     killed = 0
 
+    if standalone_only:
+        service_pids, complete = _discover_service_pids()
+        if not complete:
+            return 0
+        protected_service_pids.update(service_pids)
+
     for pid in pids:
+        if standalone_only and pid in protected_service_pids:
+            continue
         try:
             terminate_pid(pid, force=force)
             killed += 1
@@ -1722,6 +1829,26 @@ def _windows_gateway_should_absorb_console_controls() -> bool:
 
 _SERVICE_BASE = "hermes-gateway"
 SERVICE_DESCRIPTION = "Hermes Agent Gateway - Messaging Platform Integration"
+_SYSTEMD_SCOPE_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,127}$")
+
+
+def _resolve_systemd_scope() -> str | None:
+    """Return the validated user-systemd scope from the active config."""
+    config = read_raw_config()
+    gateway_config = config.get("gateway", {}) if isinstance(config, dict) else {}
+    raw_scope = (
+        gateway_config.get("systemd_scope")
+        if isinstance(gateway_config, dict)
+        else None
+    )
+    if raw_scope is None:
+        return None
+    if not isinstance(raw_scope, str) or _SYSTEMD_SCOPE_RE.fullmatch(raw_scope) is None:
+        raise ValueError(
+            "Invalid gateway.systemd_scope: expected 1-128 lowercase characters "
+            "from [a-z0-9_-], starting with a letter or digit."
+        )
+    return raw_scope
 
 
 def _profile_suffix() -> str:
@@ -1802,10 +1929,14 @@ def get_service_name() -> str:
     Profile ``~/.hermes/profiles/coder`` returns ``hermes-gateway-coder``.
     Any other HERMES_HOME appends a short hash for uniqueness.
     """
+    parts = [_SERVICE_BASE]
+    scope = _resolve_systemd_scope()
     suffix = _profile_suffix()
-    if not suffix:
-        return _SERVICE_BASE
-    return f"{_SERVICE_BASE}-{suffix}"
+    if scope:
+        parts.append(scope)
+    if suffix:
+        parts.append(suffix)
+    return "-".join(parts)
 
 
 def get_systemd_unit_path(system: bool = False) -> Path:
@@ -1843,6 +1974,14 @@ class SystemScopeRequiresRootError(RuntimeError):
 
     def __str__(self) -> str:
         return self.args[0] if self.args else ""
+
+
+class ScopedSystemdUnitOwnershipError(RuntimeError):
+    """Raised when a scoped unit is not owned by the active Hermes home."""
+
+
+class ScopedSystemdRequiresUserError(RuntimeError):
+    """Raised when a configured scope would select a systemd system unit."""
 
 
 def _user_dbus_socket_path() -> Path:
@@ -3088,6 +3227,7 @@ def refresh_systemd_unit_if_needed(system: bool = False) -> bool:
     unit_path = get_systemd_unit_path(system=system)
     if not unit_path.exists():
         return False
+    _assert_scoped_systemd_unit_owner(system=system)
 
     # The gate below funnels through ``systemd_unit_is_current``, which is the
     # single HERMES_HOME-sync chokepoint (adopts the unit's pinned home before
@@ -3192,12 +3332,17 @@ def _ensure_linger_enabled() -> None:
 
 
 def _select_systemd_scope(system: bool = False) -> bool:
+    scope = _resolve_systemd_scope()
     if system:
+        _assert_scoped_systemd_user_scope(system=True, scope=scope)
         return True
-    return (
+    selected_system = (
         get_systemd_unit_path(system=True).exists()
         and not get_systemd_unit_path(system=False).exists()
     )
+    if selected_system:
+        _assert_scoped_systemd_user_scope(system=True, scope=scope)
+    return selected_system
 
 
 def _system_scope_wizard_would_need_root(system: bool = False) -> bool:
@@ -3261,6 +3406,9 @@ def systemd_install(
     enable_on_startup: bool = True,
     non_interactive: bool = False,
 ):
+    scope = _resolve_systemd_scope()
+    _assert_scoped_systemd_user_scope(system, scope=scope)
+    _assert_scoped_systemd_unit_owner(system=system)
     if system:
         _require_root_for_system_service("install")
 
@@ -3345,6 +3493,7 @@ def systemd_uninstall(system: bool = False):
     system = _select_systemd_scope(system)
     if system:
         _require_root_for_system_service("uninstall")
+    _assert_scoped_systemd_unit_owner(system=system)
 
     _run_systemctl(["stop", get_service_name()], system=system, check=False, timeout=90)
     _run_systemctl(
@@ -3391,6 +3540,7 @@ def systemd_stop(system: bool = False):
     system = _select_systemd_scope(system)
     if system:
         _require_root_for_system_service("stop")
+    _assert_scoped_systemd_unit_owner(system=system)
     _require_service_installed("stop", system=system)
     _sync_hermes_home_from_systemd_unit(system=system)
     try:
@@ -6685,6 +6835,9 @@ def gateway_command(args):
         print_error("User systemd not reachable:")
         for line in str(e).splitlines():
             print(f"  {line}")
+        sys.exit(1)
+    except ScopedSystemdRequiresUserError as e:
+        print(str(e))
         sys.exit(1)
     except SystemScopeRequiresRootError as e:
         # The direct ``hermes gateway install|uninstall|start|stop|restart``

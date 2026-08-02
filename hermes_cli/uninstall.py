@@ -196,13 +196,11 @@ def uninstall_gateway_service():
 
     # 1. Kill any standalone gateway processes (all platforms, including Termux)
     try:
-        from hermes_cli.gateway import kill_gateway_processes, find_gateway_pids
-        pids = find_gateway_pids()
-        if pids:
-            killed = kill_gateway_processes()
-            if killed:
-                log_success(f"Killed {killed} running gateway process(es)")
-                stopped_something = True
+        from hermes_cli.gateway import kill_gateway_processes
+        killed = kill_gateway_processes(standalone_only=True)
+        if killed:
+            log_success(f"Killed {killed} running gateway process(es)")
+            stopped_something = True
     except Exception as e:
         log_warn(f"Could not check for gateway processes: {e}")
 
@@ -220,6 +218,8 @@ def uninstall_gateway_service():
             from hermes_cli.gateway import (
                 get_systemd_unit_path,
                 get_service_name,
+                _assert_scoped_systemd_unit_owner,
+                _assert_scoped_systemd_user_scope,
                 _systemctl_cmd,
             )
             svc_name = get_service_name()
@@ -231,11 +231,13 @@ def uninstall_gateway_service():
 
                 scope = "system" if is_system else "user"
                 try:
+                    _assert_scoped_systemd_user_scope(system=is_system)
                     if is_system and os.geteuid() != 0:  # windows-footgun: ok — Linux systemd uninstall path, guarded by `if system == "Linux"` above
                         log_warn(f"System gateway service exists at {unit_path} "
                                  f"but needs sudo to remove")
                         continue
 
+                    _assert_scoped_systemd_unit_owner(system=is_system)
                     cmd = _systemctl_cmd(is_system)
                     subprocess.run(cmd + ["stop", svc_name],
                                    capture_output=True, check=False)

@@ -1708,12 +1708,17 @@ def _cleanup_gateway_service(name: str, profile_dir: Path) -> None:
     old_home = os.environ.get("HERMES_HOME")
     try:
         os.environ["HERMES_HOME"] = str(profile_dir)
-        from hermes_cli.gateway import get_service_name, get_launchd_plist_path
+        from hermes_cli.gateway import (
+            _assert_scoped_systemd_unit_owner,
+            get_launchd_plist_path,
+            get_service_name,
+        )
 
         if _platform.system() == "Linux":
             svc_name = get_service_name()
             svc_file = Path.home() / ".config" / "systemd" / "user" / f"{svc_name}.service"
             if svc_file.exists():
+                _assert_scoped_systemd_unit_owner(system=False)
                 subprocess.run(
                     ["systemctl", "--user", "disable", svc_name],
                     capture_output=True, check=False, timeout=10,

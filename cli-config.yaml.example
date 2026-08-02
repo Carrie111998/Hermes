@@ -963,6 +963,13 @@ platform_toolsets:
 # =============================================================================
 # Gateway Platform Settings
 # =============================================================================
+# Optional user-systemd gateway instance namespace. Missing or null preserves the
+# default service name. See the messaging guide for validation and change rules.
+gateway:
+  # Optional user-systemd instance namespace.
+  # Produces hermes-gateway-<scope>[-<profile>].
+  systemd_scope: null
+
 # Optional per-platform messaging settings.
 # Platform-specific knobs live under `extra`.
 #
