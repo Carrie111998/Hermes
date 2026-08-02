@@ -709,7 +709,7 @@ export const zh: Translations = {
         memoryEnabled: '保存有助于未来会话的持久记忆。',
         memoryCharLimit: '每个会话的智能体记忆最大字符数。',
         userProfileEnabled: '维护一份精简的用户偏好画像。',
-        userCharLimit: '用户画像的最大字符数。'
+        userCharLimit: '用户画像记忆的最大字符数。'
       },
       context: {
         engine: '在接近上下文上限时管理长对话的策略。'

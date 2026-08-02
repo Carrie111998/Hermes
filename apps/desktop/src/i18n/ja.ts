@@ -598,7 +598,7 @@ export const ja = defineLocale({
         memoryEnabled: '将来のセッションに役立つ永続メモリを保存します。',
         memoryCharLimit: 'セッションあたりのエージェントメモリの最大文字数です。',
         userProfileEnabled: 'ユーザーの好みをまとめた簡潔なプロファイルを維持します。',
-        userCharLimit: 'ユーザープロファイルの最大文字数です。'
+        userCharLimit: 'ユーザープロファイルメモリの最大文字数です。'
       },
       context: {
         engine: '長い会話がコンテキスト上限に近づいたときの管理戦略です。'

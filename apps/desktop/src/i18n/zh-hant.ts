@@ -585,7 +585,7 @@ export const zhHant = defineLocale({
         memoryEnabled: '儲存有助於未來工作階段的持久記憶。',
         memoryCharLimit: '每個工作階段的智能體記憶最大字元數。',
         userProfileEnabled: '維護一份精簡的使用者偏好設定檔。',
-        userCharLimit: '使用者設定檔的最大字元數。'
+        userCharLimit: '使用者設定檔記憶的最大字元數。'
       },
       context: {
         engine: '長對話接近上下文上限時的管理策略。'

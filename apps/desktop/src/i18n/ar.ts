@@ -576,7 +576,7 @@ export const ar = defineLocale({
       'memory.memoryEnabled': 'يحفظ ذكريات دائمة يمكن أن تساعد الجلسات القادمة.',
       'memory.memoryCharLimit': 'الحد الأقصى للأحرف لذاكرة الوكيل في كل جلسة.',
       'memory.userProfileEnabled': 'يحافظ على ملف مختصر لتفضيلات المستخدم.',
-      'memory.userCharLimit': 'الحد الأقصى للأحرف لملف المستخدم.',
+      'memory.userCharLimit': 'الحد الأقصى للأحرف لذاكرة ملف المستخدم.',
       'context.engine': 'استراتيجية إدارة المحادثات الطويلة قرب حد السياق.',
       'compression.enabled': 'يلخص السياق الأقدم عندما تكبر المحادثات.',
       'voice.autoTts': 'ينطق ردود المساعد تلقائياً.',

@@ -599,7 +599,7 @@ export const FIELD_DESCRIPTIONS: Record<string, string> = defineFieldCopy({
     memoryEnabled: 'Save durable memories that can help future sessions.',
     memoryCharLimit: 'Maximum characters for agent memory per session.',
     userProfileEnabled: 'Maintain a compact profile of user preferences.',
-    userCharLimit: 'Maximum characters for the user profile.'
+    userCharLimit: 'Maximum characters for the user profile memory.'
   },
   context: {
     engine: 'Strategy for managing long conversations near the context limit.'
