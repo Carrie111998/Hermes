@@ -123,6 +123,62 @@ class TestSweep:
         assert dl.sweep_recoverable() == []
 
 
+class TestExternalOwner:
+    """Foreign-owned obligations (#76767): recorded WITHOUT an owner stamp
+    (NULL pid) by a non-gateway process (desktop/TUI backend continuing a
+    gateway-bound session).  ``_owner_alive`` treats NULL as dead, so any
+    gateway's sweep claims and delivers them while the desktop stays alive."""
+
+    def test_external_row_has_null_owner(self):
+        dl.record_obligation(
+            obligation_id="ext-1",
+            session_key="agent:main:telegram:dm:123",
+            platform="telegram",
+            chat_id="123",
+            thread_id=None,
+            content="reply from desktop",
+            external_owner=True,
+        )
+        with dl._connect() as conn:
+            row = conn.execute(
+                "SELECT owner_pid, owner_started_at, state FROM delivery_obligations "
+                "WHERE obligation_id=?",
+                ("ext-1",),
+            ).fetchone()
+        assert row[0] is None
+        assert row[1] is None
+        assert row[2] == "pending"
+
+    def test_external_row_claimed_by_sweep_while_recorder_alive(self):
+        dl.record_obligation(
+            obligation_id="ext-2",
+            session_key="agent:main:telegram:dm:123",
+            platform="telegram",
+            chat_id="123",
+            thread_id=None,
+            content="reply from desktop",
+            external_owner=True,
+        )
+        claimed = dl.sweep_recoverable(deliverable_platforms={"telegram"})
+        assert len(claimed) == 1
+        assert claimed[0]["obligation_id"] == "ext-2"
+        assert claimed[0]["needs_marker"] is False
+        # The claim re-stamped ownership to THIS process: no double-claim.
+        assert dl.sweep_recoverable() == []
+
+    def test_external_row_not_claimed_for_unconnected_platform(self):
+        dl.record_obligation(
+            obligation_id="ext-3",
+            session_key="agent:main:telegram:dm:123",
+            platform="telegram",
+            chat_id="123",
+            thread_id=None,
+            content="reply from desktop",
+            external_owner=True,
+        )
+        assert dl.sweep_recoverable(deliverable_platforms={"discord"}) == []
+
+
 class TestPrune:
     def test_old_delivered_rows_pruned(self):
         _record()
@@ -146,12 +202,13 @@ class TestGatewayRedeliverySweep:
     """Drive the real GatewayRunner._redeliver_pending_obligations."""
 
     @staticmethod
-    def _runner(adapter=None):
+    def _runner(adapter=None, platform=None):
         from gateway.config import Platform
         from gateway.run import GatewayRunner
 
+        platform = platform or Platform.SLACK
         runner = object.__new__(GatewayRunner)
-        runner.adapters = {Platform.SLACK: adapter} if adapter else {}
+        runner.adapters = {platform: adapter} if adapter else {}
         _store = MagicMock()
         _store.clear_resume_pending = AsyncMock()
         _store._store = None
@@ -220,6 +277,36 @@ class TestGatewayRedeliverySweep:
             )
 
         assert blocked_event_loop == []
+
+    @pytest.mark.asyncio
+    async def test_external_obligation_redelivered_while_recorder_alive(self):
+        """#76767: a desktop/TUI-recorded obligation (NULL owner) is claimed
+        and delivered by the gateway even though the recording process is
+        still alive — no crash involved."""
+        from gateway.config import Platform
+
+        dl.record_obligation(
+            obligation_id="ext-run-1",
+            session_key="agent:main:telegram:dm:123",
+            platform="telegram",
+            chat_id="123",
+            thread_id=None,
+            content="reply from desktop",
+            external_owner=True,
+        )
+        adapter = self._adapter()
+        runner = self._runner(adapter, platform=Platform.TELEGRAM)
+
+        n = await runner._redeliver_pending_obligations()
+
+        assert n == 1
+        sent = adapter.send.call_args.kwargs
+        assert sent["chat_id"] == "123"
+        assert sent["content"] == "reply from desktop"  # no marker
+        assert _row("ext-run-1")["state"] == "delivered"
+        runner._async_session_store.clear_resume_pending.assert_awaited_once_with(
+            "agent:main:telegram:dm:123"
+        )
 
 
 class TestAttemptsOnlySpentOnRealSends:
