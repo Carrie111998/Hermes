@@ -26,6 +26,7 @@ from hermes_cli.config import (
     save_env_value_secure,
     sanitize_env_file,
     set_config_value,
+    unset_config_value,
     write_platform_config_field,
     _sanitize_env_lines,
 )
