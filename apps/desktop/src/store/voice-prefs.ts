@@ -42,6 +42,7 @@ export function applyVoiceStopPhraseFromConfig(
 export const $thinkingSoundEnabled = atom<boolean>(true)
 
 const DEFAULT_VOICE_CONVERSATION_IDLE_TIMEOUT_SECONDS = 600
+const MAX_BROWSER_TIMEOUT_MS = 2_147_483_647
 
 // Continuous Desktop voice mode closes its microphone after this much time
 // without a successfully transcribed user utterance. Zero disables the limit.
@@ -55,7 +56,7 @@ export function applyVoiceConversationIdleTimeoutFromConfig(
   const raw = config?.voice?.conversation_idle_timeout_seconds
 
   const seconds =
-    typeof raw === 'number' && Number.isFinite(raw) && raw >= 0
+    typeof raw === 'number' && Number.isFinite(raw) && raw >= 0 && raw <= MAX_BROWSER_TIMEOUT_MS / 1_000
       ? raw
       : DEFAULT_VOICE_CONVERSATION_IDLE_TIMEOUT_SECONDS
 

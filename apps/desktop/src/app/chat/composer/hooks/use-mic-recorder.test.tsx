@@ -34,6 +34,7 @@ function fakeStream() {
 }
 
 class FakeMediaRecorder {
+  static deferStopEvent = false
   static instances: FakeMediaRecorder[] = []
   static isTypeSupported = vi.fn(() => true)
 
@@ -47,7 +48,10 @@ class FakeMediaRecorder {
   state: RecordingState = 'inactive'
   stop = vi.fn(() => {
     this.state = 'inactive'
-    this.onstop?.()
+
+    if (!FakeMediaRecorder.deferStopEvent) {
+      this.onstop?.()
+    }
   })
 
   constructor(readonly stream: MediaStream) {
@@ -57,6 +61,7 @@ class FakeMediaRecorder {
 
 describe('useMicRecorder async acquisition ownership', () => {
   beforeEach(() => {
+    FakeMediaRecorder.deferStopEvent = false
     FakeMediaRecorder.instances = []
     vi.stubGlobal('MediaRecorder', FakeMediaRecorder)
     Object.defineProperty(navigator, 'mediaDevices', {
@@ -144,4 +149,57 @@ describe('useMicRecorder async acquisition ownership', () => {
     expect(staleStream.stop).toHaveBeenCalledTimes(1)
     expect(FakeMediaRecorder.instances).toHaveLength(0)
   })
+
+  it.each(['stop', 'error'] as const)(
+    'ignores a stale recorder %s callback after cancellation starts a replacement',
+    async staleEvent => {
+      FakeMediaRecorder.deferStopEvent = true
+      const streamA = fakeStream()
+      const streamB = fakeStream()
+      const onErrorA = vi.fn()
+      vi.mocked(navigator.mediaDevices.getUserMedia)
+        .mockResolvedValueOnce(streamA.stream)
+        .mockResolvedValueOnce(streamB.stream)
+
+      const hook = renderHook(() => useMicRecorder(copy))
+
+      await act(async () => hook.result.current.handle.start({ onError: onErrorA }))
+      const recorderA = FakeMediaRecorder.instances[0]
+      const staleData = recorderA?.ondataavailable
+      const staleStop = recorderA?.onstop
+      const staleError = recorderA?.onerror
+      const stoppingA = hook.result.current.handle.stop()
+
+      act(() => hook.result.current.handle.cancel())
+      await expect(stoppingA).resolves.toBeNull()
+      await act(async () => hook.result.current.handle.start())
+
+      const recorderB = FakeMediaRecorder.instances[1]
+
+      act(() => {
+        staleData?.({ data: new Blob(['stale']) } as BlobEvent)
+
+        if (staleEvent === 'stop') {
+          staleStop?.()
+        } else {
+          staleError?.({ error: new Error('stale') } as Event & { error: Error })
+        }
+      })
+
+      expect(onErrorA).not.toHaveBeenCalled()
+      expect(streamB.stop).not.toHaveBeenCalled()
+      expect(recorderB?.state).toBe('recording')
+      expect(hook.result.current.recording).toBe(true)
+
+      let stoppingB!: Promise<unknown>
+
+      act(() => {
+        stoppingB = hook.result.current.handle.stop()
+        recorderB?.ondataavailable?.({ data: new Blob(['b']) } as BlobEvent)
+        recorderB?.onstop?.()
+      })
+
+      await expect(stoppingB).resolves.toMatchObject({ audio: { size: 1 } })
+    }
+  )
 })

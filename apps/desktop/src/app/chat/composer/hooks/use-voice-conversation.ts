@@ -70,6 +70,7 @@ export function useVoiceConversation({
   const turnTimeoutRef = useRef<number | null>(null)
   const lifecycleGenerationRef = useRef(0)
   const conversationActiveRef = useRef(false)
+  const micStartAttemptRef = useRef(0)
   const micStartControllersRef = useRef(new Set<AbortController>())
   const handleRef = useRef(handle)
   const pendingStartRef = useRef(false)
@@ -173,6 +174,7 @@ export function useVoiceConversation({
     awaitingSpokenResponseRef.current = false
     dropSpeechSession()
     consumePendingResponse()
+    mutedRef.current = false
     setMuted(false)
     setStatus('idle')
   }, [consumePendingResponse, handle])
@@ -301,6 +303,17 @@ export function useVoiceConversation({
       return
     }
 
+    const attempt = micStartAttemptRef.current + 1
+    micStartAttemptRef.current = attempt
+
+    for (const controller of micStartControllersRef.current) {
+      controller.abort()
+    }
+
+    // A newer attempt owns microphone startup. Release pending acquisition and
+    // any recorder that an older attempt activated before its continuation ran.
+    handle.cancel()
+
     // Let the wake-word listener fully release the capture device before we
     // open ours — opening the mic while wake still holds it makes getUserMedia
     // fail (the "clicked voice but it never starts listening" bug).
@@ -310,7 +323,7 @@ export function useVoiceConversation({
       // A pause failure shouldn't block the user's explicit start.
     }
 
-    if (lifecycleGenerationRef.current !== generation) {
+    if (lifecycleGenerationRef.current !== generation || micStartAttemptRef.current !== attempt) {
       return
     }
 
@@ -331,7 +344,7 @@ export function useVoiceConversation({
           silenceMs: 1_250,
           idleSilenceMs: 12_000,
           onError: error => {
-            if (lifecycleGenerationRef.current !== generation) {
+            if (lifecycleGenerationRef.current !== generation || micStartAttemptRef.current !== attempt) {
               return
             }
 
@@ -340,7 +353,7 @@ export function useVoiceConversation({
             onFatalError?.()
           },
           onSilence: () => {
-            if (lifecycleGenerationRef.current === generation) {
+            if (lifecycleGenerationRef.current === generation && micStartAttemptRef.current === attempt) {
               void handleTurn()
             }
           }
@@ -349,7 +362,13 @@ export function useVoiceConversation({
         micStartControllersRef.current.delete(micStartController)
       }
 
-      if (lifecycleGenerationRef.current !== generation) {
+      if (lifecycleGenerationRef.current !== generation || micStartAttemptRef.current !== attempt) {
+        return
+      }
+
+      if (!enabledRef.current || mutedRef.current || busyRef.current || statusRef.current !== 'idle') {
+        handle.cancel()
+
         return
       }
 
@@ -362,7 +381,7 @@ export function useVoiceConversation({
       clearTurnTimeout()
       turnTimeoutRef.current = window.setTimeout(() => void handleTurn(), 60_000)
     } catch (error) {
-      if (lifecycleGenerationRef.current !== generation) {
+      if (lifecycleGenerationRef.current !== generation || micStartAttemptRef.current !== attempt) {
         return
       }
 
@@ -743,6 +762,7 @@ export function useVoiceConversation({
       return
     }
 
+    mutedRef.current = false
     setMuted(false)
     awaitingSpokenResponseRef.current = false
     dropSpeechSession()
@@ -771,19 +791,24 @@ export function useVoiceConversation({
   }, [handleTurn])
 
   const toggleMute = useCallback(() => {
-    setMuted(value => {
-      const next = !value
+    const next = !mutedRef.current
 
-      if (next) {
-        clearTurnTimeout()
-        handle.cancel()
-        setStatus('idle')
-      } else if (enabledRef.current && !busyRef.current && statusRef.current === 'idle') {
-        pendingStartRef.current = true
+    mutedRef.current = next
+    setMuted(next)
+
+    if (next) {
+      micStartAttemptRef.current += 1
+
+      for (const controller of micStartControllersRef.current) {
+        controller.abort()
       }
 
-      return next
-    })
+      clearTurnTimeout()
+      handle.cancel()
+      setStatus('idle')
+    } else if (enabledRef.current && !busyRef.current && statusRef.current === 'idle') {
+      pendingStartRef.current = true
+    }
   }, [handle])
 
   useEffect(() => {

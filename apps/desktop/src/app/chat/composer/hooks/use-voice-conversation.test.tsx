@@ -155,6 +155,72 @@ describe('useVoiceConversation full-duplex barge-in', () => {
 
   afterEach(cleanup)
 
+  it.each(['stale-first', 'replacement-first'] as const)(
+    'keeps a stale cancelled start inert when unmuting starts its replacement (%s)',
+    async resolveOrder => {
+      const staleStart = deferred<void>()
+      const replacementStart = deferred<void>()
+      const startSignals: AbortSignal[] = []
+
+      micHandle.start
+        .mockImplementationOnce(options => {
+          startSignals.push(options?.signal as AbortSignal)
+
+          return staleStart.promise
+        })
+        .mockImplementationOnce(options => {
+          startSignals.push(options?.signal as AbortSignal)
+
+          return replacementStart.promise
+        })
+
+      const hook = renderHook(() =>
+        useVoiceConversation({
+          busy: false,
+          consumePendingResponse: vi.fn(),
+          enabled: true,
+          onSubmit: vi.fn(),
+          onTranscribeAudio: vi.fn(async () => ''),
+          pendingResponse: () => null
+        })
+      )
+
+      let starting!: Promise<void>
+
+      act(() => {
+        starting = hook.result.current.start()
+      })
+      await waitFor(() => expect(micHandle.start).toHaveBeenCalledTimes(1))
+
+      act(() => hook.result.current.toggleMute())
+      expect(hook.result.current).toMatchObject({ muted: true, status: 'idle' })
+      expect(micHandle.cancel).toHaveBeenCalled()
+
+      act(() => hook.result.current.toggleMute())
+      await waitFor(() => expect(micHandle.start).toHaveBeenCalledTimes(2))
+      expect(startSignals[0]?.aborted).toBe(true)
+      expect(startSignals[1]?.aborted).toBe(false)
+
+      await act(async () => {
+        if (resolveOrder === 'stale-first') {
+          staleStart.resolve()
+          await starting
+          expect(hook.result.current).toMatchObject({ muted: false, status: 'idle' })
+          replacementStart.resolve()
+          await replacementStart.promise
+        } else {
+          replacementStart.resolve()
+          await replacementStart.promise
+          staleStart.resolve()
+          await starting
+        }
+      })
+
+      expect(startSignals[1]?.aborted).toBe(false)
+      await waitFor(() => expect(hook.result.current).toMatchObject({ muted: false, status: 'listening' }))
+    }
+  )
+
   it('arms the barge monitor during generation (before any reply audio exists)', async () => {
     const { hook } = renderConversation()
 
@@ -463,6 +529,42 @@ describe('useVoiceConversation full-duplex barge-in', () => {
       expect(hook.result.current.status).toBe('listening')
     }
   )
+
+  it('releases a microphone acquired after the conversation becomes busy', async () => {
+    const microphoneStarted = deferred<undefined>()
+    micHandle.start.mockImplementationOnce(() => microphoneStarted.promise)
+
+    const hook = renderHook(
+      ({ busy }: HookProps) =>
+        useVoiceConversation({
+          busy,
+          consumePendingResponse: vi.fn(),
+          enabled: true,
+          onSubmit: vi.fn(),
+          onTranscribeAudio: vi.fn(async () => ''),
+          pendingResponse: () => null
+        }),
+      { initialProps: { busy: false } }
+    )
+
+    let starting!: Promise<void>
+
+    act(() => {
+      starting = hook.result.current.start()
+    })
+    await waitFor(() => expect(micHandle.start).toHaveBeenCalledTimes(1))
+
+    hook.rerender({ busy: true })
+    const cancelCallsBeforeAcquisition = micHandle.cancel.mock.calls.length
+
+    await act(async () => {
+      microphoneStarted.resolve(undefined)
+      await starting
+    })
+
+    expect(hook.result.current.status).toBe('idle')
+    expect(micHandle.cancel).toHaveBeenCalledTimes(cancelCallsBeforeAcquisition + 1)
+  })
 
   it('aborts a pending microphone start on unmount', async () => {
     const microphoneStarted = deferred<undefined>()

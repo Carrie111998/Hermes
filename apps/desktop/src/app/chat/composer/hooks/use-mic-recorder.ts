@@ -263,12 +263,20 @@ export function useMicRecorder(copy: MicRecorderErrorCopy): {
       startedAtRef.current = Date.now()
 
       recorder.ondataavailable = event => {
+        if (recorderRef.current !== recorder) {
+          return
+        }
+
         if (event.data.size > 0) {
           chunksRef.current.push(event.data)
         }
       }
 
       recorder.onstop = () => {
+        if (recorderRef.current !== recorder) {
+          return
+        }
+
         const chunks = chunksRef.current
         const recordingType = recorder.mimeType || mimeType || 'audio/webm'
         const durationMs = Date.now() - startedAtRef.current
@@ -294,6 +302,10 @@ export function useMicRecorder(copy: MicRecorderErrorCopy): {
       }
 
       recorder.onerror = event => {
+        if (recorderRef.current !== recorder) {
+          return
+        }
+
         const error = micError((event as Event & { error?: unknown }).error, copy)
         const resolver = stopResolverRef.current
         stopResolverRef.current = null
@@ -338,11 +350,14 @@ export function useMicRecorder(copy: MicRecorderErrorCopy): {
     const resolver = stopResolverRef.current
     stopResolverRef.current = null
 
-    if (recorder && recorder.state !== 'inactive') {
+    if (recorder) {
       recorder.ondataavailable = null
       recorder.onerror = null
       recorder.onstop = null
-      recorder.stop()
+
+      if (recorder.state !== 'inactive') {
+        recorder.stop()
+      }
     }
 
     cleanup()

@@ -60,4 +60,12 @@ describe('applyVoiceConversationIdleTimeoutFromConfig', () => {
       expect($voiceConversationIdleTimeoutMs.get()).toBe(600_000)
     }
   )
+
+  it('uses the backend default when the configured delay exceeds the browser timer range', () => {
+    applyVoiceConversationIdleTimeoutFromConfig({
+      voice: { conversation_idle_timeout_seconds: Number.MAX_SAFE_INTEGER }
+    })
+
+    expect($voiceConversationIdleTimeoutMs.get()).toBe(600_000)
+  })
 })
