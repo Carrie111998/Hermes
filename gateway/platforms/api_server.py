@@ -645,8 +645,33 @@ def _multimodal_validation_error(exc: ValueError, *, param: str) -> "web.Respons
     )
 
 
+_TURN_PROCESS_OWNERSHIP_UNSET = object()
+_TurnProcessOwnershipSnapshot = tuple[str, frozenset[str], Optional[int]]
+
+
+def _snapshot_turn_process_ownership(
+    agent: Any,
+) -> Optional[_TurnProcessOwnershipSnapshot]:
+    """Freeze one API turn's process ownership before cancellation can clear it."""
+    with _TURN_PROCESS_EPOCH_LOCK:
+        process_task_id = getattr(agent, "_gateway_turn_process_task_id", "")
+        process_baseline = getattr(agent, "_gateway_turn_process_baseline", None)
+        epoch = getattr(agent, "_gateway_turn_process_epoch", None)
+        if (
+            not isinstance(process_task_id, str)
+            or not process_task_id
+            or not isinstance(process_baseline, frozenset)
+            or (epoch is not None and not isinstance(epoch, int))
+        ):
+            return None
+        return process_task_id, process_baseline, epoch
+
+
 def _reap_disconnected_agent_processes(
-    agent: Any, *, source: str = "api_server_sse_disconnect"
+    agent: Any,
+    *,
+    source: str = "api_server_sse_disconnect",
+    ownership_snapshot: Any = _TURN_PROCESS_OWNERSHIP_UNSET,
 ) -> None:
     """Reap background processes an abandoned API-server turn created.
 
@@ -664,12 +689,18 @@ def _reap_disconnected_agent_processes(
     ``run_generation``. The epoch closure skips the reap when a newer run
     has since claimed the task_id; that newer run's own baseline covers its
     eventual cleanup.
+
+    Cancellation may synchronously release the worker, whose finalizer clears
+    the mutable agent markers.  Callers at a cancellation boundary therefore
+    pass a snapshot captured *before* signalling.  The sentinel distinguishes
+    an omitted snapshot (legacy/direct helper call: capture now) from an
+    explicitly empty pre-cancellation snapshot (do not recapture a newer run).
     """
-    process_task_id = getattr(agent, "_gateway_turn_process_task_id", "")
-    process_baseline = getattr(agent, "_gateway_turn_process_baseline", None)
-    if not process_task_id or process_baseline is None:
+    if ownership_snapshot is _TURN_PROCESS_OWNERSHIP_UNSET:
+        ownership_snapshot = _snapshot_turn_process_ownership(agent)
+    if ownership_snapshot is None:
         return
-    epoch = getattr(agent, "_gateway_turn_process_epoch", None)
+    process_task_id, process_baseline, epoch = ownership_snapshot
     is_still_current: Optional[Any] = None
     if epoch is not None:
         def _epoch_still_current(_task_id=process_task_id, _epoch=epoch):
@@ -717,14 +748,13 @@ def _publish_turn_process_ownership(agent: Any, task_id: str) -> None:
     """
     from tools.process_registry import process_registry
 
+    process_baseline = process_registry.snapshot_running_ids(task_id)
     with _TURN_PROCESS_EPOCH_LOCK:
         epoch = next(_TURN_PROCESS_EPOCH_COUNTER)
         _TURN_PROCESS_EPOCHS[task_id] = epoch
-    agent._gateway_turn_process_task_id = task_id
-    agent._gateway_turn_process_baseline = process_registry.snapshot_running_ids(
-        task_id
-    )
-    agent._gateway_turn_process_epoch = epoch
+        agent._gateway_turn_process_task_id = task_id
+        agent._gateway_turn_process_baseline = process_baseline
+        agent._gateway_turn_process_epoch = epoch
 
 
 def _clear_turn_process_ownership(agent: Any) -> None:
@@ -734,17 +764,17 @@ def _clear_turn_process_ownership(agent: Any) -> None:
     work the turn deliberately left running — mirrors the same race-window
     guard in ``gateway/run.py``'s ``_run_sync_with_timeout_lifecycle``.
     """
-    task_id = getattr(agent, "_gateway_turn_process_task_id", "")
-    epoch = getattr(agent, "_gateway_turn_process_epoch", None)
-    if task_id and epoch is not None:
-        with _TURN_PROCESS_EPOCH_LOCK:
-            # Prune only when this run is still the current claimant; a
-            # newer concurrent run owns the entry otherwise.
+    with _TURN_PROCESS_EPOCH_LOCK:
+        task_id = getattr(agent, "_gateway_turn_process_task_id", "")
+        epoch = getattr(agent, "_gateway_turn_process_epoch", None)
+        if task_id and epoch is not None:
+            # Prune only when this run is still the current claimant; a newer
+            # concurrent run owns the entry otherwise.
             if _TURN_PROCESS_EPOCHS.get(task_id) == epoch:
                 del _TURN_PROCESS_EPOCHS[task_id]
-    agent._gateway_turn_process_task_id = ""
-    agent._gateway_turn_process_baseline = frozenset()
-    agent._gateway_turn_process_epoch = None
+        agent._gateway_turn_process_task_id = ""
+        agent._gateway_turn_process_baseline = frozenset()
+        agent._gateway_turn_process_epoch = None
 
 
 def _session_chat_user_message(body: Dict[str, Any], *, param: str = "message") -> tuple[Any, Optional["web.Response"]]:
@@ -4234,15 +4264,21 @@ class APIServerAdapter(BasePlatformAdapter):
                 and hasattr(agent_ref[1], "set")
                 else None
             )
+            agent = agent_ref[0] if agent_ref else None
+            should_interrupt = agent is not None and not agent_task.done()
+            ownership_snapshot = (
+                _snapshot_turn_process_ownership(agent) if should_interrupt else None
+            )
             if cancel_signal is not None:
                 cancel_signal.set()
-            agent = agent_ref[0] if agent_ref else None
-            if agent is not None and not agent_task.done():
+            if should_interrupt:
                 try:
                     request_hard_interrupt(agent, reason)
                 except Exception:
                     pass
-                _reap_disconnected_agent_processes(agent)
+                _reap_disconnected_agent_processes(
+                    agent, ownership_snapshot=ownership_snapshot
+                )
             if agent_task.done():
                 try:
                     await agent_task
@@ -5017,11 +5053,14 @@ class APIServerAdapter(BasePlatformAdapter):
             # making upstream LLM calls, then cancel the task.
             agent = agent_ref[0] if agent_ref else None
             if agent is not None:
+                ownership_snapshot = _snapshot_turn_process_ownership(agent)
                 try:
                     request_hard_interrupt(agent, "SSE client disconnected")
                 except Exception:
                     pass
-                _reap_disconnected_agent_processes(agent)
+                _reap_disconnected_agent_processes(
+                    agent, ownership_snapshot=ownership_snapshot
+                )
             if not agent_task.done():
                 agent_task.cancel()
                 try:
@@ -5037,6 +5076,7 @@ class APIServerAdapter(BasePlatformAdapter):
             _persist_incomplete_if_needed()
             agent = agent_ref[0] if agent_ref else None
             if agent is not None:
+                ownership_snapshot = _snapshot_turn_process_ownership(agent)
                 try:
                     request_hard_interrupt(agent, "SSE task cancelled")
                 except Exception:
@@ -5046,7 +5086,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 # (#76115). Epoch-gated; no-op when the turn already
                 # finished and cleared its markers.
                 _reap_disconnected_agent_processes(
-                    agent, source="api_server_sse_cancelled"
+                    agent,
+                    source="api_server_sse_cancelled",
+                    ownership_snapshot=ownership_snapshot,
                 )
             if not agent_task.done():
                 agent_task.cancel()
@@ -6937,6 +6979,7 @@ class APIServerAdapter(BasePlatformAdapter):
         self._stopping_run_ids.add(run_id)
 
         if agent is not None:
+            ownership_snapshot = _snapshot_turn_process_ownership(agent)
             try:
                 request_hard_interrupt(agent, "Stop requested via API")
             except Exception:
@@ -6947,7 +6990,9 @@ class APIServerAdapter(BasePlatformAdapter):
             # processes; no-op if the run already finished and cleared
             # its ownership markers.
             _reap_disconnected_agent_processes(
-                agent, source="api_server_run_stop"
+                agent,
+                source="api_server_run_stop",
+                ownership_snapshot=ownership_snapshot,
             )
 
         return web.json_response({"run_id": run_id, "status": "stopping"})

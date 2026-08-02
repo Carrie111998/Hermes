@@ -481,6 +481,39 @@ class TestDisconnectedAgentReap:
         time.sleep(0.1)
         assert calls == []
 
+    def test_explicit_empty_snapshot_does_not_recapture_newer_turn(self, monkeypatch):
+        from gateway.platforms.api_server import (
+            _clear_turn_process_ownership,
+            _publish_turn_process_ownership,
+            _reap_disconnected_agent_processes,
+            _snapshot_turn_process_ownership,
+        )
+        from tools.process_registry import process_registry
+
+        calls = []
+        monkeypatch.setattr(
+            process_registry,
+            "kill_started_since",
+            lambda *args, **kwargs: calls.append((args, kwargs)) or 1,
+        )
+        monkeypatch.setattr(
+            process_registry, "snapshot_running_ids", lambda _tid: frozenset()
+        )
+
+        agent = types.SimpleNamespace()
+        empty_snapshot = _snapshot_turn_process_ownership(agent)
+        assert empty_snapshot is None
+
+        # A different/newer run publishes ownership after the cancellation
+        # boundary captured "none".  The old boundary must not recapture it.
+        _publish_turn_process_ownership(agent, "newer-turn")
+        _reap_disconnected_agent_processes(
+            agent, ownership_snapshot=empty_snapshot
+        )
+        time.sleep(0.1)
+        assert calls == []
+        _clear_turn_process_ownership(agent)
+
     def test_stale_epoch_skips_reap_when_newer_run_claimed_task_id(self, monkeypatch):
         """#76188 follow-up: concurrent API runs can share a client-provided
         session_id (same task_id). A disconnecting run whose epoch has been
@@ -620,6 +653,57 @@ class TestDisconnectedAgentReap:
             time.sleep(0.01)
         assert calls == [("run-stop-sess", frozenset(), "api_server_run_stop")]
         agent.interrupt.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_stop_run_snapshots_ownership_before_interrupt_clears_markers(
+        self, adapter, monkeypatch
+    ):
+        """A synchronous hard interrupt may let the worker finalizer clear
+        mutable ownership markers before the detached reaper starts.  The stop
+        boundary must therefore freeze task/baseline/epoch before signalling.
+        """
+        from gateway.platforms.api_server import (
+            _clear_turn_process_ownership,
+            _publish_turn_process_ownership,
+        )
+        from tools.process_registry import process_registry
+
+        calls = []
+        monkeypatch.setattr(
+            process_registry,
+            "kill_started_since",
+            lambda task_id, baseline, *, source: calls.append(
+                (task_id, baseline, source)
+            )
+            or 1,
+        )
+        monkeypatch.setattr(
+            process_registry,
+            "snapshot_running_ids",
+            lambda _tid: frozenset({"preexisting-process"}),
+        )
+
+        agent = MagicMock()
+        _publish_turn_process_ownership(agent, "run-stop-snapshot")
+        agent.interrupt.side_effect = lambda _reason: _clear_turn_process_ownership(agent)
+        adapter._active_run_agents["run_snapshot"] = agent
+
+        request = MagicMock()
+        request.match_info = {"run_id": "run_snapshot"}
+        resp = await adapter._handle_stop_run(request)
+        assert resp.status == 200
+
+        deadline = time.time() + 1.0
+        while not calls and time.time() < deadline:
+            await asyncio.sleep(0.01)
+        assert calls == [
+            (
+                "run-stop-snapshot",
+                frozenset({"preexisting-process"}),
+                "api_server_run_stop",
+            )
+        ]
+        agent.interrupt.assert_called_once_with("Stop requested via API")
 
 
 class TestRunEventCallback:

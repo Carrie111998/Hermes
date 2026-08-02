@@ -214,6 +214,95 @@ class TestSSEAgentCancelOnDisconnect:
 
         asyncio.run(run())
 
+    def test_cancel_signal_cannot_erase_process_ownership_before_reap(self, monkeypatch):
+        """The cancellation signal may synchronously release the worker and
+        clear ownership before the hard interrupt.  Reaping must use the
+        snapshot captured before either signal is published.
+        """
+        from gateway.platforms.api_server import (
+            _clear_turn_process_ownership,
+            _publish_turn_process_ownership,
+        )
+        from tools.process_registry import process_registry
+
+        adapter = _make_adapter()
+        stream_q = queue.Queue()
+        stream_q.put("hello")
+        calls = []
+        monkeypatch.setattr(
+            process_registry,
+            "snapshot_running_ids",
+            lambda _tid: frozenset({"preexisting-process"}),
+        )
+        monkeypatch.setattr(
+            process_registry,
+            "kill_started_since",
+            lambda task_id, baseline, *, source: calls.append(
+                (task_id, baseline, source)
+            )
+            or 1,
+        )
+
+        async def run():
+            from aiohttp import web
+
+            agent_done = asyncio.Event()
+
+            async def fake_agent():
+                await agent_done.wait()
+                return {"final_response": "done"}, {}
+
+            mock_agent = MagicMock()
+            mock_agent.interrupt = MagicMock()
+            _publish_turn_process_ownership(mock_agent, "sse-snapshot")
+
+            class ClearingSignal:
+                def set(self):
+                    _clear_turn_process_ownership(mock_agent)
+                    agent_done.set()
+
+            agent_task = asyncio.ensure_future(fake_agent())
+            mock_response = AsyncMock(spec=web.StreamResponse)
+            call_count = 0
+
+            async def write_side_effect(_data):
+                nonlocal call_count
+                call_count += 1
+                if call_count >= 2:
+                    raise ConnectionResetError("client disconnected")
+
+            mock_response.write = AsyncMock(side_effect=write_side_effect)
+            mock_response.prepare = AsyncMock()
+
+            with patch(
+                "gateway.platforms.api_server.web.StreamResponse",
+                return_value=mock_response,
+            ):
+                await adapter._write_sse_chat_completion(
+                    _make_request(),
+                    "cmpl-snapshot",
+                    "gpt-4",
+                    1234567890,
+                    stream_q,
+                    agent_task,
+                    [mock_agent, ClearingSignal()],
+                )
+
+            for _ in range(100):
+                if calls:
+                    break
+                await asyncio.sleep(0.01)
+            assert calls == [
+                (
+                    "sse-snapshot",
+                    frozenset({"preexisting-process"}),
+                    "api_server_sse_disconnect",
+                )
+            ]
+            mock_agent.interrupt.assert_called_once_with("SSE client disconnected")
+
+        asyncio.run(run())
+
     def test_agent_ref_none_still_cancels_task(self):
         """When agent_ref is not provided (None), the task is still cancelled
         on disconnect — just without the interrupt() call."""
