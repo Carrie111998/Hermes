@@ -775,6 +775,58 @@ class TestMediaDeliveryDefaultMode:
             notes.resolve()
         )
 
+    def test_symlinked_sibling_profile_credentials_denied(
+        self, tmp_path, monkeypatch,
+    ):
+        """Directory-symlink siblings must still deny credentials after resolve.
+
+        Profile discovery accepts directory symlinks (``profiles/bob`` ->
+        external home). ``validate_media_delivery_path`` resolves the
+        candidate first, so a structural ``<root>/profiles/<name>/`` match
+        misses the external target. Discovered profile homes must apply the
+        same credential-relative policy to their resolved targets, while
+        ordinary sibling files remain deliverable.
+        """
+        self._patch_roots(monkeypatch)
+
+        fake_home = tmp_path / "home"
+        hermes_root = fake_home / ".hermes"
+        alice = hermes_root / "profiles" / "alice"
+        bob_link = hermes_root / "profiles" / "bob"
+        alice.mkdir(parents=True)
+        external_bob = tmp_path / "external_bob"
+        external_bob.mkdir()
+        secret = external_bob / ".env"
+        secret.write_text("SECRET=1")
+        token = external_bob / "mcp-tokens" / "t.json"
+        token.parent.mkdir()
+        token.write_text("{}")
+        notes = external_bob / "notes.md"
+        notes.write_text("# ok\n")
+        try:
+            bob_link.symlink_to(external_bob, target_is_directory=True)
+        except OSError:
+            pytest.skip("directory symlink creation is unavailable")
+
+        monkeypatch.setenv("HOME", str(fake_home))
+        monkeypatch.setattr("gateway.platforms.base._HERMES_HOME", alice)
+        monkeypatch.setattr("gateway.platforms.base._HERMES_ROOT", hermes_root)
+
+        # Access via the profiles/ symlink entry (the MEDIA-tag shape).
+        linked_secret = bob_link / ".env"
+        linked_token = bob_link / "mcp-tokens" / "t.json"
+        linked_notes = bob_link / "notes.md"
+
+        import gateway.platforms.base as base
+
+        # Structural check alone misses the resolved external target.
+        assert base._path_is_profile_tree_credential(linked_secret.resolve()) is False
+        assert BasePlatformAdapter.validate_media_delivery_path(str(linked_secret)) is None
+        assert BasePlatformAdapter.validate_media_delivery_path(str(linked_token)) is None
+        assert BasePlatformAdapter.validate_media_delivery_path(str(linked_notes)) == str(
+            linked_notes.resolve()
+        )
+
     def test_denylist_blocks_google_token_default_mode(self, tmp_path, monkeypatch):
         """Integration credentials at the HERMES_HOME root (google_token.json)
         must never be deliverable, even though they aren't the historically

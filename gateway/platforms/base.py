@@ -1273,9 +1273,10 @@ _MEDIA_DELIVERY_ROOT_CREDENTIAL_DIRS = (
 def _iter_hermes_profile_dirs() -> List[Path]:
     """Return ``<root>/profiles/<name>/`` directories that currently exist.
 
-    Used by cache allowlisting so profiles created after process start are
-    covered. Missing or unreadable ``profiles/`` yields an empty list —
-    credential denial must NOT depend on this helper (see
+    Used by cache allowlisting and by media-delivery credential denial for
+    discovered profile homes (including directory-symlink targets). Missing
+    or unreadable ``profiles/`` yields an empty list — ordinary sibling
+    credential denial must NOT depend solely on this helper (see
     ``_path_is_profile_tree_credential``).
     """
     profiles_dir = _HERMES_ROOT / "profiles"
@@ -1431,12 +1432,14 @@ def _media_delivery_denied_paths() -> List[Path]:
     # validate_media_delivery_path, so generated media still delivers).
     #
     # Sibling/inactive profiles under <root>/profiles/<name>/ use the same
-    # credential file/dir policy, but denial is applied structurally in
-    # ``_path_is_profile_tree_credential`` — not by listing ``profiles/``.
-    # Directory enumeration can fail while a known child path remains
-    # openable (POSIX execute-only), so building this list from
-    # ``_iter_hermes_profile_dirs()`` would fail open at the exact boundary
-    # sibling denial is meant to close.
+    # credential file/dir policy. Denial is layered:
+    #   1. Structural match in ``_path_is_profile_tree_credential`` — works
+    #      without listing ``profiles/`` (POSIX execute-only dirs).
+    #   2. Discovered profile homes below — covers directory-symlink siblings
+    #      (``profiles/bob -> /elsewhere``) whose resolved targets sit outside
+    #      the structural profiles root after ``validate_media_delivery_path``
+    #      canonicalizes the candidate. Enumeration alone would fail open on
+    #      unreadable ``profiles/``; the structural check covers that case.
     hermes_dirs: List[Path] = []
     for base in (_HERMES_HOME, _HERMES_ROOT):
         try:
@@ -1445,6 +1448,13 @@ def _media_delivery_denied_paths() -> List[Path]:
             # Fail closed: still deny under the unresolved path rather than
             # skipping the home entirely.
             real = base
+        if real not in hermes_dirs:
+            hermes_dirs.append(real)
+    for profile_dir in _iter_hermes_profile_dirs():
+        try:
+            real = profile_dir.expanduser().resolve(strict=False)
+        except (OSError, RuntimeError, ValueError):
+            real = profile_dir
         if real not in hermes_dirs:
             hermes_dirs.append(real)
     for hermes_root in hermes_dirs:
