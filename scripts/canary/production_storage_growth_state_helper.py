@@ -1262,6 +1262,15 @@ class RootStateMachine:
                     raise StateHelperError(
                         "production_storage_event_log_invalid"
                     )
+                repaired_events = [*persisted_events, transition]
+                _append_events(
+                    event_path,
+                    repaired_events,
+                    self.state_root,
+                    self.expected_uid,
+                    self.expected_gid,
+                )
+                persisted_events = repaired_events
             elif transition != persisted_events[-1]:
                 raise StateHelperError(
                     "production_storage_event_log_invalid"

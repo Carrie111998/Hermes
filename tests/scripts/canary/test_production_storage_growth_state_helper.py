@@ -7,7 +7,9 @@ import hashlib
 import json
 import os
 import runpy
+import select
 import subprocess
+import sys
 import threading
 from pathlib import Path
 
@@ -186,10 +188,16 @@ def test_completion_journal_to_event_crash_gap_is_mechanically_recovered(
     started_events = Path(event_path).read_bytes()
 
     def forbid_second_write(*_args, **_kwargs):
-        raise AssertionError("an exact completion retry must not write")
+        raise AssertionError("completion retry must not rewrite journal")
+
+    repairs: list[int] = []
+
+    def repair_terminal_event(*args, **kwargs):
+        repairs.append(1)
+        return original_append(*args, **kwargs)
 
     monkeypatch.setattr(helper, "_write_atomic", forbid_second_write)
-    monkeypatch.setattr(helper, "_append_events", forbid_second_write)
+    monkeypatch.setattr(helper, "_append_events", repair_terminal_event)
     retried = machine.complete({
         "final_observation": {
             "state": "target", "observation_sha256": "9" * 64,
@@ -197,7 +205,20 @@ def test_completion_journal_to_event_crash_gap_is_mechanically_recovered(
     })
     assert retried["journal"]["state"] == "completed"
     assert Path(journal_path).read_bytes() == completed_journal
-    assert Path(event_path).read_bytes() == started_events
+    repaired_events = Path(event_path).read_bytes()
+    assert repaired_events != started_events
+    assert repaired_events.count(
+        b'"event_kind":"execution_completed"'
+    ) == 1
+    assert repairs == [1]
+
+    monkeypatch.setattr(helper, "_append_events", forbid_second_write)
+    assert machine.complete({
+        "final_observation": {
+            "state": "target", "observation_sha256": "9" * 64,
+        },
+    }) == retried
+    assert Path(event_path).read_bytes() == repaired_events
 
     monkeypatch.setattr(helper, "_write_atomic", original_write)
     monkeypatch.setattr(helper, "_append_events", original_append)
@@ -474,7 +495,7 @@ def test_owner_publish_transaction_restores_all_four_artifacts(
 
     def fail_final_attestation() -> dict:
         assert helper_path.read_bytes() == b"new helper"
-        assert sudoers_path.read_bytes() == b"fixed sudoers\n"
+        assert not sudoers_path.exists()
         assert receipt_path.read_bytes() == b"new receipt\n"
         assert public_path.read_bytes() == expected_public
         raise installer.ProductionStorageInstallerError(
@@ -499,6 +520,7 @@ def test_owner_publish_transaction_restores_all_four_artifacts(
                 public_readiness_path=public_path,
                 build_public_readiness=lambda: public,
                 attest_public_readiness=fail_final_attestation,
+                quiesce_predecessors=lambda: None,
                 uid=os.getuid(),
                 gid=os.getgid(),
                 sudoers_validator=accept,
@@ -511,6 +533,125 @@ def test_owner_publish_transaction_restores_all_four_artifacts(
             assert path.stat().st_mode & 0o777 == mode
         else:
             assert not path.exists()
+
+
+def test_successor_quiesces_864c239_predecessor_cached_before_lock(
+    tmp_path: Path,
+) -> None:
+    helper_path = tmp_path / "helper"
+    sudoers_path = tmp_path / "sudoers"
+    receipt_path = tmp_path / "receipt"
+    public_path = tmp_path / "public"
+    continued_path = tmp_path / "predecessor-continued"
+    old_helper = b"864c239 predecessor helper"
+    old_authority = "cached-864c239-authority"
+    old_receipt = {
+        "state_helper_sha256": hashlib.sha256(old_helper).hexdigest(),
+        "authority": old_authority,
+    }
+    helper_path.write_bytes(old_helper)
+    helper_path.chmod(0o555)
+    sudoers_path.write_bytes(b"old sudoers\n")
+    sudoers_path.chmod(0o440)
+    receipt_path.write_bytes(
+        protocol.canonical_json_bytes(old_receipt) + b"\n"
+    )
+    receipt_path.chmod(0o600)
+    public_path.write_bytes(b"old public\n")
+    public_path.chmod(0o444)
+    lock = installer._acquire_owner_execution_lock(
+        tmp_path, uid=os.getuid(), gid=os.getgid()
+    )
+    lock_identity = os.fstat(lock)
+
+    # Concurrency-critical open order copied from the installed 864c239
+    # predecessor: validate receipt+binary, cache authority, then take lock.
+    predecessor_source = r"""
+import fcntl
+import hashlib
+import json
+import os
+import sys
+
+helper_path, receipt_path, lock_path, continued_path = sys.argv[1:]
+helper_raw = open(helper_path, "rb").read()
+receipt = json.loads(open(receipt_path, "rb").read())
+if receipt["state_helper_sha256"] != hashlib.sha256(helper_raw).hexdigest():
+    raise SystemExit(3)
+cached_authority = receipt["authority"]
+sys.stdout.write("validated-before-lock\n")
+sys.stdout.flush()
+lock = os.open(lock_path, os.O_RDWR)
+fcntl.flock(lock, fcntl.LOCK_EX)
+open(continued_path, "w").write(cached_authority)
+"""
+    predecessor = subprocess.Popen(
+        (
+            sys.executable,
+            "-c",
+            predecessor_source,
+            str(helper_path),
+            str(receipt_path),
+            str(tmp_path / ".execution.lock"),
+            str(continued_path),
+        ),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    public = {"schema": "successor-public"}
+
+    def accept(command, **_kwargs):
+        return subprocess.CompletedProcess(command, 0, b"", b"")
+
+    def attest_public() -> dict:
+        raw = public_path.read_bytes()
+        return protocol.decode_canonical_json(raw[:-1])
+
+    survived_transaction = False
+    try:
+        assert predecessor.stdout is not None
+        readable, _, _ = select.select([predecessor.stdout], [], [], 2)
+        assert readable
+        assert predecessor.stdout.readline() == b"validated-before-lock\n"
+        installed = installer._publish_owner_installation_transaction(
+            state_helper_path=helper_path,
+            state_helper_payload=b"successor helper",
+            sudoers_path=sudoers_path,
+            sudoers_payload=b"successor sudoers\n",
+            receipt_path=receipt_path,
+            receipt_payload=b"successor receipt\n",
+            public_readiness_path=public_path,
+            build_public_readiness=lambda: public,
+            attest_public_readiness=attest_public,
+            quiesce_predecessors=lambda: (
+                installer._quiesce_predecessor_helpers(
+                    authorized_client_uid=os.getuid(),
+                    process_lister=lambda: (
+                        (predecessor.pid,)
+                        if predecessor.poll() is None else ()
+                    ),
+                )
+            ),
+            uid=os.getuid(),
+            gid=os.getgid(),
+            sudoers_validator=accept,
+        )
+        survived_transaction = predecessor.poll() is None
+    finally:
+        if predecessor.poll() is None:
+            predecessor.kill()
+            predecessor.wait(timeout=2)
+        installer._release_owner_execution_lock(lock)
+    assert installed == public
+    assert survived_transaction is False
+    assert predecessor.returncode != 0
+    assert not continued_path.exists()
+    lock_path_identity = (tmp_path / ".execution.lock").stat()
+    assert lock_path_identity.st_dev == lock_identity.st_dev
+    assert lock_path_identity.st_ino == lock_identity.st_ino
+    assert helper_path.read_bytes() == b"successor helper"
+    assert sudoers_path.read_bytes() == b"successor sudoers\n"
 
 
 def test_malformed_root_receipt_key_fails_with_stable_error(

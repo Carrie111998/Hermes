@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 import re
+import signal
 import stat
 import subprocess
 import sys
@@ -636,6 +637,123 @@ def _release_owner_execution_lock(descriptor: int) -> None:
         fcntl.flock(descriptor, fcntl.LOCK_UN)
     except OSError:
         pass
+
+
+def _list_predecessor_helper_processes(
+    *,
+    authorized_client_uid: int,
+) -> tuple[int, ...]:
+    """List only exact in-flight invocations of the fixed root helper."""
+
+    proc_root = Path("/proc")
+    if not proc_root.is_dir():
+        raise ProductionStorageInstallerError(
+            "production_storage_predecessor_quiescence_invalid"
+        )
+    helper = str(OWNER_STATE_HELPER).encode()
+    exact_argv = {
+        (helper,),
+        (b"/usr/bin/python3", helper),
+        (
+            b"/usr/bin/sudo", b"--non-interactive", b"--", helper,
+        ),
+        (b"sudo", b"--non-interactive", b"--", helper),
+    }
+    found: list[int] = []
+    try:
+        entries = tuple(proc_root.iterdir())
+    except OSError:
+        raise ProductionStorageInstallerError(
+            "production_storage_predecessor_quiescence_invalid"
+        ) from None
+    for entry in entries:
+        if not entry.name.isascii() or not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid == os.getpid():
+            continue
+        try:
+            owner_uid = entry.stat().st_uid
+            raw = (entry / "cmdline").read_bytes()
+        except FileNotFoundError:
+            continue
+        except OSError:
+            raise ProductionStorageInstallerError(
+                "production_storage_predecessor_quiescence_invalid"
+            ) from None
+        argv = tuple(part for part in raw.split(b"\0") if part)
+        if argv in exact_argv:
+            if owner_uid not in {0, authorized_client_uid}:
+                raise ProductionStorageInstallerError(
+                    "production_storage_predecessor_quiescence_invalid"
+                )
+            found.append(pid)
+    return tuple(sorted(found))
+
+
+def _quiesce_predecessor_helpers(
+    *,
+    authorized_client_uid: int,
+    process_lister: Callable[[], Sequence[int]] | None = None,
+    terminator: Callable[[int, int], None] = os.kill,
+    monotonic: Callable[[], float] = time.monotonic,
+    sleeper: Callable[[float], None] = time.sleep,
+) -> None:
+    """Drain helpers that cached predecessor authority before taking lock."""
+
+    lister = process_lister or (
+        lambda: _list_predecessor_helper_processes(
+            authorized_client_uid=authorized_client_uid
+        )
+    )
+    deadline = monotonic() + 10.0
+    empty_observations = 0
+    while monotonic() < deadline:
+        try:
+            pids = tuple(sorted(set(lister())))
+        except ProductionStorageInstallerError:
+            raise
+        except Exception:
+            raise ProductionStorageInstallerError(
+                "production_storage_predecessor_quiescence_invalid"
+            ) from None
+        if any(type(pid) is not int or pid <= 1 for pid in pids):
+            raise ProductionStorageInstallerError(
+                "production_storage_predecessor_quiescence_invalid"
+            )
+        if not pids:
+            empty_observations += 1
+            if empty_observations >= 2:
+                return
+            sleeper(0.05)
+            continue
+        empty_observations = 0
+        for pid in pids:
+            try:
+                terminator(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            except OSError:
+                raise ProductionStorageInstallerError(
+                    "production_storage_predecessor_quiescence_invalid"
+                ) from None
+        sleeper(0.05)
+        survivors = set(lister())
+        for pid in pids:
+            if pid not in survivors:
+                continue
+            try:
+                terminator(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except OSError:
+                raise ProductionStorageInstallerError(
+                    "production_storage_predecessor_quiescence_invalid"
+                ) from None
+        sleeper(0.05)
+    raise ProductionStorageInstallerError(
+        "production_storage_predecessor_quiescence_timeout"
+    )
     try:
         os.close(descriptor)
     except OSError:
@@ -699,6 +817,7 @@ def _publish_owner_installation_transaction(
     public_readiness_path: Path,
     build_public_readiness: Callable[[], Mapping[str, Any]],
     attest_public_readiness: Callable[[], Mapping[str, Any]],
+    quiesce_predecessors: Callable[[], None],
     uid: int,
     gid: int,
     sudoers_validator: Callable[..., subprocess.CompletedProcess[bytes]],
@@ -722,19 +841,17 @@ def _publish_owner_installation_transaction(
         for path, mode in specs
     )
     try:
+        if sudoers_path.exists():
+            _remove_new_fixed_file(
+                sudoers_path, mode=0o440, uid=uid, gid=gid
+            )
+        quiesce_predecessors()
         _write_atomic(
             state_helper_path,
             state_helper_payload,
             mode=0o555,
             uid=uid,
             gid=gid,
-        )
-        _install_validated_sudoers(
-            sudoers_path,
-            sudoers_payload,
-            uid=uid,
-            gid=gid,
-            runner=sudoers_validator,
         )
         _write_atomic(
             receipt_path,
@@ -756,6 +873,13 @@ def _publish_owner_installation_transaction(
             raise ProductionStorageInstallerError(
                 "production_storage_owner_readiness_invalid"
             )
+        _install_validated_sudoers(
+            sudoers_path,
+            sudoers_payload,
+            uid=uid,
+            gid=gid,
+            runner=sudoers_validator,
+        )
         return public
     except Exception as error:
         _rollback_owner_installation(snapshots, uid=uid, gid=gid)
@@ -1182,6 +1306,9 @@ def install_owner_state_root(
                 public_readiness_path=public_readiness_path,
                 expected_uid=expected_uid,
                 expected_gid=expected_gid,
+            ),
+            quiesce_predecessors=lambda: _quiesce_predecessor_helpers(
+                authorized_client_uid=client_uid
             ),
             uid=expected_uid,
             gid=expected_gid,
