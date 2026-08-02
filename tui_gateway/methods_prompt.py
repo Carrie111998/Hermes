@@ -131,7 +131,7 @@ def _(rid, params: dict) -> dict:
     while True:
         busy_transport = None
         with session["history_lock"]:
-            if session.get("running"):
+            if session.get("running") or _interrupt_call_pending(session):
                 # Don't reject a mid-turn prompt — queue it (and, by default,
                 # interrupt the live turn) so it runs as the next turn. The
                 # provider interrupt itself must happen after this lock is
@@ -239,6 +239,10 @@ def _(rid, params: dict) -> dict:
             session["history"] = truncated
             session["history_version"] = int(session.get("history_version", 0)) + 1
         session["running"] = True
+        session["turn_settled"] = False
+        # A retained task belongs to the turn that just settled, never this
+        # newly accepted source turn.
+        session.pop("detached_turn_task_id", None)
         session["_turn_cancel_requested"] = False
         session["last_active"] = time.time()
         _start_inflight_turn(session, text)
@@ -266,8 +270,11 @@ def _(rid, params: dict) -> dict:
 
         with session["history_lock"]:
             session["running"] = False
+            session["turn_settled"] = True
             session["last_active"] = time.time()
             _clear_inflight_turn(session)
+        _settle_detached_turn(session, "error", str(exc))
+        _finish_detached_dispatch(sid, session, only_if_idle=True)
         if is_disk_full_error(exc):
             return _err(
                 rid,
@@ -299,30 +306,42 @@ def _(rid, params: dict) -> dict:
                 (err.get("error") or {}).get("message", "agent initialization failed"),
             )
             with session["history_lock"]:
+                session["turn_settled"] = True
                 session["running"] = False
                 session["last_active"] = time.time()
+            _settle_detached_turn(
+                session,
+                "error",
+                (err.get("error") or {}).get(
+                    "message", "agent initialization failed"
+                ),
+            )
+            _finish_detached_dispatch(sid, session, only_if_idle=True)
             _emit("session.info", sid, _session_info(session.get("agent"), session))
             return
+        cancelled_before_start = False
+        cancellation_message = ""
         with session["history_lock"]:
             if session.get("_turn_cancel_requested") or not session.get("running"):
-                session["running"] = False
-                _clear_inflight_turn(session)
-                # Surface the cancellation to the client. Without this emit the
-                # turn vanishes silently — the Desktop sees `prompt.submit`
-                # return `{"status": "streaming"}` but never receives a
-                # `message.start` or `error` event, so the composer shows no
-                # feedback (issue #63078 server-side half). Match the
-                # `_wait_agent` error branch above: emit, then bail.
-                _emit(
-                    "error",
-                    sid,
-                    {
-                        "message": "Turn cancelled before the agent was ready"
-                        if session.get("_turn_cancel_requested")
-                        else "Session no longer running before the agent was ready"
-                    },
+                cancellation_message = (
+                    "Turn cancelled before the agent was ready"
+                    if session.get("_turn_cancel_requested")
+                    else "Session no longer running before the agent was ready"
                 )
-                return
+                session["running"] = False
+                session["turn_settled"] = True
+                _clear_inflight_turn(session)
+                cancelled_before_start = True
+        if cancelled_before_start:
+            # Surface the cancellation to the client. Without this emit the
+            # turn vanishes silently — the Desktop sees `prompt.submit`
+            # return `{"status": "streaming"}` but never receives a terminal
+            # event. Settlement takes history_lock itself, so it must stay
+            # outside the state-mutation critical section above.
+            _emit("error", sid, {"message": cancellation_message})
+            _settle_detached_turn(session, "interrupted", "interrupted")
+            _finish_detached_dispatch(sid, session, only_if_idle=True)
+            return
         _run_prompt_submit(rid, sid, session, text)
 
     run_thread = threading.Thread(target=run_after_agent_ready, daemon=True)
@@ -882,7 +901,13 @@ def _(rid, params: dict) -> dict:
     # from _pending) while the card is still visible — common when a WebSocket
     # reconnect during the wait drops tool.complete. A late answer must resolve
     # gracefully instead of hitting the raw 4009 "no pending answer request".
-    return _respond(rid, params, "answer", allow_expired=True)
+    return _respond(
+        rid,
+        params,
+        "answer",
+        method="clarify.respond",
+        allow_expired=True,
+    )
 
 
 @method("terminal.read.respond")
@@ -891,37 +916,150 @@ def _(rid, params: dict) -> dict:
     # allow_expired=True: the read_terminal tool's _block() uses a short 30s
     # timeout, so a slow renderer losing the race is the common case — a late
     # response must not error after the tool already returned empty.
-    return _respond(rid, params, "text", allow_expired=True)
+    return _respond(
+        rid,
+        params,
+        "text",
+        method="terminal.read.respond",
+        allow_expired=True,
+    )
 
 
 @method("sudo.respond")
 def _(rid, params: dict) -> dict:
-    return _respond(rid, params, "password", allow_expired=True)
+    return _respond(
+        rid,
+        params,
+        "password",
+        method="sudo.respond",
+        allow_expired=True,
+    )
 
 
 @method("secret.respond")
 def _(rid, params: dict) -> dict:
-    return _respond(rid, params, "value", allow_expired=True)
+    return _respond(
+        rid,
+        params,
+        "value",
+        method="secret.respond",
+        allow_expired=True,
+    )
 
 
 @method("approval.respond")
 def _(rid, params: dict) -> dict:
-    session, err = _sess(params, rid)
+    request_id = str(params.get("request_id") or "")
+    response_sid = str(params.get("session_id") or "")
+    approval = None
+    host_interaction = None
+    with _prompt_lock:
+        # Backward compatibility for clients that answer by session only:
+        # infer the one visible FIFO head.
+        if not request_id and response_sid:
+            queue = _interactive_prompt_queues.get(
+                (response_sid, "approval.request")
+            ) or []
+            if queue and queue[0] in _pending_approvals:
+                request_id = queue[0]
+        if request_id:
+            approval = _pending_approvals.get(request_id)
+            if approval is None:
+                return _err(rid, 4009, "no pending approval request")
+            if response_sid != approval.get("presentation_sid"):
+                return _err(
+                    rid, 4043, "approval response is not owned by this session"
+                )
+            source_sid = str(approval.get("source_sid") or "")
+            presentation_sid = str(approval.get("presentation_sid") or "")
+            queue = _interactive_prompt_queues.get(
+                (presentation_sid, "approval.request")
+            ) or []
+            if not queue or queue[0] != request_id:
+                return _err(
+                    rid, 4094, "approval request is queued behind another request"
+                )
+            if approval.get("compute_host"):
+                interaction = _compute_host_interactions.get(request_id)
+                if interaction is None:
+                    return _err(rid, 4009, "no pending approval request")
+                host_interaction = dict(interaction)
+        else:
+            source_sid = response_sid
+
+    if host_interaction is not None:
+        return _proxy_compute_host_interaction_response(
+            rid,
+            host_interaction,
+            method="approval.respond",
+            params={
+                "all": bool(params.get("all", False)),
+                "choice": params.get("choice", "deny"),
+            },
+            resolve_all=bool(params.get("all", False)),
+        )
+
+    session, err = _sess_nowait({"session_id": source_sid}, rid)
     if err:
         return err
     try:
         from tools.approval import resolve_gateway_approval
 
-        return _ok(
-            rid,
-            {
-                "resolved": resolve_gateway_approval(
-                    session["session_key"],
-                    params.get("choice", "deny"),
-                    resolve_all=params.get("all", False),
-                )
-            },
+        resolved = resolve_gateway_approval(
+            session["session_key"],
+            params.get("choice", "deny"),
+            resolve_all=params.get("all", False),
         )
+        unblocked: list[tuple[str, str, dict]] = []
+        completed_request_ids: list[str] = []
+        if request_id:
+            with _prompt_lock:
+                if params.get("all", False):
+                    unblocked_keys: set[tuple[str, str]] = set()
+                    for pending_id, pending in list(_pending_approvals.items()):
+                        if pending.get("source_sid") != source_sid:
+                            continue
+                        pending_presentation = str(
+                            pending.get("presentation_sid") or source_sid
+                        )
+                        queue_key = (pending_presentation, "approval.request")
+                        queue = _interactive_prompt_queues.get(queue_key) or []
+                        if queue and queue[0] == pending_id:
+                            unblocked_keys.add(queue_key)
+                        _remove_interactive_locked(
+                            pending_id,
+                            "approval.request",
+                            pending_presentation,
+                        )
+                        _pending_approvals.pop(pending_id, None)
+                        completed_request_ids.append(pending_id)
+                    for queue_key in unblocked_keys:
+                        queue = _interactive_prompt_queues.get(queue_key) or []
+                        if queue and (
+                            next_prompt := _interactive_payload_locked(queue[0])
+                        ):
+                            unblocked.append(next_prompt)
+                else:
+                    assert approval is not None
+                    next_prompt = _remove_interactive_locked(
+                        request_id,
+                        "approval.request",
+                        str(approval.get("presentation_sid") or source_sid),
+                    )
+                    if next_prompt is not None:
+                        unblocked.append(next_prompt)
+                    _pending_approvals.pop(request_id, None)
+                    completed_request_ids.append(request_id)
+        for next_prompt in unblocked:
+            _emit_interactive(next_prompt)
+        for completed_request_id in completed_request_ids:
+            _notify_compute_host_interaction_complete(
+                source_sid,
+                completed_request_id,
+                "approval.request",
+                reason="answered",
+            )
+        return _ok(rid, {"resolved": resolved})
     except Exception as e:
         return _err(rid, 5004, str(e))
 
@@ -929,6 +1067,25 @@ def _(rid, params: dict) -> dict:
 def register(server) -> None:
     """Bind this module's handlers onto ``server``'s globals and registry."""
     _registry.install(server)
+    prompt_submit = server._methods["prompt.submit"]
+
+    def serialized_prompt_submit(rid, params):
+        """Order a compute-host claim through its initial turn.start write.
+
+        The parent marks a turn running before the child pipe write. Without
+        this outer lock, a concurrent busy submit can send its interrupt before
+        that accepted turn reaches the child. The inner dispatch operation uses
+        the same RLock re-entrantly; all exception/return paths release here.
+        """
+        sid = str(params.get("session_id") or "")
+        with server._sessions_lock:
+            session = server._sessions.get(sid)
+        if session is None or not server._session_uses_compute_host(session):
+            return prompt_submit(rid, params)
+        with server._compute_host_dispatch_lock(session):
+            return prompt_submit(rid, params)
+
+    server._methods["prompt.submit"] = serialized_prompt_submit
     # Module-level helpers aren't @method handlers, so install() doesn't see
     # them — but server.py's run path calls this one (run_message enrichment,
     # beside the speech-interrupted note). Rebind and publish it the same way.

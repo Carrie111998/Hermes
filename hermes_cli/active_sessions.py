@@ -353,6 +353,43 @@ def try_acquire_active_session(
     ), None
 
 
+def try_reserve_active_session_transition(
+    *,
+    transition: str,
+    session_id: str,
+    surface: str,
+    config: Any,
+    metadata: Optional[dict[str, Any]] = None,
+) -> tuple[Optional[ActiveSessionLease], Optional[str]]:
+    """Atomically reserve capacity for a short-lived session transition.
+
+    A reservation counts against ``max_concurrent_sessions`` while the caller
+    performs a multi-step ownership transition, but it is not the lease of the
+    idle session produced by that transition.  The caller must release it on
+    both commit and rollback.  Using the same locked registry transaction as a
+    normal lease makes admission race-safe across gateway processes.
+    """
+    reservation_metadata = {}
+    if metadata:
+        reservation_metadata.update(
+            {str(key): value for key, value in metadata.items() if isinstance(key, str)}
+        )
+    # These identify the registry entry's semantics and cannot be overridden by
+    # caller-supplied diagnostic metadata.
+    reservation_metadata.update(
+        {
+            "kind": "transition_reservation",
+            "transition": str(transition),
+        }
+    )
+    return try_acquire_active_session(
+        session_id=session_id,
+        surface=surface,
+        config=config,
+        metadata=reservation_metadata,
+    )
+
+
 def release_active_session(lease: ActiveSessionLease) -> None:
     state_path = lease.registry_state_path()
     try:

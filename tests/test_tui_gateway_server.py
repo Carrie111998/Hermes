@@ -89,6 +89,322 @@ def test_session_slot_is_claimed_on_first_turn_not_on_create(monkeypatch, tmp_pa
         reset_hermes_home_override(token)
 
 
+def test_detach_replacement_is_idle_without_holding_shared_slot(
+    monkeypatch, tmp_path
+):
+    from hermes_cli.active_sessions import try_acquire_active_session
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        "max_concurrent_sessions: 2\n", encoding="utf-8"
+    )
+    token = set_hermes_home_override(home)
+    source_lease = None
+    owner_sid = ""
+    try:
+        server._cfg_cache = None
+        server._cfg_mtime = None
+        server._cfg_path = None
+        source_lease, message = try_acquire_active_session(
+            session_id="source-key",
+            surface="desktop",
+            config={"max_concurrent_sessions": 2},
+        )
+        assert message is None and source_lease is not None
+        source = _session(
+            active_session_lease=source_lease,
+            close_on_disconnect=True,
+            profile_home=str(home),
+            running=True,
+            session_key="source-key",
+            source="desktop",
+            turn_settled=False,
+        )
+        server._sessions["source-sid"] = source
+        monkeypatch.setattr(
+            server,
+            "_lazy_resume_info",
+            lambda cwd: {"model": "test-model", "cwd": cwd, "skills": {}, "tools": {}},
+        )
+        monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda: None)
+
+        response = server._methods["session.detach_turn"](
+            "detach", {"session_id": "source-sid"}
+        )
+        assert "result" in response
+        owner_sid = response["result"]["session_id"]
+        replacement = server._sessions[owner_sid]
+
+        assert replacement["active_session_lease"] is None
+        assert replacement["running"] is False
+        assert source["active_session_lease"] is source_lease
+        entries = active_session_registry_snapshot()
+        assert [entry["session_id"] for entry in entries] == ["source-key"]
+        assert all(
+            entry.get("metadata", {}).get("kind") != "transition_reservation"
+            for entry in entries
+        )
+    finally:
+        if owner_sid:
+            server._close_session_by_id(owner_sid, allow_running_detached=True)
+        server._close_session_by_id("source-sid", allow_running_detached=True)
+        if source_lease is not None:
+            source_lease.release()
+        server._detached_turns.clear()
+        server._cfg_cache = None
+        server._cfg_mtime = None
+        server._cfg_path = None
+        reset_hermes_home_override(token)
+
+
+def test_detach_at_capacity_is_atomic_and_leaves_foreground_unchanged(
+    monkeypatch, tmp_path
+):
+    from hermes_cli.active_sessions import try_acquire_active_session
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        "max_concurrent_sessions: 1\n", encoding="utf-8"
+    )
+    token = set_hermes_home_override(home)
+    source_lease = None
+    try:
+        server._cfg_cache = None
+        server._cfg_mtime = None
+        server._cfg_path = None
+        source_lease, message = try_acquire_active_session(
+            session_id="source-key",
+            surface="desktop",
+            config={"max_concurrent_sessions": 1},
+        )
+        assert message is None and source_lease is not None
+        source = _session(
+            active_session_lease=source_lease,
+            profile_home=str(home),
+            running=True,
+            session_key="source-key",
+            source="desktop",
+            turn_settled=False,
+        )
+        server._sessions["source-sid"] = source
+
+        response = server._methods["session.detach_turn"](
+            "detach", {"session_id": "source-sid"}
+        )
+
+        assert response["error"]["code"] == 4090
+        assert "active session limit (1/1)" in response["error"]["message"]
+        assert server._sessions == {"source-sid": source}
+        assert source["running"] is True
+        assert source["active_session_lease"] is source_lease
+        assert "detaching_turn" not in source
+        assert "detach_capacity_reservation" not in source
+        assert "detached_turn_task_id" not in source
+        assert server._detached_turns == {}
+        assert [
+            entry["session_id"] for entry in active_session_registry_snapshot()
+        ] == ["source-key"]
+    finally:
+        server._close_session_by_id("source-sid", allow_running_detached=True)
+        if source_lease is not None:
+            source_lease.release()
+        server._detached_turns.clear()
+        server._cfg_cache = None
+        server._cfg_mtime = None
+        server._cfg_path = None
+        reset_hermes_home_override(token)
+
+
+def test_detach_publication_failure_releases_profile_reservation(
+    monkeypatch, tmp_path
+):
+    from hermes_cli.active_sessions import try_acquire_active_session
+
+    launch_home = tmp_path / "launch-home"
+    source_home = tmp_path / "profiles" / "worker"
+    launch_home.mkdir()
+    source_home.mkdir(parents=True)
+    (source_home / "config.yaml").write_text(
+        "max_concurrent_sessions: 2\n", encoding="utf-8"
+    )
+    launch_token = set_hermes_home_override(launch_home)
+    source_lease = None
+    try:
+        source_token = set_hermes_home_override(source_home)
+        try:
+            source_lease, message = try_acquire_active_session(
+                session_id="source-key",
+                surface="desktop",
+                config={"max_concurrent_sessions": 2},
+            )
+        finally:
+            reset_hermes_home_override(source_token)
+        assert message is None and source_lease is not None
+        source = _session(
+            active_session_lease=source_lease,
+            profile_home=str(source_home),
+            running=True,
+            session_key="source-key",
+            source="desktop",
+            turn_settled=False,
+        )
+        server._sessions["source-sid"] = source
+        server._cfg_cache = None
+        server._cfg_mtime = None
+        server._cfg_path = None
+        monkeypatch.setattr(
+            server,
+            "_create_detached_replacement",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                RuntimeError("publication failed")
+            ),
+        )
+
+        response = server._methods["session.detach_turn"](
+            "detach", {"session_id": "source-sid"}
+        )
+
+        assert response["error"]["code"] == 5000
+        assert "publication failed" in response["error"]["message"]
+        assert source["running"] is True
+        assert source["active_session_lease"] is source_lease
+        assert "detaching_turn" not in source
+        assert "detach_capacity_reservation" not in source
+        assert "detached_turn_task_id" not in source
+        assert not (launch_home / "runtime" / "active_sessions.json").exists()
+        source_token = set_hermes_home_override(source_home)
+        try:
+            assert [
+                entry["session_id"]
+                for entry in active_session_registry_snapshot()
+            ] == ["source-key"]
+        finally:
+            reset_hermes_home_override(source_token)
+    finally:
+        server._close_session_by_id("source-sid", allow_running_detached=True)
+        if source_lease is not None:
+            source_lease.release()
+        server._detached_turns.clear()
+        server._cfg_cache = None
+        server._cfg_mtime = None
+        server._cfg_path = None
+        reset_hermes_home_override(launch_token)
+
+
+def test_detach_reservation_blocks_last_slot_race_then_releases_on_commit(
+    monkeypatch, tmp_path
+):
+    from hermes_cli.active_sessions import try_acquire_active_session
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        "max_concurrent_sessions: 2\n", encoding="utf-8"
+    )
+    token = set_hermes_home_override(home)
+    entered_create = threading.Event()
+    release_create = threading.Event()
+    responses = []
+    source_lease = None
+    concurrent_lease = None
+    owner_sid = ""
+    thread = None
+    try:
+        server._cfg_cache = None
+        server._cfg_mtime = None
+        server._cfg_path = None
+        source_lease, message = try_acquire_active_session(
+            session_id="source-key",
+            surface="desktop",
+            config={"max_concurrent_sessions": 2},
+        )
+        assert message is None and source_lease is not None
+        source = _session(
+            active_session_lease=source_lease,
+            profile_home=str(home),
+            running=True,
+            session_key="source-key",
+            source="desktop",
+            turn_settled=False,
+        )
+        server._sessions["source-sid"] = source
+        monkeypatch.setattr(
+            server,
+            "_lazy_resume_info",
+            lambda cwd: {"model": "test-model", "cwd": cwd, "skills": {}, "tools": {}},
+        )
+        monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda: None)
+        real_create = server._create_detached_replacement
+
+        def blocked_create(rid, source_sid, source_record):
+            assert source_record.get("detach_capacity_reservation") is not None
+            entered_create.set()
+            assert release_create.wait(2)
+            return real_create(rid, source_sid, source_record)
+
+        monkeypatch.setattr(server, "_create_detached_replacement", blocked_create)
+        thread = threading.Thread(
+            target=lambda: responses.append(
+                server._methods["session.detach_turn"](
+                    "detach", {"session_id": "source-sid"}
+                )
+            )
+        )
+        thread.start()
+        assert entered_create.wait(2)
+
+        blocked, blocked_message = try_acquire_active_session(
+            session_id="racing-turn",
+            surface="cli",
+            config={"max_concurrent_sessions": 2},
+        )
+        assert blocked is None
+        assert "active session limit (2/2)" in blocked_message
+        entries = active_session_registry_snapshot()
+        assert len(entries) == 2
+        assert sum(
+            entry.get("metadata", {}).get("kind") == "transition_reservation"
+            for entry in entries
+        ) == 1
+
+        release_create.set()
+        thread.join(2)
+        assert not thread.is_alive()
+        assert "result" in responses[0]
+        owner_sid = responses[0]["result"]["session_id"]
+        replacement = server._sessions[owner_sid]
+        assert replacement["active_session_lease"] is None
+        assert source["active_session_lease"] is source_lease
+
+        concurrent_lease, message = try_acquire_active_session(
+            session_id="racing-turn-after-commit",
+            surface="cli",
+            config={"max_concurrent_sessions": 2},
+        )
+        assert message is None and concurrent_lease is not None
+        assert sorted(
+            entry["session_id"] for entry in active_session_registry_snapshot()
+        ) == ["racing-turn-after-commit", "source-key"]
+    finally:
+        release_create.set()
+        if thread is not None and thread.ident is not None:
+            thread.join(2)
+        if concurrent_lease is not None:
+            concurrent_lease.release()
+        if owner_sid:
+            server._close_session_by_id(owner_sid, allow_running_detached=True)
+        server._close_session_by_id("source-sid", allow_running_detached=True)
+        if source_lease is not None:
+            source_lease.release()
+        server._detached_turns.clear()
+        server._cfg_cache = None
+        server._cfg_mtime = None
+        server._cfg_path = None
+        reset_hermes_home_override(token)
+
+
 def test_session_context_uses_session_cwd(monkeypatch, tmp_path):
     """Desktop/TUI sessions must pin the agent cwd per session.
 
@@ -3723,7 +4039,7 @@ def test_claim_active_session_slot_for_profile_pins_remote_registry(monkeypatch,
     ],
     ids=["lazy", "deferred"],
 )
-def test_session_resume_profile_claims_slot_in_remote_profile(
+def test_session_resume_profile_stays_idle_without_claiming_remote_slot(
     monkeypatch, tmp_path, resume_params
 ):
     target = "stored-profile-session"
@@ -3774,15 +4090,16 @@ def test_session_resume_profile_claims_slot_in_remote_profile(
 
         assert "error" not in response
         sid = response["result"]["session_id"]
-        assert claimed_homes == [profile_home]
+        assert claimed_homes == []
         assert server._sessions[sid]["profile_home"] == str(profile_home)
+        assert server._sessions[sid]["active_session_lease"] is None
     finally:
         for sid, session in list(server._sessions.items()):
             if session.get("session_key") == target:
                 server._sessions.pop(sid, None)
 
 
-def test_session_branch_claims_slot_in_source_profile(monkeypatch, tmp_path):
+def test_session_branch_does_not_claim_slot_before_first_turn(monkeypatch, tmp_path):
     profile_home = tmp_path / "profiles" / "worker"
     profile_home.mkdir(parents=True)
     source = _session(
@@ -3802,8 +4119,11 @@ def test_session_branch_claims_slot_in_source_profile(monkeypatch, tmp_path):
         response = server._methods["session.branch"](
             "branch", {"session_id": "source-sid"}
         )
-        assert response["error"]["code"] == 4090
-        assert claimed_homes == [str(profile_home)]
+        # The fake DB is intentionally incomplete, so branch creation fails
+        # later. Admission must not run first: a newly opened branch is idle
+        # until it submits a real turn, just like create/resume.
+        assert response["error"]["code"] == 5008
+        assert claimed_homes == []
     finally:
         server._sessions.pop("source-sid", None)
 
@@ -3825,7 +4145,7 @@ def test_session_branch_uses_source_profile_db_agent_and_session_context(monkeyp
             captured["db_path"] = Path(db_path)
 
         def get_session_title(self, session_id):
-            captured["title_lookup"] = session_id
+            captured.setdefault("title_lookups", []).append(session_id)
             return "parent"
 
         def get_next_title_in_lineage(self, title):
@@ -3839,18 +4159,6 @@ def test_session_branch_uses_source_profile_db_agent_and_session_context(monkeyp
 
         def set_session_title(self, session_id, title):
             captured["title"] = (session_id, title)
-
-    class Lease:
-        released = False
-
-        def release(self):
-            self.released = True
-
-    lease = Lease()
-
-    def claim(*_args, profile_home=None, **_kwargs):
-        captured["claim_profile_home"] = profile_home
-        return lease, None
 
     def make_agent(*_args, session_db=None, **_kwargs):
         captured["agent_db"] = session_db
@@ -3880,7 +4188,6 @@ def test_session_branch_uses_source_profile_db_agent_and_session_context(monkeyp
         "_get_db",
         lambda: (_ for _ in ()).throw(AssertionError("launch DB must not be used")),
     )
-    monkeypatch.setattr(server, "_claim_active_session_slot_for_profile", claim)
     monkeypatch.setattr(server, "_resolve_model", lambda: "profile/model")
     monkeypatch.setattr(server, "_set_session_context", lambda *args, **kwargs: [])
     monkeypatch.setattr(server, "_clear_session_context", lambda _tokens: None)
@@ -3895,9 +4202,9 @@ def test_session_branch_uses_source_profile_db_agent_and_session_context(monkeyp
 
         assert "error" not in response
         branch_sid = response["result"]["session_id"]
-        assert captured["claim_profile_home"] == str(profile_home)
         assert captured["db_path"] == profile_home / "state.db"
-        assert captured["title_lookup"] == source["session_key"]
+        assert captured["created"][1]["parent_session_id"] == source["session_key"]
+        assert source["session_key"] in captured["title_lookups"]
         assert captured["created"][1]["model"] == "profile/model"
         assert captured["agent_db"].__class__ is ProfileDB
         assert Path(captured["agent_home"]) == profile_home
@@ -3905,8 +4212,7 @@ def test_session_branch_uses_source_profile_db_agent_and_session_context(monkeyp
         assert captured["init"]["kwargs"]["session_db"] is captured["agent_db"]
         assert captured["init"]["kwargs"]["profile_home"] == str(profile_home)
         assert server._sessions[branch_sid]["profile_home"] == str(profile_home)
-        assert server._sessions[branch_sid]["active_session_lease"] is lease
-        assert lease.released is False
+        assert server._sessions[branch_sid]["active_session_lease"] is None
         assert server.get_hermes_home_override() is None
     finally:
         server._sessions.pop("source-sid", None)
@@ -3923,7 +4229,7 @@ def test_session_branch_remote_profile_failure_releases_lease_and_db(monkeypatch
     )
     existing_session_ids = set(server._sessions)
     server._sessions["source-sid"] = source
-    state = {"db_closed": False, "lease_released": False}
+    state = {"db_closed": False}
 
     class FailingProfileDB:
         def __init__(self, db_path=None):
@@ -3942,20 +4248,11 @@ def test_session_branch_remote_profile_failure_releases_lease_and_db(monkeypatch
         def close(self):
             state["db_closed"] = True
 
-    class Lease:
-        def release(self):
-            state["lease_released"] = True
-
     monkeypatch.setattr("hermes_state.SessionDB", FailingProfileDB)
     monkeypatch.setattr(
         server,
         "_get_db",
         lambda: (_ for _ in ()).throw(AssertionError("launch DB must not be used")),
-    )
-    monkeypatch.setattr(
-        server,
-        "_claim_active_session_slot_for_profile",
-        lambda *_args, **_kwargs: (Lease(), None),
     )
     try:
         response = server._methods["session.branch"](
@@ -3964,7 +4261,7 @@ def test_session_branch_remote_profile_failure_releases_lease_and_db(monkeypatch
 
         assert response["error"]["code"] == 5008
         assert "write failed" in response["error"]["message"]
-        assert state == {"db_closed": True, "lease_released": True}
+        assert state == {"db_closed": True}
         assert set(server._sessions) == existing_session_ids | {"source-sid"}
         assert server.get_hermes_home_override() is None
     finally:
@@ -4048,15 +4345,6 @@ def test_session_resume_profile_uses_profile_db_cwd(monkeypatch, tmp_path):
 
     monkeypatch.setattr(approval, "register_gateway_notify", lambda key, cb: None)
     monkeypatch.setattr(approval, "load_permanent_allowlist", lambda: None)
-    monkeypatch.setattr(
-        server,
-        "_claim_active_session_slot_for_profile",
-        lambda *args, profile_home=None, **kwargs: captured.setdefault(
-            "claim_profile_home", profile_home
-        )
-        and (None, None),
-    )
-
     try:
         # eager_build: asserts the synchronous build receives the profile's db
         # (the deferred default builds with the same db via _start_agent_build).
@@ -4071,7 +4359,7 @@ def test_session_resume_profile_uses_profile_db_cwd(monkeypatch, tmp_path):
         assert "error" not in resp
         sid = resp["result"]["session_id"]
         assert captured["agent_db"] is profile_db
-        assert captured["claim_profile_home"] == profile_home
+        assert server._sessions[sid]["active_session_lease"] is None
         assert server._sessions[sid]["cwd"] == str(profile_cwd)
         assert resp["result"]["info"]["cwd"] == str(profile_cwd)
         assert "launch_update" not in captured
@@ -5972,7 +6260,11 @@ def test_post_turn_drain_clears_stale_stop_before_notification_turn(
             return None
 
         def run_conversation(
-            self, prompt, conversation_history=None, stream_callback=None
+            self,
+            prompt,
+            conversation_history=None,
+            stream_callback=None,
+            **_kwargs,
         ):
             turns.append(prompt)
             if len(turns) == 1:
@@ -10672,31 +10964,6 @@ def test_cancelled_turn_before_agent_ready_emits_error_event(monkeypatch):
             self.target = target
             threads.append(self)
 
-def test_interrupt_flag_precedes_blocking_agent_interrupt(monkeypatch):
-    """Turn startup cannot clear a stop whose provider interrupt is still blocked."""
-
-    interrupt_entered = threading.Event()
-    release_interrupt = threading.Event()
-    clear_calls = []
-    created_threads = []
-
-    class BlockingAgent:
-        def interrupt(self):
-            interrupt_entered.set()
-            assert release_interrupt.wait(5)
-
-        def clear_interrupt(self):
-            clear_calls.append(True)
-
-    class LiveThread:
-        def is_alive(self):
-            return True
-
-    class DeferredThread:
-        def __init__(self, target=None, **_kwargs):
-            self.target = target
-            created_threads.append(self)
-
         def start(self):
             return None
 
@@ -10732,27 +10999,97 @@ def test_interrupt_flag_precedes_blocking_agent_interrupt(monkeypatch):
         assert submit.get("result"), f"got error: {submit.get('error')}"
         assert session["running"] is True
 
-        # User hits Stop while the agent is still building.
         stop = server.handle_request(
             {"id": "2", "method": "session.interrupt", "params": {"session_id": "sid"}}
         )
         assert stop.get("result"), f"got error: {stop.get('error')}"
         assert session.get("_turn_cancel_requested") is True
 
-        # The deferred run thread now wakes up; without the emit it would bail
-        # silently and the Desktop would never learn the turn was dropped.
         threads[0].target()
 
         assert calls["run_prompt"] == 0
         assert session["running"] is False
         assert session.get("inflight_turn") is None
-        # Exactly one error event addressed to this session.
-        error_events = [e for e in emitted if e and len(e) >= 2 and e[0] == "error" and e[1] == "sid"]
+        error_events = [
+            event
+            for event in emitted
+            if event and len(event) >= 2 and event[0] == "error" and event[1] == "sid"
+        ]
         assert len(error_events) == 1, f"expected one error event, got: {emitted}"
-        msg = error_events[0][2].get("message", "")
-        assert "cancelled" in msg.lower(), f"unexpected message: {msg}"
+        assert "cancelled" in error_events[0][2].get("message", "").lower()
     finally:
         server._sessions.pop("sid", None)
+
+
+def test_interrupt_flag_precedes_blocking_agent_interrupt(monkeypatch):
+    """Turn startup cannot clear a stop whose provider interrupt is still blocked."""
+
+    interrupt_entered = threading.Event()
+    release_interrupt = threading.Event()
+    clear_calls = []
+    created_threads = []
+
+    class BlockingAgent:
+        def interrupt(self):
+            interrupt_entered.set()
+            assert release_interrupt.wait(5)
+
+        def clear_interrupt(self):
+            clear_calls.append(True)
+
+    class LiveThread:
+        def is_alive(self):
+            return True
+
+    class DeferredThread:
+        def __init__(self, target=None, **_kwargs):
+            self.target = target
+            created_threads.append(self)
+
+        def start(self):
+            return None
+
+        def is_alive(self):
+            return True
+
+    session = _session(
+        agent=BlockingAgent(),
+        running=True,
+        _run_thread=LiveThread(),
+    )
+    server._sessions["interrupt-order"] = session
+    original_thread = threading.Thread
+    response = []
+    stop_thread = original_thread(
+        target=lambda: response.append(
+            server.handle_request(
+                {
+                    "id": "stop",
+                    "method": "session.interrupt",
+                    "params": {"session_id": "interrupt-order"},
+                }
+            )
+        ),
+        daemon=True,
+    )
+    try:
+        stop_thread.start()
+        assert interrupt_entered.wait(5)
+        monkeypatch.setattr(server.threading, "Thread", DeferredThread)
+
+        server._run_prompt_submit(
+            "turn", "interrupt-order", session, "must not start"
+        )
+
+        assert clear_calls == []
+        assert created_threads == []
+        assert session["running"] is False
+        assert session.get("inflight_turn") is None
+    finally:
+        release_interrupt.set()
+        stop_thread.join(5)
+        server._sessions.pop("interrupt-order", None)
+    assert response and response[0].get("result")
 
 
 def test_session_not_running_before_agent_ready_emits_error_event(monkeypatch):
@@ -10835,44 +11172,63 @@ def test_slow_agent_build_delivers_prompt_instead_of_timing_out(monkeypatch):
             self.target = target
             threads.append(self)
 
-    session = _session(
-        agent=BlockingAgent(),
-        running=True,
-        _run_thread=LiveThread(),
-    )
-    server._sessions["interrupt-order"] = session
-    original_thread = threading.Thread
-    response = []
-    stop_thread = original_thread(
-        target=lambda: response.append(
-            server.handle_request(
-                {
-                    "id": "stop",
-                    "method": "session.interrupt",
-                    "params": {"session_id": "interrupt-order"},
-                }
-            )
-        ),
-        daemon=True,
-    )
-    try:
-        stop_thread.start()
-        assert interrupt_entered.wait(5)
-        monkeypatch.setattr(server.threading, "Thread", DeferredThread)
+        def start(self):
+            return None
 
-        server._run_prompt_submit(
-            "turn", "interrupt-order", session, "must not start"
+        def is_alive(self):
+            return True
+
+    ready = threading.Event()
+    session = _session(agent_ready=ready)
+    session["agent"] = None
+    server._sessions["sid"] = session
+
+    slices = {"n": 0}
+
+    class _SlowReady:
+        def wait(self, timeout=None):
+            slices["n"] += 1
+            if slices["n"] >= 3:
+                ready.set()
+                session["agent"] = types.SimpleNamespace()
+                return True
+            return False
+
+        def is_set(self):
+            return ready.is_set()
+
+    session["agent_ready"] = _SlowReady()
+
+    try:
+        monkeypatch.setattr(server.threading, "Thread", _FakeThread)
+        monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: emitted.append(args))
+        monkeypatch.setattr(server, "_ensure_session_db_row", lambda session: None)
+        monkeypatch.setattr(server, "_persist_branch_seed", lambda session: None)
+        monkeypatch.setattr(server, "_start_agent_build", lambda sid, session: None)
+        monkeypatch.setattr(
+            server,
+            "_run_prompt_submit",
+            lambda *args, **kwargs: calls.__setitem__(
+                "run_prompt", calls["run_prompt"] + 1
+            ),
         )
 
-        assert clear_calls == []
-        assert created_threads == []
-        assert session["running"] is False
-        assert session.get("inflight_turn") is None
+        submit = server.handle_request(
+            {
+                "id": "1",
+                "method": "prompt.submit",
+                "params": {"session_id": "sid", "text": "first message"},
+            }
+        )
+        assert submit.get("result"), f"got error: {submit.get('error')}"
+
+        threads[0].target()
+
+        assert calls["run_prompt"] == 1
+        error_events = [event for event in emitted if event and event[0] == "error"]
+        assert not error_events, f"unexpected error events: {error_events}"
     finally:
-        release_interrupt.set()
-        stop_thread.join(5)
-        server._sessions.pop("interrupt-order", None)
-    assert response and response[0].get("result")
+        server._sessions.pop("sid", None)
 
 
 def test_explicit_interrupt_defers_new_prompt_until_provider_returns(monkeypatch):
@@ -10902,7 +11258,7 @@ def test_explicit_interrupt_defers_new_prompt_until_provider_returns(monkeypatch
     monkeypatch.setattr(
         server,
         "_run_prompt_submit",
-        lambda rid, sid, queued_session, text: dispatched.append(
+        lambda rid, sid, queued_session, text, **_kwargs: dispatched.append(
             (rid, sid, queued_session, text)
         ),
     )
@@ -10982,61 +11338,21 @@ def test_queued_prompt_claim_clears_stale_cancel_before_inline_start(monkeypatch
         def is_alive(self):
             return True
 
-    ready = threading.Event()
-    session = _session(agent_ready=ready)
-    session["agent"] = None
-    server._sessions["sid"] = session
+    session = _session(
+        agent=Agent(),
+        running=False,
+        queued_prompt={"text": "post-stop", "transport": None},
+        _turn_cancel_requested=True,
+    )
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda *_args: False)
+    monkeypatch.setattr(server.threading, "Thread", DeferredThread)
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
 
-    # The build "completes" only after the wait loop has already gone through
-    # several empty slices — i.e. well past what a single fixed-timeout wait
-    # slice would tolerate.
-    slices = {"n": 0}
-
-    class _SlowReady:
-        def wait(self, timeout=None):
-            slices["n"] += 1
-            if slices["n"] >= 3:
-                ready.set()
-                session["agent"] = types.SimpleNamespace()
-                return True
-            return False
-
-        def is_set(self):
-            return ready.is_set()
-
-    session["agent_ready"] = _SlowReady()
-
-    try:
-        monkeypatch.setattr(server.threading, "Thread", _FakeThread)
-        monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: emitted.append(args))
-        monkeypatch.setattr(server, "_ensure_session_db_row", lambda session: None)
-        monkeypatch.setattr(server, "_persist_branch_seed", lambda session: None)
-        monkeypatch.setattr(server, "_start_agent_build", lambda sid, session: None)
-        monkeypatch.setattr(
-            server,
-            "_run_prompt_submit",
-            lambda *args, **kwargs: calls.__setitem__(
-                "run_prompt", calls["run_prompt"] + 1
-            ),
-        )
-
-        submit = server.handle_request(
-            {
-                "id": "1",
-                "method": "prompt.submit",
-                "params": {"session_id": "sid", "text": "first message"},
-            }
-        )
-        assert submit.get("result"), f"got error: {submit.get('error')}"
-
-        threads[0].target()
-
-        # The message was DELIVERED, not dropped, and no error event fired.
-        assert calls["run_prompt"] == 1
-        error_events = [e for e in emitted if e and e[0] == "error"]
-        assert not error_events, f"unexpected error events: {error_events}"
-    finally:
-        server._sessions.pop("sid", None)
+    assert server._drain_queued_prompt("next", "post-stop-sid", session) is True
+    assert session["_turn_cancel_requested"] is False
+    assert session["running"] is True
+    assert clear_calls == [True]
+    assert len(created_threads) == 1
 
 
 def test_slow_agent_build_emits_keyed_progress_notice(monkeypatch):
@@ -11302,22 +11618,6 @@ def test_wait_agent_for_prompt_expires_at_cap(monkeypatch):
     finally:
         server._sessions.pop("sid", None)
 
-    session = _session(
-        agent=Agent(),
-        running=False,
-        queued_prompt={"text": "post-stop", "transport": None},
-        _turn_cancel_requested=True,
-    )
-    monkeypatch.setattr(server, "_session_uses_compute_host", lambda *_args: False)
-    monkeypatch.setattr(server.threading, "Thread", DeferredThread)
-    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
-
-    assert server._drain_queued_prompt("next", "post-stop-sid", session) is True
-    assert session["_turn_cancel_requested"] is False
-    assert session["running"] is True
-    assert clear_calls == [True]
-    assert len(created_threads) == 1
-
 
 def test_prompt_submit_queues_behind_pending_busy_interrupt(monkeypatch):
     """A direct successor cannot start while the old interrupt is blocked."""
@@ -11370,7 +11670,7 @@ def test_queued_prompt_waits_for_busy_interrupt_completion(monkeypatch):
     monkeypatch.setattr(
         server,
         "_run_prompt_submit",
-        lambda rid, sid, queued_session, text: dispatched.append(
+        lambda rid, sid, queued_session, text, **_kwargs: dispatched.append(
             (rid, sid, queued_session, text)
         ),
     )
@@ -13829,6 +14129,7 @@ def test_detach_running_turn_reuses_exact_agent_and_delivers_once(monkeypatch):
             conversation_history=None,
             stream_callback=None,
             task_id=None,
+            **_kwargs,
         ):
             calls.append((self, prompt, list(conversation_history or []), task_id))
             started.set()
@@ -13845,7 +14146,12 @@ def test_detach_running_turn_reuses_exact_agent_and_delivers_once(monkeypatch):
         model = "fresh-model"
 
         def run_conversation(
-            self, prompt, conversation_history=None, stream_callback=None, task_id=None
+            self,
+            prompt,
+            conversation_history=None,
+            stream_callback=None,
+            task_id=None,
+            **_kwargs,
         ):
             calls.append((self, prompt, list(conversation_history or []), task_id))
             return {
@@ -13861,7 +14167,9 @@ def test_detach_running_turn_reuses_exact_agent_and_delivers_once(monkeypatch):
     server._sessions["source-sid"] = source
     server._detached_turns.clear()
 
-    def fake_create(rid, params, *, routing=None):
+    def fake_create(rid, source_sid, source_record):
+        assert source_sid == "source-sid"
+        assert source_record is source
         server._sessions["fresh-sid"] = _session(
             agent=ReplacementAgent(),
             session_key="fresh-key",
@@ -13886,7 +14194,7 @@ def test_detach_running_turn_reuses_exact_agent_and_delivers_once(monkeypatch):
             replacement_done.set()
         return True
 
-    monkeypatch.setattr(server, "_create_session", fake_create)
+    monkeypatch.setattr(server, "_create_detached_replacement", fake_create)
     monkeypatch.setattr(server, "_emit", emit)
     monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
     monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
@@ -14194,7 +14502,9 @@ def test_consumption_cannot_clear_source_protection_before_dispatch_exits(monkey
     server._sessions["source-sid"] = source
     server._detached_turns.clear()
 
-    def fake_create(rid, params, *, routing=None):
+    def fake_create(rid, source_sid, source_record):
+        assert source_sid == "source-sid"
+        assert source_record is source
         owner = _session(session_key="owner-key")
         owner["_live_sid"] = "owner-sid"
         server._sessions["owner-sid"] = owner
@@ -14222,7 +14532,7 @@ def test_consumption_cannot_clear_source_protection_before_dispatch_exits(monkey
         if sid == "source-sid" and session is source:
             dispatch_finished.set()
 
-    monkeypatch.setattr(server, "_create_session", fake_create)
+    monkeypatch.setattr(server, "_create_detached_replacement", fake_create)
     monkeypatch.setattr(server, "_emit", emit)
     monkeypatch.setattr(server, "_finish_detached_dispatch", finish)
     monkeypatch.setattr(server, "make_stream_renderer", lambda _cols: None)
@@ -14631,15 +14941,15 @@ def test_close_and_disconnect_reaper_cannot_teardown_detaching_source(monkeypatc
         turn_settled=False,
     )
     server._sessions["source-sid"] = source
-    real_create = server._create_session
+    real_create = server._create_detached_replacement
 
-    def blocked_create(rid, params, *, routing=None):
+    def blocked_create(rid, source_sid, source_record):
         entered_create.set()
         assert release_create.wait(2)
-        return real_create(rid, params, routing=routing)
+        return real_create(rid, source_sid, source_record)
 
-    monkeypatch.setattr(server, "_create_session", blocked_create)
-    monkeypatch.setattr(server, "_claim_active_session_slot", lambda *a, **k: (None, None))
+    monkeypatch.setattr(server, "_create_detached_replacement", blocked_create)
+    monkeypatch.setattr(server, "_reserve_detach_capacity", lambda *a, **k: (None, None))
     monkeypatch.setattr(server, "_start_agent_build", lambda *a, **k: None)
     responses = []
     thread = threading.Thread(
@@ -14705,14 +15015,16 @@ def test_detach_real_lazy_create_observes_source_profile_and_cwd(monkeypatch, tm
         built.append((sid, session["cwd"], session.get("profile_home")))
         build_seen.set()
 
+    def reserve_in_source_profile(_source_sid, source_record):
+        with server._session_profile_context(source_record):
+            claimed_homes.append(str(server.get_hermes_home_override() or ""))
+        return None, None
+
     monkeypatch.setattr(server, "_start_agent_build", observe_build)
     monkeypatch.setattr(
         server,
-        "_claim_active_session_slot",
-        lambda *a, **k: claimed_homes.append(
-            str(server.get_hermes_home_override() or "")
-        )
-        or (None, None),
+        "_reserve_detach_capacity",
+        reserve_in_source_profile,
     )
     monkeypatch.setattr(server, "_resolve_model", lambda: "profile-model")
     monkeypatch.setattr(
@@ -14789,7 +15101,7 @@ def test_detach_real_lazy_builder_succeeds_in_source_profile(monkeypatch, tmp_pa
 
     monkeypatch.setattr(server, "_make_agent", make_agent)
     monkeypatch.setattr(server, "_SlashWorker", Worker)
-    monkeypatch.setattr(server, "_claim_active_session_slot", lambda *a, **k: (None, None))
+    monkeypatch.setattr(server, "_reserve_detach_capacity", lambda *a, **k: (None, None))
     monkeypatch.setattr(server, "_config_model_target", lambda: "profile-model")
     monkeypatch.setattr(server, "_wire_callbacks", lambda _sid: None)
     monkeypatch.setattr(server, "_start_notification_poller", lambda *a, **k: None)
@@ -14848,30 +15160,23 @@ def test_detach_builder_failure_before_publication_rolls_back(monkeypatch, tmp_p
     )
     server._sessions["source-sid"] = source
     seen_homes = []
-    real_create = server._create_session
-
     def fail_make_agent(_sid, _key, **_kwargs):
         seen_homes.append(str(server.get_hermes_home_override() or ""))
         raise RuntimeError("builder exploded")
 
-    def create_and_wait_for_real_builder(rid, params, *, routing=None):
-        response = real_create(rid, params, routing=routing)
-        owner_sid = response["result"]["session_id"]
-        owner = server._sessions[owner_sid]
-        server._start_agent_build(owner_sid, owner)
-        assert owner["agent_ready"].wait(2)
-        return response
+    def fail_create(_rid, _source_sid, source_record):
+        with server._session_profile_context(source_record):
+            fail_make_agent("unused", "unused")
 
-    monkeypatch.setattr(server, "_create_session", create_and_wait_for_real_builder)
-    monkeypatch.setattr(server, "_make_agent", fail_make_agent)
-    monkeypatch.setattr(server, "_claim_active_session_slot", lambda *a, **k: (None, None))
+    monkeypatch.setattr(server, "_create_detached_replacement", fail_create)
+    monkeypatch.setattr(server, "_reserve_detach_capacity", lambda *a, **k: (None, None))
     monkeypatch.setattr(server, "_emit", lambda *a, **k: True)
     monkeypatch.setattr(server, "_finalize_session", lambda *a, **k: None)
     try:
         response = server._methods["session.detach_turn"](
             "detach", {"session_id": "source-sid"}
         )
-        assert response["error"]["code"] == 5032
+        assert response["error"]["code"] == 5000
         assert "builder exploded" in response["error"]["message"]
         assert server._sessions.get("source-sid") is source
         assert not any(
@@ -14907,7 +15212,7 @@ def test_detach_builder_failure_after_publication_emits_source_recovery(
         raise RuntimeError("late builder failure")
 
     monkeypatch.setattr(server, "_make_agent", fail_after_publication)
-    monkeypatch.setattr(server, "_claim_active_session_slot", lambda *a, **k: (None, None))
+    monkeypatch.setattr(server, "_reserve_detach_capacity", lambda *a, **k: (None, None))
     monkeypatch.setattr(
         server,
         "_emit",
@@ -15168,12 +15473,14 @@ def test_detach_capacity_failure_rolls_back_marker_without_replacement(
     claimed_homes = []
 
     def reject_at_profile_cap(*_args, **_kwargs):
-        claimed_homes.append(str(server.get_hermes_home_override() or ""))
+        source_record = _args[1]
+        with server._session_profile_context(source_record):
+            claimed_homes.append(str(server.get_hermes_home_override() or ""))
         return None, "Hermes is at the active session limit (1/1)."
 
     monkeypatch.setattr(
         server,
-        "_claim_active_session_slot",
+        "_reserve_detach_capacity",
         reject_at_profile_cap,
     )
     try:

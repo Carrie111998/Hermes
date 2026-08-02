@@ -598,6 +598,49 @@ def _claim_active_session_slot_for_profile(
             reset_hermes_home_override(token)
 
 
+def _reserve_detach_capacity(
+    source_sid: str,
+    source: dict,
+) -> tuple[Any, str | None]:
+    """Reserve one profile-local slot for the detach ownership transition."""
+    try:
+        from hermes_cli.active_sessions import try_reserve_active_session_transition
+
+        with _session_profile_context(source):
+            return try_reserve_active_session_transition(
+                transition="detach_turn",
+                session_id=f"detach:{source.get('session_key') or source_sid}",
+                surface=_session_source(source),
+                config=_load_cfg(),
+                metadata={
+                    "live_session_id": source_sid,
+                    "source_session_id": str(source.get("session_key") or ""),
+                },
+            )
+    except Exception as exc:
+        logger.warning("Failed to reserve detach capacity: %s", exc)
+        return None, None
+
+
+def _release_detach_capacity_reservation(
+    source: dict | None,
+    reservation: Any = None,
+) -> None:
+    """Release and forget a detach reservation without touching either lease."""
+    if source is not None:
+        current = source.get("detach_capacity_reservation")
+        if reservation is None:
+            reservation = current
+        if current is reservation:
+            source.pop("detach_capacity_reservation", None)
+    if reservation is None:
+        return
+    try:
+        reservation.release()
+    except Exception:
+        logger.debug("Failed to release detach capacity reservation", exc_info=True)
+
+
 def _release_active_session_slot(session: dict | None) -> None:
     if not session:
         return
@@ -717,6 +760,7 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
     if not session or session.get("_finalized"):
         return
     session["_finalized"] = True
+    _release_detach_capacity_reservation(session)
     _release_active_session_slot(session)
     stop_event = session.get("_notif_stop")
     if stop_event is not None:
@@ -1289,11 +1333,15 @@ def _reclaim_orphaned_leases() -> None:
         from hermes_cli.active_sessions import release_orphaned_leases
 
         with _sessions_lock:
-            live = {
-                lease.lease_id
-                for session in _sessions.values()
-                if (lease := session.get("active_session_lease")) is not None
-            }
+            live = set()
+            for session in _sessions.values():
+                for field in (
+                    "active_session_lease",
+                    "detach_capacity_reservation",
+                ):
+                    lease = session.get(field)
+                    if lease is not None:
+                        live.add(lease.lease_id)
         if dropped := release_orphaned_leases(live):
             logger.info("Reclaimed %d orphaned active-session lease(s)", dropped)
     except Exception:
@@ -2309,7 +2357,12 @@ def _submit_prompt_to_compute_host(
             return _err(rid, 5019, f"compute-host dispatch failed: {exc}")
         with session["history_lock"]:
             session["_compute_host_active"] = True
-            session["attached_images"] = []
+            # Explicit paths came from a captured/queued prompt. Do not erase
+            # attachments added concurrently while the pipe write was in
+            # flight; only consume the live attachment buffer when it supplied
+            # this turn's images.
+            if image_paths is None:
+                session["attached_images"] = []
     return _ok(rid, {"status": "streaming", "turn_isolation": True})
 
 
@@ -8325,7 +8378,7 @@ def _handle_busy_submit(
             # helper. Let the caller retry and claim the now-idle session.
             return None
     with session["history_lock"]:
-        if not session.get("running"):
+        if not session.get("running") and not _interrupt_call_pending(session):
             return None
         image_paths = list(session.get("attached_images", []))
         if image_paths:
@@ -8639,6 +8692,77 @@ def _deferred_session_record(
         "tool_started_at": {},
         "transport": current_transport() or _stdio_transport,
     }
+
+
+def _create_detached_replacement(
+    rid,
+    source_sid: str,
+    source: dict,
+) -> dict:
+    """Publish the fresh, idle presentation owner for an exact-turn detach.
+
+    This intentionally does not claim an active-session lease. Detach admission
+    is represented by the source's short-lived transition reservation; once
+    publication commits, the replacement is an ordinary idle session and will
+    claim its own lease only on its first ``prompt.submit``.
+    """
+    sid = uuid.uuid4().hex[:8]
+    key = _new_session_key()
+    cwd = _session_cwd(source)
+    profile_home_raw = source.get("profile_home")
+    profile_home = Path(profile_home_raw) if profile_home_raw else None
+    record = _deferred_session_record(
+        key,
+        cols=int(source.get("cols", 80) or 80),
+        cwd=cwd,
+        history=[],
+        lease=None,
+        source=_session_source(source),
+        close_on_disconnect=False,
+        profile_home=profile_home,
+    )
+    # This is a new conversation, not a cold resume of ``key``.
+    record.pop("resume_session_id", None)
+    record.pop("resume_runtime_overrides", None)
+    record.pop("lazy", None)
+    record.update(
+        {
+            "create_reasoning_override": None,
+            "create_service_tier_override": None,
+            "detach_source_session_id": source_sid,
+            "explicit_cwd": bool(source.get("explicit_cwd")),
+            "parent_session_id": None,
+            "restore_close_on_disconnect": bool(
+                source.get("close_on_disconnect")
+            ),
+            "transport": source.get("transport")
+            or current_transport()
+            or _stdio_transport,
+        }
+    )
+
+    with _sessions_lock:
+        _sessions[sid] = record
+        _register_session_cwd(record)
+
+    try:
+        with _session_profile_context(record):
+            info = _lazy_resume_info(cwd)
+    except Exception:
+        _close_session_by_id(sid, end_reason="detach_replacement_rollback")
+        raise
+
+    _schedule_session_cap_enforcement()
+    return _ok(
+        rid,
+        {
+            "session_id": sid,
+            "stored_session_id": key,
+            "message_count": 0,
+            "messages": [],
+            "info": info,
+        },
+    )
 
 
 def _claim_or_reuse_live(

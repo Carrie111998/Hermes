@@ -317,3 +317,55 @@ def test_cap_is_isolated_per_profile_registry(tmp_path, monkeypatch):
     assert len(_registry_entries_for(home_b)) == 1
     lease_a.release()
     lease_b.release()
+
+
+def test_transition_reservation_is_atomic_and_released_without_transfer(
+    tmp_path, monkeypatch
+):
+    """Detach admission occupies the last slot only for the transition.
+
+    The reservation is deliberately not transferred to the idle replacement:
+    after commit/release, a real turn can acquire that capacity normally.
+    """
+    home = tmp_path / ".hermes"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    cfg = {"max_concurrent_sessions": 1}
+
+    reservation, message = active_sessions.try_reserve_active_session_transition(
+        transition="detach_turn",
+        session_id="detach:source",
+        surface="desktop",
+        config=cfg,
+        metadata={"source_session_id": "source"},
+    )
+    assert message is None
+    assert reservation is not None
+    entries = active_sessions.active_session_registry_snapshot()
+    assert len(entries) == 1
+    assert entries[0]["metadata"] == {
+        "kind": "transition_reservation",
+        "source_session_id": "source",
+        "transition": "detach_turn",
+    }
+
+    blocked, blocked_message = active_sessions.try_acquire_active_session(
+        session_id="concurrent-turn",
+        surface="cli",
+        config=cfg,
+    )
+    assert blocked is None
+    assert "active session limit (1/1)" in blocked_message
+
+    reservation.release()
+    replacement_turn, replacement_message = active_sessions.try_acquire_active_session(
+        session_id="replacement-first-turn",
+        surface="desktop",
+        config=cfg,
+    )
+    assert replacement_message is None
+    assert replacement_turn is not None
+    assert [
+        entry["session_id"]
+        for entry in active_sessions.active_session_registry_snapshot()
+    ] == ["replacement-first-turn"]
+    replacement_turn.release()

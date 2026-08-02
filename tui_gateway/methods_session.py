@@ -159,6 +159,238 @@ def _(rid, params: dict) -> dict:
     )
 
 
+@method("session.detach_turn")
+def _(rid, params: dict) -> dict:
+    """Detach one exact in-flight turn and create a fresh idle UI owner."""
+    source_sid = str(params.get("session_id") or "")
+    marker = uuid.uuid4().hex
+    reservation = None
+    with _sessions_lock:
+        source = _sessions.get(source_sid)
+        if source is None:
+            return _err(rid, 4001, "session not found")
+        with source["history_lock"]:
+            if source.get("detaching_turn"):
+                return _err(rid, 4093, "detach already in progress")
+
+            existing_id = str(source.get("detached_turn_task_id") or "")
+            if existing_id:
+                with _detached_turns_lock:
+                    existing = _detached_turns.get(existing_id)
+                    if existing is not None:
+                        result = dict(existing["detach_response"])
+                        result["task"] = _detached_turn_snapshot(existing)
+                        return _ok(rid, result)
+
+            if source.get("detached_dispatch_active"):
+                return _err(rid, 4093, "turn is already detached")
+            if not source.get("running") or source.get("turn_settled"):
+                return _err(
+                    rid, 4024, "already_settled: no running turn to detach"
+                )
+
+            # Protect the source from close/reap before performing admission.
+            source["detaching_turn"] = marker
+            reservation, limit_message = _reserve_detach_capacity(
+                source_sid, source
+            )
+            if limit_message is not None:
+                source.pop("detaching_turn", None)
+                return _err(rid, 4090, limit_message)
+            if reservation is not None:
+                # The orphan reconciler includes this field while the
+                # transition is in flight; it cannot reclaim the reservation.
+                source["detach_capacity_reservation"] = reservation
+
+    owner_sid = ""
+
+    def rollback(message: str, *, code: int = 5000) -> dict:
+        if owner_sid:
+            _close_session_by_id(owner_sid, end_reason="detach_rollback")
+        held_reservation = reservation
+        with _sessions_lock:
+            if _sessions.get(source_sid) is source:
+                with source["history_lock"]:
+                    if source.get("detaching_turn") == marker:
+                        source.pop("detaching_turn", None)
+                    current = source.pop("detach_capacity_reservation", None)
+                    if current is not None:
+                        held_reservation = current
+        _release_detach_capacity_reservation(None, held_reservation)
+        return _err(rid, code, message)
+
+    try:
+        create_response = _create_detached_replacement(
+            f"{rid}:replacement", source_sid, source
+        )
+    except Exception as exc:
+        return rollback(f"could not create replacement session: {exc}")
+    if "error" in create_response:
+        error = create_response.get("error") or {}
+        return rollback(
+            str(error.get("message") or "could not create replacement session"),
+            code=int(error.get("code", 5000)),
+        )
+
+    result = dict(create_response["result"])
+    owner_sid = str(result["session_id"])
+    task_id = f"bg_turn_{uuid.uuid4().hex[:8]}"
+    publication_error: tuple[int, str] | None = None
+
+    with _sessions_lock:
+        replacement = _sessions.get(owner_sid)
+        if replacement is None or _sessions.get(source_sid) is not source:
+            publication_error = (
+                5000,
+                "replacement session disappeared during detach",
+            )
+        elif replacement.get("detached_replacement_error") or replacement.get(
+            "agent_error"
+        ):
+            message = replacement.get(
+                "detached_replacement_error"
+            ) or replacement.get("agent_error")
+            publication_error = (
+                5032,
+                f"replacement agent failed to initialize: {message}",
+            )
+        else:
+            source["history_lock"].acquire()
+
+        if publication_error is None:
+            try:
+                if (
+                    source.get("detaching_turn") != marker
+                    or not source.get("running")
+                    or source.get("turn_settled")
+                ):
+                    publication_error = (
+                        4024,
+                        "already_settled: no running turn to detach",
+                    )
+                else:
+                    source_key = str(source.get("session_key") or "")
+                    result.update(
+                        {
+                            "source_session_id": source_sid,
+                            "source_session_key": source_key,
+                            "task_id": task_id,
+                        }
+                    )
+                    task = {
+                        "created_at": time.time(),
+                        "detach_response": dict(result),
+                        "notified": False,
+                        "owner_session_id": owner_sid,
+                        "registered": False,
+                        "source_session_id": source_sid,
+                        "source_session_key": source_key,
+                        "status": "running",
+                        "task_id": task_id,
+                        "text": "",
+                    }
+                    with _detached_turns_lock:
+                        _detached_turns[task_id] = task
+                    replacement["detached_replacement_published"] = True
+                    replacement["detached_replacement_task_id"] = task_id
+                    replacement["detached_replacement_source_key"] = source_key
+                    source["detached_turn_task_id"] = task_id
+                    source["detached_dispatch_active"] = True
+                    replacement_ready = bool(
+                        replacement.get("detached_replacement_ready")
+                        or (
+                            replacement.get("agent") is not None
+                            and replacement.get("agent_ready") is None
+                        )
+                    )
+                    if not replacement_ready:
+                        source["detached_replacement_pending"] = True
+                    source.pop("detaching_turn", None)
+                    result["task"] = _detached_turn_snapshot(task)
+            finally:
+                source["history_lock"].release()
+
+    if publication_error is not None:
+        code, message = publication_error
+        return rollback(message, code=code)
+
+    # Commit the transition by dropping only its temporary reservation. The
+    # source keeps the lease for its running turn; the new idle owner has none.
+    with _sessions_lock:
+        held_reservation = source.pop("detach_capacity_reservation", reservation)
+    _release_detach_capacity_reservation(None, held_reservation)
+    return _ok(rid, result)
+
+
+@method("session.detach_turn_ack")
+def _(rid, params: dict) -> dict:
+    """Register presentation ownership after Ink activates the fresh chat."""
+    task_id = str(params.get("task_id") or "")
+    owner_sid = str(params.get("session_id") or "")
+    with _sessions_lock:
+        if owner_sid not in _sessions:
+            return _err(rid, 4001, "session not found")
+    with _detached_turns_lock:
+        task = _detached_turns.get(task_id)
+        if not task or task.get("owner_session_id") != owner_sid:
+            return _err(rid, 4042, "detached task is not owned by this session")
+        was_registered = bool(task.get("registered"))
+        task["registered"] = True
+        source_sid = str(task.get("source_session_id") or "")
+        snapshot = _detached_turn_snapshot(task)
+    _restore_pending_prompts(
+        source_sid,
+        owner_sid,
+        replay_visible=not was_registered,
+    )
+    _schedule_agent_build(owner_sid, delay=0.0)
+    return _ok(rid, {"task": snapshot})
+
+
+@method("session.detach_turn_consumed")
+def _(rid, params: dict) -> dict:
+    """Forget a terminal task only after its owner displayed it."""
+    task_id = str(params.get("task_id") or "")
+    owner_sid = str(params.get("session_id") or "")
+    source_sid = ""
+    with _sessions_lock:
+        with _detached_turns_lock:
+            task = _detached_turns.get(task_id)
+            if not task or task.get("owner_session_id") != owner_sid:
+                return _err(rid, 4042, "detached task is not owned by this session")
+            if task.get("status") == "running":
+                return _err(rid, 4092, "detached task is still running")
+            source_sid = str(task.get("source_session_id") or "")
+            _detached_turns.pop(task_id, None)
+
+        source = _sessions.get(source_sid)
+        if source is not None:
+            with source["history_lock"]:
+                if source.get("detached_turn_task_id") == task_id:
+                    source.pop("detached_turn_task_id", None)
+        owner = _sessions.get(owner_sid)
+        if owner is not None and owner.get("restore_close_on_disconnect") is not None:
+            owner["close_on_disconnect"] = bool(
+                owner.pop("restore_close_on_disconnect")
+            )
+    _reschedule_detached_orphans(source_sid, owner_sid)
+    return _ok(rid, {"consumed": True, "task_id": task_id})
+
+
+@method("session.interactions.replay")
+def _(rid, params: dict) -> dict:
+    """Replay the visible FIFO heads after a client activates this session."""
+    sid = str(params.get("session_id") or "")
+    session, err = _sess_nowait({"session_id": sid}, rid)
+    if err:
+        return err
+    assert session is not None
+    if session.get("_finalized"):
+        return _err(rid, 4001, "session not found")
+    replayed = _restore_pending_prompts(sid, sid, replay_visible=True)
+    return _ok(rid, {"replayed": replayed})
+
+
 @method("session.list")
 def _(rid, params: dict) -> dict:
     with _profile_db(params) as db:
@@ -770,20 +1002,22 @@ def _(rid, params: dict) -> dict:
     returns enough state for Ink to redraw around another live session id.
     """
     sid = str(params.get("session_id") or "")
-    session, err = _sess_nowait({"session_id": sid}, rid)
-    if err:
-        return err
-    assert session is not None
-
-    return _ok(
-        rid,
-        _live_session_payload(
+    transport = current_transport() or _stdio_transport
+    with _sessions_lock:
+        session = _sessions.get(sid)
+        if session is None:
+            return _err(rid, 4001, "session not found")
+        payload = _live_session_payload(
             sid,
             session,
             touch=True,
-            transport=current_transport() or _stdio_transport,
-        ),
-    )
+            transport=transport,
+        )
+        # A replacement-build failure temporarily protects the healthy source
+        # turn while the client is told how to recover it. Activation is the
+        # atomic acknowledgement that presentation ownership is restored.
+        session.pop("detached_recovery_until", None)
+    return _ok(rid, payload)
 
 
 @method("session.delete")
@@ -2723,18 +2957,37 @@ def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)
     if err:
         return err
+    assert session is not None
+    sid = str(params.get("session_id") or "")
     if _session_uses_compute_host(session):
-        sid = str(params.get("session_id") or "")
-        if session.get("running"):
-            try:
-                _get_compute_host_supervisor().interrupt(sid, request_id=f"interrupt-{rid}")
-            except Exception as exc:
-                return _err(rid, 5019, f"compute-host interrupt failed: {exc}")
-        with session["history_lock"]:
-            session["_turn_cancel_requested"] = True
-            session["queued_prompt"] = None
-            session.pop("queued_prompts", None)
-            session["_queued_prompt_generation"] = int(session.get("_queued_prompt_generation", 0)) + 1
+        dispatch_lock = _compute_host_dispatch_lock(session)
+        with dispatch_lock:
+            with session["history_lock"]:
+                should_interrupt = bool(
+                    session.get("running")
+                    and not _interrupt_call_pending(session)
+                )
+                session["_turn_cancel_requested"] = True
+                session["queued_prompt"] = None
+                session.pop("queued_prompts", None)
+                session["_queued_prompt_generation"] = int(
+                    session.get("_queued_prompt_generation", 0)
+                ) + 1
+                if should_interrupt:
+                    session["_interrupt_call_count"] = int(
+                        session.get("_interrupt_call_count") or 0
+                    ) + 1
+            if should_interrupt:
+                try:
+                    _get_compute_host_supervisor().interrupt(
+                        sid, request_id=f"interrupt-{rid}"
+                    )
+                except Exception as exc:
+                    return _err(
+                        rid, 5019, f"compute-host interrupt failed: {exc}"
+                    )
+                finally:
+                    _finish_interrupt_call(sid, session)
         _clear_pending(sid)
         try:
             from tools.approval import resolve_gateway_approval
@@ -2753,18 +3006,30 @@ def _(rid, params: dict) -> dict:
     # Always tell the agent to interrupt when the session claims a run is active:
     # stale flags are cleared below, and fresh turns clear the interrupt flag at
     # entry. This keeps a stale/missing thread handle from making Stop a no-op.
-    run_thread = session.get("_run_thread")
-    run_thread_alive = run_thread is not None and run_thread.is_alive()
-    should_interrupt = bool(session.get("running"))
     with session["history_lock"]:
+        run_thread = session.get("_run_thread")
+        run_thread_alive = run_thread is not None and run_thread.is_alive()
+        agent = session.get("agent")
+        should_interrupt = bool(
+            session.get("running")
+            and agent is not None
+            and not _interrupt_call_pending(session)
+        )
         session["_turn_cancel_requested"] = True
         session["queued_prompt"] = None
         session.pop("queued_prompts", None)
         session["_queued_prompt_generation"] = int(session.get("_queued_prompt_generation", 0)) + 1
+        if should_interrupt:
+            session["_interrupt_call_count"] = int(
+                session.get("_interrupt_call_count") or 0
+            ) + 1
     if should_interrupt:
         from agent.interrupt_compat import request_hard_interrupt
 
-        request_hard_interrupt(session["agent"])
+        try:
+            request_hard_interrupt(agent)
+        finally:
+            _finish_interrupt_call(sid, session)
     if not run_thread_alive:
         with session["history_lock"]:
             if session.get("running"):
