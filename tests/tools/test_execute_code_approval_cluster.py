@@ -119,6 +119,10 @@ def gw_session(monkeypatch):
 
     session_key = "cluster-test-session"
     token = A.set_current_session_key(session_key)
+    execute_code_aliases = A._approval_key_aliases("execute_code")
+    with A._lock:
+        permanent_snapshot = set(A._permanent_approved)
+        A._permanent_approved.difference_update(execute_code_aliases)
     with A._lock:
         A._gateway_queues.pop(session_key, None)
         A._gateway_notify_cbs.pop(session_key, None)
@@ -127,6 +131,8 @@ def gw_session(monkeypatch):
     finally:
         A.reset_current_session_key(token)
         with A._lock:
+            A._permanent_approved.clear()
+            A._permanent_approved.update(permanent_snapshot)
             A._gateway_queues.pop(session_key, None)
             A._gateway_notify_cbs.pop(session_key, None)
 
@@ -175,6 +181,21 @@ def test_guard_headless_local_approved(monkeypatch):
     monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
     monkeypatch.setattr(A, "_get_approval_mode", lambda: "manual")
     assert A.check_execute_code_guard("import os", "local")["approved"] is True
+
+
+def test_guard_permanent_allowlist_is_isolated(monkeypatch):
+    monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+    snapshot = set(A._permanent_approved)
+    try:
+        A.approve_permanent("execute_code")
+        assert A.check_execute_code_guard("import os", "local") == {
+            "approved": True,
+            "message": None,
+        }
+    finally:
+        with A._lock:
+            A._permanent_approved.clear()
+            A._permanent_approved.update(snapshot)
 
 
 def test_guard_cron_deny_blocks(monkeypatch):
