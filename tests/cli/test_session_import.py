@@ -359,3 +359,41 @@ def test_import_does_not_use_profile_name_for_host(tmp_path):
         assert model_config.get("_import_host") == "testhost"
     finally:
         db.close()
+
+
+def test_import_permanent_title_conflict_settles_to_skipped(tmp_path):
+    """A title that permanently collides with another session (e.g. Claude
+    Code compaction recreating the same conversation under a new session id)
+    must stop being reported as needing an update once the conflict is
+    known — not retried forever."""
+    projects = tmp_path / "projects"
+    projects.mkdir()
+    lines = [
+        {
+            "type": "user",
+            "message": {"role": "user", "content": "hi"},
+            "timestamp": "2026-08-01T10:00:00Z",
+        },
+        {"type": "ai-title", "aiTitle": "Duplicate Title"},
+    ]
+    _write_session(projects, stem="dup-session", lines=lines)
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.create_session("other-session", source="claude_code")
+        db.set_session_title("other-session", "Duplicate Title")
+
+        first = import_claude_sessions(str(projects), host="testhost", db=db)
+        assert first.imported == 1
+        sid = "claude_testhost_dup-session"
+        row = db.get_session(sid)
+        assert row is not None and row["title"] is None  # write collided, caught
+
+        second = import_claude_sessions(str(projects), host="testhost", db=db)
+        assert second.updated == 0
+        assert second.skipped == 1  # settled — not retried as a perpetual update
+
+        row = db.get_session(sid)
+        assert row["title"] is None
+    finally:
+        db.close()

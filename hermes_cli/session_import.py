@@ -250,6 +250,24 @@ def _create_session_atomic(
     db._execute_write(_do)
 
 
+def _title_taken(db: SessionDB, session_id: str, title: str) -> bool:
+    """True if another session already owns this exact title.
+
+    Claude Code compaction/session-rotation can recreate the same
+    conversation under a new session id with the same `ai-title`; Hermes
+    title uniqueness (app-level, see `_set_session_title`) then rejects the
+    second one's title forever. Pre-checking this avoids reporting that
+    session as needing an update on every single run for a write that can
+    never succeed.
+    """
+    with db._lock:
+        row = db._conn.execute(
+            "SELECT 1 FROM sessions WHERE title = ? AND id != ? LIMIT 1",
+            (title, session_id),
+        ).fetchone()
+    return row is not None
+
+
 def _ts_to_float(ts: Any) -> Optional[float]:
     if not ts:
         return None
@@ -345,7 +363,11 @@ def import_claude_sessions(
                 # trailing `summary` line appended after the last turn), so
                 # each kind of change is checked independently.
                 needs_replace = (existing.get("message_count") or 0) != len(messages)
-                needs_title = bool(title) and not existing.get("title")
+                needs_title = (
+                    bool(title)
+                    and not existing.get("title")
+                    and not _title_taken(db, session_id, title)
+                )
                 needs_end = ended and existing.get("ended_at") is None
                 if not (needs_replace or needs_title or needs_end):
                     report.skipped += 1
