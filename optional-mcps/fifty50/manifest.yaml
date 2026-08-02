@@ -1,0 +1,43 @@
+# Nous-approved MCP catalog entry.
+# Presence in this directory = approval. Merged via PR review.
+manifest_version: 1
+
+name: fifty50
+description: Find a co-founder and split equity fairly — partnership analysis, vesting recommendations, and a co-founder marketplace.
+source: https://frederickandsons.xyz/fifty50/developers
+
+# Fifty50 ships a public, unauthenticated remote MCP server over Streamable
+# HTTP — nothing to install locally, no API key. The same endpoint any AI
+# agent can add by URL (see README).
+transport:
+  type: http
+  url: https://frederickandsons.xyz/fifty50/mcp
+
+auth:
+  type: none
+
+# Tool selection at install time:
+# Fifty50 exposes 9 tools. The 4 that create or mutate stored data
+# (create_partnership, add_contribution, record_outcome, post_listing) are
+# pruned from the default so a user who installs casually gets a
+# read-mostly safe surface — same reasoning n8n's catalog entry uses for its
+# workflow activate/deactivate tools. None are destructive (no delete
+# capability exists on the API), but an equity platform's write paths still
+# deserve an explicit opt-in rather than being on by default.
+tools:
+  default_enabled:
+    - get_attribution
+    - forecast_equity
+    - recommend_vesting
+    - browse_marketplace
+    - ask_assistant
+
+post_install: |
+  No credentials needed — the endpoint is public and unauthenticated.
+
+  create_partnership returns a one-time owner_token the caller must store
+  to manage that partnership later; Fifty50 has no way to recover a lost
+  token. Read-only tools (get_attribution, forecast_equity,
+  recommend_vesting, browse_marketplace, ask_assistant) need no token.
+
+  Full API reference: https://frederickandsons.xyz/fifty50/developers
