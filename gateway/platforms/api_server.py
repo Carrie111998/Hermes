@@ -42,6 +42,7 @@ import hashlib
 import hmac
 import inspect
 import ipaddress
+import itertools
 import json
 import math
 from contextlib import contextmanager
@@ -1539,6 +1540,108 @@ def _multimodal_validation_error(exc: ValueError, *, param: str) -> "web.Respons
         _openai_error(message, code=code, param=param),
         status=400,
     )
+
+
+def _reap_disconnected_agent_processes(
+    agent: Any, *, source: str = "api_server_sse_disconnect"
+) -> None:
+    """Reap background processes an abandoned API-server turn created.
+
+    Mirrors the gateway-turn cleanup in ``gateway/run.py`` (#76115) for this
+    API-server surface, which runs its own agent lifecycle via ``_run_agent``
+    and never passes through ``TurnRunner`` — so it needs its own trigger for
+    the same baseline-diff reap. Fire-and-forget on a daemon thread so the
+    SSE handler's own cleanup isn't blocked on process-tree teardown.
+
+    Reaping is epoch-gated: client-provided session IDs are conversation
+    scopes, and multiple concurrent runs can intentionally share one (see
+    ``_handle_runs``). Without the gate, run A disconnecting could kill a
+    process a still-live run B (same task_id) spawned after A's baseline
+    snapshot — the same stale-reaper bug class the gateway path gates via
+    ``run_generation``. The epoch closure skips the reap when a newer run
+    has since claimed the task_id; that newer run's own baseline covers its
+    eventual cleanup.
+    """
+    process_task_id = getattr(agent, "_gateway_turn_process_task_id", "")
+    process_baseline = getattr(agent, "_gateway_turn_process_baseline", None)
+    if not process_task_id or process_baseline is None:
+        return
+    epoch = getattr(agent, "_gateway_turn_process_epoch", None)
+    is_still_current: Optional[Any] = None
+    if epoch is not None:
+        def _epoch_still_current(_task_id=process_task_id, _epoch=epoch):
+            # Skip only when a NEWER run has claimed this task_id. A missing
+            # entry means the abandoned run's own clear pruned it (worker
+            # returned after the interrupt) — no newer claimant exists, so
+            # the reap must still proceed or the leak survives. This matches
+            # the gateway gate's semantics: worker completion does not bump
+            # run_generation either.
+            with _TURN_PROCESS_EPOCH_LOCK:
+                current = _TURN_PROCESS_EPOCHS.get(_task_id)
+            return current is None or current == _epoch
+
+        is_still_current = _epoch_still_current
+
+    from gateway.run import _reap_gateway_turn_processes
+
+    threading.Thread(
+        target=_reap_gateway_turn_processes,
+        args=(process_task_id, process_baseline),
+        kwargs={"source": source, "is_still_current": is_still_current},
+        name=f"api-turn-reaper-{process_task_id[:12]}",
+        daemon=True,
+    ).start()
+
+
+# Per-task-id run epochs for the reap gate above. task_id is a conversation
+# scope shared by concurrent API runs, so each run that claims it bumps the
+# epoch; a reaper holding a stale epoch declines to kill. Epochs come from a
+# single monotonic counter (never reused), so pruning an entry and later
+# re-claiming the task_id can never resurrect a stale reaper's claim.
+# Entries are pruned on clear when still current, bounding the dict to
+# in-flight runs.
+_TURN_PROCESS_EPOCHS: Dict[str, int] = {}
+_TURN_PROCESS_EPOCH_LOCK = threading.Lock()
+_TURN_PROCESS_EPOCH_COUNTER = itertools.count(1)
+
+
+def _publish_turn_process_ownership(agent: Any, task_id: str) -> None:
+    """Snapshot the process baseline and claim the task_id's current epoch.
+
+    Single place all API-server agent lifecycles (chat/responses ``_run_agent``
+    and ``/v1/runs``) record turn ownership, so the marker attribute names and
+    epoch bookkeeping cannot drift between surfaces.
+    """
+    from tools.process_registry import process_registry
+
+    with _TURN_PROCESS_EPOCH_LOCK:
+        epoch = next(_TURN_PROCESS_EPOCH_COUNTER)
+        _TURN_PROCESS_EPOCHS[task_id] = epoch
+    agent._gateway_turn_process_task_id = task_id
+    agent._gateway_turn_process_baseline = process_registry.snapshot_running_ids(
+        task_id
+    )
+    agent._gateway_turn_process_epoch = epoch
+
+
+def _clear_turn_process_ownership(agent: Any) -> None:
+    """Clear turn ownership the moment the turn finishes (success or crash).
+
+    A disconnect/cancel landing after this point must not reap background
+    work the turn deliberately left running — mirrors the same race-window
+    guard in ``gateway/run.py``'s ``_run_sync_with_timeout_lifecycle``.
+    """
+    task_id = getattr(agent, "_gateway_turn_process_task_id", "")
+    epoch = getattr(agent, "_gateway_turn_process_epoch", None)
+    if task_id and epoch is not None:
+        with _TURN_PROCESS_EPOCH_LOCK:
+            # Prune only when this run is still the current claimant; a
+            # newer concurrent run owns the entry otherwise.
+            if _TURN_PROCESS_EPOCHS.get(task_id) == epoch:
+                del _TURN_PROCESS_EPOCHS[task_id]
+    agent._gateway_turn_process_task_id = ""
+    agent._gateway_turn_process_baseline = frozenset()
+    agent._gateway_turn_process_epoch = None
 
 
 def _session_chat_user_message(body: Dict[str, Any], *, param: str = "message") -> tuple[Any, Optional["web.Response"]]:
@@ -8646,6 +8749,13 @@ class APIServerAdapter(BasePlatformAdapter):
             await response.write(f"data: {json.dumps(finish_chunk)}\n\n".encode())
             await response.write(b"data: [DONE]\n\n")
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
+            # Capture and reap only the background processes owned by this
+            # abandoned turn before the worker clears its ownership markers.
+            # The exact Canonical cleanup below remains the sole owner of
+            # capability revocation and is deliberately not cancelled.
+            agent = agent_ref[0] if agent_ref else None
+            if agent is not None:
+                _reap_disconnected_agent_processes(agent)
             await self._interrupt_and_await_api_task(
                 agent_task,
                 agent_ref,
@@ -8654,6 +8764,11 @@ class APIServerAdapter(BasePlatformAdapter):
             )
             logger.info("SSE client disconnected; interrupted agent task %s", completion_id)
         except asyncio.CancelledError:
+            agent = agent_ref[0] if agent_ref else None
+            if agent is not None:
+                _reap_disconnected_agent_processes(
+                    agent, source="api_server_sse_cancelled"
+                )
             await self._interrupt_and_await_api_task(
                 agent_task,
                 agent_ref,
@@ -9550,6 +9665,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 })
 
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
+            # Reap the abandoned turn's process-baseline diff while its
+            # ownership markers are still available.  Do not cancel the
+            # executor wrapper: exact capability cleanup remains shielded.
+            agent = agent_ref[0] if agent_ref else None
+            if agent is not None:
+                _reap_disconnected_agent_processes(agent)
             cleanup_confirmed = await self._interrupt_and_await_api_task(
                 agent_task,
                 agent_ref,
@@ -9563,6 +9684,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 _track_aborted_stream_finalizer("sse_client_disconnected")
             logger.info("SSE client disconnected; interrupted agent task %s", response_id)
         except asyncio.CancelledError:
+            agent = agent_ref[0] if agent_ref else None
+            if agent is not None:
+                _reap_disconnected_agent_processes(
+                    agent, source="api_server_sse_cancelled"
+                )
             cleanup_confirmed = await self._interrupt_and_await_api_task(
                 agent_task,
                 agent_ref,
@@ -11440,6 +11566,13 @@ class APIServerAdapter(BasePlatformAdapter):
                                 "task",
                                 session_id or str(uuid.uuid4()),
                             ).internal_key
+                            # This API-server surface bypasses TurnRunner, so
+                            # publish its exact task/baseline ownership before
+                            # model execution. Disconnect/stop reapers consume
+                            # only this baseline diff and are epoch-gated.
+                            _publish_turn_process_ownership(
+                                agent, effective_task_id
+                            )
                             self._attest_capability_agent_policy(agent)
                             conversation_kwargs = {
                                 "user_message": user_message,
@@ -11602,6 +11735,12 @@ class APIServerAdapter(BasePlatformAdapter):
                         except Exception as exc:
                             execution_error = exc
                     finally:
+                        # Once model execution has returned (success or
+                        # failure), a later transport disconnect must not reap
+                        # background work the completed turn intentionally
+                        # left running.
+                        if agent is not None:
+                            _clear_turn_process_ownership(agent)
                         try:
                             self._attempt_api_server_cleanup_once(
                                 cleanup_handle,
@@ -12368,6 +12507,11 @@ class APIServerAdapter(BasePlatformAdapter):
                                     approval_session_key, _approval_notify
                                 )
                                 self._attest_capability_agent_policy(agent)
+                                # /v1/runs owns a separate agent lifecycle and
+                                # bypasses both TurnRunner and _run_agent.
+                                _publish_turn_process_ownership(
+                                    agent, effective_task_id
+                                )
                                 result = agent.run_conversation(
                                     user_message=user_message,
                                     conversation_history=conversation_history,
@@ -12381,6 +12525,11 @@ class APIServerAdapter(BasePlatformAdapter):
                                         _cleanup_state_callback,
                                     )
                         finally:
+                            # Clear immediately at the model-execution boundary;
+                            # a later stop during Canonical cleanup must not reap
+                            # intentionally surviving background work.
+                            if agent is not None:
+                                _clear_turn_process_ownership(agent)
                             # Linearize stop ownership at the execution/cleanup
                             # boundary. A stop received while the model is still
                             # executing cancels the run; a later stop received
@@ -13035,6 +13184,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 agent.interrupt("Stop requested via API")
             except Exception:
                 pass
+            # Stop abandons model execution: reap only this run's process
+            # baseline diff, with the upstream epoch gate protecting a newer
+            # concurrent claimant of the same session/task id.
+            _reap_disconnected_agent_processes(
+                agent, source="api_server_run_stop"
+            )
             self._clear_api_clarify_scope(
                 str(getattr(agent, "_api_clarify_scope", "") or "")
             )
