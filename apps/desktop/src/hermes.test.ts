@@ -21,6 +21,7 @@ import {
   listSidebarSessions,
   resetSidebarBatchCapability,
   setApiRequestProfile,
+  setSessionArchived,
   speakText,
   transcribeAudio
 } from './hermes'
@@ -386,6 +387,20 @@ describe('Hermes REST helpers', () => {
       'Desktop safe-load limit'
     )
   })
+
+  it('clears the durable pin in the same profile-scoped archive request', async () => {
+    api.mockResolvedValue({ ok: true })
+
+    await setSessionArchived('session-1', true, 'work', false)
+
+    expect(api).toHaveBeenCalledWith({
+      body: { archived: true, pinned: false },
+      method: 'PATCH',
+      path: '/api/sessions/session-1',
+      profile: 'work'
+    })
+  })
+
 
   it('bounds blocking TTS synthesis timeouts by text length', () => {
     expect(audioSpeakRequestTimeoutMs('short message')).toBe(AUDIO_SPEAK_MIN_REQUEST_TIMEOUT_MS)
