@@ -5055,25 +5055,35 @@ class GatewaySlashCommandsMixin:
                 parent_session_id=parent_session_id,
             )
             branch_staged = True
-            for msg in history:
-                await self._session_db.append_message(
-                    session_id=new_session_id,
-                    role=msg.get("role", "user"),
-                    content=msg.get("content"),
-                    tool_name=msg.get("tool_name") or msg.get("name"),
-                    tool_calls=msg.get("tool_calls"),
-                    tool_call_id=msg.get("tool_call_id"),
-                    finish_reason=msg.get("finish_reason"),
-                    reasoning=msg.get("reasoning"),
-                    reasoning_content=msg.get("reasoning_content"),
-                    reasoning_details=msg.get("reasoning_details"),
-                    codex_reasoning_items=msg.get("codex_reasoning_items"),
-                    codex_message_items=msg.get("codex_message_items"),
-                    # Keep the api_content sidecar so the branch's first turn
-                    # replays the parent's exact wire bytes (warm provider
-                    # prompt cache) instead of a full cold prefill.
-                    api_content=extract_api_content_sidecar(msg),
-                    timestamp=msg.get("timestamp"),
+            copied_rows = await self._session_db.append_messages_batch(
+                new_session_id,
+                [
+                    {
+                        "role": msg.get("role", "user"),
+                        "content": msg.get("content"),
+                        "tool_name": msg.get("tool_name") or msg.get("name"),
+                        "tool_calls": msg.get("tool_calls"),
+                        "tool_call_id": msg.get("tool_call_id"),
+                        "finish_reason": msg.get("finish_reason"),
+                        "reasoning": msg.get("reasoning"),
+                        "reasoning_content": msg.get("reasoning_content"),
+                        "reasoning_details": msg.get("reasoning_details"),
+                        "codex_reasoning_items": msg.get("codex_reasoning_items"),
+                        "codex_message_items": msg.get("codex_message_items"),
+                        # Keep the api_content sidecar so the branch's first turn
+                        # replays the parent's exact wire bytes (warm provider
+                        # prompt cache) instead of a full cold prefill.
+                        "api_content": extract_api_content_sidecar(msg),
+                        "timestamp": msg.get("timestamp"),
+                    }
+                    for msg in history
+                ],
+                chunk_rows=500,
+            )
+            if copied_rows != len(history):
+                raise RuntimeError(
+                    "staged branch transcript copy was not complete: "
+                    f"expected {len(history)}, wrote {copied_rows}"
                 )
             title_written = await self._session_db.set_session_title(
                 new_session_id,

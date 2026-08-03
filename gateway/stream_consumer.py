@@ -193,6 +193,7 @@ class GatewayStreamConsumer:
         on_new_message: Optional[callable] = None,
         on_before_finalize: Optional[Callable[[], Any]] = None,
         initial_reply_to_id: Optional[str] = None,
+        new_message_reply_to_id: Optional[str] = None,
         run_still_current: Optional[Callable[[], bool]] = None,
     ):
         self.adapter = adapter
@@ -212,6 +213,13 @@ class GatewayStreamConsumer:
         # final rich-text edit (Telegram MarkdownV2 finalize, etc.).
         self._on_before_finalize = on_before_finalize
         self._initial_reply_to_id = initial_reply_to_id
+        # Relay Discord creates the conversation thread lazily from a reply
+        # anchor. Every later *new* bubble in the same turn (commentary,
+        # recovery, or a fresh-final replacement) must repeat that anchor or
+        # it escapes into the parent channel. Keep this opt-in separate from
+        # ``initial_reply_to_id`` because native platforms generally only want
+        # the first reply anchored.
+        self._new_message_reply_to_id = new_message_reply_to_id
         self._queue: queue.Queue = queue.Queue()
         self._accumulated = ""
         self._message_id: Optional[str] = None
@@ -1404,6 +1412,7 @@ class GatewayStreamConsumer:
                 result = await self.adapter.send(
                     chat_id=self.chat_id,
                     content=chunk,
+                    reply_to=self._new_message_reply_to_id,
                     metadata=self._metadata_for_send(final=True),
                 )
                 if result.success:
@@ -1503,6 +1512,7 @@ class GatewayStreamConsumer:
                 result = await self.adapter.send(
                     chat_id=self.chat_id,
                     content=final_text,
+                    reply_to=self._new_message_reply_to_id,
                     metadata=self._metadata_for_send(final=True),
                 )
             except Exception as exc:
@@ -1697,6 +1707,7 @@ class GatewayStreamConsumer:
             result = await self.adapter.send(
                 chat_id=self.chat_id,
                 content=tail,
+                reply_to=self._new_message_reply_to_id,
                 metadata=self.metadata,
             )
             if result.success:
@@ -1734,6 +1745,7 @@ class GatewayStreamConsumer:
             result = await self.adapter.send(
                 chat_id=self.chat_id,
                 content=text,
+                reply_to=self._new_message_reply_to_id,
                 metadata=self.metadata,
             )
             # Note: do NOT set _already_sent = True here.
@@ -1880,6 +1892,7 @@ class GatewayStreamConsumer:
             result = await self.adapter.send(
                 chat_id=self.chat_id,
                 content=text,
+                reply_to=self._new_message_reply_to_id,
                 metadata=self._metadata_for_send(final=True),
             )
         except Exception as e:

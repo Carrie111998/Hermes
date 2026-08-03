@@ -6435,6 +6435,39 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         )
         return None
 
+    def _check_transcript_write_guards(
+        self, conn, session_id: str, compression_lock_holder: Optional[str]
+    ) -> None:
+        """Transcript-append admission checks, run INSIDE the write txn.
+
+        Shared by :meth:`append_message` and :meth:`append_messages_batch` so
+        the two writers can never diverge on these correctness invariants
+        (this guard has already needed targeted fixes — see the #74478
+        patience note below).
+        """
+        active_lock = conn.execute(
+            "SELECT holder FROM compression_locks "
+            "WHERE session_id = ? AND expires_at > ?",
+            (session_id, time.time()),
+        ).fetchone()
+        if (
+            active_lock is not None
+            and active_lock["holder"] != compression_lock_holder
+        ):
+            raise SessionCompressionInProgressError(
+                f"Session {session_id!r} is being compressed by another writer"
+            )
+        session = conn.execute(
+            "SELECT ended_at, end_reason FROM sessions WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+        if (
+            session is not None
+            and session["ended_at"] is not None
+            and session["end_reason"] == "compression"
+        ):
+            raise CompressionSessionClosedError(session_id)
+
     @staticmethod
     def _decode_display_metadata(raw: Any) -> Optional[Dict[str, Any]]:
         """Decode a ``display_metadata`` column into the dict every reader expects.
@@ -6551,28 +6584,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             num_tool_calls = len(tool_calls) if isinstance(tool_calls, list) else 1
 
         def _do(conn):
-            active_lock = conn.execute(
-                "SELECT holder FROM compression_locks "
-                "WHERE session_id = ? AND expires_at > ?",
-                (session_id, time.time()),
-            ).fetchone()
-            if (
-                active_lock is not None
-                and active_lock["holder"] != compression_lock_holder
-            ):
-                raise SessionCompressionInProgressError(
-                    f"Session {session_id!r} is being compressed by another writer"
-                )
-            session = conn.execute(
-                "SELECT ended_at, end_reason FROM sessions WHERE id = ?",
-                (session_id,),
-            ).fetchone()
-            if (
-                session is not None
-                and session["ended_at"] is not None
-                and session["end_reason"] == "compression"
-            ):
-                raise CompressionSessionClosedError(session_id)
+            self._check_transcript_write_guards(
+                conn, session_id, compression_lock_holder
+            )
             cursor = conn.execute(
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, effect_disposition, internal_provenance,
@@ -6626,6 +6640,86 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # a sibling process legitimately holding the write lock for seconds
         # (VACUUM, TRUNCATE checkpoint at close, an older pre-bounded-merge
         # process's FTS optimize) can't destroy a healthy turn (#74478).
+        return self._execute_write(
+            _do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S
+        )
+
+    def append_messages_batch(
+        self,
+        session_id: str,
+        messages: List[Dict[str, Any]],
+        compression_lock_holder: Optional[str] = None,
+        chunk_rows: Optional[int] = None,
+    ) -> int:
+        """Append multiple messages atomically in ONE write transaction.
+
+        ``messages`` is a list of dicts in the same shape
+        :meth:`_insert_message_rows` already consumes for replace/compact/
+        import (role, content, tool_name, tool_calls, tool_call_id,
+        finish_reason, reasoning*, codex_*, timestamp, api_content,
+        display_kind, display_metadata, ...). Reusing that helper keeps ONE
+        row-serialization path for every multi-row writer.
+
+        A turn-boundary flush writes the whole turn (user + assistant + tool
+        rows, typically 3-8 messages) as one BEGIN IMMEDIATE / commit pair
+        instead of one transaction (and, off WAL, one fsync) per row.
+
+        Atomicity contract: all rows land or none do (the caller re-flushes
+        unstamped messages on the next attempt). The same admission guards
+        as :meth:`append_message` run once for the batch — same session,
+        same instant.
+
+        ``chunk_rows`` bounds the transaction size for LARGE copies (branch
+        seeds can be thousands of rows; measured: 10k rows ≈ 2.4s inside one
+        BEGIN IMMEDIATE because the FTS triggers run per row, which would
+        monopolize the write lock and starve concurrent writers). When set,
+        the batch commits in chunks of at most that many rows — same
+        recovery semantics as the old per-row loops (a mid-copy failure
+        leaves a partial seed), just with bounded lock holds. A turn flush
+        never needs it. Returns the inserted row count.
+        """
+        if not messages:
+            return 0
+
+        if chunk_rows is not None and (
+            isinstance(chunk_rows, bool)
+            or not isinstance(chunk_rows, int)
+            or chunk_rows <= 0
+        ):
+            raise ValueError("chunk_rows must be a positive integer")
+
+        if chunk_rows is not None and len(messages) > chunk_rows:
+            inserted_total = 0
+            for start in range(0, len(messages), chunk_rows):
+                inserted_total += self.append_messages_batch(
+                    session_id,
+                    messages[start:start + chunk_rows],
+                    compression_lock_holder=compression_lock_holder,
+                )
+            return inserted_total
+
+        def _do(conn):
+            self._check_transcript_write_guards(
+                conn, session_id, compression_lock_holder
+            )
+            inserted, tool_calls_total = self._insert_message_rows(
+                conn, session_id, messages
+            )
+            # One aggregated counter update for the whole batch.
+            if tool_calls_total > 0:
+                conn.execute(
+                    """UPDATE sessions SET message_count = message_count + ?,
+                       tool_call_count = tool_call_count + ? WHERE id = ?""",
+                    (inserted, tool_calls_total, session_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE sessions SET message_count = message_count + ? WHERE id = ?",
+                    (inserted, session_id),
+                )
+            return inserted
+
+        # Same criticality as append_message: this IS the turn's transcript.
         return self._execute_write(
             _do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S
         )
@@ -7384,9 +7478,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             session_ids = self._session_lineage_root_to_tip(session_id)
 
         active_clause = "" if include_inactive else " AND active = 1"
-        with self._lock:
+        with self._read_ctx() as conn:
             placeholders = ",".join("?" for _ in session_ids)
-            rows = self._conn.execute(
+            rows = conn.execute(
                 f"SELECT {self._CONVERSATION_ROW_COLUMNS} "
                 f"FROM messages WHERE session_id IN ({placeholders})"
                 # Order by AUTOINCREMENT id (true insertion order), NOT timestamp:
@@ -7575,9 +7669,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         output (see test_get_resume_conversations_matches_separate_reads).
         """
         session_ids = self._session_lineage_root_to_tip(session_id)
-        with self._lock:
+        with self._read_ctx() as conn:
             placeholders = ",".join("?" for _ in session_ids)
-            rows = self._conn.execute(
+            rows = conn.execute(
                 f"SELECT session_id, {self._CONVERSATION_ROW_COLUMNS} "
                 f"FROM messages WHERE session_id IN ({placeholders}) AND active = 1 "
                 # ORDER BY id (insertion order) — see get_messages_as_conversation
@@ -7629,9 +7723,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         session_ids = self._session_lineage_root_to_tip(session_id)
         if len(session_ids) <= 1:
             return []
-        with self._lock:
+        with self._read_ctx() as conn:
             placeholders = ",".join("?" for _ in session_ids)
-            rows = self._conn.execute(
+            rows = conn.execute(
                 f"SELECT session_id, {self._CONVERSATION_ROW_COLUMNS} "
                 f"FROM messages WHERE session_id IN ({placeholders}) AND active = 1 "
                 "ORDER BY id",
@@ -7668,13 +7762,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         chain = []
         current = session_id
         seen = set()
-        with self._lock:
+        with self._read_ctx() as conn:
             for _ in range(100):
                 if not current or current in seen:
                     break
                 seen.add(current)
                 chain.append(current)
-                row = self._conn.execute(
+                row = conn.execute(
                     "SELECT parent_session_id FROM sessions WHERE id = ?",
                     (current,),
                 ).fetchone()

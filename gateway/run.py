@@ -965,7 +965,15 @@ def render_notice_line(notice) -> str:
     return str(getattr(notice, "text", "") or "").strip()
 
 
-async def _send_or_update_status_coro(adapter, chat_id, status_key, content, metadata):
+async def _send_or_update_status_coro(
+    adapter,
+    chat_id,
+    status_key,
+    content,
+    metadata,
+    *,
+    reply_to=None,
+):
     """Route a status message through adapter.send_or_update_status when supported.
 
     Issue #30045: adapters that implement send_or_update_status (currently
@@ -975,7 +983,10 @@ async def _send_or_update_status_coro(adapter, chat_id, status_key, content, met
     sender = getattr(adapter, "send_or_update_status", None)
     if callable(sender):
         return await sender(chat_id, status_key, content, metadata=metadata)
-    return await adapter.send(chat_id, content, metadata=metadata)
+    send_kwargs = {"metadata": metadata}
+    if reply_to is not None:
+        send_kwargs["reply_to"] = reply_to
+    return await adapter.send(chat_id, content, **send_kwargs)
 
 
 def _resolve_progress_thread_id(
@@ -5482,6 +5493,7 @@ class TurnRunner:
                 event_type,
                 prepared_message,
                 _status_metadata,
+                reply_to=ctx._status_reply_to,
             ),
             ctx._loop_for_step,
             logger=logger,
@@ -5543,6 +5555,7 @@ class TurnRunner:
                     _TERMINAL_FINAL_MIRROR_STATUS_EVENT,
                     prepared_message,
                     metadata,
+                    reply_to=ctx._status_reply_to,
                 )
                 if (
                     ctx._cleanup_progress
@@ -5708,7 +5721,10 @@ class TurnRunner:
                             else None
                         ),
                         on_before_finalize=_pause_typing_before_finalize,
-                        initial_reply_to_id=ctx.event_message_id,
+                        initial_reply_to_id=(
+                            ctx._status_reply_to or ctx.event_message_id
+                        ),
+                        new_message_reply_to_id=ctx._status_reply_to,
                         run_still_current=ctx._run_still_current,
                     )
                     if _want_stream_deltas:
@@ -5747,11 +5763,14 @@ class TurnRunner:
                 or not str(display_text or "").strip()
             ):
                 return
+            _interim_send_kwargs = {"metadata": ctx._status_thread_metadata}
+            if ctx._status_reply_to is not None:
+                _interim_send_kwargs["reply_to"] = ctx._status_reply_to
             safe_schedule_threadsafe(
                 ctx._status_adapter.send(
                     ctx._status_chat_id,
                     display_text,
-                    metadata=ctx._status_thread_metadata,
+                    **_interim_send_kwargs,
                 ),
                 ctx._loop_for_step,
                 logger=logger,
@@ -5765,6 +5784,36 @@ class TurnRunner:
             service_tier=service_tier,
         )
 
+        # Per-platform skip_context_files — messaging platforms can opt out
+        # of filesystem-heavy context-file discovery (SOUL.md, AGENTS.md,
+        # .cursorrules) to cut AIAgent construction latency. Especially
+        # impactful on Windows, where stat() + directory walks are 10-100x
+        # slower than Linux. Off by default; soul identity is preserved so
+        # the persona survives even with minimal context.
+        _platforms_gw_cfg = (ctx.user_config.get("gateway") or {}).get("platforms") or {}
+        _plat_gw_cfg = _platforms_gw_cfg.get(platform_key) or {}
+        _skip_context = _plat_gw_cfg.get("skip_context_files")
+        _platform_skips_context_files = (
+            bool(_skip_context) if _skip_context is not None else False
+        )
+        _agent_startup_kwargs = self._runner._agent_startup_isolation_kwargs(
+            ctx.source,
+            production_access=ctx.production_access,
+        )
+        _isolation_skips_context_files = bool(
+            _agent_startup_kwargs.get("skip_context_files")
+        )
+        skip_context_files = bool(
+            _platform_skips_context_files or _isolation_skips_context_files
+        )
+        _agent_startup_kwargs["skip_context_files"] = skip_context_files
+        # A platform-level cold-start optimization still loads the small,
+        # profile-owned SOUL.md. A sealed/isolated runtime must retain its
+        # stronger clean-room boundary and therefore does not re-enable it.
+        load_soul_identity = bool(
+            _platform_skips_context_files and not _isolation_skips_context_files
+        )
+
         # Check agent cache — reuse the AIAgent from the previous message
         # in this session to preserve the frozen system prompt and tool
         # schemas for prompt cache hits.
@@ -5776,6 +5825,7 @@ class TurnRunner:
             cache_keys=self._runner._extract_cache_busting_config(ctx.user_config),
             user_id=getattr(ctx.source, "user_id", None),
             user_id_alt=getattr(ctx.source, "user_id_alt", None),
+            skip_context_files=skip_context_files,
         )
         agent = None
         reused_cached_agent = False
@@ -6023,10 +6073,8 @@ class TurnRunner:
                 gateway_session_key=ctx.session_key,
                 session_db=getattr(self._runner._session_db, "_db", self._runner._session_db),
                 fallback_model=ctx.turn_fallback_model,
-                **self._runner._agent_startup_isolation_kwargs(
-                    ctx.source,
-                    production_access=ctx.production_access,
-                ),
+                load_soul_identity=load_soul_identity,
+                **_agent_startup_kwargs,
             )
             self._runner._attest_capability_agent_policy(agent)
             if _cache_lock and _cache is not None:
@@ -29816,6 +29864,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         cache_keys: dict | None = None,
         user_id: str | None = None,
         user_id_alt: str | None = None,
+        skip_context_files: bool = False,
     ) -> str:
         """Compute a stable string key from agent config values.
 
@@ -29872,6 +29921,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _cache_keys_sorted,
                 str(user_id or ""),
                 str(user_id_alt or ""),
+                # skip_context_files changes the agent's frozen system prompt
+                # (context files in vs out) — a toggled config edit must
+                # rebuild the cached agent, not silently reuse it.
+                bool(skip_context_files),
             ],
             sort_keys=True,
             default=str,
@@ -32078,6 +32131,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             source.platform, source.thread_id, event_message_id,
             reply_in_thread=_progress_reply_in_thread,
         )
+        # Relay Discord auto-thread lane: a channel-initiating message has no
+        # thread_id at ingest (the thread is born on the connector's FIRST
+        # send). The connector stamps prospective_thread_id (the anchor message
+        # id, == the id of the thread it will create) and auto-threads any
+        # outbound carrying that anchor as reply_to. Without it, the progress /
+        # tool-status bubble is sent flat (no thread, no anchor) and lands in
+        # the PARENT channel while the final reply threads — the search-status
+        # updates leaked outside the thread (staging repro 2026-08-02). Carry
+        # the anchor on the progress send so it routes into the SAME auto-thread.
+        _relay_prospective_thread_id = (
+            str(getattr(source, "prospective_thread_id", None))
+            if source.platform == Platform.DISCORD
+            and getattr(source, "delivered_via_upstream_relay", False)
+            and getattr(source, "prospective_thread_id", None)
+            and not source.thread_id
+            else None
+        )
         _progress_metadata = (
             self._thread_metadata_for_source(source, event_message_id)
             if _progress_thread_id == source.thread_id
@@ -32089,14 +32159,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 reply_to_message_id=event_message_id,
             )
         ) if _progress_thread_id else None
+        if _progress_metadata is None and _relay_prospective_thread_id:
+            # No real thread yet, but the connector will auto-thread on the
+            # reply anchor; carry it so progress joins that thread.
+            _progress_metadata = {
+                "reply_to_message_id": _relay_prospective_thread_id
+            }
         _progress_metadata = _non_conversational_metadata(_progress_metadata, platform=source.platform)
-        _progress_reply_to = (
-            event_message_id
-            if source.platform in (Platform.FEISHU, Platform.MATTERMOST)
+        if (
+            source.platform in (Platform.FEISHU, Platform.MATTERMOST)
             and source.thread_id
             and event_message_id
-            else None
-        )
+        ):
+            _progress_reply_to = event_message_id
+        else:
+            _progress_reply_to = _relay_prospective_thread_id
 
         async def write_tool_log():
             """Drain log_queue and append tool-call lines to tool_calls.log.
@@ -32158,6 +32235,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # exactly where the original closure's captured locals were bound.
         turn_ctx._progress_metadata = _progress_metadata
         turn_ctx._progress_reply_to = _progress_reply_to
+        # Every transient output lane shares the prospective Discord anchor:
+        # tool progress, status, interim commentary, and streamed text must not
+        # split one mirrored conversation between the parent and its thread.
+        turn_ctx._status_reply_to = _progress_reply_to
         send_progress_messages = turn_runner.send_progress_messages
 
         # We need to share the agent instance for interrupt support
@@ -32217,6 +32298,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     reply_to_message_id=event_message_id,
                 )
             ) if _progress_thread_id else None
+            if _status_thread_metadata is None and _relay_prospective_thread_id:
+                # Relay Discord auto-thread lane (see _progress_metadata above):
+                # carry the reply anchor so status/interim bubbles route into
+                # the same connector-created thread as the final reply.
+                _status_thread_metadata = {
+                    "reply_to_message_id": _relay_prospective_thread_id
+                }
 
         # Bridge extracted to TurnRunner._status_callback_sync; publish the
         # status wiring computed above onto the shared TurnContext at the

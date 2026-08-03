@@ -141,6 +141,7 @@ def _make_branch_runner():
     runner._session_db._db.get_next_title_in_lineage.return_value = "Current Work #2"
     runner._session_db._db.set_session_title.return_value = True
     runner._session_db._db.delete_session.return_value = True
+    runner._session_db._db.append_messages_batch.return_value = 2
     original_clear = runner._clear_session_boundary_security_state
     runner._clear_session_boundary_security_state = MagicMock(
         wraps=original_clear
@@ -248,16 +249,34 @@ async def test_branch_preserves_persisted_assistant_metadata():
     result = await runner._handle_branch_command(_make_event("/branch"))
 
     assert "Branched to" in result
-    append_calls = runner._session_db._db.append_message.call_args_list
-    assert len(append_calls) == 2
-    assistant_kwargs = append_calls[1].kwargs
-    assert assistant_kwargs["role"] == "assistant"
-    assert assistant_kwargs["finish_reason"] == "stop"
-    assert assistant_kwargs["reasoning"] == "thinking"
-    assert assistant_kwargs["reasoning_content"] == "provider scratchpad"
-    assert assistant_kwargs["reasoning_details"] == [{"type": "summary", "text": "step"}]
-    assert assistant_kwargs["codex_reasoning_items"] == [{"id": "r1", "type": "reasoning"}]
-    assert assistant_kwargs["codex_message_items"] == [{"id": "m1", "type": "message"}]
+    batch_call = runner._session_db._db.append_messages_batch.call_args
+    assert batch_call.args[0] != "current-session"
+    assert batch_call.kwargs["chunk_rows"] == 500
+    copied = batch_call.args[1]
+    assert len(copied) == 2
+    assistant = copied[1]
+    assert assistant["role"] == "assistant"
+    assert assistant["finish_reason"] == "stop"
+    assert assistant["reasoning"] == "thinking"
+    assert assistant["reasoning_content"] == "provider scratchpad"
+    assert assistant["reasoning_details"] == [{"type": "summary", "text": "step"}]
+    assert assistant["codex_reasoning_items"] == [{"id": "r1", "type": "reasoning"}]
+    assert assistant["codex_message_items"] == [{"id": "m1", "type": "message"}]
+
+
+@pytest.mark.asyncio
+async def test_branch_rejects_partial_batched_transcript_before_publication():
+    runner, _session_key = _make_branch_runner()
+    runner._session_db._db.append_messages_batch.return_value = 1
+
+    result = await runner._handle_branch_command(_make_event("/branch"))
+
+    assert "failed" in result.lower()
+    created_id = runner._session_db._db.create_session.call_args.kwargs[
+        "session_id"
+    ]
+    runner._session_db._db.delete_session.assert_called_once_with(created_id)
+    runner.session_store.switch_session.assert_not_called()
 
 
 @pytest.mark.asyncio
