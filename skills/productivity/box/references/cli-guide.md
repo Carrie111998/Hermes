@@ -1,85 +1,58 @@
-# CLI Guide
+# Box CLI guide
 
-Use Box CLI via the `terminal` tool. Default flags: `--json` plus `--fields` to minimize token output.
+Run Box commands through Hermes' `terminal` tool. Prefer the documented command in this skill over exploratory help calls. Use help only when a required option is absent here or the installed CLI rejects the syntax.
 
-## Safe checks
+## Check identity and control output
 
 ```bash
 command -v box
 box --version
 box users:get me --json --fields id,name,login
-```
-
-## Output control
-
-```bash
-# Minimal fields
 box folders:items 0 --json --max-items 20 --fields id,name,type
-
-# Pagination — repeat with offset or use --max-items
-box search "contract" --json --limit 25
 ```
 
-Run `box <command> --help` before first use of an unfamiliar subcommand.
+Use `--json` for machine-readable output and `--fields` to return only needed fields. Folder `0` is the current actor's root.
 
-## Serial execution
-
-**One `box` command at a time.** Parallel CLI processes against the same environment cause auth conflicts and dropped operations.
-
-## Common commands
+## Environments and actors
 
 ```bash
-# Browse
-box folders:get <ID> --json --fields id,name,item_collection
-box folders:items <ID> --json --max-items 100 --fields id,name,type
-
-# Write
-box folders:create <PARENT_ID> "Project-Alpha" --json
-box files:upload ./report.pdf --parent-id <FOLDER_ID> --json
-box files:download <FILE_ID> --destination . --save-as report.pdf
-
-# Edit (metadata + content)
-box files:update <FILE_ID> --name "Q1-Report.pdf" --description "Final" --json
-box files:versions:upload <FILE_ID> ./report-v2.pdf --json
-box files:upload ./report-v2.pdf --parent-id <FOLDER_ID> --overwrite --json
-box files:move <FILE_ID> <NEW_PARENT_ID> --json
-
-# Share
-box shared-links:create <FILE_ID> file --access company --json
-box collaborations:create <FOLDER_ID> folder --role editor --login user@example.com --json
-
-# Search
-box search "quarterly review" --json --limit 20
-box metadata-query --help  # requires template scope/key and ancestor folder ID
-
-# Admin-ish (scope-dependent)
-box users:get me --json
-box webhooks:list --json
+box configure:environments:list
+box configure:environments:set-current <ENVIRONMENT_NAME>
+box users:get me --json --fields id,name,login
+box folders:items <FOLDER_ID> --as-user <USER_ID> --json --fields id,name,type
 ```
 
-Folder **`0`** is the current actor's root.
+The CLI has one current environment. Confirm before switching it, then verify the actor. Use `--as-user` only when the configured app supports it and the user has asked for that actor.
 
-## `box request` — REST escape hatch
+## Pagination and search
 
-When no dedicated subcommand exists, call any API path:
+```bash
+box folders:items <FOLDER_ID> --json --max-items 100 --fields id,name,type
+box search "quarterly review" --json --limit 20 --fields id,name,type,parent
+box metadata-query enterprise_12345.contractTemplate <ANCESTOR_FOLDER_ID> \
+  --query "status = :status" --query-param status=active --json
+```
+
+Paginate inventories fully before bulk work. Metadata queries require the template scope/key and an ancestor folder ID.
+
+## REST escape hatch
+
+When the CLI has no dedicated command, preserve its configured auth with `box request`:
 
 ```bash
 box request /files/<FILE_ID> --json
 box request /files/<FILE_ID> -X PUT --body '{"name":"renamed.pdf"}' --json
-box request /folders -X POST --body '{"name":"New","parent":{"id":"0"}}' --json
+box request /folders -X POST --body '{"name":"New folder","parent":{"id":"0"}}' --json
 ```
 
-Prefer `box request` over hand-written curl when CLI is installed — same auth, same environment.
+Read [REST API fallback](rest-api.md) only when the CLI is unavailable or application code genuinely needs direct REST.
 
-## Actor controls
+## Batch inputs and mutations
 
-- **`--as-user <USER_ID>`** — impersonate another user (requires app scopes and access level).
-- **Separate CCG environment with `--ccg-user`** — persistent impersonation; see `references/auth-and-setup.md`.
+Many Box CLI commands accept `--bulk-file-path` for CSV or JSON input. Use it only after inventorying the target set and confirming material writes. For ordered moves, version updates, and other recoverable mutations, keep an operation log and process serially. Use bounded concurrency in application SDK code only when its retry and rate-limit behavior is explicit.
 
-## When to use REST instead
+## Confirmation rules
 
-Only when `box` is not installed or user declines CLI setup. See `references/rest-api.md`.
-
-## Bulk work
-
-For more than a handful of moves, follow `references/bulk-operations.md` (inventory → plan → serial execute → verify).
+- Confirm before deletes, access changes, or broad moves.
+- Confirm the scope before an AI-unit-consuming bulk request.
+- Do not pass `--yes` unless the user has already approved the exact operation.

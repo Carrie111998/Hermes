@@ -1,156 +1,86 @@
 ---
 name: box
-description: Box CLI and API for content, search, and SDK apps.
+description: Box stores, organizes, and shares files; extracts metadata.
 version: 1.0.0
-author: community
+author: Chris Kim / @iskysun96
 license: MIT
 platforms: [linux, macos, windows]
 prerequisites:
-  env_vars: [BOX_CLIENT_ID, BOX_CLIENT_SECRET, BOX_ENTERPRISE_ID]
   commands: [box]
 metadata:
   hermes:
-    tags: [Box, Productivity, CLI, API, Content, Files, SDK]
-    homepage: https://developer.box.com/guides/cli
+    tags: [Box, Productivity, Cloud Storage, Collaboration, Metadata, Content Extraction, CLI, SDK]
+    homepage: https://developer.box.com/
 ---
 
-# Box Skill
+# Box
 
-Hermes operates Box as a **service account** via Client Credentials Grant (CCG). Use the `terminal` tool to run Box CLI commands for agent workflows; read `references/sdk-development.md` when the user is building a shipped Box app.
+Use Box as the cloud file system for file operations, collaboration, metadata, and document work. Run operations with Hermes' `terminal` tool and use the Box CLI; use the SDK guide when building an application.
 
-## When to Use
+## Use this skill for
 
-- Upload, download, edit(rename, new version), move, or organize files and folders
-- Search content, run metadata queries, or use Box AI
-- Bulk reorganize folders or batch-tag metadata
-- Create webhooks or poll events for automation
-- Add Box SDK auth, API calls, or webhook handlers to application code
+- Organizing, uploading, versioning, moving, sharing, or collaborating on Box files and folders
+- Searching Box content or existing metadata
+- Asking questions about Box files, extracting metadata, or generating text grounded in a file
+- Processing a Box folder at scale without downloading every source file
+- Building a Box-backed application, integration, or webhook handler
 
-## Prerequisites
+## Start each task
 
-1. **Box CLI** — Node.js 18+ and `npm install -g @box/cli`.
-2. **CCG Platform App** — Developer Console → Platform App → Client Credentials Grant (auth method is locked at creation). See `references/auth-and-setup.md`.
-3. **Credentials in `~/.hermes/.env`** — `BOX_CLIENT_ID`, `BOX_CLIENT_SECRET`, `BOX_ENTERPRISE_ID`.
-4. **CLI environment** — copy `templates/ccg-config.json.example`, fill values, then:
+1. Confirm the CLI and current actor:
    ```bash
-   box configure:environments:add /path/to/ccg-config.json --ccg-auth --name hermes --set-as-current
+   command -v box
+   box users:get me --json --fields id,name,login
    ```
+   If this succeeds, record the actor and continue. Do not ask about authentication again.
+2. If authentication is absent, ask which identity the user wants:
+   - **Act as me (OAuth):** fastest setup for one person using Hermes as an extension of themselves. Read [OAuth setup](references/oauth-setup.md).
+   - **Act as its own agent (CCG):** use for shared/background Hermes or an identity that only sees explicitly shared content. Read [CCG setup](references/ccg-setup.md).
+3. Read the relevant reference before operating. Use documented commands first; only run subcommand help when the request needs an option not covered by the reference or the installed CLI rejects the documented form.
 
-Free developer accounts auto-authorize CCG apps. Enterprise plans may require admin approval.
+## Choose the right path
 
-5. **Folder access** — the service account only sees its own empty root until you share content with it. After the app is **authorized**, invite the service account to every folder Hermes should use (see Step 0 below).
-
-## How to Run
-
-### Step 0 — Auth and content gate
-
-Run via `terminal`:
-
-```bash
-box users:get me --json --fields id,name,login
-```
-
-Record the service account **id**, **name**, and **login** (`login` is the service account email). If auth fails, walk through `references/auth-and-setup.md` before any other Box work.
-
-#### Grant Hermes access to existing folders
-
-The CCG service account is a separate Box user. It **cannot** see files in your personal or team folders until you collaborate it in.
-
-**Find the service account email** (pick one):
-
-| Source | Where |
+| Need | Read |
 | --- | --- |
-| Developer Console | Open your app → **General Settings** tab → **Service Account** section (shown after the app is authorized). Email looks like `AutomationUser_<app-id>_…@boxdevedition.com`. |
-| Box CLI | `login` field from `box users:get me` above |
+| CLI conventions, environments, JSON, or REST escape hatch | [CLI guide](references/cli-guide.md) |
+| Files, folders, versions, links, or collaborations | [Content workflows](references/content-workflows.md) |
+| Search, metadata, Box AI, or AI units | [Search and AI](references/search-and-ai.md) |
+| Many files or a resumable batch | [Bulk operations](references/bulk-operations.md) |
+| Application code or a Box SDK | [SDK development](references/sdk-development.md) |
+| Webhooks or Events API | [Webhooks and events](references/webhooks-and-events.md) |
+| CLI unavailable or a missing CLI operation | [REST API fallback](references/rest-api.md) |
+| Auth, permissions, rate limits, or API errors | [Troubleshooting](references/troubleshooting.md) |
 
-**Invite the service account** (tell the user to do this in the Box web app — not via Hermes chat secrets):
+## Content handling policy
 
-1. In [Box](https://app.box.com), open the folder Hermes should access (or the parent folder).
-2. Click **Invite People** (or **Share** → **Invite Collaborators**).
-3. Paste the **service account email** from the table above.
-4. Choose a role: **Viewer** (read/search), **Editor** (upload/move/edit), or **Co-owner** (manage collaborators — only if needed).
-5. Repeat for each top-level folder Hermes needs; subfolders inherit access.
+For semantic analysis of Box-hosted content, use Box AI before downloading source files. Use external-model processing only as an explicit, user-approved fallback.
 
-Alternatively, an Editor on the folder can add the collaborator via CLI:
+Use existing Box metadata or metadata queries for deterministic lookups. Otherwise use Box AI:
 
-```bash
-box collaborations:create <FOLDER_ID> folder --role editor --login <SERVICE_ACCOUNT_EMAIL> --json
-```
+- `ai:ask` for Q&A, summaries, and comparisons
+- `ai:extract-structured` for known fields or metadata templates
+- `ai:extract` for flexible key-value extraction
+- `ai:text-gen` for writing grounded in one Box file
 
-**Before any search, move, or download on user-owned content:** confirm the target folder is shared with the service account. If operations return 404 or empty search, ask the user to complete the invite step first.
+Box AI keeps source file bodies out of Hermes' coding-model context, but an AI response returned to Hermes can still contain sensitive information. Box AI calls require eligible access and consume AI units; explain that before the first AI call, and confirm the scope before a material batch. See [Search and AI](references/search-and-ai.md).
 
-Confirm where target content lives:
+## Operate safely
 
-- **Shared folder** — user invited the service account (most common for existing content)
-- **Hermes workspace** — content under the service account root (`folder id 0`) — upload/create here when Hermes owns the files
-- **User impersonation (advanced)** — `--ccg-user` (see `references/auth-and-setup.md`)
+- Prefer IDs to paths and verify the current actor before diagnosing a missing file.
+- Use `--json` and `--fields` to keep output small. For mutations, inventory first, confirm ambiguous or large scope, then read back the result.
+- Run ordered CLI mutations serially so progress and recovery are unambiguous. Use documented bulk input support or bounded SDK concurrency for scalable work.
+- Do not create a shared link merely to provide navigation. Shared links change access and require explicit confirmation.
+- Do not put secrets in chat, command output, source control, or logs.
 
-### Route the request
+## Report results
 
-| User need | Read first |
-| --- | --- |
-| Agent task (search, move, upload, AI) | This skill + domain reference below |
-| Application code (SDK, OAuth in app) | `references/sdk-development.md` |
-| Setup, CCG, actors, workspace | `references/auth-and-setup.md` |
-| CLI patterns, `box request`, `--fields` | `references/cli-guide.md` |
-| Files, folders, links, collaborations, edit/version | `references/content-workflows.md` |
-| Search, metadata-query, Box AI | `references/search-and-ai.md` |
-| Batch moves, folder trees | `references/bulk-operations.md` |
-| Webhooks, events | `references/webhooks-and-events.md` |
-| CLI missing / no command | `references/rest-api.md` |
-| 401, 403, 404, 409, 429 | `references/troubleshooting.md` |
+For every individually reported Box item, include its ID and a clickable navigation link:
 
-### Tool ladder
+- File: `https://app.box.com/file/<FILE_ID>`
+- Folder: `https://app.box.com/folder/<FOLDER_ID>`
 
-1. **Box CLI** via `terminal` — default for all agent operations
-2. **`box request`** — escape hatch for any REST endpoint when no dedicated CLI subcommand exists
-3. **Direct REST** via `terminal` — only when CLI is unavailable and user confirms; see `references/rest-api.md`
+For large batches, link the source and destination folders plus exceptions instead of listing hundreds of items. A human may not be able to open content that is only visible to a CCG service account; state that clearly. Include the actor and verification performed in every write summary.
 
-Run **one** `box` command at a time. Parallel CLI calls break auth.
+## Verify
 
-## Quick Reference
-
-Folder `0` is the service account root. Always append `--json`; add `--fields id,name,...` to limit output.
-
-```bash
-box folders:get 0 --json --fields id,name,item_collection
-box folders:items <FOLDER_ID> --json --max-items 50 --fields id,name,type
-box search "invoice" --json --limit 10
-box files:upload ./file.pdf --parent-id <FOLDER_ID> --json
-box files:update <FILE_ID> --name "renamed.pdf" --json
-box files:versions:upload <FILE_ID> ./updated.pdf --json
-box files:upload ./updated.pdf --parent-id <FOLDER_ID> --overwrite --json
-box folders:create <PARENT_ID> "Hermes-Inbox" --json
-box shared-links:create <FILE_ID> file --access company --json
-box request /files/<ID> --json
-```
-
-## Procedure
-
-1. Run Step 0 auth gate; confirm content access model (workspace vs shared folder).
-2. Pick the domain reference from the route table; read it before acting.
-3. Resolve folder/file IDs — prefer IDs over paths; persist IDs from responses.
-4. Execute with `--json --fields`; paginate large lists with `--max-items` / offset.
-5. For bulk work: inventory → plan → execute serially → verify counts (`references/bulk-operations.md`).
-6. Summarize results with actor context, Box IDs, and the verification command used.
-
-## Pitfalls
-
-- **Serial CLI only** — never run concurrent `box` processes against the same environment.
-- **No folder invite** — Hermes returns 404 or empty search for content you can see in the Box UI; invite the service account email from **General Settings** (Developer Console) or `box users:get me` → `login`.
-- **Wrong actor** — many 404s are permission/actor mismatches, not missing objects.
-- **No secrets in chat** — guide users to `~/.hermes/.env`; never echo client secrets or tokens.
-- **Box AI pacing** — space AI calls 1–2 seconds apart; prefer AI over downloading file bodies when possible.
-- **Editor role required** — rename, upload new versions, and move need **Editor** (or higher) collaboration on the folder, not Viewer.
-- **Office/Google in-browser edit** — `.docx` / Google Docs editing in Box Preview (Open With) is a **human UI** flow; Hermes uses download → local edit → upload new version for file content changes.
-
-## Verification
-
-After setup or any write operation:
-
-```bash
-box users:get me --json --fields id,name
-box folders:items 0 --json --max-items 5 --fields id,name,type
-```
-
-For writes: create a smoke folder, confirm it in the parent listing, then delete if disposable.
+After any write, fetch the file or folder with the same actor or list its parent and confirm the returned ID and name. For a disposable setup check, create a smoke folder, verify it, then delete it only if the user authorized cleanup.

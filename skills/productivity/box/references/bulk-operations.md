@@ -1,82 +1,43 @@
-# Bulk Operations
+# Bulk operations
 
-Use when moving, creating, or tagging **more than a handful** of items. Read `references/auth-and-setup.md` if the acting identity is unclear.
-
-## Constraints
-
-- **Serial CLI** — one `box` command at a time; parallel CLI breaks auth.
-- **Rate limits** — `429` responses include `Retry-After`; wait and retry.
-- **Name uniqueness** — duplicate folder names in the same parent return `409`; look up existing folder ID instead of failing.
+Use this workflow for more than a handful of files. Choose the current actor before inventorying; a CCG service account only sees folders shared with it.
 
 ## Workflow
 
 ```
-Inventory → Classify (optional) → Plan → Execute (serial) → Verify
+Inventory → classify if needed → plan → confirm → execute → verify → report
 ```
 
-Skip classify when sorting by filename, extension, or existing metadata alone.
-
-## Step 1 — Inventory
+## Inventory and plan
 
 ```bash
-box folders:items <FOLDER_ID> --json --max-items 1000 --fields id,name,type
+box folders:items <FOLDER_ID> --json --max-items 1000 --fields id,name,type,parent
 ```
 
-Paginate until all items captured. Record `id`, `name`, `type` for each.
+Paginate until every item is accounted for. Record IDs, names, types, target folder IDs, and a completed-ID log. Before broad moves, access changes, or AI use, show the user the scope and ambiguous cases.
 
-## Step 2 — Classify (optional)
+## Classify content
 
-Preference order:
-
-1. Box AI ask/extract (server-side)
-2. Existing metadata
-3. Filename/extension rules
-4. Download + local analysis (last resort)
-
-Sample-first: classify 5–10 files, derive category set, use cheap rules for the rest. Pace AI calls 1–2s apart.
+Prefer deterministic filename, extension, and existing-metadata rules. For semantic classification, use Box AI rather than downloading file bodies:
 
 ```bash
 box ai:ask --items=id=<FILE_ID>,type=file \
-  --prompt "Document type? One of: invoice, receipt, contract, report, other." \
-  --json --no-color
+  --prompt "Classify as invoice, receipt, contract, report, or other." --json
 ```
 
-## Step 3 — Plan
+For known fields, use `ai:extract-structured`; for variable fields, use `ai:extract`. Sample a small representative set before processing a large batch. State that Box AI uses units and get confirmation before a material AI batch.
 
-Map each file ID → target folder path. Note which folders exist vs need creation. Confirm with user before large or ambiguous batches.
-
-## Step 4 — Create folders (serial)
+## Execute and recover
 
 ```bash
 box folders:create <PARENT_ID> "Category" --json --fields id,name
+box files:move <FILE_ID> <TARGET_FOLDER_ID> --json --fields id,name,parent
 ```
 
-Create parents before children. On `409`, list parent to reuse existing folder ID.
+Process ordered CLI mutations serially and log each success or failure. On `409`, find and reuse the existing target. On `429`, honor `Retry-After` and retry the same request. Resume from `inventory minus completed IDs`; do not restart blindly.
 
-## Step 5 — Move files (serial)
+Use a documented `--bulk-file-path` workflow when the relevant command supports it. Use bounded SDK concurrency only when the application owns retries, idempotency, and rate-limit handling.
 
-```bash
-box files:move <FILE_ID> <TARGET_FOLDER_ID> --json
-```
+## Verify and report
 
-Log successes and failures; continue on individual errors. Pause 200–500ms between ops for large batches.
-
-## Step 6 — Verify
-
-List each target folder; confirm counts and IDs. List source folder for stragglers.
-
-```bash
-box folders:items <TARGET_FOLDER_ID> --json --max-items 1000 --fields id,name
-```
-
-## Rate limits
-
-On `429`: read `Retry-After`, wait, retry the same request. Do not blast parallel requests during cooldown.
-
-## Recovery
-
-Keep a completed-ID log. Retry pass = inventory minus completed. Re-moving to the same parent is safe.
-
-## CLI vs REST
-
-Default to CLI for agent bulk work. Use `references/rest-api.md` only when CLI is unavailable and user confirms.
+List each destination and the source folder, then compare IDs and counts with the plan. Report links to the source folder, destination folders, and exceptions. Do not dump hundreds of item links unless the user asks for a manifest.

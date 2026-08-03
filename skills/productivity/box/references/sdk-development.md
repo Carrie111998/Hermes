@@ -1,29 +1,35 @@
-# SDK Development
+# SDK development
 
-Read this when the user is **building application code** — not for one-off agent tasks (those use CLI via `references/cli-guide.md`).
+Use this reference for shipped Box applications. For a one-off Hermes task, use the CLI references instead.
 
-## Official SDKs
+## Start with the application
 
-- Python: https://github.com/box/box-python-sdk-gen
-- Node: https://github.com/box/box-node-sdk
-- Java, .NET, iOS — https://developer.box.com/guides/tooling/sdks/
+Inspect the repository for existing Box clients, `BOX_` configuration, token storage, webhook handlers, retry policy, and language conventions. Extend the existing integration instead of mixing SDK and raw REST without a reason.
 
-Prefer the SDK matching the project's language. Do not mix SDK and raw REST for the same feature without reason.
+## Choose an identity
 
-## Auth in application code
-
-| Method | Use when |
+| Identity | Use when |
 | --- | --- |
-| **CCG** | Server-side, no user login — same model as Hermes service account |
-| **OAuth 2.0** | End users connect their own Box accounts |
-| **JWT** | Enterprise server auth with keypair (legacy server apps) |
+| OAuth | each end user connects their own Box account |
+| CCG | a server-side app needs its own service-account identity |
+| `as_user` / managed user | an authorized enterprise app must act as a specified user |
 
-Hermes agent sessions use CCG + CLI. Shipped apps pick auth based on product requirements — see [Authentication guides](https://developer.box.com/guides/authentication/).
+OAuth follows the user's permissions and app scopes. CCG is a separate identity and needs folder collaboration unless enterprise capabilities explicitly provide another model.
 
-### CCG in Python (sketch)
+## Use an official SDK
+
+- [Python SDK Gen](https://github.com/box/box-python-sdk-gen)
+- [Node SDK](https://github.com/box/box-node-sdk)
+- [Other Box SDKs](https://developer.box.com/guides/tooling/sdks/)
+
+Use the SDK matching the project language. Store credentials in the project's approved secret mechanism, not source control.
+
+## Python CCG client
 
 ```python
-from box_sdk_gen import BoxCCGAuth, CCGConfig, BoxClient
+import os
+
+from box_sdk_gen import BoxCCGAuth, BoxClient, CCGConfig
 
 auth = BoxCCGAuth(
     CCGConfig(
@@ -32,36 +38,23 @@ auth = BoxCCGAuth(
         enterprise_id=os.environ["BOX_ENTERPRISE_ID"],
     )
 )
-client = BoxClient(auth=auth)
+client = BoxClient(auth)
 me = client.users.get_user_me()
 ```
 
-Use `user_id=` in config when impersonating a managed user (requires Generate User Access Tokens).
+Use the generated SDK's file, folder, search, metadata, and webhook APIs rather than rebuilding HTTP and token refresh logic. Follow the installed SDK's current method names when implementing a concrete call.
 
-## Webhooks in apps
+## Build document-aware apps with Box AI
 
-- Verify signatures with the primary key from Developer Console
-- Respond quickly; process async
-- Idempotent handlers — duplicate deliveries are normal
+When an application must understand Box documents, call Box AI rather than downloading document bodies to an unrelated model service:
 
-See `references/webhooks-and-events.md` for checklist.
+- ask for Q&A and summaries;
+- structured extract for repeatable fields or a metadata template;
+- extract for variable fields;
+- text generation for output grounded in one Box file.
 
-## Inspect existing codebases
+Expose plan/AI-unit implications in the product flow. Do not silently switch to external processing when Box AI is unavailable. Treat Box AI responses as potentially confidential application data.
 
-Use `search_files` / `read_file` to find:
+## Webhooks and reliability
 
-- `BOX_`, `box_sdk`, `BoxClient`, `client_id`, `webhook`
-- Where tokens are issued/refreshed
-- Whether calls are user-scoped or service-account-scoped
-
-Preserve existing retry, logging, and error patterns.
-
-## Scopes and re-authorization
-
-Changing app scopes or access level requires **re-authorization** in Admin Console. Verify against current docs before adding permissions.
-
-## Docs entry points
-
-- Guides: https://developer.box.com/guides
-- API reference: https://developer.box.com/reference
-- Security: https://developer.box.com/guides/security
+Verify webhook signatures, persist idempotency keys, fetch authoritative state after events, and keep retry/backoff policy explicit. Bound concurrent API calls and make retries safe before increasing throughput. See [Webhooks and events](webhooks-and-events.md).
