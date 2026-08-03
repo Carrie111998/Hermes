@@ -393,6 +393,7 @@ _UPDATEABLE_JOB_FIELDS = frozenset(
         "base_url",
         "script",
         "context_from",
+        "description",
         "enabled_toolsets",
         "workdir",
         "no_agent",
