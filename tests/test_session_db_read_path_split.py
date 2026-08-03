@@ -167,3 +167,43 @@ def test_session_resume_reads_do_not_take_writer_lock(db):
         assert len(done["ancestor_prefix"]) == 2
     finally:
         db._lock.release()
+
+
+@pytest.mark.requires_wal
+def test_prune_fires_through_read_ctx_no_explicit_call(db):
+    """Prune fires through _read_ctx; callers never need to call it directly.
+
+    When a read operation goes through _read_ctx (the WAL read-path
+    context manager), dead-thread connections are pruned automatically.
+    Callers of get_session / search_messages / get_messages etc. get
+    prune-for-free without explicitly calling _prune_dead_read_conns.
+    """
+    import time
+
+    dead_tids = []
+
+    def open_and_die():
+        conn = db._get_read_conn()
+        assert conn is not None
+        dead_tids.append(threading.get_ident())
+
+    t = threading.Thread(target=open_and_die)
+    t.start()
+    t.join()
+
+    assert len(dead_tids) == 1
+    dead_tid = dead_tids[0]
+
+    # Verify dead_tid is in _read_conns before the read
+    with db._read_conns_lock:
+        assert dead_tid in db._read_conns, "dead thread entry missing before read"
+
+    # Any read through _read_ctx triggers prune — no explicit call needed
+    result = db.get_session("s1")
+    assert result["id"] == "s1"
+
+    # The dead thread's connection was pruned by _read_ctx
+    with db._read_conns_lock:
+        assert dead_tid not in db._read_conns, (
+            "dead thread entry leaked after read through _read_ctx"
+        )

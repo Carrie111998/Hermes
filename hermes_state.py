@@ -1916,7 +1916,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # hold a reference so short-lived reader threads' connections are
         # not GC'd without close() — that would leak tracked fds in
         # _live_connections.  close() drains this set.
-        self._read_conns: "set[sqlite3.Connection]" = set()
+        self._read_conns: "dict[int, sqlite3.Connection]" = {}
         self._read_conns_lock = threading.Lock()
         # Set when close() begins.  _get_read_conn checks this under the
         # lock so a reader that finishes opening after the drain finds the
@@ -2176,6 +2176,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 f"file:{self.db_path}?mode=ro",
                 tracking_path=self.db_path,
                 uri=True,
+                check_same_thread=False,
                 timeout=5.0,
                 isolation_level=None,
             )
@@ -2194,7 +2195,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     conn.close()
                     self._read_local.failed = True
                     return None
-                self._read_conns.add(conn)
+                self._read_conns[threading.get_ident()] = conn
         except sqlite3.Error:
             # Mark this thread failed so we don't retry the open on every
             # query; the locked writer connection still serves reads.
@@ -2203,6 +2204,44 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return None
         self._read_local.conn = conn
         return conn
+
+
+    def _prune_dead_read_conns(self) -> int:
+        """Close and remove read connections whose owning threads are dead.
+
+        Closes each dead-thread connection *before* removing it from the
+        strong registry.  On close failure the entry is retained and logged
+        so the shutdown drain in close() gets another attempt.
+        """
+        active_thread_ids = {t.ident for t in threading.enumerate() if t.ident is not None}
+        pruned = 0
+        # Phase 1: collect dead entries under the lock (no I/O)
+        with self._read_conns_lock:
+            if self._read_conns_closed:
+                return 0
+            dead_entries = [
+                (tid, self._read_conns[tid])
+                for tid in list(self._read_conns)
+                if tid not in active_thread_ids
+            ]
+        # Phase 2: close OUTSIDE the lock, then pop on success
+        for tid, conn in dead_entries:
+            try:
+                conn.close()
+            except Exception:
+                logger.warning(
+                    "Failed to close dead-thread read connection (tid=%s); "
+                    "retained for shutdown drain",
+                    tid,
+                )
+                continue  # Entry stays in _read_conns for close()-retry
+            # close succeeded → safe to remove from registry
+            with self._read_conns_lock:
+                # Re-check: concurrent _get_read_conn may have reused this tid
+                if self._read_conns.get(tid) is conn:
+                    del self._read_conns[tid]
+                    pruned += 1
+        return pruned
 
     @contextmanager
     def _read_ctx(self):
@@ -2214,6 +2253,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         Non-WAL or read-conn failure: the shared writer connection under
         self._lock, byte-for-byte the legacy behavior.
         """
+        if self._read_conns:
+            self._prune_dead_read_conns()
         conn = self._get_read_conn()
         if conn is not None:
             yield conn
@@ -2737,7 +2778,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # connection after the drain.
         with self._read_conns_lock:
             self._read_conns_closed = True
-            read_conns = list(self._read_conns)
+            read_conns = list(self._read_conns.values())
             self._read_conns.clear()
         for conn in read_conns:
             try:
