@@ -108,16 +108,24 @@ _RE_CJK = re.compile(
 _RE_CJK_QUOTE = re.compile(r'[「『《〈【“‘]'
                            r'([^」』》〉】”’]{1,40})'
                            r'[」』》〉】”’]')
-# A Latin run inside CJK prose is usually a proper noun or identifier:
+# A Latin run in a CJK fact is usually a proper noun or identifier:
 # "Notion에 정리한다" -> Notion, "飞书白兔 App 已接入" -> App. The run stops at the
 # first Hangul/Han character, so particles fall off for free, and trailing
 # capitalized words are absorbed so "John Doe가" stays one entity like rule 1
-# gives in English. All-lowercase runs are prose ("download", "use"), and an
-# entity per prose word is how the table fills with junk that links unrelated
-# facts (#57900) — the cost is missing lowercase tool names such as "pytest".
+# gives in English. The second branch keeps internal capitals whole (iPhone,
+# macOS, eBay); the lookbehind stops either branch from starting mid-word.
 _RE_LATIN_RUN = re.compile(
-    r'[A-Za-z][A-Za-z0-9]*(?:[.+-][A-Za-z0-9]+)*(?:\s+[A-Z][a-z]+)*'
+    r'(?<![A-Za-z0-9])'
+    r'(?:[A-Z][A-Za-z0-9]*(?:[.+-][A-Za-z0-9]+)*(?:\s+[A-Z][a-z]+)*'
+    r'|[a-z][A-Za-z0-9]*[A-Z][A-Za-z0-9]*(?:[.+-][A-Za-z0-9]+)*)'
 )
+# A fact only has to contain one CJK character for this rule to see the whole
+# sentence, so an English clause inside it would otherwise become entities
+# (#57900). A name is followed by CJK, by another name, or by nothing:
+# "Slack 대신", "Notion, Slack 그리고 Jira", "회의록 Jira". English prose keeps
+# going in lowercase, which is what "Today we discussed" and "Follow up
+# needed" do, so a lowercase word after the run rules it out.
+_RE_RUN_TRAILER = re.compile(r'[\s,;:.!?/()\[\]{}"\'\u201c\u201d\u2018\u2019]*(.?)')
 _LATIN_RUN_STOPWORDS = frozenset(
     'a an the and or of in on at to for with is are was were be it this that'.split()
 )
@@ -520,9 +528,10 @@ class MemoryStore:
 
             for m in _RE_LATIN_RUN.finditer(text):
                 run = m.group(0)
+                trailer = _RE_RUN_TRAILER.match(text, m.end()).group(1)
                 if (
                     len(run) > 1
-                    and not run.islower()
+                    and not (trailer.isascii() and trailer.islower())
                     and run.lower() not in _LATIN_RUN_STOPWORDS
                 ):
                     _add(run)

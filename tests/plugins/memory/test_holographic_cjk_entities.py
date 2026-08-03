@@ -63,10 +63,53 @@ def test_cjk_bracket_quotes(store, text, expected):
 
 
 def test_multiword_name_stays_one_entity_across_scripts(store):
-    assert store._extract_entities("The Q3 report은 John Doe가 작성") == [
-        "Q3",
-        "John Doe",
+    # John and Doe stay together; Q3 sits inside English prose, away from any
+    # CJK character, so the run rule leaves it alone.
+    assert store._extract_entities("The Q3 report은 John Doe가 작성") == ["John Doe"]
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        # One CJK character is enough to open the rule on the whole sentence,
+        # so an English clause must not turn into entities (#57900). The clause
+        # can sit on either side of the CJK.
+        ("Today we discussed 中文", []),
+        ("결론: 中文 We should ship tomorrow", []),
+        ("팀 회의 Today was long", []),
+        ("Meeting notes 会議 Follow up needed", []),
+        ("이건 The 방법 이다", []),
+        # A lowercase word must not swallow the name behind it: the run has to
+        # match at Notion, not at "in".
+        ("Please save this in Notion 中文", ["Notion"]),
+        ("회의는 Zoom 에서 한다", ["Zoom"]),
+    ],
+)
+def test_english_prose_in_cjk_facts_is_not_an_entity(store, text, expected):
+    assert store._extract_entities(text) == expected
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        # An internal capital is part of the name, not the start of one.
+        ("iPhone은 비싸다", ["iPhone"]),
+        ("macOS에서 실행", ["macOS"]),
+        ("팀은 eBay를 쓴다", ["eBay"]),
+    ],
+)
+def test_internal_capitals_stay_whole(store, text, expected):
+    assert store._extract_entities(text) == expected
+
+
+def test_names_in_a_list_all_survive(store):
+    # A name is followed by CJK, by another name, or by nothing.
+    assert store._extract_entities("Notion, Slack 그리고 Jira") == [
+        "Notion",
+        "Slack",
+        "Jira",
     ]
+    assert store._extract_entities("Slack\n\n중요") == ["Slack"]
 
 
 def test_lowercase_prose_is_not_an_entity(store):
