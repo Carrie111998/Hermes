@@ -40,6 +40,12 @@ hermes-*/*
 examples/
 tests/quick_test_dataset.jsonl
 tests/sample_dataset.jsonl
+# Agent trajectory exports (AIAgent(save_trajectories=True) /
+# `run_agent.py --save_trajectories`). These append to the CWD, so a run
+# inside this checkout drops a full transcript — tool results and tool-call
+# arguments verbatim — next to the source. Never an artifact of the repo.
+trajectory_samples.jsonl
+failed_trajectories.jsonl
 run_datagen_kimik2-thinking.sh
 run_datagen_megascience_glm4-6.sh
 run_datagen_sonnet.sh

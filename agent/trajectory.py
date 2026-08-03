@@ -49,7 +49,15 @@ def save_trajectory(trajectory: List[Dict[str, Any]], model: str,
     }
 
     try:
-        with open(filename, "a", encoding="utf-8") as f:
+        # Trajectories carry full tool results and tool-call arguments. A bare
+        # append open would create the file with umask permissions (0o644 on a
+        # default install), leaving a complete transcript readable by every
+        # local account — and these land in the CWD, not under the 0o700
+        # HERMES_HOME. Create new files owner-only; an existing file the user
+        # deliberately widened is left alone (see open_private_append).
+        from utils import open_private_append
+
+        with open_private_append(filename) as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
         logger.info("Trajectory saved to %s", filename)
     except Exception as e:

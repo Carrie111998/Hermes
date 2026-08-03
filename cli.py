@@ -8318,13 +8318,25 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         path = saved_dir / f"hermes_conversation_{timestamp}.json"
 
         try:
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump({
+            from utils import atomic_json_write
+
+            # The snapshot is a full plaintext transcript. Write it owner-only
+            # (0600) rather than at umask default (0644) — the enclosing
+            # HERMES_HOME is 0700, but the snapshot is the artifact users copy
+            # out to share, so its own mode is what travels with it. Content is
+            # deliberately verbatim: this exports the same history the session
+            # DB replays, and masking it here would make the export lossy
+            # against the thing it snapshots (see #43083).
+            atomic_json_write(
+                path,
+                {
                     "model": self.model,
                     "session_id": self.session_id,
                     "session_start": self.session_start.isoformat(),
                     "messages": self.conversation_history,
-                }, f, indent=2, ensure_ascii=False)
+                },
+                mode=0o600,
+            )
             print(f"(^_^)v Conversation snapshot saved to: {path}")
             if self.session_id:
                 print(f"       Resume the live session with: hermes --resume {self.session_id}")

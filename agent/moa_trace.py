@@ -124,7 +124,11 @@ def save_moa_turn(
     if base is None:
         return
     try:
-        base.mkdir(parents=True, exist_ok=True)
+        # Trace records embed the full messages every reference model saw.
+        # Create the directory owner-only (mode applies to dirs this call
+        # creates; an existing dir keeps its permissions) and the JSONL
+        # owner-only on first write.
+        base.mkdir(parents=True, exist_ok=True, mode=0o700)
         path = base / f"{_sanitize_session_id(session_id)}.jsonl"
         # output_location tells an offline reader where the acting text lives:
         # embedded here when we have it (both non-streaming inline capture and
@@ -161,7 +165,9 @@ def save_moa_turn(
                 "output_location": _output_location,
             },
         }
-        with path.open("a", encoding="utf-8") as f:
+        from utils import open_private_append
+
+        with open_private_append(path) as f:
             f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
     except Exception as exc:  # pragma: no cover - tracing must never break a turn
         logger.debug("MoA trace write failed (session=%s): %s", session_id, exc)
