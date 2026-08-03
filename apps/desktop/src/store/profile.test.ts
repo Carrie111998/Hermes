@@ -146,6 +146,19 @@ describe('selectProfile navigation restore', () => {
 
     expect($profileNavigationRequest.get()).toMatchObject({ profile: 'default', sequence: 1 })
   })
+
+  it('coalesces rapid switches to the latest target', () => {
+    selectProfile('coder')
+    selectProfile('research')
+
+    expect($profileNavigationRequest.get()).toMatchObject({ profile: 'research', sequence: 2 })
+  })
+
+  it('does not request navigation when the active profile is selected again', () => {
+    selectProfile('default')
+
+    expect($profileNavigationRequest.get()).toBeNull()
+  })
 })
 
 describe('prewarmProfileBackend (hover-intent pool spawn)', () => {
