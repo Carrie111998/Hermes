@@ -19,6 +19,11 @@ import { seedAgentTerminalCommand } from './agent-terminal-stream'
 // we stay pinned on 0.19.0, so every terminal that mutates the shared atlas
 // must refresh its siblings itself. Registration is the inverse: each xterm
 // registers its own redraw+atlas-rebuild and unregisters on dispose.
+// Two-phase fan-out: all clears FIRST, then all refreshes. A sequential
+// clear+refresh per terminal would let a later clear wipe the atlas that an
+// earlier terminal just rebuilt, leaving it with dangling glyph references.
+// Splitting the phases guarantees every terminal rebuilds against a clean atlas.
+const webglClearFns = new Map<Terminal, () => void>()
 const webglRefreshFns = new Map<Terminal, () => void>()
 
 /** Register a terminal's atlas-rebuild+redraw so sibling refreshes reach it.
@@ -27,12 +32,15 @@ export function registerWebglRefresh(
   term: Terminal,
   getWebgl: () => WebglAddon | null
 ): () => void {
-  webglRefreshFns.set(term, () => {
+  webglClearFns.set(term, () => {
     getWebgl()?.clearTextureAtlas()
+  })
+  webglRefreshFns.set(term, () => {
     term.refresh(0, term.rows - 1)
   })
 
   return () => {
+    webglClearFns.delete(term)
     webglRefreshFns.delete(term)
   }
 }
@@ -45,6 +53,10 @@ let refreshFrame = 0
  *  cells. Coalesced into one frame per tick: a theme switch fires N
  *  per-terminal effects, and fanning out on each would clear+rebuild the atlas
  *  N times over.
+ *
+ *  Two-phase execution: all atlas clears run first, then all terminal refreshes.
+ *  This prevents a later clear from invalidating an earlier terminal's rebuilt
+ *  glyph model (GottZ triage, PR #76463).
  *
  *  Skip the caller only when it already clears+redraws itself inline (font
  *  change); theme/activation callers must NOT skip — they need their own atlas
@@ -59,6 +71,16 @@ export function redrawAllTerminals(skipTerm?: Terminal): void {
   refreshFrame = requestAnimationFrame(() => {
     refreshFrame = 0
 
+    // Phase 1: clear all atlases first.
+    for (const [term, clear] of webglClearFns) {
+      if (skipTerm && term === skipTerm) {
+        continue
+      }
+
+      clear()
+    }
+
+    // Phase 2: rebuild render models against the now-clean atlas.
     for (const [term, refresh] of webglRefreshFns) {
       if (skipTerm && term === skipTerm) {
         continue

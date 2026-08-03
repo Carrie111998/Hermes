@@ -268,4 +268,40 @@ describe('shared WebGL atlas refresh fan-out', () => {
     expect(caller.refresh).not.toHaveBeenCalled()
     expect(sibling.refresh).toHaveBeenCalledTimes(1)
   })
+
+  it('clears all atlases before refreshing any terminal (two-phase ordering)', async () => {
+    const { redrawAllTerminals, registerWebglRefresh } = await loadTerminalStore()
+
+    // Track operation order across terminals sharing one atlas.
+    const ops: string[] = []
+    const sharedAtlas = { clearTextureAtlas: () => ops.push('clear') }
+    const getWebgl = () => sharedAtlas as never
+
+    const termA = {
+      refresh: () => ops.push('refresh-A'),
+      rows: 24
+    }
+    const termB = {
+      refresh: () => ops.push('refresh-B'),
+      rows: 24
+    }
+
+    registerWebglRefresh(termA as never, getWebgl)
+    registerWebglRefresh(termB as never, getWebgl)
+
+    redrawAllTerminals()
+    await new Promise<void>(resolve => {
+      requestAnimationFrame(() => resolve())
+    })
+
+    // Both clears must precede both refreshes. If a clear ran after a refresh,
+    // that terminal's rebuilt model would reference freed atlas rows.
+    const clearIndices = ops.map((op, i) => op === 'clear' ? i : -1).filter(i => i >= 0)
+    const refreshIndices = ops.map((op, i) => op.startsWith('refresh-') ? i : -1).filter(i => i >= 0)
+
+    expect(clearIndices).toHaveLength(2)
+    expect(refreshIndices).toHaveLength(2)
+    expect(Math.max(...clearIndices)).toBeLessThan(Math.min(...refreshIndices))
+  })
 })
+
