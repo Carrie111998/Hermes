@@ -607,6 +607,100 @@ class TestXmppScopedJidLock:
 
 
 # ---------------------------------------------------------------------------
+# Disconnect send-queue flush
+# ---------------------------------------------------------------------------
+
+class TestXmppDisconnectFlush:
+    """slixmpp's disconnect() returns a Future that drains the send queue
+    before closing the stream. The long-lived gateway adapter can get away
+    with merely scheduling it — its loop keeps running — but the one-shot
+    sender's caller closes the event loop as soon as send_xmpp_message()
+    returns, so an unawaited flush silently drops the very stanza the sender
+    existed to deliver (client.send_message() only enqueues, so SendResult
+    already reported success).
+    """
+
+    @pytest.mark.asyncio
+    async def test_disconnect_awaits_client_disconnect(self, monkeypatch):
+        # test_disconnect_sets_closing_flag runs with client=None, skipping
+        # the client teardown entirely — the await needs its own coverage.
+        # Returning the bare coroutine (not scheduling it) keeps this
+        # deterministic: the flag flips only if disconnect() awaits it.
+        adapter = _make_xmpp_adapter(monkeypatch)
+        drained = False
+
+        async def _drain():
+            nonlocal drained
+            drained = True
+
+        client = MagicMock()
+        client.disconnect = lambda *a, **kw: _drain()
+        adapter.client = client
+
+        await adapter.disconnect()
+        assert drained is True
+
+    @pytest.mark.asyncio
+    async def test_disconnect_flush_timeout_is_bounded(self, monkeypatch):
+        # An unresponsive server must not hang teardown (cron jobs run
+        # unattended) — the flush wait is bounded, and cleanup still runs.
+        adapter = _make_xmpp_adapter(monkeypatch)
+        monkeypatch.setattr(adapter, "_DISCONNECT_TIMEOUT_SECS", 0.05)
+        client = MagicMock()
+        client.disconnect = lambda *a, **kw: asyncio.Event().wait()  # never completes
+        adapter.client = client
+
+        await asyncio.wait_for(adapter.disconnect(), timeout=1.0)
+        assert adapter.client is None
+        assert adapter._closing is True
+
+    @pytest.mark.asyncio
+    async def test_standalone_send_flushes_queue_before_returning(self, monkeypatch):
+        # Regression for the silent-drop report: by the time
+        # send_xmpp_message() returns, the send queue must have been drained,
+        # because the caller tears down the loop immediately afterwards.
+        monkeypatch.setenv("XMPP_ALLOWED_USERS", "")
+        monkeypatch.setenv("XMPP_ALLOW_ALL_USERS", "")
+        monkeypatch.setenv("XMPP_OMEMO_ENABLED", "false")
+        config = PlatformConfig()
+        config.enabled = True
+        config.extra = {"jid": "hermes@example.org", "password": "pw"}
+
+        fake_client = MagicMock()
+
+        def _connect(*a, **k):
+            _connect.owner._session_ready.set()
+
+        fake_client.connect = MagicMock(side_effect=_connect)
+        sent = []
+        fake_client.send_message = lambda **kw: sent.append(kw) or MagicMock()
+        drained = False
+
+        async def _drain(*a, **kw):
+            nonlocal drained
+            drained = True
+
+        fake_client.disconnect = lambda *a, **kw: _drain()
+
+        orig_init = _xmpp.XmppAdapter.__init__
+
+        def _capture_init(self, cfg):
+            orig_init(self, cfg)
+            _connect.owner = self
+
+        monkeypatch.setattr(_xmpp.XmppAdapter, "__init__", _capture_init)
+        with patch(
+            "plugin_adapter_xmpp.slixmpp.ClientXMPP", return_value=fake_client
+        ):
+            result = await _xmpp.send_xmpp_message(
+                config, "alice@example.org", "cron says hi"
+            )
+        assert result["success"] is True
+        assert sent and sent[0]["mbody"] == "cron says hi"
+        assert drained is True
+
+
+# ---------------------------------------------------------------------------
 # SessionSource roundtrip
 # ---------------------------------------------------------------------------
 
