@@ -954,7 +954,7 @@ wheels = [
 
 [[package]]
 name = "cua-sandbox"
-version = "0.1.21"
+version = "0.1.23"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "cua-auto" },
@@ -969,9 +969,9 @@ dependencies = [
     { name = "vncdotool" },
     { name = "websockets" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/5d/68/7245d04fb2251a3af367509245a2dc28da3aab763ed612ad64a449e55300/cua_sandbox-0.1.21.tar.gz", hash = "sha256:ffb6e95746c3375195c8bb2a513b4facb755149ebc9557f35e35e5e923a4a1fd", size = 152418, upload-time = "2026-08-02T17:57:26.812Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/45/bd/9a98f22a27932da2b5a5b61b95bd3fcab565f55863bd7687fe4fe01f1bf8/cua_sandbox-0.1.23.tar.gz", hash = "sha256:a9a71a7b9fcd83c56e7881b1cfeb66a8f4a1128086bdc765b91b82d3bd3118f3", size = 152303, upload-time = "2026-08-03T05:59:05.053Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/c4/f3/3d074b9512909a0c9f2dd018669a0bdd22087600f66faa20be804e05d95a/cua_sandbox-0.1.21-py3-none-any.whl", hash = "sha256:85dba37f9b2e57d8ae719c55d77a15a704472f4e0479848709016a0d269e4e8a", size = 186034, upload-time = "2026-08-02T17:57:25.627Z" },
+    { url = "https://files.pythonhosted.org/packages/00/cb/08c2c82d458ded60744cbdb9a96c3e40cf320740699dc1d27113942de49d/cua_sandbox-0.1.23-py3-none-any.whl", hash = "sha256:46ae1517269358177101f77cd8b080b591afc88f57fbff8948694c5e27e66b32", size = 185881, upload-time = "2026-08-03T05:59:03.987Z" },
 ]
 
 [[package]]
@@ -1983,7 +1983,7 @@ requires-dist = [
     { name = "concurrent-log-handler", marker = "sys_platform == 'win32'", specifier = "==0.9.29" },
     { name = "croniter", specifier = "==6.0.0" },
     { name = "cryptography", specifier = "==48.0.1" },
-    { name = "cua-sandbox", marker = "extra == 'cua-fleet'", specifier = "==0.1.21" },
+    { name = "cua-sandbox", marker = "extra == 'cua-fleet'", specifier = "==0.1.23" },
     { name = "daytona", marker = "extra == 'daytona'", specifier = "==0.155.0" },
     { name = "debugpy", marker = "extra == 'dev'", specifier = "==1.8.20" },
     { name = "defusedxml", marker = "extra == 'wecom'", specifier = "==0.7.1" },

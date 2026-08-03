@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import enum
 import json
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -14,11 +15,11 @@ from tools.environments import CuaFleetConfig, CuaFleetDesktopProvider
 from tools.environments.capability_adapter import resolve_tools
 from tools.environments.capability_manifest import CapabilityManifest, desktop_manifest
 from tools.environments.compute_provider import ComputeLease, EnvironmentCapabilities
+from tools.environments.cua_fleet import CuaFleetConfig as CuaFleetConfigImplementation
 from tools.environments.cua_fleet import (
-    CuaFleetConfig as CuaFleetConfigImplementation,
     CuaFleetDesktopProvider as CuaFleetDesktopProviderImplementation,
-    _provider_from_config,
 )
+from tools.environments.cua_fleet import _provider_from_config
 from tools.environments.desktop_lease import DesktopSandboxManager
 from tools.environments.modal_desktop import ModalDesktopConfig, ModalDesktopEnvironment
 
@@ -48,10 +49,15 @@ def test_environment_capabilities_to_capabilities() -> None:
 
 
 def test_manifest_parses_dict_and_json() -> None:
-    manifest = CapabilityManifest.from_dict({
-        "image": "desktop:latest",
-        "capabilities": {"terminal": True, "computer_use": {"service": "cua-driver"}},
-    })
+    manifest = CapabilityManifest.from_dict(
+        {
+            "image": "desktop:latest",
+            "capabilities": {
+                "terminal": True,
+                "computer_use": {"service": "cua-driver"},
+            },
+        }
+    )
     json_manifest = CapabilityManifest.from_json(
         json.dumps({"capabilities": ["files"]})
     )
@@ -140,7 +146,6 @@ def test_http_transport_start_stop_and_alive() -> None:
     assert not transport.is_alive()
 
 
-
 class _ModalWorker:
     def run_coroutine(self, coroutine, timeout: int = 60):
         return asyncio.run(coroutine)
@@ -165,9 +170,14 @@ def _modal_mcp_response():
 
 
 def test_modal_sandbox_transport_uses_the_lease_tunnel() -> None:
-    transport = ModalSandboxMcpTransport(_ModalSandbox(), _ModalWorker(), port=8080, path="/mcp")
+    transport = ModalSandboxMcpTransport(
+        _ModalSandbox(), _ModalWorker(), port=8080, path="/mcp"
+    )
 
-    with patch("tools.computer_use.transports.modal_sandbox.urlopen", return_value=_modal_mcp_response()):
+    with patch(
+        "tools.computer_use.transports.modal_sandbox.urlopen",
+        return_value=_modal_mcp_response(),
+    ):
         transport.start()
 
     assert transport.endpoint == "https://lease-1.modal.host/mcp"
@@ -176,23 +186,36 @@ def test_modal_sandbox_transport_uses_the_lease_tunnel() -> None:
 
 def test_modal_sandbox_transport_decodes_streamable_http_sse() -> None:
     response = Mock()
-    response.headers = {"mcp-session-id": "session-1", "content-type": "text/event-stream"}
+    response.headers = {
+        "mcp-session-id": "session-1",
+        "content-type": "text/event-stream",
+    }
     response.read.side_effect = [
         b'event: message\ndata: {"jsonrpc":"2.0","id":1,"result":{}}\n\n',
         b"",
     ]
     response.__enter__ = Mock(return_value=response)
     response.__exit__ = Mock(return_value=False)
-    transport = ModalSandboxMcpTransport(_ModalSandbox(), _ModalWorker(), port=8080, path="/mcp")
+    transport = ModalSandboxMcpTransport(
+        _ModalSandbox(), _ModalWorker(), port=8080, path="/mcp"
+    )
 
-    with patch("tools.computer_use.transports.modal_sandbox.urlopen", return_value=response):
+    with patch(
+        "tools.computer_use.transports.modal_sandbox.urlopen", return_value=response
+    ):
         transport.start()
 
     assert transport.headers["mcp-session-id"] == "session-1"
 
 
 def test_modal_desktop_starts_the_image_mcp_runtime_on_an_encrypted_port() -> None:
-    lease = ComputeLease("task-1", "lease-1", "modal", "registry.example/cua-driver-mcp@sha256:test", EnvironmentCapabilities(computer_use=True))
+    lease = ComputeLease(
+        "task-1",
+        "lease-1",
+        "modal",
+        "registry.example/cua-driver-mcp@sha256:test",
+        EnvironmentCapabilities(computer_use=True),
+    )
 
     with patch("tools.environments.modal_desktop.ModalEnvironment.__init__") as init:
         ModalDesktopEnvironment(compute_lease=lease, config=ModalDesktopConfig())
@@ -209,10 +232,14 @@ def test_modal_desktop_backend_uses_the_lease_bound_transport() -> None:
     environment._sandbox = _ModalSandbox()
     environment._worker = _ModalWorker()
 
-    with patch("tools.computer_use.transports.modal_sandbox.urlopen", return_value=_modal_mcp_response()):
+    with patch(
+        "tools.computer_use.transports.modal_sandbox.urlopen",
+        return_value=_modal_mcp_response(),
+    ):
         backend = environment.get_computer_backend()
 
     assert isinstance(backend.transport, ModalSandboxMcpTransport)
+
 
 def test_modal_desktop_config_defaults() -> None:
     config = ModalDesktopConfig()
@@ -236,8 +263,8 @@ def test_cua_fleet_config_defaults() -> None:
 
 
 def test_cua_fleet_config_rejects_non_positive_replicas() -> None:
-    with pytest.raises(ValueError, match="replicas"):
-        CuaFleetConfig(replicas=0)
+    with pytest.raises(ValueError, match="spec.replicas"):
+        CuaFleetConfig(spec={"replicas": 0})
 
 
 def test_environments_package_reexports_cua_fleet_sdk() -> None:
@@ -248,7 +275,9 @@ def test_environments_package_reexports_cua_fleet_sdk() -> None:
 class _FakeResponse:
     def __init__(self, status_code: int = 200, content: bytes | None = None):
         self.status_code = status_code
-        self.content = content or b'{"result":{"stdout":"ok\\n","stderr":"","returncode":0}}'
+        self.content = (
+            content or b'{"result":{"stdout":"ok\\n","stderr":"","returncode":0}}'
+        )
 
 
 class _FakeServices:
@@ -294,31 +323,145 @@ class _FakePool:
         return context
 
 
+class _FakeRuntimeKind(enum.Enum):
+    KUBEVIRT = 0
+
+
+class _FakeFirmware(enum.Enum):
+    BIOS = 0
+    EFI = 1
+
+
+class _FakeServiceProtocol(enum.Enum):
+    TCP = 0
+
+
+class _FakeSandboxService:
+    def __init__(
+        self, *, name: str, target_port: int, protocol: _FakeServiceProtocol | None
+    ):
+        self.name = name
+        self.target_port = target_port
+        self.protocol = protocol
+
+
+class _FakePreservedJson:
+    def __init__(self, *args, **kwargs):
+        self.args = args
+        self.kwargs = kwargs
+
+
+class _FakePoolTemplate:
+    def __init__(
+        self,
+        *,
+        runtime: _FakeRuntimeKind | None,
+        runtime_class_name: str | None,
+        node_selector: dict[str, str] | None,
+        tolerations: list[object] | None,
+        command: list[str] | None,
+        container_disk_image: str,
+        image_pull_secret: str | None,
+        cpu_cores: int | None,
+        memory: str | None,
+        firmware: _FakeFirmware | None,
+        probes: _FakePreservedJson | None,
+        oidc: object | None,
+    ):
+        self.runtime = runtime
+        self.runtime_class_name = runtime_class_name
+        self.node_selector = node_selector
+        self.tolerations = tolerations
+        self.command = command
+        self.container_disk_image = container_disk_image
+        self.image_pull_secret = image_pull_secret
+        self.cpu_cores = cpu_cores
+        self.memory = memory
+        self.firmware = firmware
+        self.probes = probes
+        self.oidc = oidc
+
+
+class _FakePoolSpec:
+    def __init__(
+        self,
+        *,
+        replicas: int,
+        template: _FakePoolTemplate,
+        autoscaling: object | None,
+        services: list[_FakeSandboxService] | None,
+    ):
+        self.replicas = replicas
+        self.template = template
+        self.autoscaling = autoscaling
+        self.services = services
+
+
+class _FakeCreatePoolRequest:
+    def __init__(self, *, namespace: str, spec: _FakePoolSpec):
+        self.namespace = namespace
+        self.spec = spec
+
+
 class _FakeSandboxApi:
     configure_calls: list[dict[str, str]] = []
-    reconcile_configs: list[dict[str, object]] = []
+    reconcile_requests: list[_FakeCreatePoolRequest] = []
     pool = _FakePool()
+    CreatePoolRequest = _FakeCreatePoolRequest
+    PoolSpec = _FakePoolSpec
+    PoolTemplate = _FakePoolTemplate
+    SandboxService = _FakeSandboxService
+    ServiceProtocol = _FakeServiceProtocol
+    Firmware = _FakeFirmware
+    RuntimeKind = _FakeRuntimeKind
 
     @classmethod
     def reset(cls) -> None:
         cls.configure_calls = []
-        cls.reconcile_configs = []
+        cls.reconcile_requests = []
         cls.pool = _FakePool()
 
     @staticmethod
     def configure(**kwargs) -> None:
         _FakeSandboxApi.configure_calls.append(kwargs)
 
-    class Image:
-        @staticmethod
-        def from_registry(ref: str):
-            return SimpleNamespace(ref=ref)
-
     class Pool:
         @classmethod
-        async def reconcile(cls, config):
-            _FakeSandboxApi.reconcile_configs.append(dict(config))
+        async def reconcile(cls, request):
+            _FakeSandboxApi.reconcile_requests.append(request)
             return _FakeSandboxApi.pool
+
+
+def _pool_spec(
+    *,
+    image: str = "registry.example/desktop:latest",
+    replicas: int = 2,
+    template_updates: dict[str, object] | None = None,
+) -> dict[str, object]:
+    template = {
+        "runtime": "kubevirt",
+        "runtime_class_name": None,
+        "node_selector": None,
+        "tolerations": None,
+        "command": None,
+        "container_disk_image": image,
+        "image_pull_secret": "ecr-credentials",
+        "cpu_cores": 4,
+        "memory": "4Gi",
+        "firmware": "bios",
+        "probes": {"readinessProbe": {"tcpSocket": {"port": 8000}}},
+        "oidc": None,
+    }
+    template.update(template_updates or {})
+    return {
+        "replicas": replicas,
+        "autoscaling": None,
+        "services": [
+            {"name": "server", "target_port": 8000, "protocol": "tcp"},
+            {"name": "mcp", "target_port": 3000, "protocol": "tcp"},
+        ],
+        "template": template,
+    }
 
 
 def _fleet_provider(replicas: int = 2) -> CuaFleetDesktopProvider:
@@ -327,9 +470,8 @@ def _fleet_provider(replicas: int = 2) -> CuaFleetDesktopProvider:
         CuaFleetConfig(
             client_id="ukey-test",
             client_secret="secret",
-            image="registry.example/desktop:latest",
             pool="hermes-desktop",
-            replicas=replicas,
+            spec=_pool_spec(replicas=replicas),
         ),
         sandbox_module=_FakeSandboxApi,
     )
@@ -340,25 +482,74 @@ def test_cua_fleet_reconciles_named_pool_with_public_sandbox_api() -> None:
 
     lease = provider.acquire("task-1")
 
-    assert _FakeSandboxApi.configure_calls == [{
-        "fleet_base_url": "https://run.cua.ai",
-        "token_url": (
-            "https://auth.cua.ai/realms/cyclops-cs/protocol/openid-connect/token"
-        ),
-        "client_id": "ukey-test",
-        "client_secret": "secret",
-    }]
-    assert len(_FakeSandboxApi.reconcile_configs) == 1
-    config = _FakeSandboxApi.reconcile_configs[0]
-    assert config["name"] == "hermes-desktop"
-    assert config["image"].ref == "registry.example/desktop:latest"
-    assert config["replicas"] == 2
-    assert config["services"] == {"server": 8000, "mcp": 3000}
+    assert _FakeSandboxApi.configure_calls == [
+        {
+            "fleet_base_url": "https://run.cua.ai",
+            "token_url": (
+                "https://auth.cua.ai/realms/cyclops-cs/protocol/openid-connect/token"
+            ),
+            "client_id": "ukey-test",
+            "client_secret": "secret",
+        }
+    ]
+    assert len(_FakeSandboxApi.reconcile_requests) == 1
+    request = _FakeSandboxApi.reconcile_requests[0]
+    assert isinstance(request, _FakeCreatePoolRequest)
+    assert request.namespace == "hermes-desktop"
+    assert request.spec.replicas == 2
+    assert (
+        request.spec.template.container_disk_image == "registry.example/desktop:latest"
+    )
+    assert request.spec.template.runtime is _FakeRuntimeKind.KUBEVIRT
+    assert request.spec.template.firmware is _FakeFirmware.BIOS
+    assert request.spec.template.probes == {
+        "readinessProbe": {"tcpSocket": {"port": 8000}}
+    }
+    assert [
+        (service.name, service.target_port, service.protocol)
+        for service in request.spec.services
+    ] == [
+        ("server", 8000, _FakeServiceProtocol.TCP),
+        ("mcp", 3000, _FakeServiceProtocol.TCP),
+    ]
     assert lease.metadata == {"pool": "hermes-desktop", "sandbox": "sandbox-1"}
     assert _FakeSandboxApi.pool.claim_contexts[0].entered == 1
 
     provider.release(lease)
     assert _FakeSandboxApi.pool.claim_contexts[0].exited == 1
+
+
+def test_cua_fleet_passes_native_pool_request_fields_to_reconcile() -> None:
+    _FakeSandboxApi.reset()
+    provider = CuaFleetDesktopProvider(
+        CuaFleetConfig(
+            client_id="ukey-test",
+            client_secret="secret",
+            pool="hermes-cua-pool",
+            spec=_pool_spec(
+                image="registry.example/windows:latest",
+                template_updates={
+                    "firmware": "efi",
+                    "cpu_cores": 10,
+                    "memory": "20Gi",
+                },
+            ),
+        ),
+        sandbox_module=_FakeSandboxApi,
+    )
+
+    lease = provider.acquire("task-template")
+
+    request = _FakeSandboxApi.reconcile_requests[0]
+    assert request.namespace == "hermes-cua-pool"
+    assert (
+        request.spec.template.container_disk_image == "registry.example/windows:latest"
+    )
+    assert request.spec.template.firmware is _FakeFirmware.EFI
+    assert request.spec.template.cpu_cores == 10
+    assert request.spec.template.memory == "20Gi"
+
+    provider.release(lease)
 
 
 def test_cua_fleet_environment_routes_terminal_through_named_server_service() -> None:
@@ -394,9 +585,7 @@ def test_cua_fleet_mcp_transport_routes_through_named_mcp_service() -> None:
 def test_cua_fleet_requires_client_credentials(monkeypatch) -> None:
     monkeypatch.delenv("CUA_CLIENT_ID", raising=False)
     monkeypatch.delenv("CUA_CLIENT_SECRET", raising=False)
-    provider = CuaFleetDesktopProvider(
-        CuaFleetConfig(), sandbox_module=_FakeSandboxApi
-    )
+    provider = CuaFleetDesktopProvider(CuaFleetConfig(), sandbox_module=_FakeSandboxApi)
 
     with pytest.raises(RuntimeError, match="CUA_CLIENT_ID"):
         provider.acquire("task-3")
@@ -405,19 +594,24 @@ def test_cua_fleet_requires_client_credentials(monkeypatch) -> None:
 def test_compute_config_selects_cua_fleet_provider(monkeypatch) -> None:
     monkeypatch.setenv("CUA_CLIENT_ID", "ukey-test")
     monkeypatch.setenv("CUA_CLIENT_SECRET", "secret")
-    provider = _provider_from_config({
-        "provider": "cua_fleet",
-        "image": "registry.example/desktop:latest",
-        "cua_fleet": {
-            "base_url": "https://run.cua.ai",
-            "pool": "hermes-desktop",
-            "replicas": 2,
-        },
-    })
+    provider = _provider_from_config(
+        {
+            "provider": "cua_fleet",
+            "cua_fleet": {
+                "base_url": "https://run.cua.ai",
+                "pool": "hermes-desktop",
+                "spec": _pool_spec(
+                    image="registry.example/desktop:latest",
+                    template_updates={"firmware": "efi"},
+                ),
+            },
+        }
+    )
 
     assert isinstance(provider, CuaFleetDesktopProvider)
     assert provider.config.image == "registry.example/desktop:latest"
     assert provider.config.replicas == 2
+    assert provider.config.spec["template"]["firmware"] == "efi"
 
 
 def test_cua_fleet_environment_cleanup_exits_claim_once() -> None:
@@ -460,7 +654,7 @@ def test_cua_fleet_terminal_parses_sse_command_response() -> None:
 def test_cua_fleet_sandbox_package_is_lazy_installable() -> None:
     from tools.lazy_deps import LAZY_DEPS
 
-    assert LAZY_DEPS["terminal.cua_fleet"] == ("cua-sandbox==0.1.21",)
+    assert LAZY_DEPS["terminal.cua_fleet"] == ("cua-sandbox==0.1.23",)
 
 
 def test_desktop_terminal_reuses_existing_task_lease_without_incrementing(monkeypatch):
@@ -488,7 +682,7 @@ def test_desktop_terminal_reuses_existing_task_lease_without_incrementing(monkey
 def test_cua_fleet_provider_uses_public_sandbox_facade() -> None:
     from tools.lazy_deps import LAZY_DEPS
 
-    assert LAZY_DEPS["terminal.cua_fleet"] == ("cua-sandbox==0.1.21",)
+    assert LAZY_DEPS["terminal.cua_fleet"] == ("cua-sandbox==0.1.23",)
 
 
 def test_cua_fleet_nix_build_declares_evdev_build_system() -> None:

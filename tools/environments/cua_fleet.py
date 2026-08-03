@@ -4,13 +4,17 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import copy
+import enum
+import inspect
 import json
 import logging
 import os
 import threading
+import types
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, Sequence, Union, get_args, get_origin, get_type_hints
 
 from tools.computer_use.transports.base import CuaToolTransport
 from tools.environments.base import BaseEnvironment, _ThreadedProcessHandle
@@ -24,30 +28,64 @@ _DEFAULT_TOKEN_URL = (
 )
 
 
+def _default_pool_spec() -> dict[str, Any]:
+    return {
+        "replicas": 1,
+        "autoscaling": None,
+        "services": [
+            {"name": "server", "target_port": 8000, "protocol": "tcp"},
+            {"name": "mcp", "target_port": 3000, "protocol": "tcp"},
+        ],
+        "template": {
+            "runtime": "kubevirt",
+            "runtime_class_name": None,
+            "node_selector": None,
+            "tolerations": None,
+            "command": None,
+            "container_disk_image": "trycua/cua:latest",
+            "image_pull_secret": "ecr-credentials",
+            "cpu_cores": 2,
+            "memory": "8Gi",
+            "firmware": "bios",
+            "probes": None,
+            "oidc": None,
+        },
+    }
+
+
 @dataclass(frozen=True)
 class CuaFleetConfig:
     base_url: str = _DEFAULT_BASE_URL
     token_url: str = _DEFAULT_TOKEN_URL
     client_id: str = ""
     client_secret: str = ""
-    image: str = "trycua/cua:latest"
     pool: str = "hermes-desktop"
-    replicas: int = 1
+    spec: Mapping[str, Any] = field(default_factory=_default_pool_spec)
     cwd: str = "/root"
     timeout: int = 60
     ready_timeout: float = 600
     request_timeout: float = 30
-    services: Mapping[str, int] = field(
-        default_factory=lambda: {"server": 8000, "mcp": 3000}
-    )
 
     def __post_init__(self) -> None:
-        if (
-            isinstance(self.replicas, bool)
-            or not isinstance(self.replicas, int)
-            or self.replicas < 1
-        ):
-            raise ValueError("replicas must be a positive integer")
+        replicas = self.spec.get("replicas")
+        if isinstance(replicas, bool) or not isinstance(replicas, int) or replicas < 1:
+            raise ValueError("spec.replicas must be a positive integer")
+
+    @property
+    def replicas(self) -> int:
+        return int(self.spec["replicas"])
+
+    @property
+    def image(self) -> str:
+        template = self.spec.get("template")
+        if not isinstance(template, Mapping):
+            raise ValueError("spec.template must be a mapping")
+        image = template.get("container_disk_image")
+        if not isinstance(image, str) or not image:
+            raise ValueError(
+                "spec.template.container_disk_image must be a non-empty string"
+            )
+        return image
 
 
 @dataclass
@@ -288,6 +326,64 @@ def _shell_quote(value: str) -> str:
     return shlex.quote(value)
 
 
+def _hydrate_fleet_schema(schema_type: Any, value: Any) -> Any:
+    """Construct public Fleet schema objects from their native config shape."""
+    origin = get_origin(schema_type)
+    if origin in (Union, types.UnionType):
+        if value is None and type(None) in get_args(schema_type):
+            return None
+        for option in get_args(schema_type):
+            if option is not type(None):
+                return _hydrate_fleet_schema(option, value)
+
+    if origin in (list, tuple, Sequence):
+        item_type = get_args(schema_type)[0] if get_args(schema_type) else Any
+        return [_hydrate_fleet_schema(item_type, item) for item in value]
+    if origin in (dict, Mapping):
+        return value
+
+    if inspect.isclass(schema_type) and issubclass(schema_type, enum.Enum):
+        if isinstance(value, schema_type):
+            return value
+        if not isinstance(value, str):
+            raise TypeError(f"{schema_type.__name__} must be configured by name")
+        return schema_type[value.upper()]
+
+    if inspect.isclass(schema_type) and isinstance(value, Mapping):
+        fields = [
+            parameter.name
+            for parameter in inspect.signature(schema_type).parameters.values()
+            if parameter.name != "self"
+            and parameter.kind
+            in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+        ]
+        if fields:
+            hints = get_type_hints(schema_type.__init__)
+            return schema_type(
+                **{
+                    name: _hydrate_fleet_schema(hints.get(name, Any), value[name])
+                    for name in fields
+                }
+            )
+
+    return value
+
+
+def _create_pool_request(
+    sandbox_api: Any, config: CuaFleetConfig, image: str | None
+) -> Any:
+    spec = copy.deepcopy(dict(config.spec))
+    if image is not None:
+        template = spec.get("template")
+        if not isinstance(template, Mapping):
+            raise ValueError("spec.template must be a mapping")
+        spec["template"] = {**template, "container_disk_image": image}
+    return sandbox_api.CreatePoolRequest(
+        namespace=config.pool,
+        spec=_hydrate_fleet_schema(sandbox_api.PoolSpec, spec),
+    )
+
+
 class CuaFleetDesktopProvider:
     name = "cua_fleet"
 
@@ -337,16 +433,10 @@ class CuaFleetDesktopProvider:
         pool = claim_context = None
         entered_claim = False
         try:
+            request = _create_pool_request(sandbox_api, self.config, image)
             with self._reconcile_lock:
                 pool = worker.run(
-                    sandbox_api.Pool.reconcile({
-                        "name": self.config.pool,
-                        "image": sandbox_api.Image.from_registry(
-                            image or self.config.image
-                        ),
-                        "replicas": self.config.replicas,
-                        "services": dict(self.config.services),
-                    }),
+                    sandbox_api.Pool.reconcile(request),
                     self.config.request_timeout,
                 )
             claim_context = pool.claim()
@@ -386,12 +476,16 @@ class CuaFleetDesktopProvider:
             raise RuntimeError(f"Unknown Cua Fleet lease {lease.lease_id}")
         config = self.config
         if lease.image != config.image:
-            config = CuaFleetConfig(**{
-                field_name: lease.image
-                if field_name == "image"
-                else getattr(config, field_name)
-                for field_name in CuaFleetConfig.__dataclass_fields__
-            })
+            config = CuaFleetConfig(
+                **{
+                    field_name: (
+                        lease.image
+                        if field_name == "image"
+                        else getattr(config, field_name)
+                    )
+                    for field_name in CuaFleetConfig.__dataclass_fields__
+                }
+            )
         return CuaFleetEnvironment(
             compute_lease=lease,
             state=state,
@@ -434,14 +528,11 @@ def _provider_from_config(compute_config: Mapping[str, Any] | None = None) -> An
     provider_name = str(config.get("provider") or "modal").lower()
     if provider_name == "cua_fleet":
         fleet = dict(config.get("cua_fleet") or {})
-        fleet["image"] = str(
-            config.get("image") or fleet.get("image") or CuaFleetConfig.image
-        )
         allowed = CuaFleetConfig.__dataclass_fields__
         return CuaFleetDesktopProvider(
-            CuaFleetConfig(**{
-                key: value for key, value in fleet.items() if key in allowed
-            })
+            CuaFleetConfig(
+                **{key: value for key, value in fleet.items() if key in allowed}
+            )
         )
     if provider_name == "modal":
         from tools.environments.modal_desktop import (
@@ -455,8 +546,8 @@ def _provider_from_config(compute_config: Mapping[str, Any] | None = None) -> An
         )
         allowed = ModalDesktopConfig.__dataclass_fields__
         return ModalDesktopProvider(
-            ModalDesktopConfig(**{
-                key: value for key, value in modal.items() if key in allowed
-            })
+            ModalDesktopConfig(
+                **{key: value for key, value in modal.items() if key in allowed}
+            )
         )
     raise ValueError(f"Unsupported compute provider: {provider_name}")
