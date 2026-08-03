@@ -27,6 +27,7 @@ def _(rid, params: dict) -> dict:
         "total_input_tokens": 0,
         "total_output_tokens": 0,
         "total_cache_read_tokens": 0,
+        "total_cache_write_tokens": 0,
         "most_expensive_session_usd": 0.0,
         "cheapest_session_usd": 0.0,
     }
@@ -45,9 +46,7 @@ def _(rid, params: dict) -> dict:
                               OR COALESCE(cache_write_tokens, 0) > 0
                             THEN 1 ELSE 0 END) AS token_sessions,
                    SUM(CASE WHEN COALESCE(estimated_cost_usd, 0) > 0
-                            THEN 1 ELSE 0 END) AS cost_sessions,
-                   MIN(CASE WHEN COALESCE(estimated_cost_usd, 0) > 0
-                            THEN estimated_cost_usd END) AS cheapest_session_usd
+                            THEN 1 ELSE 0 END) AS cost_sessions
             FROM sessions
             """
         ).fetchone()
@@ -62,20 +61,24 @@ def _(rid, params: dict) -> dict:
             "total_input_tokens": 0,
             "total_output_tokens": 0,
             "total_cache_read_tokens": 0,
+            "total_cache_write_tokens": 0,
             "most_expensive_session_usd": 0.0,
-            "cheapest_session_usd": float(session["cheapest_session_usd"] or 0.0),
+            "cheapest_session_usd": 0.0,
         }
 
         # session_model_usage includes auxiliary calls (for example vision or
         # compression) as well as the main model calls. It is the complete
         # metering ledger, while the sessions columns remain the session-level
         # compatibility counters. Fall back to those counters for older DBs.
+        # Both cost extrema are derived from the SAME source (per-session
+        # aggregates) so the two numbers tell one story.
         try:
             usage = db._conn.execute(
                 """
                 SELECT COALESCE(SUM(input_tokens), 0) AS input_tokens,
                        COALESCE(SUM(output_tokens), 0) AS output_tokens,
                        COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
+                       COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens,
                        COALESCE(SUM(estimated_cost_usd), 0) AS estimated_cost_usd
                 FROM session_model_usage
                 """
@@ -84,18 +87,19 @@ def _(rid, params: dict) -> dict:
                 """
                 SELECT COALESCE(SUM(estimated_cost_usd), 0) AS estimated_cost_usd
                 FROM session_model_usage
+                WHERE COALESCE(estimated_cost_usd, 0) > 0
                 GROUP BY session_id
                 """
             ).fetchall()
+            session_costs = [float(row["estimated_cost_usd"] or 0.0) for row in by_session]
             payload.update(
                 total_estimated_cost_usd=float(usage["estimated_cost_usd"] or 0.0),
                 total_input_tokens=int(usage["input_tokens"] or 0),
                 total_output_tokens=int(usage["output_tokens"] or 0),
                 total_cache_read_tokens=int(usage["cache_read_tokens"] or 0),
-                most_expensive_session_usd=max(
-                    (float(row["estimated_cost_usd"] or 0.0) for row in by_session),
-                    default=0.0,
-                ),
+                total_cache_write_tokens=int(usage["cache_write_tokens"] or 0),
+                most_expensive_session_usd=max(session_costs, default=0.0),
+                cheapest_session_usd=min(session_costs, default=0.0),
             )
         except Exception:
             fallback = db._conn.execute(
@@ -104,7 +108,11 @@ def _(rid, params: dict) -> dict:
                        COALESCE(SUM(input_tokens), 0) AS input_tokens,
                        COALESCE(SUM(output_tokens), 0) AS output_tokens,
                        COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
-                       COALESCE(MAX(estimated_cost_usd), 0) AS most_expensive_session_usd
+                       COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens,
+                       MAX(CASE WHEN COALESCE(estimated_cost_usd, 0) > 0
+                                THEN estimated_cost_usd END) AS most_expensive_session_usd,
+                       MIN(CASE WHEN COALESCE(estimated_cost_usd, 0) > 0
+                                THEN estimated_cost_usd END) AS cheapest_session_usd
                 FROM sessions
                 """
             ).fetchone()
@@ -113,8 +121,12 @@ def _(rid, params: dict) -> dict:
                 total_input_tokens=int(fallback["input_tokens"] or 0),
                 total_output_tokens=int(fallback["output_tokens"] or 0),
                 total_cache_read_tokens=int(fallback["cache_read_tokens"] or 0),
+                total_cache_write_tokens=int(fallback["cache_write_tokens"] or 0),
                 most_expensive_session_usd=float(
                     fallback["most_expensive_session_usd"] or 0.0
+                ),
+                cheapest_session_usd=float(
+                    fallback["cheapest_session_usd"] or 0.0
                 ),
             )
 

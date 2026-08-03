@@ -9,6 +9,7 @@ interface UsageSummary {
   total_input_tokens: number
   total_output_tokens: number
   total_cache_read_tokens: number
+  total_cache_write_tokens: number
   most_expensive_session_usd: number
   cheapest_session_usd: number
 }
@@ -21,12 +22,18 @@ const EMPTY_SUMMARY: UsageSummary = {
   total_input_tokens: 0,
   total_output_tokens: 0,
   total_cache_read_tokens: 0,
+  total_cache_write_tokens: 0,
   most_expensive_session_usd: 0,
   cheapest_session_usd: 0
 }
 
-const formatUsd = (value: number) =>
-  new Intl.NumberFormat(undefined, { currency: 'USD', style: 'currency', minimumFractionDigits: 2 }).format(value || 0)
+// Micro-costs (e.g. $0.000056) must not collapse to "$0.00". Use more
+// decimals when the value is tiny, so small positive costs stay visible.
+const formatUsd = (value: number) => {
+  const v = value || 0
+  const fractionDigits = v > 0 && v < 0.01 ? 6 : 2
+  return new Intl.NumberFormat(undefined, { currency: 'USD', style: 'currency', minimumFractionDigits: fractionDigits, maximumFractionDigits: fractionDigits }).format(v)
+}
 
 function SummaryCard({ label, value }: { label: string; value: string }) {
   return (
