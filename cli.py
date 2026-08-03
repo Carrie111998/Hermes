@@ -16133,7 +16133,21 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         from hermes_cli.voice import prompt_toolkit_key_binding_args
         _voice_binding = prompt_toolkit_key_binding_args(_voice_key)
 
-        @kb.add(*_voice_binding)
+        # An Alt chord like ``alt+v`` shares its ``(escape, <key>)`` sequence
+        # with existing non-eager bindings — Alt+V clipboard paste, Alt+Enter,
+        # Alt+G. Two guards keep them from colliding (#74169):
+        #   * ``filter``: only claim the chord while voice mode is active, so
+        #     when voice mode is off the binding is dropped from the match set
+        #     and those defaults keep working (no shadowing).
+        #   * ``eager``: when voice mode is on, win over the equally-specific
+        #     non-eager sibling that would otherwise run last (prompt_toolkit
+        #     prefers eager matches), so the configured PTT chord actually
+        #     toggles recording instead of pasting the clipboard.
+        @kb.add(
+            *_voice_binding,
+            filter=Condition(lambda: bool(self._voice_mode)),
+            eager=True,
+        )
         def handle_voice_record(event):
             """Toggle voice recording when voice mode is active.
 
