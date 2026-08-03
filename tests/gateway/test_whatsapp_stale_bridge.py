@@ -452,7 +452,11 @@ class TestCacheDirEnvPassthrough:
             session_path=tmp_path / "session",
         )
         adapter._dm_policy = "allowlist"
-        adapter._allow_from = {"15550000002", "15550000001"}
+        adapter._allow_from = {"stale-snapshot"}
+        adapter._dm_allowlist_source = "WHATSAPP_ALLOWED_USERS"
+        monkeypatch.setenv(
+            "WHATSAPP_ALLOWED_USERS", "15550000002,15550000001"
+        )
         adapter._group_policy = "allowlist"
         adapter._group_allow_from = {
             "120363009999999999@g.us",

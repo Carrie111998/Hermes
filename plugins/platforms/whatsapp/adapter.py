@@ -662,11 +662,23 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 "_dm_policy",
                 str(_wenv("WHATSAPP_DM_POLICY", "pairing")).strip().lower(),
             )
-            effective_allowed_users = getattr(
-                self,
-                "_allow_from",
-                self._coerce_allow_list(_wenv("WHATSAPP_ALLOWED_USERS", "")),
-            )
+            # Pairing approve/revoke updates env-backed DM allowlists live. Read
+            # that source through _wenv so multiplexed profiles cannot borrow a
+            # process-global allowlist from another profile; explicit config
+            # remains authoritative over any env carrier.
+            dm_allowlist_source = getattr(self, "_dm_allowlist_source", None)
+            if dm_allowlist_source == "config":
+                effective_allowed_users = set(getattr(self, "_allow_from", ()) or ())
+            elif isinstance(dm_allowlist_source, str):
+                effective_allowed_users = self._coerce_allow_list(
+                    _wenv(dm_allowlist_source, "")
+                )
+            elif hasattr(self, "_allow_from"):
+                effective_allowed_users = set(self._allow_from or ())
+            else:
+                effective_allowed_users = self._coerce_allow_list(
+                    _wenv("WHATSAPP_ALLOWED_USERS", "")
+                )
             effective_group_policy = getattr(
                 self,
                 "_group_policy",
