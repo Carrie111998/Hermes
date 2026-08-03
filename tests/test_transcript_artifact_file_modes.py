@@ -22,7 +22,6 @@ from __future__ import annotations
 import json
 import os
 import stat
-import sys
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -116,16 +115,14 @@ def test_save_conversation_snapshot_owner_only(tmp_path, monkeypatch, permissive
     """/save writes a full transcript — the snapshot must be owner-only."""
     home = tmp_path / ".hermes"
     home.mkdir()
-    monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setenv("HERMES_HOME", str(home))
 
-    import hermes_constants
-
-    if hasattr(hermes_constants, "_hermes_home_cache"):
-        hermes_constants._hermes_home_cache = None
-    for mod in [m for m in sys.modules if m.startswith("cli") or m == "hermes_constants"]:
-        sys.modules.pop(mod, None)
-
+    # No sys.modules purge and no Path.home patch here: save_conversation
+    # resolves the directory through get_hermes_home() at call time, and that
+    # reads HERMES_HOME from the environment on every call with no caching, so
+    # the setenv above is sufficient no matter how early cli was imported.
+    # Purging modules by ``startswith("cli")`` would also evict click and its
+    # submodules, breaking module identity for the rest of the suite.
     import cli
 
     history = [

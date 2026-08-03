@@ -8321,12 +8321,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             from utils import atomic_json_write
 
             # The snapshot is a full plaintext transcript. Write it owner-only
-            # (0600) rather than at umask default (0644) — the enclosing
-            # HERMES_HOME is 0700, but the snapshot is the artifact users copy
-            # out to share, so its own mode is what travels with it. Content is
-            # deliberately verbatim: this exports the same history the session
-            # DB replays, and masking it here would make the export lossy
-            # against the thing it snapshots (see #43083).
+            # (0600) rather than at umask default (0644). Don't lean on the
+            # enclosing directory for this: ensure_hermes_home() does chmod
+            # HERMES_HOME itself owner-only, but that is 0750/2770 in managed
+            # (NixOS) mode, overridable via HERMES_HOME_MODE (e.g. 0701 for web
+            # server traversal), and this saved_dir is created by the bare
+            # mkdir above at umask default (0755) either way. The file's own
+            # mode is the part that holds across deployments — and it is what
+            # travels with the snapshot when users copy it out to share.
+            # Content is deliberately verbatim: this exports the same history
+            # the session DB replays, and masking it here would make the export
+            # lossy against the thing it snapshots (see #43083).
             atomic_json_write(
                 path,
                 {
