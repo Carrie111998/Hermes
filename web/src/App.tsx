@@ -12,14 +12,12 @@ import {
   type ReactNode,
 } from "react";
 import { createPortal } from "react-dom";
-import {
-  Routes,
-  Route,
-  NavLink,
-  Navigate,
-  useLocation,
-  useNavigate,
-} from "react-router-dom";
+import { Routes,
+Route,
+NavLink,
+Navigate,
+useLocation,
+useNavigate, } from "react-router"
 import {
   Activity,
   BarChart3,

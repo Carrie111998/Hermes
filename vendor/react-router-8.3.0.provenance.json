@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "package": "react-router@8.3.0",
+  "source_url": "https://github.com/remix-run/react-router.git",
+  "source_tag": "react-router@8.3.0",
+  "source_commit": "2edaca7a4f12a50cad002d55d84f73b0cdd462b6",
+  "toolchain": {
+    "node": "v24.18.0",
+    "pnpm": "11.7.0"
+  },
+  "build_commands": [
+    "corepack pnpm install --frozen-lockfile",
+    "corepack pnpm --filter react-router build",
+    "copy LICENSE.md packages/react-router/LICENSE.md",
+    "npm pack packages/react-router"
+  ],
+  "artifact": "react-router-8.3.0.tgz",
+  "artifact_sha256": "c32d84f52acbc81586ef82c2b62896c692687d17205e71ff3f6cf0ca704f8349",
+  "license": "MIT",
+  "license_sha256": "76d5bbb5b3e7d445723c81ac4743eee7d997eee898b7710cf501ffbddea58609"
+}
