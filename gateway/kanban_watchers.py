@@ -1143,6 +1143,11 @@ class GatewayKanbanWatchersMixin:
         HEALTH_WINDOW = 6
         bad_ticks = 0
         last_warn_at = 0
+        # Queue-drain alert cooldown: at most one high-signal drain alert
+        # per board per 5 minutes, so a persistent drain stays visible
+        # without spamming the log on every 60s tick.
+        QUEUE_DRAIN_ALERT_COOLDOWN_SECONDS = 300
+        last_drain_alert_at: dict[str, float] = {}
         # Avoid hot-looping corrupt-looking board DBs, but do not suppress
         # same-fingerprint retries forever: transient WAL/open races can
         # surface as "database disk image is malformed" for one tick.
@@ -1315,6 +1320,55 @@ class GatewayKanbanWatchersMixin:
                             pass
             return False
 
+        def _queue_drain_alert_once(slug: str) -> "Optional[object]":
+            """Run the board-level queue-drain check and emit the alert.
+
+            Returns the emitted alert line (or None when nothing fired).
+            The alert fires when Todo/Blocked work exists but no runnable
+            worker remains because every owner profile is gated — its store
+            is quarantined/unhealthy or the two-failure circuit breaker has
+            tripped on all of its pending tasks. This is the incident's
+            "silent fleet drain" signal: after the breaker trips every task
+            goes blocked and the board looks idle even though it is drained.
+            """
+            try:
+                from hermes_cli import kanban_health as _kh
+            except Exception as exc:  # pragma: no cover
+                logger.warning(
+                    "kanban dispatcher: kanban_health not importable; "
+                    "queue-drain alert disabled (%s)", exc,
+                )
+                return None
+            conn = None
+            try:
+                conn = _kb.connect(board=slug)
+                report = _kh.check_queue_drain(
+                    conn,
+                    board=slug,
+                    failure_limit=failure_limit,
+                )
+            except Exception as exc:
+                # The dispatcher's corrupt-board handling owns board DB
+                # failures; don't layer a drain alert on top.
+                logger.debug(
+                    "kanban dispatcher: queue-drain check skipped on board %s (%s)",
+                    slug, exc,
+                )
+                return None
+            finally:
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+            if not report.should_alert:
+                return None
+            now = int(time.time())
+            if now - last_drain_alert_at.get(slug, 0) < QUEUE_DRAIN_ALERT_COOLDOWN_SECONDS:
+                return None
+            last_drain_alert_at[slug] = now
+            return _kh.emit_queue_drain_alert(report)
+
         # Auto-decompose: turn fresh triage tasks into ready workgraphs
         # before the dispatcher fans out workers. Gated by
         # ``kanban.auto_decompose`` (default True). Capped by
@@ -1470,6 +1524,26 @@ class GatewayKanbanWatchersMixin:
                             bad_ticks,
                         )
                         last_warn_at = now
+                # Queue-drain alert: Todo/Blocked work exists but no runnable
+                # worker remains because every owner profile is gated
+                # (quarantined store or tripped circuit breaker). Runs every
+                # tick independent of the ready-queue telemetry above — after
+                # the breaker trips all tasks go blocked, the ready probe
+                # goes quiet, and only this check still sees the drain.
+                # Boards whose tick failed (corrupt DB / quarantine timer)
+                # return None and are skipped: the corrupt-board handler
+                # owns that signal, and opening an extra connection there
+                # would add per-tick cost for no additional signal.
+                for slug, res in (results or []):
+                    if res is None:
+                        continue
+                    try:
+                        await asyncio.to_thread(_queue_drain_alert_once, slug)
+                    except Exception:
+                        logger.exception(
+                            "kanban dispatcher: queue-drain alert failed on board %s",
+                            slug,
+                        )
             except asyncio.CancelledError:
                 logger.debug("kanban dispatcher: cancelled")
                 _release_singleton_lock(self._kanban_dispatcher_lock_handle)

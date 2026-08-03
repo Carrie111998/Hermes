@@ -562,6 +562,23 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Emit JSON (structured) instead of the default human table",
     )
 
+    # --- health (queue-drain alert check) ---
+    # On-demand mirror of the gateway dispatcher's periodic queue-drain
+    # monitor. Exit code 1 when the alert condition holds, so scripts and
+    # cron watchdogs can react to a drained board.
+    p_health = sub.add_parser(
+        "health",
+        help="Check for queue-drain: Todo/Blocked work with no runnable workers",
+    )
+    p_health.add_argument(
+        "--json", action="store_true",
+        help="Emit JSON (structured) instead of the default human line",
+    )
+    p_health.add_argument(
+        "--failure-limit", type=int, default=None,
+        help="Circuit-breaker failure limit (default: kanban.failure_limit / 2)",
+    )
+
     # --- link / unlink ---
     p_link = sub.add_parser("link", help="Add a parent->child dependency")
     p_link.add_argument("parent_id")
@@ -1121,6 +1138,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "context":  _cmd_context,
             "specify":  _cmd_specify,
             "decompose":  _cmd_decompose,
+            "health":   _cmd_health,
             "gc":       _cmd_gc,
         }
         handler = handlers.get(action)
@@ -2071,6 +2089,62 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_health(args: argparse.Namespace) -> int:
+    """Run the board-level queue-drain check.
+
+    Fires (exit 1) when Todo/Blocked work exists but no runnable worker
+    remains because every owner profile is gated — quarantined/unhealthy
+    store or tripped two-failure circuit breaker. Exit 0 when the board is
+    healthy (or the drain has a runnable worker / no known gate reason).
+    """
+    from hermes_cli import kanban_health as kh
+    from hermes_cli.config import load_config
+
+    try:
+        cfg = load_config()
+        kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+    except Exception:
+        kanban_cfg = {}
+    failure_limit = getattr(args, "failure_limit", None)
+    if failure_limit is None:
+        try:
+            failure_limit = int(kanban_cfg.get("failure_limit", kb.DEFAULT_FAILURE_LIMIT))
+        except (TypeError, ValueError):
+            failure_limit = kb.DEFAULT_FAILURE_LIMIT
+
+    with kb.connect_closing() as conn:
+        report = kh.check_queue_drain(
+            conn,
+            board=kb.get_current_board(),
+            failure_limit=failure_limit,
+        )
+
+    if getattr(args, "json", False):
+        print(json.dumps(report.to_dict(), indent=2, ensure_ascii=False))
+    elif report.should_alert:
+        print(kh.format_queue_drain_alert(report))
+        print(
+            "Recovery: repair the quarantined profile store(s) or unblock "
+            "breaker-tripped tasks, then re-run `hermes kanban dispatch`.",
+            file=sys.stderr,
+        )
+    else:
+        if report.todo_blocked_count == 0:
+            print("No Todo/Blocked work pending — no queue-drain risk.")
+        elif report.runnable_profiles:
+            print(
+                f"{report.todo_blocked_count} todo/blocked task(s) pending with "
+                f"runnable worker(s): {', '.join(report.runnable_profiles)}."
+            )
+        else:
+            print(
+                f"{report.todo_blocked_count} todo/blocked task(s) pending, "
+                "no runnable workers, but no known gate reason "
+                "(quarantine/circuit-breaker) — not alerting."
+            )
+    return 1 if report.should_alert else 0
+
+
 def _cmd_link(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
         kb.link_tasks(conn, args.parent_id, args.child_id)
@@ -2732,6 +2806,37 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
     # itself is dysfunctional.
     HEALTH_WINDOW = 6  # ticks (default 30s at interval=5)
     health_state = {"bad_ticks": 0, "last_warn_at": 0}
+    # Queue-drain alert cooldown: at most one high-signal alert per 5 min.
+    QUEUE_DRAIN_ALERT_COOLDOWN_SECONDS = 300
+    drain_state = {"last_alert_at": 0}
+
+    def _queue_drain_alert() -> None:
+        """Mirror the gateway dispatcher's queue-drain monitor: alert when
+        Todo/Blocked work exists but no runnable worker remains because
+        every owner profile is gated (quarantined store / tripped breaker).
+        """
+        try:
+            from hermes_cli import kanban_health as kh
+            with kb.connect_closing() as conn:
+                report = kh.check_queue_drain(
+                    conn,
+                    board=kb.get_current_board(),
+                    failure_limit=getattr(
+                        args, "failure_limit", kb.DEFAULT_SPAWN_FAILURE_LIMIT
+                    ),
+                )
+        except Exception:
+            return
+        if not report.should_alert:
+            return
+        now = int(time.time())
+        if now - drain_state["last_alert_at"] < QUEUE_DRAIN_ALERT_COOLDOWN_SECONDS:
+            return
+        drain_state["last_alert_at"] = now
+        print(
+            f"[{_fmt_ts(now)}] ERROR {kh.format_queue_drain_alert(report)}",
+            file=sys.stderr, flush=True,
+        )
 
     def _on_tick(res):
         ready_pending = bool(res.skipped_unassigned) or _ready_queue_nonempty()
@@ -2757,6 +2862,10 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
                     file=sys.stderr, flush=True,
                 )
                 health_state["last_warn_at"] = now
+        # Queue-drain alert runs every tick, independent of the ready-queue
+        # telemetry above: after the breaker trips all tasks go blocked and
+        # the ready probe goes quiet, but the drain signal must persist.
+        _queue_drain_alert()
         if not verbose:
             return
         did_work = (
