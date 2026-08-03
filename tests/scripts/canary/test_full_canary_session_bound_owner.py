@@ -5,6 +5,7 @@ import inspect
 import hashlib
 import json
 import os
+import shlex
 import signal
 import subprocess
 import sys
@@ -124,7 +125,7 @@ def _stopped_release_source_transport(monkeypatch, *, initially_exists=True):
             stdout = f"{launcher.STOPPED_RELEASE_SOURCE_REPOSITORY}\n".encode()
         elif argv[-2:] == ("rev-parse", "--is-inside-work-tree"):
             stdout = b"true\n"
-        elif argv[-3:] == ("rev-parse", "--verify", "HEAD^{commit}"):
+        elif argv[-3:] == ("rev-parse", "--verify", "HEAD"):
             stdout = f"{RELEASE_SHA}\n".encode()
         else:
             stdout = b""
@@ -154,10 +155,11 @@ def test_stopped_release_source_prepare_resumes_exact_no_checkout_clone(
     assert checkout[-3:] == ("checkout", "--detach", RELEASE_SHA)
     assert any(command[-3:] == ("remote", "get-url", "origin") for command in commands)
     assert any(
-        command[-3:] == ("rev-parse", "--verify", "HEAD^{commit}")
+        command[-3:] == ("rev-parse", "--verify", "HEAD")
         for command in commands
     )
     assert any("--porcelain=v1" in command for command in commands)
+    assert all(shlex.join(command) == " ".join(command) for command in commands)
     if initially_exists:
         assert not any("clone" in command for command in commands)
     else:

@@ -16313,7 +16313,7 @@ class IapStoppedReleaseTransport(IapCoordinatorTransport):
                 source_root,
                 "rev-parse",
                 "--verify",
-                "HEAD^{commit}",
+                "HEAD",
             ),
             account=account,
             maximum_output_bytes=64,
