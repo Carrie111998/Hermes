@@ -10,9 +10,15 @@ from __future__ import annotations
 import asyncio
 import pytest
 
+# Hypothesis is optional.  A module-level importorskip took the plain unit
+# tests down with it, so an environment without Hypothesis silently covered
+# nothing (review: teknium1, 2026-07-30).  Unconditional regressions now live in
+# tests/gateway/test_completion_registry_regressions.py; only the property-based
+# state machine below is gated.
 hypothesis = pytest.importorskip(
     "hypothesis",
-    reason="hypothesis is not a declared test dependency; see module docstring",
+    reason="hypothesis is an optional test dependency; unconditional coverage "
+           "lives in test_completion_registry_regressions.py",
 )
 
 from hypothesis import HealthCheck, settings  # noqa: E402
@@ -152,11 +158,8 @@ class RegistryStateMachine(RuleBasedStateMachine):
 
     @invariant()
     def capacity_is_respected(self) -> None:
-        live = [
-            e for e in self.registry._entries.values()
-            if e["state"] in (State.PENDING, State.CLAIMED)
-        ]
-        assert len(live) <= CAPACITY, f"{len(live)} live entries exceeds {CAPACITY}"
+        live = self.registry.live_count()
+        assert live <= CAPACITY, f"{live} live entries exceeds {CAPACITY}"
 
     @invariant()
     def distinct_routes_stay_distinct(self) -> None:
@@ -179,56 +182,5 @@ RegistryStateMachine.TestCase.settings = settings(
 TestRegistryStateMachine = RegistryStateMachine.TestCase
 
 
-# ---------------------------------------------------------------- unit checks
-
-def test_deliver_without_claim_is_noop() -> None:
-    async def _test():
-        reg = _fresh()
-        reg.enqueue("proc_a", ("r1",), _dummy_payload())
-        reg.deliver("proc_a")
-        assert reg.snapshot()["proc_a"] is State.PENDING
-    run_sync(_test())
-
-
-def test_claim_of_already_claimed_by_other_batch_is_rejected() -> None:
-    async def _test():
-        reg = _fresh()
-        reg.enqueue("proc_a", ("r1",), _dummy_payload())
-        claimed, skipped = reg.claim_batch(["proc_a"], "b1")
-        assert len(claimed) == 1 and claimed[0]["identity"] == "proc_a"
-        claimed2, skipped2 = reg.claim_batch(["proc_a"], "b2")
-        assert len(claimed2) == 0
-        assert skipped2 == ["proc_a"]
-    run_sync(_test())
-
-
-def test_terminal_entry_cannot_be_reclaimed() -> None:
-    async def _test():
-        reg = _fresh()
-        reg.enqueue("proc_a", ("r1",), _dummy_payload())
-        reg.claim_batch(["proc_a"], "b1")
-        reg.deliver("proc_a")
-        claimed, skipped = reg.claim_batch(["proc_a"], "b2")
-        assert len(claimed) == 0
-    run_sync(_test())
-
-
-def test_none_and_empty_route_do_not_coalesce() -> None:
-    async def _test():
-        reg = _fresh()
-        reg.enqueue("proc_none", (None,), _dummy_payload())
-        reg.enqueue("proc_empty", ("",), _dummy_payload())
-        e_none = reg._entries["proc_none"]
-        e_empty = reg._entries["proc_empty"]
-        assert e_none["route_key"] != e_empty["route_key"]
-    run_sync(_test())
-
-
-def test_overflow_is_counted_not_silent() -> None:
-    async def _test():
-        reg = _fresh()
-        for i in range(CAPACITY + 5):
-            reg.enqueue(f"proc_{i:04d}", ("r1",), _dummy_payload())
-        # CAPACITY entries accepted, 5 silently rejected (returned None)
-        assert len(reg._entries) == CAPACITY
-    run_sync(_test())
+# Unit checks moved to tests/gateway/test_completion_registry_regressions.py so
+# they run without Hypothesis installed.

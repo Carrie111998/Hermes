@@ -6067,6 +6067,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # the old dict-of-lists approach.
         self._completion_registry = self.PendingCompletionRegistry()
         self._flush_tasks_by_route: dict = {}
+        # Shutdown must cancel *only* completion flushes before adapter
+        # teardown.  Selecting from _background_tasks also cancelled heartbeat
+        # and supervised tasks (review: teknium1, 2026-07-30).
+        self._completion_flush_tasks: set = set()
         self._completion_notification_batch_lock = threading.Lock()
         self._completion_notification_batch_window = 0.1
         self._batch_window_sleep = asyncio.sleep
@@ -12981,27 +12985,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # handlers resolve every waiter as RETRY; signal_stop moves
             # remaining non-terminal entries to STOPPING.
             _flush_tasks = [
-                _t for _t in list(self._background_tasks)
-                if _t is not self._stop_task
-                and _t is not self._restart_task
+                _t for _t in list(getattr(self, "_completion_flush_tasks", ()))
+                if not _t.done()
             ]
             if _flush_tasks:
                 for _t in _flush_tasks:
-                    if not _t.done():
-                        _t.cancel()
-                _drain_deadline = time.monotonic() + 3.0
-                for _t in _flush_tasks:
-                    try:
-                        _remaining = max(0.0, _drain_deadline - time.monotonic())
-                        await asyncio.wait_for(
-                            asyncio.shield(_t),
-                            timeout=_remaining,
-                        )
-                    except (asyncio.CancelledError, TimeoutError):
-                        pass
+                    _t.cancel()
+                try:
+                    # gather(return_exceptions=True) absorbs the children's
+                    # CancelledError without swallowing a cancellation aimed at
+                    # this coroutine.
+                    await asyncio.wait_for(
+                        asyncio.gather(*_flush_tasks, return_exceptions=True),
+                        timeout=3.0,
+                    )
+                except TimeoutError:
+                    logger.warning(
+                        "Completion flush drain timed out after 3s (%d tasks)",
+                        len(_flush_tasks),
+                    )
 
             _stopped = self._completion_registry.signal_stop()
             if _stopped:
+                # STOPPING is terminal by contract, so every waiter still
+                # parked on one of these entries has to be resolved here —
+                # otherwise a watcher cancelled inside the batch window awaits
+                # a Future that nothing will ever complete.
+                self._completion_registry.resolve_futures(
+                    _stopped, self.CompletionDisposition.SHUTTING_DOWN,
+                )
                 logger.info(
                     "Completion registry: %d entries moved to STOPPING",
                     len(_stopped),
@@ -22139,6 +22151,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Explicit resolution for every completion notification waiter."""
         DELIVERED = "delivered"
         RETRY = "retry"
+        FAILED = "failed"            # attempts exhausted; terminal
         DROP_DUPLICATE = "drop_duplicate"
         DROP_UNROUTABLE = "drop_unroutable"
         DROPPED_OVERFLOW = "dropped_overflow"
@@ -22146,6 +22159,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     class PendingCompletionRegistry:
         """Explicit state machine for completion notification delivery.
+
+        Entry fields: identity, route_key, state, attempts, payload,
+        batch_id, future.
 
         One entry per completion identity.  Owned by the gateway lifecycle —
         created at start, drained to ``STOPPING`` at shutdown before adapter
@@ -22159,14 +22175,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                |        +-- attempts exhausted -> FAILED            (logged)
                |        +-- already delivered --> SUPERSEDED
                |        +-- no route ----------> UNROUTABLE
-               |        +-- over capacity -----> DROPPED_OVERFLOW   (counted)
                +-- cancel ---------------------+
-               +-- gateway stopping ----------> STOPPING            (counted)
+               +-- gateway stopping ----------> STOPPING            (logged)
+
+        ``BATCH_CAPACITY`` bounds live entries; a completion refused at the
+        capacity gate never becomes an entry, so it is reported to the caller
+        as ``CompletionDisposition.DROPPED_OVERFLOW`` and logged rather than
+        being represented as a state here.
         """
 
         MAX_ATTEMPTS = 5
         BASE_BACKOFF = 0.5  # seconds, doubled each retry
-        BATCH_CAPACITY = 50
+        BATCH_CAPACITY = 50          # concurrent *live* (non-terminal) entries
+        TERMINAL_RETENTION = 2048    # terminal entries kept as dedupe memory
 
         class State(enum.Enum):
             PENDING = "pending"
@@ -22175,12 +22196,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             FAILED = "failed"
             SUPERSEDED = "superseded"
             UNROUTABLE = "unroutable"
-            DROPPED_OVERFLOW = "dropped_overflow"
             STOPPING = "stopping"
 
         _TERMINAL = {
             State.DELIVERED, State.FAILED, State.SUPERSEDED,
-            State.UNROUTABLE, State.DROPPED_OVERFLOW, State.STOPPING,
+            State.UNROUTABLE, State.STOPPING,
         }
 
         def __init__(self):
@@ -22194,10 +22214,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         def enqueue(
             self, identity: str, route_key: tuple, payload: dict,
         ) -> "asyncio.Future | None":
-            """Create a PENDING entry. Returns Future or None if capped or duplicate."""
+            """Create a PENDING entry. Returns Future or None if capped or duplicate.
+
+            ``BATCH_CAPACITY`` bounds *live* entries only.  Terminal entries are
+            retained as a short dedupe memory and evicted FIFO beyond
+            ``TERMINAL_RETENTION``; counting them against the cap turned the
+            limit into a process-lifetime ceiling that rejected every completion
+            after the first 50 (review: teknium1, 2026-07-30).
+            """
             import asyncio as _asyncio
             with self._lock:
-                if len(self._entries) >= self.BATCH_CAPACITY:
+                self._evict_terminal_locked()
+                live = sum(
+                    1 for _e in self._entries.values()
+                    if _e["state"] not in self._TERMINAL
+                )
+                if live >= self.BATCH_CAPACITY:
                     return None
                 existing = self._entries.get(identity)
                 if existing is not None and existing["state"] not in self._TERMINAL:
@@ -22208,12 +22240,48 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "route_key": route_key,
                     "state": self.State.PENDING,
                     "attempts": 0,
-                    "next_attempt_at": 0.0,
                     "payload": payload,
                     "batch_id": None,
                     "future": future,
                 }
             return future
+
+        def _evict_terminal_locked(self) -> None:
+            """Drop the oldest terminal entries beyond ``TERMINAL_RETENTION``.
+
+            Caller must hold ``self._lock``.  ``dict`` preserves insertion
+            order, so slicing the front evicts FIFO.
+            """
+            terminal = [
+                ident for ident, entry in self._entries.items()
+                if entry["state"] in self._TERMINAL
+            ]
+            excess = len(terminal) - self.TERMINAL_RETENTION
+            if excess <= 0:
+                return
+            for ident in terminal[:excess]:
+                del self._entries[ident]
+
+        def live_count(self) -> int:
+            """Number of non-terminal entries (for tests and diagnostics)."""
+            with self._lock:
+                return sum(
+                    1 for _e in self._entries.values()
+                    if _e["state"] not in self._TERMINAL
+                )
+
+        def rejection_reason(self, identity: str) -> str:
+            """Why ``enqueue()`` returned ``None``: ``duplicate`` or ``capacity``.
+
+            Without this the caller mapped both refusals onto
+            ``DROPPED_OVERFLOW`` — reintroducing the single-value ambiguity this
+            registry exists to remove.
+            """
+            with self._lock:
+                entry = self._entries.get(identity)
+                if entry is not None and entry["state"] not in self._TERMINAL:
+                    return "duplicate"
+                return "capacity"
 
         def claim_batch(
             self, identities: list[str], batch_id: str,
@@ -22256,24 +22324,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if entry["attempts"] >= self.MAX_ATTEMPTS:
                     entry["state"] = self.State.FAILED
                     return None
+                # The deadline is returned to the caller, which owns the
+                # wait; storing it on the entry as well left a field that
+                # nothing ever read.
                 deadline = _time.monotonic() + self.BASE_BACKOFF * (2 ** (entry["attempts"] - 1))
-                entry["next_attempt_at"] = deadline
                 entry["state"] = self.State.PENDING
                 entry["batch_id"] = None
                 return deadline
 
         def supersede(self, identity: str) -> None:
-            """Transition to SUPERSEDED."""
+            """Transition to SUPERSEDED, never overwriting a terminal state."""
             with self._lock:
                 entry = self._entries.get(identity)
-                if entry is not None:
+                if entry is not None and entry["state"] not in self._TERMINAL:
                     entry["state"] = self.State.SUPERSEDED
 
         def mark_unroutable(self, identity: str) -> None:
-            """Transition to UNROUTABLE."""
+            """Transition to UNROUTABLE, never overwriting a terminal state."""
             with self._lock:
                 entry = self._entries.get(identity)
-                if entry is not None:
+                if entry is not None and entry["state"] not in self._TERMINAL:
                     entry["state"] = self.State.UNROUTABLE
 
         def signal_stop(self) -> list[dict]:
@@ -22538,8 +22608,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Build one bounded synthetic turn from multiple process completions.
 
         Counts succeed/failed over *all* entries (not just the rendered
-        slice) so the aggregate summary is authoritative.  Overflow entries
-        are counted as ``DROPPED_OVERFLOW`` in the summary.
+        slice) so the aggregate summary is authoritative.  Entries beyond the
+        render cap are reported as *not shown* — they were delivered and are
+        already inside the succeeded/failed totals, so labelling them
+        "dropped over capacity" both double-counted them and told the agent
+        results had been lost when none had.
         """
         MAX_DETAIL = 10
         MAX_OUTPUT = 800  # chars per process output tail
@@ -22549,7 +22622,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if evt.get("exit_code") == 0
         )
         all_failed = len(entries) - all_succeeded
-        overflow = max(0, len(entries) - MAX_DETAIL)
+        omitted = max(0, len(entries) - MAX_DETAIL)
 
         shown = entries[:MAX_DETAIL]
         lines = [
@@ -22600,8 +22673,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             parts.append(f"{all_succeeded} succeeded")
         if all_failed:
             parts.append(f"{all_failed} failed")
-        if overflow:
-            parts.append(f"{overflow} dropped over capacity")
+        if omitted:
+            parts.append(f"{omitted} not shown in detail")
         if parts:
             lines.append(f"\nSummary: {', '.join(parts)}.")
 
@@ -22621,11 +22694,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         import uuid as _uuid
 
+        # __init__ creates all of this; the guard exists only for tests that
+        # build a GatewayRunner via object.__new__ and never run __init__.  It
+        # must stay in sync with __init__ — _completion_flush_tasks included,
+        # or flush-task tracking raises AttributeError on that path.
         if not hasattr(self, "_completion_registry"):
             self._completion_registry = self.PendingCompletionRegistry()
             self._flush_tasks_by_route = {}
+            self._completion_flush_tasks = set()
             self._completion_notification_batch_lock = __import__("threading").Lock()
             self._completion_notification_batch_window = 0.1
+            self._batch_window_sleep = asyncio.sleep
             self._completion_route_keys = {}
             self._completion_entry_data = {}
 
@@ -22638,6 +22717,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             identity, key, {"synth_text": synth_text, "evt": evt},
         )
         if future is None:
+            if self._completion_registry.rejection_reason(identity) == "duplicate":
+                # Another watcher already owns delivery for this identity.
+                return self.CompletionDisposition.DROP_DUPLICATE
+            logger.warning(
+                "Completion registry at capacity (%d live); dropping %s",
+                self._completion_registry.BATCH_CAPACITY,
+                identity,
+            )
             return self.CompletionDisposition.DROPPED_OVERFLOW
 
         self._completion_entry_data[identity] = (synth_text, evt)
@@ -22648,13 +22735,50 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 task = asyncio.create_task(
                     self._flush_process_completion_batch(key)
                 )
-                _bg_tasks = getattr(self, "_background_tasks", None)
-                if _bg_tasks is not None:
-                    _bg_tasks.add(task)
-                    task.add_done_callback(_bg_tasks.discard)
+                self._track_completion_flush_task(task)
                 self._flush_tasks_by_route[key] = task
 
         return await future
+
+    def _track_completion_flush_task(self, task: "asyncio.Task") -> None:
+        """Keep *task* alive and shutdown-owned without touching unrelated sets."""
+        self._completion_flush_tasks.add(task)
+        task.add_done_callback(self._completion_flush_tasks.discard)
+        _bg_tasks = getattr(self, "_background_tasks", None)
+        if _bg_tasks is not None:
+            _bg_tasks.add(task)
+            task.add_done_callback(_bg_tasks.discard)
+
+    async def _retry_process_completion_batch(
+        self, key: tuple, retry_at: "float | None",
+    ) -> None:
+        """Wait out the registry backoff, then re-flush *key*."""
+        import time as _time
+
+        if retry_at is not None:
+            delay = max(0.0, retry_at - _time.monotonic())
+            if delay:
+                await self._batch_window_sleep(delay)
+        await self._flush_process_completion_batch(key)
+
+    def _schedule_completion_retry(
+        self, key: tuple, retry_at: "float | None",
+    ) -> None:
+        """Own the backoff wait for a route whose delivery failed transiently.
+
+        ``PendingCompletionRegistry.retry()`` records ``next_attempt_at``, but
+        nothing read it: the entry was left PENDING with its route index
+        deleted, so no flush could ever find it again and the documented
+        exponential backoff never ran (review: teknium1, 2026-07-30).
+        """
+        with self._completion_notification_batch_lock:
+            if key in self._flush_tasks_by_route:
+                return
+            task = asyncio.create_task(
+                self._retry_process_completion_batch(key, retry_at)
+            )
+            self._track_completion_flush_task(task)
+            self._flush_tasks_by_route[key] = task
 
     async def _flush_process_completion_batch(
         self, key: tuple,
@@ -22670,12 +22794,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         current_task = asyncio.current_task()
         batch_id = _uuid.uuid4().hex
         claimed: list[dict] = []
+        retryable: list[dict] = []
+        exhausted: list[dict] = []
+        retry_at: "float | None" = None
 
         try:
             await self._batch_window_sleep(self._completion_notification_batch_window)
 
-            if self._flush_tasks_by_route.get(key) is current_task:
-                self._flush_tasks_by_route.pop(key, None)
+            with self._completion_notification_batch_lock:
+                if self._flush_tasks_by_route.get(key) is current_task:
+                    self._flush_tasks_by_route.pop(key, None)
 
             # Collect PENDING identities for this route key
             identities = [
@@ -22734,8 +22862,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     self._completion_deliveries_delivered.popitem(last=False)
                 elif delivered is self.CompletionDisposition.RETRY:
                     delivered_disposition = self.CompletionDisposition.RETRY
+                    retryable, exhausted, retry_at = self._plan_completion_retry(
+                        claimed,
+                    )
+                elif delivered is self.CompletionDisposition.DROP_DUPLICATE:
+                    # A duplicate is SUPERSEDED, not UNROUTABLE — conflating the
+                    # two is exactly the state ambiguity this registry removes.
+                    delivered_disposition = self.CompletionDisposition.DROP_DUPLICATE
                     for reg in claimed:
-                        self._completion_registry.retry(reg["identity"])
+                        self._completion_registry.supersede(reg["identity"])
                 else:
                     delivered_disposition = self.CompletionDisposition.DROP_UNROUTABLE
                     for reg in claimed:
@@ -22743,21 +22878,63 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 logger.exception("Coalesced process completion delivery failed")
                 delivered_disposition = self.CompletionDisposition.RETRY
-                for reg in claimed:
-                    self._completion_registry.retry(reg["identity"])
+                retryable, exhausted, retry_at = self._plan_completion_retry(
+                    claimed,
+                )
             finally:
-                self._completion_registry.resolve_futures(claimed, delivered_disposition)
-                for reg in claimed:
-                    entry_data.pop(reg["identity"], None)
-                    self._completion_route_keys.pop(reg["identity"], None)
+                # Entries going back to PENDING keep their route/payload
+                # indexes so the scheduled re-flush can find them; only
+                # terminal entries are unindexed and resolved here.
+                if delivered_disposition is self.CompletionDisposition.RETRY:
+                    for reg in exhausted:
+                        entry_data.pop(reg["identity"], None)
+                        self._completion_route_keys.pop(reg["identity"], None)
+                    self._completion_registry.resolve_futures(
+                        exhausted, self.CompletionDisposition.FAILED,
+                    )
+                    if retryable:
+                        self._schedule_completion_retry(key, retry_at)
+                else:
+                    self._completion_registry.resolve_futures(
+                        claimed, delivered_disposition,
+                    )
+                    for reg in claimed:
+                        entry_data.pop(reg["identity"], None)
+                        self._completion_route_keys.pop(reg["identity"], None)
         except asyncio.CancelledError:
-            for reg in claimed:
-                self._completion_registry.retry(reg["identity"])
-            self._completion_registry.resolve_futures(claimed, self.CompletionDisposition.RETRY)
+            # Cancellation is never terminal by omission.  Claimed entries go
+            # back to PENDING with their indexes intact; entries still PENDING
+            # (cancelled inside the batch window) were never claimed, so they
+            # stay enqueued and their waiters stay unresolved until either a
+            # later flush delivers them or signal_stop() resolves them as
+            # SHUTTING_DOWN.
+            if claimed:
+                self._plan_completion_retry(claimed)
             raise
         finally:
-            if self._flush_tasks_by_route.get(key) is current_task:
-                self._flush_tasks_by_route.pop(key, None)
+            with self._completion_notification_batch_lock:
+                if self._flush_tasks_by_route.get(key) is current_task:
+                    self._flush_tasks_by_route.pop(key, None)
+
+    def _plan_completion_retry(
+        self, claimed: list,
+    ) -> "tuple[list, list, float | None]":
+        """Run ``registry.retry()`` over *claimed*, splitting live vs exhausted.
+
+        Returns ``(retryable, exhausted, retry_at)`` where ``retry_at`` is the
+        latest backoff deadline among the retryable entries.
+        """
+        retryable: list = []
+        exhausted: list = []
+        deadlines: list = []
+        for reg in claimed:
+            deadline = self._completion_registry.retry(reg["identity"])
+            if deadline is None:
+                exhausted.append(reg)
+            else:
+                retryable.append(reg)
+                deadlines.append(deadline)
+        return retryable, exhausted, (max(deadlines) if deadlines else None)
 
     async def _coalesce_and_inject_watch_events(
         self, watch_events: list,
@@ -22772,11 +22949,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not watch_events:
             return
 
-        # Group by (type, session_key)
-        buckets: dict[str, dict[str, list[dict]]] = {}
+        # Group by (type, full routing key).  Grouping on session_key alone
+        # collapsed None and "" into one bucket — the exact case
+        # _completion_notification_batch_key()'s sentinel exists to keep apart —
+        # and ignored platform/chat_id/thread_id/user_id, so events from
+        # different chats could coalesce into one message delivered to
+        # whichever chat happened to be first in the group.
+        buckets: dict[str, dict[tuple, list[dict]]] = {}
         for evt in watch_events:
             evt_type = str(evt.get("type") or "completion")
-            sk = str(evt.get("session_key") or "")
+            sk = self._completion_notification_batch_key(evt)
             buckets.setdefault(evt_type, {}).setdefault(sk, []).append(evt)
 
         for evt_type, by_key in buckets.items():
@@ -22805,12 +22987,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         snippet_lines = []
                         for e in group[:5]:
                             sid = str(e.get("session_id", "?"))
+                            # Redact *then* truncate: slicing first can cut a
+                            # credential mid-pattern, leaving a fragment the
+                            # redactor no longer matches.
                             cmd = _redact_gateway_user_facing_secrets(
-                                str(e.get("command", ""))[:100]
-                            )
+                                str(e.get("command", ""))
+                            )[:100]
                             out = _redact_gateway_user_facing_secrets(
-                                str(e.get("output", ""))[:120]
-                            )
+                                str(e.get("output", ""))
+                            )[:120]
                             sup = e.get("suppressed", 0)
                             line = f"  {sid}: {cmd}"
                             if out:
@@ -22951,10 +23136,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     delivered = await self._enqueue_process_completion_notification(
                         synth_text, completion_evt,
                     )
-                    if delivered is self.CompletionDisposition.RETRY:
-                        # The process remains terminal; retry after failed
-                        # adapter injection instead of suppressing the result.
-                        continue
+                    # Retry and backoff are owned by the registry now, so
+                    # every disposition reaching here is terminal.  Log the
+                    # non-delivered ones instead of spinning on them.
+                    if delivered is not self.CompletionDisposition.DELIVERED:
+                        logger.warning(
+                            "Process %s completion not delivered: %s",
+                            session_id,
+                            getattr(delivered, "value", delivered),
+                        )
                     break
 
                 # --- Normal text-only notification ---
