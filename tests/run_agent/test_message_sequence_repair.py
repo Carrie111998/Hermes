@@ -363,7 +363,10 @@ def test_sanitize_drops_empty_tool_calls_array():
 # assistant message" (INVALID_REQUEST_BODY). sanitize_api_messages now heals
 # such turns on the per-call copy so the session recovers itself in memory.
 
-messages = [
+def test_sanitize_preserves_populated_tool_calls():
+    from agent.agent_runtime_helpers import sanitize_api_messages
+
+    messages = [
         {"role": "assistant", "content": None, "tool_calls": [
             {"id": "call_Z", "type": "function",
              "function": {"name": "foo", "arguments": "{}"}},
