@@ -106,6 +106,33 @@ def test_load_website_blocklist_wraps_shared_file_read_errors(tmp_path, monkeypa
     assert result["rules"] == []  # shared file rules skipped
 
 
+def test_load_website_blocklist_warns_and_ignores_unknown_keys(tmp_path, caplog):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "security": {
+                    "website_blocklist": {
+                        "enabled": True,
+                        "domains": ["example.com"],
+                        "shared_file": "typo.txt",
+                        "allowed": ["example.org"],
+                    }
+                }
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
+    with caplog.at_level("WARNING"):
+        policy = load_website_blocklist(config_path)
+
+    assert policy["enabled"] is True
+    assert {rule["pattern"] for rule in policy["rules"]} == {"example.com"}
+    assert "Unknown security.website_blocklist keys ignored: allowed, shared_file" in caplog.text
+
+
 def test_check_website_access_blocks_scheme_less_urls(tmp_path):
     config_path = tmp_path / "config.yaml"
     config_path.write_text(

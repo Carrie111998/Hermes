@@ -27,6 +27,7 @@ _DEFAULT_WEBSITE_BLOCKLIST = {
     "domains": [],
     "shared_files": [],
 }
+_KNOWN_WEBSITE_BLOCKLIST_KEYS = frozenset(_DEFAULT_WEBSITE_BLOCKLIST)
 
 # Cache: parsed policy + timestamp.  Avoids re-reading config.yaml on every
 # URL check (a multi-URL extract with 50 pages would otherwise mean 51 YAML parses).
@@ -123,8 +124,17 @@ def _load_policy_config(config_path: Optional[Path] = None) -> Dict[str, Any]:
     if not isinstance(website_blocklist, dict):
         raise WebsitePolicyError("security.website_blocklist must be a mapping")
 
+    unknown_keys = sorted(set(website_blocklist) - _KNOWN_WEBSITE_BLOCKLIST_KEYS)
+    if unknown_keys:
+        logger.warning(
+            "Unknown security.website_blocklist keys ignored: %s",
+            ", ".join(unknown_keys),
+        )
+
     policy = dict(_DEFAULT_WEBSITE_BLOCKLIST)
-    policy.update(website_blocklist)
+    for key in _KNOWN_WEBSITE_BLOCKLIST_KEYS:
+        if key in website_blocklist:
+            policy[key] = website_blocklist[key]
     return policy
 
 
