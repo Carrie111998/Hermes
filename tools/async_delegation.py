@@ -273,7 +273,15 @@ def _prune_durable_records() -> None:
             )
 
 
-def _persist_completion(event: Dict[str, Any], result: Dict[str, Any]) -> None:
+def _write_durable_terminal(event: Dict[str, Any], result: Dict[str, Any]) -> None:
+    """Write the terminal outcome onto the durable row (state + payloads).
+
+    Shared by the primary persist path and the persist-failure converge
+    fallback so both leave the same ``state`` / ``event_json`` /
+    ``result_json``. Leaving the row in ``running``/``finalizing`` after an
+    in-process delivery lets ``recover_abandoned_delegations`` invent a
+    contradictory ``unknown`` completion on the next process start.
+    """
     now = time.time()
     with _DB_LOCK, _transaction() as conn:
         conn.execute(
@@ -283,6 +291,40 @@ def _persist_completion(event: Dict[str, Any], result: Dict[str, Any]) -> None:
             (event.get("status", "completed"), event.get("completed_at", now), now,
              json.dumps(event), json.dumps(result), event["delegation_id"]),
         )
+
+
+def _persist_completion(event: Dict[str, Any], result: Dict[str, Any]) -> None:
+    """Primary durable completion write (monkeypatch seam for tests)."""
+    _write_durable_terminal(event, result)
+
+
+def _converge_durable_completion(event: Dict[str, Any], result: Dict[str, Any]) -> bool:
+    """Ensure state.db matches the in-process terminal outcome before enqueue.
+
+    Returns True when the durable row carries the same terminal status and
+    payloads. On primary-persist failure, retries via ``_write_durable_terminal``
+    so acknowledgement / restart recovery cannot race a still-``running`` row.
+    """
+    delegation_id = event.get("delegation_id")
+    try:
+        _persist_completion(event, result)
+        return True
+    except Exception as exc:
+        logger.error(
+            "Async delegation %s: durable completion persist failed; "
+            "retrying terminal converge: %s",
+            delegation_id, exc,
+        )
+    try:
+        _write_durable_terminal(event, result)
+        return True
+    except Exception as exc:
+        logger.error(
+            "Async delegation %s: durable terminal converge failed; "
+            "in-memory delivery may diverge from state.db: %s",
+            delegation_id, exc,
+        )
+        return False
 
 
 def _note_delivery_attempt(delegation_id: str) -> None:
@@ -926,15 +968,14 @@ def _push_completion_event(
     ):
         if _k in result:
             evt[_k] = result[_k]
-    try:
-        _persist_completion(evt, result)
-    except Exception as exc:
-        # Durable write is best-effort relative to in-process delivery: still
-        # enqueue so the parent session learns the outcome this process.
+    # Converge durable state first (including persist-failure fallback) so a
+    # later gateway ack / process restart cannot invent a contradictory
+    # ``unknown`` over a still-``running`` row after this in-memory delivery.
+    if not _converge_durable_completion(evt, result):
         logger.error(
-            "Async delegation %s: durable completion persist failed; "
-            "continuing with in-memory delivery: %s",
-            record.get("delegation_id"), exc,
+            "Async delegation %s: continuing with in-memory delivery after "
+            "durable terminal converge failure",
+            record.get("delegation_id"),
         )
     try:
         process_registry.completion_queue.put(evt)
@@ -1146,13 +1187,11 @@ def _push_batch_completion_event(
     ):
         if _k in combined:
             evt[_k] = combined[_k]
-    try:
-        _persist_completion(evt, combined)
-    except Exception as exc:
+    if not _converge_durable_completion(evt, combined):
         logger.error(
-            "Async delegation batch %s: durable completion persist failed; "
-            "continuing with in-memory delivery: %s",
-            event_record.get("delegation_id"), exc,
+            "Async delegation batch %s: continuing with in-memory delivery "
+            "after durable terminal converge failure",
+            event_record.get("delegation_id"),
         )
     try:
         process_registry.completion_queue.put(evt)

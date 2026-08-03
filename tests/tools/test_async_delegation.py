@@ -807,6 +807,83 @@ def test_persist_failure_still_finishes_and_enqueues(monkeypatch):
     assert ad.active_count() == 0
 
 
+def _read_durable_row(delegation_id: str):
+    with ad._DB_LOCK, ad._transaction() as conn:
+        return conn.execute(
+            """SELECT state, event_json, result_json, delivery_state
+               FROM async_delegations WHERE delegation_id=?""",
+            (delegation_id,),
+        ).fetchone()
+
+
+def test_persist_failure_converges_durable_row_against_restart_unknown(monkeypatch):
+    """Primary persist failure must still write the terminal outcome before enqueue.
+
+    Without converge, the durable row stays ``running``; gateway ack only flips
+    ``delivery_state``, and ``recover_abandoned_delegations`` later invents a
+    contradictory ``unknown`` completion after restart.
+    """
+
+    def boom(_evt, _result):
+        raise RuntimeError("simulated sqlite failure")
+
+    monkeypatch.setattr(ad, "_persist_completion", boom)
+
+    res = ad.dispatch_async_delegation(
+        goal="g", context=None, toolsets=None, role="leaf", model="m",
+        session_key="s-restart",
+        parent_session_id="parent-1",
+        runner=lambda: {
+            "status": "completed",
+            "summary": "survived persist failure",
+            "api_calls": 2,
+            "duration_seconds": 0.02,
+        },
+        max_async_children=3,
+    )
+    assert res["status"] == "dispatched"
+    did = res["delegation_id"]
+
+    evt = _drain_for(did, timeout=5.0)
+    assert evt is not None
+    assert evt["status"] == "completed"
+    assert evt["summary"] == "survived persist failure"
+
+    row = _read_durable_row(did)
+    assert row is not None
+    state, event_json, result_json, delivery_state = row
+    assert state == "completed"
+    assert delivery_state == "pending"
+    durable_evt = json.loads(event_json)
+    assert durable_evt["status"] == "completed"
+    assert durable_evt["summary"] == "survived persist failure"
+    durable_result = json.loads(result_json)
+    assert durable_result["summary"] == "survived persist failure"
+
+    # Simulate owner process gone so recovery would rewrite any still-live row.
+    monkeypatch.setattr("gateway.status._pid_exists", lambda _pid: False)
+    recovered = ad.recover_abandoned_delegations()
+    assert recovered == 0
+
+    row_after = _read_durable_row(did)
+    assert row_after is not None
+    state2, event_json2, _, _ = row_after
+    assert state2 == "completed"
+    assert json.loads(event_json2)["summary"] == "survived persist failure"
+    assert json.loads(event_json2)["status"] == "completed"
+
+    # Fresh-process restore must replay the same terminal outcome, not unknown.
+    while not process_registry.completion_queue.empty():
+        process_registry.completion_queue.get_nowait()
+    restored = ad.restore_undelivered_completions(process_registry.completion_queue)
+    assert restored == 1
+    replay = _drain_for(did, timeout=2.0)
+    assert replay is not None
+    assert replay["status"] == "completed"
+    assert replay["summary"] == "survived persist failure"
+    assert replay.get("restored") is True
+
+
 # ---------------------------------------------------------------------------
 # Gateway routing: session_key -> platform/chat_id, rich formatting, injection
 # ---------------------------------------------------------------------------
