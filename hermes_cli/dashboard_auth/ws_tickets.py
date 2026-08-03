@@ -31,9 +31,11 @@ token — so this module provides two credential shapes:
    persistent, resume-only linked device on first consume. Never confers
    ``API_SERVER_KEY`` / superuser / ``*`` scope.
 
-In-memory; the dashboard is a single process so no distributed coordination
-is needed. The module exposes a small functional API rather than a class so
-tests can patch ``time.time`` cleanly.
+WS tickets and internal credentials remain process-local. Phone-handoff
+tickets use a small SQLite store when ``HERMES_HANDOFF_STORE`` is set because
+Hermes Desktop and its public dashboard can be separate local processes. The
+store keeps only a SHA-256 ticket hash, and consumption is an atomic delete.
+Without that environment variable the original in-memory behaviour remains.
 """
 
 from __future__ import annotations
@@ -42,9 +44,12 @@ import base64
 import hashlib
 import hmac
 import json
+import os
 import secrets
+import sqlite3
 import threading
 import time
+from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 from hermes_cli.dashboard_auth.scopes import (
@@ -76,6 +81,10 @@ RESUME_EVENT_CHANNEL_PREFIX = "resume-"
 #: Explicitly excludes superuser / API_SERVER_KEY / wildcard / admin power.
 #: Canonical value lives in scopes.EXACT_HANDOFF_SCOPES — single source.
 HANDOFF_SCOPES: tuple[str, ...] = EXACT_HANDOFF_SCOPES
+
+# Optional cross-process store used by Hermes Desktop plus its public dashboard
+# sidecar. The Desktop shell pins this to a profile-root-owned runtime path.
+HANDOFF_STORE_ENV = "HERMES_HANDOFF_STORE"
 
 _lock = threading.Lock()
 _tickets: Dict[str, Tuple[int, Dict[str, Any]]] = {}  # ticket -> (expires_at, info)
@@ -238,9 +247,13 @@ def mint_handoff_ticket(
         "scopes": list(HANDOFF_SCOPES),
         "minted_at": now,
     }
-    with _lock:
-        _handoff_tickets[ticket] = (now + HANDOFF_TTL_SECONDS, info)
-        _gc_handoff_expired_locked()
+    expires_at = now + HANDOFF_TTL_SECONDS
+    if _handoff_store_path() is not None:
+        _persist_handoff_ticket(ticket, expires_at, info)
+    else:
+        with _lock:
+            _handoff_tickets[ticket] = (expires_at, info)
+            _gc_handoff_expired_locked()
     return ticket
 
 
@@ -254,14 +267,17 @@ def consume_handoff_ticket(ticket: str) -> Dict[str, Any]:
         raise TicketInvalid(f"ws ticket not valid as handoff ticket: {truncated}")
 
     now = int(time.time())
-    with _lock:
-        entry = _handoff_tickets.pop(ticket, None)
-        if entry is None:
-            truncated = ticket[:8] + "…"
-            raise TicketInvalid(f"unknown ticket: {truncated}")
-        expires_at, info = entry
-        if expires_at < now:
-            raise TicketInvalid("expired")
+    if _handoff_store_path() is not None:
+        entry = _consume_persisted_handoff_ticket(ticket)
+    else:
+        with _lock:
+            entry = _handoff_tickets.pop(ticket, None)
+    if entry is None:
+        truncated = ticket[:8] + "…"
+        raise TicketInvalid(f"unknown ticket: {truncated}")
+    expires_at, info = entry
+    if expires_at < now:
+        raise TicketInvalid("expired")
 
     scopes = tuple(info.get("scopes") or ())
     if exact_handoff_scopes_or_none(scopes) is None:
@@ -284,6 +300,95 @@ def _gc_handoff_expired_locked() -> None:
     expired = [t for t, (exp, _) in _handoff_tickets.items() if exp < now]
     for t in expired:
         _handoff_tickets.pop(t, None)
+
+
+def _handoff_store_path() -> Path | None:
+    raw = (os.environ.get(HANDOFF_STORE_ENV) or "").strip()
+    if not raw:
+        return None
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        raise RuntimeError(f"{HANDOFF_STORE_ENV} must be an absolute path")
+    return path
+
+
+def _handoff_db() -> sqlite3.Connection:
+    path = _handoff_store_path()
+    if path is None:
+        raise RuntimeError(f"{HANDOFF_STORE_ENV} is not configured")
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        path.parent.chmod(0o700)
+    except OSError:
+        pass
+    fd = os.open(path, os.O_CREAT | os.O_WRONLY, 0o600)
+    os.close(fd)
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
+    db = sqlite3.connect(path, timeout=5.0)
+    db.execute("PRAGMA busy_timeout=5000")
+    db.execute(
+        """CREATE TABLE IF NOT EXISTS handoff_tickets (
+            ticket_hash BLOB PRIMARY KEY,
+            expires_at INTEGER NOT NULL,
+            payload_json TEXT NOT NULL
+        )"""
+    )
+    return db
+
+
+def _handoff_hash(ticket: str) -> bytes:
+    return hashlib.sha256(ticket.encode("utf-8")).digest()
+
+
+def _persist_handoff_ticket(
+    ticket: str,
+    expires_at: int,
+    info: Dict[str, Any],
+) -> None:
+    payload = json.dumps(info, separators=(",", ":"), sort_keys=True)
+    now = int(time.time())
+    with _handoff_db() as db:
+        db.execute("DELETE FROM handoff_tickets WHERE expires_at < ?", (now,))
+        db.execute(
+            "INSERT INTO handoff_tickets VALUES (?, ?, ?)",
+            (_handoff_hash(ticket), expires_at, payload),
+        )
+
+
+def _consume_persisted_handoff_ticket(
+    ticket: str,
+) -> Tuple[int, Dict[str, Any]] | None:
+    ticket_hash = _handoff_hash(ticket)
+    db = _handoff_db()
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        row = db.execute(
+            "SELECT expires_at, payload_json FROM handoff_tickets WHERE ticket_hash=?",
+            (ticket_hash,),
+        ).fetchone()
+        if row is not None:
+            db.execute(
+                "DELETE FROM handoff_tickets WHERE ticket_hash=?",
+                (ticket_hash,),
+            )
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+    if row is None:
+        return None
+    try:
+        info = json.loads(row[1])
+    except (TypeError, ValueError) as exc:
+        raise TicketInvalid("invalid handoff payload") from exc
+    if not isinstance(info, dict):
+        raise TicketInvalid("invalid handoff payload")
+    return int(row[0]), info
 
 
 def internal_ws_credential() -> str:
@@ -340,3 +445,6 @@ def _reset_for_tests() -> None:
         _handoff_tickets.clear()
         _internal_credential = None
         _event_channel_key = None
+    if _handoff_store_path() is not None:
+        with _handoff_db() as db:
+            db.execute("DELETE FROM handoff_tickets")

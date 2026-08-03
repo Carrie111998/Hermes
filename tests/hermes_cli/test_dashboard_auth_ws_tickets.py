@@ -8,6 +8,7 @@ call ``_reset_for_tests`` between tests to keep things deterministic.
 from __future__ import annotations
 
 import threading
+import sqlite3
 
 import pytest
 
@@ -207,6 +208,33 @@ class TestHandoffTickets:
             session_id="s", user_id="u", provider="stub"
         )
         ws_tickets.consume_handoff_ticket(ticket)
+        with pytest.raises(TicketInvalid, match="unknown"):
+            ws_tickets.consume_handoff_ticket(ticket)
+
+    def test_cross_process_store_is_hash_only_and_single_use(
+        self, monkeypatch, tmp_path
+    ):
+        store = tmp_path / "runtime" / "handoff.sqlite3"
+        monkeypatch.setenv(ws_tickets.HANDOFF_STORE_ENV, str(store))
+        ticket = ws_tickets.mint_handoff_ticket(
+            session_id="shared", user_id="u", provider="desktop"
+        )
+
+        # Simulate the consuming dashboard having no access to the minting
+        # process's in-memory state.
+        with ws_tickets._lock:
+            ws_tickets._handoff_tickets.clear()
+
+        with sqlite3.connect(store) as db:
+            row = db.execute(
+                "SELECT ticket_hash, payload_json FROM handoff_tickets"
+            ).fetchone()
+        assert row is not None
+        assert ticket not in row[1]
+        assert ticket.encode() not in store.read_bytes()
+
+        info = ws_tickets.consume_handoff_ticket(ticket)
+        assert info["session_id"] == "shared"
         with pytest.raises(TicketInvalid, match="unknown"):
             ws_tickets.consume_handoff_ticket(ticket)
 
