@@ -114,6 +114,8 @@ export interface ClarifyReq {
 }
 
 export interface Msg {
+  dbId?: number
+  dbSessionId?: string
   info?: SessionInfo
   kind?: 'diff' | 'event' | 'intro' | 'panel' | 'slash' | 'trail'
   panelData?: PanelData

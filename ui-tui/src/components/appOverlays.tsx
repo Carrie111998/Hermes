@@ -10,6 +10,7 @@ import { $uiSessionId, $uiTheme } from '../app/uiStore.js'
 import { ActiveSessionSwitcher } from './activeSessionSwitcher.js'
 import { FloatBox } from './appChrome.js'
 import { BillingOverlay } from './billingOverlay.js'
+import { historyTimelineMaxVisibleItems, HistoryTimelineOverlay } from './historyTimelineOverlay.js'
 import { MaskedPrompt } from './maskedPrompt.js'
 import { ModelPicker } from './modelPicker.js'
 import { OverlayHint } from './overlayControls.js'
@@ -57,11 +58,15 @@ function PromptCell({ children, cols, id }: { children: ReactNode; cols: number;
 
 export function PromptZone({
   cols,
+  pagerPageSize,
   onApprovalChoice,
   onClarifyAnswer,
   onSecretSubmit,
   onSudoSubmit
-}: Pick<AppOverlaysProps, 'cols' | 'onApprovalChoice' | 'onClarifyAnswer' | 'onSecretSubmit' | 'onSudoSubmit'>) {
+}: Pick<
+  AppOverlaysProps,
+  'cols' | 'onApprovalChoice' | 'onClarifyAnswer' | 'onSecretSubmit' | 'onSudoSubmit' | 'pagerPageSize'
+>) {
   const overlay = useStore($overlayState)
   const theme = useStore($uiTheme)
 
@@ -282,6 +287,22 @@ export function FloatingOverlays({
       render: width => (
         <FloatBox color={theme.color.border}>
           <PluginsHub gw={gw} maxWidth={width} onClose={() => patchOverlayState({ pluginsHub: false })} t={theme} />
+        </FloatBox>
+      )
+    })
+  }
+
+  if (overlay.historyTimeline) {
+    widgets.push({
+      id: 'history-timeline',
+      render: () => (
+        <FloatBox color={theme.color.border}>
+          <HistoryTimelineOverlay
+            maxVisibleItems={historyTimelineMaxVisibleItems(pagerPageSize)}
+            state={overlay.historyTimeline!}
+            t={theme}
+            width={Math.max(40, cols - 4)}
+          />
         </FloatBox>
       )
     })

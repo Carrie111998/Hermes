@@ -2266,9 +2266,16 @@ def _(rid, params: dict) -> dict:
         with _session_db(session) as db:
             if db is not None:
                 try:
-                    history = db.get_messages_as_conversation(
-                        session["session_key"], include_ancestors=True
-                    )
+                    try:
+                        history = db.get_messages_as_conversation(
+                            session["session_key"],
+                            include_ancestors=True,
+                            include_ids=True,
+                        )
+                    except TypeError:
+                        history = db.get_messages_as_conversation(
+                            session["session_key"], include_ancestors=True
+                        )
                 except Exception:
                     pass
     return _ok(

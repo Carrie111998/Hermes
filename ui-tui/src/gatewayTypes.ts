@@ -20,6 +20,8 @@ export interface GatewayTranscriptMessage {
   context?: string
   display_kind?: string
   display_metadata?: Record<string, unknown>
+  db_id?: number
+  db_session_id?: string
   name?: string
   role: 'assistant' | 'system' | 'tool' | 'user'
   text?: string
@@ -283,6 +285,11 @@ export interface SessionStatusResponse {
   output?: string
 }
 
+export interface SessionHistoryResponse {
+  count?: number
+  messages?: GatewayTranscriptMessage[]
+}
+
 export interface SessionCompressResponse {
   after_messages?: number
   after_tokens?: number
@@ -301,6 +308,18 @@ export interface SessionCompressResponse {
 }
 
 export interface SessionBranchResponse {
+  branch?: {
+    copied_message_count?: number
+    cut_mode?: string
+    parent_session_id?: string
+    prefill?: string | null
+    session_id?: string
+    source_message_id?: number | null
+    source_session_id?: string
+  }
+  db_session_id?: string
+  parent?: string
+  prefill?: string | null
   session_id?: string
   title?: string
 }

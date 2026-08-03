@@ -34,7 +34,10 @@ def server():
 
         mod = importlib.import_module("tui_gateway.server")
 
+    methods = dict(mod._methods)
     yield mod
+    mod._methods.clear()
+    mod._methods.update(methods)
     mod._sessions.clear()
     mod._pending.clear()
     mod._answers.clear()

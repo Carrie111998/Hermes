@@ -46,6 +46,7 @@ def server(hermes_home, monkeypatch):
     ):
         mod = importlib.import_module("tui_gateway.server")
 
+    methods = dict(mod._methods)
     # Pin config resolution to the isolated HERMES_HOME. Sibling test
     # files (test_billing_rpc, test_delegation_session_lifecycle,
     # test_gateway_owned_session_reap, ...) import tui_gateway.server at
@@ -62,12 +63,8 @@ def server(hermes_home, monkeypatch):
     monkeypatch.setattr(mod, "_cfg_mtime", None)
     monkeypatch.setattr(mod, "_cfg_path", None)
     yield mod
-    # Reset module-level session state without re-importing. importlib.reload
-    # would re-register the module's atexit hooks (ThreadPoolExecutor
-    # shutdown, _shutdown_sessions); the duplicates race the stderr
-    # buffer at interpreter shutdown and surface as Fatal Python error:
-    # _enter_buffered_busy. Clearing the per-session dicts gives the
-    # next test a clean slate.
+    mod._methods.clear()
+    mod._methods.update(methods)
     mod._sessions.clear()
     mod._pending.clear()
     mod._answers.clear()

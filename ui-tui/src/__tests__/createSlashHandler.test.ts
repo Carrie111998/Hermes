@@ -9,6 +9,7 @@ import { TUI_SESSION_MODEL_FLAG } from '../domain/slash.js'
 import * as ClipboardModule from '../lib/clipboard.js'
 import * as Osc52Module from '../lib/osc52.js'
 import * as TerminalSetupModule from '../lib/terminalSetup.js'
+import type { Msg } from '../types.js'
 
 // DASHBOARD_TUI_MODE resolves once at module load from HERMES_TUI_DASHBOARD,
 // so toggling process.env in a test body can't move it. Mock just that one
@@ -937,7 +938,7 @@ describe('createSlashHandler', () => {
     expect(ctx.gateway.gw.request).not.toHaveBeenCalledWith('command.dispatch', expect.anything())
   })
 
-  it('/history pages the current TUI transcript (user + assistant)', () => {
+  it('/history opens the current TUI transcript in the timeline overlay', () => {
     const ctx = buildCtx({
       local: {
         ...buildLocal(),
@@ -951,18 +952,61 @@ describe('createSlashHandler', () => {
     })
 
     createSlashHandler(ctx)('/history')
-    expect(ctx.transcript.page).toHaveBeenCalledTimes(1)
-
-    const [body, title] = ctx.transcript.page.mock.calls[0]!
-
-    expect(title).toBe('History')
-    expect(body).toContain('[You #1]')
-    expect(body).toContain('hello')
-    expect(body).toContain('[Hermes #2]')
-    expect(body).toContain('hi there')
-    expect(body).toContain('[You #3]')
-    expect(body).not.toContain('ignore me')
+    expect(ctx.transcript.page).not.toHaveBeenCalled()
+    expect(getOverlayState().historyTimeline).toMatchObject({
+      items: [
+        { actionable: true, ordinal: 1, preview: 'hello', role: 'user', sourceIndex: 0 },
+        { actionable: false, ordinal: 2, preview: 'ignore me', role: 'system', sourceIndex: 1 },
+        { actionable: true, ordinal: 3, preview: 'hi there', role: 'assistant', sourceIndex: 2 },
+        { actionable: true, ordinal: 4, preview: 'test', role: 'user', sourceIndex: 3 }
+      ],
+      query: '',
+      selected: 3,
+      unfilteredSelected: 3
+    })
     expect(ctx.gateway.gw.request).not.toHaveBeenCalled()
+  })
+
+  it('/history prefers the latest persisted branch target over unpersisted optimistic tail rows', async () => {
+    patchUiState({ sid: 'sid-abc' })
+
+    const rpc = vi.fn(() =>
+      Promise.resolve({
+        messages: [
+          { db_id: 101, role: 'user', text: 'persisted prompt' },
+          { db_id: 102, role: 'assistant', text: 'persisted answer' }
+        ]
+      })
+    )
+
+    const ctx = buildCtx({
+      gateway: { ...buildGateway(), rpc },
+      local: {
+        ...buildLocal(),
+        getHistoryItems: vi.fn<() => Msg[]>(() => [
+          { dbId: 101, role: 'user', text: 'persisted prompt' },
+          { dbId: 102, role: 'assistant', text: 'persisted answer' },
+          { role: 'user', text: 'optimistic local prompt' },
+          { role: 'assistant', text: 'optimistic local answer' }
+        ])
+      }
+    })
+
+    createSlashHandler(ctx)('/history')
+
+    expect(rpc).toHaveBeenCalledWith('session.history', { session_id: 'sid-abc' })
+    await vi.waitFor(() => {
+      expect(getOverlayState().historyTimeline).toMatchObject({
+        items: [
+          { dbId: 101, identity: 'db:101', role: 'user' },
+          { dbId: 102, identity: 'db:102', role: 'assistant' },
+          { identity: 'ordinal:user:2:source:2', role: 'user' },
+          { identity: 'ordinal:assistant:2:source:3', role: 'assistant' }
+        ],
+        selected: 1,
+        unfilteredSelected: 1
+      })
+    })
   })
 
   it('/history reports empty state without paging', () => {
@@ -1085,7 +1129,16 @@ const buildComposer = () => ({
   openEditor: vi.fn(async () => {}),
   paste: vi.fn(),
   queueRef: { current: [] as string[] },
-  selection: { copySelection: vi.fn(async () => '') },
+  selection: {
+    captureScrolledRows: vi.fn(),
+    clearSelection: vi.fn(),
+    copySelection: vi.fn(async () => ''),
+    copySelectionNoClear: vi.fn(async () => ''),
+    getState: vi.fn(() => ({})),
+    shiftAnchor: vi.fn(),
+    shiftSelection: vi.fn(),
+    version: vi.fn(() => 0)
+  },
   setInput: vi.fn()
 })
 
@@ -1100,7 +1153,7 @@ const buildGateway = () => ({
 
 const buildLocal = () => ({
   catalog: null,
-  getHistoryItems: vi.fn(() => []),
+  getHistoryItems: vi.fn<() => Msg[]>(() => []),
   getLastUserMsg: vi.fn(() => ''),
   maybeWarn: vi.fn(),
   setCatalog: vi.fn()
