@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Iterable
 
 from hermes_cli.config import (
+    _raw_config_has_explicit_version,
     check_config_version,
     get_config_path,
     get_env_path,
@@ -63,11 +64,13 @@ def main() -> int:
     if current_ver >= latest_ver:
         return 0
 
-    # Below the auto-migration support floor: migrate_config() refuses (and
-    # leaves the file untouched), so don't run the backup/verify dance that
-    # would raise "did not advance config version" and block the boot.
-    # Warn-and-continue matches the CLI's fail-safe posture.
-    if current_ver < SUPPORT_FLOOR_VERSION:
+    # Below the auto-migration support floor, only explicitly versioned legacy
+    # configs are refused. Unversioned configs are fresh/minimal and must reach
+    # migrate_config(), which stamps them with the current schema version.
+    # Otherwise, don't run the backup/verify dance that would raise "did not
+    # advance config version" and block the boot. Warn-and-continue matches the
+    # CLI's fail-safe posture.
+    if current_ver < SUPPORT_FLOOR_VERSION and _raw_config_has_explicit_version():
         print(
             f"[config-migrate] WARNING: {support_floor_message()}",
             file=sys.stderr,
