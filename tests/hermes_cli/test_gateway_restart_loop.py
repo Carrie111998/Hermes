@@ -560,6 +560,55 @@ class TestTerminalToolGatewayLifecycleGuard:
         assert result["exit_code"] == 0
         assert calls == ["systemctl status nginx"]
 
+    def test_binary_executable_referenced_in_command_does_not_crash(
+        self, monkeypatch, tmp_path
+    ):
+        """A command whose executable is a NUL-byte-laden binary (e.g. a venv
+        interpreter) must not crash the guard with ValueError('embedded null
+        byte') while resolving the referenced path, and must pass through when
+        the binary contains no lifecycle command."""
+        import tools.terminal_tool as tt
+
+        calls = []
+        binary = tmp_path / "venv-python"
+        # Realistic binary signature: NUL bytes + non-UTF-8 junk. No
+        # lifecycle command inside, so the scan must come back clean.
+        binary.write_bytes(b"\x7fELF\x00\x00\x00\x00\xfe\xff\x00\x00MZ\x00")
+        binary.chmod(0o755)
+
+        class _FakeEnv:
+            env = {}
+            def execute(self, command, **kwargs):
+                calls.append(command)
+                return {"output": "", "returncode": 0}
+
+        self._patch_env(monkeypatch, _FakeEnv(), inside_gateway=True)
+        monkeypatch.setattr(
+            tt, "_check_all_guards", lambda cmd, env, **kwargs: {"approved": True}
+        )
+
+        # Referenced as an absolute executable path (the crash shape).
+        result = json.loads(tt.terminal_tool(command=f"{binary} --version"))
+        assert result["exit_code"] == 0
+        assert calls == [f"{binary} --version"]
+
+    def test_binary_executable_hiding_lifecycle_command_still_blocked(
+        self, monkeypatch, tmp_path
+    ):
+        """Fail-closed guarantee: a NUL-byte binary that embeds a gateway
+        lifecycle command must still be blocked — stripping NULs cannot let
+        a crafted binary bypass the guard."""
+        import tools.terminal_tool as tt
+
+        binary = tmp_path / "sneaky-bin"
+        binary.write_bytes(b"\x00\x00hermes gateway restart\x00\x00")
+        binary.chmod(0o755)
+        self._patch_env(monkeypatch, self._make_fake_env(), inside_gateway=True)
+
+        result = json.loads(tt.terminal_tool(command=f"{binary}"))
+        assert result["exit_code"] == 1
+        assert "Blocked" in result["error"]
+
 
 # ---------------------------------------------------------------------------
 # cron.lifecycle_guard module — the shared checker create_job/CLI/terminal use

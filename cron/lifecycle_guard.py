@@ -267,7 +267,14 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
         os.close(descriptor)
     if len(data) > _MAX_REFERENCED_SCRIPT_BYTES:
         return None, True
-    return data.decode("utf-8", errors="replace"), False
+    text = data.decode("utf-8", errors="replace")
+    # Strip NUL bytes so binary content (e.g. a venv interpreter passed as
+    # an executable) can still be scanned without crashing downstream path
+    # resolution, which raises ValueError("embedded null byte") on paths
+    # containing "\\x00". The scan must still run: removing NULs keeps the
+    # fail-closed guarantee that a crafted binary cannot hide a lifecycle
+    # command behind non-UTF-8 bytes.
+    return text.replace("\x00", ""), False
 
 
 def _contains_unsafe_gateway_action(
@@ -298,7 +305,7 @@ def _contains_unsafe_gateway_action(
     for script_path in _iter_referenced_shell_scripts(command, cwd=cwd):
         try:
             resolved = script_path.resolve(strict=False)
-        except OSError:
+        except (OSError, ValueError):
             resolved = script_path
         if resolved in visited:
             continue
