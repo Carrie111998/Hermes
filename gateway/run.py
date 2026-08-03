@@ -12934,6 +12934,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         message can race the restore turn immediately after ``handle_message``
         returns.
         """
+        # The scheduler reserves the runner slot before creating this task.
+        # Mark this synthetic event so the normal busy-session fast path does
+        # not queue it behind that reservation (there is no active adapter
+        # task to drain it).  A dedicated marker keeps unrelated internal
+        # completion events on their existing non-interrupting queue path.
+        try:
+            setattr(event, "_hermes_startup_resume", True)
+        except Exception:
+            pass
         try:
             await adapter.handle_message(event)
             session_tasks = getattr(adapter, "_session_tasks", {})
@@ -19575,6 +19584,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 self._release_running_agent_state(_quick_key)
 
+<<<<<<< HEAD
         # #99106: durable-reaped guard.  A session whose routing row was
         # ended in state.db (e.g. ``ws_orphan_reap`` / ``agent_close``) while
         # the gateway stayed alive keeps its in-memory turn slot alive
@@ -19618,7 +19628,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 logger.debug("reaped-session staleness check failed", exc_info=True)
 
-        if self._is_session_running(_quick_key):
+        _is_startup_resume = bool(
+            getattr(event, "_hermes_startup_resume", False)
+        )
+        if self._is_session_running(_quick_key) and not _is_startup_resume:
             # Resolve the command once; every command's mid-run behavior is
             # declared on its CommandDef (busy_policy / busy_handler in
             # hermes_cli/commands.py) and dispatched through the single
