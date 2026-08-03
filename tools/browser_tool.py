@@ -2102,7 +2102,23 @@ def _get_session_info(task_id: Optional[str] = None) -> Dict[str, Any]:
                     session_info = dict(session_info)
                     session_info["cdp_url"] = _resolve_cdp_override(str(session_info["cdp_url"]))
             except Exception as e:
-                provider_name = type(provider).__name__
+                from agent.firecrawl_run_state import (
+                    FirecrawlCircuitOpenError,
+                    FirecrawlCreditsExhaustedError,
+                )
+
+                configured_name = getattr(provider, "name", None)
+                provider_name = (
+                    configured_name
+                    if isinstance(configured_name, str) and configured_name
+                    else type(provider).__name__
+                )
+                if isinstance(e, FirecrawlCreditsExhaustedError):
+                    fallback_reason = "provider_credits_exhausted"
+                elif isinstance(e, FirecrawlCircuitOpenError):
+                    fallback_reason = "provider_circuit_open"
+                else:
+                    fallback_reason = str(e)
                 logger.warning(
                     "Cloud provider %s failed (%s); attempting fallback to local "
                     "Chromium for task %s",
@@ -2120,7 +2136,7 @@ def _get_session_info(task_id: Optional[str] = None) -> Dict[str, Any]:
                 if isinstance(session_info, dict):
                     session_info = dict(session_info)
                     session_info["fallback_from_cloud"] = True
-                    session_info["fallback_reason"] = str(e)
+                    session_info["fallback_reason"] = fallback_reason
                     session_info["fallback_provider"] = provider_name
 
     with _cleanup_lock:

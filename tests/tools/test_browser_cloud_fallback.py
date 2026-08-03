@@ -8,6 +8,10 @@ from unittest.mock import Mock
 
 import pytest
 
+from agent.firecrawl_run_state import (
+    FirecrawlCircuitOpenError,
+    FirecrawlCreditsExhaustedError,
+)
 import tools.browser_tool as browser_tool
 
 
@@ -39,6 +43,34 @@ class TestCloudProviderRuntimeFallback:
         assert session["fallback_provider"] == "Mock"
         assert session["features"]["local"] is True
         assert session["cdp_url"] is None
+
+    @pytest.mark.parametrize(
+        "error,reason",
+        [
+            (
+                FirecrawlCreditsExhaustedError(),
+                "provider_credits_exhausted",
+            ),
+            (FirecrawlCircuitOpenError(), "provider_circuit_open"),
+        ],
+    )
+    def test_firecrawl_credit_errors_use_stable_local_fallback_reason(
+        self, monkeypatch, error, reason
+    ):
+        _reset_session_state(monkeypatch)
+
+        provider = Mock()
+        provider.name = "firecrawl"
+        provider.create_session.side_effect = error
+        monkeypatch.setattr(browser_tool, "_get_cloud_provider", lambda: provider)
+        monkeypatch.setattr(browser_tool, "_get_cdp_override", lambda: None)
+
+        session = browser_tool._get_session_info(f"task-{reason}")
+
+        assert session["features"]["local"] is True
+        assert session["fallback_reason"] == reason
+        assert session["fallback_provider"] == "firecrawl"
+        assert "response" not in session["fallback_reason"]
 
     def test_cloud_success_no_fallback(self, monkeypatch):
         """When cloud succeeds, no fallback markers are present."""

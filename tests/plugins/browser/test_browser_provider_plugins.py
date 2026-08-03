@@ -23,6 +23,8 @@ PR #25182.
 """
 from __future__ import annotations
 
+from unittest.mock import Mock
+
 import pytest
 
 
@@ -301,6 +303,93 @@ class TestRegistryResolution:
 
         # Only firecrawl is_available() — but it's not in the legacy walk.
         assert _resolve(None) is None
+
+
+# ---------------------------------------------------------------------------
+# Firecrawl run circuit
+# ---------------------------------------------------------------------------
+
+
+class TestFirecrawlRunCircuit:
+    def test_402_opens_run_without_response_body(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from agent import firecrawl_run_state as state
+        from plugins.browser.firecrawl.provider import FirecrawlBrowserProvider
+
+        response = Mock(ok=False, status_code=402, text="secret billing response")
+        post = Mock(return_value=response)
+        monkeypatch.setenv("FIRECRAWL_API_KEY", "test-only")
+        monkeypatch.setattr(
+            "plugins.browser.firecrawl.provider.requests.post", post
+        )
+        run, token = state.install_firecrawl_run()
+        try:
+            with pytest.raises(state.FirecrawlCreditsExhaustedError) as raised:
+                FirecrawlBrowserProvider().create_session("task")
+        finally:
+            state.reset_firecrawl_run(token)
+
+        assert post.call_count == 1
+        assert run.circuit_open is True
+        assert "secret billing response" not in str(raised.value)
+
+    def test_open_run_blocks_post_but_allows_cleanup_delete(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from agent import firecrawl_run_state as state
+        from plugins.browser.firecrawl.provider import FirecrawlBrowserProvider
+
+        response = Mock(
+            ok=True,
+            status_code=200,
+            json=Mock(return_value={"id": "session", "cdpUrl": "ws://example"}),
+        )
+        post = Mock(return_value=response)
+        delete = Mock(return_value=Mock(status_code=204))
+        monkeypatch.setenv("FIRECRAWL_API_KEY", "test-only")
+        monkeypatch.setattr(
+            "plugins.browser.firecrawl.provider.requests.post", post
+        )
+        monkeypatch.setattr(
+            "plugins.browser.firecrawl.provider.requests.delete", delete
+        )
+        provider = FirecrawlBrowserProvider()
+
+        run, token = state.install_firecrawl_run()
+        try:
+            provider.create_session("closed-positive-control")
+            run.record_credits_exhausted()
+            with pytest.raises(state.FirecrawlCircuitOpenError):
+                provider.create_session("blocked")
+            assert provider.close_session("session") is True
+            provider.emergency_cleanup("session")
+        finally:
+            state.reset_firecrawl_run(token)
+
+        assert post.call_count == 1
+        assert delete.call_count == 2
+
+    def test_non_402_does_not_open_run(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from agent import firecrawl_run_state as state
+        from plugins.browser.firecrawl.provider import FirecrawlBrowserProvider
+
+        response = Mock(ok=False, status_code=503, text="temporarily unavailable")
+        monkeypatch.setenv("FIRECRAWL_API_KEY", "test-only")
+        monkeypatch.setattr(
+            "plugins.browser.firecrawl.provider.requests.post",
+            Mock(return_value=response),
+        )
+        run, token = state.install_firecrawl_run()
+        try:
+            with pytest.raises(RuntimeError, match="503 temporarily unavailable"):
+                FirecrawlBrowserProvider().create_session("task")
+        finally:
+            state.reset_firecrawl_run(token)
+
+        assert run.circuit_open is False
 
 
 # ---------------------------------------------------------------------------

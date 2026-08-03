@@ -34,6 +34,11 @@ from typing import Any, Dict
 import requests
 
 from agent.browser_provider import BrowserProvider
+from agent.firecrawl_run_state import (
+    FirecrawlCreditsExhaustedError,
+    raise_if_firecrawl_circuit_open,
+    record_firecrawl_credits_exhausted,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +91,7 @@ class FirecrawlBrowserProvider(BrowserProvider):
         body: Dict[str, object] = {"ttl": ttl}
 
         try:
+            raise_if_firecrawl_circuit_open()
             response = requests.post(
                 f"{self._api_url()}/v2/browser",
                 headers=self._headers(),
@@ -98,6 +104,9 @@ class FirecrawlBrowserProvider(BrowserProvider):
             ) from exc
 
         if not response.ok:
+            if response.status_code == 402:
+                record_firecrawl_credits_exhausted()
+                raise FirecrawlCreditsExhaustedError()
             raise RuntimeError(
                 f"Failed to create Firecrawl browser session: "
                 f"{response.status_code} {response.text}"
