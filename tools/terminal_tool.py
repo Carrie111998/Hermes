@@ -2663,15 +2663,18 @@ def terminal_tool(
                 session_key=session_key,
             )
             try:
+                owner_kwarg: Dict[str, Any] = (
+                    {"owner_id": owner_id} if owner_id else {}
+                )
                 if env_type == "local":
                     proc_session = process_registry.spawn_local(
                         command=command,
                         cwd=effective_cwd,
                         task_id=effective_task_id,
-                        owner_id=owner_id or "",
                         session_key=session_key,
                         env_vars=env.env if hasattr(env, 'env') else None,
                         use_pty=effective_pty,
+                        **owner_kwarg,
                     )
                 else:
                     proc_session = process_registry.spawn_via_env(
@@ -2679,8 +2682,8 @@ def terminal_tool(
                         command=command,
                         cwd=effective_cwd,
                         task_id=effective_task_id,
-                        owner_id=owner_id or "",
                         session_key=session_key,
+                        **owner_kwarg,
                     )
 
                 result_data = {
