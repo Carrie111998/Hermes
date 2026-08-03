@@ -5300,11 +5300,18 @@ class BasePlatformAdapter(ABC):
         # _queue_or_replace_pending_event itself.
         _busy_handler = getattr(self, "_busy_session_handler", None)
         _runner = getattr(_busy_handler, "__self__", None)
+        #
+        # _queue_or_replace_pending_event returns early WITHOUT queueing
+        # when it cannot resolve an adapter for the event source, so only
+        # delegate once we know it resolves back to THIS adapter. Otherwise
+        # keep the historical merge: merging is lossy, but dropping is worse.
         _enqueue = getattr(_runner, "_queue_or_replace_pending_event", None)
-        if callable(_enqueue):
+        _resolve = getattr(_runner, "_adapter_for_source", None)
+        if callable(_enqueue) and callable(_resolve):
             try:
-                _enqueue(session_key, state.event)
-                return True
+                if _resolve(getattr(state.event, "source", None)) is self:
+                    _enqueue(session_key, state.event)
+                    return True
             except Exception:
                 logger.warning(
                     "[%s] FIFO enqueue of debounced burst failed for %s; "
