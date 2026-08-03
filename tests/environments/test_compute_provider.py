@@ -740,6 +740,22 @@ def test_cua_fleet_sandbox_package_is_lazy_installable() -> None:
     assert LAZY_DEPS["terminal.cua_fleet"] == ("cua-sandbox==0.1.24",)
 
 
+def test_cua_fleet_nix_extra_matches_lazy_dependency_pin() -> None:
+    from pathlib import Path
+    import tomllib
+
+    from tools.lazy_deps import LAZY_DEPS
+
+    with (Path(__file__).parents[2] / "pyproject.toml").open("rb") as pyproject_file:
+        optional_dependencies = tomllib.load(pyproject_file)["project"][
+            "optional-dependencies"
+        ]
+
+    assert tuple(optional_dependencies["cua-fleet"]) == LAZY_DEPS[
+        "terminal.cua_fleet"
+    ]
+
+
 def test_desktop_terminal_reuses_existing_task_lease_without_incrementing(monkeypatch):
     from tools import terminal_tool
     from tools.environments import desktop_lease
