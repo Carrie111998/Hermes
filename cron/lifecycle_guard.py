@@ -258,7 +258,10 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
     try:
         descriptor = os.open(path, flags)
-    except OSError:
+    except (OSError, ValueError):
+        # ValueError catches `embedded null byte` from a malformed path the
+        # model put in a command (e.g. a NUL in a filename). Gracefully skip
+        # instead of letting the uncaught exception hang the turn for minutes.
         return None, False
     try:
         metadata = os.fstat(descriptor)
