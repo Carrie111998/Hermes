@@ -199,6 +199,8 @@ async def test_scout_activation_stops_later_firecrawl_and_emits_one_credits_acti
     try:
         client.search_error = TimeoutError("temporary timeout")
         transient_result = firecrawl_web.search("transient")
+        assert client.search_calls[-1] == {"query": "transient", "limit": 5}
+        assert len(client.search_calls) == 2
         assert transient_result["success"] is False
         assert "error_info" not in transient_result
         assert transient_run.circuit_open is False

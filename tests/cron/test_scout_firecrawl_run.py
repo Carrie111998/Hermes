@@ -167,6 +167,9 @@ def test_failed_run_emits_credits_but_failed_without_402_emits_nothing():
         state.reset_firecrawl_run(token)
     assert len(credits_emitter.bus.calls) == 1
     assert credits_emitter.bus.calls[0]["payload"]["action_kind"] == "credits"
+    assert credits_emitter.bus.calls[0]["payload"]["summary"] == (
+        "scout failed with Firecrawl credits exhausted"
+    )
 
     ordinary_emitter = _emitter()
     scheduler._finalize_agent_iteration_event(
@@ -366,7 +369,7 @@ def test_tick_installs_and_finalizes_same_scout_lifecycle(monkeypatch):
     assert len(credit_calls) == 1
 
 
-def test_tick_abandoned_scout_suppresses_late_iteration_and_resets(monkeypatch):
+def test_tick_abandoned_scout_emits_credits_once_without_late_iteration(monkeypatch):
     emitter = _emitter()
     _patch_execution_pipeline(monkeypatch, emitter)
     monkeypatch.setattr(
@@ -399,10 +402,56 @@ def test_tick_abandoned_scout_suppresses_late_iteration_and_resets(monkeypatch):
 
     assert state.current_firecrawl_run() is None
     assert worker_context_after_reset == [None]
+    credit_calls = [
+        call for call in emitter.bus.calls
+        if call["event_type"] == EventType.AGENT_ITERATION
+        and call["payload"].get("action_kind") == "credits"
+    ]
+    assert len(credit_calls) == 1
+    assert credit_calls[0]["payload"]["summary"] == (
+        "scout failed with Firecrawl credits exhausted"
+    )
     assert not any(
         call["event_type"] == EventType.AGENT_ITERATION
+        and call["payload"].get("action_kind") != "credits"
         for call in emitter.bus.calls
     )
+
+
+def test_tick_abandoned_scout_finalizes_credits_recorded_after_deadline(monkeypatch):
+    emitter = _emitter()
+    _patch_execution_pipeline(monkeypatch, emitter)
+    monkeypatch.setattr(
+        scheduler, "get_due_and_skipped_jobs", lambda: ([_scout_job()], [])
+    )
+    monkeypatch.setattr(scheduler, "advance_next_run", lambda *a, **k: None)
+    monkeypatch.setattr(scheduler, "load_config", lambda: {})
+    monkeypatch.setattr(scheduler, "_sweep_mcp_orphans", lambda: None, raising=False)
+    monkeypatch.setattr(scheduler, "_job_timeout_seconds", lambda job: 0.01)
+    worker_finished = threading.Event()
+
+    def fake_run_job(job, **kwargs):
+        time.sleep(0.03)
+        state.record_firecrawl_credits_exhausted()
+        return False, "output", "", "credits"
+
+    monkeypatch.setattr(scheduler, "run_job", fake_run_job)
+    original_reset = scheduler._reset_scout_firecrawl_run
+
+    def recording_reset(token):
+        original_reset(token)
+        worker_finished.set()
+
+    monkeypatch.setattr(scheduler, "_reset_scout_firecrawl_run", recording_reset)
+
+    assert scheduler.tick(verbose=False, sync=True) == 0
+    assert worker_finished.wait(1)
+    credits = [
+        call for call in emitter.bus.calls
+        if call["event_type"] == EventType.AGENT_ITERATION
+        and call["payload"].get("action_kind") == "credits"
+    ]
+    assert len(credits) == 1
 
 
 def test_emit_failure_after_claim_is_not_retried():

@@ -538,7 +538,8 @@ class TestErrorResponseShapes:
         result = firecrawl_provider.FirecrawlWebSearchProvider().search("test")
 
         assert result["success"] is False
-        assert "Firecrawl search failed" in result["error"]
+        assert result["error"] == "Firecrawl account credits are exhausted"
+        assert "Payment Required" not in repr(result)
         assert result["error_info"] == {
             "code": "provider_credits_exhausted",
             "provider": "firecrawl",
@@ -614,6 +615,8 @@ class TestErrorResponseShapes:
             result = firecrawl_provider.FirecrawlWebSearchProvider().search("query")
             assert run.circuit_open is True
             assert result["error_info"] == dict(state.CREDITS_EXHAUSTED_INFO)
+            assert result["error"] == "Firecrawl account credits are exhausted"
+            assert "secret response body" not in repr(result)
             assert "secret response body" not in repr(run.first_failure)
         finally:
             state.reset_firecrawl_run(token)
@@ -647,6 +650,8 @@ class TestErrorResponseShapes:
             assert run.circuit_open is True
             assert calls == ["https://example.com/1"]
             assert first[0]["error_info"] == dict(state.CREDITS_EXHAUSTED_INFO)
+            assert first[0]["error"] == "Firecrawl account credits are exhausted"
+            assert "secret response" not in repr(first[0])
             assert second[0]["error_info"] == dict(state.CIRCUIT_OPEN_INFO)
         finally:
             state.reset_firecrawl_run(token)

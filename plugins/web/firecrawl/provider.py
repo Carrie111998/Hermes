@@ -454,16 +454,20 @@ class FirecrawlWebSearchProvider(WebSearchProvider):
             logger.info("Firecrawl: found %d search results", len(web_results))
             return {"success": True, "data": {"web": web_results}}
         except Exception as exc:  # noqa: BLE001
+            error_info = _credit_error_info(exc)
+            if error_info:
+                logger.warning("Firecrawl search failed: account credits exhausted")
+                record_firecrawl_credits_exhausted()
+                return {
+                    "success": False,
+                    "error": "Firecrawl account credits are exhausted",
+                    "error_info": error_info,
+                }
             logger.warning("Firecrawl search error: %s", exc)
-            result = {
+            return {
                 "success": False,
                 "error": f"Firecrawl search failed: {exc}",
             }
-            error_info = _credit_error_info(exc)
-            if error_info:
-                record_firecrawl_credits_exhausted()
-                result["error_info"] = error_info
-            return result
 
     async def extract(self, urls: List[str], **kwargs: Any) -> List[Dict[str, Any]]:
         """Extract content from one or more URLs via Firecrawl.
@@ -645,25 +649,46 @@ class FirecrawlWebSearchProvider(WebSearchProvider):
                     }
                 )
             except Exception as scrape_err:  # noqa: BLE001
-                logger.debug("Firecrawl scrape failed for %s: %s", url, scrape_err)
-                result = {
-                    "url": url,
-                    "title": "",
-                    "content": "",
-                    "raw_content": "",
-                    "error": str(scrape_err),
-                }
                 if isinstance(scrape_err, FirecrawlCircuitOpenError):
-                    result["error_info"] = dict(scrape_err.error_info)
+                    logger.debug("Firecrawl scrape skipped: account circuit open")
+                    results.append(
+                        {
+                            "url": url,
+                            "title": "",
+                            "content": "",
+                            "raw_content": "",
+                            "error": str(scrape_err),
+                            "error_info": dict(scrape_err.error_info),
+                        }
+                    )
                     credit_circuit_open = True
-                    results.append(result)
                     continue
                 error_info = _credit_error_info(scrape_err)
                 if error_info:
+                    logger.debug("Firecrawl scrape failed: account credits exhausted")
                     record_firecrawl_credits_exhausted()
-                    result["error_info"] = error_info
+                    results.append(
+                        {
+                            "url": url,
+                            "title": "",
+                            "content": "",
+                            "raw_content": "",
+                            "error": "Firecrawl account credits are exhausted",
+                            "error_info": error_info,
+                        }
+                    )
                     credit_circuit_open = True
-                results.append(result)
+                    continue
+                logger.debug("Firecrawl scrape failed for %s: %s", url, scrape_err)
+                results.append(
+                    {
+                        "url": url,
+                        "title": "",
+                        "content": "",
+                        "raw_content": "",
+                        "error": str(scrape_err),
+                    }
+                )
 
         return results
 

@@ -171,7 +171,7 @@ class SyncFallbackExtract:
         return list(self.results)
 
 
-def _patch_extract(monkeypatch, primary, fallback, unsafe=()):
+def _patch_extract(monkeypatch, primary, fallback, unsafe=(), policy_blocks=()):
     import agent.web_search_registry as registry
 
     monkeypatch.setattr(web_tools, "_ensure_web_plugins_loaded", lambda: None)
@@ -183,6 +183,20 @@ def _patch_extract(monkeypatch, primary, fallback, unsafe=()):
         return url not in unsafe
 
     monkeypatch.setattr(web_tools, "async_is_safe_url", safe)
+    monkeypatch.setattr(
+        web_tools,
+        "check_website_access",
+        lambda url: (
+            {
+                "host": "example.com",
+                "rule": "blocked.example",
+                "source": "test",
+                "message": "Blocked by website policy",
+            }
+            if url in policy_blocks
+            else None
+        ),
+    )
 
 
 @pytest.mark.asyncio
@@ -245,14 +259,16 @@ async def test_extract_fallback_exception_is_normalized_per_unresolved_url(monke
 
 
 @pytest.mark.asyncio
-async def test_extract_short_fallback_result_marks_only_missing_position(monkeypatch):
+async def test_extract_short_or_url_misaligned_fallback_results_are_incomplete(
+    monkeypatch,
+):
     urls = ["https://example.com/a", "https://example.com/b"]
     primary = ExtractProvider([
         {"url": urls[0], "error": "credits", "error_info": CREDITS},
         {"url": urls[1], "error": "open", "error_info": CIRCUIT},
     ])
     fallback = AsyncFallbackExtract([
-        {"url": "wrong-provider-url", "title": "first", "content": "ok"},
+        {"url": "https://example.com/wrong", "title": "first", "content": "wrong"},
     ])
     _patch_extract(monkeypatch, primary, fallback)
     _, token = state.install_firecrawl_run()
@@ -262,11 +278,44 @@ async def test_extract_short_fallback_result_marks_only_missing_position(monkeyp
         state.reset_firecrawl_run(token)
 
     assert [item["url"] for item in result["results"]] == urls
-    assert result["results"][0]["content"] == "ok"
-    assert result["results"][1]["content"] == ""
-    assert result["results"][1]["error"] == (
-        "Extract backend returned no result for this URL"
+    assert [item["content"] for item in result["results"]] == ["", ""]
+    assert all(
+        item["error"] == "Extract backend returned no usable result for this URL"
+        for item in result["results"]
     )
+
+
+@pytest.mark.asyncio
+async def test_extract_reapplies_website_policy_before_fallback(monkeypatch):
+    allowed = "https://example.com/allowed"
+    blocked = "https://example.com/blocked"
+    primary = ExtractProvider([
+        {"url": allowed, "error": "credits", "error_info": CREDITS},
+        {"url": blocked, "error": "open", "error_info": CIRCUIT},
+    ])
+    fallback = AsyncFallbackExtract([
+        {"url": allowed, "title": "ok", "content": "fallback"},
+    ])
+    _patch_extract(
+        monkeypatch,
+        primary,
+        fallback,
+        policy_blocks={blocked},
+    )
+    _, token = state.install_firecrawl_run()
+    try:
+        result = json.loads(await web_tools.web_extract_tool([allowed, blocked]))
+    finally:
+        state.reset_firecrawl_run(token)
+
+    assert fallback.calls == [([allowed], {"format": None})]
+    assert result["results"][0]["content"] == "fallback"
+    assert result["results"][1]["error"] == "Blocked by website policy"
+    assert result["results"][1]["blocked_by_policy"] == {
+        "host": "example.com",
+        "rule": "blocked.example",
+        "source": "test",
+    }
 
 
 @pytest.mark.asyncio

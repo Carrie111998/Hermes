@@ -985,7 +985,12 @@ def _run_callable_with_deadline(job, process_fn, abandon_on_timeout, ctx):
 
     def _worker():
         try:
-            box["result"] = ctx.run(process_fn, job, _abandoned=abandoned)
+            import inspect
+
+            worker_kwargs = {"_abandoned": abandoned}
+            if "_deadline_box" in inspect.signature(process_fn).parameters:
+                worker_kwargs["_deadline_box"] = box
+            box["result"] = ctx.run(process_fn, job, **worker_kwargs)
         except Exception:
             logger.exception("Deadline worker for cron job %s crashed", job_id)
             box["result"] = False
@@ -1026,6 +1031,15 @@ def _run_callable_with_deadline(job, process_fn, abandon_on_timeout, ctx):
         return bool(box.get("result", False))
 
     abandoned.set()
+    firecrawl_state = box.get("firecrawl_state")
+    if firecrawl_state and firecrawl_state.first_failure:
+        _finalize_agent_iteration_event(
+            emitter,
+            job,
+            "",
+            success=False,
+            firecrawl_state=firecrawl_state,
+        )
     try:
         mark_job_run(job_id, False, msg)
     except Exception:
@@ -1505,8 +1519,12 @@ def _emit_agent_iteration_event(
             synth_payload = {
                 "agent": canonical_name,
                 "summary": (
-                    f"{canonical_name} completed (synthesized — "
-                    f"agent did not emit AGENT_ITERATION_JSON)"
+                    f"{canonical_name} failed with Firecrawl credits exhausted"
+                    if credits_only and credits_owed
+                    else (
+                        f"{canonical_name} completed (synthesized — "
+                        f"agent did not emit AGENT_ITERATION_JSON)"
+                    )
                 ),
                 "synthesized": True,
                 "job_id": job_id,
@@ -1602,7 +1620,7 @@ def _emit_agent_iteration_event(
                 synth_payload = {
                     "agent": canonical_name,
                     "summary": (
-                        f"{canonical_name} completed with Firecrawl credits exhausted"
+                        f"{canonical_name} failed with Firecrawl credits exhausted"
                     ),
                     "synthesized": True,
                     "job_id": job_id,
@@ -5369,7 +5387,7 @@ def tick(
                 _max_workers if _max_workers else "unbounded",
             )
 
-        def _process_job(job: dict, _abandoned=None) -> bool:
+        def _process_job(job: dict, _abandoned=None, _deadline_box=None) -> bool:
             """Run one due job end-to-end: execute, save, deliver, mark.
 
             ``_abandoned`` is set by the soft-deadline wrapper when this
@@ -5539,6 +5557,8 @@ def tick(
                             "mark_execution_running failed for %s", _job_id
                         )
                 firecrawl_state, firecrawl_token = _install_scout_firecrawl_run(job)
+                if _deadline_box is not None and firecrawl_state is not None:
+                    _deadline_box["firecrawl_state"] = firecrawl_state
                 success, output, final_response, error = run_job(job)
                 _job_duration = _time.monotonic() - _job_start
 
@@ -5722,6 +5742,18 @@ def tick(
                                 job,
                                 final_response or "",
                                 success=success,
+                                firecrawl_state=firecrawl_state,
+                            )
+                        elif firecrawl_state and firecrawl_state.first_failure:
+                            # The deadline owner finalizes any credits already
+                            # recorded at abandonment. If the 402 arrives later,
+                            # the worker performs the same failure-only attempt;
+                            # the run-state claim lock makes the two paths one-shot.
+                            _finalize_agent_iteration_event(
+                                emitter,
+                                job,
+                                "",
+                                success=False,
                                 firecrawl_state=firecrawl_state,
                             )
                     finally:
