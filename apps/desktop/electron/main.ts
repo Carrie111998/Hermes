@@ -35,7 +35,7 @@ import { classifyActiveRuntime } from './active-runtime-state'
 import { stopBackendChild as stopBackendChildImpl } from './backend-child'
 import { dashboardFallbackArgs, sourceDeclaresServe } from './backend-command'
 import { createBackendConnectionState } from './backend-connection-state'
-import { buildDesktopBackendEnv, normalizeHermesHomeRoot } from './backend-env'
+import { buildDesktopBackendEnv, hermesManagedNodePathEntries, normalizeHermesHomeRoot } from './backend-env'
 import { isReauthRequiredError, waitForHermesReady } from './backend-health'
 import {
   canImportHermesCli,
@@ -578,19 +578,10 @@ function resolveHermesHome() {
 
 const HERMES_HOME = resolveHermesHome()
 
-function hermesManagedNodePathEntries() {
-  // NOTE: keep this ordering in sync with iter_hermes_node_dirs() in
-  // hermes_constants.py — this Node main process cannot import the Python
-  // module, so the platform-ordering rule is mirrored here.
-  const root = path.join(HERMES_HOME, 'node')
-  const bin = path.join(root, 'bin')
-  const entries = IS_WINDOWS ? [root, bin] : [bin, root]
-
-  return entries.filter(directoryExists)
-}
-
 function pathWithHermesManagedNode(...entries) {
-  return [...hermesManagedNodePathEntries(), ...entries, process.env.PATH].filter(Boolean).join(path.delimiter)
+  const managed = hermesManagedNodePathEntries(HERMES_HOME).filter(directoryExists)
+
+  return [...managed, ...entries, process.env.PATH].filter(Boolean).join(path.delimiter)
 }
 
 // ACTIVE_HERMES_ROOT — the canonical mutable Hermes install. Same path
@@ -5419,6 +5410,12 @@ function buildApplicationMenu() {
       { role: 'cut' },
       { role: 'copy' },
       { role: 'paste' },
+      // ⌘⇧V is only wired up by this item existing: an accelerator with no menu
+      // entry is never translated into an editor command, so the chord was a
+      // no-op in every input in the app. The composer inserts plain text on
+      // every paste anyway, so this is the same result as ⌘V there — it's the
+      // terminal, preview, and other editable surfaces that need the strip.
+      { role: 'pasteAndMatchStyle' },
       { role: 'delete' },
       { role: 'selectAll' }
     ]
