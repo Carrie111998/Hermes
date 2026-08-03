@@ -806,7 +806,23 @@ def test_fixed_observation_parser_binds_authenticated_session_and_exact_shape() 
     (
         (
             {"control_admin_role_exact": "false"},
-            "schema_reconciliation_control_admin_session_boundary_drifted",
+            "schema_reconciliation_control_admin_role_contract_drifted",
+        ),
+        (
+            {"control_admin_count": "0"},
+            "schema_reconciliation_control_admin_count_drifted",
+        ),
+        (
+            {"control_admin_forward_role_count": "2"},
+            "schema_reconciliation_control_admin_role_closure_drifted",
+        ),
+        (
+            {"control_admin_owned_object_count": "1"},
+            "schema_reconciliation_control_admin_owned_objects_present",
+        ),
+        (
+            {"control_admin_shared_dependency_count": "1"},
+            "schema_reconciliation_control_admin_dependencies_present",
         ),
         (
             {"foreign_client_session_count": "1"},

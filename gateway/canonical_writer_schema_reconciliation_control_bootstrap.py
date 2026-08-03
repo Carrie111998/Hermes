@@ -2543,15 +2543,19 @@ def _foundation_drift_error_code(row: Mapping[str, Any]) -> str:
             "helper_absent",
         )
     }
+    if counts["control_admin_count"] != 1:
+        return "schema_reconciliation_control_admin_count_drifted"
+    if flags["control_admin_role_exact"] is not True:
+        return "schema_reconciliation_control_admin_role_contract_drifted"
     if (
-        counts["control_admin_count"] != 1
-        or flags["control_admin_role_exact"] is not True
-        or counts["control_admin_forward_role_count"]
+        counts["control_admin_forward_role_count"]
         != 1 + counts["executor_membership_count"]
-        or counts["control_admin_owned_object_count"] != 0
-        or counts["control_admin_shared_dependency_count"] != 0
     ):
-        return "schema_reconciliation_control_admin_session_boundary_drifted"
+        return "schema_reconciliation_control_admin_role_closure_drifted"
+    if counts["control_admin_owned_object_count"] != 0:
+        return "schema_reconciliation_control_admin_owned_objects_present"
+    if counts["control_admin_shared_dependency_count"] != 0:
+        return "schema_reconciliation_control_admin_dependencies_present"
     if counts["foreign_client_session_count"] != 0:
         return "schema_reconciliation_control_foreign_client_sessions_present"
     if (
