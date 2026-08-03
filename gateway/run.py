@@ -13767,6 +13767,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return await self._handle_goal_command(event)
         return "Agent is running — use /goal status / pause / clear / wait mid-run, or /stop before setting a new goal."
 
+    def _resolve_goal_final_text(
+        self, agent_result, quick_key: str
+    ) -> str:
+        """Resolve the final response text for the /goal continuation hook.
+
+        Handles every return shape of _handle_message_with_agent:
+
+        - dict: extract ``final_response`` (non-streaming structured result)
+        - str: the response text itself (non-streaming plain result)
+        - None: streaming already delivered the body and the handler
+          returned None to avoid double-delivery — recover the one-shot
+          stashed text keyed by session (consumed via pop, so a later turn
+          with no new streamed text gets "" and the judge is skipped).
+
+        Extracted as a method so the streamed return-None recovery path can
+        be unit-tested directly (driving the real production pop, not a
+        manual simulation of the stash handoff).
+        """
+        if isinstance(agent_result, dict):
+            return str(agent_result.get("final_response") or "")
+        if isinstance(agent_result, str):
+            return agent_result
+        if agent_result is None:
+            return self._last_streamed_response.pop(quick_key, "")
+        return ""
+
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """
         Handle an incoming message from any platform.
@@ -15133,20 +15159,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # next turn makes more progress. Wrapped in try/except so a
             # broken judge never breaks normal message handling.
             try:
-                _final_text = ""
-                if isinstance(_agent_result, dict):
-                    _final_text = str(_agent_result.get("final_response") or "")
-                elif isinstance(_agent_result, str):
-                    _final_text = _agent_result
-                elif _agent_result is None:
-                    # Streaming path: the response text was already delivered
-                    # and _handle_message_with_agent returned None to avoid
-                    # double-delivery.  Retrieve and consume the stashed text
-                    # (one-shot, session-scoped via session_key) so the goal
-                    # judge runs even when streaming is enabled.
-                    _final_text = self._last_streamed_response.pop(
-                        _quick_key, ""
-                    )
+                _final_text = self._resolve_goal_final_text(
+                    _agent_result, _quick_key
+                )
                 # Skip for empty responses (interrupted / errored) — the
                 # judge would almost always say "continue" and we'd loop
                 # on error. Let the user drive the next turn.
