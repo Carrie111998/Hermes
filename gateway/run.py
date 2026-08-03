@@ -49,6 +49,7 @@ from typing import Awaitable, Callable, Dict, Optional, Any, List, Tuple, Union,
 from agent.async_utils import consume_detached_task_result, safe_schedule_threadsafe
 from agent.conversation_compression import (
     COMPACTION_STATUS,
+    COMPACTION_DONE_STATUS,
     COMPRESSION_RETRY_CONTEXT_REDUCED_STATUS_TEMPLATE,
     COMPRESSION_RETRY_MESSAGES_STATUS_TEMPLATE,
     COMPRESSION_RETRY_TOKENS_STATUS_TEMPLATE,
@@ -94,6 +95,7 @@ _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"|skipping\s+concurrent\s+compression"
     r"|compacting\s+context\s+[—-]\s+summarizing\s+earlier\s+conversation"
     r"|resumed\s+after\s+\d+s\s+idle\s+[—-]\s+compacting"
+    r"|context\s+compaction\s+complete\s+[—-]\s+continuing"
     r"|preflight\s+compression"
     r"|pre[- ]api\s+compression"
     # Buffered attempt/overflow retry chatter replayed through _emit_status
@@ -164,6 +166,7 @@ _COMPRESSION_PROGRESS_STATUS_RE = re.compile(
         _status_template_to_regex(_template)
         for _template in (
             COMPACTION_STATUS,
+            COMPACTION_DONE_STATUS,
             PRE_API_COMPRESSION_STATUS_TEMPLATE,
             PREFLIGHT_COMPRESSION_STATUS_TEMPLATE,
             IDLE_COMPACTION_STATUS_TEMPLATE,
