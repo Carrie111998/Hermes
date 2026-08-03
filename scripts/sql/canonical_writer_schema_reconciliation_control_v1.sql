@@ -63,6 +63,15 @@ BEGIN
                  FROM pg_catalog.pg_auth_members AS membership
                  JOIN forward_role_closure AS reachable
                    ON reachable.roleid = membership.member
+           ), provider_forward_role_closure(roleid) AS (
+               SELECT role.oid
+                 FROM pg_catalog.pg_roles AS role
+                WHERE role.rolname = 'cloudsqlsuperuser'
+               UNION
+               SELECT membership.roleid
+                 FROM pg_catalog.pg_auth_members AS membership
+                 JOIN provider_forward_role_closure AS reachable
+                   ON reachable.roleid = membership.member
            )
            SELECT (SELECT pg_catalog.count(*) = 1 FROM bootstrap)
               AND (SELECT pg_catalog.bool_and(
@@ -81,13 +90,15 @@ BEGIN
                               AND inherit_option IS TRUE
                               AND set_option IS TRUE
                           ) FROM relevant_edges)
-              AND (SELECT pg_catalog.count(DISTINCT role.rolname) = 1
-                          AND pg_catalog.bool_and(
-                              role.rolname = 'cloudsqlsuperuser'
-                          )
-                     FROM forward_role_closure AS closure
-                     JOIN pg_catalog.pg_roles AS role
-                       ON role.oid = closure.roleid)
+              AND NOT EXISTS (
+                  (SELECT roleid FROM forward_role_closure
+                   EXCEPT
+                   SELECT roleid FROM provider_forward_role_closure)
+                  UNION ALL
+                  (SELECT roleid FROM provider_forward_role_closure
+                   EXCEPT
+                   SELECT roleid FROM forward_role_closure)
+              )
        )
        OR pg_catalog.current_setting(
               'max_prepared_transactions'
