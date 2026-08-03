@@ -4910,6 +4910,16 @@ def set_config_value(key: str, value: str, force: bool = False):
             coerced_value = int(value)
         elif value.replace('.', '', 1).isdigit():
             coerced_value = float(value)
+        elif value.lstrip()[:1] in ('{', '['):
+            # Persist JSON object/array literals as structured YAML rather than
+            # quoted scalars (#40545). Only dict/list results are applied, so a
+            # malformed value falls through and is kept verbatim below.
+            try:
+                _parsed = json.loads(value)
+            except (json.JSONDecodeError, ValueError):
+                _parsed = None
+            if isinstance(_parsed, (dict, list)):
+                coerced_value = _parsed
 
     value = coerced_value
     # Normalize a scalar ``model`` key before writing sub-keys so that

@@ -723,3 +723,69 @@ class TestMalformedYAMLConfigPreservation:
         assert "Cannot parse" in captured.out or "Cannot parse" in captured.err
         raw = _read_config(_isolated_hermes_home)
         assert raw == self.BROKEN_CONFIG
+
+
+# ---------------------------------------------------------------------------
+# JSON object/array values → structured YAML (#40545)
+# ---------------------------------------------------------------------------
+
+def _parse_config(tmp_path):
+    import yaml
+
+    config_path = tmp_path / "config.yaml"
+    if not config_path.exists():
+        return {}
+    text = config_path.read_text()
+    return yaml.safe_load(text) or {}
+
+
+class TestJsonValueCoercion:
+    """``hermes config set`` must persist JSON object/array values as structured
+    YAML, not as quoted scalars (#40545)."""
+
+    def test_object_value_persisted_as_mapping(self, _isolated_hermes_home):
+        set_config_value("foo.bar", '{"x": 1}')
+        parsed = _parse_config(_isolated_hermes_home)
+        assert parsed["foo"]["bar"] == {"x": 1}
+        # Must NOT be the literal string.
+        assert not isinstance(parsed["foo"]["bar"], str)
+
+    def test_array_value_persisted_as_list(self, _isolated_hermes_home):
+        set_config_value("foo.list", '[1, 2, 3]')
+        parsed = _parse_config(_isolated_hermes_home)
+        assert parsed["foo"]["list"] == [1, 2, 3]
+        assert not isinstance(parsed["foo"]["list"], str)
+
+    def test_nested_structure_preserved(self, _isolated_hermes_home):
+        set_config_value("foo.nested", '{"a": {"b": [1, 2]}}')
+        parsed = _parse_config(_isolated_hermes_home)
+        assert parsed["foo"]["nested"] == {"a": {"b": [1, 2]}}
+
+    def test_real_world_provider_mapping(self, _isolated_hermes_home):
+        set_config_value(
+            "providers.deepseek",
+            '{"base_url": "https://api.deepseek.com", '
+            '"key_env": "DEEPSEEK_API_KEY", "api_mode": "chat_completions"}',
+        )
+        parsed = _parse_config(_isolated_hermes_home)
+        assert parsed["providers"]["deepseek"] == {
+            "base_url": "https://api.deepseek.com",
+            "key_env": "DEEPSEEK_API_KEY",
+            "api_mode": "chat_completions",
+        }
+
+    def test_invalid_json_kept_as_string_literal(self, _isolated_hermes_home):
+        """A clearly malformed object literal must round-trip as the original string."""
+        set_config_value("foo.bad", '{not valid json')
+        parsed = _parse_config(_isolated_hermes_home)
+        # Must remain the literal string the user typed, not crash.
+        assert parsed["foo"]["bad"] == "{not valid json"
+
+    def test_string_typed_setting_not_json_parsed(self, _isolated_hermes_home):
+        """A setting whose schema default is a string (e.g. approvals.mode) must
+        keep a JSON-looking value as a literal string — enum/string settings are
+        never reinterpreted as structured data."""
+        set_config_value("approvals.mode", '{"x": 1}')
+        parsed = _parse_config(_isolated_hermes_home)
+        # approvals.mode default is a string ("off"), so no JSON coercion.
+        assert parsed["approvals"]["mode"] == '{"x": 1}'
