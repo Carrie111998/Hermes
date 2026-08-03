@@ -464,6 +464,14 @@ class FileOperations(ABC):
         """
         ...
 
+    def validate_write_candidate(self, path: str, content: str) -> Optional[str]:
+        """Return an error when a candidate cannot safely be written.
+
+        Backends may override this non-mutating preflight. The default keeps
+        third-party backends compatible with V4A's validation phase.
+        """
+        return None
+
     @abstractmethod
     def write_file(self, path: str, content: str) -> WriteResult:
         """Write content to a file, creating directories as needed."""
@@ -1400,6 +1408,26 @@ class ShellFileOperations(FileOperations):
     # WRITE Implementation
     # =========================================================================
 
+    def validate_write_candidate(self, path: str, content: str) -> Optional[str]:
+        """Preflight write policy and fail-closed structured syntax gates."""
+        path = self._expand_path(path)
+        denied = get_write_denied_error(path)
+        if denied:
+            return denied
+
+        ext = os.path.splitext(path)[1].lower()
+        inproc_linter = LINTERS_INPROC.get(ext) if ext in _FAIL_CLOSED_INPROC_EXTS else None
+        if inproc_linter is None:
+            return None
+        ok, lint_error = inproc_linter(content)
+        if ok or lint_error == "__SKIP__":
+            return None
+        return (
+            f"Refusing to write '{path}': candidate content fails "
+            f"{ext} syntax validation ({lint_error}). The file was "
+            "NOT created or modified. Fix the content and retry."
+        )
+
     def write_file(self, path: str, content: str) -> WriteResult:
         """
         Write content to a file, creating parent directories as needed.
@@ -1431,51 +1459,13 @@ class ShellFileOperations(FileOperations):
         Returns:
             WriteResult with bytes written, lint summary, or error.
         """
-        # Expand ~ and other shell paths
+        # Expand paths and run the same non-mutating gate used by V4A batch
+        # validation, keeping preflight and apply policy in lockstep.
         path = self._expand_path(path)
-
-        # Block writes to sensitive paths
-        denied = get_write_denied_error(path)
-        if denied:
-            return WriteResult(error=denied)
-
-        # ── Fail-closed pre-write syntax gate ───────────────────────────
-        # Validate the CANDIDATE content BEFORE any bytes touch disk —
-        # previously this only ran as a post-write lint *report* that the
-        # caller could ignore (or that ``files_modified`` gating wouldn't
-        # catch, since a lint failure never set the top-level ``error``
-        # key). A structured-format write that doesn't even parse (mashed
-        # quotes, truncated generation, wrong indentation dialect) is a
-        # corrupt write, not a style nit — refuse it outright instead of
-        # writing first and reporting the damage afterward.
-        #
-        # Scope: only extensions in ``_FAIL_CLOSED_INPROC_EXTS`` (JSON/
-        # YAML/TOML). ``.py`` deliberately keeps its pre-existing,
-        # non-blocking lint-delta *report* instead of a hard refusal — see
-        # ``_FAIL_CLOSED_INPROC_EXTS``'s docstring above for why. Extensions
-        # with no in-process linter at all (including ones only covered by
-        # a shell linter) are completely unaffected — this gate never runs
-        # for them, so behavior there is unchanged.
-        #
-        # Checked against the raw ``content`` argument, before the
-        # BOM/CRLF preservation shims below run. Those shims exist purely
-        # to match the on-disk file's existing conventions; linting
-        # post-shim would false-positive a JSONDecodeError on a
-        # legitimately BOM-marked JSON file purely because this method
-        # re-adds the marker the read layer strips — see
-        # ``_file_has_bom``/``_UTF8_BOM`` below.
+        candidate_error = self.validate_write_candidate(path, content)
+        if candidate_error:
+            return WriteResult(error=candidate_error)
         ext = os.path.splitext(path)[1].lower()
-        inproc_linter = LINTERS_INPROC.get(ext) if ext in _FAIL_CLOSED_INPROC_EXTS else None
-        if inproc_linter is not None:
-            _ok, _lint_err = inproc_linter(content)
-            if not _ok and _lint_err != "__SKIP__":
-                return WriteResult(
-                    error=(
-                        f"Refusing to write '{path}': candidate content fails "
-                        f"{ext} syntax validation ({_lint_err}). The file was "
-                        "NOT created or modified. Fix the content and retry."
-                    )
-                )
 
         # Capture pre-write content.  Two consumers want it:
         #

@@ -279,6 +279,21 @@ def _apply_addition_only_hunk(content: str, hunk: Hunk) -> Tuple[str, Optional[s
     return content.rstrip('\n') + '\n' + insert_text + '\n', None
 
 
+def _candidate_validation_error(
+    candidate_validator: Any,
+    path: str,
+    content: str,
+) -> Optional[str]:
+    """Keep backend preflight exceptions inside the structured patch result."""
+    if not callable(candidate_validator):
+        return None
+    try:
+        result = candidate_validator(path, content)
+        return str(result) if result else None
+    except Exception as exc:
+        return f"candidate preflight raised {type(exc).__name__}: {exc}"
+
+
 def _validate_operations(
     operations: List[PatchOperation],
     file_ops: Any,
@@ -296,6 +311,7 @@ def _validate_operations(
 
     errors: List[str] = []
     real_change_count = 0
+    candidate_validator = getattr(file_ops, "validate_write_candidate", None)
 
     # Virtual filesystem overlay so inter-op state (notably a MOVE creating the
     # destination a later UPDATE targets) validates correctly. Maps a path to
@@ -316,6 +332,7 @@ def _validate_operations(
         return r.content, None
 
     for op in operations:
+        operation_error_count = len(errors)
         if op.operation != OperationType.UPDATE:
             real_change_count += 1
         if op.operation == OperationType.UPDATE:
@@ -380,6 +397,26 @@ def _validate_operations(
             # Record the post-update content so a later op (e.g. a MOVE of this
             # file) sees the edited version in the overlay.
             pending_content[op.file_path] = simulated
+
+            if len(errors) == operation_error_count and simulated is not None:
+                candidate_error = _candidate_validation_error(
+                    candidate_validator, op.file_path, simulated
+                )
+                if candidate_error:
+                    errors.append(f"{op.file_path}: {candidate_error}")
+
+        elif op.operation == OperationType.ADD:
+            content = '\n'.join(
+                line.content
+                for hunk in op.hunks
+                for line in hunk.lines
+                if line.prefix == '+'
+            )
+            candidate_error = _candidate_validation_error(
+                candidate_validator, op.file_path, content
+            )
+            if candidate_error:
+                errors.append(f"{op.file_path}: {candidate_error}")
 
         elif op.operation == OperationType.DELETE:
             _content, read_err = _read(op.file_path)
