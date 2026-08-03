@@ -131,6 +131,12 @@ _PACKAGED_CANONICAL_WRITER_SCHEMA_RECONCILIATION_CONTROL_MODULE = Path(
 _PACKAGED_CANONICAL_WRITER_SCHEMA_RECONCILIATION_CONTROL_BOOTSTRAP_MODULE = Path(
     "gateway/canonical_writer_schema_reconciliation_control_bootstrap.py"
 )
+_PACKAGED_CANONICAL_WRITER_SCHEMA_UPGRADE_MODULE = Path(
+    "gateway/canonical_writer_schema_upgrade.py"
+)
+_PACKAGED_CANONICAL_WRITER_SCHEMA_UPGRADE_RUNTIME_MODULE = Path(
+    "gateway/canonical_writer_schema_upgrade_runtime.py"
+)
 CANONICAL_WRITER_BASE_MIGRATION_SQL_RELATIVE_PATH = Path(
     "scripts/sql/canonical_writer_v1.sql"
 )
@@ -394,6 +400,17 @@ class ReleaseBuildSpec:
         return (
             self.site_packages
             / _PACKAGED_CANONICAL_WRITER_SCHEMA_RECONCILIATION_CONTROL_BOOTSTRAP_MODULE
+        )
+
+    @property
+    def schema_upgrade_module_origin(self) -> Path:
+        return self.site_packages / _PACKAGED_CANONICAL_WRITER_SCHEMA_UPGRADE_MODULE
+
+    @property
+    def schema_upgrade_runtime_module_origin(self) -> Path:
+        return (
+            self.site_packages
+            / _PACKAGED_CANONICAL_WRITER_SCHEMA_UPGRADE_RUNTIME_MODULE
         )
 
     @property
@@ -973,6 +990,8 @@ def create_release_manifest(spec: ReleaseBuildSpec) -> ReleaseManifest:
         spec.schema_reconciliation_runtime_module_origin,
         spec.schema_reconciliation_control_module_origin,
         spec.schema_reconciliation_control_bootstrap_module_origin,
+        spec.schema_upgrade_module_origin,
+        spec.schema_upgrade_runtime_module_origin,
         spec.schema_contract_asset_origin,
         spec.runtime_dependency_module_origin,
         spec.release_root / SOURCE_COMMIT_MARKER_RELATIVE_PATH,
@@ -1843,6 +1862,8 @@ def _validate_installed_runtime(
         spec.schema_reconciliation_runtime_module_origin,
         spec.schema_reconciliation_control_module_origin,
         spec.schema_reconciliation_control_bootstrap_module_origin,
+        spec.schema_upgrade_module_origin,
+        spec.schema_upgrade_runtime_module_origin,
     )
     for module_path in schema_reconciliation_module_paths:
         try:

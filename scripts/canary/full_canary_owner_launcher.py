@@ -201,11 +201,21 @@ SCHEMA_RECONCILIATION_CONTROL_ADMIN_AUTHORITY_RECEIPT_SCHEMA = (
 SCHEMA_RECONCILIATION_CONTROL_ADMIN_ABSENCE_RECEIPT_SCHEMA = (
     "muncho-cloud-sql-schema-reconciliation-control-admin-absence.v1"
 )
+SCHEMA_UPGRADE_ADMIN_AUTHORITY_RECEIPT_SCHEMA = (
+    "muncho-cloud-sql-schema-upgrade-admin-authority.v1"
+)
+SCHEMA_UPGRADE_ADMIN_ABSENCE_RECEIPT_SCHEMA = (
+    "muncho-cloud-sql-schema-upgrade-admin-absence.v1"
+)
 SCHEMA_RECONCILIATION_DATABASE_ROLES = (
     "canonical_brain_schema_reconciler",
 )
 SCHEMA_RECONCILIATION_CONTROL_DATABASE_ROLES = (
     "canonical_brain_migration_owner",
+    "cloudsqlsuperuser",
+)
+SCHEMA_UPGRADE_DATABASE_ROLES = (
+    "canonical_brain_schema_reconciler",
     "cloudsqlsuperuser",
 )
 CANARY_BOOTSTRAP_LOGIN = "canonical_brain_canary_bootstrap_login"
@@ -359,6 +369,15 @@ SCHEMA_RECONCILIATION_CONTROL_INSTALL_SSHSIG_NAMESPACE = (
 SCHEMA_RECONCILIATION_CONTROL_CLEANUP_SSHSIG_NAMESPACE = (
     "muncho-canonical-writer-schema-reconciliation-control-cleanup-owner-v1"
 )
+SCHEMA_UPGRADE_APPLY_MAGIC = b"MCU1"
+SCHEMA_UPGRADE_CLEANUP_MAGIC = b"MCX1"
+SCHEMA_UPGRADE_CREDENTIAL_BYTES = 64
+SCHEMA_UPGRADE_APPLY_SSHSIG_NAMESPACE = (
+    "muncho-canonical-writer-schema-upgrade-apply-owner-v1"
+)
+SCHEMA_UPGRADE_CLEANUP_SSHSIG_NAMESPACE = (
+    "muncho-canonical-writer-schema-upgrade-cleanup-owner-v1"
+)
 _SCHEMA_RECONCILIATION_REMOTE_FAILURE_STAGES = frozenset({
     "a1_to_p1",
     "a2_to_i2",
@@ -401,7 +420,11 @@ FINAL_APPROVAL_INSTALL_RECEIPT_SCHEMA = (
 FINAL_APPROVAL_CANCEL_RECEIPT_SCHEMA = (
     "muncho-full-canary-final-approval-cancel-receipt.v2"
 )
-ADMIN_USERNAME_PREFIX = "muncho_canary_admin_"
+# The installed canonical-truth observer admits only the fixed one-time
+# reconciler namespace. The schema-upgrade action uses that namespace with a
+# stronger, exact dual-role authority receipt; a separate admin prefix cannot
+# cross the installed observer boundary.
+ADMIN_USERNAME_PREFIX = "muncho_canary_reconciler_"
 SCHEMA_RECONCILIATION_EXECUTOR_USERNAME_PREFIX = "muncho_canary_reconciler_"
 SCHEMA_RECONCILIATION_CONTROL_ADMIN_USERNAME_PREFIX = "muncho_canary_control_"
 ADMIN_FRAME_MAGIC = b"MCA2"
@@ -673,7 +696,7 @@ _OWNER_GATE_RFC3339_TIMESTAMP = re.compile(
     r"(?:\.[0-9]{1,9})?(?:Z|[+-][0-9]{2}:[0-9]{2})$"
 )
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
-_ADMIN_USERNAME = re.compile(r"^muncho_canary_admin_[0-9a-f]{16}$")
+_ADMIN_USERNAME = re.compile(r"^muncho_canary_reconciler_[0-9a-f]{16}$")
 _SCHEMA_RECONCILIATION_EXECUTOR_USERNAME = re.compile(
     r"^muncho_canary_reconciler_[0-9a-f]{16}$"
 )
@@ -1695,6 +1718,8 @@ class _PhaseBOwnerExternalSigner:
                 SCHEMA_RECONCILIATION_EXECUTOR_CLEANUP_SSHSIG_NAMESPACE,
                 SCHEMA_RECONCILIATION_CONTROL_INSTALL_SSHSIG_NAMESPACE,
                 SCHEMA_RECONCILIATION_CONTROL_CLEANUP_SSHSIG_NAMESPACE,
+                SCHEMA_UPGRADE_APPLY_SSHSIG_NAMESPACE,
+                SCHEMA_UPGRADE_CLEANUP_SSHSIG_NAMESPACE,
                 OWNER_GATE_HOST_IDENTITY_SSHSIG_NAMESPACE,
                 PRODUCTION_STORAGE_IAM_SSHSIG_NAMESPACE,
             }
@@ -1974,6 +1999,35 @@ def _schema_reconciliation_control_frame(
         raise OwnerLauncherError(
             "schema_reconciliation_control_owner_frame_invalid"
         )
+    frame = bytearray(magic + struct.pack(">I", len(payload)) + payload)
+    if credential is not None:
+        frame.extend(credential)
+    return frame
+
+
+def _schema_upgrade_frame(
+    magic: bytes,
+    claim: Mapping[str, Any],
+    *,
+    credential: bytearray | None = None,
+) -> bytearray:
+    if magic not in {
+        SCHEMA_UPGRADE_APPLY_MAGIC,
+        SCHEMA_UPGRADE_CLEANUP_MAGIC,
+    } or not isinstance(claim, Mapping):
+        raise OwnerLauncherError("schema_upgrade_owner_frame_invalid")
+    expects_credential = magic == SCHEMA_UPGRADE_APPLY_MAGIC
+    if expects_credential:
+        if (
+            not isinstance(credential, bytearray)
+            or len(credential) != SCHEMA_UPGRADE_CREDENTIAL_BYTES
+        ):
+            raise OwnerLauncherError("schema_upgrade_owner_frame_invalid")
+    elif credential is not None:
+        raise OwnerLauncherError("schema_upgrade_owner_frame_invalid")
+    payload = _canonical_bytes(claim)
+    if not 2 <= len(payload) <= PHASE_B_MAX_RESPONSE_BYTES:
+        raise OwnerLauncherError("schema_upgrade_owner_frame_invalid")
     frame = bytearray(magic + struct.pack(">I", len(payload)) + payload)
     if credential is not None:
         frame.extend(credential)
@@ -9983,6 +10037,59 @@ class CloudSqlSchemaReconciliationControlAdmin(
         }
 
 
+class CloudSqlSchemaUpgradeAdmin(CloudSqlSchemaReconciliationControlAdmin):
+    """Exact temporary dual-role authority for one stopped schema upgrade."""
+
+    _DATABASE_ROLES = SCHEMA_UPGRADE_DATABASE_ROLES
+
+    def _valid_target_username(self, username: object) -> bool:
+        return (
+            isinstance(username, str)
+            and _ADMIN_USERNAME.fullmatch(username) is not None
+        )
+
+    def _absence_evidence_identity(self) -> Mapping[str, Any]:
+        return {
+            "schema": SCHEMA_UPGRADE_ADMIN_ABSENCE_RECEIPT_SCHEMA,
+            "temporary_schema_upgrade_admin_absent": True,
+        }
+
+    def temporary_schema_upgrade_admin_authority_receipt(
+        self,
+        username: str,
+    ) -> Mapping[str, Any]:
+        base = dict(
+            CloudSqlTemporaryAdmin.temporary_admin_authority_receipt(
+                self,
+                username,
+            )
+        )
+        base.pop("receipt_sha256", None)
+        resource = self._role_bound_resource(
+            username,
+            require_exact_roles=True,
+        )
+        if resource is None:
+            raise OwnerLauncherError(
+                "cloud_sql_schema_upgrade_authority_unconfirmed"
+            )
+        self.require_current_authority(username)
+        unsigned = {
+            **base,
+            "schema": SCHEMA_UPGRADE_ADMIN_AUTHORITY_RECEIPT_SCHEMA,
+            "broad_schema_upgrade_authority": True,
+            "database_roles_requested": list(self._DATABASE_ROLES),
+            "normal_reconciliation_executor": False,
+            "resource_etag_sha256": _sha256(
+                str(resource["etag"]).encode("ascii")
+            ),
+        }
+        return {
+            **unsigned,
+            "receipt_sha256": _sha256(_canonical_bytes(unsigned)),
+        }
+
+
 class CloudSqlCanaryBootstrapLogin(CloudSqlTemporaryAdmin):
     """Fixed Cloud SQL boundary for the canary bootstrap login.
 
@@ -12839,6 +12946,78 @@ class _IapRemoteSession:
         self._validate_schema_reconciliation_control_frame(frame, sequence=1)
         return self._write_frame(frame, close_stdin=True)
 
+    @staticmethod
+    def _validate_schema_upgrade_frame(
+        frame: bytes | bytearray | memoryview,
+        *,
+        sequence: int,
+    ) -> None:
+        if type(sequence) is not int or sequence not in {0, 1}:
+            raise OwnerLauncherError("schema_upgrade_remote_frame_invalid")
+        try:
+            view = memoryview(frame).cast("B")
+        except (TypeError, ValueError):
+            raise OwnerLauncherError(
+                "schema_upgrade_remote_frame_invalid"
+            ) from None
+        try:
+            if view.nbytes < 10:
+                raise OwnerLauncherError("schema_upgrade_remote_frame_invalid")
+            magic = bytes(view[:4])
+            payload_size = struct.unpack(">I", view[4:8])[0]
+            expected_magic = (
+                SCHEMA_UPGRADE_APPLY_MAGIC,
+                SCHEMA_UPGRADE_CLEANUP_MAGIC,
+            )[sequence]
+            credential_size = SCHEMA_UPGRADE_CREDENTIAL_BYTES if sequence == 0 else 0
+            if (
+                magic != expected_magic
+                or not 2 <= payload_size <= PHASE_B_MAX_RESPONSE_BYTES
+                or view.nbytes != 8 + payload_size + credential_size
+            ):
+                raise OwnerLauncherError("schema_upgrade_remote_frame_invalid")
+        finally:
+            view.release()
+
+    def schema_upgrade_exchange_before(
+        self,
+        frame: bytes | bytearray | memoryview,
+        *,
+        write_guard: Callable[[], None],
+        on_first_write: Callable[[], None],
+        on_write_complete: Callable[[], None],
+    ) -> Mapping[str, Any]:
+        if (
+            self._stdin_closed
+            or self._frames_written != 0
+            or self._messages_read != 1
+            or not callable(write_guard)
+            or not callable(on_first_write)
+            or not callable(on_write_complete)
+        ):
+            raise OwnerLauncherError("schema_upgrade_remote_frame_state_invalid")
+        self._validate_schema_upgrade_frame(frame, sequence=0)
+        return self._write_frame(
+            frame,
+            close_stdin=False,
+            write_guard=write_guard,
+            on_first_write=on_first_write,
+            on_write_complete=on_write_complete,
+        )
+
+    def schema_upgrade_finish(
+        self,
+        frame: bytes | bytearray | memoryview,
+    ) -> Mapping[str, Any]:
+        if (
+            self._stdin_closed
+            or self._frames_written != 1
+            or self._messages_read != 2
+        ):
+            raise OwnerLauncherError("schema_upgrade_remote_frame_state_invalid")
+        self._validate_schema_upgrade_frame(frame, sequence=1)
+        return self._write_frame(frame, close_stdin=True)
+
     def finish(self, frame: bytes | bytearray | memoryview) -> Mapping[str, Any]:
         if (
             self._frames_written == 0
@@ -13600,6 +13779,22 @@ class IapSchemaReconciliationControlBootstrapTransport(
             # The initial gate is secret-free and binds the owner subject.
             # Owner-approved authority is rechecked immediately before the
             # first credential byte is written.
+            approved=False,
+            post_frame_timeout_seconds=2_400.0,
+            maximum_line_bytes=PHASE_B_MAX_RESPONSE_BYTES,
+        )
+
+
+class IapCanonicalWriterSchemaUpgradeTransport(IapCoordinatorTransport):
+    """Pinned transport for the exact stopped schema-generation upgrade."""
+
+    _MODULE = "gateway.canonical_writer_schema_upgrade_runtime"
+    _COMMANDS = frozenset({"upgrade"})
+
+    def open_upgrade(self, release_sha: str) -> _IapRemoteSession:
+        return self._open(
+            release_sha,
+            "upgrade",
             approved=False,
             post_frame_timeout_seconds=2_400.0,
             maximum_line_bytes=PHASE_B_MAX_RESPONSE_BYTES,
@@ -14572,6 +14767,383 @@ def bootstrap_schema_reconciliation_control(
         raise OwnerLauncherError(
             "schema_reconciliation_control_terminal_incomplete"
         )
+    return terminal
+
+
+def upgrade_canonical_writer_schema(
+    *,
+    release_sha: str,
+    transport: IapCanonicalWriterSchemaUpgradeTransport,
+    cloud_sql_client: GoogleRestClient,
+    owner_identity: GcloudOwnerAccessToken,
+    now: Callable[[], int] = lambda: int(time.time()),
+    password_factory: Callable[[], bytearray] = _new_admin_password,
+    nonce_factory: Callable[[int], bytes] = secrets.token_bytes,
+    signer: _PhaseBOwnerExternalSigner | None = None,
+    boundary_factory: Callable[
+        [GoogleRestClient], CloudSqlTemporaryAdmin
+    ] = CloudSqlSchemaUpgradeAdmin,
+    secret_hardener: Callable[[], None] = harden_owner_secret_process,
+    provenance_guard: Callable[
+        [str], None
+    ] = require_owner_runtime_and_launcher_provenance,
+) -> Mapping[str, Any]:
+    """Upgrade the exact reviewed schema generation while services stay stopped."""
+
+    if not isinstance(release_sha, str) or _RELEASE_SHA.fullmatch(release_sha) is None:
+        raise OwnerLauncherError("invalid_release_sha")
+
+    signal_fence = _OwnerSignalFence()
+    signal_fence.install()
+    session: _IapRemoteSession | None = None
+    boundary: CloudSqlTemporaryAdmin | None = None
+    credential: bytearray | None = None
+    apply_frame: bytearray | None = None
+    cleanup_frame: bytearray | None = None
+    expected_username: str | None = None
+    cleanup_receipt: Mapping[str, Any] | None = None
+    terminal: Mapping[str, Any] | None = None
+    primary: BaseException | None = None
+    mutation_request_started = False
+    mutation_may_exist = False
+    database_capability_terminated = False
+    cleanup_complete = False
+    try:
+        provenance_guard(release_sha)
+        from gateway import canonical_writer_schema_upgrade_runtime as upgrade
+
+        if (
+            upgrade.APPLY_OWNER_SSHSIG_NAMESPACE
+            != SCHEMA_UPGRADE_APPLY_SSHSIG_NAMESPACE
+            or upgrade.CLEANUP_OWNER_SSHSIG_NAMESPACE
+            != SCHEMA_UPGRADE_CLEANUP_SSHSIG_NAMESPACE
+            or upgrade.APPLY_MAGIC != SCHEMA_UPGRADE_APPLY_MAGIC
+            or upgrade.CLEANUP_MAGIC != SCHEMA_UPGRADE_CLEANUP_MAGIC
+            or upgrade.OPAQUE_CREDENTIAL_BYTES != SCHEMA_UPGRADE_CREDENTIAL_BYTES
+        ):
+            raise OwnerLauncherError("schema_upgrade_protocol_invalid")
+
+        secret_hardener()
+        account = owner_identity.account_for_read_only_preflight()
+        expected_owner_subject = _sha256(account.encode("utf-8"))
+        owner_signer = signer or _PhaseBOwnerExternalSigner()
+        owner_authority = owner_signer.inspect()
+        if (
+            owner_authority.public_fingerprint
+            != PHASE_B_OWNER_PUBLIC_KEY_FINGERPRINT
+            or _sha256(owner_authority.public_fingerprint.encode("ascii"))
+            != PHASE_B_PINNED_APPROVAL_SOURCE_SHA256
+        ):
+            raise OwnerLauncherError("schema_upgrade_owner_authority_invalid")
+
+        session = transport.open_upgrade(release_sha)
+        gate_raw = session.read_gate()
+        current = now()
+        try:
+            gate = upgrade.validate_gate_for_owner(
+                gate_raw,
+                expected_release_revision=release_sha,
+                expected_owner_subject_sha256=expected_owner_subject,
+                owner_public_key_ed25519_hex=(
+                    owner_authority.public_key_ed25519_hex
+                ),
+                owner_public_fingerprint=owner_authority.public_fingerprint,
+                now_unix=current,
+            )
+        except BaseException:
+            raise OwnerLauncherError("schema_upgrade_gate_invalid") from None
+        expected_username = ADMIN_USERNAME_PREFIX + gate["plan_sha256"][:16]
+        if (
+            gate.get("release_revision") != release_sha
+            or gate.get("owner_subject_sha256") != expected_owner_subject
+            or gate.get("owner_public_key_ed25519_hex")
+            != owner_authority.public_key_ed25519_hex
+            or gate.get("owner_key_id") != owner_authority.key_id
+            or gate.get("owner_public_fingerprint")
+            != owner_authority.public_fingerprint
+            or gate.get("temporary_schema_upgrade_admin_username")
+            != expected_username
+            or gate.get("temporary_schema_upgrade_admin_username_sha256")
+            != _sha256(expected_username.encode("ascii"))
+            or gate.get("database_roles_requested")
+            != list(SCHEMA_UPGRADE_DATABASE_ROLES)
+            or current + SCHEMA_RECONCILIATION_MIN_GATE_REMAINING_SECONDS
+            >= gate.get("expires_at_unix", 0)
+        ):
+            raise OwnerLauncherError("schema_upgrade_gate_binding_invalid")
+        owner_identity.bind_approved_subject(expected_owner_subject)
+        owner_identity.require_stable()
+        session.require_current_authority()
+        provenance_guard(release_sha)
+
+        boundary = boundary_factory(cloud_sql_client)
+        boundary.begin_mutation_observation(
+            expected_owner_subject_sha256=expected_owner_subject,
+            expected_mutation_context_sha256=gate["gate_sha256"],
+        )
+        credential = password_factory()
+        if (
+            not isinstance(credential, bytearray)
+            or len(credential) != SCHEMA_UPGRADE_CREDENTIAL_BYTES
+        ):
+            _wipe(credential if isinstance(credential, bytearray) else None)
+            credential = None
+            raise OwnerLauncherError("schema_upgrade_credential_invalid")
+        try:
+            credential_text = credential.decode("ascii", errors="strict")
+        except UnicodeError:
+            raise OwnerLauncherError("schema_upgrade_credential_invalid") from None
+        if re.fullmatch(r"[A-Za-z0-9_-]{64}", credential_text) is None:
+            credential_text = ""
+            raise OwnerLauncherError("schema_upgrade_credential_invalid")
+        mutation_request_started = True
+        try:
+            boundary.create_or_rotate_recovery(expected_username, credential_text)
+        finally:
+            credential_text = ""
+        mutation_may_exist = True
+        authority_receipt = getattr(
+            boundary,
+            "temporary_schema_upgrade_admin_authority_receipt",
+            None,
+        )
+        if not callable(authority_receipt):
+            raise OwnerLauncherError("schema_upgrade_boundary_invalid")
+        cloud_authority = authority_receipt(expected_username)
+        issued_at, expires_at = _schema_reconciliation_time_window(
+            gate,
+            now_unix=now(),
+        )
+        apply_claim = upgrade.build_owner_apply_unsigned(
+            gate=gate,
+            cloud_sql_authority_receipt=cloud_authority,
+            issued_at_unix=issued_at,
+            expires_at_unix=expires_at,
+            nonce_sha256=_schema_reconciliation_nonce_sha256(nonce_factory),
+        )
+        apply_signature = owner_signer.sign(
+            upgrade.owner_apply_signature_payload(apply_claim),
+            namespace=SCHEMA_UPGRADE_APPLY_SSHSIG_NAMESPACE,
+            expected_authority=owner_authority,
+        )
+        apply_claim = {**apply_claim, "signature_sshsig": apply_signature}
+        apply_frame = _schema_upgrade_frame(
+            SCHEMA_UPGRADE_APPLY_MAGIC,
+            apply_claim,
+            credential=credential,
+        )
+
+        def guard_apply_first_byte() -> None:
+            provenance_guard(release_sha)
+            owner_identity.require_stable()
+            session.require_current_authority()
+            if owner_signer.inspect() != owner_authority:
+                raise OwnerLauncherError("schema_upgrade_owner_authority_changed")
+            if (
+                now() + _SECRET_FRAME_TRANSMIT_MARGIN_SECONDS
+                >= apply_claim["expires_at_unix"]
+            ):
+                raise OwnerLauncherError("schema_upgrade_apply_claim_expired")
+            boundary.require_current_authority(expected_username)
+
+        def wipe_apply_material_after_write() -> None:
+            nonlocal credential, apply_frame
+            _wipe(credential)
+            _wipe(apply_frame)
+            credential = None
+            apply_frame = None
+
+        intermediate_raw = session.schema_upgrade_exchange_before(
+            apply_frame,
+            write_guard=guard_apply_first_byte,
+            on_first_write=lambda: None,
+            on_write_complete=wipe_apply_material_after_write,
+        )
+        _wipe(credential)
+        _wipe(apply_frame)
+        credential = None
+        apply_frame = None
+        if intermediate_raw.get("schema") == upgrade.FAILURE_SCHEMA:
+            failure = upgrade.validate_failure_for_owner(
+                intermediate_raw,
+                gate=gate,
+                expected_wire_stage="apply_to_intermediate",
+                expected_transcript_head_sha256=apply_claim[
+                    "apply_claim_sha256"
+                ],
+            )
+            session.mark_validated(failure)
+            raise RemoteCommandFailed(failure)
+        try:
+            intermediate = upgrade.validate_intermediate_for_owner(
+                intermediate_raw,
+                gate=gate,
+                apply_claim=apply_claim,
+                now_unix=now(),
+            )
+        except BaseException:
+            raise OwnerLauncherError("schema_upgrade_intermediate_invalid") from None
+        if intermediate.get("database_capability_terminated") is not True:
+            raise OwnerLauncherError("schema_upgrade_intermediate_invalid")
+        database_capability_terminated = True
+
+        cleanup_receipt = _cleanup_cloud_sql_temporary_login(
+            boundary,
+            username=expected_username,
+        )
+        cleanup_complete = True
+        issued_at, expires_at = _schema_reconciliation_time_window(
+            gate,
+            now_unix=now(),
+        )
+        cleanup_claim = upgrade.build_owner_cleanup_unsigned(
+            gate=gate,
+            apply_claim=apply_claim,
+            intermediate=intermediate,
+            cloud_sql_absence_receipt=cleanup_receipt,
+            issued_at_unix=issued_at,
+            expires_at_unix=expires_at,
+            nonce_sha256=_schema_reconciliation_nonce_sha256(nonce_factory),
+        )
+        cleanup_signature = owner_signer.sign(
+            upgrade.owner_cleanup_signature_payload(cleanup_claim),
+            namespace=SCHEMA_UPGRADE_CLEANUP_SSHSIG_NAMESPACE,
+            expected_authority=owner_authority,
+        )
+        cleanup_claim = {**cleanup_claim, "signature_sshsig": cleanup_signature}
+        cleanup_frame = _schema_upgrade_frame(
+            SCHEMA_UPGRADE_CLEANUP_MAGIC,
+            cleanup_claim,
+        )
+        terminal_raw = session.schema_upgrade_finish(cleanup_frame)
+        _wipe(cleanup_frame)
+        cleanup_frame = None
+        if terminal_raw.get("schema") == upgrade.FAILURE_SCHEMA:
+            failure = upgrade.validate_failure_for_owner(
+                terminal_raw,
+                gate=gate,
+                expected_wire_stage="cleanup_to_terminal",
+                expected_transcript_head_sha256=cleanup_claim[
+                    "cleanup_claim_sha256"
+                ],
+            )
+            session.mark_validated(failure)
+            raise RemoteCommandFailed(failure)
+        try:
+            terminal = upgrade.validate_terminal_for_owner(
+                terminal_raw,
+                gate=gate,
+                apply_claim=apply_claim,
+                intermediate=intermediate,
+                cleanup_claim=cleanup_claim,
+                now_unix=now(),
+            )
+        except BaseException:
+            raise OwnerLauncherError("schema_upgrade_terminal_invalid") from None
+        session.mark_validated(terminal)
+        session.close()
+        session = None
+        owner_identity.require_stable()
+        provenance_guard(release_sha)
+    except BaseException as exc:
+        primary = exc
+    finally:
+        signal_fence.begin_cleanup()
+        _wipe(credential)
+        _wipe(apply_frame)
+        _wipe(cleanup_frame)
+        credential = None
+        apply_frame = None
+        cleanup_frame = None
+        reconciliation_required = False
+        if (
+            boundary is not None
+            and expected_username is not None
+            and not cleanup_complete
+            and not mutation_request_started
+            and not mutation_may_exist
+        ):
+            try:
+                reconciliation_required = (
+                    boundary.mutation_reconciliation_required()
+                )
+            except BaseException as state_error:
+                code = (
+                    state_error.code
+                    if isinstance(state_error, OwnerLauncherError)
+                    else "schema_upgrade_cleanup_state_failed"
+                )
+                blocked = CleanupBlocked(code)
+                if primary is None:
+                    primary = blocked
+                else:
+                    _attach_cleanup_failure(primary, blocked)
+        needs_cleanup = bool(
+            boundary is not None
+            and expected_username is not None
+            and not cleanup_complete
+            and (
+                mutation_request_started
+                or mutation_may_exist
+                or reconciliation_required
+            )
+        )
+        if (
+            needs_cleanup
+            and session is not None
+            and not database_capability_terminated
+        ):
+            try:
+                session.abort_and_prove_terminated()
+                database_capability_terminated = True
+                session = None
+            except BaseException as termination_error:
+                code = (
+                    termination_error.code
+                    if isinstance(termination_error, OwnerLauncherError)
+                    else "remote_termination_unconfirmed"
+                )
+                blocked = CleanupBlocked(code)
+                if primary is not None:
+                    _attach_cleanup_failure(blocked, primary)
+                primary = blocked
+        if (
+            needs_cleanup
+            and boundary is not None
+            and expected_username is not None
+            and database_capability_terminated
+        ):
+            try:
+                cleanup_receipt = _cleanup_cloud_sql_temporary_login(
+                    boundary,
+                    username=expected_username,
+                )
+                cleanup_complete = True
+            except BaseException as cleanup_error:
+                if not isinstance(cleanup_error, CleanupBlocked):
+                    code = (
+                        cleanup_error.code
+                        if isinstance(cleanup_error, OwnerLauncherError)
+                        else "schema_upgrade_cleanup_failed"
+                    )
+                    cleanup_error = CleanupBlocked(code)
+                if primary is not None:
+                    _attach_cleanup_failure(cleanup_error, primary)
+                primary = cleanup_error
+        if session is not None:
+            _close_session_preserving_primary(session, primary)
+        try:
+            signal_fence.restore()
+        except BaseException as cleanup_error:
+            if primary is None:
+                primary = cleanup_error
+            else:
+                _attach_cleanup_failure(primary, cleanup_error)
+
+    if primary is not None:
+        raise primary
+    if terminal is None or cleanup_receipt is None or not cleanup_complete:
+        raise OwnerLauncherError("schema_upgrade_terminal_incomplete")
     return terminal
 
 
@@ -21838,6 +22410,14 @@ def _cli_parser() -> argparse.ArgumentParser:
         ),
     )
     actions.add_argument(
+        "--upgrade-canonical-writer-schema",
+        action="store_true",
+        help=(
+            "upgrade only the exact reviewed 1ef981b schema generation to the "
+            "sealed current release while all canary services remain stopped"
+        ),
+    )
+    actions.add_argument(
         "--publish-writer-preflight",
         action="store_true",
         help="stage and attest writer-only inputs without starting services",
@@ -21978,6 +22558,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             (
                 arguments.reconcile_legacy_canary_db
                 or arguments.bootstrap_schema_reconciliation_control
+                or arguments.upgrade_canonical_writer_schema
                 or arguments.apply_phase_b_foundation
                 or arguments.publish_coordinator_input
             )
@@ -21988,6 +22569,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if (
                     arguments.reconcile_legacy_canary_db
                     or arguments.bootstrap_schema_reconciliation_control
+                    or arguments.upgrade_canonical_writer_schema
                 )
                 else (
                     "phase_b_owner_cli_invalid"
@@ -22325,6 +22907,22 @@ def main(argv: Sequence[str] | None = None) -> int:
             runtime_and_provenance_guard(release_sha)
             _emit_canonical_line(receipt)
             return 0
+        if arguments.upgrade_canonical_writer_schema:
+            transport = IapCanonicalWriterSchemaUpgradeTransport(
+                owner_identity,
+                gcloud_executable=gcloud_executable,
+                gcloud_configuration=gcloud_configuration,
+            )
+            receipt = upgrade_canonical_writer_schema(
+                release_sha=release_sha,
+                transport=transport,
+                cloud_sql_client=GoogleRestClient(owner_identity),
+                owner_identity=owner_identity,
+                provenance_guard=runtime_and_provenance_guard,
+            )
+            runtime_and_provenance_guard(release_sha)
+            _emit_canonical_line(receipt)
+            return 0
         if arguments.publish_writer_preflight:
             external_iam_policy_sha256 = _require_sha256(
                 arguments.external_iam_policy_sha256,
@@ -22466,6 +23064,7 @@ __all__ = [
     "CloudSqlSchemaReconciliationControlAdmin",
     "CloudSqlSchemaReconciliationAdmin",
     "CloudSqlSchemaReconciliationExecutor",
+    "CloudSqlSchemaUpgradeAdmin",
     "CloudSqlTemporaryAdmin",
     "COORDINATOR_FAILURE_SCHEMA",
     "COORDINATOR_INPUT_PUBLICATION_SCHEMA",
@@ -22503,6 +23102,7 @@ __all__ = [
     "IapHostReceiptRotationTransport",
     "IapSchemaReconciliationTransport",
     "IapSchemaReconciliationControlBootstrapTransport",
+    "IapCanonicalWriterSchemaUpgradeTransport",
     "IapStoppedReleaseTransport",
     "IapWriterActivationBridgeTransport",
     "IapWriterPreflightTransport",
@@ -22602,6 +23202,7 @@ __all__ = [
     "bootstrap_trusted_gcloud_runtime",
     "repair_trusted_gcloud_sdk_bytecode",
     "bootstrap_schema_reconciliation_control",
+    "upgrade_canonical_writer_schema",
     "activate_trusted_owner_support",
     "install_owner_gate_activation_seal",
     "invoke_exact_production_storage_growth_owner_cli",

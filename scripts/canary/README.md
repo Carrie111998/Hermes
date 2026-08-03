@@ -728,7 +728,32 @@ SQL statement, credential, or semantic instruction. It selects only reviewed
 packaged commands from the sealed wheel and validates one canonical JSON result
 from each command.
 
-The first writer action is a stopped preflight:
+If the stopped database is the exact reviewed `1ef981b4` generation, first
+install/revalidate the fixed reconciliation control and run the bounded schema
+upgrade. The upgrade also accepts the exact current target as a crash-recovery
+replay; every other generation fails closed:
+
+```bash
+/Users/emillomliev/.local/share/uv/python/\
+cpython-3.11.15-macos-aarch64-none/bin/python3.11 \
+  -I -S -B -X pycache_prefix=/var/empty/muncho-canary \
+  /absolute/clean/hermes-agent/scripts/canary/full_canary_owner_launcher.py \
+  --release-sha <exact-40-character-release-sha> \
+  --upgrade-canonical-writer-schema
+```
+
+The launcher creates one deterministic temporary Cloud SQL login in the
+already-installed `muncho_canary_reconciler_<16hex>` observer namespace, with
+only the two fixed roles required by this migration. The stronger dual-role
+authority receipt distinguishes this stopped upgrade from normal
+reconciliation. It transmits the credential once to the stopped root runtime,
+commits source observation, three fixed digest-pinned sealed-SQL chunks, target
+observation, and canonical-truth equality in one `SERIALIZABLE` transaction,
+then deletes the login before accepting a fresh writer-session terminal
+receipt. The chunks stay below the normal database query-size bound; this
+action does not widen the general SQL transport.
+
+The next writer action is a stopped preflight:
 
 ```bash
 /Users/emillomliev/.local/share/uv/python/\
@@ -832,8 +857,10 @@ cpython-3.11.15-macos-aarch64-none/bin/python3.11 \
   --publish-stopped-release
 ```
 
-Run `--publish-writer-preflight` and `--activate-writer-stopped` exactly as
-shown above. Next publish the secret-free, public-channel fixture:
+Install/revalidate the schema reconciliation control, run
+`--upgrade-canonical-writer-schema`, and then run `--publish-writer-preflight`
+and `--activate-writer-stopped` exactly as shown above. Next publish the
+secret-free, public-channel fixture:
 
 ```bash
 /Users/emillomliev/.local/share/uv/python/\
