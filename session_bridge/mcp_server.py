@@ -1018,6 +1018,8 @@ def _claude_visibility_status_payload(
         degraded.add("invalid_status")
 
     counts: dict[str, int] = {}
+    if set(counts_raw) != set(states):
+        degraded.add("invalid_status")
     for state in states:
         counts[state] = _nonnegative_int(counts_raw.get(state, 0), degraded)
 

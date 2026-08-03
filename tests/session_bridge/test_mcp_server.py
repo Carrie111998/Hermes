@@ -2068,6 +2068,25 @@ def test_claude_visibility_status_is_read_only_and_exposes_fixed_health_contract
     )
 
 
+def test_claude_visibility_status_rejects_missing_count_fields() -> None:
+    raw = {
+        "counts": {},
+        "retry_codes": {},
+        "failed_codes": {},
+        "fatal": [],
+        "usage": {
+            "local_day": "2026-08-03",
+            "attempts": 0,
+            "reserved_cost_usd": "0",
+        },
+    }
+    config = ClaudeVisibilityConfig(enabled=True, continuous=True)
+
+    payload = _claude_visibility_status_payload(raw, config)
+
+    assert payload["degraded_reasons"] == ["invalid_status"]
+
+
 def test_claude_visibility_status_rejects_coercible_counts_and_shapes_heartbeats() -> (
     None
 ):
