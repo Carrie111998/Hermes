@@ -1780,6 +1780,74 @@ def get_custom_provider_context_length(
     return None
 
 
+def get_custom_provider_max_output_tokens(
+    model: str,
+    base_url: str,
+    custom_providers: Optional[List[Dict[str, Any]]] = None,
+    config: Optional[Dict[str, Any]] = None,
+) -> Optional[int]:
+    """Look up a per-model ``max_output_tokens`` override from ``custom_providers``.
+
+    Mirrors :func:`get_custom_provider_context_length` but reads
+    ``custom_providers[i].models.<model>.max_output_tokens`` (or the
+    ``max_tokens`` alias) instead of ``context_length``.
+
+    A single ``custom_providers`` entry often serves multiple models with
+    different output caps (e.g. an Aliyun Token-Plan endpoint exposing both
+    qwen3.8-max at 131_072 and glm-5.2 at a different limit).  The existing
+    per-provider ``max_output_tokens`` field applies uniformly to every model
+    on that endpoint; this per-model override lets users pin the cap
+    individually.
+
+    Precedence (unchanged, this is a new tier slotted *below* the existing
+    ones):
+
+      ``HERMES_MAX_TOKENS`` > ``model.max_tokens`` >
+      per-provider ``max_output_tokens`` >
+      **per-model ``max_output_tokens``** > ``None``
+    """
+    if not model or not base_url:
+        return None
+    if custom_providers is None:
+        try:
+            custom_providers = get_compatible_custom_providers(config)
+        except Exception:
+            if config is None:
+                return None
+            raw = config.get("custom_providers")
+            custom_providers = raw if isinstance(raw, list) else []
+    if not isinstance(custom_providers, list):
+        return None
+
+    target_url = normalize_route_base_url(base_url)
+    if not target_url:
+        return None
+
+    for entry in custom_providers:
+        if not isinstance(entry, dict):
+            continue
+        entry_url = normalize_route_base_url(entry.get("base_url"))
+        if not entry_url or entry_url != target_url:
+            continue
+        models = entry.get("models")
+        if not isinstance(models, dict):
+            continue
+        model_cfg = models.get(model)
+        if not isinstance(model_cfg, dict):
+            continue
+        for key in ("max_output_tokens", "max_tokens"):
+            raw_val = model_cfg.get(key)
+            if raw_val is None:
+                continue
+            try:
+                val = int(raw_val)
+            except (TypeError, ValueError):
+                continue
+            if val > 0:
+                return val
+    return None
+
+
 def _coerce_config_version(value: Any) -> int:
     """Return a safe integer config version, treating invalid values as legacy."""
     if isinstance(value, bool):

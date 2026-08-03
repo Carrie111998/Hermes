@@ -2447,6 +2447,21 @@ def _resolve_runtime_agent_kwargs() -> dict:
         if isinstance(_runtime_mot, int) and _runtime_mot > 0:
             max_tokens = _runtime_mot
 
+    # Per-model override (lowest tier).  A single provider endpoint can serve
+    # models with different output caps; this lets users pin
+    # ``models.<id>.max_output_tokens`` individually.  Only fills in when no
+    # higher-precedence source already set the cap.
+    if max_tokens is None:
+        _runtime_base = runtime.get("base_url") or ""
+        _runtime_model = runtime.get("model") or ""
+        if _runtime_base and _runtime_model:
+            from hermes_cli.config import get_custom_provider_max_output_tokens
+            _per_model_mot = get_custom_provider_max_output_tokens(
+                _runtime_model, _runtime_base
+            )
+            if isinstance(_per_model_mot, int) and _per_model_mot > 0:
+                max_tokens = _per_model_mot
+
     return {
         "api_key": runtime.get("api_key"),
         "base_url": runtime.get("base_url"),

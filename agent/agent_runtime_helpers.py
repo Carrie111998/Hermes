@@ -25,6 +25,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import os
 import re
 import threading
 import time
@@ -2625,7 +2626,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
 
     # ── Re-resolve reasoning_config from per-model override ──
     # The new model may have a different reasoning_effort override. Re-read
-    # config so the override takes effect immediately on /model switch —
+    # config so the override takes effect immediately on /model switch -
     # resolved through the shared chokepoint (per-model > global; YAML
     # boolean False = disabled).
     try:
@@ -2640,6 +2641,41 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
         )
     except Exception as _reasoning_err:
         logger.debug("switch_model: could not re-resolve reasoning_config: %s", _reasoning_err)
+
+    # ── Re-resolve max_tokens from per-model override ──
+    # The new model may have a different output cap pinned in
+    # custom_providers.models.<id>.max_output_tokens. Re-read config so the
+    # cap tracks the model, not the stale value inherited from the previous
+    # model. Precedence: env var > model.max_tokens > per-provider >
+    # per-model > None — same tiers as startup in agent_init.py.
+    try:
+        from hermes_cli.config import (
+            load_config as _sm_load_config2,
+            get_custom_provider_max_output_tokens,
+        )
+        _mt_cfg = _sm_load_config2() or {}
+        _mt_env = os.environ.get("HERMES_MAX_TOKENS")
+        if _mt_env:
+            agent.max_tokens = int(_mt_env)
+        else:
+            _mt_model_cfg = _mt_cfg.get("model", {})
+            _mt_global = _mt_model_cfg.get("max_tokens") if isinstance(_mt_model_cfg, dict) else None
+            if isinstance(_mt_global, int) and _mt_global > 0:
+                agent.max_tokens = _mt_global
+            elif _sm_custom_providers:
+                _mt_per_model = get_custom_provider_max_output_tokens(
+                    model=agent.model,
+                    base_url=agent.base_url,
+                    custom_providers=_sm_custom_providers,
+                )
+                if isinstance(_mt_per_model, int) and _mt_per_model > 0:
+                    agent.max_tokens = _mt_per_model
+                else:
+                    agent.max_tokens = None
+            else:
+                agent.max_tokens = None
+    except Exception as _mt_err:
+        logger.debug("switch_model: could not re-resolve max_tokens: %s", _mt_err)
 
     # ── Invalidate cached system prompt so it rebuilds next turn ──
     agent._cached_system_prompt = None
