@@ -38,12 +38,11 @@ def _positive_int(raw: Any, default: int) -> int:
     return default
 
 
-def get_native_image_limits() -> tuple[int, int]:
-    """Load native-image limits from the cached Hermes configuration.
+def agent_config_int(key: str, default: int) -> int:
+    """Positive-int value of ``agent.<key>`` from the cached configuration.
 
-    ``native_image_max_payload_bytes`` limits the complete ASCII data URL
-    (``data:<mime>;base64,<encoded bytes>``), not the raw file size.
-    Malformed, missing, zero, or negative values fall back to safe defaults.
+    Malformed, missing, zero, or negative values fall back to ``default``.
+    The config loader caches on file mtime, so this is safe on hot paths.
     """
     agent_cfg: dict[str, Any] = {}
     try:
@@ -56,13 +55,23 @@ def get_native_image_limits() -> tuple[int, int]:
     except Exception as exc:  # pragma: no cover - defensive config fallback
         logger.debug("image_payloads: could not load config; using defaults: %s", exc)
 
+    return _positive_int(agent_cfg.get(key), default)
+
+
+def get_native_image_limits() -> tuple[int, int]:
+    """Load native-image limits from the cached Hermes configuration.
+
+    ``native_image_max_payload_bytes`` limits the complete ASCII data URL
+    (``data:<mime>;base64,<encoded bytes>``), not the raw file size.
+    Malformed, missing, zero, or negative values fall back to safe defaults.
+    """
     return (
-        _positive_int(
-            agent_cfg.get("native_image_max_payload_bytes"),
+        agent_config_int(
+            "native_image_max_payload_bytes",
             DEFAULT_NATIVE_IMAGE_MAX_PAYLOAD_BYTES,
         ),
-        _positive_int(
-            agent_cfg.get("native_image_max_dimension"),
+        agent_config_int(
+            "native_image_max_dimension",
             DEFAULT_NATIVE_IMAGE_MAX_DIMENSION,
         ),
     )
