@@ -1180,7 +1180,7 @@ class ShellFileOperations(FileOperations):
             )
         
         # Read a sample to check for binary content
-        sample_cmd = f"head -c 1000 {self._escape_shell_arg(path)} 2>/dev/null"
+        sample_cmd = f"head -c 4096 {self._escape_shell_arg(path)} 2>/dev/null"
         sample_result = self._exec(sample_cmd)
         sample_output = _strip_terminal_fence_leaks(sample_result.stdout)
         
@@ -1298,7 +1298,7 @@ class ShellFileOperations(FileOperations):
             file_size = 0
         if self._is_image(path):
             return ReadResult(is_image=True, is_binary=True, file_size=file_size)
-        sample_result = self._exec(f"head -c 1000 {self._escape_shell_arg(path)} 2>/dev/null")
+        sample_result = self._exec(f"head -c 4096 {self._escape_shell_arg(path)} 2>/dev/null")
         sample_output = _strip_terminal_fence_leaks(sample_result.stdout)
         if self._is_likely_binary(path, sample_output):
             return ReadResult(
