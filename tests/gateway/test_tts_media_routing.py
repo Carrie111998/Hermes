@@ -134,6 +134,7 @@ async def test_base_adapter_surfaces_html_upload_failure_in_same_thread():
     await adapter._process_message_background(event, build_session_key(event.source))
 
     adapter.send.assert_awaited_once()
+    assert adapter.send.await_args is not None
     notice = adapter.send.await_args.kwargs
     assert notice["metadata"]["thread_id"] == "topic-1"
     assert "was not attached" in notice["content"]
@@ -263,6 +264,7 @@ async def test_streaming_delivery_surfaces_html_upload_rejection_in_same_thread(
     )
 
     adapter.send.assert_awaited_once()
+    assert adapter.send.await_args is not None
     notice = adapter.send.await_args.kwargs
     assert notice["chat_id"] == "C123"
     assert notice["metadata"] == {"thread_ts": thread_ts}
