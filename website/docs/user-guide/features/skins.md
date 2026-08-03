@@ -43,7 +43,7 @@ display:
 | `charizard` | Volcanic theme — burnt orange and ember | `Charizard Agent` | Warm burnt orange to ember gradient. Fire-themed spinners ("banking into the draft", "measuring burn"). Dragon-silhouette ASCII art banner. |
 | `forest-teal` | Living studio — mint-teal on deep forest, calm and low-glare | `Hermes Agent` | Deep forest background, mint-teal accents, sage text, and restrained low-glare status surfaces. |
 
-![Forest-teal in the Hermes CLI](/img/docs/forest-teal-cli.png)
+![Forest-teal CLI/TUI hero](/img/docs/forest-teal-cli.png)
 
 ## Complete list of configurable keys
 
