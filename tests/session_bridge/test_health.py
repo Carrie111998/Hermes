@@ -299,12 +299,48 @@ def test_unregistered_provider_failure_is_unknown_and_not_echoed() -> None:
     assert secret_code not in json.dumps(result)
 
 
-def test_hermes_freshness_is_not_inferred_from_counts() -> None:
-    freshness = build_session_health_evidence(**healthy_inputs())["catalog"][
+def test_hermes_catalog_only_observation_is_current_without_coordinator_or_backfill() -> None:
+    hermes = build_session_health_evidence(**healthy_inputs())["catalog"][
         "providers"
-    ]["hermes"]["freshness"]
-    assert freshness["state"] == "unknown"
-    assert freshness["code"] == "freshness_not_tracked"
+    ]["hermes"]
+
+    assert hermes["work_state"]["state"] == "healthy"
+    assert hermes["work_state"]["code"] == "catalog_provider_readable"
+    assert hermes["freshness"] == {
+        "state": "healthy",
+        "code": "current_catalog_observation",
+    }
+    assert hermes["backfill"] == {
+        field: {"state": "healthy", "code": "not_applicable"}
+        for field in ("version", "indexed_total", "remaining")
+    }
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda data: data["catalog_status"]["providers"].pop("hermes"),
+        lambda data: data["catalog_status"]["providers"]["hermes"].update(
+            sessions=True
+        ),
+        lambda data: data["catalog_status"]["providers"]["hermes"].update(
+            degraded="0"
+        ),
+    ],
+)
+def test_hermes_catalog_only_observation_fails_closed(mutation: Any) -> None:
+    inputs = healthy_inputs()
+    mutation(inputs)
+    hermes = build_session_health_evidence(**inputs)["catalog"]["providers"][
+        "hermes"
+    ]
+
+    assert hermes["work_state"]["state"] == "unknown"
+    assert hermes["work_state"]["code"] == "invalid_measurement"
+    assert hermes["freshness"] == {
+        "state": "unknown",
+        "code": "invalid_measurement",
+    }
 
 
 def test_invalid_catalog_counts_are_unknown_not_zero() -> None:
@@ -758,8 +794,8 @@ def test_invalid_source_observation_poison_owned_axes_and_summaries(
                 assert fact["state"] == "healthy"
         hermes = evidence["catalog"]["providers"]["hermes"]
         assert hermes["work_state"]["state"] == "unknown"
-        assert hermes["work_state"]["code"] == "invalid_measurement"
-        assert hermes["freshness"]["code"] == "freshness_not_tracked"
+        assert hermes["work_state"]["code"] == "invalid_observation_time"
+        assert hermes["freshness"]["code"] == "invalid_observation_time"
         assert evidence["catalog"]["aggregate"]["total_sessions"]["code"] == (
             "invalid_observation_time"
         )
@@ -973,7 +1009,7 @@ def test_provider_coordinator_and_catalog_timestamps_have_separate_ownership() -
     invalid_health = healthy_inputs()
     invalid_health["health_observed_at"] = 999.0
     evidence = build_session_health_evidence(**invalid_health)
-    for provider in ("claude", "codex", "hermes"):
+    for provider in ("claude", "codex"):
         value = evidence["catalog"]["providers"][provider]
         assert value["work_state"]["code"] == "invalid_observation_time"
         assert value["freshness"]["code"] == "invalid_observation_time"
@@ -981,6 +1017,13 @@ def test_provider_coordinator_and_catalog_timestamps_have_separate_ownership() -
             assert value[fact_name]["state"] == "healthy"
         for fact in value["backfill"].values():
             assert fact["code"] == "invalid_observation_time"
+    hermes = evidence["catalog"]["providers"]["hermes"]
+    assert hermes["work_state"]["state"] == "healthy"
+    assert hermes["freshness"]["state"] == "healthy"
+    assert all(
+        fact["code"] == "not_applicable"
+        for fact in hermes["backfill"].values()
+    )
     assert evidence["catalog"]["aggregate"]["total_sessions"]["state"] == (
         "healthy"
     )
@@ -999,6 +1042,9 @@ def test_provider_coordinator_and_catalog_timestamps_have_separate_ownership() -
         assert value["degraded_count"]["code"] == "invalid_observation_time"
         for fact in value["backfill"].values():
             assert fact["state"] == "healthy"
+    hermes = evidence["catalog"]["providers"]["hermes"]
+    assert hermes["work_state"]["code"] == "invalid_observation_time"
+    assert hermes["freshness"]["code"] == "invalid_observation_time"
 
 
 def test_hydration_failed_count_uses_fixed_aggregate_not_recent_cause() -> None:

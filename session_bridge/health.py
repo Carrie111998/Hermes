@@ -286,6 +286,67 @@ def _invalid_observation_axis(
     )
 
 
+def _not_applicable_fact() -> dict[str, str]:
+    return {"state": "healthy", "code": "not_applicable"}
+
+
+def _hermes_catalog_provider_axis(
+    *,
+    catalog_raw: object,
+    catalog_observed_at: int | float | None,
+) -> dict[str, Any]:
+    counts = _mapping(catalog_raw)
+    session_count = _count_fact(
+        counts.get("sessions"),
+        observation_valid=catalog_observed_at is not None,
+    )
+    degraded_count = _count_fact(
+        counts.get("degraded"),
+        observation_valid=catalog_observed_at is not None,
+    )
+    facts_valid = all(
+        fact["state"] == "healthy" for fact in (session_count, degraded_count)
+    )
+    if catalog_observed_at is None:
+        state: State = "unknown"
+        code = "invalid_observation_time"
+    elif facts_valid:
+        state = "healthy"
+        code = "catalog_provider_readable"
+    else:
+        state = "unknown"
+        code = "invalid_measurement"
+    freshness = _freshness(
+        "healthy" if state == "healthy" else "unknown",
+        "current_catalog_observation" if state == "healthy" else code,
+    )
+    return {
+        "work_state": _axis(
+            state=state,
+            code=code,
+            evidence_kind="current_catalog_state",
+            scope="catalog_provider_hermes",
+            impact="none" if state == "healthy" else "provider_state_unknown",
+            action="none" if state == "healthy" else "report_only",
+            owner="session_bridge_catalog",
+            required_for_service_impact=False,
+            required_for_governance=True,
+            observed_at=catalog_observed_at,
+            freshness=freshness,
+            lifecycle_context=(
+                "current" if state == "healthy" else "sleep_wake_unknown"
+            ),
+        ),
+        "freshness": freshness,
+        "session_count": session_count,
+        "degraded_count": degraded_count,
+        "backfill": {
+            field: _not_applicable_fact()
+            for field in ("version", "indexed_total", "remaining")
+        },
+    }
+
+
 def _provider_timestamp(provider: Mapping[str, Any]) -> int | float | None:
     """Admit canonical last_success_at and current coordinator last_success alias."""
 
@@ -308,6 +369,11 @@ def _provider_axis(
     catalog_observed_at: int | float | None,
     scan_seconds: int | float | None,
 ) -> dict[str, Any]:
+    if name == "hermes":
+        return _hermes_catalog_provider_axis(
+            catalog_raw=catalog_raw,
+            catalog_observed_at=catalog_observed_at,
+        )
     provider = _mapping(provider_raw)
     counts = _mapping(catalog_raw)
     backfill = _mapping(backfill_raw)
@@ -398,33 +464,28 @@ def _provider_axis(
             lifecycle_context="sleep_wake_unknown",
         )
 
-    if name == "hermes":
-        freshness_axis: dict[str, str] = _freshness(
-            "unknown", "freshness_not_tracked"
-        )
+    lag = _number(provider.get("lag_seconds"))
+    last_success = _provider_timestamp(provider)
+    if lag is None or last_success is None or scan_seconds is None:
+        freshness_axis = _freshness("unknown", "invalid_measurement")
     else:
-        lag = _number(provider.get("lag_seconds"))
-        last_success = _provider_timestamp(provider)
-        if lag is None or last_success is None or scan_seconds is None:
-            freshness_axis = _freshness("unknown", "invalid_measurement")
+        limit = max(
+            scan_seconds * PROVIDER_FRESHNESS_MULTIPLIER,
+            scan_seconds + PROVIDER_FRESHNESS_JITTER_FLOOR_SECONDS,
+        )
+        if lag <= limit:
+            state: State = "healthy"
+            freshness_code = "within_freshness_limit"
+        elif degraded is None:
+            state = "unknown"
+            freshness_code = "stale_without_lifecycle_context"
+        elif degraded in {"scan_failed", "refresh_failed"}:
+            state = "error"
+            freshness_code = "stale_index"
         else:
-            limit = max(
-                scan_seconds * PROVIDER_FRESHNESS_MULTIPLIER,
-                scan_seconds + PROVIDER_FRESHNESS_JITTER_FLOOR_SECONDS,
-            )
-            if lag <= limit:
-                state: State = "healthy"
-                freshness_code = "within_freshness_limit"
-            elif degraded is None:
-                state = "unknown"
-                freshness_code = "stale_without_lifecycle_context"
-            elif degraded in {"scan_failed", "refresh_failed"}:
-                state = "error"
-                freshness_code = "stale_index"
-            else:
-                state = "unknown"
-                freshness_code = "stale_without_lifecycle_context"
-            freshness_axis = _freshness(state, freshness_code)
+            state = "unknown"
+            freshness_code = "stale_without_lifecycle_context"
+        freshness_axis = _freshness(state, freshness_code)
 
     return {
         "work_state": work_state,
