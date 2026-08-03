@@ -867,34 +867,52 @@ export function disconnectOAuthProvider(providerId: string): Promise<{ ok: boole
   })
 }
 
-export function startOAuthLogin(providerId: string): Promise<OAuthStartResponse> {
+// The backend permits four 15s device-code requests plus three 60s capped
+// Retry-After delays (245s total with margin). Keep transport timeout above it.
+export const CODEX_OAUTH_START_TIMEOUT_MS = 255_000
+
+export function startOAuthLogin(
+  providerId: string,
+  activateProvider = true,
+  profile?: null | string
+): Promise<OAuthStartResponse> {
   return window.hermesDesktop.api<OAuthStartResponse>({
-    ...profileScoped(),
-    path: `/api/providers/oauth/${encodeURIComponent(providerId)}/start`,
+    ...profileScoped(profile),
+    path: `/api/providers/oauth/${encodeURIComponent(providerId)}/start?activate_provider=${activateProvider}`,
     method: 'POST',
-    body: {}
+    body: {},
+    ...(providerId === 'openai-codex' ? { timeoutMs: CODEX_OAUTH_START_TIMEOUT_MS } : {})
   })
 }
 
-export function submitOAuthCode(providerId: string, sessionId: string, code: string): Promise<OAuthSubmitResponse> {
+export function submitOAuthCode(
+  providerId: string,
+  sessionId: string,
+  code: string,
+  profile?: null | string
+): Promise<OAuthSubmitResponse> {
   return window.hermesDesktop.api<OAuthSubmitResponse>({
-    ...profileScoped(),
+    ...profileScoped(profile),
     path: `/api/providers/oauth/${encodeURIComponent(providerId)}/submit`,
     method: 'POST',
     body: { session_id: sessionId, code }
   })
 }
 
-export function pollOAuthSession(providerId: string, sessionId: string): Promise<OAuthPollResponse> {
+export function pollOAuthSession(
+  providerId: string,
+  sessionId: string,
+  profile?: null | string
+): Promise<OAuthPollResponse> {
   return window.hermesDesktop.api<OAuthPollResponse>({
-    ...profileScoped(),
+    ...profileScoped(profile),
     path: `/api/providers/oauth/${encodeURIComponent(providerId)}/poll/${encodeURIComponent(sessionId)}`
   })
 }
 
-export function cancelOAuthSession(sessionId: string): Promise<{ ok: boolean }> {
+export function cancelOAuthSession(sessionId: string, profile?: null | string): Promise<{ ok: boolean }> {
   return window.hermesDesktop.api<{ ok: boolean }>({
-    ...profileScoped(),
+    ...profileScoped(profile),
     path: `/api/providers/oauth/sessions/${encodeURIComponent(sessionId)}`,
     method: 'DELETE'
   })

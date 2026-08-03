@@ -10118,7 +10118,16 @@ def _oauth_session_profile(
     with _oauth_sessions_lock:
         sess = _oauth_sessions.get(session_id)
         profile = sess.get("profile") if sess else None
-    return profile or _oauth_profile_name(fallback)
+    # A registered session always owns the profile captured at creation.  In
+    # particular, ``None`` means the default profile and must not fall through
+    # to a later request's currently-selected profile.
+    return profile if sess is not None else _oauth_profile_name(fallback)
+
+
+def _require_oauth_session_profile(sess: Dict[str, Any], profile: Optional[str]) -> None:
+    """Reject cross-profile access to a profile-owned OAuth session."""
+    if sess.get("profile") != _oauth_profile_name(profile):
+        raise HTTPException(status_code=409, detail="Profile mismatch for OAuth session")
 
 
 def _save_anthropic_oauth_creds(access_token: str, refresh_token: str, expires_at_ms: int) -> None:
@@ -10215,6 +10224,7 @@ def _submit_anthropic_pkce(
         sess = _oauth_sessions.get(session_id)
     if not sess or sess["provider"] != "anthropic" or sess["flow"] != "pkce":
         raise HTTPException(status_code=404, detail="Unknown or expired session")
+    _require_oauth_session_profile(sess, profile)
     if sess["status"] != "pending":
         return {"ok": False, "status": sess["status"], "message": sess.get("error_message")}
 
@@ -10288,6 +10298,8 @@ def _submit_anthropic_pkce(
 async def _start_device_code_flow(
     provider_id: str,
     profile: Optional[str] = None,
+    *,
+    activate_provider: bool = True,
 ) -> Dict[str, Any]:
     """Initiate a device-code flow (Nous, OpenAI Codex, MiniMax, or xAI).
 
@@ -10348,8 +10360,11 @@ async def _start_device_code_flow(
         }
 
     if provider_id == "openai-codex":
+        from hermes_cli.auth import CODEX_DEVICE_CODE_START_MAX_WAIT_SECONDS
+
         # Codex uses fixed OpenAI device-auth endpoints; reuse the helper.
-        sid, _ = _new_oauth_session("openai-codex", "device_code", profile=profile)
+        sid, sess = _new_oauth_session("openai-codex", "device_code", profile=profile)
+        sess["activate_provider"] = activate_provider
         # Use the helper but in a thread because it polls inline.
         # We can't extract just the start step without refactoring auth.py,
         # so we run the full helper in a worker and proxy the user_code +
@@ -10359,8 +10374,11 @@ async def _start_device_code_flow(
             target=_codex_full_login_worker, args=(sid,), daemon=True,
             name=f"oauth-codex-{sid[:6]}",
         ).start()
-        # Block briefly until the worker has populated the user_code, OR error.
-        deadline = time.monotonic() + 10
+        # Wait through the bounded device-code request/retry window until the
+        # worker has populated the user_code, or surfaced an error.
+        deadline = (
+            time.monotonic() + CODEX_DEVICE_CODE_START_MAX_WAIT_SECONDS
+        )
         while time.monotonic() < deadline:
             with _oauth_sessions_lock:
                 s = _oauth_sessions.get(sid)
@@ -10372,6 +10390,8 @@ async def _start_device_code_flow(
         if s.get("status") == "error":
             raise HTTPException(status_code=500, detail=s.get("error_message") or "device-auth failed")
         if not s.get("user_code"):
+            with _oauth_sessions_lock:
+                _oauth_sessions.pop(sid, None)
             raise HTTPException(status_code=504, detail="device-auth timed out before returning a user code")
         return {
             "session_id": sid,
@@ -10782,21 +10802,15 @@ def _codex_full_login_worker(session_id: str) -> None:
     try:
         import httpx
         from hermes_cli.auth import (
-            CODEX_OAUTH_CLIENT_ID,
-            CODEX_OAUTH_TOKEN_URL,
+            _exchange_codex_device_tokens,
+            _request_codex_device_code,
         )
         issuer = "https://auth.openai.com"
 
         # Step 1: request device code
-        with httpx.Client(timeout=httpx.Timeout(15.0)) as client:
-            resp = client.post(
-                f"{issuer}/api/accounts/deviceauth/usercode",
-                json={"client_id": CODEX_OAUTH_CLIENT_ID},
-                headers={"Content-Type": "application/json"},
-            )
-        if resp.status_code != 200:
-            raise RuntimeError(_codex_device_code_start_error(resp))
-        device_data = resp.json()
+        device_data = _request_codex_device_code(
+            error_formatter=_codex_device_code_start_error
+        )
         user_code = device_data.get("user_code", "")
         device_auth_id = device_data.get("device_auth_id", "")
         poll_interval = max(3, int(device_data.get("interval", "5")))
@@ -10827,9 +10841,10 @@ def _codex_full_login_worker(session_id: str) -> None:
                     _log.info("oauth/device: openai-codex login cancelled (session=%s)", session_id)
                     return
                 time.sleep(poll_interval)
-                if sess.get("cancelled"):
-                    _log.info("oauth/device: openai-codex login cancelled (session=%s)", session_id)
-                    return
+                with _oauth_sessions_lock:
+                    current = _oauth_sessions.get(session_id)
+                    if current is not sess or current.get("cancelled"):
+                        return
                 poll = client.post(
                     f"{issuer}/api/accounts/deviceauth/token",
                     json={"device_auth_id": device_auth_id, "user_code": user_code},
@@ -10844,8 +10859,10 @@ def _codex_full_login_worker(session_id: str) -> None:
 
         if code_resp is None:
             with _oauth_sessions_lock:
-                sess["status"] = "expired"
-                sess["error_message"] = "Device code expired before approval"
+                current = _oauth_sessions.get(session_id)
+                if current:
+                    current["status"] = "expired"
+                    current["error_message"] = "Device code expired before approval"
             return
 
         if sess.get("cancelled"):
@@ -10857,46 +10874,29 @@ def _codex_full_login_worker(session_id: str) -> None:
         code_verifier = code_resp.get("code_verifier", "")
         if not authorization_code or not code_verifier:
             raise RuntimeError("device-auth response missing authorization_code/code_verifier")
-        with httpx.Client(timeout=httpx.Timeout(15.0)) as client:
-            token_resp = client.post(
-                CODEX_OAUTH_TOKEN_URL,
-                data={
-                    "grant_type": "authorization_code",
-                    "code": authorization_code,
-                    "redirect_uri": f"{issuer}/deviceauth/callback",
-                    "client_id": CODEX_OAUTH_CLIENT_ID,
-                    "code_verifier": code_verifier,
-                },
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-            )
-        if token_resp.status_code != 200:
-            raise RuntimeError(f"token exchange returned {token_resp.status_code}")
-        tokens = token_resp.json()
+        tokens = _exchange_codex_device_tokens(authorization_code, code_verifier)
         access_token = tokens.get("access_token", "")
         refresh_token = tokens.get("refresh_token", "")
         if not access_token:
             raise RuntimeError("token exchange did not return access_token")
 
-        from hermes_cli.auth import _save_codex_tokens
+        from hermes_cli.auth import _save_codex_device_login_tokens
 
-        # The cancellation check and the save must be one atomic critical
-        # section under the same lock cancel_oauth_session() uses. Checking
-        # "cancelled" and then saving as two separate steps left a window
-        # where DELETE could flip the flag between them and the worker would
-        # still persist tokens after the user believed the login was
-        # aborted. Holding the lock across both closes that window: DELETE
-        # either lands before this section (worker observes cancelled and
-        # returns) or blocks until this section (and the save) is done.
         with _oauth_sessions_lock:
-            if sess.get("cancelled"):
-                _log.info("oauth/device: openai-codex login cancelled before token save (session=%s)", session_id)
+            current = _oauth_sessions.get(session_id)
+            if current is not sess or current.get("cancelled"):
                 return
-            with _profile_scope(session_profile):
-                _save_codex_tokens({
-                    "access_token": access_token,
-                    "refresh_token": refresh_token,
-                })
-            sess["status"] = "approved"
+            # Keep cancellation and persistence atomic: cancellation acquires
+            # this same lock before removing the session.
+            with _profile_scope(current.get("profile")):
+                _save_codex_device_login_tokens(
+                    {
+                        "access_token": access_token,
+                        "refresh_token": refresh_token,
+                    },
+                    set_active=bool(current.get("activate_provider", True)),
+                )
+            current["status"] = "approved"
         _log.info("oauth/device: openai-codex login completed (session=%s)", session_id)
     except Exception as e:
         _log.warning("codex device-code worker failed (session=%s): %s", session_id, e)
@@ -10912,6 +10912,7 @@ async def start_oauth_login(
     provider_id: str,
     request: Request,
     profile: Optional[str] = None,
+    activate_provider: bool = True,
 ):
     """Initiate an OAuth login flow. Token-protected."""
     _require_token(request)
@@ -10936,7 +10937,11 @@ async def start_oauth_login(
         if catalog_entry["flow"] == "pkce" and provider_id == "anthropic":
             return _start_anthropic_pkce(profile=profile)
         if catalog_entry["flow"] == "device_code":
-            return await _start_device_code_flow(provider_id, profile=profile)
+            return await _start_device_code_flow(
+                provider_id,
+                profile=profile,
+                activate_provider=activate_provider,
+            )
     except HTTPException:
         raise
     except Exception as e:
@@ -10979,6 +10984,7 @@ async def poll_oauth_session(
         raise HTTPException(status_code=404, detail="Session not found or expired")
     if sess["provider"] != provider_id:
         raise HTTPException(status_code=400, detail="Provider mismatch for session")
+    _require_oauth_session_profile(sess, profile)
     return {
         "session_id": session_id,
         "status": sess["status"],
@@ -11005,6 +11011,7 @@ async def cancel_oauth_session(
     with _oauth_sessions_lock:
         sess = _oauth_sessions.get(session_id)
         if sess is not None:
+            _require_oauth_session_profile(sess, profile)
             sess["cancelled"] = True
         _oauth_sessions.pop(session_id, None)
     if sess is None:

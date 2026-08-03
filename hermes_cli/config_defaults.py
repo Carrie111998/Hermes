@@ -1507,7 +1507,8 @@ DEFAULT_CONFIG = {
         # the raw transcript is also echoed back to the user as a 🎙️ message.
         # Set false to keep STT for the agent while suppressing that user-facing echo.
         "echo_transcripts": True,
-        "provider": "local",  # "local" (free, faster-whisper) | "groq" | "openai" (Whisper API) | "mistral" (Voxtral Transcribe) | "elevenlabs" (Scribe) | "deepinfra"
+        # Built-in and plugin provider names are documented in the voice-mode guide.
+        "provider": "local",
         # Global language hint applied to EVERY provider unless a per-provider
         # language overrides it. Defaults to "en" — Whisper auto-detection
         # frequently misidentifies short/accented clips, which reads as
@@ -1532,6 +1533,9 @@ DEFAULT_CONFIG = {
         "openai": {
             "model": "whisper-1",  # whisper-1, gpt-4o-mini-transcribe, gpt-4o-transcribe, gpt-transcribe
             "language": "",  # auto-detect by default; set to "en", "es", "fr", etc. to force
+        },
+        "openai_codex": {
+            "timeout": 120,
         },
         "mistral": {
             "model": "voxtral-mini-latest",  # voxtral-mini-latest, voxtral-mini-2602

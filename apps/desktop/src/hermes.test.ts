@@ -7,6 +7,8 @@ import {
   AUDIO_TRANSCRIBE_MIN_REQUEST_TIMEOUT_MS,
   audioSpeakRequestTimeoutMs,
   audioTranscribeRequestTimeoutMs,
+  cancelOAuthSession,
+  CODEX_OAUTH_START_TIMEOUT_MS,
   getCronJobs,
   getGlobalModelInfo,
   getGlobalModelOptions,
@@ -18,9 +20,11 @@ import {
   listAllProfileSessions,
   listSessions,
   listSidebarSessions,
+  pollOAuthSession,
   resetSidebarBatchCapability,
   setApiRequestProfile,
   speakText,
+  startOAuthLogin,
   transcribeAudio
 } from './hermes'
 import { refreshActiveProfile } from './store/profile'
@@ -58,6 +62,37 @@ describe('Hermes REST helpers', () => {
         path: '/api/sessions?limit=50&offset=0&min_messages=1&archived=exclude&order=recent',
         timeoutMs: 60_000
       })
+    )
+  })
+
+  it('allows Codex OAuth start to outlive the backend retry window', async () => {
+    await startOAuthLogin('openai-codex', false)
+
+    expect(api).toHaveBeenCalledWith(
+      expect.objectContaining({
+        path: '/api/providers/oauth/openai-codex/start?activate_provider=false',
+        timeoutMs: CODEX_OAUTH_START_TIMEOUT_MS
+      })
+    )
+    expect(CODEX_OAUTH_START_TIMEOUT_MS).toBeGreaterThan(245_000)
+  })
+
+  it('pins OAuth lifecycle requests to an explicit initiating profile', async () => {
+    await startOAuthLogin('openai-codex', false, 'coder')
+    await pollOAuthSession('openai-codex', 'session-1', 'coder')
+    await cancelOAuthSession('session-1', 'coder')
+
+    expect(api).toHaveBeenCalledWith(
+      expect.objectContaining({
+        path: '/api/providers/oauth/openai-codex/start?activate_provider=false',
+        profile: 'coder'
+      })
+    )
+    expect(api).toHaveBeenCalledWith(
+      expect.objectContaining({ path: '/api/providers/oauth/openai-codex/poll/session-1', profile: 'coder' })
+    )
+    expect(api).toHaveBeenCalledWith(
+      expect.objectContaining({ path: '/api/providers/oauth/sessions/session-1', profile: 'coder' })
     )
   })
 

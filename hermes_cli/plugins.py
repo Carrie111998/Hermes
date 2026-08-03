@@ -915,7 +915,7 @@ class PluginContext:
 
         1. ``provider.name`` is NOT a built-in STT provider name
            (``local``, ``local_command``, ``groq``, ``openai``,
-           ``mistral``, ``xai``). Built-ins always win — the registry
+           ``openai-codex``, ``mistral``, ``xai``). Built-ins always win — the registry
            rejects shadowing names with a warning.
         2. There is NO ``stt.providers.<name>: type: command`` entry
            with the same name. Command-providers win on name
@@ -923,7 +923,7 @@ class PluginContext:
            — same precedence rule as TTS.
 
         Coexists with the in-tree dispatcher and the STT
-        command-provider registry rather than replacing them. The 6
+        command-provider registry rather than replacing them. The
         built-in STT backends keep their native implementations in
         ``tools/transcription_tools.py``; this hook is for *new* Python
         engines (OpenRouter, SenseAudio, Gemini-STT, custom proprietary

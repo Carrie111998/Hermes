@@ -434,6 +434,14 @@ TOOL_CATEGORIES = {
                 "override_env_vars": ["VOICE_TOOLS_OPENAI_KEY", "OPENAI_API_KEY"],
             },
             {
+                "name": "OpenAI Codex OAuth",
+                "badge": "subscription",
+                "tag": "ChatGPT/Codex dictation via your existing OAuth login",
+                "env_vars": [],
+                "auth_provider": "openai-codex",
+                "stt_provider": "openai-codex",
+            },
+            {
                 "name": "OpenAI",
                 "badge": "paid",
                 "tag": "whisper-1, gpt-4o-transcribe, gpt-transcribe",
@@ -1939,6 +1947,34 @@ def _run_post_setup(post_setup_key: str):
         _print_info("    Restart Hermes for tracing to take effect.")
         _print_info("    Verify: hermes plugins list")
 
+    elif post_setup_key == "openai_codex":
+        try:
+            from hermes_cli.auth import (
+                has_codex_runtime_credentials,
+                login_openai_codex_credentials_only,
+            )
+        except Exception as exc:
+            _print_warning(f"    Could not load OpenAI Codex auth helpers: {exc}")
+            _print_info("    Run later: hermes auth add openai-codex")
+            return False
+
+        if has_codex_runtime_credentials():
+            _print_success("    OpenAI Codex OAuth credentials are already configured")
+            return True
+
+        _print_info("    OpenAI Codex OAuth login is required for transcription.")
+        try:
+            if login_openai_codex_credentials_only():
+                _print_success("    OpenAI Codex OAuth credentials saved")
+                return True
+        except (Exception, SystemExit) as exc:
+            logger.debug("OpenAI Codex credential-only login failed: %s", exc)
+        _print_warning(
+            "    OpenAI Codex login did not complete. "
+            "Run later: hermes auth add openai-codex"
+        )
+        return False
+
     elif post_setup_key == "xai_grok":
         # Shared credential bootstrap for any picker entry that talks to xAI
         # (TTS, Video Gen, future Image Gen, etc.). Accepts either a
@@ -2061,9 +2097,12 @@ def run_post_setup_command(args) -> int:
         return 2
     _print_info(f"Running post-setup hook: {key}")
     try:
-        _run_post_setup(key)
+        result = _run_post_setup(key)
     except Exception as exc:  # pragma: no cover — defensive
         _print_error(f"Post-setup failed: {exc}")
+        return 1
+    if result is False:
+        _print_error(f"Post-setup '{key}' did not complete")
         return 1
     _print_success(f"Post-setup '{key}' complete")
     return 0
@@ -3344,6 +3383,15 @@ def provider_readiness_status(
         # carry a local install hook (e.g. the managed browser row needs
         # the agent-browser CLI on this machine).
 
+    auth_provider = provider.get("auth_provider")
+    if auth_provider == "openai-codex":
+        try:
+            from hermes_cli.auth import has_codex_runtime_credentials
+
+            return "ready" if has_codex_runtime_credentials() else "needs_auth"
+        except Exception:
+            return "needs_auth"
+
     post_setup = provider.get("post_setup")
     if post_setup:
         if post_setup == "xai_grok":
@@ -4187,6 +4235,17 @@ def _configure_provider(
             )
             return
 
+    if provider.get("auth_provider") == "openai-codex":
+        from hermes_cli.auth import has_codex_runtime_credentials
+
+        if not has_codex_runtime_credentials():
+            _run_post_setup("openai_codex")
+        if not has_codex_runtime_credentials():
+            _print_warning(
+                "  Not enabled — OpenAI Codex OAuth login is required for transcription."
+            )
+            return
+
     # Set TTS provider in config if applicable
     if provider.get("tts_provider"):
         tts_cfg = config.setdefault("tts", {})
@@ -4693,6 +4752,17 @@ def _reconfigure_provider(
             )
             _print_warning(
                 f"  {message or 'Nous Subscription is only available after logging into Nous Portal.'}"
+            )
+            return
+
+    if provider.get("auth_provider") == "openai-codex":
+        from hermes_cli.auth import has_codex_runtime_credentials
+
+        if not has_codex_runtime_credentials():
+            _run_post_setup("openai_codex")
+        if not has_codex_runtime_credentials():
+            _print_warning(
+                "  Not enabled — OpenAI Codex OAuth login is required for transcription."
             )
             return
 

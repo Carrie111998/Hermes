@@ -235,6 +235,7 @@ async def get_toolset_config(name: str, profile: Optional[str] = None):
                     "tag": prov.get("tag", ""),
                     "env_vars": env_vars,
                     "post_setup": prov.get("post_setup"),
+                    "auth_provider": prov.get("auth_provider"),
                     "requires_nous_auth": bool(prov.get("requires_nous_auth")),
                     "is_active": is_active,
                     # Honest server-side readiness. The GUI's old client-side
@@ -425,6 +426,7 @@ async def select_toolset_provider(
     from hermes_cli.tools_config import (
         TOOL_CATEGORIES,
         apply_provider_selection,
+        provider_readiness_status,
         web_provider_capabilities,
         _get_effective_configurable_toolsets,
         _visible_providers,
@@ -482,6 +484,27 @@ async def select_toolset_provider(
                 config["web"] = web_cfg
             web_cfg[f"{body.capability}_backend"] = backend
         else:
+            cat = TOOL_CATEGORIES.get(name)
+            row = None
+            if cat:
+                row = next(
+                    (
+                        p
+                        for p in _visible_providers(cat, config, force_fresh=True)
+                        if p.get("name") == body.provider
+                    ),
+                    None,
+                )
+            if row and row.get("auth_provider"):
+                status = provider_readiness_status(row, config)
+                if status == "needs_auth":
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            f"Authenticate {row['auth_provider']} before selecting "
+                            f"{body.provider}"
+                        ),
+                    )
             try:
                 apply_provider_selection(name, body.provider, config)
             except KeyError as exc:

@@ -243,6 +243,7 @@ def _tts_label(current_provider: str) -> str:
 def _stt_label(current_provider: str) -> str:
     mapping = {
         "openai": "OpenAI Whisper",
+        "openai-codex": "OpenAI Codex OAuth",
         "groq": "Groq Whisper",
         "mistral": "Mistral Voxtral Transcribe",
         "local": "Local faster-whisper",
@@ -264,6 +265,16 @@ def _local_stt_backend_available() -> bool:
         from tools.transcription_tools import _HAS_FASTER_WHISPER
 
         return bool(_HAS_FASTER_WHISPER)
+    except Exception:
+        return False
+
+
+def _codex_stt_backend_available() -> bool:
+    """Return whether Hermes has locally stored Codex OAuth credentials."""
+    try:
+        from hermes_cli.auth import has_codex_runtime_credentials
+
+        return has_codex_runtime_credentials()
     except Exception:
         return False
 
@@ -443,6 +454,9 @@ def get_nous_subscription_features(
     # signal is whether faster-whisper is importable; we lazy-import so
     # this module stays cheap on the happy path.
     direct_openai_stt = bool(resolve_openai_audio_api_key())
+    direct_codex_stt = bool(
+        stt_provider == "openai-codex" and _codex_stt_backend_available()
+    )
     direct_groq_stt = bool(get_env_value("GROQ_API_KEY"))
     direct_mistral_stt = bool(get_env_value("MISTRAL_API_KEY"))
     try:
@@ -468,6 +482,7 @@ def get_nous_subscription_features(
         direct_elevenlabs = False
     if stt_use_gateway:
         direct_openai_stt = False
+        direct_codex_stt = False
         direct_groq_stt = False
         direct_mistral_stt = False
         local_stt_available = False
@@ -583,6 +598,7 @@ def get_nous_subscription_features(
     )
     stt_available = bool(
         (stt_current_provider == "local" and local_stt_available)
+        or (stt_current_provider == "openai-codex" and direct_codex_stt)
         or (stt_current_provider == "openai" and (managed_stt_available or direct_openai_stt))
         or (stt_current_provider == "groq" and direct_groq_stt)
         or (stt_current_provider == "mistral" and direct_mistral_stt)
