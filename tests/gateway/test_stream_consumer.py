@@ -25,6 +25,98 @@ def test_stream_send_metadata_carries_original_reply_anchor():
     }
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("is_turn_final", [False, True])
+async def test_stream_send_metadata_carries_turn_final(is_turn_final):
+    adapter = MagicMock()
+    adapter.send = AsyncMock(
+        return_value=SimpleNamespace(success=True, message_id="m1")
+    )
+    adapter.MAX_MESSAGE_LENGTH = 4096
+    consumer = GatewayStreamConsumer(adapter=adapter, chat_id="123")
+
+    await consumer._send_or_edit(
+        "answer",
+        finalize=True,
+        is_turn_final=is_turn_final,
+    )
+
+    assert adapter.send.await_args.kwargs["metadata"]["is_turn_final"] is is_turn_final
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("is_turn_final", [False, True])
+async def test_stream_edit_metadata_carries_turn_final_without_mutating_base_metadata(
+    is_turn_final,
+):
+    class CaptureAdapter:
+        def __init__(self):
+            self.metadata = None
+
+        async def edit_message(
+            self,
+            chat_id,
+            message_id,
+            content,
+            *,
+            finalize=False,
+            metadata=None,
+        ):
+            self.metadata = metadata
+            return SimpleNamespace(success=True, message_id=message_id)
+
+    adapter = CaptureAdapter()
+    base_metadata = {"thread_id": "topic-1"}
+    consumer = GatewayStreamConsumer(
+        adapter=adapter,
+        chat_id="123",
+        metadata=base_metadata,
+    )
+
+    await consumer._edit_message(
+        message_id="m1",
+        content="answer",
+        finalize=True,
+        is_turn_final=is_turn_final,
+    )
+
+    assert adapter.metadata == {
+        "thread_id": "topic-1",
+        "is_turn_final": is_turn_final,
+    }
+    assert base_metadata == {"thread_id": "topic-1"}
+
+
+@pytest.mark.asyncio
+async def test_nonfinal_helper_edit_defaults_turn_final_false():
+    class CaptureAdapter:
+        def __init__(self):
+            self.metadata = None
+
+        async def edit_message(
+            self,
+            chat_id,
+            message_id,
+            content,
+            *,
+            finalize=False,
+            metadata=None,
+        ):
+            self.metadata = metadata
+            return SimpleNamespace(success=True, message_id=message_id)
+
+    adapter = CaptureAdapter()
+    consumer = GatewayStreamConsumer(adapter=adapter, chat_id="123")
+
+    await consumer._edit_message(
+        message_id="m1",
+        content="preview",
+        finalize=False,
+    )
+
+    assert adapter.metadata == {"is_turn_final": False}
+
+
 # ── _clean_for_display unit tests ────────────────────────────────────────
 
 

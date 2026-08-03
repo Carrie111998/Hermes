@@ -320,6 +320,7 @@ class GatewayStreamConsumer:
         *,
         final: bool = False,
         expect_edits: bool = False,
+        is_turn_final: Optional[bool] = None,
     ) -> dict | None:
         """Return per-send metadata for stream-created messages.
 
@@ -331,6 +332,10 @@ class GatewayStreamConsumer:
         preview messages that may be edited later must stay on the editable
         legacy send path, while fresh/fallback final sends can still use richer
         final-message delivery.
+
+        ``is_turn_final`` distinguishes completion of the whole assistant turn
+        from a finalized segment at a tool or overflow boundary. It is omitted
+        when the caller does not know that distinction.
         """
         meta = dict(self.metadata) if self.metadata else {}
         if self._initial_reply_to_id:
@@ -339,6 +344,8 @@ class GatewayStreamConsumer:
             meta["expect_edits"] = True
         if final:
             meta["notify"] = True
+        if is_turn_final is not None:
+            meta["is_turn_final"] = is_turn_final
         return meta or None
 
     @property
@@ -382,6 +389,7 @@ class GatewayStreamConsumer:
         message_id: str,
         content: str,
         finalize: bool = False,
+        is_turn_final: bool = False,
     ):
         """Edit via the adapter, passing routing metadata when supported."""
         kwargs = {
@@ -393,16 +401,17 @@ class GatewayStreamConsumer:
         # must accept finalize= even when it is False (guarded by tests).
         kwargs["finalize"] = finalize
 
-        if self.metadata:
-            try:
-                params = inspect.signature(self.adapter.edit_message).parameters
-                if "metadata" in params or any(
-                    param.kind is inspect.Parameter.VAR_KEYWORD
-                    for param in params.values()
-                ):
-                    kwargs["metadata"] = self.metadata
-            except (TypeError, ValueError):
-                pass
+        try:
+            params = inspect.signature(self.adapter.edit_message).parameters
+            if "metadata" in params or any(
+                param.kind is inspect.Parameter.VAR_KEYWORD
+                for param in params.values()
+            ):
+                edit_metadata = dict(self.metadata or {})
+                edit_metadata["is_turn_final"] = is_turn_final
+                kwargs["metadata"] = edit_metadata
+        except (TypeError, ValueError):
+            pass
         return await self.adapter.edit_message(**kwargs)
 
     def _record_turn_final_payload(self, text: str) -> None:
@@ -1531,7 +1540,10 @@ class GatewayStreamConsumer:
                 result = await self.adapter.send(
                     chat_id=self.chat_id,
                     content=final_text,
-                    metadata=self._metadata_for_send(final=True),
+                    metadata=self._metadata_for_send(
+                        final=True,
+                        is_turn_final=True,
+                    ),
                 )
             except Exception as exc:
                 logger.debug("Empty fallback final send failed: %s", exc)
@@ -1908,7 +1920,10 @@ class GatewayStreamConsumer:
             result = await self.adapter.send(
                 chat_id=self.chat_id,
                 content=text,
-                metadata=self._metadata_for_send(final=True),
+                metadata=self._metadata_for_send(
+                    final=True,
+                    is_turn_final=is_turn_final,
+                ),
             )
         except Exception as e:
             logger.debug("Fresh-final send failed, falling back to edit: %s", e)
@@ -2147,6 +2162,7 @@ class GatewayStreamConsumer:
                         message_id=self._message_id,
                         content=text,
                         finalize=finalize,
+                        is_turn_final=is_turn_final,
                     )
                     if result.success:
                         self._already_sent = True
@@ -2309,6 +2325,7 @@ class GatewayStreamConsumer:
                     metadata=self._metadata_for_send(
                         final=finalize,
                         expect_edits=True,
+                        is_turn_final=is_turn_final,
                     ),
                 )
                 if result.success:
