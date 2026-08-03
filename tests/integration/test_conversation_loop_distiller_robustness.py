@@ -189,6 +189,70 @@ def agent_env_enabled(tmp_path, monkeypatch):
         yield agent, _MockHandler, store_path
 
 
+class TestTurnSliceHasToolError:
+    """Pure-function coverage for the tool-error slice scan feeding the
+    distiller's ``has_tool_error`` signal (t_d1048be1 advisory #1)."""
+
+    def test_startswith_marker_detected(self):
+        from agent.conversation_loop import _turn_slice_has_tool_error
+
+        messages = [
+            {"role": "user", "content": "hi"},
+            {"role": "tool", "name": "x", "content": "Error executing tool 'boom': timeout"},
+        ]
+        assert _turn_slice_has_tool_error(messages, 0) is True
+
+    def test_scope_block_contains_marker_detected(self):
+        from agent.conversation_loop import _turn_slice_has_tool_error
+
+        messages = [
+            {"role": "user", "content": "hi"},
+            {"role": "tool", "name": "tool_search",
+             "content": "'memory_search' is not available in this session. Use tool_search to find tools you can call."},
+        ]
+        assert _turn_slice_has_tool_error(messages, 0) is True
+
+    def test_contains_marker_buried_mid_content(self):
+        from agent.conversation_loop import _turn_slice_has_tool_error
+
+        messages = [
+            {"role": "user", "content": "hi"},
+            {"role": "tool", "name": "mcp_x",
+             "content": "<untrusted_tool_result>prefix 'foo' is not available in this session. Use tool_search to find tools you can call.</untrusted_tool_result>"},
+        ]
+        assert _turn_slice_has_tool_error(messages, 0) is True
+
+    def test_normal_tool_content_not_flagged(self):
+        from agent.conversation_loop import _turn_slice_has_tool_error
+
+        messages = [
+            {"role": "user", "content": "hi"},
+            {"role": "tool", "name": "x", "content": "all good here"},
+        ]
+        assert _turn_slice_has_tool_error(messages, 0) is False
+
+    def test_prior_turn_messages_ignored(self):
+        from agent.conversation_loop import _turn_slice_has_tool_error
+
+        messages = [
+            {"role": "user", "content": "first"},
+            {"role": "tool", "name": "x", "content": "Error executing tool 'boom'"},
+            {"role": "user", "content": "second"},
+            {"role": "tool", "name": "y", "content": "ok"},
+        ]
+        # start_idx=2 (second user message): only messages after index 2 scanned.
+        assert _turn_slice_has_tool_error(messages, 2) is False
+
+    def test_non_str_content_ignored(self):
+        from agent.conversation_loop import _turn_slice_has_tool_error
+
+        messages = [
+            {"role": "user", "content": "hi"},
+            {"role": "tool", "name": "x", "content": ["not", "a", "string"]},
+        ]
+        assert _turn_slice_has_tool_error(messages, 0) is False
+
+
 class TestDisabledPath:
     def test_disabled_never_executes_distiller_path(self, agent_env):
         agent, handler, store_path = agent_env

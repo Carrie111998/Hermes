@@ -1258,6 +1258,17 @@ _TOOL_ERROR_CONTENT_MARKERS = (
     "Tool '",
 )
 
+# Substring-only markers: these appear mid-content rather than at the start of
+# the tool-result text, so a prefix scan would miss them. The tool_search
+# scope-block path (tool_executor.py concurrent/sequential) emits
+# "'<name>' is not available in this session. Use tool_search to find tools
+# you can call." — starts with a quote, so no startswith marker matches.
+# Kept long and specific so untrusted tool payloads can't trivially forge the
+# signal (prompt-injection defense posture).
+_TOOL_ERROR_CONTENT_CONTAINS = (
+    "is not available in this session. Use tool_search",
+)
+
 
 def _turn_slice_has_tool_error(messages: List[Dict[str, Any]], start_idx: int) -> bool:
     """True when any tool-result message appended after ``start_idx`` carries
@@ -1272,6 +1283,9 @@ def _turn_slice_has_tool_error(messages: List[Dict[str, Any]], start_idx: int) -
             continue
         for marker in _TOOL_ERROR_CONTENT_MARKERS:
             if content.startswith(marker):
+                return True
+        for marker in _TOOL_ERROR_CONTENT_CONTAINS:
+            if marker in content:
                 return True
     return False
 
@@ -7313,7 +7327,9 @@ def run_conversation(
     if getattr(agent, "_principle_distiller_enabled", False) and _principle_distiller is not None:
         try:
             _pd_record = _principle_distiller.distill_from_turn(
-                user_message=original_user_message or user_message,
+                user_message=original_user_message
+                if (isinstance(original_user_message, str) and original_user_message)
+                else user_message,
                 hit_principles=list(getattr(agent, "_prev_turn_principle_hits", None) or []),
                 has_tool_error=bool(failed)
                 or bool(getattr(agent, "_turn_had_tool_error", False))
