@@ -133,38 +133,26 @@ def test_cli_close_preflush_resumed_prefix_is_not_duplicated(tmp_path, monkeypat
 
     live_messages = list(loaded) + [{"role": "user", "content": "new prompt"}]
     agent = _real_agent(db, session_id, [])
-    entered_flush = threading.Event()
-    release_flush = threading.Event()
-    flush_calls = 0
+    entered_append = threading.Event()
+    release_append = threading.Event()
+    append_calls = 0
+    real_append_messages_batch = db.append_messages_batch
 
-    def _pause_before_flush(
-        messages: list[dict[str, Any]],
-        conversation_history: list[dict[str, Any]] | None = None,
-    ) -> None:
-        nonlocal flush_calls
-        flush_calls += 1
-        if flush_calls == 1:
-            # The worker has assigned its snapshot and is now paused before its
-            # regular DB write. The concurrent close call must stay live.
-            agent._session_messages = messages
-            entered_flush.set()
-            assert release_flush.wait(timeout=5)
-        from run_agent import AIAgent
+    def _pause_batch_append(*args: Any, **kwargs: Any):
+        nonlocal append_calls
+        append_calls += 1
+        if append_calls == 1:
+            entered_append.set()
+            assert release_append.wait(timeout=5)
+        return real_append_messages_batch(*args, **kwargs)
 
-        # Runtime accepts None; the stub keeps that optional contract explicit.
-        return AIAgent._flush_messages_to_session_db(
-            agent,
-            messages,
-            conversation_history if conversation_history is not None else [],
-        )
-
-    agent._flush_messages_to_session_db = _pause_before_flush
+    db.append_messages_batch = _pause_batch_append
     worker = threading.Thread(
         target=lambda: agent._persist_session(live_messages, loaded),
         daemon=True,
     )
     worker.start()
-    assert entered_flush.wait(timeout=5)
+    assert entered_append.wait(timeout=5)
 
     cli = object.__new__(cli_mod.HermesCLI)
     cli.conversation_history = list(loaded) + [{"role": "user", "content": "ui prompt"}]
@@ -185,13 +173,14 @@ def test_cli_close_preflush_resumed_prefix_is_not_duplicated(tmp_path, monkeypat
     # turn-start write has stamped its durable markers.
     assert not close_finished.wait(timeout=0.1)
 
-    release_flush.set()
+    release_append.set()
     worker.join(timeout=5)
     close_worker.join(timeout=5)
     assert not worker.is_alive()
     assert not close_worker.is_alive()
 
     stored = db.get_messages_as_conversation(session_id)
+    assert append_calls == 1
     assert [m["content"] for m in stored] == [
         "old prompt",
         "old answer",
