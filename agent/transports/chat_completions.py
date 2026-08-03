@@ -10,6 +10,7 @@ reasoning configuration, temperature handling, and extra_body assembly.
 """
 
 import json
+import logging
 from typing import Any, Dict
 
 from agent.lmstudio_reasoning import resolve_lmstudio_effort
@@ -17,6 +18,18 @@ from agent.moonshot_schema import is_moonshot_model, sanitize_moonshot_tools
 from agent.prompt_builder import DEVELOPER_ROLE_MODELS
 from agent.transports.base import ProviderTransport
 from agent.transports.types import NormalizedResponse, ToolCall, Usage
+
+logger = logging.getLogger(__name__)
+
+# Field names existing provider profiles use to forward reasoning/thinking
+# control (custom/deepseek/zai/kimi-coding/openrouter etc.) -- used by the
+# systemic silent-drop warning in _build_kwargs_from_profile() below.
+_REASONING_FIELD_NAMES = frozenset(
+    {"reasoning_effort", "reasoning", "think", "thinking"}
+)
+# Profiles already warned about a silent reasoning_config drop this process
+# lifetime -- warn once per profile, not per request (hot path).
+_reasoning_drop_warned: set = set()
 
 
 def _static_prompt_instructions(messages: list[dict[str, Any]]) -> str:
@@ -670,6 +683,34 @@ class ChatCompletionsTransport(ProviderTransport):
             )
         )
         api_kwargs.update(top_level_from_profile)
+
+        # Fail loud on the same class of silent drop reported in #77818: a
+        # thin-shell provider profile that doesn't override
+        # build_api_kwargs_extras() inherits the base class's no-op default
+        # (({}, {})), so a configured reasoning_config is discarded without
+        # any error or warning -- the setting parses correctly and /reasoning
+        # echoes the change, but the value never reaches the wire. Warn once
+        # per profile (not per request) to avoid log spam on a hot path.
+        if (
+            reasoning_config
+            and isinstance(reasoning_config, dict)
+            and not _REASONING_FIELD_NAMES.intersection(top_level_from_profile)
+            and not _REASONING_FIELD_NAMES.intersection(extra_body_from_profile or {})
+        ):
+            _profile_name = getattr(profile, "name", type(profile).__name__)
+            if _profile_name not in _reasoning_drop_warned:
+                _reasoning_drop_warned.add(_profile_name)
+                logger.warning(
+                    "Provider profile %r has a configured reasoning_config "
+                    "but build_api_kwargs_extras() returned no reasoning-"
+                    "related field -- the setting will silently have no "
+                    "effect on the outgoing request. If this profile "
+                    "supports reasoning/thinking control, override "
+                    "build_api_kwargs_extras() to forward it (see the "
+                    "custom/deepseek/zai/kimi-coding profiles for the "
+                    "precedent).",
+                    _profile_name,
+                )
 
         # extra_body assembly
         extra_body: dict[str, Any] = {}
