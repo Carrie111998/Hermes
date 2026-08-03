@@ -298,12 +298,57 @@ def _persist_completion(event: Dict[str, Any], result: Dict[str, Any]) -> None:
     _write_durable_terminal(event, result)
 
 
+def _shield_unconverged_durable_row(event: Dict[str, Any]) -> bool:
+    """Keep restart recovery from inventing ``unknown`` after payload writes fail.
+
+    In-memory queue delivery still proceeds (strategy B). Full
+    ``event_json`` / ``result_json`` writes already failed, so this last
+    ditch either marks the row terminal with a minimal UPDATE (no payload
+    dependency on ``_write_durable_terminal``) or deletes it. Either way
+    ``recover_abandoned_delegations`` no longer selects a live
+    ``running``/``finalizing`` row and cannot contradict the delivered result.
+    """
+    delegation_id = event.get("delegation_id")
+    if not delegation_id:
+        return False
+    status = event.get("status", "completed")
+    now = time.time()
+    completed_at = event.get("completed_at", now)
+    try:
+        with _DB_LOCK, _transaction() as conn:
+            conn.execute(
+                """UPDATE async_delegations
+                   SET state=?, completed_at=?, updated_at=?, delivery_state='pending'
+                   WHERE delegation_id=? AND state IN ('running', 'finalizing')""",
+                (status, completed_at, now, delegation_id),
+            )
+        return True
+    except Exception as exc:
+        logger.error(
+            "Async delegation %s: minimal terminal shield failed; "
+            "deleting durable row before in-memory delivery: %s",
+            delegation_id, exc,
+        )
+    try:
+        _delete_durable_delegation(delegation_id)
+        return True
+    except Exception as exc:
+        logger.error(
+            "Async delegation %s: durable restart shield failed; "
+            "in-memory delivery may diverge from state.db on restart: %s",
+            delegation_id, exc,
+        )
+        return False
+
+
 def _converge_durable_completion(event: Dict[str, Any], result: Dict[str, Any]) -> bool:
-    """Ensure state.db matches the in-process terminal outcome before enqueue.
+    """Ensure state.db will not contradict the in-process terminal outcome.
 
     Returns True when the durable row carries the same terminal status and
-    payloads. On primary-persist failure, retries via ``_write_durable_terminal``
-    so acknowledgement / restart recovery cannot race a still-``running`` row.
+    payloads. On primary-persist failure, retries via ``_write_durable_terminal``.
+    If both payload writes fail, still shields the row (minimal terminal mark
+    or delete) so in-memory delivery remains restart-safe, then returns False
+    to signal payloads were not fully converged.
     """
     delegation_id = event.get("delegation_id")
     try:
@@ -321,10 +366,16 @@ def _converge_durable_completion(event: Dict[str, Any], result: Dict[str, Any]) 
     except Exception as exc:
         logger.error(
             "Async delegation %s: durable terminal converge failed; "
-            "in-memory delivery may diverge from state.db: %s",
+            "shielding restart recovery before in-memory delivery: %s",
             delegation_id, exc,
         )
-        return False
+    if not _shield_unconverged_durable_row(event):
+        logger.error(
+            "Async delegation %s: durable shield failed; "
+            "in-memory delivery may diverge from state.db",
+            delegation_id,
+        )
+    return False
 
 
 def _note_delivery_attempt(delegation_id: str) -> None:
@@ -968,13 +1019,14 @@ def _push_completion_event(
     ):
         if _k in result:
             evt[_k] = result[_k]
-    # Converge durable state first (including persist-failure fallback) so a
-    # later gateway ack / process restart cannot invent a contradictory
-    # ``unknown`` over a still-``running`` row after this in-memory delivery.
+    # Converge durable state first (including persist-failure fallback +
+    # last-ditch restart shield) so a later gateway ack / process restart
+    # cannot invent a contradictory ``unknown`` over a still-``running`` row
+    # after this in-memory delivery. Payload converge failure still enqueues.
     if not _converge_durable_completion(evt, result):
         logger.error(
             "Async delegation %s: continuing with in-memory delivery after "
-            "durable terminal converge failure",
+            "durable terminal converge failure (restart shield attempted)",
             record.get("delegation_id"),
         )
     try:
@@ -1190,7 +1242,7 @@ def _push_batch_completion_event(
     if not _converge_durable_completion(evt, combined):
         logger.error(
             "Async delegation batch %s: continuing with in-memory delivery "
-            "after durable terminal converge failure",
+            "after durable terminal converge failure (restart shield attempted)",
             event_record.get("delegation_id"),
         )
     try:

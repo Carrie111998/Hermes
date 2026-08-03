@@ -884,6 +884,79 @@ def test_persist_failure_converges_durable_row_against_restart_unknown(monkeypat
     assert replay.get("restored") is True
 
 
+def test_dual_durable_write_failure_delivers_and_shields_restart_unknown(monkeypatch):
+    """Persistent payload-write failure must still enqueue and not invent unknown.
+
+    When both ``_persist_completion`` and ``_write_durable_terminal`` raise,
+    in-memory delivery continues (strategy B) and a last-ditch shield must
+    clear the recoverable ``running``/``finalizing`` row so restart recovery
+    cannot contradict the delivered success with ``unknown``.
+    """
+
+    def boom(_evt, _result):
+        raise RuntimeError("simulated persistent sqlite failure")
+
+    monkeypatch.setattr(ad, "_persist_completion", boom)
+    monkeypatch.setattr(ad, "_write_durable_terminal", boom)
+
+    res = ad.dispatch_async_delegation(
+        goal="g", context=None, toolsets=None, role="leaf", model="m",
+        session_key="s-dual-fail",
+        parent_session_id="parent-dual",
+        runner=lambda: {
+            "status": "completed",
+            "summary": "delivered despite durable io failure",
+            "api_calls": 1,
+            "duration_seconds": 0.01,
+        },
+        max_async_children=3,
+    )
+    assert res["status"] == "dispatched"
+    did = res["delegation_id"]
+
+    evt = _drain_for(did, timeout=5.0)
+    assert evt is not None
+    assert evt["status"] == "completed"
+    assert evt["summary"] == "delivered despite durable io failure"
+
+    with ad._records_lock:
+        status = ad._records.get(did, {}).get("status")
+    assert status == "completed"
+    assert ad.active_count() == 0
+
+    row = _read_durable_row(did)
+    if row is not None:
+        state, event_json, _, delivery_state = row
+        assert state not in {"running", "finalizing"}
+        assert state != "unknown"
+        assert delivery_state == "pending"
+        # Minimal shield may leave payloads empty; never rewrite to unknown.
+        if event_json:
+            assert json.loads(event_json).get("status") != "unknown"
+
+    monkeypatch.setattr("gateway.status._pid_exists", lambda _pid: False)
+    recovered = ad.recover_abandoned_delegations()
+    assert recovered == 0
+
+    row_after = _read_durable_row(did)
+    if row_after is not None:
+        state2, event_json2, _, _ = row_after
+        assert state2 != "unknown"
+        assert state2 not in {"running", "finalizing"}
+        if event_json2:
+            assert json.loads(event_json2).get("status") != "unknown"
+
+    while not process_registry.completion_queue.empty():
+        process_registry.completion_queue.get_nowait()
+    restored = ad.restore_undelivered_completions(process_registry.completion_queue)
+    # Shielded minimal mark has no event_json -> not restored; delete -> not restored.
+    # Either way, never a contradictory unknown completion.
+    for _ in range(restored):
+        replay = process_registry.completion_queue.get_nowait()
+        assert replay.get("status") != "unknown"
+        assert replay.get("delegation_id") != did or replay.get("status") == "completed"
+
+
 # ---------------------------------------------------------------------------
 # Gateway routing: session_key -> platform/chat_id, rich formatting, injection
 # ---------------------------------------------------------------------------
