@@ -2001,6 +2001,24 @@ def init_agent(
                 compression_threshold_tokens = None
         except (TypeError, ValueError):
             compression_threshold_tokens = None
+    # Automatic handoff boundary. It runs before a model request and routes
+    # through the existing compression boundary without changing a live prompt.
+    compression_handoff_enabled = is_truthy_value(
+        _compression_cfg.get("handoff_enabled"), default=True
+    )
+    _raw_handoff_threshold = _compression_cfg.get("handoff_threshold_tokens", 100_000)
+    try:
+        if isinstance(_raw_handoff_threshold, bool):
+            raise ValueError
+        compression_handoff_threshold_tokens = int(_raw_handoff_threshold)
+        if isinstance(_raw_handoff_threshold, float) and (
+            _raw_handoff_threshold != compression_handoff_threshold_tokens
+        ):
+            raise ValueError
+        if compression_handoff_threshold_tokens <= 0:
+            compression_handoff_threshold_tokens = None
+    except (TypeError, ValueError):
+        compression_handoff_threshold_tokens = None
     # In-place compaction: when True, compress_context() rewrites the message
     # list + rebuilds the system prompt WITHOUT rotating the session id (no
     # parent_session_id chain, no `name #N` renumber). See #38763 and
@@ -2493,6 +2511,8 @@ def init_agent(
             pass
     agent.compression_enabled = compression_enabled
     agent.compression_in_place = compression_in_place
+    agent.compression_handoff_enabled = compression_handoff_enabled
+    agent.compression_handoff_threshold_tokens = compression_handoff_threshold_tokens
     # Apply micro-compaction settings to the compressor (feature is opt-in)
     _cc = getattr(agent, "context_compressor", None)
     if _cc is not None and hasattr(_cc, "_micro_compact_enabled"):

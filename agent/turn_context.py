@@ -39,6 +39,7 @@ from agent.conversation_compression import (
     recover_rotated_compression_session,
 )
 from agent.context_engine import automatic_compaction_status_message
+from agent.context_handoff import handoff_is_due
 from agent.iteration_budget import IterationBudget
 from agent.memory_manager import build_memory_context_block
 from agent.memory_provider import is_trivial_prompt
@@ -737,17 +738,49 @@ def build_turn_context(
     _preflight_compression_blocked = False
     agent._turn_received_provider_response = False
     agent._turn_preflight_display_snapshot = None
+    _handoff_threshold = getattr(
+        agent, "compression_handoff_threshold_tokens", None
+    )
+    _handoff_threshold_int = (
+        _handoff_threshold
+        if isinstance(_handoff_threshold, int) and not isinstance(_handoff_threshold, bool)
+        else 0
+    )
+    _handoff_enabled = bool(
+        getattr(agent, "compression_handoff_enabled", False)
+    )
+    _handoff_due = False
+    _preflight_tokens = 0
+    _handoff_artifact_tokens = 0
+    _handoff_estimate_valid = _handoff_enabled and _handoff_threshold_int > 0
+    # Automatic handoff is an independent metadata boundary. Its decision must
+    # use the authoritative request estimate even when the cheap message-only
+    # compression gate says the transcript is small; system prompts and tool
+    # schemas are part of the request and can be the load-bearing tokens.
+    if _handoff_estimate_valid:
+        _preflight_tokens = estimate_request_tokens_rough(
+            messages,
+            system_prompt=active_system_prompt or "",
+            tools=agent.tools or None,
+        )
+        _handoff_artifact_tokens = _preflight_tokens
+        _handoff_due = handoff_is_due(
+            enabled=_handoff_enabled,
+            estimated_tokens=_preflight_tokens,
+            threshold_tokens=_handoff_threshold_int,
+        )
     if agent.compression_enabled and _should_run_preflight_estimate(
         messages,
         agent.context_compressor.protect_first_n,
         agent.context_compressor.protect_last_n,
         agent.context_compressor.threshold_tokens,
     ):
-        _preflight_tokens = estimate_request_tokens_rough(
-            messages,
-            system_prompt=active_system_prompt or "",
-            tools=agent.tools or None,
-        )
+        if not _handoff_estimate_valid:
+            _preflight_tokens = estimate_request_tokens_rough(
+                messages,
+                system_prompt=active_system_prompt or "",
+                tools=agent.tools or None,
+            )
         _compressor = agent.context_compressor
         # getattr guard: minimal compressor doubles (SimpleNamespace in the
         # engine-preflight tests) and plugin context engines lack this
@@ -1034,6 +1067,23 @@ def build_turn_context(
                     agent._last_content_with_tools = None
                     agent._last_content_tools_all_housekeeping = False
                     agent._mute_post_response = False
+
+    if _handoff_due:
+        # Write after compression/rotation, not before it: rotation changes
+        # agent.session_id and the marker must always name the active session.
+        try:
+            from agent.context_handoff import write_handoff_artifact
+            from hermes_constants import get_hermes_home
+
+            write_handoff_artifact(
+                hermes_home=get_hermes_home(),
+                session_id=agent.session_id,
+                estimated_tokens=_handoff_artifact_tokens,
+                threshold_tokens=_handoff_threshold_int,
+                model=getattr(agent, "model", ""),
+            )
+        except Exception:
+            logger.warning("Automatic context handoff artifact failed", exc_info=True)
 
     if _preflight_compressed:
         # Compression rebuilt the list (tail messages are fresh compaction

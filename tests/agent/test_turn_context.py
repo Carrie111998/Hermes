@@ -8,6 +8,7 @@ confirm the prologue produces the right ``TurnContext`` and applies the
 
 from __future__ import annotations
 
+import json
 import threading
 import types
 from unittest.mock import MagicMock, patch
@@ -195,6 +196,87 @@ def _build(agent, **overrides):
     )
     kwargs.update(overrides)
     return build_turn_context(**kwargs)
+
+
+def test_handoff_estimate_includes_system_prompt_and_tools_even_when_cheap_gate_skips():
+    agent = _FakeAgent()
+    agent.compression_handoff_enabled = True
+    agent.compression_handoff_threshold_tokens = 100
+    agent.tools = [{"type": "function", "function": {"name": "large_tool_schema"}}]
+    observed = {}
+
+    def _estimate(messages, *, system_prompt, tools):
+        observed.update(system_prompt=system_prompt, tools=tools, messages=messages)
+        return 101
+
+    with patch("agent.turn_context._should_run_preflight_estimate", return_value=False), \
+         patch("agent.turn_context.estimate_request_tokens_rough", side_effect=_estimate), \
+         patch("agent.context_handoff.write_handoff_artifact") as write_marker:
+        _build(agent)
+
+    assert observed["system_prompt"] == "SYSTEM"
+    assert observed["tools"] == agent.tools
+    write_marker.assert_called_once()
+    assert write_marker.call_args.kwargs["estimated_tokens"] == 101
+
+
+def test_handoff_estimate_does_not_force_compression_when_enabled():
+    agent = _FakeAgent()
+    agent.compression_enabled = True
+    agent.compression_handoff_enabled = True
+    agent.compression_handoff_threshold_tokens = 100
+    agent.context_compressor.threshold_tokens = 1000
+    agent.context_compressor.last_prompt_tokens = -1
+    agent.context_compressor.last_real_prompt_tokens = 0
+    agent.context_compressor.context_length = 10000
+    agent.context_compressor.should_defer_preflight_to_real_usage = lambda _tokens: False
+    agent.context_compressor.get_active_compression_failure_cooldown = lambda: None
+    agent._compress_context = MagicMock(side_effect=lambda messages, *_a, **_k: (messages, "SYSTEM"))
+
+    with patch("agent.turn_context._should_run_preflight_estimate", return_value=False), \
+         patch("agent.turn_context.estimate_request_tokens_rough", return_value=101), \
+         patch("agent.context_handoff.write_handoff_artifact"):
+        _build(agent)
+
+    agent._compress_context.assert_not_called()
+
+
+def test_handoff_marker_preserves_precompression_threshold_after_rotation(tmp_path):
+    agent = _FakeAgent()
+    agent.compression_enabled = True
+    agent.compression_handoff_enabled = True
+    agent.compression_handoff_threshold_tokens = 100
+    agent.context_compressor.threshold_tokens = 150
+    agent.context_compressor.last_prompt_tokens = -1
+    agent.context_compressor.last_real_prompt_tokens = 0
+    agent.context_compressor.context_length = 1000
+    agent.context_compressor.should_defer_preflight_to_real_usage = lambda _tokens: False
+    agent.context_compressor.should_compress = lambda tokens: tokens >= 150
+    compacted = [{"role": "user", "content": "[summary]"}]
+
+    def _compress(_messages, *_args, **_kwargs):
+        agent.session_id = "rotated-session"
+        return compacted, "SYSTEM"
+
+    agent._compress_context = MagicMock(side_effect=_compress)
+
+    with patch("agent.turn_context._should_run_preflight_estimate", return_value=True), \
+         patch(
+             "agent.turn_context.estimate_request_tokens_rough",
+             side_effect=[200, 50],
+         ), \
+         patch(
+             "agent.turn_context.conversation_history_after_compression",
+             return_value=compacted,
+         ), \
+         patch("hermes_constants.get_hermes_home", return_value=tmp_path):
+        _build(agent)
+
+    artifacts = list((tmp_path / "sessions" / "handoffs").glob("*.json"))
+    assert len(artifacts) == 1
+    payload = json.loads(artifacts[0].read_text(encoding="utf-8"))
+    assert payload["session_id"] == "rotated-session"
+    assert payload["estimated_tokens"] == 200
 
 
 def test_returns_turn_context_with_user_message_appended():

@@ -578,6 +578,10 @@ DEFAULT_CONFIG = {
                                       # triggers at the lower of the ratio-based
                                       # threshold and this token count. Clamped to
                                       # the model's context length at apply-time.
+        "handoff_enabled": True,      # create a bounded resume marker and use the
+                                      # existing pre-model compression boundary.
+        "handoff_threshold_tokens": 100000,  # set to 0 to disable; SessionDB is
+                                      # authoritative and the artifact is metadata-only.
         "target_ratio": 0.20,         # fraction of threshold to preserve as recent tail
         "protect_last_n": 20,         # minimum recent messages to keep uncompressed
         "min_tail_user_messages": 1,  # REAL (actionable) user messages guaranteed to
