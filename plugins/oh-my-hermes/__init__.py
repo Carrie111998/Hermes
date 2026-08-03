@@ -4,15 +4,21 @@ The upstream project remains the source of truth. This thin adapter only adds
 its bundled Hermes plugin to the host import path, exposes the upstream
 registration contract, and provides lifecycle commands for the checked-out
 workflow skills.
+
+CI and shallow checkouts do not recurse ``vendor/oh-my-hermes``. Registration
+must therefore soft-fail when the submodule is absent so the host stays usable
+and the lifecycle CLI can still report status / install guidance.
 """
 
 from __future__ import annotations
 
+import logging
 import sys
 from pathlib import Path
 
 
 PLUGIN_NAME = "oh-my-hermes"
+logger = logging.getLogger(__name__)
 
 
 def _repo_root() -> Path:
@@ -29,6 +35,11 @@ def _plugin_bundle_root() -> Path:
 
 def _upstream_skills_root() -> Path:
     return _submodule_root() / "skills"
+
+
+def submodule_ready() -> bool:
+    """True when the vendored OMH plugin bundle directory is present."""
+    return _plugin_bundle_root().is_dir()
 
 
 def _load_upstream_package():
@@ -61,6 +72,18 @@ def _register_cli(ctx) -> None:
 
 
 def register(ctx) -> None:
-    """Register upstream OMH tools/hooks plus the local lifecycle CLI."""
-    _load_upstream_package().register(ctx)
+    """Register upstream OMH tools/hooks plus the local lifecycle CLI.
+
+    When ``vendor/oh-my-hermes`` is not checked out (typical for CI shallow
+    clones), skip upstream registration with a warning and still expose the
+    lifecycle CLI so operators can diagnose / install skills after init.
+    """
+    if submodule_ready():
+        _load_upstream_package().register(ctx)
+    else:
+        logger.warning(
+            "oh-my-hermes submodule not initialized at %s; "
+            "skipping upstream tool/hook registration (CLI still available)",
+            _plugin_bundle_root(),
+        )
     _register_cli(ctx)

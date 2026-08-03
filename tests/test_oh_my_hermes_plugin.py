@@ -6,9 +6,13 @@ import importlib.util
 import sys
 from pathlib import Path
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
 PLUGIN = ROOT / "plugins" / "oh-my-hermes" / "__init__.py"
+BUNDLE = ROOT / "vendor" / "oh-my-hermes" / "src" / "plugin_bundle"
+SKILLS = ROOT / "vendor" / "oh-my-hermes" / "skills"
 
 
 class StubContext:
@@ -36,6 +40,23 @@ def load_plugin():
     return module
 
 
+def test_register_soft_skips_upstream_when_submodule_missing(monkeypatch):
+    """CI shallow checkouts omit vendor/oh-my-hermes — must not raise."""
+    plugin = load_plugin()
+    monkeypatch.setattr(plugin, "submodule_ready", lambda: False)
+    context = StubContext()
+
+    plugin.register(context)
+
+    assert context.tools == []
+    assert context.hooks == []
+    assert "oh-my-hermes" in context.commands
+
+
+@pytest.mark.skipif(
+    not BUNDLE.is_dir(),
+    reason="vendor/oh-my-hermes submodule not checked out",
+)
 def test_plugin_registers_upstream_tools_hooks_and_cli():
     plugin = load_plugin()
     context = StubContext()
@@ -59,6 +80,10 @@ def test_plugin_registers_upstream_tools_hooks_and_cli():
     assert "oh-my-hermes" in context.commands
 
 
+@pytest.mark.skipif(
+    not SKILLS.is_dir(),
+    reason="vendor/oh-my-hermes submodule not checked out",
+)
 def test_submodule_contains_workflow_skills():
     plugin = load_plugin()
     skills = plugin._upstream_skills_root()
