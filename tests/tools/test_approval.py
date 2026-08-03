@@ -593,6 +593,102 @@ class TestFullCommandAlwaysShown:
         assert result == "deny"
 
 
+class TestApprovalSecretRedaction:
+    """Approval previews redact secrets before echoing into shared surfaces.
+
+    DAN-2114: a credential-writing command flagged for approval must not
+    publish its live token into the approval-prompt preview (itself a
+    persisted Slack message). The command STRUCTURE stays visible for an
+    approve/deny decision; only the secret VALUE is masked. terminal_tool
+    still runs the original command — redaction is display-only.
+    """
+
+    # The 2026-07-13 incident form: a heredoc writing a Slack app-level
+    # token into ~/.hermes/.env. (Flagged in production by tirith, not the
+    # regex patterns — the heredoc continuation defeats _COMMAND_TAIL — but
+    # redaction is independent of which detector flagged it.) The token
+    # literal lives only on the `# fake`-marked line so gitleaks allows it.
+    _FAKE_APP_TOKEN = "xapp-1-A0ABQE7GA6T-abcdef0123456789secrettoken"  # fake
+    INCIDENT_CMD = (
+        "cat >> ~/.hermes/.env << 'EOF'\n"
+        "# Slack App Token (from 1Password: Slack App Token - Hermes (JHJ))\n"
+        f"SLACK_APP_TOKEN={_FAKE_APP_TOKEN}\n"
+        "EOF"
+    )
+
+    def test_redacts_slack_app_token_in_env_assignment(self):
+        from tools.approval import _redact_command_for_display
+        out = _redact_command_for_display(self.INCIDENT_CMD)
+        # Variable name kept so the user can see WHICH secret is being written.
+        assert "SLACK_APP_TOKEN=" in out
+        # The live token value is gone — full token and its app id both masked.
+        assert self._FAKE_APP_TOKEN not in out  # fake
+        assert "A0ABQE7GA6T" not in out  # fake — app id masked too
+        # Command structure preserved — still recognizably the heredoc write.
+        assert "cat >> ~/.hermes/.env" in out
+        assert "EOF" in out
+
+    def test_redacts_bare_prefix_token_in_url(self):
+        from tools.approval import _redact_command_for_display
+        fake_secret = "xoxb-1234567890123456789012345678901234567890"  # fake
+        cmd = f"git push https://{fake_secret}@github.com/dizhaky/repo.git"
+        out = _redact_command_for_display(cmd)
+        assert fake_secret not in out
+        assert "git push" in out
+        assert "github.com/dizhaky/repo.git" in out
+
+    def test_clean_command_passes_through_unchanged(self):
+        from tools.approval import _redact_command_for_display
+        cmd = "rm -rf /tmp/scratch-dir"
+        assert _redact_command_for_display(cmd) == cmd
+
+    def test_empty_command_returns_empty(self):
+        from tools.approval import _redact_command_for_display
+        assert _redact_command_for_display("") == ""
+
+    def test_gateway_approval_data_command_is_redacted(self, monkeypatch):
+        """The notify callback (Slack) receives an already-redacted command."""
+        from tools import approval as mod
+
+        mod._gateway_queues.clear()
+        mod._gateway_notify_cbs.clear()
+        mod._session_approved.clear()
+        mod._permanent_approved.clear()
+        mod._pending.clear()
+        saved = {k: os.environ.get(k) for k in (
+            "HERMES_GATEWAY_SESSION", "HERMES_YOLO_MODE",
+            "HERMES_SESSION_KEY", "HERMES_INTERACTIVE")}
+        try:
+            os.environ.pop("HERMES_YOLO_MODE", None)
+            os.environ.pop("HERMES_INTERACTIVE", None)
+            os.environ["HERMES_GATEWAY_SESSION"] = "1"
+            os.environ["HERMES_SESSION_KEY"] = "test-redact-session"
+            monkeypatch.setattr(
+                mod, "_get_approval_config",
+                lambda: {"mode": "manual", "gateway_timeout": 1, "timeout": 1},
+            )
+            notified = []
+            mod.register_gateway_notify(
+                "test-redact-session", lambda data: notified.append(data))
+
+            fake_secret = "xoxb-1234567890123456789012345678901234567890"  # fake
+            cmd = f"git push --force https://{fake_secret}@github.com/dizhaky/repo.git"
+            mod.check_all_command_guards(cmd, "local")
+
+            assert len(notified) == 1
+            echo = notified[0]["command"]
+            assert fake_secret not in echo
+            assert "git push --force" in echo
+        finally:
+            mod._gateway_queues.clear()
+            mod._gateway_notify_cbs.clear()
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+
 class TestForkBombDetection:
     """The fork bomb regex must match the classic :(){ :|:& };: pattern."""
 
