@@ -624,21 +624,25 @@ def _get_disabled_skill_names() -> Set[str]:
     as a public re-export so existing callers don't need updating.
     """
     from agent.skill_utils import get_disabled_skill_names
-    return get_disabled_skill_names()
+    return get_disabled_skill_names(_get_session_platform())
+
+
+def _get_index_excluded_skill_names() -> Set[str]:
+    """Load names omitted from discovery while remaining explicitly loadable."""
+    from agent.skill_utils import get_index_excluded_skill_names
+    return get_index_excluded_skill_names(_get_session_platform())
 
 
 def _get_session_platform() -> str:
-    """Resolve the current platform from gateway session context.
+    """Resolve the platform for gateway and local discovery surfaces.
 
-    Mirrors the platform-resolution logic in
-    ``agent.skill_utils.get_disabled_skill_names`` so that
-    ``_is_skill_disabled`` respects ``HERMES_SESSION_PLATFORM``.
+    Use the shared resolver so explicit ``HERMES_PLATFORM`` overrides,
+    messaging session platforms, and local TUI/desktop sources match prompt
+    assembly. A bare process is the classic CLI surface.
     """
-    try:
-        from gateway.session_context import get_session_env
-        return get_session_env("HERMES_SESSION_PLATFORM") or ""
-    except Exception:
-        return ""
+    from agent.skill_utils import resolve_skill_config_platform
+
+    return resolve_skill_config_platform(default_local=True) or "cli"
 
 
 def _is_skill_disabled(name: str, platform: str = None) -> bool:
@@ -648,6 +652,7 @@ def _is_skill_disabled(name: str, platform: str = None) -> bool:
     1. Explicit ``platform`` argument
     2. ``HERMES_PLATFORM`` environment variable
     3. ``HERMES_SESSION_PLATFORM`` from gateway session context
+    4. Local source mapped to ``cli`` (including bare CLI)
     """
     try:
         from hermes_cli.config import load_config
@@ -686,9 +691,11 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
 
     cache_key = _SKILLS_CACHE_KEY_DISABLED if skip_disabled else _SKILLS_CACHE_KEY_FILTERED
 
-    # Load disabled set once (not per-skill). Part of the cache signature:
-    # disabling a skill is a config change with no filesystem mtime bump.
+    # Load visibility sets once (not per-skill). They are part of the cache
+    # signature because config changes do not bump skill directory mtimes.
     disabled = set() if skip_disabled else _get_disabled_skill_names()
+    index_excluded = set() if skip_disabled else _get_index_excluded_skill_names()
+    hidden = disabled | index_excluded
 
     # Collect directories to scan — same resolution as the scan loop below
     # (_skills_dir() resolves the LIVE profile HERMES_HOME; the module-level
@@ -699,7 +706,7 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
         dirs_to_scan.append(active_skills_dir)
     dirs_to_scan.extend(get_external_skills_dirs())
 
-    signature = _skills_scan_signature(dirs_to_scan, disabled)
+    signature = _skills_scan_signature(dirs_to_scan, hidden)
     now = time.monotonic()
 
     cached = _SKILLS_CACHE.get(cache_key)
@@ -738,7 +745,7 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
                 name = frontmatter.get("name", skill_dir.name)[:MAX_NAME_LENGTH]
                 if name in seen_names:
                     continue
-                if name in disabled:
+                if {name, skill_dir.name} & hidden:
                     continue
 
                 description = frontmatter.get("description", "")
@@ -1278,7 +1285,7 @@ def skill_view(
 
         # Check if the skill is disabled by the user
         resolved_name = parsed_frontmatter.get("name", skill_md.parent.name)
-        if _is_skill_disabled(resolved_name):
+        if _is_skill_disabled(resolved_name) or _is_skill_disabled(skill_md.parent.name):
             return json.dumps(
                 {
                     "success": False,

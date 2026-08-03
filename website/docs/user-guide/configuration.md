@@ -627,6 +627,29 @@ hermes config set skills.config.myplugin.path ~/myplugin-data
 
 For details on declaring config settings in your own skills, see [Creating Skills — Config Settings](/developer-guide/creating-skills#config-settings-configyaml).
 
+### Skill availability and index visibility
+
+`skills.disabled` makes a skill unavailable, including exact `skill_view` and
+`--skills` loads. `skills.index_excluded` only removes it from the prompt index,
+`skills_list`, and generated slash-command discovery, so explicit loads still
+work. Both accept global lists plus additive per-platform maps. The `cli` platform
+covers classic CLI, TUI, desktop, Kanban workers, and other local agent surfaces:
+
+```yaml
+skills:
+  disabled: [retired-skill]
+  platform_disabled:
+    telegram: [unsafe-on-telegram]
+  index_excluded: [large-specialist-skill]
+  platform_index_excluded:
+    telegram: [desktop-only-helper]
+```
+
+Disabled takes precedence when a name appears in both states. All four settings
+default to empty, and apply equally to local and `skills.external_dirs` skills.
+Use `hermes prompt-size` to see active, index-excluded, and disabled counts for
+the selected platform.
+
 ### Guard on agent-created skill writes
 
 When the agent uses `skill_manage` to create, edit, patch, or delete a skill, Hermes can optionally scan the new/updated content for dangerous keyword patterns (credential harvesting, obvious prompt injection, exfil instructions). The scanner is **off by default** — real agent workflows that legitimately touch `~/.ssh/` or mention `$OPENAI_API_KEY` were tripping the heuristic too often. Turn it back on if you want the scanner to prompt you before the agent's skill writes land:

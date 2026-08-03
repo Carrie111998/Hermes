@@ -371,7 +371,7 @@ def skill_matches_environment(frontmatter: Dict[str, Any]) -> bool:
     return False
 
 
-# ── Disabled skills ───────────────────────────────────────────────────────
+# ── Skill visibility state ────────────────────────────────────────────────
 
 
 _RAW_CONFIG_CACHE: Dict[Tuple[str, int, int], Dict[str, Any]] = {}
@@ -417,6 +417,44 @@ def _load_raw_config() -> Dict[str, Any]:
     return parsed
 
 
+def _normalize_skill_config_platform(platform: str | None) -> str | None:
+    """Map runtime surface identities onto skill-config platform keys."""
+    value = str(platform or "").strip().lower()
+    if not value:
+        return None
+    if value in {"tui", "desktop", "kanban", "subagent", "tool"}:
+        return "cli"
+    return value
+
+
+def resolve_skill_config_platform(
+    platform: str | None = None, *, default_local: bool = False
+) -> str | None:
+    """Resolve the authoritative platform key for skill visibility config.
+
+    Precedence matches existing platform-disabled behavior: an explicit caller
+    value, ``HERMES_PLATFORM``, then gateway session platform. Local runtime
+    source names are normalized to the shared ``cli`` config surface.
+    """
+    resolved = platform or os.getenv("HERMES_PLATFORM")
+    source = ""
+    if not resolved:
+        try:
+            from gateway.session_context import get_session_env
+
+            resolved = get_session_env("HERMES_SESSION_PLATFORM") or ""
+            if not resolved:
+                source = get_session_env("HERMES_SESSION_SOURCE") or ""
+        except Exception:
+            resolved = os.getenv("HERMES_SESSION_PLATFORM", "")
+            source = os.getenv("HERMES_SESSION_SOURCE", "")
+    if not resolved and source:
+        resolved = source
+    if not resolved and default_local:
+        resolved = "cli"
+    return _normalize_skill_config_platform(resolved)
+
+
 def get_disabled_skill_names(platform: str | None = None) -> Set[str]:
     """Read disabled skill names from config.yaml.
 
@@ -439,12 +477,7 @@ def get_disabled_skill_names(platform: str | None = None) -> Set[str]:
     if not isinstance(skills_cfg, dict):
         return set()
 
-    from gateway.session_context import get_session_env
-    resolved_platform = (
-        platform
-        or os.getenv("HERMES_PLATFORM")
-        or get_session_env("HERMES_SESSION_PLATFORM")
-    )
+    resolved_platform = resolve_skill_config_platform(platform)
     global_disabled = _normalize_string_set(skills_cfg.get("disabled"))
     if resolved_platform:
         platform_disabled = (skills_cfg.get("platform_disabled") or {}).get(
@@ -453,6 +486,34 @@ def get_disabled_skill_names(platform: str | None = None) -> Set[str]:
         if platform_disabled is not None:
             return global_disabled | _normalize_string_set(platform_disabled)
     return global_disabled
+
+
+def get_index_excluded_skill_names(platform: str | None = None) -> Set[str]:
+    """Return skills hidden from discovery but still explicitly loadable.
+
+    ``skills.index_excluded`` applies on every surface. When a platform is
+    resolved, ``skills.platform_index_excluded.<platform>`` is unioned with
+    the global list, mirroring :func:`get_disabled_skill_names`. This state is
+    deliberately separate from ``disabled``: use the disabled helper for load
+    authorization and this helper only for offer/index paths.
+    """
+    parsed = _load_raw_config()
+    if not parsed:
+        return set()
+
+    skills_cfg = parsed.get("skills")
+    if not isinstance(skills_cfg, dict):
+        return set()
+
+    resolved_platform = resolve_skill_config_platform(platform)
+    global_excluded = _normalize_string_set(skills_cfg.get("index_excluded"))
+    if resolved_platform:
+        platform_excluded = (
+            skills_cfg.get("platform_index_excluded") or {}
+        ).get(resolved_platform)
+        if platform_excluded is not None:
+            return global_excluded | _normalize_string_set(platform_excluded)
+    return global_excluded
 
 
 def _normalize_string_set(values) -> Set[str]:

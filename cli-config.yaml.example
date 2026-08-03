@@ -812,6 +812,17 @@ skills:
   #   - ~/.agents/skills
   #   - /home/shared/team-skills
 
+  # Hide skills from the always-on prompt index, skills_list, and generated
+  # slash commands without disabling exact skill_view or --skills preloading.
+  # Disabled always wins if a skill appears in both lists.
+  # index_excluded: [large-specialist-skill]
+
+  # Add surface-specific exclusions to the global list. Supported keys match
+  # skills.platform_disabled (cli, telegram, discord, slack, etc.). The cli
+  # surface includes the classic CLI, TUI, desktop, and local worker sessions.
+  # platform_index_excluded:
+  #   telegram: [desktop-only-helper]
+
 # =============================================================================
 # Agent Behavior
 # =============================================================================

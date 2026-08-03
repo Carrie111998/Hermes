@@ -139,6 +139,34 @@ Level 2: skill_view(name, path)  → Specific reference file       (varies)
 
 The agent only loads the full skill content when it actually needs it.
 
+### Hiding skills from discovery without disabling them
+
+Use `skills.index_excluded` when a profile should keep a thin always-on catalog
+without losing task-scoped capabilities:
+
+```yaml
+skills:
+  index_excluded:
+    - large-specialist-skill
+  platform_index_excluded:
+    telegram:
+      - desktop-only-helper
+```
+
+Index-excluded skills are omitted from the `<available_skills>` system-prompt
+index, `skills_list`, and generated slash-command discovery. They remain
+loadable by an exact `skill_view(name)` call and by explicit session/task
+preloading such as `hermes --skills large-specialist-skill`. The
+`platform_index_excluded` map uses the same additive platform keys as
+`platform_disabled`; global exclusions still apply on every platform.
+
+This is intentionally different from `skills.disabled` and
+`skills.platform_disabled`: disabled skills are unavailable and cannot be
+loaded explicitly. If a skill is both disabled and index-excluded, disabled
+wins. The default lists are empty, so existing profiles keep their current
+behavior. Local skills and skills from `skills.external_dirs` follow the same
+rules.
+
 ## SKILL.md Format
 
 ```markdown

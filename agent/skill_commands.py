@@ -381,16 +381,26 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
     _skill_commands_platform = _resolve_skill_commands_platform()
     _skill_commands = {}
     try:
-        from tools.skills_tool import SKILLS_DIR, _parse_frontmatter, skill_matches_platform, skill_matches_environment, _get_disabled_skill_names
+        from tools.skills_tool import (
+            _get_disabled_skill_names,
+            _get_index_excluded_skill_names,
+            _parse_frontmatter,
+            _skills_dir,
+            skill_matches_environment,
+            skill_matches_platform,
+        )
         from agent.skill_utils import get_external_skills_dirs, iter_skill_index_files
         from hermes_cli.commands import resolve_command
         disabled = _get_disabled_skill_names()
+        index_excluded = _get_index_excluded_skill_names()
+        hidden = disabled | index_excluded
         seen_names: set = set()
 
-        # Scan local dir first, then external dirs
+        # Scan the live profile's local dir first, then external dirs.
         dirs_to_scan = []
-        if SKILLS_DIR.exists():
-            dirs_to_scan.append(SKILLS_DIR)
+        active_skills_dir = _skills_dir()
+        if active_skills_dir.exists():
+            dirs_to_scan.append(active_skills_dir)
         dirs_to_scan.extend(get_external_skills_dirs())
 
         for scan_dir in dirs_to_scan:
@@ -410,8 +420,8 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
                     name = frontmatter.get('name', skill_md.parent.name)
                     if name in seen_names:
                         continue
-                    # Respect user's disabled skills config
-                    if name in disabled:
+                    # Respect disabled and index-excluded discovery state.
+                    if {name, skill_md.parent.name} & hidden:
                         continue
                     description = frontmatter.get('description', '')
                     if not description:

@@ -204,6 +204,56 @@ def _compute_skills_breakdown(skills_block: str) -> List[Dict[str, Any]]:
     return entries
 
 
+def _compute_skill_state_counts(platform: str) -> Dict[str, int]:
+    """Count installed skills by configured discovery/load state.
+
+    Local skills win over external directories by declared name, matching prompt
+    assembly. Platform-specific config is resolved for the requested surface.
+    Disabled has precedence when a name appears in both visibility lists.
+    """
+    from agent.skill_utils import (
+        get_all_skills_dirs,
+        get_disabled_skill_names,
+        get_index_excluded_skill_names,
+        iter_skill_index_files,
+        parse_frontmatter,
+        skill_matches_platform,
+    )
+
+    disabled = get_disabled_skill_names(platform)
+    index_excluded = get_index_excluded_skill_names(platform)
+    counts = {"active": 0, "index_excluded": 0, "disabled": 0, "total": 0}
+    seen: set[str] = set()
+
+    for skills_dir in get_all_skills_dirs():
+        if not skills_dir.exists():
+            continue
+        for skill_file in iter_skill_index_files(skills_dir, "SKILL.md"):
+            directory_name = skill_file.parent.name
+            frontmatter: Dict[str, Any] = {}
+            try:
+                frontmatter, _ = parse_frontmatter(
+                    skill_file.read_text(encoding="utf-8")
+                )
+            except Exception:
+                pass
+            if not skill_matches_platform(frontmatter):
+                continue
+            name = str(frontmatter.get("name") or directory_name)
+            if name in seen:
+                continue
+            seen.add(name)
+            counts["total"] += 1
+            aliases = {name, directory_name}
+            if aliases & disabled:
+                counts["disabled"] += 1
+            elif aliases & index_excluded:
+                counts["index_excluded"] += 1
+            else:
+                counts["active"] += 1
+    return counts
+
+
 def _compute_toolsets_breakdown(tools: List[Any]) -> List[Dict[str, Any]]:
     """Per-toolset schema-byte breakdown of the resolved tool list.
 
@@ -241,6 +291,7 @@ def compute_prompt_breakdown(platform: str = "cli") -> Dict[str, Any]:
     largest-first). The last two answer "what should I disable to cut tokens?".
     """
     from agent.system_prompt import build_system_prompt, build_system_prompt_parts
+    from agent.skill_utils import resolve_skill_config_platform
 
     agent = _build_inspection_agent(platform)
 
@@ -276,6 +327,15 @@ def compute_prompt_breakdown(platform: str = "cli") -> Dict[str, Any]:
     tools = getattr(agent, "tools", None) or []
     tools_json = json.dumps(tools, ensure_ascii=False)
 
+    # Prompt assembly preserves an explicit runtime/session platform override
+    # over the agent surface. Count skill states in that same effective scope
+    # so the summary cannot disagree with the rendered skills index.
+    skills_platform = (
+        resolve_skill_config_platform(default_local=False)
+        or resolve_skill_config_platform(platform)
+        or platform
+    )
+
     sections: List[Tuple[str, int, int]] = [
         ("stable (identity/guidance/skills)", len(stable), _bytes(stable)),
         ("context (AGENTS.md/cwd files)", len(context), _bytes(context)),
@@ -290,6 +350,7 @@ def compute_prompt_breakdown(platform: str = "cli") -> Dict[str, Any]:
         "memory": {"chars": len(memory_block), "bytes": _bytes(memory_block)},
         "user_profile": {"chars": len(user_block), "bytes": _bytes(user_block)},
         "tools": {"count": len(tools), "json_bytes": _bytes(tools_json)},
+        "skills": _compute_skill_state_counts(skills_platform),
         "sections": sections,
         "skills_breakdown": _compute_skills_breakdown(skills_index),
         "toolsets_breakdown": _compute_toolsets_breakdown(tools),
@@ -313,6 +374,14 @@ def render_breakdown(data: Dict[str, Any]) -> str:
     mem = data["memory"]
     up = data["user_profile"]
     lines.append(f"    skills index       : {si['bytes']:>8,} B  ({_fmt_kb(si['bytes'])})")
+    skill_states = data.get("skills") or {}
+    if skill_states:
+        lines.append(
+            "    skill states       : "
+            f"{skill_states.get('active', 0)} active, "
+            f"{skill_states.get('index_excluded', 0)} index-excluded, "
+            f"{skill_states.get('disabled', 0)} disabled"
+        )
     lines.append(f"    memory             : {mem['bytes']:>8,} B  ({_fmt_kb(mem['bytes'])})")
     lines.append(f"    user profile       : {up['bytes']:>8,} B  ({_fmt_kb(up['bytes'])})")
     lines.append("")

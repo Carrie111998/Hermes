@@ -1789,6 +1789,11 @@ DEFAULT_CONFIG = {
     # always goes to ~/.hermes/skills/.
     "skills": {
         "external_dirs": [],   # e.g. ["~/.agents/skills", "/shared/team-skills"]
+        # Skills hidden from prompt indexes, skills_list, and generated slash
+        # commands while remaining loadable by exact skill_view and --skills.
+        "index_excluded": [],
+        # Per-surface additions to index_excluded. Global entries always apply.
+        "platform_index_excluded": {},
         # Substitute ${HERMES_SKILL_DIR} and ${HERMES_SESSION_ID} in SKILL.md
         # content with the absolute skill directory and the active session id
         # before the agent sees it.  Lets skill authors reference bundled
