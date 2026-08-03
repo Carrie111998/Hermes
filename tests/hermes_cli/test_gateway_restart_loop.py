@@ -695,6 +695,25 @@ class TestLifecycleGuardModule:
         )
         assert result is False
 
+    def test_nul_byte_in_command_string_does_not_crash_guard(self):
+        """A NUL byte in the command string itself must not crash the guard.
+
+        #76762 covered NUL bytes read out of a referenced binary's contents,
+        but a path token containing a literal NUL can also arrive straight
+        from the command string (e.g. an agent emitting "\\x00" inside a
+        JSON-encoded command). os.open() raises ValueError — not OSError —
+        for such a path, which escaped _read_referenced_script's handler and
+        crashed the guard. A NUL-bearing path can never exist on POSIX, so
+        it reads as "nothing to scan".
+        """
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+        result = contains_gateway_lifecycle_command_or_referenced_script(
+            "bash /tmp/junk\x00fragment.sh"
+        )
+        assert result is False
+
     def test_shell_script_reference_walk_still_works(self, tmp_path):
         """The referenced-script walk still applies to real shell scripts:
         a .sh script that itself invokes a lifecycle command is caught."""

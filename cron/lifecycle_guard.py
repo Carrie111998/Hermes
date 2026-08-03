@@ -258,7 +258,11 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
     try:
         descriptor = os.open(path, flags)
-    except OSError:
+    except (OSError, ValueError):
+        # ValueError: an embedded NUL byte in the path itself — the token
+        # came straight from the command string, not from file contents, so
+        # the #76762 binary-content skip never sees it. No such file can
+        # exist on POSIX; there is nothing to read.
         return None, False
     try:
         metadata = os.fstat(descriptor)
