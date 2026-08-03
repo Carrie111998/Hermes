@@ -804,10 +804,18 @@ def _safe_name(context_id: str) -> str:
 def persist_message(context_id: str, role: str, text: str, task_id: str = "") -> None:
     """Append one message to the context's on-disk conversation log."""
     try:
+        # These records are verbatim peer conversation turns — the same text
+        # the model saw, unredacted. A bare mkdir + append open derives both
+        # modes from the umask (0o755 dir / 0o644 file on a default install),
+        # so every local account can read another agent's conversation log.
+        # Create both owner-only, at creation, with no chmod-after window.
+        from hermes_cli.config import secure_mkdir
+        from utils import open_private_append
+
         d = _conv_dir()
-        d.mkdir(parents=True, exist_ok=True)
+        secure_mkdir(d)
         rec = {"ts": time.time(), "role": role, "text": text, "task_id": task_id}
-        with (d / f"{_safe_name(context_id)}.jsonl").open("a", encoding="utf-8") as fh:
+        with open_private_append(d / f"{_safe_name(context_id)}.jsonl") as fh:
             fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
     except Exception:
         pass

@@ -8375,7 +8375,16 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         saved_dir = get_hermes_home() / "sessions" / "saved"
         try:
-            saved_dir.mkdir(parents=True, exist_ok=True)
+            # Every file in here is a full plaintext transcript, so the
+            # directory listing is sensitive too: a bare mkdir creates it 0o755
+            # at a default umask, which under the documented HERMES_HOME_MODE
+            # traversal hatch (e.g. 0o701 so nginx can reach a served subdir)
+            # leaves the snapshot filenames world-readable. secure_mkdir sets
+            # the mode at creation and skips managed mode, where the NixOS
+            # module deliberately group-shares sessions/ (2770).
+            from hermes_cli.config import secure_mkdir
+
+            secure_mkdir(saved_dir)
         except Exception as e:
             print(f"(x_x) Failed to create save directory {saved_dir}: {e}")
             return

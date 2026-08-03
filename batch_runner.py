@@ -47,6 +47,7 @@ logger = logging.getLogger(__name__)
 import fire
 
 from run_agent import AIAgent
+from utils import open_private_append
 from toolset_distributions import (
     list_distributions, 
     sample_toolsets_from_distribution,
@@ -483,7 +484,13 @@ def _process_batch_worker(args: Tuple) -> Dict[str, Any]:
             }
             
             # Append to batch output file
-            with open(batch_output_file, 'a', encoding='utf-8') as f:
+            # Same artifact class as agent/trajectory.py: a full trajectory
+            # (tool results and tool-call arguments verbatim) appended under
+            # the CWD, not the 0o700 HERMES_HOME. A bare append open would
+            # create it 0o644 at a default umask. New files start owner-only;
+            # an existing file the operator widened to feed a training
+            # pipeline is left alone (see open_private_append).
+            with open_private_append(batch_output_file) as f:
                 f.write(json.dumps(trajectory_entry, ensure_ascii=False) + "\n")
                 f.flush()
                 os.fsync(f.fileno())

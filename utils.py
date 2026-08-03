@@ -171,6 +171,37 @@ def atomic_write_text(
         raise
 
 
+def open_private_append(
+    path: Union[str, Path],
+    *,
+    encoding: str = "utf-8",
+    mode: int = 0o600,
+):
+    """Open *path* for appending, creating it owner-only when it's new.
+
+    Append-mode transcript artifacts (agent trajectories, MoA traces) are
+    created by a bare ``open(..., "a")`` in most codebases, which derives
+    permissions from the process umask — typically 0o644, i.e. readable by
+    every local account. These files carry full tool output and message
+    content, so a fresh one should start owner-only.
+
+    Only the *creating* open applies ``mode``: an existing file keeps whatever
+    permissions it has. That is deliberate. These artifacts are explicit
+    opt-in exports (``save_trajectories``, ``moa.save_traces``) that users
+    legitimately relax to share or to feed a training pipeline, and silently
+    re-tightening a file the user widened on purpose would fight that.
+
+    ``mode`` is advisory on Windows, where ``os.open`` honours only the
+    read-only bit; at-rest protection there comes from ACLs, not POSIX bits.
+    """
+    path = Path(path)
+
+    def _opener(target: str, flags: int) -> int:
+        return os.open(target, flags, mode)
+
+    return open(path, "a", encoding=encoding, opener=_opener)
+
+
 def atomic_json_write(
     path: Union[str, Path],
     data: Any,

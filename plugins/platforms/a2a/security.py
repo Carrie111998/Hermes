@@ -365,8 +365,15 @@ def audit(direction: str, peer: str, task_id: str, summary: str) -> None:
             "summary": (summary or "")[:500],
         }
         path = _audit_path()
+        # Each record embeds a 500-char summary of the peer exchange, so the
+        # log is partial transcript content and must not be born 0o644.
+        # Only the file gets a mode here: path.parent is HERMES_HOME itself,
+        # whose mode belongs to ensure_hermes_home()/_secure_dir (and is
+        # user-overridable via HERMES_HOME_MODE) — not to this call site.
+        from utils import open_private_append
+
         path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as fh:
+        with open_private_append(path) as fh:
             fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
     except Exception:
         logger.debug("A2A: audit write failed", exc_info=True)

@@ -794,6 +794,50 @@ def _secure_dir(path):
     _chown_to_hermes_uid(path)
 
 
+def secure_mkdir(path) -> None:
+    """Create an artifact subdirectory of HERMES_HOME owner-only, at creation.
+
+    For directories that hold verbatim transcript content the agent names
+    itself (``sessions/saved``, ``a2a_conversations``). A bare
+    ``mkdir(parents=True, exist_ok=True)`` derives the mode from the process
+    umask — 0o755 on a default install — so the listing of a conversation-log
+    directory is world-readable even though each file inside is 0o600.
+
+    The mode is passed to ``mkdir`` rather than chmod'd afterwards, so there
+    is no window in which the directory exists at umask permissions. An
+    already-existing directory keeps its mode (``exist_ok=True`` does not
+    re-apply it), matching ``_secure_dir``'s "never fight the user" stance and
+    ``open_private_append``'s create-only contract.
+
+    Skipped in managed mode, exactly like ``_secure_dir``: the NixOS module
+    creates HERMES_HOME's subdirs setgid group-writable (2770) with
+    ``UMask=0007`` on the service, so interactive users in the hermes group can
+    share state with the gateway. Forcing 0o700 here would silently revoke
+    that group access, and unlike ``_secure_dir``'s chmod a mode passed at
+    creation is not re-reconciled by a later activation pass. Note
+    ``_is_container()`` is deliberately *not* consulted — it gates
+    ``_secure_file`` only, and this module has no container carve-out for
+    directories.
+
+    ``HERMES_HOME_MODE`` is deliberately not honoured either. That hatch
+    exists so a web server can *traverse* HERMES_HOME to reach a served
+    subdirectory (e.g. 0o701); nothing is served out of these artifact dirs,
+    and a 0o755 child under a 0o701 home is exactly the case where the listing
+    becomes genuinely world-readable.
+
+    Only the leaf gets the mode — ``parents=True`` creates intermediate dirs at
+    umask, as ``mkdir -p`` does. Both call sites sit under a HERMES_HOME that
+    ``ensure_hermes_home()`` has already secured.
+
+    POSIX bits are advisory on Windows, where at-rest protection is ACL-based.
+    """
+    path = Path(path)
+    if is_managed():
+        path.mkdir(parents=True, exist_ok=True)
+        return
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+
+
 def _is_container() -> bool:
     """Detect if we're running inside a Docker/Podman/LXC container.
 
