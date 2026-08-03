@@ -177,6 +177,8 @@ def _write_schema_reconciliation_modules(spec: ReleaseBuildSpec) -> None:
         spec.schema_reconciliation_runtime_module_origin,
         spec.schema_reconciliation_control_module_origin,
         spec.schema_reconciliation_control_bootstrap_module_origin,
+        spec.schema_upgrade_module_origin,
+        spec.schema_upgrade_runtime_module_origin,
     )
     for module_path in module_paths:
         module_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1339,6 +1341,8 @@ def test_tree_manifest_is_canonical_and_binds_installed_module_origins(tmp_path)
         spec.schema_reconciliation_runtime_module_origin,
         spec.schema_reconciliation_control_module_origin,
         spec.schema_reconciliation_control_bootstrap_module_origin,
+        spec.schema_upgrade_module_origin,
+        spec.schema_upgrade_runtime_module_origin,
     ):
         module_entry = next(
             entry
@@ -1728,6 +1732,8 @@ def test_installed_runtime_requires_packaged_canonical_writer_foundation(
         "schema_reconciliation_runtime_module_origin",
         "schema_reconciliation_control_module_origin",
         "schema_reconciliation_control_bootstrap_module_origin",
+        "schema_upgrade_module_origin",
+        "schema_upgrade_runtime_module_origin",
     ),
 )
 @pytest.mark.parametrize("mutation", ("missing", "symlink", "mode", "empty"))
