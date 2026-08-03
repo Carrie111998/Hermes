@@ -217,6 +217,17 @@ def get_consolidate() -> bool:
     return bool(cfg.get("consolidate", DEFAULT_CONSOLIDATE))
 
 
+def get_consolidate_archived() -> bool:
+    """Whether the LLM consolidation pass may inspect archived skills.
+
+    Archived candidates are opt-in separately from the existing consolidation
+    gate so enabling ``curator.consolidate`` keeps its historical behavior and
+    does not add old packages to the review prompt unexpectedly.
+    """
+    cfg = _load_config()
+    return bool(cfg.get("consolidate_archived", False))
+
+
 # ---------------------------------------------------------------------------
 # Idle / interval check
 # ---------------------------------------------------------------------------
@@ -449,6 +460,16 @@ CURATOR_REVIEW_PROMPT = (
     "run. You MAY still consolidate it into an umbrella — but only because "
     "the curator rewrites cron job skill references to follow consolidations; "
     "never simply prune it.\n"
+    "3d. Entries with `state=archived` are historical local skill packages, "
+    "not live prompt skills. Inspect their complete package at the listed "
+    "`archive_path` with terminal before judging it. Compare each archived "
+    "package against live skills in the same domain: patch a live umbrella "
+    "with genuinely unique content and leave the original archived, or restore "
+    "the whole package before merging/restoring it when no suitable live "
+    "umbrella exists. Never flatten a package and leave its support files or "
+    "relative links behind. If an archived package was absorbed, list it in "
+    "the structured `consolidations` block so its durable absorbed marker can "
+    "prevent a future re-merge.\n"
     "4. DO NOT use usage counters as a reason to skip consolidation. The "
     "counters are new and often mostly zero. Judge overlap on CONTENT, "
     "not on use_count. 'use=0' is not evidence a skill is valuable; it's "
@@ -1188,6 +1209,65 @@ def _write_run_report(
     consolidated = classification["consolidated"]
     pruned = classification["pruned"]
 
+    # An archived candidate remains in the archive after its unique content is
+    # merged into a live umbrella, so it is not part of ``removed``. Trust the
+    # reviewer's structured declaration for those historical packages when the
+    # named source was actually present as an archived candidate and the target
+    # survived the pass.
+    archived_before = {
+        row.get("name")
+        for row in before_report
+        if isinstance(row, dict) and row.get("state") == skill_usage.STATE_ARCHIVED
+    }
+    live_destinations = {
+        row.get("name")
+        for row in after_report
+        if isinstance(row, dict) and row.get("state") != skill_usage.STATE_ARCHIVED
+    } | set(added or [])
+    classified_names = {
+        entry.get("name")
+        for entry in consolidated + pruned
+        if isinstance(entry, dict)
+    }
+    for entry in model_block.get("consolidations", []):
+        source = entry.get("from")
+        target = entry.get("into")
+        if (
+            isinstance(source, str)
+            and isinstance(target, str)
+            and source in archived_before
+            and source not in classified_names
+            and target != source
+            and target in live_destinations
+        ):
+            consolidated.append({
+                "name": source,
+                "into": target,
+                "source": "model (archived candidate)",
+                "reason": entry.get("reason") or "",
+            })
+            classified_names.add(source)
+
+    # Persist the guard before the next curator run. Active consolidations are
+    # already marked by skill_manage's recoverable archive path; this idempotent
+    # pass also covers archived packages that stayed under .archive/ while their
+    # content was merged into a live umbrella.
+    for entry in consolidated:
+        if not isinstance(entry, dict):
+            continue
+        source = entry.get("name")
+        target = entry.get("into")
+        if isinstance(source, str) and isinstance(target, str) and source and target:
+            try:
+                if not skill_usage.mark_absorbed(source, target):
+                    logger.debug(
+                        "Curator could not persist absorbed marker: %s -> %s",
+                        source,
+                        target,
+                    )
+            except Exception as e:
+                logger.debug("Curator absorbed marker write failed: %s", e, exc_info=True)
+
     # Rewrite cron job skill references. When the curator consolidates
     # skill X into umbrella Y, any cron job that lists X fails to load
     # it at run time — the scheduler skips it and the job runs without
@@ -1470,14 +1550,22 @@ def _render_report_markdown(p: Dict[str, Any]) -> str:
 # Orchestrator — spawn a forked AIAgent for the LLM review pass
 # ---------------------------------------------------------------------------
 
-def _render_candidate_list() -> str:
-    """Human/agent-readable list of curator-managed skills with usage stats."""
-    rows = skill_usage.curated_report()
+def _render_candidate_list(include_archived: Optional[bool] = None) -> str:
+    """Render live candidates and, when enabled, archived package candidates."""
+    if include_archived is None:
+        include_archived = get_consolidate_archived()
+    rows = skill_usage.curated_report(include_archived=bool(include_archived))
     if not rows:
         return "No curator-managed skills to review."
     cron_referenced = _cron_referenced_skills()
     lines = [f"Curator-managed skills ({len(rows)}):\n"]
     for r in rows:
+        archived_fields = ""
+        if r.get("state") == skill_usage.STATE_ARCHIVED:
+            archived_fields = (
+                "  location=archived"
+                f"  archive_path={r.get('archive_path', '.archive/' + r['name'])}"
+            )
         lines.append(
             f"- {r['name']}  "
             f"provenance={r.get('provenance', 'agent')}  "
@@ -1489,6 +1577,7 @@ def _render_candidate_list() -> str:
             f"view={r.get('view_count', 0)}  "
             f"patches={r.get('patch_count', 0)}  "
             f"last_activity={r.get('last_activity_at') or 'never'}"
+            f"{archived_fields}"
         )
     return "\n".join(lines)
 
@@ -1529,11 +1618,12 @@ def run_curator_review(
     """
     if consolidate is None:
         consolidate = get_consolidate()
+    include_archived = bool(consolidate) and get_consolidate_archived()
     start = datetime.now(timezone.utc)
     if dry_run:
         # Count candidates without mutating state.
         try:
-            report = skill_usage.curated_report()
+            report = skill_usage.curated_report(include_archived=include_archived)
             counts = {
                 "checked": len(report),
                 "marked_stale": 0,
@@ -1586,7 +1676,7 @@ def run_curator_review(
         nonlocal auto_summary
         # Snapshot skill state BEFORE the LLM pass so the report can diff.
         try:
-            before_report = skill_usage.curated_report()
+            before_report = skill_usage.curated_report(include_archived=include_archived)
         except Exception:
             before_report = []
         before_names = {r.get("name") for r in before_report if isinstance(r, dict)}
@@ -1612,7 +1702,7 @@ def run_curator_review(
             state2["last_run_duration_seconds"] = elapsed
             state2["last_run_summary"] = final_summary
             try:
-                after_report = skill_usage.curated_report()
+                after_report = skill_usage.curated_report(include_archived=include_archived)
             except Exception:
                 after_report = []
             try:
@@ -1640,8 +1730,8 @@ def run_curator_review(
 
         llm_meta: Dict[str, Any] = {}
         try:
-            candidate_list = _render_candidate_list()
-            if "No agent-created skills" in candidate_list:
+            candidate_list = _render_candidate_list(include_archived=include_archived)
+            if candidate_list.startswith("No curator-managed skills"):
                 final_summary = f"{prefix}{auto_summary}; llm: skipped (no candidates)"
                 llm_meta = {
                     "final": "",
@@ -1699,7 +1789,7 @@ def run_curator_review(
         try:
             rename_lines = _build_rename_summary(
                 before_names=before_names,
-                after_report=skill_usage.curated_report(),
+                after_report=skill_usage.curated_report(include_archived=include_archived),
                 tool_calls=llm_meta.get("tool_calls", []) or [],
                 model_final=llm_meta.get("final", "") or "",
             )
@@ -1717,7 +1807,7 @@ def run_curator_review(
         # reporting bug never breaks the curator itself. Report path is
         # recorded in state so `hermes curator status` can point at it.
         try:
-            after_report = skill_usage.curated_report()
+            after_report = skill_usage.curated_report(include_archived=include_archived)
         except Exception:
             after_report = []
         try:

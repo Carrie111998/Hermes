@@ -34,7 +34,11 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from hermes_constants import get_hermes_home
-from agent.skill_utils import is_excluded_skill_path, is_external_skill_path
+from agent.skill_utils import (
+    is_excluded_skill_path,
+    is_external_skill_path,
+    is_skill_support_path,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +57,8 @@ except ImportError:  # pragma: no cover - platform-specific fallback
 STATE_ACTIVE = "active"
 STATE_STALE = "stale"
 STATE_ARCHIVED = "archived"
-_VALID_STATES = {STATE_ACTIVE, STATE_STALE, STATE_ARCHIVED}
+STATE_ABSORBED = "absorbed"
+_VALID_STATES = {STATE_ACTIVE, STATE_STALE, STATE_ARCHIVED, STATE_ABSORBED}
 
 # Load-bearing bundled built-ins the curator must NEVER archive or consolidate,
 # regardless of ``curator.prune_builtins``, pin state, or LLM judgment. These
@@ -172,6 +177,19 @@ def activity_count(record: Dict[str, Any]) -> int:
         except (TypeError, ValueError):
             continue
     return total
+
+
+def is_absorbed_record(record: Any) -> bool:
+    """Return True when a skill has been durably absorbed into another skill.
+
+    ``absorbed_into`` is deliberately independent of the lifecycle ``state``:
+    an absorbed skill may be archived and later restored for inspection without
+    becoming a consolidation candidate again.
+    """
+    if not isinstance(record, dict):
+        return False
+    target = record.get("absorbed_into")
+    return bool(isinstance(target, str) and target.strip()) or record.get("state") == STATE_ABSORBED
 
 
 # ---------------------------------------------------------------------------
@@ -372,6 +390,10 @@ def list_agent_created_skill_names() -> List[str]:
         # Hub-installed skills are always off-limits.
         if name in hub:
             continue
+        # An absorbed skill remains hidden even if it was restored. This is a
+        # durable guard against re-merging the same content on every pass.
+        if is_absorbed_record(usage.get(name)):
+            continue
         # Protected built-ins are never curation candidates — exempt from the
         # automatic transition walk AND the LLM consolidation pass.
         if is_protected_builtin(name):
@@ -422,6 +444,27 @@ def _read_skill_name(skill_md: Path, fallback: str) -> str:
             if value:
                 return value
     return fallback
+
+
+def _iter_archived_skill_files():
+    """Yield archived skill entry points without using the active-tree scan.
+
+    ``.archive`` is intentionally in ``EXCLUDED_SKILL_DIRS`` for normal skill
+    discovery. Consolidation needs a narrow exception: walk the archive
+    explicitly, while still ignoring support-package ``SKILL.md`` files nested
+    below ``references/``, ``templates/``, ``scripts/``, or ``assets/``.
+    """
+    archive_root = _archive_dir()
+    if not archive_root.exists():
+        return
+    for skill_md in sorted(archive_root.rglob("SKILL.md")):
+        try:
+            skill_md.relative_to(archive_root)
+        except ValueError:
+            continue
+        if is_skill_support_path(skill_md, root=archive_root):
+            continue
+        yield skill_md
 
 
 def is_agent_created(skill_name: str) -> bool:
@@ -630,6 +673,10 @@ def adopt_skill(skill_name: str) -> Tuple[bool, str]:
         return False, _external_read_only_message(skill_name)
     usage = load_usage()
     if _is_curator_managed_record(usage.get(skill_name)):
+        if is_absorbed_record(usage.get(skill_name)):
+            if clear_absorbed(skill_name):
+                return True, f"re-adopted '{skill_name}' into curator management"
+            return False, f"could not clear absorbed marker for '{skill_name}'"
         return True, f"'{skill_name}' is already curator-managed"
     mark_agent_created(skill_name)
     if not _is_curator_managed_record(load_usage().get(skill_name)):
@@ -654,6 +701,8 @@ def _empty_record() -> Dict[str, Any]:
         "state": STATE_ACTIVE,
         "pinned": False,
         "archived_at": None,
+        "absorbed_into": None,
+        "absorbed_at": None,
     }
 
 
@@ -821,12 +870,76 @@ def set_state(skill_name: str, state: str) -> None:
         logger.debug("set_state: invalid state %r for %s", state, skill_name)
         return
     def _apply(rec: Dict[str, Any]) -> None:
-        rec["state"] = state
+        # Legacy/state-only absorbed markers must survive archive/restore too;
+        # newer records use ``absorbed_into`` and can retain normal lifecycle
+        # state values for clearer status output.
+        state_only_absorbed = (
+            rec.get("state") == STATE_ABSORBED
+            and not rec.get("absorbed_into")
+            and state in {STATE_ACTIVE, STATE_STALE, STATE_ARCHIVED}
+        )
+        rec["state"] = STATE_ABSORBED if state_only_absorbed else state
         if state == STATE_ARCHIVED:
             rec["archived_at"] = _now_iso()
         elif state == STATE_ACTIVE:
             rec["archived_at"] = None
+        elif state == STATE_ABSORBED:
+            rec["absorbed_at"] = rec.get("absorbed_at") or _now_iso()
     _mutate(skill_name, _apply, require_curation_eligible=True)
+
+
+def mark_absorbed(skill_name: str, absorbed_into: str) -> bool:
+    """Persist that *skill_name* was merged into *absorbed_into*.
+
+    The sidecar read-modify-write is protected by the same lock and atomic
+    replace used by all other usage mutations. The marker is intentionally not
+    cleared by ``set_state`` so archive/restore can change lifecycle state
+    without making an absorbed skill visible to a future consolidation pass.
+    """
+    target = absorbed_into.strip() if isinstance(absorbed_into, str) else ""
+    if not skill_name or not target:
+        return False
+    try:
+        with _usage_file_lock():
+            data = load_usage()
+            rec = data.get(skill_name)
+            if not isinstance(rec, dict):
+                rec = _empty_record()
+            rec["absorbed_into"] = target
+            rec["absorbed_at"] = _now_iso()
+            data[skill_name] = rec
+            save_usage(data)
+            persisted = load_usage().get(skill_name)
+            return (
+                isinstance(persisted, dict)
+                and persisted.get("absorbed_into") == target
+            )
+    except Exception as e:
+        logger.debug("skill_usage.mark_absorbed(%s) failed: %s", skill_name, e, exc_info=True)
+        return False
+
+
+def clear_absorbed(skill_name: str) -> bool:
+    """Explicitly re-adopt a previously absorbed skill for future review."""
+    if not skill_name:
+        return False
+    try:
+        with _usage_file_lock():
+            data = load_usage()
+            rec = data.get(skill_name)
+            if not isinstance(rec, dict) or not is_absorbed_record(rec):
+                return False
+            rec.pop("absorbed_into", None)
+            rec.pop("absorbed_at", None)
+            if rec.get("state") == STATE_ABSORBED:
+                rec["state"] = STATE_ACTIVE
+            data[skill_name] = rec
+            save_usage(data)
+            persisted = load_usage().get(skill_name)
+            return isinstance(persisted, dict) and not is_absorbed_record(persisted)
+    except Exception as e:
+        logger.debug("skill_usage.clear_absorbed(%s) failed: %s", skill_name, e, exc_info=True)
+        return False
 
 
 def set_pinned(skill_name: str, pinned: bool) -> None:
@@ -873,7 +986,7 @@ def forget(skill_name: str) -> None:
 # Archive / restore
 # ---------------------------------------------------------------------------
 
-def archive_skill(skill_name: str) -> Tuple[bool, str]:
+def archive_skill(skill_name: str, absorbed_into: Optional[str] = None) -> Tuple[bool, str]:
     """Move a curator-eligible skill directory to ~/.hermes/skills/.archive/.
 
     Returns (ok, message). Never archives hub-installed skills. Bundled
@@ -931,6 +1044,11 @@ def archive_skill(skill_name: str) -> Tuple[bool, str]:
         add_suppressed_name(skill_name)
 
     set_state(skill_name, STATE_ARCHIVED)
+    if isinstance(absorbed_into, str) and absorbed_into.strip():
+        # Mark after the recoverable move succeeds. If the archive operation
+        # fails, the source remains a visible active candidate and can be
+        # retried; a failed consolidation must not silently hide it.
+        mark_absorbed(skill_name, absorbed_into)
     return True, f"archived to {dest}"
 
 
@@ -1005,6 +1123,9 @@ def restore_skill(skill_name: str) -> Tuple[bool, str]:
     # Restoring a pruned built-in lifts its suppression so updates can manage it.
     remove_suppressed_name(skill_name)
 
+    # ``set_state`` intentionally leaves ``absorbed_into`` untouched. A
+    # restored absorbed package remains excluded until ``curator adopt`` or a
+    # deliberate manual sidecar edit clears that marker.
     set_state(skill_name, STATE_ACTIVE)
     return True, f"restored to {dest}"
 
@@ -1049,10 +1170,14 @@ def _find_external_skill_dir(skill_name: str) -> Optional[Path]:
 # Reporting — for the curator CLI / slash command
 # ---------------------------------------------------------------------------
 
-def curated_report() -> List[Dict[str, Any]]:
+def curated_report(*, include_archived: bool = False) -> List[Dict[str, Any]]:
     """Return a list of {name, provenance, state, pinned, last_activity_at, ...}
     records for every curator-managed skill. Missing usage records are
     backfilled with defaults so callers can always index fields.
+
+    ``include_archived`` is opt-in because the lifecycle transition pass must
+    continue to scan only live skills. The consolidation candidate builder can
+    request archived packages explicitly.
 
     ``provenance`` is 'agent', 'bundled', or 'hub' (see :func:`provenance`).
     Bundled skills are only included when ``curator.prune_builtins`` is enabled.
@@ -1067,12 +1192,61 @@ def curated_report() -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     for name in list_agent_created_skill_names():
         raw = data.get(name)
+        if is_absorbed_record(raw):
+            continue
         persisted = isinstance(raw, dict)
-        rec: Dict[str, Any] = raw if isinstance(raw, dict) else _empty_record()
+        rec: Dict[str, Any] = dict(raw) if isinstance(raw, dict) else _empty_record()
         base = _empty_record()
         for k, v in base.items():
             rec.setdefault(k, v)
         row = {"name": name, **rec, "_persisted": persisted}
+        row["last_activity_at"] = latest_activity_at(row)
+        row["activity_count"] = activity_count(row)
+        row["provenance"] = provenance(name)
+        rows.append(row)
+    if include_archived:
+        active_names = {row["name"] for row in rows}
+        for row in archived_report():
+            if row["name"] not in active_names:
+                rows.append(row)
+    return rows
+
+
+def archived_report() -> List[Dict[str, Any]]:
+    """Return curator-managed archived skills with their last-known stats.
+
+    This is deliberately a separate filesystem scan from active discovery:
+    ``.archive`` is excluded from ``agent.skill_utils``' normal ``rglob``
+    traversal. Archived rows are marked ``state=archived`` for the reviewer,
+    even if an older sidecar record still says ``active``.
+    """
+    data = load_usage()
+    hub = _read_hub_installed_names()
+    bundled = _read_bundled_manifest_names()
+    prune_builtins = _prune_builtins_enabled()
+    rows: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
+
+    for skill_md in _iter_archived_skill_files():
+        name = _read_skill_name(skill_md, fallback=skill_md.parent.name)
+        if not name or name in seen or name in hub or is_protected_builtin(name):
+            continue
+        raw = data.get(name)
+        if is_absorbed_record(raw):
+            continue
+        if name in bundled:
+            if not prune_builtins:
+                continue
+        elif not _is_curator_managed_record(raw):
+            continue
+
+        seen.add(name)
+        rec: Dict[str, Any] = dict(raw) if isinstance(raw, dict) else _empty_record()
+        for key, value in _empty_record().items():
+            rec.setdefault(key, value)
+        row = {"name": name, **rec, "_persisted": isinstance(raw, dict)}
+        row["state"] = STATE_ARCHIVED
+        row["archive_path"] = str(skill_md.relative_to(_skills_dir()))
         row["last_activity_at"] = latest_activity_at(row)
         row["activity_count"] = activity_count(row)
         row["provenance"] = provenance(name)

@@ -1237,7 +1237,10 @@ def _delete_skill(name: str, absorbed_into: Optional[str] = None) -> Dict[str, A
     if curator_pass:
         try:
             from tools.skill_usage import archive_skill
-            ok, archive_msg = archive_skill(name)
+            ok, archive_msg = archive_skill(
+                name,
+                absorbed_into=absorbed_target if is_consolidation else None,
+            )
         except Exception as e:
             return {"success": False, "error": f"failed to archive '{name}': {e}"}
         if not ok:

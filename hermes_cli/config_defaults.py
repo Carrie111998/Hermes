@@ -1823,6 +1823,10 @@ DEFAULT_CONFIG = {
         # class-level umbrellas. `hermes curator run --consolidate` overrides
         # this for a single invocation.
         "consolidate": False,
+        # Include recoverable packages under skills/.archive/ in the opt-in
+        # consolidation review. Kept separate so existing consolidation users
+        # do not incur extra historical-package review until they enable it.
+        "consolidate_archived": False,
         # Also prune (archive) bundled built-in skills after the inactivity
         # period, not just agent-created ones. ON by default. Built-ins are
         # normally restored on every `hermes update`, so pruning them only
