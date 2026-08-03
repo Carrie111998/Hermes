@@ -34,6 +34,173 @@
  */
 
 import { execFileSync } from 'node:child_process'
+import path from 'node:path'
+
+/**
+ * Python versions Hermes supports, oldest first.
+ *
+ * Single source of truth for the floor `pyproject.toml` declares
+ * (`requires-python = ">=3.11,<3.14"`). main.ts's Windows detection passes
+ * (PEP 514 registry, standard install dirs, `py.exe -<version>`) and the POSIX
+ * candidate walk below both derive from this list, so the floor can't drift
+ * between platforms.
+ */
+const SUPPORTED_PYTHON_VERSIONS = ['3.11', '3.12', '3.13'] as const
+
+/**
+ * Ordered, bounded list of POSIX interpreter command names to try.
+ *
+ * Explicitly-versioned names come first so a box whose bare `python3` is out
+ * of range (Debian 11 / Ubuntu 20.04 ship 3.9; macOS CommandLineTools ships
+ * 3.9.6) still finds a supported interpreter instead of stopping at the first
+ * PATH hit. Bare `python3` / `python` stay as lower rungs rather than being
+ * removed: a venv or conda env on PATH exposes only the bare name, and the
+ * caller's probe -- not the file name -- is what proves a candidate runnable.
+ *
+ * Windows is deliberately excluded: bare PATH lookup there hits the Microsoft
+ * Store redirector, so main.ts uses registry / install-dir / `py.exe` passes.
+ *
+ * @returns {string[]} Command names in priority order.
+ */
+function posixPythonCommandCandidates() {
+  return [...SUPPORTED_PYTHON_VERSIONS.map(version => `python${version}`), 'python3', 'python']
+}
+
+/**
+ * Walk interpreter candidates and return the first one `accept` approves.
+ *
+ * Pure and dependency-injected (no electron, no direct PATH access) so the
+ * ordering policy is unit-testable without a real interpreter zoo on disk.
+ * Resolved paths are de-duplicated, so the common case where several names
+ * point at the same binary (`python3` and `python` symlinked together) costs
+ * one probe, not two.
+ *
+ * @param {object} deps
+ * @param {(command: string) => string | null} deps.findOnPath - PATH resolver.
+ * @param {(candidate: string) => boolean} [deps.accept] - Validator; when
+ *   omitted the first resolvable candidate wins (legacy behaviour).
+ * @param {string[]} [deps.candidates] - Override the command list (tests).
+ * @returns {string | null} An accepted interpreter path, or null.
+ */
+function findAcceptablePython(deps: {
+  findOnPath: (command: string) => string | null | undefined
+  accept?: ((candidate: string) => boolean) | null
+  candidates?: string[]
+}) {
+  const candidates = deps.candidates || posixPythonCommandCandidates()
+  const seen = new Set<string>()
+
+  for (const command of candidates) {
+    const resolved = deps.findOnPath(command)
+
+    if (!resolved || seen.has(resolved)) {
+      continue
+    }
+
+    seen.add(resolved)
+
+    if (!deps.accept || deps.accept(resolved)) {
+      return resolved
+    }
+  }
+
+  return null
+}
+
+/**
+ * Actionable message for "no interpreter on this machine can run Hermes."
+ *
+ * The failure this replaces was actively misleading: an out-of-range
+ * interpreter got spawned anyway and died inside hermes_cli with a bare
+ * `TypeError: unsupported operand type(s) for |` from PEP 604 syntax, which
+ * invites the wrong fix (making a `>=3.11` codebase 3.9-compatible) instead of
+ * pointing at interpreter selection.
+ *
+ * @param {string} root - Hermes source root the interpreter was resolved for.
+ * @returns {string} Log-ready message naming both remedies.
+ */
+function pythonResolutionFailureMessage(root: string) {
+  const floor = SUPPORTED_PYTHON_VERSIONS[0]
+  const venvHint = root ? `${root}/.venv` : '<hermes root>/.venv'
+
+  return (
+    `No Python >= ${floor} with Hermes dependencies found — expected a venv at ${venvHint}, ` +
+    'or set HERMES_DESKTOP_PYTHON to an interpreter that has them.'
+  )
+}
+
+/**
+ * In-checkout venv interpreter paths for `root`, in precedence order.
+ *
+ * `.venv` first (what `uv sync` creates, and what CI's `uv sync --locked
+ * --python 3.11` produces), then `venv` (what `scripts/install.sh` creates when
+ * it isn't redirecting via UV_PROJECT_ENVIRONMENT).
+ *
+ * @param {string} root - Hermes source root.
+ * @param {boolean} isWindows - Selects Scripts/python.exe vs bin/python.
+ * @returns {string[]} Absolute candidate paths, highest precedence first.
+ */
+function venvPythonCandidates(root: string, isWindows: boolean) {
+  const relativePaths = isWindows
+    ? [path.join('.venv', 'Scripts', 'python.exe'), path.join('venv', 'Scripts', 'python.exe')]
+    : [path.join('.venv', 'bin', 'python'), path.join('venv', 'bin', 'python')]
+
+  return relativePaths.map(relativePath => path.join(root, relativePath))
+}
+
+/**
+ * The whole interpreter-precedence ladder for a Hermes source root, as one
+ * pure function. Extracted here (rather than left inline in main.ts) so the
+ * precedence policy is written down once and unit-testable without electron:
+ *
+ *   1. explicit `HERMES_DESKTOP_PYTHON` override, when it exists on disk
+ *   2. `<root>/.venv`, then `<root>/venv`
+ *   3. a system interpreter that passes `accept`
+ *
+ * Rungs 1-2 are trusted unprobed on purpose. An override is a deployment
+ * contract (the `hgui` worktree helper points it at a shared venv), and a venv
+ * inside the checkout is the layout every install path produces -- probing
+ * either would spend a subprocess to second-guess a deliberate choice, and a
+ * broken venv there is a repair case, not a "silently use something else" case.
+ * Rung 3 is the only rung that picks an interpreter the user never pointed at,
+ * which is exactly why it is the one that must be proven runnable.
+ *
+ * The rung-3 gate is built HERE, not by the caller: `canImport` is a required
+ * dependency, so the walk cannot be wired up without it. That is deliberate --
+ * an optional gate is one an edit can quietly drop, which is how this rung came
+ * to be the only one in the ladder running unprobed.
+ *
+ * @param {object} deps
+ * @param {string} deps.root - Hermes source root.
+ * @param {string} [deps.override] - HERMES_DESKTOP_PYTHON value.
+ * @param {boolean} deps.isWindows
+ * @param {(filePath: string) => boolean} deps.fileExists
+ * @param {(candidate: string, root: string) => boolean} deps.canImport - Proof
+ *   that a candidate can import Hermes with `root` on PYTHONPATH.
+ * @param {(accept: (candidate: string) => boolean) => string | null}
+ *   deps.findSystemPython - Platform walk; must honour the accept validator.
+ * @returns {string | null} Interpreter path, or null when nothing qualifies.
+ */
+function resolvePythonForRoot(deps: {
+  root: string
+  override?: string | null
+  isWindows: boolean
+  fileExists: (filePath: string) => boolean
+  canImport: (candidate: string, root: string) => boolean
+  findSystemPython: (accept: (candidate: string) => boolean) => string | null | undefined
+}) {
+  if (deps.override && deps.fileExists(deps.override)) {
+    return deps.override
+  }
+
+  for (const candidate of venvPythonCandidates(deps.root, deps.isWindows)) {
+    if (deps.fileExists(candidate)) {
+      return candidate
+    }
+  }
+
+  return deps.findSystemPython(candidate => deps.canImport(candidate, deps.root)) || null
+}
 
 /** Default probe budget. 5s false-negativeed healthy Windows cold starts (#61764). */
 const DEFAULT_PROBE_TIMEOUT_MS = 15_000
@@ -213,9 +380,15 @@ export {
   canImportHermesCli,
   DEFAULT_PROBE_TIMEOUT_MS,
   execProbeSync,
+  findAcceptablePython,
   hermesRuntimeImportProbe,
+  posixPythonCommandCandidates,
   PROBE_TIMEOUT_MS,
+  pythonResolutionFailureMessage,
   resolveProbeTimeoutMs,
+  resolvePythonForRoot,
   shouldTrustHermesOverride,
+  SUPPORTED_PYTHON_VERSIONS,
+  venvPythonCandidates,
   verifyHermesCli
 }

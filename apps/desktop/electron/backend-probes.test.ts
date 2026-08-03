@@ -15,10 +15,16 @@ import { test } from 'vitest'
 import {
   canImportHermesCli,
   DEFAULT_PROBE_TIMEOUT_MS,
+  findAcceptablePython,
   hermesRuntimeImportProbe,
+  posixPythonCommandCandidates,
   PROBE_TIMEOUT_MS,
+  pythonResolutionFailureMessage,
   resolveProbeTimeoutMs,
+  resolvePythonForRoot,
   shouldTrustHermesOverride,
+  SUPPORTED_PYTHON_VERSIONS,
+  venvPythonCandidates,
   verifyHermesCli
 } from './backend-probes'
 
@@ -124,4 +130,292 @@ test('resolveProbeTimeoutMs honours HERMES_PROBE_TIMEOUT_MS', () => {
   assert.equal(resolveProbeTimeoutMs({ HERMES_PROBE_TIMEOUT_MS: 'nope' }), DEFAULT_PROBE_TIMEOUT_MS)
   // Cap runaway values
   assert.equal(resolveProbeTimeoutMs({ HERMES_PROBE_TIMEOUT_MS: '999999' }), 120_000)
+})
+
+// ── Interpreter resolution ladder ────────────────────────────────────────────
+//
+// A PATH interpreter that merely EXISTS used to be returned unprobed, so a
+// `python3` below the `requires-python = ">=3.11"` floor (3.9.6 from macOS
+// CommandLineTools; Debian 11 / Ubuntu 20.04 system python3) was spawned and
+// died inside hermes_cli on PEP 604 syntax. These assert the ordering and the
+// probe gate as behaviour contracts, not as a snapshot of the version list.
+
+/** Build a findOnPath stub from a name -> resolved-path table. */
+function pathTable(table: Record<string, string>) {
+  return (command: string) => table[command] || null
+}
+
+test('a venv inside the checkout wins over anything on PATH', () => {
+  const root = path.join(os.tmpdir(), 'hermes-resolve-root')
+  const dotVenv = venvPythonCandidates(root, false)[0]
+  let walked = false
+
+  const resolved = resolvePythonForRoot({
+    root,
+    isWindows: false,
+    fileExists: candidate => candidate === dotVenv,
+    canImport: () => true,
+    findSystemPython: () => {
+      walked = true
+
+      return '/usr/bin/python3'
+    }
+  })
+
+  assert.equal(resolved, dotVenv)
+  // Precedence has to short-circuit: a hit here must not pay for a PATH walk
+  // (each rejected candidate there costs an interpreter subprocess).
+  assert.equal(walked, false)
+})
+
+test('.venv takes precedence over venv, and both over the system walk', () => {
+  const root = path.join(os.tmpdir(), 'hermes-resolve-root')
+  const [dotVenv, plainVenv] = venvPythonCandidates(root, false)
+
+  assert.match(dotVenv, /[\\/]\.venv[\\/]/)
+  assert.match(plainVenv, /[\\/]venv[\\/]/)
+  assert.equal(
+    resolvePythonForRoot({
+      root,
+      isWindows: false,
+      fileExists: candidate => candidate === plainVenv,
+      canImport: () => true,
+      findSystemPython: () => '/usr/bin/python3'
+    }),
+    plainVenv
+  )
+})
+
+test('an explicit interpreter override outranks the checkout venv', () => {
+  // HERMES_DESKTOP_PYTHON is the documented escape hatch for a venv that lives
+  // outside the checkout (the `hgui` worktree helper sets it). It must stay
+  // authoritative, and it is trusted unprobed: the user pointed at it.
+  const root = path.join(os.tmpdir(), 'hermes-resolve-root')
+  const override = path.join(os.tmpdir(), 'shared-venv', 'bin', 'python')
+
+  assert.equal(
+    resolvePythonForRoot({
+      root,
+      override,
+      isWindows: false,
+      fileExists: () => true,
+      canImport: () => false,
+      findSystemPython: () => '/usr/bin/python3'
+    }),
+    override
+  )
+})
+
+test('a nonexistent override falls through instead of being spawned', () => {
+  const root = path.join(os.tmpdir(), 'hermes-resolve-root')
+
+  assert.equal(
+    resolvePythonForRoot({
+      root,
+      override: '/gone/bin/python',
+      isWindows: false,
+      fileExists: candidate => candidate !== '/gone/bin/python',
+      canImport: () => true,
+      findSystemPython: () => '/usr/bin/python3'
+    }),
+    venvPythonCandidates(root, false)[0]
+  )
+})
+
+test('the system-walk rung is handed a gate bound to this root', () => {
+  // Wiring contract: the fallback rung must receive a validator, and that
+  // validator must ask about the root being resolved -- a probe run with the
+  // wrong (or no) PYTHONPATH would reject every candidate on a source checkout,
+  // where hermes_cli is only importable via the root.
+  const root = '/home/dev/hermes-agent'
+  const asked: Array<[string, string]> = []
+  let sawAccept = false
+
+  const resolved = resolvePythonForRoot({
+    root,
+    isWindows: false,
+    fileExists: () => false,
+    canImport: (candidate, forRoot) => {
+      asked.push([candidate, forRoot])
+
+      return true
+    },
+    findSystemPython: accept => {
+      sawAccept = typeof accept === 'function'
+
+      return accept('/opt/py313/bin/python3.13') ? '/opt/py313/bin/python3.13' : null
+    }
+  })
+
+  assert.equal(sawAccept, true)
+  assert.equal(resolved, '/opt/py313/bin/python3.13')
+  assert.deepEqual(asked, [['/opt/py313/bin/python3.13', root]])
+})
+
+test('no venv plus a too-old PATH python3: probe rejects and the walk continues', () => {
+  // The reported failure, with no versioned name available to short-circuit
+  // it: `python3` resolves and exists but cannot import hermes_cli (3.9.6
+  // can't even parse `str | None` in hermes_cli/main.py). Existence alone must
+  // not end the walk -- the probe has to demote it and try the next name.
+  const tooOld = '/usr/bin/python3'
+  const usable = '/opt/conda/bin/python'
+  const probed: string[] = []
+
+  const resolved = findAcceptablePython({
+    findOnPath: pathTable({ python3: tooOld, python: usable }),
+    accept: candidate => {
+      probed.push(candidate)
+
+      return candidate !== tooOld
+    }
+  })
+
+  assert.equal(resolved, usable)
+  assert.deepEqual(probed, [tooOld, usable], 'the too-old interpreter must be probed, then skipped')
+})
+
+test('an unprobed walk would have returned the too-old interpreter', () => {
+  // Teeth: this is the pre-fix behaviour. Same PATH, no validator -> the
+  // interpreter that dies on spawn is exactly what gets returned. If this ever
+  // starts returning the usable one, the probe gate stopped being what makes
+  // the difference and the fix is being carried by something else.
+  assert.equal(
+    findAcceptablePython({
+      findOnPath: pathTable({ python3: '/usr/bin/python3', python: '/opt/conda/bin/python' })
+    }),
+    '/usr/bin/python3'
+  )
+})
+
+test('a versioned name short-circuits before an out-of-range bare python3', () => {
+  // The other half of the fix, and a distinct mechanism from the probe: when a
+  // versioned name resolves, the walk never reaches bare `python3` at all, so
+  // the too-old interpreter costs zero subprocesses.
+  const probed: string[] = []
+
+  const resolved = findAcceptablePython({
+    findOnPath: pathTable({ 'python3.13': '/opt/py313/bin/python3.13', python3: '/usr/bin/python3' }),
+    accept: candidate => {
+      probed.push(candidate)
+
+      return true
+    }
+  })
+
+  assert.equal(resolved, '/opt/py313/bin/python3.13')
+  assert.deepEqual(probed, ['/opt/py313/bin/python3.13'])
+})
+
+test('an explicitly versioned name is preferred over bare python3', () => {
+  const order: string[] = []
+
+  const resolved = findAcceptablePython({
+    findOnPath: command => {
+      order.push(command)
+
+      return command === 'python3' ? '/usr/bin/python3' : `/usr/bin/${command}`
+    },
+    accept: () => true
+  })
+
+  assert.equal(resolved, `/usr/bin/python${SUPPORTED_PYTHON_VERSIONS[0]}`)
+  assert.equal(order[0], `python${SUPPORTED_PYTHON_VERSIONS[0]}`)
+  assert.ok(order.indexOf('python3') === -1, 'bare python3 must not be consulted once a versioned name answers')
+})
+
+test('bare python3 stays a candidate when no versioned name resolves', () => {
+  // A venv or conda env on PATH exposes only the bare name. Dropping bare
+  // python3 to enforce the floor would break those, so ordering (not
+  // exclusion) is the policy and the probe is the proof.
+  assert.equal(
+    findAcceptablePython({
+      findOnPath: pathTable({ python3: '/opt/conda/bin/python3' }),
+      accept: () => true
+    }),
+    '/opt/conda/bin/python3'
+  )
+})
+
+test('candidate ordering puts every supported version ahead of the bare names', () => {
+  const candidates = posixPythonCommandCandidates()
+
+  for (const version of SUPPORTED_PYTHON_VERSIONS) {
+    assert.ok(
+      candidates.indexOf(`python${version}`) < candidates.indexOf('python3'),
+      `python${version} must be tried before bare python3`
+    )
+  }
+
+  assert.ok(candidates.indexOf('python3') < candidates.indexOf('python'))
+  // Bounded: one name per supported version plus the two bare names. The walk
+  // costs at most this many interpreter subprocesses.
+  assert.equal(candidates.length, SUPPORTED_PYTHON_VERSIONS.length + 2)
+})
+
+test('the walk probes each distinct interpreter at most once', () => {
+  // python3 and python are commonly the same binary; paying two subprocesses
+  // for one answer is pure boot latency.
+  const shared = '/usr/local/bin/python3'
+  const probed: string[] = []
+
+  assert.equal(
+    findAcceptablePython({
+      findOnPath: pathTable({ python3: shared, python: shared }),
+      accept: candidate => {
+        probed.push(candidate)
+
+        return false
+      }
+    }),
+    null
+  )
+  assert.deepEqual(probed, [shared])
+})
+
+test('with no accept validator the first resolvable candidate wins', () => {
+  // Callers that only need "any interpreter" (the uninstall path) must keep
+  // the original zero-subprocess behaviour.
+  assert.equal(findAcceptablePython({ findOnPath: pathTable({ python3: '/usr/bin/python3' }) }), '/usr/bin/python3')
+})
+
+test('nothing usable yields the actionable message, not a doomed spawn', () => {
+  const root = '/home/dev/hermes-agent'
+
+  assert.equal(
+    resolvePythonForRoot({
+      root,
+      isWindows: false,
+      fileExists: () => false,
+      canImport: () => false,
+      findSystemPython: accept => (accept('/usr/bin/python3') ? '/usr/bin/python3' : null)
+    }),
+    null
+  )
+
+  const message = pythonResolutionFailureMessage(root)
+
+  // Names the floor, the venv location we expect, and the escape hatch --
+  // so the reader fixes interpreter selection instead of trying to make a
+  // `requires-python = ">=3.11"` codebase run on 3.9.
+  assert.match(message, new RegExp(`>= ?${SUPPORTED_PYTHON_VERSIONS[0]}`))
+  assert.match(message, /\.venv/)
+  assert.ok(message.includes(root))
+  assert.match(message, /HERMES_DESKTOP_PYTHON/)
+})
+
+test('supported versions stay within the requires-python floor', () => {
+  // Invariant, not a snapshot: pyproject declares ">=3.11,<3.14".
+  for (const version of SUPPORTED_PYTHON_VERSIONS) {
+    const [major, minor] = version.split('.').map(Number)
+
+    assert.equal(major, 3)
+    assert.ok(minor >= 11 && minor < 14, `${version} is outside requires-python`)
+  }
+})
+
+test('windows venv candidates use Scripts/python.exe', () => {
+  const [dotVenv] = venvPythonCandidates('C:\\src\\hermes', true)
+
+  assert.match(dotVenv, /Scripts/)
+  assert.match(dotVenv, /python\.exe$/)
 })
