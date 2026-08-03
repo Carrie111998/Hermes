@@ -6338,13 +6338,16 @@ class APIServerAdapter(BasePlatformAdapter):
 
         session_id = body.get("session_id") or stored_session_id
 
-        # Auto-load persisted session history when the client supplied only a
-        # session_id (mirrors /chat, which always loads history from the
-        # session store). Explicit conversation_history, previous_response_id
-        # chaining, and multi-message input all take precedence; this only
-        # fires when none of those produced history. repair_alternation=True
-        # because this feed is LIVE REPLAY: a durable user;user wedge would
-        # otherwise re-trigger the pre-request repair on every request (see
+        # Auto-load persisted session history only when the client supplied NO
+        # history mechanism at all (mirrors /chat, which always loads history
+        # from the session store). A supplied-but-empty source must win: an
+        # explicit conversation_history: [] means "fresh run", an unknown
+        # previous_response_id stays authoritative, and a multi-message input
+        # array is itself the history. Tracking source presence (not resolved
+        # list truthiness) keeps the documented precedence exact at its
+        # boundary cases. repair_alternation=True because this feed is LIVE
+        # REPLAY: a durable user;user wedge would otherwise re-trigger the
+        # pre-request repair on every request (see
         # SessionDB.get_messages_as_conversation docstring). A missing session
         # degrades to empty history, never an error — the run still starts.
         # Callers that use session_id purely as a tracking/telemetry token
@@ -6352,7 +6355,14 @@ class APIServerAdapter(BasePlatformAdapter):
         # load_session_history=false. Loaded history is tail-windowed to
         # RUNS_SESSION_HISTORY_LIMIT so an arbitrarily long transcript cannot
         # blow the model context (compaction summaries are preserved).
-        if not conversation_history and session_id and body.get("load_session_history", True):
+        history_source_supplied = ("conversation_history" in body) or bool(
+            previous_response_id
+        ) or (isinstance(raw_input, list) and len(raw_input) > 1)
+        if (
+            not history_source_supplied
+            and session_id
+            and body.get("load_session_history", True)
+        ):
             conversation_history = await self._conversation_history_for_session(
                 session_id, repair_alternation=True
             )
