@@ -246,6 +246,59 @@ def _count_occurrences(text: str, pattern: str) -> int:
     return count
 
 
+def _apply_addition_only_hunk(content: str, hunk: Hunk) -> Tuple[str, Optional[str]]:
+    """Insert an addition-only hunk (only ``+`` lines) into *content*.
+
+    Shared by the validate and apply phases so both operate on byte-identical
+    intermediate content for every hunk type. Returns ``(new_content, error)``;
+    on error ``content`` is returned unchanged.
+
+    Insertion rules (mirrored exactly by both phases):
+    - context hint present and unique → insert after the line holding the hint;
+    - context hint present but missing → error (caller rejects the patch);
+    - context hint present but ambiguous → error (caller rejects the patch);
+    - no context hint → append at end of file.
+    """
+    insert_text = '\n'.join(l.content for l in hunk.lines if l.prefix == '+')
+    if hunk.context_hint:
+        occurrences = _count_occurrences(content, hunk.context_hint)
+        if occurrences == 0:
+            return content, (
+                f"addition-only hunk: context hint '{hunk.context_hint}' "
+                "not found"
+            )
+        if occurrences > 1:
+            return content, (
+                f"addition-only hunk: context hint '{hunk.context_hint}' is ambiguous "
+                f"({occurrences} occurrences) — provide a more unique hint"
+            )
+        hint_pos = content.find(hunk.context_hint)
+        # Insert after the line containing the context hint
+        eol = content.find('\n', hint_pos)
+        if eol != -1:
+            return content[:eol + 1] + insert_text + '\n' + content[eol + 1:], None
+        return content + '\n' + insert_text, None
+    return content.rstrip('\n') + '\n' + insert_text + '\n', None
+
+
+def _candidate_validation_error(
+    candidate_validator: Any,
+    path: str,
+    content: str,
+) -> Optional[str]:
+    """Keep backend preflight exceptions inside the structured patch result."""
+    if not callable(candidate_validator):
+        return None
+    try:
+        result = candidate_validator(path, content)
+        # The interface contract is Optional[str]. Ignore other truthy values
+        # so duck-typed backends and unspecced mocks do not become accidental
+        # hard rejections merely because they expose a callable attribute.
+        return result if isinstance(result, str) and result else None
+    except Exception as exc:
+        return f"candidate preflight raised {type(exc).__name__}: {exc}"
+
+
 def _validate_operations(
     operations: List[PatchOperation],
     file_ops: Any,
@@ -263,6 +316,7 @@ def _validate_operations(
 
     errors: List[str] = []
     real_change_count = 0
+    candidate_validator = getattr(file_ops, "validate_write_candidate", None)
 
     # Virtual filesystem overlay so inter-op state (notably a MOVE creating the
     # destination a later UPDATE targets) validates correctly. Maps a path to
@@ -283,6 +337,7 @@ def _validate_operations(
         return r.content, None
 
     for op in operations:
+        operation_error_count = len(errors)
         if op.operation != OperationType.UPDATE:
             real_change_count += 1
         if op.operation == OperationType.UPDATE:
@@ -302,20 +357,14 @@ def _validate_operations(
                     continue
                 real_change_count += 1
                 if not search_lines:
-                    # Addition-only hunk: validate context hint uniqueness
-                    if hunk.context_hint:
-                        occurrences = _count_occurrences(simulated, hunk.context_hint)
-                        if occurrences == 0:
-                            errors.append(
-                                f"{op.file_path}: addition-only hunk context hint "
-                                f"'{hunk.context_hint}' not found"
-                            )
-                        elif occurrences > 1:
-                            errors.append(
-                                f"{op.file_path}: addition-only hunk context hint "
-                                f"'{hunk.context_hint}' is ambiguous "
-                                f"({occurrences} occurrences)"
-                            )
+                    # Addition-only hunk: simulate the insertion exactly as the
+                    # apply phase does, so later hunks validate against the same
+                    # post-insertion content apply will see.
+                    new_simulated, add_error = _apply_addition_only_hunk(simulated, hunk)
+                    if add_error:
+                        errors.append(f"{op.file_path}: {add_error}")
+                    else:
+                        simulated = new_simulated
                     continue
 
                 search_pattern = '\n'.join(search_lines)
@@ -354,6 +403,26 @@ def _validate_operations(
             # file) sees the edited version in the overlay.
             pending_content[op.file_path] = simulated
 
+            if len(errors) == operation_error_count and simulated is not None:
+                candidate_error = _candidate_validation_error(
+                    candidate_validator, op.file_path, simulated
+                )
+                if candidate_error:
+                    errors.append(f"{op.file_path}: {candidate_error}")
+
+        elif op.operation == OperationType.ADD:
+            content = '\n'.join(
+                line.content
+                for hunk in op.hunks
+                for line in hunk.lines
+                if line.prefix == '+'
+            )
+            candidate_error = _candidate_validation_error(
+                candidate_validator, op.file_path, content
+            )
+            if candidate_error:
+                errors.append(f"{op.file_path}: {candidate_error}")
+
         elif op.operation == OperationType.DELETE:
             _content, read_err = _read(op.file_path)
             if read_err:
@@ -382,7 +451,8 @@ def _validate_operations(
                 pending_content.pop(op.file_path, None)
                 removed_paths.add(op.file_path)
 
-        # ADD: parent directory creation handled by write_file; no pre-check needed.
+        # ADD parent creation and mutation remain apply-phase responsibilities;
+        # candidate policy/syntax was preflighted above.
 
     if not errors and real_change_count == 0:
         errors.append("Patch contains no changes (only context lines were provided)")
@@ -653,28 +723,10 @@ def _apply_update(op: PatchOperation, file_ops: Any) -> Tuple[bool, str, Optiona
                     return False, err_msg, None
         else:
             # Addition-only hunk (no context or removed lines).
-            # Insert at the location indicated by the context hint, or at end of file.
-            insert_text = '\n'.join(replace_lines)
-            if hunk.context_hint:
-                occurrences = _count_occurrences(new_content, hunk.context_hint)
-                if occurrences == 0:
-                    # Hint not found — append at end as a safe fallback
-                    new_content = new_content.rstrip('\n') + '\n' + insert_text + '\n'
-                elif occurrences > 1:
-                    return False, (
-                        f"Addition-only hunk: context hint '{hunk.context_hint}' is ambiguous "
-                        f"({occurrences} occurrences) — provide a more unique hint"
-                    ), None
-                else:
-                    hint_pos = new_content.find(hunk.context_hint)
-                    # Insert after the line containing the context hint
-                    eol = new_content.find('\n', hint_pos)
-                    if eol != -1:
-                        new_content = new_content[:eol + 1] + insert_text + '\n' + new_content[eol + 1:]
-                    else:
-                        new_content = new_content + '\n' + insert_text
-            else:
-                new_content = new_content.rstrip('\n') + '\n' + insert_text + '\n'
+            # Use the shared helper so apply and validation stay byte-identical.
+            new_content, add_error = _apply_addition_only_hunk(new_content, hunk)
+            if add_error:
+                return False, add_error, None
     
     # Write new content
     write_result = file_ops.write_file(op.file_path, new_content)
