@@ -9190,7 +9190,7 @@ async def cancel_telegram_onboarding(pairing_id: str):
 
 
 @app.get("/api/messaging/platforms")
-async def get_messaging_platforms(profile: Optional[str] = None):
+def get_messaging_platforms(profile: Optional[str] = None):
     # Profile-scoped so the dashboard's global profile switcher shows the
     # TARGET profile's channel credentials/state, not the root install's.
     # load_env() honors the HERMES_HOME contextvar override; the gateway
