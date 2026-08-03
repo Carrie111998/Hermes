@@ -509,6 +509,47 @@ class TestWebServerEndpoints:
         assert seen["status_path"] == worker_home / "gateway_state.json"
         assert seen["expected_home"] == worker_home
 
+    def test_messaging_platforms_loads_gateway_config_once(self, monkeypatch):
+        """The unscoped listing must load the gateway config exactly ONCE.
+
+        load_gateway_config() is a full reload — plugin discovery plus
+        per-platform requirement checks (~360ms). The per-entry
+        _gateway_platform_config() path re-ran it for every catalog entry
+        (~30), so one dashboard request stacked ~10s of identical reloads.
+        The handler now hoists a single load before the loop and passes it
+        down to every payload (credit: PR #56636).
+        """
+        import gateway.config as gateway_config_mod
+
+        calls = {"n": 0}
+
+        class _FakeGatewayConfig:
+            platforms: dict = {}
+
+            def _is_platform_connected(self, platform, platform_config):
+                return False
+
+        def _counting_load(*args, **kwargs):
+            calls["n"] += 1
+            return _FakeGatewayConfig()
+
+        monkeypatch.setattr(
+            gateway_config_mod, "load_gateway_config", _counting_load
+        )
+
+        resp = self.client.get("/api/messaging/platforms")
+
+        assert resp.status_code == 200
+        platforms = resp.json()["platforms"]
+        # The invariant only means something when the catalog fans out to
+        # many entries — the whole point of the hoist.
+        assert len(platforms) > 1
+        assert calls["n"] == 1, (
+            f"load_gateway_config() ran {calls['n']}x for "
+            f"{len(platforms)} catalog entries; the hoist in "
+            "get_messaging_platforms must load it exactly once per request"
+        )
+
 
 
 

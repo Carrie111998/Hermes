@@ -8216,10 +8216,21 @@ def _messaging_env_info(key: str) -> dict[str, Any]:
     }
 
 
-def _gateway_platform_config(platform_id: str):
+# Sentinel: "no pre-loaded gateway config was provided — load on demand".
+# Distinct from None, which means "the caller's per-request load failed".
+_GATEWAY_CONFIG_UNSET = object()
+
+
+def _gateway_platform_config(platform_id: str, config: Any = _GATEWAY_CONFIG_UNSET):
     from gateway.config import Platform, load_gateway_config
 
-    config = load_gateway_config()
+    if config is _GATEWAY_CONFIG_UNSET:
+        config = load_gateway_config()
+    if config is None:
+        # The caller pre-loaded the config for the whole request and that load
+        # failed; surface it so each payload takes its env-var fallback path
+        # (same behavior as a per-entry load failure — never a 500).
+        raise RuntimeError("gateway config unavailable for this request")
     platform = Platform(platform_id)
     platform_config = config.platforms.get(platform)
     return config, platform, platform_config
@@ -8231,6 +8242,7 @@ def _messaging_platform_payload(
     runtime: dict | None,
     scoped: bool = False,
     profile_home: Optional[Path] = None,
+    gateway_config: Any = _GATEWAY_CONFIG_UNSET,
 ) -> dict[str, Any]:
     platform_id = entry["id"]
     runtime_platforms = runtime.get("platforms") if runtime else {}
@@ -8300,13 +8312,13 @@ def _messaging_platform_payload(
         configured = all(env_on_disk.get(key) for key in entry["required_env"])
     else:
         try:
-            gateway_config, platform, platform_config = _gateway_platform_config(
-                platform_id
+            gw_config, platform, platform_config = _gateway_platform_config(
+                platform_id, gateway_config
             )
             enabled = bool(platform_config and platform_config.enabled)
             configured = bool(
                 platform_config
-                and gateway_config._is_platform_connected(platform, platform_config)
+                and gw_config._is_platform_connected(platform, platform_config)
             )
             home_channel = (
                 platform_config.home_channel.to_dict()
@@ -9273,6 +9285,24 @@ async def get_messaging_platforms(profile: Optional[str] = None):
             if scoped_dir is not None
             else read_runtime_status()
         )
+        # Snapshot the catalog BEFORE loading the gateway config: loading can
+        # re-run plugin discovery, which mutates the registry the catalog is
+        # built from (credit: PR #56636).
+        catalog = list(_messaging_platform_catalog())
+        # Hoist the config load out of the per-entry loop: the config is
+        # identical for every catalog entry (~30), and load_gateway_config()
+        # is a full reload including plugin requirement checks (~360ms), so
+        # per-entry loads added ~10s per request (credit: PR #56636). Scoped
+        # requests never consume it — don't pay for it. None signals a failed
+        # load so each payload takes its env-var fallback (never a 500).
+        gateway_config = _GATEWAY_CONFIG_UNSET
+        if scoped_dir is None:
+            from gateway.config import load_gateway_config
+
+            try:
+                gateway_config = load_gateway_config()
+            except Exception:
+                gateway_config = None
         return {
             "env_path": str(get_env_path()),
             "gateway_start_command": _gateway_display_command(profile, "start"),
@@ -9283,8 +9313,9 @@ async def get_messaging_platforms(profile: Optional[str] = None):
                     runtime,
                     scoped=scoped_dir is not None,
                     profile_home=scoped_dir,
+                    gateway_config=gateway_config,
                 )
-                for entry in _messaging_platform_catalog()
+                for entry in catalog
             ]
         }
 
