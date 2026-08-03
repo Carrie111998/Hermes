@@ -72,7 +72,11 @@ class SlashAccessPolicy:
             # downstream code can keep using ``is_admin`` / ``can_run``
             # uniformly.
             return True
-        if not user_id:
+        if (
+            isinstance(user_id, bool)
+            or not isinstance(user_id, (str, int))
+            or not str(user_id).strip()
+        ):
             return False
         return str(user_id) in self.admin_user_ids
 
@@ -88,14 +92,27 @@ class SlashAccessPolicy:
         return canonical_cmd in self.user_allowed_commands
 
 
-_DM_CHAT_TYPES = frozenset({"dm", "direct", "private", ""})
+_DM_CHAT_TYPES = frozenset({"dm", "direct", "private"})
+_GROUP_CHAT_TYPES = frozenset({"group", "channel", "thread", "supergroup", "forum"})
+
+
+def canonical_scope_for_chat_type(chat_type: Optional[str]) -> Optional[str]:
+    """Return the recognized DM/group scope for *chat_type*, else ``None``."""
+    if not isinstance(chat_type, str):
+        return None
+    normalized = chat_type.strip().lower()
+    if normalized in _DM_CHAT_TYPES:
+        return "dm"
+    if normalized in _GROUP_CHAT_TYPES:
+        return "group"
+    return None
 
 
 def _coerce_id_list(raw: Any) -> FrozenSet[str]:
     """Normalize a YAML-loaded admin/user list into a frozenset of strings.
 
-    Accepts ``None``, list, tuple, or comma-separated string. Stringifies
-    each entry and strips whitespace; empty entries are dropped.
+    Accepts string/integer identities, collections of those values, or a
+    comma-separated string. Booleans and structured values fail closed.
     """
     if raw is None:
         return frozenset()
@@ -108,6 +125,8 @@ def _coerce_id_list(raw: Any) -> FrozenSet[str]:
         items = (raw,)
     out: list[str] = []
     for it in items:
+        if isinstance(it, bool) or not isinstance(it, (str, int)):
+            continue
         s = str(it).strip()
         if s:
             out.append(s)
@@ -138,9 +157,7 @@ def _coerce_command_list(raw: Any) -> FrozenSet[str]:
 
 
 def _scope_for_chat_type(chat_type: Optional[str]) -> str:
-    if chat_type and chat_type.lower() in _DM_CHAT_TYPES:
-        return "dm"
-    return "group"
+    return canonical_scope_for_chat_type(chat_type) or "group"
 
 
 def _platform_extra(platform_config: Any) -> dict:
@@ -224,6 +241,7 @@ def policy_for_source(gateway_config: Any, source: Any) -> SlashAccessPolicy:
 
 __all__ = [
     "SlashAccessPolicy",
+    "canonical_scope_for_chat_type",
     "policy_from_extra",
     "policy_for_source",
 ]

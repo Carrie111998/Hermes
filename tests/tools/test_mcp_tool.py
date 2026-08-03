@@ -50,6 +50,355 @@ def _make_mock_server(name, session=None, tools=None):
     return server
 
 
+def test_mcp_payload_redaction_handles_wordpress_option_rows():
+    from tools.mcp_tool import _redact_mcp_tool_payload
+
+    secret = "synthetic-mcp-option-value-for-tests-only"
+    payload = {
+        "results": [{
+            "option_name": "sample_integration_client_secret",
+            "option_value": secret,
+        }]
+    }
+    redacted = _redact_mcp_tool_payload(payload)
+    assert redacted["results"][0]["option_value"] == "***"
+    assert secret not in json.dumps(redacted)
+
+
+def test_mcp_payload_redaction_parses_prefixed_json_text_blocks():
+    from tools.mcp_tool import _redact_mcp_tool_payload
+
+    secret = "synthetic-json-text-option-value"
+    payload = "Synthetic query failed: " + json.dumps({
+        "option_name": "sample_auth_token",
+        "option_value": secret,
+    })
+    redacted = _redact_mcp_tool_payload(payload)
+    assert isinstance(redacted, str)
+    assert "Synthetic query failed" in redacted
+    assert "***" in redacted
+    assert secret not in redacted
+
+
+def test_mcp_payload_redaction_fails_closed(monkeypatch, caplog):
+    from tools.mcp_tool import _redact_mcp_tool_payload
+
+    secret = "synthetic-redaction-failure-value-for-tests-only"
+
+    def fail_redaction(_payload):
+        raise RuntimeError(f"synthetic redaction failure {secret}")
+
+    monkeypatch.setattr("agent.redact.redact_sensitive_data", fail_redaction)
+    redacted = _redact_mcp_tool_payload({"api_key": secret})
+    assert redacted == "[REDACTED - MCP tool output sanitization failed]"
+    assert secret not in redacted
+    assert secret not in caplog.text
+
+
+def test_sanitize_error_redacts_prefixed_structured_json():
+    from tools.mcp_tool import _sanitize_error
+
+    secret = "synthetic-prefixed-error-secret-for-tests-only"
+    error = "Synthetic failure: " + json.dumps({
+        "option_name": "demo_service_auth_token",
+        "option_value": secret,
+    })
+
+    sanitized = _sanitize_error(error)
+
+    assert "Synthetic failure" in sanitized
+    assert secret not in sanitized
+    assert "***" in sanitized
+
+
+def test_sanitize_error_applies_comprehensive_plain_text_redaction():
+    from tools.mcp_tool import _sanitize_error
+
+    secret = "opaque-synthetic-sentinel-314159"
+    error = (
+        f"api_key: {secret}\n"
+        f"url=https://demo:{secret}@example.test/path?access_token={secret}"
+    )
+
+    sanitized = _sanitize_error(error)
+
+    assert secret not in sanitized
+    assert "example.test" in sanitized
+
+
+def test_sanitize_error_fails_closed(monkeypatch, caplog):
+    from tools.mcp_tool import _sanitize_error
+
+    secret = "synthetic-error-sanitizer-failure-secret"
+
+    def fail_redaction(*_args, **_kwargs):
+        raise RuntimeError(f"redaction failed with {secret}")
+
+    monkeypatch.setattr("agent.redact.redact_sensitive_text", fail_redaction)
+    result = _sanitize_error(f"api_key: {secret}")
+
+    assert result == "[REDACTED - MCP error sanitization failed]"
+    assert secret not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_mcp_server_log_notification_is_sanitized(caplog):
+    from tools.mcp_tool import MCPServerTask
+
+    secret = "opaque-synthetic-notification-credential"
+    callback = MCPServerTask("synthetic")._make_logging_callback()
+    params = SimpleNamespace(
+        level="warning",
+        data={"api_key": secret, "message": "diagnostic retained"},
+        logger=f"api_key={secret}",
+    )
+
+    with caplog.at_level(logging.WARNING, logger="tools.mcp_tool"):
+        await callback(params)
+
+    assert secret not in caplog.text
+    assert "diagnostic retained" in caplog.text
+    assert "[REDACTED]" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_mcp_background_exception_logs_are_sanitized(monkeypatch, caplog):
+    from tools.mcp_tool import MCPServerTask
+
+    secret = "opaque-synthetic-background-exception-credential"
+    monkeypatch.setattr(
+        MCPServerTask,
+        "_refresh_tools",
+        AsyncMock(side_effect=RuntimeError(f"api_key: {secret}")),
+    )
+    server = MCPServerTask("synthetic")
+
+    with caplog.at_level(logging.DEBUG, logger="tools.mcp_tool"):
+        await server._refresh_tools_task()
+        await server._make_message_handler()(RuntimeError(f"password={secret}"))
+
+    assert secret not in caplog.text
+    assert "[REDACTED]" in caplog.text
+
+
+def test_sanitize_error_redacts_escaped_quotes_inside_assignment():
+    from tools.mcp_tool import _sanitize_error
+
+    secret = "synthetic-secret-after-escaped-quote"
+    error = f'api_key: "prefix\\\"{secret}"'
+
+    sanitized = _sanitize_error(error)
+
+    assert secret not in sanitized
+    assert "prefix" not in sanitized
+
+
+def test_sanitize_error_redacts_full_unquoted_assignment_line():
+    from tools.mcp_tool import _sanitize_error
+
+    secret = "correct horse, battery; staple"
+    sanitized = _sanitize_error(f"password: {secret}\nstatus: failed")
+
+    assert "correct" not in sanitized
+    assert "battery" not in sanitized
+    assert "staple" not in sanitized
+    assert "status: failed" in sanitized
+
+
+def test_mcp_payload_redaction_handles_json_encoded_string_fields():
+    from tools.mcp_tool import _redact_mcp_tool_payload
+
+    secret = "synthetic-json-encoded-field-secret"
+    payload = {
+        "body": json.dumps({
+            "option_name": "demo_service_client_secret",
+            "option_value": secret,
+        })
+    }
+
+    redacted = _redact_mcp_tool_payload(payload)
+
+    assert secret not in json.dumps(redacted)
+    assert "***" in redacted["body"]
+
+
+def test_mcp_payload_redaction_honors_global_opt_out(monkeypatch):
+    from tools.mcp_tool import _redact_mcp_tool_payload
+
+    secret = "synthetic-mcp-opt-out-secret"
+    payload = {"api_key": secret}
+    monkeypatch.setattr("agent.redact._REDACT_ENABLED", False)
+
+    assert _redact_mcp_tool_payload(payload) is payload
+
+
+def test_mcp_payload_redaction_opt_out_preserves_exact_json_text(monkeypatch):
+    from tools.mcp_tool import _redact_mcp_tool_payload
+
+    payload = '{  "api_key" : "synthetic-mcp-opt-out-secret"  }\n'
+    monkeypatch.setattr("agent.redact._REDACT_ENABLED", False)
+
+    assert _redact_mcp_tool_payload(payload) is payload
+
+
+def test_mcp_resource_link_preserves_actionable_url_credentials():
+    from tools.mcp_tool import _render_mcp_resource_block
+
+    secret = "synthetic-resource-link-secret"
+    block = SimpleNamespace(
+        type="resource_link",
+        uri=f"https://demo:{secret}@example.test/data?access_token={secret}",
+        name="fixture",
+        mimeType="application/json",
+    )
+
+    rendered = _render_mcp_resource_block(block, "demo")
+
+    assert secret in rendered
+    assert "example.test" in rendered
+
+
+def test_mcp_embedded_resource_error_force_redacts_uri_credentials():
+    from tools.mcp_tool import _render_mcp_resource_block
+
+    secret = "synthetic-embedded-resource-error-secret"
+    block = SimpleNamespace(
+        type="resource",
+        resource=SimpleNamespace(
+            text=None,
+            blob="a",
+            uri=f"https://example.test/data?access_token={secret}",
+            mimeType="",
+        ),
+    )
+
+    rendered = _render_mcp_resource_block(block, "demo")
+
+    assert secret not in rendered
+    assert "example.test" in rendered
+
+
+def test_mcp_payload_preserves_noncredential_text_and_actionable_urls():
+    from tools.mcp_tool import _redact_mcp_tool_payload
+
+    payload = {
+        "phone": "+14155552671",
+        "download_url": "https://example.test/file?signature=public-demo",
+        "source": 'const api_key = "fixture-value"',
+    }
+
+    assert _redact_mcp_tool_payload(payload) == payload
+
+
+def test_mcp_payload_redacts_line_oriented_plain_text_credentials():
+    from tools.mcp_tool import _redact_mcp_tool_payload
+
+    secret = "opaque-synthetic-success-secret"
+    payload = f"Status: failed\napi_key: {secret}\nRetry later"
+
+    redacted = _redact_mcp_tool_payload(payload)
+
+    assert secret not in redacted
+    assert "api_key: ***" in redacted
+
+
+def test_mcp_payload_redacts_plain_text_api_token_assignment():
+    from tools.mcp_tool import _redact_mcp_tool_payload
+
+    secret = "opaque-synthetic-api-token"
+    redacted = _redact_mcp_tool_payload(f"api_token: {secret}")
+
+    assert secret not in redacted
+    assert redacted == "api_token: ***"
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "webhook_signing_secret", "session_token", "proxy_authorization",
+        "raw_secret", "key_material", "refresh_token", "license_key",
+        "API key", "access token", "client secret", "private key",
+        "id_token", "oauth token", "personal access token", "bot_token",
+    ],
+)
+def test_mcp_payload_redacts_high_signal_plain_text_assignments(key):
+    from tools.mcp_tool import _redact_mcp_tool_payload
+
+    secret = "opaque-synthetic-high-signal-value"
+    redacted = _redact_mcp_tool_payload(f"{key}: {secret}")
+
+    assert secret not in redacted
+    assert redacted == f"{key}: ***"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "token: 42 available",
+        "secret: public metadata",
+        "credential: required",
+        "authorization: pending",
+    ],
+)
+def test_mcp_payload_preserves_ambiguous_plain_text_labels(text):
+    from tools.mcp_tool import _redact_mcp_tool_payload
+
+    assert _redact_mcp_tool_payload(text) == text
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        'api_key = os.getenv("API_KEY")',
+        'client_secret: os.environ["CLIENT_SECRET"]',
+        "access_token = process.env.ACCESS_TOKEN",
+        "password: $ENV{DB_PASSWORD}",
+    ],
+)
+def test_mcp_payload_preserves_line_leading_env_lookup_source(source):
+    from tools.mcp_tool import _redact_mcp_tool_payload
+
+    assert _redact_mcp_tool_payload(source) == source
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "secret: public metadata; api_key: {secret}",
+        "status: failed, client secret: {secret}",
+    ],
+)
+def test_mcp_payload_redacts_secondary_plain_text_assignment(payload):
+    from tools.mcp_tool import _redact_mcp_tool_payload
+
+    secret = "opaque-synthetic-secondary-credential"
+    redacted = _redact_mcp_tool_payload(payload.format(secret=secret))
+
+    assert secret not in redacted
+    assert "***" in redacted
+
+
+@pytest.mark.parametrize("key", ["token", "secret", "credential", "authorization"])
+def test_mcp_payload_redacts_opaque_ambiguous_plain_text_values(key):
+    from tools.mcp_tool import _redact_mcp_tool_payload
+
+    secret = "opaque-synthetic-credential-value"
+    redacted = _redact_mcp_tool_payload(f"{key}: {secret}")
+
+    assert secret not in redacted
+
+
+def test_mcp_resource_filename_drops_credential_shaped_uri_basename():
+    from tools.mcp_tool import _mcp_resource_filename
+
+    secret_name = "ghp_SyntheticCredentialFilename123456789.pdf"
+
+    assert _mcp_resource_filename(
+        f"https://example.test/files/{secret_name}",
+        "application/pdf",
+    ) == "resource.pdf"
+
+
 class TestFilterMCPChildren:
     def test_filters_gateway_children_by_argv_marker(self, monkeypatch):
         """Non-MCP children start with an interpreter/binary, not the marker."""
@@ -495,6 +844,92 @@ class TestToolHandler:
             mock_session.call_tool.assert_called_once_with("greet", arguments={"name": "world"})
         finally:
             _servers.pop("test_srv", None)
+
+    @pytest.mark.parametrize("channel", ["text", "resource", "structured"])
+    def test_successful_call_redacts_wordpress_option_rows(self, channel):
+        from tools.mcp_tool import _make_tool_handler, _servers
+
+        server_name = f"redaction_success_{channel}_srv"
+        secret = f"synthetic-{channel}-option-value-for-tests-only"
+        payload = {
+            "option_name": "sample_service_client_secret",
+            "option_value": secret,
+        }
+        content = []
+        structured = None
+        if channel == "text":
+            content = [SimpleNamespace(type="text", text=json.dumps(payload))]
+        elif channel == "resource":
+            resource = SimpleNamespace(
+                uri="mem://synthetic-options",
+                mimeType="application/json",
+                text=json.dumps(payload),
+                blob=None,
+            )
+            content = [SimpleNamespace(type="resource", resource=resource)]
+        else:
+            structured = payload
+        call_result = SimpleNamespace(
+            content=content,
+            isError=False,
+            structuredContent=structured,
+        )
+        mock_session = MagicMock()
+        mock_session.call_tool = AsyncMock(return_value=call_result)
+        _servers[server_name] = _make_mock_server(server_name, session=mock_session)
+        try:
+            handler = _make_tool_handler(server_name, "database_query", 120)
+            with self._patch_mcp_loop():
+                result = json.loads(handler({"query": "SELECT synthetic_fixture"}))
+            assert secret not in json.dumps(result)
+            assert "***" in json.dumps(result)
+        finally:
+            _servers.pop(server_name, None)
+
+    def test_mcp_error_result_redacts_multiblock_and_prefixed_option_rows(self):
+        from tools.mcp_tool import _make_tool_handler, _servers
+
+        server_name = "redaction_multiblock_error_srv"
+        text_secret = "opaque-violet-castle-47"
+        resource_secret = "opaque-silver-river-92"
+        resource = SimpleNamespace(
+            uri="mem://synthetic-error-options",
+            mimeType="application/json",
+            text=json.dumps({
+                "message": "resource diagnostic retained",
+                "option_name": "sample_service_private_key",
+                "option_value": resource_secret,
+            }),
+            blob=None,
+        )
+        call_result = SimpleNamespace(
+            content=[
+                SimpleNamespace(
+                    type="text",
+                    text="Synthetic query failed: " + json.dumps({
+                        "option_name": "sample_service_client_secret",
+                        "option_value": text_secret,
+                    }),
+                ),
+                SimpleNamespace(type="resource", resource=resource),
+            ],
+            isError=True,
+            structuredContent=None,
+        )
+        mock_session = MagicMock()
+        mock_session.call_tool = AsyncMock(return_value=call_result)
+        _servers[server_name] = _make_mock_server(server_name, session=mock_session)
+        try:
+            handler = _make_tool_handler(server_name, "database_query", 120)
+            with self._patch_mcp_loop():
+                result = json.loads(handler({}))
+            assert "Synthetic query failed" in result["error"]
+            assert "resource diagnostic retained" in result["error"]
+            assert result["error"].count("***") == 2
+            assert text_secret not in json.dumps(result)
+            assert resource_secret not in json.dumps(result)
+        finally:
+            _servers.pop(server_name, None)
 
 
     def test_recycled_stdio_server_reconnects_lazily_on_tool_call(self):
@@ -1444,6 +1879,29 @@ class TestUtilityHandlers:
 
 
     # -- read_resource --
+
+    def test_read_resource_redacts_wordpress_option_rows(self):
+        from tools.mcp_tool import _make_read_resource_handler, _servers
+
+        server_name = "redaction_resource_srv"
+        secret = "synthetic-resource-read-option-value"
+        content_block = SimpleNamespace(text=json.dumps({
+            "option_name": "sample_client_secret",
+            "option_value": secret,
+        }))
+        mock_session = MagicMock()
+        mock_session.read_resource = AsyncMock(
+            return_value=SimpleNamespace(contents=[content_block])
+        )
+        _servers[server_name] = _make_mock_server(server_name, session=mock_session)
+        try:
+            handler = _make_read_resource_handler(server_name, 120)
+            with self._patch_mcp_loop():
+                result = json.loads(handler({"uri": "mem://synthetic-option"}))
+            assert secret not in json.dumps(result)
+            assert "***" in result["result"]
+        finally:
+            _servers.pop(server_name, None)
 
 
     # -- list_prompts --
