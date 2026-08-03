@@ -1650,10 +1650,17 @@ def run_doctor(args):
             except (KeyError, TypeError, ValueError):
                 pass
         if _venv_bin is None and _environment_scripts_dir is not None:
-            _candidate = _environment_scripts_dir / "hermes"
-            if _candidate.exists():
-                _venv_bin = _candidate
-                _uses_environment_entry_point = True
+            # Windows console scripts are installed as <name>.exe (plus .cmd/.bat
+            # shims); POSIX installs a bare <name>. Check all platform variants so
+            # an environment-installed entry point is not reported missing on
+            # Windows (verified on Win11: venv\Scripts\hermes.exe, bare "hermes"
+            # absent) or in cross-layout venvs.
+            for _script_name in ("hermes", "hermes.exe", "hermes.cmd", "hermes.bat"):
+                _candidate = _environment_scripts_dir / _script_name
+                if _candidate.exists():
+                    _venv_bin = _candidate
+                    _uses_environment_entry_point = True
+                    break
 
         _source_checkout = (PROJECT_ROOT / "pyproject.toml").is_file()
 

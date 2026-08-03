@@ -67,6 +67,26 @@ def _run_doctor(fix=False):
     return buf.getvalue()
 
 
+def _stub_posix_stdlib(monkeypatch):
+    """Provide minimal POSIX-only stdlib stubs (fcntl) so a win32 host can
+    exercise the POSIX-guarded doctor section after sys.platform is mocked."""
+    import types as _types
+    try:
+        import fcntl  # noqa: F401
+    except ImportError:
+        monkeypatch.setitem(
+            sys.modules,
+            "fcntl",
+            _types.SimpleNamespace(
+                flock=lambda *a, **k: None,
+                LOCK_EX=2,
+                LOCK_UN=8,
+                LOCK_SH=1,
+                LOCK_NB=4,
+            ),
+        )
+
+
 class TestDoctorCommandInstallation:
     """Tests for the ◆ Command Installation section."""
 
@@ -232,4 +252,79 @@ class TestDoctorCommandInstallation:
         out = _run_doctor(fix=False)
         assert "Command Installation" in out
         assert "$PREFIX/bin" in out
+
+    def test_wheel_virtualenv_windows_console_script_entry_point(
+        self, monkeypatch, tmp_path
+    ):
+        """Windows console-script layout (hermes.exe in the env Scripts dir)
+        must be detected, not reported as a missing entry point (#49529,
+        verified on Win11: venv\\Scripts\\hermes.exe, bare \"hermes\" absent)."""
+        _setup_doctor_env(monkeypatch, tmp_path)
+        # Reach the POSIX-guarded section on a win32 host without cascading
+        # POSIX-only stdlib imports (fcntl) through the doctor call chain.
+        _stub_posix_stdlib(monkeypatch)
+        monkeypatch.setattr(sys, "platform", "linux")
+        venv = tmp_path / "wheel-venv"
+        scripts = venv / "Scripts"
+        scripts.mkdir(parents=True)
+        hermes_exe = scripts / "hermes.exe"
+        hermes_exe.write_bytes(b"MZ\x90\x00")  # minimal PE header stub
+
+        site_packages = venv / "Lib" / "site-packages"
+        site_packages.mkdir(parents=True)
+        monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", site_packages)
+        monkeypatch.setattr(sys, "prefix", str(venv))
+        monkeypatch.setattr(sys, "base_prefix", str(tmp_path / "base-python"))
+        real_get_path = sysconfig.get_path
+        monkeypatch.setattr(
+            sysconfig,
+            "get_path",
+            lambda name, *args, **kwargs: (
+                str(scripts)
+                if name == "scripts"
+                else real_get_path(name, *args, **kwargs)
+            ),
+        )
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        out = _run_doctor(fix=False)
+
+        assert "Venv entry point exists" in out
+        assert "hermes.exe" in out
+        assert "Venv entry point not found" not in out
+        assert "Active environment entry point needs no global symlink" in out
+
+    def test_wheel_virtualenv_windows_console_script_missing_still_warns(
+        self, monkeypatch, tmp_path
+    ):
+        """Windows layout with no console script at all must still warn (no
+        false all-clear from the .exe/.cmd/.bat name scan)."""
+        _setup_doctor_env(monkeypatch, tmp_path)
+        _stub_posix_stdlib(monkeypatch)
+        monkeypatch.setattr(sys, "platform", "linux")  # reach the POSIX-guarded section
+        venv = tmp_path / "wheel-venv"
+        scripts = venv / "Scripts"
+        scripts.mkdir(parents=True)
+
+        site_packages = venv / "Lib" / "site-packages"
+        site_packages.mkdir(parents=True)
+        monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", site_packages)
+        monkeypatch.setattr(sys, "prefix", str(venv))
+        monkeypatch.setattr(sys, "base_prefix", str(tmp_path / "base-python"))
+        real_get_path = sysconfig.get_path
+        monkeypatch.setattr(
+            sysconfig,
+            "get_path",
+            lambda name, *args, **kwargs: (
+                str(scripts)
+                if name == "scripts"
+                else real_get_path(name, *args, **kwargs)
+            ),
+        )
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        out = _run_doctor(fix=False)
+
+        assert "Venv entry point not found" in out
+        assert "Active environment entry point needs no global symlink" not in out
 
