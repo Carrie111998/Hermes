@@ -661,11 +661,12 @@ def vision_router_enabled(config: Optional[Dict[str, Any]] = None) -> bool:
 
     The default is always False; the live runtime configuration is not
     modified by this module. ``auxiliary.vision`` behavior is never touched.
+    The canonical section is ``auxiliary.vision_router`` (legacy top-level
+    ``vision_router`` accepted only when the nested mapping is absent).
     """
-    if not config:
-        return _DEFAULT_ENABLED
-    router = (config.get("vision_router") or {}) if isinstance(config, dict) else {}
-    return bool(router.get("enabled", _DEFAULT_ENABLED))
+    from tools.vision_policy import resolve_vision_router_enabled
+
+    return resolve_vision_router_enabled(config)
 
 
 # -- serialization convenience ----------------------------------------------

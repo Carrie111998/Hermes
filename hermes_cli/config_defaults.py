@@ -1079,6 +1079,9 @@ DEFAULT_CONFIG = {
             "auxiliary_integration_enabled": False,
             "max_model_calls": 1,
             "telemetry_mode": "decisions_only",
+            "ocr_excerpt_chars": 4000,
+            "ocr_page_chars": 65536,
+            "per_workflow_max_calls": 20,
             "models": {
                 "fast_vlm": "qwen2.5vl",
                 "precision_vlm": "qwen3.6:27b",

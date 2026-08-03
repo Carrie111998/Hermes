@@ -20,9 +20,128 @@ from __future__ import annotations
 import enum
 import json
 from dataclasses import dataclass, field
+import os as _os
+from urllib.parse import urlparse as _urlparse
 from typing import Any, Dict, List, Optional, Tuple
 
 # ---------------------------------------------------------------------------
+# Vision Router configuration resolver (config-path alignment repair)
+#
+# Canonical path: config["auxiliary"]["vision_router"].
+# Legacy fallback: top-level config["vision_router"] ONLY when the nested
+# mapping is absent. Both paths present -> nested wins. No merging of
+# conflicting values. Malformed values fail closed.
+# ---------------------------------------------------------------------------
+
+_VR_ROUTER_KEYS = ("enabled", "ocr_excerpt_chars", "ocr_page_chars",
+                   "per_workflow_max_calls")
+
+
+def resolve_vision_router_config(config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Resolve the Vision Router configuration section.
+
+    Precedence (deterministic):
+    1. ``config["auxiliary"]["vision_router"]`` when present and a mapping
+       (canonical);
+    2. top-level ``config["vision_router"]`` mapping ONLY when the nested
+       mapping is absent (legacy compatibility);
+    3. anything else -> empty mapping (fail closed).
+    """
+    if not isinstance(config, dict):
+        return {}
+    aux = config.get("auxiliary")
+    if isinstance(aux, dict):
+        nested = aux.get("vision_router")
+        if isinstance(nested, dict):
+            return nested
+    legacy = config.get("vision_router")
+    if isinstance(legacy, dict):
+        return legacy
+    return {}
+
+
+def resolve_vision_router_enabled(config: Optional[Dict[str, Any]]) -> bool:
+    """Effective Router flag from the canonical section.
+
+    Malformed or non-boolean values fail closed to False.
+    """
+    router = resolve_vision_router_config(config)
+    val = router.get("enabled", False)
+    return val if isinstance(val, bool) else False
+
+
+def resolve_vision_router_value(
+    config: Optional[Dict[str, Any]], key: str, default: Any
+) -> Any:
+    """Read one Router-section value through the shared resolver."""
+    router = resolve_vision_router_config(config)
+    if key not in _VR_ROUTER_KEYS:
+        return default
+    return router.get(key, default)
+
+
+# ---------------------------------------------------------------------------
+# Trusted Ollama endpoint resolution (native base_url wiring repair)
+#
+# Source precedence (deterministic, no merging):
+# 1. explicit trusted config: auxiliary.vision.base_url (the accepted
+#    OpenAI-compatible Vision service endpoint — same Ollama service);
+# 2. OLLAMA_HOST environment convention (Ollama's standard host:port env);
+# 3. otherwise None -> fail closed.
+#
+# The returned value is the NATIVE root (scheme://host:port) — the /v1
+# OpenAI-compatible suffix is stripped because the native transport calls
+# {base_url}/api/generate at the root.
+# ---------------------------------------------------------------------------
+
+def resolve_ollama_base_url(config: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Trusted Ollama service root for the native /api/generate transport.
+
+    Server-controlled only: never derived from model-visible arguments.
+    Malformed values fail closed to None.
+    """
+    base: Optional[str] = None
+    if isinstance(config, dict):
+        aux = config.get("auxiliary")
+        if isinstance(aux, dict):
+            vis = aux.get("vision")
+            if isinstance(vis, dict):
+                v = vis.get("base_url")
+                if isinstance(v, str) and v.strip():
+                    base = v.strip()
+    if not base:
+        env = _os.environ.get("OLLAMA_HOST", "")
+        if isinstance(env, str) and env.strip():
+            base = env.strip()
+    if not base:
+        return None
+    return _normalize_ollama_base(base)
+
+
+def _normalize_ollama_base(base: str) -> Optional[str]:
+    """Normalize to scheme://host:port. Rejects file://, paths, embedded
+    credentials, unsupported schemes, and empty hosts. Deterministic."""
+    if not base or not isinstance(base, str):
+        return None
+    candidate = base if "://" in base else f"http://{base}"
+    try:
+        parsed = _urlparse(candidate)
+    except ValueError:
+        return None
+    if parsed.scheme not in ("http", "https"):
+        return None
+    if not parsed.hostname:
+        return None
+    if parsed.username or parsed.password:
+        return None
+    try:
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    except ValueError:
+        return None
+    return f"{parsed.scheme}://{parsed.hostname}:{port}"
+
+# ---------------------------------------------------------------------------
+
 # Canonical enums (V0.1 frozen set)
 # ---------------------------------------------------------------------------
 
@@ -70,8 +189,7 @@ class ExecutionStatus(str, enum.Enum):
 
 # Transport identities (single source of truth for the Vision layer).
 # The native Ollama ``/api/generate`` transport is bound as the default
-# execution profile for the PRECISION_VLM slot (task
-# HERMES_VISION_PRECISION_NATIVE_GENERATE_PROFILE_BINDING_V0_1); the
+# execution profile for the PRECISION_VLM slot ; the
 # OpenAI-compatible transport remains the default for FAST_VLM / OCR and
 # remains selectable for PRECISION_VLM via an explicit override.
 TRANSPORT_OPENAI_COMPATIBLE = "OPENAI_COMPATIBLE"
@@ -1017,7 +1135,7 @@ def build_result(
     bytes were converted for endpoint compatibility, e.g. WebP → PNG).
 
     ``transport`` (optional) carries the transport-selection metadata for the
-    invocation path used (task HERMES_VISION_GENERATE_ROUTE_ADAPTER_V0_1):
+    invocation path used :
     ``requested_transport``, ``selected_transport``, ``endpoint_family`` and
     ``native_generate_used``. Non-sensitive; never contains endpoint
     credentials or raw output.
