@@ -615,10 +615,12 @@ def _build_markdown_post_rows(content: str) -> List[List[Dict[str, str]]]:
     """Build Feishu post rows while isolating fenced AND indented code blocks.
 
     Feishu's `md` renderer can swallow trailing content when a fenced code block
-    or a 4-space-indented code block appears inside one large markdown element.
-    Split the reply at real fence lines and at indented-code-block boundaries so
-    prose before/after the code block remains visible while code stays in a
-    dedicated row.
+    or a 4-space-indented code block appears inside one large markdown element,
+    and it renders 4-space-indented blocks as EMPTY. Split the reply at real
+    fence lines and at indented-code-block boundaries so prose before/after the
+    code block remains visible while code stays in a dedicated row. Indented
+    segments are emitted as ``text`` rows (rendered verbatim) so they survive;
+    everything else stays an ``md`` row so normal markdown still renders.
     """
     if not content:
         return [[{"tag": "md", "text": ""}]]
@@ -636,7 +638,11 @@ def _build_markdown_post_rows(content: str) -> List[List[Dict[str, str]]]:
             return
         segment = "\n".join(current)
         if segment.strip():
-            rows.append([{"tag": "md", "text": segment}])
+            # Indented blocks go out as `text` rows: Feishu's md renderer
+            # drops 4-space-indented blocks (renders them EMPTY), but `text`
+            # rows are rendered verbatim, indentation preserved.
+            tag = "text" if in_indent_block else "md"
+            rows.append([{"tag": tag, "text": segment}])
         current = []
 
     for raw_line in content.splitlines():
@@ -4643,6 +4649,12 @@ class FeishuAdapter(BasePlatformAdapter):
         # MAX_MESSAGE_LENGTH, the per-chunk regex would otherwise
         # mis-classify a plain-prose chunk as ``text``. See #26841.
         if prefer_post or _MARKDOWN_HINT_RE.search(content):
+            # Feishu's post ``md`` renderer drops 4-space-indented blocks
+            # entirely (renders them as EMPTY). _build_markdown_post_rows
+            # isolates them into dedicated ``text`` rows, which Feishu renders
+            # verbatim (indentation preserved) while everything else stays an
+            # ``md`` row — so markdown formatting is NOT lost for the rest of
+            # the message.
             return "post", _build_markdown_post_payload(content)
         text_payload = {"text": content}
         return "text", json.dumps(text_payload, ensure_ascii=False)
