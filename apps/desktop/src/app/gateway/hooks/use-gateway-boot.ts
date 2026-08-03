@@ -1,6 +1,8 @@
 import { isGatewayReauthRequired, resolveGatewayWsUrl } from '@hermes/shared'
 import { useEffect, useRef } from 'react'
+import { useNavigate } from 'react-router'
 
+import { SETTINGS_ROUTE } from '@/app/routes'
 import type { HermesConnection } from '@/global'
 import { HermesGateway } from '@/hermes'
 import { translateNow } from '@/i18n'
@@ -73,6 +75,8 @@ export function useGatewayBoot({
   refreshHermesConfig,
   refreshSessions
 }: GatewayBootOptions) {
+  const navigate = useNavigate()
+
   const callbacksRef = useRef({
     beforeConnectionSwitch,
     handleGatewayEvent,
@@ -548,6 +552,23 @@ export function useGatewayBoot({
       } catch (err) {
         if (!cancelled) {
           const message = err instanceof Error ? err.message : String(err)
+
+          const evaSignInRequired =
+            Boolean(window.hermesDesktop.eva) && message.includes('Sign in to evaOS Agent from Settings')
+
+          if (evaSignInRequired) {
+            setDesktopBootStep({
+              phase: 'renderer.enrollment',
+              message: 'Sign in to evaOS Agent from Settings → Gateway.',
+              progress: 100,
+              running: false
+            })
+            setSessionsLoading(false)
+            navigate(`${SETTINGS_ROUTE}?tab=gateway`, { replace: true })
+
+            return
+          }
+
           failDesktopBoot(message)
           notifyError(err, translateNow('boot.errors.desktopBootFailed'))
           setSessionsLoading(false)
@@ -634,5 +655,5 @@ export function useGatewayBoot({
       setPrimaryGateway(null)
       $gateway.set(null)
     }
-  }, [])
+  }, [navigate])
 }

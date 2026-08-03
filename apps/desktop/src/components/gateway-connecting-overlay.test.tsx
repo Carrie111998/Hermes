@@ -170,6 +170,101 @@ describe('connecting overlay vs recovery surface', () => {
     expect(isRecoveryShown()).toBe(false)
   })
 
+  it('managed Eva enrollment leaves Settings reachable before a gateway exists', () => {
+    setGatewayState('idle')
+    $desktopBoot.set({
+      ...$desktopBoot.get(),
+      phase: 'renderer.enrollment',
+      progress: 100,
+      running: false,
+      visible: false
+    })
+
+    render(
+      <>
+        <GatewayConnectingOverlay />
+        <BootFailureOverlay />
+      </>
+    )
+
+    expect(isConnectingShown()).toBe(false)
+    expect(isRecoveryShown()).toBe(false)
+  })
+
+  it('managed Eva main-process sign-in state also leaves Settings visible', () => {
+    setGatewayState('idle')
+    $desktopBoot.set({
+      ...$desktopBoot.get(),
+      phase: 'eva.sign-in-required',
+      message: 'Sign in to evaOS Agent from Settings → Gateway.',
+      progress: 8,
+      running: false,
+      visible: true
+    })
+
+    render(
+      <>
+        <GatewayConnectingOverlay />
+        <BootFailureOverlay />
+      </>
+    )
+
+    expect(isConnectingShown()).toBe(false)
+    expect(isRecoveryShown()).toBe(false)
+  })
+
+  it('managed Eva hard failures expose only managed retry and sign-in recovery', () => {
+    const originalDesktop = window.hermesDesktop
+    window.hermesDesktop = {
+      eva: {
+        refresh: async () => ({
+          managed: true,
+          productName: 'evaOS Agent',
+          signedOut: false,
+          customerId: 'jackie-david',
+          email: null,
+          desktopSessionExpiresAt: null,
+          desktopSessionActive: false,
+          runtimeSessionExpiresAt: null,
+          runtimeSessionActive: false,
+          agentId: null,
+          updateChannel: 'managed-beta'
+        }),
+        signIn: async () => ({
+          managed: true,
+          productName: 'evaOS Agent',
+          signedOut: false,
+          customerId: 'jackie-david',
+          email: null,
+          desktopSessionExpiresAt: null,
+          desktopSessionActive: false,
+          runtimeSessionExpiresAt: null,
+          runtimeSessionActive: false,
+          agentId: null,
+          updateChannel: 'managed-beta'
+        })
+      }
+    } as unknown as Window['hermesDesktop']
+    $desktopBoot.set({
+      ...$desktopBoot.get(),
+      error: 'Managed backend unavailable',
+      running: false,
+      visible: true
+    })
+
+    try {
+      render(<BootFailureOverlay />)
+      expect(screen.getByRole('button', { name: /retry/i })).toBeTruthy()
+      expect(screen.getByRole('button', { name: /sign in/i })).toBeTruthy()
+      expect(screen.queryByRole('button', { name: /use local gateway/i })).toBeNull()
+      expect(screen.queryByRole('button', { name: /repair/i })).toBeNull()
+      expect(screen.queryByRole('button', { name: /open logs/i })).toBeNull()
+    } finally {
+      cleanup()
+      window.hermesDesktop = originalDesktop
+    }
+  })
+
   it('FIX: once the prolonged reconnect raises a recoverable boot error, the recovery overlay takes over', async () => {
     // Mirrors what useGatewayBoot.scheduleReconnect() now does after ~45s of
     // failed post-boot reconnects: it calls failDesktopBoot(), flipping the UI

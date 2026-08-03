@@ -101,7 +101,7 @@ const API_KEY_OPTIONS: ApiKeyOption[] = [
     id: 'local',
     name: 'Local / custom endpoint',
     envKey: 'OPENAI_BASE_URL',
-    docsUrl: 'https://github.com/NousResearch/hermes-agent#bring-your-own-endpoint',
+    docsUrl: 'https://www.electricsheephq.com',
     placeholder: 'http://127.0.0.1:8000/v1'
   }
 ]
@@ -179,12 +179,19 @@ function useApiKeyCatalog(): ApiKeyOption[] {
 // → surface-out (520ms, held back by [transition-delay:660ms]). Finalize after.
 const ONBOARDING_EXIT_MS = 1180
 
-export function DesktopOnboardingOverlay({
-  enabled,
-  onCompleted,
-  profile,
-  requestGateway
-}: DesktopOnboardingOverlayProps) {
+export function DesktopOnboardingOverlay(props: DesktopOnboardingOverlayProps) {
+  // Managed evaOS Agent authenticates through Electric Sheep and connects to the
+  // administrator-bound remote agent. The upstream provider picker is a local
+  // runtime flow, so mounting it here would cover the managed Gateway sign-in
+  // surface before a remote session exists.
+  if (window.hermesDesktop?.eva) {
+    return null
+  }
+
+  return <UnmanagedDesktopOnboardingOverlay {...props} />
+}
+
+function UnmanagedDesktopOnboardingOverlay({ enabled, onCompleted, profile, requestGateway }: DesktopOnboardingOverlayProps) {
   const { t } = useI18n()
   const onboarding = useStore($desktopOnboarding)
   const boot = useStore($desktopBoot)

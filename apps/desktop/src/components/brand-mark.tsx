@@ -2,8 +2,8 @@ import { cn } from '@/lib/utils'
 
 const assetPath = (path: string) => `${import.meta.env.BASE_URL}${path.replace(/^\/+/, '')}`
 
-// Brand badge: nous-girl mark on a white tile, identical in light/dark.
-// Fills the tile (softly rounded); size via className (default size-14).
+// Eva's Electric Sheep app portrait. The source asset is the same identity
+// used by the managed macOS bundle so in-app and Finder branding stay aligned.
 export function BrandMark({ className, ...props }: React.ComponentProps<'span'>) {
   return (
     <span
@@ -13,7 +13,7 @@ export function BrandMark({ className, ...props }: React.ComponentProps<'span'>)
       )}
       {...props}
     >
-      <img alt="" className="size-full object-contain" src={assetPath('nous-girl.jpg')} />
+      <img alt="" className="size-full object-contain" src={assetPath('eva.png')} />
     </span>
   )
 }

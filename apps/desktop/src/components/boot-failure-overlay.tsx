@@ -58,6 +58,7 @@ export function BootFailureOverlay() {
   // to the full Settings page (keeps the user on the recovery surface, no z-index
   // juggling, no second connection form to maintain).
   const [view, setView] = useState<RecoveryView>('recovery')
+  const managedEva = Boolean(window.hermesDesktop?.eva)
 
   const visible = Boolean(boot.error) && !boot.running
   // While first-run onboarding owns the picker/flow we let it surface its own
@@ -70,17 +71,22 @@ export function BootFailureOverlay() {
       return
     }
 
-    void window.hermesDesktop
-      ?.getRecentLogs()
+    const getRecentLogs = window.hermesDesktop?.getRecentLogs
+
+    if (!getRecentLogs || managedEva) {
+      return
+    }
+
+    void getRecentLogs()
       .then(res => setLogs(res.lines ?? []))
       .catch(() => undefined)
-  }, [boot.error, visible])
+  }, [boot.error, managedEva, visible])
 
   // Resolve whether this boot failure is a remote-gateway reauth so we can
   // offer the actionable "Sign in" path instead of the local-only recovery
   // buttons. Runs whenever the overlay becomes visible.
   useEffect(() => {
-    if (!visible) {
+    if (!visible || managedEva) {
       setRemoteReauth(null)
       setConnectionConfig(null)
       setRemoteFailure(false)
@@ -137,7 +143,7 @@ export function BootFailureOverlay() {
     return () => {
       cancelled = true
     }
-  }, [boot.error, visible])
+  }, [boot.error, managedEva, visible])
 
   if (!visible || suppressed) {
     return null
@@ -145,13 +151,25 @@ export function BootFailureOverlay() {
 
   const retry = async () => {
     setBusy('retry')
-    await window.hermesDesktop?.resetBootstrap().catch(() => undefined)
+
+    if (managedEva) {
+      await window.hermesDesktop.eva.refresh().catch(() => undefined)
+    } else {
+      await window.hermesDesktop?.resetBootstrap?.().catch(() => undefined)
+    }
+
+    window.location.reload()
+  }
+
+  const signInManaged = async () => {
+    setBusy('signin')
+    await window.hermesDesktop.eva.signIn().catch(() => undefined)
     window.location.reload()
   }
 
   const repair = async () => {
     setBusy('repair')
-    await window.hermesDesktop?.repairBootstrap().catch(() => undefined)
+    await window.hermesDesktop?.repairBootstrap?.().catch(() => undefined)
     window.location.reload()
   }
 
@@ -198,7 +216,7 @@ export function BootFailureOverlay() {
     }
   }
 
-  const openLogs = () => void window.hermesDesktop?.revealLogs().catch(() => undefined)
+  const openLogs = () => void window.hermesDesktop?.revealLogs?.().catch(() => undefined)
   const copy = t.boot.failure
 
   const label = signInLabel(remoteReauth, {
@@ -248,7 +266,10 @@ export function BootFailureOverlay() {
   let actions: RecoveryAction[]
   let hint: string
 
-  if (remoteReauth) {
+  if (managedEva) {
+    actions = [retryAction]
+    hint = 'Your business assignment is selected by Electric Sheep. Sign in again if access was changed or revoked.'
+  } else if (remoteReauth) {
     actions = [
       {
         key: 'signin',
@@ -334,10 +355,18 @@ export function BootFailureOverlay() {
                   {action.label}
                 </Button>
               ))}
-              <Button onClick={openLogs} variant="ghost">
-                <FileText />
-                {copy.openLogs}
-              </Button>
+              {managedEva ? (
+                <Button disabled={Boolean(busy)} onClick={() => void signInManaged()} variant="secondary">
+                  {busy === 'signin' ? <Loader2 className="animate-spin" /> : <LogIn />}
+                  {copy.signInToRemoteGateway}
+                </Button>
+              ) : null}
+              {!managedEva ? (
+                <Button onClick={openLogs} variant="ghost">
+                  <FileText />
+                  {copy.openLogs}
+                </Button>
+              ) : null}
             </div>
             <p className="text-xs text-muted-foreground">{hint}</p>
           </div>

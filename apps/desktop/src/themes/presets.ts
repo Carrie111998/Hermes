@@ -33,8 +33,8 @@ const nousTintTransparent = (pct: number) => `color-mix(in srgb, ${NOUS_BLUE} ${
  */
 export const nousTheme: DesktopTheme = {
   name: 'nous',
-  label: 'Nous',
-  description: 'Glass neutrals with Nous blue accents',
+  label: 'Electric Sheep',
+  description: 'Glass neutrals with Electric Sheep blue accents',
   colors: {
     background: '#F8FAFF',
     foreground: '#17171A',

@@ -14,11 +14,17 @@
 import { expect, test } from './test'
 
 import {
+  IS_MANAGED_EVAOS_AGENT,
   type MockBackendFixture,
   setupMockBackend,
   waitForAppReady,
 } from './fixtures'
 import { expectVisualSnapshot } from './visual-snapshot'
+
+test.skip(
+  IS_MANAGED_EVAOS_AGENT,
+  'The managed product is remote-only; its signed-out boot contract is covered by managed-boot.spec.ts.',
+)
 
 let fixture: MockBackendFixture | null = null
 

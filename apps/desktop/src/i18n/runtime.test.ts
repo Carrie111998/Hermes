@@ -3,7 +3,9 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { fieldCopyForSchemaKey } from '@/app/settings/field-copy'
 
 import { TRANSLATIONS } from './catalog'
-import { setRuntimeI18nLocale, translateNow } from './runtime'
+import { en } from './en'
+import { createManagedTranslations } from './managed-brand'
+import { setRuntimeI18nLocale, translateFrom, translateNow } from './runtime'
 import { zh } from './zh'
 
 describe('desktop i18n runtime translator', () => {
@@ -26,6 +28,14 @@ describe('desktop i18n runtime translator', () => {
 
   it('passes arguments to function translations', () => {
     expect(translateNow('notifications.updateReadyMessage', 2)).toBe('2 new changes available.')
+  })
+
+  it('does not rewrite runtime values while applying managed static branding', () => {
+    const managed = createManagedTranslations(en)
+
+    expect(translateFrom(() => managed, 'en', 'settings.gateway.connectedTo', ['Hermes-plugin', '1.0'])).toBe(
+      'Connected to Hermes-plugin · evaOS Agent 1.0'
+    )
   })
 
   it('translates migrated overlap keys for newly supported locales', () => {
@@ -61,7 +71,7 @@ describe('desktop i18n runtime translator', () => {
       boot.ready = undefined
       setRuntimeI18nLocale('ja')
 
-      expect(translateNow('boot.ready')).toBe('Hermes Desktop is ready')
+      expect(translateNow('boot.ready')).toBe('evaOS Agent is ready')
     } finally {
       boot.ready = originalReady
     }

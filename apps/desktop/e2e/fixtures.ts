@@ -33,6 +33,14 @@ import { installErrorBannerGuard } from './test'
 const DESKTOP_ROOT = path.resolve(import.meta.dirname, '..')
 const REPO_ROOT = path.resolve(DESKTOP_ROOT, '..', '..')
 const RELEASE_ROOT = path.join(DESKTOP_ROOT, 'release')
+const DESKTOP_PACKAGE = JSON.parse(
+  fs.readFileSync(path.join(DESKTOP_ROOT, 'package.json'), 'utf8'),
+) as {
+  build?: { appId?: string; productName?: string }
+}
+
+export const IS_MANAGED_EVAOS_AGENT =
+  DESKTOP_PACKAGE.build?.appId === 'com.electricsheephq.evaos.agent'
 
 // ─── Credential stripping (matches launch.spec.ts) ──────────────────────
 
@@ -416,6 +424,35 @@ export interface NoProviderFixture {
   page: Page
   sandbox: Sandbox
   cleanup: () => Promise<void>
+}
+
+export interface ManagedSignedOutFixture {
+  app: ElectronApplication
+  page: Page
+  sandbox: Sandbox
+  cleanup: () => Promise<void>
+}
+
+/**
+ * Launch the managed product without enrollment.
+ *
+ * The managed build must render Electric Sheep sign-in without starting or
+ * falling back to the upstream local-backend fixture.
+ */
+export async function setupManagedSignedOut(): Promise<ManagedSignedOutFixture> {
+  const sandbox = createSandbox('managed-signed-out')
+  const env = buildAppEnv(sandbox)
+  const { app, page } = await launchDesktop(env)
+
+  return {
+    app,
+    page,
+    sandbox,
+    cleanup: async () => {
+      await app.close().catch(() => undefined)
+      sandbox.cleanup()
+    },
+  }
 }
 
 /**
