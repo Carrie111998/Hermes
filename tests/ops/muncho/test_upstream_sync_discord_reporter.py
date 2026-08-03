@@ -23,6 +23,25 @@ reporter = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = reporter
 SPEC.loader.exec_module(reporter)
 
+_ORIGINAL_PARENT_CHAIN_VALIDATOR = reporter._validate_controlled_parent_chain
+
+
+@pytest.fixture(autouse=True)
+def _trust_pytest_tmp_parent_chain(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep receipt tests portable without weakening production validation.
+
+    Linux CI creates ``tmp_path`` below the intentionally world-writable
+    system ``/tmp``.  The reporter must reject that ancestry in production,
+    so receipt-focused tests replace only the parent-chain probe.  Dedicated
+    tests below exercise the original validator directly.
+    """
+
+    monkeypatch.setattr(
+        reporter,
+        "_validate_controlled_parent_chain",
+        lambda _path, *, runtime_uid: None,
+    )
+
 
 def _report(created: str = "2026-07-25T05:00:00Z") -> dict[str, object]:
     return {
@@ -67,6 +86,16 @@ def _public_report_dir(tmp_path: Path) -> Path:
         encoding="utf-8",
     )
     return public
+
+
+def test_original_parent_validator_accepts_root_and_rejects_system_tmp() -> None:
+    _ORIGINAL_PARENT_CHAIN_VALIDATOR(Path("/"), runtime_uid=os.geteuid())
+
+    with pytest.raises(
+        reporter.DeliveryStateError,
+        match="delivery_state_parent_not_controlled",
+    ):
+        _ORIGINAL_PARENT_CHAIN_VALIDATOR(Path("/tmp"), runtime_uid=os.geteuid())
 
 
 def test_daily_report_contains_both_components_and_safety() -> None:
