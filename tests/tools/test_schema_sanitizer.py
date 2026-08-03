@@ -311,7 +311,10 @@ def test_bare_string_array_value_gets_items():
     assert prop == {"type": "array", "items": {}}
 
 
-def test_array_with_prefix_items_not_backfilled():
+def test_array_with_prefix_items_gets_items_backfill():
+    # Gemini requires ``items`` on every array node, including tuple-form arrays
+    # that already have ``prefixItems``. Verify both keys are present after
+    # sanitization.
     tools = [_tool("t", {
         "type": "object",
         "properties": {
@@ -323,7 +326,7 @@ def test_array_with_prefix_items_not_backfilled():
     })]
     out = sanitize_tool_schemas(tools)
     prop = out[0]["function"]["parameters"]["properties"]["pair"]
-    assert "items" not in prop
+    assert prop["items"] == {}
     assert prop["prefixItems"] == [{"type": "string"}, {"type": "integer"}]
 
 
