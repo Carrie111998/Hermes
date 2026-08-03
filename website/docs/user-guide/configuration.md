@@ -1356,11 +1356,19 @@ tool_loop_guardrails:
     exact_failure: 2           # identical failing call repeated N times
     same_tool_failure: 3       # same tool failing N times (different args)
     idempotent_no_progress: 2  # same result, no progress, N times
+    mutating_no_progress: 3    # same for mutating tools (write_file, terminal, …)
   hard_stop_after:
     exact_failure: 5
     same_tool_failure: 8
     idempotent_no_progress: 5
+    mutating_no_progress: 8
 ```
+
+Mutating tools carry looser thresholds than idempotent reads: an identical
+successful call *can* be intentional (an append, a poll with a side effect).
+Byte-identical arguments **and** byte-identical output repeated many times in
+one turn is a degenerate generation loop, which the failure-based counters
+above cannot see because every call "succeeded".
 
 `hard_stop_enabled` defaults to `false` because interactive sessions have a human in the loop. In unattended deployments (gateway, cron, kanban workers) set it to `true` so repeated failures are blocked rather than only warned. See also [Docker / unattended deployments](docker.md).
 

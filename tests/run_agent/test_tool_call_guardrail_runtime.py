@@ -353,3 +353,121 @@ def test_guardrail_halt_emits_final_response_through_stream_delta_callback():
     assert halt_text in text_deltas, (
         f"halt message was never streamed; callback only saw {deltas!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Mutating no-progress guardrail (#58221)
+#
+# Successful calls to a MUTATING tool were never tracked: the controller
+# cleared `_no_progress` for any non-idempotent tool, so a model repeating a
+# byte-identical `terminal` call with byte-identical output ran to the
+# iteration cap unchallenged (observed live: glm-4.5-flash, 30 repeats).
+#
+# The reviewer asked for coverage of the nested config parsing and of the
+# agent executor path, not just the controller in isolation.
+# ---------------------------------------------------------------------------
+
+TERMINAL_ARGS = {"command": "ls /tmp"}
+TERMINAL_OUTPUT = json.dumps({"exit_code": 0, "output": "same"})
+
+
+def _mutating_config(warn_after: int = 3, block_after: int = 8, hard_stop: bool = True) -> dict:
+    return {
+        "tool_loop_guardrails": {
+            "warnings_enabled": True,
+            "hard_stop_enabled": hard_stop,
+            "warn_after": {"mutating_no_progress": warn_after},
+            "hard_stop_after": {"mutating_no_progress": block_after},
+        }
+    }
+
+
+def _seed_identical_successes(agent, tool_name, args, output, count):
+    for _ in range(count):
+        agent._tool_guardrails.after_call(tool_name, args, output, failed=False)
+
+
+def test_nested_mutating_thresholds_are_parsed_from_config():
+    agent = _make_agent("terminal", config=_mutating_config(warn_after=4, block_after=9))
+
+    cfg = agent._tool_guardrails.config
+
+    assert cfg.mutating_no_progress_warn_after == 4
+    assert cfg.mutating_no_progress_block_after == 9
+
+
+def test_mutating_thresholds_fall_back_to_defaults_when_absent():
+    # A config that omits the nested keys must not disturb the shipped
+    # defaults, which is what every existing install has.
+    agent = _make_agent("terminal", config={"tool_loop_guardrails": {"warnings_enabled": True}})
+
+    cfg = agent._tool_guardrails.config
+
+    assert cfg.mutating_no_progress_warn_after == 3
+    assert cfg.mutating_no_progress_block_after == 8
+
+
+def test_runtime_warns_on_repeated_identical_successful_terminal_output():
+    agent = _make_agent("terminal", config=_mutating_config(warn_after=2, block_after=8))
+    _seed_identical_successes(agent, "terminal", TERMINAL_ARGS, TERMINAL_OUTPUT, count=1)
+    tc = _mock_tool_call("terminal", json.dumps(TERMINAL_ARGS), "c-mut-warn")
+    msg = SimpleNamespace(content="", tool_calls=[tc])
+    messages = []
+
+    with patch("run_agent.handle_function_call", return_value=TERMINAL_OUTPUT) as mock_hfc:
+        agent._execute_tool_calls_sequential(msg, messages, "task-mut-warn")
+
+    mock_hfc.assert_called_once()
+    assert [m["role"] for m in messages] == ["tool"]
+    assert messages[0]["tool_call_id"] == "c-mut-warn"
+    assert "mutating_no_progress_warning" in messages[0]["content"]
+    assert "mutating_no_progress_block" not in messages[0]["content"]
+    assert agent._tool_guardrail_halt_decision is None
+
+
+def test_runtime_blocks_repeated_identical_successful_terminal_output():
+    agent = _make_agent("terminal", config=_mutating_config(warn_after=2, block_after=3))
+    _seed_identical_successes(agent, "terminal", TERMINAL_ARGS, TERMINAL_OUTPUT, count=3)
+    tc = _mock_tool_call("terminal", json.dumps(TERMINAL_ARGS), "c-mut-block")
+    msg = SimpleNamespace(content="", tool_calls=[tc])
+    messages = []
+
+    with patch("run_agent.handle_function_call", return_value="SHOULD_NOT_RUN") as mock_hfc:
+        agent._execute_tool_calls_sequential(msg, messages, "task-mut-block")
+
+    mock_hfc.assert_not_called()
+    assert [m["role"] for m in messages] == ["tool"]
+    assert messages[0]["tool_call_id"] == "c-mut-block"
+    assert "mutating_no_progress_block" in messages[0]["content"]
+
+
+def test_runtime_changed_output_resets_the_mutating_streak():
+    # Identical arguments with a FRESH result are legitimate (append, poll with
+    # a side effect) and must never be blocked — this is the property that
+    # separates the mutating counter from the idempotent one.
+    agent = _make_agent("terminal", config=_mutating_config(warn_after=2, block_after=3))
+    _seed_identical_successes(agent, "terminal", TERMINAL_ARGS, TERMINAL_OUTPUT, count=2)
+
+    fresh = json.dumps({"exit_code": 0, "output": "different"})
+    agent._tool_guardrails.after_call("terminal", TERMINAL_ARGS, fresh, failed=False)
+
+    tc = _mock_tool_call("terminal", json.dumps(TERMINAL_ARGS), "c-mut-reset")
+    msg = SimpleNamespace(content="", tool_calls=[tc])
+    messages = []
+
+    with patch("run_agent.handle_function_call", return_value=fresh) as mock_hfc:
+        agent._execute_tool_calls_sequential(msg, messages, "task-mut-reset")
+
+    mock_hfc.assert_called_once()
+    assert "mutating_no_progress_block" not in messages[0]["content"]
+    assert agent._tool_guardrail_halt_decision is None
+
+
+def test_idempotent_tools_keep_their_own_lower_thresholds():
+    # The mutating knobs must not bleed into the idempotent counter: a read
+    # tool repeating an identical result still trips at its own threshold.
+    agent = _make_agent("read_file", config=_mutating_config(warn_after=3, block_after=8))
+    cfg = agent._tool_guardrails.config
+
+    assert cfg.no_progress_warn_after == 2
+    assert cfg.no_progress_block_after == 5
