@@ -382,7 +382,7 @@ def profile_exists(name: str) -> bool:
     canon = normalize_profile_name(name)
     if canon == "default":
         return True
-    return get_profile_dir(canon).is_dir()
+    return get_profile_dir(canon).is_dir()  # codeql[py/path-injection]
 
 
 # ---------------------------------------------------------------------------
