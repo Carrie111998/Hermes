@@ -28,6 +28,45 @@ import { setSessionTodos } from '@/store/todos'
 import type { ClientSessionState } from '../../../types'
 
 import { useGatewayEventHandler } from './gateway-event'
+
+/**
+ * Replace the streamed text parts of an assistant message with the finalized
+ * server text while preserving reasoning and other non-text parts.
+ *
+ * Exported for unit testing the completion-time text replacement. The
+ * prefix-based reasoning dedup that used to live here was removed: it could
+ * silently drop reasoning content that naturally overlaps with the final
+ * answer, making the thinking disclosure vanish on turn completion.
+ */
+export function replaceTextPart(parts: ChatMessagePart[], finalText: string): ChatMessagePart[] {
+  const visibleFinalText = stripGeneratedImageEchoes(finalText, generatedImageEchoSources(parts)).trim()
+
+  // If final text is empty/missing, keep streamed content as-is instead
+  // of removing all text parts with nothing to replace them.
+  // This handles models that return reasoning-only responses where
+  // the server's final_response is empty.
+  if (!visibleFinalText) {
+    // Preserve reference identity: parts are kept as-is, so React
+    // does not re-render expensive trees for the no-op case.
+    return parts
+  }
+
+  const kept = parts.filter(part => {
+    // Remove all text parts — they'll be replaced by the final text
+    if (part.type === 'text') {
+      return false
+    }
+
+    // Keep all non-text parts (reasoning, tool calls, etc.)
+    // Reasoning dedup was removed: the old prefix-match logic could
+    // silently drop reasoning content that naturally overlaps with
+    // the final answer text, making the thinking disclosure vanish
+    // on turn completion.
+    return true
+  })
+
+  return [...kept, assistantTextPart(visibleFinalText)]
+}
 import { completionErrorText, delegateTaskPayloads, STREAM_DELTA_FLUSH_MS } from './utils'
 
 interface MessageStreamOptions {
@@ -355,34 +394,6 @@ export function useMessageStream({
         const finalText = renderMediaTags(text).trim()
         const completionError = completionErrorText(finalText)
 
-        const replaceTextPart = (parts: ChatMessagePart[]) => {
-          const visibleFinalText = stripGeneratedImageEchoes(finalText, generatedImageEchoSources(parts)).trim()
-
-          // If final text is empty/missing, keep streamed content as-is instead
-          // of removing all text parts with nothing to replace them.
-          // This handles models that return reasoning-only responses where
-          // the server's final_response is empty.
-          if (!visibleFinalText) {
-            return parts.map(part => ({ ...part }))
-          }
-
-          const kept = parts.filter(part => {
-            // Remove all text parts — they'll be replaced by the final text
-            if (part.type === 'text') {
-              return false
-            }
-
-            // Keep all non-text parts (reasoning, tool calls, etc.)
-            // Reasoning dedup was removed: the old prefix-match logic could
-            // silently drop reasoning content that naturally overlaps with
-            // the final answer text, making the thinking disclosure vanish
-            // on turn completion.
-            return true
-          })
-
-          return [...kept, assistantTextPart(visibleFinalText)]
-        }
-
         const completeMessage = (message: ChatMessage): ChatMessage =>
           completionError
             ? {
@@ -393,7 +404,7 @@ export function useMessageStream({
               }
             : {
                 ...message,
-                parts: replaceTextPart(message.parts),
+                parts: replaceTextPart(message.parts, finalText),
                 pending: false
               }
 
