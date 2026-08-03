@@ -120,6 +120,14 @@ class _FifoRunner:
     def _adapter_for_source(self, source):
         return self._adapter
 
+    def _queue_depth(self, session_key, *, adapter=None):
+        # Mirrors GatewayRunner._queue_depth: overflow + the head slot.
+        depth = len(self.queued)
+        slot = getattr(adapter, '_pending_messages', None) if adapter is not None else None
+        if slot is not None and session_key in slot:
+            depth += 1
+        return depth
+
     def _queue_or_replace_pending_event(self, session_key, event):
         slot = self._adapter._pending_messages
         if session_key in slot:
