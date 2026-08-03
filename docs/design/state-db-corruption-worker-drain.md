@@ -90,7 +90,7 @@ ladder fails, and the worker drains.
   `hermes_cli/session_recovery.py`, and the `SessionDB()` open-time
   malformed-schema self-heal.
 
-## Gap: no pre-dispatch health probe
+## Gap: no pre-dispatch health probe (FIXED)
 
 The kanban dispatcher (`hermes_cli/kanban_db.py` `dispatch_once` →
 `_default_spawn`) spawns `hermes -p <assignee> ... chat -q "work kanban
@@ -98,7 +98,7 @@ task ..."` subprocesses **without checking the assignee's state.db
 health**. A worker pointed at a corrupt store opens the DB fine (schema is
 healthy), fails its first write, and drains the fleet.
 
-### Contract to implement (NOT yet implemented — tests fail on purpose)
+### Implementation (landed with this task)
 
 `tests/state/test_state_db_corruption_worker_drain.py` pins this API:
 
@@ -114,12 +114,38 @@ def pre_dispatch_state_db_probe(profile_name: str) -> Optional[str]:
     """
 ```
 
-`dispatch_once` must call this per assignee before `_default_spawn`; on a
-non-None result it must refuse to spawn — block the task with the reason
-(so it surfaces on the board) instead of spawning a worker doomed to
-`session_persistence_failed`. The detector contract is already proven:
-`_db_opens_cleanly` flags both the `messages` b-tree class and the FTS
-class on real fixtures (see `TestProbeDetectorContract` in the test file).
+`dispatch_once` calls this per assignee before `_default_spawn` (memoized
+per normalized profile per tick so a fan-out tick probes once). On a
+non-None result the dispatcher quarantines instead of spawning a worker
+doomed to `session_persistence_failed`:
+
+- **Ready tasks** are hard-blocked via `block_task(kind="capability")`
+  with the high-signal diagnostic
+  `profile <name> store unhealthy: <error>; worker blocked` — the exact DB
+  path + SQLite error (e.g. `database disk image is malformed`, or the
+  affected FTS index from the probe's `fts5 read probe failed on
+  messages_fts: ...`) land in the block reason / synthesized run, so the
+  card surfaces on the board with evidence instead of silently cycling.
+- **Review tasks** have no ready/running transition to block; they are
+  skipped without claiming (stay in the review lane until the store is
+  fixed) and a `quarantined` event records the diagnostic.
+- **Crash enrichment:** `detect_crashed_workers` probes the assignee's
+  store for the low-signal `pid N not alive` class and, when the store is
+  unhealthy, records
+  `profile <name> store unhealthy: <error>; worker blocked` in the run
+  history instead — so the requeue/auto-block story is the storage cause,
+  not a generic vanished-pid message.
+- The store is never replaced, repaired, or deleted by the gate;
+  `_db_opens_cleanly` is read-only + rolled-back-write, and recovery
+  relies on the existing timestamped backups / `repair_state_db_schema`.
+
+The detector contract was already proven: `_db_opens_cleanly` flags both
+the `messages` b-tree class and the FTS class on real fixtures (see
+`TestProbeDetectorContract` in the test file). Tests live in
+`tests/hermes_cli/test_kanban_store_quarantine.py` (probe behavior,
+quarantine gate, healthy-profile dispatch, dry-run, review lane, crash
+diagnostic) and `tests/state/test_state_db_corruption_worker_drain.py`
+(incident reproduction + the now-passing wiring contract).
 
 ## Recovery / restart paths (from the incident)
 
@@ -148,5 +174,6 @@ class on real fixtures (see `TestProbeDetectorContract` in the test file).
 - FAIL against current code (the contract to implement later):
   - `test_pre_dispatch_state_db_probe_exists_in_kanban_dispatch` — asserts
     `hermes_cli.kanban_db.pre_dispatch_state_db_probe` exists and is wired
-    into dispatch. This is the expected red test; the assertion message
-    carries the implementation pointer.
+    into dispatch. This was the expected red test; with the
+    implementation landed it now passes (see the Implementation section
+    above and `tests/hermes_cli/test_kanban_store_quarantine.py`).

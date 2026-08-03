@@ -7376,6 +7376,23 @@ class DispatchResult:
     (EX_TEMPFAIL sentinel exit) and were released back to ``ready`` WITHOUT
     counting a failure. These never trip the circuit breaker — a long quota
     window just makes the task bounce cheaply until the window clears."""
+    quarantined: list[tuple[str, str, str]] = field(default_factory=list)
+    """Tasks blocked/skipped because their assignee's state.db failed the
+    pre-dispatch health probe. Each entry is ``(task_id, assignee,
+    reason)`` where the reason is the high-signal diagnostic carrying the
+    exact DB path + SQLite error (e.g. ``profile alpha store unhealthy:
+    state.db unhealthy at <path>: database disk image is malformed;
+    worker blocked``). Ready tasks are hard-blocked (kind=capability) so
+    they surface on the board instead of spawning a worker doomed to
+    ``session_persistence_failed``; review tasks are skipped without
+    claiming (they stay in the review lane until the store is fixed). The
+    store is never replaced or deleted — timestamped backups are the
+    recovery path."""
+    store_unhealthy_profiles: dict[str, str] = field(default_factory=dict)
+    """Profiles whose state.db failed the pre-dispatch probe this tick,
+    mapped ``normalized_profile -> reason``. Lets telemetry / the
+    dashboard show which profiles are quarantined even when no ready task
+    happened to be assigned to them this tick."""
     skipped_locked: bool = False
     """True when this tick was skipped because another process already held
     the board's dispatch lock (issue #35240). A losing dispatcher does no
@@ -8091,7 +8108,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # (task_id, pid, claimer, protocol_violation, error_text)
     with write_txn(conn):
         rows = conn.execute(
-            "SELECT id, worker_pid, claim_lock, started_at FROM tasks "
+            "SELECT id, worker_pid, claim_lock, started_at, assignee FROM tasks "
             "WHERE status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
         host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
@@ -8168,7 +8185,28 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 elif kind == "signaled":
                     error_text = f"pid {pid} killed by signal {code}"
                 else:
+                    # Low-signal default ("pid not alive") — the worker
+                    # vanished without a usable exit status. When the
+                    # assignee's state.db is unhealthy, the far more
+                    # probable story is the 2026-08-03 incident class
+                    # (first canonical write failed -> session_persistence
+                    # _failed -> worker exited); surface the high-signal
+                    # store diagnostic instead of the generic message so
+                    # the run history and the auto-block reason carry the
+                    # exact DB/error evidence.
                     error_text = f"pid {pid} not alive"
+                    _assignee = (
+                        row["assignee"] if "assignee" in row.keys() else None
+                    )
+                    if _assignee:
+                        try:
+                            _store_reason = pre_dispatch_state_db_probe(_assignee)
+                        except Exception:
+                            _store_reason = None
+                        if _store_reason is not None:
+                            error_text = _store_unhealthy_blocker(
+                                _assignee, _store_reason
+                            )
                 event_kind = "crashed"
                 event_payload = {"pid": pid, "claimer": row["claim_lock"]}
                 if code is not None and kind != "unknown":
@@ -8794,6 +8832,141 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     return False
 
 
+def pre_dispatch_state_db_probe(profile_name: str) -> Optional[str]:
+    """Return None if ``profile_name``'s state.db is healthy enough to spawn
+    a worker, else a human-readable reason naming the corruption.
+
+    Resolves the profile's HERMES_HOME state.db (via
+    :func:`hermes_cli.profiles.resolve_profile_env` /
+    :func:`hermes_constants.get_hermes_home`) and delegates to
+    :func:`hermes_state._db_opens_cleanly`, which runs a fresh-connection
+    probe: ``PRAGMA journal_mode`` (trips malformed-schema parse),
+    ``PRAGMA integrity_check``, a canonical ``sessions`` read, FTS5 read
+    probes on all three ``messages_fts*`` tables, and a rolled-back
+    ``messages`` write through the FTS triggers (so the FTS write class
+    from #50502 is caught even when reads look healthy).
+
+    A missing state.db is healthy — a spawned worker's ``SessionDB()``
+    open creates it on first use; only an existing file is probed. The
+    probe never mutates the store (the write probe always rolls back), so
+    it is safe to run on every dispatch tick and leaves any corruption in
+    place for recovery from timestamped backups.
+    """
+    if not profile_name:
+        return None
+    try:
+        from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
+
+        canon = normalize_profile_name(profile_name)
+        hermes_home = Path(resolve_profile_env(canon))
+    except FileNotFoundError:
+        # No profile directory → no store to probe. Routing for "profile
+        # doesn't exist" belongs to the caller's profile_exists gate
+        # (skipped_nonspawnable), not to the store-health probe — a
+        # missing dir must never be misclassified as store corruption.
+        return None
+    except Exception as exc:
+        return f"cannot resolve HERMES_HOME for profile {profile_name!r}: {exc}"
+    db_path = hermes_home / "state.db"
+    if not db_path.exists():
+        return None
+    try:
+        from hermes_state import _db_opens_cleanly
+
+        reason = _db_opens_cleanly(db_path)
+    except Exception as exc:
+        return f"state.db probe raised on {db_path}: {exc}"
+    if reason is not None:
+        return f"state.db unhealthy at {db_path}: {reason}"
+    return None
+
+
+def _store_unhealthy_blocker(profile_name: str, reason: str) -> str:
+    """High-signal diagnostic for a quarantined profile store.
+
+    Format matches the incident requirement — ``profile <name> store
+    unhealthy: <error>; worker blocked`` — so the block reason / crash
+    error is grep-able and carries the exact DB path + SQLite error from
+    the probe's reason.
+    """
+    return f"profile {profile_name} store unhealthy: {reason}; worker blocked"
+
+
+def _quarantine_unhealthy_store(
+    conn: sqlite3.Connection,
+    task_id: str,
+    assignee: str,
+    *,
+    dry_run: bool,
+    result: DispatchResult,
+    probe_cache: dict[str, Optional[str]],
+    blockable: bool,
+) -> bool:
+    """Quarantine gate: return True and block/skip *task_id* when
+    *assignee*'s state.db fails the pre-dispatch health probe.
+
+    This is the "never spawn a worker against an unhealthy store" gate
+    from the 2026-08-03 incident: a worker pointed at a corrupt state.db
+    opens fine, fails its FIRST canonical transcript write, and drains
+    the fleet through the failure circuit breaker. Instead, the task is
+    blocked with the high-signal diagnostic (``profile <name> store
+    unhealthy: <error>; worker blocked``) so it surfaces on the board
+    with exact DB path / SQLite error evidence rather than spawning a
+    doomed worker.
+
+    ``probe_cache`` memoizes the probe per normalized profile within one
+    tick (the probe is cheap but a fan-out tick can have many ready tasks
+    for one assignee). ``blockable`` is False for the review lane —
+    review tasks have no running/ready transition so they are skipped
+    without claiming (they stay in the review lane until the store is
+    fixed; the per-tick probe is the gate). The store itself is never
+    replaced or deleted; timestamped backups are the recovery path.
+    """
+    if not assignee:
+        return False
+    try:
+        from hermes_cli.profiles import normalize_profile_name
+
+        canon = normalize_profile_name(assignee)
+    except Exception:
+        canon = (assignee or "").strip().lower()
+    if canon not in probe_cache:
+        probe_cache[canon] = pre_dispatch_state_db_probe(canon)
+    reason = probe_cache[canon]
+    if reason is None:
+        return False
+
+    blocker = _store_unhealthy_blocker(canon, reason)
+    result.store_unhealthy_profiles[canon] = reason
+    result.quarantined.append((task_id, assignee, blocker))
+    if dry_run:
+        return True
+    if blockable:
+        try:
+            block_task(conn, task_id, reason=blocker, kind="capability")
+        except Exception:
+            _log.exception(
+                "kanban dispatch: failed to quarantine task %s (store unhealthy)",
+                task_id,
+            )
+    else:
+        # Review lane: no ready/running transition to block — leave the
+        # card in review, emit the diagnostic so `hermes kanban tail`
+        # shows why it is not being dispatched.
+        try:
+            with write_txn(conn):
+                _append_event(
+                    conn, task_id, "quarantined",
+                    {"assignee": assignee, "reason": blocker, "lane": "review"},
+                )
+        except Exception:
+            _log.exception(
+                "kanban dispatch: failed to record review quarantine for task %s",
+                task_id,
+            )
+    return True
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -8990,6 +9163,11 @@ def _dispatch_once_locked(
             "GROUP BY assignee"
         ):
             _per_profile_running[prow["assignee"]] = int(prow["n"])
+    # Pre-dispatch state.db health probe memo (per normalized profile per
+    # tick): the probe is cheap but a fan-out tick can have many ready
+    # tasks for one assignee, so probe once and reuse. A non-None result
+    # quarantines every task assigned to that profile this tick.
+    _store_probe_cache: dict[str, Optional[str]] = {}
     # Normalize default_assignee once: empty/whitespace string → None so the
     # rest of the loop can use ``if default_assignee:`` as a single check.
     # We also resolve profile_exists once here for the same reason.
@@ -9075,6 +9253,21 @@ def _dispatch_once_locked(
             # multi-lane setups where the ready queue is steadily full
             # of human-pulled work.
             result.skipped_nonspawnable.append(row["id"])
+            continue
+        # Pre-dispatch store health gate (#incident 2026-08-03): never
+        # spawn a worker whose assignee's state.db is unhealthy — it
+        # would fail its first canonical transcript write and drain via
+        # the failure circuit breaker. Quarantine instead: block the
+        # task with the high-signal diagnostic (exact DB path + SQLite
+        # error) so it surfaces on the board, and leave the corrupt store
+        # in place for recovery from timestamped backups.
+        if _quarantine_unhealthy_store(
+            conn, row["id"], row_assignee,
+            dry_run=dry_run,
+            result=result,
+            probe_cache=_store_probe_cache,
+            blockable=True,
+        ):
             continue
         # Per-profile concurrency cap (#21582): even if there's global
         # headroom, refuse to spawn for an assignee that's already at
@@ -9213,6 +9406,19 @@ def _dispatch_once_locked(
             profile_exists = None  # type: ignore[assignment]
         if profile_exists is not None and not profile_exists(row["assignee"]):
             result.skipped_nonspawnable.append(row["id"])
+            continue
+        # Same store-health gate as the ready loop: never spawn a review
+        # agent against an unhealthy state.db. Review cards have no
+        # running/ready transition to block, so they are skipped without
+        # claiming (they stay in the review lane until the store is
+        # fixed); the diagnostic is emitted as a `quarantined` event.
+        if _quarantine_unhealthy_store(
+            conn, row["id"], row["assignee"],
+            dry_run=dry_run,
+            result=result,
+            probe_cache=_store_probe_cache,
+            blockable=False,
+        ):
             continue
         # Review cards bypass the ready-task loop, so apply the respawn guard
         # here as well.  Otherwise a rate-limited reviewer is claimed again

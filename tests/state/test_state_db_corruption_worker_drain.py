@@ -35,11 +35,12 @@ Two corruption classes matter here:
 
 These tests (a) reproduce the incident's write-failure against a real
 corrupted ``messages`` b-tree, and (b) pin the contract for the
-pre-dispatch health probe that must be wired into the kanban dispatcher
-so workers are never spawned against an unhealthy state.db. The probe
-wiring does not exist yet — ``test_pre_dispatch_state_db_probe_*`` is
-expected to FAIL against current code (that is the point: it is the
-contract to implement later).
+pre-dispatch health probe wired into the kanban dispatcher so workers are
+never spawned against an unhealthy state.db. The probe wiring is
+implemented in ``hermes_cli/kanban_db.py``
+(``pre_dispatch_state_db_probe`` + the quarantine gate in
+``dispatch_once``; see docs/design/state-db-corruption-worker-drain.md and
+tests/hermes_cli/test_kanban_store_quarantine.py).
 """
 import sqlite3
 import uuid
@@ -183,24 +184,25 @@ class TestCanonicalWriteAgainstCorruptStore:
         assert _db_opens_cleanly(db_path) is not None
 
 
-# ── Contract for the pre-dispatch health probe (TO BE IMPLEMENTED) ──────────
-# The kanban dispatcher currently spawns ``hermes -p <assignee>`` workers
+# ── Contract for the pre-dispatch health probe (IMPLEMENTED) ────────────────
+# The kanban dispatcher previously spawned ``hermes -p <assignee>`` workers
 # without checking the assignee's state.db health
 # (``hermes_cli.kanban_db.dispatch_once`` / ``_default_spawn``). A worker
 # pointed at a corrupt store fails its first write and drains the fleet via
-# the failure circuit breaker. The probe below is the contract to implement:
-# a module-level function in ``hermes_cli/kanban_db.py``
+# the failure circuit breaker. The contract implemented in
+# ``hermes_cli/kanban_db.py``: a module-level function
 # (``pre_dispatch_state_db_probe(profile_name) -> Optional[str]``) that
 # resolves the profile's state.db and delegates to
-# ``hermes_state._db_opens_cleanly``; ``dispatch_once`` must consult it per
-# assignee before spawning and block/skip instead of spawning a doomed
-# worker. These tests FAIL on current code on purpose.
+# ``hermes_state._db_opens_cleanly``; ``dispatch_once`` consults it per
+# assignee before spawning and blocks/skips instead of spawning a doomed
+# worker. See tests/hermes_cli/test_kanban_store_quarantine.py for the
+# quarantine-gate / crash-diagnostic coverage.
 
 
 def test_pre_dispatch_state_db_probe_exists_in_kanban_dispatch():
-    """The dispatcher must expose the probe — FAILS today (not implemented).
+    """The dispatcher must expose the probe (implemented; was red before).
 
-    Expected API once implemented::
+    Expected API (now live)::
 
         def pre_dispatch_state_db_probe(profile_name: str) -> Optional[str]:
             \"\"\"None if the profile's state.db is healthy enough to spawn a
@@ -208,9 +210,9 @@ def test_pre_dispatch_state_db_probe_exists_in_kanban_dispatch():
             Resolves the profile's HERMES_HOME state.db and delegates to
             hermes_state._db_opens_cleanly.\"\"\"
 
-    ``dispatch_once`` should call this for every assignee before
-    ``_default_spawn`` and refuse to spawn (blocking the task with the
-    reason) when it returns non-None.
+    ``dispatch_once`` calls it for every assignee before ``_default_spawn``
+    and refuses to spawn (blocking the task with the reason) when it
+    returns non-None.
     """
     from hermes_cli import kanban_db
 
