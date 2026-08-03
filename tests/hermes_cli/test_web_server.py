@@ -6771,7 +6771,12 @@ class TestNewEndpoints:
         monkeypatch.setattr(
             tools_config,
             "_toolset_has_keys",
-            lambda ts_key, config=None: ts_key != "web",
+            lambda ts_key, config=None, **_kwargs: ts_key != "web",
+        )
+        monkeypatch.setattr(
+            tools_config,
+            "get_nous_subscription_features",
+            lambda config, **_kwargs: object(),
         )
         monkeypatch.setattr(
             toolsets_module,
@@ -6884,6 +6889,36 @@ class TestNewEndpoints:
             "/api/tools/toolsets/not_a_real_toolset", json={"enabled": True}
         )
         assert resp.status_code == 400
+
+    def test_toolsets_resolve_subscription_features_once(self, monkeypatch):
+        import hermes_cli.tools_config as tools_config
+        from hermes_cli.nous_subscription import NousSubscriptionFeatures
+
+        calls = 0
+        features = NousSubscriptionFeatures(
+            subscribed=False,
+            nous_auth_present=False,
+            provider_is_nous=False,
+            features={},
+            account_info=None,
+        )
+
+        def resolve_features(config, *, force_fresh=False):
+            nonlocal calls
+            calls += 1
+            return features
+
+        monkeypatch.setattr(
+            tools_config,
+            "get_nous_subscription_features",
+            resolve_features,
+        )
+
+        resp = self.client.get("/api/tools/toolsets")
+
+        assert resp.status_code == 200
+        assert resp.json()
+        assert calls == 1
 
     def test_get_toolset_config_returns_provider_matrix(self):
         """GET .../config returns provider rows with structured env_vars."""

@@ -6695,6 +6695,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 _get_effective_configurable_toolsets,
                 _get_platform_tools,
                 _toolset_has_keys,
+                get_nous_subscription_features,
             )
             from model_tools import _compute_tool_definitions
             from tools.registry import registry
@@ -6733,6 +6734,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 grouped.setdefault(toolset_name, []).append(dict(definition))
 
             group_names = set(metadata) | set(enabled_toolsets) | set(grouped)
+            features = get_nous_subscription_features(config)
             data: List[Dict[str, Any]] = []
             for name in sorted(group_names):
                 schemas = sorted(
@@ -6742,7 +6744,11 @@ class APIServerAdapter(BasePlatformAdapter):
                     ),
                 )
                 try:
-                    configured = _toolset_has_keys(name, config)
+                    configured = _toolset_has_keys(
+                        name,
+                        config,
+                        features=features,
+                    )
                 except Exception:
                     configured = False
                 meta = metadata.get(name, {})
