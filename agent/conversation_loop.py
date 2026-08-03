@@ -94,6 +94,36 @@ logger = logging.getLogger(__name__)
 # to treat it as cancellation metadata rather than assistant prose.
 INTERRUPT_WAITING_FOR_MODEL_PREFIX = "Operation interrupted: waiting for model response ("
 
+
+def _is_root_kanban_worker() -> bool:
+    """Return true only for the dispatcher-owned agent, never its children."""
+    if not os.environ.get("HERMES_KANBAN_TASK"):
+        return False
+    from agent.delegation_context import is_delegated_child_process_context
+
+    return not is_delegated_child_process_context()
+
+
+def _kanban_soft_iteration_limit(max_iterations: int) -> int:
+    """Reserve up to 10% (capped at ten calls) for a Kanban handoff."""
+    limit = max(1, int(max_iterations))
+    if not _is_root_kanban_worker() or limit <= 1:
+        return limit
+    reserve = max(1, min(10, limit // 10))
+    return max(1, limit - reserve)
+
+
+def _kanban_soft_checkpoint_due(agent: Any, api_call_count: int) -> bool:
+    """Return whether a root worker may checkpoint before its next API call."""
+    if agent._budget_grace_call or agent._interrupt_requested:
+        return False
+    effective_turn_limit = min(
+        agent.max_iterations,
+        api_call_count + max(0, int(agent.iteration_budget.remaining)),
+    )
+    soft_limit = _kanban_soft_iteration_limit(effective_turn_limit)
+    return soft_limit < effective_turn_limit and api_call_count >= soft_limit
+
 # Modules that indicate a deterministic local processing error when they
 # appear in an exception traceback WITHOUT any API-call module. Used by the
 # outer-loop error classifier to avoid retrying bugs that will fail
@@ -1387,7 +1417,11 @@ def run_conversation(
 
     # Optional opt-in runtime: if api_mode == codex_app_server, hand the
     # turn to the codex app-server subprocess (terminal/file ops/patching
-    # all run inside Codex). Default Hermes path is bypassed entirely.
+    # all run inside Codex). That runtime owns one whole turn and does not
+    # consume Hermes' per-tool ``iteration_budget``; its native thread/turn
+    # persistence and watchdog retirement are handled in codex_runtime.py.
+    # The soft iteration checkpoint below therefore applies only to the
+    # Hermes-managed tool loop it actually budgets.
     # See agent/transports/codex_app_server_session.py for the adapter
     # and references/codex-app-server-runtime.md for the rationale.
     if agent.api_mode == "codex_app_server":
@@ -1419,6 +1453,13 @@ def run_conversation(
             _turn_exit_reason = "interrupted_by_user"
             if not agent.quiet_mode:
                 agent._safe_print("\n⚡ Breaking out of tool loop due to interrupt...")
+            break
+
+        # The shared iteration budget may be smaller than max_iterations (for
+        # example after delegated work). Check only after redirects and user
+        # cancellation so a checkpoint never wins over active steering.
+        if _kanban_soft_checkpoint_due(agent, api_call_count):
+            _turn_exit_reason = "kanban_soft_budget_checkpoint"
             break
         
         api_call_count += 1

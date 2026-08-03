@@ -7796,6 +7796,10 @@ def _record_task_failure(
     release_claim: bool = False,
     end_run: bool = False,
     event_payload_extra: Optional[dict] = None,
+    expected_run_id: Optional[int] = None,
+    run_summary: Optional[str] = None,
+    run_metadata: Optional[dict] = None,
+    failure_count_override: Optional[int] = None,
 ) -> bool:
     """Record a non-success outcome (spawn_failed / crashed / timed_out)
     and maybe trip the circuit breaker.
@@ -7845,12 +7849,20 @@ def _record_task_failure(
     blocked = False
     with write_txn(conn):
         row = conn.execute(
-            "SELECT consecutive_failures, status, max_retries "
+            "SELECT consecutive_failures, status, max_retries, current_run_id "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if row is None:
             return False
-        failures = int(row["consecutive_failures"]) + 1
+        if expected_run_id is not None and row["current_run_id"] != expected_run_id:
+            raise KanbanContinuationConflict(
+                f"task {task_id} is no longer owned by run {expected_run_id}"
+            )
+        failures = (
+            max(0, int(failure_count_override))
+            if failure_count_override is not None
+            else int(row["consecutive_failures"]) + 1
+        )
 
         # Per-task override wins over both caller-supplied and default
         # thresholds. None (the common case) falls through.
@@ -7891,8 +7903,10 @@ def _record_task_failure(
                 run_id = _end_run(
                     conn, task_id,
                     outcome="gave_up", status="gave_up",
+                    summary=run_summary,
                     error=error[:500],
                     metadata={
+                        **(run_metadata or {}),
                         "failures": failures,
                         "trigger_outcome": outcome,
                         "effective_limit": effective_limit,
@@ -7936,16 +7950,432 @@ def _record_task_failure(
                 run_id = _end_run(
                     conn, task_id,
                     outcome=outcome, status=outcome,
+                    summary=run_summary,
                     error=error[:500],
-                    metadata={"failures": failures},
+                    metadata={**(run_metadata or {}), "failures": failures},
                 )
                 _append_event(
                     conn, task_id, outcome,
-                    {"error": error[:500], "failures": failures},
+                    {
+                        "error": error[:500],
+                        "failures": failures,
+                        **(event_payload_extra or {}),
+                    },
                     run_id=run_id,
                 )
             # Timeout/crash path's caller already emitted its own event.
     return blocked
+
+
+class KanbanContinuationConflict(RuntimeError):
+    """A stale worker attempted to checkpoint a run it no longer owns."""
+
+
+def _canonical_workspace(value: Any) -> str:
+    if not value:
+        return ""
+    try:
+        return str(Path(str(value)).expanduser().resolve())
+    except (OSError, RuntimeError):
+        return os.path.abspath(os.path.expanduser(str(value)))
+
+
+def _checkpoint_progress_fingerprint(checkpoint: Mapping[str, Any]) -> str:
+    progress = {
+        "head": checkpoint.get("head"),
+        "dirty_hash": checkpoint.get("dirty_hash"),
+        "dirty_files": checkpoint.get("dirty_files") or [],
+    }
+    return hashlib.sha256(
+        json.dumps(progress, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+
+def capture_worker_checkpoint(
+    *,
+    worker_session_id: Optional[str],
+    workspace: Optional[str],
+    profile: Optional[str],
+    model: Optional[str],
+    provider: Optional[str],
+) -> dict[str, Any]:
+    """Capture fail-open worker/session and git state for a durable handoff."""
+    canonical_workspace = _canonical_workspace(workspace)
+    checkpoint: dict[str, Any] = {
+        "worker_session_id": worker_session_id,
+        "workspace": canonical_workspace,
+        "profile": profile,
+        "model": model,
+        "provider": provider,
+        "branch": None,
+        "head": None,
+        "dirty_hash": None,
+        "dirty_files": [],
+    }
+    if not canonical_workspace or not os.path.isdir(canonical_workspace):
+        return checkpoint
+
+    def _git(*args: str, text: bool = True):
+        return subprocess.run(
+            ["git", "-C", canonical_workspace, *args],
+            check=False,
+            capture_output=True,
+            text=text,
+            timeout=5,
+        )
+
+    try:
+        head = _git("rev-parse", "--verify", "HEAD")
+        if head.returncode != 0:
+            return checkpoint
+        checkpoint["head"] = head.stdout.strip() or None
+
+        branch = _git("symbolic-ref", "--quiet", "--short", "HEAD")
+        if branch.returncode == 0:
+            checkpoint["branch"] = branch.stdout.strip() or None
+
+        status = _git(
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            "-z",
+            text=False,
+        )
+        if status.returncode == 0:
+            raw = status.stdout or b""
+            entries = [part for part in raw.split(b"\0") if part]
+            dirty_paths: list[bytes] = []
+            index = 0
+            while index < len(entries):
+                entry = entries[index]
+                status_code = entry[:2]
+                dirty_paths.append(entry[3:])
+                index += 1
+                if any(code in status_code for code in (b"R", b"C")):
+                    if index < len(entries):
+                        dirty_paths.append(entries[index])
+                        index += 1
+
+            digest = hashlib.sha256(raw)
+            # Porcelain records only status codes and paths. Include the
+            # index's staged blob IDs so index-only changes cannot look like
+            # an identical resumable workspace.
+            index_state = _git("ls-files", "--stage", "-z", text=False)
+            if index_state.returncode == 0:
+                digest.update(b"index\0")
+                digest.update(index_state.stdout or b"")
+            else:
+                digest.update(b"index-unavailable\0")
+            workspace_root = Path(canonical_workspace)
+            decoded_paths: list[str] = []
+            for raw_path in dirty_paths:
+                relative = os.fsdecode(raw_path)
+                decoded_paths.append(relative)
+                digest.update(len(raw_path).to_bytes(8, "big"))
+                digest.update(raw_path)
+                candidate = workspace_root / relative
+                try:
+                    resolved_parent = candidate.parent.resolve()
+                    resolved_parent.relative_to(workspace_root)
+                    if candidate.is_symlink():
+                        digest.update(b"symlink\0")
+                        digest.update(os.fsencode(os.readlink(candidate)))
+                    elif candidate.is_file():
+                        digest.update(b"file\0")
+                        with candidate.open("rb") as handle:
+                            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                                digest.update(chunk)
+                    elif candidate.exists():
+                        digest.update(b"other\0")
+                    else:
+                        digest.update(b"missing\0")
+                except (OSError, RuntimeError, ValueError):
+                    digest.update(b"unreadable\0")
+            checkpoint["dirty_hash"] = digest.hexdigest()
+            checkpoint["dirty_files"] = decoded_paths[:200]
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return checkpoint
+
+
+def record_iteration_timeout(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    expected_run_id: int,
+    summary: str,
+    checkpoint: Mapping[str, Any],
+    budget_used: int,
+    budget_max: int,
+    soft_checkpoint: bool,
+) -> bool:
+    """Atomically persist a resumable timeout handoff and release its claim.
+
+    The exact run identity is checked inside the same write transaction that
+    closes the run.  A stale process therefore cannot overwrite a newer
+    worker's handoff or release its claim.
+    """
+    task_row = conn.execute(
+        "SELECT assignee, workspace_kind, workspace_path, model_override, "
+        "provider_override, reasoning_effort, max_retries, current_run_id "
+        "FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if task_row is None or task_row["current_run_id"] != expected_run_id:
+        raise KanbanContinuationConflict(
+            f"task {task_id} is no longer owned by run {expected_run_id}"
+        )
+    if checkpoint.get("profile") != task_row["assignee"]:
+        raise KanbanContinuationConflict(
+            f"task {task_id} ownership changed from {checkpoint.get('profile')!r} "
+            f"to {task_row['assignee']!r}"
+        )
+
+    prior_rows = conn.execute(
+        "SELECT metadata FROM task_runs "
+        "WHERE task_id = ? AND outcome = 'timed_out' AND ended_at IS NOT NULL "
+        "ORDER BY id ASC",
+        (task_id,),
+    ).fetchall()
+    prior_meta: list[dict[str, Any]] = []
+    for row in prior_rows:
+        try:
+            parsed = json.loads(row["metadata"]) if row["metadata"] else {}
+        except (TypeError, ValueError, json.JSONDecodeError):
+            parsed = {}
+        if isinstance(parsed, dict):
+            prior_meta.append(parsed)
+
+    metadata = dict(checkpoint)
+    metadata["task_id"] = task_id
+    metadata["run_id"] = int(expected_run_id)
+    metadata["workspace"] = _canonical_workspace(metadata.get("workspace"))
+    metadata["model_override"] = task_row["model_override"]
+    metadata["provider_override"] = task_row["provider_override"]
+    metadata["reasoning_effort"] = task_row["reasoning_effort"]
+    metadata["budget_used"] = int(budget_used)
+    metadata["budget_max"] = int(budget_max)
+    metadata["soft_checkpoint"] = bool(soft_checkpoint)
+    metadata["timeout_retries"] = len(prior_meta) + 1
+    metadata["cumulative_iterations"] = sum(
+        int(item.get("budget_used") or 0) for item in prior_meta
+    ) + int(budget_used)
+    fingerprint = _checkpoint_progress_fingerprint(metadata)
+    metadata["progress_fingerprint"] = fingerprint
+    previous_fingerprint = (
+        prior_meta[-1].get("progress_fingerprint") if prior_meta else None
+    )
+    # The first timeout has no dispatch-start baseline, so it cannot prove
+    # progress and must not erase failures accumulated by other failure paths.
+    # Later checkpoints demonstrate progress only by differing from the last
+    # durable timeout fingerprint.
+    metadata["progress_made"] = (
+        previous_fingerprint is not None and previous_fingerprint != fingerprint
+    )
+    previous_no_progress = (
+        int(prior_meta[-1].get("no_progress_retries") or 0) if prior_meta else 0
+    )
+    metadata["no_progress_retries"] = (
+        0 if metadata["progress_made"] else previous_no_progress + 1
+    )
+
+    error = (
+        f"Iteration budget checkpoint ({int(budget_used)}/{int(budget_max)}) — "
+        "task yielded with a durable continuation handoff"
+    )
+    event_extra = {
+        "budget_used": int(budget_used),
+        "budget_max": int(budget_max),
+        "soft_checkpoint": bool(soft_checkpoint),
+        "timeout_retries": metadata["timeout_retries"],
+        "cumulative_iterations": metadata["cumulative_iterations"],
+        "progress_made": metadata["progress_made"],
+        "no_progress_retries": metadata["no_progress_retries"],
+    }
+    stagnation_limit = int(task_row["max_retries"] or DEFAULT_FAILURE_LIMIT)
+    # Productive checkpoints reset the stagnant-timeout circuit. A separate
+    # bounded total cap prevents a worker that makes tiny changes forever from
+    # retrying without limit.
+    failure_count_override: Optional[int] = (
+        0 if metadata["progress_made"] else None
+    )
+    if metadata["timeout_retries"] >= stagnation_limit * 4:
+        failure_count_override = stagnation_limit
+    return _record_task_failure(
+        conn,
+        task_id,
+        error=error,
+        outcome="timed_out",
+        release_claim=True,
+        end_run=True,
+        event_payload_extra=event_extra,
+        expected_run_id=int(expected_run_id),
+        run_summary=str(summary or "").strip() or None,
+        run_metadata=metadata,
+        failure_count_override=failure_count_override,
+    )
+
+
+def _session_provider(session: Mapping[str, Any]) -> Optional[str]:
+    raw = session.get("model_config")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            raw = {}
+    if not isinstance(raw, Mapping):
+        return None
+    value = raw.get("provider") or raw.get("requested_provider")
+    return str(value) if value else None
+
+
+def compatible_worker_resume_session(
+    prior: Mapping[str, Any],
+    current: Mapping[str, Any],
+    session: Mapping[str, Any],
+) -> Optional[str]:
+    """Return the resumable session id only for an exact worker identity match."""
+    session_id = str(prior.get("worker_session_id") or "").strip()
+    if not session_id or str(session.get("id") or "") != session_id:
+        return None
+    if int(current.get("active_run_count") or 0) != 1:
+        return None
+    if str(session.get("source") or "") != "kanban":
+        return None
+
+    exact_keys = (
+        "task_id",
+        "workspace",
+        "profile",
+        "model",
+        "provider",
+        "model_override",
+        "provider_override",
+        "reasoning_effort",
+        "branch",
+        "head",
+        "dirty_hash",
+        "dirty_files",
+    )
+    for key in exact_keys:
+        left = prior.get(key)
+        right = current.get(key)
+        if key == "workspace":
+            left = _canonical_workspace(left)
+            right = _canonical_workspace(right)
+        if left != right:
+            return None
+
+    if prior.get("run_id") == current.get("run_id"):
+        return None
+    if str(session.get("profile_name") or "") != str(current.get("profile") or ""):
+        return None
+    if _canonical_workspace(session.get("cwd")) != _canonical_workspace(
+        current.get("workspace")
+    ):
+        return None
+    if session.get("model") != current.get("model"):
+        return None
+    session_provider = _session_provider(session)
+    if not session_provider or session_provider != current.get("provider"):
+        return None
+    return session_id
+
+
+def _worker_route_identity(task: Task, profile_home: str) -> tuple[Optional[str], Optional[str]]:
+    """Resolve the effective model route without mutating process profile state."""
+    model = task.model_override
+    provider = task.provider_override
+    if model and provider:
+        return model, provider
+    try:
+        import yaml
+
+        raw = yaml.safe_load(
+            Path(profile_home, "config.yaml").read_text(encoding="utf-8")
+        ) or {}
+        model_config = raw.get("model") if isinstance(raw, dict) else {}
+        if isinstance(model_config, str):
+            model = model or model_config.strip() or None
+        elif isinstance(model_config, dict):
+            model = model or (
+                str(model_config.get("default") or model_config.get("model") or "").strip()
+                or None
+            )
+            provider = provider or (
+                str(model_config.get("provider") or "").strip() or None
+            )
+    except (OSError, ValueError, TypeError):
+        pass
+    return model, provider
+
+
+def _resolve_worker_resume_session(
+    task: Task,
+    workspace: str,
+    profile_home: str,
+    *,
+    board: Optional[str] = None,
+) -> Optional[str]:
+    """Select the latest prior timeout only when every resume invariant holds."""
+    try:
+        with connect_closing(board=board) as conn:
+            prior_row = conn.execute(
+                "SELECT metadata FROM task_runs "
+                "WHERE task_id = ? AND outcome = 'timed_out' "
+                "AND ended_at IS NOT NULL AND metadata IS NOT NULL "
+                "ORDER BY id DESC LIMIT 1",
+                (task.id,),
+            ).fetchone()
+            active_run_count = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM task_runs "
+                    "WHERE task_id = ? AND ended_at IS NULL",
+                    (task.id,),
+                ).fetchone()[0]
+            )
+        if prior_row is None:
+            return None
+        prior = json.loads(prior_row["metadata"])
+        if not isinstance(prior, dict):
+            return None
+
+        model, provider = _worker_route_identity(task, profile_home)
+        current = capture_worker_checkpoint(
+            worker_session_id=None,
+            workspace=workspace,
+            profile=task.assignee,
+            model=model,
+            provider=provider,
+        )
+        current.update(
+            {
+                "task_id": task.id,
+                "run_id": task.current_run_id,
+                "model_override": task.model_override,
+                "provider_override": task.provider_override,
+                "reasoning_effort": task.reasoning_effort,
+                "active_run_count": active_run_count,
+            }
+        )
+
+        from hermes_state import SessionDB
+
+        state = SessionDB(Path(profile_home) / "state.db", read_only=True)
+        try:
+            session = state.get_session(str(prior.get("worker_session_id") or ""))
+        finally:
+            state.close()
+        if not session:
+            return None
+        return compatible_worker_resume_session(prior, current, session)
+    except (OSError, sqlite3.Error, TypeError, ValueError, json.JSONDecodeError):
+        _log.warning(
+            "Could not resolve continuation session for task %s; using handoff only",
+            task.id,
+            exc_info=True,
+        )
+        return None
 
 
 # Backward-compat alias. Old name is referenced from tests and possibly
@@ -9128,6 +9558,16 @@ def _default_spawn(
     worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
+    resume_session = _resolve_worker_resume_session(
+        task,
+        workspace,
+        env.get("HERMES_HOME", ""),
+        board=board,
+    )
+    if resume_session:
+        # Workspace compatibility was already verified against the checkpoint;
+        # do not let generic resume handling chdir based on stale row metadata.
+        cmd.extend(["--resume", resume_session, "--no-restore-cwd"])
     cmd.extend([
         "chat",
         "-q", prompt,
