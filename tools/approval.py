@@ -910,6 +910,45 @@ Respond with exactly one word: APPROVE, DENY, or ESCALATE"""
         return "escalate"
 
 
+def _redact_command_for_display(command: str) -> str:
+    """Redact secret values from a command before echoing it into any
+    approval surface (Slack DM history, API event stream, agent transcript).
+
+    DAN-2114: a credential-writing command such as
+
+        cat >> ~/.hermes/.env << 'EOF'
+        SLACK_APP_TOKEN=xapp-1-A0ABQE7GA6T-<live-token>
+        EOF
+
+    was flagged for approval and its full text — including the live
+    ``xapp-`` app-level token — was posted in cleartext into the Slack
+    approval-prompt preview, which is itself a Slack message. The security
+    scanner caught the *file write* but not that the command text itself
+    carried a secret that would be echoed back into chat. A blocked
+    file-write thereby became a published token.
+
+    This is a display-only transform: ``terminal_tool`` executes the
+    original, un-redacted command. Only the value echoed into the approval
+    request is masked, so the user still sees the full command *structure*
+    (enough to approve/deny) without the secret *value* landing in shared,
+    persisted history.
+
+    Reuses ``agent.redact.redact_sensitive_text`` with ``force=True`` so
+    masking applies regardless of the operator's logging-redaction
+    preference (this is a safety boundary, not a log-beauty setting). Falls
+    back to the raw command if the redactor is unavailable — redaction is
+    defense-in-depth and must never break an approval flow.
+    """
+    if not command:
+        return command
+    try:
+        from agent.redact import redact_sensitive_text
+        return redact_sensitive_text(command, force=True)
+    except Exception as exc:
+        logger.debug("Command redaction unavailable; echoing raw: %s", exc)
+        return command
+
+
 def check_dangerous_command(command: str, env_type: str,
                             approval_callback=None) -> dict:
     """Check if a command is dangerous and handle approval.
@@ -971,8 +1010,14 @@ def check_dangerous_command(command: str, env_type: str,
         return {"approved": True, "message": None}
 
     if is_gateway or env_var_enabled("HERMES_EXEC_ASK"):
+        # DAN-2114: redact secret values before the command is echoed into
+        # the approval request (Slack DM / API stream) or the agent-visible
+        # message — a credential-writing command must not publish its live
+        # token into shared/persisted surfaces. terminal_tool still runs the
+        # original command; this is display-only.
+        safe_command = _redact_command_for_display(command)
         submit_pending(session_key, {
-            "command": command,
+            "command": safe_command,
             "pattern_key": pattern_key,
             "description": description,
         })
@@ -980,11 +1025,11 @@ def check_dangerous_command(command: str, env_type: str,
             "approved": False,
             "pattern_key": pattern_key,
             "status": "approval_required",
-            "command": command,
+            "command": safe_command,
             "description": description,
             "message": (
                 f"⚠️ This command is potentially dangerous ({description}). "
-                f"Asking the user for approval.\n\n**Command:**\n```\n{command}\n```"
+                f"Asking the user for approval.\n\n**Command:**\n```\n{safe_command}\n```"
             ),
         }
 
@@ -1193,7 +1238,11 @@ def check_all_command_guards(command: str, env_type: str,
             # Each call gets its own _ApprovalEntry so parallel subagents
             # and execute_code threads can block concurrently.
             approval_data = {
-                "command": command,
+                # DAN-2114: redact secrets before the notify callback echoes
+                # this into the Slack approval prompt / API stream. The
+                # queued entry is display-only — terminal_tool runs the
+                # original command unchanged.
+                "command": _redact_command_for_display(command),
                 "pattern_key": primary_key,
                 "pattern_keys": all_keys,
                 "description": combined_desc,
@@ -1345,8 +1394,9 @@ def check_all_command_guards(command: str, env_type: str,
 
         # Fallback: no gateway callback registered (e.g. cron, batch).
         # Return approval_required for backward compat.
+        safe_command = _redact_command_for_display(command)
         submit_pending(session_key, {
-            "command": command,
+            "command": safe_command,
             "pattern_key": primary_key,
             "pattern_keys": all_keys,
             "description": combined_desc,
@@ -1356,10 +1406,10 @@ def check_all_command_guards(command: str, env_type: str,
             "pattern_key": primary_key,
             "status": "pending_approval",
             "approval_pending": True,
-            "command": command,
+            "command": safe_command,
             "description": combined_desc,
             "message": (
-                f"⚠️ {combined_desc}. Asking the user for approval.\n\n**Command:**\n```\n{command}\n```"
+                f"⚠️ {combined_desc}. Asking the user for approval.\n\n**Command:**\n```\n{safe_command}\n```"
             ),
         }
 
