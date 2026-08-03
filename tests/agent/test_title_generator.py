@@ -10,7 +10,9 @@ from agent.title_generator import (
     maybe_auto_title,
     _title_language,
 )
+from agent.context_compressor import SUMMARY_PREFIX
 from hermes_state import SessionDB
+from tools.todo_tool import TODO_INJECTION_HEADER
 
 
 class TestGenerateTitle:
@@ -188,6 +190,42 @@ class TestAutoTitleSession:
 
 class TestMaybeAutoTitle:
     """Tests for maybe_auto_title() — the fire-and-forget entry point."""
+
+    def test_fires_when_first_exchange_contains_internal_user_scaffolding(self):
+        db = MagicMock()
+        history = [
+            {"role": "user", "content": "Investigate the Telegram title bug"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "terminal", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call-1", "content": "done"},
+            {"role": "user", "content": f"{SUMMARY_PREFIX}\nCompacted work so far"},
+            {
+                "role": "user",
+                "content": f"{TODO_INJECTION_HEADER}\n- Finish the regression test",
+            },
+            {"role": "assistant", "content": "The issue is fixed."},
+        ]
+
+        with patch("agent.title_generator.threading.Thread") as thread_cls:
+            maybe_auto_title(
+                db,
+                "sess-1",
+                "Investigate the Telegram title bug",
+                "The issue is fixed.",
+                history,
+            )
+
+        thread_cls.assert_called_once()
+        thread_cls.return_value.start.assert_called_once_with()
 
     def test_skips_if_not_first_exchange(self):
         """Should not fire for conversations with more than 2 user messages."""
