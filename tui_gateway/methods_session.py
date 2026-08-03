@@ -315,6 +315,10 @@ def _(rid, params: dict) -> dict:
     # ``profile`` (app-global remote mode): resume a session that lives in another
     # local profile's state.db. None/own profile → the launch profile (unchanged).
     profile, profile_home = _profile_target(params.get("profile"))
+    # Desktop hydrates the persisted transcript through the authenticated REST
+    # route in parallel. Suppress only the duplicate WebSocket copy when the
+    # caller explicitly opts in; all other clients retain the full payload.
+    omit_messages = is_truthy_value(params.get("omit_messages", False))
 
     # Non-launch handles begin as a bounded read scope. Lazy/deferred/fast/error
     # exits close them; only a successfully built eager AIAgent adopts the
@@ -343,6 +347,7 @@ def _(rid, params: dict) -> dict:
             profile_home=profile_home,
             db=db,
             db_ownership=db_ownership,
+            omit_messages=omit_messages,
         )
     finally:
         db_ownership.close()
@@ -431,6 +436,7 @@ def _(rid, params: dict) -> dict:
             session,
             touch=True,
             transport=current_transport() or _stdio_transport,
+            omit_messages=is_truthy_value(params.get("omit_messages", False)),
         ),
     )
 
