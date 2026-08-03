@@ -1593,10 +1593,7 @@ def _emit_agent_iteration_event(
         )
         if firecrawl_state and firecrawl_state.first_failure:
             canonical_name = canonical_agent_source(job_name)
-            if (
-                is_canonical_agent(canonical_name)
-                and _claim_credits_iteration(firecrawl_state)
-            ):
+            if is_canonical_agent(canonical_name):
                 synth_payload = {
                     "agent": canonical_name,
                     "summary": (
@@ -1607,13 +1604,14 @@ def _emit_agent_iteration_event(
                     "job_name": job_name,
                     **_credits_iteration_fields(),
                 }
-                bus.emit(
-                    event_type=EventType.AGENT_ITERATION,
-                    source=canonical_name,
-                    payload=synth_payload,
-                    correlation_id=job_id or None,
-                    job_id=job_id or None,
-                )
+                if _claim_credits_iteration(firecrawl_state):
+                    bus.emit(
+                        event_type=EventType.AGENT_ITERATION,
+                        source=canonical_name,
+                        payload=synth_payload,
+                        correlation_id=job_id or None,
+                        job_id=job_id or None,
+                    )
     except Exception as e:  # pragma: no cover - defensive
         logger.debug("agent_iteration emit failed: %s", e)
 
@@ -5222,18 +5220,20 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
 
     finally:
         try:
-            _finalize_agent_iteration_event(
-                emitter,
-                job,
-                final_response or "",
-                success=success,
-                firecrawl_state=firecrawl_state,
-            )
+            try:
+                _finalize_agent_iteration_event(
+                    emitter,
+                    job,
+                    final_response or "",
+                    success=success,
+                    firecrawl_state=firecrawl_state,
+                )
+            finally:
+                _reset_scout_firecrawl_run(firecrawl_token)
         finally:
-            _reset_scout_firecrawl_run(firecrawl_token)
-        # Release the fork's same-job concurrency slot on every exit path
-        # (claim-refused, success, agent failure, raised exception).
-        _release_in_flight(_job_id)
+            # Release the fork's same-job concurrency slot on every exit path
+            # (claim-refused, success, agent failure, raised exception).
+            _release_in_flight(_job_id)
 
 
 def _notify_provider_jobs_changed() -> None:
@@ -5710,23 +5710,26 @@ def tick(
 
             finally:
                 try:
-                    _finalize_agent_iteration_event(
-                        emitter,
-                        job,
-                        final_response or "",
-                        success=success,
-                        firecrawl_state=firecrawl_state,
-                    )
+                    try:
+                        if _abandoned is None or not _abandoned.is_set():
+                            _finalize_agent_iteration_event(
+                                emitter,
+                                job,
+                                final_response or "",
+                                success=success,
+                                firecrawl_state=firecrawl_state,
+                            )
+                    finally:
+                        _reset_scout_firecrawl_run(firecrawl_token)
                 finally:
-                    _reset_scout_firecrawl_run(firecrawl_token)
-                # Release the same-job concurrency slot regardless of how
-                # the run exited (success, agent failure, raised exception).
-                # See `_in_flight` registry block at module top — Guard #3.
-                # EXCEPT when the deadline handler abandoned this run: it
-                # already released the slot, and a successor fire may have
-                # registered a fresh record that must not be popped here.
-                if _abandoned is None or not _abandoned.is_set():
-                    _release_in_flight(_job_id)
+                    # Release the same-job concurrency slot regardless of how
+                    # the run exited (success, agent failure, raised exception).
+                    # See `_in_flight` registry block at module top — Guard #3.
+                    # EXCEPT when the deadline handler abandoned this run: it
+                    # already released the slot, and a successor fire may have
+                    # registered a fresh record that must not be popped here.
+                    if _abandoned is None or not _abandoned.is_set():
+                        _release_in_flight(_job_id)
 
         # Partition due jobs: jobs with a per-job workdir and/or profile touch
         # process-global runtime state inside run_job. Workdir jobs temporarily

@@ -1,4 +1,8 @@
+import threading
+import time
 from unittest.mock import MagicMock
+
+import pytest
 
 import cron.scheduler as scheduler
 from agent import firecrawl_run_state as state
@@ -111,6 +115,46 @@ def test_malformed_marker_keeps_error_then_synthesizes_credits_iteration():
     assert emitter.bus.calls[1]["payload"]["action_kind"] == "credits"
 
 
+def test_malformed_marker_claims_immediately_before_credits_emit(monkeypatch):
+    order = []
+
+    class OrderingBus(RecordingBus):
+        def emit(self, **kwargs):
+            order.append(("emit", kwargs["event_type"]))
+            super().emit(**kwargs)
+
+    emitter = _emitter(OrderingBus())
+    run, token = _install_open_run()
+    original_claim = scheduler._claim_credits_iteration
+    original_fields = scheduler._credits_iteration_fields
+
+    def recording_claim(firecrawl_state):
+        order.append(("claim", firecrawl_state._credits_action_claimed))
+        return original_claim(firecrawl_state)
+
+    def recording_fields():
+        order.append(("build", run._credits_action_claimed))
+        return original_fields()
+
+    monkeypatch.setattr(scheduler, "_claim_credits_iteration", recording_claim)
+    monkeypatch.setattr(scheduler, "_credits_iteration_fields", recording_fields)
+    malformed = "<AGENT_ITERATION_JSON>{bad json}</AGENT_ITERATION_JSON>"
+    try:
+        scheduler._finalize_agent_iteration_event(
+            emitter, _scout_job(), malformed, success=True,
+            firecrawl_state=run,
+        )
+    finally:
+        state.reset_firecrawl_run(token)
+
+    assert order == [
+        ("emit", EventType.AGENT_ERROR),
+        ("build", False),
+        ("claim", False),
+        ("emit", EventType.AGENT_ITERATION),
+    ]
+
+
 def test_failed_run_emits_credits_but_failed_without_402_emits_nothing():
     credits_emitter = _emitter()
     run, token = _install_open_run()
@@ -210,6 +254,31 @@ def test_run_one_job_resets_and_finalizes_when_run_job_raises(monkeypatch):
     assert emitter.bus.calls[0]["payload"]["action_kind"] == "credits"
 
 
+def test_run_one_job_releases_slot_when_finalizer_raises_base_exception(
+    monkeypatch,
+):
+    emitter = _emitter()
+    _patch_execution_pipeline(monkeypatch, emitter)
+    released = []
+    monkeypatch.setattr(scheduler, "_release_in_flight", released.append)
+    monkeypatch.setattr(
+        scheduler,
+        "run_job",
+        lambda job, **kwargs: (True, "output", "plain response", None),
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "_finalize_agent_iteration_event",
+        MagicMock(side_effect=KeyboardInterrupt("finalizer interrupted")),
+    )
+
+    with pytest.raises(KeyboardInterrupt, match="finalizer interrupted"):
+        scheduler.run_one_job(_scout_job())
+
+    assert released == ["scout-1"]
+    assert state.current_firecrawl_run() is None
+
+
 def test_tick_installs_and_finalizes_same_scout_lifecycle(monkeypatch):
     emitter = _emitter()
     _patch_execution_pipeline(monkeypatch, emitter)
@@ -234,6 +303,45 @@ def test_tick_installs_and_finalizes_same_scout_lifecycle(monkeypatch):
         and call["payload"].get("action_kind") == "credits"
     ]
     assert len(credit_calls) == 1
+
+
+def test_tick_abandoned_scout_suppresses_late_iteration_and_resets(monkeypatch):
+    emitter = _emitter()
+    _patch_execution_pipeline(monkeypatch, emitter)
+    monkeypatch.setattr(
+        scheduler, "get_due_and_skipped_jobs", lambda: ([_scout_job()], [])
+    )
+    monkeypatch.setattr(scheduler, "advance_next_run", lambda *a, **k: None)
+    monkeypatch.setattr(scheduler, "load_config", lambda: {})
+    monkeypatch.setattr(scheduler, "_sweep_mcp_orphans", lambda: None, raising=False)
+    monkeypatch.setattr(scheduler, "_job_timeout_seconds", lambda job: 0.01)
+    worker_finished = threading.Event()
+    worker_context_after_reset = []
+    original_reset = scheduler._reset_scout_firecrawl_run
+
+    def recording_reset(token):
+        original_reset(token)
+        worker_context_after_reset.append(state.current_firecrawl_run())
+        worker_finished.set()
+
+    monkeypatch.setattr(scheduler, "_reset_scout_firecrawl_run", recording_reset)
+
+    def fake_run_job(job, **kwargs):
+        assert state.current_firecrawl_run() is not None
+        state.record_firecrawl_credits_exhausted()
+        time.sleep(0.05)
+        return True, "output", "plain response", None
+
+    monkeypatch.setattr(scheduler, "run_job", fake_run_job)
+    assert scheduler.tick(verbose=False, sync=True) == 0
+    assert worker_finished.wait(1)
+
+    assert state.current_firecrawl_run() is None
+    assert worker_context_after_reset == [None]
+    assert not any(
+        call["event_type"] == EventType.AGENT_ITERATION
+        for call in emitter.bus.calls
+    )
 
 
 def test_emit_failure_after_claim_is_not_retried():
