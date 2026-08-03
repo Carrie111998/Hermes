@@ -41,7 +41,7 @@ python scripts/scan.py --file message.txt --json
 ```
 
 Use `--json` when you need to parse the result programmatically; omit it for a
-human-readable summary. For long messages, save the text with `write_file`
+human-readable summary. Add `--lang en` for English output (default is Russian). For long messages, save the text with `write_file`
 first and pass `--file` to avoid shell-quoting issues.
 
 ## Quick Reference
@@ -51,6 +51,7 @@ first and pass `--file` to avoid shell-quoting issues.
 | `--text "..."` | Scan an inline message string |
 | `--file PATH` | Scan a UTF-8 file (use for long / multi-line messages) |
 | `--json` | Emit structured JSON instead of the text summary |
+| `--lang ru|en` | Output language for advice and findings (default: `ru`) |
 | `--patterns PATH` | Use an alternate pattern set (default: `references/patterns.json`) |
 
 Output fields (JSON): `risk_score` (0–100), `risk_band`, `confidence`,

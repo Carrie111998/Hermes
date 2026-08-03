@@ -7,11 +7,12 @@ It speaks in probabilities, not verdicts, and describes the *scheme* present in
 the text — it never labels the sender as a person.
 
 Cross-platform: standard library only, ``pathlib`` for paths, no shell calls.
+Bilingual output: Russian by default, English via ``--lang en``.
 
 Usage:
     python scripts/scan.py --text "message text here"
     python scripts/scan.py --file message.txt --json
-    python scripts/scan.py --text "..." --patterns /path/to/patterns.json
+    python scripts/scan.py --text "..." --lang en --json
 """
 from __future__ import annotations
 
@@ -26,19 +27,75 @@ DEFAULT_PATTERNS = Path(__file__).resolve().parent.parent / "references" / "patt
 _URL_RE = re.compile(r"""(?xi)\b(?:https?://|www\.)[^\s<>"'）)]+""")
 _IP_HOST_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
 
+# --- localized strings -------------------------------------------------------
+
+BANDS = {
+    "ru": ["низкий", "повышенный", "высокий", "очень высокий"],
+    "en": ["low", "elevated", "high", "very high"],
+}
+CONFIDENCE = {
+    "ru": ["низкая", "средняя", "высокая"],
+    "en": ["low", "medium", "high"],
+}
+DISCLAIMER = {
+    "ru": ("Оценка вероятностная, а не вердикт. Анализируется схема сообщения, "
+           "не личность отправителя. Низкий балл не гарантирует безопасность."),
+    "en": ("This is a probabilistic estimate, not a verdict. It analyzes the "
+           "message's scheme, not the sender as a person. A low score is not a "
+           "guarantee of safety."),
+}
+URL_SAFE_ACTION = {
+    "ru": "Не переходи по ссылке из сообщения — открой сайт вручную из закладки и сверь домен.",
+    "en": "Don't open the link from the message — open the site manually from a bookmark and verify the domain.",
+}
+URL_NOTES = {
+    "at_symbol": {
+        "ru": "ссылка содержит '@' перед доменом ({u}…) — реальный хост скрыт",
+        "en": "the link contains '@' before the domain ({u}…) — the real host is hidden",
+    },
+    "ip_host": {
+        "ru": "ссылка ведёт на голый IP ({h}), а не на домен",
+        "en": "the link points to a bare IP ({h}) instead of a domain",
+    },
+    "punycode": {
+        "ru": "домен в punycode ({h}) — вероятна подмена символов",
+        "en": "punycode domain ({h}) — likely character substitution",
+    },
+    "shortener": {
+        "ru": "сокращатель ссылок ({b}) прячет настоящий адрес",
+        "en": "link shortener ({b}) hides the real address",
+    },
+    "suspicious_tld": {
+        "ru": "подозрительная зона .{t}",
+        "en": "suspicious .{t} zone",
+    },
+    "many_subdomains": {
+        "ru": "много поддоменов в хосте ({h})",
+        "en": "many subdomains in the host ({h})",
+    },
+    "lookalike": {
+        "ru": "домен маскируется под '{brand}' ({h}) — официальный: {off}",
+        "en": "domain impersonates '{brand}' ({h}) — official: {off}",
+    },
+}
+LABELS = {
+    "ru": {"risk": "Риск", "conf": "уверенность", "schemes": "Сработавшие схемы:",
+           "link": "ссылка", "todo": "Что делать:"},
+    "en": {"risk": "Risk", "conf": "confidence", "schemes": "Matched schemes:",
+           "link": "link", "todo": "What to do:"},
+}
+
+# --- core --------------------------------------------------------------------
+
 
 def load_patterns(path: Path) -> dict:
-    """Load the pattern set. Raises FileNotFoundError with a clear message."""
     if not path.exists():
         raise FileNotFoundError(f"pattern file not found: {path}")
     return json.loads(path.read_text(encoding="utf-8"))
 
 
 def _noisy_or(weights):
-    """Combine independent per-hit probabilities: P(at least one) = 1 - prod(1-w).
-
-    Naturally caps below 1.0 and gives diminishing returns as evidence stacks.
-    """
+    """P(at least one) = 1 - prod(1-w). Caps below 1.0, diminishing returns."""
     product = 1.0
     for w in weights:
         w = max(0.0, min(1.0, float(w)))
@@ -57,48 +114,42 @@ def _host_of(url: str) -> str:
 
 
 def _registrable(host: str) -> str:
-    """Best-effort registrable domain: the last two labels (sld.tld)."""
     labels = host.split(".")
     return ".".join(labels[-2:]) if len(labels) >= 2 else host
 
 
-def score_urls(urls, url_cfg):
-    """Return (weights, notes) for URL-based signals."""
+def score_urls(urls, url_cfg, lang="ru"):
+    """Return (weights, notes) for URL-based signals, notes localized to lang."""
     weights, notes = [], []
     w = url_cfg.get("weights", {})
     brands = url_cfg.get("protected_brands", {})
+
+    def note(key, **kw):
+        notes.append(URL_NOTES[key][lang].format(**kw))
+
     for url in urls:
         host = _host_of(url)
         if not host:
             continue
         if "@" in url.split("//")[-1].split("/")[0]:
-            weights.append(w.get("at_symbol_in_url", 0.6))
-            notes.append(f"ссылка содержит '@' перед доменом ({url[:40]}…) — реальный хост скрыт")
+            weights.append(w.get("at_symbol_in_url", 0.6)); note("at_symbol", u=url[:40])
         if _IP_HOST_RE.match(host):
-            weights.append(w.get("ip_host", 0.55))
-            notes.append(f"ссылка ведёт на голый IP ({host}), а не на домен")
+            weights.append(w.get("ip_host", 0.55)); note("ip_host", h=host)
         if "xn--" in host:
-            weights.append(w.get("punycode", 0.7))
-            notes.append(f"домен в punycode ({host}) — вероятна подмена символов")
+            weights.append(w.get("punycode", 0.7)); note("punycode", h=host)
         base = host[4:] if host.startswith("www.") else host
         if base in url_cfg.get("shorteners", []):
-            weights.append(w.get("shortener", 0.35))
-            notes.append(f"сокращатель ссылок ({base}) прячет настоящий адрес")
+            weights.append(w.get("shortener", 0.35)); note("shortener", b=base)
         tld = host.rsplit(".", 1)[-1] if "." in host else ""
         if tld in url_cfg.get("suspicious_tlds", []):
-            weights.append(w.get("suspicious_tld", 0.4))
-            notes.append(f"подозрительная зона .{tld}")
+            weights.append(w.get("suspicious_tld", 0.4)); note("suspicious_tld", t=tld)
         if len(host.split(".")) >= 5:
-            weights.append(w.get("many_subdomains", 0.3))
-            notes.append(f"много поддоменов в хосте ({host})")
-        # Lookalike: a protected brand appears as a distinct token in the host,
-        # but the registrable domain is not one of that brand's official ones.
-        # Token-boundary matching (split on non-alphanumeric) avoids false
-        # positives on unrelated words that merely contain a short brand string
-        # (e.g. "colgate.com" / "gateway.com" are NOT flagged for brand "gate").
-        # For brands >= 6 chars a concatenated prefix ("binancelogin.top") also
-        # matches. Bare-brand deceptive domains ("metamask.top") are caught,
-        # while official domains ("metamask.io", "support.metamask.io") are not.
+            weights.append(w.get("many_subdomains", 0.3)); note("many_subdomains", h=host)
+        # Lookalike: brand appears as a distinct token in the host, but the
+        # registrable domain is not one of that brand's official domains.
+        # Token-boundary matching avoids false positives on unrelated words
+        # ("colgate.com"/"gateway.com" not flagged for brand "gate"); for
+        # brands >= 6 chars a concatenated prefix ("binancelogin.top") matches.
         reg = _registrable(host)
         host_tokens = [t for t in re.split(r"[^a-z0-9]+", host) if t]
         sld = host.split(".")[-2] if len(host.split(".")) >= 2 else host
@@ -107,24 +158,16 @@ def score_urls(urls, url_cfg):
                 continue
             if brand in host_tokens or (len(brand) >= 6 and sld.startswith(brand)):
                 weights.append(w.get("lookalike_domain", 0.75))
-                official_str = ", ".join(official)
-                notes.append(
-                    f"домен маскируется под '{brand}' ({host}) — официальный: {official_str}"
-                )
+                note("lookalike", brand=brand, h=host, off=", ".join(official))
                 break
     return weights, notes
 
 
 def match_signals(text: str, signals):
-    """Return list of fired signals (dedup by id)."""
     lowered = text.lower()
     fired = {}
     for sig in signals:
-        hit = False
-        for kw in sig.get("keywords", []):
-            if kw.lower() in lowered:
-                hit = True
-                break
+        hit = any(kw.lower() in lowered for kw in sig.get("keywords", []))
         if not hit:
             for rx in sig.get("regexes", []):
                 try:
@@ -138,78 +181,70 @@ def match_signals(text: str, signals):
     return list(fired.values())
 
 
-def band(score: int) -> str:
+def band(score: int, lang="ru") -> str:
+    b = BANDS[lang]
     if score >= 80:
-        return "очень высокий"
+        return b[3]
     if score >= 50:
-        return "высокий"
+        return b[2]
     if score >= 20:
-        return "повышенный"
-    return "низкий"
+        return b[1]
+    return b[0]
 
 
-def build_report(text: str, patterns: dict) -> dict:
+def build_report(text: str, patterns: dict, lang: str = "ru") -> dict:
     signals = patterns.get("signals", [])
     url_cfg = patterns.get("url_config", {})
 
     fired = match_signals(text, signals)
     urls = extract_urls(text)
-    url_weights, url_notes = score_urls(urls, url_cfg)
+    url_weights, url_notes = score_urls(urls, url_cfg, lang)
 
     weights = [s.get("weight", 0.5) for s in fired] + url_weights
-    prob = _noisy_or(weights)
-    score = int(round(prob * 100))
+    score = int(round(_noisy_or(weights) * 100))
 
-    # Confidence rises with the number of *independent* scheme categories seen.
     categories = {s.get("scheme_tag", s["id"]) for s in fired}
     if url_weights:
         categories.add("suspicious_link")
     n = len(categories)
-    confidence = "низкая" if n <= 1 else ("средняя" if n == 2 else "высокая")
+    conf = CONFIDENCE[lang][0] if n <= 1 else (CONFIDENCE[lang][1] if n == 2 else CONFIDENCE[lang][2])
 
     reasons = [
         {"id": s["id"], "scheme": s.get("scheme_tag"), "why": s.get("description")}
         for s in fired
     ]
-    safe_actions = []
-    seen = set()
+    key = "safe_action_en" if lang == "en" else "safe_action"
+    safe_actions, seen = [], set()
     for s in fired:
-        a = s.get("safe_action")
+        a = s.get(key) or s.get("safe_action")
         if a and a not in seen:
-            safe_actions.append(a)
-            seen.add(a)
+            safe_actions.append(a); seen.add(a)
     if url_notes:
-        safe_actions.append(
-            "Не переходи по ссылке из сообщения — открой сайт вручную из закладки и сверь домен."
-        )
+        safe_actions.append(URL_SAFE_ACTION[lang])
 
     return {
         "risk_score": score,
-        "risk_band": band(score),
-        "confidence": confidence,
+        "risk_band": band(score, lang),
+        "confidence": conf,
         "scheme_tags": sorted(categories),
         "reasons": reasons,
         "url_findings": url_notes,
         "safe_actions": safe_actions,
-        "disclaimer": (
-            "Оценка вероятностная, а не вердикт. Анализируется схема сообщения, "
-            "не личность отправителя. Низкий балл не гарантирует безопасность."
-        ),
+        "disclaimer": DISCLAIMER[lang],
     }
 
 
-def _format_human(rep: dict) -> str:
-    lines = [
-        f"Риск: {rep['risk_score']}/100 ({rep['risk_band']}), уверенность {rep['confidence']}",
-    ]
+def _format_human(rep: dict, lang: str = "ru") -> str:
+    L = LABELS[lang]
+    lines = [f"{L['risk']}: {rep['risk_score']}/100 ({rep['risk_band']}), {L['conf']} {rep['confidence']}"]
     if rep["reasons"]:
-        lines.append("Сработавшие схемы:")
+        lines.append(L["schemes"])
         for r in rep["reasons"]:
             lines.append(f"  • {r['scheme']}: {r['why']}")
     for note in rep["url_findings"]:
-        lines.append(f"  • ссылка: {note}")
+        lines.append(f"  • {L['link']}: {note}")
     if rep["safe_actions"]:
-        lines.append("Что делать:")
+        lines.append(L["todo"])
         for a in rep["safe_actions"]:
             lines.append(f"  → {a}")
     lines.append(rep["disclaimer"])
@@ -222,17 +257,18 @@ def main(argv=None) -> int:
     src.add_argument("--text", help="message text to scan")
     src.add_argument("--file", help="path to a UTF-8 file with the message")
     p.add_argument("--patterns", default=str(DEFAULT_PATTERNS), help="pattern JSON path")
+    p.add_argument("--lang", choices=["ru", "en"], default="ru", help="output language")
     p.add_argument("--json", action="store_true", help="emit JSON instead of text")
     args = p.parse_args(argv)
 
     text = args.text if args.text is not None else Path(args.file).read_text(encoding="utf-8")
     patterns = load_patterns(Path(args.patterns))
-    report = build_report(text, patterns)
+    report = build_report(text, patterns, args.lang)
 
     if args.json:
         print(json.dumps(report, ensure_ascii=False, indent=2))
     else:
-        print(_format_human(report))
+        print(_format_human(report, args.lang))
     return 0
 
 

@@ -107,3 +107,22 @@ def test_noisy_or_is_monotonic_and_bounded():
     assert 0.0 < scan._noisy_or([0.5]) < 1.0
     assert scan._noisy_or([0.9, 0.9, 0.9]) < 1.0
     assert scan._noisy_or([0.5, 0.5]) > scan._noisy_or([0.5])
+
+
+def test_english_output_mode():
+    rep = scan.build_report(
+        "URGENT: enter your seed phrase at https://metamask.top or account blocked",
+        PATTERNS, lang="en",
+    )
+    assert rep["risk_band"] == "very high"
+    assert rep["confidence"] in ("low", "medium", "high")
+    assert "verdict" in rep["disclaimer"].lower()
+    assert any("impersonates" in n for n in rep["url_findings"])
+    # no Cyrillic characters leak into English output
+    assert not any("\u0400" <= c <= "\u04ff" for a in rep["safe_actions"] for c in a)
+
+
+def test_default_lang_is_russian():
+    rep = scan.build_report("введи сид фразу на https://metamask.top", PATTERNS)
+    assert rep["risk_band"] in ("высокий", "очень высокий")
+    assert any("маскируется" in n for n in rep["url_findings"])
