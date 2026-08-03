@@ -2,7 +2,7 @@
 name: vortex-notes
 description: Read, search, and update the user's encrypted notes vault.
 version: 1.1.0
-author: Nico Ruggieri (@vortex-303)
+author: Vortex303 (@vortex-303)
 license: MIT
 platforms: [macos, linux, windows]
 metadata:
