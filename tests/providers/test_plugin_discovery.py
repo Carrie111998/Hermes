@@ -22,6 +22,7 @@ def _clear_provider_caches():
 
     _pkg._REGISTRY.clear()
     _pkg._ALIASES.clear()
+    _pkg._PROVIDER_LIST_CACHE = None
     _pkg._discovered = False
     # Evict any cached plugin modules so the next import re-executes.
     for mod in list(sys.modules.keys()):
