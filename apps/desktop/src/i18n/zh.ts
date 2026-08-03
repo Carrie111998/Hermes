@@ -671,6 +671,7 @@ export const zh: Translations = {
       model: '用于新对话，除非你在输入框中选择其他模型。',
       modelContextLength: '保持为 0 则使用所选模型检测到的上下文窗口。',
       fallbackProviders: '默认模型失败时尝试的备用 provider:model 条目。',
+      toolsets: '可启用的工具集列表。',
       display: {
         personality: '新会话的默认助手风格。',
         showReasoning: '当后端提供推理内容时予以显示。'
@@ -683,17 +684,31 @@ export const zh: Translations = {
       timezone: '当 Hermes 需要本地时间上下文时使用。留空则使用系统时区。',
       agent: {
         imageInputMode: '控制图片附件如何发送给模型。',
-        maxTurns: 'Hermes 停止一次运行前工具调用轮次的上限。'
+        maxTurns: 'Hermes 停止一次运行前工具调用轮次的上限。',
+        apiMaxRetries: 'API 调用失败后的最大重试次数。',
+        serviceTier: 'API 服务等级（OpenAI/Anthropic）。',
+        toolUseEnforcement: '控制模型必须调用工具而非仅描述动作的严格程度。'
       },
       terminal: {
         cwd: '工具与终端操作的默认项目目录。',
+        backend: '终端命令的执行后端。',
+        timeout: '单条终端命令的超时时间（秒）。',
         persistentShell: '当后端支持时，在命令之间保留 Shell 状态。',
-        envPassthrough: '传入工具执行的环境变量。'
+        envPassthrough: '传入工具执行的环境变量。',
+        dockerImage: '执行后端为 Docker 时使用的容器镜像。',
+        singularityImage: '执行后端为 Singularity 时使用的镜像。',
+        modalImage: '执行后端为 Modal 时使用的镜像。',
+        daytonaImage: '执行后端为 Daytona 时使用的镜像。'
       },
       codeExecution: {
         mode: '代码执行被限定到当前项目的严格程度。'
       },
       fileReadMaxChars: 'Hermes 单次文件读取可读取的最大字符数。',
+      toolOutput: {
+        maxBytes: '单次终端命令输出的最大字节数。',
+        maxLines: '读取文件时每页的最大行数。',
+        maxLineLength: '单行最大长度，超出部分将被截断。'
+      },
       approvals: {
         mode: 'Hermes 如何处理需要显式审批的命令。',
         timeout: '审批提示在超时前等待的时长。'
@@ -702,7 +717,8 @@ export const zh: Translations = {
         redactSecrets: '尽可能从模型可见内容中隐藏检测到的密钥。'
       },
       checkpoints: {
-        enabled: '在文件编辑前创建可回滚的快照。'
+        enabled: '在文件编辑前创建可回滚的快照。',
+        maxSnapshots: '保留的文件检查点快照数量上限。'
       },
       memory: {
         memoryEnabled: '保存有助于未来会话的持久记忆。',
@@ -713,6 +729,14 @@ export const zh: Translations = {
       },
       compression: {
         enabled: '当对话变大时对较早的上下文进行摘要。'
+      },
+      delegation: {
+        model: '子智能体使用的模型。',
+        provider: '子智能体使用的提供方。',
+        maxIterations: '子智能体单次任务的轮次上限。',
+        maxConcurrentChildren: '可同时运行的并行子智能体数量。',
+        childTimeoutSeconds: '子智能体的超时时间（秒）。',
+        reasoningEffort: '委派给子智能体的推理强度。'
       },
       voice: {
         autoTts: '自动朗读助手回复。'
@@ -728,6 +752,34 @@ export const zh: Translations = {
           'Hermes 从应用内更新时（无终端提示），保留本地源码修改（暂存）或丢弃（放弃）。通过终端更新时始终会询问。'
       }
     }),
+    optionLabels: {
+      'terminal.backend': {
+        local: '本地',
+        docker: 'Docker',
+        singularity: 'Singularity',
+        modal: 'Modal',
+        daytona: 'Daytona',
+        ssh: 'SSH'
+      },
+      'agent.service_tier': {
+        auto: '自动',
+        default: '默认',
+        flex: 'Flex'
+      },
+      'delegation.reasoning_effort': {
+        minimal: '最小',
+        low: '低',
+        medium: '中',
+        high: '高',
+        xhigh: '极高',
+        max: '最高',
+        ultra: '超高'
+      },
+      'updates.non_interactive_local_changes': {
+        stash: '暂存',
+        discard: '放弃'
+      }
+    },
     about: {
       heading: 'Hermes Desktop',
       version: value => `版本 ${value}`,
@@ -783,7 +835,7 @@ export const zh: Translations = {
       enabledTitle: '快速输入',
       enabledDesc: '用全局快捷键在任何地方唤出一个小输入框，无需打开 Hermes 即可发送提示。',
       shortcutTitle: '快速输入快捷键',
-      shortcutDesc: '至少需要一个修饰键，例如 CommandOrControl+Shift+Space。',
+      shortcutDesc: '至少需要一个修饰键，例如 Command Or Control + Shift + Space。',
       active: '快捷键已生效。',
       takenBy: '此快捷键已被其他应用占用，请换一个。',
       invalidShortcut: '不是有效的快捷键。请至少包含一个修饰键。'

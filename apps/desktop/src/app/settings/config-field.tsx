@@ -44,6 +44,11 @@ export function ConfigField({
   const { t } = useI18n()
   const c = t.settings.config
 
+  // Translated enum option labels for this field, if the locale provides any
+  // (keyed by raw schema key → option value). Falls through to `prettyName`
+  // below when absent, so English and partial locales keep their default render.
+  const optionLabelMap = t.settings.optionLabels[schemaKey]
+
   const label =
     fieldCopyForSchemaKey(t.settings.fieldLabels, schemaKey) ??
     fieldCopyForSchemaKey(FIELD_LABELS, schemaKey) ??
@@ -143,7 +148,7 @@ export function ConfigField({
           {selectOptions.map(option => (
             <SelectItem key={option || EMPTY_SELECT_VALUE} value={option || EMPTY_SELECT_VALUE}>
               {option
-                ? (optionLabels?.[option] ?? prettyName(option))
+                ? (optionLabels?.[option] ?? optionLabelMap?.[option] ?? prettyName(option))
                 : schemaKey === 'display.personality'
                   ? c.none
                   : schemaKey === 'memory.provider'

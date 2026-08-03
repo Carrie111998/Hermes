@@ -421,6 +421,11 @@ export interface Translations {
     }
     fieldLabels: Record<string, string>
     fieldDescriptions: Record<string, string>
+    // Per-field enum option labels, keyed by raw schema key (e.g.
+    // 'terminal.backend') → option value → translated label. Missing entries
+    // fall back to `prettyName(option)` in ConfigField, so a locale only needs
+    // entries for the options it wants to translate.
+    optionLabels: Record<string, Record<string, string>>
     about: {
       heading: string
       version: (value: string) => string
