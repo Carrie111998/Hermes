@@ -45,41 +45,69 @@ def b1_engine_with_clock_skew(frozen_time, in_memory_storage, audit_capture) -> 
 def b1_engine_with_policy_vs_obsidian_high(frozen_time, in_memory_storage, audit_capture) -> EvidencePackEngine:
     """Engine designed to produce a policy_vs_goal conflict (severity=high).
 
-    The pair {policy, obsidian} triggers policy_vs_goal → high per the
-    classifier. We use distinct hit_ids + distinct snippets with low token
-    overlap to avoid being captured by an earlier rule (scope).
+    Both hits carry the same explicit subject (``zephyr``) and the same
+    explicit attribute (``deployment_status``) under the accepted grammar
+    ``subject attribute = value``. Policy carries the affirmative polarity
+    word (``approved``); obsidian carries its closed opposite
+    (``rejected``). The explicit-claim parser parses both hits, the
+    polarity-pair check fires, and the {policy, obsidian} source pair
+    selects ``policy_vs_goal`` at high severity.
 
-    Tokens ≥ 3 chars: "policy" and "obsidian" share no common tokens with the
-    objective (different content domains), so the conflict detector lands on
-    policy_vs_goal.
+    Hit IDs, source URIs, source types, and retrieval modes remain
+    distinct so no earlier rule (freshness, identity, cross-band, scope)
+    captures the pair before the content-aware rule fires.
     """
     observed = frozen_time
     updated = '2026-07-08T20:00:00+00:00'
 
     def _policy(query, *, max_hits: int=5, observed_at: str):
-        return [_make_hit_v2(source='policy', hit_id='b1-conflict-policy-001', title=f'{_UNIVERSAL_TOKEN} policy decision alpha', relevance_score=0.9, snippet=f'{_UNIVERSAL_TOKEN} decision alpha approved', source_uri='state_meta[objective_policy_decision:b1-conflict-policy-001]', source_updated_at=updated, retrieval_mode='metadata_only', observed_at=observed, ttl_days=SOURCE_TTL_DAYS['policy'])]
+        return [_make_hit_v2(source='policy', hit_id='b1-conflict-policy-001', title=f'{_UNIVERSAL_TOKEN} policy zephyr deployment_status', relevance_score=0.9, snippet=f'zephyr deployment_status = approved', source_uri='state_meta[objective_policy_decision:b1-conflict-policy-001]', source_updated_at=updated, retrieval_mode='metadata_only', observed_at=observed, ttl_days=SOURCE_TTL_DAYS['policy'])]
 
     def _obsidian(query, *, max_hits: int=5, observed_at: str):
-        return [_make_hit_v2(source='obsidian', hit_id='b1-conflict-obsidian-001', title=f'{_UNIVERSAL_TOKEN} obsidian diary beta', relevance_score=0.9, snippet=f'{_UNIVERSAL_TOKEN} diary beta rejected', source_uri='file://obsidian/b1-conflict-obsidian-001', source_updated_at=updated, retrieval_mode='snippet', observed_at=observed, ttl_days=SOURCE_TTL_DAYS['obsidian'])]
+        return [_make_hit_v2(source='obsidian', hit_id='b1-conflict-obsidian-001', title=f'{_UNIVERSAL_TOKEN} obsidian zephyr deployment_status', relevance_score=0.9, snippet=f'zephyr deployment_status = rejected', source_uri='file://obsidian/b1-conflict-obsidian-001', source_updated_at=updated, retrieval_mode='snippet', observed_at=observed, ttl_days=SOURCE_TTL_DAYS['obsidian'])]
     sources = {'policy': _policy, 'obsidian': _obsidian}
     return EvidencePackEngine(sources=sources, storage=in_memory_storage, audit_sink=audit_capture)
 
 @pytest.fixture
 def b1_engine_with_three_policy_vs_obsidian_conflicts(frozen_time, in_memory_storage, audit_capture) -> EvidencePackEngine:
-    """Engine that produces 3 distinct policy_vs_goal conflicts (3 high audit events)."""
+    """Engine that produces 3×3 = 9 distinct policy_vs_goal conflicts.
+
+    All 6 hits describe the same explicit subject (``zephyr``) and the
+    same explicit attribute (``deployment_status``) under the accepted
+    grammar ``subject attribute = value``. Every policy hit carries the
+    identical affirmative polarity word (``approved``); every obsidian
+    hit carries the identical closed opposite (``rejected``). The
+    explicit-claim parser parses both sides, the polarity-pair check
+    fires on every cross-source pair, and the {policy, obsidian} source
+    pair selects ``policy_vs_goal`` at high severity.
+
+    The parser never reads the title, so the per-hit discriminator is
+    placed in the title field to keep snippets and parsed claims
+    identical across the three policy hits and across the three obsidian
+    hits while still producing unique fingerprints and source URIs.
+
+    Hit IDs, source URIs, and provenance records are unique across all
+    6 hits. The semantic subject and attribute remain identical so the
+    cross-product of conflict pairs equals 9 with no same-source
+    conflicts contributing to the high-severity count.
+
+    1 high-severity audit event per cross-source hit pair -> 9 total.
+    """
     observed = frozen_time
     updated = '2026-07-08T20:00:00+00:00'
 
     def _policy(query, *, max_hits: int=5, observed_at: str):
         out = []
+        discriminator = ('q001', 'q002', 'q003')
         for i in range(3):
-            out.append(_make_hit_v2(source='policy', hit_id=f'b1-multi-policy-{i:03d}', title=f'{_UNIVERSAL_TOKEN} policy decision alpha-{i}', relevance_score=0.9, snippet=f'{_UNIVERSAL_TOKEN} decision alpha-{i} approved', source_uri=f'state_meta[objective_policy_decision:b1-multi-policy-{i:03d}]', source_updated_at=updated, retrieval_mode='metadata_only', observed_at=observed, ttl_days=SOURCE_TTL_DAYS['policy']))
+            out.append(_make_hit_v2(source='policy', hit_id=f'b1-multi-policy-{i:03d}', title=f'{_UNIVERSAL_TOKEN} policy zephyr deployment_status {discriminator[i]}', relevance_score=0.9, snippet=f'zephyr deployment_status = approved', source_uri=f'state_meta[objective_policy_decision:b1-multi-policy-{i:03d}]', source_updated_at=updated, retrieval_mode='metadata_only', observed_at=observed, ttl_days=SOURCE_TTL_DAYS['policy']))
         return out
 
     def _obsidian(query, *, max_hits: int=5, observed_at: str):
         out = []
+        discriminator = ('r001', 'r002', 'r003')
         for i in range(3):
-            out.append(_make_hit_v2(source='obsidian', hit_id=f'b1-multi-obsidian-{i:03d}', title=f'{_UNIVERSAL_TOKEN} obsidian diary beta-{i}', relevance_score=0.9, snippet=f'{_UNIVERSAL_TOKEN} diary beta-{i} rejected', source_uri=f'file://obsidian/b1-multi-obsidian-{i:03d}', source_updated_at=updated, retrieval_mode='snippet', observed_at=observed, ttl_days=SOURCE_TTL_DAYS['obsidian']))
+            out.append(_make_hit_v2(source='obsidian', hit_id=f'b1-multi-obsidian-{i:03d}', title=f'{_UNIVERSAL_TOKEN} obsidian zephyr deployment_status {discriminator[i]}', relevance_score=0.9, snippet=f'zephyr deployment_status = rejected', source_uri=f'file://obsidian/b1-multi-obsidian-{i:03d}', source_updated_at=updated, retrieval_mode='snippet', observed_at=observed, ttl_days=SOURCE_TTL_DAYS['obsidian']))
         return out
     sources = {'policy': _policy, 'obsidian': _obsidian}
     return EvidencePackEngine(sources=sources, storage=in_memory_storage, audit_sink=audit_capture)

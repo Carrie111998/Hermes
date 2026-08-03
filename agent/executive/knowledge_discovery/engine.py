@@ -503,13 +503,23 @@ def _detect_conflicts(hits: list[KnowledgeHitV2], observed_at: str) -> list[Conf
     """Pairwise O(N²) conflict detector on top-K hits.
 
     Conflict types and severities per conflict_resolution_policy.md:
-    * policy_vs_goal        — medium/high
+    * policy_vs_goal        — high (when a hit pair satisfies the
+                              explicit-claim content rule)
     * memory_vs_evidence    — medium
-    * evidence_vs_evidence  — low (same band) / medium (cross band)
+    * evidence_vs_evidence  — low / medium
     * freshness             — low (delta > 30d)
     * scope                 — low
     * identity              — medium
-    * unknown               — low (fallback)
+
+    Conflict detection is content-aware. A source combination alone is NEVER
+    sufficient to declare a conflict; a positive conflict must demonstrate:
+    (1) the same normalized subject, (2) the same normalized attribute,
+    (3) explicit polarity opposition OR explicit numeric values with the
+    SAME explicit unit, and (4) intact provenance on both hits.
+    Order of input is irrelevant — the pair is canonicalised before evaluation.
+
+    Unparseable prose, free-form negation, and identifier-like numerics all
+    default to no_conflict. False negatives are preferred over false positives.
     """
     conflicts: list[ConflictRecord] = []
     if not hits:
@@ -525,12 +535,15 @@ def _detect_conflicts(hits: list[KnowledgeHitV2], observed_at: str) -> list[Conf
             if detected is None:
                 continue
             ctype, severity, impact, rec = detected
-            cid = _conflict_id((a.hit_id, b.hit_id), ctype)
+            # ConflictRecord.items preserves canonical provenance for both
+            # hits; the tuple order is sorted so input order cannot perturb
+            # the identity of the conflict.
+            cid = _conflict_id(_canonical_pair(a, b), ctype)
             conflicts.append(ConflictRecord(
                 conflict_id=cid,
                 conflict_type=ctype,
                 severity=severity,
-                items=(a.hit_id, b.hit_id),
+                items=_canonical_pair(a, b),
                 impact=impact,
                 recommended_resolution=rec,
                 resolution_status="unresolved",
@@ -539,11 +552,235 @@ def _detect_conflicts(hits: list[KnowledgeHitV2], observed_at: str) -> list[Conf
     return conflicts
 
 
+# Closed polarity pairs (positive, negative). Recognition requires both
+# halves to appear as exact normalized values of parsed explicit claims.
+_POLARITY_PAIRS: tuple[tuple[str, ...], ...] = (
+    ("approved", "rejected"),
+    ("allowed", "forbidden"),
+    ("enabled", "disabled"),
+    ("active", "inactive"),
+    ("pass", "fail"),
+    ("true", "false"),
+    ("yes", "no"),
+    ("open", "closed"),
+    ("on", "off"),
+    ("successful", "unsuccessful"),
+)
+
+_POLARITY_WORDS: frozenset[str] = frozenset(
+    w for pair in _POLARITY_PAIRS for w in pair
+)
+
+# Identifier-like attributes — numerics on these never produce a
+# conflict. Auditable exclusion set: date / datetime / timestamp,
+# version / revision, id / identifier, phone / telephone, port,
+# ip / address, serial / model, build / commit, ticket / issue,
+# account / postal / zip, plus the legacy token ``incidents`` and any
+# attribute ending in an excluded suffix.
+_NUMERIC_EXCLUDED_WORDS: frozenset[str] = frozenset({
+    "date", "datetime", "timestamp",
+    "version", "revision",
+    "id", "identifier",
+    "phone", "telephone",
+    "port",
+    "ip", "address",
+    "serial", "model",
+    "build", "commit",
+    "ticket", "issue",
+    "account", "postal", "zip",
+    "incidents",
+})
+_NUMERIC_EXCLUDED_SUFFIXES: tuple[str, ...] = (
+    "_id", "_version", "_date", "_port", "_phone",
+    "_serial", "_build", "_ticket", "_issue",
+)
+
+# Ranker near-duplicate threshold (snippet-token Jaccard). Above this the
+# pair is collapsed unless the explicit-claim opposition exception applies.
+_NEAR_DUP_JACCARD = 0.85
+
+# Explicit-claim grammar: ``subject attribute = value`` or
+# ``subject attribute: value``. Subject and attribute are each a single
+# token ``[a-z][a-z0-9_-]*``; value is the rest of the line, trimmed.
+_EXPLICIT_CLAIM_RE = re.compile(
+    r"^([a-z][a-z0-9_-]*)\s+([a-z][a-z0-9_-]*)\s*[:=]\s*(.+?)\s*$"
+)
+
+# Numeric value grammar: integer / decimal followed by an optional unit
+# token (letters, %).
+_NUMERIC_VALUE_RE = re.compile(r"^(\d+(?:\.\d+)?)(?:\s+([a-z%]+))?$")
+
+
+def _canonical_pair(a: KnowledgeHitV2, b: KnowledgeHitV2) -> tuple[str, str]:
+    """Return the hit_id pair in canonical (sorted) order.
+
+    Ensures conflict detection is independent of input order.
+    """
+    return (a.hit_id, b.hit_id) if a.hit_id <= b.hit_id else (b.hit_id, a.hit_id)
+
+
+def _parse_explicit_claim(text: Optional[str]) -> Optional[tuple[str, str, str]]:
+    """Parse ``subject attribute = value`` or ``subject attribute: value``.
+
+    Returns ``(subject, attribute, value)`` (all lower-cased and trimmed)
+    or ``None``. The parser is purely structural — no NLP fallback, no
+    token fallback, no title/context concatenation.
+    """
+    if not text:
+        return None
+    s = text.strip().lower()
+    if not s:
+        return None
+    m = _EXPLICIT_CLAIM_RE.match(s)
+    if not m:
+        return None
+    subject, attribute, value = m.group(1), m.group(2), m.group(3).strip()
+    if not value:
+        return None
+    return (subject, attribute, value)
+
+
+def _hit_claim(h: KnowledgeHitV2) -> Optional[tuple[str, str, str]]:
+    """Inspect snippet first; fall back to ``provenance.quote`` if present.
+
+    Never synthesises a claim from title or arbitrary context prose.
+    """
+    claim = _parse_explicit_claim(h.snippet)
+    if claim is not None:
+        return claim
+    return _parse_explicit_claim(h.provenance.quote)
+
+
+def _parse_numeric_value(value: str) -> Optional[tuple[str, str]]:
+    """Parse a numeric value, returning ``(number, unit)`` or ``None``.
+
+    ``unit`` is the empty string when no explicit unit is present.
+    """
+    m = _NUMERIC_VALUE_RE.match(value.strip())
+    if not m:
+        return None
+    return (m.group(1), m.group(2) or "")
+
+
+def _is_identifier_like_attribute(attr: str) -> bool:
+    """True when ``attr`` represents an identifier-like class.
+
+    Identifier-like attributes must never produce numeric conflicts —
+    distinct identifiers are not contradictory measurements.
+    """
+    if attr in _NUMERIC_EXCLUDED_WORDS:
+        return True
+    for suffix in _NUMERIC_EXCLUDED_SUFFIXES:
+        if attr.endswith(suffix):
+            return True
+    return False
+
+
+def _polarity_opposite(a: str, b: str) -> bool:
+    """True iff ``(a, b)`` are opposite members of one closed polarity pair."""
+    a = a.strip()
+    b = b.strip()
+    for pair in _POLARITY_PAIRS:
+        if (a == pair[0] and b == pair[1]) or (a == pair[1] and b == pair[0]):
+            return True
+    return False
+
+
+def _explicit_claims_conflict(
+    claim_a: tuple[str, str, str],
+    claim_b: tuple[str, str, str],
+) -> Optional[str]:
+    """Return ``"polarity"`` / ``"numeric"`` for a content conflict, else ``None``.
+
+    Conflict requires identical subject + identical attribute + differing
+    values, and either an opposite closed-polarity pair OR comparable
+    numerics with the SAME explicit unit. Identifier-like attributes
+    suppress numeric conflicts.
+    """
+    sa, aa, va = claim_a
+    sb, ab, vb = claim_b
+    if sa != sb or aa != ab:
+        return None
+    if va == vb:
+        return None
+    if (
+        va in _POLARITY_WORDS
+        and vb in _POLARITY_WORDS
+        and _polarity_opposite(va, vb)
+    ):
+        return "polarity"
+    if _is_identifier_like_attribute(aa):
+        return None
+    na = _parse_numeric_value(va)
+    nb = _parse_numeric_value(vb)
+    if na is None or nb is None:
+        return None
+    if na[1] != nb[1]:
+        return None
+    if na[0] == nb[0]:
+        return None
+    return "numeric"
+
+
+def _content_aware_conflict(
+    a: KnowledgeHitV2, b: KnowledgeHitV2
+) -> Optional[tuple[str, str]]:
+    """Conflict iff both hits parse to explicit opposing claims.
+
+    Source combination only SELECTS the conflict type / severity; it
+    never proves a conflict.
+    """
+    ca = _hit_claim(a)
+    cb = _hit_claim(b)
+    if ca is None or cb is None:
+        return None
+    if _explicit_claims_conflict(ca, cb) is None:
+        return None
+    pair = {a.source, b.source}
+    if "policy" in pair:
+        return ("policy_vs_goal", "high")
+    if pair == {"gbrain", "obsidian"} or pair == {"gbrain", "report"}:
+        return ("memory_vs_evidence", "medium")
+    if a.source == b.source:
+        return ("evidence_vs_evidence", "medium")
+    return ("evidence_vs_evidence", "low")
+
+
+def _ranker_preserve_opposing_claims(
+    h1: KnowledgeHitV2, h2: KnowledgeHitV2
+) -> bool:
+    """Ranker near-duplicate exception: keep both if claims oppose.
+
+    Returns ``True`` iff both hits parse to explicit claims on the same
+    subject + same attribute and the values differ as either
+    closed-polarity opposites or numeric with identical explicit units.
+    The function does NOT itself declare a conflict.
+    """
+    c1 = _hit_claim(h1)
+    c2 = _hit_claim(h2)
+    if c1 is None or c2 is None:
+        return False
+    return _explicit_claims_conflict(c1, c2) is not None
+
+
 def _classify_conflict(
     a: KnowledgeHitV2, b: KnowledgeHitV2
 ) -> Optional[tuple[str, str, str, str]]:
-    """Return (type, severity, impact, recommended_resolution) or None."""
-    # Freshness delta: a/b from same source, very different updated_at
+    """Return (type, severity, impact, recommended_resolution) or None.
+
+    Order of evaluation:
+      1. Freshness delta — same source, very different updated_at.
+      2. Identity — same hit_id with different source_uri (canonical
+         identity rule; takes precedence over content-aware conflict).
+      3. Cross-band freshness on the same source.
+      4. Content-aware conflict rule (subject + attribute + incompatibility).
+      5. Scope — same hit_id prefix, divergent content.
+
+    The source-pair-only ``memory_vs_evidence`` and ``policy_vs_goal``
+    heuristics have been replaced by ``_content_aware_conflict``. A source
+    combination is never sufficient to declare a conflict.
+    """
+    # Freshness delta: a/b from same source, very different updated_at.
     if (a.source == b.source
             and abs(a.freshness.staleness_days - b.freshness.staleness_days) > 30):
         return (
@@ -552,10 +789,10 @@ def _classify_conflict(
             "use newer source_updated_at; archive older",
         )
 
-    # Identity: same hit_id, different source_uri
-    # IMPORTANT: this check is BEFORE memory_vs_evidence because identity
-    # is the more specific classification (same entity, different URI is
-    # an identity issue, not a generic memory-vs-evidence contradiction).
+    # Identity: same hit_id, different source_uri.
+    # IMPORTANT: this check is BEFORE the content-aware rule because
+    # identity is the more specific classification (same entity, different
+    # URI is an identity issue, not a content contradiction).
     if a.hit_id == b.hit_id and a.provenance.source_uri != b.provenance.source_uri:
         return (
             "identity", "medium",
@@ -563,24 +800,7 @@ def _classify_conflict(
             "dedup by source_uri; keep higher-priority source",
         )
 
-    # Memory vs evidence: gbrain vs obsidian
-    pair = {a.source, b.source}
-    if pair == {"gbrain", "obsidian"} or pair == {"gbrain", "report"}:
-        return (
-            "memory_vs_evidence", "medium",
-            f"contradiction between {a.source} and {b.source}",
-            "resolve by policy; default to higher source priority",
-        )
-
-    # Policy vs goal: policy/contract contradictions
-    if pair == {"policy", "gbrain"} or pair == {"policy", "obsidian"}:
-        return (
-            "policy_vs_goal", "high",
-            f"policy decision contradicted by {a.source if a.source != 'policy' else b.source}",
-            "requires_human; flag in human_gate_audit",
-        )
-
-    # Evidence vs evidence: same source, freshness band delta
+    # Evidence vs evidence: same source, freshness band delta.
     if a.source == b.source and a.freshness.freshness != b.freshness.freshness:
         return (
             "evidence_vs_evidence", "medium",
@@ -588,7 +808,24 @@ def _classify_conflict(
             "prefer current; demote stale",
         )
 
-    # Scope: same hit_id family (prefix), different token overlap pattern
+    # Content-aware conflict rule. Replaces the old source-pair-only
+    # memory_vs_evidence / policy_vs_goal heuristics.
+    content_result = _content_aware_conflict(a, b)
+    if content_result is not None:
+        ctype, severity = content_result
+        impact = (
+            f"explicit incompatibility between {a.source} and {b.source} "
+            f"on shared subject/attribute"
+        )
+        if ctype == "policy_vs_goal":
+            rec = "requires_human; flag in human_gate_audit"
+        elif ctype == "memory_vs_evidence":
+            rec = "resolve by policy; default to higher source priority"
+        else:
+            rec = "prefer higher-priority source; reconcile via policy"
+        return (ctype, severity, impact, rec)
+
+    # Scope: same hit_id family (prefix), low token overlap, different source.
     a_prefix = a.hit_id.rsplit("/", 1)[0] if "/" in a.hit_id else a.hit_id
     b_prefix = b.hit_id.rsplit("/", 1)[0] if "/" in b.hit_id else b.hit_id
     if (a_prefix == b_prefix
@@ -666,15 +903,33 @@ def _rank_hits(
         seen_fp.add(h.fingerprint)
         deduped.append(h)
 
-    # Near-dup Jaccard ≥ 0.85 → drop lower score
+    # Near-dup Jaccard ≥ 0.85 → drop lower score. The Jaccard check only
+    # applies across DIFFERENT sources — within a single source the
+    # fingerprint dedup already collapses true duplicates (each hit
+    # has a unique hit_id per document), and separate documents that
+    # happen to render the same sentence must be preserved so the
+    # conflict detector can evaluate them.
+    #
+    # Cross-source exception: when both snippets parse to explicit
+    # opposing claims on the same subject + same attribute
+    # (closed-polarity opposites OR comparable numerics with identical
+    # explicit units), the ranker keeps BOTH hits so the conflict
+    # detector can evaluate the pair. Same-value claims remain subject
+    # to normal duplicate suppression. The exception is narrow —
+    # arbitrary prose with different numbers is NOT preserved.
     final: list[KnowledgeHitV2] = []
     for h in deduped:
         tokens_h = _tokenize(h.snippet)
         is_dup = False
         for kept in final:
-            if _jaccard(tokens_h, _tokenize(kept.snippet)) >= 0.85:
-                is_dup = True
-                break
+            if kept.source == h.source:
+                continue  # fingerprint dedup already handled within source
+            if _jaccard(tokens_h, _tokenize(kept.snippet)) < _NEAR_DUP_JACCARD:
+                continue
+            if _ranker_preserve_opposing_claims(h, kept):
+                continue  # opposing explicit claims — keep both
+            is_dup = True
+            break
         if not is_dup:
             final.append(h)
 

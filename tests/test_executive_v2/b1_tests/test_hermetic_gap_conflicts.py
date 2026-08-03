@@ -81,9 +81,17 @@ def test_co_pvg_03_policy_vs_obsidian_high_severity_audit_event_count(b1_engine_
     pvg = [c for c in pack.conflicts if c.conflict_type == 'policy_vs_goal']
     assert pvg, f'expected policy_vs_goal conflict, got {pack.conflicts}'
     assert all((c.severity == 'high' for c in pvg))
+    # Exactly one policy_vs_goal conflict (1×1 pairwise).
+    assert len(pvg) == 1, f'expected 1 policy_vs_goal conflict, got {len(pvg)}'
+    # Exactly one high-severity conflict.
+    high = [c for c in pack.conflicts if c.severity == 'high']
+    assert len(high) == 1, f'expected 1 high-severity conflict, got {len(high)}'
     events = engine._audit_sink.get_events()
     pvg_events = [e for e in events if e.get('gate_type') == 'knowledge_conflict' and e.get('severity') == 'high']
     assert len(pvg_events) == 1, f'expected 1 audit event, got {len(pvg_events)}: {pvg_events}'
+    # Item pair corresponds to the two fixture hits (canonical pair).
+    expected_ids = {'b1-conflict-policy-001', 'b1-conflict-obsidian-001'}
+    assert set(pvg[0].items) == expected_ids, (pvg[0].items, expected_ids)
 
 def test_co_res_04_resolution_status_persists_in_state_meta(b1_engine_with_policy_vs_obsidian_high, in_memory_storage):
     """discover() with policy_vs_goal conflict → second discover() with a

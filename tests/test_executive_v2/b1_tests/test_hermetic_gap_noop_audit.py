@@ -30,6 +30,19 @@ def test_audit_nomut_05_multi_conflict_appends_one_event_per_high(b1_engine_with
     high = [c for c in pack.conflicts if c.severity == 'high']
     assert all((c.conflict_type == 'policy_vs_goal' for c in high)), f'unexpected conflict_type in high set: {[c.conflict_type for c in high]}'
     assert len(high) == 9, f'expected 9 high-severity conflicts (3×3 pairwise), got {len(high)}'
+    # All 9 conflicts are policy_vs_goal (i.e. no same-group conflicts).
+    assert all((c.conflict_type == 'policy_vs_goal' for c in pack.conflicts)), (
+        f'unexpected conflict_type in pack: {[c.conflict_type for c in pack.conflicts]}'
+    )
+    # Item pairs cover every (policy, obsidian) hit combination.
+    # The engine canonicalises the pair (sorted by hit_id), so we
+    # build the expected set with sorted tuples as well.
+    expected_pairs = {
+        tuple(sorted((f'b1-multi-policy-{i:03d}', f'b1-multi-obsidian-{j:03d}')))
+        for i in range(3) for j in range(3)
+    }
+    observed_pairs = {tuple(c.items) for c in high}
+    assert observed_pairs == expected_pairs, (observed_pairs, expected_pairs)
     events = engine._audit_sink.get_events()
     pvg_events = [e for e in events if e.get('gate_type') == 'knowledge_conflict' and e.get('severity') == 'high']
     assert len(pvg_events) == 9, f'expected 9 audit events (1 per high conflict), got {len(pvg_events)}: {pvg_events}'
