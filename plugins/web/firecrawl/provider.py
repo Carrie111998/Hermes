@@ -50,6 +50,13 @@ import logging
 import os
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
+from agent.firecrawl_run_state import (
+    CIRCUIT_OPEN_INFO,
+    CREDITS_EXHAUSTED_INFO,
+    FirecrawlCircuitOpenError,
+    raise_if_firecrawl_circuit_open,
+    record_firecrawl_credits_exhausted,
+)
 from agent.web_search_provider import WebSearchProvider
 from tools.url_safety import is_safe_url
 from tools.website_policy import check_website_access
@@ -371,21 +378,22 @@ def _credit_error_info(exc: Exception) -> Optional[Dict[str, Any]]:
     """Classify Firecrawl account-credit failures without exposing responses."""
     if getattr(exc, "status_code", None) != 402:
         return None
-    return {
-        "code": "provider_credits_exhausted",
-        "provider": "firecrawl",
-        "scope": "account",
-        "retryable": False,
-    }
+    return dict(CREDITS_EXHAUSTED_INFO)
 
 
 def _credit_circuit_info() -> Dict[str, Any]:
-    return {
-        "code": "provider_circuit_open",
-        "provider": "firecrawl",
-        "scope": "account",
-        "retryable": False,
-    }
+    return dict(CIRCUIT_OPEN_INFO)
+
+
+def _scrape_with_run_admission(
+    client: Any,
+    *,
+    url: str,
+    formats: List[str],
+) -> Any:
+    """Perform the final run-circuit check immediately before scrape I/O."""
+    raise_if_firecrawl_circuit_open()
+    return client.scrape(url=url, formats=formats)
 
 
 class FirecrawlWebSearchProvider(WebSearchProvider):
@@ -433,6 +441,14 @@ class FirecrawlWebSearchProvider(WebSearchProvider):
         # let it propagate so the dispatcher emits the legacy envelope shape.
         client = _get_firecrawl_client()
         try:
+            raise_if_firecrawl_circuit_open()
+        except FirecrawlCircuitOpenError as exc:
+            return {
+                "success": False,
+                "error": str(exc),
+                "error_info": dict(exc.error_info),
+            }
+        try:
             response = client.search(query=query, limit=limit)
             web_results = _extract_web_search_results(response)
             logger.info("Firecrawl: found %d search results", len(web_results))
@@ -445,6 +461,7 @@ class FirecrawlWebSearchProvider(WebSearchProvider):
             }
             error_info = _credit_error_info(exc)
             if error_info:
+                record_firecrawl_credits_exhausted()
                 result["error_info"] = error_info
             return result
 
@@ -529,7 +546,8 @@ class FirecrawlWebSearchProvider(WebSearchProvider):
                 try:
                     scrape_result = await asyncio.wait_for(
                         asyncio.to_thread(
-                            _get_firecrawl_client().scrape,
+                            _scrape_with_run_admission,
+                            _get_firecrawl_client(),
                             url=url,
                             formats=formats,
                         ),
@@ -635,8 +653,14 @@ class FirecrawlWebSearchProvider(WebSearchProvider):
                     "raw_content": "",
                     "error": str(scrape_err),
                 }
+                if isinstance(scrape_err, FirecrawlCircuitOpenError):
+                    result["error_info"] = dict(scrape_err.error_info)
+                    credit_circuit_open = True
+                    results.append(result)
+                    continue
                 error_info = _credit_error_info(scrape_err)
                 if error_info:
+                    record_firecrawl_credits_exhausted()
                     result["error_info"] = error_info
                     credit_circuit_open = True
                 results.append(result)

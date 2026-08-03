@@ -563,6 +563,122 @@ class TestErrorResponseShapes:
         assert result["success"] is False
         assert "error_info" not in result
 
+    def test_firecrawl_search_run_circuit_blocks_later_network_call(
+        self,
+        monkeypatch,
+    ):
+        from agent import firecrawl_run_state as state
+        from plugins.web.firecrawl import provider as firecrawl_provider
+
+        calls = []
+
+        class Client:
+            def search(self, **kwargs):
+                calls.append(kwargs)
+                return {"web": []}
+
+        monkeypatch.setattr(
+            firecrawl_provider, "_get_firecrawl_client", lambda: Client()
+        )
+        provider = firecrawl_provider.FirecrawlWebSearchProvider()
+        _, token = state.install_firecrawl_run()
+        try:
+            assert provider.search("before")["success"] is True
+            assert len(calls) == 1
+            state.record_firecrawl_credits_exhausted()
+            blocked = provider.search("after")
+            assert len(calls) == 1
+            assert blocked["error_info"] == dict(state.CIRCUIT_OPEN_INFO)
+        finally:
+            state.reset_firecrawl_run(token)
+
+    def test_firecrawl_search_402_opens_shared_run_state(
+        self,
+        monkeypatch,
+    ):
+        from agent import firecrawl_run_state as state
+        from plugins.web.firecrawl import provider as firecrawl_provider
+
+        class PaymentRequiredError(Exception):
+            status_code = 402
+
+        class Client:
+            def search(self, **kwargs):
+                raise PaymentRequiredError("secret response body must not escape")
+
+        monkeypatch.setattr(
+            firecrawl_provider, "_get_firecrawl_client", lambda: Client()
+        )
+        run, token = state.install_firecrawl_run()
+        try:
+            result = firecrawl_provider.FirecrawlWebSearchProvider().search("query")
+            assert run.circuit_open is True
+            assert result["error_info"] == dict(state.CREDITS_EXHAUSTED_INFO)
+            assert "secret response body" not in repr(run.first_failure)
+        finally:
+            state.reset_firecrawl_run(token)
+
+    def test_firecrawl_extract_shared_run_blocks_next_invocation(
+        self,
+        monkeypatch,
+    ):
+        from agent import firecrawl_run_state as state
+        from plugins.web.firecrawl import provider as firecrawl_provider
+
+        calls = []
+
+        class PaymentRequiredError(Exception):
+            status_code = 402
+
+        class Client:
+            def scrape(self, *, url, formats):
+                calls.append(url)
+                raise PaymentRequiredError("secret response")
+
+        monkeypatch.setattr(
+            firecrawl_provider, "_get_firecrawl_client", lambda: Client()
+        )
+        monkeypatch.setattr(firecrawl_provider, "check_website_access", lambda url: None)
+        provider = firecrawl_provider.FirecrawlWebSearchProvider()
+        run, token = state.install_firecrawl_run()
+        try:
+            first = asyncio.run(provider.extract(["https://example.com/1"]))
+            second = asyncio.run(provider.extract(["https://example.com/2"]))
+            assert run.circuit_open is True
+            assert calls == ["https://example.com/1"]
+            assert first[0]["error_info"] == dict(state.CREDITS_EXHAUSTED_INFO)
+            assert second[0]["error_info"] == dict(state.CIRCUIT_OPEN_INFO)
+        finally:
+            state.reset_firecrawl_run(token)
+
+    def test_firecrawl_extract_transient_failure_leaves_shared_run_open_for_calls(
+        self,
+        monkeypatch,
+    ):
+        from agent import firecrawl_run_state as state
+        from plugins.web.firecrawl import provider as firecrawl_provider
+
+        calls = []
+
+        class Client:
+            def scrape(self, *, url, formats):
+                calls.append(url)
+                raise TimeoutError("temporary timeout")
+
+        monkeypatch.setattr(
+            firecrawl_provider, "_get_firecrawl_client", lambda: Client()
+        )
+        monkeypatch.setattr(firecrawl_provider, "check_website_access", lambda url: None)
+        provider = firecrawl_provider.FirecrawlWebSearchProvider()
+        run, token = state.install_firecrawl_run()
+        try:
+            asyncio.run(provider.extract(["https://example.com/1"]))
+            asyncio.run(provider.extract(["https://example.com/2"]))
+            assert run.circuit_open is False
+            assert calls == ["https://example.com/1", "https://example.com/2"]
+        finally:
+            state.reset_firecrawl_run(token)
+
     def test_firecrawl_extract_opens_invocation_circuit_after_payment_required(
         self,
         monkeypatch,
