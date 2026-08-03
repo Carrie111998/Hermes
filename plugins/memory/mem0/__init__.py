@@ -65,7 +65,8 @@ _DEFAULT_USER_ID = "hermes-user"
 # ---------------------------------------------------------------------------
 # Staleness / recency decay
 # ---------------------------------------------------------------------------
-# Blend formula: adjusted = (1 - alpha) * sim_score + alpha * decay_factor
+# Blend formula: adjusted = base * [(1 - alpha) + alpha * decay_factor]
+#   equivalently: (1 - alpha) * base + alpha * decay_factor * base
 # decay_factor = 0.5 ** (days_past_grace / half_life)
 # The alpha=0.3 blend keeps semantic relevance dominant — an old but highly
 # relevant memory still beats a recent but irrelevant one. The grace period
@@ -142,6 +143,9 @@ def _apply_staleness_weight(
         days_since_return = (now - best_past_end).total_seconds() / 86400
         if days_since_return <= grace_days:
             effective_now = best_past_end
+        else:
+            # smooth: don't snap back fully, shift by grace_days to avoid cliff
+            effective_now = now - timedelta(days=grace_days)
 
     scored = []
     for r in results:

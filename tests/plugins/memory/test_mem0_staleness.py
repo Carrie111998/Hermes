@@ -286,22 +286,29 @@ class TestMultiplePastVacations:
         assert out[0]["score"] == pytest.approx(0.9, rel=1e-6)
 
     def test_older_end_would_have_penalised(self):
-        """Confirm that if we used the older vacation_end instead, the score
-        would be lower — proving that the newest-end selection matters."""
-        older_end = NOW - timedelta(days=20)
-        # Only one past vacation whose end is 20 days ago
+        """Confirm that a very old vacation_end still results in a decayed score.
+
+        With the smooth-transition fix, effective_now = now - grace_days when
+        days_since_return > grace_days.  To see decay the memory must be older
+        than effective_now by more than grace_days.  We place the memory at
+        vacation_end (60 days ago) and vacation_end 60 days ago; then
+        effective_now = now - 14 days, and days_old = (now-14) - (now-60) = 46
+        days, which is > grace_days → decay < 1.0.
+        """
+        older_end = NOW - timedelta(days=60)
+        # Only one past vacation whose end is 60 days ago
         vacations = [
             {"start": _iso(older_end - timedelta(days=5)), "end": _iso(older_end)},
         ]
-        # Memory created right at vacation_end
+        # Memory created right at vacation_end (60 days ago)
         mem_ts = _iso(older_end)
         r = _result(1.0, mem_ts)
 
-        # 20 days since return > default grace_days (14) → effective_now stays as now
+        # 60 days since return > grace_days (14) → smooth transition:
+        # effective_now = now - 14 days; days_old ≈ 46 days > grace → decay < 1.0
         with _patch_now(NOW):
             out = _apply_staleness_weight([r], vacations=vacations)
 
-        # days_old measured from NOW: 20 days → beyond grace → decay < 1.0
         assert out[0]["score"] < 1.0
 
 
