@@ -20,7 +20,7 @@ source: https://github.com/genspark-ai/genoffice
 install:
   type: git
   url: https://github.com/criptogus/mcp-genoffice.git
-  ref: 6530d7bfd46aa7d462c40703596aa8ace612ac58
+  ref: a23f738c5099efc70c6b127c155248c3f498e864
   bootstrap:
     - npm install --no-audit --no-fund
 

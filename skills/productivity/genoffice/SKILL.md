@@ -44,6 +44,11 @@ engines into `~/.cache/mcp-genoffice/src` and runs `npm install`).
 | `genoffice_pptx_patch` | Replace element text on a slide (element-level byte-preserving) |
 | `genoffice_pptx_create` | New .pptx from scratch (one blank slide) |
 | `genoffice_pptx_delete` | Delete elements from a slide |
+| `genoffice_app_status` | Is the GenOffice desktop app installed / CDP port up |
+| `genoffice_app_launch` | Launch the app with the CDP debug port (handles auto-update relaunch) |
+| `genoffice_app_open_file` | Open a file in the app (macOS `open -a`, registered doc types) |
+| `genoffice_app_screenshot` | PNG screenshot of the app window over CDP |
+| `genoffice_app_eval` | Evaluate read-only JS in the app page context (DOM) |
 
 ## Workflow
 
@@ -54,6 +59,8 @@ engines into `~/.cache/mcp-genoffice/src` and runs `npm install`).
    content is identical.
 4. All edits write a **new file** (`<name>.patched.docx` etc. by default) —
    the original is never modified.
+5. **Visual check (optional)** — `genoffice_app_launch` + `genoffice_app_open_file`
+   + `genoffice_app_screenshot` to inspect the result in the real app.
 
 ## Pitfalls
 
