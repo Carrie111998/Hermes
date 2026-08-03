@@ -21,6 +21,9 @@ from utils import is_truthy_value
 
 logger = logging.getLogger(__name__)
 
+# Maximum webhook events per request (shared by LINE gateway and plugin adapters).
+LINE_WEBHOOK_EVENTS_MAX = 100
+
 
 def _coerce_bool(value: Any, default: bool = True) -> bool:
     """Coerce bool-ish config values, preserving a caller-provided default."""

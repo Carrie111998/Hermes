@@ -66,6 +66,39 @@ hermes-agent/
 `gateway.log` when running the gateway. Profile-aware via `get_hermes_home()`.
 Browse with `hermes logs [--follow] [--level ...] [--session ...]`.
 
+**Dev records**: `01-backup/dev-YYYYMMDD.md` — 1-record-per-issue flat tracking
+(snapshots, tasks, bugs, improvements, research, technical debt). Past daily logs
+(`01-backup/YYYYMMDD.md`) and the old `AI-summary.md` have been consolidated into
+this format. See `01-backup/dev-20260801.md` for the current state.
+
+## Dev Record Conventions
+
+All improvements — bugs, features, security fixes, refactors, research, technical
+debt — are tracked in flat Dev records under `01-backup/dev-YYYYMMDD.md`. The key
+rules:
+
+- **One layer**: no issue/task/TODO separation. Every item is a DEV record.
+- **Sequential IDs**: `DEV-0001` format; never reuse retired IDs.
+- **No deletion**: records are updated, not removed. History is permanent.
+- **Minimum fields**: ID, title, status, priority, category, summary, work items,
+  checklist, related IDs, notes.
+- **Status**: `Open`, `Closed`, `Deferred` only.
+- **Priority**: `Critical`, `High`, `Medium`, `Low`.
+- **Category**: `Bug`, `Feature`, `Security`, `Performance`, `Refactor`,
+  `Documentation`, `Test`, `Research`, `Infrastructure`, `Technical Debt`,
+  `Process`.
+- **Summary**: concisely states what is broken or what should be achieved.
+- **Cause**: known cause or `Unknown` if not yet investigated.
+- **Work items**: AI or developer implementation plan / investigation steps.
+- **Checklist**: unnumbered, completion-verification items only.
+- **Evidence**: static analysis, review, test results, logs, screenshots —
+  recorded inline, no separate IDs.
+- **Related IDs**: `DEV-XXXX` format when records are linked.
+- **Duplicates**: when the AI discovers a new issue, it checks for existing
+  records and appends to the existing one instead of creating a new ID.
+- **Completion**: the AI updates status, checklist, and notes after work.
+  Always re-check the checklist before marking `Closed`.
+
 ## File Dependency Chain
 
 ```
