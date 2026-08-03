@@ -64,6 +64,39 @@ def _sanitize_session_id(session_id: Optional[str]) -> str:
     return "".join(c if (c.isalnum() or c in "-_.") else "_" for c in str(session_id))
 
 
+def _managed_install() -> bool:
+    """True when a package manager (NixOS) owns this install's modes.
+
+    Mirrors the check ``hermes_cli.config._secure_dir`` makes internally, read
+    here so the *creation* mode honours the same carve-out as reconciliation.
+    Import is local and failure means "not managed": an unimportable config
+    module is the single-user source-install case, where 0700 is correct.
+
+    Why the trace dir needs the carve-out at creation: ``nix/nixosModules.nix``
+    runs the gateway with ``UMask = "0007"`` precisely so "files created by the
+    gateway should be group-writable so interactive users in the hermes group
+    can read/write them", pins ``stateDir/.hermes`` to 2770 (setgid,
+    group-rwx), and avoids ``chown -R`` to keep the setgid bit alive "for group
+    access by hostUsers" — who get a ``~/.hermes`` symlink to that same
+    stateDir. Gateway and interactive CLI therefore share one ``$HERMES_HOME``,
+    so a 0700 trace dir created by whichever ran first locks the other out with
+    EACCES: the tracing feature itself, not just its permissions. Omitting the
+    mode lets the inherited setgid + umask land 2770, matching
+    ``ensure_hermes_home``'s managed branch and its ``logs/curator`` lazy-mkdir
+    precedent in ``hermes_cli.config``.
+
+    Deliberately a local helper. ``hermes_cli.config.secure_mkdir`` (PR #77655)
+    centralises exactly this branch, but it is not on ``main`` yet, so importing
+    it would couple this PR's merge to that one. Consolidate when it lands.
+    """
+    try:
+        from hermes_cli.config import is_managed
+
+        return bool(is_managed())
+    except Exception:  # pragma: no cover - defensive
+        return False
+
+
 def _slot_trace(acct: Any, label: str) -> dict[str, Any]:
     """Render one reference's _RefAccounting into a full trace dict.
 
@@ -124,11 +157,34 @@ def save_moa_turn(
     if base is None:
         return
     try:
-        # Trace records embed the full messages every reference model saw.
-        # Create the directory owner-only (mode applies to dirs this call
-        # creates; an existing dir keeps its permissions) and the JSONL
-        # owner-only on first write.
-        base.mkdir(parents=True, exist_ok=True, mode=0o700)
+        # Trace records embed the full messages every reference model saw, so
+        # create the directory owner-only and the JSONL owner-only on first
+        # write. Two limits on that ``mode``, both deliberate:
+        #
+        # * It applies only to the *final* component. ``Path.mkdir(parents=
+        #   True, mode=…)`` creates intermediates at the umask default, so a
+        #   ``moa.trace_dir`` override of ``a/b/traces`` leaves ``a`` and ``b``
+        #   at 0755 (measured). Harmless — the leaf stays 0700 and the JSONL
+        #   0600, so traversal into the traces themselves is still blocked —
+        #   but it is not the blanket "dirs this call creates" guarantee the
+        #   original comment claimed.
+        # * An existing dir keeps its permissions (``exist_ok=True`` does not
+        #   re-apply ``mode``), matching ``open_private_append``'s create-only
+        #   contract: never fight a mode the user widened on purpose.
+        #
+        # Managed mode is carved out at creation, not just at reconciliation.
+        # ``moa-traces`` is NOT among the dirs ``nix/nixosModules.nix``
+        # pre-creates via ``systemd.tmpfiles`` (stateDir, .hermes, cron,
+        # sessions, logs, memories, plugins — all 2770), so on a managed host it
+        # is always made lazily here and this ``mode`` is the only thing setting
+        # it. See ``_managed_install`` for why forcing 0700 there breaks the
+        # module's hermes-group sharing. ``HERMES_HOME_MODE`` is deliberately
+        # not honoured: that hatch exists so a web server can *traverse*
+        # HERMES_HOME to reach a served subdir, and nothing is served from here.
+        if _managed_install():
+            base.mkdir(parents=True, exist_ok=True)
+        else:
+            base.mkdir(parents=True, exist_ok=True, mode=0o700)
         path = base / f"{_sanitize_session_id(session_id)}.jsonl"
         # output_location tells an offline reader where the acting text lives:
         # embedded here when we have it (both non-streaming inline capture and
