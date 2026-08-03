@@ -141,6 +141,22 @@ hermes portal open       # open the subscription management page in your browser
 
 `hermes portal` (with no subcommand) is the human-readable alias for `hermes auth add nous --type oauth` — it logs you in, lets you pick a Nous model, sets Nous as your inference provider, and offers the Tool Gateway opt-in (identical to `hermes setup --portal`, and the same Nous flow as the first-time quick setup).
 
+### Per-model usage charts
+
+`hermes models-usage` breaks local session history down by model: estimated
+cost, tokens, API calls, and a per-day cost series. It renders human-readable
+bar charts by default and accepts `--json` for scripts, `--days N` to change
+the window, `--source` to filter by platform, and `--top N` to limit the chart.
+
+```bash
+hermes models-usage --days 30
+hermes models-usage --days 30 --json
+```
+
+Values are local estimates from Hermes session accounting. Portal billing
+remains the authoritative source; `hermes portal usage --json` reports the
+subscription-level balance.
+
 ### Machine-readable usage telemetry
 
 `hermes portal usage --json` emits a versioned, sanitized account-usage
