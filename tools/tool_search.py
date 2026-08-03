@@ -74,7 +74,9 @@ class ToolSearchConfig:
     # without making ``tools=`` dynamic.
     listing: str = "auto"  # "auto" | "on" | "off"
     threshold_pct: float = 5.0
-    listing_max_tokens: int = 20000
+    # Absolute cap on the user-turn catalog snapshot. Effective budget is the
+    # smaller of this value and ``threshold_pct`` of the context window.
+    listing_max_tokens: int = 4000
 
     @classmethod
     def from_raw(cls, raw: Any) -> "ToolSearchConfig":
@@ -120,7 +122,7 @@ class ToolSearchConfig:
             0.0, min(100.0, _safe_float(raw.get("threshold_pct"), 5.0))
         )
         listing_max_tokens = max(
-            200, min(60000, _safe_int(raw.get("listing_max_tokens"), 20000))
+            200, min(60000, _safe_int(raw.get("listing_max_tokens"), 4000))
         )
 
         return cls(
@@ -490,10 +492,43 @@ def _listing_group_label(source_name: str) -> str:
     return label[4:] if label.startswith("mcp-") else label
 
 
+def build_catalog_listing(
+    deferrable: List[Dict[str, Any]],
+    *,
+    max_tokens: int = 4000,
+) -> Optional[str]:
+    """Render a skills-style manifest of the deferred catalog.
+
+    One line per tool — ``name: short description`` — grouped under a
+    heading per source (MCP server / plugin toolset), exactly like the
+    bundled-skills listing in the system prompt:
+
+        github tools: (44)
+        - create_issue: Open a new issue in a GitHub repository.
+        - merge_pull_request: Merge an open pull request.
+        ...
+
+    Ordering is deterministic (groups and tools sorted by name) so the
+    rendered block is byte-stable across assemblies of the same catalog —
+    this keeps the request prefix cacheable across turns.
+
+    Token-budget fallbacks (cheap chars/4 estimate, same rule as the
+    activation gate):
+      1. full listing (names + short descriptions)
+      2. names-only listing, still grouped
+      3. server-level summary — one line per MCP server / plugin toolset
+         (name + tool count), so the model always knows WHICH domains are
+         reachable through the bridge even when per-tool names don't fit
+      4. ``None`` — only when the summary itself exceeds the budget
+    """
+    text, _form = build_catalog_listing_with_form(deferrable, max_tokens=max_tokens)
+    return text
+
+
 def build_catalog_listing_with_form(
     deferrable: List[Dict[str, Any]],
     *,
-    max_tokens: int = 20000,
+    max_tokens: int = 4000,
 ) -> Tuple[Optional[str], str]:
     """Render a deterministic, budgeted catalog manifest.
 
@@ -574,23 +609,6 @@ def build_catalog_listing_with_form(
     return None, "none"
 
 
-def build_catalog_listing(
-    deferrable: List[Dict[str, Any]],
-    *,
-    max_tokens: int = 20000,
-) -> Optional[str]:
-    """Return only the rendered catalog manifest.
-
-    Kept as the compatibility wrapper for callers that do not need to inspect
-    which budget fallback was selected.
-    """
-    listing, _listing_form = build_catalog_listing_with_form(
-        deferrable,
-        max_tokens=max_tokens,
-    )
-    return listing
-
-
 def _catalog_snapshot_id(
     deferrable: List[Dict[str, Any]],
     listing: Optional[str],
@@ -622,7 +640,7 @@ def _catalog_snapshot_id(
 def build_catalog_snapshot(
     current_tool_defs: List[Dict[str, Any]],
     *,
-    max_tokens: int = 20000,
+    max_tokens: int = 4000,
     pending_mcp_servers: Iterable[str] = (),
 ) -> CatalogSnapshot:
     """Build the API-only catalog snapshot attached to a real user turn.
@@ -910,6 +928,26 @@ def _format_search_hit(entry: CatalogEntry) -> Dict[str, Any]:
     }
 
 
+def _available_source_summary(catalog: List[CatalogEntry]) -> List[Dict[str, Any]]:
+    """Return a compact, deterministic summary of connected deferred sources.
+
+    Included only when search returns no matches. This gives the model enough
+    evidence to retry with a source/action query instead of treating a lexical
+    miss as proof that the capability is unavailable, without adding anything
+    to the fixed per-turn prompt.
+    """
+    counts: Dict[str, int] = {}
+    for entry in catalog:
+        # _listing_group_label already falls back to "other" for empty
+        # source names, matching the listing path's grouping.
+        label = _listing_group_label(entry.source_name)
+        counts[label] = counts.get(label, 0) + 1
+    return [
+        {"name": name, "tool_count": counts[name]}
+        for name in sorted(counts)
+    ]
+
+
 def dispatch_tool_search(args: Dict[str, Any],
                          *,
                          current_tool_defs: List[Dict[str, Any]],
@@ -930,11 +968,20 @@ def dispatch_tool_search(args: Dict[str, Any],
     _, deferrable = classify_tools(current_tool_defs)
     catalog = build_catalog(deferrable)
     hits = search_catalog(catalog, query, limit=limit)
-    return json.dumps({
+    result: Dict[str, Any] = {
         "query": query,
         "total_available": len(catalog),
         "matches": [_format_search_hit(h) for h in hits],
-    }, ensure_ascii=False)
+    }
+    if not hits and catalog:
+        result["available_sources"] = _available_source_summary(catalog)
+        result["hint"] = (
+            "No lexical match was found, but the sources above are connected "
+            "and their tools remain available. Retry tool_search with the "
+            "service name plus a concrete action or object before concluding "
+            "the capability is unavailable."
+        )
+    return json.dumps(result, ensure_ascii=False)
 
 
 def dispatch_tool_describe(args: Dict[str, Any],

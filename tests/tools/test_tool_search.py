@@ -51,7 +51,7 @@ class TestConfigParsing:
         assert cfg.max_search_limit == 20
         assert cfg.listing == "auto"
         assert cfg.threshold_pct == 5.0
-        assert cfg.listing_max_tokens == 20000
+        assert cfg.listing_max_tokens == 4000
 
     def test_bool_true_maps_to_auto(self):
         from tools.tool_search import ToolSearchConfig
@@ -394,6 +394,32 @@ class TestBridgeDispatch:
         result = dispatch_tool_search({}, current_tool_defs=[])
         assert "error" in json.loads(result)
 
+    def test_empty_search_keeps_connected_sources_discoverable(self):
+        from tools.registry import registry
+        from tools.tool_search import dispatch_tool_search
+
+        name = "recovery_catalog_create_record"
+        tool_def = _td(name, "Create a record in the connected catalog service.")
+        registry.register(
+            name=name,
+            handler=lambda args, **kwargs: "{}",
+            schema=tool_def,
+            toolset="mcp-recovery-catalog",
+        )
+
+        result = json.loads(dispatch_tool_search(
+            {"query": "unrelated vocabulary"},
+            current_tool_defs=[tool_def],
+        ))
+
+        assert result["matches"] == []
+        assert result["total_available"] == 1
+        assert result["available_sources"] == [
+            {"name": "recovery-catalog", "tool_count": 1},
+        ]
+        assert "remain available" in result["hint"]
+        assert "before concluding" in result["hint"]
+
     def test_resolve_underlying_call_parses_object_args(self):
         from tools.tool_search import resolve_underlying_call
 
@@ -612,6 +638,11 @@ class TestStableBridgeSchemas:
 
     def test_listing_config_controls_user_turn_manifest_not_bridge(self):
         from tools.tool_search import ToolSearchConfig
+        cfg = ToolSearchConfig.from_raw(None)
+        assert cfg.listing == "auto"
+        assert cfg.listing_max_tokens == 4000
+        # legacy bool shapes keep defaults too
+        assert ToolSearchConfig.from_raw(True).listing == "auto"
 
         cfg = ToolSearchConfig.from_raw({
             "enabled": "auto",
@@ -623,6 +654,15 @@ class TestStableBridgeSchemas:
         assert cfg.listing == "on"
         assert cfg.threshold_pct == 99
         assert cfg.listing_max_tokens == 60000
+
+    def test_short_desc_first_sentence_and_clip(self):
+        from tools.tool_search import _short_desc
+        assert _short_desc("Open an issue. Second sentence dropped.") == "Open an issue."
+        long = "word " * 40
+        s = _short_desc(long)
+        assert len(s) <= 61  # 60 + ellipsis char
+        assert s.endswith("…")
+        assert _short_desc("") == ""
 
 
 class TestUserTurnCatalogSnapshot:

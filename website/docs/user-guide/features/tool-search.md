@@ -93,7 +93,7 @@ tools:
     max_search_limit: 20
     listing: auto       # catalog snapshot on a real user turn
     threshold_pct: 5    # snapshot budget as a percentage of context
-    listing_max_tokens: 20000
+    listing_max_tokens: 4000
 ```
 
 | Key | Default | Meaning |
@@ -103,7 +103,18 @@ tools:
 | `max_search_limit` | `20` | Hard upper bound the model can request via `limit`. Range 1–50. |
 | `listing` | `auto` | `auto`/`on` attach a catalog snapshot to the first real user turn and again when its full-schema fingerprint changes; `off` uses a bare stable bridge. The listing is never embedded in a tool schema. |
 | `threshold_pct` | `5` | Snapshot budget as a percentage of the active model's context length. Range 0–100. |
-| `listing_max_tokens` | `20000` | Absolute cap on the snapshot manifest. Range 200–60000. |
+| `listing_max_tokens` | `4000` | Absolute cap on the snapshot manifest. Range 200–60000. Large catalogs degrade to names-only or per-server summaries, keeping full schemas available through search. |
+
+### Why the listing exists
+
+Without it, deferred capabilities are *invisible* — live benchmarking showed
+models substituting visible core tools (running `gh` in the terminal instead
+of searching for the deferred GitHub tool) or declaring a capability
+nonexistent instead of calling `tool_search`. The listing applies the skills
+pattern to tools: every capability stays discoverable by name at all times,
+while full parameter schemas remain deferred. If the model sees the exact
+tool name in the listing, it can skip `tool_search` and go straight to
+`tool_describe`, saving a round trip.
 
 You can also flip the legacy boolean shape:
 
