@@ -616,6 +616,74 @@ def _ensure_web_plugins_loaded() -> None:
         logger.warning("Web plugin discovery failed (non-fatal): %s", exc)
 
 
+_FIRECRAWL_CREDIT_CODES = frozenset(
+    {"provider_credits_exhausted", "provider_circuit_open"}
+)
+
+
+def _is_firecrawl_credit_result(value: object) -> bool:
+    if not isinstance(value, dict):
+        return False
+    error_info = value.get("error_info")
+    return bool(
+        isinstance(error_info, dict)
+        and error_info.get("provider") == "firecrawl"
+        and error_info.get("code") in _FIRECRAWL_CREDIT_CODES
+    )
+
+
+def _resolve_run_fallback(capability: str):
+    from agent.firecrawl_run_state import get_or_select_fallback_provider
+    from agent.web_search_registry import get_fallback_provider
+
+    return get_or_select_fallback_provider(
+        capability,
+        lambda: get_fallback_provider(
+            capability,
+            excluded=frozenset({"firecrawl"}),
+        ),
+    )
+
+
+async def _invoke_extract_provider(
+    provider,
+    urls: List[str],
+    *,
+    format: str | None,
+) -> List[Dict[str, Any]]:
+    import inspect
+
+    if inspect.iscoroutinefunction(provider.extract):
+        return await provider.extract(urls, format=format)
+    return await asyncio.to_thread(provider.extract, urls, format=format)
+
+
+def _merge_credit_fallback_results(
+    primary: List[Dict[str, Any]],
+    fallback: List[Dict[str, Any]],
+    safe_urls: List[str],
+) -> List[Dict[str, Any]]:
+    merged = list(primary)
+    unresolved = [
+        index for index, result in enumerate(primary)
+        if _is_firecrawl_credit_result(result)
+    ]
+    for fallback_index, primary_index in enumerate(unresolved):
+        url = safe_urls[primary_index]
+        if fallback_index < len(fallback) and isinstance(fallback[fallback_index], dict):
+            replacement = dict(fallback[fallback_index])
+            replacement["url"] = url
+        else:
+            replacement = {
+                "url": url,
+                "title": "",
+                "content": "",
+                "error": "Extract backend returned no result for this URL",
+            }
+        merged[primary_index] = replacement
+    return merged
+
+
 def web_search_tool(query: str, limit: int = 5) -> str:
     """
     Search the web for information using available search API backend.
@@ -721,6 +789,10 @@ def web_search_tool(query: str, limit: int = 5) -> str:
                 provider.name, query, limit,
             )
             response_data = provider.search(query, limit)
+            if _is_firecrawl_credit_result(response_data):
+                fallback = _resolve_run_fallback("search")
+                if fallback is not None:
+                    response_data = fallback.search(query, limit)
 
         debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
         result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
@@ -931,17 +1003,42 @@ async def web_extract_tool(
                 "Web extract via %s: %d URL(s)", provider.name, len(safe_urls)
             )
 
-            # Async-or-sync dispatch: parallel + firecrawl have async
-            # extract(); exa + tavily are sync.
-            import inspect
-            if inspect.iscoroutinefunction(provider.extract):
-                results = await provider.extract(safe_urls, format=format)
-            else:
-                # Run sync extract() in a thread so we don't block the
-                # event loop on network I/O.
-                results = await asyncio.to_thread(
-                    provider.extract, safe_urls, format=format
-                )
+            results = await _invoke_extract_provider(
+                provider,
+                safe_urls,
+                format=format,
+            )
+            unresolved = [
+                index for index, result in enumerate(results)
+                if _is_firecrawl_credit_result(result)
+            ]
+            if unresolved:
+                fallback_provider = _resolve_run_fallback("extract")
+                if fallback_provider is not None:
+                    fallback_urls = [safe_urls[index] for index in unresolved]
+                    try:
+                        fallback_results = await _invoke_extract_provider(
+                            fallback_provider,
+                            fallback_urls,
+                            format=format,
+                        )
+                        if not isinstance(fallback_results, list):
+                            fallback_results = []
+                    except Exception:
+                        fallback_results = [
+                            {
+                                "url": url,
+                                "title": "",
+                                "content": "",
+                                "error": "Fallback extract failed for this URL",
+                            }
+                            for url in fallback_urls
+                        ]
+                    results = _merge_credit_fallback_results(
+                        results,
+                        fallback_results,
+                        safe_urls,
+                    )
 
         # Reconstruct the original input order across invalid, blocked, and
         # provider-processed entries. Providers are expected to preserve the
