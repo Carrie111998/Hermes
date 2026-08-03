@@ -1569,16 +1569,6 @@ def build_local_transcribe_kwargs(stt_config: Optional[Dict[str, Any]] = None) -
     if isinstance(initial_prompt, str) and initial_prompt.strip():
         kwargs["initial_prompt"] = initial_prompt
 
-    for fw_key, cfg_key, default in (
-        ("no_speech_threshold", "no_speech_prob_threshold", _NO_SPEECH_PROB_THRESHOLD_DEFAULT),
-        ("log_prob_threshold", "logprob_threshold", _LOGPROB_THRESHOLD_DEFAULT),
-    ):
-        try:
-            val = float(local_cfg.get(cfg_key, default))
-        except (TypeError, ValueError):
-            val = default
-        kwargs[fw_key] = val
-
     return kwargs
 
 
