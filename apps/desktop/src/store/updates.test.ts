@@ -537,6 +537,49 @@ describe('applyBackendUpdate recovery', () => {
     await promise
   })
 
+  it('keeps polling when the backend update runs past the old 45-second window', async () => {
+    updateHermesSpy.mockResolvedValue({ ok: true, name: 'update', pid: 1 })
+    let polls = 0
+    getActionStatusSpy.mockImplementation(async () => {
+      polls += 1
+
+      if (polls <= 31) {
+        return {
+          exit_code: null,
+          lines: ['Installing dependencies...'],
+          name: 'update',
+          pid: 1,
+          running: true
+        }
+      }
+
+      return {
+        exit_code: 0,
+        lines: ['Update complete.'],
+        name: 'update',
+        pid: 1,
+        running: false
+      }
+    })
+    checkHermesUpdateSpy.mockResolvedValue({
+      install_method: 'git',
+      current_version: '0.19.1',
+      behind: 0,
+      update_available: false,
+      can_apply: true,
+      update_command: 'hermes update',
+      message: null
+    })
+
+    const promise = applyBackendUpdate()
+    await vi.advanceTimersByTimeAsync(60000)
+    const result = await promise
+
+    expect(result.ok).toBe(true)
+    expect(polls).toBeGreaterThan(30)
+    expect($backendUpdateApply.get().stage).toBe('idle')
+  })
+
   it('surfaces an error when the backend never comes back after the restart', async () => {
     updateHermesSpy.mockResolvedValue({ ok: true, name: 'update', pid: 1 })
     getActionStatusSpy.mockRejectedValue(new Error('ECONNREFUSED'))
