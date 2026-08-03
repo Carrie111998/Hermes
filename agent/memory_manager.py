@@ -362,16 +362,16 @@ def build_memory_context_block(raw_context: str) -> str:
 
 
 class MemoryManager:
-    """Orchestrates the built-in provider plus at most one external provider.
+    """Orchestrates the built-in provider plus zero or more external providers.
 
-    The builtin provider is always first. Only one non-builtin (external)
-    provider is allowed.  Failures in one provider never block the other.
+    The builtin provider is always first. One or more non-builtin (external)
+    providers may run simultaneously in ``memory.providers`` list order (==
+    injection/priority order). Failures in one provider never block the others.
     """
 
     def __init__(self, *, external_prefetch_timeout: Optional[float] = None) -> None:
         self._providers: List[MemoryProvider] = []
         self._tool_to_provider: Dict[str, MemoryProvider] = {}
-        self._has_external: bool = False  # True once a non-builtin provider is added
         self._external_prefetch_timeout = (
             _EXTERNAL_PREFETCH_TIMEOUT_S
             if external_prefetch_timeout is None
@@ -404,27 +404,28 @@ class MemoryManager:
     def add_provider(self, provider: MemoryProvider) -> None:
         """Register a memory provider.
 
-        Built-in provider (name ``"builtin"``) is always accepted.
-        Only **one** external (non-builtin) provider is allowed — a second
-        attempt is rejected with a warning.
+        Built-in provider (name ``"builtin"``) is always accepted. Multiple
+        external (non-builtin) providers may be registered and run
+        simultaneously; list order (see ``memory.providers`` in config.yaml) is
+        injection/priority order. The MemoryManager already iterates ALL
+        registered providers for prefetch, sync, tool routing, system-prompt
+        contribution, and lifecycle, so registration is unconditional here —
+        the reserved-core-tool-name guard below is the only gate.
+
+        De-dup: a provider whose ``name`` is already registered is skipped
+        (order-preserving — the FIRST registration wins its priority slot). This
+        closes the double-register/double-inject class when a partial-migration
+        config lists the same provider twice (``providers: [honcho, honcho]``)
+        or a caller merges the legacy singular field into the list. The manager
+        owns this invariant so no individual caller has to de-dup first.
         """
-        is_builtin = provider.name == "builtin"
-
-        if not is_builtin:
-            if self._has_external:
-                existing = next(
-                    (p.name for p in self._providers if p.name != "builtin"), "unknown"
-                )
-                logger.warning(
-                    "Rejected memory provider '%s' — external provider '%s' is "
-                    "already registered. Only one external memory provider is "
-                    "allowed at a time. Configure which one via memory.provider "
-                    "in config.yaml.",
-                    provider.name, existing,
-                )
-                return
-            self._has_external = True
-
+        if any(p.name == provider.name for p in self._providers):
+            logger.debug(
+                "Memory provider '%s' already registered; skipping duplicate "
+                "(order-preserving — first registration keeps its priority slot).",
+                provider.name,
+            )
+            return
         self._providers.append(provider)
 
         # Core tool names are reserved — a memory provider must never register
@@ -473,6 +474,11 @@ class MemoryManager:
     def providers(self) -> List[MemoryProvider]:
         """All registered providers in order."""
         return list(self._providers)
+
+    @property
+    def provider_names(self) -> List[str]:
+        """Names of all registered providers, in registration (priority) order."""
+        return [p.name for p in self._providers]
 
     def get_provider(self, name: str) -> Optional[MemoryProvider]:
         """Get a provider by name, or None if not registered."""

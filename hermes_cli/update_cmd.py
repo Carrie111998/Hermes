@@ -1821,37 +1821,48 @@ def _refresh_active_lazy_features(
     return False
 
 def _refresh_active_memory_provider_dependencies() -> None:
-    """Refresh pip dependencies for the configured external memory provider.
+    """Refresh pip dependencies for every active external memory provider.
 
     Memory-provider bridge packages are declared in each provider's
     ``plugin.yaml`` (plus mode-dependent extras like Hindsight's
     ``hindsight-all``), NOT in Hermes' editable-install extras or
     ``LAZY_DEPS`` alone — so the core dependency reinstall above can strip
-    or downgrade them (#53272 mem0ai, #70636 hindsight-embed). Re-run the
-    provider's declared install for the ACTIVE provider only, after the
-    core install and lazy refresh, so the last write to any shared package
-    is the one the active provider needs.
+    or downgrade them (#53272 mem0ai, #70636 hindsight-embed). Re-run each
+    ACTIVE provider's declared install, in priority order, after the core
+    install and lazy refresh, so the last write to any shared package is the
+    one the highest-priority active provider needs.
+
+    Reads the ordered ``memory.providers`` list through the canonical FR-1
+    resolver (#5688). Reading the legacy singular ``memory.provider`` here was
+    a data-loss bug: the canonical setter BLANKS that field whenever 2+
+    providers are active, so a multi-provider user would resolve provider=""
+    and refresh dependencies for ZERO providers — silently stripping their
+    bridge packages on every core update.
 
     Never raises. A failure here must not block the rest of the update.
     """
     try:
-        from hermes_cli.config import load_config
+        from hermes_cli.config import get_active_memory_providers, load_config
 
         cfg = load_config()
     except Exception as exc:
         logger.debug("Memory provider refresh skipped (config load failed): %s", exc)
         return
 
-    provider = ""
     if isinstance(cfg, dict):
         memory_cfg = cfg.get("memory")
-        if isinstance(memory_cfg, dict):
-            if memory_cfg.get("enabled") is False:
-                return
-            provider = str(memory_cfg.get("provider") or "").strip()
+        if isinstance(memory_cfg, dict) and memory_cfg.get("enabled") is False:
+            return
 
-    # "default" / empty is the built-in file-backed store — no pip deps.
-    if not provider or provider in {"default", "builtin", "none"}:
+    try:
+        providers = get_active_memory_providers(cfg)
+    except Exception as exc:
+        logger.debug("Memory provider refresh skipped (resolver failed): %s", exc)
+        return
+
+    # Drop any built-in sentinels — the file-backed store has no pip deps.
+    providers = [p for p in providers if p not in {"default", "builtin", "none"}]
+    if not providers:
         return
 
     try:
@@ -1860,13 +1871,14 @@ def _refresh_active_memory_provider_dependencies() -> None:
         logger.debug("Memory provider refresh skipped (import failed): %s", exc)
         return
 
-    print()
-    print(f"→ Refreshing active memory provider dependencies ({provider})...")
+    for provider in providers:
+        print()
+        print(f"→ Refreshing active memory provider dependencies ({provider})...")
 
-    try:
-        _install_dependencies(provider, force=True)
-    except Exception as exc:
-        print(f"  ⚠ {provider} dependencies failed to refresh: {exc}")
+        try:
+            _install_dependencies(provider, force=True)
+        except Exception as exc:
+            print(f"  ⚠ {provider} dependencies failed to refresh: {exc}")
 
 def _is_android_python() -> bool:
     return _m().sys.platform == "android"

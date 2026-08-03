@@ -172,9 +172,18 @@ class TestHonchoDoctorConfigDetection:
     def test_reports_configured_when_enabled_with_api_key(self, monkeypatch):
         fake_config = SimpleNamespace(enabled=True, api_key="***")
 
+        # Patch the class attribute on the imported object directly rather than
+        # via monkeypatch's dotted-string traversal. The string form walks
+        # plugins.memory.honcho.client attribute-by-attribute, which fails with
+        # "module 'plugins.memory' has no attribute 'honcho'" when an earlier
+        # test's monkeypatch teardown has stripped the submodule binding off the
+        # parent package (import order / teardown make the string form fragile).
+        from plugins.memory.honcho.client import HonchoClientConfig
+
         monkeypatch.setattr(
-            "plugins.memory.honcho.client.HonchoClientConfig.from_global_config",
-            lambda: fake_config,
+            HonchoClientConfig,
+            "from_global_config",
+            staticmethod(lambda: fake_config),
         )
 
         assert doctor._honcho_is_configured_for_doctor()
@@ -224,18 +233,23 @@ def test_doctor_reports_vercel_backend_diagnostics(monkeypatch, tmp_path):
 class TestDoctorMemoryProviderSection:
     """The ◆ Memory Provider section should respect memory.provider config."""
 
-    def _make_hermes_home(self, tmp_path, provider=""):
+    def _make_hermes_home(self, tmp_path, provider="", providers=None):
         """Create a minimal HERMES_HOME with config.yaml."""
         home = tmp_path / ".hermes"
         home.mkdir(parents=True, exist_ok=True)
         import yaml
-        config = {"memory": {"provider": provider}} if provider else {"memory": {}}
+        mem: dict = {}
+        if providers is not None:
+            mem["providers"] = providers
+        if provider:
+            mem["provider"] = provider
+        config = {"memory": mem}
         (home / "config.yaml").write_text(yaml.dump(config))
         return home
 
-    def _run_doctor_and_capture(self, monkeypatch, tmp_path, provider=""):
+    def _run_doctor_and_capture(self, monkeypatch, tmp_path, provider="", providers=None):
         """Run doctor and capture stdout."""
-        home = self._make_hermes_home(tmp_path, provider)
+        home = self._make_hermes_home(tmp_path, provider, providers)
         monkeypatch.setattr(doctor_mod, "HERMES_HOME", home)
         monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", tmp_path / "project")
         monkeypatch.setattr(doctor_mod, "_DHH", str(home))
@@ -270,6 +284,26 @@ class TestDoctorMemoryProviderSection:
         # Should NOT mention Honcho or Mem0 errors
         assert "Honcho API key" not in out
         assert "Mem0" not in out
+
+    def test_multiple_active_providers_all_checked(self, monkeypatch, tmp_path):
+        """FR-7/#5688: doctor must run its health check for EVERY active
+        provider, not just the singular one. With a 2-provider config the
+        section must reference BOTH — the old singular read (blanked at 2+)
+        would have reported neither, just "Built-in memory active".
+        """
+        out = self._run_doctor_and_capture(
+            monkeypatch, tmp_path, providers=["honcho", "mem0"]
+        )
+        assert "Memory Provider" in out
+        # Both providers get a health line (ok/warn/fail depending on install
+        # state) — the contract is that each active name is CHECKED, not that
+        # any particular status shows. The generic/honcho/mem0 arms all echo
+        # the provider name.
+        assert "Honcho" in out or "honcho" in out
+        assert "Mem0" in out or "mem0" in out
+        # And it must NOT fall back to the built-in-only line when providers
+        # ARE configured.
+        assert "no external provider configured" not in out
 
 
     def test_mem0_provider_not_installed_shows_fail(self, monkeypatch, tmp_path):

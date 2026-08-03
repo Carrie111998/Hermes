@@ -6,24 +6,39 @@ description: "External memory provider plugins — Honcho, OpenViking, Mem0, Hin
 
 # Memory Providers
 
-Hermes Agent ships with 8 external memory provider plugins that give the agent persistent, cross-session knowledge beyond the built-in MEMORY.md and USER.md. Only **one** external provider can be active at a time — the built-in memory is always active alongside it.
+Hermes Agent ships with 8 external memory provider plugins that give the agent persistent, cross-session knowledge beyond the built-in MEMORY.md and USER.md. You can activate **one or more** external providers at once — they run together in priority order, and the built-in memory is always active alongside them.
 
 ## Quick Start
 
 ```bash
 hermes memory setup      # interactive picker + configuration
 hermes memory status     # check what's active
-hermes memory off        # disable external provider
+hermes memory off        # disable external providers
 ```
 
-You can also select the active memory provider via `hermes plugins` → Provider Plugins → Memory Provider.
+You can also select the active memory providers via `hermes plugins` → Provider Plugins → Memory Provider (a multi-select checklist; the order you have them is the injection/priority order).
 
-Or set manually in `~/.hermes/config.yaml`:
+In the desktop app, go to **Settings → Memory & Context → Memory providers**: an ordered list of numbered rows, one provider per row. Row 1 is highest priority; add rows with **+ Add provider** and remove with the **✕** button. The row order is the injection/priority order, and saving preserves the full list.
+
+Or set manually in `~/.hermes/config.yaml` — use the ordered `providers` list:
 
 ```yaml
 memory:
-  provider: openviking   # or honcho, mem0, hindsight, holographic, retaindb, byterover, supermemory
+  providers:            # ordered: list order == injection / priority order
+    - openviking        # highest priority
+    - hindsight
 ```
+
+### Legacy single-provider config (still supported)
+
+The older singular `provider` key continues to work with zero migration and is treated as a one-element list:
+
+```yaml
+memory:
+  provider: openviking   # legacy single-select — equivalent to providers: [openviking]
+```
+
+Resolution rule: if `memory.providers` is present and non-empty it wins; otherwise Hermes falls back to the singular `memory.provider`. When you activate exactly one provider through the tooling, both keys are kept in sync for backward compatibility; when you activate two or more, the singular key is cleared and `providers` is authoritative.
 
 ## How It Works
 

@@ -474,8 +474,15 @@ class CredentialPoolAdd(BaseModel):
 # --- from web_server.py (originally lines 14171-14178) ---
 
 class MemoryProviderSelect(BaseModel):
-    # "" or "built-in" disables the external provider (built-in only).
-    provider: str
+    # Ordered active-provider list (list order == priority == injection order).
+    # Empty list disables all external providers (built-in only). This is the
+    # canonical multi-provider field (#5688 FR-7).
+    providers: Optional[List[str]] = None
+    # Legacy single-provider field, retained for back-compat with older
+    # dashboards. "" or "built-in" disables the external provider. When
+    # ``providers`` is supplied it wins; ``provider`` is only read as a
+    # fallback for a client that hasn't been updated to send the list.
+    provider: Optional[str] = None
 
 
 class MemoryReset(BaseModel):

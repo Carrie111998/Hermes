@@ -18,7 +18,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 from hermes_constants import get_hermes_home
 from hermes_cli._subprocess_compat import noninteractive_git_env
@@ -1242,14 +1242,43 @@ def _discover_context_engines() -> list[tuple[str, str]]:
     return engines
 
 
-def _get_current_memory_provider() -> str:
-    """Return the current memory.provider from config (empty = built-in)."""
+def _get_current_memory_providers() -> List[str]:
+    """Return the ordered list of active memory providers ([] = built-in only).
+
+    Canonical multi-provider read for the plugins UX; defers to
+    ``hermes_cli.config.get_active_memory_providers`` (reads ``memory.providers``
+    list, legacy singular ``memory.provider`` fallback).
+    """
     try:
-        from hermes_cli.config import load_config
-        config = load_config()
-        return cfg_get(config, "memory", "provider", default="") or ""
+        from hermes_cli.config import load_config, get_active_memory_providers
+        return get_active_memory_providers(load_config())
     except Exception:
-        return ""
+        return []
+
+
+def _get_current_memory_provider() -> str:
+    """Legacy singular display shim — FIRST active provider ("" = built-in).
+
+    Retained for the handful of display call sites and web_server that still
+    render a single name. Multi-provider-aware call sites must use
+    ``_get_current_memory_providers()`` (plural) so providers 2..N aren't hidden.
+    """
+    providers = _get_current_memory_providers()
+    return providers[0] if providers else ""
+
+
+def _format_active_memory_providers(default: str = "built-in") -> str:
+    """Human-readable label for the active memory-provider set.
+
+    Returns ``default`` (``"built-in"``) when no external provider is active,
+    the single name when one is active, or a comma-joined ordered list when
+    several are active (order == priority). Used by the plugins UX display rows
+    so 2..N providers are shown, not just the first (#5688).
+    """
+    providers = _get_current_memory_providers()
+    if not providers:
+        return default
+    return ", ".join(providers)
 
 
 def _get_current_context_engine() -> str:
@@ -1262,14 +1291,24 @@ def _get_current_context_engine() -> str:
         return "compressor"
 
 
-def _save_memory_provider(name: str) -> None:
-    """Persist memory.provider to config.yaml."""
-    from hermes_cli.config import load_config, save_config
+def _save_memory_providers(names: List[str]) -> None:
+    """Persist the ordered memory.providers list to config.yaml.
+
+    Routes through the canonical ``set_active_memory_providers`` setter, which
+    writes the ordered list and mirrors the legacy singular ``memory.provider``
+    only when exactly one provider is set (else clears it) — #5688.
+    """
+    from hermes_cli.config import load_config, save_config, set_active_memory_providers
     config = load_config()
     if "memory" not in config:
         config["memory"] = {}
-    config["memory"]["provider"] = name
+    set_active_memory_providers(config, list(names))
     save_config(config)
+
+
+def _save_memory_provider(name: str) -> None:
+    """Legacy singular saver shim — persists a single provider ("" clears)."""
+    _save_memory_providers([name] if name else [])
 
 
 def _save_context_engine(name: str) -> None:
@@ -1283,39 +1322,64 @@ def _save_context_engine(name: str) -> None:
 
 
 def _configure_memory_provider() -> bool:
-    """Launch a radio picker for memory providers. Returns True if changed."""
-    from hermes_cli.curses_ui import curses_radiolist
+    """Launch an ordered multi-select picker for memory providers.
 
-    current = _get_current_memory_provider()
+    Multiple external providers can be active simultaneously (``memory.providers``
+    list, order == injection/priority order — #5688). Returns True if the active
+    set OR its order changed. Order is preserved deterministically: providers
+    already active keep their current relative order (priority is meaningful and
+    must not be silently reshuffled by a re-open of the picker), and any
+    newly-checked providers are appended in the picker's display order.
+    """
+    from hermes_cli.curses_ui import curses_checklist
+
+    current = _get_current_memory_providers()  # ordered active set
     providers = _discover_memory_providers()
 
-    # Build items: "built-in" first, then discovered providers
-    items = ["built-in (default)"]
-    names = [""]  # empty string = built-in
-    selected = 0
-
+    # Build the checklist rows. Unlike the old radio picker there is no
+    # "built-in" row — built-in MEMORY.md/USER.md is ALWAYS active alongside any
+    # external providers; an empty selection == built-in only.
+    names: List[str] = []
+    items: List[str] = []
     for name, desc in providers:
         names.append(name)
         label = f"{name} \u2014 {desc}" if desc else name
         items.append(label)
-        if name == current:
-            selected = len(items) - 1
 
-    # If current provider isn't in discovered list, add it
-    if current and current not in names:
-        names.append(current)
-        items.append(f"{current} (not found)")
-        selected = len(items) - 1
+    # Include any currently-active provider that isn't in the discovered list
+    # (e.g. installed out-of-tree or since-removed) so it's visible + togglable.
+    for name in current:
+        if name not in names:
+            names.append(name)
+            items.append(f"{name} (not found)")
 
-    choice = curses_radiolist(
-        title="Memory Provider (select one)",
+    preselected = {i for i, n in enumerate(names) if n in current}
+
+    def _status(chosen_idx):
+        k = len(chosen_idx)
+        if k == 0:
+            return "built-in only"
+        return f"{k} provider{'s' if k != 1 else ''} active"
+
+    chosen_idx = curses_checklist(
+        title="Memory Providers (SPACE toggle, multiple allowed; order = priority)",
         items=items,
-        selected=selected,
+        selected=preselected,
+        status_fn=_status,
     )
 
-    new_provider = names[choice]
-    if new_provider != current:
-        _save_memory_provider(new_provider)
+    # Derive the NEW ordered list: keep already-active providers in their prior
+    # order first (stable priority), then append newly-checked ones in display
+    # order. Deselected providers drop out.
+    chosen_names = {names[i] for i in chosen_idx}
+    new_order: List[str] = [n for n in current if n in chosen_names]
+    for i in sorted(chosen_idx):
+        n = names[i]
+        if n not in new_order:
+            new_order.append(n)
+
+    if new_order != current:
+        _save_memory_providers(new_order)
         return True
     return False
 
@@ -1404,7 +1468,7 @@ def cmd_toggle() -> None:
             plugin_selected.add(i)
 
     # -- Provider categories --
-    current_memory = _get_current_memory_provider() or "built-in"
+    current_memory = _format_active_memory_providers()
     current_context = _get_current_context_engine()
     categories = [
         ("Memory Provider", current_memory, _configure_memory_provider),
@@ -1598,7 +1662,7 @@ def _run_composite_ui(curses, plugin_keys, plugin_labels, plugin_selected,
                             # Refresh current values
                             categories[ci] = (
                                 _cat_name,
-                                _get_current_memory_provider() or "built-in" if ci == 0
+                                _format_active_memory_providers() if ci == 0
                                 else _get_current_context_engine(),
                                 cat_fn,
                             )
@@ -1631,7 +1695,7 @@ def _run_composite_ui(curses, plugin_keys, plugin_labels, plugin_selected,
                             result_holder["providers_changed"] = True
                             categories[ci] = (
                                 _cat_name,
-                                _get_current_memory_provider() or "built-in" if ci == 0
+                                _format_active_memory_providers() if ci == 0
                                 else _get_current_context_engine(),
                                 cat_fn,
                             )
@@ -1689,7 +1753,7 @@ def _run_composite_ui(curses, plugin_keys, plugin_labels, plugin_selected,
         console.print("\n[dim]General plugins unchanged.[/dim]")
 
     if result_holder["providers_changed"]:
-        new_memory = _get_current_memory_provider() or "built-in"
+        new_memory = _format_active_memory_providers()
         new_context = _get_current_context_engine()
         console.print(
             f"[green]\u2713[/green] Memory provider: [bold]{new_memory}[/bold]  "

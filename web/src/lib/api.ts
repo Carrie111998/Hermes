@@ -1194,10 +1194,19 @@ export const api = {
       },
     ),
   setMemoryProvider: (provider: string) =>
-    fetchJSON<{ ok: boolean; active: string }>("/api/memory/provider", {
+    fetchJSON<{ ok: boolean; active: string; providers: string[] }>("/api/memory/provider", {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ provider }),
+    }),
+  // FR-7 (#5688): activate an ordered set of memory providers (list order ==
+  // priority == injection order). Prefer this over setMemoryProvider when the
+  // surface can express multiple providers.
+  setMemoryProviders: (providers: string[]) =>
+    fetchJSON<{ ok: boolean; active: string; providers: string[] }>("/api/memory/provider", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ providers }),
     }),
   resetMemory: (target: "all" | "memory" | "user") =>
     fetchJSON<{ ok: boolean; deleted: string[] }>("/api/memory/reset", {
@@ -1682,6 +1691,9 @@ export interface MemoryProviderInfo {
 
 export interface MemoryStatus {
   active: string;
+  // FR-7 (#5688): the full ordered active-provider list (priority order).
+  // ``active`` remains the first entry for back-compat.
+  active_providers?: string[];
   providers: MemoryProviderInfo[];
   builtin_files: { memory: number; user: number };
 }

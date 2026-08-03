@@ -202,10 +202,16 @@ def _configured_platforms() -> list[str]:
 
 
 def _memory_provider(config: dict) -> str:
-    """Return the active memory provider name."""
-    mem = config.get("memory", {})
-    provider = mem.get("provider", "")
-    return provider if provider else "built-in"
+    """Return the active memory provider(s), ordered.
+
+    Routes through the canonical FR-1 resolver (#5688) so ``hermes dump``
+    reports ALL active providers in multi-provider mode, not just the legacy
+    singular field (which the canonical setter blanks whenever 2+ are active).
+    """
+    from hermes_cli.config import get_active_memory_providers
+
+    providers = get_active_memory_providers(config)
+    return ", ".join(providers) if providers else "built-in"
 
 
 def _get_model_and_provider(config: dict) -> tuple[str, str]:

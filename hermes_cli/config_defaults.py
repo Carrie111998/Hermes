@@ -1654,10 +1654,17 @@ DEFAULT_CONFIG = {
         "write_approval": False,
         "memory_char_limit": 2200,   # ~800 tokens at 2.75 chars/token
         "user_char_limit": 1375,     # ~500 tokens at 2.75 chars/token
-        # External memory provider plugin (empty = built-in only).
-        # Set to a provider name to activate: "openviking", "mem0",
-        # "hindsight", "holographic", "retaindb", "byterover".
-        # Only ONE external provider is allowed at a time.
+        # External memory providers (empty = built-in only). Ordered list:
+        # list order == priority == injection order. Activate one or more of
+        # "openviking", "mem0", "hindsight", "holographic", "retaindb",
+        # "byterover". Resolution: the ``providers`` list wins when non-empty;
+        # the legacy singular ``provider`` below is the fallback for configs
+        # written before multi-provider support (#5688). Every canonical write
+        # goes through ``set_active_memory_providers`` which keeps the two in
+        # sync (mirrors ``provider`` to the single value, blanks it at 2+).
+        "providers": [],
+        # Legacy single-provider field, retained for back-compat. Prefer
+        # ``providers`` above. Kept in sync by the canonical setter.
         "provider": "",
     },
 

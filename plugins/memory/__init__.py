@@ -347,54 +347,80 @@ class _ProviderCollector:
         pass  # CLI registration happens via discover_plugin_cli_commands()
 
 
-def _get_active_memory_provider() -> Optional[str]:
-    """Read the active memory provider name from config.yaml.
+def _get_active_memory_providers() -> List[str]:
+    """Read the ordered list of active external memory providers from config.yaml.
 
-    Returns the provider name (e.g. ``"honcho"``) or None if no
-    external provider is configured.  Lightweight — only reads config,
-    no plugin loading.
+    Returns provider names in ``memory.providers`` order (e.g. ``["honcho",
+    "hindsight"]``), falling back to the legacy singular ``memory.provider``
+    string. Empty list = no external provider configured. Lightweight — only
+    reads config, no plugin loading. This is the canonical read seam for this
+    module; it defers to ``hermes_cli.config.get_active_memory_providers`` so the
+    list/legacy fallback lives in exactly one place.
     """
     try:
-        from hermes_cli.config import load_config
-        config = load_config()
-        return cfg_get(config, "memory", "provider") or None
+        from hermes_cli.config import load_config, get_active_memory_providers
+        return get_active_memory_providers(load_config())
     except Exception:
-        return None
+        return []
+
+
+def _get_active_memory_provider() -> Optional[str]:
+    """Legacy singular shim — returns the FIRST active provider or None.
+
+    Retained only for backward compatibility with any out-of-tree caller that
+    still expects a single provider name. Internal callers must use
+    ``_get_active_memory_providers()`` (plural); resolving "the" provider when
+    several are active silently drops providers 2..N, which is exactly the
+    data-loss class #5688 fixes. Do not add new callers of this shim.
+    """
+    providers = _get_active_memory_providers()
+    return providers[0] if providers else None
 
 
 def discover_plugin_cli_commands() -> List[dict]:
-    """Return CLI commands for the **active** memory plugin only.
+    """Return CLI commands for **every active** memory plugin.
 
-    Only one memory provider can be active at a time (set via
-    ``memory.provider`` in config.yaml).  This function reads that
-    value and only loads CLI registration for the matching plugin.
-    If no provider is active, no commands are registered.
+    Multiple memory providers can be active simultaneously (set via the ordered
+    ``memory.providers`` list in config.yaml, with a legacy singular
+    ``memory.provider`` fallback). This function reads that set and loads CLI
+    registration for each matching plugin, in list order. If no provider is
+    active, no commands are registered.
 
-    Looks for a ``register_cli(subparser)`` function in the active
-    plugin's ``cli.py``.  Returns a list of at most one dict with
-    keys: ``name``, ``help``, ``description``, ``setup_fn``,
-    ``handler_fn``.
+    Looks for a ``register_cli(subparser)`` function in each active plugin's
+    ``cli.py``.  Returns a list with one dict per active provider that exposes
+    CLI commands, each with keys: ``name``, ``help``, ``description``,
+    ``setup_fn``, ``handler_fn``, ``plugin``.
 
-    This is a lightweight scan — it only imports ``cli.py``, not the
-    full plugin module.  Safe to call during argparse setup before
-    any provider is loaded.
+    This is a lightweight scan — it only imports ``cli.py``, not the full plugin
+    module.  Safe to call during argparse setup before any provider is loaded.
     """
     results: List[dict] = []
     if not _MEMORY_PLUGINS_DIR.is_dir():
         return results
 
-    active_provider = _get_active_memory_provider()
-    if not active_provider:
-        return results
+    for active_provider in _get_active_memory_providers():
+        cmd = _scan_provider_cli_command(active_provider)
+        if cmd is not None:
+            results.append(cmd)
+    return results
 
-    # Only look at the active provider's directory
+
+def _scan_provider_cli_command(active_provider: str) -> Optional[dict]:
+    """Scan one provider's ``cli.py`` for a ``register_cli`` entry point.
+
+    Returns a single command dict (name/help/description/setup_fn/handler_fn/
+    plugin) or None if the provider dir / cli.py / register_cli is absent. Split
+    out from ``discover_plugin_cli_commands`` so the multi-provider loop scans
+    each active provider independently — one provider's missing cli.py must not
+    abort discovery for the rest (#5688).
+    """
     plugin_dir = find_provider_dir(active_provider)
     if not plugin_dir:
-        return results
+        return None
 
     cli_file = plugin_dir / "cli.py"
     if not cli_file.exists():
-        return results
+        return None
 
     _is_bundled = _MEMORY_PLUGINS_DIR in plugin_dir.parents or plugin_dir.parent == _MEMORY_PLUGINS_DIR
     module_name = f"plugins.memory.{active_provider}.cli" if _is_bundled else f"{_USER_NAMESPACE}.{active_provider}.cli"
@@ -419,14 +445,14 @@ def discover_plugin_cli_commands() -> List[dict]:
                 module_name, str(cli_file)
             )
             if not spec or not spec.loader:
-                return results
+                return None
             cli_mod = importlib.util.module_from_spec(spec)
             sys.modules[module_name] = cli_mod
             spec.loader.exec_module(cli_mod)
 
         register_cli = getattr(cli_mod, "register_cli", None)
         if not callable(register_cli):
-            return results
+            return None
 
         # Read metadata from plugin.yaml if available
         help_text = f"Manage {active_provider} memory plugin"
@@ -447,15 +473,14 @@ def discover_plugin_cli_commands() -> List[dict]:
         handler_fn = getattr(cli_mod, f"{active_provider}_command", None) or \
                      getattr(cli_mod, "honcho_command", None)
 
-        results.append({
+        return {
             "name": active_provider,
             "help": help_text,
             "description": description,
             "setup_fn": register_cli,
             "handler_fn": handler_fn,
             "plugin": active_provider,
-        })
+        }
     except Exception as e:
         logger.debug("Failed to scan CLI for memory plugin '%s': %s", active_provider, e)
-
-    return results
+        return None

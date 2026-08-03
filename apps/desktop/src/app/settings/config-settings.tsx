@@ -28,7 +28,7 @@ import { useOnProfileSwitch } from '../hooks/use-on-profile-switch'
 import { PanelEmpty } from '../overlays/panel'
 
 import { ConfigField } from './config-field'
-import { enumOptionsFor, getNested, isExternalMemoryProvider, sectionFieldEntries, setNested } from './helpers'
+import { activeMemoryProviders, enumOptionsFor, getNested, sectionFieldEntries, setNested } from './helpers'
 import { MemoryConnect } from './memory/connect'
 import { ProviderConfigPanel } from './memory/provider-config-panel'
 import { ModelSettings, ModelSettingsSkeleton } from './model-settings'
@@ -327,11 +327,6 @@ export function ConfigSettings({
           {visibleFields.map(([key, field]) => (
             <div className="scroll-mt-6 rounded-lg" id={`setting-field-${key}`} key={key}>
               <ConfigField
-                descriptionExtra={
-                  key === 'memory.provider' && isExternalMemoryProvider(getNested(config, key)) ? (
-                    <MemoryConnect provider={String(getNested(config, key))} />
-                  ) : undefined
-                }
                 enumOptions={
                   key === 'tts.elevenlabs.voice_id'
                     ? enumOptionsFor(key, getNested(config, key), config, elevenLabsVoiceOptions ?? undefined)
@@ -343,9 +338,19 @@ export function ConfigSettings({
                 schemaKey={key}
                 value={getNested(config, key)}
               />
-              {key === 'memory.provider' && isExternalMemoryProvider(getNested(config, key)) ? (
-                <ProviderConfigPanel key={String(getNested(config, key))} provider={String(getNested(config, key))} />
-              ) : null}
+              {/* Per-provider affordances (OAuth connect + config panel) render
+                  once per active external provider, in priority order. The
+                  editor above authors the ordered `memory.providers` list; each
+                  configured external provider gets its own connect/config block
+                  below, mirroring the old single-provider surface for all N. */}
+              {key === 'memory.providers'
+                ? activeMemoryProviders(getNested(config, key)).map(provider => (
+                    <div className="mt-2" key={provider}>
+                      <MemoryConnect provider={provider} />
+                      <ProviderConfigPanel provider={provider} />
+                    </div>
+                  ))
+                : null}
             </div>
           ))}
         </div>

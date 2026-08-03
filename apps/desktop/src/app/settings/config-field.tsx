@@ -13,6 +13,7 @@ import { ComboboxInput } from './combobox-input'
 import { CONTROL_TEXT, EMPTY_SELECT_VALUE, FIELD_DESCRIPTIONS, FIELD_LABELS, FREE_INPUT_KEYS } from './constants'
 import { FallbackModelsField } from './fallback-models-field'
 import { fieldCopyForSchemaKey } from './field-copy'
+import { MemoryProvidersField } from './memory-providers-field'
 import { ListRow } from './primitives'
 import { SearchableSelect } from './searchable-select'
 
@@ -83,6 +84,18 @@ export function ConfigField({
   // dedicated structured editor instead.
   if (schemaKey === 'fallback_providers') {
     return row(<FallbackModelsField onChange={onChange} value={value} />, true)
+  }
+
+  // `memory.providers` is an ordered list of provider slugs (priority ==
+  // injection order). The generic `list` branch below is a comma-string input
+  // that can't express order intent or offer the discovery-driven options;
+  // render the dedicated ordered multi-row editor instead (#5688 FR-7). Reuses
+  // the FallbackModelsField pattern (single value per row).
+  if (schemaKey === 'memory.providers') {
+    const memoryOptions =
+      enumOptions ?? (schema.type === 'list' ? (schema.options ?? []).map(String) : [])
+
+    return row(<MemoryProvidersField onChange={onChange} options={memoryOptions} value={value} />, true)
   }
 
   if (schema.type === 'boolean') {

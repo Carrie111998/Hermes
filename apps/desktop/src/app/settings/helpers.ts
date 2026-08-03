@@ -317,3 +317,28 @@ export function isExternalMemoryProvider(value: unknown): value is string {
 
   return normalized !== '' && normalized !== 'builtin' && normalized !== 'built-in' && normalized !== 'none'
 }
+
+// Frontend mirror of the FR-1 resolver (`get_active_memory_providers`): read
+// the ordered `memory.providers` list, keep only real external providers, and
+// de-dup order-preservingly. Used to render one connect/config affordance per
+// active provider. Defensive against a legacy singular string bleeding through.
+export function activeMemoryProviders(value: unknown): string[] {
+  const raw = Array.isArray(value) ? value : typeof value === 'string' ? [value] : []
+  const seen = new Set<string>()
+  const result: string[] = []
+
+  for (const item of raw) {
+    if (!isExternalMemoryProvider(item)) {
+      continue
+    }
+
+    const name = item.trim()
+
+    if (!seen.has(name)) {
+      seen.add(name)
+      result.push(name)
+    }
+  }
+
+  return result
+}
