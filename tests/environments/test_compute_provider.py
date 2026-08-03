@@ -382,9 +382,12 @@ class _FakeSandboxService:
 
 
 class _FakePreservedJson:
-    def __init__(self, *args, **kwargs):
-        self.args = args
-        self.kwargs = kwargs
+    def __init__(self, value: str):
+        self.value = value
+
+    @classmethod
+    def from_json(cls, value: str) -> _FakePreservedJson:
+        return cls(value)
 
 
 class _FakePoolTemplate:
@@ -538,7 +541,8 @@ def test_cua_fleet_reconciles_named_pool_with_public_sandbox_api() -> None:
     )
     assert request.spec.template.runtime is _FakeRuntimeKind.KUBEVIRT
     assert request.spec.template.firmware is _FakeFirmware.BIOS
-    assert request.spec.template.probes == {
+    assert isinstance(request.spec.template.probes, _FakePreservedJson)
+    assert json.loads(request.spec.template.probes.value) == {
         "readinessProbe": {"tcpSocket": {"port": 8000}}
     }
     assert [

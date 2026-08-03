@@ -342,6 +342,13 @@ def _hydrate_fleet_schema(schema_type: Any, value: Any) -> Any:
     if origin in (dict, Mapping):
         return value
 
+    if inspect.isclass(schema_type):
+        from_json = getattr(schema_type, "from_json", None)
+        if callable(from_json):
+            if isinstance(value, schema_type):
+                return value
+            return from_json(json.dumps(value, separators=(",", ":")))
+
     if inspect.isclass(schema_type) and issubclass(schema_type, enum.Enum):
         if isinstance(value, schema_type):
             return value
