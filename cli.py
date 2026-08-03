@@ -4114,6 +4114,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         checkpoints: bool = False,
         pass_session_id: bool = False,
         ignore_rules: bool = False,
+        reasoning_effort: Optional[str] = None,
     ):
         """
         Initialize the Hermes CLI.
@@ -4379,8 +4380,21 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # Reasoning config (OpenRouter reasoning effort level)
         # Per-model override > global reasoning_effort — resolved through the
         # shared chokepoint in hermes_constants (Closes #21256).
+        # --reasoning / HERMES_REASONING (per-invocation override) wins over
+        # everything: it is ephemeral, never written to config.yaml.
         from hermes_constants import resolve_reasoning_config
-        self.reasoning_config = resolve_reasoning_config(CLI_CONFIG, self.model)
+        from hermes_constants import parse_reasoning_effort
+
+        _cli_reasoning_effort = (
+            (reasoning_effort or "").strip()
+            or os.environ.get("HERMES_REASONING", "").strip()
+        )
+        _cli_reasoning_config = parse_reasoning_effort(_cli_reasoning_effort)
+        self.reasoning_config = (
+            _cli_reasoning_config
+            if _cli_reasoning_config is not None
+            else resolve_reasoning_config(CLI_CONFIG, self.model or "")
+        )
         self.service_tier = _parse_service_tier_config(
             CLI_CONFIG["agent"].get("service_tier", "")
         )
@@ -16873,6 +16887,7 @@ def main(
     pass_session_id: bool = False,
     ignore_user_config: bool = False,
     ignore_rules: bool = False,
+    reasoning_effort: Optional[str] = None,
 ):
     """
     Hermes Agent CLI - Interactive AI Assistant
@@ -17008,6 +17023,7 @@ def main(
         checkpoints=checkpoints,
         pass_session_id=pass_session_id,
         ignore_rules=ignore_rules,
+        reasoning_effort=reasoning_effort,
     )
 
     if parsed_skills:

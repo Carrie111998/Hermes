@@ -173,6 +173,7 @@ def run_oneshot(
     provider: Optional[str] = None,
     toolsets: object = None,
     usage_file: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
 ) -> int:
     """Execute a single prompt and print only the final content block.
 
@@ -187,6 +188,9 @@ def run_oneshot(
             cost, token counts, model, api_calls) is written there after the
             run — even when the run fails — so pipelines can account for
             spend per invocation.
+        reasoning_effort: Optional per-invocation reasoning-effort level
+            (none|minimal|low|medium|high|xhigh|max|ultra). Overrides
+            agent.reasoning_effort in config.yaml for this run only.
 
     Returns the exit code.  The caller owns process termination.
     """
@@ -248,6 +252,7 @@ def run_oneshot(
                     provider=provider,
                     toolsets=explicit_toolsets,
                     use_config_toolsets=use_config_toolsets,
+                    reasoning_effort=reasoning_effort,
                 )
             except BaseException as exc:  # noqa: BLE001
                 # Capture anything that escapes the agent (including OSError
@@ -316,6 +321,7 @@ def _run_agent(
     provider: Optional[str] = None,
     toolsets: object = None,
     use_config_toolsets: bool = True,
+    reasoning_effort: Optional[str] = None,
 ) -> tuple[str, dict]:
     """Build an AIAgent exactly like a normal CLI chat turn would, then
     run a single conversation.  Returns ``(final_response, run_result)``."""
@@ -338,6 +344,21 @@ def _run_agent(
 
     env_model = os.getenv("HERMES_INFERENCE_MODEL", "").strip()
     effective_model = (model or "").strip() or env_model or cfg_model
+
+    # Per-invocation reasoning-effort override (--reasoning / HERMES_REASONING).
+    # Resolved through the shared chokepoint so per-model overrides and the
+    # YAML boolean-False semantics still apply when no explicit flag is given.
+    from hermes_constants import parse_reasoning_effort, resolve_reasoning_config
+
+    _effort = (reasoning_effort or "").strip() or os.environ.get(
+        "HERMES_REASONING", ""
+    ).strip()
+    _effort_config = parse_reasoning_effort(_effort)
+    effective_reasoning_config = (
+        _effort_config
+        if _effort_config is not None
+        else resolve_reasoning_config(cfg, effective_model)
+    )
 
     # Resolve effective provider: explicit arg → (auto-detect from model if
     # model was explicit) → env / config (handled inside resolve_runtime_provider).
@@ -420,6 +441,7 @@ def _run_agent(
             session_db=session_db,
             credential_pool=runtime.get("credential_pool"),
             fallback_model=_fb or None,
+            reasoning_config=effective_reasoning_config,
             # Interactive callbacks are intentionally NOT wired beyond this
             # one.  In oneshot mode there's no user sitting at a terminal:
             #   - clarify  → returns a synthetic "pick a default" instruction

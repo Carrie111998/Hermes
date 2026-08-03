@@ -147,6 +147,18 @@ def build_top_level_parser():
             "under model.provider — use `hermes setup` or edit the file to change it."
         ),
     )
+    _inherited_flag(
+        parser,
+        "--reasoning",
+        choices=("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"),
+        default=None,
+        help=(
+            "Reasoning effort override for this invocation "
+            "(none|minimal|low|medium|high|xhigh|max|ultra). Applies to -z/--oneshot "
+            "and --tui. Overrides agent.reasoning_effort in config.yaml for this "
+            "launch only — nothing is written to config."
+        ),
+    )
     parser.add_argument(
         "-t",
         "--toolsets",
@@ -316,6 +328,17 @@ def build_top_level_parser():
         # `--provider` flag.
         default=argparse.SUPPRESS,
         help="Inference provider (default: auto). Built-in or a user-defined name from `providers:` in config.yaml.",
+    )
+    _inherited_flag(
+        chat_parser,
+        "--reasoning",
+        choices=("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"),
+        default=argparse.SUPPRESS,
+        help=(
+            "Reasoning effort override for this session "
+            "(none|minimal|low|medium|high|xhigh|max|ultra). Overrides "
+            "agent.reasoning_effort in config.yaml for this launch only."
+        ),
     )
     chat_parser.add_argument(
         "-v",

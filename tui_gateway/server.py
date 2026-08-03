@@ -3597,9 +3597,19 @@ def _load_reasoning_config(model: str = "") -> dict | None:
     :func:`hermes_constants.resolve_reasoning_config` (per-model override >
     global ``agent.reasoning_effort``; YAML boolean False = disabled).
     Closes #21256.
-    """
-    from hermes_constants import resolve_reasoning_config
 
+    ``HERMES_TUI_REASONING`` (set by ``hermes chat --reasoning <level>`` /
+    ``hermes --reasoning <level> --tui`` in hermes_cli/main.py) is a
+    per-invocation override and wins over everything — it is ephemeral and
+    never written to config.yaml.
+    """
+    from hermes_constants import parse_reasoning_effort, resolve_reasoning_config
+
+    _env_effort = os.environ.get("HERMES_TUI_REASONING", "").strip()
+    if _env_effort:
+        _env_config = parse_reasoning_effort(_env_effort)
+        if _env_config is not None:
+            return _env_config
     return resolve_reasoning_config(_load_cfg(), model)
 
 

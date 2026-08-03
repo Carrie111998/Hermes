@@ -171,6 +171,7 @@ def _run_and_exit_oneshot(
     provider: object = None,
     toolsets: object = None,
     usage_file: object = None,
+    reasoning_effort: object = None,
 ) -> None:
     try:
         from hermes_cli.oneshot import run_oneshot
@@ -181,6 +182,7 @@ def _run_and_exit_oneshot(
             provider=provider,
             toolsets=toolsets,
             usage_file=usage_file,
+            reasoning_effort=reasoning_effort,
         )
     except KeyboardInterrupt:
         rc = 130
@@ -2248,6 +2250,7 @@ def _launch_tui(
     pass_session_id: bool = False,
     max_turns: Optional[int] = None,
     accept_hooks: bool = False,
+    reasoning_effort: Optional[str] = None,
 ):
     """Replace current process with the TUI."""
     tui_dir = PROJECT_ROOT / "ui-tui"
@@ -2297,6 +2300,8 @@ def _launch_tui(
     if provider:
         env["HERMES_TUI_PROVIDER"] = provider
         env["HERMES_INFERENCE_PROVIDER"] = provider
+    if reasoning_effort:
+        env["HERMES_TUI_REASONING"] = str(reasoning_effort).strip().lower()
     tui_toolsets = _normalize_tui_toolsets(toolsets)
     if tui_toolsets:
         env["HERMES_TUI_TOOLSETS"] = ",".join(tui_toolsets)
@@ -2637,6 +2642,14 @@ def cmd_chat(args):
     if getattr(args, "source", None):
         os.environ["HERMES_SESSION_SOURCE"] = args.source
 
+    # --reasoning: per-invocation reasoning-effort override. The classic CLI
+    # reads it back from the env (see cli.py HermesCLI.__init__), the TUI
+    # wrapper forwards it via HERMES_TUI_REASONING below, and the oneshot
+    # path passes it as an explicit kwarg. Nothing is written to config.yaml.
+    _reasoning_effort = getattr(args, "reasoning", None)
+    if _reasoning_effort:
+        os.environ["HERMES_REASONING"] = str(_reasoning_effort).strip().lower()
+
     _pin_kanban_board_env()
 
     if use_tui:
@@ -2656,6 +2669,7 @@ def cmd_chat(args):
             pass_session_id=getattr(args, "pass_session_id", False),
             max_turns=getattr(args, "max_turns", None),
             accept_hooks=getattr(args, "accept_hooks", False),
+            reasoning_effort=getattr(args, "reasoning", None),
         )
 
     # Import and run the CLI
@@ -2679,6 +2693,7 @@ def cmd_chat(args):
         "ignore_rules": getattr(args, "ignore_rules", False) or getattr(args, "safe_mode", False),
         "ignore_user_config": getattr(args, "ignore_user_config", False) or getattr(args, "safe_mode", False),
         "compact": getattr(args, "compact", False),
+        "reasoning_effort": getattr(args, "reasoning", None),
     }
     # Filter out None values
     kwargs = {k: v for k, v in kwargs.items() if v is not None}
@@ -15666,6 +15681,7 @@ def _set_chat_arg_defaults(args) -> None:
         ("resume", None),
         ("continue_last", None),
         ("worktree", False),
+        ("reasoning", None),
     ]:
         if not hasattr(args, attr):
             setattr(args, attr, default)
@@ -15717,6 +15733,7 @@ def _try_termux_fast_cli_launch() -> bool:
             provider=getattr(args, "provider", None),
             toolsets=getattr(args, "toolsets", None),
             usage_file=getattr(args, "usage_file", None),
+            reasoning_effort=getattr(args, "reasoning", None),
         )
 
     if (args.resume or args.continue_last) and args.command is None:
@@ -18368,6 +18385,7 @@ def main():
             provider=getattr(args, "provider", None),
             toolsets=getattr(args, "toolsets", None),
             usage_file=getattr(args, "usage_file", None),
+            reasoning_effort=getattr(args, "reasoning", None),
         )
 
     # Handle top-level --resume / --continue as shortcut to chat
