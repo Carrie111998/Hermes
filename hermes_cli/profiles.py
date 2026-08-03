@@ -369,8 +369,11 @@ def get_profile_dir(name: str) -> Path:
     canon = normalize_profile_name(name)
     if canon == "default":
         return _get_default_hermes_home()
-    validate_profile_name(canon)
-    return _get_profiles_root() / canon
+    safe_name = os.path.basename(canon)
+    if safe_name != canon:
+        raise ValueError(f"Invalid profile name {name!r}: path components are not allowed")
+    validate_profile_name(safe_name)
+    return _get_profiles_root() / safe_name
 
 
 def profile_exists(name: str) -> bool:
