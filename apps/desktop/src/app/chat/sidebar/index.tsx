@@ -27,6 +27,7 @@ import { searchSessions, type SessionInfo, type SessionSearchResult } from '@/he
 import { useI18n } from '@/i18n'
 import { comboTokens } from '@/lib/keybinds/combo'
 import { profileColor } from '@/lib/profile-color'
+import { isDelegateChildSession } from '@/lib/session-branch-tree'
 import { sessionMatchesSearch } from '@/lib/session-search'
 import { normalizeSessionSource, sessionSourceLabel } from '@/lib/session-source'
 import { cn } from '@/lib/utils'
@@ -197,17 +198,78 @@ const HEADER_ACTION_BTN =
 const HEADER_NAV_BTN =
   'text-(--ui-text-tertiary) opacity-70 transition-opacity hover:bg-(--ui-control-hover-background) hover:text-foreground hover:opacity-100 focus-visible:opacity-100'
 
+// The search row, and the no-drag carve-out that keeps it out of Electron's
+// compositor-level drag hit testing (the nav rows above and session rows below
+// carry the same class; a global `button{-webkit-app-region:no-drag}` already
+// covers every button here, which is why the input was the one control left
+// uncovered).
+//
+// The carve-out belongs on the ROW, not on SearchField's own container. That
+// container is `inline-flex` around a `[field-sizing:content]` input, so it is
+// only as wide as the glyph plus the typed text — a carve-out there leaves most
+// of the visible row outside the rect, and leaves the row's padding with no
+// focusable target at all.
+const SEARCH_ROW = 'shrink-0 px-2 pb-1 pt-1 [-webkit-app-region:no-drag]'
+
+// Descendants that own their own click. The row must not intercept these:
+// the input needs its native caret placement, the clear button its onClick.
+const SEARCH_ROW_INTERACTIVE = 'input, textarea, select, button, a, [role="button"]'
+
+/** The sidebar's sessions search row: `SearchField`, the drag carve-out, and
+ *  click-anywhere-to-focus.
+ *
+ *  The row is full width but the field inside it is content-sized, so a native
+ *  click at most row coordinates lands on this container rather than the input.
+ *  With no handler that leaves focus on `<body>` — and the next keystroke falls
+ *  through to the session-list key handlers instead of the search field, which
+ *  is what made the field look like it refused focus and value entirely. The
+ *  pointer-events-none glyph retargets to the field root and misses too.
+ *
+ *  `mousedown`, not `click`, is the event that moves focus, and preventDefault
+ *  is what stops the row from taking focus before the explicit `focus()` lands.
+ *  Exported so the regression test mounts this exact composition. */
+export function SidebarSearchField({ inputRef, ...props }: React.ComponentProps<typeof SearchField>) {
+  const focusInput = (event: React.MouseEvent<HTMLDivElement>) => {
+    const target = event.target as Element | null
+
+    if (target?.closest(SEARCH_ROW_INTERACTIVE)) {
+      return
+    }
+
+    const input = inputRef?.current
+
+    if (!input) {
+      return
+    }
+
+    event.preventDefault()
+    input.focus()
+  }
+
+  return (
+    <div className={SEARCH_ROW} onMouseDown={focusInput}>
+      <SearchField {...props} inputRef={inputRef} />
+    </div>
+  )
+}
+
 // FTS results cover sessions that aren't in the loaded page; synthesize a
 // minimal SessionInfo so they render in the same row component (resume works
-// by id; the snippet stands in for the preview).
-function searchResultToSession(result: SessionSearchResult): SessionInfo {
+// by id; the snippet stands in for the preview). Delegation metadata must be
+// carried over verbatim: an unloaded delegated child has no loaded row to fall
+// back on, so dropping it here is what would let one through the sidebar's
+// delegate filter. Left undefined when the backend predates the flag, which
+// isDelegateChildSession reads as "not a child".
+export function searchResultToSession(result: SessionSearchResult): SessionInfo {
   const ts = result.session_started ?? Date.now() / 1000
 
   return {
     archived: false,
     cwd: null,
+    delegate_from: result.delegate_from,
     ended_at: null,
     id: result.session_id,
+    is_delegate_child: result.is_delegate_child,
     _lineage_root_id: result.lineage_root ?? null,
     input_tokens: 0,
     is_active: false,
@@ -221,6 +283,79 @@ function searchResultToSession(result: SessionSearchResult): SessionInfo {
     title: null,
     tool_call_count: 0
   }
+}
+
+// Server hits carry the delegation metadata the gateway holds RIGHT NOW; a
+// loaded row carries whatever it held when it was paged in, which for a
+// subagent child spawned mid-session is routinely older. Merge by presence, not
+// wholesale: a key the server omits (older gateway) must not erase what the
+// loaded row already knows, and a key it sends wins over the stale copy.
+//
+// Merging rather than replacing is also what keeps §4-style contradictions
+// conservative. Server `is_delegate_child: false` over a loaded
+// `delegate_from: 'parent'` leaves both keys set, and isDelegateChildSession's
+// OR predicate still reads that as a child.
+function mergeSearchDelegation(session: SessionInfo, match: SessionSearchResult): SessionInfo {
+  const fresh: Partial<SessionInfo> = {}
+
+  if (match.delegate_from !== undefined) {
+    fresh.delegate_from = match.delegate_from
+  }
+
+  if (match.is_delegate_child !== undefined) {
+    fresh.is_delegate_child = match.is_delegate_child
+  }
+
+  // Same object back when the server said nothing — no needless row identity
+  // churn for every legacy hit.
+  return Object.keys(fresh).length > 0 ? { ...session, ...fresh } : session
+}
+
+/**
+ * The sidebar's search result set: local (already-loaded) matches reconciled
+ * against the server's FTS hits.
+ *
+ * Every server hit is processed even when a local match for the same id is
+ * already in the set. Skipping those was the mixed-freshness hole: a delegated
+ * child that had been paged in before its delegation metadata existed matched
+ * locally, went in as a top-level row, and the server hit that knew better was
+ * skipped by id. So classification runs on the merged row, and a row that
+ * classifies as a child is deleted rather than merely not-added.
+ *
+ * Exported so both paths — preinserted-local and loaded-fallback — are testable
+ * without mounting ChatSidebar.
+ */
+export function mergeSearchResults(
+  localMatches: readonly SessionInfo[],
+  serverMatches: readonly SessionSearchResult[],
+  sessionByAnyId: ReadonlyMap<string, SessionInfo>
+): SessionInfo[] {
+  const out = new Map<string, SessionInfo>()
+
+  for (const session of localMatches) {
+    if (!isDelegateChildSession(session)) {
+      out.set(session.id, session)
+    }
+  }
+
+  for (const match of serverMatches) {
+    // Prefer the row already staged for display, so reconciliation changes
+    // delegation classification and nothing else about which row is shown.
+    const existing = out.get(match.session_id) ?? sessionByAnyId.get(match.session_id)
+    const session = existing ? mergeSearchDelegation(existing, match) : searchResultToSession(match)
+
+    if (isDelegateChildSession(session)) {
+      out.delete(match.session_id)
+
+      continue
+    }
+
+    // Re-setting an existing key keeps its original insertion position, so
+    // result order is unchanged.
+    out.set(match.session_id, session)
+  }
+
+  return [...out.values()]
 }
 
 interface ChatSidebarProps extends React.ComponentProps<typeof Sidebar> {
@@ -471,28 +606,15 @@ export function ChatSidebar({
       return []
     }
 
-    const out = new Map<string, SessionInfo>()
-
-    for (const s of sortedSessions) {
-      if (sessionMatchesSearch(s, trimmedQuery)) {
-        out.set(s.id, s)
-      }
-    }
-
-    for (const match of serverMatches) {
-      if (out.has(match.session_id)) {
-        continue
-      }
-
-      const loaded = sessionByAnyId.get(match.session_id)
-      out.set(match.session_id, loaded ?? searchResultToSession(match))
-    }
-
-    return [...out.values()]
+    return mergeSearchResults(
+      sortedSessions.filter(s => sessionMatchesSearch(s, trimmedQuery)),
+      serverMatches,
+      sessionByAnyId
+    )
   }, [trimmedQuery, sortedSessions, serverMatches, sessionByAnyId])
 
   const unpinnedAgentSessions = useMemo(
-    () => sortedSessions.filter(s => !isPinnedSession(s)),
+    () => sortedSessions.filter(s => !isPinnedSession(s) && !isDelegateChildSession(s)),
     [sortedSessions, isPinnedSession]
   )
 
@@ -1222,15 +1344,13 @@ export function ChatSidebar({
         </SidebarGroup>
 
         {showSessionSections && (
-          <div className="shrink-0 px-2 pb-1 pt-1">
-            <SearchField
-              aria-label={s.searchAria}
-              inputRef={searchInputRef}
-              onChange={setSearchQuery}
-              placeholder={s.searchPlaceholder}
-              value={searchQuery}
-            />
-          </div>
+          <SidebarSearchField
+            aria-label={s.searchAria}
+            inputRef={searchInputRef}
+            onChange={setSearchQuery}
+            placeholder={s.searchPlaceholder}
+            value={searchQuery}
+          />
         )}
 
         {showSessionSections && (

@@ -1195,6 +1195,12 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 logging.debug("Tool result (%d chars): %s", len(function_result), function_result)
 
         agent._current_tool = None
+        try:
+            agent._mark_tool_result_progress(
+                name, function_result, is_error=is_error, args=function_args
+            )
+        except Exception:
+            pass
         _status_suffix = " (error)" if is_error else ""
         agent._touch_activity(f"tool completed: {name} ({tool_duration:.1f}s){_status_suffix}")
 

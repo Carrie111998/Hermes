@@ -495,6 +495,16 @@ export interface SessionInfo {
    *  elsewhere. Undefined against a backend predating the flag; treat that as
    *  "no opinion" and leave the local pin set alone. */
   pinned?: boolean
+  /** Parent conversation when this session was spawned as a delegated child
+   *  subagent — the parent's id, derived server-side from
+   *  `model_config._delegate_from`. Null for user branches and top-level rows. */
+  delegate_from?: null | string
+  /** Authoritative "this row is a delegated/background child" flag, set by the
+   *  backend from `model_config._delegate_from`. The sidebar hides these in
+   *  every lifecycle state; never infer it from `parent_session_id`/`source`,
+   *  which user branches and top-level kanban/tool rows also carry. Undefined
+   *  against a backend predating the flag — treat that as "not a child". */
+  is_delegate_child?: boolean
   preview: null | string
   source: null | string
   started_at: number
@@ -1074,6 +1084,15 @@ export interface ComputerUseStatus {
 }
 
 export interface SessionSearchResult {
+  /** Parent conversation when the matched session was spawned as a delegated
+   *  child subagent. Mirrors {@link SessionInfo.delegate_from}. */
+  delegate_from?: null | string
+  /** Authoritative "this hit is a delegated/background child" flag. Search is
+   *  the only surface for a session the client never paged in, so the sidebar
+   *  filter depends on it being carried here. Mirrors
+   *  {@link SessionInfo.is_delegate_child}; undefined against a backend
+   *  predating the flag - treat that as "not a child". */
+  is_delegate_child?: boolean
   /** Lineage root of the matched conversation. Stable across compression and
    *  used as the durable pin id; falls back to session_id when absent. */
   lineage_root?: string | null

@@ -17,18 +17,38 @@ export interface FlattenSessionsOptions {
 
 const recency = (session: SessionInfo): number => session.last_active || session.started_at || 0
 
+/**
+ * Authoritatively check if a session is a delegated subagent child.
+ *
+ * Either signal is sufficient: `is_delegate_child === true` OR a non-empty
+ * `delegate_from`. Deliberately OR, not a precedence chain — a payload naming a
+ * delegating parent while flagging `is_delegate_child: false` is internally
+ * inconsistent, and the safe reading of an inconsistent payload is "child".
+ * Letting the explicit `false` win there is what would leak a background
+ * subagent into the sidebar as an ordinary conversation; the opposite mistake
+ * only nests a row that already has a parent to nest under.
+ *
+ * Preserves user branches (`parent_session_id` alone) and top-level kanban/tool
+ * sessions. Compatibility-safe: false for older payloads carrying neither key.
+ */
+export function isDelegateChildSession(session: SessionInfo): boolean {
+  return session.is_delegate_child === true || Boolean(session.delegate_from?.trim())
+}
+
 /** Flat list with branch/fork sessions nested visually under their parent. */
 export function flattenSessionsWithBranches(
   sessions: readonly SessionInfo[],
   options: FlattenSessionsOptions = {}
 ): SidebarSessionEntry[] {
-  if (sessions.length < 2) {
-    return sessions.map(session => ({ session }))
+  const filteredSessions = sessions.filter(session => !isDelegateChildSession(session))
+
+  if (filteredSessions.length < 2) {
+    return filteredSessions.map(session => ({ session }))
   }
 
   const byVisibleId = new Map<string, SessionInfo>()
 
-  for (const session of sessions) {
+  for (const session of filteredSessions) {
     byVisibleId.set(session.id, session)
     const rootId = session._lineage_root_id?.trim()
 
@@ -40,7 +60,7 @@ export function flattenSessionsWithBranches(
   const childrenByParent = new Map<string, SessionInfo[]>()
   const nestedIds = new Set<string>()
 
-  for (const session of sessions) {
+  for (const session of filteredSessions) {
     const parentId = session.parent_session_id?.trim()
 
     if (!parentId) {
@@ -106,7 +126,9 @@ export function flattenSessionsWithBranches(
     children?.forEach((child, index) => emit(child, index === children.length - 1 ? '└─ ' : '├─ '))
   }
 
-  const roots = sessions.filter(session => !nestedIds.has(session.id)).map((session, index) => ({ index, session }))
+  const roots = filteredSessions
+    .filter(session => !nestedIds.has(session.id))
+    .map((session, index) => ({ index, session }))
 
   if (!options.preserveOrder) {
     roots.sort((a, b) => groupRecency(b.session) - groupRecency(a.session) || a.index - b.index)
@@ -114,7 +136,7 @@ export function flattenSessionsWithBranches(
 
   roots.forEach(({ session }) => emit(session))
 
-  for (const session of sessions) {
+  for (const session of filteredSessions) {
     if (!seen.has(session.id)) {
       out.push({ session })
     }

@@ -3636,6 +3636,30 @@ class AIAgent:
         from agent.agent_runtime_helpers import apply_pending_steer_to_tool_results
         return apply_pending_steer_to_tool_results(self, messages, num_tool_msgs)
 
+    def _mark_tool_result_progress(
+        self, tool_name: str, result: Any, is_error: bool = False, args: Any = None
+    ) -> None:
+        """Advance verified progress only when a successful tool result changes."""
+        try:
+            arg_text = repr(args) if args is not None else ""
+            action_digest = hashlib.sha256(arg_text.encode("utf-8", "replace")).hexdigest()[:16]
+            self._action_fingerprint = f"{tool_name}:{action_digest}"
+        except Exception:
+            pass
+        if is_error:
+            return
+        try:
+            text = result if isinstance(result, str) else repr(result)
+            digest = hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()
+            marker = f"{tool_name}:{digest}"
+            if marker == getattr(self, "_last_tool_result_marker", None):
+                return
+            self._last_tool_result_marker = marker
+            self._progress_seq = int(getattr(self, "_progress_seq", 0)) + 1
+            self._progress_evidence = f"tool-result:{self._progress_seq}:{marker}"
+        except Exception:
+            return
+
     def _touch_activity(
         self,
         desc: str,
@@ -3671,6 +3695,21 @@ class AIAgent:
         self._last_activity_ts = time.time()
         self._last_activity_desc = bound_activity_description(desc)
         self._last_activity_provenance = normalize_activity_provenance(provenance)
+        normalized = " ".join(str(self._last_activity_desc or "").split())
+        lowered = normalized.lower()
+        self._action_fingerprint = normalized[:512] or None
+        # Heartbeats, API starts/completions, tool execution and tool-result
+        # transport keep a worker alive but do not prove state advancement.
+        # Only explicit state-changing evidence resets the family no-progress
+        # window; action_fingerprint remains useful for semantic cycle checks.
+        progress_markers = (
+            "file changed", "files changed", "artifact changed", "artifact written",
+            "test passed", "tests passed", "diagnostic updated", "state advanced",
+            "verified progress", "final response",
+        )
+        if any(marker in lowered for marker in progress_markers):
+            self._progress_seq = int(getattr(self, "_progress_seq", 0)) + 1
+            self._progress_evidence = f"{self._progress_seq}:{normalized[:512]}"
         if os.environ.get("HERMES_KANBAN_TASK"):
             try:
                 from tools.kanban_tools import (
@@ -3689,7 +3728,9 @@ class AIAgent:
                 pass
         if force_persist:
             reset_session_activity_persist_window(self)
-        self._persist_session_activity_if_due()
+        persist_activity = getattr(self, "_persist_session_activity_if_due", None)
+        if callable(persist_activity):
+            persist_activity()
 
     def _persist_session_activity_if_due(self) -> None:
         """Best-effort durable activity heartbeat for SessionDB consumers.
@@ -3995,6 +4036,15 @@ class AIAgent:
             extra={
             "current_tool": self._current_tool,
             "api_call_count": self._api_call_count,
+            "attempt_seq": self._api_call_count,
+            "failure_seq": getattr(self, "_failure_seq", 0),
+            "failure_streak": getattr(self, "_failure_streak", 0),
+            "progress_seq": getattr(self, "_progress_seq", 0),
+            "progress_evidence": getattr(self, "_progress_evidence", ""),
+            "action_fingerprint": getattr(self, "_action_fingerprint", None),
+            "context_tokens": int(getattr(self, "_context_tokens", 0) or 0),
+            "is_non_retryable_failure": bool(getattr(self, "_is_non_retryable_failure", False)),
+            "last_error_code": getattr(self, "_last_error_code", None),
             "max_iterations": self.max_iterations,
             "budget_used": self.iteration_budget.used,
             "budget_max": self.iteration_budget.max_total,

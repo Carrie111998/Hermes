@@ -39,6 +39,10 @@ interface UseComposerVoiceArgs {
   target: ComposerTarget
 }
 
+export function shouldStartRequestedVoiceConversation(target: ComposerTarget, active: boolean) {
+  return target === 'main' && !active
+}
+
 /**
  * The composer's voice engine: push-to-talk dictation (transcript → draft), the
  * full voice-conversation loop, and auto-speak of replies. Self-contained — it
@@ -194,10 +198,15 @@ export function useComposerVoice({
   )
 
   useEffect(() => {
-    if (target === 'main' && !disabled && takeVoiceConversationStart(voiceStartRequest) && !voiceConversationActive) {
+    // A wake-requested capture must not wait for the fresh session/profile
+    // gateway to open. Manual button/hotkey starts remain gated above.
+    if (
+      shouldStartRequestedVoiceConversation(target, voiceConversationActive) &&
+      takeVoiceConversationStart(voiceStartRequest)
+    ) {
       setVoiceConversationActive(true)
     }
-  }, [disabled, target, voiceConversationActive, voiceStartRequest])
+  }, [target, voiceConversationActive, voiceStartRequest])
 
   const resumeWakeIfPaused = useCallback(() => {
     if (!wakePausedRef.current) {

@@ -305,6 +305,15 @@ async def search_sessions(
                             "preview": row.get("preview"),
                             "parent_session_id": row.get("parent_session_id"),
                             "archived": bool(row.get("archived")),
+                            # Delegated (background subagent) children are hidden
+                            # by the sidebar. A search hit is frequently the only
+                            # view a client has of a session it never loaded a
+                            # page for, so the flag has to ride along here or the
+                            # child resurfaces as a top-level result. Both values
+                            # arrive pre-resolved from ``model_config.
+                            # _delegate_from`` via ``get_session_rich_row``.
+                            "delegate_from": row.get("delegate_from"),
+                            "is_delegate_child": bool(row.get("is_delegate_child")),
                         }
                     )
                 else:

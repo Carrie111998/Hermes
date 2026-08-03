@@ -3835,6 +3835,136 @@ class TestApplyDatabasePragmas:
             assert conn.execute("PRAGMA wal_autocheckpoint").fetchone()[0] == before
         finally:
             conn.close()
+
+
+class TestDelegationFieldEnrichment:
+    """``model_config._delegate_from`` -> explicit ``delegate_from`` /
+    ``is_delegate_child`` on every row shape the desktop sidebar consumes.
+
+    The sidebar hides delegated (background subagent) children but must keep
+    user ``/branch`` forks and top-level kanban/tool rows, so the flag has to be
+    authoritative rather than inferred from ``parent_session_id``/``source``.
+    """
+
+    def _seed(self, db):
+        db.create_session(session_id="parent_sess", source="cli")
+        db.create_session(
+            session_id="subagent_sess",
+            source="cli",
+            parent_session_id="parent_sess",
+            model_config={"_delegate_from": "parent_sess"},
+        )
+        db.create_session(
+            session_id="user_branch_sess",
+            source="cli",
+            parent_session_id="parent_sess",
+        )
+
+    def test_enrich_delegation_fields_in_session_queries(self, db):
+        """Sessions with model_config._delegate_from surface delegate_from and is_delegate_child."""
+        self._seed(db)
+
+        subagent_row = db.get_session("subagent_sess")
+        assert subagent_row["delegate_from"] == "parent_sess"
+        assert subagent_row["is_delegate_child"] is True
+
+        user_branch_row = db.get_session("user_branch_sess")
+        assert user_branch_row["delegate_from"] is None
+        assert user_branch_row["is_delegate_child"] is False
+
+        rich_rows = {s["id"]: s for s in db.list_sessions_rich(include_children=True)}
+        assert rich_rows["subagent_sess"]["delegate_from"] == "parent_sess"
+        assert rich_rows["subagent_sess"]["is_delegate_child"] is True
+        assert rich_rows["user_branch_sess"]["delegate_from"] is None
+        assert rich_rows["user_branch_sess"]["is_delegate_child"] is False
+
+    def test_flag_survives_every_lifecycle_state(self, db):
+        """Live, ended, and archived delegate children all stay flagged.
+
+        The sidebar filters on this flag alone, so a child that loses it when
+        it ends (or is archived) reappears in the list.
+        """
+        self._seed(db)
+
+        def flag(**kwargs):
+            rows = {
+                s["id"]: s
+                for s in db.list_sessions_rich(include_children=True, **kwargs)
+            }
+            return rows["subagent_sess"]["is_delegate_child"]
+
+        # Live.
+        assert flag() is True
+
+        # Ended.
+        db.end_session("subagent_sess", "completed")
+        assert flag() is True
+
+        # Archived.
+        db.set_session_archived("subagent_sess", True)
+        assert flag(include_archived=True) is True
+        assert flag(archived_only=True) is True
+
+    def test_top_level_kanban_and_tool_rows_are_not_delegate_children(self, db):
+        """Source alone must never mark a row as a delegated child."""
+        db.create_session(session_id="kanban_sess", source="kanban")
+        db.create_session(session_id="tool_sess", source="tool")
+
+        rows = {s["id"]: s for s in db.list_sessions_rich(include_children=True)}
+        for sid in ("kanban_sess", "tool_sess"):
+            assert rows[sid]["delegate_from"] is None
+            assert rows[sid]["is_delegate_child"] is False
+
+    def test_single_row_and_cron_run_paths_are_enriched(self, db):
+        """The portability-mixin row shapes carry the flag too.
+
+        ``get_session_rich_row`` backs the web server's session-search
+        hydration and the compression-tip projection; ``list_cron_job_runs``
+        backs the desktop cron run-history endpoint. Both bypass
+        ``list_sessions_rich``, so each needs its own enrichment.
+        """
+        self._seed(db)
+
+        assert db.get_session_rich_row("subagent_sess")["is_delegate_child"] is True
+        assert db.get_session_rich_row("user_branch_sess")["is_delegate_child"] is False
+        # compact_rows drops system_prompt but must not drop the flag.
+        compact = db.get_session_rich_row("subagent_sess", compact_rows=True)
+        assert compact["delegate_from"] == "parent_sess"
+
+        db.create_session(
+            session_id="cron_job7_00000001",
+            source="cron",
+            model_config={"_delegate_from": "parent_sess"},
+        )
+        db.create_session(session_id="cron_job7_00000002", source="cron")
+
+        runs = {r["id"]: r for r in db.list_cron_job_runs("job7")}
+        assert runs["cron_job7_00000001"]["is_delegate_child"] is True
+        assert runs["cron_job7_00000002"]["is_delegate_child"] is False
+
+    def test_pinned_backfill_rows_are_enriched(self, db):
+        """The pinned back-fill appends rows on a second query path.
+
+        A pinned delegate child that the page window missed would otherwise
+        reach the sidebar with no delegation metadata and render as a
+        top-level conversation.
+        """
+        self._seed(db)
+        db.set_session_pinned("subagent_sess", True)
+
+        # limit=1 forces subagent_sess out of the page window, so the only way
+        # it can appear is via the pinned back-fill.
+        rows = {
+            s["id"]: s
+            for s in db.list_sessions_rich(
+                include_children=True, limit=1, include_pinned=True
+            )
+        }
+        assert "subagent_sess" in rows
+        assert rows["subagent_sess"]["delegate_from"] == "parent_sess"
+        assert rows["subagent_sess"]["is_delegate_child"] is True
+
+
 class TestInsightsToolCallIndex:
     """The Insights assistant tool-call scan has a predicate-aligned index.
 

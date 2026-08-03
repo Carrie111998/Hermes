@@ -141,3 +141,95 @@ def test_desktop_session_search_merges_id_matches_before_content_matches(monkeyp
         ]
     }
     assert _FakeSessionDB.opened_read_only is True
+
+
+class _DelegationSessionDB(_FakeSessionDB):
+    """Fake whose rich rows carry the delegation metadata the sidebar filters on.
+
+    ``get_session_rich_row`` resolves ``model_config._delegate_from`` into the
+    explicit ``delegate_from`` / ``is_delegate_child`` pair (see
+    ``hermes_state_common._enrich_delegation_fields``); this fake stands in for
+    rows that have already been through it.
+    """
+
+    _RICH_ROWS = {
+        "top_level_sess": {
+            "id": "top_level_sess",
+            "source": "cli",
+            "started_at": 100,
+            "parent_session_id": None,
+            "delegate_from": None,
+            "is_delegate_child": False,
+        },
+        "user_branch_sess": {
+            "id": "user_branch_sess",
+            "source": "cli",
+            "started_at": 110,
+            # A user /branch fork carries a parent but is NOT a delegate child.
+            "parent_session_id": "top_level_sess",
+            "delegate_from": None,
+            "is_delegate_child": False,
+        },
+        "subagent_sess": {
+            "id": "subagent_sess",
+            "source": "cli",
+            "started_at": 120,
+            "parent_session_id": "top_level_sess",
+            "delegate_from": "top_level_sess",
+            "is_delegate_child": True,
+        },
+    }
+
+    def search_sessions_by_id(self, query, limit=20, **kwargs):
+        return []
+
+    def search_messages(
+        self,
+        query,
+        source_filter=None,
+        exclude_sources=None,
+        limit=20,
+        fields=None,
+    ):
+        type(self).requested_fields = fields
+        return [
+            {
+                "session_id": sid,
+                "snippet": "delegated work",
+                "role": "assistant",
+                "source": "cli",
+                "model": "hermes",
+                "session_started": row["started_at"],
+            }
+            for sid, row in self._RICH_ROWS.items()
+        ][:limit]
+
+    def get_session_rich_row(self, session_id, compact_rows=False):
+        return self._RICH_ROWS.get(session_id)
+
+
+def test_desktop_session_search_propagates_delegation_metadata(monkeypatch):
+    """Search hits carry delegate_from / is_delegate_child.
+
+    Search is the only sidebar surface that can show a session the client never
+    paged in, so it is the only place these fields can reach an unloaded
+    delegated child. Without them the sidebar's delegate filter sees nothing to
+    filter on and the background subagent renders as a top-level conversation.
+    """
+    monkeypatch.setattr("hermes_state.SessionDB", _DelegationSessionDB)
+
+    response = asyncio.run(web_server.search_sessions(q="delegated", limit=10))
+
+    by_id = {r["session_id"]: r for r in response["results"]}
+    assert set(by_id) == {"top_level_sess", "user_branch_sess", "subagent_sess"}
+
+    # The delegated child is flagged, and names its parent.
+    assert by_id["subagent_sess"]["is_delegate_child"] is True
+    assert by_id["subagent_sess"]["delegate_from"] == "top_level_sess"
+
+    # An ordinary top-level hit and a user /branch fork are both kept unflagged
+    # -- the branch shares the delegate child's parent_session_id, so a filter
+    # inferred from parentage rather than the flag would wrongly hide it.
+    for sid in ("top_level_sess", "user_branch_sess"):
+        assert by_id[sid]["is_delegate_child"] is False
+        assert by_id[sid]["delegate_from"] is None

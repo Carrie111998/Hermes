@@ -17,6 +17,7 @@ from agent.skill_commands import SKILL_SCAFFOLD_SQL_LIKE
 from hermes_state_common import (
     SCHEMA_SQL,
     _PREVIEW_RAW_SELECT,
+    _enrich_delegation_fields,
     _shape_preview,
     _sql_session_last_active,
 )
@@ -123,6 +124,7 @@ class SessionPortabilityMixin:
         for row in rows:
             s = dict(row)
             s["preview"] = _shape_preview(s.pop("_preview_raw", ""))
+            _enrich_delegation_fields(s)
             runs.append(s)
         return runs
 
@@ -195,6 +197,7 @@ class SessionPortabilityMixin:
         for row in rows:
             s = dict(row)
             s["preview"] = _shape_preview(s.pop("_preview_raw", ""))
+            _enrich_delegation_fields(s)
             result[s["id"]] = s
         return result
 

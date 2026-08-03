@@ -7,6 +7,8 @@ import os
 import shutil
 import stat
 import tempfile
+import sys
+import time
 from pathlib import Path
 from typing import Any, Union
 from urllib.parse import urlparse
@@ -14,6 +16,9 @@ from urllib.parse import urlparse
 import yaml
 
 logger = logging.getLogger(__name__)
+
+_WINDOWS_REPLACE_RETRIES = 4
+_WINDOWS_REPLACE_BACKOFF_SECONDS = 0.05
 
 
 TRUTHY_STRINGS = frozenset({"1", "true", "yes", "on"})
@@ -111,28 +116,39 @@ def atomic_replace(tmp_path: Union[str, Path], target: Union[str, Path]) -> str:
     target_str = str(target)
     real_path = os.path.realpath(target_str) if os.path.islink(target_str) else target_str
     tmp_str = str(tmp_path)
-    try:
-        os.replace(tmp_str, real_path)
-    except OSError as exc:
-        if exc.errno not in (errno.EXDEV, errno.EBUSY):
-            raise
-        logger.debug(
-            "atomic_replace: %s -> %s failed with %s; falling back to copy",
-            tmp_str,
-            real_path,
-            errno.errorcode.get(exc.errno, exc.errno),
-        )
-        shutil.copyfile(tmp_str, real_path)
+    for attempt in range(_WINDOWS_REPLACE_RETRIES + 1):
         try:
-            shutil.copystat(tmp_str, real_path)
-        except OSError:
-            pass
-        try:
-            with open(real_path, "rb") as f:
-                os.fsync(f.fileno())
-        except OSError:
-            pass
-        os.unlink(tmp_str)
+            os.replace(tmp_str, real_path)
+            break
+        except OSError as exc:
+            winerror = getattr(exc, "winerror", None)
+            if (
+                sys.platform.startswith("win")
+                and winerror in (5, 32)
+                and attempt < _WINDOWS_REPLACE_RETRIES
+            ):
+                time.sleep(_WINDOWS_REPLACE_BACKOFF_SECONDS * (attempt + 1))
+                continue
+            if exc.errno not in (errno.EXDEV, errno.EBUSY):
+                raise
+            logger.debug(
+                "atomic_replace: %s -> %s failed with %s; falling back to copy",
+                tmp_str,
+                real_path,
+                errno.errorcode.get(exc.errno, exc.errno),
+            )
+            shutil.copyfile(tmp_str, real_path)
+            try:
+                shutil.copystat(tmp_str, real_path)
+            except OSError:
+                pass
+            try:
+                with open(real_path, "rb") as f:
+                    os.fsync(f.fileno())
+            except OSError:
+                pass
+            os.unlink(tmp_str)
+            break
     return real_path
 
 

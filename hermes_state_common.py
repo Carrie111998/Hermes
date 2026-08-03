@@ -6,7 +6,8 @@ reference them without importing hermes_state (which would be a cycle).
 hermes_state re-imports every name here for backward compatibility.
 """
 
-from typing import Any
+import json
+from typing import Any, Dict
 
 from agent.skill_commands import (
     SKILL_EXCERPT_JOINT,
@@ -89,6 +90,44 @@ _COMPRESSION_CHILD_SQL = (
 # Rows that surface in pickers: roots + branch children (subagent runs and
 # compression continuations stay hidden).
 _LISTABLE_CHILD_SQL = f"(s.parent_session_id IS NULL OR {_BRANCH_CHILD_SQL.format(a='s')})"
+
+
+def _enrich_delegation_fields(s: Dict[str, Any]) -> Dict[str, Any]:
+    """Stamp the authoritative delegate-child metadata onto a session row.
+
+    ``model_config._delegate_from`` is the only source of truth for "this
+    session is a delegated/background subagent child" — it is written once at
+    creation (see ``tools/delegate_tool``) and survives the parent being
+    reopened, ended, compressed, or archived. ``parent_session_id`` and
+    ``source`` must NOT be used to infer it: user ``/branch`` forks also carry a
+    parent, and kanban/tool rows are top-level sessions the sidebar keeps.
+
+    Sets ``delegate_from`` (the parent's id, or None) and ``is_delegate_child``
+    so clients get an explicit flag instead of re-deriving one. ``model_config``
+    arrives as a JSON string from sqlite and as a dict from in-memory callers;
+    both are handled. Mutates and returns ``s`` for call-site convenience.
+    """
+    model_cfg = s.get("model_config")
+    delegate_from = None
+    if isinstance(model_cfg, dict):
+        delegate_from = model_cfg.get("_delegate_from")
+    elif isinstance(model_cfg, str) and model_cfg.strip():
+        try:
+            parsed = json.loads(model_cfg)
+            if isinstance(parsed, dict):
+                delegate_from = parsed.get("_delegate_from")
+        except Exception:
+            # Malformed model_config is not worth failing a listing over —
+            # treat it as "no delegation marker".
+            pass
+    # A row projected from a compression tip already carries the resolved
+    # value; keep it when this row's own model_config has no marker.
+    if not delegate_from and s.get("delegate_from"):
+        delegate_from = s.get("delegate_from")
+
+    s["delegate_from"] = str(delegate_from) if delegate_from is not None else None
+    s["is_delegate_child"] = bool(delegate_from)
+    return s
 
 
 def _ephemeral_child_sql(alias: str = "s") -> str:
