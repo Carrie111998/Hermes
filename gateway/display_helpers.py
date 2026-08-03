@@ -22,16 +22,6 @@ _AUTO_CONTINUE_FRESHNESS_SECS_DEFAULT = 60 * 60
 
 
 # ---------------------------------------------------------------------------
-# Platform normalisation
-# ---------------------------------------------------------------------------
-
-
-def _gateway_platform_value(platform: Any) -> str:
-    """Return a normalized gateway platform value for enums or raw strings."""
-    return str(getattr(platform, "value", platform) or "").strip().lower()
-
-
-# ---------------------------------------------------------------------------
 # Progress / thread resolution
 # ---------------------------------------------------------------------------
 
@@ -91,8 +81,8 @@ def _resolve_gateway_display_bool(
     setting: str,
     *,
     default: bool = False,
-    platform: Any = None,
-    require_platform_override_for: set[Any] | None = None,
+    platform_value: Optional[str] = None,
+    require_platform_override_for: set[str] | None = None,
 ) -> bool:
     """Resolve a boolean display setting with optional platform-only opt-in.
 
@@ -100,10 +90,15 @@ def _resolve_gateway_display_bool(
     user-facing output.  For high-noise threaded chat surfaces such as
     Mattermost, a global opt-in is too broad: they must be enabled with an
     explicit display.platforms.<platform>.<setting> override.
+
+    ``platform_value`` is the caller-normalized platform key (lowercase) — the
+    normalization helper itself stays in ``gateway.run`` to avoid duplicating
+    ``_gateway_platform_value`` here (it is extracted separately by the
+    platform-routing slice).
     """
-    current_platform = _gateway_platform_value(platform or platform_key)
+    current_platform = platform_value or str(platform_key or "").strip().lower()
     platform_only = {
-        _gateway_platform_value(candidate)
+        str(candidate or "").strip().lower()
         for candidate in (require_platform_override_for or set())
     }
     if (

@@ -13,6 +13,7 @@ from gateway.display_helpers import (
     _coerce_gateway_timestamp,
     _float_env,
     _has_platform_display_override,
+    _resolve_gateway_display_bool,
     _resolve_progress_thread_id,
 )
 
@@ -87,6 +88,84 @@ class TestHasPlatformDisplayOverride:
 
     def test_returns_false_for_non_dict_user_config(self):
         assert _has_platform_display_override(None, "telegram", "show_reasoning") is False
+
+
+# ---------------------------------------------------------------------------
+# _resolve_gateway_display_bool
+# ---------------------------------------------------------------------------
+
+
+class TestResolveGatewayDisplayBool:
+    """Boolean display settings with platform-only opt-in requirements."""
+
+    def test_platform_override_required_blocks_global_opt_in(self):
+        """A platform in require_platform_override_for needs an explicit override."""
+        user_config = {"display": {"thinking_progress": True}}
+        assert _resolve_gateway_display_bool(
+            user_config,
+            "mattermost",
+            "thinking_progress",
+            default=False,
+            platform_value="mattermost",
+            require_platform_override_for={"mattermost"},
+        ) is False
+
+    def test_explicit_platform_override_enables(self):
+        user_config = {
+            "display": {
+                "thinking_progress": True,
+                "platforms": {"mattermost": {"thinking_progress": True}},
+            }
+        }
+        assert _resolve_gateway_display_bool(
+            user_config,
+            "mattermost",
+            "thinking_progress",
+            default=False,
+            platform_value="mattermost",
+            require_platform_override_for={"mattermost"},
+        ) is True
+
+    def test_other_platforms_unaffected_by_platform_only_requirement(self):
+        user_config = {"display": {"thinking_progress": True}}
+        assert _resolve_gateway_display_bool(
+            user_config,
+            "telegram",
+            "thinking_progress",
+            default=False,
+            platform_value="telegram",
+            require_platform_override_for={"mattermost"},
+        ) is True
+
+    def test_missing_platform_value_falls_back_to_platform_key(self):
+        user_config = {"display": {"thinking_progress": True}}
+        assert _resolve_gateway_display_bool(
+            user_config,
+            "telegram",
+            "thinking_progress",
+            default=False,
+        ) is True
+
+    def test_string_settings_parsed_as_bools(self):
+        user_config = {"display": {"thinking_progress": "on"}}
+        assert _resolve_gateway_display_bool(
+            user_config,
+            "telegram",
+            "thinking_progress",
+            default=False,
+            platform_value="telegram",
+        ) is True
+
+    def test_platform_value_is_normalized_insensitively(self):
+        user_config = {"display": {"thinking_progress": True}}
+        assert _resolve_gateway_display_bool(
+            user_config,
+            "telegram",
+            "thinking_progress",
+            default=False,
+            platform_value="Telegram",
+            require_platform_override_for={"MATTERMOST"},
+        ) is True
 
 
 # ---------------------------------------------------------------------------

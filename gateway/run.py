@@ -324,6 +324,11 @@ def _ensure_windows_gateway_venv_imports() -> None:
         return
 
 
+def _gateway_platform_value(platform: Any) -> str:
+    """Return a normalized gateway platform value for enums or raw strings."""
+    return str(getattr(platform, "value", platform) or "").strip().lower()
+
+
 def _non_conversational_metadata(
     metadata: Optional[Dict[str, Any]] = None,
     *,
@@ -663,7 +668,6 @@ from gateway.display_helpers import (  # noqa: E402
     _auto_continue_freshness_window,
     _coerce_gateway_timestamp,
     _float_env,
-    _gateway_platform_value,
     _has_platform_display_override,
     _resolve_gateway_display_bool,
     _resolve_progress_thread_id,
@@ -17310,8 +17314,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _platform_config_key(source.platform),
                     "show_reasoning",
                     default=bool(getattr(self, "_show_reasoning", False)),
-                    platform=source.platform,
-                    require_platform_override_for={Platform.MATTERMOST},
+                    platform_value=_gateway_platform_value(source.platform),
+                    require_platform_override_for={_gateway_platform_value(Platform.MATTERMOST)},
                 )
             except Exception:
                 _show_reasoning_effective = (
