@@ -64,6 +64,8 @@
     "agent-browser@0.26.0": true,
     "electron@40.10.2": true,
     "fsevents@2.3.2": true,
-    "fsevents@2.3.3": true
+    "fsevents@2.3.3": true,
+    "@askjo/camofox-browser@1.12.1": true,
+    "better-sqlite3@12.11.1": true
   }
 }
