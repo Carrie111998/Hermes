@@ -27,6 +27,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from pathlib import Path
 from typing import Any, Awaitable, Dict, Optional
 
 from tools.registry import registry
@@ -72,13 +73,24 @@ def _authorized_source_handles() -> Dict[str, str]:
 def _resolve_source(source_handle: str) -> Optional[str]:
     """Authorize a model-supplied source handle.
 
-    Accepts ``locator://<key>`` (approved locator handle) or a bare key that
-    exists in the approved locator set. Returns the resolved local path, or
-    None when the handle is not authorized (→ SOURCE_DENIED, zero calls).
+    Accepts:
+    - ``locator://<key>`` (approved locator handle) or a bare key that
+      exists in the approved locator set;
+    - ``attachment://<session>/<id>`` registered through the session-scoped
+      allowlist (limited-use session mode; server path stays off the
+      model-visible surface).
+
+    Returns the resolved local path, or None when the handle is not
+    authorized (→ SOURCE_DENIED, zero calls).
     """
     handle = source_handle.strip()
     if handle.startswith("locator://"):
         handle = handle[len("locator://"):]
+        handles = _authorized_source_handles()
+        return handles.get(handle)
+    if handle.startswith("attachment://"):
+        from tools.vision_session_state import vision_session_state
+        return vision_session_state.resolve_attachment(handle)
     handles = _authorized_source_handles()
     return handles.get(handle)
 
@@ -89,9 +101,14 @@ def _criticality_for(task: str) -> str:
     return _TASK_TO_CRITICALITY.get(task, "NORMAL")
 
 
-def _build_envelope(result: Dict[str, Any], config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+def _build_envelope(
+    result: Dict[str, Any],
+    config: Optional[Dict[str, Any]],
+    request_id: Optional[str] = None,
+) -> Dict[str, Any]:
     """Safe model-visible envelope. Never contains thinking / raw provider
     output / base64 / private paths / credentials."""
+    rid = request_id or result.get("request_id")
     excerpt_limit = int(_config_value(config, "ocr_excerpt_chars",
                                       DEFAULT_OCR_EXCERPT_CHARS))
     structured = result.get("structured") or {}
@@ -107,13 +124,15 @@ def _build_envelope(result: Dict[str, Any], config: Optional[Dict[str, Any]]) ->
                 "returned_chars": len(excerpt),
                 "truncated": True,
                 "sha256": hashlib.sha256(joined.encode("utf-8")).hexdigest()[:16],
-                "private_handle": result.get("request_id"),
+                "private_handle": rid,
                 "full_text_policy": "explicit_followup_required",
             }
             observed_text = [excerpt]
+            _store_ocr_full_result(rid, joined)
+
     trace = (result.get("trace") or [{}])[0]
     envelope = {
-        "request_id": result.get("request_id"),
+        "request_id": rid,
         "task": result.get("task"),
         "selected_slot": result.get("final_model_slot")
         or result.get("initial_model_slot"),
@@ -135,6 +154,30 @@ def _build_envelope(result: Dict[str, Any], config: Optional[Dict[str, Any]]) ->
     return envelope
 
 
+def _store_ocr_full_result(handle: Optional[str], full_text: str) -> None:
+    """Persist the complete OCR text to a bounded session-scoped cache and
+    register the retrieval handle. The model-visible envelope never carries
+    the full text; ``vision_ocr_page`` reads it in bounded pages. Uses the
+    system temp dir (never a private/user path) so no local filesystem
+    layout is exposed.
+    """
+    if not handle:
+        return
+    try:
+        import tempfile
+
+        safe_name = "".join(c for c in handle if c.isalnum() or c in "-_")[:64]
+        cache_dir = Path(tempfile.gettempdir()) / "hermes-vision-ocr"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        target = cache_dir / f"{safe_name}.txt"
+        target.write_text(full_text, encoding="utf-8")
+        from tools.vision_session_state import vision_session_state
+        vision_session_state.register_ocr_result(
+            f"ocr://{safe_name}", str(target))
+    except Exception:  # noqa: BLE001 — never break the envelope
+        pass
+
+
 def _source_denied_envelope() -> Dict[str, Any]:
     """SOURCE_DENIED: zero model calls, nothing leaked."""
     return {
@@ -147,6 +190,18 @@ def _source_denied_envelope() -> Dict[str, Any]:
     }
 
 
+def _session_gate_envelope(reason: str) -> Dict[str, Any]:
+    """Session gate (Stage-3): zero model calls, explicit reason."""
+    return {
+        "request_id": None,
+        "execution_status": "POLICY_BLOCKED",
+        "quality_decision": "NOT_EVALUATED",
+        "logical_model_calls": 0,
+        "error": reason,
+        "source_handle": None,
+    }
+
+
 def _build_request(
     args: Dict[str, Any],
     resolved_path: str,
@@ -154,13 +209,17 @@ def _build_request(
     from tools.vision_policy import (
         VisionRequest, VisionTask, VisionMode, VisionCriticality,
     )
+    import uuid
+
     task = str(args.get("task", "UI_READ")).upper()
     if task not in _ALLOWED_TASKS:
         task = "UI_READ"
     question = str(args.get("question") or "")
     question = question[:DEFAULT_MAX_QUESTION_CHARS]
     return VisionRequest(
-        request_id="vision-router-tool",
+        # unique per invocation: doubles as the private OCR retrieval handle
+        # (must never collide across calls)
+        request_id=f"vr-{uuid.uuid4().hex[:12]}",
         image_source=resolved_path,
         task=VisionTask(task),
         mode=VisionMode.AUTO,
@@ -171,16 +230,33 @@ def _build_request(
 
 
 async def _handle_vision_router(args: Dict[str, Any], **kw: Any) -> str:
-    """Registry handler. Returns a JSON envelope string (tool protocol)."""
+    """Registry handler. Returns a JSON envelope string (tool protocol).
+
+    Stage-3 limited-use gates (all zero-call):
+    - session must be enabled by the human (``/vision on``) — the model can
+      never set it;
+    - per-turn / per-session logical-call budgets (BUSY on exhaustion);
+    - same source + same task requires explicit user authorization;
+    - attachment:// handles must be registered in the session allowlist.
+    """
     from tools.vision_orchestrator import analyze_image
 
     source_handle = str(args.get("source_handle") or "").strip()
     if not source_handle:
         return json.dumps(_source_denied_envelope(), ensure_ascii=False)
 
-    resolved_path = _resolve_source(source_handle)
-    if not resolved_path:
-        return json.dumps(_source_denied_envelope(), ensure_ascii=False)
+    from tools.vision_session_state import vision_session_state
+
+    # -- zero-call session gates ---------------------------------------------
+    if not vision_session_state.enabled:
+        return json.dumps(_session_gate_envelope("SESSION_DISABLED"),
+                          ensure_ascii=False)
+
+    task = str(args.get("task", "UI_READ")).upper()
+    if vision_session_state.needs_authorization(source_handle, task):
+        return json.dumps(_session_gate_envelope(
+            "NEEDS_AUTHORIZATION: repeat same source+task"),
+            ensure_ascii=False)
 
     config = None
     try:
@@ -189,20 +265,33 @@ async def _handle_vision_router(args: Dict[str, Any], **kw: Any) -> str:
     except Exception:  # noqa: BLE001
         config = None
 
+    per_turn_max = int(_config_value(config, "per_turn_max_calls", 1))
+    per_session_max = int(_config_value(config, "per_session_max_calls", 5))
+    busy = vision_session_state.consume_call(per_turn_max, per_session_max)
+    if busy is not None:
+        return json.dumps(_session_gate_envelope(busy), ensure_ascii=False)
+
+    resolved_path = _resolve_source(source_handle)
+    if not resolved_path:
+        vision_session_state.fail_call()
+        return json.dumps(_source_denied_envelope(), ensure_ascii=False)
+
     request = _build_request(args, resolved_path)
     try:
-        # enabled=None → the server flag (vision_router.enabled) is resolved
-        # inside analyze_image. The model cannot influence it.
+        # enabled → the in-memory session flag (user-only /vision on; the
+        # model can never set it). Server config flag stays persistent and
+        # false; the session flag governs execution while it is on.
         # base_url → trusted server-side Ollama endpoint (native transport
         # requires it); never model-visible, never model-supplied.
         from tools.vision_policy import resolve_ollama_base_url
 
         result = await analyze_image(
             request,
-            enabled=None,
+            enabled=vision_session_state.enabled,
             base_url=resolve_ollama_base_url(config),
         )
     except Exception as exc:  # noqa: BLE001 — never crash the tool protocol
+        vision_session_state.fail_call()
         envelope = {
             "request_id": request.request_id,
             "execution_status": "INVALID_RESPONSE",
@@ -212,7 +301,10 @@ async def _handle_vision_router(args: Dict[str, Any], **kw: Any) -> str:
         }
         return json.dumps(envelope, ensure_ascii=False)
 
-    envelope = _build_envelope(result, config)
+    vision_session_state.finish_call()
+    vision_session_state.record_call(source_handle, task)
+
+    envelope = _build_envelope(result, config, request_id=request.request_id)
     envelope["source_handle"] = source_handle
     envelope["request_id"] = result.get("request_id") or source_handle
     return json.dumps(envelope, ensure_ascii=False)

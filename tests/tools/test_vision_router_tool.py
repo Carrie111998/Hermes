@@ -60,6 +60,11 @@ class TestSchema:
 
 
 class TestSourceAuthorization:
+    def setup_method(self):
+        from tools.vision_session_state import vision_session_state
+        vision_session_state.set_enabled(True)
+        vision_session_state.begin_turn()
+
     pytestmark = pytest.mark.asyncio
 
     async def test_empty_handle_denied_zero_calls(self):
@@ -104,6 +109,11 @@ class TestSourceAuthorization:
 
 
 class TestCriticalityDerivation:
+    def setup_method(self):
+        from tools.vision_session_state import vision_session_state
+        vision_session_state.set_enabled(True)
+        vision_session_state.begin_turn()
+
     def test_policy_derived(self):
         assert vrt._criticality_for("UI_READ") == "HIGH"
         assert vrt._criticality_for("EXACT_OCR") == "HIGH"
@@ -136,6 +146,11 @@ class TestCriticalityDerivation:
 
 
 class TestEnvelope:
+    def setup_method(self):
+        from tools.vision_session_state import vision_session_state
+        vision_session_state.set_enabled(True)
+        vision_session_state.begin_turn()
+
     pytestmark = pytest.mark.asyncio
 
     async def test_envelope_is_safe_and_bounded(self):
@@ -200,6 +215,12 @@ class TestEnvelope:
 
 
 class TestVisibilityGate:
+    def setup_method(self):
+        # The effective-flag fingerprint includes the in-memory session flag;
+        # reset it so these tests exercise the server flag exclusively.
+        from tools.vision_session_state import vision_session_state
+        vision_session_state.set_enabled(False)
+
     def test_flag_default_false(self):
         assert vrt._config_value(None, "ocr_excerpt_chars", 1) == 1
 
@@ -251,6 +272,343 @@ class TestVisibilityGate:
         assert vr["ocr_page_chars"] == 65536
         assert vr["per_workflow_max_calls"] == 20
         assert vr["enabled"] is False
+
+
+class TestSessionState:
+    """In-memory session state (Stage-3): flag / budgets / allowlist / OCR."""
+
+    def setup_method(self):
+        from tools.vision_session_state import vision_session_state
+        vision_session_state.set_enabled(False)
+
+    def test_toggle_on_off(self):
+        from tools.vision_session_state import vision_session_state as s
+        s.set_enabled(True)
+        assert s.enabled is True
+        s.set_enabled(False)
+        assert s.enabled is False
+
+    def test_off_revokes_all_sources(self):
+        from tools.vision_session_state import vision_session_state as s
+        s.set_enabled(True)
+        s.register_attachment("attachment://sess/a", "/tmp/a.png")
+        s.register_ocr_result("ocr://r", "/tmp/r.txt")
+        s.set_enabled(False)
+        assert s.resolve_attachment("attachment://sess/a") is None
+        assert s.resolve_ocr_result("ocr://r") is None
+
+    def test_budget_turn_and_session(self):
+        from tools.vision_session_state import vision_session_state as s
+        s.set_enabled(True)
+        assert s.consume_call(1, 5) is None
+        # second consume while the first is still in flight -> BUSY
+        assert s.consume_call(1, 5) == "VISION_BUSY_IN_FLIGHT"
+        s.finish_call()
+        # same turn, second finished call -> turn budget exhausted
+        assert s.consume_call(1, 5) == "TURN_BUDGET_EXHAUSTED"
+        s.fail_call()
+        s.begin_turn()
+        assert s.consume_call(1, 5) is None
+        for _ in range(3):
+            s.finish_call()
+            s.begin_turn()
+            assert s.consume_call(1, 5) is None
+        s.finish_call()
+        s.begin_turn()
+        assert s.consume_call(1, 5) == "SESSION_BUDGET_EXHAUSTED"
+        s.fail_call()
+
+    def test_in_flight_blocks(self):
+        from tools.vision_session_state import vision_session_state as s
+        s.set_enabled(True)
+        assert s.consume_call(1, 5) is None
+        assert s.consume_call(1, 5) == "VISION_BUSY_IN_FLIGHT"
+        s.fail_call()
+
+    def test_attachment_register_resolve_revoke(self):
+        from tools.vision_session_state import vision_session_state as s
+        s.set_enabled(True)
+        s.register_attachment("attachment://sess/a", "/tmp/a.png")
+        assert s.resolve_attachment("attachment://sess/a") == "/tmp/a.png"
+        s.revoke_attachment("attachment://sess/a")
+        assert s.resolve_attachment("attachment://sess/a") is None
+
+    def test_dedupe_and_authorization(self):
+        from tools.vision_session_state import vision_session_state as s
+        s.set_enabled(True)
+        assert s.needs_authorization("h", "UI_READ") is False
+        s.record_call("h", "UI_READ")
+        assert s.needs_authorization("h", "UI_READ") is True
+        s.authorize_source_task("h", "UI_READ")
+        assert s.needs_authorization("h", "UI_READ") is False
+
+
+class TestStage3SessionGates:
+    """Wrapper gates: SESSION_DISABLED / budgets / dedupe / attachment://."""
+
+    pytestmark = pytest.mark.asyncio
+
+    @staticmethod
+    def _real_cfg():
+        import copy
+        from hermes_cli.config import load_config
+        cfg = copy.deepcopy(load_config())
+        cfg["auxiliary"]["vision_router"]["enabled"] = True
+        return cfg
+
+    async def test_session_disabled_rejects_zero_calls(self):
+        from tools.registry import registry
+        from tools.vision_session_state import vision_session_state
+        vision_session_state.set_enabled(False)
+        handler = registry.get_entry("vision_router_analyze").handler
+        assert handler is not None
+        called = {"n": 0}
+
+        async def fake_ai(*a, **k):
+            called["n"] += 1
+            return {"execution_status": "SUCCESS"}
+
+        with patch("tools.vision_orchestrator.analyze_image", new=fake_ai):
+            raw = await handler({"source_handle": "TAOBAO-VISION-0003",
+                                 "task": "UI_READ"})
+        env = json.loads(raw)
+        assert env["error"] == "SESSION_DISABLED"
+        assert called["n"] == 0
+
+    async def test_turn_budget_exhausted(self):
+        from tools.registry import registry
+        from tools.vision_session_state import vision_session_state
+        vision_session_state.set_enabled(True)
+        vision_session_state.begin_turn()
+        handler = registry.get_entry("vision_router_analyze").handler
+        assert handler is not None
+
+        async def fake_ai(*a, **k):
+            return {"execution_status": "SUCCESS", "quality_decision": "PASS",
+                    "initial_model_slot": "PRECISION_VLM",
+                    "final_model_slot": "PRECISION_VLM",
+                    "actual_model": "qwen3.6:27b",
+                    "logical_model_calls": 1,
+                    "structured": {"observed_text": ["ok"]},
+                    "trace": []}
+
+        with patch("hermes_cli.config.load_config",
+                   return_value=self._real_cfg()), \
+             patch("tools.vision_orchestrator.analyze_image", new=fake_ai):
+            env1 = json.loads(await handler(
+                {"source_handle": "TAOBAO-VISION-0003", "task": "UI_READ"}))
+            # second call in same turn -> turn budget exhausted
+            env2 = json.loads(await handler(
+                {"source_handle": "TAOBAO-VISION-0004", "task": "UI_READ"}))
+        assert env1["execution_status"] == "SUCCESS"
+        assert env2["error"] == "TURN_BUDGET_EXHAUSTED"
+        vision_session_state.set_enabled(False)
+
+    async def test_same_source_task_needs_authorization(self):
+        from tools.registry import registry
+        from tools.vision_session_state import vision_session_state
+        vision_session_state.set_enabled(True)
+        vision_session_state.begin_turn()
+        handler = registry.get_entry("vision_router_analyze").handler
+        assert handler is not None
+
+        async def fake_ai(*a, **k):
+            return {"execution_status": "SUCCESS", "quality_decision": "PASS",
+                    "initial_model_slot": "PRECISION_VLM",
+                    "final_model_slot": "PRECISION_VLM",
+                    "actual_model": "qwen3.6:27b",
+                    "logical_model_calls": 1,
+                    "structured": {"observed_text": ["ok"]},
+                    "trace": []}
+
+        with patch("hermes_cli.config.load_config",
+                   return_value=self._real_cfg()), \
+             patch("tools.vision_orchestrator.analyze_image", new=fake_ai):
+            env1 = json.loads(await handler(
+                {"source_handle": "TAOBAO-VISION-0003", "task": "UI_READ"}))
+            vision_session_state.begin_turn()  # new turn (fresh budget)
+            env2 = json.loads(await handler(
+                {"source_handle": "TAOBAO-VISION-0003", "task": "UI_READ"}))
+        assert env1["execution_status"] == "SUCCESS"
+        assert env2["error"].startswith("NEEDS_AUTHORIZATION")
+        vision_session_state.set_enabled(False)
+
+    async def test_attachment_handle_authorized(self):
+        from tools.registry import registry
+        from tools.vision_session_state import vision_session_state
+        vision_session_state.set_enabled(True)
+        vision_session_state.begin_turn()
+        vision_session_state.register_attachment(
+            "attachment://sess/a", "/tmp/stage3-att.png")
+        handler = registry.get_entry("vision_router_analyze").handler
+        assert handler is not None
+        received = {}
+
+        async def fake_ai(request, **kw):
+            received["source"] = request.image_source
+            return {"execution_status": "SUCCESS", "quality_decision": "PASS",
+                    "initial_model_slot": "PRECISION_VLM",
+                    "final_model_slot": "PRECISION_VLM",
+                    "actual_model": "qwen3.6:27b",
+                    "logical_model_calls": 1,
+                    "structured": {"observed_text": ["ok"]},
+                    "trace": []}
+
+        with patch("hermes_cli.config.load_config",
+                   return_value=self._real_cfg()), \
+             patch("tools.vision_orchestrator.analyze_image", new=fake_ai):
+            raw = await handler({"source_handle": "attachment://sess/a",
+                                 "task": "UI_READ"})
+        env = json.loads(raw)
+        assert env["execution_status"] == "SUCCESS"
+        assert received["source"] == "/tmp/stage3-att.png"
+        vision_session_state.set_enabled(False)
+
+    async def test_unknown_attachment_denied_zero_calls(self):
+        from tools.registry import registry
+        from tools.vision_session_state import vision_session_state
+        vision_session_state.set_enabled(True)
+        vision_session_state.begin_turn()
+        handler = registry.get_entry("vision_router_analyze").handler
+        assert handler is not None
+        called = {"n": 0}
+
+        async def fake_ai(*a, **k):
+            called["n"] += 1
+            return {"execution_status": "SUCCESS"}
+
+        with patch("tools.vision_orchestrator.analyze_image", new=fake_ai):
+            raw = await handler({"source_handle": "attachment://sess/nope",
+                                 "task": "UI_READ"})
+        env = json.loads(raw)
+        assert env["error"] == "SOURCE_DENIED: source handle is not authorized"
+        assert called["n"] == 0
+        vision_session_state.set_enabled(False)
+
+
+class TestOcrPageTool:
+    """vision_ocr_page: bounded pagination, session binding, zero calls."""
+
+    @staticmethod
+    def _mk_handle(text):
+        from tools.vision_session_state import vision_session_state
+        import tempfile
+        f = tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False,
+                                        encoding="utf-8")
+        f.write(text)
+        f.close()
+        vision_session_state.set_enabled(True)
+        vision_session_state.register_ocr_result("ocr://page-test", f.name)
+        return f.name
+
+    def test_first_page_bounded(self):
+        from tools.vision_ocr_page import _handle_vision_ocr_page
+        long = "页" * 70000
+        self._mk_handle(long)
+        raw = _handle_vision_ocr_page({"handle": "ocr://page-test", "page": 1})
+        env = json.loads(raw)
+        assert env["execution_status"] == "SUCCESS"
+        assert len(env["page_text"]) == 65536
+        assert env["total_chars"] == 70000
+        assert env["remaining_chars"] == 70000 - 65536
+        assert env["truncated"] is True
+        assert env["sha256"]
+        from tools.vision_session_state import vision_session_state
+        vision_session_state.set_enabled(False)
+
+    def test_second_page(self):
+        from tools.vision_ocr_page import _handle_vision_ocr_page
+        long = "行" * 70000
+        self._mk_handle(long)
+        raw = _handle_vision_ocr_page({"handle": "ocr://page-test", "page": 2})
+        env = json.loads(raw)
+        assert env["execution_status"] == "SUCCESS"
+        assert env["remaining_chars"] == 0
+        assert env["page_chars"] == 70000 - 65536
+        from tools.vision_session_state import vision_session_state
+        vision_session_state.set_enabled(False)
+
+    def test_unknown_handle_denied(self):
+        from tools.vision_ocr_page import _handle_vision_ocr_page
+        from tools.vision_session_state import vision_session_state
+        vision_session_state.set_enabled(True)
+        raw = _handle_vision_ocr_page({"handle": "ocr://missing", "page": 1})
+        env = json.loads(raw)
+        assert env["error"].startswith("SOURCE_DENIED")
+        vision_session_state.set_enabled(False)
+
+    def test_session_disabled_denied(self):
+        from tools.vision_ocr_page import _handle_vision_ocr_page
+        from tools.vision_session_state import vision_session_state
+        vision_session_state.set_enabled(False)
+        raw = _handle_vision_ocr_page({"handle": "ocr://x", "page": 1})
+        env = json.loads(raw)
+        assert env["error"] == "SESSION_DISABLED"
+
+    def test_schema_no_path_fields(self):
+        import tools.vision_ocr_page as vop
+        props = vop.VISION_OCR_PAGE_SCHEMA["parameters"]["properties"]
+        for banned in ("path", "base_url", "endpoint"):
+            assert banned not in props
+
+    def test_wrapper_registers_retrievable_ocr_handle(self):
+        """End-to-end (mocked analyze_image): long OCR result through the
+        registry wrapper must mint a NON-EMPTY private handle, persist the
+        full text, and be retrievable via vision_ocr_page (zero calls)."""
+        import asyncio
+        from tools.registry import registry
+        from tools.vision_session_state import vision_session_state
+        vision_session_state.set_enabled(True)
+        vision_session_state.begin_turn()
+        vision_session_state.register_attachment(
+            "attachment://uat-test/att", "/tmp/ocr-e2e.png")
+        handler = registry.get_entry("vision_router_analyze").handler
+        assert handler is not None
+        long_text = "行" * 9000
+
+        async def fake_ai(*a, **k):
+            return {"execution_status": "SUCCESS",
+                    "quality_decision": "PASS",
+                    "initial_model_slot": "OCR",
+                    "final_model_slot": "OCR",
+                    "actual_model": "glm-ocr",
+                    "logical_model_calls": 1,
+                    "structured": {"observed_text": [long_text]},
+                    "trace": []}
+
+        import tools.vision_router_tool as vrt
+        with patch("hermes_cli.config.load_config",
+                   return_value=self._cfg()), \
+             patch("tools.vision_orchestrator.analyze_image", new=fake_ai):
+            raw = asyncio.run(handler(
+                {"source_handle": "attachment://uat-test/att",
+                 "task": "EXACT_OCR"}))
+        env = json.loads(raw)
+        ocr_meta = env.get("ocr_meta") or {}
+        handle = ocr_meta.get("private_handle")
+        assert handle, "private_handle must be non-empty"
+        assert ocr_meta.get("truncated") is True
+        assert ocr_meta.get("returned_chars", 0) <= 4000
+        # full text persisted + registered
+        assert vision_session_state.resolve_ocr_result(f"ocr://{handle}")
+        # retrievable through vision_ocr_page (zero calls)
+        from tools.vision_ocr_page import _handle_vision_ocr_page
+        page = json.loads(_handle_vision_ocr_page(
+            {"handle": f"ocr://{handle}", "page": 0}))
+        assert page["execution_status"] == "SUCCESS"
+        assert page["page_chars"] > 0
+        assert page["total_chars"] == 9000
+        assert page["logical_model_calls"] == 0
+        vision_session_state.set_enabled(False)
+
+    @staticmethod
+    def _cfg():
+        import copy
+        from hermes_cli.config import load_config
+        cfg = copy.deepcopy(load_config())
+        cfg["auxiliary"]["vision_router"]["enabled"] = True
+        return cfg
+
 
 
 class TestConfigPathAlignment:
@@ -459,6 +817,11 @@ class TestOllamaEndpointAlignment:
     ALIGNMENT_V0_1): one shared resolver; wrapper passes the resolved native
     root to analyze_image; base_url stays model-invisible.
     """
+    def setup_method(self):
+        from tools.vision_session_state import vision_session_state
+        vision_session_state.set_enabled(True)
+        vision_session_state.begin_turn()
+
 
     pytestmark = pytest.mark.asyncio
 
@@ -573,7 +936,9 @@ class TestOllamaEndpointAlignment:
                                  "task": "UI_READ", "mode": "AUTO"})
         env = json.loads(raw)
         assert received.get("base_url") == "http://ollama.internal:11434"
-        assert received.get("enabled") is None  # flag resolution stays server-side
+        # enabled carries the in-memory session flag (limited-use session
+        # mode user toggle); model-visible flag resolution stays server-side.
+        assert received.get("enabled") is True
         assert env["execution_status"] == "SUCCESS"
         assert "ollama.internal" not in json.dumps(env)  # endpoint not leaked
 
