@@ -3103,6 +3103,86 @@ class SlackAdapter(BasePlatformAdapter):
             return "none"
         return value
 
+    def _slack_allow_bots_apps(self) -> set:
+        """Return the set of Slack app IDs allowed to relay app-authored
+        messages (``slack.allow_bots_apps`` / ``SLACK_ALLOW_BOTS_APPS``).
+
+        A narrow, fail-closed carve-out that works even when
+        ``allow_bots`` is ``none``: an app-authored message is accepted
+        only when its ``app_id`` is in this set AND the acting user is in
+        ``SLACK_ALLOWED_USERS`` AND the message @mentions this bot.
+        Unset/empty/malformed config → empty set → no carve-out.
+        """
+        raw = self.config.extra.get("allow_bots_apps")
+        if raw is None:
+            raw = os.getenv("SLACK_ALLOW_BOTS_APPS", "")
+        try:
+            if isinstance(raw, str):
+                items = [p.strip() for p in raw.split(",")]
+            elif isinstance(raw, (list, tuple, set)):
+                items = [str(p).strip() for p in raw]
+            else:
+                logger.warning(
+                    "[Slack] Malformed allow_bots_apps=%r; treating as empty (deny)",
+                    raw,
+                )
+                return set()
+            return {p for p in items if p and p.upper().startswith("A")}
+        except Exception as exc:
+            logger.warning(
+                "[Slack] Failed to parse allow_bots_apps (%s); treating as empty (deny)",
+                exc,
+            )
+            return set()
+
+    def _slack_app_gate_permits(self, event: dict) -> bool:
+        """Fail-closed check for the ``allow_bots_apps`` carve-out.
+
+        Returns True only when ALL hold:
+          1. the event's ``app_id`` is in ``allow_bots_apps``
+          2. the acting ``user`` is in ``SLACK_ALLOWED_USERS`` (non-empty)
+          3. the message @mentions this bot (flat text or blocks)
+          4. the sender is not this bot itself
+        Any error → False (deny).
+        """
+        try:
+            allowed_apps = self._slack_allow_bots_apps()
+            if not allowed_apps:
+                return False
+            app_id = str(event.get("app_id") or "").strip()
+            if not app_id or app_id not in allowed_apps:
+                return False
+            msg_user = str(event.get("user") or "").strip()
+            if not msg_user:
+                return False
+            if self._bot_user_id and msg_user == self._bot_user_id:
+                return False
+            allowed_users = {
+                u.strip()
+                for u in os.getenv("SLACK_ALLOWED_USERS", "").split(",")
+                if u.strip()
+            }
+            if not allowed_users or msg_user not in allowed_users:
+                return False
+            if not self._bot_user_id:
+                return False
+            text_check = _slack_mention_detection_text(event)
+            if f"<@{self._bot_user_id}>" not in text_check:
+                return False
+            logger.info(
+                "[Slack] allow_bots_apps carve-out: accepting app-authored "
+                "message (app_id=%s user=%s)",
+                app_id,
+                msg_user,
+            )
+            return True
+        except Exception as exc:
+            logger.warning(
+                "[Slack] allow_bots_apps gate error (%s); denying (fail closed)",
+                exc,
+            )
+            return False
+
     def _event_declares_bot_sender(self, event: dict) -> bool:
         """Return True when the Slack event itself identifies a bot sender."""
         if event.get("bot_id") or event.get("bot_profile"):
@@ -5326,7 +5406,11 @@ class SlackAdapter(BasePlatformAdapter):
         if sender_is_bot:
             allow_bots = self._slack_allow_bots()
             if allow_bots == "none":
-                return
+                # Narrow fail-closed carve-out: explicitly allowlisted app
+                # IDs relaying for explicitly allowlisted human users, with
+                # an @mention. Everything else stays denied.
+                if not self._slack_app_gate_permits(event):
+                    return
             elif allow_bots == "mentions":
                 # Include Block-Kit-only mentions, not just the flat text (#52387)
                 text_check = _slack_mention_detection_text(event)
@@ -5636,8 +5720,11 @@ class SlackAdapter(BasePlatformAdapter):
             if sender_is_bot_user:
                 allow_bots = self._slack_allow_bots()
                 if allow_bots == "none":
-                    return
-                if allow_bots == "mentions" and not is_mentioned:
+                    # Same fail-closed carve-out as the primary gate:
+                    # allowlisted app + allowlisted human user + @mention.
+                    if not self._slack_app_gate_permits(event):
+                        return
+                elif allow_bots == "mentions" and not is_mentioned:
                     return
 
         if not is_one_to_one_dm and bot_uid:

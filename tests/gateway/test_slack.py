@@ -1933,6 +1933,130 @@ class TestMessageRouting:
 
 
     @pytest.mark.asyncio
+    async def test_allow_bots_apps_carveout_accepts_allowed_app_and_user(
+        self, adapter, monkeypatch
+    ):
+        """allow_bots=none + allow_bots_apps: allowed app relaying for an
+        allowlisted human with a mention must be processed."""
+        adapter.config.extra["allow_bots_apps"] = ["A_CURSOR"]
+        monkeypatch.setenv("SLACK_ALLOWED_USERS", "U_HUMAN,U_OTHER")
+        event = {
+            "text": "<@U_BOT> please review PR 1",
+            "user": "U_HUMAN",
+            "app_id": "A_CURSOR",
+            "channel": "C123",
+            "channel_type": "channel",
+            "ts": "1234567890.000001",
+        }
+        await adapter._handle_slack_message(event)
+        adapter.handle_message.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_allow_bots_apps_carveout_denies_wrong_app(
+        self, adapter, monkeypatch
+    ):
+        adapter.config.extra["allow_bots_apps"] = ["A_CURSOR"]
+        monkeypatch.setenv("SLACK_ALLOWED_USERS", "U_HUMAN")
+        event = {
+            "text": "<@U_BOT> please review PR 1",
+            "user": "U_HUMAN",
+            "app_id": "A_EVIL",
+            "channel": "C123",
+            "channel_type": "channel",
+            "ts": "1234567890.000001",
+        }
+        await adapter._handle_slack_message(event)
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_allow_bots_apps_carveout_denies_unlisted_user(
+        self, adapter, monkeypatch
+    ):
+        adapter.config.extra["allow_bots_apps"] = ["A_CURSOR"]
+        monkeypatch.setenv("SLACK_ALLOWED_USERS", "U_HUMAN")
+        event = {
+            "text": "<@U_BOT> please review PR 1",
+            "user": "U_STRANGER",
+            "app_id": "A_CURSOR",
+            "channel": "C123",
+            "channel_type": "channel",
+            "ts": "1234567890.000001",
+        }
+        await adapter._handle_slack_message(event)
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_allow_bots_apps_carveout_denies_without_mention(
+        self, adapter, monkeypatch
+    ):
+        adapter.config.extra["allow_bots_apps"] = ["A_CURSOR"]
+        monkeypatch.setenv("SLACK_ALLOWED_USERS", "U_HUMAN")
+        event = {
+            "text": "please review PR 1",
+            "user": "U_HUMAN",
+            "app_id": "A_CURSOR",
+            "channel": "C123",
+            "channel_type": "channel",
+            "ts": "1234567890.000001",
+        }
+        await adapter._handle_slack_message(event)
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_allow_bots_apps_carveout_denies_empty_allowed_users(
+        self, adapter, monkeypatch
+    ):
+        """Fail closed: the carve-out requires a non-empty SLACK_ALLOWED_USERS."""
+        adapter.config.extra["allow_bots_apps"] = ["A_CURSOR"]
+        monkeypatch.setenv("SLACK_ALLOWED_USERS", "")
+        event = {
+            "text": "<@U_BOT> please review PR 1",
+            "user": "U_HUMAN",
+            "app_id": "A_CURSOR",
+            "channel": "C123",
+            "channel_type": "channel",
+            "ts": "1234567890.000001",
+        }
+        await adapter._handle_slack_message(event)
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_allow_bots_apps_malformed_config_denies(
+        self, adapter, monkeypatch
+    ):
+        """Malformed allow_bots_apps (dict) is treated as empty → deny."""
+        adapter.config.extra["allow_bots_apps"] = {"app": "A_CURSOR"}
+        monkeypatch.setenv("SLACK_ALLOWED_USERS", "U_HUMAN")
+        event = {
+            "text": "<@U_BOT> please review PR 1",
+            "user": "U_HUMAN",
+            "app_id": "A_CURSOR",
+            "channel": "C123",
+            "channel_type": "channel",
+            "ts": "1234567890.000001",
+        }
+        await adapter._handle_slack_message(event)
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_allow_bots_apps_unset_keeps_default_deny(
+        self, adapter, monkeypatch
+    ):
+        """No allow_bots_apps config → app-authored messages drop as before."""
+        monkeypatch.delenv("SLACK_ALLOW_BOTS_APPS", raising=False)
+        monkeypatch.setenv("SLACK_ALLOWED_USERS", "U_HUMAN")
+        event = {
+            "text": "<@U_BOT> please review PR 1",
+            "user": "U_HUMAN",
+            "app_id": "A_CURSOR",
+            "channel": "C123",
+            "channel_type": "channel",
+            "ts": "1234567890.000001",
+        }
+        await adapter._handle_slack_message(event)
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_message_edit_with_new_mention_processed(self, adapter):
         """Editing @bot into a previously ignored MPIM message should route once."""
         original_event = {
