@@ -11641,11 +11641,73 @@ def test_reconcile_keeps_prior_member_state_when_sibling_advances_tip(
             "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind=?",
             (sibling, "story_integrated_to_epic"),
         ).fetchone()[0]
+        had_merge = any("merge" in cmd and "--no-ff" in cmd for cmd in calls)
+        calls.clear()
+        second = kb.reconcile(conn, board=board, spawn_ready=False)
+        first_events_after = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind=?",
+            (first, "story_integrated_to_epic"),
+        ).fetchone()[0]
+        sibling_events_after = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind=?",
+            (sibling, "story_integrated_to_epic"),
+        ).fetchone()[0]
 
     assert result.integrated == [sibling]
     assert first_events == 1
     assert sibling_events == 1
-    assert any("merge" in cmd and "--no-ff" in cmd for cmd in calls)
+    assert had_merge
+    assert second.integrated == []
+    assert first_events_after == first_events
+    assert sibling_events_after == sibling_events
+    assert calls == []
+
+
+def test_explicit_integration_verification_is_not_skipped_by_durable_state(
+    kanban_home, tmp_path
+):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    board = "v2-explicit-integration-verification"
+    _v2_product_board_with_repo(board, repo)
+    epic, story, _epic_branch, story_sha = _make_epic_and_done_story(board, repo)
+
+    with kb.connect(board=board) as conn:
+        assert kb.integrate_story_to_epic(conn, story, board=board) == "integrated"
+        verify_calls = []
+        ownership_calls = []
+
+        def verify(candidate):
+            verify_calls.append(candidate)
+            return True
+
+        def before_apply():
+            ownership_calls.append(True)
+            return True
+
+        assert (
+            kb.integrate_story_to_epic(
+                conn,
+                story,
+                board=board,
+                expected_source_sha="different-source-sha",
+            )
+            == "verify_failed"
+        )
+        assert (
+            kb.integrate_story_to_epic(
+                conn,
+                story,
+                board=board,
+                candidate_verify_fn=verify,
+                expected_source_sha=story_sha,
+                before_apply_fn=before_apply,
+            )
+            == "already_integrated"
+        )
+
+    assert len(verify_calls) == 1
+    assert ownership_calls == [True]
 
 
 def test_integration_state_survives_member_event_gc_and_restart(

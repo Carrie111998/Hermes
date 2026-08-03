@@ -13478,12 +13478,19 @@ def integrate_story_to_epic(
         return None
 
     # Durable integration state is checked before resolving the repository or
-    # any Git ref.  Member events are intentionally GC-able; this table is the
-    # cheap, restart-safe memory that makes a settled member silent forever.
-    if conn.execute(
-        "SELECT 1 FROM epic_story_integrations WHERE epic_id=? AND story_id=? LIMIT 1",
-        (epic_id, story_id),
-    ).fetchone() is not None:
+    # any Git ref only for the ordinary reconcile fast path. Explicit source,
+    # candidate, or ownership controls must retain their verification semantics
+    # and must never be hidden by an older integration row.
+    if (
+        candidate_verify_fn is _RECONCILE_INTEGRATION_VERIFY_UNSET
+        and expected_source_sha is None
+        and before_apply_fn is None
+        and conn.execute(
+            "SELECT 1 FROM epic_story_integrations WHERE epic_id=? AND story_id=? LIMIT 1",
+            (epic_id, story_id),
+        ).fetchone()
+        is not None
+    ):
         return "already_integrated"
 
     try:
