@@ -67,6 +67,20 @@ landing in this tree. PRs that add a new directory under
 provider as its own repo. Existing in-tree providers stay; bug fixes
 to them are welcome.
 
+**No new third-party-product plugins in-tree (policy, June 2026):** the
+same rule applies beyond memory providers. Plugins that integrate
+someone else's product or project — observability/metrics backends,
+vendor SaaS connectors, analytics dashboards, paid-service tie-ins —
+must ship as **standalone plugin repos** that users install into
+`~/.hermes/plugins/` (or via pip entry points). They register through
+the existing plugin discovery path and use the ABCs/hooks/ctx surface
+we expose; nothing special is needed in core. The reason is
+maintenance load: every product we absorb into the tree becomes our
+burden to keep working against a fast-moving core, for a backend we
+don't own. Promote standalone plugins in the Nous Research Discord
+(`#plugins-skills-and-skins`). PRs that add such a directory under
+`plugins/` are closed.
+
 ### Model-provider plugins (`plugins/model-providers/<name>/`)
 
 Every inference backend (openrouter, anthropic, gmi, deepseek, nvidia, …)

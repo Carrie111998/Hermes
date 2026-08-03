@@ -66,6 +66,14 @@ CASES = {
     # SKILL.md reads like docs, but the skill-doc tests read skills/, so a
     # skill edit must still run Python.
     "skill md → python + site": (["skills/github/SKILL.md"], _lanes(python=True, site=True)),
+    "root project context → budget contract without product jobs": (
+        ["AGENTS.md"],
+        _lanes(python=True, python_prod=False),
+    ),
+    "frontend project context → budget contract + frontend": (
+        ["apps/desktop/AGENTS.md"],
+        _lanes(python=True, python_prod=False, frontend=True),
+    ),
     "dockerfile → docker meta": (["Dockerfile"], _lanes(docker_meta=True)),
     # Unknown top-level file keeps Python on rather than risk a silent skip.
     "unknown toplevel → python": (["Makefile"], _lanes(python=True)),

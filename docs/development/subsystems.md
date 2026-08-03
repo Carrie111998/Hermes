@@ -9,9 +9,9 @@ Read the relevant section before changing scheduling, skill lifecycle, or the wo
 
 ## Curator (skill lifecycle)
 
-Background skill-maintenance system that tracks usage on agent-created
-skills and auto-archives stale ones. Users never lose skills; archives
-go to `~/.hermes/skills/.archive/` and are restorable.
+Background skill-maintenance system that tracks eligible skills and
+auto-archives stale ones. Users never lose skills; archives go to
+`~/.hermes/skills/.archive/` and are restorable.
 
 - **Core:** `agent/curator.py` (review loop, auto-transitions, LLM review
   prompt) + `agent/curator_backup.py` (pre-run tar.gz snapshots).
@@ -24,8 +24,9 @@ go to `~/.hermes/skills/.archive/` and are restorable.
   archived), `pinned`.
 
 Invariants:
-- Curator only touches skills with `created_by: "agent"` provenance —
-  bundled + hub-installed skills are off-limits.
+- Agent-created/adopted local skills are eligible. Bundled built-ins are also
+  eligible when `curator.prune_builtins` is true (the default), except for the
+  small protected set. Hub-installed and external skills remain off-limits.
 - Never deletes; max destructive action is archive.
 - Pinned skills are exempt from every auto-transition and from the
   LLM review pass.
@@ -35,7 +36,7 @@ Invariants:
 
 Config section (`curator:` in `config.yaml`):
 `enabled`, `interval_hours`, `min_idle_hours`, `stale_after_days`,
-`archive_after_days`, `backup.*`.
+`archive_after_days`, `prune_builtins`, `backup.*`.
 
 Full user-facing docs: `website/docs/user-guide/features/curator.md`.
 ---
@@ -61,8 +62,9 @@ job B's prompt), `workdir` (run in a specific directory with its
 `AGENTS.md`/`CLAUDE.md` loaded), and multi-platform delivery.
 
 Hardening invariants:
-- **3-minute hard interrupt** on cron sessions — runaway agent loops
-  cannot monopolize the scheduler.
+- Cron sessions use a **600-second inactivity watchdog by default**; `0`
+  disables it. The watchdog bounds a wedged job rather than imposing a fixed
+  total runtime cap.
 - Catchup window: half the job's period, clamped to 120s–2h.
 - Grace window: 120s for one-shot jobs whose fire time was missed.
 - File lock at `~/.hermes/cron/.tick.lock` prevents duplicate ticks
@@ -85,14 +87,16 @@ kanban task.
 
 - **CLI:** `hermes_cli/kanban.py` wires `hermes kanban` with verbs
   `init`, `create`, `list` (alias `ls`), `show`, `assign`, `link`,
-  `unlink`, `comment`, `complete`, `block`, `unblock`, `archive`,
-  `tail`, plus less-commonly-used `watch`, `stats`, `runs`, `log`,
-  `assignees`, `heartbeat`, `notify-*`, `dispatch`, `daemon`, `gc`.
+  `unlink`, `comment`, `attach`, `attachments`, `attach-rm`, `complete`,
+  `block`, `unblock`, `archive`, `tail`, plus less-commonly-used `watch`,
+  `stats`, `runs`, `log`, `assignees`, `heartbeat`, `notify-*`,
+  `dispatch`, `daemon`, `gc`.
 - **Worker/orchestrator toolset:** `tools/kanban_tools.py` exposes
   `kanban_show`, `kanban_complete`, `kanban_block`, `kanban_heartbeat`,
-  `kanban_comment`, `kanban_create`, `kanban_link`; profiles that
-  explicitly enable the `kanban` toolset outside a dispatcher-spawned
-  task also get `kanban_list` and `kanban_unblock` for board routing.
+  `kanban_comment`, `kanban_create`, `kanban_link`, `kanban_attach`,
+  `kanban_attach_url`, `kanban_attachments`; profiles that explicitly
+  enable the `kanban` toolset outside a dispatcher-spawned task also get
+  `kanban_list` and `kanban_unblock` for board routing.
 - **Dispatcher:** long-lived loop that (default every 60s) reclaims
   stale claims, promotes ready tasks, atomically claims, and spawns
   assigned profiles. Runs **inside the gateway** by default via

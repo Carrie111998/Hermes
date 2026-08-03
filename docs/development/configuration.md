@@ -66,3 +66,16 @@ versa), you're on the wrong loader. Check `DEFAULT_CONFIG` coverage.
   removed** — the config loader prints a deprecation warning if it's set in
   `.env`. Same for `TERMINAL_CWD` in `.env`; the canonical setting is
   `terminal.cwd` in `config.yaml`.
+
+### Background process notifications
+
+`display.background_process_notifications` controls gateway messages for
+tracked background commands:
+
+- `all` — running-output updates and the final message (default)
+- `result` — only the final completion message
+- `error` — only a non-zero-exit final message
+- `off` — no watcher messages
+
+`HERMES_BACKGROUND_NOTIFICATIONS` remains an internal/backward-compatible
+override; user-facing configuration belongs in `config.yaml`.

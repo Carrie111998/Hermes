@@ -21,7 +21,7 @@ class AIAgent:
         provider: str = None,
         api_mode: str = None,              # "chat_completions" | "codex_responses" | ...
         model: str = "",                   # empty → resolved from config/provider later
-        max_iterations: int = 90,          # tool-calling iterations (shared with subagents)
+        max_iterations: int = 90,          # per-agent tool-calling iteration cap
         enabled_toolsets: list = None,
         disabled_toolsets: list = None,
         quiet_mode: bool = False,
@@ -64,6 +64,15 @@ while (api_call_count < self.max_iterations and self.iteration_budget.remaining 
 
 Messages follow OpenAI format: `{"role": "system/user/assistant/tool", ...}`.
 Reasoning content is stored in `assistant_msg["reasoning"]`.
+
+## Tool discovery and exposure
+
+`tools/registry.py` is dependency-light and imported by tool modules. Built-in
+tool modules under `tools/` register at import time; `model_tools.py` triggers discovery
+and resolves schemas/dispatch before `run_agent.py`, `cli.py`, `batch_runner.py`,
+and environment consumers use them. Registration alone does not expose a tool:
+the root contract in `AGENTS.md` governs toolset exposure.
+
 ## CLI Architecture (cli.py)
 
 - **Rich** for banner/panels, **prompt_toolkit** for input with autocomplete
@@ -115,3 +124,40 @@ if canonical == "mycommand":
 - `gateway_config_gate` — config dotpath (e.g. `"display.tool_progress_command"`); when set on a `cli_only` command, the command becomes available in the gateway if the config value is truthy. `GATEWAY_KNOWN_COMMANDS` always includes config-gated commands so the gateway can dispatch them; help/menus only show them when the gate is open.
 
 **Adding an alias** requires only adding it to the `aliases` tuple on the existing `CommandDef`. No other file changes needed — dispatch, help text, Telegram menu, Slack mapping, and autocomplete all update automatically.
+
+---
+
+## Delegation (`delegate_task`)
+
+`tools/delegate_tool.py` spawns isolated child conversations with their own
+terminal sessions and toolsets. Top-level model calls normally dispatch in the
+background and return immediately; the completed single result or consolidated
+batch re-enters the parent conversation. Finite/non-routable sessions and
+rejected or capacity-limited dispatches fall back to synchronous execution.
+Do not poll. Direct Python callers retain the historical synchronous default,
+and orchestrator children run synchronously so their own turn can consume
+worker results.
+
+- Use `goal` for one child or `tasks` for parallel fan-out. Concurrency is
+  bounded by `delegation.max_concurrent_children`.
+- `leaf` children retain `execute_code` but cannot call `delegate_task`,
+  `clarify`, `memory`, `send_message`, or `cronjob`. Orchestrators regain only
+  `delegate_task`, and only when `delegation.orchestrator_enabled` and
+  `max_spawn_depth` allow it.
+- Children know none of the parent conversation; pass every requirement in
+  `context`. Their final summaries are self-reports, so verify paths, URLs, IDs,
+  or other external side effects before claiming success.
+- Delegation is not durable: `/stop`, `/new`, or process exit cancels in-flight
+  children. Use cron or tracked terminal background work for tasks that must
+  survive the session.
+
+The model-facing `background` parameter is retained only for compatibility and
+is ignored. Dynamic schema descriptions in `get_definitions()` expose the
+user's actual concurrency and nesting limits.
+
+Delegation controls live under `delegation`: `max_concurrent_children`,
+`max_spawn_depth`, `child_timeout_seconds`, `orchestrator_enabled`,
+`subagent_auto_approve`, `inherit_mcp_toolsets`, and the per-child independent
+`max_iterations`. A non-positive child timeout disables the wall-clock cap.
+`subagent_auto_approve` removes human review from dangerous child commands; keep
+it disabled unless that non-interactive trust boundary is intentional.
