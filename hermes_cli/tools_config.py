@@ -1757,26 +1757,62 @@ def _run_post_setup(post_setup_key: str):
     elif post_setup_key == "camofox":
         camofox_dir = PROJECT_ROOT / "node_modules" / "@askjo" / "camofox-browser"
         _npm_bin = find_node_executable("npm")
-        if camofox_dir.exists():
+        if _camofox_installed():
             _print_success("    Camofox already installed, nothing to do")
         elif _npm_bin:
-            _print_info("    Installing Camofox browser server...")
-            import subprocess
-            # Absolute npm path so .cmd shim executes on Windows.
-            result = subprocess.run(
-                # --workspaces=false avoids resolving apps/desktop. See #38772.
-                [_npm_bin, "install", "--silent", "--workspaces=false"],
-                capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=str(PROJECT_ROOT),
-                creationflags=_post_setup_no_window_flags(),
+            version = _camofox_approved_version()
+            spec = (
+                f"@askjo/camofox-browser@{version}"
+                if version
+                else "@askjo/camofox-browser"
             )
-            if result.returncode == 0:
-                _print_success("    Camofox installed")
-            else:
-                _print_warning("    npm install failed - run manually: npm install --workspaces=false")
+            _print_info(f"    Installing {spec}...")
+            _print_info(
+                "    First run downloads the Camoufox engine (~300MB) — "
+                "this can take several minutes."
+            )
+            import subprocess
+            # Install the package on demand. It is deliberately NOT a
+            # committed dependency so `hermes update` never pulls the
+            # ~300MB Camoufox binary for users who didn't opt in; saving
+            # it makes the opt-in durable across updates (the updater's
+            # autostash re-applies the local package.json change).
+            # Pin to the exact version approved in package.json
+            # allowScripts — npm's install-script gate is exact-version,
+            # and a bare range would silently block the engine-fetch
+            # postinstall. --workspaces=false avoids resolving
+            # apps/desktop. See #38772.
+            try:
+                result = subprocess.run(
+                    [_npm_bin, "install", "--save", "--save-exact",
+                     "--no-fund", "--no-audit", "--progress=false",
+                     "--workspaces=false", spec],
+                    cwd=str(PROJECT_ROOT),
+                    creationflags=_post_setup_no_window_flags(),
+                )
+                if result.returncode == 0:
+                    # The package's postinstall exits 0 even when the
+                    # engine download fails — verify the real artifact.
+                    if not _camofox_engine_installed():
+                        _print_info("    Engine cache empty — fetching explicitly...")
+                        _fetch_camofox_engine(camofox_dir)
+                    if _camofox_engine_installed():
+                        _print_success("    Camofox installed")
+                    else:
+                        _print_warning(
+                            "    Engine download incomplete — run manually: "
+                            "npx camoufox-js fetch"
+                        )
+                else:
+                    _print_warning(
+                        f"    npm install failed — run manually: npm install {spec}"
+                    )
+            except Exception as exc:
+                _print_warning(f"    Camofox install failed: {exc}")
+                _print_info(f"    Run manually: npm install {spec}")
         if camofox_dir.exists():
             _print_info("    Start the Camofox server:")
             _print_info("      npx @askjo/camofox-browser")
-            _print_info("    First run downloads the Camoufox engine (~300MB)")
             _print_info("    Or use Docker: docker run -p 9377:9377 -e CAMOFOX_PORT=9377 jo-inc/camofox-browser")
         elif not _npm_bin:
             _print_warning("    Node.js not found. Install Camofox via Docker:")
@@ -3237,10 +3273,72 @@ def _agent_browser_installed() -> bool:
     return _local_browser_runnable()
 
 
+def _camofox_approved_version() -> Optional[str]:
+    """Exact @askjo/camofox-browser version approved in package.json
+    ``allowScripts`` (npm's install-script gate is exact-version), or None.
+
+    The install must pin to this version so the engine-fetch postinstall
+    is allowed to run — a bare range would resolve to a newer version
+    whose postinstall is silently blocked, leaving the server without an
+    engine. Mirrors the ``allowScripts`` entry the install script needs.
+    """
+    try:
+        pkg = _json.loads(
+            (PROJECT_ROOT / "package.json").read_text(encoding="utf-8")
+        )
+        for key in (pkg.get("allowScripts") or {}):
+            if key.startswith("@askjo/camofox-browser@"):
+                return key.split("@", 2)[2]
+    except Exception:
+        pass
+    return None
+
+
+def _camofox_engine_cache_dir() -> Path:
+    """Per-user Camoufox engine cache dir (mirrors the package's postinstall)."""
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Caches" / "camoufox"
+    if sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+        return Path(base) / "camoufox" / "camoufox" / "Cache"
+    xdg = os.environ.get("XDG_CACHE_HOME")
+    return (Path(xdg) if xdg else Path.home() / ".cache") / "camoufox"
+
+
+def _camofox_engine_installed() -> bool:
+    """True when the Camoufox engine binary is cached (version.json present).
+
+    The engine lives in a per-user cache, not node_modules — the npm
+    package alone cannot run the server, so this is the real readiness
+    signal (mirrors agent_browser checking Chromium runnability).
+    """
+    return (_camofox_engine_cache_dir() / "version.json").exists()
+
+
+def _fetch_camofox_engine(camofox_dir: Path) -> None:
+    """Run the package's own postinstall to fetch the engine explicitly."""
+    from hermes_constants import find_node_executable
+
+    node_bin = find_node_executable("node")
+    if not node_bin or not camofox_dir.exists():
+        return
+    try:
+        subprocess.run(
+            [node_bin, "scripts/postinstall.js"],
+            cwd=str(camofox_dir),
+            creationflags=_post_setup_no_window_flags(),
+        )
+    except Exception:
+        pass
+
+
 def _camofox_installed() -> bool:
-    """True when the Camofox npm package ``_run_post_setup("camofox")``
-    installs is already in node_modules."""
-    return (PROJECT_ROOT / "node_modules" / "@askjo" / "camofox-browser").exists()
+    """True when Camofox can actually run: npm package present AND the
+    Camoufox engine binary cached (the real artifact)."""
+    return (
+        (PROJECT_ROOT / "node_modules" / "@askjo" / "camofox-browser").exists()
+        and _camofox_engine_installed()
+    )
 
 
 # post_setup_key -> predicate(): True when the install side-effect is already
