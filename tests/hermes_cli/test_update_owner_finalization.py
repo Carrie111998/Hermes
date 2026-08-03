@@ -8,11 +8,11 @@ dashboard and result marker are finalized kills the updater mid-flight.
 from __future__ import annotations
 
 import json
-import signal
+import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from hermes_cli import update_cmd
+from hermes_cli import update_cmd, update_owner_restart
 
 
 def _owner() -> tuple[str, list[str], str]:
@@ -23,7 +23,9 @@ def _owner() -> tuple[str, list[str], str]:
     )
 
 
-def test_dashboard_and_durable_status_precede_terminal_owner_restart(monkeypatch):
+def test_dashboard_precedes_terminal_owner_verifier_without_early_success(
+    monkeypatch, capsys
+):
     events: list[str] = []
 
     monkeypatch.setattr(
@@ -33,40 +35,12 @@ def test_dashboard_and_durable_status_precede_terminal_owner_restart(monkeypatch
     )
     monkeypatch.setattr(
         update_cmd,
-        "_restart_updater_owning_gateway",
+        "_launch_updater_owner_restart_verifier",
         lambda _owner, *, final_exit_code, persist_result: events.append(
-            f"owner:{final_exit_code}:{persist_result}"
+            f"verifier:{final_exit_code}:{persist_result}"
         )
         or True,
-    )
-
-    ok = update_cmd._finish_update_service_finalization(
-        [],
-        gateway_mode=True,
-        gateway_fleet_restart_incomplete=False,
-        updater_owner_discovery_failed=False,
-        deferred_owner=_owner(),
-    )
-
-    assert ok is True
-    assert events == ["dashboard", "owner:0:True"]
-
-
-def test_partial_failure_is_persisted_before_owner_restart(monkeypatch, capsys):
-    events: list[str] = []
-
-    monkeypatch.setattr(
-        update_cmd,
-        "_finish_dashboard_update_cleanup",
-        lambda _failures: events.append("dashboard") or False,
-    )
-    monkeypatch.setattr(
-        update_cmd,
-        "_restart_updater_owning_gateway",
-        lambda _owner, *, final_exit_code, persist_result: events.append(
-            f"owner:{final_exit_code}:{persist_result}"
-        )
-        or True,
+        raising=False,
     )
 
     ok = update_cmd._finish_update_service_finalization(
@@ -78,11 +52,44 @@ def test_partial_failure_is_persisted_before_owner_restart(monkeypatch, capsys):
     )
 
     assert ok is False
-    assert events == ["dashboard", "owner:1:True"]
-    assert "Update finalization incomplete" in capsys.readouterr().out
+    assert events == ["dashboard", "verifier:0:True"]
+    output = capsys.readouterr().out
+    assert "verification is pending" in output
+    assert "✓ Update complete!" not in output
 
 
-def test_owner_signal_failure_persists_error_result(monkeypatch, capsys):
+def test_partial_failure_is_staged_before_owner_verifier(monkeypatch, capsys):
+    events: list[str] = []
+
+    monkeypatch.setattr(
+        update_cmd,
+        "_finish_dashboard_update_cleanup",
+        lambda _failures: events.append("dashboard") or False,
+    )
+    monkeypatch.setattr(
+        update_cmd,
+        "_launch_updater_owner_restart_verifier",
+        lambda _owner, *, final_exit_code, persist_result: events.append(
+            f"verifier:{final_exit_code}:{persist_result}"
+        )
+        or True,
+        raising=False,
+    )
+
+    ok = update_cmd._finish_update_service_finalization(
+        [],
+        gateway_mode=True,
+        gateway_fleet_restart_incomplete=False,
+        updater_owner_discovery_failed=False,
+        deferred_owner=_owner(),
+    )
+
+    assert ok is False
+    assert events == ["dashboard", "verifier:1:True"]
+    assert "verification is pending" in capsys.readouterr().out
+
+
+def test_owner_verifier_launch_failure_persists_error_result(monkeypatch, capsys):
     events: list[str] = []
 
     monkeypatch.setattr(
@@ -95,11 +102,12 @@ def test_owner_signal_failure_persists_error_result(monkeypatch, capsys):
     )
     monkeypatch.setattr(
         update_cmd,
-        "_restart_updater_owning_gateway",
+        "_launch_updater_owner_restart_verifier",
         lambda _owner, *, final_exit_code, persist_result: events.append(
-            f"owner:{final_exit_code}:{persist_result}"
+            f"verifier:{final_exit_code}:{persist_result}"
         )
         or False,
+        raising=False,
     )
 
     ok = update_cmd._finish_update_service_finalization(
@@ -111,11 +119,11 @@ def test_owner_signal_failure_persists_error_result(monkeypatch, capsys):
     )
 
     assert ok is False
-    assert events == ["owner:0:True", "status:1"]
-    assert "Could not prepare or signal" in capsys.readouterr().out
+    assert events == ["verifier:0:True", "status:1"]
+    assert "Could not launch" in capsys.readouterr().out
 
 
-def test_no_owner_persists_final_status_after_dashboard(monkeypatch):
+def test_non_systemd_fallback_persists_final_status_without_verifier(monkeypatch):
     events: list[str] = []
     monkeypatch.setattr(
         update_cmd,
@@ -126,6 +134,14 @@ def test_no_owner_persists_final_status_after_dashboard(monkeypatch):
         update_cmd,
         "_write_gateway_update_exit_code",
         lambda required, code: events.append(f"status:{required}:{code}") or True,
+    )
+    monkeypatch.setattr(
+        update_cmd,
+        "_launch_updater_owner_restart_verifier",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("non-systemd fallback must not launch verifier")
+        ),
+        raising=False,
     )
 
     assert update_cmd._finish_update_service_finalization(
@@ -139,55 +155,109 @@ def test_no_owner_persists_final_status_after_dashboard(monkeypatch):
     assert events == ["dashboard", "status:True:0"]
 
 
-def test_owner_pending_result_is_durable_before_signal(tmp_path, monkeypatch):
+def test_owner_verifier_timeout_covers_after_turn_wait(monkeypatch):
+    from hermes_cli import gateway as gateway_cli
+
+    monkeypatch.setattr(gateway_cli, "_get_restart_drain_timeout", lambda: 1.0)
+    monkeypatch.setattr(gateway_cli, "_get_restart_exit_wait_budget", lambda: 700.0)
+    monkeypatch.setattr(
+        update_cmd,
+        "_service_restart_sec",
+        lambda _scope_cmd, _service, *, default: 5.0,
+    )
+
+    assert update_cmd._owner_restart_verification_timeout(_owner()) == 825.0
+
+
+def test_owner_request_is_durable_before_transient_verifier_launch(
+    tmp_path, monkeypatch
+):
     monkeypatch.setattr(update_cmd, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(update_cmd.shutil, "which", lambda name: "/bin/systemd-run")
+    monkeypatch.setattr(
+        update_cmd,
+        "_owner_restart_verification_timeout",
+        lambda _owner: 120.0,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        update_owner_restart,
+        "read_systemd_service_state",
+        lambda _scope, _service: {
+            "active_state": "active",
+            "sub_state": "running",
+            "main_pid": 4321,
+            "exec_start": 101,
+            "active_enter": 102,
+            "restart": "on-failure",
+        },
+    )
+    monkeypatch.setattr(update_cmd.secrets, "token_hex", lambda _size: "a" * 32)
+    launches: list[list[str]] = []
 
     def fake_run(args, *unused_args, **unused_kwargs):
-        assert args == [
-            "systemctl",
-            "--user",
-            "show",
-            "hermes-gateway-coding_lead",
-            "--property=MainPID",
-            "--value",
-        ]
-        return MagicMock(returncode=0, stdout="4321\n", stderr="")
-
-    def fake_kill(pid, sig):
-        assert (pid, sig) == (4321, signal.SIGUSR1)
         pending = json.loads(
-            (tmp_path / ".update_owner_restart_pending.json").read_text()
+            (tmp_path / update_owner_restart.OWNER_RESTART_PENDING_FILE).read_text()
         )
-        assert pending == {
-            "exit_code": 0,
-            "owner_pid": 4321,
-            "owner_service": "hermes-gateway-coding_lead",
-            "version": 1,
-        }
+        assert pending["version"] == 2
+        assert pending["old_state"]["main_pid"] == 4321
+        assert pending["generation_key"] == "exec_start"
         assert not (tmp_path / ".update_exit_code").exists()
+        launches.append(args)
+        return MagicMock(returncode=0, stdout="", stderr="")
 
     with patch.object(update_cmd.subprocess, "run", side_effect=fake_run), patch.object(
-        update_cmd.os, "kill", side_effect=fake_kill
+        update_cmd.os,
+        "kill",
+        side_effect=AssertionError("updater cgroup must not own the terminal signal"),
     ):
-        assert update_cmd._restart_updater_owning_gateway(
+        assert update_cmd._launch_updater_owner_restart_verifier(
             _owner(), final_exit_code=0, persist_result=True
         ) is True
 
+    command = launches[0]
+    assert command[0:2] == ["/bin/systemd-run", "--user"]
+    assert "--collect" in command
+    assert any(part.startswith("--unit=hermes-update-owner-verify-") for part in command)
+    assert command[-6:] == [
+        sys.executable,
+        "-m",
+        "hermes_cli.update_owner_restart",
+        "--home",
+        str(tmp_path),
+        f"--nonce={'a' * 32}",
+    ]
 
-def test_owner_is_not_signalled_when_pending_result_cannot_be_written(monkeypatch):
+
+def test_owner_is_not_restarted_when_request_cannot_be_written(monkeypatch):
     monkeypatch.setattr(
-        update_cmd, "_write_gateway_owner_restart_pending", lambda *args, **kwargs: False
+        update_owner_restart,
+        "read_systemd_service_state",
+        lambda _scope, _service: {
+            "active_state": "active",
+            "sub_state": "running",
+            "main_pid": 4321,
+            "exec_start": 101,
+            "active_enter": 102,
+            "restart": "on-failure",
+        },
     )
-    with patch.object(
-        update_cmd.subprocess,
-        "run",
-        return_value=MagicMock(returncode=0, stdout="4321\n", stderr=""),
-    ), patch.object(update_cmd.os, "kill") as kill:
-        assert update_cmd._restart_updater_owning_gateway(
+    monkeypatch.setattr(
+        update_owner_restart,
+        "prepare_owner_restart_request",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("read-only home")),
+    )
+    monkeypatch.setattr(
+        update_cmd,
+        "_owner_restart_verification_timeout",
+        lambda _owner: 120.0,
+    )
+    with patch.object(update_cmd.subprocess, "run") as run:
+        assert update_cmd._launch_updater_owner_restart_verifier(
             _owner(), final_exit_code=0, persist_result=True
         ) is False
 
-    kill.assert_not_called()
+    run.assert_not_called()
 
 
 def test_owner_detection_uses_pid_cgroup_scope(monkeypatch):
@@ -246,23 +316,41 @@ def test_malformed_gateway_cgroup_that_cannot_resolve_owner_is_a_failure(monkeyp
     assert update_cmd._detect_updater_systemd_gateway_owner() == (None, True)
 
 
-def test_terminal_owner_restart_signals_only_the_service_main_pid():
-    def fake_run(args, *unused_args, **unused_kwargs):
-        assert args == [
-            "systemctl",
-            "--user",
-            "show",
-            "hermes-gateway-coding_lead",
-            "--property=MainPID",
-            "--value",
-        ]
-        return MagicMock(returncode=0, stdout="4321\n", stderr="")
+def test_transient_verifier_launch_failure_clears_pending_request(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(update_cmd, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(update_cmd.shutil, "which", lambda _name: "/bin/systemd-run")
+    monkeypatch.setattr(
+        update_cmd,
+        "_owner_restart_verification_timeout",
+        lambda _owner: 120.0,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        update_owner_restart,
+        "read_systemd_service_state",
+        lambda _scope, _service: {
+            "active_state": "active",
+            "sub_state": "running",
+            "main_pid": 4321,
+            "exec_start": 101,
+            "active_enter": 102,
+            "restart": "on-failure",
+        },
+    )
+    monkeypatch.setattr(update_cmd.secrets, "token_hex", lambda _size: "c" * 32)
+    monkeypatch.setattr(
+        update_cmd.subprocess,
+        "run",
+        lambda *_args, **_kwargs: MagicMock(
+            returncode=1, stdout="", stderr="permission denied"
+        ),
+    )
 
-    with patch.object(update_cmd.subprocess, "run", side_effect=fake_run), patch.object(
-        update_cmd.os, "kill"
-    ) as kill:
-        assert update_cmd._restart_updater_owning_gateway(
-            _owner(), final_exit_code=0, persist_result=False
-        ) is True
-
-    kill.assert_called_once_with(4321, signal.SIGUSR1)
+    assert update_cmd._launch_updater_owner_restart_verifier(
+        _owner(), final_exit_code=0, persist_result=True
+    ) is False
+    assert not (
+        tmp_path / update_owner_restart.OWNER_RESTART_PENDING_FILE
+    ).exists()

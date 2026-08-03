@@ -27,6 +27,7 @@ import hashlib
 import json
 import logging
 import os
+import secrets
 import shlex
 import shutil
 import subprocess
@@ -3358,9 +3359,6 @@ def _detect_updater_systemd_gateway_owner(
     return (scope, scope_cmd, svc_name.removesuffix(".service")), False
 
 
-_OWNER_RESTART_PENDING_FILE = ".update_owner_restart_pending.json"
-
-
 def _write_gateway_update_exit_code(required: bool, code: int) -> bool:
     """Atomically persist a terminal updater result when a consumer needs it."""
     if not required:
@@ -3377,90 +3375,128 @@ def _write_gateway_update_exit_code(required: bool, code: int) -> bool:
     return True
 
 
-def _write_gateway_owner_restart_pending(
-    required: bool,
-    *,
-    code: int,
-    owner_pid: int,
-    owner_service: str,
-) -> bool:
-    """Persist a non-terminal result for promotion by the restarted owner.
-
-    The gateway notification watchers intentionally ignore this separate file.
-    The new owner process promotes it to ``.update_exit_code`` only after its PID
-    differs from ``owner_pid``, proving the terminal owner transition happened.
-    """
-    if not required:
-        return True
+def _owner_restart_verification_timeout(
+    owner: tuple[str, list[str], str],
+) -> float:
+    """Bound owner drain, restart backoff, and new-gateway startup verification."""
+    _scope, scope_cmd, svc_name = owner
     try:
-        from utils import atomic_json_write
+        from hermes_cli.gateway import _get_restart_exit_wait_budget
 
-        atomic_json_write(
-            get_hermes_home() / _OWNER_RESTART_PENDING_FILE,
-            {
-                "version": 1,
-                "exit_code": int(code),
-                "owner_pid": int(owner_pid),
-                "owner_service": owner_service,
-            },
-            indent=None,
-        )
-    except (OSError, TypeError, ValueError):
-        return False
-    return True
+        exit_wait_budget = max(0.0, float(_get_restart_exit_wait_budget()))
+    except Exception:
+        exit_wait_budget = 105.0
+    restart_timeout = _service_restart_sec(scope_cmd, svc_name, default=0.0)
+    # SIGUSR1 may first wait for the active turn and only then enter stop/drain.
+    # Cover the same full wait budget used by gateway restart callers, plus
+    # service backoff and two minutes for replacement startup/readiness.  Keep
+    # the verifier within the gateway update watcher's bounded 30-minute window.
+    return min(1800.0, max(180.0, exit_wait_budget + restart_timeout + 120.0))
 
 
-def _clear_gateway_owner_restart_pending() -> None:
-    try:
-        (get_hermes_home() / _OWNER_RESTART_PENDING_FILE).unlink(missing_ok=True)
-    except OSError:
-        pass
+def _clear_owner_restart_request_files() -> None:
+    from hermes_cli.update_owner_restart import (
+        OWNER_RESTART_ACK_FILE,
+        OWNER_RESTART_PENDING_FILE,
+    )
+
+    home = get_hermes_home()
+    for name in (OWNER_RESTART_PENDING_FILE, OWNER_RESTART_ACK_FILE):
+        try:
+            (home / name).unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
-def _restart_updater_owning_gateway(
+def _launch_updater_owner_restart_verifier(
     owner: tuple[str, list[str], str],
     *,
     final_exit_code: int,
     persist_result: bool,
 ) -> bool:
-    """Signal the updater-owning gateway as the final restart action.
+    """Launch the terminal owner restart in a separate transient systemd cgroup.
 
-    Waiting for this service to exit is inherently unsafe: systemd may kill
-    every remaining process in the cgroup, including this updater.  Resolve
-    the unit's MainPID, durably stage the final result outside the terminal
-    marker watched by the old gateway, then send the drain-safe SIGUSR1 signal
-    exactly once.  The restarted owner promotes that staged result only after
-    its PID proves the transition completed.
+    The transient verifier, not this updater-owned cgroup, sends SIGUSR1.  It
+    then boundedly proves ActiveState, changed MainPID/start generation, and a
+    readiness acknowledgement from the new gateway before atomically exposing
+    the terminal update result.  If the transient unit cannot be launched, the
+    owner remains untouched and the caller records an immediate failure.
     """
-    _scope, scope_cmd, svc_name = owner
+    if not persist_result:
+        return False
+    systemd_run = shutil.which("systemd-run")
+    if not systemd_run:
+        return False
+
+    from hermes_cli import update_owner_restart
+
+    scope, _scope_cmd, svc_name = owner
     try:
-        shown = subprocess.run(
-            scope_cmd
-            + ["show", svc_name, "--property=MainPID", "--value"],
+        old_state = update_owner_restart.read_systemd_service_state(scope, svc_name)
+        timeout_seconds = _owner_restart_verification_timeout(owner)
+        nonce = secrets.token_hex(16)
+        home = get_hermes_home()
+        update_owner_restart.prepare_owner_restart_request(
+            home,
+            scope=scope,
+            service=svc_name,
+            old_state=old_state,
+            final_exit_code=int(final_exit_code),
+            timeout_seconds=timeout_seconds,
+            nonce=nonce,
+        )
+    except (FileNotFoundError, OSError, TypeError, ValueError, subprocess.TimeoutExpired):
+        return False
+
+    unit_name = (
+        f"hermes-update-owner-verify-{os.getpid()}-{nonce[:8]}".replace(".", "-")
+    )
+    project_root = Path(__file__).resolve().parent.parent
+    command = [systemd_run]
+    if scope == "user":
+        command.append("--user")
+    command.extend(
+        [
+            "--collect",
+            f"--unit={unit_name}",
+            "--property=Type=exec",
+            f"--property=RuntimeMaxSec={int(timeout_seconds + 30)}",
+            f"--property=WorkingDirectory={project_root}",
+            f"--setenv=HERMES_HOME={home}",
+            "--setenv=PYTHONUNBUFFERED=1",
+        ]
+    )
+    if scope == "system":
+        command.extend(
+            [
+                f"--property=User={os.geteuid()}",
+                f"--property=Group={os.getegid()}",
+            ]
+        )
+    command.extend(
+        [
+            sys.executable,
+            "-m",
+            "hermes_cli.update_owner_restart",
+            "--home",
+            str(home),
+            f"--nonce={nonce}",
+        ]
+    )
+
+    try:
+        launched = subprocess.run(
+            command,
             capture_output=True,
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=5,
+            timeout=10,
         )
-        main_pid = int((shown.stdout or "").strip() or 0)
-    except (FileNotFoundError, subprocess.TimeoutExpired, OSError, ValueError):
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
         return False
-    if shown.returncode != 0 or main_pid <= 0:
-        return False
-    if not _write_gateway_owner_restart_pending(
-        persist_result,
-        code=final_exit_code,
-        owner_pid=main_pid,
-        owner_service=svc_name,
-    ):
-        return False
-    try:
-        import signal as _signal
-
-        os.kill(main_pid, _signal.SIGUSR1)
-    except (ProcessLookupError, PermissionError, OSError):
-        _clear_gateway_owner_restart_pending()
+    if launched.returncode != 0:
+        _clear_owner_restart_request_files()
         return False
     return True
 
@@ -3483,23 +3519,29 @@ def _finish_update_service_finalization(
     )
     result_required = gateway_mode or deferred_owner is not None
     marker_ok = True
-    owner_restart_ok = True
+    verifier_launched = False
     if deferred_owner is not None:
         print()
         print(
-            f"  → Restarting updater-owning service {deferred_owner[2]} last..."
+            f"  → Handing final updater-owner restart for {deferred_owner[2]} "
+            "to an external verifier..."
         )
-        owner_restart_ok = _restart_updater_owning_gateway(
+        verifier_launched = _launch_updater_owner_restart_verifier(
             deferred_owner,
             final_exit_code=0 if final_ok else 1,
             persist_result=result_required,
         )
-        if not owner_restart_ok:
+        if verifier_launched:
+            print(
+                "  → Owner restart verification is pending outside the service "
+                "cgroup; completion will be published only after readiness proof."
+            )
+        else:
             final_ok = False
             marker_ok = _write_gateway_update_exit_code(result_required, 1)
             print(
-                f"  ✗ Could not prepare or signal {deferred_owner[2]} for its "
-                "final restart."
+                f"  ✗ Could not launch the external restart verifier for "
+                f"{deferred_owner[2]}."
             )
     else:
         marker_ok = _write_gateway_update_exit_code(
@@ -3514,6 +3556,12 @@ def _finish_update_service_finalization(
             "updater-owning service running."
         )
 
+    if deferred_owner is not None and verifier_launched:
+        # This process belongs to the owner cgroup that the verifier will tear
+        # down.  Only the external verifier can truthfully publish completion
+        # after observing the replacement process and its readiness ack.
+        return False
+
     print()
     if node_failures:
         print(
@@ -3522,11 +3570,11 @@ def _finish_update_service_finalization(
         )
         print("  Code and Python deps are updated, but the dashboard/TUI may")
         print("  be in a mixed state until the Node deps are rebuilt.")
-    elif final_ok and owner_restart_ok:
+    elif final_ok:
         print("✓ Update complete!")
     else:
         print("⚠ Update finalization incomplete — see the warnings above.")
-    return final_ok and owner_restart_ok
+    return final_ok
 
 def _warn_incomplete_gateway_fleet_restart(failed_units: list) -> None:
     """Print an explicit incomplete-update warning for unrestarted units."""

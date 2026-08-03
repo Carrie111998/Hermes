@@ -1699,71 +1699,33 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 # Resolve Hermes home directory (respects HERMES_HOME override)
 from hermes_constants import get_hermes_home, get_hermes_home_override
-from utils import atomic_json_write, atomic_write_text, is_truthy_value
+from utils import atomic_json_write, is_truthy_value
 _hermes_home = get_hermes_home()
-_OWNER_RESTART_PENDING_FILE = ".update_owner_restart_pending.json"
 
 
 def _current_systemd_gateway_service() -> str | None:
-    """Return the gateway service component that contains this process."""
-    if not sys.platform.startswith("linux"):
-        return None
+    """Return the exact gateway service component containing this process."""
+    from hermes_cli.update_owner_restart import current_systemd_gateway_service
+
+    return current_systemd_gateway_service()
+
+
+def _read_update_terminal_exit_code(home: Path) -> int | None:
+    """Read a generic exit marker or the atomic owner-restart result."""
+    exit_code_path = Path(home) / ".update_exit_code"
+    if exit_code_path.exists():
+        try:
+            return int(exit_code_path.read_text(encoding="utf-8").strip() or "1")
+        except (OSError, TypeError, ValueError):
+            return 1
     try:
-        cgroup_text = Path("/proc/self/cgroup").read_text(
-            encoding="utf-8", errors="replace"
+        from hermes_cli.update_owner_restart import (
+            read_owner_restart_result_exit_code,
         )
-    except OSError:
+
+        return read_owner_restart_result_exit_code(Path(home))
+    except Exception:
         return None
-    for line in cgroup_text.splitlines():
-        cgroup_path = line.split(":", 2)[-1]
-        for component in reversed(cgroup_path.split("/")):
-            if component.startswith("hermes-gateway") and component.endswith(
-                ".service"
-            ):
-                return component.removesuffix(".service")
-    return None
-
-
-def _promote_deferred_owner_update_result() -> bool:
-    """Publish a staged updater result only from the restarted gateway owner.
-
-    The old owner has the PID recorded in the marker and must leave the result
-    non-terminal.  A new process with a different PID proves the owner
-    transition happened and may atomically expose the final exit code to the
-    existing notification paths.
-    """
-    pending_path = _hermes_home / _OWNER_RESTART_PENDING_FILE
-    if not pending_path.exists():
-        return False
-    try:
-        payload = json.loads(pending_path.read_text(encoding="utf-8"))
-        if not isinstance(payload, dict) or payload.get("version") != 1:
-            raise ValueError("unsupported owner restart marker")
-        owner_pid = int(payload.get("owner_pid") or 0)
-        exit_code = int(payload.get("exit_code"))
-        owner_service = payload.get("owner_service")
-        if (
-            owner_pid <= 0
-            or exit_code not in {0, 1}
-            or not isinstance(owner_service, str)
-            or not owner_service.startswith("hermes-gateway")
-        ):
-            raise ValueError("invalid owner restart marker")
-        if owner_pid == os.getpid():
-            return False
-        if owner_service != _current_systemd_gateway_service():
-            return False
-    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
-        logger.warning("Invalid deferred owner update result: %s", exc)
-        return False
-
-    try:
-        atomic_write_text(_hermes_home / ".update_exit_code", str(exit_code))
-        pending_path.unlink(missing_ok=True)
-    except OSError as exc:
-        logger.warning("Could not promote deferred owner update result: %s", exc)
-        return False
-    return True
 
 # Load environment variables from ~/.hermes/.env first.
 # User-managed env files should override stale shell exports on restart.
@@ -11334,6 +11296,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.info("Channel directory built: %d target(s)", ch_count)
         except Exception as e:
             logger.warning("Channel directory build failed: %s", e)
+
+        # A transient verifier in a separate systemd cgroup owns the terminal
+        # update result.  Acknowledge only after this new owner has completed
+        # adapter/config startup and published its running runtime state.  The
+        # verifier independently checks ActiveState, MainPID, and start
+        # generation before it exposes .update_exit_code.
+        try:
+            from hermes_cli.update_owner_restart import (
+                acknowledge_owner_restart_ready,
+            )
+
+            if acknowledge_owner_restart_ready(
+                _hermes_home,
+                current_service=_current_systemd_gateway_service(),
+                current_pid=os.getpid(),
+            ):
+                logger.info("Acknowledged updater-owner restart readiness")
+        except Exception as exc:
+            logger.warning("Could not acknowledge updater-owner readiness: %s", exc)
         
         # Check if we're restarting after a /update command. If the update is
         # still running, keep watching so we notify once it actually finishes.
@@ -20628,6 +20609,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         claimed_path = _hermes_home / ".update_pending.claimed.json"
         output_path = _hermes_home / ".update_output.txt"
         exit_code_path = _hermes_home / ".update_exit_code"
+        owner_result_path = _hermes_home / ".update_owner_restart_result.json"
         prompt_path = _hermes_home / ".update_prompt.json"
 
         loop = asyncio.get_running_loop()
@@ -20676,10 +20658,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # after the first completion check — otherwise a platform that
             # reconnects a few seconds after completion never gets notified.
             while (pending_path.exists() or claimed_path.exists()) and loop.time() < deadline:
-                if exit_code_path.exists() and await self._send_update_notification():
+                if (
+                    _read_update_terminal_exit_code(_hermes_home) is not None
+                    and await self._send_update_notification()
+                ):
                     return
                 await asyncio.sleep(poll_interval)
-            if (pending_path.exists() or claimed_path.exists()) and not exit_code_path.exists():
+            if (
+                pending_path.exists() or claimed_path.exists()
+            ) and _read_update_terminal_exit_code(_hermes_home) is None:
                 exit_code_path.write_text("124", encoding="utf-8")
                 await self._send_update_notification()
             return
@@ -20718,8 +20705,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     logger.debug("Update stream send failed: %s", e)
 
         while loop.time() < deadline:
-            # Check for completion
-            if exit_code_path.exists():
+            # Check for completion.  Owner-managed updates commit their atomic
+            # result JSON before best-effort projection to .update_exit_code.
+            terminal_exit_code = _read_update_terminal_exit_code(_hermes_home)
+            if terminal_exit_code is not None:
                 # Read any remaining output
                 if output_path.exists():
                     try:
@@ -20733,8 +20722,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
                 # Send final status
                 try:
-                    exit_code_raw = exit_code_path.read_text(encoding="utf-8").strip() or "1"
-                    exit_code = int(exit_code_raw)
+                    exit_code = terminal_exit_code
                     if exit_code == 0:
                         await adapter.send(
                             chat_id,
@@ -20752,8 +20740,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     logger.warning("Update final notification failed: %s", e)
 
                 # Cleanup
-                for p in (pending_path, claimed_path, output_path,
-                          exit_code_path, prompt_path):
+                for p in (
+                    pending_path,
+                    claimed_path,
+                    output_path,
+                    exit_code_path,
+                    owner_result_path,
+                    prompt_path,
+                ):
                     p.unlink(missing_ok=True)
                 (_hermes_home / ".update_response").unlink(missing_ok=True)
                 _up_done = self._peek_session_state(session_key)
@@ -20836,7 +20830,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             await asyncio.sleep(poll_interval)
 
         # Timeout
-        if not exit_code_path.exists():
+        if _read_update_terminal_exit_code(_hermes_home) is None:
             logger.warning("Update watcher timed out after %.0fs", timeout)
             exit_code_path.write_text("124", encoding="utf-8")
             await _flush_buffer()
@@ -20848,8 +20842,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
             except Exception:
                 pass
-            for p in (pending_path, claimed_path, output_path,
-                      exit_code_path, prompt_path):
+            for p in (
+                pending_path,
+                claimed_path,
+                output_path,
+                exit_code_path,
+                owner_result_path,
+                prompt_path,
+            ):
                 p.unlink(missing_ok=True)
             (_hermes_home / ".update_response").unlink(missing_ok=True)
             _up_timeout_state = self._peek_session_state(session_key)
@@ -20870,6 +20870,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         claimed_path = _hermes_home / ".update_pending.claimed.json"
         output_path = _hermes_home / ".update_output.txt"
         exit_code_path = _hermes_home / ".update_exit_code"
+        owner_result_path = _hermes_home / ".update_owner_restart_result.json"
 
         if not pending_path.exists() and not claimed_path.exists():
             return False
@@ -20887,22 +20888,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return True
 
             pending = json.loads(claimed_path.read_text(encoding="utf-8"))
-            _promote_deferred_owner_update_result()
             platform_str = pending.get("platform")
             chat_id = pending.get("chat_id")
             chat_type = pending.get("chat_type")
             thread_id = pending.get("thread_id")
             message_id = pending.get("message_id")
 
-            if not exit_code_path.exists():
+            exit_code = _read_update_terminal_exit_code(_hermes_home)
+            if exit_code is None:
                 logger.info("Update notification deferred: update still running")
                 cleanup = False
                 active_pending_path = pending_path
                 claimed_path.replace(pending_path)
                 return False
-
-            exit_code_raw = exit_code_path.read_text(encoding="utf-8").strip() or "1"
-            exit_code = int(exit_code_raw)
 
             # Read the captured update output
             output = ""
@@ -20973,6 +20971,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 claimed_path.unlink(missing_ok=True)
                 output_path.unlink(missing_ok=True)
                 exit_code_path.unlink(missing_ok=True)
+                owner_result_path.unlink(missing_ok=True)
 
         return True
 
