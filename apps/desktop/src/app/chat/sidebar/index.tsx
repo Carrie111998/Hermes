@@ -132,6 +132,7 @@ import {
 } from './projects'
 import { SidebarBlankState, SidebarPinnedEmptyState, SidebarSessionSkeletons } from './section-states'
 import { buildSessionByAnyId } from './session-index'
+import { showSessionSectionsGate } from './session-sections-gate'
 import { SidebarSessionsSection, VIRTUALIZE_THRESHOLD } from './sessions-section'
 import { CONTEXT_SPLIT_KIT, SplitSubmenu } from './split-submenu'
 
@@ -1087,7 +1088,13 @@ export function ChatSidebar({
 
   const showSessionSkeletons = sessionsLoading && sortedSessions.length === 0
 
-  const showSessionSections = showSessionSkeletons || sortedSessions.length > 0 || projectModel.length > 0
+  const showSessionSections = showSessionSectionsGate({
+    showSessionSkeletons,
+    localSessionCount: sortedSessions.length,
+    messagingSessionCount: messagingSessions.length,
+    cronSessionCount: cronSessions.length,
+    projectCount: projectModel.length
+  })
 
   // Each reorderable list reports its OWN new id order; persisting is a direct,
   // typed write — no id-prefix sniffing to figure out which level moved.
