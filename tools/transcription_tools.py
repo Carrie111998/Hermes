@@ -158,6 +158,10 @@ _local_model_name: Optional[str] = None
 # Without it, two concurrent voice messages can both see `_local_model is
 # None` and download/load the whisper model twice (#24767).
 _local_model_lock = threading.Lock()
+# Worker mode intentionally avoids retaining a model in the parent, but the
+# parent must still admit only one child model initialization at a time.  This
+# preserves the same concurrent first-load guarantee as the in-process cache.
+_local_stt_worker_admission_lock = threading.Lock()
 
 # ---------------------------------------------------------------------------
 # Config helpers
@@ -904,16 +908,20 @@ def _transcribe_local_worker(
             request_path = Path(work_dir) / "request.json"
             response_path = Path(work_dir) / "response.json"
             _write_private_worker_json(request_path, request)
-            try:
-                return _run_local_stt_worker_process(
-                    request_path,
-                    response_path,
-                    timeout,
-                )
-            except subprocess.TimeoutExpired:
-                return _local_stt_worker_result(
-                    f"Local STT worker timed out after {timeout:g}s"
-                )
+            # A worker initializes its own model. Serialize admission through
+            # the parent so concurrent voice messages cannot download/load the
+            # same model in multiple children at once (#24767).
+            with _local_stt_worker_admission_lock:
+                try:
+                    return _run_local_stt_worker_process(
+                        request_path,
+                        response_path,
+                        timeout,
+                    )
+                except subprocess.TimeoutExpired:
+                    return _local_stt_worker_result(
+                        f"Local STT worker timed out after {timeout:g}s"
+                    )
     except Exception as exc:
         logger.error("Transient local STT worker failed: %s", exc, exc_info=True)
         return _local_stt_worker_result(f"Local STT worker failed: {exc}")

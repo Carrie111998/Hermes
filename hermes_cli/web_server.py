@@ -895,6 +895,19 @@ _SCHEMA_OVERRIDES: Dict[str, Dict[str, Any]] = {
         "description": "Local faster-whisper model size",
         "options": ["tiny", "base", "small", "medium", "large-v3"],
     },
+    "stt.local.mode": {
+        "type": "select",
+        "description": "Local faster-whisper execution mode",
+        "options": ["worker", "in_process"],
+    },
+    "stt.local.worker_timeout_seconds": {
+        "type": "number",
+        "description": "Maximum seconds for one local STT worker",
+    },
+    "stt.local.worker_max_audio_bytes": {
+        "type": "number",
+        "description": "Maximum audio bytes accepted by one local STT worker",
+    },
     "stt.groq.model": {
         "type": "select",
         "description": "Groq Whisper model",

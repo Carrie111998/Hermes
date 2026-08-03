@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import json
 import subprocess
+import threading
+import time
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -182,6 +184,48 @@ def test_worker_mode_releases_stale_in_process_model(monkeypatch, tmp_path):
     assert result["success"] is True
     assert stt._local_model is None
     assert stt._local_model_name is None
+
+
+def test_worker_admission_serializes_concurrent_model_initialization(monkeypatch, tmp_path):
+    """Concurrent worker requests must not start independent model loads."""
+    audio = tmp_path / "voice.wav"
+    audio.write_bytes(b"fake audio")
+    first_worker_started = threading.Event()
+    release_first_worker = threading.Event()
+    started = []
+    results = []
+
+    def fake_run(request_path, response_path, timeout):
+        started.append(threading.get_ident())
+        if len(started) == 1:
+            first_worker_started.set()
+            assert release_first_worker.wait(timeout=2)
+        return {"success": True, "transcript": "serialized", "provider": "local"}
+
+    monkeypatch.setattr(stt, "_run_local_stt_worker_process", fake_run)
+    monkeypatch.setattr(stt, "_local_stt_worker_admission_lock", threading.Lock())
+
+    def transcribe():
+        results.append(stt._transcribe_local_worker(str(audio), "medium", _worker_config()))
+
+    first = threading.Thread(target=transcribe)
+    second = threading.Thread(target=transcribe)
+    first.start()
+    assert first_worker_started.wait(timeout=2)
+    second.start()
+    time.sleep(0.05)
+    assert len(started) == 1
+    release_first_worker.set()
+    first.join(timeout=2)
+    second.join(timeout=2)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert len(started) == 2
+    assert results == [
+        {"success": True, "transcript": "serialized", "provider": "local"},
+        {"success": True, "transcript": "serialized", "provider": "local"},
+    ]
 
 
 def test_worker_input_size_is_bounded_before_child_spawn(monkeypatch, tmp_path):

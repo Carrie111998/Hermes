@@ -1771,7 +1771,7 @@ def _run_post_setup(post_setup_key: str):
             result = _pip_install(["-U", "faster-whisper", "--quiet"], timeout=300)
             if result.returncode == 0:
                 _print_success("    faster-whisper installed")
-                _print_info("    Model sizes: tiny, base (default), small, medium, large-v3")
+                _print_info("    Model sizes: tiny, base, small, medium (default), large-v3")
                 _print_info("    Change via stt.local.model in ~/.hermes/config.yaml")
             else:
                 _print_warning("    faster-whisper install failed:")
