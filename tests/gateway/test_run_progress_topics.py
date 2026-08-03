@@ -103,6 +103,18 @@ class ProgressCaptureAdapter(BasePlatformAdapter):
         return {"id": chat_id}
 
 
+class DiscordProgressCaptureAdapter(ProgressCaptureAdapter):
+    """Capture sends while exercising Discord's real preview formatter."""
+
+    def __init__(self):
+        super().__init__(platform=Platform.DISCORD)
+
+    def format_tool_preview(self, preview, **kwargs):
+        from plugins.platforms.discord.adapter import DiscordAdapter
+
+        return DiscordAdapter.format_tool_preview(self, preview, **kwargs)
+
+
 class SmallLimitProgressAdapter(ProgressCaptureAdapter):
     """Adapter with a tiny platform limit to exercise progress rollover."""
 
@@ -459,6 +471,28 @@ class LongPreviewAgent:
 
     def run_conversation(self, message, conversation_history=None, task_id=None):
         self.tool_progress_callback("tool.started", "terminal", self.LONG_CMD, {})
+        time.sleep(0.35)
+        return {
+            "final_response": "done",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
+class UrlPreviewAgent:
+    URL = "https://hermes-agent.nousresearch.com/docs/gateway/discord/tool-progress"
+
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        self.tool_progress_callback(
+            "tool.started",
+            "web_extract",
+            self.URL,
+            {"urls": [self.URL]},
+        )
         time.sleep(0.35)
         return {
             "final_response": "done",
@@ -1221,6 +1255,57 @@ def test_all_mode_no_truncation_when_preview_fits(monkeypatch, tmp_path):
     content = adapter.sent[0]["content"]
     # With a 200-char cap, the 165-char command should NOT be truncated
     assert "..." not in content, f"Preview was truncated when it shouldn't be: {content}"
+def test_discord_truncated_tool_url_links_to_full_destination(monkeypatch, tmp_path):
+    """The real gateway path must retain the URL beyond its visible cap."""
+    import yaml
+
+    monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "all")
+
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = UrlPreviewAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    (tmp_path / "config.yaml").write_text(
+        yaml.dump({"display": {"tool_preview_length": 0}}),
+        encoding="utf-8",
+    )
+
+    adapter = DiscordProgressCaptureAdapter()
+    runner = _make_runner(adapter, tmp_path)
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {"api_key": "***"},
+    )
+
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="12345",
+        chat_type="dm",
+        thread_id=None,
+    )
+    result = asyncio.get_event_loop().run_until_complete(
+        runner._run_agent(
+            message="hello",
+            context_prompt="",
+            history=[],
+            source=source,
+            session_id="sess-discord-url",
+            session_key="agent:main:discord:dm:12345",
+        )
+    )
+
+    assert result["final_response"] == "done"
+    assert adapter.sent
+    visible = UrlPreviewAgent.URL[:37] + "..."
+    label = visible.removeprefix("https://")
+    assert f"[{label}](<{UrlPreviewAgent.URL}>)" in adapter.sent[0]["content"]
 
 
 class CommentaryAgent:

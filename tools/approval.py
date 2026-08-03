@@ -2457,7 +2457,10 @@ def prompt_dangerous_approval(command: str, description: str,
             prompt_toolkit integration. Signature:
             (command, description, *, allow_permanent=True, ...) -> str.
 
-    Returns: 'once', 'session', 'always', or 'deny'
+    Returns: 'once', 'session', 'always', 'deny', or 'timeout'.
+        'timeout' means the prompt expired without a user response — the
+        action must still be blocked (fail-closed), but callers should
+        report it as "no response" rather than an explicit user denial.
     """
     if timeout_seconds is None:
         timeout_seconds = _get_approval_timeout()
@@ -2559,7 +2562,10 @@ def prompt_dangerous_approval(command: str, description: str,
 
             if thread.is_alive():
                 print("\n" + t("approval.timeout"))
-                return "deny"
+                # Distinct from an explicit deny: the user never answered.
+                # Callers still block (fail-closed) but tell the agent the
+                # prompt timed out instead of claiming the user refused.
+                return "timeout"
 
             choice = result["choice"]
             if choice in {'o', 'once'}:
@@ -2912,7 +2918,28 @@ def _request_exact_execution_approval(
         choice=choice,
     )
     if choice != "once":
-        return _exact_plan_capability_required(execution_kind)
+        timed_out = choice == "timeout"
+        outcome = "timeout" if timed_out else "denied"
+        reason = (
+            "timed out without user response"
+            if timed_out
+            else "was denied by the user"
+        )
+        addendum = " Silence is not consent." if timed_out else ""
+        return {
+            "approved": False,
+            "message": (
+                f"BLOCKED: Exact {execution_kind} operation {reason}. The "
+                "user has NOT consented to this action. Do NOT retry it, do "
+                "NOT rephrase it, and do NOT attempt the same outcome with a "
+                f"different command or tool.{addendum}"
+            ),
+            "status": "blocked",
+            "outcome": outcome,
+            "error_code": f"exact_execution_{outcome}",
+            "user_consent": False,
+            "execution_subject_sha256": exact_id,
+        }
     return {
         "approved": True,
         "message": None,
@@ -3486,4 +3513,8 @@ def request_elicitation_consent(
 
     if choice == "once":
         return "accept"
+    if choice == "timeout":
+        # Prompt expired without a user response — mirror the gateway's
+        # unresolved outcome ("cancel") rather than an explicit decline.
+        return "cancel"
     return "decline"
