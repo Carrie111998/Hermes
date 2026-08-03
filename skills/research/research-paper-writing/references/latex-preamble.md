@@ -56,4 +56,3 @@ Add these packages to any paper for professional quality. They are compatible wi
 - `siunitx` handles decimal alignment in tables via the `S` column type — eliminates manual spacing.
 - `cleveref` must be loaded **after** `hyperref`. Most conference .sty files load hyperref, so put cleveref last.
 - Check if the conference template already loads any of these (especially `algorithm`, `amsmath`, `graphicx`). Don't double-load.
-
