@@ -1145,6 +1145,22 @@ def _capture_after_mode() -> str:
     return mode if mode in {"som", "vision", "ax"} else "som"
 
 
+def _managed_install() -> bool:
+    """True when a package manager (NixOS) owns this install's modes.
+
+    Mirrors the check ``hermes_cli.config._secure_dir`` makes internally, read
+    here so the *creation* mode honours the same carve-out as reconciliation.
+    Import is local and failure means "not managed": an unimportable config
+    module is the single-user source-install case, where 0700 is correct.
+    """
+    try:
+        from hermes_cli.config import is_managed
+
+        return bool(is_managed())
+    except Exception:  # pragma: no cover - defensive
+        return False
+
+
 def _vision_cache_dir():
     """Return the vision scratch dir, created owner-only.
 
@@ -1160,7 +1176,16 @@ def _vision_cache_dir():
     which is what keeps this correct for deployments that are not a single
     desktop user:
 
-    * managed/NixOS installs are skipped (the activation script owns modes);
+    * managed/NixOS installs are skipped — at *creation* as well as at
+      reconciliation. ``cache/vision`` is not one of the directories the
+      module's ``systemd.tmpfiles`` rules pre-create, so it is made lazily at
+      runtime and a hardcoded 0700 would be the only thing setting its mode.
+      The module pins ``stateDir/.hermes`` to ``2770`` and runs the gateway
+      with ``UMask = "0007"`` so "interactive users in the hermes group can
+      read/write" gateway-created state; the gateway and a hostUsers CLI
+      share one ``$HERMES_HOME``, so a 0700 cache locks whichever ran second
+      out with EACCES. Skipping the explicit mode lets the inherited setgid +
+      umask land 2770, matching ``ensure_hermes_home``'s managed branch;
     * ``HERMES_HOME_MODE`` stays honored for the web-server traversal hatch;
     * ``HERMES_UID``/``HERMES_GID`` ownership is applied, so a root-created
       dir does not lock out uid-mapped Docker workers (#34107).
@@ -1175,6 +1200,9 @@ def _vision_cache_dir():
     from hermes_constants import get_hermes_dir
 
     cache_dir = get_hermes_dir("cache/vision", "temp_vision_images")
+    if _managed_install():
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        return cache_dir
     # mode= is honored only for the leaf and is not masked by umask.
     cache_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     try:

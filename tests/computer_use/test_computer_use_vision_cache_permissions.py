@@ -71,6 +71,57 @@ def hermes_home(tmp_path, monkeypatch):
     return home
 
 
+@pytest.fixture
+def neutralized_secure_dir(monkeypatch):
+    """Make the post-creation reconciliation step a no-op.
+
+    ``_vision_cache_dir`` hardens twice over: ``mode=`` on the ``mkdir`` call,
+    then ``hermes_cli.config._secure_dir`` to reconcile policy. Either
+    mechanism alone satisfies a plain "is it 0700?" assertion, so the two mask
+    each other — with the reconciler in play every mode assertion in this file
+    stays green even if ``mode=`` is deleted.
+
+    Stubbing the reconciler out isolates the creation mode as the *only* thing
+    that can produce the observed bits. Patched on ``hermes_cli.config``
+    rather than on the caller because the production code imports it lazily
+    inside the function, so the attribute is resolved at call time.
+    """
+    import hermes_cli.config as hermes_config
+
+    calls = []
+
+    def _recording_noop(path):
+        calls.append(str(path))
+
+    monkeypatch.setattr(hermes_config, "_secure_dir", _recording_noop)
+    return calls
+
+
+@pytest.fixture
+def managed_nixos_home(hermes_home, monkeypatch):
+    """Simulate a managed NixOS install that shares state via the hermes group.
+
+    Reproduces the two conditions ``nix/nixosModules.nix`` actually creates:
+
+    * ``systemd.tmpfiles`` pins ``stateDir/.hermes`` to ``2770`` — setgid,
+      group-rwx — so the gateway and interactive ``hostUsers`` share it;
+    * the service runs with ``UMask = "0007"``, commented "files created by
+      the gateway should be group-writable so interactive users in the hermes
+      group can read/write them".
+
+    ``cache/vision`` is *not* in those tmpfiles rules, so it is created lazily
+    at runtime under exactly this umask — which is why the creation mode, not
+    just the reconciliation, has to honour the carve-out.
+    """
+    monkeypatch.setenv("HERMES_MANAGED", "nixos")
+    os.chmod(hermes_home, 0o2770)
+    previous = os.umask(0o007)
+    try:
+        yield hermes_home
+    finally:
+        os.umask(previous)
+
+
 def test_fresh_vision_cache_dir_has_no_group_or_other_access(
     hermes_home, permissive_umask
 ):
@@ -194,6 +245,96 @@ def test_managed_mode_leaves_existing_permissions_alone(
     from tools.computer_use.tool import _vision_cache_dir
 
     assert _mode(_vision_cache_dir()) == 0o750, "managed-mode permissions overridden"
+
+
+def test_creation_mode_alone_yields_owner_only(hermes_home, neutralized_secure_dir):
+    """``mode=`` on the ``mkdir`` call must be doing real work by itself.
+
+    Two mechanisms harden this directory and either one satisfies a bare
+    "is it 0700?" check, so they mask each other: with ``_secure_dir`` in play
+    every mode assertion in this file stays green even if ``mode=`` is deleted.
+    Here the reconciler is stubbed to a no-op, so the only thing that can
+    produce owner-only bits is the mode passed at creation.
+
+    This is the TOCTOU guarantee made observable. The window ``mode=`` closes —
+    the instant between ``mkdir`` and a follow-up ``chmod`` where the captures
+    directory sits world-readable — cannot be asserted by racing creation, but
+    "correct without any chmod at all" is exactly equivalent and is
+    deterministic.
+
+    Deliberately not stacked with ``permissive_umask`` so a 0700 result cannot
+    be an accident of a restrictive ambient umask on the machine running the
+    suite; the sibling test below forces the umask wide open instead.
+    """
+    from tools.computer_use.tool import _vision_cache_dir
+
+    cache_dir = _vision_cache_dir()
+
+    assert cache_dir.is_dir()
+    assert neutralized_secure_dir == [
+        str(cache_dir)
+    ], "reconciler stub was not exercised; this test is not isolating creation"
+    mode = _mode(cache_dir)
+    assert mode & GROUP_OTHER_BITS == 0, (
+        f"with the reconciler neutralized {cache_dir} is group/other-accessible "
+        f"({oct(mode)}) — the mode= on mkdir is not being applied, so the "
+        "mkdir->chmod TOCTOU window is open"
+    )
+    assert mode & stat.S_IRWXU == stat.S_IRWXU, "owner must retain full access"
+
+
+def test_creation_mode_is_not_inherited_from_a_permissive_umask(
+    hermes_home, permissive_umask, neutralized_secure_dir
+):
+    """Same isolation, with the umask forced wide open.
+
+    Together with the test above this pins the claim precisely: 0700 comes from
+    the ``mode=`` argument, not from the ambient umask and not from the
+    reconciler. ``Path.mkdir`` masks its ``mode`` with the umask, so ``mode=``
+    of 0700 under ``umask 022`` still yields 0700 — but a *missing* ``mode=``
+    yields 0755 and fails here.
+    """
+    from tools.computer_use.tool import _vision_cache_dir
+
+    mode = _mode(_vision_cache_dir())
+
+    assert neutralized_secure_dir, "reconciler stub was not exercised"
+    assert (
+        mode & GROUP_OTHER_BITS == 0
+    ), f"umask-derived mode leaked with the reconciler neutralized: {oct(mode)}"
+
+
+def test_managed_mode_fresh_cache_keeps_group_sharing(managed_nixos_home):
+    """A *newly created* cache on NixOS must stay group-shareable.
+
+    The sibling test above covers a pre-existing directory, where
+    ``_secure_dir``'s ``is_managed()`` early return is enough. This is the
+    other managed path: the directory does not exist yet, so the mode passed at
+    *creation* is the only thing that decides it — and ``cache/vision`` is not
+    among the directories ``nix/nixosModules.nix`` pre-creates via
+    ``systemd.tmpfiles``, so on a managed host it is always this path.
+
+    Forcing 0700 here would not merely be cosmetic. The module shares
+    ``$HERMES_HOME`` between the gateway service and interactive ``hostUsers``
+    through the hermes group (``2770`` + ``UMask = "0007"`` + a deliberate
+    refusal to ``chown -R``, which strips setgid). A 0700 cache created by
+    whichever side runs first makes the capture path fail with EACCES for the
+    other.
+    """
+    from tools.computer_use.tool import _vision_cache_dir
+
+    expected = managed_nixos_home / "cache" / "vision"
+    assert not expected.exists(), "fixture precondition: dir must be absent"
+
+    cache_dir = _vision_cache_dir()
+
+    assert cache_dir.is_dir(), "managed mode must still create the cache dir"
+    mode = _mode(cache_dir)
+    assert mode & stat.S_IRWXG, (
+        f"fresh managed-mode {cache_dir} dropped group access ({oct(mode)}); the "
+        "NixOS module's hermes-group sharing (2770 + UMask=0007) is broken, so "
+        "an interactive hostUsers CLI and the gateway can no longer share it"
+    )
 
 
 def test_home_mode_override_is_honored(hermes_home, permissive_umask, monkeypatch):

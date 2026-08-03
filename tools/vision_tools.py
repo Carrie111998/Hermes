@@ -72,8 +72,24 @@ logger = logging.getLogger(__name__)
 _debug = DebugSession("vision_tools", env_var="VISION_TOOLS_DEBUG")
 
 
+def _managed_install() -> bool:
+    """True when a package manager (NixOS) owns this install's modes.
+
+    Mirrors the check ``hermes_cli.config._secure_dir`` makes internally, read
+    here so the *creation* mode honours the same carve-out as reconciliation.
+    Import is local and failure means "not managed": an unimportable config
+    module is the single-user source-install case, where 0700 is correct.
+    """
+    try:
+        from hermes_cli.config import is_managed
+
+        return bool(is_managed())
+    except Exception:  # pragma: no cover - defensive
+        return False
+
+
 def _secure_cache_dir(new_subpath: str, old_name: str) -> Path:
-    """Resolve a Hermes media cache dir and create it owner-only (0700).
+    """Resolve a Hermes media cache dir, creating it owner-only (0700).
 
     A downloaded image or video is as sensitive as whatever the user pointed
     the agent at — a private attachment, an internal screenshot, a document
@@ -93,6 +109,20 @@ def _secure_cache_dir(new_subpath: str, old_name: str) -> Path:
     ownership is applied so a root-created dir does not lock out uid-mapped
     Docker workers (#34107).
 
+    The managed/NixOS carve-out applies to **creation as well as
+    reconciliation**. ``cache/vision`` and ``cache/video`` are not among the
+    directories the NixOS module's ``systemd.tmpfiles`` rules pre-create, so
+    they are made lazily at runtime; a hardcoded 0700 here would be the only
+    thing setting their mode and would silently override a design that pins
+    ``stateDir/.hermes`` to ``2770`` and runs the gateway with
+    ``UMask = "0007"`` so "interactive users in the hermes group can read/write"
+    gateway-created state. On such a host the gateway and a hostUsers CLI
+    share one ``$HERMES_HOME``, so a 0700 cache created by whichever ran
+    first makes vision fail with EACCES for the other. Skipping the explicit
+    mode there lets the inherited setgid + umask land 2770, matching
+    ``ensure_hermes_home``'s managed branch and its ``logs/curator``
+    lazy-mkdir precedent.
+
     Running it unconditionally also heals a directory an older Hermes left at
     0755. That retroactive tighten is safe *here* because this is
     Hermes-private scratch that the same user re-reads in the same call —
@@ -106,6 +136,11 @@ def _secure_cache_dir(new_subpath: str, old_name: str) -> Path:
     collapsed into one shared helper next to ``_secure_dir``.
     """
     cache_dir = get_hermes_dir(new_subpath, old_name)
+    if _managed_install():
+        # Managed mode: the NixOS-configured umask/setgid owns the mode, and
+        # _secure_dir would no-op anyway.
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        return cache_dir
     # mode= is honored only for the leaf and is not further masked by umask
     # for the bits we care about; _secure_dir reconciles anything unusual.
     cache_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
