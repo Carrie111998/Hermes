@@ -802,6 +802,20 @@ DEFAULT_CONFIG = {
         # not a meaningful recovery, so an unretried blip silently loses the
         # call.
         "transient_retries": 2,
+        # Restrict the auxiliary auto-chain's OpenRouter fallback to free
+        # (:free) SKUs. When true, the OpenRouter step is skipped entirely
+        # unless the resolved fallback model ends in ":free" — a PAID lane
+        # is never engaged for background auxiliary traffic (compression,
+        # title generation, session search, vision, web extract) even when
+        # OPENROUTER_API_KEY is present. Default false keeps the historical
+        # paid fallback for users who want it.
+        "free_only": False,
+        # Override the auxiliary auto-chain's OpenRouter fallback model
+        # (default: google/gemini-3.6-flash, a PAID model). Set e.g.
+        # "nvidia/nemotron-3-ultra-550b-a55b:free" together with
+        # free_only: true to keep auxiliary traffic free-only. A one-time
+        # WARNING is logged whenever a non-":free" model is engaged.
+        "openrouter_model": "",
         # Endpoints that reject NON-streaming chat requests outright (e.g.
         # Tencent Copilot returns HTTP 400 "Non-stream chat request is
         # currently not supported"). Auxiliary calls to a matching endpoint
@@ -1573,6 +1587,18 @@ DEFAULT_CONFIG = {
     # a plugin in plugins/context_engine/<name>/ or ~/.hermes/plugins/.
     "context": {
         "engine": "compressor",
+        # Return freed glibc allocator pages after long-running agent/TUI
+        # cleanup boundaries. Unsupported platforms are safe no-ops.
+        "memory_trim": {
+            "enabled": True,
+            "cooldown_seconds": 60.0,
+            # Successful trim calls are INFO logged every Nth periodic call;
+            # force paths always log so process-close behavior is visible.
+            "log_every_n": 1,
+            # Suppress INFO logs only when a readable RSS change is smaller.
+            # 0 reports every successful configured trim.
+            "info_log_min_delta_mb": 0.0,
+        },
     },
 
     # Persistent memory -- bounded curated memory injected into system prompt
@@ -2611,6 +2637,9 @@ DEFAULT_CONFIG = {
         # 100MB, so it only runs at startup, and only when prune deleted
         # ≥1 session.
         "vacuum_after_prune": True,
+        # Minimum days between successful VACUUM rewrites. Pruning can still
+        # run on its normal cadence while SQLite reuses the freed pages.
+        "min_vacuum_interval_days": 30,
         # Minimum hours between auto-maintenance runs (avoids repeating
         # the sweep on every CLI invocation).  Tracked via state_meta in
         # state.db itself, so it's shared across all processes.
