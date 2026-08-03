@@ -17,8 +17,8 @@ export function resolveMediaRequestPath(pathname: string): string {
 }
 
 /**
- * hermes:readFileDataUrl / hermes:readFileText IPC handlers: a renderer-supplied
- * path → a bridged fs path.
+ * hermes:readFileDataUrl / hermes:readFileDataUrlForAttach / hermes:readFileText
+ * IPC handlers: a renderer-supplied path → a bridged fs path.
  */
 export function resolveIpcFileReadPath(filePath: unknown): string {
   return resolveLocalReadPath(String(filePath ?? ''))
