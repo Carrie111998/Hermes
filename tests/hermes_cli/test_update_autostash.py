@@ -59,7 +59,7 @@ def _setup_update_mocks(monkeypatch, tmp_path):
     """Common setup for cmd_update tests."""
     (tmp_path / ".git").mkdir()
     monkeypatch.setattr(hermes_main, "PROJECT_ROOT", tmp_path)
-    monkeypatch.setattr(hermes_main, "_stash_local_changes_if_needed", lambda *a, **kw: None)
+    monkeypatch.setattr(hermes_main, "_stash_local_changes_if_needed", lambda *a, **kw: (None, []))
     monkeypatch.setattr(hermes_main, "_restore_stashed_changes", lambda *a, **kw: True)
     monkeypatch.setattr(hermes_config, "get_missing_env_vars", lambda required_only=True: [])
     monkeypatch.setattr(hermes_config, "get_missing_config_fields", lambda: [])
@@ -172,7 +172,7 @@ def test_cmd_update_skips_stash_restore_when_reset_fails(monkeypatch, tmp_path, 
     # Re-enable stash so it actually returns a ref
     monkeypatch.setattr(
         hermes_main, "_stash_local_changes_if_needed",
-        lambda *a, **kw: "abc123deadbeef",
+        lambda *a, **kw: ("abc123deadbeef", []),
     )
     restore_calls = []
     monkeypatch.setattr(
@@ -208,7 +208,7 @@ def _setup_setting_test(monkeypatch, tmp_path, mode):
     monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/uv" if name == "uv" else None)
     monkeypatch.setattr(
         hermes_main, "_stash_local_changes_if_needed",
-        lambda *a, **kw: "abc123deadbeef",
+        lambda *a, **kw: ("abc123deadbeef", []),
     )
     restore_calls = []
     discard_calls = []
@@ -323,7 +323,7 @@ def test_update_autostash_survives_undeletable_untracked_dir(tmp_path):
     (pkg / "hermes-agent.rb").write_text("formula\n")
     os.chmod(pkg, 0o555)  # undeletable contents, like a root-owned dir
     try:
-        stash_ref = hermes_main._stash_local_changes_if_needed(["git"], tmp_path)
+        stash_ref, _ = hermes_main._stash_local_changes_if_needed(["git"], tmp_path)
         assert stash_ref
 
         # The tracked change is stashed; simulate the updater's checkout window.
@@ -483,7 +483,7 @@ def test_stash_local_changes_renames_reserved_untracked_on_windows(
     # Create a reserved-name untracked file
     (tmp_path / "CON.txt").write_text("con content")
 
-    stash_ref = _stash_local_changes_if_needed(["git"], tmp_path)
+    stash_ref, _ = _stash_local_changes_if_needed(["git"], tmp_path)
     assert stash_ref is not None
 
     # The reserved file was renamed before stash, then the renamed file
@@ -528,12 +528,13 @@ def test_restore_stashed_changes_restores_reserved_names_after_apply(
     # Create a reserved-name untracked file
     (tmp_path / "CON.txt").write_text("con content")
 
-    stash_ref = _stash_local_changes_if_needed(["git"], tmp_path)
+    stash_ref, reserved_renames = _stash_local_changes_if_needed(["git"], tmp_path)
     assert stash_ref is not None
 
     # After restore, original name should be back
     restored = _restore_stashed_changes(
-        ["git"], tmp_path, stash_ref, prompt_user=False
+        ["git"], tmp_path, stash_ref, prompt_user=False,
+        reserved_renames=reserved_renames,
     )
     assert restored is True
 
@@ -671,7 +672,7 @@ def test_manual_stash_apply_recovery_via_sidecar(
     # Create a reserved-name untracked file
     (tmp_path / "CON.txt").write_text("con content")
 
-    stash_ref = _stash_local_changes_if_needed(["git"], tmp_path)
+    stash_ref, _ = _stash_local_changes_if_needed(["git"], tmp_path)
     assert stash_ref is not None
     assert not (tmp_path / "CON.txt").exists()
     # Sidecar was stashed along with the renamed file; not in working tree.

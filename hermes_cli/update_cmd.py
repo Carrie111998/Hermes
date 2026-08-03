@@ -923,7 +923,9 @@ def _restore_reserved_renames(
                 )
 
 
-def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[str]:
+def _stash_local_changes_if_needed(
+    git_cmd: list[str], cwd: Path
+) -> tuple[Optional[str], list[tuple[Path, Path]]]:
     status = subprocess.run(
         git_cmd + ["status", "--porcelain"],
         cwd=cwd,
@@ -932,7 +934,7 @@ def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[st
         check=True,
     )
     if not status.stdout.strip():
-        return None
+        return None, []
 
     # If the index has unmerged entries (e.g. from an interrupted merge/rebase),
     # git stash will fail with "needs merge / could not write index".  Clear the
@@ -1046,7 +1048,7 @@ def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[st
                 push.returncode, push.args, output=push.stdout, stderr=push.stderr
             )
 
-    return stash_ref
+    return stash_ref, _reserved_name_backups
 
 def _resolve_stash_selector(
     git_cmd: list[str], cwd: Path, stash_ref: str
@@ -1113,6 +1115,7 @@ def _restore_stashed_changes(
     stash_ref: str,
     prompt_user: bool = False,
     input_fn=None,
+    reserved_renames: list[tuple[Path, Path]] | None = None,
 ) -> bool:
     if prompt_user:
         print()
@@ -1150,7 +1153,10 @@ def _restore_stashed_changes(
     )
 
     # Restore any files that were renamed before stash due to Windows reserved names
-    _restore_reserved_renames(cwd)
+    if reserved_renames is not None:
+        _restore_reserved_renames(cwd, reserved_renames)
+    else:
+        _restore_reserved_renames(cwd)
 
     # Check for unmerged (conflicted) files — can happen even when returncode is 0
     unmerged = subprocess.run(
@@ -3489,7 +3495,9 @@ def _cmd_update_impl(args, gateway_mode: bool):
             )
             print(f"  ⚠ Currently on {label} — switching to {branch} for update...")
             # Stash before checkout so uncommitted work isn't lost
-            auto_stash_ref = _m()._stash_local_changes_if_needed(git_cmd, _m().PROJECT_ROOT)
+            auto_stash_ref, reserved_renames = _m()._stash_local_changes_if_needed(
+                git_cmd, _m().PROJECT_ROOT
+            )
             checkout_result = subprocess.run(
                 git_cmd + ["checkout", branch],
                 cwd=_m().PROJECT_ROOT,
@@ -3517,13 +3525,16 @@ def _cmd_update_impl(args, gateway_mode: bool):
                             auto_stash_ref,
                             prompt_user=False,
                             input_fn=gw_input_fn,
+                            reserved_renames=reserved_renames,
                         )
                     print(f"✗ Branch '{branch}' does not exist locally or on origin.")
                     if track_result.stderr.strip():
                         print(f"  {track_result.stderr.strip().splitlines()[0]}")
                     sys.exit(1)
         else:
-            auto_stash_ref = _m()._stash_local_changes_if_needed(git_cmd, _m().PROJECT_ROOT)
+            auto_stash_ref, reserved_renames = _m()._stash_local_changes_if_needed(
+                git_cmd, _m().PROJECT_ROOT
+            )
 
         prompt_for_restore = (
             auto_stash_ref is not None
@@ -3556,6 +3567,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     auto_stash_ref,
                     prompt_user=prompt_for_restore,
                     input_fn=gw_input_fn,
+                    reserved_renames=reserved_renames,
                 )
             if current_branch not in {branch, "HEAD"}:
                 subprocess.run(
@@ -3731,6 +3743,13 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
             update_succeeded = True
         finally:
+            # Always restore temporarily-renamed reserved files, regardless of
+            # whether the update succeeded — the rename is purely temporary and
+            # has no bearing on the stash contents.
+            if reserved_renames:
+                _restore_reserved_renames(_m().PROJECT_ROOT, reserved_renames)
+                _load_and_clear_reserved_rename_map(_m().PROJECT_ROOT)
+
             if auto_stash_ref is not None:
                 # Don't attempt stash restore if the code update itself failed —
                 # working tree is in an unknown state.
@@ -3755,6 +3774,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         auto_stash_ref,
                         prompt_user=prompt_for_restore,
                         input_fn=gw_input_fn,
+                        reserved_renames=reserved_renames,
                     )
 
         _invalidate_update_cache()
