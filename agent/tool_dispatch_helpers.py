@@ -37,7 +37,6 @@ from agent.tool_result_classification import (
 )
 from tools.budget_config import (
     DEFAULT_BUDGET,
-    DEFAULT_RESULT_TOKEN_LIMIT,
     BudgetConfig,
 )
 from tools.threat_patterns import scan_for_threats
@@ -547,8 +546,6 @@ def make_tool_result_message(
     effect_disposition: str | None = None,
     env=None,
     budget_config: BudgetConfig = DEFAULT_BUDGET,
-    result_token_limit: int = DEFAULT_RESULT_TOKEN_LIMIT,
-    override_requested: bool = False,
     source_args: Dict[str, Any] | None = None,
     token_counter: TokenCounter | None = None,
 ) -> dict:
@@ -578,8 +575,6 @@ def make_tool_result_message(
         tool_use_id=tool_call_id,
         env=env,
         config=budget_config,
-        limit_tokens=result_token_limit,
-        override_requested=override_requested,
         source_args=source_args,
         token_counter=token_counter,
     )
@@ -590,7 +585,7 @@ def make_tool_result_message(
         "content": finalized,
         "tool_call_id": tool_call_id,
     }
-    if budget_outcome.truncated or budget_outcome.override_requested:
+    if budget_outcome.truncated:
         message["_tool_result_budget"] = budget_outcome.as_metadata()
     try:
         risk_metadata = _tool_output_risk_metadata(name, content)
