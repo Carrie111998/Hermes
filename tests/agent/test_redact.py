@@ -858,6 +858,15 @@ class TestEgressSecretValueMasking:
         assert self._OPAQUE not in result
         assert result == "token *** in output"
 
+    def test_masks_lowercase_env_name_value(self, monkeypatch):
+        """Suffix match is case-insensitive — a lowercase env var name
+        (e.g. from a .env carrying ``db_password=``) must still be caught,
+        matching the sibling exact-value masker's behavior."""
+        monkeypatch.setitem(os.environ, "egress_test_db_password", self._OPAQUE)
+        result = mask_egress_secret_values(f"the db password is {self._OPAQUE}")
+        assert self._OPAQUE not in result
+        assert "***" in result
+
     def test_masks_extra_values(self):
         result = mask_egress_secret_values(
             f"FOO={self._OPAQUE}", extra_values={self._OPAQUE}
