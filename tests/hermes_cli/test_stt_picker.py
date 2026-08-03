@@ -63,6 +63,13 @@ class TestConfigWrites:
         # Legacy key is popped so the read-time shim can't override the pick.
         assert "use_gateway" not in config["stt"]
 
+    def test_write_provider_config_sets_gladia(self):
+        config = {}
+        prov = _stt_provider_named("Gladia")
+        _write_provider_config(prov, config, managed_feature=None)
+        assert config["stt"]["provider"] == "gladia"
+        assert "use_gateway" not in config["stt"]
+
 
     def test_apply_provider_selection_stt(self):
         config = {}
