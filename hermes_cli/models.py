@@ -1536,11 +1536,10 @@ def fetch_openrouter_models(
         pass
 
     preferred_ids = [mid for mid, _ in fallback]
-    extra_set = set(extra_ids)
     for extra_id in extra_ids:
         if extra_id not in preferred_ids:
             preferred_ids.append(extra_id)
-            fallback.append((extra_id, "custom"))
+            fallback.append((extra_id, ""))
 
     try:
         req = urllib.request.Request(
@@ -1577,15 +1576,9 @@ def fetch_openrouter_models(
         if not _openrouter_model_supports_tools(live_item):
             continue
         if preferred_id == silent_default:
-            # Keep the silent-default badge through the live refresh so the
-            # picker shows which model Hermes lands on when none is selected.
             desc = "default"
-        elif _openrouter_model_is_free(live_item.get("pricing")):
-            desc = "free"
-        elif preferred_id in extra_set:
-            desc = "custom"
         else:
-            desc = ""
+            desc = "free" if _openrouter_model_is_free(live_item.get("pricing")) else ""
         curated.append((preferred_id, desc))
 
     if not curated:

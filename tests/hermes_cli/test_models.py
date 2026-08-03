@@ -80,7 +80,7 @@ class TestFetchOpenRouterModels:
         ids = [mid for mid, _ in models]
         assert "anthropic/claude-opus-4.6" in ids
         assert "google/gemini-2.5-flash" in ids
-        assert ("google/gemini-2.5-flash", "custom") in models
+        assert ("google/gemini-2.5-flash", "") in models
 
     def test_extra_models_in_fallback_when_offline(self, monkeypatch):
         """User-configured openrouter.extra_models remain in fallback list during fetch failure."""
