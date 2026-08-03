@@ -609,7 +609,7 @@ def _queue_current_failure(
         failed_codes, failed_overflow, failed_valid = _positive_mapping_codes(
             source.get("failed_codes")
         )
-        _retry_codes, retry_overflow, retry_valid = _positive_mapping_codes(
+        retry_codes, retry_overflow, retry_valid = _positive_mapping_codes(
             source.get("retry_codes")
         )
         if reason_overflow or failed_overflow or retry_overflow:
@@ -617,7 +617,7 @@ def _queue_current_failure(
         if not reasons_valid or not failed_valid or not retry_valid:
             return "unknown", "invalid_failure_evidence"
         classified = _classify_registered_codes(
-            reasons + failed_codes,
+            reasons + retry_codes + failed_codes,
             capability="claude_visibility",
         )
         if classified is not None:
@@ -730,12 +730,20 @@ def _queue(
                 required_for_service_impact=True,
             ),
         }
+    ledger_not_applicable = False
     if feature_flag is False:
         ledger_state: State = "healthy"
         ledger_code = "optional_feature_disabled"
     elif feature_flag is None:
         ledger_state = "unknown"
         ledger_code = "invalid_feature_flag"
+    elif name == "mirror_jobs" and work["state"] == "healthy":
+        ledger_state = "healthy"
+        ledger_code = "not_applicable"
+        ledger_not_applicable = True
+    elif name == "mirror_jobs":
+        ledger_state = "unknown"
+        ledger_code = cast(str, work["code"])
     elif ledger_valid is True:
         ledger_state = "healthy"
         ledger_code = "terminal_resolution_consistent"
@@ -765,11 +773,13 @@ def _queue(
         observed_at=observed_at,
         freshness=(
             _freshness("healthy", "current_observation")
-            if observed_at is not None and ledger_valid is not None
+            if ledger_not_applicable or ledger_valid is not None
             else _freshness("unknown", "not_tracked")
         ),
         lifecycle_context=(
-            "not_applicable" if feature_flag is False else "current"
+            "not_applicable"
+            if feature_flag is False or ledger_not_applicable
+            else "current"
         ),
     )
     return {

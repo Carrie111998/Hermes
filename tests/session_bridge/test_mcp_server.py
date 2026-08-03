@@ -2826,11 +2826,11 @@ def test_session_status_adds_evidence_from_one_sequential_composite_observation(
         "counts": {
             "claude_pending": 0,
             "claude_leased": 0,
-            "claude_retry": 0,
+            "claude_retry": 1,
             "claude_visible": 0,
             "claude_failed": 0,
         },
-        "retry_codes": {},
+        "retry_codes": {"creation_ambiguous": 1},
         "failed_codes": {},
         "fatal": [],
         "usage": {"local_day": None, "attempts": 0, "reserved_cost_usd": "0"},
@@ -2924,6 +2924,10 @@ def test_session_status_adds_evidence_from_one_sequential_composite_observation(
     assert status["sidebar"] == expected_legacy["sidebar"]
     evidence = status["evidence_v1"]
     assert evidence["schema_version"] == 1
+    assert evidence["queues"]["claude_visibility"]["work_state"]["state"] == "error"
+    assert evidence["queues"]["claude_visibility"]["work_state"]["code"] == (
+        "creation_ambiguous"
+    )
     assert evidence["catalog"]["providers"]["claude"]["freshness"] == {
         "state": "healthy",
         "code": "within_freshness_limit",

@@ -443,12 +443,16 @@ def create_app(
         hydration_observed_at = time.time()
         visibility = config.claude_visibility
         if visibility.enabled:
-            visibility_status = await asyncio.to_thread(
+            raw_visibility_status = await asyncio.to_thread(
                 store.claude_visibility_status,
                 time.time(),
             )
         else:
-            visibility_status = _disabled_claude_visibility_status()
+            raw_visibility_status = _disabled_claude_visibility_status()
+        visibility_status = _claude_visibility_status_payload(
+            raw_visibility_status,
+            visibility,
+        )
         claude_visibility_observed_at = time.time()
         sidebar_status["last_visible_task_id"] = redact_codex_thread_id(
             sidebar_status.get("last_visible_task_id")

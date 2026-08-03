@@ -381,6 +381,24 @@ def test_all_queue_subaxes_are_independent_and_untracked_axes_stay_unknown() -> 
             assert queue[name]["code"] == "not_tracked"
 
 
+def test_mirror_ledger_is_not_applicable_only_for_valid_authoritative_work() -> None:
+    inputs = healthy_inputs()
+    mirror = build_session_health_evidence(**inputs)["queues"]["mirror_jobs"]
+
+    assert mirror["work_state"]["state"] == "healthy"
+    assert mirror["ledger_integrity"]["state"] == "healthy"
+    assert mirror["ledger_integrity"]["code"] == "not_applicable"
+    assert mirror["ledger_integrity"]["lifecycle_context"] == "not_applicable"
+
+    malformed = healthy_inputs()
+    malformed["coordinator_health"]["queue_counts"]["queued"] = "0"
+    mirror = build_session_health_evidence(**malformed)["queues"]["mirror_jobs"]
+
+    assert mirror["work_state"]["state"] == "unknown"
+    assert mirror["ledger_integrity"]["state"] == "unknown"
+    assert mirror["ledger_integrity"]["code"] == "invalid_measurement"
+
+
 def test_nonzero_pending_and_retry_without_age_is_not_error() -> None:
     inputs = healthy_inputs()
     inputs["coordinator_health"]["queue_counts"]["queued"] = 2
@@ -903,6 +921,21 @@ def test_claude_visibility_current_degraded_reason_is_classified(
     assert work["code"] == expected_code
 
 
+def test_claude_visibility_registered_retry_code_is_current_error() -> None:
+    inputs = healthy_inputs()
+    inputs["claude_visibility_status"]["counts"]["claude_retry"] = 1
+    inputs["claude_visibility_status"]["retry_codes"] = {
+        "creation_ambiguous": 1
+    }
+
+    work = build_session_health_evidence(**inputs)["queues"][
+        "claude_visibility"
+    ]["work_state"]
+
+    assert work["state"] == "error"
+    assert work["code"] == "creation_ambiguous"
+
+
 def test_provider_canonical_timestamp_boundary_and_conflict() -> None:
     canonical = healthy_inputs()
     provider = canonical["coordinator_health"]["providers"]["claude"]
@@ -1068,7 +1101,7 @@ def test_hydration_recent_history_alone_never_selects_current_cause() -> None:
     assert work["code"] == "work_state_readable"
 
 
-def test_claude_retry_codes_alone_are_not_current_errors() -> None:
+def test_claude_unregistered_retry_code_is_unknown() -> None:
     inputs = healthy_inputs()
     inputs["claude_visibility_status"]["counts"]["claude_retry"] = 2
     inputs["claude_visibility_status"]["retry_codes"] = {
@@ -1077,8 +1110,8 @@ def test_claude_retry_codes_alone_are_not_current_errors() -> None:
     work = build_session_health_evidence(**inputs)["queues"][
         "claude_visibility"
     ]["work_state"]
-    assert work["state"] == "healthy"
-    assert work["code"] == "work_state_readable"
+    assert work["state"] == "unknown"
+    assert work["code"] == "unregistered_failure_code"
 
 
 class HostileMapping(Mapping[str, object]):
