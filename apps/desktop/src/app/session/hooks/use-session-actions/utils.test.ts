@@ -1,9 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
+import { textWithoutReferenceLines, WIRE_REFERENCE_KINDS } from '@/components/assistant-ui/reference-kinds'
 import type { ChatMessage } from '@/lib/chat-messages'
 import { $approvalModes, approvalModeForProfile } from '@/store/approval-mode'
 import { $desktopOnboarding } from '@/store/onboarding'
 import { $activeGatewayProfile } from '@/store/profile'
+import { $currentBranch, $currentCwd, setCurrentBranch, setCurrentCwd } from '@/store/session'
 import type { SessionInfo } from '@/types/hermes'
 
 import {
@@ -62,6 +64,36 @@ describe('applyRuntimeInfo credential warnings', () => {
     applyRuntimeInfo({ credential_warning: 'OPENROUTER_API_KEY not set' })
 
     expect($desktopOnboarding.get()).toMatchObject({ reason: null, requested: false })
+  })
+})
+
+describe('applyRuntimeInfo foreground scoping', () => {
+  beforeEach(() => {
+    setCurrentCwd('/main-repo')
+    setCurrentBranch('main')
+  })
+
+  afterEach(() => {
+    setCurrentCwd('')
+    setCurrentBranch('')
+  })
+
+  it('publishes a foreground runtime into the composer atoms', () => {
+    const patch = applyRuntimeInfo({ branch: 'bb/feature', cwd: '/main-repo/worktree' })
+
+    expect($currentCwd.get()).toBe('/main-repo/worktree')
+    expect($currentBranch.get()).toBe('bb/feature')
+    expect(patch).toMatchObject({ branch: 'bb/feature', cwd: '/main-repo/worktree' })
+  })
+
+  it('keeps a background runtime out of the composer atoms but still returns its patch', () => {
+    const patch = applyRuntimeInfo({ branch: 'bb/tile', cwd: '/other-worktree' }, { foreground: false })
+
+    // The main pane's rail must stay on its own tree.
+    expect($currentCwd.get()).toBe('/main-repo')
+    expect($currentBranch.get()).toBe('main')
+    // ...while the caller still gets everything it needs for its own session.
+    expect(patch).toMatchObject({ branch: 'bb/tile', cwd: '/other-worktree' })
   })
 })
 
@@ -542,6 +574,89 @@ describe('preserveLocalPendingTurnMessages', () => {
     ]
 
     expect(preserveLocalPendingTurnMessages(next, previous)).toBe(next)
+  })
+
+  it('does not duplicate the optimistic file turn when the persisted turn carries @file refs', () => {
+    const previous = [
+      msg('1-user', 'user', 'first'),
+      msg('2-assistant', 'assistant', 'first answer'),
+      msg('user-optimistic', 'user', 'text', {
+        attachmentRefs: ['@file:X']
+      })
+    ]
+
+    const next = [
+      msg('1-user-stored', 'user', 'first'),
+      msg('2-assistant-stored', 'assistant', 'first answer'),
+      msg('3-user-stored', 'user', '@file:X\n\ntext')
+    ]
+
+    expect(preserveLocalPendingTurnMessages(next, previous)).toBe(next)
+  })
+
+  it.each(WIRE_REFERENCE_KINDS.filter(kind => kind !== 'file' && kind !== 'image'))(
+    'does not duplicate the optimistic %s turn when the persisted turn carries its directive',
+    kind => {
+      const ref = `@${kind}:X`
+      const previous = [
+        msg('1-user', 'user', 'first'),
+        msg('2-assistant', 'assistant', 'first answer'),
+        msg('user-optimistic', 'user', 'text', {
+          attachmentRefs: [ref]
+        })
+      ]
+
+      const next = [
+        msg('1-user-stored', 'user', 'first'),
+        msg('2-assistant-stored', 'assistant', 'first answer'),
+        msg('3-user-stored', 'user', `${ref}\n\ntext`)
+      ]
+
+      expect(preserveLocalPendingTurnMessages(next, previous)).toBe(next)
+    }
+  )
+
+  it('does not duplicate a directive-only file turn', () => {
+    const previous = [
+      msg('1-user', 'user', 'first'),
+      msg('2-assistant', 'assistant', 'first answer'),
+      msg('user-optimistic', 'user', '', {
+        attachmentRefs: ['@file:X']
+      })
+    ]
+
+    const next = [
+      msg('1-user-stored', 'user', 'first'),
+      msg('2-assistant-stored', 'assistant', 'first answer'),
+      msg('3-user-stored', 'user', '@file:X')
+    ]
+
+    expect(preserveLocalPendingTurnMessages(next, previous)).toBe(next)
+  })
+
+  it('does not duplicate a turn with multiple CRLF directives and Unicode payloads', () => {
+    const refs = ['@file:`資料/über notes.md`', '@url:`https://example.com/café?q=✓`']
+    const previous = [
+      msg('1-user', 'user', 'first'),
+      msg('2-assistant', 'assistant', 'first answer'),
+      msg('user-optimistic', 'user', 'text', {
+        attachmentRefs: refs
+      })
+    ]
+
+    const next = [
+      msg('1-user-stored', 'user', 'first'),
+      msg('2-assistant-stored', 'assistant', 'first answer'),
+      msg('3-user-stored', 'user', `${refs.join('\r\n')}\r\n\r\ntext`)
+    ]
+
+    expect(preserveLocalPendingTurnMessages(next, previous)).toBe(next)
+  })
+
+  it('strips only complete reference lines from visible text', () => {
+    expect(textWithoutReferenceLines('see @file:X here')).toBe('see @file:X here')
+    expect(textWithoutReferenceLines('@file:X trailing prose')).toBe('@file:X trailing prose')
+    expect(textWithoutReferenceLines('  @file:X')).toBe('@file:X')
   })
 
   it('still keeps a genuinely uncommitted optimistic image turn when the persisted text differs', () => {
