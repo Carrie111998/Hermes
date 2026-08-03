@@ -12599,9 +12599,65 @@ async def remove_mcp_server(name: str, profile: Optional[str] = None):
     return {"ok": True}
 
 
+# ---------------------------------------------------------------------------
+# Cache cho POST /api/mcp/servers/{name}/test.
+#
+# Probe (_probe_single_server) luôn connect thật tới MCP server — không rẻ,
+# và các dashboard/backend bên ngoài (vd. NestJS) có thể gọi lại route này
+# thường xuyên chỉ để đếm/hiển thị danh sách tool. Cache theo TTL, key gồm
+# hash config server đó nên SỬA CONFIG (đổi url, transport, tool allowlist...)
+# tự động vô hiệu cache cũ — không cần dọn cache thủ công ở đâu khác.
+#
+# TTL ngắn hơn cho kết quả lỗi (probe fail/timeout) để 1 lần fail tạm thời
+# không bị "đóng băng" quá lâu — lần gọi sau sẽ sớm được thử lại.
+# ---------------------------------------------------------------------------
+_MCP_TEST_CACHE_TTL = 60.0       # giây — TTL cho kết quả test thành công
+_MCP_TEST_ERROR_CACHE_TTL = 5.0  # giây — TTL ngắn hơn cho kết quả lỗi/timeout
+
+_mcp_test_cache: Dict[str, tuple] = {}  # key -> (expires_at_monotonic, result_dict)
+_mcp_test_cache_lock = threading.Lock()
+
+
+def _mcp_test_cache_key(name: str, config: Dict[str, Any]) -> str:
+    """Key theo tên server + hash config hiện tại — sửa config sẽ tự đổi
+    key, khiến cache cũ (ứng với config cũ) không bao giờ được đọc lại nữa.
+    """
+    digest = hashlib.sha256(
+        json.dumps(config, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()[:16]
+    return f"{name}:{digest}"
+
+
+def _get_cached_mcp_test(key: str) -> Optional[Dict[str, Any]]:
+    with _mcp_test_cache_lock:
+        entry = _mcp_test_cache.get(key)
+        if not entry:
+            return None
+        expires_at, value = entry
+        if expires_at < time.monotonic():
+            _mcp_test_cache.pop(key, None)
+            return None
+        return value
+
+
+def _set_cached_mcp_test(
+    key: str, value: Dict[str, Any], ttl: float = _MCP_TEST_CACHE_TTL
+) -> None:
+    with _mcp_test_cache_lock:
+        _mcp_test_cache[key] = (time.monotonic() + ttl, value)
+
+
 @app.post("/api/mcp/servers/{name}/test")
-async def test_mcp_server(name: str, profile: Optional[str] = None):
-    """Connect to the server, list its tools, disconnect.  Returns tool list."""
+async def test_mcp_server(
+    name: str, profile: Optional[str] = None, force: bool = False
+):
+    """Connect to the server, list its tools, disconnect.  Returns tool list.
+
+    Kết quả được cache theo TTL (60s cho OK, 5s cho lỗi), key theo config
+    hiện tại của server — sửa config tự invalidate cache cũ. Truyền
+    ``?force=true`` để luôn probe mới, bỏ qua cache (vd. nút "Test" thủ công
+    trên dashboard).
+    """
     from hermes_cli.mcp_config import (
         _get_mcp_servers,
         _oauth_tokens_present,
@@ -12619,6 +12675,41 @@ async def test_mcp_server(name: str, profile: Optional[str] = None):
     # /auth verification (some providers don't enforce auth on tools/list).
     needs_oauth_token = servers[name].get("auth") == "oauth"
 
+    def _check_oauth_scoped() -> bool:
+        # Cùng lý do dùng _config_profile_scope (không phải _profile_scope) bên
+        # dưới: chỉ cần contextvar HERMES_HOME để đọc đúng token của profile
+        # này, không cần giữ skills lock toàn cục.
+        with _config_profile_scope(profile):
+            return _oauth_tokens_present(name)
+
+    token_present = (
+        await asyncio.to_thread(_check_oauth_scoped) if needs_oauth_token else True
+    )
+
+    # QUAN TRỌNG: cache key phải phụ thuộc vào trạng thái xác thực OAuth hiện
+    # tại. Nếu chỉ key theo config server (như trước), lần test đầu (chưa có
+    # token) bị cache là lỗi "cần xác thực" — sau khi user hoàn tất OAuth
+    # login, request tiếp theo trong TTL vẫn nhận lại y nguyên lỗi cũ dù token
+    # đã tồn tại, vì cache key không đổi. Thêm hậu tố oauth={True/False} khiến
+    # 2 trạng thái trước/sau khi có token dùng 2 cache key khác nhau.
+    cache_key = _mcp_test_cache_key(name, servers[name])
+    if needs_oauth_token:
+        cache_key = f"{cache_key}:oauth={token_present}"
+
+    if not force:
+        cached = _get_cached_mcp_test(cache_key)
+        if cached is not None:
+            return cached
+
+    if needs_oauth_token and not token_present:
+        result = {
+            "ok": False,
+            "error": "OAuth authentication required — no token found.",
+            "tools": [],
+        }
+        _set_cached_mcp_test(cache_key, result, ttl=_MCP_TEST_ERROR_CACHE_TTL)
+        return result
+
     def _probe_scoped():
         # Home-only scope (contextvar), NOT _profile_scope. A probe blocks for
         # as long as the server takes to spawn/connect — a stdio `npx` cold
@@ -12627,36 +12718,37 @@ async def test_mcp_server(name: str, profile: Optional[str] = None):
         # serialized every other endpoint (config/skills/toolsets all take the
         # same lock), so a slow server made unrelated requests time out at 15s.
         # The probe touches no skills globals; it only needs the HERMES_HOME
-        # override for .env interpolation + OAuth token resolution, which the
-        # contextvar provides (copied into this to_thread worker; and
-        # _run_on_mcp_loop re-wraps it onto the MCP event-loop thread).
+        # override for .env interpolation, which the contextvar provides
+        # (copied into this to_thread worker; and _run_on_mcp_loop re-wraps it
+        # onto the MCP event-loop thread).
         with _config_profile_scope(profile):
-            tools = _probe_single_server(name, servers[name], details=details)
-            token_present = _oauth_tokens_present(name) if needs_oauth_token else True
-            return tools, token_present
+            # truncate_descriptions=False: route này phục vụ dashboard/API bên
+            # ngoài (vd. hiển thị popup chi tiết tool) — cần mô tả đầy đủ, không
+            # cắt còn 80 ký tự như mặc định dành cho hiển thị CLI.
+            return _probe_single_server(
+                name, servers[name], details=details, truncate_descriptions=False
+            )
 
     try:
         # Probe blocks on a dedicated MCP event loop — run in a thread so the
         # FastAPI event loop is never blocked.
-        tools, token_present = await asyncio.to_thread(_probe_scoped)
+        tools = await asyncio.to_thread(_probe_scoped)
     except Exception as exc:
-        return {
+        result = {
             "ok": False,
             "error": str(exc),
             "tools": [],
         }
-    if not token_present:
-        return {
-            "ok": False,
-            "error": "OAuth authentication required — no token found.",
-            "tools": [],
-        }
-    return {
+        _set_cached_mcp_test(cache_key, result, ttl=_MCP_TEST_ERROR_CACHE_TTL)
+        return result
+    result = {
         "ok": True,
         "tools": [{"name": t, "description": d} for t, d in tools],
         "prompts": details.get("prompts", 0),
         "resources": details.get("resources", 0),
     }
+    _set_cached_mcp_test(cache_key, result)
+    return result
 
 
 _MCP_DASHBOARD_OAUTH_TTL = 15 * 60
@@ -12744,6 +12836,7 @@ def _run_dashboard_mcp_oauth(flow, cfg: dict) -> None:
                         flow.server_name,
                         cfg,
                         connect_timeout=max(float(cfg.get("connect_timeout", 0) or 0), 315),
+                        truncate_descriptions=False,
                     )
                     if not _oauth_tokens_present(flow.server_name):
                         raise RuntimeError(

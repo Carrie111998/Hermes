@@ -212,7 +212,7 @@ class TestProfileScopedMcp:
         )
         seen = {}
 
-        def fake_probe(name, config, connect_timeout=30, details=None):
+        def fake_probe(name, config, connect_timeout=30, details=None, **kwargs):
             seen["home"] = str(get_hermes_home())
             return [("tool-a", "desc")]
 
@@ -238,7 +238,7 @@ class TestProfileScopedMcp:
         monkeypatch.setattr(
             mcp_config,
             "_probe_single_server",
-            lambda name, config, connect_timeout=30, details=None: [("tool-a", "desc")],
+            lambda name, config, connect_timeout=30, details=None, **kwargs: [("tool-a", "desc")],
         )
         monkeypatch.setattr(mcp_config, "_oauth_tokens_present", lambda name: False)
 
