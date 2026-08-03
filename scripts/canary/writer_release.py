@@ -193,6 +193,7 @@ STOPPED_RELEASE_RECEIPT_SCHEMA = "muncho-canary-stopped-release-publication.v1"
 STOPPED_RELEASE_FAILURE_SCHEMA = "muncho-canary-stopped-release-failure.v1"
 FORK_REPOSITORY = "https://github.com/lomliev/hermes-agent.git"
 DEFAULT_SOURCE_BASE = Path("/opt/muncho-canary-source")
+_STOPPED_SOURCE_RETENTION_COUNT = 12
 DEFAULT_EVIDENCE_BASE = Path("/var/lib/muncho-canary-release-evidence")
 DEFAULT_HOST_RECEIPT_PATH = Path("/etc/muncho/full-canary/host-identity.json")
 DEFAULT_SYSTEMCTL_EXECUTABLE = Path("/usr/bin/systemctl")
@@ -1544,6 +1545,79 @@ def _remove_build_scratch(
         raise RuntimeError("release scratch cleanup did not complete")
 
 
+def _prune_stopped_release_sources(revision: str) -> tuple[str, ...]:
+    """Retain the current and newest bounded stopped-release source trees."""
+
+    if _REVISION_RE.fullmatch(revision) is None:
+        raise ValueError("stopped-release source revision is invalid")
+    parent_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    parent_descriptor = os.open(DEFAULT_SOURCE_BASE, parent_flags)
+    try:
+        parent = os.fstat(parent_descriptor)
+        if (
+            not stat.S_ISDIR(parent.st_mode)
+            or parent.st_uid != _BUILD_OWNER_UID
+            or parent.st_gid != _BUILD_OWNER_GID
+            or stat.S_IMODE(parent.st_mode) & 0o022
+        ):
+            raise RuntimeError("stopped-release source base is not trusted")
+
+        observed: list[tuple[int, str]] = []
+        with os.scandir(parent_descriptor) as entries:
+            for entry in entries:
+                name = entry.name
+                if _REVISION_RE.fullmatch(name) is None:
+                    raise RuntimeError(
+                        "stopped-release source base contains an unknown entry"
+                    )
+                item = entry.stat(follow_symlinks=False)
+                if (
+                    not stat.S_ISDIR(item.st_mode)
+                    or stat.S_ISLNK(item.st_mode)
+                    or item.st_uid != _BUILD_OWNER_UID
+                    or item.st_gid != _BUILD_OWNER_GID
+                    or item.st_dev != parent.st_dev
+                    or stat.S_IMODE(item.st_mode) & 0o022
+                ):
+                    raise RuntimeError(
+                        "stopped-release source entry is not trusted"
+                    )
+                observed.append((item.st_mtime_ns, name))
+
+        names = {name for _mtime_ns, name in observed}
+        if revision not in names:
+            raise RuntimeError("current stopped-release source is absent")
+        newest = {
+            name
+            for _mtime_ns, name in sorted(observed, reverse=True)[
+                :_STOPPED_SOURCE_RETENTION_COUNT
+            ]
+        }
+        retained = newest | {revision}
+        removable = tuple(
+            name
+            for _mtime_ns, name in sorted(observed)
+            if name not in retained
+        )
+        if not getattr(shutil.rmtree, "avoids_symlink_attacks", False):
+            raise RuntimeError("symlink-safe stopped-source cleanup is unavailable")
+        for name in removable:
+            shutil.rmtree(name, dir_fd=parent_descriptor)
+            try:
+                os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            raise RuntimeError("stopped-release source cleanup did not complete")
+        return removable
+    finally:
+        os.close(parent_descriptor)
+
+
 def _read_stable_release_build_file(
     path: Path,
     *,
@@ -2357,6 +2431,7 @@ HostReceiptCollector = Callable[[int], Mapping[str, Any]]
 PathExists = Callable[[Path], bool]
 ReleaseBuilder = Callable[..., ReleaseManifest]
 Clock = Callable[[], float]
+SourceRetainer = Callable[[str], tuple[str, ...]]
 
 
 def _sha256_json(value: Mapping[str, Any]) -> str:
@@ -3686,6 +3761,7 @@ def apply_stopped_release(
     path_exists: PathExists = os.path.lexists,
     release_builder: ReleaseBuilder = build_release,
     host_receipt_collector: HostReceiptCollector = _default_host_receipt_collector,
+    source_retainer: SourceRetainer = _prune_stopped_release_sources,
     clock: Clock = time.time,
 ) -> dict[str, Any]:
     """Publish one exact sealed release while all canary services stay stopped."""
@@ -3747,6 +3823,16 @@ def apply_stopped_release(
     if release_exists:
         release = _validate_completed_release(spec)
     else:
+        removed_sources = source_retainer(revision)
+        if (
+            not isinstance(removed_sources, tuple)
+            or any(
+                not isinstance(item, str)
+                or _REVISION_RE.fullmatch(item) is None
+                for item in removed_sources
+            )
+        ):
+            raise TypeError("stopped-release source retention result is invalid")
         built = release_builder(spec, runner=runner)
         if not isinstance(built, ReleaseManifest):
             raise TypeError("stopped-release builder returned an invalid manifest")
