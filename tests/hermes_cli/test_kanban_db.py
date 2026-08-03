@@ -6817,10 +6817,9 @@ def _make_task(**overrides) -> "kb.Task":
 
 def _set_task_status(conn: sqlite3.Connection, task_id: str, status: str) -> None:
     """Test helper: set a task's status directly."""
-    completed_at = int(time.time()) if status == "done" else None
     conn.execute(
-        "UPDATE tasks SET status = ?, completed_at = ? WHERE id = ?",
-        (status, completed_at, task_id),
+        "UPDATE tasks SET status = ? WHERE id = ?",
+        (status, task_id),
     )
 
 
@@ -9642,6 +9641,35 @@ def _make_epic_and_done_story(board: str, repo: Path) -> tuple[str, str, str, st
     return epic, story, epic_branch, story_sha
 
 
+def _add_approved_review_candidate(
+    conn: sqlite3.Connection,
+    task_id: str,
+    branch: str,
+    source_sha: str,
+) -> None:
+    metadata = {
+        "workflow_outcome": {"verdict": "approved"},
+        "ai_provenance": {
+            "writer": {"agent": "developer"},
+            "reviewer": {
+                "agent": "reviewer",
+                "verdict": "approved",
+                "reviewed_branch": branch,
+                "reviewed_commit": source_sha,
+            },
+        },
+    }
+    now = int(time.time())
+    conn.execute(
+        """
+        INSERT INTO task_runs
+            (task_id, step_key, status, started_at, ended_at, outcome, metadata)
+        VALUES (?, 'review', 'done', ?, ?, 'completed', ?)
+        """,
+        (task_id, now, now, json.dumps(metadata)),
+    )
+
+
 def test_integrate_story_to_epic_merges_and_never_pushes(kanban_home, tmp_path, monkeypatch):
     repo = tmp_path / "repo"
     _init_git_repo(repo)
@@ -11611,9 +11639,11 @@ def test_reconcile_reintegrates_story_after_later_completion(
     _init_git_repo(repo)
     board = "v2-reconcile-reworked-story"
     _v2_product_board_with_repo(board, repo)
-    epic, story, epic_branch, _story_sha = _make_epic_and_done_story(board, repo)
+    epic, story, epic_branch, story_sha = _make_epic_and_done_story(board, repo)
 
     with kb.connect(board=board) as conn:
+        story_branch = f"story/{epic}-s1"
+        _add_approved_review_candidate(conn, story, story_branch, story_sha)
         assert kb.integrate_story_to_epic(conn, story, board=board) == "integrated"
         first_events = conn.execute(
             "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind=?",
@@ -11630,17 +11660,10 @@ def test_reconcile_reintegrates_story_after_later_completion(
             ["git", "-C", str(repo), "switch", "main"],
             check=True, capture_output=True, text=True,
         )
-        first_integrated_at = conn.execute(
-            "SELECT integrated_at FROM epic_story_integrations WHERE epic_id=? AND story_id=?",
-            (epic, story),
-        ).fetchone()[0]
-        conn.execute(
-            "UPDATE tasks SET completed_at=? WHERE id=?",
-            (first_integrated_at + 1, story),
-        )
+        reworked_sha = _git_output(repo, "rev-parse", story_branch)
+        _add_approved_review_candidate(conn, story, story_branch, reworked_sha)
         conn.commit()
 
-    time.sleep(1.1)
     calls = _record_git_calls(monkeypatch)
     with kb.connect(board=board) as conn:
         result = kb.reconcile(conn, board=board, spawn_ready=False)

@@ -13485,21 +13485,35 @@ def integrate_story_to_epic(
         candidate_verify_fn is _RECONCILE_INTEGRATION_VERIFY_UNSET
         and expected_source_sha is None
         and before_apply_fn is None
-        and conn.execute(
-            """
-            SELECT 1
-              FROM epic_story_integrations AS integration
-              JOIN tasks AS story ON story.id = integration.story_id
-             WHERE integration.epic_id=?
-               AND integration.story_id=?
-               AND integration.integrated_at >= story.completed_at
-             LIMIT 1
-            """,
-            (epic_id, story_id),
-        ).fetchone()
-        is not None
     ):
-        return "already_integrated"
+        reviewed_candidate = _latest_approved_review_candidate(conn, story_id)
+        if reviewed_candidate is not None:
+            already_integrated = conn.execute(
+                """
+                SELECT 1
+                  FROM epic_story_integrations
+                 WHERE epic_id=?
+                   AND story_id=?
+                   AND source_sha=?
+                 LIMIT 1
+                """,
+                (epic_id, story_id, reviewed_candidate[1]),
+            ).fetchone()
+        else:
+            already_integrated = conn.execute(
+                """
+                SELECT 1
+                  FROM epic_story_integrations AS integration
+                  JOIN tasks AS story ON story.id = integration.story_id
+                 WHERE integration.epic_id=?
+                   AND integration.story_id=?
+                   AND story.status='done'
+                 LIMIT 1
+                """,
+                (epic_id, story_id),
+            ).fetchone()
+        if already_integrated is not None:
+            return "already_integrated"
 
     try:
         board_default = str(meta.get("default_workdir") or "").strip()
