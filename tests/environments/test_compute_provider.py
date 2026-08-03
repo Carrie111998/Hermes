@@ -174,6 +174,23 @@ def test_modal_sandbox_transport_uses_the_lease_tunnel() -> None:
     assert transport.headers["mcp-session-id"] == "session-1"
 
 
+def test_modal_sandbox_transport_decodes_streamable_http_sse() -> None:
+    response = Mock()
+    response.headers = {"mcp-session-id": "session-1", "content-type": "text/event-stream"}
+    response.read.side_effect = [
+        b'event: message\ndata: {"jsonrpc":"2.0","id":1,"result":{}}\n\n',
+        b"",
+    ]
+    response.__enter__ = Mock(return_value=response)
+    response.__exit__ = Mock(return_value=False)
+    transport = ModalSandboxMcpTransport(_ModalSandbox(), _ModalWorker(), port=8080, path="/mcp")
+
+    with patch("tools.computer_use.transports.modal_sandbox.urlopen", return_value=response):
+        transport.start()
+
+    assert transport.headers["mcp-session-id"] == "session-1"
+
+
 def test_modal_desktop_starts_the_image_mcp_runtime_on_an_encrypted_port() -> None:
     lease = ComputeLease("task-1", "lease-1", "modal", "registry.example/cua-driver-mcp@sha256:test", EnvironmentCapabilities(computer_use=True))
 

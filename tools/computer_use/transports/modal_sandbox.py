@@ -72,9 +72,16 @@ class ModalSandboxMcpTransport(HttpMcpTransport):
             session_id = response.headers.get("mcp-session-id")
             if session_id:
                 self.headers["mcp-session-id"] = session_id
+            content_type = response.headers.get("Content-Type", response.headers.get("content-type", ""))
             body = response.read().decode("utf-8")
         if not body:
             return {}
+        if "text/event-stream" in content_type.lower():
+            body = "\n".join(
+                line[5:].lstrip() for line in body.splitlines() if line.startswith("data:")
+            )
+            if not body:
+                return {}
         parsed = json.loads(body)
         if not isinstance(parsed, Mapping):
             raise ValueError("MCP endpoint returned a non-object response")
