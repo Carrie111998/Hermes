@@ -908,7 +908,10 @@ class ShellFileOperations(FileOperations):
             # sample carries the replacement char as binary (read-only) so the
             # agent can't corrupt it. Legitimate UTF-8 text effectively never
             # contains U+FFFD.
-            if "\ufffd" in content_sample[:1000]:
+            # If sample is binary-cut to fixed size, 3-byte-uft8-chars can be
+            # sliced in half at the end of the sample, resulting in \ufffd,
+            # therefore ignoring potentially mangled last char.
+            if "\ufffd" in content_sample[:1000][:-1]:
                 return True
             non_printable = sum(1 for c in content_sample[:1000]
                                if ord(c) < 32 and c not in '\n\r\t')
@@ -1182,8 +1185,7 @@ class ShellFileOperations(FileOperations):
         # Read a sample to check for binary content
         sample_cmd = f"head -c 1000 {self._escape_shell_arg(path)} 2>/dev/null"
         sample_result = self._exec(sample_cmd)
-        sample_output = _strip_terminal_fence_leaks(sample_result.stdout)
-        
+        sample_output = _strip_terminal_fence_leaks(sample_result.stdout[:-1])
         if self._is_likely_binary(path, sample_output):
             return ReadResult(
                 is_binary=True,
