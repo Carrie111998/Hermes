@@ -172,6 +172,16 @@ function assertEvaManagedLocalTerminalAllowed(managed) {
   }
 }
 
+function assertEvaManagedLocalMutationAllowed(managed, capability = 'This local action') {
+  if (managed) {
+    throw new EvaBrokerError(
+      `${String(capability || 'This local action')} is unavailable for this managed remote agent.`,
+      403,
+      'managed-local-mutation-unavailable'
+    )
+  }
+}
+
 function makeDeviceCode(cryptoApi = crypto) {
   const value = String(cryptoApi.randomUUID())
     .toUpperCase()
@@ -507,6 +517,7 @@ module.exports = {
   EVA_MANAGED_POLICY,
   EvaBrokerError,
   assertEvaManagedApiRequestAllowed,
+  assertEvaManagedLocalMutationAllowed,
   assertEvaManagedLocalTerminalAllowed,
   brokerPost,
   buildEvaDesktopAuthUrl,

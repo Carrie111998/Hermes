@@ -5,6 +5,7 @@ const {
   EVA_MANAGED_POLICY,
   EvaBrokerError,
   assertEvaManagedApiRequestAllowed,
+  assertEvaManagedLocalMutationAllowed,
   assertEvaManagedLocalTerminalAllowed,
   buildEvaDesktopAuthUrl,
   buildEvaManagedWsUrl,
@@ -38,6 +39,39 @@ test('managed mode refuses to start a local terminal for a remote agent', () => 
       /unavailable for this managed remote agent/i.test(error.message)
   )
   assert.doesNotThrow(() => assertEvaManagedLocalTerminalAllowed(false))
+})
+
+test('managed mode fails closed before local machine mutation while unmanaged mode preserves it', () => {
+  const capabilities = [
+    'Writing local files',
+    'Renaming local files',
+    'Trashing local files',
+    'Mutating local Git state',
+    'Controlling local terminal processes'
+  ]
+
+  for (const capability of capabilities) {
+    let managedMutationRan = false
+    assert.throws(
+      () => {
+        assertEvaManagedLocalMutationAllowed(true, capability)
+        managedMutationRan = true
+      },
+      error =>
+        error instanceof EvaBrokerError &&
+        error.statusCode === 403 &&
+        error.code === 'managed-local-mutation-unavailable' &&
+        error.message.includes(capability)
+    )
+    assert.equal(managedMutationRan, false)
+
+    let unmanagedMutationRan = false
+    assert.doesNotThrow(() => {
+      assertEvaManagedLocalMutationAllowed(false, capability)
+      unmanagedMutationRan = true
+    })
+    assert.equal(unmanagedMutationRan, true)
+  }
 })
 
 test('evaOS Agent auth URL carries a high-entropy fallback code and state but no agent selector', () => {

@@ -91,7 +91,11 @@ import {
 import { describeDevCdpDecision, resolveDevCdpPort } from './dev-cdp'
 import { installEmbedReferer } from './embed-referer'
 const { createEvaAppUpdater } = require('./eva-app-updater.cjs')
-const { assertEvaManagedLocalTerminalAllowed, EVA_MANAGED_POLICY } = require('./eva-managed.cjs')
+const {
+  assertEvaManagedLocalMutationAllowed,
+  assertEvaManagedLocalTerminalAllowed,
+  EVA_MANAGED_POLICY
+} = require('./eva-managed.cjs')
 const { createEvaManagedRuntime } = require('./eva-runtime.cjs')
 import { createEventDeduper } from './event-dedupe'
 import { findGitBash as _findGitBash } from './find-git-bash'
@@ -11275,6 +11279,8 @@ ipcMain.handle('hermes:fs:reveal', async (_event, targetPath) => {
 // which often doesn't exist on first use. `shell.openPath` returns '' on
 // success or an error string; both mkdir + openPath failures are surfaced.
 ipcMain.handle('hermes:fs:openDir', async (_event, dirPath) => {
+  assertEvaManagedLocalMutationAllowed(EVA_MANAGED_BUILD, 'Opening or creating a local directory')
+
   const dir = String(dirPath || '').trim()
 
   if (!dir) {
@@ -11299,6 +11305,8 @@ ipcMain.handle('hermes:fs:openDir', async (_event, dirPath) => {
 // on-disk plugin door silently breaks (#66899). Electron owns this resolution
 // so it stays valid in every connection mode. Created on demand, like openDir.
 ipcMain.handle('hermes:fs:desktopPluginsRoot', async () => {
+  assertEvaManagedLocalMutationAllowed(EVA_MANAGED_BUILD, 'Creating a local desktop plugin directory')
+
   // Profile-aware: a named Desktop profile gets its own plugin root under
   // profiles/<name>/, matching the profile-scoped hermes_home the backend
   // reported before this resolver existed. 'default'/unset pins the global root.
@@ -11320,6 +11328,8 @@ ipcMain.handle('hermes:fs:desktopPluginsRoot', async () => {
 // base name; the destination is resolved in the SAME parent dir so a rename can
 // never move the item elsewhere or traverse out. Rejects on a name collision.
 ipcMain.handle('hermes:fs:rename', async (_event, targetPath, newName) => {
+  assertEvaManagedLocalMutationAllowed(EVA_MANAGED_BUILD, 'Renaming local files')
+
   const src = String(targetPath || '').trim()
   const name = String(newName || '').trim()
 
@@ -11347,6 +11357,8 @@ ipcMain.handle('hermes:fs:rename', async (_event, targetPath, newName) => {
 // this never creates directory trees or escapes the allowed roots, and content
 // is size-capped so it can't be abused as a bulk-write primitive.
 ipcMain.handle('hermes:fs:writeText', async (_event, filePath, content) => {
+  assertEvaManagedLocalMutationAllowed(EVA_MANAGED_BUILD, 'Writing local files')
+
   const raw = String(filePath || '').trim()
 
   if (!raw) {
@@ -11373,6 +11385,8 @@ ipcMain.handle('hermes:fs:writeText', async (_event, filePath, content) => {
 // Move a file/folder to the OS trash (recoverable) — the VS Code "Delete"
 // default. `shell.trashItem` routes to Finder/Explorer/Files trash per platform.
 ipcMain.handle('hermes:fs:trash', async (_event, targetPath) => {
+  assertEvaManagedLocalMutationAllowed(EVA_MANAGED_BUILD, 'Trashing local files')
+
   const target = String(targetPath || '').trim()
 
   if (!target) {
@@ -11388,17 +11402,23 @@ ipcMain.handle('hermes:fs:trash', async (_event, targetPath) => {
 // renderer as rejected promises so it can toast a friendly message.
 ipcMain.handle('hermes:git:worktreeList', async (_event, repoPath) => listWorktrees(repoPath, resolveGitBinary()))
 
-ipcMain.handle('hermes:git:worktreeAdd', async (_event, repoPath, options) =>
-  addWorktree(repoPath, options || {}, resolveGitBinary())
-)
+ipcMain.handle('hermes:git:worktreeAdd', async (_event, repoPath, options) => {
+  assertEvaManagedLocalMutationAllowed(EVA_MANAGED_BUILD, 'Adding local Git worktrees')
 
-ipcMain.handle('hermes:git:worktreeRemove', async (_event, repoPath, worktreePath, options) =>
-  removeWorktree(repoPath, worktreePath, options || {}, resolveGitBinary())
-)
+  return addWorktree(repoPath, options || {}, resolveGitBinary())
+})
 
-ipcMain.handle('hermes:git:branchSwitch', async (_event, repoPath, branch) =>
-  switchBranch(repoPath, branch, resolveGitBinary())
-)
+ipcMain.handle('hermes:git:worktreeRemove', async (_event, repoPath, worktreePath, options) => {
+  assertEvaManagedLocalMutationAllowed(EVA_MANAGED_BUILD, 'Removing local Git worktrees')
+
+  return removeWorktree(repoPath, worktreePath, options || {}, resolveGitBinary())
+})
+
+ipcMain.handle('hermes:git:branchSwitch', async (_event, repoPath, branch) => {
+  assertEvaManagedLocalMutationAllowed(EVA_MANAGED_BUILD, 'Switching local Git branches')
+
+  return switchBranch(repoPath, branch, resolveGitBinary())
+})
 
 ipcMain.handle('hermes:git:branchList', async (_event, repoPath) => listBranches(repoPath, resolveGitBinary()))
 
@@ -11422,29 +11442,43 @@ ipcMain.handle('hermes:git:review:diff', async (_event, repoPath, filePath, scop
 ipcMain.handle('hermes:git:fileDiff', async (_event, repoPath, filePath) =>
   fileDiffVsHead(repoPath, filePath, resolveGitBinary())
 )
-ipcMain.handle('hermes:git:review:stage', async (_event, repoPath, filePath) =>
-  reviewStage(repoPath, filePath ?? null, resolveGitBinary())
-)
-ipcMain.handle('hermes:git:review:unstage', async (_event, repoPath, filePath) =>
-  reviewUnstage(repoPath, filePath ?? null, resolveGitBinary())
-)
-ipcMain.handle('hermes:git:review:revert', async (_event, repoPath, filePath) =>
-  reviewRevert(repoPath, filePath ?? null, resolveGitBinary())
-)
+ipcMain.handle('hermes:git:review:stage', async (_event, repoPath, filePath) => {
+  assertEvaManagedLocalMutationAllowed(EVA_MANAGED_BUILD, 'Staging local Git changes')
+
+  return reviewStage(repoPath, filePath ?? null, resolveGitBinary())
+})
+ipcMain.handle('hermes:git:review:unstage', async (_event, repoPath, filePath) => {
+  assertEvaManagedLocalMutationAllowed(EVA_MANAGED_BUILD, 'Unstaging local Git changes')
+
+  return reviewUnstage(repoPath, filePath ?? null, resolveGitBinary())
+})
+ipcMain.handle('hermes:git:review:revert', async (_event, repoPath, filePath) => {
+  assertEvaManagedLocalMutationAllowed(EVA_MANAGED_BUILD, 'Reverting local Git changes')
+
+  return reviewRevert(repoPath, filePath ?? null, resolveGitBinary())
+})
 ipcMain.handle('hermes:git:review:revParse', async (_event, repoPath, ref) =>
   reviewRevParse(repoPath, ref, resolveGitBinary())
 )
-ipcMain.handle('hermes:git:review:commit', async (_event, repoPath, message, push) =>
-  reviewCommit(repoPath, message, Boolean(push), resolveGitBinary())
-)
+ipcMain.handle('hermes:git:review:commit', async (_event, repoPath, message, push) => {
+  assertEvaManagedLocalMutationAllowed(EVA_MANAGED_BUILD, 'Committing local Git changes')
+
+  return reviewCommit(repoPath, message, Boolean(push), resolveGitBinary())
+})
 ipcMain.handle('hermes:git:review:commitContext', async (_event, repoPath) =>
   reviewCommitContext(repoPath, resolveGitBinary())
 )
-ipcMain.handle('hermes:git:review:push', async (_event, repoPath) => reviewPush(repoPath, resolveGitBinary()))
+ipcMain.handle('hermes:git:review:push', async (_event, repoPath) => {
+  assertEvaManagedLocalMutationAllowed(EVA_MANAGED_BUILD, 'Pushing local Git changes')
+
+  return reviewPush(repoPath, resolveGitBinary())
+})
 ipcMain.handle('hermes:git:review:shipInfo', async (_event, repoPath) => reviewShipInfo(repoPath, resolveGhBinary()))
-ipcMain.handle('hermes:git:review:createPr', async (_event, repoPath) =>
-  reviewCreatePr(repoPath, resolveGitBinary(), resolveGhBinary())
-)
+ipcMain.handle('hermes:git:review:createPr', async (_event, repoPath) => {
+  assertEvaManagedLocalMutationAllowed(EVA_MANAGED_BUILD, 'Creating pull requests from local Git state')
+
+  return reviewCreatePr(repoPath, resolveGitBinary(), resolveGhBinary())
+})
 
 // Repo-first project discovery: scan bounded roots for git repos (pure fs walk,
 // no native addon). Never throws to the renderer — failures yield an empty list.
@@ -11540,6 +11574,8 @@ ipcMain.handle('hermes:terminal:start', async (event, payload = {}) => {
 })
 
 ipcMain.handle('hermes:terminal:write', (_event, id, data) => {
+  assertEvaManagedLocalMutationAllowed(EVA_MANAGED_BUILD, 'Writing to local terminal processes')
+
   const sessionInfo = terminalSessions.get(String(id || ''))
 
   if (!sessionInfo) {
@@ -11552,6 +11588,8 @@ ipcMain.handle('hermes:terminal:write', (_event, id, data) => {
 })
 
 ipcMain.handle('hermes:terminal:resize', (_event, id, size = {}) => {
+  assertEvaManagedLocalMutationAllowed(EVA_MANAGED_BUILD, 'Controlling local terminal processes')
+
   const sessionInfo = terminalSessions.get(String(id || ''))
 
   if (!sessionInfo) {
@@ -11575,7 +11613,11 @@ ipcMain.handle('hermes:terminal:cwd', async (_event, id) => {
   return sessionInfo.sshScope !== undefined ? null : readProcessCwd(sessionInfo.pty.pid)
 })
 
-ipcMain.handle('hermes:terminal:dispose', (_event, id) => disposeTerminalSession(String(id || '')))
+ipcMain.handle('hermes:terminal:dispose', (_event, id) => {
+  assertEvaManagedLocalMutationAllowed(EVA_MANAGED_BUILD, 'Controlling local terminal processes')
+
+  return disposeTerminalSession(String(id || ''))
+})
 
 ipcMain.handle('hermes:updates:check', async () =>
   EVA_MANAGED_BUILD
