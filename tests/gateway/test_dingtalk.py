@@ -416,6 +416,86 @@ class TestExtractMedia:
         assert urls == ["dl_voice_rt"]
         assert mtypes == ["audio"]
 
+    def test_richtext_image_downloadcode_only(self):
+        """A picture rich-text item with only ``downloadCode`` delivers it."""
+        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
+        from gateway.platforms.base import MessageType
+
+        msg = self._msg_with_rich_text(
+            [{"type": "picture", "downloadCode": "dl_pic_code"}]
+        )
+        msg.message_type = "richText"
+        msg_type, urls, mtypes = DingTalkAdapter._extract_media(
+            DingTalkAdapter, msg
+        )
+        assert msg_type == MessageType.PHOTO
+        assert urls == ["dl_pic_code"]
+        assert mtypes == ["image"]
+
+    def test_richtext_image_picurl_only(self):
+        """A picture rich-text item carrying only ``picUrl`` (no
+        ``downloadCode``) must still deliver the image via the fallback
+        (#77633)."""
+        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
+        from gateway.platforms.base import MessageType
+
+        msg = self._msg_with_rich_text(
+            [{"type": "picture", "picUrl": "https://cdn.dingtalk.com/p.png"}]
+        )
+        msg.message_type = "richText"
+        msg_type, urls, mtypes = DingTalkAdapter._extract_media(
+            DingTalkAdapter, msg
+        )
+        assert msg_type == MessageType.PHOTO
+        assert urls == ["https://cdn.dingtalk.com/p.png"]
+        assert mtypes == ["image"]
+
+    def test_richtext_image_both_prefers_downloadcode(self):
+        """When both ``downloadCode`` and ``picUrl`` are present, the
+        authoritative ``downloadCode`` wins (#77633)."""
+        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
+        from gateway.platforms.base import MessageType
+
+        msg = self._msg_with_rich_text(
+            [
+                {
+                    "type": "picture",
+                    "downloadCode": "dl_pic_code",
+                    "picUrl": "https://cdn.dingtalk.com/p.png",
+                }
+            ]
+        )
+        msg.message_type = "richText"
+        msg_type, urls, mtypes = DingTalkAdapter._extract_media(
+            DingTalkAdapter, msg
+        )
+        assert msg_type == MessageType.PHOTO
+        assert urls == ["dl_pic_code"]
+        assert mtypes == ["image"]
+
+    def test_richtext_image_empty_downloadcode_falls_back_to_picurl(self):
+        """An empty/falsy ``downloadCode`` must fall through to ``picUrl``
+        rather than dropping the image (#77633)."""
+        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
+        from gateway.platforms.base import MessageType
+
+        msg = self._msg_with_rich_text(
+            [
+                {
+                    "type": "picture",
+                    "downloadCode": "",
+                    "picUrl": "https://cdn.dingtalk.com/fallback.png",
+                }
+            ]
+        )
+        msg.message_type = "richText"
+        msg_type, urls, mtypes = DingTalkAdapter._extract_media(
+            DingTalkAdapter, msg
+        )
+        assert msg_type == MessageType.PHOTO
+        assert urls == ["https://cdn.dingtalk.com/fallback.png"]
+        assert mtypes == ["image"]
+
 
     def test_image_no_filename_still_photo(self):
         """msgtype='image' without fileName → still PHOTO (MIME heuristic)."""

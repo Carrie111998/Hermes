@@ -875,8 +875,17 @@ class DingTalkAdapter(BasePlatformAdapter):
             if isinstance(rich_list, list):
                 for item in rich_list:
                     if isinstance(item, dict):
+                        # Prefer the authoritative downloadCode (DingTalk's
+                        # own CDN, resolved by _resolve_media_codes), but
+                        # fall back to picUrl when downloadCode is empty or
+                        # absent — picture items sometimes carry only a
+                        # direct CDN URL (#77633).
                         dl_code = (
-                            item.get("downloadCode") or item.get("download_code") or ""
+                            item.get("downloadCode")
+                            or item.get("download_code")
+                            or item.get("picUrl")
+                            or item.get("pic_url")
+                            or ""
                         )
                         item_type = item.get("type", "")
                         if dl_code:
