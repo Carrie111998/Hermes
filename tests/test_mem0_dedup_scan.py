@@ -444,10 +444,23 @@ class TestDryRunSafety:
     ) -> None:
         """verify_qdrant_connection in embedded mode must not attempt any HTTP call."""
         mod = _load_module()
+        qdrant_path = tmp_path / "mem0_qdrant"
+        qdrant_path.mkdir()  # path must exist; verify_qdrant_connection exits(1) if missing
 
         with patch.object(mod, "api_get") as mock_api_get:
             mod.verify_qdrant_connection(
                 qdrant_url=None,
-                qdrant_path=str(tmp_path / "mem0_qdrant"),
+                qdrant_path=str(qdrant_path),
             )
             mock_api_get.assert_not_called()
+
+    def test_verify_qdrant_connection_embedded_exits_on_missing_path(
+        self, tmp_path: Path
+    ) -> None:
+        """verify_qdrant_connection must exit(1) when the embedded path is absent."""
+        mod = _load_module()
+        missing_path = str(tmp_path / "does_not_exist")
+
+        with pytest.raises(SystemExit) as exc_info:
+            mod.verify_qdrant_connection(qdrant_url=None, qdrant_path=missing_path)
+        assert exc_info.value.code == 1

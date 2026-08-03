@@ -531,7 +531,7 @@ def consolidate_groups(groups: list, dry_run: bool = True) -> tuple[int, int]:
                 f"  [FAIL] Batch delete of {deleted_count} point(s) did not fully succeed.",
                 file=sys.stderr,
             )
-            return len(plan), 0
+            sys.exit(1)
         print(f"  [OK] Deleted {deleted_count} point(s) in one batch.")
 
     return len(plan), deleted_count
@@ -544,16 +544,17 @@ def consolidate_groups(groups: list, dry_run: bool = True) -> tuple[int, int]:
 def verify_qdrant_connection(qdrant_url: str | None, qdrant_path: str | None) -> None:
     """Verify Qdrant is reachable; exit(1) on failure."""
     if qdrant_path:
-        # Embedded mode — check the path exists or can be created
+        # Embedded mode — the path must already exist (it is created by mem0/Qdrant on
+        # first write, but if it is absent at scan time there are no memories to read).
         p = Path(qdrant_path)
         if not p.exists():
             print(
-                f"[WARN] Embedded Qdrant path '{qdrant_path}' does not exist yet "
-                f"(will be created on first write).",
+                f"[ERROR] Embedded Qdrant path '{qdrant_path}' does not exist. "
+                f"Has mem0 written any memories yet?",
                 file=sys.stderr,
             )
-        else:
-            print(f"Embedded Qdrant at: {qdrant_path}", file=sys.stderr)
+            sys.exit(1)
+        print(f"Embedded Qdrant at: {qdrant_path}", file=sys.stderr)
         return
 
     # HTTP mode — hit the root endpoint
