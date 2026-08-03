@@ -3293,16 +3293,19 @@ def _build_minimax_oauth_aux_client(model: str) -> Tuple[Optional[Any], Optional
     re-uses the cached one if it still has enough lifetime left).
 
     Returns ``(None, None)`` when the user has not authenticated with
-    MiniMax OAuth, or when the anthropic SDK is missing. The caller is
-    responsible for passing a model — pinning a default would silently rot
-    when MiniMax's accepted-model list drifts.
+    MiniMax OAuth, or when the anthropic SDK is missing. The model falls
+    back to the provider profile's ``default_aux_model`` (MiniMax-M2.7)
+    when the caller does not pass one explicitly.
     """
     if not model:
-        logger.warning(
-            "Auxiliary client: minimax-oauth requested without a model; "
-            "pass model explicitly (auxiliary.<task>.model in config.yaml)."
-        )
-        return None, None
+        model = _get_aux_model_for_provider("minimax-oauth")
+        if not model:
+            logger.warning(
+                "Auxiliary client: minimax-oauth requested but no model "
+                "resolved (auxiliary.<task>.model in config.yaml or the "
+                "minimax-oauth provider profile default_aux_model)."
+            )
+            return None, None
     try:
         from agent.anthropic_adapter import build_anthropic_client
         from hermes_cli.auth import (
@@ -3346,13 +3349,14 @@ def _build_minimax_oauth_aux_client(model: str) -> Tuple[Optional[Any], Optional
         "Auxiliary client: MiniMax OAuth (%s) at %s (per-request token provider)",
         model, base_url,
     )
-    # is_oauth=True is the safer default for MiniMax: even if the callable
-    # path is bypassed in some future change, the AnthropicAuxiliaryClient
-    # shim already strips the OAuth identity headers that would leak to
-    # MiniMax's third-party endpoint. See agent.anthropic_adapter for the
-    # third-party identity-injection guard.
+    # is_oauth must stay False: MiniMax is a third-party Anthropic-
+    # Messages-compatible endpoint, and the OAuth code paths (Claude Code
+    # identity system prefix, mcp__ tool renaming, OAuth-only betas) are
+    # for native Anthropic subscriptions only — agent_init.py's guard
+    # (#1739) is explicit that third-party providers must never trip them.
+    # The callable token provider handles auth; nothing else is needed.
     return AnthropicAuxiliaryClient(
-        real_client, model, "oauth-callable", base_url, is_oauth=True,
+        real_client, model, token_provider, base_url, is_oauth=False,
     ), model
 
 
