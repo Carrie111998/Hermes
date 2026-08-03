@@ -200,13 +200,21 @@ async function startSocket() {
 
   sock.ev.on('creds.update', () => { saveCreds(); lidToPhone = buildLidMap(); });
 
-  sock.ev.on('connection.update', (update) => {
+  sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
       console.log('\n📱 Scan this QR code with WhatsApp on your phone:\n');
       qrcode.generate(qr, { small: true });
       console.log('\nWaiting for scan...\n');
+      // Also save QR as PNG for easy scanning
+      try {
+        const qrPath = '/tmp/whatsapp-qr.png';
+        await qrcodePNG.toFile(qrPath, qr, { width: 512, margin: 2 });
+        console.log(`📸 QR code also saved to ${qrPath}`);
+      } catch (e) {
+        // qrcode npm package not available as PNG generator, that's ok
+      }
     }
 
     if (connection === 'close') {
