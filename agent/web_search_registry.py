@@ -130,6 +130,23 @@ _LEGACY_PREFERENCE = (
 )
 
 
+def _capable(provider: WebSearchProvider, capability: str) -> bool:
+    if capability == "search":
+        return bool(provider.supports_search())
+    if capability == "extract":
+        return bool(provider.supports_extract())
+    return False
+
+
+def _is_available_safe(provider: WebSearchProvider) -> bool:
+    """Return availability without letting a buggy provider kill resolution."""
+    try:
+        return bool(provider.is_available())
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("provider %s.is_available() raised %s", provider.name, exc)
+        return False
+
+
 def _resolve(configured: Optional[str], *, capability: str) -> Optional[WebSearchProvider]:
     """Resolve the active provider for a capability ("search" | "extract").
 
@@ -163,27 +180,12 @@ def _resolve(configured: Optional[str], *, capability: str) -> Optional[WebSearc
     with _lock:
         snapshot = dict(_providers)
 
-    def _capable(p: WebSearchProvider) -> bool:
-        if capability == "search":
-            return bool(p.supports_search())
-        if capability == "extract":
-            return bool(p.supports_extract())
-        return False
-
-    def _is_available_safe(p: WebSearchProvider) -> bool:
-        """Wrap ``is_available()`` so a buggy provider doesn't kill resolution."""
-        try:
-            return bool(p.is_available())
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("provider %s.is_available() raised %s", p.name, exc)
-            return False
-
     # 1. Explicit config wins — return regardless of is_available() so the
     #    user gets a precise downstream error message rather than a silent
     #    backend switch. Matches _get_backend() in web_tools.py.
     if configured:
         provider = snapshot.get(configured)
-        if provider is not None and _capable(provider):
+        if provider is not None and _capable(provider, capability):
             return provider
         if provider is None:
             logger.debug(
@@ -202,7 +204,7 @@ def _resolve(configured: Optional[str], *, capability: str) -> Optional[WebSearc
     #    a fresh install with no API keys at all.
     eligible = [
         p for p in snapshot.values()
-        if _capable(p) and _is_available_safe(p)
+        if _capable(p, capability) and _is_available_safe(p)
     ]
     if len(eligible) == 1:
         return eligible[0]
@@ -211,11 +213,53 @@ def _resolve(configured: Optional[str], *, capability: str) -> Optional[WebSearc
         provider = snapshot.get(legacy)
         if (
             provider is not None
-            and _capable(provider)
+            and _capable(provider, capability)
             and _is_available_safe(provider)
         ):
             return provider
 
+    return None
+
+
+def get_fallback_provider(
+    capability: str,
+    *,
+    excluded: frozenset[str] = frozenset(),
+) -> Optional[WebSearchProvider]:
+    """Resolve one available provider for a post-failure capability fallback."""
+    if capability not in {"search", "extract"}:
+        raise ValueError(f"Unsupported web capability: {capability}")
+
+    explicit = (
+        _read_config_key("web", f"{capability}_backend")
+        or _read_config_key("web", "backend")
+    )
+    with _lock:
+        snapshot = dict(_providers)
+
+    if explicit and explicit not in excluded:
+        provider = snapshot.get(explicit)
+        if (
+            provider is not None
+            and _capable(provider, capability)
+            and _is_available_safe(provider)
+        ):
+            return provider
+
+    eligible = [
+        provider
+        for provider in snapshot.values()
+        if provider.name not in excluded
+        and _capable(provider, capability)
+        and _is_available_safe(provider)
+    ]
+    if len(eligible) == 1:
+        return eligible[0]
+
+    for name in _LEGACY_PREFERENCE:
+        provider = snapshot.get(name)
+        if provider in eligible:
+            return provider
     return None
 
 

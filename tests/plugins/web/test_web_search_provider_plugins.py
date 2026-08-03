@@ -328,6 +328,75 @@ class TestRegistryResolution:
             # means an env var leaked in.
             assert result.is_available() is True
 
+    def test_fallback_search_excludes_firecrawl_and_uses_existing_priority(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _ensure_plugins_loaded()
+        from agent.web_search_registry import get_fallback_provider
+
+        monkeypatch.setenv("FIRECRAWL_API_KEY", "fc")
+        monkeypatch.setenv("PARALLEL_API_KEY", "parallel")
+        result = get_fallback_provider(
+            "search", excluded=frozenset({"firecrawl"})
+        )
+        assert result is not None
+        assert result.name == "parallel"
+
+    def test_explicit_firecrawl_is_excluded_but_explicit_non_firecrawl_wins(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _ensure_plugins_loaded()
+        import agent.web_search_registry as registry
+
+        monkeypatch.setattr(
+            registry, "_read_config_key", lambda *path: "firecrawl"
+        )
+        monkeypatch.setenv("EXA_API_KEY", "exa")
+        result = registry.get_fallback_provider(
+            "extract", excluded=frozenset({"firecrawl"})
+        )
+        assert result is not None
+        assert result.name == "exa"
+
+    def test_explicit_non_firecrawl_must_be_available(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _ensure_plugins_loaded()
+        import agent.web_search_registry as registry
+
+        monkeypatch.setattr(
+            registry, "_read_config_key", lambda *path: "parallel"
+        )
+        monkeypatch.setenv("EXA_API_KEY", "exa")
+        result = registry.get_fallback_provider(
+            "extract", excluded=frozenset({"firecrawl"})
+        )
+        assert result is not None
+        assert result.name == "exa"
+
+    def test_fallback_returns_none_when_all_capable_providers_are_excluded(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _ensure_plugins_loaded()
+        import agent.web_search_registry as registry
+
+        firecrawl = registry.get_provider("firecrawl")
+        assert firecrawl is not None
+        monkeypatch.setattr(registry, "_providers", {"firecrawl": firecrawl})
+        assert (
+            registry.get_fallback_provider(
+                "extract", excluded=frozenset({"firecrawl"})
+            )
+            is None
+        )
+
+    def test_fallback_rejects_unknown_capability(self) -> None:
+        _ensure_plugins_loaded()
+        from agent.web_search_registry import get_fallback_provider
+
+        with pytest.raises(ValueError, match="Unsupported web capability"):
+            get_fallback_provider("browse")
+
 
 # ---------------------------------------------------------------------------
 # Sync-vs-async extract detection
