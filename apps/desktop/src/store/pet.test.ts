@@ -12,10 +12,10 @@ import {
   flashPetActivity,
   hasPetSpriteForMeta,
   mergePetInfoMeta,
+  type PetInfo,
   setPetActivity,
   setPetBubble,
-  setPetControls,
-  type PetInfo
+  setPetControls
 } from './pet'
 
 describe('derivePetState', () => {
