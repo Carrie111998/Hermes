@@ -347,6 +347,33 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 5016, str(e))
 
 
+@method("usage.overview")
+def _(rid, params: dict) -> dict:
+    """Usage + cost overview for the desktop: wraps InsightsEngine output.
+
+    Reuses the engine's existing aggregation (sessions, model breakdown,
+    cost buckets, daily time-series) — the desktop reads the same data
+    `/insights` prints, as JSON. ``days`` defaults to 30, ``source``
+    optionally filters to one platform. Returns the full engine report.
+    """
+    try:
+        from agent.insights import InsightsEngine
+
+        days = int(params.get("days") or 30)
+        if days < 1 or days > 3650:
+            return _err(rid, 5071, "days must be between 1 and 3650")
+        source = params.get("source") or None
+
+        db = _get_db()
+        if db is None:
+            return _err(rid, 5072, "session store unavailable")
+        engine = InsightsEngine(db)
+        report = engine.generate(days=days, source=source)
+        return _ok(rid, report)
+    except Exception as e:
+        return _err(rid, 5070, str(e))
+
+
 @method("setup.runtime_check")
 def _(rid, params: dict) -> dict:
     """Strict provider check: does the configured/default model actually resolve to a usable runtime?
