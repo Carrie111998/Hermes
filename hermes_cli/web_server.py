@@ -14133,27 +14133,12 @@ def _get_models_analytics(days: int = 30, profile: Optional[str] = None):
         """, (cutoff,))
         raw_rows = [dict(r) for r in cur.fetchall()]
 
-        # Add auxiliary usage as (model, provider) rows so aux-only models
-        # (dedicated vision/compression models) appear on the Models page
-        # instead of being invisible (issue #23270). Keyed by
-        # model+billing_provider to match the GROUP BY above.
-        for aux in _aux_usage_rows(db, cutoff):
-            raw_rows.append({
-                "model": aux.get("model") or "unknown",
-                "billing_provider": aux.get("billing_provider") or "",
-                "input_tokens": aux.get("input_tokens") or 0,
-                "output_tokens": aux.get("output_tokens") or 0,
-                "cache_read_tokens": aux.get("cache_read_tokens") or 0,
-                "reasoning_tokens": aux.get("reasoning_tokens") or 0,
-                "estimated_cost": aux.get("estimated_cost") or 0,
-                "actual_cost": 0,
-                "sessions": aux.get("sessions") or 0,
-                "api_calls": aux.get("api_calls") or 0,
-                "tool_calls": 0,
-                "last_used_at": aux.get("last_used_at"),
-                "avg_tokens_per_session": 0,
-                "aux_task": aux.get("task") or "",
-            })
+        # Auxiliary usage (vision, compression, title_generation, approval, ...)
+        # lives only in session_model_usage, never in the sessions counters.
+        # It must be folded INTO the per-model row — appending each (model,
+        # task) as its own row makes the Models page show one card per aux
+        # task (issue: duplicate "deepseek-v4" cards). Fetch here, merge below.
+        aux_rows = _aux_usage_rows(db, cutoff)
 
         # Session rows can be created before the first billable provider call
         # finishes. If that early row records only the model name, and a later
@@ -14213,6 +14198,46 @@ def _get_models_analytics(days: int = 30, profile: Optional[str] = None):
                 )
             else:
                 rows.extend(model_rows)
+
+        # Fold auxiliary usage into the per-model rows (issue #23270).
+        # Aux calls never touch the sessions counters, so this is add-only.
+        # Models that ONLY appear via aux calls get their own entry; models
+        # with both main + aux usage get the aux tokens merged into the one
+        # card instead of splitting into a card per aux task.
+        if aux_rows:
+            by_name: Dict[str, List[Dict[str, Any]]] = {}
+            for row in rows:
+                by_name.setdefault(row.get("model") or "", []).append(row)
+            for aux in aux_rows:
+                model = aux.get("model") or "unknown"
+                candidates = by_name.get(model)
+                if candidates:
+                    target = candidates[0]
+                else:
+                    target = {
+                        "model": model,
+                        "billing_provider": aux.get("billing_provider") or "",
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "cache_read_tokens": 0,
+                        "reasoning_tokens": 0,
+                        "estimated_cost": 0,
+                        "actual_cost": 0,
+                        "sessions": 0,
+                        "api_calls": 0,
+                        "tool_calls": 0,
+                        "last_used_at": 0,
+                        "avg_tokens_per_session": 0,
+                    }
+                    rows.append(target)
+                    by_name.setdefault(model, []).append(target)
+                for key in ("input_tokens", "output_tokens", "cache_read_tokens",
+                            "reasoning_tokens", "estimated_cost", "actual_cost",
+                            "sessions", "api_calls"):
+                    target[key] = (target.get(key) or 0) + (aux.get(key) or 0)
+                target["last_used_at"] = max(
+                    target.get("last_used_at") or 0, aux.get("last_used_at") or 0
+                )
 
         rows.sort(
             key=lambda r: (r.get("input_tokens") or 0) + (r.get("output_tokens") or 0),
