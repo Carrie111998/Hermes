@@ -107,6 +107,14 @@ class ProcessSession:
     termination_source: str = ""                # process.kill|kill_all|backend_lost|failed_start
     output_buffer: str = ""                     # Rolling output (last MAX_OUTPUT_CHARS)
     max_output_chars: int = MAX_OUTPUT_CHARS
+    # Optional bounded head/tail capture used by foreground-to-background
+    # handoff. Ordinary background sessions keep the historical rolling tail;
+    # foreground handoffs must preserve the same head/tail contract as
+    # BaseEnvironment._wait_for_process.
+    bounded_capture_limit: Optional[int] = None
+    _bounded_capture_text: str = field(default="", repr=False)
+    _bounded_capture_total: int = field(default=0, repr=False)
+    persist_cwd: bool = False
     detached: bool = False                      # True if recovered from crash (no pipe)
     pid_scope: str = "host"                     # "host" for local/PTY PIDs, "sandbox" for env-local PIDs
     # Watcher/notification metadata (persisted for crash recovery)
@@ -221,6 +229,69 @@ class ProcessRegistry:
         while lines and any(noise in lines[0] for noise in ProcessRegistry._SHELL_NOISE_SUBSTRINGS):
             lines.pop(0)
         return "\n".join(lines)
+
+    def _visible_output(self, session: ProcessSession, output: str) -> str:
+        """Return output without private environment bookkeeping markers."""
+        from tools.ansi_strip import strip_ansi
+
+        visible = strip_ansi(output)
+        if session.env_ref is None:
+            return visible
+        cleaned = {"output": visible}
+        try:
+            # Environment-backed foreground handoffs include a private cwd
+            # marker. Keep cwd tracking while hiding that marker from poll,
+            # log, and wait consumers.
+            session.env_ref._update_cwd(cleaned)
+            self._persist_session_cwd(session)
+            return cleaned["output"]
+        except Exception:
+            return visible
+
+    @staticmethod
+    def _append_bounded_capture(session: ProcessSession, chunk: str) -> None:
+        """Maintain a bounded head/tail capture for foreground handoffs."""
+        limit = session.bounded_capture_limit
+        if not limit or limit <= 0 or not chunk:
+            return
+        session._bounded_capture_total += len(chunk)
+        candidate = session._bounded_capture_text + chunk
+        if len(candidate) <= limit:
+            session._bounded_capture_text = candidate
+            return
+        head_chars = int(limit * 0.4)
+        tail_chars = limit - head_chars
+        session._bounded_capture_text = (
+            candidate[:head_chars] + candidate[-tail_chars:]
+        )
+
+    @staticmethod
+    def _bounded_capture_output(session: ProcessSession) -> Optional[str]:
+        """Render the configured head/tail capture, including its notice."""
+        limit = session.bounded_capture_limit
+        if not limit or limit <= 0:
+            return None
+        output = session._bounded_capture_text
+        if session._bounded_capture_total <= limit:
+            return output
+        head_chars = int(limit * 0.4)
+        tail_chars = limit - head_chars
+        omitted = session._bounded_capture_total - head_chars - tail_chars
+        notice = (
+            f"\n\n... [OUTPUT TRUNCATED - {omitted} chars omitted "
+            f"out of {session._bounded_capture_total} total] ...\n\n"
+        )
+        return output[:head_chars] + notice + output[-tail_chars:]
+
+    def _persist_session_cwd(self, session: ProcessSession) -> None:
+        """Persist cwd learned from an adopted foreground command."""
+        if not session.persist_cwd or session.env_ref is None:
+            return
+        try:
+            from tools.terminal_tool import record_session_cwd
+            record_session_cwd(session.session_key, getattr(session.env_ref, "cwd", None))
+        except Exception:
+            logger.debug("Failed to persist adopted process cwd", exc_info=True)
 
     def _emit_output(self, session: ProcessSession, chunk: str) -> None:
         """Forward a freshly-read chunk to the live-output sink, if one is set.
@@ -835,6 +906,70 @@ class ProcessRegistry:
 
         return session
 
+    def adopt_local_process(
+        self,
+        process: subprocess.Popen,
+        *,
+        command: str,
+        cwd: str,
+        task_id: str = "",
+        session_key: str = "",
+        env_ref: Any = None,
+        max_runtime: Optional[float] = None,
+        bounded_capture_limit: Optional[int] = None,
+        persist_cwd: bool = False,
+    ) -> ProcessSession:
+        """Register an already-started local process.
+
+        ``BaseEnvironment.spawn()`` starts a command with the same environment
+        snapshot and shell wrapper as foreground ``execute()``.  This method
+        hands that live Popen to the normal registry reader instead of starting
+        a second shell during foreground-to-background handoff.
+        """
+        session = ProcessSession(
+            id=f"proc_{uuid.uuid4().hex[:12]}",
+            command=command,
+            task_id=task_id,
+            session_key=session_key,
+            pid=process.pid,
+            process=process,
+            env_ref=env_ref,
+            cwd=_resolve_safe_cwd(cwd or os.getcwd()),
+            started_at=time.time(),
+            bounded_capture_limit=bounded_capture_limit,
+            persist_cwd=persist_cwd,
+        )
+        session.host_start_time = self._safe_host_start_time(process.pid)
+        with self._lock:
+            self._prune_if_needed()
+            self._running[session.id] = session
+
+        session._reader_thread = threading.Thread(
+            target=self._reader_loop,
+            args=(session,),
+            name=f"process-reader-{session.id}",
+            daemon=True,
+        )
+        session._reader_thread.start()
+        if max_runtime and max_runtime > 0:
+            threading.Thread(
+                target=self._enforce_max_runtime,
+                args=(session, float(max_runtime)),
+                name=f"process-deadline-{session.id}",
+                daemon=True,
+            ).start()
+        self._write_checkpoint()
+        return session
+
+    def _enforce_max_runtime(self, session: ProcessSession, max_runtime: float) -> None:
+        """Kill an adopted process only at its true execution deadline."""
+        if session._completion_event.wait(timeout=max_runtime):
+            return
+        with session._lock:
+            if session.exited:
+                return
+        self.kill_process(session.id, source="execution_timeout")
+
     def spawn_via_env(
         self,
         env: Any,
@@ -977,6 +1112,7 @@ class ProcessRegistry:
                 first_chunk = False
             with session._lock:
                 session.output_buffer += chunk
+                self._append_bounded_capture(session, chunk)
                 if len(session.output_buffer) > session.max_output_chars:
                     session.output_buffer = session.output_buffer[-session.max_output_chars:]
             self._check_watch_patterns(session, chunk)
@@ -1068,6 +1204,7 @@ class ProcessRegistry:
                 session.exit_code = session.process.returncode
                 session.completion_reason = "exited"
             self._move_to_finished(session)
+            self._persist_session_cwd(session)
 
     def _env_poller_loop(
         self, session: ProcessSession, env: Any, log_path: str, pid_path: str, exit_path: str
@@ -1425,6 +1562,7 @@ class ProcessRegistry:
         with session._lock:
             if drained:
                 session.output_buffer += drained
+                self._append_bounded_capture(session, drained)
                 if len(session.output_buffer) > session.max_output_chars:
                     session.output_buffer = session.output_buffer[-session.max_output_chars:]
             session.exited = True
@@ -1437,10 +1575,10 @@ class ProcessRegistry:
             session.id, rc,
         )
         self._move_to_finished(session)
+        self._persist_session_cwd(session)
 
     def poll(self, session_id: str) -> dict:
         """Check status and get new output for a background process."""
-        from tools.ansi_strip import strip_ansi
 
         session = self.get(session_id)
         if session is None:
@@ -1451,7 +1589,8 @@ class ProcessRegistry:
         self._reconcile_local_exit(session)
 
         with session._lock:
-            output_preview = strip_ansi(session.output_buffer[-1000:]) if session.output_buffer else ""
+            raw_output = session.output_buffer[-1000:] if session.output_buffer else ""
+        output_preview = self._visible_output(session, raw_output)
 
         result = {
             "session_id": session.id,
@@ -1483,14 +1622,13 @@ class ProcessRegistry:
 
     def read_log(self, session_id: str, offset: int = 0, limit: int = 200) -> dict:
         """Read the full output log with optional pagination by lines."""
-        from tools.ansi_strip import strip_ansi
 
         session = self.get(session_id)
         if session is None:
             return {"status": "not_found", "error": f"No process with ID {session_id}"}
 
         with session._lock:
-            full_output = strip_ansi(session.output_buffer)
+            full_output = self._visible_output(session, session.output_buffer)
 
         lines = full_output.splitlines()
         total_lines = len(lines)
@@ -1566,23 +1704,40 @@ class ProcessRegistry:
             self._reconcile_local_exit(session)
             if session.exited:
                 self._completion_consumed.add(session_id)
+                visible_output = self._bounded_capture_output(session)
+                if visible_output is None:
+                    visible_output = strip_ansi(session.output_buffer[-2000:])
+                if session.env_ref is not None:
+                    # Environment-backed foreground handoffs include a private
+                    # cwd marker in shell output. Consume it here so process
+                    # wait exposes the same clean output as terminal.
+                    cleaned = {"output": visible_output}
+                    try:
+                        session.env_ref._update_cwd(cleaned)
+                        self._persist_session_cwd(session)
+                        visible_output = cleaned["output"]
+                    except Exception:
+                        pass
                 result = {
                     "status": "exited",
                     "command": session.command,
                     "exit_code": session.exit_code,
                     "completion_reason": session.completion_reason,
                     "termination_source": session.termination_source,
-                    "output": strip_ansi(session.output_buffer[-2000:]),
+                    "output": visible_output,
                 }
                 if timeout_note:
                     result["timeout_note"] = timeout_note
                 return result
 
             if _is_interrupted():
+                interrupted_output = self._bounded_capture_output(session)
+                if interrupted_output is None:
+                    interrupted_output = session.output_buffer[-1000:]
                 result = {
                     "status": "interrupted",
                     "command": session.command,
-                    "output": strip_ansi(session.output_buffer[-1000:]),
+                    "output": strip_ansi(interrupted_output),
                     "note": "User sent a new message -- wait interrupted",
                 }
                 if timeout_note:
@@ -1594,10 +1749,13 @@ class ProcessRegistry:
                 break
             session._completion_event.wait(timeout=min(1.0, remaining))
 
+        timed_out_output = self._bounded_capture_output(session)
+        if timed_out_output is None:
+            timed_out_output = session.output_buffer[-1000:]
         result = {
             "status": "timeout",
             "command": session.command,
-            "output": strip_ansi(session.output_buffer[-1000:]),
+            "output": strip_ansi(timed_out_output),
         }
         if timeout_note:
             result["timeout_note"] = timeout_note

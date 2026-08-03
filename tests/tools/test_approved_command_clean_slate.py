@@ -180,6 +180,9 @@ def test_retry_backoff_does_not_clear_genuine_interrupt(monkeypatch):
         return {"output": "partial\n[Command interrupted]", "returncode": 130}
 
     monkeypatch.setattr(LocalEnvironment, "execute", fake_execute)
+    # This test targets the retry loop itself; disable the separate
+    # foreground-to-background lifecycle path so the fake executor is used.
+    monkeypatch.setattr(tt, "_auto_handoff_foreground", lambda **_: None)
     monkeypatch.setattr("tools.terminal_tool.time.sleep", lambda *a, **k: None)
     set_interrupt(False)
 

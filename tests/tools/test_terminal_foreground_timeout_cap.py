@@ -15,6 +15,7 @@ def _make_env_config(**overrides):
     config = {
         "env_type": "local",
         "timeout": 180,
+        "handoff_timeout": 10,
         "cwd": "/tmp",
         "host_cwd": None,
         "modal_mode": "auto",

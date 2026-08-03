@@ -248,6 +248,10 @@ DEFAULT_CONFIG = {
         # it here without patching the built desktop app.
         "font_family": "",
         "timeout": 180,
+        # Foreground commands are handed to the process registry after this
+        # short synchronous window instead of being killed.  The command keeps
+        # running under its execution timeout and returns a session_id.
+        "handoff_timeout": 10,
         # Bounded grace period (seconds) between SIGTERM and an escalated
         # SIGKILL when terminating a host process tree (browser daemons, etc.).
         # A daemon that stalls in its SIGTERM handler is force-killed after this

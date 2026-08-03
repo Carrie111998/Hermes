@@ -25,3 +25,14 @@ class TestTimeoutPreservesPartialOutput:
         assert result["returncode"] == 124
         assert "timed out" in result["output"].lower()
         assert not result["output"].startswith("\n")
+
+
+def test_environment_can_spawn_without_waiting():
+    """Long commands must be detachable before the normal wait deadline."""
+    env = LocalEnvironment()
+    proc, _cwd = env.spawn("sleep 30", timeout=60)
+
+    try:
+        assert proc.poll() is None
+    finally:
+        env._kill_process(proc)

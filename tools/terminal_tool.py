@@ -1033,7 +1033,7 @@ Do NOT use echo/cat heredoc to create files — use write_file instead.
 Reserve terminal for: builds, installs, git, processes, scripts, network, package managers, and anything that needs a shell.
 Because exported environment state persists, activate a virtualenv or export setup variables once per session; do not re-source the same environment before every command unless a command proves the shell state was reset.
 
-Foreground (default): Commands return INSTANTLY when done, even if the timeout is high. Set timeout=300 for long builds/scripts — you'll still get the result in seconds if it's fast. Prefer foreground for short commands.
+Foreground (default): Commands return INSTANTLY when done, even if the timeout is high. Set timeout=300 for long builds/scripts — you'll still get the result in seconds if it's fast. After the configured handoff window (default 10s), a still-running local command is adopted as a managed background process and returns a session_id; this handoff does NOT kill the command. Prefer foreground for short commands.
 Background: Set background=true to get a session_id. Almost always pair with notify_on_complete=true — bg without notify runs SILENTLY and you have no way to learn it finished short of calling process(action='poll') yourself. Two legitimate uses:
   (1) Long-lived processes that never exit (servers, watchers, daemons) — silent is correct, there's no exit to notify on.
   (2) Long-running bounded tasks (tests, builds, deploys, CI pollers, batch jobs) — MUST set notify_on_complete=true. Without it you'll either forget to poll or sit blocked waiting for the user to surface the result.
@@ -1514,6 +1514,7 @@ def _get_env_config() -> Dict[str, Any]:
         "host_cwd": host_cwd,
         "docker_mount_cwd_to_workspace": mount_docker_cwd,
         "timeout": _parse_env_var("TERMINAL_TIMEOUT", "180"),
+        "handoff_timeout": _parse_env_var("TERMINAL_HANDOFF_TIMEOUT", "10"),
         "lifetime_seconds": _parse_env_var("TERMINAL_LIFETIME_SECONDS", "300"),
         # SSH-specific config
         "ssh_host": os.getenv("TERMINAL_SSH_HOST", ""),
@@ -2200,6 +2201,101 @@ def _resolve_command_cwd(
     return get_session_cwd(session_key) or default_cwd
 
 
+def _auto_handoff_foreground(
+    *,
+    env: Any,
+    env_type: str,
+    command: str,
+    command_cwd: str,
+    effective_timeout: int,
+    handoff_timeout: int,
+    effective_task_id: str,
+    session_key: str,
+    persist_cwd: bool = True,
+):
+    """Run a local foreground command with a non-destructive handoff window.
+
+    Returns a normal ``env.execute``-shaped result when the command exits
+    quickly, a terminal-tool response when it is handed off, or ``None`` when
+    the backend cannot support this lifecycle path.
+    """
+    if env_type != "local" or handoff_timeout <= 0:
+        return None
+    if effective_timeout <= handoff_timeout:
+        return None
+
+    from tools.process_registry import process_registry
+    from tools.tool_output_limits import get_max_bytes
+
+    proc = None
+    proc_session = None
+    try:
+        proc, spawned_cwd = env.spawn(
+            command,
+            cwd=command_cwd,
+            timeout=effective_timeout,
+        )
+        proc_session = process_registry.adopt_local_process(
+            proc,
+            command=command,
+            cwd=spawned_cwd,
+            task_id=effective_task_id,
+            session_key=session_key,
+            env_ref=env,
+            max_runtime=effective_timeout,
+            bounded_capture_limit=get_max_bytes(),
+            persist_cwd=persist_cwd,
+        )
+        waited = process_registry.wait(proc_session.id, timeout=handoff_timeout)
+        if waited.get("status") == "timeout":
+            return {
+                "output": waited.get("output", ""),
+                "session_id": proc_session.id,
+                "pid": proc_session.pid,
+                "exit_code": 0,
+                "error": None,
+                "status": "running",
+                "auto_handoff": True,
+                "handoff_timeout": handoff_timeout,
+                "execution_timeout": effective_timeout,
+            }
+        if waited.get("status") == "interrupted":
+            process_registry.kill_process(proc_session.id, source="interrupt")
+            return {
+                "output": waited.get("output", "") + "\n[Command interrupted]",
+                "returncode": 130,
+            }
+
+        output = waited.get("output", "")
+        if persist_cwd:
+            env._update_cwd({"output": output})
+            record_session_cwd(session_key, getattr(env, "cwd", None))
+        return {
+            "output": output,
+            "returncode": waited.get("exit_code", 0),
+        }
+    except Exception:
+        if proc_session is not None:
+            try:
+                process_registry.kill_process(proc_session.id, source="handoff_error")
+            except Exception:
+                pass
+        elif proc is not None:
+            try:
+                env._kill_process(proc)
+            except Exception:
+                pass
+        logger.debug("Automatic foreground handoff unavailable", exc_info=True)
+        if proc is not None:
+            return {
+                "output": "",
+                "returncode": -1,
+                "error": "Automatic foreground handoff failed after the command was started; the command was not retried.",
+                "handoff_failed": True,
+            }
+        return None
+
+
 def terminal_tool(
     command: str,
     background: bool = False,
@@ -2218,7 +2314,10 @@ def terminal_tool(
     Args:
         command: The command to execute
         background: Whether to run in background (default: False)
-        timeout: Command timeout in seconds (default: from config)
+        timeout: Maximum execution time in seconds (default: from config). The
+                 shorter terminal.handoff_timeout only controls how long a
+                 foreground call waits before handing a live local process to
+                 the process registry.
         task_id: Unique identifier for environment isolation (optional)
         session_id: Conversation/session identifier for durable observability
         force: If True, skip dangerous command check (use after user confirms)
@@ -2318,6 +2417,9 @@ def terminal_tool(
                 f"timeout must be a positive number of seconds (got {timeout})."
             )
         effective_timeout = timeout or default_timeout
+        # Keep compatibility with older/custom config-shaped mappings that do
+        # not yet carry the newly introduced handoff timeout.
+        handoff_timeout = config.get("handoff_timeout", 10)
 
         # Reject foreground commands where the model explicitly requests
         # a timeout above FOREGROUND_MAX_TIMEOUT — nudge it toward background.
@@ -2869,25 +2971,49 @@ def terminal_tool(
             max_retries = 3
             retry_count = 0
             result = None
-            command_cwd = None
+            command_cwd = _resolve_command_cwd(
+                workdir=workdir,
+                default_cwd=cwd,
+                session_key=session_key,
+            )
 
-            # Clean interrupt slate for an approved command, ONCE before the
-            # retry loop: drop a stale bit that landed on this thread during the
-            # approval-wait so it can't SIGINT the just-approved run.  Do NOT
-            # re-clear inside the loop -- a genuine interrupt arriving during the
-            # backoff sleep between retries must survive and abort the command
-            # (caught by the next attempt's _wait_for_process poll loop -> 130).
+            # Clean interrupt slate before starting any approved command,
+            # including the handoff path. A stale approval-time bit must not be
+            # mistaken for a new interrupt by ProcessRegistry.wait().
             if _approved_run:
                 from tools.interrupt import clear_current_thread_interrupt
                 clear_current_thread_interrupt()
 
+            handoff_running = False
+            # A short foreground window is a handoff, not a kill.  The
+            # environment process is adopted by ProcessRegistry so its shell
+            # snapshot and cwd semantics are preserved while the agent gets
+            # control back with a session_id.
+            if not effective_pty:
+                handoff_result = _auto_handoff_foreground(
+                    env=env,
+                    env_type=env_type,
+                    command=command,
+                    command_cwd=command_cwd,
+                    effective_timeout=effective_timeout,
+                    handoff_timeout=handoff_timeout,
+                    effective_task_id=effective_task_id,
+                    session_key=session_key,
+                    persist_cwd=not bool(workdir),
+                )
+                if handoff_result and handoff_result.get("status") == "running":
+                    handoff_running = True
+                if handoff_result is not None:
+                    result = handoff_result
+
+            # The interrupt slate is intentionally not cleared again inside
+            # the retry loop: a genuine interrupt arriving during backoff must
+            # survive and abort the command or its adopted ProcessRegistry
+            # session.
             while retry_count <= max_retries:
+                if result is not None:
+                    break
                 try:
-                    command_cwd = _resolve_command_cwd(
-                        workdir=workdir,
-                        default_cwd=cwd,
-                        session_key=session_key,
-                    )
                     execute_kwargs = {
                         "timeout": effective_timeout,
                         "cwd": command_cwd,
@@ -2939,12 +3065,13 @@ def terminal_tool(
             # (docstring: "Working directory for this command"). Recording it
             # would hijack the session's durable cwd for every later command
             # that doesn't pass ``workdir``. Skip the dual-write in that case.
-            if not workdir:
+            if not workdir and not handoff_running:
                 record_session_cwd(session_key, getattr(env, "cwd", None))
 
             # Extract output
-            output = result.get("output", "")
-            returncode = result.get("returncode", 0)
+            result_data = result or {}
+            output = result_data.get("output", "")
+            returncode = result_data.get("returncode", result_data.get("exit_code", 0))
 
             # Add helpful message for sudo failures in messaging context
             output = _handle_sudo_failure(output, env_type)
@@ -3021,27 +3148,37 @@ def terminal_tool(
             result_dict = {
                 "output": output,
                 "exit_code": returncode,
-                "error": None,
+                "error": result_data.get("error"),
             }
-            try:
-                from agent.verification_evidence import record_terminal_result
+            if handoff_running:
+                # Preserve the lifecycle metadata while still applying the
+                # foreground output pipeline to the initial handoff response.
+                for key in (
+                    "status", "session_id", "pid", "auto_handoff",
+                    "handoff_timeout", "execution_timeout",
+                ):
+                    if key in result_data:
+                        result_dict[key] = result_data[key]
+            if not handoff_running:
+                try:
+                    from agent.verification_evidence import record_terminal_result
 
-                evidence = record_terminal_result(
-                    command=command,
-                    cwd=command_cwd,
-                    session_id=session_id or task_id or effective_task_id or "default",
-                    exit_code=returncode,
-                    output=output,
-                )
-                if evidence:
-                    result_dict["verification_evidence"] = {
-                        "status": evidence.get("status"),
-                        "kind": evidence.get("kind"),
-                        "scope": evidence.get("scope"),
-                        "canonical_command": evidence.get("canonical_command"),
-                    }
-            except Exception:
-                logger.debug("verification evidence recording failed", exc_info=True)
+                    evidence = record_terminal_result(
+                        command=command,
+                        cwd=command_cwd,
+                        session_id=session_id or task_id or effective_task_id or "default",
+                        exit_code=returncode,
+                        output=output,
+                    )
+                    if evidence:
+                        result_dict["verification_evidence"] = {
+                            "status": evidence.get("status"),
+                            "kind": evidence.get("kind"),
+                            "scope": evidence.get("scope"),
+                            "canonical_command": evidence.get("canonical_command"),
+                        }
+                except Exception:
+                    logger.debug("verification evidence recording failed", exc_info=True)
             if approval_note:
                 # Treat rc=130 as an interrupt only when the executor's marker is
                 # present.  A command can legitimately exit 130 on its own

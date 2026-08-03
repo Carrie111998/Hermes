@@ -1189,6 +1189,51 @@ class BaseEnvironment(ABC):
     # Unified execute()
     # ------------------------------------------------------------------
 
+    def spawn(
+        self,
+        command: str,
+        cwd: str = "",
+        *,
+        timeout: int | None = None,
+        stdin_data: str | None = None,
+        rewrite_compound_background: bool = True,
+    ):
+        """Prepare and start a command without waiting for it to finish.
+
+        This lifecycle seam lets the terminal tool hand a live command to the
+        process registry without losing the environment snapshot, cwd marker,
+        sudo stdin handling, or shell wrapper used by ``execute()``.
+        """
+        self._before_execute()
+
+        exec_command, sudo_stdin = self._prepare_command(command)
+        if rewrite_compound_background:
+            from tools.terminal_tool import _rewrite_compound_background
+            exec_command = _rewrite_compound_background(exec_command)
+        effective_timeout = timeout or self.timeout
+        effective_cwd = cwd or self.cwd
+
+        if sudo_stdin is not None and stdin_data is not None:
+            effective_stdin = sudo_stdin + stdin_data
+        elif sudo_stdin is not None:
+            effective_stdin = sudo_stdin
+        else:
+            effective_stdin = stdin_data
+
+        if effective_stdin and self._stdin_mode == "heredoc":
+            exec_command = self._embed_stdin_heredoc(exec_command, effective_stdin)
+            effective_stdin = None
+
+        wrapped = self._wrap_command(exec_command, effective_cwd)
+        login = not self._snapshot_ready and not self._prefer_nonlogin
+        proc = self._run_bash(
+            wrapped,
+            login=login,
+            timeout=effective_timeout,
+            stdin_data=effective_stdin,
+        )
+        return proc, effective_cwd
+
     def execute(
         self,
         command: str,
@@ -1210,40 +1255,14 @@ class BaseEnvironment(ABC):
         the patch engine, code-execution RPC reads, log reads — MUST leave
         it False: truncating those corrupts data, not just display.
         """
-        self._before_execute()
-
-        exec_command, sudo_stdin = self._prepare_command(command)
-        # Guard against the `A && B &` subshell-wait trap by default.
-        # Some callers (spawn_via_env) already produce shell-safe wrappers and
-        # pass rewrite_compound_background=False.
-        if rewrite_compound_background:
-            from tools.terminal_tool import _rewrite_compound_background
-            exec_command = _rewrite_compound_background(exec_command)
-        effective_timeout = timeout or self.timeout
-        effective_cwd = cwd or self.cwd
-
-        # Merge sudo stdin with caller stdin
-        if sudo_stdin is not None and stdin_data is not None:
-            effective_stdin = sudo_stdin + stdin_data
-        elif sudo_stdin is not None:
-            effective_stdin = sudo_stdin
-        else:
-            effective_stdin = stdin_data
-
-        # Embed stdin as heredoc for backends that need it
-        if effective_stdin and self._stdin_mode == "heredoc":
-            exec_command = self._embed_stdin_heredoc(exec_command, effective_stdin)
-            effective_stdin = None
-
-        wrapped = self._wrap_command(exec_command, effective_cwd)
-
-        # Use login shell if snapshot failed (so user's profile still loads),
-        # unless login itself is broken — then non-login is the only path.
-        login = not self._snapshot_ready and not self._prefer_nonlogin
-
-        proc = self._run_bash(
-            wrapped, login=login, timeout=effective_timeout, stdin_data=effective_stdin
+        proc, effective_cwd = self.spawn(
+            command,
+            cwd,
+            timeout=timeout,
+            stdin_data=stdin_data,
+            rewrite_compound_background=rewrite_compound_background,
         )
+        effective_timeout = timeout or self.timeout
         result = self._wait_for_process(
             proc, timeout=effective_timeout, bounded_capture=bounded_capture
         )
