@@ -14,6 +14,9 @@ from hermes_cli.subcommands.cron import build_cron_parser
 
 @pytest.fixture()
 def tmp_cron_dir(tmp_path, monkeypatch):
+    # Scheduler-target scripts resolve below the effective Hermes home. Keep
+    # the test job store and that real validation boundary in the same temp home.
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr("cron.jobs.CRON_DIR", tmp_path / "cron")
     monkeypatch.setattr("cron.jobs.JOBS_FILE", tmp_path / "cron" / "jobs.json")
     monkeypatch.setattr("cron.jobs.OUTPUT_DIR", tmp_path / "cron" / "output")
@@ -131,8 +134,20 @@ class TestCronCommandLifecycle:
 
 class TestCronDoctor:
     def test_doctor_reports_cron_health_issues(self, tmp_cron_dir, capsys):
-        job = create_job(prompt="Daily digest", schedule="every 1h", script="missing.py")
+        # New jobs with a missing scheduler script are rejected at persistence.
+        # Doctor must still diagnose legacy/corrupt records that predate that
+        # invariant, so create a valid job then persist the stale record directly.
+        scripts_dir = tmp_cron_dir / "scripts"
+        scripts_dir.mkdir()
+        (scripts_dir / "valid.py").write_text("print('ok')\n", encoding="utf-8")
+        job = create_job(
+            prompt="Daily digest",
+            schedule="every 1h",
+            script="valid.py",
+            target="scheduler",
+        )
         jobs = load_jobs()
+        jobs[0]["script"] = "missing.py"
         jobs[0]["last_status"] = "error"
         jobs[0]["last_error"] = "Provider returned error"
         jobs[0]["last_delivery_error"] = "telegram timeout"
@@ -152,7 +167,12 @@ class TestCronDoctor:
         scripts_dir = tmp_cron_dir / "scripts"
         scripts_dir.mkdir()
         (scripts_dir / "ok.py").write_text("print('ok')\n", encoding="utf-8")
-        create_job(prompt="Daily digest", schedule="every 1h", script="ok.py")
+        create_job(
+            prompt="Daily digest",
+            schedule="every 1h",
+            script="ok.py",
+            target="scheduler",
+        )
 
         rc = cron_command(Namespace(cron_command="doctor"))
 
@@ -315,6 +335,7 @@ def test_cron_create_failure_returns_nonzero(monkeypatch, capsys):
         skills=None,
         script=None,
         workdir=None,
+        target=None,
         no_agent=False,
     )
 
@@ -446,3 +467,32 @@ class TestCronRunBackgroundDispatch:
         assert rc == 0
         assert "Running in background (delegation del-xyz)." in out
         assert "failed" not in out.lower()
+
+
+def test_cron_create_forwards_script_target(monkeypatch):
+    """The CLI exposes the target required by target-aware script validation."""
+    captured = {}
+
+    def fake_cron_api(**kwargs):
+        captured.update(kwargs)
+        return {"success": False, "error": "expected test failure"}
+
+    monkeypatch.setattr(cron_cli, "_cron_api", fake_cron_api)
+    args = SimpleNamespace(
+        schedule="every 1h",
+        prompt=None,
+        name=None,
+        deliver=None,
+        repeat=None,
+        skill=None,
+        skills=None,
+        script="/workspace/check.py",
+        workdir=None,
+        target="backend",
+        model=None,
+        model_provider=None,
+        no_agent=True,
+    )
+
+    assert cron_cli.cron_create(args) == 1
+    assert captured["target"] == "backend"
