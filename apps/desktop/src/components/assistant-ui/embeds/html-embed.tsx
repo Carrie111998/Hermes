@@ -10,9 +10,14 @@ import type { RichFenceProps } from './types'
 // (instead of promoting to an artifact card that opens in the right rail).
 export const HTML_INLINE_FENCE_LANGUAGES: ReadonlySet<string> = new Set(['html', 'htm', 'xhtml'])
 
-const INLINE_HEIGHT_MESSAGE = '__inlineHeight'
+export const INLINE_HEIGHT_MESSAGE = '__inlineHeight'
 const START_HEIGHT = 340
 const MIN_HEIGHT = 60
+// Cap on the iframe's reported content height. The frame's own allowed script
+// controls the height message, so the reported value is untrusted — without a
+// cap, a generated document could post an arbitrarily large number and blow up
+// the transcript row. Content taller than this scrolls inside the frame.
+export const MAX_HEIGHT = 1200
 
 /** Height-sync shim injected into the composed document: reports the content
  *  height to the parent frame so the iframe sizes itself to its content. The
@@ -64,7 +69,9 @@ export function InlineHtmlEmbed({ code, streaming }: RichFenceProps) {
   const srcDoc = useMemo(() => buildSrcDoc(code), [code])
 
   // Content-height sync: only accept height reports from this frame's own
-  // contentWindow.
+  // contentWindow, and clamp the reported value. The message is authored by
+  // the untrusted document's script, so event.source checks provenance but
+  // not honesty — the clamp is the actual security boundary.
   useEffect(() => {
     const onMessage = (event: MessageEvent) => {
       if (event.source !== iframeRef.current?.contentWindow) {
@@ -74,7 +81,8 @@ export function InlineHtmlEmbed({ code, streaming }: RichFenceProps) {
       const next = (event.data as Record<string, unknown> | null)?.[INLINE_HEIGHT_MESSAGE]
 
       if (typeof next === 'number' && Number.isFinite(next)) {
-        setHeight(Math.max(MIN_HEIGHT, Math.round(next)))
+        const clamped = Math.min(MAX_HEIGHT, Math.max(MIN_HEIGHT, Math.round(next)))
+        setHeight(clamped)
       }
     }
 
@@ -95,7 +103,8 @@ export function InlineHtmlEmbed({ code, streaming }: RichFenceProps) {
   // Three-level scrollbar containment:
   // 1. srcdoc body constrains children (fragment shell CSS) + the height-sync
   //    shim grows the frame, so no inner scrollbar;
-  // 2. the iframe element is display:block width:100% with explicit height;
+  // 2. the iframe element is display:block width:100% with explicit height
+  //    (clamped to MAX_HEIGHT — taller documents scroll inside the frame);
   // 3. the container clips overflow and contains layout.
   return (
     <div
