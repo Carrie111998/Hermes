@@ -80,6 +80,15 @@ def test_replay_is_no_send_and_enforces_attention_invariants(tmp_path):
     assert all(row["destination_count"] == 1 for row in report["rows"])
     assert all("header" in row for row in report["rows"])
 
+    credits_rows = [
+        row for row in report["rows"]
+        if row["payload"].get("action_kind") == "credits"
+    ]
+    assert len(credits_rows) == 1
+    assert credits_rows[0]["attention"] == "act"
+    assert credits_rows[0]["topic"] == "action_required"
+    assert credits_rows[0]["destination_count"] == 1
+
     tracker_failure = report["rows"][0]
     assert tracker_failure["attention"] == "warn"
     assert tracker_failure["topic"] == "watchdog_alerts"
