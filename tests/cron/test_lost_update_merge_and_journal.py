@@ -126,3 +126,68 @@ def test_incoming_wins_on_values(store):
     assert result[0]["enabled"] is True
     assert dropped == 0
     assert not store.journal_path().exists()
+
+
+def test_stale_snapshot_cannot_regress_completion_metadata(store):
+    """C2 (t_95fbd07c): a stale writer's older last_run_at must not erase a
+    fresher completion's metadata on a shared job. Structural fields (e.g.
+    enabled) still follow the caller's intent."""
+    fresh = _job("A")
+    fresh["last_run_at"] = "2026-08-03T13:31:13.020842+01:00"
+    fresh["last_status"] = "ok"
+    fresh["last_error"] = None
+    fresh["next_run_at"] = "2026-08-03T14:31:00+01:00"
+    store.seed([fresh])
+
+    # A stale snapshot writer that loaded A earlier (last_run_at from 08:57)
+    # and now disables the job must not regress last_run_at back to 08:57.
+    stale = _job("A", enabled=False)
+    stale["last_run_at"] = "2026-08-03T08:57:14.473529+01:00"
+    stale["last_status"] = "ok"
+
+    dropped = store.save([stale], loaded_ids={"A"})
+
+    result = store.read()
+    assert len(result) == 1
+    assert result[0]["enabled"] is False  # structural intent honored
+    assert result[0]["last_run_at"] == "2026-08-03T13:31:13.020842+01:00"
+    assert result[0]["last_status"] == "ok"
+    assert result[0]["next_run_at"] == "2026-08-03T14:31:00+01:00"
+    assert dropped == 0
+
+
+def test_incoming_newer_completion_wins(store):
+    """C2 (t_95fbd07c): when the incoming writer is genuinely fresher, its
+    completion metadata wins (normal mark_job_run path)."""
+    old = _job("A")
+    old["last_run_at"] = "2026-08-03T13:31:13.020842+01:00"
+    store.seed([old])
+
+    newer = _job("A")
+    newer["last_run_at"] = "2026-08-03T13:35:00.123456+01:00"
+    newer["last_status"] = "error"
+    newer["last_error"] = "boom"
+
+    store.save([newer], loaded_ids={"A"})
+
+    result = store.read()
+    assert len(result) == 1
+    assert result[0]["last_run_at"] == "2026-08-03T13:35:00.123456+01:00"
+    assert result[0]["last_status"] == "error"
+    assert result[0]["last_error"] == "boom"
+
+
+def test_mark_job_run_not_found_journaled(store):
+    """C2 (t_95fbd07c): mark_job_run for a job absent from the store must
+    journal a probe-visible skip line instead of silently dropping the
+    completion write (cf46180e12ee class)."""
+    with jobs_mod.use_cron_store(store.home):
+        jobs_mod.mark_job_run("cf46180e12ee", True, None)
+
+    skip_path = store.home / "cron" / jobs_mod._MARK_JOB_RUN_SKIPS_JOURNAL_NAME
+    assert skip_path.exists()
+    lines = [json.loads(ln) for ln in skip_path.read_text().splitlines() if ln.strip()]
+    assert len(lines) == 1
+    assert lines[0]["job_id"] == "cf46180e12ee"
+    assert lines[0]["success"] is True
+    assert lines[0]["pid"] == os.getpid()
