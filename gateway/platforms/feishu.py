@@ -212,6 +212,7 @@ _FEISHU_WEBHOOK_RATE_MAX_KEYS = 4096               # max tracked keys (prevents 
 _FEISHU_WEBHOOK_BODY_TIMEOUT_SECONDS = 30          # max seconds to read request body
 _FEISHU_WEBHOOK_ANOMALY_THRESHOLD = 25             # consecutive error responses before WARNING log
 _FEISHU_WEBHOOK_ANOMALY_TTL_SECONDS = 6 * 60 * 60  # anomaly tracker TTL (6 hours) — matches openclaw
+_FEISHU_WEBHOOK_ANOMALY_MAX_KEYS = 4096            # max tracked IPs (prevents unbounded growth)
 _FEISHU_CARD_ACTION_DEDUP_TTL_SECONDS = 15 * 60    # card action token dedup window (15 min)
 
 _APPROVAL_CHOICE_MAP: Dict[str, str] = {
@@ -2940,6 +2941,14 @@ class FeishuAdapter(BasePlatformAdapter):
                 self._webhook_anomaly_counts[remote_ip] = (count, status, first_seen)
                 return
         # Either first occurrence or TTL expired — start fresh.
+        # Prune stale entries if we're at the cap.
+        if len(self._webhook_anomaly_counts) >= _FEISHU_WEBHOOK_ANOMALY_MAX_KEYS:
+            stale_ips = [
+                ip for ip, (_, _, fs) in self._webhook_anomaly_counts.items()
+                if now - fs >= _FEISHU_WEBHOOK_ANOMALY_TTL_SECONDS
+            ]
+            for ip in stale_ips:
+                self._webhook_anomaly_counts.pop(ip, None)
         self._webhook_anomaly_counts[remote_ip] = (1, status, now)
 
     def _clear_webhook_anomaly(self, remote_ip: str) -> None:
