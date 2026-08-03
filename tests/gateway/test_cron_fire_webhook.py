@@ -103,7 +103,7 @@ async def test_valid_token_accepts_and_fires(adapter, monkeypatch):
     )
 
     resp = await _post(
-        adapter, {"job_id": "abc123", "fire_at": "2026-08-01T09:10:00Z"},
+        adapter, {"job_id": "abc123", "fire_at": "2026-08-01T09:10:00+00:00"},
     )
     assert resp.status == 202
     assert _response_json(resp)["job_id"] == "abc123"
@@ -114,6 +114,29 @@ async def test_valid_token_accepts_and_fires(adapter, monkeypatch):
             break
         await asyncio.sleep(0.01)
     assert spy.fired == [("abc123", "2026-08-01T09:10:00+00:00")]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("fire_at", [
+    "2026-08-01T09:10:00Z",
+    "2026-08-01T10:10:00+01:00",
+    " 2026-08-01T09:10:00+00:00 ",
+    "2026-08-01T09:10:00.000000+00:00",
+])
+async def test_noncanonical_fire_body_is_rejected(adapter, monkeypatch, fire_at):
+    spy = _SpyProvider()
+    monkeypatch.setattr("cron.scheduler_provider.resolve_cron_scheduler", lambda: spy)
+    monkeypatch.setattr(
+        "plugins.cron_providers.chronos.verify.get_fire_verifier",
+        lambda: (lambda **_kw: {
+            "purpose": "cron_fire", "aud": "agent:x", "job_id": "abc123",
+            "fire_at": "2026-08-01T09:10:00+00:00",
+        }),
+    )
+
+    resp = await _post(adapter, {"job_id": "abc123", "fire_at": fire_at})
+    assert resp.status == 400
+    assert spy.fired == []
 
 
 @pytest.mark.anyio
@@ -133,7 +156,7 @@ async def test_signed_claims_must_match_exact_job_and_nominal_fire(
     )
 
     async def request_json():
-        return {"job_id": "abc123", "fire_at": "2026-08-01T09:10:00Z"}
+        return {"job_id": "abc123", "fire_at": "2026-08-01T09:10:00+00:00"}
 
     request = SimpleNamespace(
         headers={"Authorization": "Bearer good"},
@@ -215,7 +238,7 @@ async def test_valid_fire_reservation_blocks_drain_before_body_and_task(adapter,
     async def delayed_json():
         body_started.set()
         await release_body.wait()
-        return {"job_id": "abc123", "fire_at": "2026-08-01T09:10:00Z"}
+        return {"job_id": "abc123", "fire_at": "2026-08-01T09:10:00+00:00"}
 
     monkeypatch.setattr("cron.scheduler_provider.resolve_cron_scheduler", BlockingProvider)
     monkeypatch.setattr(
@@ -295,7 +318,7 @@ async def test_fire_does_not_require_api_server_key(adapter, monkeypatch):
     # Bearer is the FIRE token, not the API_SERVER_KEY "sk-secret".
     resp = await _post(
         adapter,
-        {"job_id": "j9", "fire_at": "2026-08-01T09:10:00Z"},
+        {"job_id": "j9", "fire_at": "2026-08-01T09:10:00+00:00"},
         token="nas-jwt",
     )
     assert resp.status == 202
@@ -333,7 +356,7 @@ async def test_sync_verifier_runs_off_the_event_loop(adapter, monkeypatch):
 
     resp = await _post(
         adapter,
-        {"job_id": "off-loop", "fire_at": "2026-08-01T09:10:00Z"},
+        {"job_id": "off-loop", "fire_at": "2026-08-01T09:10:00+00:00"},
     )
     assert resp.status == 202
 
@@ -387,7 +410,7 @@ async def test_async_verifier_is_awaited(adapter, monkeypatch):
 
     resp = await _post(
         adapter,
-        {"job_id": "async-ok", "fire_at": "2026-08-01T09:10:00Z"},
+        {"job_id": "async-ok", "fire_at": "2026-08-01T09:10:00+00:00"},
     )
     assert resp.status == 202
 

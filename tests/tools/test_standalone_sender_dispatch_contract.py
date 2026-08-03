@@ -89,6 +89,50 @@ def test_direct_registry_helper_forwards_callback_without_outer_marking(monkeypa
     assert contacts == []
 
 
+def test_slack_text_forwards_contact_callback_through_adapter_fallback(monkeypatch):
+    from gateway.platform_registry import PlatformEntry, platform_registry
+
+    contacts = []
+
+    async def sender(*_args, on_provider_contact=None, **_kwargs):
+        assert on_provider_contact is not None
+        on_provider_contact()
+        raise RuntimeError("response lost after provider acceptance")
+
+    original = platform_registry.get("slack")
+    if original is not None:
+        platform_registry.unregister("slack")
+    platform_registry.register(
+        PlatformEntry(
+            name="slack",
+            label="Slack",
+            adapter_factory=lambda _config: None,
+            check_fn=lambda: True,
+            standalone_sender_fn=sender,
+        )
+    )
+    monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: None)
+    try:
+        result = asyncio.run(
+            _send_to_platform(
+                Platform.SLACK,
+                SimpleNamespace(token="", extra={}),
+                "C123",
+                "payload",
+                on_provider_contact=lambda: contacts.append("contact"),
+            )
+        )
+    finally:
+        platform_registry.unregister("slack")
+        if original is not None:
+            platform_registry.register(original)
+
+    assert result == {
+        "error": "Plugin standalone send failed: response lost after provider acceptance",
+    }
+    assert contacts == ["contact"]
+
+
 @pytest.mark.parametrize(
     ("message", "media_count", "expected_caption"),
     [("native caption", 1, "native caption"), ("separate text", 2, None)],

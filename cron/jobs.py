@@ -817,6 +817,11 @@ def _compute_grace_seconds(schedule: dict) -> int:
     return MIN_GRACE
 
 
+def _canonical_fire_datetime(value: datetime) -> str:
+    """Serialize scheduler-owned nominal time at exact UTC second precision."""
+    return _ensure_aware(value).astimezone(timezone.utc).replace(microsecond=0).isoformat()
+
+
 def compute_next_run(schedule: Dict[str, Any], last_run_at: Optional[str] = None) -> Optional[str]:
     """
     Compute the next run time for a schedule.
@@ -2142,7 +2147,10 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                 # Track delivery failures separately — cleared on successful delivery
                 job["last_delivery_error"] = delivery_error
                 # Clear any external-fire claim so a re-armed recurring job can
-                # be claimed again on its next fire (Phase 4C CAS).
+                # be claimed again on its next fire (Phase 4C CAS). The claim
+                # already advanced recurring next_run_at atomically; preserve
+                # that exact successor instead of recomputing from completion time.
+                had_fire_claim = job.get("fire_claim") is not None
                 job["fire_claim"] = None
                 # Clear the one-shot running-claim (#59229): the run is over, so
                 # a re-armed recurring job or a re-dispatched one-shot recovery
@@ -2188,8 +2196,9 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                         save_jobs(jobs)
                         return
                 
-                # Compute next run
-                job["next_run_at"] = compute_next_run(job["schedule"], now)
+                # Compute next run unless the external claim already advanced it.
+                if not had_fire_claim:
+                    job["next_run_at"] = compute_next_run(job["schedule"], now)
 
                 # If no next run, decide whether this is terminal completion
                 # (one-shot) or a transient failure (recurring schedule couldn't
@@ -2457,15 +2466,27 @@ def _machine_id() -> str:
 
 def canonicalize_fire_at(value: Optional[str]) -> str:
     """Return one canonical UTC identity for a scheduler-owned fire instant."""
-    if not isinstance(value, str) or not value.strip():
+    if not isinstance(value, str) or not value:
         raise ValueError("missing fire_at")
+    from cron.executions import require_canonical_scheduled_for
+
+    try:
+        return require_canonical_scheduled_for(value)
+    except ValueError as exc:
+        raise ValueError("invalid fire_at") from exc
+
+
+def _normalize_stored_fire_at(value: Any) -> str:
+    """Upgrade an older persisted scheduler timestamp to current authority form."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("missing stored fire_at")
     try:
         parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
     except ValueError as exc:
-        raise ValueError("invalid fire_at") from exc
+        raise ValueError("invalid stored fire_at") from exc
     if parsed.tzinfo is None or parsed.utcoffset() is None:
-        raise ValueError("fire_at must include a timezone")
-    return parsed.astimezone(timezone.utc).isoformat()
+        raise ValueError("stored fire_at must include a timezone")
+    return _canonical_fire_datetime(parsed)
 
 
 def fire_claims_match_body(
@@ -2520,7 +2541,7 @@ def claim_job_for_fire(
                 return False
             current_fire_at = job.get("next_run_at") or ""
             try:
-                expected_fire_at = canonicalize_fire_at(current_fire_at)
+                expected_fire_at = _normalize_stored_fire_at(current_fire_at)
                 requested_fire_at = (
                     canonicalize_fire_at(nominal_fire_at)
                     if nominal_fire_at is not None
@@ -2553,7 +2574,7 @@ def claim_job_for_fire(
             }
             kind = job.get("schedule", {}).get("kind")
             if kind in {"cron", "interval"}:
-                nxt = compute_next_run(job["schedule"], now.isoformat())
+                nxt = compute_next_run(job["schedule"], requested_fire_at)
                 if nxt:
                     job["next_run_at"] = nxt
             save_jobs(jobs)

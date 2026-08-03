@@ -1135,6 +1135,7 @@ async def _send_to_platform(
                 thread_id=thread_id,
                 media_files=media_files if is_last else [],
                 force_document=force_document,
+                on_provider_contact=on_provider_contact,
             )
             if isinstance(result, dict) and result.get("error"):
                 return result

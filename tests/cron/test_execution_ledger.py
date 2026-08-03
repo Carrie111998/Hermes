@@ -68,6 +68,9 @@ def test_execution_persists_nominal_scheduled_time(monkeypatch, tmp_path):
     "2026-08-01T09:10:00",
     "2026-08-01T09:10:00Z",
     "2026-08-01T04:10:00-05:00",
+    " 2026-08-01T09:10:00+00:00 ",
+    "2026-08-01T09:10:00.000000+00:00",
+    "2026-08-01T09:10:00.123456+00:00",
 ])
 def test_producer_execution_rejects_missing_or_noncanonical_nominal_time(
     monkeypatch, tmp_path, scheduled_for,

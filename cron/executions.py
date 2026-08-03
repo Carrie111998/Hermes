@@ -10,11 +10,12 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import threading
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
 
@@ -27,11 +28,14 @@ _TERMINAL_STATES = ("completed", "failed", "unknown")
 _lock = threading.RLock()
 _PROCESS_ID = uuid.uuid4().hex
 SCHEDULER_SOURCES = frozenset({"builtin", "chronos"})
+_CANONICAL_SCHEDULED_FOR_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\+00:00$",
+)
 
 
 def require_canonical_scheduled_for(value: Optional[str]) -> str:
     """Require the exact UTC spelling used as durable scheduled-run authority."""
-    if not isinstance(value, str) or not value or value != value.strip():
+    if not isinstance(value, str) or not _CANONICAL_SCHEDULED_FOR_RE.fullmatch(value):
         raise ValueError("producer execution requires canonical UTC scheduled_for")
     try:
         parsed = datetime.fromisoformat(value)
@@ -39,12 +43,9 @@ def require_canonical_scheduled_for(value: Optional[str]) -> str:
         raise ValueError(
             "producer execution requires canonical UTC scheduled_for",
         ) from exc
-    if parsed.tzinfo is None or parsed.utcoffset() is None:
+    if parsed.tzinfo is None or parsed.utcoffset() is None or parsed.isoformat() != value:
         raise ValueError("producer execution requires canonical UTC scheduled_for")
-    canonical = parsed.astimezone(timezone.utc).isoformat()
-    if value != canonical:
-        raise ValueError("producer execution requires canonical UTC scheduled_for")
-    return canonical
+    return value
 
 
 def require_scheduler_source(value: Any) -> str:
