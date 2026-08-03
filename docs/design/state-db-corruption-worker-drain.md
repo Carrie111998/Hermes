@@ -135,9 +135,20 @@ doomed to `session_persistence_failed`:
   `profile <name> store unhealthy: <error>; worker blocked` in the run
   history instead — so the requeue/auto-block story is the storage cause,
   not a generic vanished-pid message.
+- **Queue-drain alert contract events:** the gate also emits
+  `profile_quarantined` (on quarantine, once per profile per tick) and
+  `profile_store_healthy` (when a previously-quarantined profile's store
+  heals) — the exact events `hermes_cli.kanban_health.check_queue_drain`'s
+  default event-stream provider scans for. This is the wiring the
+  queue-drain alert (task 2) documented as its seam; without it the alert
+  can never fire from a real quarantine. See
+  `tests/hermes_cli/test_kanban_store_quarantine.py` (event-contract
+  tests) and `tests/hermes_cli/test_kanban_queue_drain_alert.py`.
 - The store is never replaced, repaired, or deleted by the gate;
   `_db_opens_cleanly` is read-only + rolled-back-write, and recovery
-  relies on the existing timestamped backups / `repair_state_db_schema`.
+  relies on the existing timestamped backups / `repair_state_db_schema`
+  (see `RECOVERY.md` at the repo root for the safe offline recovery
+  procedure).
 
 The detector contract was already proven: `_db_opens_cleanly` flags both
 the `messages` b-tree class and the FTS class on real fixtures (see

@@ -24,6 +24,7 @@ backups (``repair_state_db_schema`` / manual restore).
 """
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import sys
@@ -426,3 +427,116 @@ def test_crash_keeps_pid_message_when_store_healthy(kanban_with_profiles):
         err = run["error"] or ""
         assert "not alive" in err
         assert "store unhealthy" not in err
+
+
+# ── Queue-drain alert contract events (task-2 seam) ─────────────────────────
+
+
+def _fetch_event_payloads(conn, task_id: str, kind: str) -> list:
+    return [
+        r["payload"] for r in conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? ORDER BY id",
+            (task_id, kind),
+        ).fetchall()
+    ]
+
+
+def test_gate_emits_profile_quarantined_event(kanban_with_profiles):
+    """The quarantine gate must emit the ``profile_quarantined`` event the
+    queue-drain alert's default provider scans for (contract pinned in
+    tests/hermes_cli/test_kanban_queue_drain_alert.py: the pre-dispatch
+    health probe emits ``profile_quarantined`` events and the alert picks
+    them up with zero provider registration)."""
+    kb, root = kanban_with_profiles
+    _make_store_unhealthy(root, "alpha")
+    with kb.connect_closing() as conn:
+        kb.create_board(slug="default", name="Test")
+        task_id = kb.create_task(conn, title="doomed", assignee="alpha")
+
+    with kb.connect_closing() as conn:
+        kb.dispatch_once(conn, spawn_fn=_fake_spawn)
+
+    with kb.connect_closing() as conn:
+        payloads = _fetch_event_payloads(conn, task_id, "profile_quarantined")
+    assert len(payloads) == 1
+    payload = json.loads(payloads[0])
+    assert payload["profile"] == "alpha"
+    assert payload["reason"] == "store_unhealthy"
+    assert "malformed" in payload["error"].lower()
+    assert "state.db" in payload["db_path"]
+
+
+def test_gate_emits_single_quarantine_event_per_tick_fanout(kanban_with_profiles):
+    """A fan-out tick with many ready tasks for one unhealthy profile emits
+    exactly one ``profile_quarantined`` event (deduped per profile per tick),
+    while every task is still blocked."""
+    kb, root = kanban_with_profiles
+    _make_store_unhealthy(root, "alpha")
+    with kb.connect_closing() as conn:
+        kb.create_board(slug="default", name="Test")
+        ids = [
+            kb.create_task(conn, title=f"fan{i}", assignee="alpha")
+            for i in range(3)
+        ]
+
+    with kb.connect_closing() as conn:
+        res = kb.dispatch_once(conn, spawn_fn=_fake_spawn)
+
+    assert len(res.quarantined) == 3
+    total = 0
+    with kb.connect_closing() as conn:
+        for tid in ids:
+            total += len(_fetch_event_payloads(conn, tid, "profile_quarantined"))
+    assert total == 1  # deduped across the fan-out
+
+
+def test_gate_emits_healthy_clear_when_store_heals(kanban_with_profiles):
+    """After a profile's store heals, the next dispatch tick must emit
+    ``profile_store_healthy`` so the queue-drain alert's default provider
+    stops treating the profile as gated. This is the recovery path."""
+    kb, root = kanban_with_profiles
+    db_path = _make_store_unhealthy(root, "alpha")
+    with kb.connect_closing() as conn:
+        kb.create_board(slug="default", name="Test")
+        task_id = kb.create_task(conn, title="recover", assignee="alpha")
+
+    # Tick 1: quarantined + profile_quarantined event.
+    with kb.connect_closing() as conn:
+        kb.dispatch_once(conn, spawn_fn=_fake_spawn)
+    with kb.connect_closing() as conn:
+        assert _fetch_event_payloads(conn, task_id, "profile_quarantined")
+
+    # Heal the store: rebuild a healthy DB in place (probe must pass).
+    db_path.unlink()
+    _build_healthy_db(db_path)
+    assert kb.pre_dispatch_state_db_probe("alpha") is None
+
+    # Tick 2: task was blocked, so unblock it first, then dispatch.
+    with kb.connect_closing() as conn:
+        kb.unblock_task(conn, task_id)
+        res = kb.dispatch_once(conn, spawn_fn=_fake_spawn)
+
+    assert [s[0] for s in res.spawned] == [task_id]
+    with kb.connect_closing() as conn:
+        payloads = _fetch_event_payloads(conn, task_id, "profile_store_healthy")
+    assert len(payloads) == 1
+    payload = json.loads(payloads[0])
+    assert payload["profile"] == "alpha"
+    assert payload["reason"] == "store_recovered"
+
+
+def test_no_healthy_event_spam_for_never_quarantined(kanban_with_profiles):
+    """A healthy profile that was never quarantined must not emit any
+    profile_store_healthy noise — the clear event only fires on an actual
+    quarantine → healthy transition."""
+    kb, _ = kanban_with_profiles
+    with kb.connect_closing() as conn:
+        kb.create_board(slug="default", name="Test")
+        task_id = kb.create_task(conn, title="clean", assignee="beta")
+
+    with kb.connect_closing() as conn:
+        kb.dispatch_once(conn, spawn_fn=_fake_spawn)
+
+    with kb.connect_closing() as conn:
+        assert _fetch_event_payloads(conn, task_id, "profile_store_healthy") == []
+        assert _fetch_event_payloads(conn, task_id, "profile_quarantined") == []

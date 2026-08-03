@@ -8892,6 +8892,58 @@ def _store_unhealthy_blocker(profile_name: str, reason: str) -> str:
     return f"profile {profile_name} store unhealthy: {reason}; worker blocked"
 
 
+def _extract_probe_db_path(reason: str) -> str:
+    """Best-effort parse of the probe's ``state.db unhealthy at <path>:
+    <error>`` reason into the DB path (for the QuarantineState contract)."""
+    try:
+        if "unhealthy at " in reason:
+            return reason.split("unhealthy at ", 1)[1].rsplit(": ", 1)[0]
+    except Exception:
+        pass
+    return ""
+
+
+def _emit_store_healthy_if_quarantined(
+    conn: sqlite3.Connection,
+    task_id: str,
+    canon: str,
+) -> None:
+    """Emit ``profile_store_healthy`` for *canon* when the board's event
+    stream still records it as quarantined.
+
+    Called from the quarantine gate's healthy path (probe returned None): a
+    previously-quarantined profile whose store has since healed must clear
+    its quarantine event so the queue-drain alert stops treating it as
+    gated. Uses :func:`kanban_health.get_quarantine_state` (lazy import) so
+    the registered-provider seam is respected and the event-stream scan
+    stays the single source of truth. If the profile is not currently
+    quarantined (or the health module is unavailable) nothing is written.
+    """
+    try:
+        from hermes_cli import kanban_health as _kh
+
+        state = _kh.get_quarantine_state(conn, canon)
+    except Exception:
+        return
+    if state is None:
+        return
+    try:
+        with write_txn(conn):
+            _append_event(
+                conn, task_id, "profile_store_healthy",
+                {
+                    "profile": canon,
+                    "reason": "store_recovered",
+                    "detail": "pre-dispatch state.db probe passed; profile un-gated",
+                },
+            )
+    except Exception:
+        _log.exception(
+            "kanban dispatch: failed to record store-healthy clear for %s",
+            canon,
+        )
+
+
 def _quarantine_unhealthy_store(
     conn: sqlite3.Connection,
     task_id: str,
@@ -8900,6 +8952,7 @@ def _quarantine_unhealthy_store(
     dry_run: bool,
     result: DispatchResult,
     probe_cache: dict[str, Optional[str]],
+    quarantine_evented: set,
     blockable: bool,
 ) -> bool:
     """Quarantine gate: return True and block/skip *task_id* when
@@ -8934,6 +8987,14 @@ def _quarantine_unhealthy_store(
         probe_cache[canon] = pre_dispatch_state_db_probe(canon)
     reason = probe_cache[canon]
     if reason is None:
+        # Store is healthy. If the board's event stream still records this
+        # profile as quarantined (from a previous unhealthy tick), emit the
+        # clear event so the queue-drain alert stops treating it as gated.
+        # Emitted once per profile per tick (memoized via the per-tick set)
+        # so a fan-out tick does not spam identical clear events.
+        if not dry_run and canon not in quarantine_evented:
+            quarantine_evented.add(canon)
+            _emit_store_healthy_if_quarantined(conn, task_id, canon)
         return False
 
     blocker = _store_unhealthy_blocker(canon, reason)
@@ -8963,6 +9024,31 @@ def _quarantine_unhealthy_store(
             _log.exception(
                 "kanban dispatch: failed to record review quarantine for task %s",
                 task_id,
+            )
+    # Emit the profile-level quarantine event the queue-drain alert's
+    # default event-stream provider scans for (contract pinned in
+    # tests/hermes_cli/test_kanban_queue_drain_alert.py: the pre-dispatch
+    # health probe emits ``profile_quarantined`` events and the alert picks
+    # them up with zero provider registration). Once per profile per tick,
+    # memoized via the per-tick set.
+    if canon not in quarantine_evented:
+        quarantine_evented.add(canon)
+        try:
+            with write_txn(conn):
+                _append_event(
+                    conn, task_id, "profile_quarantined",
+                    {
+                        "profile": canon,
+                        "reason": "store_unhealthy",
+                        "detail": blocker,
+                        "db_path": _extract_probe_db_path(reason),
+                        "error": reason,
+                    },
+                )
+        except Exception:
+            _log.exception(
+                "kanban dispatch: failed to record profile quarantine event for %s",
+                canon,
             )
     return True
 
@@ -9168,6 +9254,10 @@ def _dispatch_once_locked(
     # tasks for one assignee, so probe once and reuse. A non-None result
     # quarantines every task assigned to that profile this tick.
     _store_probe_cache: dict[str, Optional[str]] = {}
+    # Profiles that already got a profile_quarantined / profile_store_healthy
+    # event this tick — dedupes the queue-drain alert contract events across
+    # a fan-out of many tasks for one assignee.
+    _quarantine_evented: set = set()
     # Normalize default_assignee once: empty/whitespace string → None so the
     # rest of the loop can use ``if default_assignee:`` as a single check.
     # We also resolve profile_exists once here for the same reason.
@@ -9266,6 +9356,7 @@ def _dispatch_once_locked(
             dry_run=dry_run,
             result=result,
             probe_cache=_store_probe_cache,
+            quarantine_evented=_quarantine_evented,
             blockable=True,
         ):
             continue
@@ -9417,6 +9508,7 @@ def _dispatch_once_locked(
             dry_run=dry_run,
             result=result,
             probe_cache=_store_probe_cache,
+            quarantine_evented=_quarantine_evented,
             blockable=False,
         ):
             continue
