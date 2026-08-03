@@ -3565,6 +3565,21 @@ class TurnRunner:
     def progress_callback(self, event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
         """Callback invoked by agent on tool lifecycle events."""
         ctx = self._ctx
+        # Fire on_tool_call_start hook before the progress_queue guard so
+        # reaction swapping works even when tool progress messages are off.
+        if event_type == "tool.started" and tool_name and ctx._run_still_current():
+            try:
+                _adapter = self._runner._adapter_for_source(ctx.source)
+                if _adapter is not None:
+                    import asyncio
+                    asyncio.run_coroutine_threadsafe(
+                        _adapter._run_processing_hook(
+                            "on_tool_call_start", ctx.event, tool_name
+                        ),
+                        self._runner._loop,
+                    )
+            except Exception:
+                pass
         # Live status line (Slack's assistant status): stash the current
         # tool phrase on the adapter; the _keep_typing refresh renders it
         # within a couple of seconds. Handled before every other gate
