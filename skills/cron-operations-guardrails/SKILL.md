@@ -1,8 +1,8 @@
 ---
 name: cron-operations-guardrails
-description: Diagnose and harden Hermes cron operations against watchdog loops, mode drift, provider failures, schedule collisions, and oversized completion responses.
-version: 0.1.0
-author: Community Contributor
+description: Diagnose and harden Hermes cron operations safely.
+version: 0.2.0
+author: goodchang77, Hermes Agent
 license: MIT
 platforms: [macos, linux, windows]
 metadata:
@@ -12,23 +12,33 @@ metadata:
     requires_toolsets: [cronjob]
 ---
 
-# Hermes Cron Operations Guardrails
+# Hermes Cron Operations Guardrails Skill
 
-Use this skill when Hermes scheduled jobs are failing intermittently, producing repeated alerts, changing model behavior after configuration updates, colliding at the same minute, or truncating long report responses.
+Diagnose intermittent cron failures, repeated alerts, routing drift, schedule collisions, and truncated completion responses. This skill keeps diagnosis read-only by default and does not rewrite operator-controlled policy without explicit approval.
 
-## Safety Boundary
+## When to Use
 
-- Start read-only: inspect job definitions, execution metadata, persisted run artifacts, gateway logs, and active model configuration before changing anything.
-- Never print or persist API keys, platform tokens, chat IDs, private prompts, or credentials.
-- Treat model/provider/schedule settings as operator-controlled policy.
-- Drift monitors should alert but must not automatically rewrite configuration unless the user explicitly requests a specific change.
-- Resolve paths through the active Hermes profile/configuration. Do not assume the default `~/.hermes` location in reusable scripts.
+Use this skill when:
 
-## Triage Procedure
+- Scheduled jobs fail intermittently or do not trigger.
+- A watchdog repeatedly alerts on itself or on healthy services.
+- Model behavior changes after provider or configuration updates.
+- Multiple expensive jobs start in the same minute.
+- A report artifact succeeds but the final response is truncated.
+- Execution succeeds but delivery fails.
 
-### 1. Inventory jobs and scheduler health
+## Prerequisites
 
-Run the supported CLI first:
+- Hermes CLI access for `hermes cron` and `hermes status` commands.
+- The `cronjob` toolset when managing jobs through Hermes tools.
+- Read access to job definitions, persisted run artifacts, and gateway logs.
+- Operator approval before changing schedules, providers, models, or routing policy.
+
+Resolve paths through the active Hermes profile and configuration. Do not assume the default `~/.hermes` location in reusable scripts.
+
+## How to Run
+
+Start with the supported read-only CLI commands:
 
 ```bash
 hermes cron status
@@ -36,112 +46,116 @@ hermes cron list --all
 hermes status --all
 ```
 
-Record, without exposing private prompt text:
+Use the `cronjob` tool to inspect job definitions and execution state. Use `read_file` for complete local definitions or persisted artifacts and `search_files` for bounded log searches. Redact private prompt text and credentials before sharing evidence.
 
-- Job ID and sanitized name
-- Enabled/paused state
-- Schedule and timezone
-- Agent versus no-agent mode
-- Script presence
-- Explicit provider/model pin
-- Delivery target type
-- Last status and last/next run time
+Do not diagnose a complex job from a truncated prompt preview or short chat-delivered error snippet.
 
-Do not diagnose a complex job from a truncated prompt preview. Read the complete local definition only when necessary and redact it before sharing.
+## Quick Reference
 
-### 2. Classify each failure
+### Safety boundary
 
-Use these categories:
+- Start read-only and gather evidence before changing anything.
+- Never print or persist API keys, platform tokens, chat IDs, private prompts, or credentials.
+- Treat model, provider, and schedule settings as operator-controlled policy.
+- Drift monitors alert; they do not automatically rewrite configuration.
+- Confirm execution and delivery separately.
+
+### Failure classes
 
 1. Scheduler did not trigger.
-2. Script/process failed.
-3. Agent/model invocation failed or was skipped.
+2. Script or process failed.
+3. Agent or model invocation failed or was skipped.
 4. Artifact generation succeeded but final response failed.
 5. Delivery failed after successful execution.
 6. Watchdog produced a false positive or failed itself.
-7. Remote provider capacity/authentication failure.
+7. Remote provider capacity or authentication failed.
 
-Read the complete persisted run artifact and nearby gateway logs. A short chat-delivered error snippet is not sufficient evidence.
+### Reliable no-agent watchdog contract
+
+| Outcome | Stdout | Exit code |
+|---|---|---|
+| Healthy | Empty | 0 |
+| Alert generated | One concise alert | 0 |
+| Monitor implementation failed | Diagnostic only | Non-zero |
+
+Exclude the monitor itself and sibling watchdogs by stable job ID. Use consecutive-failure thresholds and a recovery-reset latch when transient failures are common.
+
+### Agent versus script mode
+
+- Use no-agent mode when script stdout is the exact delivery content and no reasoning is required.
+- Use agent mode when interpretation, selection, or summarization is required.
+- A script attached to an agent job provides context; it is not equivalent to a script-only no-agent job.
+
+## Procedure
+
+### 1. Inventory jobs and scheduler health
+
+Record, without exposing private prompt text:
+
+- Job ID and sanitized name.
+- Enabled or paused state.
+- Schedule and timezone.
+- Agent versus no-agent mode.
+- Script presence.
+- Explicit provider and model pin.
+- Delivery target type.
+- Last status and last or next run time.
+
+### 2. Classify the failure
+
+Assign one failure class from the quick reference. Read the complete persisted run artifact and nearby gateway logs before deciding on a root cause.
 
 ### 3. Verify provider attribution
 
 For capacity, quota, authentication, or rate-limit errors, identify:
 
-- Provider selected for the failed attempt
-- Model identifier
-- Remote endpoint or adapter
-- Whether the failure occurred on the primary route or a fallback
-- Whether multiple jobs reached the same provider concurrently
+- Provider selected for the failed attempt.
+- Model identifier.
+- Remote endpoint or adapter.
+- Primary route versus fallback route.
+- Whether multiple jobs reached the same provider concurrently.
 
-Do not infer local CPU, memory, or worker exhaustion from an error containing words such as `local worker` unless host process/system evidence confirms it.
+Do not infer local CPU, memory, or worker exhaustion from wording such as `local worker` unless host process or system evidence confirms it.
 
-## Reliable No-Agent Watchdog Pattern
-
-For platform health checks and cron failure monitors:
-
-- Healthy: print nothing and exit 0.
-- Alert successfully generated: print one concise alert and exit 0.
-- Monitor implementation failure: exit non-zero.
-- Exclude the monitor itself and sibling watchdogs by stable job ID.
-- Require consecutive failed probes before paging when transient failures are common.
-- Latch repeated alerts and reset the latch only after recovery.
-- Match specific critical patterns in a bounded recent time window; do not alert on every warning mentioning a platform.
-
-Why: if an alerting watchdog exits non-zero, Hermes marks the watchdog as failed. A failure monitor that scans itself can then create an endless self-alert loop.
-
-## Agent and Script Mode Guardrails
-
-### Deterministic script jobs
-
-Use no-agent mode when script stdout is already the exact content to deliver and no LLM reasoning is required.
+### 4. Check no-agent watchdog behavior
 
 Verify:
 
-- `no_agent=true`
-- Script exists and is executable/readable as appropriate
-- Healthy execution may intentionally produce empty stdout
-- Secrets needed by the script are available through the supported environment/configuration path
+- `no_agent=true` for deterministic script-only monitors.
+- The script exists and is readable or executable as appropriate.
+- Healthy execution may intentionally produce empty stdout.
+- Required secrets are available through supported configuration paths.
+- The monitor excludes itself from scans.
+- A successful alert exits zero to avoid a self-alert loop.
+- Pattern matching is specific and limited to a recent time window.
 
-### Agent-driven jobs
+### 5. Check agent-job routing
 
-Use agent mode when interpretation, selection, summarization, or other reasoning is required.
+For reproducible or cost-sensitive agent jobs:
 
-For reproducible or cost-sensitive scheduled workloads:
-
-- Explicitly pin provider and model.
-- Attach only required skills/toolsets.
-- Keep smart/hidden model routing disabled unless intentionally approved.
+- Pin the provider and model explicitly.
+- Attach only the required skills and toolsets.
+- Keep smart or hidden routing disabled unless intentionally approved.
 - Smoke-test the primary model and approved fallbacks after routing changes.
 
-A script attached to an agent job may provide context to the model; it is not equivalent to a no-agent script-only job.
+Maintain an operator-approved, non-secret baseline containing the primary route, ordered fallbacks, smart-routing policy, required no-agent jobs, required model pins, and critical script identities or hashes.
 
-## Model and Configuration Drift Checks
+Report drift and suggested remediation without changing the baseline automatically.
 
-Maintain an operator-approved baseline containing only non-secret policy values:
-
-- Primary provider/model
-- Ordered fallback providers/models
-- Whether smart model routing is allowed
-- Jobs required to be no-agent
-- Jobs required to pin provider/model
-- Critical script identities or hashes when appropriate
-
-A drift check should report differences and suggested remediation, but remain read-only.
-
-## Schedule Collision Checks
+### 6. Check schedule collisions
 
 Group enabled jobs by effective start minute and flag clusters containing multiple expensive jobs.
 
 Prefer:
 
-- Moving low-priority heartbeat/monitor jobs by 5–10 minutes
-- Separating large research jobs
-- Limiting retries against a saturated provider
-- Using per-provider concurrency controls when available
+- Moving low-priority heartbeat or monitor jobs by 5–10 minutes.
+- Separating large research jobs.
+- Limiting retries against a saturated provider.
+- Applying per-provider concurrency controls when available.
 
-Do not increase concurrency limits until provider-side and host-side capacity have been distinguished with evidence.
+Do not increase concurrency limits until provider-side and host-side capacity are distinguished with evidence.
 
-## Long Artifact and Output-Truncation Pattern
+### 7. Handle long artifacts safely
 
 For reports, transcripts, presentations, or audio:
 
@@ -149,27 +163,20 @@ For reports, transcripts, presentations, or audio:
 2. Write it to a durable path.
 3. Verify that the artifact exists and is non-empty.
 4. Deliver the artifact.
-5. Return a short completion receipt containing status and artifact reference.
-6. Do not repeat the complete report/transcript in the final cron response.
+5. Return a short completion receipt with status and artifact reference.
+6. Do not repeat the complete artifact in the final cron response.
 
-If increasing `max_tokens` merely causes the output to hit the new exact ceiling, inspect whether the final response duplicates already-created artifacts.
+If raising `max_tokens` only moves the response to the new exact ceiling, check whether the final response duplicates an already-created artifact.
 
-## Post-Fix Verification
+### 8. Apply an approved remediation
 
-After an approved change:
+Make the smallest change that addresses the verified root cause. Preserve an evidence trail and avoid unrelated schedule, routing, or delivery changes.
 
-1. Run syntax/static checks for modified scripts.
-2. Run the script manually with sanitized output expectations.
-3. Trigger the target cron job once using the supported CLI/tool.
-4. Confirm the persisted execution status and full run artifact.
-5. Confirm delivery separately from execution success.
-6. Re-run the monitor and verify that healthy mode is silent.
-7. Confirm the monitor does not include itself in findings.
-8. Confirm model/provider routing from live runtime data, not memory.
-
-## Reporting Template
+### 9. Report the incident
 
 ```markdown
+[SEVERITY]
+
 ### Incident
 - Symptom:
 - Affected job class:
@@ -197,15 +204,29 @@ After an approved change:
 - Monitor silent-health test:
 ```
 
-## Common Pitfalls
+## Pitfalls
 
 - Treating every gateway warning as an outage.
 - Returning exit 1 after successfully emitting a watchdog alert.
 - Allowing a failure monitor to scan its own status.
 - Assuming scheduled jobs inherit a full interactive shell environment.
-- Confusing a remote provider capacity error with local host exhaustion.
+- Confusing remote provider capacity errors with local host exhaustion.
 - Leaving cost-sensitive agent jobs unpinned unintentionally.
 - Starting several heavy jobs in the same minute.
-- Reporting cron `completed` as proof that external delivery succeeded.
+- Treating cron `completed` as proof that external delivery succeeded.
 - Repeating a large generated artifact in the final response.
 - Automatically repairing model routing or schedules without operator approval.
+
+## Verification
+
+After an approved change:
+
+1. Run syntax or static checks for modified scripts.
+2. Run the script manually with sanitized output expectations.
+3. Trigger the target cron job once with the supported CLI or `cronjob` tool.
+4. Confirm the persisted execution status and complete run artifact.
+5. Confirm delivery separately from execution success.
+6. Re-run the monitor and verify that healthy mode is silent.
+7. Confirm the monitor does not include itself in findings.
+8. Confirm model and provider routing from live runtime data, not memory.
+9. Verify that no credentials or private prompt text appear in reports.
