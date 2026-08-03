@@ -2883,8 +2883,8 @@ class DiscordAdapter(BasePlatformAdapter):
         Format message for Discord.
 
         Discord uses its own markdown variant.
-        Collapses consecutive blank lines and trims each line to reduce vertical whitespace,
-        while preserving code blocks exactly as-is.
+        Collapses consecutive blank lines to reduce vertical whitespace,
+        while preserving code blocks and line indentation exactly as-is.
         """
         # Normalise Windows line endings
         lines = content.replace("\r\n", "\n").split("\n")
@@ -2906,14 +2906,16 @@ class DiscordAdapter(BasePlatformAdapter):
                 prev_blank = False
                 continue
 
-            stripped = line.strip()
-            if stripped == "":
+            # rstrip only — preserve leading whitespace (Markdown indentation
+            # for nested lists, blockquotes, indented code, etc.)
+            cleaned = line.rstrip()
+            if cleaned == "":
                 # Collapse consecutive blank lines to a single blank line
                 if not prev_blank:
                     result.append("")
                     prev_blank = True
             else:
-                result.append(stripped)
+                result.append(cleaned)
                 prev_blank = False
 
         # Auto-close unclosed code blocks

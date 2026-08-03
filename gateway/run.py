@@ -7989,6 +7989,19 @@ class GatewayRunner:
             except Exception:
                 pass
             logger.exception("Agent error in session %s", session_key)
+            # Classify the error to surface structured recovery hints in logs.
+            _classified = None
+            try:
+                from agent.error_classifier import classify_api_error
+                _classified = classify_api_error(e, num_messages=_hist_len)
+                logger.warning(
+                    "Agent error classified: reason=%s, retryable=%s, should_fallback=%s",
+                    _classified.reason.value if _classified else "unknown",
+                    getattr(_classified, "retryable", False),
+                    getattr(_classified, "should_fallback", False),
+                )
+            except Exception:
+                pass  # classification is best-effort — never break the main error path
             error_type = type(e).__name__
             error_detail = str(e)[:300] if str(e) else "no details available"
             status_hint = ""
