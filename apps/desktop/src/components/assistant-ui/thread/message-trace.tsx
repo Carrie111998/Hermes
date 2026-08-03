@@ -4,14 +4,14 @@ import { cn } from '@/lib/utils'
 // Position 0.0 = top (positive) → green
 // Position 0.5 = middle (neutral) → teal
 // Position 1.0 = bottom (constructive) → blue
-const TRACE_RAMP = [
+const TRACE_RAMP: ReadonlyArray<readonly [number, number, number, number]> = [
   [0.0, 100, 230, 100], // green
   [0.15, 100, 230, 100], // green
   [0.42, 61, 170, 148], // teal
   [0.58, 55, 120, 180], // blue-steel
   [0.85, 55, 100, 200], // blue
   [1.0, 55, 100, 200] // blue
-] as const
+]
 
 const rampColor = (t: number, alpha: number): string => {
   // Clamp to [0, 1]
@@ -83,7 +83,9 @@ export function MessageTrace({ className, onTrace, trace }: MessageTraceProps) {
 
   const handleClick = (event: React.MouseEvent<HTMLDivElement>) => {
     const rect = event.currentTarget.getBoundingClientRect()
-    const y = (event.clientY - rect.top) / rect.height
+    const rawY = (event.clientY - rect.top) / rect.height
+    // Clamp to [0, 1] — clicks outside the element bounds shouldn't explode
+    const y = Math.max(0, Math.min(1, rawY))
     // Top = high score (100), bottom = low (0)
     const score = Math.round((1 - y) * 100)
 
