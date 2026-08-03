@@ -178,6 +178,38 @@ def test_guard_cron_deny_blocks(monkeypatch):
         clear_session_vars(tokens)
 
 
+def test_guard_explicit_non_cron_masks_leaked_env(monkeypatch):
+    from gateway.session_context import clear_session_vars, set_session_vars
+
+    monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+    monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+    monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+    monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
+    monkeypatch.setattr(A, "_get_approval_mode", lambda: "manual")
+    monkeypatch.setattr(A, "_get_cron_approval_mode", lambda: "deny")
+    tokens = set_session_vars(cron_session="")
+    try:
+        result = A.check_execute_code_guard("import os", "local")
+        assert result["approved"] is False
+        assert result["outcome"] == "exact_plan_capability_required"
+    finally:
+        clear_session_vars(tokens)
+
+
+def test_guard_legacy_cron_env_fallback_still_blocks(monkeypatch):
+    from gateway.session_context import reset_session_vars
+
+    reset_session_vars()
+    monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+    monkeypatch.setattr(A, "_get_approval_mode", lambda: "manual")
+    monkeypatch.setattr(A, "_get_cron_approval_mode", lambda: "deny")
+
+    result = A.check_execute_code_guard("import os", "local")
+
+    assert result["approved"] is False
+    assert result["error_code"] == "cron_execute_code_not_authorized"
+
+
 def test_guard_gateway_user_approves_is_one_shot(gw_session):
     _register_resolver(gw_session, "once")
     first = A.check_execute_code_guard("import os; print(1)", "local")

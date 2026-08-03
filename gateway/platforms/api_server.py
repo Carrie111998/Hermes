@@ -11054,6 +11054,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 ),
                 capability_epoch_sha256=capability_epoch_sha256,
                 async_delivery=False,
+                cron_session="",
             ),
             capability_epoch_sha256,
         )

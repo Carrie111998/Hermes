@@ -844,9 +844,19 @@ def _seed_cron_thread_session(
             except (ValueError, KeyError):
                 platform_enum = None
             if platform_enum is not None:
+                # Discord thread destinations must key on the thread's OWN id
+                # to match how the Discord adapter keys organic in-thread
+                # messages (chat_id == thread_id). Other platforms (Slack,
+                # Telegram) use chat_id == parent_channel for thread messages,
+                # so the parent chat_id is correct for them. See the matching
+                # guard in GatewayRunner._process_handoff.
+                if platform_enum == Platform.DISCORD:
+                    seed_chat_id = str(thread_id)
+                else:
+                    seed_chat_id = str(chat_id)
                 dest_source = SessionSource(
                     platform=platform_enum,
-                    chat_id=str(chat_id),
+                    chat_id=seed_chat_id,
                     chat_name=chat_name,
                     chat_type="thread",
                     user_id="system:cron",
@@ -3148,7 +3158,6 @@ def run_job(
         platform="",
         chat_id="",
         chat_name="",
-        cron_session=True,
         # A cron job cannot receive a completion after its turn ends. We clear the
         # HERMES_SESSION_* routing keys just below, so an async delegation's
         # completion event carries session_key="" — _enrich_async_delegation_routing
@@ -3214,6 +3223,8 @@ def run_job(
     )
 
     _cron_history_authority_token = bind_cron_history_job(job_id)
+    _cron_session_var = _VAR_MAP["HERMES_CRON_SESSION"]
+    _cron_session_token = _cron_session_var.set("1")
 
     # Everything after the acquire MUST live inside this try, so the finally
     # below always releases the lock even if the env override or any later
@@ -3894,7 +3905,10 @@ def run_job(
         try:
             clear_session_vars(_ctx_tokens)
         finally:
-            reset_cron_history_job(_cron_history_authority_token)
+            try:
+                _cron_session_var.reset(_cron_session_token)
+            finally:
+                reset_cron_history_job(_cron_history_authority_token)
         for _var_name in _cron_delivery_vars:
             _VAR_MAP[_var_name].set("")
         if _session_db:

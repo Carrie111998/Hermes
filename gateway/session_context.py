@@ -100,6 +100,12 @@ _SESSION_MESSAGE_ID: ContextVar = ContextVar("HERMES_SESSION_MESSAGE_ID", defaul
 
 _SESSION_PROFILE: ContextVar = ContextVar("HERMES_SESSION_PROFILE", default=_UNSET)
 
+# Per-session cron marker. Unlike the process-global legacy env var, this is
+# scoped to one cron job / inbound session. _UNSET preserves the legacy env
+# fallback for CLI/tests; "1" marks cron; "" explicitly marks non-cron and
+# masks any leaked process env value.
+_CRON_SESSION: ContextVar = ContextVar("HERMES_CRON_SESSION", default=_UNSET)
+
 # Whether the current session's delivery channel can route an ASYNC completion
 # back to the agent AFTER the current turn ends (i.e. wake a fresh turn).
 #
@@ -125,9 +131,6 @@ _SESSION_ASYNC_DELIVERY: ContextVar = ContextVar("HERMES_SESSION_ASYNC_DELIVERY"
 _CRON_AUTO_DELIVER_PLATFORM: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_PLATFORM", default=_UNSET)
 _CRON_AUTO_DELIVER_CHAT_ID: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_CHAT_ID", default=_UNSET)
 _CRON_AUTO_DELIVER_THREAD_ID: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_THREAD_ID", default=_UNSET)
-# Whether THIS execution context is a scheduled cron run. This must be
-# task-local: the scheduler shares a process with live gateway turns.
-_CRON_SESSION: ContextVar = ContextVar("HERMES_CRON_SESSION", default=_UNSET)
 
 _VAR_MAP = {
     "HERMES_SESSION_PLATFORM": _SESSION_PLATFORM,
@@ -144,10 +147,10 @@ _VAR_MAP = {
     "HERMES_UI_SESSION_ID": _SESSION_UI_SESSION_ID,
     "HERMES_SESSION_MESSAGE_ID": _SESSION_MESSAGE_ID,
     "HERMES_SESSION_PROFILE": _SESSION_PROFILE,
+    "HERMES_CRON_SESSION": _CRON_SESSION,
     "HERMES_CRON_AUTO_DELIVER_PLATFORM": _CRON_AUTO_DELIVER_PLATFORM,
     "HERMES_CRON_AUTO_DELIVER_CHAT_ID": _CRON_AUTO_DELIVER_CHAT_ID,
     "HERMES_CRON_AUTO_DELIVER_THREAD_ID": _CRON_AUTO_DELIVER_THREAD_ID,
-    "HERMES_CRON_SESSION": _CRON_SESSION,
 }
 
 
@@ -223,7 +226,7 @@ def set_session_vars(
     cwd: str = "",
     async_delivery: bool = True,
     ui_session_id: str = "",
-    cron_session: bool = False,
+    cron_session: Any = _UNSET,
 ) -> list:
     """Set all session context variables and return reset tokens.
 
@@ -239,12 +242,22 @@ def set_session_vars(
     background completion back to the agent after the turn ends (see
     ``_SESSION_ASYNC_DELIVERY`` / ``async_delivery_supported``). Stateless
     request/response adapters (the API server) pass ``False``.
+
+    ``cron_session`` is tri-state: ``_UNSET`` preserves legacy
+    ``os.environ["HERMES_CRON_SESSION"]`` fallback, ``"1"`` marks a cron job,
+    and ``""`` explicitly marks a non-cron session while masking leaked env.
     """
     # Mark the session-context machinery engaged for this process. The
     # subprocess-env bridge uses this to switch from "os.environ fallback" to
     # "ContextVar-authoritative, strip on _UNSET" — see session_context_engaged.
     global _session_context_engaged
     _session_context_engaged = True
+    if cron_session is _UNSET:
+        cron_value = _UNSET
+    elif isinstance(cron_session, bool):
+        cron_value = "1" if cron_session else ""
+    else:
+        cron_value = str(cron_session)
     tokens = [
         _SESSION_PLATFORM.set(platform),
         _SESSION_SOURCE.set(source),
@@ -260,10 +273,8 @@ def set_session_vars(
         _SESSION_UI_SESSION_ID.set(ui_session_id),
         _SESSION_MESSAGE_ID.set(message_id),
         _SESSION_PROFILE.set(profile),
+        _CRON_SESSION.set(cron_value),
         _SESSION_ASYNC_DELIVERY.set(bool(async_delivery)),
-        # Live user turns bind empty; scheduled jobs bind "1". Either explicit
-        # value suppresses fallback to stale process-global legacy state.
-        _CRON_SESSION.set("1" if cron_session else ""),
     ]
     try:
         from agent.runtime_cwd import set_session_cwd

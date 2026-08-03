@@ -58,6 +58,27 @@ def test_manual_callback_receives_exact_unmodified_bytes(monkeypatch):
     assert observed[0][1]["exact_execution"] is True
 
 
+def test_manual_callback_timeout_is_distinct_from_explicit_denial(monkeypatch):
+    monkeypatch.setattr(approval, "_get_approval_mode", lambda: "manual")
+    monkeypatch.setattr(approval, "_is_cron_session", lambda: False)
+    monkeypatch.setattr(
+        approval,
+        "check_exact_execution_authority",
+        lambda *_args, **_kwargs: None,
+    )
+
+    result = approval.check_all_command_guards(
+        "opaque exact bytes",
+        "local",
+        approval_callback=lambda *_args, **_kwargs: "timeout",
+    )
+
+    assert result["approved"] is False
+    assert result["outcome"] == "timeout"
+    assert result["error_code"] == "exact_execution_timeout"
+    assert "Silence is not consent" in result["message"]
+
+
 def test_mcp_cli_elicitation_is_exact_one_operation(monkeypatch):
     observed = {}
 

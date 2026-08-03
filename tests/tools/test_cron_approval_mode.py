@@ -83,3 +83,25 @@ def test_docker_host_bind_is_not_treated_as_isolated(monkeypatch):
         has_host_access=True,
     )
     assert result["error_code"] == "cron_terminal_execution_not_authorized"
+
+
+def test_legacy_cron_env_fallback_remains_supported(monkeypatch):
+    from gateway.session_context import reset_session_vars
+
+    reset_session_vars()
+    monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+
+    assert approval._is_cron_session() is True
+
+
+def test_explicit_non_cron_context_masks_leaked_env(monkeypatch):
+    from gateway.session_context import clear_session_vars, set_session_vars
+
+    monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+    monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
+    tokens = set_session_vars(cron_session="")
+    try:
+        assert approval._is_cron_session() is False
+        assert approval._is_gateway_approval_context() is True
+    finally:
+        clear_session_vars(tokens)
