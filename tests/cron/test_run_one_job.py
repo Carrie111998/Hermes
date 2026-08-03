@@ -80,7 +80,7 @@ def test_tick_does_not_propagate_delegated_child_context_to_cron_parent(monkeypa
 
     seen = []
     monkeypatch.setattr(s, "get_due_jobs", lambda: [{"id": "j-context", "name": "t"}])
-    monkeypatch.setattr(s, "advance_next_run", lambda _: True)
+    monkeypatch.setattr(s, "advance_next_runs", lambda _ids: 1)
     monkeypatch.setattr(
         s,
         "run_one_job",
