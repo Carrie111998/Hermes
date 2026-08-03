@@ -231,13 +231,11 @@ class TestSSHCleanup:
 
         first = SSHEnvironment(host="h", user="u")
         second = SSHEnvironment(host="h", user="u")
-        assert first.control_socket == second.control_socket
+        shared_socket = first.control_socket
+        assert shared_socket == second.control_socket
 
-        import tempfile
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".sock") as tmp:
-            shared_socket = Path(tmp.name)
-        first.control_socket = shared_socket
-        second.control_socket = shared_socket
+        shared_socket.parent.mkdir(parents=True, exist_ok=True)
+        shared_socket.touch()
 
         exit_calls = []
 
@@ -269,9 +267,8 @@ class TestSSHCleanup:
 
         env = SSHEnvironment(host="h", user="u")
 
-        import tempfile
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".sock") as tmp:
-            env.control_socket = Path(tmp.name)
+        env.control_socket.parent.mkdir(parents=True, exist_ok=True)
+        env.control_socket.touch()
 
         exit_calls = []
 
