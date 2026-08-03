@@ -32,6 +32,7 @@ import { ModelReloadConfirm } from "@/components/ModelReloadConfirm";
 import { ReasoningPicker } from "@/components/ReasoningPicker";
 import { GatewayClient, type ConnectionState } from "@/lib/gatewayClient";
 import { api, buildWsUrl } from "@/lib/api";
+import { chatSidebarModelOptionsLoader } from "@/lib/chat-sidebar-model-options";
 import { titleFromSessionInfoPayload } from "@/lib/chat-title";
 
 import { cn } from "@/lib/utils";
@@ -405,7 +406,7 @@ export function ChatSidebar({
           // Same path the Models page uses (REST /api/model/set), not the
           // sidecar config.set RPC, which didn't reliably land in the
           // config.yaml the agent boots from. Always persisted (alwaysGlobal).
-          loader={() => api.getModelOptions(profile)}
+          loader={chatSidebarModelOptionsLoader(profile)}
           alwaysGlobal
           onApply={async ({ provider, model, confirmExpensiveModel }) => {
             setModelNotice(null);
