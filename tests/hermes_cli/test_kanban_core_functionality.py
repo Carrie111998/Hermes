@@ -4707,6 +4707,157 @@ def test_protocol_violation_respects_max_retries_precedence(kanban_home):
         conn.close()
 
 
+def _drive_rate_limited(conn, tid, fake_pid):
+    """One rate-limited (EX_TEMPFAIL sentinel) worker exit reaper pass.
+
+    KANBAN_RATE_LIMIT_EXIT_CODE == 75 → os.W_EXITCODE(75, 0) == 75*256+0.
+    This is the exit code cli.py emits when a worker dies purely on a
+    provider 429/quota wall, so the dispatcher can requeue WITHOUT tripping
+    the circuit breaker (the fix for t_44cfa735 — a 429 death must not be
+    counted as a task failure).
+    """
+    return _drive_worker_exit(conn, tid, fake_pid, 75 * 256)
+
+
+def test_rate_limited_exit_requeues_without_failure(kanban_home):
+    """A provider 429 death (rc=75) is released to ready, NOT counted.
+
+    This is the core fix for the t_44cfa735 provider class: a worker that
+    dies on a provider rate-limit must bounce back to ``ready`` with no
+    ``consecutive_failures`` tick and no ``gave_up`` event, so the breaker
+    never trips on a transient quota wall and the card stays routable.
+    """
+    import hermes_cli.kanban_db as _kb
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="ratelimited", assignee="worker")
+        _drive_rate_limited(conn, tid, 994000)
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready", (
+            f"rate-limited death must requeue, got {task.status}"
+        )
+        assert task.consecutive_failures == 0, (
+            "a quota wall must NOT count as a failure, got "
+            f"consecutive_failures={task.consecutive_failures}"
+        )
+        events = kb.list_events(conn, tid)
+        kinds = [e.kind for e in events]
+        assert "rate_limited" in kinds, (
+            f"expected 'rate_limited' event, got {kinds}"
+        )
+        assert "gave_up" not in kinds, (
+            f"breaker must not trip on a quota wall, got {kinds}"
+        )
+        assert tid in _kb.detect_crashed_workers._last_rate_limited
+    finally:
+        conn.close()
+
+
+def test_auto_block_records_typed_block_kind_and_comment(kanban_home):
+    """_record_task_failure's auto-block must leave a non-NULL block_kind and
+    a human-readable comment on the card.
+
+    Before the t_44cfa735 instrumentation, auto-blocks wrote NULL block_kind
+    and no comment, so every auto-blocked card looked identical to a generic
+    human/legacy block and the *reason* a card was auto-blocked was invisible
+    on the card itself. That hidden reason is exactly what masked the
+    protocol-violation failure class.
+    """
+    import hermes_cli.kanban_db as _kb
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="autoblock", assignee="worker")
+        kb.claim_task(conn, tid, claimer=f"{_kb._claimer_id().split(':',1)[0]}:mock")
+        # Below limit -> no trip; trip via force_trip to exercise the
+        # auto-block transition directly.
+        tripped = _kb._record_task_failure(
+            conn, tid,
+            error="repeated provider 429 (HTTP 429) after 3 retries",
+            outcome="crashed",
+            failure_limit=1,
+            force_trip=True,
+            release_claim=True,
+            end_run=True,
+            block_kind="capability",
+            block_comment=(
+                "AUTO-BLOCK (capability): provider 429 after retries "
+                "(t_44cfa735) — verify completion before retrying."
+            ),
+        )
+        assert tripped is True
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        assert task.block_kind == "capability", (
+            f"auto-block must stamp a typed block_kind, got {task.block_kind!r}"
+        )
+        # The reason must be visible on the card as a comment.
+        comments = [e for e in kb.list_events(conn, tid) if e.kind == "commented"]
+        assert comments, "expected a dispatcher comment recording the why"
+        # And the raw comment body must name the real cause.
+        rows = conn.execute(
+            "SELECT body FROM task_comments WHERE task_id=?", (tid,)
+        ).fetchall()
+        assert rows, "expected a task_comments row"
+        body = rows[-1]["body"]
+        assert "provider 429" in body, (
+            f"auto-block comment must name the cause, got {body!r}"
+        )
+    finally:
+        conn.close()
+
+
+def test_nonzero_exit_auto_block_comment_surfaces_worker_cause(kanban_home):
+    """A non-zero worker death auto-blocks with the worker's own last-failure
+    error in the comment, not a bare 'pid exited with code 1'.
+
+    The worker stamps last_failure_error (e.g. 'API 429 after 3 retries')
+    before it dies; detect_crashed_workers now prepends it to the crash text
+    so the auto-block comment names the real cause instead of a generic pid
+    line. Exercise the real path: drive the breaker to trip via repeated
+    crash passes so the production error_text (with prepend) is what reaches
+    _record_task_failure.
+    """
+    import hermes_cli.kanban_db as _kb
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="cause", assignee="worker")
+        host_prefix = _kb._claimer_id().split(":", 1)[0]
+
+        def _one_nonzero_crash():
+            kb.claim_task(conn, tid, claimer=f"{host_prefix}:mock")
+            kb._set_worker_pid(conn, tid, 995000)
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET last_failure_error=? WHERE id=?",
+                    ("API 429 after 3 retries (HTTP 429)", tid),
+                )
+            _kb._record_worker_exit(995000, 256)  # nonzero exit
+            original_alive = _kb._pid_alive
+            _kb._pid_alive = lambda p: False
+            try:
+                kb.detect_crashed_workers(conn)
+            finally:
+                _kb._pid_alive = original_alive
+
+        # Two crashes hit the default limit (DEFAULT_FAILURE_LIMIT=2) → trip.
+        _one_nonzero_crash()
+        assert kb.get_task(conn, tid).status == "ready"
+        _one_nonzero_crash()
+
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        rows = conn.execute(
+            "SELECT body FROM task_comments WHERE task_id=?", (tid,)
+        ).fetchall()
+        assert rows, "expected an auto-block comment"
+        body = rows[-1]["body"]
+        assert "API 429 after 3 retries" in body, (
+            f"auto-block comment must surface the worker cause, got {body!r}"
+        )
+    finally:
+        conn.close()
+
+
 def test_detect_crashed_workers_nonzero_exit_uses_default_limit(kanban_home):
     """A worker that exited non-zero (real error / crash) uses the
     normal counter path — one failure doesn't trip the breaker.

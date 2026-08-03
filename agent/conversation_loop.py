@@ -3664,6 +3664,19 @@ def run_conversation(
                     classified.retryable, classified.should_compress,
                     classified.should_rotate_credential, classified.should_fallback,
                 )
+                # Capture the most recent classified API error on the agent so
+                # turn_finalizer can surface a typed ``failure_reason`` to the
+                # kanban dispatcher. This is what lets a worker that dies on a
+                # provider 429 exit with the EX_TEMPFAIL sentinel (rc=75) and be
+                # requeued WITHOUT tripping the circuit breaker — instead of the
+                # silent generic "crashed" that hid the provider class in
+                # t_44cfa735. Only the *last* API error matters: if the worker
+                # recovers and completes, failure_reason is irrelevant; if it
+                # dies, the final error is the causal one.
+                try:
+                    agent._last_api_error_classification = classified
+                except Exception:
+                    logger.debug("failed to stash last api error classification", exc_info=True)
                 agent._invoke_api_request_error_hook(
                     task_id=effective_task_id,
                     turn_id=turn_id,
@@ -6895,6 +6908,67 @@ def run_conversation(
                     final_response = None
                     continue
 
+                # Nudge budget exhausted: the model has had its chances and
+                # still ended the turn with only narration (no terminal board
+                # tool). Rather than let the process exit rc=0 and leave the
+                # card silently `running` (the protocol_violation class tracked
+                # in t_44cfa735), fire a concrete kanban_block so the card
+                # lands in a visible, routable `blocked` state with a real
+                # reason. The block is gated on HERMES_KANBAN_TASK and only
+                # when no terminal call was ever made this session.
+                try:
+                    from agent.kanban_stop import build_kanban_stop_fallback_block
+
+                    _fallback = build_kanban_stop_fallback_block(
+                        final_response=final_response,
+                        model=getattr(agent, "model", None),
+                        attempts=getattr(agent, "_kanban_stop_nudges", 0),
+                    )
+                except Exception:
+                    logger.debug("kanban stop fallback check failed", exc_info=True)
+                    _fallback = None
+
+                if _fallback:
+                    tid = _fallback.get("task_id") or os.environ.get(
+                        "HERMES_KANBAN_TASK", ""
+                    )
+                    try:
+                        from tools.kanban_tools import _handle_block
+                        _block_result = _handle_block(
+                            {
+                                "task_id": tid,
+                                "reason": _fallback["reason"],
+                                "kind": _fallback.get("kind"),
+                            }
+                        )
+                        logger.info(
+                            "kanban stop-guard hard block fired task=%s result=%r",
+                            tid,
+                            _block_result,
+                        )
+                        agent._emit_status(
+                            "🛑 Kanban worker exited without a terminal call — "
+                            "auto-blocking with a recorded reason (protocol-violation guard)."
+                        )
+                    except Exception:
+                        logger.exception(
+                            "kanban stop-guard hard block failed task=%s", tid
+                        )
+                    # Either way, do not let the process report a clean text
+                    # completion — the card is now blocked (or stayed blocked on
+                    # error). Clear the narration so the finalizer does not
+                    # surface it as a finished answer.
+                    _pending_verification_response = final_response
+                    _pending_verification_response_previewed = (
+                        agent._interim_content_was_streamed(final_response or "")
+                    )
+                    final_response = None
+                    _turn_exit_reason = (
+                        "kanban_protocol_violation_guarded(task_id=%s)" % tid
+                    )
+                    messages.append(final_msg)
+                    break
+
                 messages.append(final_msg)
                 
                 _turn_exit_reason = f"text_response(finish_reason={finish_reason})"
@@ -6933,6 +7007,20 @@ def run_conversation(
                 )
             else:
                 error_msg = f"Error during OpenAI-compatible API call #{api_call_count}: {str(e)}"
+            # If this fatal error escaped the inner retry loop without a
+            # classification (e.g. a provider error raised past the swallow
+            # point), still classify it so turn_finalizer can surface a typed
+            # ``failure_reason`` to the dispatcher (provider 429 → rc=75 → clean
+            # requeue instead of a breaker-tripping crash, t_44cfa735).
+            try:
+                _outer_classified = classify_api_error(
+                    e,
+                    provider=getattr(agent, "provider", "") or "",
+                    model=getattr(agent, "model", "") or "",
+                )
+                agent._last_api_error_classification = _outer_classified
+            except Exception:
+                logger.debug("outer-loop api error classification failed", exc_info=True)
             try:
                 print(f"❌ {error_msg}")
             except (OSError, ValueError):
