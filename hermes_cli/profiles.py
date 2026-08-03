@@ -382,7 +382,16 @@ def profile_exists(name: str) -> bool:
     canon = normalize_profile_name(name)
     if canon == "default":
         return True
-    return get_profile_dir(canon).is_dir()  # lgtm[py/path-injection]
+    validate_profile_name(canon)
+    try:
+        # Compare the validated profile name with existing directory entries
+        # instead of using request-derived text in a filesystem path.
+        return any(
+            entry.name == canon and entry.is_dir()
+            for entry in _get_profiles_root().iterdir()
+        )
+    except FileNotFoundError:
+        return False
 
 
 # ---------------------------------------------------------------------------
