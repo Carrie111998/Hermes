@@ -101,6 +101,92 @@ def test_stopped_release_service_inventory_matches_writer_release_contract():
     assert set(foundation_phase_b.SERVICE_UNITS) < set(CANARY_RUNTIME_UNITS)
 
 
+def _stopped_release_source_transport(monkeypatch, *, initially_exists=True):
+    transport = object.__new__(launcher.IapStoppedReleaseTransport)
+    calls: list[tuple[tuple[str, ...], dict[str, object]]] = []
+    find_calls = 0
+
+    def run_remote(command, **kwargs):
+        nonlocal find_calls
+        argv = tuple(command)
+        calls.append((argv, dict(kwargs)))
+        if argv[0] == transport._REMOTE_FIND:
+            find_calls += 1
+            exists = initially_exists or find_calls > 1
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                stdout=RELEASE_SHA.encode("ascii") if exists else b"",
+            )
+        if "clone" in argv:
+            raise launcher.OwnerLauncherError("stopped_release_remote_failed")
+        if argv[-3:] == ("remote", "get-url", "origin"):
+            stdout = f"{launcher.STOPPED_RELEASE_SOURCE_REPOSITORY}\n".encode()
+        elif argv[-2:] == ("rev-parse", "--is-inside-work-tree"):
+            stdout = b"true\n"
+        elif argv[-3:] == ("rev-parse", "--verify", "HEAD^{commit}"):
+            stdout = f"{RELEASE_SHA}\n".encode()
+        else:
+            stdout = b""
+        return subprocess.CompletedProcess(argv, 0, stdout=stdout)
+
+    monkeypatch.setattr(transport, "_run_remote", run_remote)
+    return transport, calls
+
+
+@pytest.mark.parametrize("initially_exists", (True, False))
+def test_stopped_release_source_prepare_resumes_exact_no_checkout_clone(
+    monkeypatch,
+    initially_exists,
+):
+    transport, calls = _stopped_release_source_transport(
+        monkeypatch,
+        initially_exists=initially_exists,
+    )
+
+    assert transport._prepare_source(
+        RELEASE_SHA,
+        account="owner@example.com",
+    ) == f"{launcher.STOPPED_RELEASE_SOURCE_BASE}/{RELEASE_SHA}"
+
+    commands = [command for command, _kwargs in calls]
+    checkout = next(command for command in commands if "checkout" in command)
+    assert checkout[-3:] == ("checkout", "--detach", RELEASE_SHA)
+    assert any(command[-3:] == ("remote", "get-url", "origin") for command in commands)
+    assert any(
+        command[-3:] == ("rev-parse", "--verify", "HEAD^{commit}")
+        for command in commands
+    )
+    assert any("--porcelain=v1" in command for command in commands)
+    if initially_exists:
+        assert not any("clone" in command for command in commands)
+    else:
+        assert sum("clone" in command for command in commands) == 1
+
+
+def test_stopped_release_source_prepare_rejects_wrong_repository(monkeypatch):
+    transport, _calls = _stopped_release_source_transport(monkeypatch)
+    original_run_remote = transport._run_remote
+
+    def wrong_repository(command, **kwargs):
+        completed = original_run_remote(command, **kwargs)
+        if tuple(command)[-3:] == ("remote", "get-url", "origin"):
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout=b"https://example.invalid/untrusted.git\n",
+            )
+        return completed
+
+    monkeypatch.setattr(transport, "_run_remote", wrong_repository)
+
+    with pytest.raises(
+        launcher.OwnerLauncherError,
+        match="stopped_release_source_repository_invalid",
+    ):
+        transport._prepare_source(RELEASE_SHA, account="owner@example.com")
+
+
 def _canonical(value: Mapping[str, object]) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
 

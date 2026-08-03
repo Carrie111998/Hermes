@@ -16231,26 +16231,68 @@ class IapStoppedReleaseTransport(IapCoordinatorTransport):
 
     def _prepare_source(self, release_sha: str, *, account: str) -> str:
         source_root = self._source_root(release_sha)
-        if self._revision_source_exists(release_sha, account=account):
-            return source_root
         git_environment = (
             *self._fixed_remote_environment(),
             "GIT_CONFIG_GLOBAL=/dev/null",
             "GIT_CONFIG_NOSYSTEM=1",
         )
-        self._run_remote(
+        if not self._revision_source_exists(release_sha, account=account):
+            try:
+                self._run_remote(
+                    (
+                        *git_environment,
+                        self._REMOTE_GIT,
+                        "clone",
+                        "--no-checkout",
+                        "--no-tags",
+                        STOPPED_RELEASE_SOURCE_REPOSITORY,
+                        source_root,
+                    ),
+                    account=account,
+                    timeout_seconds=900.0,
+                )
+            except OwnerLauncherError as exc:
+                if (
+                    exc.code != "stopped_release_remote_failed"
+                    or not self._revision_source_exists(
+                        release_sha,
+                        account=account,
+                    )
+                ):
+                    raise
+
+        repository = self._run_remote(
             (
                 *git_environment,
                 self._REMOTE_GIT,
-                "clone",
-                "--no-checkout",
-                "--no-tags",
-                STOPPED_RELEASE_SOURCE_REPOSITORY,
+                "-C",
                 source_root,
+                "remote",
+                "get-url",
+                "origin",
             ),
             account=account,
-            timeout_seconds=900.0,
+            maximum_output_bytes=512,
         )
+        inside_work_tree = self._run_remote(
+            (
+                *git_environment,
+                self._REMOTE_GIT,
+                "-C",
+                source_root,
+                "rev-parse",
+                "--is-inside-work-tree",
+            ),
+            account=account,
+            maximum_output_bytes=16,
+        )
+        if (
+            repository.stdout
+            != f"{STOPPED_RELEASE_SOURCE_REPOSITORY}\n".encode("ascii")
+            or inside_work_tree.stdout != b"true\n"
+        ):
+            raise OwnerLauncherError("stopped_release_source_repository_invalid")
+
         self._run_remote(
             (
                 *git_environment,
@@ -16263,6 +16305,52 @@ class IapStoppedReleaseTransport(IapCoordinatorTransport):
             ),
             account=account,
         )
+        head = self._run_remote(
+            (
+                *git_environment,
+                self._REMOTE_GIT,
+                "-C",
+                source_root,
+                "rev-parse",
+                "--verify",
+                "HEAD^{commit}",
+            ),
+            account=account,
+            maximum_output_bytes=64,
+        )
+        detached = self._run_remote(
+            (
+                *git_environment,
+                self._REMOTE_GIT,
+                "-C",
+                source_root,
+                "symbolic-ref",
+                "--quiet",
+                "HEAD",
+            ),
+            account=account,
+            allowed_returncodes=frozenset({1}),
+            maximum_output_bytes=512,
+        )
+        status = self._run_remote(
+            (
+                *git_environment,
+                self._REMOTE_GIT,
+                "-C",
+                source_root,
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+            ),
+            account=account,
+            maximum_output_bytes=8_192,
+        )
+        if (
+            head.stdout != f"{release_sha}\n".encode("ascii")
+            or detached.stdout != b""
+            or status.stdout != b""
+        ):
+            raise OwnerLauncherError("stopped_release_source_checkout_invalid")
         return source_root
 
     def _run_release_command(
