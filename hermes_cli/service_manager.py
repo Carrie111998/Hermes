@@ -20,7 +20,7 @@ import re
 from pathlib import Path
 from typing import Literal, Protocol, runtime_checkable
 
-ServiceManagerKind = Literal["systemd", "launchd", "windows", "s6", "none"]
+ServiceManagerKind = Literal["systemd", "launchd", "windows", "openrc", "s6", "none"]
 
 # Profile name → service directory mapping. Profile names must be safe
 # as filesystem directory names because the s6 backend creates a service
@@ -92,6 +92,7 @@ def detect_service_manager() -> ServiceManagerKind:
         "windows" — native Windows host
         "launchd" — macOS host
         "systemd" — Linux host with a working user/system bus
+        "openrc" — Linux host with OpenRC's rc-service available
         "none" — anything else (Termux, sandbox shells, etc.)
 
     This function does NOT replace ``supports_systemd_services()`` —
@@ -302,17 +303,6 @@ class WindowsServiceManager(_RegistrationUnsupportedMixin):
             return False
         return bool(find_gateway_pids())
 
-
-# Compatibility note
-# ----------------
-# On Alpine Linux the gateway process is launched through ``supervise-daemon``/
-# ``rc-service`` in ``/etc/init.d/hermes-gateway``. In that launch path the
-# import machinery resolves ``gateway.slash_access`` differently from a plain
-# interactive Python run, so `ModuleNotFoundError: No module named 'gateway.slash_access'`
-# can appear if the working directory / ``PYTHONPATH`` is not set for the
-# editable install. Thus, operators may need to set PYTHONPATH in the init
-# script env or otherwise ensure the editable finder is included on sys.path
-# so that submodules are importable in the service process.
 
 class OpenRCServiceManager(_RegistrationUnsupportedMixin):
     """Thin wrapper around the ``openrc_*`` functions in hermes_cli.gateway.
