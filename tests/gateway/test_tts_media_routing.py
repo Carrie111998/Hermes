@@ -133,6 +133,7 @@ async def test_streaming_delivery_blocks_media_path_outside_allowed_roots(tmp_pa
     adapter.send_voice.assert_not_awaited()
 
 
+
 class _DiscordMediaFailureAdapter(BasePlatformAdapter):
     """Minimal adapter to exercise non-streaming MEDIA failure notification."""
 
@@ -175,24 +176,3 @@ async def test_non_streaming_media_failure_notifies_user(tmp_path, monkeypatch):
 
     adapter.send_video.assert_awaited_once()
     assert adapter.notices == ["⚠️ Couldn't deliver the video attachment."]
-
-
-class _DiscordMediaFailureAdapter(BasePlatformAdapter):
-    """Minimal adapter to exercise non-streaming MEDIA failure notification."""
-
-    def __init__(self):
-        super().__init__(PlatformConfig(enabled=True, token="test"), Platform.DISCORD)
-        self.notices: list[str] = []
-
-    async def connect(self, *, is_reconnect: bool = False):
-        return True
-
-    async def disconnect(self):
-        pass
-
-    async def send(self, chat_id, content=None, **kwargs):
-        self.notices.append(content or "")
-        return SendResult(success=True, message_id="notice")
-
-    async def get_chat_info(self, chat_id):
-        return {"id": chat_id, "type": "dm"}

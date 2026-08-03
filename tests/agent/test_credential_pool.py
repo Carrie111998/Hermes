@@ -1508,16 +1508,6 @@ class TestLeastUsedStrategy:
 
 
 # ── OpenAI Codex OAuth cross-process sync tests ────────────────────────────
-
-
-
-
-
-
-
-
-
-
 # ---------------------------------------------------------------------------
 # xAI OAuth terminal error quarantine
 # ---------------------------------------------------------------------------

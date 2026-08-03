@@ -100,12 +100,6 @@ def codex_auth_dir(tmp_path, monkeypatch):
     )
     return codex_dir
 
-
-class TestAuxiliaryMaxTokensParam:
-    pass
-
-
-
 class TestResolveTaskProviderModel:
     @pytest.mark.parametrize(
         "provider",
@@ -4166,8 +4160,6 @@ class TestCustomEndpointApiKeyInheritance:
             )
 
         assert captured.get("api_key") == "no-key-required"
-
-
 class TestMoaAggregatorStreamingBypass:
     def test_moa_aggregator_stream_bypasses_relay_for_codex_auxiliary_client(self, monkeypatch):
         """The MoA facade owns the streaming contract. For Codex Responses-shim

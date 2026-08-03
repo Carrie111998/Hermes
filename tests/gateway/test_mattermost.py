@@ -242,7 +242,6 @@ class TestMattermostSend:
         assert "Mattermost thread delivery failed" in flat_payload["message"]
         assert "Final answer body" in flat_payload["message"]
 
-
     @pytest.mark.asyncio
     async def test_progress_send_with_broken_thread_and_no_recorded_error_stays_quiet(self):
         """Same rule when no post error was recorded: still no flat fallback."""
@@ -260,8 +259,6 @@ class TestMattermostSend:
         assert self.adapter._api_post.call_count == 1
         payload = self.adapter._api_post.call_args_list[0][0][1]
         assert payload["root_id"] == "bad_root"
-
-
 # ---------------------------------------------------------------------------
 # WebSocket event parsing
 # ---------------------------------------------------------------------------
@@ -592,5 +589,3 @@ async def test_mattermost_top_level_channel_post_is_thread_root():
     assert msg_event.source.thread_id == "top_post_123"
     assert msg_event.source.message_id == "top_post_123"
     assert msg_event.message_id == "top_post_123"
-
-
