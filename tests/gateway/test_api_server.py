@@ -1748,6 +1748,7 @@ class TestToolsetsEndpoint:
             ("default", "Default Tools", "Core tools"),
             ("web", "Web Tools", "Search and extract"),
         ]
+        feature_snapshot = object()
         with patch(
             "hermes_cli.tools_config._get_effective_configurable_toolsets",
             return_value=fake_toolsets,
@@ -1755,9 +1756,12 @@ class TestToolsetsEndpoint:
             "hermes_cli.tools_config._get_platform_tools",
             return_value={"default"},
         ), patch(
+            "hermes_cli.tools_config.get_nous_subscription_features",
+            return_value=feature_snapshot,
+        ) as resolve_features, patch(
             "hermes_cli.tools_config._toolset_has_keys",
             return_value=True,
-        ), patch(
+        ) as has_keys, patch(
             "model_tools._compute_tool_definitions",
             return_value=[
                 {"type": "function", "function": {"name": "terminal"}},
@@ -1788,6 +1792,12 @@ class TestToolsetsEndpoint:
                     schema["function"]["name"]
                     for schema in by_name["default"]["tool_schemas"]
                 ] == ["read_file", "terminal"]
+                resolve_features.assert_called_once()
+                assert has_keys.call_count == 2
+                assert all(
+                    call.kwargs.get("features") is feature_snapshot
+                    for call in has_keys.call_args_list
+                )
 
     @pytest.mark.asyncio
     async def test_toolsets_keeps_unavailable_metadata_groups_empty(self, adapter):
