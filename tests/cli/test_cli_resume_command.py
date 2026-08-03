@@ -264,3 +264,39 @@ class TestResumeFlushesBeforeEndSession:
             conversation_history=[{"role": "user", "content": "hello"}, {"role": "assistant", "content": "hi"}],
         )
         cli_obj._session_db.end_session.assert_called_once()
+
+
+class TestListRecentSessionsSourceScope:
+    """Regression for #44964/#47214/#59224: /sessions and /resume must list
+    sessions from every source (TUI, Desktop, gateway), not only
+    ``source=\"cli\"`` — matching the Dashboard, ``hermes sessions list``, and
+    the TUI picker, all of which already list all sources."""
+
+    def test_includes_non_cli_sources_and_excludes_internal_runs(self, tmp_path):
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        try:
+            db.create_session("sess_cli", "cli", user_id="1", chat_id="2")
+            db.set_session_title("sess_cli", "CLI Session")
+            db.create_session("sess_tui", "tui", user_id="1", chat_id="2")
+            db.set_session_title("sess_tui", "TUI Session")
+            db.create_session("sess_gateway", "whatsapp", user_id="1", chat_id="2")
+            db.set_session_title("sess_gateway", "WhatsApp Session")
+            db.create_session("sess_tool", "tool", user_id="1", chat_id="2")
+            db.set_session_title("sess_tool", "Tool run")
+            db.create_session("sess_kanban", "kanban", user_id="1", chat_id="2")
+            db.set_session_title("sess_kanban", "Kanban run")
+
+            cli_obj = _make_cli()
+            cli_obj._session_db = db
+
+            ids = [s["id"] for s in cli_obj._list_recent_sessions(limit=10)]
+
+            assert "sess_cli" in ids
+            assert "sess_tui" in ids
+            assert "sess_gateway" in ids
+            assert "sess_tool" not in ids
+            assert "sess_kanban" not in ids
+        finally:
+            db.close()
