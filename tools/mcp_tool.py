@@ -827,8 +827,10 @@ def _scan_mcp_description(server_name: str, tool_name: str, description: str) ->
         logger.warning(
             "MCP server '%s' tool '%s': suspicious description content — %s. "
             "Description: %.200s",
-            server_name, tool_name, "; ".join(findings),
-            description,
+            _sanitize_error(server_name),
+            _sanitize_error(tool_name),
+            "; ".join(findings),
+            _sanitize_error(description),
         )
     return findings
 
@@ -1006,7 +1008,7 @@ def _cache_mcp_image_block(block) -> str:
     except (TypeError, ValueError) as exc:
         logger.warning(
             "MCP image block decode failed (%s): %s",
-            normalized_mime,
+            _sanitize_error(normalized_mime),
             _safe_exc_str(exc),
         )
         return ""
@@ -1105,7 +1107,7 @@ def _cache_mcp_audio_block(block) -> str:
     except (TypeError, ValueError) as exc:
         logger.warning(
             "MCP audio block decode failed (%s): %s",
-            mime_type,
+            _sanitize_error(mime_type),
             _safe_exc_str(exc),
         )
         return ""
@@ -5308,12 +5310,14 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 if block_type in {"text", "resource", "audio", "image"}:
                     logger.debug(
                         "MCP %s: content block type %r rendered empty",
-                        server_name, block_type,
+                        _sanitize_error(server_name),
+                        _sanitize_error(str(block_type)),
                     )
                 else:
                     logger.warning(
                         "MCP %s: dropping unsupported content block type %r",
-                        server_name, block_type,
+                        _sanitize_error(server_name),
+                        _sanitize_error(str(block_type)),
                     )
             text_result = "\n".join(parts) if parts else ""
 

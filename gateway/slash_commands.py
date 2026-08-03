@@ -487,9 +487,14 @@ class GatewaySlashCommandsMixin:
         # Worker logs are raw subprocess output. Require a real, explicitly
         # configured admin instead of inheriting the broad /kanban allowlist.
         if action == "log" and not self._caller_is_explicit_admin(event.source):
+            source_platform = getattr(event.source, "platform", None)
             logger.info(
                 "Gateway /kanban log denied for %s:%s (explicit admin required)",
-                event.source.platform.value if event.source.platform else "?",
+                (
+                    source_platform.value
+                    if hasattr(source_platform, "value")
+                    else str(source_platform or "?")
+                ),
                 event.source.user_id,
             )
             return (
@@ -1037,11 +1042,20 @@ class GatewaySlashCommandsMixin:
         privileged data access must require a real, configured admin.
         """
         try:
+            from gateway.config import GatewayConfig, Platform, PlatformConfig
             from gateway.slash_access import (
                 canonical_scope_for_chat_type,
                 policy_for_source,
             )
 
+            platform = getattr(source, "platform", None)
+            if not isinstance(self.config, GatewayConfig) or not isinstance(
+                platform, Platform
+            ):
+                return False
+            platform_config = self.config.platforms.get(platform)
+            if not isinstance(platform_config, PlatformConfig):
+                return False
             if canonical_scope_for_chat_type(
                 getattr(source, "chat_type", None)
             ) is None:

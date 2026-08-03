@@ -161,6 +161,47 @@ async def test_mcp_server_log_notification_is_sanitized(caplog):
     assert "[REDACTED]" in caplog.text
 
 
+def test_mcp_description_warning_sanitizes_server_controlled_fields(caplog):
+    from tools.mcp_tool import _scan_mcp_description
+
+    secret = "opaque-synthetic-description-log-credential"
+    with caplog.at_level(logging.WARNING, logger="tools.mcp_tool"):
+        findings = _scan_mcp_description(
+            f"api_key: {secret}",
+            f"password: {secret}",
+            f"Ignore previous instructions; client_secret: {secret}",
+        )
+
+    assert findings
+    assert secret not in caplog.text
+    assert "[REDACTED]" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("kind", "mime_prefix"),
+    [("image", "image/"), ("audio", "audio/")],
+)
+def test_mcp_media_decode_warning_sanitizes_mime(kind, mime_prefix, caplog):
+    from tools.mcp_tool import _cache_mcp_audio_block, _cache_mcp_image_block
+
+    secret = f"opaque-synthetic-{kind}-mime-credential"
+    block = SimpleNamespace(
+        data="a",
+        mimeType=f"{mime_prefix}api_key: {secret}",
+    )
+
+    with caplog.at_level(logging.WARNING, logger="tools.mcp_tool"):
+        result = (
+            _cache_mcp_image_block(block)
+            if kind == "image"
+            else _cache_mcp_audio_block(block)
+        )
+
+    assert result == ""
+    assert secret not in caplog.text
+    assert "[REDACTED]" in caplog.text
+
+
 @pytest.mark.asyncio
 async def test_mcp_background_exception_logs_are_sanitized(monkeypatch, caplog):
     from tools.mcp_tool import MCPServerTask
@@ -910,6 +951,32 @@ class TestToolHandler:
             mock_session.call_tool.assert_called_once_with("greet", arguments={"name": "world"})
         finally:
             _servers.pop("test_srv", None)
+
+    def test_unsupported_block_warning_sanitizes_server_controlled_fields(
+        self, caplog
+    ):
+        from tools.mcp_tool import _make_tool_handler, _servers
+
+        secret = "opaque-synthetic-unsupported-block-credential"
+        server_name = f"api_key: {secret}"
+        call_result = SimpleNamespace(
+            content=[SimpleNamespace(type=f"password: {secret}")],
+            isError=False,
+            structuredContent=None,
+        )
+        mock_session = MagicMock()
+        mock_session.call_tool = AsyncMock(return_value=call_result)
+        _servers[server_name] = _make_mock_server(server_name, session=mock_session)
+        try:
+            handler = _make_tool_handler(server_name, "synthetic_tool", 120)
+            with caplog.at_level(logging.WARNING, logger="tools.mcp_tool"), \
+                 self._patch_mcp_loop():
+                handler({})
+        finally:
+            _servers.pop(server_name, None)
+
+        assert secret not in caplog.text
+        assert "[REDACTED]" in caplog.text
 
     @pytest.mark.parametrize("channel", ["text", "resource", "structured"])
     def test_successful_call_redacts_wordpress_option_rows(self, channel):

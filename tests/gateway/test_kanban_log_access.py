@@ -151,6 +151,47 @@ async def test_worker_log_rejects_non_identity_admin_config(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "malformed_admins",
+    [["admin", True], ["admin", {"nested": True}], ["admin", ["nested"]]],
+)
+async def test_worker_log_rejects_mixed_malformed_admin_config(
+    monkeypatch, malformed_admins
+):
+    runner = _runner(admins=[], user_commands=[])
+    runner.config.platforms[Platform.SLACK].extra[
+        "group_allow_admin_from"
+    ] = malformed_admins
+    run_slash = Mock(return_value="raw worker output")
+    monkeypatch.setattr("hermes_cli.kanban.run_slash", run_slash)
+
+    result = await runner._handle_kanban_command(_event("admin"))
+
+    assert "admin-only" in result
+    assert "raw worker output" not in result
+    run_slash.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_worker_log_rejects_malformed_platform_and_config_types(monkeypatch):
+    runner = _runner(admins=[], user_commands=[])
+    runner.config.platforms = cast(
+        dict[Platform, PlatformConfig],
+        {"slack": {"group_allow_admin_from": ["admin"]}},
+    )
+    event = _event("admin")
+    event.source.platform = cast(Platform, "slack")
+    run_slash = Mock(return_value="raw worker output")
+    monkeypatch.setattr("hermes_cli.kanban.run_slash", run_slash)
+
+    result = await runner._handle_kanban_command(event)
+
+    assert "admin-only" in result
+    assert "raw worker output" not in result
+    run_slash.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_worker_log_fails_closed_without_authenticated_user_id(monkeypatch):
     runner = _runner(admins=["admin"], user_commands=["kanban"])
     run_slash = Mock(return_value="raw worker output")

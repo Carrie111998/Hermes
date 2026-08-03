@@ -126,10 +126,11 @@ def _coerce_id_list(raw: Any) -> FrozenSet[str]:
     out: list[str] = []
     for it in items:
         if isinstance(it, bool) or not isinstance(it, (str, int)):
-            continue
+            return frozenset()
         s = str(it).strip()
-        if s:
-            out.append(s)
+        if not s:
+            return frozenset()
+        out.append(s)
     return frozenset(out)
 
 
