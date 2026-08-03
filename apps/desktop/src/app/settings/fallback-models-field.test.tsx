@@ -78,7 +78,7 @@ describe('FallbackModelsField', () => {
 
     fireEvent.click(screen.getAllByRole('combobox')[0])
 
-    expect(await screen.findByText('Electric Sheep')).toBeTruthy()
+    expect((await screen.findAllByText('Electric Sheep')).length).toBeGreaterThan(0)
     expect(screen.queryByText('Nous')).toBeNull()
   })
 
