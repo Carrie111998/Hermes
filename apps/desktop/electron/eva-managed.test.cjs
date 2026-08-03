@@ -9,6 +9,7 @@ const {
   assertEvaManagedLocalTerminalAllowed,
   buildEvaDesktopAuthUrl,
   buildEvaManagedWsUrl,
+  isEvaManagedGatewayMethodBlocked,
   launchEvaHermesRuntime,
   makeDeviceCode,
   normalizeHermesEnrollment,
@@ -72,6 +73,28 @@ test('managed mode fails closed before local machine mutation while unmanaged mo
     })
     assert.equal(unmanagedMutationRan, true)
   }
+})
+
+test('managed gateway policy blocks hidden Nous billing methods and their future namespaces', () => {
+  for (const method of [
+    'billing.state',
+    'billing.charge',
+    'billing.auto_reload',
+    'billing.step_up',
+    'subscription.state',
+    'subscription.change',
+    'subscription.resume',
+    'subscription.upgrade',
+    'usage.bars',
+    'billing.future_method',
+    'subscription.future_method'
+  ]) {
+    assert.equal(isEvaManagedGatewayMethodBlocked(method), true)
+  }
+
+  assert.equal(isEvaManagedGatewayMethodBlocked('session.status'), false)
+  assert.equal(isEvaManagedGatewayMethodBlocked('usage.snapshot'), false)
+  assert.equal(isEvaManagedGatewayMethodBlocked('plugin.billing-helper.run'), false)
 })
 
 test('evaOS Agent auth URL carries a high-entropy fallback code and state but no agent selector', () => {

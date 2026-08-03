@@ -2,7 +2,7 @@ const crypto = require('node:crypto')
 const http = require('node:http')
 const tls = require('node:tls')
 
-const { buildEvaManagedWsUrl } = require('./eva-managed.cjs')
+const { buildEvaManagedWsUrl, isEvaManagedGatewayMethodBlocked } = require('./eva-managed.cjs')
 
 const TICKET_TTL_MS = 30_000
 const MAX_UPSTREAM_HEADER_BYTES = 64 * 1024
@@ -111,7 +111,7 @@ function writeFailure(socket, statusCode, reason) {
   )
 }
 
-function buildUpgradeRequest(request, upstreamUrl) {
+function buildUpgradeRequest(request, upstreamUrl, options = {}) {
   const key = String(request.headers['sec-websocket-key'] || '')
   const version = String(request.headers['sec-websocket-version'] || '')
   if (!key || version !== '13') {
@@ -129,8 +129,115 @@ function buildUpgradeRequest(request, upstreamUrl) {
   const protocol = String(request.headers['sec-websocket-protocol'] || '').trim()
   const extensions = String(request.headers['sec-websocket-extensions'] || '').trim()
   if (protocol) lines.push(`Sec-WebSocket-Protocol: ${protocol}`)
-  if (extensions) lines.push(`Sec-WebSocket-Extensions: ${extensions}`)
+  if (extensions && options.forwardExtensions !== false) lines.push(`Sec-WebSocket-Extensions: ${extensions}`)
   return `${lines.join('\r\n')}\r\n\r\n`
+}
+
+function containsBlockedGatewayMethod(payload) {
+  let parsed
+  try {
+    parsed = JSON.parse(payload.toString('utf8'))
+  } catch {
+    return false
+  }
+
+  const messages = Array.isArray(parsed) ? parsed : [parsed]
+  return messages.some(
+    message =>
+      message !== null &&
+      typeof message === 'object' &&
+      typeof message.method === 'string' &&
+      isEvaManagedGatewayMethodBlocked(message.method)
+  )
+}
+
+function createClientFrameGuard({ onFrame, onReject }) {
+  let buffered = Buffer.alloc(0)
+  let fragmentedOpcode = null
+
+  return chunk => {
+    if (chunk?.length) buffered = Buffer.concat([buffered, Buffer.from(chunk)])
+
+    while (buffered.length >= 2) {
+      const first = buffered[0]
+      const second = buffered[1]
+      const fin = (first & 0x80) !== 0
+      const reserved = first & 0x70
+      const opcode = first & 0x0f
+      const masked = (second & 0x80) !== 0
+      let payloadLength = second & 0x7f
+      let headerLength = 2
+
+      if (payloadLength === 126) {
+        if (buffered.length < 4) return true
+        payloadLength = buffered.readUInt16BE(2)
+        headerLength = 4
+      } else if (payloadLength === 127) {
+        if (buffered.length < 10) return true
+        const wideLength = buffered.readBigUInt64BE(2)
+        if (wideLength > BigInt(Number.MAX_SAFE_INTEGER)) {
+          onReject('client_frame_rejected')
+          return false
+        }
+        payloadLength = Number(wideLength)
+        headerLength = 10
+      }
+
+      const maskLength = masked ? 4 : 0
+      if (payloadLength > Number.MAX_SAFE_INTEGER - headerLength - maskLength) {
+        onReject('client_frame_rejected')
+        return false
+      }
+      const frameLength = headerLength + maskLength + payloadLength
+      if (buffered.length < frameLength) return true
+
+      const frame = buffered.subarray(0, frameLength)
+      buffered = buffered.subarray(frameLength)
+
+      if (opcode === 0x1) {
+        if (!fin || reserved !== 0 || fragmentedOpcode !== null) {
+          onReject('client_text_frame_rejected')
+          return false
+        }
+
+        const payloadOffset = headerLength + maskLength
+        let payload = frame.subarray(payloadOffset)
+        if (masked) {
+          const mask = frame.subarray(headerLength, headerLength + 4)
+          payload = Buffer.from(payload)
+          for (let index = 0; index < payload.length; index += 1) {
+            payload[index] ^= mask[index % 4]
+          }
+        }
+        if (containsBlockedGatewayMethod(payload)) {
+          onReject('client_rpc_denied')
+          return false
+        }
+      } else if (opcode === 0x2) {
+        if (fragmentedOpcode !== null) {
+          onReject('client_frame_rejected')
+          return false
+        }
+        if (!fin) fragmentedOpcode = opcode
+      } else if (opcode === 0x0) {
+        if (fragmentedOpcode === null) {
+          onReject('client_frame_rejected')
+          return false
+        }
+        if (fin) fragmentedOpcode = null
+      }
+
+      onFrame(frame)
+    }
+
+    return true
+  }
+}
+
+function policyCloseFrame() {
+  const payload = Buffer.alloc(2)
+  payload.writeUInt16BE(1008)
+  return Buffer.concat([Buffer.from([0x88, payload.length]), payload])
 }
 
 function connectTls(upstreamUrl) {
@@ -265,7 +372,8 @@ function createEvaWsRelay(options) {
         safeDestroy(upstreamSocket)
         return
       }
-      upstreamSocket.write(buildUpgradeRequest(request, upstreamUrl))
+      const guardGatewayRpc = grant.endpoint.pathname === '/api/ws'
+      upstreamSocket.write(buildUpgradeRequest(request, upstreamUrl, { forwardExtensions: !guardGatewayRpc }))
     } catch (error) {
       if (setupFinished) return
       setupFinished = true
@@ -331,8 +439,33 @@ function createEvaWsRelay(options) {
 
       clientSocket.write(responseHead)
       if (responseTail.length) clientSocket.write(responseTail)
-      if (head?.length) upstreamSocket.write(head)
-      clientSocket.pipe(upstreamSocket)
+      const guardGatewayRpc = grant.endpoint.pathname === '/api/ws'
+      if (guardGatewayRpc) {
+        let rejected = false
+        const rejectClientFrame = event => {
+          if (rejected) return
+          rejected = true
+          onEvent(event)
+          if (!clientSocket.destroyed) clientSocket.end(policyCloseFrame())
+          safeDestroy(upstreamSocket)
+        }
+        const inspectClientFrames = createClientFrameGuard({
+          onFrame: frame => {
+            if (!upstreamSocket.write(frame)) {
+              clientSocket.pause()
+              upstreamSocket.once('drain', () => {
+                if (!rejected && !clientSocket.destroyed) clientSocket.resume()
+              })
+            }
+          },
+          onReject: rejectClientFrame
+        })
+        if (head?.length) inspectClientFrames(head)
+        if (!rejected) clientSocket.on('data', inspectClientFrames)
+      } else {
+        if (head?.length) upstreamSocket.write(head)
+        clientSocket.pipe(upstreamSocket)
+      }
       upstreamSocket.pipe(clientSocket)
     }
 

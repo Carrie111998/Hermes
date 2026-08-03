@@ -47,6 +47,18 @@ const EVA_MANAGED_ESCAPE_QUERY_KEYS = new Set([
 ])
 const EVA_MANAGED_BLOCKED_BACKEND_PATHS = new Set(['/api/hermes/update', '/api/hermes/update/check'])
 const EVA_MANAGED_BLOCKED_BACKEND_PREFIXES = ['/api/providers/oauth/nous']
+const EVA_MANAGED_HIDDEN_NOUS_GATEWAY_METHODS = new Set([
+  'billing.state',
+  'billing.charge',
+  'billing.auto_reload',
+  'billing.step_up',
+  'subscription.state',
+  'subscription.change',
+  'subscription.resume',
+  'subscription.upgrade',
+  'usage.bars'
+])
+const EVA_MANAGED_BLOCKED_GATEWAY_PREFIXES = ['billing.', 'subscription.']
 const EVA_MANAGED_PROFILE_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
 
 class EvaBrokerError extends Error {
@@ -180,6 +192,14 @@ function assertEvaManagedLocalMutationAllowed(managed, capability = 'This local 
       'managed-local-mutation-unavailable'
     )
   }
+}
+
+function isEvaManagedGatewayMethodBlocked(value) {
+  const method = String(value || '')
+  return (
+    EVA_MANAGED_HIDDEN_NOUS_GATEWAY_METHODS.has(method) ||
+    EVA_MANAGED_BLOCKED_GATEWAY_PREFIXES.some(prefix => method.startsWith(prefix))
+  )
 }
 
 function makeDeviceCode(cryptoApi = crypto) {
@@ -524,6 +544,7 @@ module.exports = {
   buildEvaManagedWsUrl,
   claimEvaDeviceCode,
   expiresSoon,
+  isEvaManagedGatewayMethodBlocked,
   launchEvaHermesRuntime,
   makeAuthState,
   makeDeviceCode,
