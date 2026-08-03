@@ -606,6 +606,15 @@ class TestStripYamlFrontmatter:
 class TestPromptBuilderConstants:
 
 
+    def test_qqbot_hint_frames_agent_identity(self):
+        """#66959 — weaker models routed via aggregators skip skill_view() when
+        the QQ hint lacks explicit 'AI Agent' identity framing. Mirror the CLI
+        hint so the model loads skill bodies instead of relying on short
+        descriptions alone."""
+        hint = PLATFORM_HINTS["qqbot"]
+        assert "AI Agent" in hint
+        assert "skill" in hint
+
     def test_cli_and_tui_hints_flag_local_only_cron(self):
         """#51568 — cron jobs from CLI/TUI sessions don't deliver back into
         the session, so the agent must be told up front not to promise it."""
