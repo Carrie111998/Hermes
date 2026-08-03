@@ -1998,35 +1998,55 @@ class SlackAdapter(BasePlatformAdapter):
                         # Slack accepted the upload. Resolve that ID through
                         # files.info instead of falsely reporting failure or
                         # retrying the upload and creating a duplicate file.
-                        metadata_result = None
                         metadata_exc: Optional[Exception] = None
+                        verified_metadata_file_id: Optional[str] = None
                         for metadata_attempt in range(3):
                             try:
                                 metadata_result = await self._get_client(
                                     chat_id
                                 ).files_info(file=upload_file_id)
+                                candidate_file_id = _verified_upload_file_id(
+                                    metadata_result, display_name, len(file_bytes)
+                                )
+                                if candidate_file_id != upload_file_id:
+                                    raise RuntimeError(
+                                        "Slack returned mismatched file IDs while "
+                                        "verifying the upload"
+                                    )
+                                verified_metadata_file_id = candidate_file_id
                                 break
+                            except _SlackUploadMetadataIncomplete as exc:
+                                # Slack's file record is eventually consistent:
+                                # an immediate files.info call can still omit
+                                # filetype/name for a newly-created snippet.
+                                metadata_exc = exc
+                                metadata_state = "incomplete"
                             except Exception as exc:
                                 metadata_exc = exc
-                                if (
-                                    not self._is_retryable_upload_error(exc)
-                                    or metadata_attempt >= 2
-                                ):
-                                    break
-                                await asyncio.sleep(1.5 * (metadata_attempt + 1))
-                        if metadata_result is None:
+                                if not self._is_retryable_upload_error(exc):
+                                    raise
+                                metadata_state = "transient_error"
+                            if metadata_attempt >= 2:
+                                break
+                            logger.info(
+                                "artifact_delivery correlation_id=%s "
+                                "stage=upload_metadata_retry platform=slack "
+                                "chat_id=%s thread_id=%s file_id=%s attempt=%s "
+                                "metadata_state=%s",
+                                correlation_id,
+                                chat_id,
+                                thread_ts,
+                                upload_file_id,
+                                metadata_attempt + 1,
+                                metadata_state,
+                            )
+                            await asyncio.sleep(1.5 * (metadata_attempt + 1))
+                        if verified_metadata_file_id is None:
                             raise RuntimeError(
                                 "Slack accepted the upload but its file metadata "
                                 "could not be verified"
                             ) from metadata_exc
-                        file_id = _verified_upload_file_id(
-                            metadata_result, display_name, len(file_bytes)
-                        )
-                        if file_id != upload_file_id:
-                            raise RuntimeError(
-                                "Slack returned mismatched file IDs while "
-                                "verifying the upload"
-                            )
+                        file_id = verified_metadata_file_id
                     logger.info(
                         "artifact_delivery correlation_id=%s stage=upload_result "
                         "platform=slack chat_id=%s thread_id=%s filename=%s "

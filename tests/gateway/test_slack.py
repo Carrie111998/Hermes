@@ -788,6 +788,39 @@ class TestSendDocument:
         sleep_mock.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_send_document_retries_eventually_consistent_metadata_without_reupload(
+        self, adapter, tmp_path
+    ):
+        test_file = tmp_path / "report.html"
+        payload = b"<p>safe</p>"
+        test_file.write_bytes(payload)
+        adapter._app.client.files_upload_v2 = AsyncMock(
+            return_value={"ok": True, "files": [{"id": "F123"}]}
+        )
+        adapter._app.client.files_info = AsyncMock(
+            side_effect=[
+                {"ok": True, "file": {"id": "F123", "name": "report.html"}},
+                {
+                    "ok": True,
+                    "file": {
+                        "id": "F123",
+                        "name": "report.html",
+                        "filetype": "html",
+                        "size": len(payload),
+                    },
+                },
+            ]
+        )
+
+        with patch("asyncio.sleep", new_callable=AsyncMock) as sleep_mock:
+            result = await adapter.send_document("C123", str(test_file))
+
+        assert result.success
+        adapter._app.client.files_upload_v2.assert_awaited_once()
+        assert adapter._app.client.files_info.await_count == 2
+        sleep_mock.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_send_document_with_thread(self, adapter, tmp_path):
         test_file = tmp_path / "notes.txt"
         test_file.write_bytes(b"some notes")
