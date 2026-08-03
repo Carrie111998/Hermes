@@ -402,7 +402,13 @@ def _warn_context_length_fallback(model: str, base_url: str) -> None:
 # Minimum context length required to run Hermes Agent.  Models with fewer
 # tokens cannot maintain enough working memory for tool-calling workflows.
 # Sessions, model switches, and cron jobs should reject models below this.
-MINIMUM_CONTEXT_LENGTH = 64_000
+# Support 16K self-hosted models by default while allowing operators to raise
+# the reliability floor. The compressor's degenerate-window guard still
+# triggers before the configured window fills.
+MINIMUM_CONTEXT_LENGTH = max(
+    8_000,
+    int(os.environ.get("HERMES_MINIMUM_CONTEXT_LENGTH", "16384")),
+)
 
 # Short-lived in-process cache for local-server context probes. Bounds the
 # probe rate when the new local-endpoint live-probe paths (reconcile-on-hit +
