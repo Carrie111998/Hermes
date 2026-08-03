@@ -908,7 +908,7 @@ export function mirrorLayoutTree() {
 }
 
 export interface DropHint {
-  kind: 'group'
+  kind: 'group' | 'project'
   /** The zone a drop will land in (ClosestCenter among `groupIds`). */
   groupId?: string
   /** Full highlighted set (multi-zone when Shift extends the range). */
@@ -918,6 +918,9 @@ export interface DropHint {
    *  before this pane id, or at the end (`before: null`). The strip renders
    *  the insertion divider; the zone sheet stands down. */
   stack?: { before: null | string }
+  /** Sidebar project receiving a dragged chat. Mutually exclusive with zone
+   * geometry; the project row owns the visual affordance. */
+  projectId?: string
 }
 
 /** Live drop target under the pointer while dragging. */
@@ -930,7 +933,16 @@ export const $dropHint = atom<DropHint | null>(null)
  * computeds collapse the churn to booleans that only notify on actual flips —
  * and stay `false` throughout pane/tab drags, which chat never cares about.
  */
-export const $sessionTileDragging = computed($treeDragging, dragging => dragging === SESSION_TILE_DRAG)
+export const $sessionTileDragging = computed(
+  [$treeDragging, $dropHint],
+  (dragging, hint) => dragging === SESSION_TILE_DRAG && hint?.kind !== 'project'
+)
+
+/** Project row currently receiving a sidebar chat drag. */
+export const $sessionProjectDropTargetId = computed(
+  [$treeDragging, $dropHint],
+  (dragging, hint) => (dragging === SESSION_TILE_DRAG && hint?.kind === 'project' ? (hint.projectId ?? null) : null)
+)
 
 /** True while a session drag aims at a zone EDGE (a tile split) or a tab
  *  strip (a stack) — the moments the chat surfaces' "link to chat" overlay

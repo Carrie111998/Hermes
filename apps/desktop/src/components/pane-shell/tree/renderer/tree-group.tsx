@@ -715,6 +715,10 @@ function ZoneDropOverlay({ node }: { node: GroupNode }) {
     return null
   }
 
+  if (hint?.kind === 'project') {
+    return null
+  }
+
   // A session drag (sidebar row) reuses this exact overlay — over ANY zone
   // now (stack into its tabs / split its edges); only a CHAT zone's center is
   // a link-to-chat (the composer overlay owns that visual).

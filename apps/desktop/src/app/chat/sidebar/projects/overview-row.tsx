@@ -1,6 +1,8 @@
 import type * as React from 'react'
+import { useStore } from '@nanostores/react'
 import { useRef } from 'react'
 
+import { $sessionProjectDropTargetId } from '@/components/pane-shell/tree/store'
 import { Codicon } from '@/components/ui/codicon'
 import { DisclosureCaret } from '@/components/ui/disclosure-caret'
 import { Tip } from '@/components/ui/tooltip'
@@ -92,6 +94,8 @@ export function ProjectOverviewRow({
   const { t } = useI18n()
   const s = t.sidebar
   const isActive = project.id === activeProjectId
+  const projectDropTargetId = useStore($sessionProjectDropTargetId)
+  const isSessionDropTarget = projectDropTargetId === project.id
   const [open, toggleOpen] = useWorkspaceNodeOpen(project.id)
   // The appearance popover anchors here (the full row) so it opens flush with
   // the sidebar's content edge regardless of which side the sidebar is on.
@@ -158,7 +162,16 @@ export function ProjectOverviewRow({
   )
 
   return (
-    <div className={cn(dragging && 'relative z-10')} ref={ref} style={style}>
+    <div
+      className={cn(
+        'rounded-md transition-[background-color,box-shadow]',
+        dragging && 'relative z-10',
+        isSessionDropTarget && 'bg-(--ui-bg-quaternary) ring-1 ring-(--ui-stroke-secondary)'
+      )}
+      data-project-drop-id={!project.isNoProject && project.path ? project.id : undefined}
+      ref={ref}
+      style={style}
+    >
       {/* Home has no per-project actions, so it gets no right-click menu. */}
       {project.isNoProject ? (
         shell
