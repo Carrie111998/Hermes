@@ -21,7 +21,7 @@ from __future__ import annotations
 import ast
 import inspect
 
-from gateway import run as gateway_run
+from gateway import dispatch_mixin as gateway_dispatch
 
 
 def _calls(node: ast.AST) -> set[str]:
@@ -35,7 +35,7 @@ def _calls(node: ast.AST) -> set[str]:
 def _find_deferred_guarded_reset_chain() -> ast.If:
     """Return the ``if agent_result.get('compression_deferred') ... elif
     agent_result.get('compression_exhausted') ... reset_session`` chain."""
-    tree = ast.parse(inspect.getsource(gateway_run))
+    tree = ast.parse(inspect.getsource(gateway_dispatch))
 
     for node in ast.walk(tree):
         if not isinstance(node, ast.If):
@@ -56,7 +56,7 @@ def _find_deferred_guarded_reset_chain() -> ast.If:
             return node
     raise AssertionError(
         "Could not locate the compression_deferred guard in front of the "
-        "compression-exhausted auto-reset block in gateway/run.py. The "
+        "compression-exhausted auto-reset block in gateway/dispatch_mixin.py. The "
         "soft-defer contract (#49874: lock-contended defer must never "
         "auto-reset the session) is no longer structurally guaranteed."
     )

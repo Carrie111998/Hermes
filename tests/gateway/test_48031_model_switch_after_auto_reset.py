@@ -10,7 +10,7 @@ config default — while the session DB still shows the switched model (a
 two-sources-of-truth divergence).
 
 The fix consumes `was_auto_reset` at two sites:
-  1. the cleanup block in gateway/run.py captures it into a local and sets the
+  1. the cleanup block in gateway/dispatch_mixin.py captures it into a local and sets the
      attribute False immediately (so it can't re-fire next message);
   2. the slash-command model path in gateway/slash_commands.py consumes it
      before storing the override (so a /model-first-after-reset isn't wiped).
@@ -23,7 +23,7 @@ from __future__ import annotations
 import ast
 import inspect
 
-from gateway import run as gateway_run
+from gateway import dispatch_mixin as gateway_dispatch
 from gateway import slash_commands as gateway_slash
 
 
@@ -47,7 +47,7 @@ def test_run_consumes_was_auto_reset_in_cleanup_block():
     `session_entry.was_auto_reset = False` so the cleanup (which pops the
     session model/reasoning overrides) cannot re-fire on the next message and
     wipe an override stored between turns (#48031)."""
-    tree = ast.parse(inspect.getsource(gateway_run))
+    tree = ast.parse(inspect.getsource(gateway_dispatch))
 
     # Find the cleanup branch: an `if <flag>:` block that clears the
     # conversation scope (post-funnel: one _clear_conversation_scope call
@@ -68,7 +68,7 @@ def test_run_consumes_was_auto_reset_in_cleanup_block():
             found = True
             break
     assert found, (
-        "gateway/run.py auto-reset cleanup block must consume "
+        "gateway/dispatch_mixin.py auto-reset cleanup block must consume "
         "`was_auto_reset` (set it False) so it can't re-fire and wipe a "
         "model override stored between turns (#48031)."
     )
