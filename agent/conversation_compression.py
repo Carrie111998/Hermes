@@ -2383,6 +2383,7 @@ def compress_context(
                     if _store is not None:
                         from tools.memory_tool import memory_tool
 
+                        _results: list[tuple[str, dict[str, Any]]] = []
                         _persisted = 0
                         for _fact in _facts:
                             _result_json = memory_tool(
@@ -2393,10 +2394,11 @@ def compress_context(
                             )
                             try:
                                 _result = json.loads(_result_json)
-                                if _result.get("success"):
-                                    _persisted += 1
                             except (json.JSONDecodeError, TypeError):
-                                pass
+                                _result = {}
+                            _results.append((_result_json, _result))
+                            if _result.get("success"):
+                                _persisted += 1
                         if _persisted:
                             logger.info(
                                 "persisted %d durable fact(s) from compression "
@@ -2404,6 +2406,18 @@ def compress_context(
                                 _persisted,
                                 len(_facts) - _persisted,
                             )
+                            # Mirror to external memory providers (Mem0,
+                            # Honcho, etc.) so they see the new facts too.
+                            _manager = getattr(agent, "_memory_manager", None)
+                            if _manager:
+                                for _fact, (_result_json, _) in zip(
+                                    _facts, _results
+                                ):
+                                    _manager.notify_memory_tool_write(
+                                        _result_json,
+                                        {"action": "add", "target": "memory",
+                                         "content": _fact},
+                                    )
         except Exception as _exc:
             logger.debug(
                 "durable facts persistence after compression failed: %s", _exc
