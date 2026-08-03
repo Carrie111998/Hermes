@@ -6,6 +6,7 @@ import {
   getRecommendedDefaultModel,
   listOAuthProviders,
   pollOAuthSession,
+  reEnableOAuthProvider,
   setEnvVar,
   setModelAssignment,
   startOAuthLogin,
@@ -733,6 +734,15 @@ export async function recheckExternalSignin(ctx: OnboardingContext) {
   }
 
   const { provider } = flow
+
+  // Claude Code disconnect is non-destructive (a suppression marker), so
+  // reconnection just clears the marker — no CLI command needed.  Other
+  // external providers still require the user to sign in through their
+  // own CLI first.
+  if (provider.id === 'claude-code') {
+    await reEnableOAuthProvider(provider.id)
+  }
+
   await completeWithModelConfirm(ctx, provider.name, [provider.id], reason =>
     setFlow({
       status: 'error',
