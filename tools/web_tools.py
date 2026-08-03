@@ -756,43 +756,35 @@ def web_search_tool(query: str, limit: int = 5) -> str:
                     # First attempt: fall back to active provider
                     provider = get_active_search_provider()
                     if provider is None:
-                        response_data = {
-                            "success": False,
-                            "error": (
-                                "No web search provider configured. "
-                                "Run `hermes tools` to set one up."
-                            ),
-                        }
+                        # A bundled web plugin the user explicitly disabled
+                        # looks identical to "no provider" here — point at the
+                        # real cause (re-enable the plugin) rather than a
+                        # generic setup hint.
+                        disabled_key = _disabled_web_plugin_for(capability="search")
+                        if disabled_key:
+                            _vendor = disabled_key.split("/", 1)[-1]
+                            response_data = {
+                                "success": False,
+                                "error": (
+                                    f"web.search_backend is set to '{_vendor}', but its "
+                                    f"plugin ('{disabled_key}') is disabled in config. "
+                                    f"Re-enable it with `hermes plugins enable {disabled_key}` "
+                                    "(or remove it from plugins.disabled)."
+                                ),
+                            }
+                        else:
+                            response_data = {
+                                "success": False,
+                                "error": (
+                                    "No web search provider configured. "
+                                    "Run `hermes tools` to set one up."
+                                ),
+                            }
                         break
                 else:
                     # Failover attempt: skip backends that don't support search
                     continue
 
-        if provider is None:
-            # A bundled web plugin the user explicitly disabled looks
-            # identical to "no provider" here — point at the real cause
-            # (re-enable the plugin) rather than a generic setup hint.
-            disabled_key = _disabled_web_plugin_for(capability="search")
-            if disabled_key:
-                _vendor = disabled_key.split("/", 1)[-1]
-                response_data = {
-                    "success": False,
-                    "error": (
-                        f"web.search_backend is set to '{_vendor}', but its "
-                        f"plugin ('{disabled_key}') is disabled in config. "
-                        f"Re-enable it with `hermes plugins enable {disabled_key}` "
-                        "(or remove it from plugins.disabled)."
-                    ),
-                }
-            else:
-                response_data = {
-                    "success": False,
-                    "error": (
-                        "No web search provider configured. "
-                        "Run `hermes tools` to set one up."
-                    ),
-                }
-        else:
             logger.info(
                 "Web search via %s: '%s' (limit: %d)",
                 provider.name, query, limit,
