@@ -1,0 +1,32 @@
+name: oh-my-hermes
+version: 1.0.4
+description: "Hermes-native OMH routing, evidence, status, memory, and workflow bridge sourced from the oh-my-hermes git submodule."
+author: "zapabob / oh-my-hermes maintainers"
+kind: standalone
+platforms:
+  - linux
+  - macos
+  - windows
+provides_tools:
+  - omh_capabilities
+  - omh_context
+  - omh_gather_evidence
+  - omh_hud
+  - omh_interact
+  - omh_memory
+  - omh_probe
+  - omh_recommend
+  - omh_role
+  - omh_status
+provides_hooks:
+  - on_session_end
+  - pre_llm_call
+  - pre_tool_call
+  - pre_verify
+config:
+  auto_install_skills:
+    type: boolean
+    default: false
+  source_submodule:
+    type: string
+    default: vendor/oh-my-hermes

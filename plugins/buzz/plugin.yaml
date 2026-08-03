@@ -3,7 +3,7 @@ version: 0.2.0
 description: >
   Buzz relay integration for Hermes Agent swarms — Kind 9 channel messages,
   encrypted observer frames (Kind 24200 / NIP-44), and workflow triggers.
-kind: tool
+kind: standalone
 platforms: [windows, linux, macos]
 config:
   buzz_bin:
