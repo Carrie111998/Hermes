@@ -42,7 +42,13 @@ _lock = threading.Lock()
 
 # Tool-call result shapes we can parse
 _WRITE_FILE_PATH_KEY = "path"
-_TERMINAL_PATH_REGEX = re.compile(r"(?:^|\s)(/[^\s'\"`]+|\~/[^\s'\"`]+)")
+# Windows drive-qualified paths (``C:\...`` or ``C:/...``) — terminal output
+# on Windows (Explorer, PowerShell, git-bash) quotes created files as drive
+# paths, which the POSIX-only matcher below used to miss entirely.
+_WIN_DRIVE_PATH_RE = re.compile(r"^[A-Za-z]:[\\/]")
+_TERMINAL_PATH_REGEX = re.compile(
+    r"(?:^|\s)(/[^\s'\"`]+|\~/[^\s'\"`]+|[A-Za-z]:[\\/][^\s'\"`]+)"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -108,9 +114,10 @@ def _extract_paths_from_terminal(args: Dict[str, Any], result: str) -> Set[str]:
     cmd = args.get("command") or ""
     if isinstance(cmd, str) and cmd:
         # Tokenise the command — catches `touch /tmp/hermes-x/test_foo.py`
+        # and, on Windows, `touch C:/Users/.../test_foo.py` (git-bash style).
         try:
             for tok in shlex.split(cmd, posix=True):
-                if tok.startswith(("/", "~")):
+                if tok.startswith(("/", "~")) or _WIN_DRIVE_PATH_RE.match(tok):
                     paths.add(tok)
         except ValueError:
             pass

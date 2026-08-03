@@ -333,6 +333,26 @@ class TestPostToolCallHook:
         data = json.loads(tracked_file.read_text())
         assert any(Path(i["path"]) == p.resolve() for i in data)
 
+    def test_terminal_regex_captures_windows_drive_paths(self):
+        """Terminal result text with Windows drive paths (backslash form) must
+        be picked up — the scanner used to only match POSIX-style paths, so
+        Windows terminals reported created files that were never tracked."""
+        pi = _load_plugin_init()
+        result = "created C:\\Users\\dejan\\AppData\\Local\\Temp\\x\\tmp_created.log\n"
+        matches = pi._TERMINAL_PATH_REGEX.findall(result)
+        assert matches
+        assert matches[0].startswith("C:")
+
+    def test_terminal_command_extracts_windows_drive_token(self):
+        """A git-bash style `touch C:/Users/...` command token must be treated
+        as a candidate path."""
+        pi = _load_plugin_init()
+        paths = pi._extract_paths_from_terminal(
+            {"command": "touch C:/Users/dejan/tmp_created.log"},
+            "",
+        )
+        assert any("C:/Users/dejan/tmp_created.log" in p for p in paths)
+
     def test_ignores_unrelated_tool(self, _isolate_env):
         pi = _load_plugin_init()
         pi._on_post_tool_call(
