@@ -5,14 +5,14 @@ import { cn } from '@/lib/utils'
 import {
   ANNOTATION_COLORS,
   ANNOTATION_TOOLS,
+  type AnnotationShape,
+  type AnnotationTool,
   DEFAULT_ANNOTATION_COLOR,
   isClick,
   nextCalloutNumber,
   nextShapeId,
-  shapeBounds,
-  type AnnotationShape,
-  type AnnotationTool,
-  type Point
+  type Point,
+  shapeBounds
 } from './annotation-model'
 
 interface AnnotationCanvasProps {
@@ -51,6 +51,7 @@ function drawShape(ctx: CanvasRenderingContext2D, shape: AnnotationShape) {
   ctx.lineJoin = 'round'
 
   const [start, end] = [shape.points[0], shape.points[shape.points.length - 1]]
+
   if (!start || !end) {
     ctx.restore()
 
@@ -61,40 +62,53 @@ function drawShape(ctx: CanvasRenderingContext2D, shape: AnnotationShape) {
     case 'rect': {
       const bounds = shapeBounds(shape)
       ctx.strokeRect(bounds.minX, bounds.minY, bounds.maxX - bounds.minX, bounds.maxY - bounds.minY)
+
       break
     }
+
     case 'ellipse': {
       const bounds = shapeBounds(shape)
       const width = bounds.maxX - bounds.minX
       const height = bounds.maxY - bounds.minY
+
       if (width === 0 && height === 0) {
         break
       }
+
       ctx.beginPath()
       ctx.ellipse(bounds.minX + width / 2, bounds.minY + height / 2, width / 2, height / 2, 0, 0, Math.PI * 2)
       ctx.stroke()
+
       break
     }
+
     case 'arrow': {
       ctx.beginPath()
       ctx.moveTo(start.x, start.y)
       ctx.lineTo(end.x, end.y)
       ctx.stroke()
       drawArrowHead(ctx, start, end, shape.color)
+
       break
     }
+
     case 'pen': {
       if (shape.points.length < 2) {
         break
       }
+
       ctx.beginPath()
       ctx.moveTo(shape.points[0]!.x, shape.points[0]!.y)
+
       for (const point of shape.points.slice(1)) {
         ctx.lineTo(point.x, point.y)
       }
+
       ctx.stroke()
+
       break
     }
+
     case 'callout': {
       const center = start
       ctx.beginPath()
@@ -105,6 +119,7 @@ function drawShape(ctx: CanvasRenderingContext2D, shape: AnnotationShape) {
       ctx.textAlign = 'center'
       ctx.textBaseline = 'middle'
       ctx.fillText(String(shape.number ?? ''), center.x, center.y + 0.5)
+
       break
     }
   }
@@ -124,6 +139,7 @@ export const AnnotationCanvas = forwardRef<AnnotationCanvasHandle, AnnotationCan
     const inProgressRef = useRef<AnnotationShape | null>(null)
     const draggingRef = useRef(false)
     const [imageSize, setImageSize] = useState<{ width: number; height: number } | null>(null)
+
     const [drawScale, setDrawScale] = useState<{ scale: number; offsetX: number; offsetY: number }>({
       scale: 1,
       offsetX: 0,
@@ -135,6 +151,7 @@ export const AnnotationCanvas = forwardRef<AnnotationCanvasHandle, AnnotationCan
     // Map a pointer event to canvas coordinates (canvas is the image at fit).
     const pointerToCanvas = useCallback((event: React.PointerEvent<HTMLCanvasElement>): Point => {
       const canvas = canvasRef.current
+
       if (!canvas) {
         return { x: 0, y: 0 }
       }
@@ -194,12 +211,15 @@ export const AnnotationCanvas = forwardRef<AnnotationCanvasHandle, AnnotationCan
     }, [shapes, pushHistory, commit])
 
     // Load the source image once.
+    // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)
     useEffect(() => {
       const image = new Image()
       imageRef.current = image
+
       image.onload = () => {
         setImageSize({ width: image.naturalWidth, height: image.naturalHeight })
       }
+
       image.src = src
 
       return () => {
@@ -210,6 +230,7 @@ export const AnnotationCanvas = forwardRef<AnnotationCanvasHandle, AnnotationCan
     // Fit the image inside the canvas (up to a work area) preserving aspect.
     useEffect(() => {
       const canvas = canvasRef.current
+
       if (!canvas || !imageSize) {
         return
       }
@@ -263,6 +284,7 @@ export const AnnotationCanvas = forwardRef<AnnotationCanvasHandle, AnnotationCan
           points: [point],
           number: nextCalloutNumber(shapes)
         }
+
         pushHistory(shapes)
         commit([...shapes, shape])
 

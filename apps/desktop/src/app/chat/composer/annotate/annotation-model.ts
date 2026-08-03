@@ -33,6 +33,7 @@ let shapeCounter = 0
 
 export function nextShapeId(): string {
   shapeCounter += 1
+
   return `annotation-${Date.now().toString(36)}-${shapeCounter}`
 }
 

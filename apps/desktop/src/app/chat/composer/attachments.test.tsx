@@ -137,6 +137,7 @@ describe('AttachmentList', () => {
       label: 'shot.png',
       previewUrl: DATA_URL
     }
+
     const onAnnotateImage = vi.fn()
 
     await renderWithI18n(<AttachmentList attachments={[image]} onAnnotateImage={onAnnotateImage} />)

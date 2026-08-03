@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest'
 import {
   ANNOTATION_COLORS,
   ANNOTATION_TOOLS,
+  type AnnotationShape,
   colorName,
   DEFAULT_ANNOTATION_COLOR,
   isClick,
@@ -10,8 +11,7 @@ import {
   nextShapeId,
   shapeBounds,
   shapesToLegend,
-  toolLabel,
-  type AnnotationShape
+  toolLabel
 } from './annotation-model'
 
 function shape(overrides: Partial<AnnotationShape> = {}): AnnotationShape {

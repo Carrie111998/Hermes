@@ -13,7 +13,7 @@ import { useI18n } from '@/i18n'
 import { PencilLine } from '@/lib/icons'
 
 import { AnnotationCanvas, type AnnotationCanvasHandle } from './annotation-canvas'
-import { shapesToLegend, type AnnotationShape } from './annotation-model'
+import { type AnnotationShape, shapesToLegend } from './annotation-model'
 
 export interface AnnotateResult {
   /** Composite PNG data URL (original image + overlay rendered into one buffer). */
