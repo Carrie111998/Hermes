@@ -127,6 +127,9 @@ Before changing the app, read:
   transport, performance, and testing rules.
 - [`DESIGN.md`](./DESIGN.md): visual system, information architecture, motion,
   direct manipulation, and keyboard behavior.
+- [`docs/messaging-tile-runtime-refresh-incident.md`](./docs/messaging-tile-runtime-refresh-incident.md):
+  why background-written messaging transcripts must resolve every open surface,
+  not only the primary selected session.
 
 ### Connections, projects, and switching
 
