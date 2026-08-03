@@ -963,6 +963,34 @@ class TestProcessToolHandler:
         result = json.loads(_handle_process({"action": "unknown_action"}))
         assert "error" in result
 
+    def test_list_redacts_command_and_output_preview(self, monkeypatch):
+        """Issue #77484: process(action=list) leaked raw command[:200] and
+        output_preview[-200:] including inline secrets — unlike poll/log/wait
+        which are wrapped in _redact_process_result."""
+        from tools import process_registry as pr
+
+        fake_entries = [
+            {
+                "session_id": "p1",
+                "command": "curl -H 'Authorization: Bearer sk-secret1234567890' http://x",
+                "cwd": "/home/user",
+                "pid": 123,
+                "started_at": "2026-08-03T00:00:00",
+                "uptime_seconds": 5,
+                "status": "running",
+                "output_preview": "token: ghp_abcdef1234567890",
+            }
+        ]
+        monkeypatch.setattr(pr.process_registry, "list_sessions", lambda **kw: fake_entries)
+        result = json.loads(pr._handle_process({"action": "list"}))
+        procs = result["processes"]
+        assert len(procs) == 1
+        assert "sk-secret1234567890" not in procs[0]["command"]
+        assert "ghp_abcdef1234567890" not in procs[0]["output_preview"]
+        # Key structure preserved.
+        assert procs[0]["session_id"] == "p1"
+        assert procs[0]["pid"] == 123
+
 
 # =========================================================================
 # format_process_notification + drain_notifications (shared helpers)

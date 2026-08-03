@@ -2477,6 +2477,20 @@ def _redact_process_result(result: dict) -> dict:
     return result
 
 
+def _redact_process_list(entries: list) -> list:
+    """Redact every entry of a ``process(action=list)`` result.
+
+    ``list_sessions`` returns a LIST of per-process dicts (unlike poll/log/wait
+    which return a single dict), so ``_redact_process_result`` alone can't be
+    applied — map it over the entries. Without this, ``process(action=list)``
+    leaked raw ``command[:200]`` and ``output_preview[-200:]`` including inline
+    secrets (issue #77484).
+    """
+    if not isinstance(entries, list):
+        return entries
+    return [_redact_process_result(e) for e in entries]
+
+
 def _handle_process(args, **kw):
     task_id = kw.get("task_id")
     action = args.get("action", "")
@@ -2493,7 +2507,7 @@ def _handle_process(args, **kw):
         except Exception:
             session_key = ""
         return json.dumps(
-            {"processes": process_registry.list_sessions(task_id=task_id, session_key=session_key or None)},
+            {"processes": _redact_process_list(process_registry.list_sessions(task_id=task_id, session_key=session_key or None))},
             ensure_ascii=False,
         )
     elif action in {"poll", "log", "wait", "kill", "write", "submit", "close"}:

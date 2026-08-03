@@ -133,7 +133,11 @@ _PREFIX_PATTERNS = [
 # ENV assignment patterns: KEY=value where KEY contains a secret-like name.
 # Uppercase keys tolerate spaces around "=" (e.g. ``FOO_SECRET = bar``) because
 # an all-caps key is almost never prose/code.
-_SECRET_ENV_NAMES = r"(?:API_?KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH)"
+# ``KEY`` alone, ``*_PASS``/``*_PW``, and ``*_KEY`` (not just ``API_KEY``) are
+# secret-shaped too: FAL_KEY, OPENAI_KEY, MYSQL_PASS, DB_PW all leaked verbatim
+# before these alternatives (issue #77484). ``AUTH`` stays so ``AUTH=…`` still
+# masks while not matching plain ``AUTHOR``.
+_SECRET_ENV_NAMES = r"(?:API_?KEY|KEY|TOKEN|SECRET|PASSWORD|PASSWD|PASS|_?PW|CREDENTIAL|AUTH)\b"
 _ENV_ASSIGN_RE = re.compile(
     rf"([A-Z0-9_]{{0,50}}{_SECRET_ENV_NAMES}[A-Z0-9_]{{0,50}})\s*=\s*(['\"]?)(\S+)\2",
 )
@@ -155,7 +159,7 @@ _ENV_ASSIGN_RE = re.compile(
 #      (optionally after ``export``), so conversational ``I have password=foo``
 #      mid-sentence is left alone.
 # The colon-form URL guard (skip when ``://`` present) lives at the call site.
-_SECRET_CFG_NAMES = r"(?:api[ _.\-]?key|token|secret|passwd|password|credential|auth)"
+_SECRET_CFG_NAMES = r"(?:api[ _.\\-]?key|token|secret|passwd|password|credential|auth|key|pass|pw)"
 _CFG_VALUE = r"(['\"]?)([^\s&]+?)\2(?=[\s&]|$)"
 # Linear pre-gate for the _CFG_*_RE subs below: a text with no secret keyword
 # can never match either pattern, so the (potentially backtrack-heavy) subs
@@ -229,8 +233,9 @@ _YAML_ASSIGN_RE = re.compile(
 # match. ALL-CAPS keys keep the legacy embedded matching (``MYTOKEN=…``) — an
 # all-caps key is almost never prose, the same rationale as _ENV_ASSIGN_RE.
 _KEY_KEYWORD_RE = re.compile(
-    r"(?:api|auth|access|refresh|session|secret)[ _.\-]?(?:key|token)"
-    r"|token|secret|passwd|password|credential|auth",
+    r"(?:api|auth|access|refresh|session|secret)[ _.\\-]?(?:key|token)"
+    r"|token|secret|passwd|password|credential|auth"
+    r"|key|pass|pw",
     re.IGNORECASE,
 )
 
@@ -437,6 +442,19 @@ _FORM_BODY_RE = re.compile(
 _PREFIX_RE = re.compile(
     r"(?<![A-Za-z0-9_-])(" + "|".join(_PREFIX_PATTERNS) + r")(?![A-Za-z0-9_-])"
 )
+
+# C0 control chars (except \n and \t, which carry real line structure) plus
+# zero-width / format chars. \r is dropped too: it is redundant with \n in
+# CRLF and never carries meaning alone in modern output, so removing it can't
+# corrupt structure — and it fixes CR-split secrets (issue #77484). Dropping
+# \n/\t would merge lines and break the line-anchored _CFG_*_RE passes, so a
+# token split by a raw newline stays split (pathological — real secrets are
+# single-line). Gate + full pattern (see redact_sensitive_text).
+_HAS_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\u200b-\u200f\u202a-\u202e\u2060-\u2064]")
+_CONTROL_RE = _HAS_CONTROL_RE
+# \r additionally dropped (redundant with \n in CRLF).
+_HAS_CR_RE = re.compile(r"\r")
+_CRLF_RE = re.compile(r"\r\n?")
 
 
 def mask_secret(
@@ -709,6 +727,16 @@ def redact_sensitive_text(
         return text
     if not (force or _REDACT_ENABLED):
         return text
+
+    # Control-char normalization: C0 controls (except \n / \t) and zero-width
+    # chars inside a token make every regex miss — a secret split by \r, ESC,
+    # or \u200b passes through unmasked (issue #77484). They have no display
+    # meaning, so drop them before matching (this is the text we return). \r
+    # is dropped as redundant with \n in CRLF.
+    if _HAS_CONTROL_RE.search(text):
+        text = _CONTROL_RE.sub("", text)
+    if "\r" in text:
+        text = _CRLF_RE.sub("\n", text)
 
     # file_read content shouldn't hit the source-code ENV/JSON false-positive
     # paths either (it's config/data, not log lines).

@@ -831,3 +831,72 @@ class TestKeywordWordBoundary:
         assert "hunter2hunter2hunter2hh" not in result
 
 
+class TestEnvNameGapRedaction:
+    """Issue #77484: ``_ENV_ASSIGN_RE`` missed ``*_KEY``/``*_PASS``/``*_PW``
+    and lowercase env keys, so ``FAL_KEY=…`` / ``openai_key=…`` leaked
+    verbatim."""
+
+    def test_bare_key_suffix_redacted(self):
+        for text in (
+            "FAL_KEY=sk-abc123",
+            "OPENAI_KEY=sk-def456",
+            "MYSQL_PASS=ghi789",
+            "DB_PW=jkl012",
+        ):
+            result = redact_sensitive_text(text)
+            assert result != text, text
+            assert "=" in result  # key preserved, value masked
+
+    def test_lowercase_env_key_redacted(self):
+        text = "openai_key=sk-def456"
+        result = redact_sensitive_text(text)
+        assert result != text
+        assert "openai_key=" in result
+        assert "sk-def456" not in result
+
+    def test_prose_words_not_mangled(self):
+        # The new bare KEY/PASS/PW keywords must not match prose.
+        for text in (
+            "The author=Smith wrote the paper",
+            "monkey=banana",
+            "keyboard=logitech",
+            "passage=doorway",
+        ):
+            assert redact_sensitive_text(text) == text, text
+
+
+class TestControlCharSplitRedaction:
+    """Issue #77484: secrets split by control/zero-width chars escaped every
+    regex (``sk-abc123\\x1bsk-def456`` leaked verbatim)."""
+
+    def test_esc_split_token_redacted(self):
+        text = "sk-abc123\x1bsk-def456"
+        result = redact_sensitive_text(text)
+        assert result != text
+        assert "sk-def456" not in result
+
+    def test_zero_width_split_token_redacted(self):
+        text = "sk-abc123\u200bsk-def456"
+        result = redact_sensitive_text(text)
+        assert result != text
+        assert "sk-def456" not in result
+
+    def test_cr_split_token_redacted(self):
+        # \r is normalized to \n (redundant with \n in CRLF); a real
+        # 10+ char prefix token split by it must still be caught on each side.
+        text = "sk-abcdef123456\rsk-ghijkl789012"
+        result = redact_sensitive_text(text)
+        assert result != text
+        assert "sk-abcdef123456" not in result
+        assert "sk-ghijkl789012" not in result
+
+    def test_newline_structure_preserved(self):
+        # \n carries line structure; dropping it would merge lines and break
+        # the line-anchored _CFG_*_RE passes. A CRLF pair still normalizes.
+        text = "FOO_KEY=abc123\r\nBAR=1"
+        result = redact_sensitive_text(text)
+        assert "\n" in result
+        assert "abc123" not in result
+
+
+
