@@ -1,13 +1,14 @@
 ---
 name: cron-operations-guardrails
-description: Diagnose and harden Hermes cron operations safely.
-version: 0.2.0
-author: goodchang77, Hermes Agent
+description: Triage and stabilize failing or drifting Hermes cron jobs.
+version: 0.2.1
+author: Good Chang (goodchang77) + Hermes Agent
 license: MIT
 platforms: [macos, linux, windows]
 metadata:
   hermes:
     tags: [cron, reliability, monitoring, gateway, model-routing, operations]
+    category: autonomous-ai-agents
     related_skills: [hermes-agent]
     requires_toolsets: [cronjob]
 ---
@@ -29,7 +30,7 @@ Use this skill when:
 
 ## Prerequisites
 
-- Hermes CLI access for `hermes cron` and `hermes status` commands.
+- Hermes CLI access for `hermes cron` and `hermes status` commands, run via the `terminal` tool.
 - The `cronjob` toolset when managing jobs through Hermes tools.
 - Read access to job definitions, persisted run artifacts, and gateway logs.
 - Operator approval before changing schedules, providers, models, or routing policy.
@@ -38,7 +39,7 @@ Resolve paths through the active Hermes profile and configuration. Do not assume
 
 ## How to Run
 
-Start with the supported read-only CLI commands:
+Start with the supported read-only CLI commands via `terminal`:
 
 ```bash
 hermes cron status
@@ -172,38 +173,6 @@ If raising `max_tokens` only moves the response to the new exact ceiling, check 
 
 Make the smallest change that addresses the verified root cause. Preserve an evidence trail and avoid unrelated schedule, routing, or delivery changes.
 
-### 9. Report the incident
-
-```markdown
-[SEVERITY]
-
-### Incident
-- Symptom:
-- Affected job class:
-- First/last observed:
-
-### Evidence
-- Scheduler status:
-- Full artifact result:
-- Provider/model/endpoint:
-- Delivery result:
-
-### Root cause
-- Verified:
-- Inferred:
-- Not established:
-
-### Remediation
-- Change made:
-- Safety boundary:
-
-### Verification
-- Manual script test:
-- Cron rerun:
-- Delivery test:
-- Monitor silent-health test:
-```
-
 ## Pitfalls
 
 - Treating every gateway warning as an outage.
@@ -230,3 +199,34 @@ After an approved change:
 7. Confirm the monitor does not include itself in findings.
 8. Confirm model and provider routing from live runtime data, not memory.
 9. Verify that no credentials or private prompt text appear in reports.
+
+Report with:
+
+```markdown
+### Incident
+- Severity: [LOW|MEDIUM|HIGH|CRITICAL]
+- Symptom:
+- Affected job class:
+- First/last observed:
+
+### Evidence
+- Scheduler status:
+- Full artifact result:
+- Provider/model/endpoint:
+- Delivery result:
+
+### Root cause
+- Verified:
+- Inferred:
+- Not established:
+
+### Remediation
+- Change made:
+- Safety boundary:
+
+### Verification
+- Manual script test:
+- Cron rerun:
+- Delivery test:
+- Monitor silent-health test:
+```

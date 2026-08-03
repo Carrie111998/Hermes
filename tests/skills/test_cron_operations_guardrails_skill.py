@@ -1,4 +1,7 @@
-"""Structural tests for the cron-operations-guardrails skill."""
+"""Structural tests for the cron-operations-guardrails skill.
+
+Stdlib + pytest only, per AGENTS.md §7 ("stdlib + pytest + unittest.mock").
+"""
 
 from __future__ import annotations
 
@@ -11,6 +14,7 @@ import pytest
 SKILL_MD = (
     Path(__file__).resolve().parents[2]
     / "skills"
+    / "autonomous-ai-agents"
     / "cron-operations-guardrails"
     / "SKILL.md"
 )
@@ -47,9 +51,24 @@ def test_frontmatter_invariants(frontmatter: dict[str, str]) -> None:
     assert description.endswith(".")
     assert description.count(".") == 1
 
-    assert frontmatter["author"].split(",", 1)[0].strip() == "goodchang77"
-    assert "Hermes Agent" in frontmatter["author"]
+    author = frontmatter["author"]
+    assert "Community Contributor" not in author
+    assert "goodchang77" in author
+    assert "Hermes Agent" in author
+    assert author.index("goodchang77") < author.index("Hermes Agent"), (
+        "human contributor must be credited before Hermes Agent"
+    )
+
     assert frontmatter["platforms"] == "[macos, linux, windows]"
+
+
+def test_category_matches_directory(content: str) -> None:
+    match = re.match(r"^---\n(.*?)\n---\n", content, re.DOTALL)
+    assert match
+    category = re.search(r"^\s+category:\s*(\S+)\s*$", match.group(1), re.MULTILINE)
+    assert category, "frontmatter must declare metadata.hermes.category"
+    assert category.group(1) == "autonomous-ai-agents"
+    assert SKILL_MD.parent.parent.name == category.group(1)
 
 
 def test_modern_section_order(content: str) -> None:
@@ -95,11 +114,9 @@ def test_required_operational_contracts(content: str) -> None:
     assert "Exclude the monitor itself" in content
 
 
-def test_reporting_template_has_severity_and_verification(content: str) -> None:
-    template = content.split("### 9. Report the incident", 1)[1].split(
-        "## Pitfalls", 1
-    )[0]
-    assert "[SEVERITY]" in template
+def test_reporting_template_under_verification(content: str) -> None:
+    template = content.split("## Verification", 1)[1]
+    assert "- Severity: [LOW|MEDIUM|HIGH|CRITICAL]" in template
     for heading in (
         "### Incident",
         "### Evidence",
