@@ -8,6 +8,8 @@ import { GatewayProvider } from '../app/gatewayContext.js'
 import { $isBlocked, type OverlayState, patchOverlayState, resetOverlayState } from '../app/overlayStore.js'
 import { patchUiState } from '../app/uiStore.js'
 import { FloatingOverlays } from '../components/appOverlays.js'
+import { AmbientDock, openWidget } from '../sdk/host.js'
+import { defineWidgetApp, removeWidgetApp } from '../sdk/registry.js'
 
 // ── Stubs ─────────────────────────────────────────────────────────────
 // The real panel widgets mount their own input handlers + gateway RPC
@@ -62,7 +64,8 @@ const makeCapturingStdout = () => {
 // and the gateway context. Seed the stores, wrap in a provider, render, give
 // the throttled/microtask-deferred frame a tick to flush, then read the frame.
 const renderOverlays = async (overlay: Partial<OverlayState>, completions: { display: string; text: string }[] = []) => {
-  patchOverlayState({ ...resetOverlayState(), ...overlay })
+  resetOverlayState()
+  patchOverlayState(overlay)
   patchUiState({ sid: 'sess-test' })
 
   const { stdout, read } = makeCapturingStdout()
@@ -146,13 +149,96 @@ const renderSlice = async (
   completions: { display: string; text: string }[] = [],
   headroom = 0
 ) => {
-  patchOverlayState({ ...resetOverlayState(), ...overlay })
+  resetOverlayState()
+  patchOverlayState(overlay)
 
   const { stdout, read } = makeCapturingStdout()
 
   const instance = await render(
     <GatewayProvider value={{ gw: {} as never, rpc: vi.fn() as never }}>
       <ComposerSlice completions={completions} headroom={headroom} prompt={prompt} />
+    </GatewayProvider>,
+    { stderr: process.stderr, stdin: process.stdin, stdout }
+  )
+
+  await new Promise(resolve => setTimeout(resolve, 60))
+  instance.unmount()
+  await new Promise(resolve => setTimeout(resolve, 20))
+
+  return read()
+}
+
+// Real appLayout chrome stack: AmbientDock (top) + relative composer with
+// FloatingOverlays + $isBlocked prompt gate + AmbientDock (bottom).
+// Review #72208 / issue #69592 required this integrated path — synthetic
+// ComposerSlice alone does not mount AmbientDock.
+const DOCK_APP_ID = 'test-ambient-dock-69592'
+const DOCK_MARKER = 'AMBIENT_DOCK_MARKER'
+
+const AppLayoutChromeSlice = ({
+  completions,
+  prompt
+}: {
+  completions: { display: string; text: string }[]
+  prompt: string
+}) => {
+  const isBlocked = React.useSyncExternalStore(
+    cb => $isBlocked.subscribe(cb),
+    () => $isBlocked.get(),
+    () => $isBlocked.get()
+  )
+
+  return (
+    <Box flexDirection="column">
+      <AmbientDock placement="dock-top" />
+      <Box position="relative">
+        <FloatingOverlays
+          cols={100}
+          compIdx={0}
+          completions={completions}
+          onActiveSessionClose={vi.fn()}
+          onActiveSessionSelect={vi.fn()}
+          onModelSelect={vi.fn()}
+          onNewLiveSession={vi.fn()}
+          onNewPromptSession={vi.fn()}
+          onResumeSelect={vi.fn()}
+          pagerPageSize={20}
+        />
+        {!isBlocked && <Text>{prompt}</Text>}
+      </Box>
+      <AmbientDock placement="dock-bottom" />
+    </Box>
+  )
+}
+
+const seedDockTopWidget = () => {
+  const app = defineWidgetApp({
+    help: 'test ambient dock marker',
+    id: DOCK_APP_ID,
+    init: () => ({}),
+    mode: 'ambient' as const,
+    reduce: (state: Record<string, never>) => state,
+    render: () => <Text>{DOCK_MARKER}</Text>,
+    zone: 'dock-top' as const
+  })
+  openWidget(app, {})
+}
+
+const renderAppLayoutChrome = async (
+  overlay: Partial<OverlayState>,
+  prompt: string,
+  completions: { display: string; text: string }[] = []
+) => {
+  resetOverlayState()
+  seedDockTopWidget()
+  // openWidget wrote ambient; merge blocking flags without wiping the dock.
+  patchOverlayState(overlay)
+
+  const { stdout, read } = makeCapturingStdout()
+
+  const instance = await render(
+    <GatewayProvider value={{ gw: {} as never, rpc: vi.fn() as never }}>
+      <AppLayoutChromeSlice completions={completions} prompt={prompt} />
     </GatewayProvider>,
     { stderr: process.stderr, stdin: process.stdin, stdout }
   )
@@ -172,6 +258,7 @@ describe('FloatingOverlays ambient-dock layout (#69592)', () => {
 
   afterEach(() => {
     resetOverlayState()
+    removeWidgetApp(DOCK_APP_ID)
   })
 
   describe('blocking panels render in-flow (reserve rows, stay visible)', () => {
@@ -217,7 +304,7 @@ describe('FloatingOverlays ambient-dock layout (#69592)', () => {
       // stays live and the parent keeps its height. That is exactly why the
       // completion track can stay absolute (bottom:100% above a live prompt)
       // instead of in-flow like blocking panels.
-      patchOverlayState({ ...resetOverlayState() })
+      resetOverlayState()
       expect($isBlocked.get()).toBe(false)
     })
 
@@ -246,6 +333,36 @@ describe('FloatingOverlays ambient-dock layout (#69592)', () => {
       expect(frame).toContain('SESSIONS_PANEL_MARKER')
       // … while the ordinary prompt is hidden because the composer is blocked.
       expect(frame).not.toContain('PROMPT_LIVE_MARKER')
+    })
+  })
+
+  describe('integrated AmbientDock + blocking panel (#69592 / #72208 review)', () => {
+    it('keeps dock + sessions panel visible while the prompt is blocked', async () => {
+      const frame = await renderAppLayoutChrome({ sessions: true }, 'PROMPT_LIVE_MARKER')
+
+      // Real AmbientDock row must paint (this is the chrome that stole height
+      // under the old absolute-only overlay path).
+      expect(frame).toContain(DOCK_MARKER)
+      // Sessions panel stays on screen with the dock occupying rows above.
+      expect(frame).toContain('SESSIONS_PANEL_MARKER')
+      // Prompt is gated off via $isBlocked, same as appLayout.
+      expect(frame).not.toContain('PROMPT_LIVE_MARKER')
+    })
+
+    it('keeps dock + model picker visible while the prompt is blocked', async () => {
+      const frame = await renderAppLayoutChrome({ modelPicker: true }, 'PROMPT_LIVE_MARKER')
+
+      expect(frame).toContain(DOCK_MARKER)
+      expect(frame).toContain('MODEL_PICKER_MARKER')
+      expect(frame).not.toContain('PROMPT_LIVE_MARKER')
+    })
+
+    it('dock stays while completions leave the prompt live', async () => {
+      const frame = await renderAppLayoutChrome({}, 'PROMPT_LIVE_MARKER', [{ display: 'reload', text: 'reload' }])
+
+      expect(frame).toContain(DOCK_MARKER)
+      expect(frame).toContain('PROMPT_LIVE_MARKER')
+      expect($isBlocked.get()).toBe(false)
     })
   })
 })
