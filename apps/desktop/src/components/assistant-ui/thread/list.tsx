@@ -28,6 +28,8 @@ import { isSecondaryWindow } from '@/store/windows'
 
 import { MessageRenderBoundary } from '../message-render-boundary'
 
+import { resolveShowEarlierAction, useTranscriptWindow } from './transcript-window'
+
 type ThreadMessageComponents = ComponentProps<typeof ThreadPrimitive.MessageByIndex>['components']
 
 export type MessageGroup = { id: string; weight: number } & (
@@ -300,6 +302,8 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
     resize: 'instant'
   })
 
+  const { olderAvailable, historyTruncated, expandWindow } = useTranscriptWindow()
+
   const [renderBudget, setRenderBudget] = useState(FIRST_PAINT_BUDGET)
 
   // Cut the budget during RENDER, not in the post-commit layout effect. An
@@ -525,11 +529,25 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
 
   // Prepend an older page while preserving the on-screen position. The user is
   // scrolled up (reading history) so the stick-to-bottom lock is escaped and
-  // won't fight this manual restore.
+  // won't fight this manual restore. Prefer the DOM part-budget page first;
+  // once that is exhausted, expand the assistant-ui store window (#55191).
   const showEarlier = useCallback(() => {
+    const action = resolveShowEarlierAction(hiddenCount, olderAvailable)
+
+    if (!action) {
+      return
+    }
+
     anchorBeforePrepend()
-    setRenderBudget(budget => budget + RENDER_BUDGET)
-  }, [anchorBeforePrepend])
+
+    if (action === 'dom') {
+      setRenderBudget(budget => budget + RENDER_BUDGET)
+
+      return
+    }
+
+    expandWindow()
+  }, [anchorBeforePrepend, expandWindow, hiddenCount, olderAvailable])
 
   useLayoutEffect(() => {
     const el = scrollRef.current
@@ -538,7 +556,8 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
       el.scrollTop = el.scrollHeight - restoreFromBottomRef.current
       restoreFromBottomRef.current = null
     }
-  }, [scrollRef, renderBudget])
+    // groups.length covers store-window expands; renderBudget covers DOM pages.
+  }, [scrollRef, renderBudget, groups.length])
 
   // The row array is memoized on the inputs the rows actually read. This
   // component re-renders on every isAtBottom flip — and use-stick-to-bottom
@@ -632,7 +651,15 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
             data-slot="aui_thread-content"
             ref={contentRef as React.RefCallback<HTMLDivElement>}
           >
-            {hiddenCount > 0 && (
+            {historyTruncated && (
+              <p
+                className="mx-auto mb-(--conversation-turn-gap) max-w-md px-3 text-center text-xs text-muted-foreground"
+                data-slot="aui_thread-history-truncated"
+              >
+                {t.assistant.thread.historyTruncated}
+              </p>
+            )}
+            {(hiddenCount > 0 || olderAvailable) && (
               <button
                 className="mx-auto mb-(--conversation-turn-gap) rounded-full border border-border/65 bg-(--composer-fill) px-3 py-1 text-xs text-muted-foreground hover:text-foreground"
                 onClick={showEarlier}

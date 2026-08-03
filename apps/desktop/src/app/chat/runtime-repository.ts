@@ -11,6 +11,88 @@ import { coalesceToolOnlyAssistants, createToolMergeCache, toRuntimeMessage } fr
 const FALLBACK_STATUS = getAutoStatus(false, false, false, false, undefined)
 
 /**
+ * Rendering the full transcript of an oversized session (200K+-token always-on
+ * conversations) exhausts the renderer's V8 heap on each update and crash-loops
+ * the window (#55191). Only a bounded tail reaches assistant-ui; older history
+ * stays in the session store and can be pulled in via "Show earlier".
+ */
+export const RENDERED_MESSAGE_CAP = 400
+
+/** Soft ceiling so expanding the window cannot re-create the OOM (#55191). */
+export const RENDERED_MESSAGE_WINDOW_MAX = 2000
+
+/** Clamp a requested window into the allowed [CAP, MAX] band. */
+export function clampRenderedWindowSize(windowSize: number): number {
+  if (!Number.isFinite(windowSize) || windowSize < RENDERED_MESSAGE_CAP) {
+    return RENDERED_MESSAGE_CAP
+  }
+
+  return Math.min(RENDERED_MESSAGE_WINDOW_MAX, Math.floor(windowSize))
+}
+
+/** Grow the window by one CAP page, never past total or MAX. */
+export function nextRenderedWindowSize(current: number, total: number): number {
+  const base = clampRenderedWindowSize(current)
+
+  return Math.min(Math.max(0, total), RENDERED_MESSAGE_WINDOW_MAX, base + RENDERED_MESSAGE_CAP)
+}
+
+/** Return the transcript tail assistant-ui is allowed to materialize. */
+export function selectRenderedMessages(
+  messages: readonly ChatMessage[],
+  windowSize: number = RENDERED_MESSAGE_CAP
+): ChatMessage[] {
+  const size = clampRenderedWindowSize(windowSize)
+
+  if (messages.length <= size) {
+    return messages as ChatMessage[]
+  }
+
+  return messages.slice(-size)
+}
+
+export interface TranscriptWindowFlags {
+  /** Store has older messages than the current materialized window. */
+  windowed: boolean
+  /** Window can still grow via Show earlier. */
+  olderAvailable: boolean
+  /** At the soft max with older store history still unloaded. */
+  historyTruncated: boolean
+}
+
+/** Derive expand/truncated UI flags from store size + current window. */
+export function getTranscriptWindowFlags(storeCount: number, windowSize: number): TranscriptWindowFlags {
+  const size = clampRenderedWindowSize(windowSize)
+  const renderedCount = Math.min(Math.max(0, storeCount), size)
+  const windowed = storeCount > renderedCount
+  const olderAvailable = windowed && nextRenderedWindowSize(windowSize, storeCount) > size
+
+  return {
+    windowed,
+    olderAvailable,
+    historyTruncated: windowed && !olderAvailable
+  }
+}
+
+/**
+ * Adapter patch for branch persistence. When windowed, omit `setMessages` so
+ * the runtime disables `switchToBranch` (it keys that capability on
+ * `setMessages !== undefined`, so a no-op would leave the picker enabled but
+ * unable to persist).
+ */
+export function threadSetMessagesOption<T>(
+  windowed: boolean,
+  setMessages: T
+): { setMessages: T } | Record<string, never> {
+  return windowed ? {} : { setMessages }
+}
+
+/** Mirrors IncrementalExternalStoreThreadRuntimeCore capability wiring. */
+export function branchSwitchEnabled(adapter: { setMessages?: unknown }): boolean {
+  return adapter.setMessages !== undefined
+}
+
+/**
  * ChatMessage[] -> assistant-ui message repository, with a WeakMap identity
  * cache so unchanged messages convert once (and a tool-merge cache that folds
  * tool-only assistant turns into their neighbour). Shared by the main chat's

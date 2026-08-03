@@ -8,6 +8,7 @@ import { useLocation } from 'react-router'
 
 import type { SubmitTextOptions } from '@/app/session/hooks/use-prompt-actions/utils'
 import { Thread } from '@/components/assistant-ui/thread'
+import { TranscriptWindowProvider } from '@/components/assistant-ui/thread/transcript-window'
 import { Backdrop } from '@/components/Backdrop'
 import { COMPOSER_HEART_CONFIG, HeartField } from '@/components/chat/vibe-hearts'
 import { usePaneVisible } from '@/components/pane-shell/pane-visibility'
@@ -58,7 +59,14 @@ import type { ChatBarState } from './composer/types'
 import { type DroppedFile, partitionDroppedFiles } from './hooks/use-composer-actions'
 import { type DragKind, useFileDropZone } from './hooks/use-file-drop-zone'
 import { ProfileTag } from './profile-tag'
-import { useRuntimeMessageRepository } from './runtime-repository'
+import {
+  getTranscriptWindowFlags,
+  nextRenderedWindowSize,
+  RENDERED_MESSAGE_CAP,
+  selectRenderedMessages,
+  threadSetMessagesOption,
+  useRuntimeMessageRepository
+} from './runtime-repository'
 import { ScrollToBottomButton } from './scroll-to-bottom-button'
 import { useSessionView } from './session-view'
 import { SessionActionsMenu } from './sidebar/session-actions-menu'
@@ -220,14 +228,45 @@ function ChatRuntimeBoundary({
   onThreadMessagesChange,
   suppressMessages
 }: ChatRuntimeBoundaryProps) {
-  const storeMessages = useMessagesWhileVisible(useSessionView().$messages)
+  const view = useSessionView()
+  const runtimeId = useStore(view.$runtimeId)
+  const storeMessages = useMessagesWhileVisible(view.$messages)
   const messages = suppressMessages ? NO_MESSAGES : storeMessages
-  const runtimeMessageRepository = useRuntimeMessageRepository(messages)
+
+  const [windowSize, setWindowSize] = useState(RENDERED_MESSAGE_CAP)
+  const [windowSessionKey, setWindowSessionKey] = useState(runtimeId)
+
+  // Reset the materialized window on session swap so a large expand from the
+  // previous chat cannot leak into the next one's first paint (#55191).
+  if (windowSessionKey !== runtimeId) {
+    setWindowSessionKey(runtimeId)
+    setWindowSize(RENDERED_MESSAGE_CAP)
+  }
+
+  const renderedMessages = selectRenderedMessages(messages, windowSize)
+
+  const { windowed, olderAvailable, historyTruncated } = getTranscriptWindowFlags(
+    messages.length,
+    windowSize
+  )
+
+  const runtimeMessageRepository = useRuntimeMessageRepository(renderedMessages)
+
+  const expandWindow = useCallback(() => {
+    setWindowSize(current => nextRenderedWindowSize(current, messages.length))
+  }, [messages.length])
+
+  const transcriptWindow = useMemo(
+    () => ({ olderAvailable, historyTruncated, expandWindow }),
+    [expandWindow, historyTruncated, olderAvailable]
+  )
 
   const runtime = useIncrementalExternalStoreRuntime<ThreadMessage>({
     messageRepository: runtimeMessageRepository,
     isRunning: busy,
-    setMessages: onThreadMessagesChange,
+    // When windowed, omit setMessages so switchToBranch disables cleanly
+    // (runtime keys that capability on setMessages !== undefined).
+    ...threadSetMessagesOption(windowed, onThreadMessagesChange),
     onNew: async () => {
       // Submission is handled explicitly by ChatBar.
       // Keeping this no-op avoids duplicate prompt.submit calls.
@@ -237,7 +276,11 @@ function ChatRuntimeBoundary({
     onReload
   })
 
-  return <AssistantRuntimeProvider runtime={runtime}>{children}</AssistantRuntimeProvider>
+  return (
+    <TranscriptWindowProvider value={transcriptWindow}>
+      <AssistantRuntimeProvider runtime={runtime}>{children}</AssistantRuntimeProvider>
+    </TranscriptWindowProvider>
+  )
 }
 
 export function ChatView({

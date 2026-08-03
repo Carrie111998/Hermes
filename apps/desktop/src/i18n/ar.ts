@@ -2270,6 +2270,7 @@ export const ar = defineLocale({
     thread: {
       loadingSession: 'جار تحميل الجلسة...',
       showEarlier: 'عرض الرسائل الأقدم',
+      historyTruncated: 'يتم عرض أحدث الرسائل حتى حد العرض. السجل الأقدم يبقى في هذه الجلسة.',
       loadingResponse: 'جار تحميل الرد...',
       resumeWhenBackgroundDone: count =>
         count === 1 ? 'سيُستأنف عند انتهاء المهمة الخلفية' : `سيُستأنف عند انتهاء ${count} مهام خلفية`,

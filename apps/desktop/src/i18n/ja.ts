@@ -2525,6 +2525,8 @@ export const ja = defineLocale({
     thread: {
       loadingSession: 'セッションを読み込み中',
       showEarlier: '以前のメッセージを表示',
+      historyTruncated:
+        '表示上限までの最新メッセージを表示しています。それより前の履歴はこのセッションに残っています。',
       loadingResponse: 'Hermes が応答を読み込み中',
       resumeWhenBackgroundDone: count =>
         count === 1

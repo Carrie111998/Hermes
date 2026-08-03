@@ -2298,6 +2298,7 @@ export interface Translations {
     thread: {
       loadingSession: string
       showEarlier: string
+      historyTruncated: string
       loadingResponse: string
       resumeWhenBackgroundDone: (count: number) => string
       thinking: string

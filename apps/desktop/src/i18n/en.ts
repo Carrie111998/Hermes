@@ -2699,6 +2699,8 @@ export const en: Translations = {
     thread: {
       loadingSession: 'Loading session',
       showEarlier: 'Show earlier messages',
+      historyTruncated:
+        'Showing the newest messages up to the display limit. Older history stays in this session.',
       loadingResponse: 'Hermes is loading a response',
       resumeWhenBackgroundDone: count =>
         count === 1

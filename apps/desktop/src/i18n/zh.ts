@@ -2877,6 +2877,7 @@ export const zh: Translations = {
     thread: {
       loadingSession: '正在加载会话',
       showEarlier: '显示更早的消息',
+      historyTruncated: '已显示到界面上限的最新消息。更早的记录仍保存在此会话中。',
       loadingResponse: 'Hermes 正在加载回复',
       resumeWhenBackgroundDone: count =>
         count === 1 ? '后台任务完成后将自动继续' : `${count} 个后台任务完成后将自动继续`,
