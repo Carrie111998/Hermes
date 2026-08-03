@@ -285,9 +285,38 @@ class TestWindowsShellDestructiveCommands:
         assert key == "Windows disk formatting/partitioning"
         assert desc == "Windows disk formatting/partitioning"
 
+    def test_native_windows_force_kill_requires_approval(self):
+        for command in (
+            r"taskkill /f /pid 1234",
+            r"Stop-Process -Name node -Force",
+        ):
+            dangerous, key, desc = detect_dangerous_command(command)
+            assert dangerous is True
+            assert key == "Windows force-kill process"
+            assert desc == "Windows force-kill process"
+
+    def test_native_windows_icacls_world_writable_requires_approval(self):
+        for command in (
+            r"icacls C:\tmp /grant Everyone:(F)",
+            r"icacls C:\tmp /grant *:(F)",
+        ):
+            dangerous, key, desc = detect_dangerous_command(command)
+            assert dangerous is True
+            assert key == "Windows world-writable permissions"
+            assert desc == "Windows world-writable permissions"
+
     def test_native_windows_plain_file_commands_do_not_require_approval(self):
         assert detect_dangerous_command(r"rm tmp/file") == (False, None, None)
         assert detect_dangerous_command(r"ls C:\Users") == (False, None, None)
+        assert detect_dangerous_command(r"tasklist") == (False, None, None)
+        assert detect_dangerous_command(r"taskkill /pid 1234") == (False, None, None)
+        assert detect_dangerous_command(r"Stop-Process -Name node") == (False, None, None)
+        assert detect_dangerous_command(r"icacls C:\tmp") == (False, None, None)
+        assert detect_dangerous_command(r"icacls C:\tmp /grant Users:(R)") == (
+            False,
+            None,
+            None,
+        )
 
 
 class TestDetectDangerousSudo:
