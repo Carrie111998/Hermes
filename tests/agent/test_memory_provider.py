@@ -1138,3 +1138,24 @@ class TestMemoryInjectionRejectsMalformedSchema:
         names = {t["function"]["name"] for t in agent.tools}
         assert names == {"good_tool"}
         assert agent.valid_tool_names == {"good_tool"}
+
+
+class TestMemoryRecallSemanticNeutrality:
+    """Every accepted text query follows the same provider fan-out contract."""
+
+    @pytest.mark.parametrize(
+        "query",
+        ("hi!", "thanks", "ok", "continue", "/help", "what changed in the deploy?"),
+    )
+    def test_prefetch_and_warmup_forward_query_without_semantic_routing(self, query):
+        mgr = MemoryManager()
+        provider = FakeMemoryProvider("builtin")
+        provider._prefetch_result = "remembered context"
+        mgr.add_provider(provider)
+
+        assert mgr.prefetch_all(query) == "remembered context"
+        mgr.queue_prefetch_all(query, session_id="session-1")
+        assert mgr.flush_pending(timeout=5)
+
+        assert provider.prefetch_queries == [query]
+        assert provider.queued_prefetches == [query]

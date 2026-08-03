@@ -6388,7 +6388,7 @@ class TurnRunner:
         agent_history, observed_group_context = _build_gateway_agent_history(
             ctx.history,
             channel_prompt=ctx.channel_prompt,
-            inject_timestamps=_message_timestamps_enabled(_load_gateway_config()),
+            inject_timestamps=_message_timestamps_enabled(ctx.user_config),
         )
 
         # FTS write-corruption guard (#50502): when message persistence
@@ -21049,6 +21049,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # session_entry.session_id while the old run is still unwinding.
             _run_start_session_id = session_entry.session_id
             _run_start_resume_marked_at = session_entry.last_resume_marked_at
+            _turn_started_monotonic = time.monotonic()
             agent_result = await self._run_agent(
                 message=message_text,
                 context_prompt=context_prompt,
@@ -21068,6 +21069,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _delivery_lifecycle_event=event,
                 message_type=event.message_type,
             )
+            _turn_seconds = time.monotonic() - _turn_started_monotonic
             agent_result = _canonicalize_agent_result(agent_result)
             _run_end_session_id = _resume_ack_session_id(
                 _run_start_session_id,
@@ -21308,6 +21310,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     context_tokens=agent_result.get("last_prompt_tokens", 0) or 0,
                     context_length=agent_result.get("context_length") or None,
                     cwd=os.environ.get("TERMINAL_CWD", ""),
+                    turn_seconds=_turn_seconds,
                 )
             except Exception as _footer_err:
                 logger.debug("runtime_footer build failed: %s", _footer_err)
