@@ -811,6 +811,33 @@ class TestRunJobSessionPersistence:
         advance.assert_not_called()
         run_one.assert_not_called()
 
+    def test_tick_canonicalizes_persisted_nominal_time_before_execution(self, tmp_path):
+        from cron.scheduler import tick
+
+        job = {
+            "id": "local-fractional-due-job",
+            "name": "local fractional due job",
+            "schedule": {"kind": "interval", "minutes": 5},
+            "next_run_at": "2026-08-02T19:53:03.565157-05:00",
+            "enabled": True,
+        }
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler.get_due_jobs", return_value=[job]), \
+             patch("cron.scheduler.advance_next_runs"), \
+             patch("cron.scheduler.create_execution") as create, \
+             patch("cron.scheduler.run_one_job", return_value=True):
+            create.return_value = {
+                "id": "execution-1",
+                "scheduled_for": "2026-08-03T00:53:03+00:00",
+            }
+            assert tick(verbose=False, sync=True) == 1
+
+        create.assert_called_once_with(
+            "local-fractional-due-job",
+            source="builtin",
+            scheduled_for="2026-08-03T00:53:03+00:00",
+        )
+
     def test_tick_marks_empty_response_as_error(self, tmp_path):
         """When run_job returns success=True but final_response is empty,
         tick() should mark the job as error so last_status != 'ok'.

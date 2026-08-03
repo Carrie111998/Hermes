@@ -1251,7 +1251,9 @@ def test_generic_submit_failure_finishes_attempt_and_releases_guard(monkeypatch)
         scheduler, "finish_execution",
         lambda execution_id, **kwargs: finished.append((execution_id, kwargs)),
     )
-    monkeypatch.setattr(scheduler, "get_due_jobs", lambda: [{"id": "submit-fail"}])
+    monkeypatch.setattr(scheduler, "get_due_jobs", lambda: [{
+        "id": "submit-fail", "next_run_at": "2026-08-03T00:53:03+00:00",
+    }])
     monkeypatch.setattr(scheduler, "advance_next_runs", lambda _ids: 0)
     monkeypatch.setattr(scheduler, "_get_parallel_pool", lambda _workers: BrokenPool())
 

@@ -22,7 +22,7 @@ def test_claim_succeeds_once_then_blocks(temp_home):
     """First claim for a fire wins; a second claim for the same fire loses, and
     next_run_at is advanced (a re-delivery for the old time can't re-fire)."""
     from cron.jobs import (
-        _normalize_stored_fire_at,
+        canonicalize_stored_fire_at,
         create_job,
         claim_job_for_fire,
         get_job,
@@ -34,7 +34,7 @@ def test_claim_succeeds_once_then_blocks(temp_home):
 
     assert claim_job_for_fire(jid) is True
     assert claim_job_for_fire(jid) is False
-    assert get_job(jid)["fire_claim"]["scheduled_for"] == _normalize_stored_fire_at(before)
+    assert get_job(jid)["fire_claim"]["scheduled_for"] == canonicalize_stored_fire_at(before)
     assert get_job(jid)["next_run_at"] != before
 
 
@@ -49,7 +49,7 @@ def test_claim_oneshot_cannot_be_double_claimed(temp_home):
 
 def test_stale_nominal_fire_cannot_claim_the_newer_slot(temp_home):
     from cron.jobs import (
-        _normalize_stored_fire_at,
+        canonicalize_stored_fire_at,
         create_job,
         claim_job_for_fire,
         get_job,
@@ -59,7 +59,7 @@ def test_stale_nominal_fire_cannot_claim_the_newer_slot(temp_home):
     job = create_job(prompt="x", schedule="every 5m", name="stale")
     job_id = job["id"]
     old_fire = get_job(job_id)["next_run_at"]
-    old_fire_authority = _normalize_stored_fire_at(old_fire)
+    old_fire_authority = canonicalize_stored_fire_at(old_fire)
     assert claim_job_for_fire(job_id, nominal_fire_at=old_fire_authority) is True
 
     mark_job_run(job_id, success=True)

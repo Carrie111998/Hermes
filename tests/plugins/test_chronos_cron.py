@@ -98,6 +98,21 @@ def test_register_job_propagates_provision_failure(chronos):
         )
 
 
+def test_arm_one_shot_canonicalizes_persisted_local_fractional_time(chronos):
+    prov, fake = chronos
+    prov._arm_one_shot({
+        "id": "j-local",
+        "next_run_at": "2026-08-02T19:53:03.565157-05:00",
+    })
+
+    assert fake.provisions == [{
+        "job_id": "j-local",
+        "fire_at": "2026-08-03T00:53:03+00:00",
+        "agent_callback_url": "https://agent.example/",
+        "dedup_key": "j-local:2026-08-03T00:53:03+00:00",
+    }]
+
+
 # -- reconcile ----------------------------------------------------------------
 
 def test_reconcile_arms_all_enabled(temp_home, chronos, monkeypatch):

@@ -2476,7 +2476,7 @@ def canonicalize_fire_at(value: Optional[str]) -> str:
         raise ValueError("invalid fire_at") from exc
 
 
-def _normalize_stored_fire_at(value: Any) -> str:
+def canonicalize_stored_fire_at(value: Any) -> str:
     """Upgrade an older persisted scheduler timestamp to current authority form."""
     if not isinstance(value, str) or not value.strip():
         raise ValueError("missing stored fire_at")
@@ -2541,7 +2541,7 @@ def claim_job_for_fire(
                 return False
             current_fire_at = job.get("next_run_at") or ""
             try:
-                expected_fire_at = _normalize_stored_fire_at(current_fire_at)
+                expected_fire_at = canonicalize_stored_fire_at(current_fire_at)
                 requested_fire_at = (
                     canonicalize_fire_at(nominal_fire_at)
                     if nominal_fire_at is not None

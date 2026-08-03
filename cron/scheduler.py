@@ -293,7 +293,7 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
     "QQBOT_HOME_CHANNEL": "QQ_HOME_CHANNEL",
 }
 
-from cron.jobs import get_due_jobs, mark_job_run, save_delivery_payload, save_job_output, advance_next_runs, claim_dispatch, heartbeat_run_claim
+from cron.jobs import canonicalize_stored_fire_at, get_due_jobs, mark_job_run, save_delivery_payload, save_job_output, advance_next_runs, claim_dispatch, heartbeat_run_claim
 from cron.executions import create_delivery_execution, create_execution, finish_execution, get_execution, mark_execution_ambiguous, mark_execution_running, read_delivery_artifacts, require_canonical_scheduled_for, require_scheduler_source
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
@@ -5489,7 +5489,7 @@ def tick(
                 return None
             # Record the attempt before executor dispatch. Recovery classifies
             # abandoned records as unknown; it never automatically retries them.
-            nominal_scheduled_for = job.get("next_run_at") or ""
+            nominal_scheduled_for = canonicalize_stored_fire_at(job.get("next_run_at"))
             execution = create_execution(
                 job_id,
                 source="builtin",
