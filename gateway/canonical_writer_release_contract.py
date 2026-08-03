@@ -22,6 +22,11 @@ RELEASE_SCHEMA = "muncho-writer-only-release.v1"
 UNIT_BUNDLE_SCHEMA = "muncho-writer-only-systemd-bundle.v3"
 RELEASE_MANIFEST_NAME = "release-manifest.json"
 MAX_RELEASE_MANIFEST_BYTES = 8 * 1024 * 1024
+# One sealed release may contain large, immutable runtime dependencies such as
+# Chromium.  Every writer-side manifest verifier must share this bound; a
+# smaller verifier-local limit can reject a release that the authoritative
+# root collector already accepts.
+MAX_RELEASE_FILE_BYTES = 4 * 1024 * 1024 * 1024
 INCOMPLETE_MARKER_NAME = ".release-build-incomplete"
 WRITER_MODULE = "gateway.canonical_writer_bootstrap"
 GATEWAY_MODULE = "gateway.canonical_writer_gateway_bootstrap"

@@ -75,6 +75,7 @@ from gateway.canonical_writer_postgres_backend import (
     PRODUCTION_CATALOG_SHA256,
     PRODUCTION_STATEMENT_CATALOG,
 )
+from gateway.canonical_writer_release_contract import MAX_RELEASE_FILE_BYTES
 
 
 MANIFEST_SCHEMA = "canonical-writer-deployment-manifest.v2"
@@ -106,7 +107,6 @@ _MAX_BPF_PROGRAM_IDS = 256
 _MAX_CGROUP_PROCS_BYTES = 4096
 _MAX_TRUSTED_JSON_BYTES = 128 * 1024
 _MAX_RELEASE_MANIFEST_BYTES = 64 * 1024 * 1024
-_MAX_RELEASE_FILE_BYTES = 4 * 1024 * 1024 * 1024
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _REVISION_RE = re.compile(r"^[0-9a-f]{40}$")
 _CODE_INJECTION_ENVIRONMENT_NAMES = frozenset(
@@ -2134,7 +2134,7 @@ def _verify_release_artifact(
                 or _sha256_trusted_file(
                     str(path),
                     expected_uid=_expected_uid,
-                    maximum=_MAX_RELEASE_FILE_BYTES,
+                    maximum=MAX_RELEASE_FILE_BYTES,
                 )
                 != declared_sha256
             ):

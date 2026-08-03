@@ -62,6 +62,7 @@ from gateway.canonical_projection_export import (
     projection_provenance_sha256,
     validate_projection_export,
 )
+from gateway.canonical_writer_release_contract import MAX_RELEASE_FILE_BYTES
 
 
 ACTIVATION_PLAN_SCHEMA = "muncho-writer-only-activation-plan.v4"
@@ -170,9 +171,9 @@ _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 _MAX_PLAN_BYTES = 4 * 1024 * 1024
 _MAX_MANIFEST_BYTES = 8 * 1024 * 1024
 _MAX_CONFIG_BYTES = 2 * 1024 * 1024
-_MAX_RELEASE_FILE_BYTES = 128 * 1024 * 1024
 _MAX_COMMAND_OUTPUT_BYTES = 1024 * 1024
 _MAX_EXPORT_BYTES = 256 * 1024 * 1024
+_MAX_NATIVE_MAPPING_BYTES = 1024 * 1024 * 1024
 _COMMAND_TIMEOUT_SECONDS = 360
 
 
@@ -3173,7 +3174,7 @@ def _verify_release_tree(plan: ActivationPlan) -> None:
                 or not stat.S_ISREG(item.st_mode)
                 or item.st_nlink != 1
                 or type(entry["size"]) is not int
-                or not 0 <= entry["size"] <= _MAX_RELEASE_FILE_BYTES
+                or not 0 <= entry["size"] <= MAX_RELEASE_FILE_BYTES
                 or item.st_size != entry["size"]
             ):
                 raise RuntimeError("release file identity drifted")
@@ -4383,7 +4384,7 @@ def _rehash_native_receipt_external_mappings(
                 or mode & 0o222
                 or _list_xattrs(path)
                 or before.st_size < 1
-                or before.st_size > _MAX_RELEASE_FILE_BYTES * 8
+                or before.st_size > _MAX_NATIVE_MAPPING_BYTES
             ):
                 raise RuntimeError("native receipt mapping protection drifted")
             digest = cache.get(path)
@@ -4393,7 +4394,7 @@ def _rehash_native_receipt_external_mappings(
                     expected_uid=policy["required_owner_uid"],
                     expected_gid=policy["required_owner_gid"],
                     allowed_modes=frozenset({mode}),
-                    maximum=_MAX_RELEASE_FILE_BYTES * 8,
+                    maximum=_MAX_NATIVE_MAPPING_BYTES,
                 )
                 digest = _sha256_bytes(raw)
                 cache[path] = digest

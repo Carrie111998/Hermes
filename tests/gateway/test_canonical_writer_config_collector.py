@@ -707,6 +707,37 @@ def test_release_entry_attestation_rejects_tampered_file(tmp_path):
         )
 
 
+def test_release_entry_attestation_accepts_large_sealed_runtime_file(
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "release"
+    root.mkdir()
+    runtime = root / "runtime.bin"
+    legacy_limit = 128 * 1024 * 1024
+    runtime.touch()
+    os.truncate(runtime, legacy_limit + 1)
+    runtime.chmod(0o444)
+    root.chmod(0o555)
+    digest = "a" * 64
+    monkeypatch.setattr(collector, "_hash_release_file", lambda _path, _item: digest)
+
+    collector._verify_release_entries(
+        root,
+        [
+            {
+                "path": "runtime.bin",
+                "kind": "file",
+                "mode": "0444",
+                "size": legacy_limit + 1,
+                "sha256": digest,
+            }
+        ],
+        expected_uid=os.getuid(),
+        expected_gid=os.getgid(),
+    )
+
+
 def test_release_entry_attestation_rejects_extra_file(tmp_path):
     root, _module, _link, entries = _release_tree(tmp_path)
     root.chmod(0o755)

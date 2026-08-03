@@ -61,6 +61,7 @@ from gateway.canonical_writer_postgres_backend import (
     EXPECTED_HELPER_ROUTINE_SIGNATURES,
     EXPECTED_ROUTINE_SIGNATURES,
 )
+from gateway.canonical_writer_release_contract import MAX_RELEASE_FILE_BYTES
 
 
 COLLECTOR_RECEIPT_SCHEMA = "muncho-writer-config-collector-receipt.v1"
@@ -110,7 +111,6 @@ _CLOUDSQL_TLS_RE = re.compile(
 _MAX_MANIFEST_BYTES = 16 * 1024 * 1024
 _MAX_CONFIG_BYTES = 2 * 1024 * 1024
 _MAX_CREDENTIAL_BYTES = 4096
-_MAX_RELEASE_FILE_BYTES = 128 * 1024 * 1024
 _SAFE_SEARCH_PATH = ("search_path=pg_catalog, canonical_brain",)
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 _COLLECTOR_RECEIPT_KEYS = frozenset(
@@ -482,7 +482,7 @@ def _hash_release_file(path: Path, before: os.stat_result) -> str:
             if not chunk:
                 break
             total += len(chunk)
-            if total > _MAX_RELEASE_FILE_BYTES:
+            if total > MAX_RELEASE_FILE_BYTES:
                 raise ValueError("collector release file exceeds its bound")
             digest.update(chunk)
         after = os.fstat(descriptor)
@@ -560,7 +560,7 @@ def _verify_release_entries(
                 or not stat.S_ISREG(item.st_mode)
                 or item.st_nlink != 1
                 or type(raw.get("size")) is not int
-                or not 0 <= raw["size"] <= _MAX_RELEASE_FILE_BYTES
+                or not 0 <= raw["size"] <= MAX_RELEASE_FILE_BYTES
                 or item.st_size != raw["size"]
                 or _digest(raw.get("sha256"), "collector release file")
                 != _hash_release_file(path, item)
