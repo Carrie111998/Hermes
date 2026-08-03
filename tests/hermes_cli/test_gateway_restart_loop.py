@@ -8,6 +8,8 @@ Covers:
 
 import json
 import os
+import shlex
+import sys
 from argparse import Namespace
 
 import pytest
@@ -309,6 +311,45 @@ class TestTerminalToolGatewayLifecycleGuard:
 
         assert result["exit_code"] == 1
         assert "referenced script" in result["error"]
+
+    def test_nul_byte_cannot_hide_lifecycle_command_in_shell_script(
+        self, monkeypatch, tmp_path
+    ):
+        import tools.terminal_tool as tt
+
+        script = tmp_path / "nul-delayed-ops.sh"
+        script.write_bytes(
+            b"#!/bin/bash\n# attacker-controlled NUL: \x00\nhermes gateway restart\n"
+        )
+        self._patch_env(monkeypatch, self._make_fake_env(), inside_gateway=True)
+
+        result = json.loads(tt.terminal_tool(command=f"/bin/bash {script}"))
+
+        assert result["exit_code"] == 1
+        assert "referenced script" in result["error"]
+
+    def test_allows_absolute_python_interpreter_inside_gateway(self, monkeypatch):
+        import tools.terminal_tool as tt
+
+        calls = []
+
+        class _FakeEnv:
+            env = {}
+
+            def execute(self, command, **kwargs):
+                calls.append(command)
+                return {"output": "Python worker started", "returncode": 0}
+
+        self._patch_env(monkeypatch, _FakeEnv(), inside_gateway=True)
+        monkeypatch.setattr(
+            tt, "_check_all_guards", lambda cmd, env, **kwargs: {"approved": True}
+        )
+        command = f"{shlex.quote(sys.executable)} --version"
+
+        result = json.loads(tt.terminal_tool(command=command))
+
+        assert result["exit_code"] == 0
+        assert calls == [command]
 
     def test_blocks_launchctl_submit_inside_gateway(self, monkeypatch, tmp_path):
         import tools.terminal_tool as tt

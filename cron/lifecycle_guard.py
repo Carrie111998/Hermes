@@ -105,6 +105,16 @@ _SHELL_OPTIONS_WITH_VALUES = frozenset({"-O", "+O", "-o", "+o"})
 _MAX_REFERENCED_SCRIPT_BYTES = 1024 * 1024
 _MAX_REFERENCED_SCRIPT_DEPTH = 8
 _CONTROL_CHARS = frozenset(";&|()")
+_NATIVE_EXECUTABLE_MAGICS = (
+    b"\x7fELF",  # Linux and other ELF platforms
+    b"MZ",  # Windows PE/COFF
+    b"\xfe\xed\xfa\xce",  # Mach-O 32-bit
+    b"\xfe\xed\xfa\xcf",  # Mach-O 64-bit
+    b"\xce\xfa\xed\xfe",  # Mach-O 32-bit, reverse byte order
+    b"\xcf\xfa\xed\xfe",  # Mach-O 64-bit, reverse byte order
+    b"\xca\xfe\xba\xbe",  # Mach-O universal binary
+    b"\xbe\xba\xfe\xca",  # Mach-O universal binary, reverse byte order
+)
 
 
 
@@ -272,14 +282,14 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
         return None, False
     finally:
         os.close(descriptor)
-    # A NUL byte in the first chunk means this is a binary (ELF/Mach-O/
-    # PE), not a shell script — scanning its decoded contents would
-    # tokenize machine code and feed junk paths into the recursion
-    # (including a `ValueError: embedded null byte` from Path.resolve,
-    # #76762). Treat it as "nothing to scan" rather than unsafe: a binary
-    # executed by the user is not a referenced *shell script*.
-    if b"\x00" in data:
-        return None, False
+    # Native executables are commands, not referenced shell scripts. Return
+    # an empty string rather than None so callers know the local read was
+    # definitive and do not retry it through a remote ``cat`` callback. That
+    # retry decoded the Python interpreter as text and reintroduced the exact
+    # false positive this check is meant to avoid (spawn_claude_code launches
+    # its tracked worker through an absolute interpreter path).
+    if any(data.startswith(magic) for magic in _NATIVE_EXECUTABLE_MAGICS):
+        return "", False
     if len(data) > _MAX_REFERENCED_SCRIPT_BYTES:
         return None, True
     return data.decode("utf-8", errors="replace"), False
