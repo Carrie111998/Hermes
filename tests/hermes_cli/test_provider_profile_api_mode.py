@@ -230,3 +230,48 @@ class TestRuntimeResolutionHonorsProfile:
         resolved = rp.resolve_runtime_provider(requested="bm-test-anthropic")
 
         assert resolved["api_mode"] == "anthropic_messages"
+
+
+class TestFallbackApiModeCarriesTheProfile:
+    """Cover the ``_fallback_api_mode()`` seam directly.
+
+    The two E2E tests above land in ``_resolve_openrouter_runtime`` (its inline
+    ``_profile_mode`` chain), so they never execute the ``_fallback_api_mode()``
+    call sites on the credential-pool and env-var-credential branches. Those
+    branches were verified blind: replacing either with
+    ``_detect_api_mode_for_url(base_url) or "chat_completions"`` left all 15
+    tests green.
+
+    ``_fallback_api_mode()`` is the upstream helper that both branches now call.
+    It delegates to ``providers.determine_api_mode()``, whose last step is the
+    base_url-gated ProviderProfile fallback, so pinning the helper pins the
+    behavior of every branch that routes through it.
+    """
+
+    def test_fallback_resolves_profile_mode_for_plugin_provider(self):
+        from hermes_cli.runtime_provider import _fallback_api_mode
+
+        # No base_url: the provider's own endpoint, so the declared mode applies.
+        assert _fallback_api_mode("bm-test-responses", "") == "codex_responses"
+        assert _fallback_api_mode("bm-test-anthropic", "") == "anthropic_messages"
+
+    def test_fallback_honors_profile_own_base_url(self):
+        from providers import get_provider_profile
+        from hermes_cli.runtime_provider import _fallback_api_mode
+
+        prof = get_provider_profile("bm-test-responses")
+        assert _fallback_api_mode("bm-test-responses", prof.base_url) == "codex_responses"
+
+    def test_fallback_url_heuristic_beats_the_profile(self):
+        from hermes_cli.runtime_provider import _fallback_api_mode
+
+        # A host-mandated wire shape is the stronger signal and must win.
+        assert (
+            _fallback_api_mode("bm-test-responses", "https://api.anthropic.com")
+            == "anthropic_messages"
+        )
+
+    def test_fallback_defaults_chat_for_unknown_provider(self):
+        from hermes_cli.runtime_provider import _fallback_api_mode
+
+        assert _fallback_api_mode("totally-unregistered-xyz", "") == "chat_completions"
