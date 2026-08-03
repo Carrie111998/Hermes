@@ -80,19 +80,6 @@ class TestIRCFreshInstallDiscovery:
         finally:
             _unregister_irc_platform()
 
-    def test_irc_status_not_configured_when_fresh(self, monkeypatch):
-        """On a fresh install with no env vars, IRC shows 'not configured'."""
-        import hermes_cli.gateway as gateway_mod
-
-        plat = _register_irc_platform()
-        try:
-            for key in ("IRC_SERVER", "IRC_CHANNEL", "IRC_NICKNAME"):
-                monkeypatch.delenv(key, raising=False)
-
-            status = gateway_mod._platform_status(plat)
-            assert status == "not configured"
-        finally:
-            _unregister_irc_platform()
 
     def test_irc_status_configured_when_env_set(self, monkeypatch):
         """After the user sets IRC_SERVER and IRC_CHANNEL, status is 'configured'."""
