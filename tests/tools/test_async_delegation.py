@@ -97,6 +97,110 @@ def test_active_for_session_counts_every_live_delegation_state():
     assert ad.active_for_session("") == 0
 
 
+def test_run_owned_completion_is_claimed_only_by_its_origin_run():
+    with ad.bind_origin_run("run_owner"):
+        res = ad.dispatch_async_delegation(
+            goal="finish the response",
+            context=None,
+            toolsets=None,
+            role="leaf",
+            model="m",
+            session_key="session",
+            runner=lambda: {"status": "completed", "summary": "artifact ready"},
+            max_async_children=1,
+        )
+    assert res["status"] == "dispatched"
+    assert _drain_for(res["delegation_id"]) is not None
+    assert ad.get_durable_delegation(res["delegation_id"])["origin_run_id"] == (
+        "run_owner"
+    )
+
+    assert ad.run_has_unsettled_delegations("run_owner") is True
+    assert ad.claim_run_completion("run_other", "other-claim") is None
+
+    claimed = ad.claim_run_completion("run_owner", "owner-claim")
+    assert claimed is not None
+    assert claimed["origin_run_id"] == "run_owner"
+    assert claimed["summary"] == "artifact ready"
+    assert ad.complete_completion_delivery(
+        claimed["delegation_id"], "owner-claim"
+    ) is True
+    assert ad.run_has_unsettled_delegations("run_owner") is False
+
+
+def test_explicit_run_ownership_propagates_to_nested_delegations():
+    nested_ids = queue.Queue()
+
+    def parent_runner():
+        nested = ad.dispatch_async_delegation(
+            goal="nested child",
+            context=None,
+            toolsets=None,
+            role="leaf",
+            model="m",
+            session_key="session",
+            runner=lambda: {"status": "completed", "summary": "nested done"},
+            max_async_children=2,
+        )
+        nested_ids.put(nested["delegation_id"])
+        return {"status": "completed", "summary": "parent done"}
+
+    parent = ad.dispatch_async_delegation(
+        goal="parent child",
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="m",
+        session_key="session",
+        origin_run_id="run_owner",
+        runner=parent_runner,
+        max_async_children=2,
+    )
+
+    nested_id = nested_ids.get(timeout=5)
+    assert ad.get_durable_delegation(parent["delegation_id"])["origin_run_id"] == (
+        "run_owner"
+    )
+    assert ad.get_durable_delegation(nested_id)["origin_run_id"] == "run_owner"
+
+
+def test_interrupt_for_run_does_not_interrupt_another_run():
+    gates = {"run_a": threading.Event(), "run_b": threading.Event()}
+    interrupts = {"run_a": 0, "run_b": 0}
+
+    def dispatch(run_id):
+        def interrupt():
+            interrupts[run_id] += 1
+            gates[run_id].set()
+
+        return ad.dispatch_async_delegation(
+            goal=run_id,
+            context=None,
+            toolsets=None,
+            role="leaf",
+            model="m",
+            session_key="shared-session",
+            origin_run_id=run_id,
+            runner=lambda: (
+                gates[run_id].wait(timeout=60),
+                {"status": "interrupted", "summary": None},
+            )[1],
+            interrupt_fn=interrupt,
+            max_async_children=2,
+        )
+
+    run_a = dispatch("run_a")
+    run_b = dispatch("run_b")
+
+    assert ad.interrupt_for_run("run_a", reason="test") == 1
+    assert interrupts == {"run_a": 1, "run_b": 0}
+    assert _drain_for(run_a["delegation_id"]) is not None
+    assert ad.run_has_unsettled_delegations("run_b") is True
+
+    gates["run_b"].set()
+    assert _drain_for(run_b["delegation_id"]) is not None
+
+
 def test_dispatch_returns_immediately_without_blocking():
     gate = threading.Event()
 
@@ -760,4 +864,3 @@ def test_gateway_cli_origin_event_left_unrouted():
     evt = _make_async_evt(session_key="")
     runner._enrich_async_delegation_routing(evt)
     assert "platform" not in evt
-

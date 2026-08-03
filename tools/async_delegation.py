@@ -44,6 +44,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any, Callable, Dict, Iterator, List, Optional
 
 from hermes_constants import get_hermes_home
@@ -84,6 +85,17 @@ _MAX_DURABLE_PENDING = 1000
 # instead of replaying on every restart forever.
 _MAX_DELIVERY_ATTEMPTS = 8
 _DB_LOCK = threading.Lock()
+_RUN_ACTIVITY = threading.Condition()
+_run_activity_epochs: Dict[str, int] = {}
+
+# ``/v1/runs`` is a stronger lifecycle boundary than an ordinary API chat
+# turn: its terminal event promises that every delegation it spawned has
+# re-entered the conversation.  Keep that ownership separate from the raw
+# session id because callers may intentionally run two jobs against the same
+# session concurrently.
+_origin_run_id: ContextVar[str] = ContextVar(
+    "async_delegation_origin_run_id", default=""
+)
 
 # ---------------------------------------------------------------------------
 # Stale-delegation detection (progress-based, on by default)
@@ -158,7 +170,8 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             task_json TEXT,
             delivery_claim TEXT,
             delivery_claimed_at REAL,
-            origin_session_id TEXT NOT NULL DEFAULT ''
+            origin_session_id TEXT NOT NULL DEFAULT '',
+            origin_run_id TEXT NOT NULL DEFAULT ''
         )"""
     )
     columns = {row[1] for row in conn.execute("PRAGMA table_info(async_delegations)")}
@@ -173,6 +186,7 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         # completions recovered after a process restart are unroutable on
         # api_server (the in-memory record that carried it is gone).
         ("origin_session_id", "TEXT"),
+        ("origin_run_id", "TEXT"),
     ):
         if name not in columns:
             conn.execute(f"ALTER TABLE async_delegations ADD COLUMN {name} {sql_type}")
@@ -215,13 +229,14 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
                (delegation_id, origin_session, origin_ui_session_id,
                 parent_session_id, state, dispatched_at, updated_at,
                 delivery_state, delivery_attempts, owner_pid,
-                owner_started_at, task_json, origin_session_id)
-               VALUES (?, ?, ?, ?, 'running', ?, ?, 'pending', 0, ?, ?, ?, ?)""",
+                owner_started_at, task_json, origin_session_id, origin_run_id)
+               VALUES (?, ?, ?, ?, 'running', ?, ?, 'pending', 0, ?, ?, ?, ?, ?)""",
             (record["delegation_id"], record.get("session_key", ""),
              record.get("origin_ui_session_id", ""), record.get("parent_session_id"),
              record["dispatched_at"], now, __import__("os").getpid(),
              owner_started_at, json.dumps(task_payload),
-             record.get("origin_session_id", "")),
+             record.get("origin_session_id", ""),
+             record.get("origin_run_id", "")),
         )
     _prune_durable_records()
 
@@ -280,6 +295,7 @@ def _persist_completion(event: Dict[str, Any], result: Dict[str, Any]) -> None:
             (event.get("status", "completed"), event.get("completed_at", now), now,
              json.dumps(event), json.dumps(result), event["delegation_id"]),
         )
+    _signal_run_activity(str(event.get("origin_run_id") or ""))
 
 
 def _note_delivery_attempt(delegation_id: str) -> None:
@@ -302,12 +318,13 @@ def recover_abandoned_delegations() -> int:
         rows = conn.execute(
             """SELECT delegation_id, origin_session, origin_ui_session_id,
                       parent_session_id, dispatched_at, owner_pid,
-                      owner_started_at, task_json, origin_session_id
+                      owner_started_at, task_json, origin_session_id,
+                      origin_run_id
                FROM async_delegations WHERE state IN ('running','finalizing')"""
         ).fetchall()
         for row in rows:
             (delegation_id, session_key, origin_ui, parent_id, dispatched_at,
-             pid, started, task_json, origin_session_id) = row
+             pid, started, task_json, origin_session_id, origin_run_id) = row
             live = False
             if pid:
                 live = _pid_exists(int(pid))
@@ -322,6 +339,7 @@ def recover_abandoned_delegations() -> int:
                 # Restore the durable wake target so completions recovered
                 # after a restart remain routable to api_server sessions.
                 "origin_session_id": origin_session_id or "",
+                "origin_run_id": origin_run_id or "",
                 "parent_session_id": parent_id, "goal": task.get("goal", ""),
                 "goals": task.get("goals"), "context": task.get("context"),
                 "toolsets": task.get("toolsets"), "role": task.get("role"),
@@ -409,6 +427,122 @@ def claim_event_delivery(evt: Dict[str, Any], consumer: str) -> Optional[str]:
         return ""
     claim_id = f"{consumer}:{__import__('os').getpid()}:{uuid.uuid4().hex}"
     return claim_id if claim_completion_delivery(delegation_id, claim_id) else None
+
+
+def claim_run_completion(origin_run_id: str, claim_id: str) -> Optional[Dict[str, Any]]:
+    """Claim the oldest completed delegation owned by one API run.
+
+    The durable row is the arbitration point between the run owner and the
+    gateway's generic completion watcher.  Returning the event only after the
+    conditional claim keeps two concurrent runs sharing a session isolated.
+    """
+    if not origin_run_id or not claim_id:
+        return None
+    now = time.time()
+    with _DB_LOCK, _transaction() as conn:
+        row = conn.execute(
+            """SELECT delegation_id, event_json
+               FROM async_delegations
+               WHERE origin_run_id=?
+                 AND state NOT IN ('running','finalizing')
+                 AND delivery_state='pending'
+                 AND event_json IS NOT NULL
+                 AND (delivery_claim IS NULL OR delivery_claimed_at < ?)
+               ORDER BY completed_at, delegation_id
+               LIMIT 1""",
+            (origin_run_id, now - 300),
+        ).fetchone()
+        if row is None:
+            return None
+        delegation_id, payload = row
+        cur = conn.execute(
+            """UPDATE async_delegations
+               SET delivery_claim=?, delivery_claimed_at=?,
+                   delivery_attempts=delivery_attempts+1, updated_at=?
+               WHERE delegation_id=? AND delivery_state='pending'
+                 AND (delivery_claim IS NULL OR delivery_claimed_at < ?)""",
+            (claim_id, now, now, delegation_id, now - 300),
+        )
+        if cur.rowcount != 1:
+            return None
+    event = json.loads(payload)
+    return event if isinstance(event, dict) else None
+
+
+def run_activity_epoch(origin_run_id: str) -> int:
+    """Return the in-process change counter for one API run's delegations."""
+    with _RUN_ACTIVITY:
+        return _run_activity_epochs.get(origin_run_id, 0)
+
+
+def wait_for_run_activity(
+    origin_run_id: str,
+    after_epoch: int,
+    timeout: float = 1.0,
+) -> int:
+    """Block until one run's delegation state changes or the timeout elapses."""
+    with _RUN_ACTIVITY:
+        _RUN_ACTIVITY.wait_for(
+            lambda: _run_activity_epochs.get(origin_run_id, 0) != after_epoch,
+            timeout=timeout,
+        )
+        return _run_activity_epochs.get(origin_run_id, 0)
+
+
+def clear_run_activity(origin_run_id: str) -> None:
+    """Release the in-process wake counter after an API run becomes terminal."""
+    with _RUN_ACTIVITY:
+        _run_activity_epochs.pop(origin_run_id, None)
+
+
+def _signal_run_activity(origin_run_id: str) -> None:
+    if not origin_run_id:
+        return
+    with _RUN_ACTIVITY:
+        _run_activity_epochs[origin_run_id] = (
+            _run_activity_epochs.get(origin_run_id, 0) + 1
+        )
+        _RUN_ACTIVITY.notify_all()
+
+
+def run_has_unsettled_delegations(origin_run_id: str) -> bool:
+    """Whether a run still owns live work or an undelivered completion."""
+    if not origin_run_id:
+        return False
+    with _records_lock:
+        if any(
+            str(record.get("origin_run_id") or "") == origin_run_id
+            and record.get("status") in {"running", "stalling", "finalizing"}
+            for record in _records.values()
+        ):
+            return True
+    with _DB_LOCK, _transaction() as conn:
+        row = conn.execute(
+            """SELECT 1 FROM async_delegations
+               WHERE origin_run_id=? AND (
+                   state IN ('running','finalizing')
+                   OR delivery_state='pending'
+               ) LIMIT 1""",
+            (origin_run_id,),
+        ).fetchone()
+    return row is not None
+
+
+def drop_run_completions(origin_run_id: str) -> int:
+    """Terminally discard pending deliveries for a cancelled API run."""
+    if not origin_run_id:
+        return 0
+    now = time.time()
+    with _DB_LOCK, _transaction() as conn:
+        cur = conn.execute(
+            """UPDATE async_delegations
+               SET delivery_state='dropped', delivery_claim=NULL,
+                   delivery_claimed_at=NULL, updated_at=?
+               WHERE origin_run_id=? AND delivery_state='pending'
+                 AND state NOT IN ('running','finalizing')""",
+            (now, origin_run_id),
+        )
+        return cur.rowcount
 
 
 def release_completion_delivery(delegation_id: str, claim_id: str) -> bool:
@@ -499,7 +633,7 @@ def get_durable_delegation(delegation_id: str) -> Optional[Dict[str, Any]]:
         row = conn.execute(
             """SELECT origin_session, state, dispatched_at, completed_at,
                       result_json, delivery_state, delivery_attempts,
-                      origin_session_id
+                      origin_session_id, origin_run_id
                FROM async_delegations WHERE delegation_id=?""", (delegation_id,),
         ).fetchone()
     if row is None:
@@ -510,6 +644,7 @@ def get_durable_delegation(delegation_id: str) -> Optional[Dict[str, Any]]:
         "result": json.loads(row[4]) if row[4] else None,
         "delivery_state": row[5], "delivery_attempts": row[6],
         "origin_session_id": row[7] or "",
+        "origin_run_id": row[8] or "",
     }
 
 
@@ -674,6 +809,21 @@ def _current_origin_session_id() -> str:
         return ""
 
 
+@contextmanager
+def bind_origin_run(origin_run_id: str) -> Iterator[None]:
+    """Bind API-run ownership while one foreground/continuation turn runs."""
+    token = _origin_run_id.set(str(origin_run_id or ""))
+    try:
+        yield
+    finally:
+        _origin_run_id.reset(token)
+
+
+def current_origin_run_id() -> str:
+    """Return the API run that owns delegations spawned in this context."""
+    return _origin_run_id.get()
+
+
 def dispatch_async_delegation(
     *,
     goal: str,
@@ -686,6 +836,7 @@ def dispatch_async_delegation(
     runner: Callable[[], Dict[str, Any]],
     origin_ui_session_id: str = "",
     origin_session_id: str = "",
+    origin_run_id: str = "",
     interrupt_fn: Optional[Callable[[], None]] = None,
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
     progress_fn: Optional[Callable[[], tuple]] = None,
@@ -732,6 +883,7 @@ def dispatch_async_delegation(
         ``{"status": "dispatched", "delegation_id": ...}`` on success, or
         ``{"status": "rejected", "error": ...}`` when at capacity.
     """
+    origin_run_id = str(origin_run_id or current_origin_run_id())
     delegation_id = _new_delegation_id()
     dispatched_at = time.time()
     record: Dict[str, Any] = {
@@ -744,6 +896,7 @@ def dispatch_async_delegation(
         "session_key": session_key,
         "origin_ui_session_id": origin_ui_session_id,
         "origin_session_id": origin_session_id,
+        "origin_run_id": origin_run_id,
         "parent_session_id": parent_session_id,
         "status": "running",
         "dispatched_at": dispatched_at,
@@ -783,7 +936,8 @@ def dispatch_async_delegation(
         result: Dict[str, Any] = {}
         status = "error"
         try:
-            result = runner() or {}
+            with bind_origin_run(origin_run_id):
+                result = runner() or {}
             status = result.get("status") or "completed"
         except Exception as exc:  # noqa: BLE001 — must never crash the worker
             logger.exception("Async delegation %s crashed", delegation_id)
@@ -891,6 +1045,7 @@ def _push_completion_event(
         "session_key": record.get("session_key", ""),
         "origin_ui_session_id": record.get("origin_ui_session_id", ""),
         "origin_session_id": record.get("origin_session_id", ""),
+        "origin_run_id": record.get("origin_run_id", ""),
         "parent_session_id": record.get("parent_session_id"),
         "goal": record.get("goal", ""),
         "context": record.get("context"),
@@ -941,6 +1096,7 @@ def dispatch_async_delegation_batch(
     runner: Callable[[], Dict[str, Any]],
     origin_ui_session_id: str = "",
     origin_session_id: str = "",
+    origin_run_id: str = "",
     interrupt_fn: Optional[Callable[[], None]] = None,
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
     delegation_id: Optional[str] = None,
@@ -966,6 +1122,7 @@ def dispatch_async_delegation_batch(
     ``{"status": "rejected", "error": ...}`` when the async pool is at
     capacity.
     """
+    origin_run_id = str(origin_run_id or current_origin_run_id())
     delegation_id = delegation_id or _new_delegation_id()
     dispatched_at = time.time()
     n = len(goals)
@@ -984,6 +1141,7 @@ def dispatch_async_delegation_batch(
         "session_key": session_key,
         "origin_ui_session_id": origin_ui_session_id,
         "origin_session_id": origin_session_id,
+        "origin_run_id": origin_run_id,
         "parent_session_id": parent_session_id,
         "status": "running",
         "dispatched_at": dispatched_at,
@@ -1019,7 +1177,8 @@ def dispatch_async_delegation_batch(
         combined: Dict[str, Any] = {}
         status = "error"
         try:
-            combined = runner() or {}
+            with bind_origin_run(origin_run_id):
+                combined = runner() or {}
             # Batch status: completed unless every child errored/was interrupted.
             child_results = combined.get("results") or []
             if child_results and all(
@@ -1096,6 +1255,7 @@ def _push_batch_completion_event(
         "session_key": event_record.get("session_key", ""),
         "origin_ui_session_id": event_record.get("origin_ui_session_id", ""),
         "origin_session_id": event_record.get("origin_session_id", ""),
+        "origin_run_id": event_record.get("origin_run_id", ""),
         "parent_session_id": event_record.get("parent_session_id"),
         "goal": event_record.get("goal", ""),
         "goals": event_record.get("goals"),
@@ -1497,9 +1657,47 @@ def interrupt_for_session(
     return count
 
 
+def interrupt_for_run(origin_run_id: str, reason: str = "run_cancelled") -> int:
+    """Signal live async delegations owned by exactly one API run."""
+    if not origin_run_id:
+        return 0
+    count = 0
+    with _records_lock:
+        targets = [
+            record
+            for record in _records.values()
+            if record.get("status") in ("running", "stalling")
+            and str(record.get("origin_run_id") or "") == origin_run_id
+        ]
+    for record in targets:
+        interrupt_fn = record.get("interrupt_fn")
+        if callable(interrupt_fn):
+            try:
+                interrupt_fn()
+                count += 1
+            except Exception as exc:
+                logger.debug(
+                    "interrupt_for_run: %s interrupt failed: %s",
+                    record.get("delegation_id"),
+                    exc,
+                )
+    if count:
+        logger.info(
+            "Interrupted %d async delegation(s) for API run %s (%s)",
+            count,
+            origin_run_id,
+            reason,
+        )
+    _signal_run_activity(origin_run_id)
+    return count
+
+
 def _reset_for_tests() -> None:
     """Test-only: clear all state and tear down the executor + monitor."""
     global _executor, _executor_max_workers, _monitor_thread
+    with _RUN_ACTIVITY:
+        _run_activity_epochs.clear()
+        _RUN_ACTIVITY.notify_all()
     with _executor_lock:
         if _executor is not None:
             _executor.shutdown(wait=False)

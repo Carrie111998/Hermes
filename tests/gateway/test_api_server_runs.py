@@ -267,6 +267,166 @@ class TestStartRun:
 class TestRunStatus:
 
     @pytest.mark.asyncio
+    async def test_failed_run_settles_owned_delegation_before_terminal(self, adapter):
+        from tools import async_delegation as ad
+
+        app = _create_runs_app(adapter)
+        child_started = threading.Event()
+        child_interrupted = threading.Event()
+
+        def child_runner():
+            child_started.set()
+            child_interrupted.wait(timeout=60)
+            return {"status": "interrupted", "summary": None}
+
+        def run_conversation(user_message=None, conversation_history=None, task_id=None):
+            dispatched = ad.dispatch_async_delegation(
+                goal="background write before provider failure",
+                context=None,
+                toolsets=None,
+                role="leaf",
+                model="m",
+                session_key=task_id,
+                runner=child_runner,
+                interrupt_fn=child_interrupted.set,
+                max_async_children=1,
+            )
+            assert dispatched["status"] == "dispatched"
+            return {"failed": True, "error": "provider failed"}
+
+        mock_agent = MagicMock()
+        mock_agent.run_conversation.side_effect = run_conversation
+        mock_agent.session_prompt_tokens = 0
+        mock_agent.session_completion_tokens = 0
+        mock_agent.session_total_tokens = 0
+
+        try:
+            async with TestClient(TestServer(app)) as cli:
+                with patch.object(adapter, "_create_agent", return_value=mock_agent):
+                    resp = await cli.post("/v1/runs", json={"input": "hello"})
+                    run_id = (await resp.json())["run_id"]
+                    assert child_started.wait(timeout=3)
+
+                    for _ in range(100):
+                        status = await (await cli.get(f"/v1/runs/{run_id}")).json()
+                        if status["status"] == "failed":
+                            break
+                        await asyncio.sleep(0.05)
+
+                    assert status["status"] == "failed"
+                    assert status["error"] == "provider failed"
+                    assert child_interrupted.is_set()
+                    assert ad.run_has_unsettled_delegations(run_id) is False
+        finally:
+            child_interrupted.set()
+            ad._reset_for_tests()
+
+    @pytest.mark.asyncio
+    async def test_run_waits_for_owned_delegation_continuation(self, adapter):
+        """A run is not terminal until its background result re-enters it."""
+        from tools import async_delegation as ad
+
+        app = _create_runs_app(adapter)
+        release_children = [threading.Event(), threading.Event()]
+        continuation_seen = threading.Event()
+        calls = []
+
+        def dispatch_child(summary, gate):
+            return ad.dispatch_async_delegation(
+                goal=summary,
+                context=None,
+                toolsets=None,
+                role="leaf",
+                model="m",
+                session_key="shared-session",
+                runner=lambda: (
+                    gate.wait(timeout=60),
+                    {"status": "completed", "summary": summary},
+                )[1],
+                max_async_children=1,
+            )
+
+        def run_conversation(user_message=None, conversation_history=None, task_id=None):
+            calls.append(user_message)
+            mock_agent.session_prompt_tokens = len(calls) * 10
+            mock_agent.session_completion_tokens = len(calls) * 5
+            mock_agent.session_total_tokens = len(calls) * 15
+            if len(calls) == 1:
+                run_id = ad.current_origin_run_id()
+                assert run_id.startswith("run_")
+                dispatched = dispatch_child("artifact ready", release_children[0])
+                assert dispatched["status"] == "dispatched"
+                return {"final_response": "delegated"}
+
+            if len(calls) == 2:
+                assert "artifact ready" in user_message
+                dispatched = dispatch_child(
+                    "final validation ready", release_children[1]
+                )
+                assert dispatched["status"] == "dispatched"
+                return {"final_response": "delegated again"}
+
+            assert "final validation ready" in user_message
+            continuation_seen.set()
+            return {"final_response": "final response after delegation"}
+
+        mock_agent = MagicMock()
+        mock_agent.run_conversation.side_effect = run_conversation
+        mock_agent.session_prompt_tokens = 0
+        mock_agent.session_completion_tokens = 0
+        mock_agent.session_total_tokens = 0
+
+        try:
+            async with TestClient(TestServer(app)) as cli:
+                with patch.object(adapter, "_create_agent", return_value=mock_agent):
+                    resp = await cli.post("/v1/runs", json={"input": "hello"})
+                    run_id = (await resp.json())["run_id"]
+
+                    for _ in range(40):
+                        status = await (await cli.get(f"/v1/runs/{run_id}")).json()
+                        if status["status"] == "waiting_for_background":
+                            break
+                        await asyncio.sleep(0.05)
+
+                    assert status["status"] == "waiting_for_background"
+                    assert continuation_seen.is_set() is False
+
+                    release_children[0].set()
+                    for _ in range(100):
+                        status = await (await cli.get(f"/v1/runs/{run_id}")).json()
+                        if len(calls) >= 2 and status["status"] == "waiting_for_background":
+                            break
+                        await asyncio.sleep(0.05)
+
+                    assert len(calls) == 2
+                    assert status["status"] == "waiting_for_background"
+                    release_children[1].set()
+                    for _ in range(100):
+                        status = await (await cli.get(f"/v1/runs/{run_id}")).json()
+                        if status["status"] == "completed":
+                            break
+                        await asyncio.sleep(0.05)
+
+                    assert status["status"] == "completed"
+                    assert status["output"] == "final response after delegation"
+                    assert status["usage"] == {
+                        "input_tokens": 30,
+                        "output_tokens": 15,
+                        "total_tokens": 45,
+                    }
+                    assert continuation_seen.is_set() is True
+                    assert len(calls) == 3
+
+                    events_resp = await cli.get(f"/v1/runs/{run_id}/events")
+                    events_body = await events_resp.text()
+                    assert events_body.count('"event": "run.completed"') == 1
+                    assert "run.waiting_for_background" in events_body
+        finally:
+            for gate in release_children:
+                gate.set()
+            ad._reset_for_tests()
+
+    @pytest.mark.asyncio
     async def test_status_reflects_explicit_session_id(self, adapter):
         app = _create_runs_app(adapter)
         async with TestClient(TestServer(app)) as cli:
@@ -476,6 +636,72 @@ class TestRunLifecycleSweep:
 
 
 class TestStopRun:
+
+    @pytest.mark.asyncio
+    async def test_stop_settles_owned_delegation_before_cancelling(self, adapter):
+        from tools import async_delegation as ad
+
+        app = _create_runs_app(adapter)
+        child_started = threading.Event()
+        child_interrupted = threading.Event()
+        calls = []
+
+        def child_runner():
+            child_started.set()
+            child_interrupted.wait(timeout=60)
+            return {"status": "interrupted", "summary": None}
+
+        def run_conversation(user_message=None, conversation_history=None, task_id=None):
+            calls.append(user_message)
+            dispatched = ad.dispatch_async_delegation(
+                goal="long background write",
+                context=None,
+                toolsets=None,
+                role="leaf",
+                model="m",
+                session_key=task_id,
+                runner=child_runner,
+                interrupt_fn=child_interrupted.set,
+                max_async_children=1,
+            )
+            assert dispatched["status"] == "dispatched"
+            return {"final_response": "delegated"}
+
+        mock_agent = MagicMock()
+        mock_agent.run_conversation.side_effect = run_conversation
+        mock_agent.session_prompt_tokens = 0
+        mock_agent.session_completion_tokens = 0
+        mock_agent.session_total_tokens = 0
+
+        try:
+            async with TestClient(TestServer(app)) as cli:
+                with patch.object(adapter, "_create_agent", return_value=mock_agent):
+                    resp = await cli.post("/v1/runs", json={"input": "hello"})
+                    run_id = (await resp.json())["run_id"]
+                    assert child_started.wait(timeout=3)
+
+                    for _ in range(40):
+                        status = await (await cli.get(f"/v1/runs/{run_id}")).json()
+                        if status["status"] == "waiting_for_background":
+                            break
+                        await asyncio.sleep(0.05)
+                    assert status["status"] == "waiting_for_background"
+
+                    stop = await cli.post(f"/v1/runs/{run_id}/stop")
+                    assert stop.status == 200
+                    for _ in range(100):
+                        status = await (await cli.get(f"/v1/runs/{run_id}")).json()
+                        if status["status"] == "cancelled":
+                            break
+                        await asyncio.sleep(0.05)
+
+                    assert status["status"] == "cancelled"
+                    assert child_interrupted.is_set()
+                    assert ad.run_has_unsettled_delegations(run_id) is False
+                    assert len(calls) == 1
+        finally:
+            child_interrupted.set()
+            ad._reset_for_tests()
 
     @pytest.mark.asyncio
     async def test_stop_keeps_uncooperative_executor_tracked_until_exit(self, adapter):

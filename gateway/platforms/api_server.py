@@ -6391,6 +6391,30 @@ class APIServerAdapter(BasePlatformAdapter):
         request_profile = _api_request_profile.get()
 
         async def _run_and_close():
+            async def _settle_owned_delegations(reason: str) -> None:
+                from tools.async_delegation import (
+                    drop_run_completions,
+                    interrupt_for_run,
+                    run_activity_epoch,
+                    run_has_unsettled_delegations,
+                    wait_for_run_activity,
+                )
+
+                interrupt_for_run(run_id, reason=reason)
+                activity_epoch = run_activity_epoch(run_id)
+                while run_has_unsettled_delegations(run_id):
+                    drop_run_completions(run_id)
+                    if not run_has_unsettled_delegations(run_id):
+                        break
+                    activity_epoch = await asyncio.get_running_loop().run_in_executor(
+                        None,
+                        wait_for_run_activity,
+                        run_id,
+                        activity_epoch,
+                        1.0,
+                    )
+                drop_run_completions(run_id)
+
             try:
                 self._set_run_status(run_id, "running")
                 if run_id in self._stopping_run_ids:
@@ -6448,8 +6472,12 @@ class APIServerAdapter(BasePlatformAdapter):
                     except Exception:
                         pass
 
-                def _run_sync():
+                def _run_sync(
+                    turn_message: str,
+                    turn_history: List[Dict[str, Any]],
+                ):
                     from gateway.session_context import clear_session_vars
+                    from tools.async_delegation import bind_origin_run
                     from tools.approval import (
                         register_gateway_notify,
                         reset_current_session_key,
@@ -6460,7 +6488,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     effective_task_id = session_id or run_id
                     approval_token = None
                     session_tokens = []
-                    with self._profile_scope(request_profile):
+                    with self._profile_scope(request_profile), bind_origin_run(run_id):
                         try:
                             # Bind approval/session identity for this API run via
                             # contextvars so concurrent runs do not share process
@@ -6486,8 +6514,8 @@ class APIServerAdapter(BasePlatformAdapter):
                             # background processes this run created (#76115).
                             _publish_turn_process_ownership(agent, effective_task_id)
                             r = agent.run_conversation(
-                                user_message=user_message,
-                                conversation_history=conversation_history,
+                                user_message=turn_message,
+                                conversation_history=turn_history,
                                 task_id=effective_task_id,
                             )
                         finally:
@@ -6517,8 +6545,98 @@ class APIServerAdapter(BasePlatformAdapter):
                         }
                         return r, u
 
-                result, usage = await asyncio.get_running_loop().run_in_executor(None, _run_sync)
+                async def _run_turn(
+                    turn_message: str,
+                    turn_history: List[Dict[str, Any]],
+                ):
+                    return await asyncio.get_running_loop().run_in_executor(
+                        None,
+                        _run_sync,
+                        turn_message,
+                        turn_history,
+                    )
+
+                result, usage = await _run_turn(user_message, conversation_history)
+
+                # Background delegations spawned by /v1/runs belong to the
+                # run, not merely to the shared conversation. Drain each
+                # durable completion as a continuation turn before exposing a
+                # terminal status. A continuation may dispatch more work, so
+                # quiescence is a loop, not a one-shot join.
+                if not (isinstance(result, dict) and result.get("failed")):
+                    from gateway.run import _format_gateway_process_notification
+                    from tools.async_delegation import (
+                        claim_run_completion,
+                        complete_completion_delivery,
+                        release_completion_delivery,
+                        run_activity_epoch,
+                        run_has_unsettled_delegations,
+                        wait_for_run_activity,
+                    )
+
+                    waiting_announced = False
+                    activity_epoch = run_activity_epoch(run_id)
+                    while run_id not in self._stopping_run_ids:
+                        claim_id = f"api-run:{run_id}:{uuid.uuid4().hex}"
+                        event = claim_run_completion(run_id, claim_id)
+                        if event is not None:
+                            delegation_id = str(event.get("delegation_id") or "")
+                            continuation = _format_gateway_process_notification(event)
+                            if not continuation:
+                                complete_completion_delivery(delegation_id, claim_id)
+                                continue
+                            self._set_run_status(
+                                run_id,
+                                "running",
+                                last_event="run.continuation",
+                            )
+                            _put_event_if_active({
+                                "event": "run.continuation",
+                                "run_id": run_id,
+                                "timestamp": time.time(),
+                                "delegation_id": delegation_id,
+                            })
+                            try:
+                                continuation_history = await self._conversation_history_for_session(
+                                    session_id
+                                )
+                                result, usage = await _run_turn(
+                                    continuation,
+                                    continuation_history,
+                                )
+                            except BaseException:
+                                release_completion_delivery(delegation_id, claim_id)
+                                raise
+                            complete_completion_delivery(delegation_id, claim_id)
+                            waiting_announced = False
+                            if isinstance(result, dict) and result.get("failed"):
+                                break
+                            continue
+
+                        if not run_has_unsettled_delegations(run_id):
+                            break
+                        if not waiting_announced:
+                            waiting_announced = True
+                            self._set_run_status(
+                                run_id,
+                                "waiting_for_background",
+                                last_event="run.waiting_for_background",
+                            )
+                            _put_event_if_active({
+                                "event": "run.waiting_for_background",
+                                "run_id": run_id,
+                                "timestamp": time.time(),
+                            })
+                        activity_epoch = await asyncio.get_running_loop().run_in_executor(
+                            None,
+                            wait_for_run_activity,
+                            run_id,
+                            activity_epoch,
+                            1.0,
+                        )
+
                 if run_id in self._stopping_run_ids:
+                    await _settle_owned_delegations("api_run_stop")
                     _put_event_if_active({
                         "event": "run.cancelled",
                         "run_id": run_id,
@@ -6533,6 +6651,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 # 401/400 return failed=True instead of raising, so the except
                 # block below never fires — issue #15561).
                 elif isinstance(result, dict) and result.get("failed"):
+                    await _settle_owned_delegations("api_run_failed")
                     error_msg = _redact_api_error_text(result.get("error") or "agent run failed")
                     _put_event_if_active({
                         "event": "run.failed",
@@ -6563,6 +6682,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         last_event="run.completed",
                     )
             except asyncio.CancelledError:
+                await _settle_owned_delegations("api_run_cancelled")
                 self._set_run_status(
                     run_id,
                     "cancelled",
@@ -6586,6 +6706,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 # failure, instead of falling through to the generic
                 # except-Exception branch below.
                 logger.warning("Provider authentication failed for run=%s: %s", run_id, exc)
+                await _settle_owned_delegations("api_run_auth_failed")
                 error_msg = f"⚠️ Provider authentication failed: {exc}"
                 self._set_run_status(
                     run_id,
@@ -6604,6 +6725,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     pass
             except Exception as exc:
                 logger.exception("[api_server] run %s failed", run_id)
+                await _settle_owned_delegations("api_run_exception")
                 self._set_run_status(
                     run_id,
                     "failed",
@@ -6620,6 +6742,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 except Exception:
                     pass
             finally:
+                try:
+                    from tools.async_delegation import clear_run_activity
+
+                    clear_run_activity(run_id)
+                except Exception:
+                    pass
                 # If the asyncio wrapper is cancelled (for example via
                 # /stop), the executor thread can still be blocked waiting
                 # on an approval Event.  Unregistering here releases those
@@ -6830,6 +6958,17 @@ class APIServerAdapter(BasePlatformAdapter):
 
         self._set_run_status(run_id, "stopping", last_event="run.stopping")
         self._stopping_run_ids.add(run_id)
+
+        try:
+            from tools.async_delegation import interrupt_for_run
+
+            interrupt_for_run(run_id, reason="api_run_stop")
+        except Exception:
+            logger.debug(
+                "Could not interrupt delegations for API run %s",
+                run_id,
+                exc_info=True,
+            )
 
         if agent is not None:
             try:

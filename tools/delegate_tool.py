@@ -2927,9 +2927,13 @@ def delegate_task(
     # request-scoped chat_id binding (the raw X-Hermes-Session-Id on
     # api_server) is untouched by child construction, so read it here and
     # thread it through the dispatch.
-    from tools.async_delegation import _current_origin_session_id
+    from tools.async_delegation import (
+        _current_origin_session_id,
+        current_origin_run_id,
+    )
 
     _origin_wake_sid = _current_origin_session_id()
+    _origin_run_id = current_origin_run_id()
 
     # Build all child agents on the main thread (thread-safe construction).
     # _build_child_preserving_parent_tools saves/restores the parent's
@@ -3326,6 +3330,7 @@ def delegate_task(
             session_key=_session_key,
             origin_ui_session_id=_origin_ui_session_id,
             origin_session_id=_wake_sid,
+            origin_run_id=_origin_run_id,
             parent_session_id=_parent_session_id,
             runner=_batch_runner,
             interrupt_fn=_batch_interrupt,

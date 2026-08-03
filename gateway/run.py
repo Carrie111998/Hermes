@@ -21852,6 +21852,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         durable_claim_id = ""
         durable_delegation_id = ""
         if evt.get("type") == "async_delegation":
+            # A live /v1/runs owner drains its own durable completion and
+            # executes the continuation before publishing run.completed. Do
+            # not let the generic watcher race it into an unrelated self-post.
+            origin_run_id = str(evt.get("origin_run_id") or "").strip()
+            if origin_run_id:
+                api_adapter = self.adapters.get(Platform.API_SERVER)
+                active_tasks = getattr(api_adapter, "_active_run_tasks", {})
+                if api_adapter is not None and origin_run_id in active_tasks:
+                    return False
             durable_delegation_id = str(evt.get("delegation_id") or "")
             if durable_delegation_id:
                 try:
