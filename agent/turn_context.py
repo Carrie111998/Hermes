@@ -1567,7 +1567,10 @@ def build_turn_context(
         except Exception:
             pass
 
-    # External memory provider: prefetch once before the tool loop.
+    # External memory provider: prefetch once before the tool loop. Prompt
+    # semantics belong to the model, so every accepted text turn follows the
+    # same recall path; providers may still apply query-agnostic operational
+    # gates such as availability, recall mode, cadence, and timeouts.
     ext_prefetch_cache = ""
     if agent._memory_manager:
         try:

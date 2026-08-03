@@ -6,6 +6,8 @@ from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from plugins.memory.honcho.session import (
     HonchoSession,
     HonchoSessionManager,
@@ -529,8 +531,8 @@ class TestDialecticInjectionCap:
 
 def _settle_prewarm(provider):
     """Wait for the session-start prewarm dialectic thread, then return the
-    provider to a clean 'nothing fired yet' state so cadence/first-turn/
-    trivial-prompt tests can assert from a known baseline."""
+    provider to a clean 'nothing fired yet' state so cadence and first-turn
+    tests can assert from a known baseline."""
     if provider._prefetch_thread:
         provider._prefetch_thread.join(timeout=3.0)
     with provider._prefetch_lock:
@@ -760,12 +762,12 @@ class TestDialecticDepth:
 
 
 # ---------------------------------------------------------------------------
-# Trivial-prompt heuristic + dialectic cadence silent-failure guards
+# Prompt-neutral recall + dialectic cadence silent-failure guards
 # ---------------------------------------------------------------------------
 
 
-class TestTrivialPromptHeuristic:
-    """Trivial prompts ('ok', 'y', slash commands) must short-circuit injection."""
+class TestPromptNeutralRecall:
+    """Prompt wording never decides whether Honcho recall runs."""
 
     @staticmethod
     def _make_provider():
@@ -778,35 +780,32 @@ class TestTrivialPromptHeuristic:
         mock_session = MagicMock()
         mock_session.messages = []
         mock_manager.get_or_create.return_value = mock_session
+        mock_manager.get_prefetch_context.return_value = None
+        mock_manager.pop_context_result.return_value = None
 
         with patch("plugins.memory.honcho.client.HonchoClientConfig.from_global_config", return_value=cfg), \
              patch("plugins.memory.honcho.client.get_honcho_client", return_value=MagicMock()), \
              patch("plugins.memory.honcho.session.HonchoSessionManager", return_value=mock_manager), \
              patch("hermes_constants.get_hermes_home", return_value=MagicMock()):
-            provider.initialize(session_id="test-session-trivial")
+            provider.initialize(session_id="test-session-prompt-neutral")
         _settle_prewarm(provider)
         return provider
 
-    def test_classifier_catches_common_trivial_forms(self):
-        for t in ("ok", "OK", " ok ", "y", "yes", "sure", "thanks", "lgtm", "/help", "", "   "):
-            assert HonchoMemoryProvider._is_trivial_prompt(t), f"expected trivial: {t!r}"
-
-
-    def test_prefetch_skips_on_trivial_prompt(self):
+    @pytest.mark.parametrize(
+        "query",
+        ("hi!", "thanks", "ok", "continue", "/help", "what changed in the deploy?"),
+    )
+    def test_prefetch_exposes_cached_base_for_every_query(self, query):
         provider = self._make_provider()
         provider._session_key = "test"
         provider._base_context_cache = "cached base"
         provider._last_dialectic_turn = 0
         provider._turn_count = 5
 
-        assert provider.prefetch("ok") == ""
-        assert provider.prefetch("/help") == ""
-        # Dialectic should not have fired
+        assert "cached base" in provider.prefetch(query)
         assert provider._manager.dialectic_query.call_count == 0
 
-
-    def test_trivial_prompt_injects_ready_pending_dialectic(self):
-        """A trivial turn consumes a ready result without starting new work."""
+    def test_acknowledgement_combines_ready_pending_dialectic(self):
         provider = self._make_provider()
         provider._session_key = "test"
         provider._base_context_cache = ""  # isolate the supplement path
@@ -825,9 +824,8 @@ class TestTrivialPromptHeuristic:
         with provider._prefetch_lock:
             assert provider._prefetch_result == ""
 
-    def test_trivial_prompt_discards_stale_pending_dialectic(self):
-        """A pending result older than cadence × multiplier must still be
-        discarded on a trivial turn — the fix must not resurrect stale content."""
+    def test_acknowledgement_discards_stale_pending_dialectic(self):
+        """Staleness remains an operational turn-age gate, not a text gate."""
         provider = self._make_provider()
         provider._session_key = "test"
         provider._base_context_cache = ""
@@ -843,6 +841,21 @@ class TestTrivialPromptHeuristic:
         assert injected == ""
         with provider._prefetch_lock:
             assert provider._prefetch_result == ""
+
+    @pytest.mark.parametrize("query", ("hi!", "thanks", "ok", "continue", "/help"))
+    def test_queue_prefetch_forwards_every_query_when_operationally_due(self, query):
+        provider = self._make_provider()
+        provider._session_key = "test"
+        provider._turn_count = 5
+        provider._last_context_turn = 0
+        provider._last_dialectic_turn = 0
+        provider._manager.dialectic_query.return_value = ""
+
+        provider.queue_prefetch(query)
+        if provider._prefetch_thread:
+            provider._prefetch_thread.join(timeout=2.0)
+
+        provider._manager.prefetch_context.assert_called_once_with("test", query)
 
 
 class TestDialecticCadenceAdvancesOnSuccess:
@@ -1041,8 +1054,7 @@ class TestDialecticLiveness:
 
 class TestDialecticLifecycleSmoke:
     """End-to-end smoke walking a multi-turn session through prewarm,
-    turn 1 consume, trivial skip, cadence fire, empty-result retry,
-    heuristic bump, and session-end flush."""
+    prompt-neutral cadence, empty-result retry, and session-end flush."""
 
     @staticmethod
     def _make_provider(cfg_extra=None):
@@ -1088,9 +1100,8 @@ class TestDialecticLifecycleSmoke:
         """Walks init → turns 1..8 → session end. Asserts at every step that
         the plugin did exactly what it should and nothing more.
 
-        Uses dialecticCadence=3 so we can exercise skip-turns between fires
-        and the silent-failure retry path without their gates tripping each
-        other. Trivial + slash skips apply independent of cadence.
+        Uses dialecticCadence=3 so acknowledgements and slash-shaped text
+        exercise the same cadence and retry rules as every other query.
         """
         from unittest.mock import patch, MagicMock
         provider, mgr, cfg = self._make_provider(
@@ -1101,9 +1112,9 @@ class TestDialecticLifecycleSmoke:
         # An extra or missing call fails the test — strong smoke signal.
         responses = iter([
             "prewarm: user is eri, works on hermes",      # session-start prewarm
-            "cadence fire: long query synthesis",         # turn 4 queue_prefetch
-            "",                                           # turn 7 fire: silent failure
-            "retry success: fresh synthesis",             # turn 8 queue_prefetch retry
+            "cadence fire: slash query synthesis",        # turn 3 queue_prefetch
+            "",                                           # turn 6 fire: silent failure
+            "retry success: fresh synthesis",             # turn 7 queue_prefetch retry
         ])
         mgr.dialectic_query.side_effect = lambda *a, **kw: next(responses)
 
@@ -1131,57 +1142,49 @@ class TestDialecticLifecycleSmoke:
         assert mgr.dialectic_query.call_count == 1, \
             "turn 1 must not fire — prewarm covered it and cadence skips"
 
-        # ---- turn 2: trivial 'ok' → skip everything ----
-        mgr.prefetch_context.reset_mock()
+        # ---- turn 2: acknowledgement obeys cadence, not text routing ----
         provider.on_turn_start(2, "ok")
-        assert provider.prefetch("ok") == "", "trivial prompt must short-circuit injection"
+        provider.prefetch("ok")
         provider.sync_turn("ok", "cool")
         provider.queue_prefetch("ok")
         self._await_thread(provider)
-        assert mgr.dialectic_query.call_count == 1, "trivial must not fire dialectic"
-        assert mgr.prefetch_context.call_count == 0, "trivial must not fire context refresh"
+        assert mgr.dialectic_query.call_count == 1, "turn 2 remains inside cadence"
 
-        # ---- turn 3: slash '/help' → also skip ----
+        # ---- turn 3: slash-shaped text reaches the due cadence fire ----
         provider.on_turn_start(3, "/help")
-        assert provider.prefetch("/help") == ""
+        provider.prefetch("/help")
         provider.queue_prefetch("/help")
-        assert mgr.dialectic_query.call_count == 1
+        self._await_thread(provider)
+        assert mgr.dialectic_query.call_count == 2, "turn 3 cadence fire"
+        assert provider._last_dialectic_turn == 3
 
-        # ---- turn 4: long query → cadence fires + heuristic bumps ----
+        # ---- turns 4–5: ordinary cadence cooldown ----
         long_q = "walk me through " + ("x " * 100)  # ~200 chars → heuristic +1
         provider.on_turn_start(4, long_q)
         provider.prefetch(long_q)
         provider.sync_turn(long_q, "sure")
-        provider.queue_prefetch(long_q)  # (4-0)≥3 → fires
+        provider.queue_prefetch(long_q)
         self._await_thread(provider)
-        assert mgr.dialectic_query.call_count == 2, "turn 4 cadence fire"
-        _, kwargs = mgr.dialectic_query.call_args
-        assert kwargs.get("reasoning_level") in {"medium", "high"}, \
-            f"long query must bump reasoning level above 'low'; got {kwargs.get('reasoning_level')}"
-        assert provider._last_dialectic_turn == 4, "cadence tracker advances on success"
-
-        # ---- turns 5–6: cadence cooldown, no fires ----
-        for t in (5, 6):
-            provider.on_turn_start(t, "tell me more")
-            provider.queue_prefetch("tell me more")
-            self._await_thread(provider)
-        assert mgr.dialectic_query.call_count == 2, "turns 5–6 blocked by cadence window"
-
-        # ---- turn 7: fires but silent failure (empty dialectic) ----
-        provider.on_turn_start(7, "and then what")
-        provider.queue_prefetch("and then what")  # (7-4)≥3 → fires
+        provider.on_turn_start(5, "tell me more")
+        provider.queue_prefetch("tell me more")
         self._await_thread(provider)
-        assert mgr.dialectic_query.call_count == 3, "turn 7 fires"
-        assert provider._last_dialectic_turn == 4, \
+        assert mgr.dialectic_query.call_count == 2, "turns 4–5 are inside cadence"
+
+        # ---- turn 6: fires but silent failure (empty dialectic) ----
+        provider.on_turn_start(6, "and then what")
+        provider.queue_prefetch("and then what")  # (6-3)≥3 → fires
+        self._await_thread(provider)
+        assert mgr.dialectic_query.call_count == 3, "turn 6 fires"
+        assert provider._last_dialectic_turn == 3, \
             "silent failure must NOT burn the cadence window"
 
-        # ---- turn 8: retries because cadence didn't advance ----
-        provider.on_turn_start(8, "try again")
-        provider.queue_prefetch("try again")  # (8-4)≥3 → fires again
+        # ---- turn 7: retries because cadence didn't advance ----
+        provider.on_turn_start(7, "try again")
+        provider.queue_prefetch("try again")  # effective cadence is now 4
         self._await_thread(provider)
         assert mgr.dialectic_query.call_count == 4, \
-            "turn 8 retries because turn 7's empty result didn't advance cadence"
-        assert provider._last_dialectic_turn == 8, "retry success advances"
+            "turn 7 retries because turn 6's empty result didn't advance cadence"
+        assert provider._last_dialectic_turn == 7, "retry success advances"
 
         # ---- session end: flush messages ----
         provider.on_session_end([])
@@ -1310,4 +1313,3 @@ class TestGetSessionContextFallback:
         peer_id, target = fetch_calls[0]
         assert peer_id == "user-peer"
         assert target == "user-peer"
-

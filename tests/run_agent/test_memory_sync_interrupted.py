@@ -57,9 +57,28 @@ class TestSyncExternalMemoryForTurn:
 
     # --- Normal completed turn still syncs ------------------------------
 
+    @pytest.mark.parametrize(
+        "query",
+        ("hi!", "thanks", "ok", "continue", "/help", "what changed in the deploy?"),
+    )
+    def test_completed_turn_always_syncs_and_warms_recall(self, query):
+        agent = _bare_agent()
 
+        agent._sync_external_memory_for_turn(
+            original_user_message=query,
+            final_response="Completed response",
+            interrupted=False,
+        )
 
-
+        agent._memory_manager.sync_all.assert_called_once_with(
+            query,
+            "Completed response",
+            session_id="test_session_001",
+        )
+        agent._memory_manager.queue_prefetch_all.assert_called_once_with(
+            query,
+            session_id="test_session_001",
+        )
     # --- Edge cases (pre-existing behaviour preserved) ------------------
 
 
@@ -75,4 +94,3 @@ class TestSyncExternalMemoryForTurn:
 
 
     # --- The specific matrix the reporter asked about ------------------
-

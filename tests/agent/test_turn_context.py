@@ -304,6 +304,30 @@ def test_nonisolated_turn_does_not_depend_on_lineage_database_read():
     agent._session_db.get_session.assert_not_called()
 
 
+def _agent_with_memory_manager():
+    agent = _FakeAgent()
+    mm = MagicMock()
+    mm.prefetch_all.return_value = "REMEMBERED CONTEXT"
+    agent._memory_manager = mm
+    return agent, mm
+
+
+@pytest.mark.parametrize(
+    "query",
+    ("hi!", "thanks", "ok", "continue", "/help", "what changed in the deploy?"),
+)
+def test_prefetch_and_model_facing_injection_are_semantically_neutral(query):
+    agent, mm = _agent_with_memory_manager()
+    ctx = _build(agent, user_message=query)
+
+    mm.prefetch_all.assert_called_once_with(query)
+    assert ctx.ext_prefetch_cache == "REMEMBERED CONTEXT"
+    turn_message = ctx.messages[ctx.current_turn_user_idx]
+    assert turn_message["content"] == query
+    assert turn_message["api_content"].startswith(f"{query}\n\n<memory-context>")
+    assert "REMEMBERED CONTEXT" in turn_message["api_content"]
+
+
 def test_turn_start_replaces_stale_parent_history_with_compression_child():
     agent = _FakeAgent()
     stale_history = [{"role": "user", "content": "stale parent"}]
