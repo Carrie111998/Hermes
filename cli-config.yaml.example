@@ -195,6 +195,21 @@ model:
 #   response_cache_ttl: 300      # Cache TTL in seconds, 1-86400 (default: 300)
 
 # =============================================================================
+# OpenRouter Full Catalog (BYOK)
+# =============================================================================
+# The model picker shows a curated OpenRouter list — the agentic models Hermes
+# recommends, not the raw /models dump. If you bring your own OpenRouter key and
+# run models the curated list has no opinion about, this shows every
+# tool-calling model OpenRouter serves instead.
+#
+# Curated entries still come first, in their curated order; the rest follow.
+# Models that don't advertise tool calling (TTS, image, rerankers) stay hidden
+# either way — Hermes can't drive them.
+#
+# openrouter:
+#   show_all_models: true        # Default: false (curated list only)
+
+# =============================================================================
 # Git Worktree Isolation
 # =============================================================================
 # When enabled, each CLI session creates an isolated git worktree so multiple

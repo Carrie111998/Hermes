@@ -778,6 +778,13 @@ DEFAULT_CONFIG = {
         "response_cache": True,
         "response_cache_ttl": 300,
         "min_coding_score": 0.65,
+        # Show every tool-calling model OpenRouter serves in the picker instead
+        # of the curated list. Off by default: the curated list is a deliberate
+        # recommendation, and BYOK users who want the rest should have to ask.
+        # The tool-calling filter still applies either way, so this never
+        # surfaces the TTS, image and reranker models the curation exists to
+        # keep out.
+        "show_all_models": False,
     },
 
     # AWS Bedrock provider configuration.

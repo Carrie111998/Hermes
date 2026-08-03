@@ -483,3 +483,99 @@ class TestFormatPricePerMtok:
     def test_one_cent_boundary_stays_two_decimals(self):
         from hermes_cli.models import _format_price_per_mtok
         assert _format_price_per_mtok("0.00000001") == "$0.01"
+
+
+class TestOpenRouterShowAllModels:
+    """`openrouter.show_all_models` lifts the curated ceiling for BYOK users (#76732).
+
+    The curated list exists so the picker recommends rather than dumps, and the
+    docs say so explicitly. A BYOK user pays OpenRouter directly and may run
+    models the list has no opinion about, so this is an opt-in that appends —
+    curation still leads the picker, and the tool-calling filter still keeps out
+    the TTS/image/reranker models curation exists to exclude.
+    """
+
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return (
+                b'{"data":['
+                b'{"id":"anthropic/claude-opus-4.6","pricing":{"prompt":"0.000015","completion":"0.000075"},'
+                b'"supported_parameters":["tools"]},'
+                b'{"id":"zzz/uncurated-tools","pricing":{"prompt":"0.000001","completion":"0.000002"},'
+                b'"supported_parameters":["tools"]},'
+                b'{"id":"aaa/uncurated-no-tools","pricing":{"prompt":"0.000001","completion":"0.000002"},'
+                b'"supported_parameters":["temperature"]}'
+                b']}'
+            )
+
+    def _fetch(self, monkeypatch, show_all: bool):
+        monkeypatch.setattr(_models_mod, "OPENROUTER_MODELS", [("anthropic/claude-opus-4.6", "")])
+        monkeypatch.setattr(_models_mod, "_openrouter_catalog_cache", None)
+        monkeypatch.setattr(_models_mod, "_openrouter_catalog_cache_show_all", None)
+        with (
+            patch("hermes_cli.model_catalog.get_curated_openrouter_models", return_value=[]),
+            patch("hermes_cli.models._urlopen_model_catalog_request", return_value=self._Resp()),
+            patch("hermes_cli.models.openrouter_show_all_models", return_value=show_all),
+        ):
+            return [mid for mid, _ in fetch_openrouter_models(force_refresh=True)]
+
+    def test_curated_only_by_default(self, monkeypatch):
+        ids = self._fetch(monkeypatch, show_all=False)
+
+        assert ids == ["anthropic/claude-opus-4.6"]
+
+    def test_show_all_appends_uncurated_tool_models(self, monkeypatch):
+        ids = self._fetch(monkeypatch, show_all=True)
+
+        # Curated entry still leads: enabling this must not demote the
+        # recommendation, only extend past it.
+        assert ids[0] == "anthropic/claude-opus-4.6"
+        assert "zzz/uncurated-tools" in ids
+
+    def test_show_all_still_hides_models_without_tool_calling(self, monkeypatch):
+        ids = self._fetch(monkeypatch, show_all=True)
+
+        # The reason the curated list exists is to keep TTS/image/reranker
+        # models out of an agent picker. Opting into the full catalog must not
+        # opt out of that.
+        assert "aaa/uncurated-no-tools" not in ids
+
+    def test_cache_does_not_leak_between_modes(self, monkeypatch):
+        """A cached curated list must not be served to a show-all caller.
+
+        Both modes answer the same function, so a cache that only remembers
+        "we fetched once" would make the setting look inert until restart.
+        """
+        curated = self._fetch(monkeypatch, show_all=False)
+        # Deliberately no cache reset here: only the mode changes.
+        monkeypatch.setattr(_models_mod, "OPENROUTER_MODELS", [("anthropic/claude-opus-4.6", "")])
+        with (
+            patch("hermes_cli.model_catalog.get_curated_openrouter_models", return_value=[]),
+            patch("hermes_cli.models._urlopen_model_catalog_request", return_value=self._Resp()),
+            patch("hermes_cli.models.openrouter_show_all_models", return_value=True),
+        ):
+            expanded = [mid for mid, _ in fetch_openrouter_models()]
+
+        assert "zzz/uncurated-tools" not in curated
+        assert "zzz/uncurated-tools" in expanded
+
+
+class TestOpenRouterShowAllModelsSetting:
+    def test_defaults_to_false_when_unset(self):
+        with patch("hermes_cli.config.load_config", return_value={}):
+            assert _models_mod.openrouter_show_all_models() is False
+
+    def test_reads_the_flag(self):
+        with patch("hermes_cli.config.load_config", return_value={"openrouter": {"show_all_models": True}}):
+            assert _models_mod.openrouter_show_all_models() is True
+
+    def test_unreadable_config_keeps_the_curated_list(self):
+        """An unreadable config must never silently change which models a user sees."""
+        with patch("hermes_cli.config.load_config", side_effect=OSError("boom")):
+            assert _models_mod.openrouter_show_all_models() is False

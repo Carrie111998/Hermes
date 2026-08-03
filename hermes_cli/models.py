@@ -101,6 +101,10 @@ OPENROUTER_MODELS: list[tuple[str, str]] = [
 ]
 
 _openrouter_catalog_cache: list[tuple[str, str]] | None = None
+# Which mode built the cache above. The curated and show-all lists are
+# different answers to the same call, so the cache has to remember which one it
+# holds or a config change is invisible until the process restarts.
+_openrouter_catalog_cache_show_all: bool | None = None
 
 
 # Fallback Vercel AI Gateway snapshot used when the live catalog is unavailable.
@@ -1494,15 +1498,45 @@ def _openrouter_model_supports_tools(item: Any) -> bool:
     return "tools" in params
 
 
+def openrouter_show_all_models() -> bool:
+    """Should the picker list every tool-calling model OpenRouter serves?
+
+    ``openrouter.show_all_models`` exists for BYOK users, who pay OpenRouter
+    directly and may have models configured that the curated list has no
+    opinion about (#76732). Off by default, so the curated recommendation stays
+    the default experience and this stays an explicit opt-in.
+    """
+    try:
+        from hermes_cli.config import load_config
+        openrouter_cfg = load_config().get("openrouter", {})
+        if isinstance(openrouter_cfg, dict):
+            return bool(openrouter_cfg.get("show_all_models", False))
+    except Exception:
+        # An unreadable config must not change which models a user sees.
+        pass
+    return False
+
+
 def fetch_openrouter_models(
     timeout: float = 8.0,
     *,
     force_refresh: bool = False,
 ) -> list[tuple[str, str]]:
-    """Return the curated OpenRouter picker list, refreshed from the live catalog when possible."""
-    global _openrouter_catalog_cache
+    """Return the OpenRouter picker list, refreshed from the live catalog when possible.
 
-    if _openrouter_catalog_cache is not None and not force_refresh:
+    Curated by default. With ``openrouter.show_all_models`` the curated entries
+    still come first, in their curated order, and every other tool-calling model
+    follows — the recommendation is preserved, the ceiling is removed.
+    """
+    global _openrouter_catalog_cache, _openrouter_catalog_cache_show_all
+
+    show_all = openrouter_show_all_models()
+
+    if (
+        _openrouter_catalog_cache is not None
+        and _openrouter_catalog_cache_show_all == show_all
+        and not force_refresh
+    ):
         return list(_openrouter_catalog_cache)
 
     # Prefer the remotely-hosted catalog manifest; fall back to the in-repo
@@ -1540,9 +1574,17 @@ def fetch_openrouter_models(
             continue
         live_by_id[mid] = item
 
+    selected_ids = preferred_ids
+    if show_all:
+        # Curated first, in curated order, then everything else alphabetically.
+        # Appending rather than replacing keeps the recommendation intact: the
+        # models Hermes actually endorses still lead the picker.
+        already = set(preferred_ids)
+        selected_ids = preferred_ids + sorted(mid for mid in live_by_id if mid not in already)
+
     curated: list[tuple[str, str]] = []
     silent_default = get_preferred_silent_default_model("openrouter")
-    for preferred_id in preferred_ids:
+    for preferred_id in selected_ids:
         live_item = live_by_id.get(preferred_id)
         if live_item is None:
             continue
@@ -1566,6 +1608,7 @@ def fetch_openrouter_models(
     if not first_desc:
         curated[0] = (first_id, "recommended")
     _openrouter_catalog_cache = curated
+    _openrouter_catalog_cache_show_all = show_all
     return list(curated)
 
 
