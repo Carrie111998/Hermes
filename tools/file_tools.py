@@ -1208,6 +1208,8 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
                     "docker_forward_env": config.get("docker_forward_env", []),
                     "docker_run_as_host_user": config.get("docker_run_as_host_user", False),
                     "docker_network": config.get("docker_network", True),
+                    "docker_persist_across_processes": config.get("docker_persist_across_processes", True),
+                    "docker_orphan_reaper": config.get("docker_orphan_reaper", True),
                 }
 
             ssh_config = None
