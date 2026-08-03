@@ -908,16 +908,39 @@ def _bash_starts(bash: str) -> bool:
         return cached
 
     try:
-        result = subprocess.run(
+        proc = subprocess.Popen(
             [bash, "--noprofile", "--norc", "-c", _BASH_EXTERNAL_PROGRAM_PROBE],
-            capture_output=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True, encoding="utf-8", errors="replace",
-            timeout=15,
             creationflags=windows_hide_flags() if _IS_WINDOWS else 0,
         )
-        ok = result.returncode == 0
+        try:
+            stdout, stderr = proc.communicate(timeout=15)
+        except subprocess.TimeoutExpired:
+            # Kill the WHOLE tree, not just the direct child. On Windows an
+            # MSYS bash that hangs in its external-program spawn leaves
+            # orphaned grandchild processes holding the stdout pipe, so
+            # subprocess.run's unbounded cleanup communicate() would block
+            # forever (observed: ACP adapter tools stall indefinitely).
+            # Use taskkill /T /F and only bounded post-kill reads.
+            try:
+                if _IS_WINDOWS:
+                    subprocess.run(
+                        ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                        capture_output=True, timeout=15,
+                    )
+                proc.kill()
+            except Exception:
+                pass
+            try:
+                stdout, stderr = proc.communicate(timeout=5)
+            except Exception:
+                stdout = stderr = ""
+        ok = proc.returncode == 0
         if not ok:
-            combined = f"{result.stdout or ''}{result.stderr or ''}"
+            combined = f"{stdout or ''}{stderr or ''}"
             _bash_probe_details_cache[bash] = combined.strip()[:2000]
             logger.debug("bash probe failed for %s: %s", bash, combined.strip()[:200])
     except Exception as exc:
