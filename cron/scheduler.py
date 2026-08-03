@@ -2274,20 +2274,32 @@ def _run_job_script(
     # choice explicit here keeps the allowed surface small and auditable.
     suffix = path.suffix.lower()
     if suffix in {".sh", ".bash"}:
-        # Resolve bash dynamically so Windows (Git Bash) and Linux/macOS
-        # all work.  On native Windows without Git for Windows installed
-        # shutil.which returns None — fall back to a clear error rather
-        # than a FileNotFoundError with a confusing "[WinError 2]"
-        # traceback.
-        _bash = shutil.which("bash") or (
-            "/bin/bash" if os.path.isfile("/bin/bash") else None
-        )
+        # Resolve bash through the shared, Windows-aware resolver
+        # (tools/environments/local._find_bash: Hermes portable Git →
+        # Git for Windows install dirs → PATH lookup with a start probe),
+        # so cron .sh jobs never pick the System32 WSL launcher when Git
+        # Bash exists.  On native Windows with no usable bash the resolver
+        # raises — surface the actionable error rather than a confusing
+        # "[WinError 2]" traceback (or a WSL stub that exits 1).
+        try:
+            from tools.environments.local import _find_bash
+
+            _bash = _find_bash()
+        except RuntimeError:
+            # Windows with no Git Bash installed — the WSL launcher is the
+            # only "bash" on PATH and cannot start; fall through to the
+            # clear error below instead of spawning it.
+            _bash = None
+        except Exception:
+            _bash = shutil.which("bash") or (
+                "/bin/bash" if os.path.isfile("/bin/bash") else None
+            )
         if _bash is None:
             return False, (
-                f"Cannot run .sh/.bash script {path.name!r}: bash not found on PATH. "
+                f"Cannot run .sh/.bash script {path.name!r}: bash not found. "
                 "On Windows, install Git for Windows (which ships Git Bash) "
                 "or rewrite the script as Python (.py)."
-        )
+            )
         argv = [_bash, str(path)]
         env_overlay: dict[str, str] = {}
     else:
