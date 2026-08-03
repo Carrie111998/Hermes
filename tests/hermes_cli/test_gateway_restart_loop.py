@@ -746,6 +746,89 @@ class TestLifecycleGuardModule:
         with pytest.raises(GatewayLifecycleBlocked):
             check_gateway_lifecycle("daily ops", str(script))
 
+    def test_absolute_path_binary_is_not_read_as_script(self, monkeypatch):
+        """#77931: absolute-path binaries (/bin/echo, /usr/bin/date) must be
+        executed directly, never opened/read as referenced shell scripts.
+
+        Before the fix, ANY executable containing '/' was yielded by
+        _iter_referenced_shell_scripts and read via _read_referenced_script —
+        opening multi-MB ELF binaries and re-tokenizing their decoded bytes,
+        which hangs cron/oneshot subprocesses. The guard must not touch the
+        file at all for bare binary paths.
+        """
+        import cron.lifecycle_guard as lg
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        def _fail_read(path):
+            raise AssertionError(f"guard must not read {path} as a script")
+
+        monkeypatch.setattr(lg, "_read_referenced_script", _fail_read)
+        for command in (
+            "/bin/echo hi",
+            "/usr/bin/date",
+            "/usr/bin/whoami",
+            "/home/linuxbrew/.linuxbrew/bin/gws --version",
+        ):
+            assert (
+                contains_gateway_lifecycle_command_or_referenced_script(command)
+                is False
+            ), command
+
+    def test_cron_prompt_with_absolute_path_binary_passes_guard(self, monkeypatch):
+        """#77931: a cron prompt instructing an absolute-path binary (the
+        exact `hermes chat -Q --source cron` repro) must pass the lifecycle
+        guard without reading the binary."""
+        import cron.lifecycle_guard as lg
+        from cron.lifecycle_guard import check_gateway_lifecycle
+
+        def _fail_read(path):
+            raise AssertionError(f"guard must not read {path} as a script")
+
+        monkeypatch.setattr(lg, "_read_referenced_script", _fail_read)
+        # No exception == job creation is allowed.
+        check_gateway_lifecycle("use terminal to execute /bin/echo hi")
+        check_gateway_lifecycle("run /usr/bin/date and report the output")
+
+    def test_absolute_path_shell_script_still_scanned(self, tmp_path):
+        """#77931: dropping the catch-all '/' branch must NOT weaken the
+        guard for real scripts — an absolute-path .sh script executed
+        directly is still read and its lifecycle command blocked."""
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+        script = tmp_path / "evil.sh"
+        script.write_text("#!/bin/bash\nhermes gateway restart\n")
+        assert (
+            contains_gateway_lifecycle_command_or_referenced_script(
+                f"{script} --flag"
+            )
+            is True
+        )
+
+    def test_extensionless_script_only_scanned_via_shell(self, tmp_path):
+        """#77931: extension-less files are still scanned when invoked
+        through a shell (`bash script`), but executed directly by absolute
+        path they are treated as plain executables and not read."""
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+        script = tmp_path / "deploy"  # no shell-script suffix
+        script.write_text("#!/bin/bash\nhermes gateway stop\n")
+        assert (
+            contains_gateway_lifecycle_command_or_referenced_script(
+                f"bash {script}"
+            )
+            is True
+        )
+        assert (
+            contains_gateway_lifecycle_command_or_referenced_script(
+                f"{script} --prod"
+            )
+            is False
+        )
+
 
 # ---------------------------------------------------------------------------
 # Defense 2 (chokepoint): cron.jobs.create_job blocks the AGENT model-tool path
@@ -863,6 +946,71 @@ class TestTerminalToolGatewayLifecycleGuardRemote:
         assert result["exit_code"] == 1
         assert "referenced script" in result["error"]
         assert any("cat" in c for c in calls)
+
+    def test_remote_binary_read_skipped_via_nul_check(self, monkeypatch, tmp_path):
+        """#77931: the remote `cat` fallback must not feed binary content
+        (NUL bytes) into the referenced-script recursion. A binary path
+        passed to a shell passes the guard unread and executes normally —
+        decoded machine code must never be scanned, even when the bytes
+        happen to embed a lifecycle-looking string."""
+        import tools.terminal_tool as tt
+
+        calls = []
+        script = "/remote/workspace/tool"  # binary exists only on the backend
+
+        class _RemoteEnv:
+            env = {}
+            cwd = str(tmp_path)
+
+            def execute(self, command, **kwargs):
+                calls.append(command)
+                if "cat" in command:
+                    # NUL-bearing binary content — must be treated as
+                    # "nothing to scan", not decoded into the recursion.
+                    return {
+                        "output": "\x00\x00\x7fELF hermes gateway restart\n",
+                        "returncode": 0,
+                    }
+                return {"output": "ran", "returncode": 0}
+
+        self._patch_env(monkeypatch, _RemoteEnv(), inside_gateway=True)
+        monkeypatch.setattr(
+            tt, "_check_all_guards", lambda cmd, env, **kwargs: {"approved": True}
+        )
+
+        result = json.loads(tt.terminal_tool(command=f"/bin/bash {script}"))
+
+        assert result["exit_code"] == 0
+        assert any("cat" in c for c in calls)
+
+    def test_local_binary_referenced_via_shell_not_scanned(
+        self, monkeypatch, tmp_path
+    ):
+        """#77931: `bash <binary>` in a gateway session must not decode the
+        binary as script text in the local fallback read either — a
+        NUL-bearing file with an embedded lifecycle-looking string passes
+        through unblocked because it is a binary, not a shell script."""
+        import tools.terminal_tool as tt
+
+        binary = tmp_path / "helper"  # extension-less, binary content
+        binary.write_bytes(b"\x7fELF\x00\x00\x00 hermes gateway restart\x00\x00")
+        calls = []
+
+        class _FakeEnv:
+            env = {}
+
+            def execute(self, command, **kwargs):
+                calls.append(command)
+                return {"output": "", "returncode": 0}
+
+        self._patch_env(monkeypatch, _FakeEnv(), inside_gateway=True)
+        monkeypatch.setattr(
+            tt, "_check_all_guards", lambda cmd, env, **kwargs: {"approved": True}
+        )
+
+        result = json.loads(tt.terminal_tool(command=f"/bin/bash {binary}"))
+
+        assert result["exit_code"] == 0
 
 
 class TestCronCreateLifecycleBlockExtra:

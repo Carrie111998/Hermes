@@ -2545,13 +2545,13 @@ def terminal_tool(
                         if stat.S_ISREG(metadata.st_mode) and metadata.st_size <= 1024 * 1024:
                             data = local_path.read_bytes()
                             if len(data) <= 1024 * 1024:
+                                # Binary content (NUL bytes) is not script
+                                # text: decoding it and feeding it to the
+                                # referenced-script recursion re-tokenizes
+                                # machine code and can hang the guard
+                                # (#76762/#77931). Mirror the skip in
+                                # cron.lifecycle_guard._read_referenced_script.
                                 if b"\x00" in data:
-                                    # Binary (ELF/Mach-O/PE), not a shell script:
-                                    # feeding its decoded bytes back into the guard
-                                    # tokenizes machine code into bogus NUL-bearing
-                                    # paths and crashes the scanner (#77703). Mirror
-                                    # lifecycle_guard._read_referenced_script and
-                                    # treat it as nothing to scan.
                                     return None
                                 return data.decode("utf-8", errors="replace")
                 except Exception:
@@ -2561,9 +2561,10 @@ def terminal_tool(
                     result = env.execute(f"cat {shlex.quote(script_path)}")
                     if result.get("returncode", -1) == 0:
                         output = result.get("output", "")
-                        if output and "\x00" in output:
-                            # Binary content from a remote `cat`: skip for the
-                            # same reason as the local branch above (#77703).
+                        # Same binary guard as the local read: a remote
+                        # `cat` of a binary must not feed decoded machine
+                        # code into the referenced-script recursion.
+                        if "\x00" in output:
                             return None
                         return output
                 except Exception:

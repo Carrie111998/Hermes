@@ -219,14 +219,20 @@ def _iter_referenced_shell_scripts(
                 yield _resolve_terminal_script_path(arguments[arg_index], cwd)
             continue
 
-        # A bare "/" token is pathlib's division operator in Python sources
-        # (e.g. `Path.home() / ".hermes"`), not an executable reference.
-        # Resolving it walks to the filesystem root and fails the
-        # regular-file check below, hard-blocking innocent .py scripts
-        # (#77131). Skip pure-separator tokens.
-        if executable.strip("/"):
-            if "/" in executable or executable.endswith((".sh", ".bash", ".zsh")):
-                yield _resolve_terminal_script_path(executable, cwd)
+        # Only EXPLICIT script references are scanned. An executable path is
+        # treated as a referenced script only when its name carries a shell
+        # script suffix; anything else path-shaped (`/bin/echo`, `/usr/bin/
+        # date`, a bare relative name resolved via PATH) is executed directly
+        # by the kernel and is never parsed as script text. Treating every
+        # path-containing executable as a script made the guard open and read
+        # arbitrary binaries (multi-MB ELF decoded as text and re-tokenized
+        # for recursion), which hangs cron/oneshot subprocesses (#77931).
+        # `source`/`.`, shell invocation (`bash script`) and `-c` payloads
+        # are handled above, so lifecycle commands inside real scripts are
+        # still caught. A bare "/" token (pathlib's division operator in
+        # Python sources, #77131) carries no suffix and is skipped here too.
+        if executable.endswith((".sh", ".bash", ".zsh")):
+            yield _resolve_terminal_script_path(executable, cwd)
 
 
 def _iter_shell_command_payloads(command: str) -> Iterator[str]:
