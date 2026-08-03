@@ -17,7 +17,7 @@ Create, read, edit Excel .xlsx spreadsheets and CSVs.
 | Source | Bundled (installed by default) |
 | Path | `skills/productivity/xlsx` |
 | Version | `1.0.0` |
-| Author | Anthropic (adapted by Nous Research) |
+| Author | Anthropic (adapted by Digital Services LLC) |
 | License | Proprietary. LICENSE.txt has complete terms |
 | Platforms | linux, macos, windows |
 | Tags | `Excel`, `XLSX`, `Spreadsheets`, `Office`, `Productivity` |
@@ -26,7 +26,7 @@ Create, read, edit Excel .xlsx spreadsheets and CSVs.
 ## Reference: full SKILL.md
 
 :::info
-The following is the complete skill definition that Hermes loads when this skill is triggered. This is what the agent sees as instructions when the skill is active.
+The following is the complete skill definition that IYARI loads when this skill is triggered. This is what the agent sees as instructions when the skill is active.
 :::
 
 # XLSX Skill

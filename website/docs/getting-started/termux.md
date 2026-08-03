@@ -87,7 +87,7 @@ Why these packages?
 ### 2. Clone IYARI
 
 ```bash
-git clone https://github.com/NousResearch/hermes-agent.git
+git clone https://github.com/digital-services-llc/iyari.git
 cd hermes-agent
 ```
 

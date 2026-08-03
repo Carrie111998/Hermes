@@ -20,6 +20,12 @@ Hermes/Nous Research → IYARI/Digital Services LLC, **SALVO** lo funcional/lega
 La doc refleja el producto final IYARI aunque el código `.py` heredado siga en
 "Hermes Agent"/"Nous Research" (el código es un grupo futuro, no GRUPO 5).
 
+**Ver [`REBRAND-EXCEPTIONS.md`](./REBRAND-EXCEPTIONS.md)** para la lista textual
+completa de qué "Nous Research" se convierte siempre, qué se preserva siempre, y
+el texto exacto aprobado para cada reemplazo de enlace de Discord/comunidad —
+esto vivía solo en mensajes de commit pasados y hay que consultarlo (no
+regrepear el historial) antes de cada sync con upstream.
+
 ## Las 5 reglas del transformador (`scripts/iyari_transform.py`)
 
 Se aplican **en este orden**:
@@ -38,6 +44,189 @@ Uso:
 ```
 python3 scripts/iyari_transform.py --dry  <archivos>   # pasada en seco (diff)
 python3 scripts/iyari_transform.py        <archivos>   # aplica in-place
+```
+
+## Proceso fijo de sync con upstream (cadencia semanal)
+
+Aprendido en el sync de 2026-07 (13 días de divergencia, 3663 commits, y un bug
+real de `--skip-nous-research` que convirtió atribuciones factuales por error).
+Estos tres puntos son parte del proceso, no "cosas que se hicieron una vez":
+
+**1. Cadencia semanal, no bisemanal.** El solapamiento entre nuestros cambios y
+los de upstream no baja porque pase menos tiempo en el calendario — baja porque
+el diff se mantiene chico. Sync semanal fuerza eso; esperar dos semanas repite
+el evento de 2026-07 cíclicamente. `scripts/check-upstream-drift.sh` hace
+`git fetch upstream` (solo lectura, no mergea ni comitea nada) y reporta
+commits/archivos de diferencia — úsalo para decidir si toca sync, no para
+ejecutarlo automáticamente. La decisión de sincronizar y las decisiones de
+marca/código solapado siguen necesitando el OK explícito del usuario cada vez
+(ver `[[iyari-flujo-trabajo-usuario]]` en memoria) — lo único que se automatiza
+aquí es el aviso y el diagnóstico, nunca el merge.
+
+**2. `REBRAND-EXCEPTIONS.md` es la fuente de verdad, no la sesión de Claude.**
+Antes de reconstruir "qué se convierte" o "qué texto exacto se usó para X" desde
+`git log`/`git show`, leer ese archivo. Si un sync encuentra un caso nuevo no
+cubierto ahí, añadirlo (no dejarlo solo en el mensaje de commit).
+
+**3. Auditoría de marca de árbol completo como gate obligatorio, no informe
+opcional.** `scripts/audit-brand-residue.sh` corre el grep de marca sobre TODO
+el repo (no solo `website/docs/`) y compara contra
+`scripts/brand-audit-baseline.txt` — solo falla (exit 1) si aparece algo NUEVO
+no clasificado, así que escala con el tamaño del cambio real, no con el tamaño
+del repo. Correr **antes de cualquier commit** del sync (después del checkout
+automático de archivos no-solapados Y después del trabajo manual de marca).
+Si falla: clasificar cada hit nuevo en `REBRAND-EXCEPTIONS.md` (convertir, o
+documentar como preservado/deuda de código diferida) y correr
+`--update-baseline` para aceptarlo — nunca comitear con hits sin clasificar.
+Este gate fue precisamente lo que faltó cuando `hermes_cli/_startup_fast.py`
+se coló sin rebrandear dentro del lote "seguro" de 4723 archivos.
+
+**4. Test de regresión del propio script de rebranding, antes de correrlo en
+masa.** `scripts/test_iyari_transform.sh` valida con fixtures que
+`apply-iyari-rebrand.sh` preserva "Nous Research" (factual/autoría/Discord) y
+convierte "Hermes Agent" — y que el flag `--skip-nous-research` realmente tiene
+efecto (para que el test no sea vacuo). Corre en segundos; si falla, es
+exactamente la regresión de 2026-07 (el script corriendo sin el flag) antes de
+que toque cientos de archivos reales, no después.
+
+**Peligro conocido: NUNCA correr `hermes update` (sin `--check`) dentro de este
+checkout.** El 2026-08-03, durante este mismo sync, algo invocó el `hermes
+update` real (no `--check`) usando el `.venv` de este repo — como es una
+instalación editable (`pip install -e .`), `PROJECT_ROOT` resuelve exactamente
+a `~/iyari`, así que el autostash + cambio de rama + reset de `hermes update`
+operó sobre el propio checkout de trabajo, escondiendo ~350 archivos sin
+comitear en un `git stash` sin que nadie lo pidiera (recuperado sin pérdida de
+datos, pero costó una investigación forense completa). No se encontró cron ni
+launchd agent recurrente causándolo — probablemente una invocación puntual, no
+un job programado — pero el riesgo mecánico sigue ahí para cualquier sesión
+futura que toque este código. `hermes update --check` es de solo lectura y
+seguro; `hermes update` a secas (o cualquier test que lo invoque sin mockear
+subprocess) NO lo es en este checkout. Si hace falta probar la lógica de
+update, usar un clon/fixture temporal, nunca este directorio.
+
+**⚠️ PENDIENTE, NO RESUELTO:** esto de arriba es solo una advertencia en texto,
+no una guarda real — exactamente el tipo de cosa que ya demostró hoy no bastar
+por sí sola (algo disparó `hermes update` sin que nadie lo pidiera, presumible-
+mente sin haber leído este archivo antes). Falta un obstáculo mecánico real:
+opción A) una guarda en el propio `hermes update` que aborte si detecta que
+`PROJECT_ROOT` es un checkout de desarrollo (p.ej. vía una env var tipo
+`HERMES_DEV_CHECKOUT=1`); opción B) quitar/renombrar temporalmente el
+entrypoint `hermes` del PATH mientras dure un sync activo. Ninguna de las dos
+está implementada — próxima sesión que toque este código, hacerlo antes de
+asumir que el riesgo ya quedó cerrado.
+
+**⚠️ PENDIENTE, NO RESUELTO (tests): de los 98 tests que fallan en la suite
+completa (`./scripts/run_tests.sh`, aislamiento por archivo, 34 archivos),
+solo 10 están arreglados y confirmados en verde** (`test_i18n.py`,
+`test_prompt_builder.py` [reconciliación real: le faltaba el monkeypatch de
+`load_config_readonly` que upstream sí tiene, tenía tests propios de guardas
+de inyección que upstream no tiene — nunca se clasificó como real_overlap en
+Bloque A], `test_startup_fast_guards.py`, `test_packaging_build_guard.py`
+[ambos: aserciones de string exacto contra marca vieja, mismo patrón que
+`test_prompt_builder.py` de Fase 1]). 3 tests más (`test_wake_word.py`,
+`test_service_manager.py`, `test_gateway_service.py`) tienen un traceback leído
+que sugiere razonablemente que son específicos de macOS (tflite/D-Bus/bits de
+permiso APFS) pero **sin confirmar contra el commit base pre-sync** — no dar
+esto por "no es regresión" sin correrlo. **Los otros 85 tests (27 archivos,
+incluidos 2 timeouts en `test_browser_hardening.py`/`test_browser_homebrew_paths.py`)
+nunca se individualmente inspeccionaron** — solo se asumió por el nombre del
+archivo (creds de Daytona/Modal/Fal, hardware, etc.), sin leer un solo
+traceback real. Antes de dar la suite por buena: correr
+`./scripts/run_tests.sh` de nuevo, leer los 85 restantes uno por uno o
+agrupados por patrón de error (como se hizo con los 1.134→98 de hoy), y recién
+entonces clasificar como regresión real vs entorno/dependencia faltante.
+
+**⚠️ PENDIENTE, NO RESUELTO (hermes_state.py — migración de esquema, NO tocar
+sin diseñarla primero):** `hermes_state.py` tiene 286 líneas de diff sin
+reconciliar contra `upstream/main` (nunca formó parte de Bloque A ni de ningún
+lote de rebranding; quedó "congelado" en el checkout automático del lote
+"seguro" — la 5ª vez que aparece este patrón hoy, ver la entrada dedicada en
+`REBRAND-EXCEPTIONS.md`). A diferencia de `tools/transcription_tools.py`
+(13 líneas, aplicado quirúrgicamente esta noche, sin riesgo — solo nuevas
+claves dentro de un blob JSON existente, sin tocar esquema), este diff **sí
+introduce columnas reales nuevas** en la tabla `sessions`
+(`last_activity_at`, `last_activity_description`, `last_activity_provenance`,
+usadas por los nuevos métodos `touch_session_activity` / `get_session_activity`
+/ `clear_session_activity_labels` / `session_yolo_enabled` / `set_session_yolo`).
+
+Confirmado con evidencia real (no asumido):
+- `grep` de esos 3 nombres de columna contra `CREATE\|ALTER\|migration\|schema`
+  en nuestro `hermes_state.py` **y** en la copia de `upstream/main`: cero
+  resultados en ambos — ninguna de las dos versiones del archivo trae consigo
+  la migración que crea estas columnas (debe vivir en otro sitio del árbol de
+  upstream que no se ha localizado, o depende de un runner de migraciones que
+  no está en este archivo).
+- `sqlite3 ~/.hermes/state.db ".schema sessions"` en una base de datos de
+  desarrollo real: la tabla `sessions` **no tiene** ninguna columna
+  `last_activity_*`.
+
+Consecuencia si se aplica el fragmento de código sin la migración: cualquier
+llamada a `touch_session_activity` fallaría en tiempo de ejecución contra una
+base de datos existente (columna inexistente) — no es un bug sutil, sería
+inmediato. Y una base de datos real con sesiones ya guardadas necesitaría un
+`ALTER TABLE` explícito y versionado antes de poder correr ese código, no un
+simple `git checkout` del archivo.
+
+**No aplicar con la técnica quirúrgica de esta noche.** Los tests de
+`tests/test_hermes_state.py` (7 fallos) quedan clasificados como **"pendiente
+de migración de esquema"**, no como "arreglado" ni como "no-regresión, entorno"
+— es una categoría propia. Antes de tocar `hermes_state.py`: (1) localizar
+dónde vive realmente la migración de estas columnas en el árbol de upstream
+(puede que en un commit posterior al fetch usado hoy, o en un mecanismo de
+migración separado), (2) diseñar el `ALTER TABLE` para bases de datos
+existentes, (3) solo entonces aplicar el código. Dedicarle su propia sesión
+con calma, no la pieza final de una sesión ya larga.
+
+**⚠️ PENDIENTE, NO RESUELTO (8 tests + 2 timeouts, sospecha fundada pero sin
+confirmar contra upstream):**
+
+- `tests/tools/test_file_tools.py` (2 tests: `TestWriteFileHandler::
+  test_writes_content`, `TestPatchHandler::test_replace_mode_calls_patch_replace`)
+  — falla comparando `'/tmp/out.txt'` (esperado) contra `'/private/tmp/out.txt'`
+  (real). Sospecha fundada: macOS resuelve `/tmp` como symlink a `/private/tmp`
+  (Linux no tiene este symlink), mismo patrón exacto que el bug ya confirmado en
+  `tools/approval.py::_is_verification_artifact_cleanup`. Falta: diffear
+  `tools/file_tools.py` y este test contra `upstream/main` para confirmar que
+  el código es idéntico (no algo que rompimos) antes de cerrarlo como
+  "no-regresión, entorno".
+- `tests/tools/test_execution_flag_detection.py` (3 tests, todos
+  `test_real_binaries_execute_leading_dash_program_payload` con distintos
+  parámetros `sort`/`man`) — un caso hace timeout de 20s con
+  `sort --buffer-size=1K --compress-program`, dos más no encuentran el archivo
+  marcador esperado. Sospecha fundada: `--buffer-size`/`--compress-program` son
+  flags de GNU `sort`; macOS trae `sort`/`man` de BSD, que no los reconoce (los
+  ignora o falla distinto). Falta: mismo diff contra upstream para confirmar
+  código idéntico, y correr el test en un Linux real (o Docker) para verificar
+  que ahí sí pasa como se espera.
+- `tests/tools/test_windows_native_support.py::
+  TestReadmeNoLongerSaysWindowsUnsupported::test_readme_mentions_powershell_installer`
+  (1 test) — **no es un bug**, es una decisión de producto pendiente: el test
+  espera que `README.md` mencione `install.ps1` (instalador nativo de
+  Windows), pero el `README.md` actual (sub-lote B, reescrito a mano con texto
+  del usuario) no lo menciona. Decidir: ¿el README debería añadir la mención
+  de instalación nativa en Windows, o el test debería ajustarse/eliminarse
+  porque el README de IYARI no cubre ese flujo? Pendiente de decisión de Ruben,
+  no de investigación técnica.
+- `tests/tools/test_browser_hardening.py` y
+  `tests/tools/test_browser_homebrew_paths.py` — **timeout de 300s en el
+  runner canónico, nunca investigados**. Sospecha razonable dado el nombre
+  (Homebrew/navegador real) de que dependen de red o de un binario de
+  navegador instalado localmente, pero esto NO está confirmado — a diferencia
+  de todo lo demás en esta sesión, aquí no se leyó ni un traceback real.
+  Primer paso la próxima vez: correrlos sueltos con un timeout más largo y ver
+  en qué línea exacta se cuelgan antes de suponer nada.
+
+Ninguno de estos 8 (+2 timeouts) bloquea el merge de
+`chore/upstream-partial-sync-non-overlapping` a `main` — quedan documentados
+con dueño y con el paso exacto que falta, no ocultos.
+
+**Orden recomendado por sync:**
+```
+./scripts/check-upstream-drift.sh          # ¿toca sync? (diagnóstico, no toca nada)
+./scripts/test_iyari_transform.sh          # ¿el rebrander funciona como se espera?
+# ... trabajo de sync (Bloque A manual + Bloque B con apply-iyari-rebrand.sh) ...
+./scripts/audit-brand-residue.sh           # gate: ¿algo nuevo sin clasificar?
+# solo si pasa limpio: commit
 ```
 
 ## Flujo obligatorio por lote

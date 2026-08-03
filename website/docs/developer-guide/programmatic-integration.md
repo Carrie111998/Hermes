@@ -98,7 +98,7 @@ GET  /v1/models                  Lists hermes-agent
 GET  /health, /health/detailed
 ```
 
-Setup, headers (`X-Hermes-Session-Id`, `X-Hermes-Session-Key`), and frontend wiring: [API Server](../user-guide/features/api-server).
+Setup, headers (`X-IYARI-Session-Id`, `X-IYARI-Session-Key`), and frontend wiring: [API Server](../user-guide/features/api-server).
 
 ---
 
