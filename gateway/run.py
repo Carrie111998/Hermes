@@ -1595,6 +1595,96 @@ def _collect_history_media_paths(agent_history: List[Dict[str, Any]]) -> set:
                         break
     return paths
 
+
+async def _deliver_media_attachments(
+    chat_id: str,
+    platform: Any,
+    response: str,
+    thread_meta: Optional[Dict[str, Any]],
+    adapter,
+) -> None:
+    """Extract explicit MEDIA: tags from ``response`` and upload them natively.
+
+    Shared core behind ``GatewayRunner._deliver_media_from_response`` (the
+    post-stream rescan, run after the text was already streamed) and the
+    queued-follow-up first-response flush (``GatewayRunner._run_agent_inner``,
+    run when the first response was never streamed at all). Both need the
+    same explicit-``MEDIA:``-tag extraction and per-type dispatch so an
+    attachment is uploaded exactly once no matter how the surrounding text
+    reached the user.
+    """
+    from pathlib import Path
+    from urllib.parse import quote as _quote
+
+    try:
+        # Capture [[as_document]] before extract_media strips it, so the
+        # dispatch partition below can route image-extension files through
+        # send_document (preserving bytes) instead of send_multiple_images
+        # (Telegram sendPhoto recompresses to ~1280px).
+        force_document_attachments = "[[as_document]]" in response
+
+        from gateway.platforms.base import BasePlatformAdapter, should_send_media_as_audio
+
+        media_files, cleaned = adapter.extract_media(response)
+        media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+        # Do NOT deduplicate explicit MEDIA tags against prior turns here
+        # (#73771): an explicit MEDIA: directive is the model deliberately
+        # attaching a file, including a user-requested resend.
+        adapter.extract_images(cleaned)
+
+        _VIDEO_EXTS = {'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'}
+        _IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp', '.gif'}
+
+        image_paths: list = []
+        non_image_media: list = []
+        for media_path, is_voice in media_files:
+            ext = Path(media_path).suffix.lower()
+            if (ext in _IMAGE_EXTS
+                    and not is_voice
+                    and not force_document_attachments):
+                image_paths.append(media_path)
+            else:
+                non_image_media.append((media_path, is_voice))
+
+        if image_paths:
+            try:
+                images = [(f"file://{_quote(p)}", "") for p in image_paths]
+                await adapter.send_multiple_images(
+                    chat_id=chat_id,
+                    images=images,
+                    metadata=thread_meta,
+                )
+            except Exception as e:
+                logger.warning("[%s] Media attachment image batch delivery failed: %s", adapter.name, e)
+
+        for media_path, is_voice in non_image_media:
+            try:
+                ext = Path(media_path).suffix.lower()
+                if should_send_media_as_audio(platform, ext, is_voice=is_voice):
+                    await adapter.send_voice(
+                        chat_id=chat_id,
+                        audio_path=media_path,
+                        metadata=thread_meta,
+                    )
+                elif ext in _VIDEO_EXTS:
+                    await adapter.send_video(
+                        chat_id=chat_id,
+                        video_path=media_path,
+                        metadata=thread_meta,
+                    )
+                else:
+                    await adapter.send_document(
+                        chat_id=chat_id,
+                        file_path=media_path,
+                        metadata=thread_meta,
+                    )
+            except Exception as e:
+                logger.warning("[%s] Media attachment delivery failed: %s", adapter.name, e)
+
+    except Exception as e:
+        logger.warning("Media attachment extraction failed: %s", e)
+
+
 # ---------------------------------------------------------------------------
 # SSL certificate auto-detection for NixOS and other non-standard systems.
 # Must run BEFORE any HTTP library (discord, aiohttp, etc.) is imported.
@@ -19091,92 +19181,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         asked to deliver (#20834). Only ``MEDIA:`` directives — the explicit
         attachment contract — trigger post-stream uploads.
         """
-        from pathlib import Path
-        from urllib.parse import quote as _quote
-
-        try:
-            # Capture [[as_document]] before extract_media strips it, so the
-            # dispatch partition below can route image-extension files
-            # through send_document (preserving bytes) instead of
-            # send_multiple_images (Telegram sendPhoto recompresses to ~1280px).
-            force_document_attachments = "[[as_document]]" in response
-
-            from gateway.platforms.base import BasePlatformAdapter, should_send_media_as_audio
-
-            media_files, cleaned = adapter.extract_media(response)
-            media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
-            # Do NOT deduplicate explicit MEDIA tags against prior turns here
-            # (#73771). This rescan is already EXPLICIT-ONLY (see docstring):
-            # a MEDIA: directive in the final streamed reply is the model
-            # deliberately attaching a file — including a user-requested
-            # resend. Stale auto-appended tags are deduped upstream in
-            # _collect_auto_append_media_tags with history_media_paths.
-            # Mirrors the same filter removal on the non-streaming path in
-            # gateway/platforms/base.py.
-            # Strip image URLs from the cleaned text for parity with the
-            # non-streaming chain, but do NOT run extract_local_files here:
-            # post-stream delivery is explicit-only (#20834). Bare local paths
-            # in an already-streamed reply are text the user has seen (or
-            # stale inspected content), not an attachment request.
-            adapter.extract_images(cleaned)
-
-            _thread_meta = self._thread_metadata_for_source(event.source, self._reply_anchor_for_event(event))
-
-            _VIDEO_EXTS = {'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'}
-            _IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp', '.gif'}
-
-            # Partition out images so they can be sent as a single batch
-            # (e.g. Signal's multi-attachment RPC). When [[as_document]] was
-            # set, image-extension files skip the photo path and route to
-            # send_document below — preserving original bytes.
-            image_paths: list = []
-            non_image_media: list = []
-            for media_path, is_voice in media_files:
-                ext = Path(media_path).suffix.lower()
-                if (ext in _IMAGE_EXTS
-                        and not is_voice
-                        and not force_document_attachments):
-                    image_paths.append(media_path)
-                else:
-                    non_image_media.append((media_path, is_voice))
-
-            if image_paths:
-                try:
-                    images = [(f"file://{_quote(p)}", "") for p in image_paths]
-                    await adapter.send_multiple_images(
-                        chat_id=event.source.chat_id,
-                        images=images,
-                        metadata=_thread_meta,
-                    )
-                except Exception as e:
-                    logger.warning("[%s] Post-stream image batch delivery failed: %s", adapter.name, e)
-
-            for media_path, is_voice in non_image_media:
-                try:
-                    ext = Path(media_path).suffix.lower()
-                    if should_send_media_as_audio(event.source.platform, ext, is_voice=is_voice):
-                        await adapter.send_voice(
-                            chat_id=event.source.chat_id,
-                            audio_path=media_path,
-                            metadata=_thread_meta,
-                        )
-                    elif ext in _VIDEO_EXTS:
-                        await adapter.send_video(
-                            chat_id=event.source.chat_id,
-                            video_path=media_path,
-                            metadata=_thread_meta,
-                        )
-                    else:
-                        await adapter.send_document(
-                            chat_id=event.source.chat_id,
-                            file_path=media_path,
-                            metadata=_thread_meta,
-                        )
-                except Exception as e:
-                    logger.warning("[%s] Post-stream media delivery failed: %s", adapter.name, e)
-
-        except Exception as e:
-            logger.warning("Post-stream media extraction failed: %s", e)
+        await _deliver_media_attachments(
+            chat_id=event.source.chat_id,
+            platform=event.source.platform,
+            response=response,
+            thread_meta=self._thread_metadata_for_source(
+                event.source, self._reply_anchor_for_event(event)
+            ),
+            adapter=adapter,
+        )
 
 
 
@@ -25325,10 +25338,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 "Queued follow-up for session %s: final stream delivery not confirmed; sending first response before continuing.",
                                 session_key or "?",
                             )
-                            await adapter.send(
-                                source.chat_id,
-                                first_response,
-                                metadata=_status_thread_metadata,
+                            # Route through the same explicit-MEDIA extraction
+                            # the normal completed-turn path uses, instead of
+                            # sending the raw response: a literal MEDIA:<path>
+                            # tag must never reach the user as text, and the
+                            # file it names must still be uploaded natively.
+                            _, _first_response_text = adapter.extract_media(first_response)
+                            _first_response_text = _first_response_text.strip()
+                            if _first_response_text:
+                                await adapter.send(
+                                    source.chat_id,
+                                    _first_response_text,
+                                    metadata=_status_thread_metadata,
+                                )
+                            await _deliver_media_attachments(
+                                chat_id=source.chat_id,
+                                platform=source.platform,
+                                response=first_response,
+                                thread_meta=_status_thread_metadata,
+                                adapter=adapter,
                             )
                         except Exception as e:
                             logger.warning("Failed to send first response before queued message: %s", e)
@@ -25337,6 +25365,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "Queued follow-up for session %s: skipping resend because final streamed delivery was confirmed.",
                             session_key or "?",
                         )
+                        # Streaming only delivers text — any MEDIA:<path> tag
+                        # in the streamed reply still needs the explicit
+                        # post-stream upload pass (mirrors the terminal-turn
+                        # handling in _handle_message_with_agent).
+                        try:
+                            await _deliver_media_attachments(
+                                chat_id=source.chat_id,
+                                platform=source.platform,
+                                response=first_response,
+                                thread_meta=_status_thread_metadata,
+                                adapter=adapter,
+                            )
+                        except Exception as e:
+                            logger.warning("Failed to deliver streamed first response's media attachments: %s", e)
                     # Release deferred bg-review notifications now that the
                     # first response has been delivered.  Pop from the
                     # adapter's callback dict (prevents double-fire in
