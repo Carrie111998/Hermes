@@ -88,6 +88,83 @@ def test_atomic_replace_accepts_pathlike_and_str(tmp_path: Path) -> None:
     assert target.read_text(encoding="utf-8") == "2"
 
 
+def test_atomic_replace_retries_transient_windows_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "auth.json"
+    target.write_text("old", encoding="utf-8")
+    tmp = _write_tmp(tmp_path, "new")
+    attempts = 0
+    real_replace = os.replace
+
+    def flaky_replace(src: str, dst: str) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts <= 2:
+            error = PermissionError(5, "access denied", src, dst)
+            error.winerror = 5
+            raise error
+        real_replace(src, dst)
+
+    monkeypatch.setattr("utils.os.replace", flaky_replace)
+    monkeypatch.setattr("utils.sys.platform", "win32")
+    monkeypatch.setattr("utils.time.sleep", lambda _seconds: None)
+
+    atomic_replace(tmp, target)
+
+    assert attempts == 3
+    assert target.read_text(encoding="utf-8") == "new"
+
+
+def test_atomic_replace_does_not_retry_permanent_windows_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "auth.json"
+    target.write_text("old", encoding="utf-8")
+    tmp = _write_tmp(tmp_path, "new")
+    attempts = 0
+
+    def denied_replace(src: str, dst: str) -> None:
+        nonlocal attempts
+        attempts += 1
+        error = PermissionError(5, "access denied", src, dst)
+        error.winerror = 5
+        raise error
+
+    monkeypatch.setattr("utils.os.replace", denied_replace)
+    monkeypatch.setattr("utils.sys.platform", "win32")
+    monkeypatch.setattr("utils.time.sleep", lambda _seconds: None)
+
+    with pytest.raises(PermissionError):
+        atomic_replace(tmp, target)
+
+    assert attempts == 5
+    assert target.read_text(encoding="utf-8") == "old"
+    assert tmp.exists()
+
+
+def test_atomic_replace_does_not_retry_posix_permission_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "auth.json"
+    target.write_text("old", encoding="utf-8")
+    tmp = _write_tmp(tmp_path, "new")
+    attempts = 0
+
+    def denied_replace(src: str, dst: str) -> None:
+        nonlocal attempts
+        attempts += 1
+        raise PermissionError(errno.EACCES, "access denied", src, dst)
+
+    monkeypatch.setattr("utils.os.replace", denied_replace)
+    monkeypatch.setattr("utils.sys.platform", "linux")
+
+    with pytest.raises(PermissionError):
+        atomic_replace(tmp, target)
+
+    assert attempts == 1
+
+
 # ─── atomic_json_write / atomic_yaml_write wiring ──────────────────────────
 
 
