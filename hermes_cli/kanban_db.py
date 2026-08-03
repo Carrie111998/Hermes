@@ -6951,12 +6951,29 @@ def _terminate_reclaimed_worker(
         return info
 
     info["termination_attempted"] = True
+    # When the worker is a process-group leader (start_new_session=True),
+    # signal the entire group so descendant processes are also terminated.
+    _use_group = False
+    if signal_fn is None and hasattr(os, "killpg") and hasattr(os, "getpgid"):
+        try:
+            _use_group = os.getpgid(int(pid)) == int(pid)
+        except (ProcessLookupError, OSError):
+            _use_group = False
+
+    def _signal_target(_pid: int, _sig: int) -> None:
+        if _use_group:
+            try:
+                os.killpg(_pid, _sig)
+                return
+            except ProcessLookupError:
+                raise
+            except OSError:
+                pass
+        kill(_pid, _sig)
+
     try:
-        kill(int(pid), signal.SIGTERM)
+        _signal_target(int(pid), signal.SIGTERM)
     except ProcessLookupError:
-        # Process is already gone — that's a successful termination, not a
-        # survival. Leaving terminated=False here would make the reclaim guard
-        # misread a dead worker as still-alive and defer forever.
         info["terminated"] = True
         return info
     except OSError:
@@ -6973,7 +6990,7 @@ def _terminate_reclaimed_worker(
             # signal.SIGKILL doesn't exist on Windows; fall back to SIGTERM
             # (which maps to TerminateProcess via the stdlib shim).
             _sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
-            kill(int(pid), _sigkill)
+            _signal_target(int(pid), _sigkill)
             info["sigkill"] = True
         except (ProcessLookupError, OSError):
             return info
