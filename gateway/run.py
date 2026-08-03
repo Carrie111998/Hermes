@@ -10672,6 +10672,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         try:
             from hermes_cli.plugins import discover_plugins
             discover_plugins()
+            # The import-time config bridge intentionally skips plugin discovery.
+            # Re-bridge plugin auxiliary tasks now that startup discovery has made
+            # their keys available, otherwise plugin-specific AUXILIARY_* settings
+            # are never propagated to the gateway process.
+            _startup_auxiliary_cfg = self.config.get("auxiliary", {})
+            if isinstance(_startup_auxiliary_cfg, dict):
+                from hermes_cli.plugins import get_plugin_auxiliary_tasks
+
+                for _entry in get_plugin_auxiliary_tasks(discover=False):
+                    _task_key = _entry["key"]
+                    _task_cfg = _startup_auxiliary_cfg.get(_task_key, {})
+                    if not isinstance(_task_cfg, dict):
+                        continue
+                    _upper = _task_key.upper()
+                    for _cfg_key, _suffix in (
+                        ("provider", "PROVIDER"),
+                        ("model", "MODEL"),
+                        ("base_url", "BASE_URL"),
+                        ("api_key", "API_KEY"),
+                    ):
+                        _value = str(_task_cfg.get(_cfg_key, "")).strip()
+                        if _value and not (_cfg_key == "provider" and _value == "auto"):
+                            os.environ[f"AUXILIARY_{_upper}_{_suffix}"] = _value
         except Exception:
             logger.warning(
                 "plugin discovery failed at gateway startup", exc_info=True,
