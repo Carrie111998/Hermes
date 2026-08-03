@@ -452,7 +452,10 @@ export default function CommandsPage() {
                                 );
                                 showToast(`Command /${cmd.name} ${checked ? "enabled" : "disabled"}`, "success");
                               })
-                              .catch((err) => showToast(`Failed to toggle command: ${err}`, "error"));
+                              .catch((err: unknown) => {
+                                const msg = err instanceof Error ? err.message : String(err);
+                                showToast(`Failed to toggle command: ${msg}`, "error");
+                              });
                           }}
                           className="scale-75"
                         />
