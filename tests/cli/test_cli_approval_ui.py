@@ -195,6 +195,7 @@ class TestCliApprovalUi:
 
         class FakeAgent:
             def __init__(self, **kwargs):
+                seen["agent_kwargs"] = kwargs
                 self._print_fn = None
                 self.thinking_callback = None
 
@@ -229,6 +230,7 @@ class TestCliApprovalUi:
         assert seen["approval"].__func__ is HermesCLI._approval_callback
         assert seen["sudo"].__self__ is cli
         assert seen["sudo"].__func__ is HermesCLI._sudo_password_callback
+        assert seen["agent_kwargs"]["provider_request_budget_exempt"] is True
         assert not cli._background_tasks
 
 

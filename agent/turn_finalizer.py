@@ -53,6 +53,74 @@ _VERIFICATION_CONTINUATION_FLAGS = (
 )
 
 
+def finalize_provider_request_budget_exhaustion(
+    agent,
+    *,
+    error,
+    user_message,
+    conversation_history,
+    effective_task_id,
+    persist_user_message=None,
+    persist_user_timestamp=None,
+    persist_user_display_kind=None,
+    persist_user_display_metadata=None,
+):
+    """Normalize an exhaustion raised before the main loop owns turn locals."""
+    if conversation_history is not None:
+        messages = list(conversation_history)
+    else:
+        messages = list(getattr(agent, "_session_messages", []) or [])
+
+    persisted_content = (
+        persist_user_message
+        if persist_user_message is not None
+        else user_message
+    )
+    user_row = {"role": "user", "content": persisted_content}
+    if persist_user_display_kind:
+        user_row["display_kind"] = persist_user_display_kind
+        if persist_user_display_metadata:
+            user_row["display_metadata"] = persist_user_display_metadata
+    if not (
+        messages
+        and isinstance(messages[-1], dict)
+        and messages[-1].get("role") == "user"
+        and messages[-1].get("content") == persisted_content
+    ):
+        messages.append(user_row)
+
+    agent._persist_user_message_idx = len(messages) - 1
+    agent._persist_user_message_override = persist_user_message
+    agent._persist_user_message_timestamp = persist_user_timestamp
+    agent._current_task_id = effective_task_id
+    turn_id = str(
+        getattr(agent, "_current_turn_id", None)
+        or getattr(agent, "_relay_pending_turn_id", None)
+        or effective_task_id
+    )
+    result = finalize_turn(
+        agent,
+        final_response=str(error),
+        api_call_count=0,
+        interrupted=False,
+        failed=True,
+        messages=messages,
+        conversation_history=(
+            list(conversation_history)
+            if conversation_history is not None
+            else []
+        ),
+        effective_task_id=effective_task_id,
+        turn_id=turn_id,
+        user_message=user_message,
+        original_user_message=persisted_content,
+        _should_review_memory=False,
+        _turn_exit_reason="provider_request_budget_exhausted",
+    )
+    result["error"] = str(error)
+    return result
+
+
 def _drop_verification_continuation_scaffolding(messages) -> None:
     """Remove verification-continuation nudge messages from *messages* in place.
 
@@ -90,6 +158,7 @@ def finalize_turn(
     loop). See module docstring.
     """
     from agent.conversation_loop import logger
+    from agent.provider_request_budget import ProviderRequestBudgetExceeded
 
     budget_exhausted = (
         api_call_count >= agent.max_iterations
@@ -109,6 +178,7 @@ def finalize_turn(
 
     iteration_limit_fallback = False
     preserved_verification_fallback = False
+    terminal_error = None
     if continuation_budget_exhausted:
         # A verification/continuation gate deliberately withheld a composed
         # answer, then consumed the remaining budget before producing a newer
@@ -138,8 +208,14 @@ def finalize_turn(
                 f"\n⚠️  Iteration budget exhausted ({api_call_count}/{agent.max_iterations}) "
                 "— requesting summary..."
             )
-        final_response = agent._handle_max_iterations(messages, api_call_count)
-        iteration_limit_fallback = True
+        try:
+            final_response = agent._handle_max_iterations(messages, api_call_count)
+            iteration_limit_fallback = True
+        except ProviderRequestBudgetExceeded as exc:
+            final_response = str(exc)
+            terminal_error = str(exc)
+            failed = True
+            _turn_exit_reason = "provider_request_budget_exhausted"
 
     if iteration_limit_fallback:
         # If running as a kanban worker, signal the dispatcher that the
@@ -663,6 +739,8 @@ def finalize_turn(
         ).get("service_tier"),
         "session_id": agent.session_id,
     }
+    if terminal_error is not None:
+        result["error"] = terminal_error
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
     # Persistence failures already set failed=True + an explanation in

@@ -3492,6 +3492,23 @@ def test_background_agent_kwargs_preserves_full_fallback_chain(monkeypatch):
     assert kwargs["fallback_model"] == chain
 
 
+def test_tui_background_agent_kwargs_exempt_both_background_consumers(monkeypatch):
+    agent = types.SimpleNamespace(
+        model="gpt-5.5",
+        provider="anthropic",
+        _fallback_chain=[],
+    )
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"max_turns": 25})
+    monkeypatch.setattr(server, "_load_enabled_toolsets", lambda: ["file"])
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+
+    background_kwargs = server._background_agent_kwargs(agent, "background-task")
+    preview_kwargs = server._ephemeral_preview_agent_kwargs(agent, "preview-task")
+
+    assert background_kwargs["provider_request_budget_exempt"] is True
+    assert preview_kwargs["provider_request_budget_exempt"] is True
+
+
 def test_background_agent_kwargs_preserves_empty_fallback_chain(monkeypatch):
     agent = types.SimpleNamespace(
         model="gpt-5.5",

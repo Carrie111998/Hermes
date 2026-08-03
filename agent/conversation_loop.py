@@ -69,6 +69,7 @@ from agent.model_metadata import (
     save_context_length,
 )
 from agent.process_bootstrap import _install_safe_stdio
+from agent.provider_request_budget import ProviderRequestBudgetExceeded
 from agent.prompt_caching import (
     build_prompt_cache_plan,
     strip_anthropic_cache_control,
@@ -3501,6 +3502,8 @@ def run_conversation(
                 agent._persist_session(messages, conversation_history)
                 break
 
+            except ProviderRequestBudgetExceeded:
+                raise
             except Exception as api_error:
                 # Stop spinner silently — retry status is buffered and
                 # only flushed when every retry+fallback is exhausted.
@@ -7082,7 +7085,18 @@ def run_conversation(
                 if not agent.quiet_mode:
                     agent._safe_print(f"🎉 Conversation completed after {api_call_count} OpenAI-compatible API call(s)")
                 break
-            
+
+        except ProviderRequestBudgetExceeded as e:
+            if thinking_spinner:
+                thinking_spinner.stop("")
+                thinking_spinner = None
+            if agent.thinking_callback:
+                agent.thinking_callback("")
+            failed = True
+            final_response = str(e)
+            _turn_exit_reason = "provider_request_budget_exhausted"
+            messages.append({"role": "assistant", "content": final_response})
+            break
         except Exception as e:
             # Phase-aware error classification. The huge outer try/except spans
             # both the actual API request and all local post-processing of the

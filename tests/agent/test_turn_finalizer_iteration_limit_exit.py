@@ -5,6 +5,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from agent.provider_request_budget import ProviderRequestBudget
 from agent.turn_finalizer import finalize_turn
 
 
@@ -233,5 +234,36 @@ def test_published_pending_candidate_is_not_duplicated_by_finalizer(monkeypatch)
     assert agent.persisted_messages is not None
     persisted_roles = [m["role"] for m in agent.persisted_messages]
     assert persisted_roles == ["user", "assistant"]
+
+
+def test_summary_request_exhaustion_still_runs_normal_finalizer_cleanup(monkeypatch):
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = _LimitAgent()
+    agent.provider_request_budget = ProviderRequestBudget(1)
+    agent.provider_request_budget.reserve(reason="earlier request")
+    agent._save_trajectory = MagicMock()
+    agent._cleanup_task_resources = MagicMock()
+
+    def exhaust_summary(_messages, _api_call_count):
+        agent.provider_request_budget.reserve(reason="iteration summary")
+
+    agent._handle_max_iterations = MagicMock(side_effect=exhaust_summary)
+
+    result = _finalize(
+        agent,
+        final_response=None,
+        exit_reason="unknown",
+    )
+
+    assert result["failed"] is True
+    assert result["turn_exit_reason"] == "provider_request_budget_exhausted"
+    assert result["error"] == result["final_response"]
+    assert "provider request budget exhausted" in result["final_response"]
+    agent._save_trajectory.assert_called_once()
+    agent._cleanup_task_resources.assert_called_once_with("task")
+    assert agent.persisted_messages[-1] == {
+        "role": "assistant",
+        "content": result["final_response"],
+    }
 
 

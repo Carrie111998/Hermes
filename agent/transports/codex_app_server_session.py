@@ -474,6 +474,7 @@ class CodexAppServerSession:
         turn_timeout: float = 600.0,
         notification_poll_timeout: float = 0.25,
         post_tool_quiet_timeout: float = 90.0,
+        before_request=None,
     ) -> TurnResult:
         """Send a user message and block until turn/completed, while
         forwarding server-initiated approval requests and projecting items
@@ -519,6 +520,8 @@ class CodexAppServerSession:
         # Send turn/start with the user input. Text-only for now (codex
         # supports rich content but Hermes' text path is the common case).
         try:
+            if callable(before_request):
+                before_request(reason="codex app-server turn/start")
             ts = self._client.request(
                 "turn/start",
                 {
@@ -793,6 +796,7 @@ class CodexAppServerSession:
         *,
         turn_timeout: float = 600.0,
         notification_poll_timeout: float = 0.25,
+        before_request=None,
     ) -> TurnResult:
         """Trigger Codex-native history compaction for the current thread.
 
@@ -817,6 +821,8 @@ class CodexAppServerSession:
         projector = CodexEventProjector()
 
         try:
+            if callable(before_request):
+                before_request(reason="codex app-server thread/compact/start")
             self._client.request(
                 "thread/compact/start",
                 {"threadId": self._thread_id},

@@ -16640,6 +16640,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     enabled_toolsets=["memory"],
                                     session_id=session_entry.session_id,
                                     session_db=_hyg_session_db,
+                                    provider_request_budget_exempt=True,
                                 )
                                 _seed_hygiene_system_prompt(
                                     _hyg_agent,
@@ -19176,6 +19177,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     provider_data_collection=pr.get("data_collection"),
                     session_id=task_id,
                     platform=platform_key,
+                    provider_request_budget_exempt=True,
                     user_id=source.user_id,
                     user_id_alt=source.user_id_alt,
                     user_name=source.user_name,
