@@ -207,6 +207,15 @@ class TestDetectAudioEnvironment:
         monkeypatch.setattr("tools.voice_mode._pulse_socket_reachable", lambda: False)
         monkeypatch.setattr("tools.voice_mode._import_audio",
                             lambda: (MagicMock(), MagicMock()))
+        # Pin the two host-dependent detection paths so this test is
+        # deterministic on every machine: (1) is_container() returns True on
+        # container-like hosts (WSL/CI) and diverts the warning to the
+        # "container" branch (no "WSL" string); (2) the WSL2 PowerShell TTS
+        # fallback, present on hosts with powershell.exe + ffmpeg, downgrades
+        # the WSL-without-forwarding case to a notice instead of a warning.
+        # Same host-dependence class as test_voice_wsl_pipewire.py (#76999).
+        monkeypatch.setattr("hermes_constants.is_container", lambda: False)
+        monkeypatch.setattr("tools.voice_mode._wsl_powershell_tts_available", lambda: False)
 
         proc_version = tmp_path / "proc_version"
         proc_version.write_text("Linux 5.15.0-microsoft-standard-WSL2")
