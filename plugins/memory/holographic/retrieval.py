@@ -164,7 +164,7 @@ class FactRetriever:
             fact_vec = hrr.bytes_to_phases(fact.pop("hrr_vector"))
             # Direct similarity -- unbind does not compose through bundle
             sim = hrr.similarity(fact_vec, probe_key)
-            fact["score"] = (sim + 1.0) / 2.0 * fact["trust_score"]
+            fact["score"] = max(sim, 0) * fact["trust_score"]
             scored.append(fact)
 
         scored.sort(key=lambda x: x["score"], reverse=True)
@@ -220,7 +220,7 @@ class FactRetriever:
             fact_vec = hrr.bytes_to_phases(fact.pop("hrr_vector"))
             # Direct similarity -- unbind does not compose through bundle
             sim = hrr.similarity(fact_vec, entity_vec)
-            fact["score"] = (sim + 1.0) / 2.0 * fact["trust_score"]
+            fact["score"] = max(sim, 0) * fact["trust_score"]
             scored.append(fact)
 
         scored.sort(key=lambda x: x["score"], reverse=True)
@@ -294,7 +294,7 @@ class FactRetriever:
                 entity_scores.append(sim)
 
             min_sim = min(entity_scores)
-            fact["score"] = (min_sim + 1.0) / 2.0 * fact["trust_score"]
+            fact["score"] = max(min_sim, 0) * fact["trust_score"]
             scored.append(fact)
 
         scored.sort(key=lambda x: x["score"], reverse=True)
@@ -437,7 +437,7 @@ class FactRetriever:
             fact = dict(row)
             fact_vec = hrr.bytes_to_phases(fact.pop("hrr_vector"))
             sim = hrr.similarity(target_vec, fact_vec)
-            fact["score"] = (sim + 1.0) / 2.0 * fact["trust_score"]
+            fact["score"] = max(sim, 0) * fact["trust_score"]
             scored.append(fact)
 
         scored.sort(key=lambda x: x["score"], reverse=True)
