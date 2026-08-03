@@ -136,6 +136,9 @@ def test_direct_session_db_flushes_share_marker_claim(agent):
                 assert self.release.wait(timeout=5)
             self.rows.append(kwargs["content"])
 
+        def flush_token_counts(self):
+            return None
+
     db = _BarrierDB()
     agent._session_db = db
     agent._session_db_created = True
