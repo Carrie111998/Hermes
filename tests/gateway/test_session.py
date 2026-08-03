@@ -1219,6 +1219,97 @@ class TestLastPromptTokens:
         assert entry.last_prompt_tokens == 50000  # unchanged
 
 
+class TestRoutingMetadataUpsert:
+    """Metadata bumps (updated_at / last_prompt_tokens) must persist as a
+    single-key upsert, not a whole-index delete-all + insert-all rewrite."""
+
+    def _store(self, tmp_path):
+        config = GatewayConfig()
+        with patch("gateway.session.SessionStore._ensure_loaded"):
+            store = SessionStore(sessions_dir=tmp_path, config=config)
+        store._loaded = True
+        return store
+
+    def _fake_db(self):
+        db = MagicMock()
+        db.save_gateway_routing_entry = MagicMock()
+        db.replace_gateway_routing_entries = MagicMock()
+        # Healthy-path probes: no compression tip, no ended session.
+        db.get_compression_tip = MagicMock(return_value=None)
+        db.get_session = MagicMock(return_value=None)
+        return db
+
+    def _seed_entry(self, store, key="k1"):
+        from datetime import datetime
+
+        from gateway.session import SessionEntry
+
+        entry = SessionEntry(
+            session_key=key,
+            session_id="s1",
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+        )
+        store._entries = {key: entry}
+        return entry
+
+    def test_update_session_persists_via_upsert_not_replace(self, tmp_path):
+        store = self._store(tmp_path)
+        db = self._fake_db()
+        store._db = db
+        self._seed_entry(store)
+
+        store.update_session("k1", last_prompt_tokens=123)
+
+        db.save_gateway_routing_entry.assert_called_once()
+        args, _kwargs = db.save_gateway_routing_entry.call_args
+        assert args[0] == "k1"
+        db.replace_gateway_routing_entries.assert_not_called()
+
+    def test_update_session_absent_key_is_noop(self, tmp_path):
+        store = self._store(tmp_path)
+        db = self._fake_db()
+        store._db = db
+        store._entries = {}
+
+        store.update_session("ghost", last_prompt_tokens=1)
+
+        db.save_gateway_routing_entry.assert_not_called()
+        db.replace_gateway_routing_entries.assert_not_called()
+
+    def test_update_session_without_db_falls_back_to_full_writer(self, tmp_path):
+        store = self._store(tmp_path)
+        store._db = None
+        self._seed_entry(store)
+
+        store.update_session("k1")
+
+        # The whole-index sessions.json mirror is the durability fallback.
+        assert (tmp_path / "sessions.json").exists()
+
+    def test_second_message_same_session_upserts_without_full_replace(self, tmp_path):
+        """Flow level: first message creates the entry (structural save),
+        the second healthy message must only upsert the one key."""
+        store = self._store(tmp_path)
+        db = self._fake_db()
+        store._db = db
+        source = SessionSource(
+            platform=Platform.TELEGRAM, chat_id="c1", chat_type="dm", user_id="u1"
+        )
+
+        first = store.get_or_create_session(source)
+        assert first is not None
+        replace_after_create = db.replace_gateway_routing_entries.call_count
+        upsert_after_create = db.save_gateway_routing_entry.call_count
+
+        second = store.get_or_create_session(source)
+        assert second is not None
+        assert second.session_id == first.session_id
+        # No second whole-index rewrite; exactly one single-key upsert.
+        assert db.replace_gateway_routing_entries.call_count == replace_after_create
+        assert db.save_gateway_routing_entry.call_count == upsert_after_create + 1
+
+
 class TestSessionMetadata:
     """SessionEntry metadata should persist arbitrary lightweight state."""
 

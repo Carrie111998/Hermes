@@ -1540,6 +1540,56 @@ class SessionStore:
         with self._lock:
             data, generation = self._snapshot_routing_locked()
         self._persist_routing_data(data, generation)
+
+    def _save_entry_metadata(self, session_key: str) -> None:
+        """Persist one entry's metadata bump without a whole-index rewrite.
+
+        Per-message saves only touch ``updated_at`` / ``last_prompt_tokens``
+        on an existing entry, so a single-key upsert into the
+        ``gateway_routing`` table replaces the full delete-all + insert-all
+        + sessions.json mirror rewrite + fsync cycle. The mirror is still
+        rewritten on structural saves (new/reset/pruned entries); its
+        metadata may lag until then, which is safe because mirror readers
+        (channel directory fallback, downgrade routing) consume origin and
+        session_id fields that only change structurally, never metadata.
+
+        Shares the generation guard with the whole-index writer so a stale
+        delayed full replace cannot clobber a newer upsert (or vice versa).
+        """
+        with self._lock:
+            entry = self._entries.get(session_key)
+            if entry is None:
+                return
+            self._routing_generation = getattr(self, "_routing_generation", 0) + 1
+            generation = self._routing_generation
+            entry_json = json.dumps(entry.to_dict())
+        save_lock = getattr(self, "_save_lock", None)
+        if save_lock is None:
+            save_lock = threading.Lock()
+            self._save_lock = save_lock
+        saved = False
+        with save_lock:
+            if generation > getattr(self, "_persisted_routing_generation", 0):
+                _db = getattr(self, "_db", None)
+                upsert = getattr(_db, "save_gateway_routing_entry", None) if _db else None
+                if callable(upsert):
+                    try:
+                        upsert(session_key, entry_json, scope=self._routing_scope())
+                        saved = True
+                    except Exception as exc:
+                        logger.warning(
+                            "gateway.session: state.db routing upsert failed: %s", exc
+                        )
+                if saved:
+                    self._persisted_routing_generation = generation
+        if not saved:
+            # No DB (or upsert failed): fall back to the whole-index writer
+            # so the bump is still durable. It has its own save lock and
+            # generation guard, so call it outside save_lock.
+            with self._lock:
+                full = {k: e.to_dict() for k, e in self._entries.items()}
+            self._persist_routing_data(full, generation)
+
     def _resolve_profile_for_key(self, source: Optional[SessionSource] = None) -> Optional[str]:
         """Return the profile namespace for session keys, or None when off.
 
@@ -2334,6 +2384,7 @@ class SessionStore:
 
         # ---- Phase 2: lock write -- apply decisions to _entries ----
         _needs_save = False
+        _needs_metadata_save = False
         _needs_recover = False
         entry: Optional[SessionEntry] = None
         was_auto_reset = False
@@ -2394,8 +2445,10 @@ class SessionStore:
                         entry = None
                         _needs_recover = True
                     else:
+                        # Metadata-only bump: persisted below via a single-key
+                        # upsert, not a whole-index rewrite.
                         entry.updated_at = now
-                        _needs_save = True
+                        _needs_metadata_save = True
             else:
                 if not force_new:
                     _needs_recover = True
@@ -2463,6 +2516,10 @@ class SessionStore:
 
         if _needs_save:
             self._save_entries()
+        if _needs_metadata_save and not _needs_save:
+            # Structural saves already carry the metadata bump, so the
+            # single-key upsert only runs when nothing structural changed.
+            self._save_entry_metadata(session_key)
 
         # SQLite operations outside the lock (unchanged).
         if self._db and db_end_session_id:
@@ -2507,18 +2564,25 @@ class SessionStore:
         with self._lock:
             self._ensure_loaded_locked()
 
-            if session_key in self._entries:
-                entry = self._entries[session_key]
-                entry.updated_at = _now()
-                if last_prompt_tokens is not None:
-                    entry.last_prompt_tokens = last_prompt_tokens
-                self._save()
-                self._record_gateway_session_peer(
-                    entry.session_id,
-                    session_key,
-                    entry.origin,
-                    display_name=entry.display_name,
-                )
+            if session_key not in self._entries:
+                return
+            entry = self._entries[session_key]
+            entry.updated_at = _now()
+            if last_prompt_tokens is not None:
+                entry.last_prompt_tokens = last_prompt_tokens
+            session_id = entry.session_id
+            origin = entry.origin
+            display_name = entry.display_name
+        # Persist outside the lock (the old form ran the whole-index rewrite
+        # + fsync while holding it, blocking all concurrent routing) and as
+        # a single-key upsert (metadata-only change).
+        self._save_entry_metadata(session_key)
+        self._record_gateway_session_peer(
+            session_id,
+            session_key,
+            origin,
+            display_name=display_name,
+        )
 
     def get_session_metadata(
         self,
