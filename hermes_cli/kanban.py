@@ -2443,6 +2443,28 @@ def _worker_run_id_for(task_id: str) -> Optional[int]:
         return None
 
 
+def _acquire_release_lock(task_id: str):
+    """Exclusive host-wide advisory lock for one card's release.
+
+    Reuses the kernel's existing flock helper — no second locking scheme.
+    Raises RuntimeError when another release of the same card holds it.
+    """
+    from hermes_cli.worktree_dependencies import _acquire_project_lock
+    from pathlib import Path as _Path
+
+    hermes_home = _Path(os.environ.get("HERMES_HOME", _Path.home() / ".hermes"))
+    return _acquire_project_lock(hermes_home / "release-lease" / task_id)
+
+
+def _release_release_lock(lock) -> None:
+    if lock is None:
+        return
+    try:
+        lock.release()
+    except Exception:
+        pass
+
+
 def _cmd_release(args: argparse.Namespace) -> int:
     """Run release orchestration for a product card at Release / Measure.
 
@@ -2493,8 +2515,13 @@ def _cmd_release(args: argparse.Namespace) -> int:
             print(f"kanban: unknown task {task_id}", file=sys.stderr)
             return 1
         is_epic = task.work_item_kind == "epic"
-        if task.workflow_template_id != "product" or (
-            not is_epic and task.current_step_key != "release_measure"
+        # Legacy epics predate product-workflow metadata: work_item_kind is
+        # 'epic' while workflow_template_id and current_step_key are null. The
+        # kernel accepts those for release, so the CLI must not refuse them
+        # ahead of it — only ordinary cards carry the step requirement.
+        if not is_epic and (
+            task.workflow_template_id != "product"
+            or task.current_step_key != "release_measure"
         ):
             print(
                 f"kanban: cannot release {task_id}: release orchestration "
@@ -2550,7 +2577,24 @@ def _cmd_release(args: argparse.Namespace) -> int:
         # deliberately unclaimable (`claim_task` refuses work_item_kind=epic),
         # so they release without a lease exactly as before.
         expected_run_id = None
-        if not is_epic:
+        epic_lock = None
+        if is_epic:
+            # Epics are deliberately unclaimable (`claim_task` refuses
+            # work_item_kind=epic), so the run-lease CAS is unavailable to
+            # them. Serialize on the same advisory file lock the kernel
+            # already uses for verification worktrees rather than inventing a
+            # second locking scheme. Host-scoped, which matches the threat:
+            # two operator terminals on this machine.
+            try:
+                epic_lock = _acquire_release_lock(task_id)
+            except RuntimeError:
+                print(
+                    f"kanban: cannot release {task_id}: another release of this "
+                    "epic is already running on this host. Nothing was changed.",
+                    file=sys.stderr,
+                )
+                return 1
+        else:
             claimed = kb.claim_task(conn, task_id)
             if claimed is None:
                 print(
@@ -2580,6 +2624,7 @@ def _cmd_release(args: argparse.Namespace) -> int:
             )
         except kb.ReleaseEvidenceError as exc:
             _release_lease()
+            _release_release_lock(epic_lock)
             print(
                 f"kanban: release of {task_id} blocked by release evidence "
                 f"policy. Missing: {', '.join(exc.missing)}. The card remains "
@@ -2589,13 +2634,17 @@ def _cmd_release(args: argparse.Namespace) -> int:
             return 1
         except ValueError as exc:
             _release_lease()
+            _release_release_lock(epic_lock)
             print(f"kanban: cannot release {task_id}: {exc}", file=sys.stderr)
             return 1
         except Exception:
             _release_lease()
+            _release_release_lock(epic_lock)
             raise
         if not result.released:
             _release_lease()
+    if epic_lock is not None:
+        _release_release_lock(epic_lock)
     if not result.released:
         print(
             f"kanban: release of {task_id} did not complete: {result.status}. "

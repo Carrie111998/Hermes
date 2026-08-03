@@ -302,3 +302,83 @@ def _refuse_branch_creation(real_run):
         return real_run(cmd, *args, **kwargs)
 
     return _run
+
+
+def test_integration_moves_the_pin_so_recovery_restores_the_epic_tip(
+    epic_home, tmp_path
+):
+    """Recovery must restore the integrated tip, not the original base.
+
+    Story cards go `done` after integrating, so `gc_events` prunes their
+    `story_integrated_to_epic` rows. If the pin stayed at the first base, a
+    later sibling would branch off a base missing every integrated story.
+    """
+    repo = _repo(tmp_path)
+    board = "epic-pin-follows-tip"
+    _v2_board(board, repo)
+    with kb.connect(board=board) as conn:
+        epic_id, story_id = _epic_with_story(conn, board, repo, "Story one")
+        story = kb.get_task(conn, story_id)
+        assert story is not None
+        kb._resolve_worktree_workspace(story, board=board, conn=conn)
+        epic_branch = kb.epic_branch_for(epic_id)
+        original = _git(repo, "rev-parse", epic_branch)
+
+        # A story integrates: the epic branch advances to a new tip.
+        _git(repo, "checkout", epic_branch)
+        (repo / "integrated.txt").write_text("story one\n", encoding="utf-8")
+        _git(repo, "add", "integrated.txt")
+        _git(repo, "commit", "-m", "integrate story one")
+        tip = _git(repo, "rev-parse", epic_branch)
+        _git(repo, "checkout", "main")
+        assert tip != original
+        kb._record_story_integration(
+            conn, story_id, epic_id, epic_branch,
+            {"target_branch": epic_branch, "candidate_sha": tip},
+        )
+        assert kb._epic_base_pinned_sha(conn, epic_id) == tip
+
+        # The story's own events are pruned exactly as gc_events would, so the
+        # pin is the only surviving evidence.
+        with kb.write_txn(conn):
+            conn.execute(
+                "DELETE FROM task_events WHERE task_id = ? AND kind = ?",
+                (story_id, "story_integrated_to_epic"),
+            )
+        _git(repo, "branch", "-D", epic_branch)
+        (repo / "moved.txt").write_text("later\n", encoding="utf-8")
+        _git(repo, "add", "moved.txt")
+        _git(repo, "commit", "-m", "main moves on")
+
+        sibling_id = _add_story(conn, board, repo, epic_id, "Story two")
+        sibling = kb.get_task(conn, sibling_id)
+        assert sibling is not None
+        kb._resolve_worktree_workspace(sibling, board=board, conn=conn)
+
+    assert _git(repo, "rev-parse", epic_branch) == tip
+
+
+def test_refused_resolver_routing_runs_before_any_other_claim_mutation(
+    epic_home, tmp_path
+):
+    """The refusal is the first statement in the claim transaction, so the
+    metadata-repair preflight and the parents demotion never touch a card that
+    can never dispatch."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="Ordinary goal", assignee="developer")
+        conn.execute("UPDATE tasks SET assignee='resolver' WHERE id=?", (tid,))
+        conn.commit()
+        before = [event.kind for event in kb.list_events(conn, tid)]
+
+        assert kb.claim_task(conn, tid) is None
+
+        after = [event.kind for event in kb.list_events(conn, tid)]
+        task = kb.get_task(conn, tid)
+        runs = conn.execute(
+            "SELECT COUNT(*) FROM task_runs WHERE task_id=?", (tid,)
+        ).fetchone()[0]
+
+    # Exactly one new event — the refusal. Nothing repaired, nothing demoted.
+    assert after == before + ["claim_rejected"]
+    assert runs == 0
+    assert task is not None and task.status == "blocked"

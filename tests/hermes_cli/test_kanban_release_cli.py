@@ -437,3 +437,85 @@ def test_release_kernel_refuses_a_policy_changed_after_cli_preflight(
     # The target branch never moved: the kernel refused before integration.
     assert after[0] == before[0]
     assert (repo / "story.txt").exists() is False
+
+
+def test_release_uses_one_metadata_snapshot_for_the_whole_operation(
+    release_home, tmp_path, monkeypatch
+):
+    """A board edited mid-release cannot make a later step disagree with the
+    gate that admitted it.
+
+    The policy flips to `required` on every read after the first. If any step
+    re-read metadata, it would refuse for a missing adapter — possibly after
+    the target branch had already moved. The release must complete on the
+    snapshot it was admitted under.
+    """
+    repo, branch, source_sha = _repo_with_story_branch(tmp_path)
+    board = "release-single-snapshot"
+    _release_board(board, repo)
+    with kb.connect(board=board) as conn:
+        task_id = _seed_reviewed_card(conn, board, repo, branch, source_sha)
+
+    real_metadata = kb.product_board_metadata
+    reads = {"n": 0}
+
+    def flipping_metadata(*args, **kwargs):
+        meta = real_metadata(*args, **kwargs)
+        reads["n"] += 1
+        if reads["n"] > 1 and isinstance(meta, dict):
+            meta = json.loads(json.dumps(meta))
+            meta.setdefault("product_workflow", {})["deployment_policy"] = "required"
+        return meta
+
+    monkeypatch.setattr(kb, "product_board_metadata", flipping_metadata)
+    with kb.connect(board=board) as conn:
+        result = kb.release_product_task(
+            conn, task_id, board, None, None,
+            measurement_note="Released and measured by operator",
+        )
+        task = kb.get_task(conn, task_id)
+
+    assert result.released is True, f"release refused on a re-read: {result.status}"
+    assert task is not None and task.status == "done"
+    assert (repo / "story.txt").read_text(encoding="utf-8") == "released\n"
+
+
+def test_release_cli_serializes_concurrent_epic_releases(
+    release_home, tmp_path
+):
+    """Epics cannot take a run lease (`claim_task` refuses work_item_kind=epic),
+    so the operator path serializes them on an advisory lock instead."""
+    repo, branch, source_sha = _repo_with_story_branch(tmp_path)
+    board = "release-epic-lease"
+    _release_board(board, repo)
+    with kb.connect(board=board) as conn:
+        epic_id = kb.create_task(
+            conn,
+            title="Epic: operator release",
+            board=board,
+            work_item_kind="epic",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+            branch_name=branch,
+        )
+        # Legacy shape on purpose: work_item_kind=epic with null workflow
+        # metadata, exactly like t_4cccacd1.
+        assert kb.claim_task(conn, epic_id) is None  # epics are unclaimable
+        before = _release_snapshot(conn, repo, epic_id)
+
+    # Operator A holds the release lock; B must refuse without mutating.
+    held = kc._acquire_release_lock(epic_id)
+    try:
+        out = _release(epic_id, board)
+    finally:
+        kc._release_release_lock(held)
+
+    assert "already running" in out
+    with kb.connect(board=board) as conn:
+        after = _release_snapshot(conn, repo, epic_id)
+    assert after == before
+
+    # With the lock free again, the same command reaches the real gates rather
+    # than the lock refusal — proving the lock was released, not leaked.
+    out_again = _release(epic_id, board)
+    assert "already running" not in out_again
