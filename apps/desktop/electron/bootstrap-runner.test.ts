@@ -28,6 +28,7 @@ function mkTmpHome() {
 
 vi.mock('node:child_process', async (importOriginal) => {
   const mod = await importOriginal<typeof import('node:child_process')>()
+
   return {
     ...mod,
     spawn: vi.fn()
@@ -283,7 +284,7 @@ test('resolveInstallScript rethrows when the 404 fallback is unavailable', async
 })
 
 test('spawnPowerShell preserves explicit PYTHONUTF8 values and defaults to 1 if absent', async () => {
-  if (process.platform !== 'win32') return
+  if (process.platform !== 'win32') {return}
   
   // Save original env
   const originalEnv = process.env
