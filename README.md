@@ -18,6 +18,16 @@ Run it on a $5 VPS, a GPU cluster, or serverless infrastructure that costs nearl
 
 IYARI is a fork of [Hermes Agent](https://github.com/NousResearch/hermes-agent), originally built by Nous Research, developed and maintained independently by Digital Services LLC under the MIT license.
 
+<table>
+<tr><td><b>A real terminal interface</b></td><td>Full TUI with multiline editing, slash-command autocomplete, conversation history, interrupt-and-redirect, and streaming tool output.</td></tr>
+<tr><td><b>Lives where you do</b></td><td>Telegram, Discord, Slack, WhatsApp, Signal, and CLI — all from a single gateway process.</td></tr>
+<tr><td><b>A closed learning loop</b></td><td>Agent-curated memory with periodic nudges, autonomous skill creation, FTS5 session search with LLM summarization, <a href="https://github.com/plastic-labs/honcho">Honcho</a> dialectic user modeling. Compatible with the <a href="https://agentskills.io">agentskills.io</a> open standard.</td></tr>
+<tr><td><b>Scheduled automations</b></td><td>Built-in cron scheduler with delivery to any platform — reports, backups, audits, all in natural language, running unattended.</td></tr>
+<tr><td><b>Delegates and parallelizes</b></td><td>Spawn isolated subagents for parallel workstreams; call tools programmatically from Python scripts to collapse multi-step pipelines into a single turn.</td></tr>
+<tr><td><b>Runs anywhere, not just your laptop</b></td><td>Local, Docker, SSH, Daytona, Singularity, Modal, and Vercel Sandbox terminal backends. Daytona and Modal offer serverless persistence — your environment hibernates when idle and wakes on demand.</td></tr>
+<tr><td><b>Native Windows support</b></td><td>Runs without WSL — CLI, gateway, TUI, and tools all work natively via bundled Git Bash for shell commands.</td></tr>
+</table>
+
 ## Use any model you want
 
 Nous Portal, OpenRouter, OpenAI, DeepSeek, Kimi, your own endpoint, and many others. Switch with `hermes model` — no code changes, no lock-in.
