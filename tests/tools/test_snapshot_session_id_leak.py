@@ -44,7 +44,7 @@ def test_regex_matches_bridged_session_vars():
 
 
 def test_export_snippet_shape():
-    snippet = _export_dump_excluding_session_vars("/tmp/snap.tmp.$BASHPID")
+    snippet = _export_dump_excluding_session_vars('"$__hermes_snap_tmp"')
     assert "export -p" in snippet
     # Unset-by-name (not line-grep): multi-line declare values must not leave
     # continuation lines in the snapshot (issue #71296).
@@ -55,15 +55,16 @@ def test_export_snippet_shape():
     assert "HERMES_CRON_SESSION" in snippet
     assert "HERMES_CAPABILITY_EPOCH_SHA256" in snippet
     assert "grep -vE" not in snippet
-    assert "/tmp/snap.tmp.$BASHPID" in snippet
+    assert '"$__hermes_snap_tmp"' in snippet
     # The redirection must be attached to a brace group wrapping the dump,
-    # NOT to a pipeline segment: a redirect on a pipeline segment expands
-    # $BASHPID inside that segment's subshell (a different PID than the parent
-    # that expands the follow-up ``mv`` operand), silently orphaning the dump
-    # and breaking snapshot env persistence entirely.
+    # NOT to a pipeline segment: a redirect on a pipeline segment expands the
+    # temp-path variable inside that segment's subshell (potentially
+    # inconsistently with the parent that expands the follow-up ``mv``
+    # operand), silently orphaning the dump and breaking snapshot env
+    # persistence entirely.
     assert snippet.lstrip().startswith("{ ")
     assert "|| true; }" in snippet
-    assert snippet.rstrip().endswith("> /tmp/snap.tmp.$BASHPID")
+    assert snippet.rstrip().endswith('> "$__hermes_snap_tmp"')
 
 
 # ---------------------------------------------------------------------------

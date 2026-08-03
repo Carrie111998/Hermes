@@ -8062,6 +8062,7 @@ def _resume_session_with_db(
     profile_home: Path | None,
     db,
     db_ownership: _ResumeDBOwnership,
+    omit_messages: bool = False,
 ) -> dict:
     found = db.get_session(target)
     if not found:
@@ -8118,6 +8119,7 @@ def _resume_session_with_db(
             cols=cols,
             touch=True,
             transport=current_transport() or _stdio_transport,
+            omit_messages=omit_messages,
         )
         payload["resumed"] = target
         # A lazy watch session never owns a run loop, so its payload's running
@@ -8198,14 +8200,15 @@ def _resume_session_with_db(
         except Exception:
             logger.debug("child-watch display projection read failed", exc_info=True)
             display_history = history
-        messages = _history_to_messages(display_history)
+        messages = [] if omit_messages else _history_to_messages(display_history)
         return _ok(
             rid,
             {
                 "session_id": sid,
                 "resumed": target,
-                "message_count": len(messages),
+                "message_count": len(display_history) if omit_messages else len(messages),
                 "messages": messages,
+                "messages_omitted": omit_messages,
                 "info": _lazy_resume_info(cwd, profile=profile),
                 "inflight": None,
                 "running": child_running,
@@ -8242,7 +8245,13 @@ def _resume_session_with_db(
             # (raw_history → sanitize_replay_history → the resumed session's
             # working conversation) and the display copy stays verbatim —
             # inspection/export must show what is actually stored.
-            raw_history, display_history = db.get_resume_conversations(target)
+            if omit_messages:
+                raw_history = db.get_messages_as_conversation(
+                    target, repair_alternation=True
+                )
+                display_history = []
+            else:
+                raw_history, display_history = db.get_resume_conversations(target)
         except Exception as e:
             if lease is not None:
                 lease.release()
@@ -8250,7 +8259,7 @@ def _resume_session_with_db(
         # Display keeps the full transcript; the model-fed history drops a
         # dangling/interrupted tool-call tail so a session killed mid-loop does
         # not replay the unanswered call forever (#29086).
-        prefix = db.get_ancestor_display_prefix(target)
+        prefix = [] if omit_messages else db.get_ancestor_display_prefix(target)
         history = sanitize_replay_history(raw_history)
         # Restore the model/provider/reasoning/tier this chat last used so the
         # deferred build (and the info below) match the eager path — without them
@@ -8279,12 +8288,13 @@ def _resume_session_with_db(
         _schedule_session_cap_enforcement()  # trim detached idle sessions over the cap
         auto_continue = _maybe_schedule_auto_continue(sid, record, target)
 
-        messages = _history_to_messages(display_history)
+        messages = [] if omit_messages else _history_to_messages(display_history)
         payload = {
             "session_id": sid,
             "resumed": target,
-            "message_count": len(messages),
+            "message_count": len(raw_history) if omit_messages else len(messages),
             "messages": messages,
+            "messages_omitted": omit_messages,
             "info": _lazy_resume_info(
                 cwd,
                 model=model_override.get("model") or "",
@@ -8322,7 +8332,13 @@ def _resume_session_with_db(
         # One lineage SELECT feeds both projections (see the interactive resume
         # above): the model-fed copy is alternation-repaired for LIVE REPLAY, the
         # display copy stays verbatim.
-        raw_history, display_history = db.get_resume_conversations(target)
+        if omit_messages:
+            raw_history = db.get_messages_as_conversation(
+                target, repair_alternation=True
+            )
+            display_history = []
+        else:
+            raw_history, display_history = db.get_resume_conversations(target)
         # The display transcript keeps every row so the user still sees their
         # full history.  The model-fed history is sanitized: a session whose
         # last turn died mid-tool-loop persists a dangling assistant(tool_calls)
@@ -8330,9 +8346,11 @@ def _resume_session_with_db(
         # re-issue the unanswered call forever — the permanent-"thinking" stuck
         # session in #29086.  The messaging gateway already strips this; this is
         # the WebUI/TUI resume path picking up the same cleanup.
-        display_history_prefix = db.get_ancestor_display_prefix(target)
+        display_history_prefix = (
+            [] if omit_messages else db.get_ancestor_display_prefix(target)
+        )
         history = sanitize_replay_history(raw_history)
-        messages = _history_to_messages(display_history)
+        messages = [] if omit_messages else _history_to_messages(display_history)
         tokens = _set_session_context(target)
         try:
             # Pass the profile's db so the agent persists turns to the right
@@ -8390,6 +8408,7 @@ def _resume_session_with_db(
                 cols=cols,
                 touch=True,
                 transport=current_transport() or _stdio_transport,
+                omit_messages=omit_messages,
             )
             payload["resumed"] = target
             return _ok(rid, payload)
@@ -8484,8 +8503,9 @@ def _resume_session_with_db(
     payload = {
         "session_id": sid,
         "resumed": target,
-        "message_count": len(messages),
+        "message_count": len(raw_history) if omit_messages else len(messages),
         "messages": messages,
+        "messages_omitted": omit_messages,
         "info": _session_info(agent, session),
         "inflight": None,
         "running": False,
@@ -8707,6 +8727,7 @@ def _live_session_payload(
     cols: int | None = None,
     touch: bool = False,
     transport: Transport | None = None,
+    omit_messages: bool = False,
 ) -> dict:
     with session["history_lock"]:
         if cols is not None:
@@ -8726,12 +8747,16 @@ def _live_session_payload(
     # lock, so read it outside the session history lock. Resolve through the
     # live session's profile DB; using the launch handle here can project a
     # same-key transcript from another profile into a remote resume payload.
-    with _session_db(session) as db:
-        history = _live_visible_history(session, db, in_memory_history)
+    if omit_messages:
+        history = in_memory_history
+    else:
+        with _session_db(session) as db:
+            history = _live_visible_history(session, db, in_memory_history)
     payload = {
         "info": _fallback_session_info(session),
         "message_count": len(history),
-        "messages": _history_to_messages(history),
+        "messages": [] if omit_messages else _history_to_messages(history),
+        "messages_omitted": omit_messages,
         "running": running,
         "session_id": sid,
         "session_key": _session_lookup_key(session, fallback=sid),
