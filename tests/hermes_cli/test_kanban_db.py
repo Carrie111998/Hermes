@@ -6817,7 +6817,11 @@ def _make_task(**overrides) -> "kb.Task":
 
 def _set_task_status(conn: sqlite3.Connection, task_id: str, status: str) -> None:
     """Test helper: set a task's status directly."""
-    conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, task_id))
+    completed_at = int(time.time()) if status == "done" else None
+    conn.execute(
+        "UPDATE tasks SET status = ?, completed_at = ? WHERE id = ?",
+        (status, completed_at, task_id),
+    )
 
 
 
@@ -11597,6 +11601,66 @@ def test_reconcile_ten_times_does_not_reprocess_integrated_story(
         ).fetchone()[0]
 
     assert after == before
+    assert calls == []
+
+
+def test_reconcile_reintegrates_story_after_later_completion(
+    kanban_home, tmp_path, monkeypatch
+):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    board = "v2-reconcile-reworked-story"
+    _v2_product_board_with_repo(board, repo)
+    epic, story, epic_branch, _story_sha = _make_epic_and_done_story(board, repo)
+
+    with kb.connect(board=board) as conn:
+        assert kb.integrate_story_to_epic(conn, story, board=board) == "integrated"
+        first_events = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind=?",
+            (story, "story_integrated_to_epic"),
+        ).fetchone()[0]
+
+        story_branch = f"story/{epic}-s1"
+        subprocess.run(
+            ["git", "-C", str(repo), "switch", story_branch],
+            check=True, capture_output=True, text=True,
+        )
+        _commit_file(repo, "rework.txt", "reworked\n", "rework commit")
+        subprocess.run(
+            ["git", "-C", str(repo), "switch", "main"],
+            check=True, capture_output=True, text=True,
+        )
+        first_integrated_at = conn.execute(
+            "SELECT integrated_at FROM epic_story_integrations WHERE epic_id=? AND story_id=?",
+            (epic, story),
+        ).fetchone()[0]
+        conn.execute(
+            "UPDATE tasks SET completed_at=? WHERE id=?",
+            (first_integrated_at + 1, story),
+        )
+        conn.commit()
+
+    time.sleep(1.1)
+    calls = _record_git_calls(monkeypatch)
+    with kb.connect(board=board) as conn:
+        result = kb.reconcile(conn, board=board, spawn_ready=False)
+        reworked_events = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind=?",
+            (story, "story_integrated_to_epic"),
+        ).fetchone()[0]
+        rework_content = _git_output(repo, "show", f"{epic_branch}:rework.txt")
+        calls.clear()
+        unchanged = kb.reconcile(conn, board=board, spawn_ready=False)
+        unchanged_events = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind=?",
+            (story, "story_integrated_to_epic"),
+        ).fetchone()[0]
+
+    assert result.integrated == [story]
+    assert reworked_events == first_events + 1
+    assert rework_content == "reworked"
+    assert unchanged.integrated == []
+    assert unchanged_events == reworked_events
     assert calls == []
 
 

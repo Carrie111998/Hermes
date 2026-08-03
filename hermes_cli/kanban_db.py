@@ -13486,7 +13486,15 @@ def integrate_story_to_epic(
         and expected_source_sha is None
         and before_apply_fn is None
         and conn.execute(
-            "SELECT 1 FROM epic_story_integrations WHERE epic_id=? AND story_id=? LIMIT 1",
+            """
+            SELECT 1
+              FROM epic_story_integrations AS integration
+              JOIN tasks AS story ON story.id = integration.story_id
+             WHERE integration.epic_id=?
+               AND integration.story_id=?
+               AND integration.integrated_at >= story.completed_at
+             LIMIT 1
+            """,
             (epic_id, story_id),
         ).fetchone()
         is not None
