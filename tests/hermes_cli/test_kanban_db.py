@@ -6184,3 +6184,239 @@ class TestTriageLifecycleRegression:
         err = capsys.readouterr().err
         assert "triage" in err.lower() or "cannot complete" in err.lower()
         assert "unknown id or terminal state" not in err
+
+
+# ---------------------------------------------------------------------------
+# DISPATCHER_MAX_CONSECUTIVE_FAILURES kill-switch regression tests
+# (t_c5d27be0 / t_458ab8d6)
+#
+# Spec: DISPATCHER_MAX_CONSECUTIVE_FAILURES = 10 is an ABSOLUTE catch-all
+# hard limit on consecutive failures that NO override — per-task
+# max_retries, config kanban.failure_limit, caller-supplied failure_limit,
+# or force_trip=False — can bypass. It must fire in:
+#   1. _record_task_failure (counter reaches the absolute max)
+#   2. detect_crashed_workers below-budget protocol-violation path
+#      (DB consecutive_failures >= absolute max, even when the violation
+#      streak is below its own budget)
+#   3. recompute_ready (a blocked task at the absolute max is never
+#      auto-promoted)
+#   4. `hermes kanban show <id>` (the gave_up event carries
+#      limit_source=absolute_max / effective_limit=10)
+# ---------------------------------------------------------------------------
+
+
+def _kill_switch_abs_max() -> int:
+    """Return DISPATCHER_MAX_CONSECUTIVE_FAILURES, failing with a precise
+    message when the kill-switch implementation is absent.
+
+    The constant is the spec anchor. When it is missing (the t_458ab8d6
+    kill-switch was not re-landed into the canonical tree, per the guardian
+    REJECT), these regression tests fail loudly and identify exactly what is
+    missing instead of crashing with a bare AttributeError.
+    """
+    value = getattr(kb, "DISPATCHER_MAX_CONSECUTIVE_FAILURES", None)
+    if value is None:
+        pytest.fail(
+            "DISPATCHER_MAX_CONSECUTIVE_FAILURES is not defined — the "
+            "absolute kill-switch implementation from t_458ab8d6 is absent "
+            "from hermes_cli/kanban_db.py; this regression test encodes the "
+            "acceptance criteria and will pass once the kill-switch is "
+            "re-landed."
+        )
+    return int(value)
+
+
+def test_record_task_failure_absolute_max_trips_despite_max_retries_99(kanban_home):
+    """Acceptance #1a: _record_task_failure trips at the absolute max even
+    when the per-task max_retries override is 99."""
+    abs_max = _kill_switch_abs_max()
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="absmax task", assignee="worker", max_retries=99,
+        )
+        # Seed the counter one below the absolute max so this failure reaches it.
+        conn.execute(
+            "UPDATE tasks SET status='ready', consecutive_failures=? WHERE id=?",
+            (abs_max - 1, tid),
+        )
+        conn.commit()
+        tripped = kb._record_task_failure(
+            conn, tid, error="synthetic absolute max",
+            outcome="crashed", failure_limit=99,
+        )
+        task = kb.get_task(conn, tid)
+        assert tripped is True, "absolute max must trip the breaker"
+        assert task.status == "blocked", f"got {task.status}"
+        assert task.consecutive_failures == abs_max
+        gave_up = [e for e in kb.list_events(conn, tid) if e.kind == "gave_up"]
+        assert len(gave_up) == 1
+        payload = gave_up[0].payload or {}
+        assert payload.get("limit_source") == "absolute_max", payload
+        assert payload.get("effective_limit") == abs_max, payload
+
+
+def test_record_task_failure_absolute_max_trips_despite_failure_limit_99(kanban_home):
+    """Acceptance #1b: _record_task_failure trips at the absolute max even
+    when the caller/config failure_limit is 99 (no per-task override)."""
+    abs_max = _kill_switch_abs_max()
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="absmax task2", assignee="worker")
+        conn.execute(
+            "UPDATE tasks SET status='ready', consecutive_failures=? WHERE id=?",
+            (abs_max - 1, tid),
+        )
+        conn.commit()
+        tripped = kb._record_task_failure(
+            conn, tid, error="synthetic absolute max 2",
+            outcome="crashed", failure_limit=99,
+        )
+        task = kb.get_task(conn, tid)
+        assert tripped is True, "absolute max must trip the breaker"
+        assert task.status == "blocked", f"got {task.status}"
+        assert task.consecutive_failures == abs_max
+        gave_up = [e for e in kb.list_events(conn, tid) if e.kind == "gave_up"]
+        assert len(gave_up) == 1
+        payload = gave_up[0].payload or {}
+        assert payload.get("limit_source") == "absolute_max", payload
+        assert payload.get("effective_limit") == abs_max, payload
+
+
+def test_detect_crashed_workers_absolute_max_force_trips_below_budget_violation(
+    kanban_home, monkeypatch,
+):
+    """Acceptance #2: the below-budget protocol-violation path force-trips
+    instead of ``continue`` when the DB consecutive_failures is at the
+    absolute max.
+
+    Setup: max_retries=99 raises the violation budget to 99, so the first
+    clean-exit violation is FAR below its own streak budget. The ONLY thing
+    that can legitimately block this card is the absolute kill-switch seeing
+    the unified counter at 10.
+    """
+    abs_max = _kill_switch_abs_max()
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="absmax proto", assignee="worker", max_retries=99,
+        )
+        host = _kb._claimer_id().split(":", 1)[0]
+        pid = 770001
+        conn.execute(
+            "UPDATE tasks SET status='running', worker_pid=?, claim_lock=?, "
+            "started_at=0, consecutive_failures=? WHERE id=?",
+            (pid, f"{host}:w", abs_max, tid),
+        )
+        conn.commit()
+        # Clean exit (raw status 0) → protocol-violation classification.
+        _kb._record_worker_exit(pid, _exited_status(0))
+        crashed = kb.detect_crashed_workers(conn)
+        task = kb.get_task(conn, tid)
+        assert tid in crashed
+        assert task.status == "blocked", (
+            f"high unified counter must force-trip, got {task.status}"
+        )
+        gave_up = [e for e in kb.list_events(conn, tid) if e.kind == "gave_up"]
+        assert len(gave_up) == 1
+        payload = gave_up[0].payload or {}
+        assert payload.get("limit_source") == "absolute_max", payload
+        assert payload.get("effective_limit") == abs_max, payload
+
+
+def test_recompute_ready_does_not_promote_absolute_max_blocked(kanban_home):
+    """Acceptance #3: recompute_ready must not promote a blocked task whose
+    consecutive_failures is at the absolute max, even with max_retries=99 /
+    failure_limit=99."""
+    abs_max = _kill_switch_abs_max()
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="a")
+        child = kb.create_task(
+            conn, title="child", assignee="a",
+            parents=[parent], max_retries=99,
+        )
+        kb.claim_task(conn, parent)
+        kb.complete_task(conn, parent, summary="done")
+        conn.execute(
+            "UPDATE tasks SET status='blocked', consecutive_failures=? "
+            "WHERE id=?",
+            (abs_max, child),
+        )
+        conn.commit()
+        promoted = kb.recompute_ready(conn, failure_limit=99)
+        assert promoted == 0
+        task = kb.get_task(conn, child)
+        assert task.status == "blocked", f"got {task.status}"
+        assert task.consecutive_failures == abs_max
+
+
+def test_kanban_show_displays_gave_up_absolute_max(kanban_home, capsys):
+    """Acceptance #4: `hermes kanban show <id>` renders the gave_up event
+    with limit_source=absolute_max after a kill-switch trip."""
+    abs_max = _kill_switch_abs_max()
+    from hermes_cli import kanban as kc
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="absmax show", assignee="worker", max_retries=99,
+        )
+        conn.execute(
+            "UPDATE tasks SET status='ready', consecutive_failures=? WHERE id=?",
+            (abs_max - 1, tid),
+        )
+        conn.commit()
+        tripped = kb._record_task_failure(
+            conn, tid, error="synthetic absmax show",
+            outcome="crashed", failure_limit=99,
+        )
+        assert tripped is True, "absolute max must trip the breaker"
+
+    ns = argparse.Namespace(task_id=tid, state_type=None, state_name=None, json=False)
+    rc = kc._cmd_show(ns)
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "gave_up" in out, out
+    assert "absolute_max" in out, out
+
+
+def test_absolute_max_trip_fires_delivered_failure_alert(kanban_home, monkeypatch):
+    """Acceptance #5 (binding jarvis seat decision, t_458ab8d6): an
+    absolute-max kill-switch trip MUST emit a LOUD, DELIVERED
+    ``kanban_failure_alert`` through the failure-alert path — not a silent
+    status change. Captures the strict hook the same way
+    test_deadpid_fleet_alert does, and asserts the trip fires it exactly
+    once with the kill-switch provenance.
+    """
+    abs_max = _kill_switch_abs_max()
+    from hermes_cli.plugins import get_plugin_manager
+
+    mgr = get_plugin_manager()
+    events: list[dict] = []
+    saved = {k: list(v) for k, v in mgr._hooks.items()}
+    mgr._hooks["kanban_failure_alert"] = [lambda **kw: events.append(kw)]
+    try:
+        with kb.connect() as conn:
+            tid = kb.create_task(
+                conn, title="absmax alert", assignee="worker", max_retries=99,
+            )
+            conn.execute(
+                "UPDATE tasks SET status='ready', consecutive_failures=? WHERE id=?",
+                (abs_max - 1, tid),
+            )
+            conn.commit()
+            tripped = kb._record_task_failure(
+                conn, tid, error="synthetic absmax alert",
+                outcome="crashed", failure_limit=99,
+            )
+            assert tripped is True, "absolute max must trip the breaker"
+    finally:
+        mgr._hooks = saved
+
+    assert len(events) == 1, events
+    ev = events[0]
+    assert ev["task_id"] == tid
+    assert ev["limit_source"] == "absolute_max"
+    assert ev["consecutive_failures"] == abs_max
+    assert ev["kill_switch"] is True
+    assert ev["fingerprint"] == f"kill-switch:absolute-max:{tid}"
+

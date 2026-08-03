@@ -169,3 +169,43 @@ def test_deadpid_plugin_dedups_by_fingerprint(monkeypatch):
     assert third == {"sent": True, "target": "discord:#fleet-reports", "fingerprint": "pid n not alive"}
     assert len(sent) == 2
     assert sent[0][:5] == ["hermes", "send", "--to", "discord:#fleet-reports", "--quiet"]
+
+
+def test_deadpid_plugin_kill_switch_message(monkeypatch):
+    """The deadpid-fleet-alert relay formats an absolute kill-switch trip as
+    its own message class (t_458ab8d6) — not a generic dead-PID alert — so a
+    delivered kill-switch alert says what actually happened."""
+    plugin = _load_deadpid_plugin()
+    sent: list[list[str]] = []
+
+    def fake_run(cmd, **_kwargs):
+        sent.append(cmd)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(plugin.subprocess, "run", fake_run)
+    monkeypatch.setattr(plugin, "_settings", lambda: ("discord:#fleet-reports", 30))
+    payload = {
+        "task_id": "t_killswitch",
+        "board": "jarvis-os",
+        "assignee": "integration-builder",
+        "run_id": 42,
+        "consecutive_failures": 10,
+        "fingerprint": "kill-switch:absolute-max:t_killswitch",
+        "error": "absolute max reached",
+        "kill_switch": True,
+        "limit_source": "absolute_max",
+    }
+
+    result = plugin._on_kanban_failure_alert(**payload)
+
+    assert result == {
+        "sent": True,
+        "target": "discord:#fleet-reports",
+        "fingerprint": "kill-switch:absolute-max:t_killswitch",
+    }
+    assert len(sent) == 1
+    message = sent[0][-1]
+    assert "ABSOLUTE kill-switch tripped" in message
+    assert "cf=10" in message
+    assert "t_killswitch" in message
+

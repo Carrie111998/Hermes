@@ -65,11 +65,23 @@ def _format_message(
     fingerprint: str,
     error: str,
     run_id: int | None = None,
+    kill_switch: bool = False,
     **_: Any,
 ) -> str:
     board_part = board or "default"
     assignee_part = assignee or "unassigned"
     run_part = f" run={run_id}" if run_id is not None else ""
+    if kill_switch:
+        # Absolute consecutive-failure kill-switch trip (t_458ab8d6). This
+        # is NOT a dead-PID failure; it is the dispatcher's catch-all
+        # circuit breaker firing after DISPATCHER_MAX_CONSECUTIVE_FAILURES
+        # consecutive non-successes. Say what actually happened so the
+        # operator can tell the two apart.
+        return (
+            "KANBAN FAILURE ALERT: ABSOLUTE kill-switch tripped at "
+            f"cf={consecutive_failures} on {board_part}/{task_id}{run_part} "
+            f"assignee={assignee_part} fp={fingerprint!r} error={error[:240]!r}"
+        )
     return (
         "KANBAN FAILURE ALERT: dead-PID worker failures reached "
         f"cf={consecutive_failures} on {board_part}/{task_id}{run_part} "

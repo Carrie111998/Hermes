@@ -280,6 +280,67 @@ def _is_dead_pid_fingerprint(fingerprint: str) -> bool:
     )
 
 
+def _maybe_fire_kill_switch_alert(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    failures: int,
+    error: str,
+    outcome: str,
+) -> None:
+    """Fire a LOUD, DELIVERED fleet alert when the absolute kill-switch trips.
+
+    Binding jarvis seat decision (t_458ab8d6): the kill-switch trip must be
+    observable through the failure-alert path (``kanban_failure_alert``
+    strict hook → deadpid-fleet-alert relay → fleet channel), not a silent
+    status change. Called AFTER ``_record_task_failure``'s write_txn commits
+    so a strict-hook relay failure can never roll back the block itself.
+
+    Uses a task-scoped synthetic fingerprint so each tripping task gets its
+    own delivered alert (dedup only suppresses repeat trips of the SAME task
+    within the relay window). Mirrors ``_maybe_fire_deadpid_fleet_alert``'s
+    contract: persist a dead-letter event, then re-raise so the
+    dispatcher/gateway logs see the relay breakage.
+    """
+    row = conn.execute(
+        "SELECT assignee, current_run_id FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return
+    payload = {
+        "board": get_current_board(),
+        "assignee": row["assignee"],
+        "run_id": row["current_run_id"],
+        "consecutive_failures": failures,
+        "fingerprint": f"kill-switch:absolute-max:{task_id}",
+        "error": error[:500],
+        "kill_switch": True,
+        "limit_source": "absolute_max",
+    }
+    try:
+        _fire_failure_alert(task_id, **payload)
+    except Exception as exc:
+        # Dead-letter the relay failure so it is inspectable from the board,
+        # then re-raise (same contract as _maybe_fire_deadpid_fleet_alert).
+        try:
+            with write_txn(conn):
+                _append_event(
+                    conn,
+                    task_id,
+                    "kanban_failure_alert_failed",
+                    {**payload, "hook_error": str(exc)[:500]},
+                    run_id=row["current_run_id"],
+                )
+        except Exception:
+            _log.warning(
+                "failed to persist kanban_failure_alert dead-letter for %s",
+                task_id,
+                exc_info=True,
+            )
+        raise
+
+
 def _maybe_fire_deadpid_fleet_alert(
     conn: sqlite3.Connection,
     task_id: str,
@@ -300,6 +361,24 @@ def _maybe_fire_deadpid_fleet_alert(
     failures = int(row["consecutive_failures"] or 0)
     if failures < 3:
         return
+    # If the absolute kill-switch just tripped (limit_source=absolute_max),
+    # _maybe_fire_kill_switch_alert already delivered a louder, more specific
+    # alert for THIS trip. Skip the generic dead-PID alert so the operator
+    # gets one loud signal, not two (t_458ab8d6).
+    last_gave_up = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'gave_up' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if last_gave_up is not None and last_gave_up["payload"]:
+        try:
+            if (json.loads(last_gave_up["payload"]) or {}).get(
+                "limit_source"
+            ) == "absolute_max":
+                return
+        except (ValueError, TypeError):
+            pass
 
     payload = {
         "board": get_current_board(),
@@ -4770,6 +4849,10 @@ def recompute_ready(
     circuit breaker in ``_record_task_failure`` so the two never
     disagree about when a task is permanently blocked:
 
+      0. ``DISPATCHER_MAX_CONSECUTIVE_FAILURES`` — the ABSOLUTE catch-all
+         (t_458ab8d6), highest precedence: a task whose counter has
+         reached the absolute max is NEVER auto-promoted, no matter what
+         its ``max_retries`` / ``failure_limit`` say.
       1. per-task ``max_retries`` if set
       2. caller-supplied ``failure_limit`` (the dispatcher passes the
          ``kanban.failure_limit`` config value through ``dispatch_once``)
@@ -4826,6 +4909,13 @@ def recompute_ready(
                         else int(failure_limit)
                     )
                     if failures >= effective_limit:
+                        continue
+                    # Absolute catch-all (t_458ab8d6): a task at the
+                    # absolute max is never auto-promoted even when
+                    # per-task max_retries / config failure_limit would
+                    # otherwise allow it — the kill-switch must be able to
+                    # park a task permanently.
+                    if failures >= DISPATCHER_MAX_CONSECUTIVE_FAILURES:
                         continue
                     conn.execute(
                         "UPDATE tasks SET status = 'ready' "
@@ -7503,6 +7593,16 @@ DEFAULT_FAILURE_LIMIT = 2
 # Legacy alias — callers / tests still reference the old name.
 DEFAULT_SPAWN_FAILURE_LIMIT = DEFAULT_FAILURE_LIMIT
 
+# ABSOLUTE catch-all consecutive-failure kill-switch (t_ceo_1784901556 /
+# t_458ab8d6). Unlike DEFAULT_FAILURE_LIMIT and per-task ``max_retries``,
+# this threshold can NEVER be overridden: per-task retries, the config
+# ``kanban.failure_limit``, a caller-supplied ``failure_limit``, and
+# ``force_trip=False`` all lose to it. Once the unified counter reaches this
+# value the circuit breaker MUST trip (``limit_source="absolute_max"``), so a
+# task with a high ``max_retries``/config limit plus interleaved failure
+# kinds cannot cycle forever.
+DISPATCHER_MAX_CONSECUTIVE_FAILURES = 10
+
 # Max bytes to keep in a single worker log file. The dispatcher truncates
 # and rotates on spawn if the file is larger than this at spawn time.
 DEFAULT_LOG_ROTATE_BYTES = 2 * 1024 * 1024   # 2 MiB
@@ -9043,12 +9143,34 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     # below-budget violation must not consume the unified
                     # failure budget, just as other failure kinds don't
                     # consume this one.
-                    continue
-                # Streak reached the bound: trip the breaker. ``force_trip``
-                # skips the threshold resolution inside
-                # ``_record_task_failure`` because the decision — including
-                # the per-task ``max_retries`` override — was already made
-                # against the violation streak above.
+                    #
+                    # EXCEPT the ABSOLUTE catch-all (t_458ab8d6): when the
+                    # unified consecutive_failures counter has already
+                    # reached DISPATCHER_MAX_CONSECUTIVE_FAILURES, fall
+                    # through to the force-trip below instead of
+                    # ``continue``. The violation streak only bounds
+                    # violations; the absolute max bounds ALL consecutive
+                    # failures, and a task parked at the absolute max must
+                    # not escape through a below-budget violation branch
+                    # (the ``max_retries=99`` bypass).
+                    _cf_row = conn.execute(
+                        "SELECT consecutive_failures FROM tasks WHERE id = ?",
+                        (tid,),
+                    ).fetchone()
+                    if _cf_row is None:
+                        continue  # task deleted mid-loop
+                    if int(_cf_row["consecutive_failures"] or 0) < (
+                        DISPATCHER_MAX_CONSECUTIVE_FAILURES
+                    ):
+                        continue
+                # Streak reached the bound — or the unified counter reached
+                # the absolute max: trip the breaker. ``force_trip`` skips
+                # the threshold resolution inside ``_record_task_failure``
+                # because the decision — including the per-task
+                # ``max_retries`` override — was already made against the
+                # violation streak above (and the absolute-max provenance
+                # fix inside the recorder re-labels the trip when the
+                # counter is at the absolute max).
                 tripped = _record_task_failure(
                     conn, tid,
                     error=error_text,
@@ -9186,6 +9308,12 @@ def _record_task_failure(
     which hid this class).
 
     Resolution order for the effective threshold:
+      0. ``DISPATCHER_MAX_CONSECUTIVE_FAILURES`` — the ABSOLUTE catch-all
+         kill-switch (t_458ab8d6), highest precedence. Once the unified
+         counter reaches it, no override — per-task ``max_retries``,
+         caller-supplied ``failure_limit``, or ``force_trip=False`` — can
+         keep the task retrying; the trip reports
+         ``limit_source="absolute_max"``.
       1. per-task ``max_retries`` if set (nothing else overrides)
       2. caller-supplied ``failure_limit`` (gateway passes the config
          value from ``kanban.failure_limit``; tests pass fixed values)
@@ -9224,6 +9352,19 @@ def _record_task_failure(
         else:
             effective_limit = int(failure_limit)
             limit_source = "dispatcher"
+
+        # Threshold #0 — the ABSOLUTE catch-all (t_458ab8d6). Highest
+        # precedence: once the unified counter reaches
+        # DISPATCHER_MAX_CONSECUTIVE_FAILURES, nothing can override it —
+        # per-task max_retries, config/caller failure_limit, or
+        # force_trip=False all lose. This is checked AFTER the effective
+        # limit resolution (so a high task/limit override is replaced) and
+        # applies EVEN when force_trip=True: a forced trip at or above the
+        # absolute max reports limit_source="absolute_max" rather than the
+        # caller's own provenance (the t_458ab8d6 provenance fix).
+        if failures >= DISPATCHER_MAX_CONSECUTIVE_FAILURES:
+            effective_limit = DISPATCHER_MAX_CONSECUTIVE_FAILURES
+            limit_source = "absolute_max"
 
         if force_trip or failures >= effective_limit:
             # Trip the breaker.
@@ -9338,6 +9479,17 @@ def _record_task_failure(
                     run_id=run_id,
                 )
             # Timeout/crash path's caller already emitted its own event.
+    # LOUD DELIVERED event for the absolute kill-switch (t_458ab8d6): the
+    # trip must be observable through the failure-alert path, not a silent
+    # status change. Fired AFTER the write_txn commits so a strict-hook
+    # relay failure can never roll back the block itself.
+    if blocked and limit_source == "absolute_max":
+        _maybe_fire_kill_switch_alert(
+            conn, task_id,
+            failures=failures,
+            error=error,
+            outcome=outcome,
+        )
     return blocked
 
 
