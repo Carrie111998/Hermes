@@ -4561,6 +4561,9 @@ def submit_for_review(
     return True
 
 
+_INTERNAL_REVIEW_REMEDIATION_PREFIX = "review-remediation:"
+
+
 def request_review_changes(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4569,56 +4572,44 @@ def request_review_changes(
     metadata: Optional[dict] = None,
     expected_run_id: Optional[int] = None,
 ) -> Optional[str]:
-    """Complete a review with findings and create one remediation card."""
+    """Record review findings and requeue the canonical card for its implementer."""
     if not summary or not summary.strip():
         raise ValueError("changes-requested summary is required")
     with write_txn(conn):
         row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
         if row is None or row["status"] != "running":
             return None
-        if expected_run_id is not None and row["current_run_id"] != int(expected_run_id):
+        current_run_id = row["current_run_id"]
+        if not current_run_id or (expected_run_id is not None and current_run_id != int(expected_run_id)):
             return None
-        event = conn.execute(
-            "SELECT payload FROM task_events WHERE task_id=? AND kind='review_submitted' "
-            "ORDER BY id DESC LIMIT 1", (task_id,)
-        ).fetchone()
+        run = conn.execute("SELECT profile, status, ended_at FROM task_runs WHERE id = ? AND task_id = ?", (current_run_id, task_id)).fetchone()
+        if run is None or run["status"] != "running" or run["ended_at"] is not None or _canonical_assignee(run["profile"]) != _canonical_assignee(row["assignee"]):
+            return None
+        claim = conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND run_id = ? AND kind = 'claimed' ORDER BY id DESC LIMIT 1", (task_id, current_run_id)).fetchone()
+        try:
+            claim_payload = json.loads(claim["payload"]) if claim and claim["payload"] else {}
+        except (TypeError, json.JSONDecodeError):
+            claim_payload = {}
+        if claim_payload.get("source_status") != "review" or _canonical_assignee(claim_payload.get("assignee")) != _canonical_assignee(row["assignee"]):
+            return None
+        event = conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = 'review_submitted' ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
         handoff = json.loads(event["payload"]) if event and event["payload"] else {}
         implementer = _canonical_assignee(handoff.get("original_assignee")) or ""
         if not implementer:
             return None
-        remediation_key = f"review-remediation:{task_id}:{row['current_run_id']}"
-        remediation_id = create_task(
-            conn, title=f"Address review feedback: {row['title']}",
-            body=f"Review task: {task_id}\n\nChanges requested:\n{summary.strip()}",
-            assignee=implementer, created_by=row["assignee"] or "reviewer",
-            tenant=row["tenant"], priority=row["priority"],
-            workspace_kind=row["workspace_kind"], workspace_path=row["workspace_path"],
-            branch_name=row["branch_name"], project_id=row["project_id"],
-            skills=json.loads(row["skills"]) if row["skills"] else None,
-            idempotency_key=remediation_key,
-        )
-        review_metadata = dict(metadata or {})
-        review_metadata.update({"approved": False, "remediation_task_id": remediation_id,
-                                "original_assignee": implementer})
-        where = "id=? AND status='running'"
-        params: tuple[Any, ...] = (summary.strip(), int(time.time()), task_id)
-        if expected_run_id is not None:
-            where += " AND current_run_id=?"
-            params += (int(expected_run_id),)
-        cur = conn.execute(
-            "UPDATE tasks SET status='done', result=?, completed_at=?, claim_lock=NULL, "
-            "claim_expires=NULL, worker_pid=NULL WHERE " + where,
-            params,
-        )
-        if cur.rowcount != 1:
+        remediation_key = f"{_INTERNAL_REVIEW_REMEDIATION_PREFIX}{task_id}:{current_run_id}"
+        if conn.execute("SELECT 1 FROM tasks WHERE idempotency_key = ? LIMIT 1", (remediation_key,)).fetchone() is not None:
             return None
-        run_id = _end_run(
-            conn, task_id, outcome="changes_requested", status="done",
-            summary=summary.strip(), metadata=review_metadata,
-        )
+        review_metadata = dict(metadata or {})
+        review_metadata.update({"approved": False, "reviewer": row["assignee"], "original_assignee": implementer, "original_implementer": implementer, "review_identity": handoff.get("review_identity"), "changes_requested": True})
+        cur = conn.execute("UPDATE tasks SET status='ready', assignee=?, result=?, completed_at=NULL, consecutive_failures=0, last_failure_error=NULL, claim_lock=NULL, claim_expires=NULL, worker_pid=NULL WHERE id=? AND status='running' AND current_run_id IS NOT NULL", (implementer, summary.strip(), task_id))
+        if cur.rowcount != 1:
+            raise RuntimeError("review task changed while requeueing same card")
+        run_id = _end_run(conn, task_id, outcome="changes_requested", status="done", summary=summary.strip(), metadata=review_metadata)
+        if run_id is None:
+            raise RuntimeError("review run disappeared while requesting changes")
         _append_event(conn, task_id, "review_changes_requested", review_metadata, run_id=run_id)
-    recompute_ready(conn)
-    return remediation_id
+    return task_id
 
 
 def heartbeat_claim(
@@ -4758,12 +4749,21 @@ def release_stale_claims(
             )
             continue
         with write_txn(conn):
+            source_status_row = conn.execute(
+                "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'claimed' "
+                "ORDER BY id DESC LIMIT 1", (row["id"],)
+            ).fetchone()
+            try:
+                source_status = json.loads(source_status_row["payload"]).get("source_status") if source_status_row else None
+            except (TypeError, json.JSONDecodeError):
+                source_status = None
+            reclaimed_status = "review" if source_status == "review" else "ready"
             cur = conn.execute(
-                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL "
                 "WHERE id = ? AND status = 'running' AND claim_lock IS ? "
                 "AND claim_expires IS NOT NULL AND claim_expires < ?",
-                (row["id"], row["claim_lock"], now),
+                (reclaimed_status, row["id"], row["claim_lock"], now),
             )
             if cur.rowcount != 1:
                 continue
@@ -4826,16 +4826,25 @@ def reclaim_task(
         # Nothing to reclaim — already ready / blocked / done.
         return False
     prev_lock = row["claim_lock"]
+    claim_event = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'claimed' "
+        "ORDER BY id DESC LIMIT 1", (task_id,)
+    ).fetchone()
+    try:
+        source_status = json.loads(claim_event["payload"]).get("source_status") if claim_event else None
+    except (TypeError, json.JSONDecodeError):
+        source_status = None
+    reclaimed_status = "review" if source_status == "review" else "ready"
     termination = _terminate_reclaimed_worker(
         row["worker_pid"], prev_lock, signal_fn=signal_fn,
     )
     with write_txn(conn):
         cur = conn.execute(
-            "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+            "UPDATE tasks SET status = ?, claim_lock = NULL, "
             "claim_expires = NULL, worker_pid = NULL "
             "WHERE id = ? AND status IN ('running', 'ready', 'blocked') "
             "AND claim_lock IS ?",
-            (task_id, prev_lock),
+            (reclaimed_status, task_id, prev_lock),
         )
         if cur.rowcount != 1:
             return False
@@ -9295,14 +9304,6 @@ def _default_spawn(
     if isinstance(task.metadata, dict) and task.metadata.get("coding_agent"):
         env["HERMES_CODING_AGENT"] = str(task.metadata["coding_agent"])
     env["HERMES_KANBAN_WORKSPACE"] = workspace
-    # Tag the worker's session so it lands in state.db as `kanban`, not as an
-    # untitled `cli` row. A worker is a dispatcher-owned run whose transcript is
-    # read on the board and in `hermes kanban log` — it is not a conversation
-    # the user started, so every session-browsing surface (desktop sidebar, TUI
-    # resume picker, session_search) filters it out by source. Without this the
-    # sidebar renders one row per attempt, labeled with the worker's own prompt
-    # ("work kanban task t_…").
-    env["HERMES_SESSION_SOURCE"] = "kanban"
     # Pin TERMINAL_CWD to the task's workspace so the worker's file tools and
     # context-file loader anchor on the workspace, not whatever cwd the
     # dispatching gateway happened to export. The worker subprocess is already
