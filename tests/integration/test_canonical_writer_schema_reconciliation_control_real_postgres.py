@@ -559,6 +559,28 @@ SELECT granted.rolname, member.rolname, grantor.rolname,
         assert creator_edge == (
             f"{EXECUTOR}|{CONTROL}|cloudsqladmin|t|f|f"
         )
+        assert _psql(
+            container,
+            f"""
+SELECT count(*)
+  FROM pg_catalog.pg_auth_members AS membership
+ WHERE membership.roleid =
+           'canonical_brain_migration_owner'::pg_catalog.regrole
+   AND membership.member = '{CONTROL}'::pg_catalog.regrole;
+""",
+        ).strip() == "0"
+        assert _psql(
+            container,
+            """
+SELECT count(*)
+  FROM pg_catalog.pg_proc AS routine
+  JOIN pg_catalog.pg_namespace AS namespace
+    ON namespace.oid = routine.pronamespace
+ WHERE namespace.nspname = 'canonical_brain_reconciliation'
+   AND pg_catalog.pg_get_userbyid(routine.proowner) =
+       'canonical_brain_migration_owner';
+""",
+        ).strip() == "2"
 
         # Install is absent-only; exact-installed adoption belongs to the
         # external bootstrap journal and never replays privileged SQL.
