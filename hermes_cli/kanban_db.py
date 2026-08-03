@@ -6146,6 +6146,65 @@ def specify_triage_task(
     return True
 
 
+def recover_triage_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: str,
+    actor: Optional[str] = None,
+) -> bool:
+    """Move one already-specified triage task to a non-dispatchable hold.
+
+    This is an operator recovery primitive for tasks routed to ``triage`` by
+    the block-loop breaker after their deliverable was completed elsewhere.
+    It deliberately preserves the task specification and lands in
+    ``blocked`` instead of ``todo``/``ready`` so a gateway dispatcher cannot
+    claim the task before the operator performs the intended next lifecycle
+    transition.
+    """
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        raise PermissionError(
+            "triage recovery is operator-only and unavailable to Kanban workers"
+        )
+    clean_reason = reason.strip()
+    if not clean_reason:
+        raise ValueError("reason cannot be blank")
+    clean_actor = actor.strip() if actor and actor.strip() else "operator"
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'blocked', block_kind = 'needs_input' "
+            "WHERE id = ? AND status = 'triage' "
+            "AND current_run_id IS NULL AND claim_lock IS NULL "
+            "AND worker_pid IS NULL",
+            (task_id,),
+        )
+        if cur.rowcount != 1:
+            return False
+        _append_event(
+            conn,
+            task_id,
+            "blocked",
+            {
+                "actor": clean_actor,
+                "kind": "needs_input",
+                "reason": clean_reason,
+                "source": "triage_recovery",
+                "status": "blocked",
+            },
+        )
+        _append_event(
+            conn,
+            task_id,
+            "triage_recovered",
+            {
+                "actor": clean_actor,
+                "reason": clean_reason,
+                "status": "blocked",
+            },
+        )
+    return True
+
+
 def decompose_triage_task(
     conn: sqlite3.Connection,
     task_id: str,

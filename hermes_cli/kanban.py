@@ -896,6 +896,24 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Emit one JSON object per task on stdout",
     )
 
+    # --- recover-triage --- (operator status-only recovery)
+    p_recover_triage = sub.add_parser(
+        "recover-triage",
+        help="Move an already-specified triage task to a blocked hold without "
+             "rewriting its title or body",
+    )
+    p_recover_triage.add_argument("task_id")
+    p_recover_triage.add_argument(
+        "--reason",
+        required=True,
+        help="Required audit reason for the status-only recovery",
+    )
+    p_recover_triage.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit a machine-readable result",
+    )
+
     # --- decompose --- (triage → fan-out via auxiliary LLM + orchestrator)
     p_decompose = sub.add_parser(
         "decompose",
@@ -1094,7 +1112,8 @@ def kanban_command(args: argparse.Namespace) -> int:
             "notify-unsubscribe": _cmd_notify_unsubscribe,
             "context":  _cmd_context,
             "specify":  _cmd_specify,
-            "decompose":  _cmd_decompose,
+            "recover-triage": _cmd_recover_triage,
+            "decompose": _cmd_decompose,
             "gc":       _cmd_gc,
         }
         handler = handlers.get(action)
@@ -1153,6 +1172,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "notify-subscribe",
     "notify-unsubscribe",
     "specify",
+    "recover-triage",
     "decompose",
     "gc",
 })
@@ -2961,6 +2981,31 @@ def _cmd_specify(args: argparse.Namespace) -> int:
     # --all: succeed if at least one promotion landed; exit 1 only when
     # every candidate failed (honest signal for scripts).
     return 0 if (ok_count > 0 or not ids) else 1
+
+
+def _cmd_recover_triage(args: argparse.Namespace) -> int:
+    actor = _profile_author()
+    with kb.connect_closing() as conn:
+        recovered = kb.recover_triage_task(
+            conn,
+            args.task_id,
+            reason=args.reason,
+            actor=actor,
+        )
+    if getattr(args, "json", False):
+        print(json.dumps({
+            "task_id": args.task_id,
+            "recovered": recovered,
+            "status": "blocked" if recovered else None,
+        }))
+    elif recovered:
+        print(f"Recovered {args.task_id}: triage → blocked")
+    else:
+        print(
+            f"cannot recover {args.task_id} (unknown id, non-triage, or active task)",
+            file=sys.stderr,
+        )
+    return 0 if recovered else 1
 
 
 def _cmd_decompose(args: argparse.Namespace) -> int:
