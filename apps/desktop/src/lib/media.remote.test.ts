@@ -164,9 +164,18 @@ describe('resolveMediaPlaybackSrc', () => {
     )
   })
 
-  it('uses the Electron streaming protocol for local desktop video', async () => {
+  it('routes local desktop video through the local backend download endpoint', async () => {
     vi.stubGlobal('window', { hermesDesktop: { api: vi.fn() } })
-    $connection.set({ mode: 'local' } as never)
+    $connection.set({ mode: 'local', baseUrl: 'http://127.0.0.1:8642', token: 'local-secret' } as never)
+
+    await expect(resolveMediaPlaybackSrc('C:\\renders\\demo.mp4')).resolves.toBe(
+      'http://127.0.0.1:8642/api/files/download?path=C%3A%5Crenders%5Cdemo.mp4&token=local-secret'
+    )
+  })
+
+  it('falls back to hermes-media when local connection has no token yet', async () => {
+    vi.stubGlobal('window', { hermesDesktop: { api: vi.fn() } })
+    $connection.set({ mode: 'local', baseUrl: 'http://127.0.0.1:8642' } as never)
 
     await expect(resolveMediaPlaybackSrc('C:\\renders\\demo.mp4')).resolves.toBe(
       'hermes-media://stream/C%3A%5Crenders%5Cdemo.mp4'

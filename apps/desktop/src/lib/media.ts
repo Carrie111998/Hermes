@@ -82,10 +82,10 @@ export async function resolveMediaDisplaySrc(path: string): Promise<string> {
   return window.hermesDesktop.readFileDataUrl(filePathFromMediaPath(path))
 }
 
-// Audio/video need a seekable source instead of a whole-file data URL. Keep
-// remote URLs untouched, route gateway-local files through the authenticated
-// download endpoint, and reserve the Electron protocol for files on this
-// desktop machine.
+// Audio/video need a seekable source instead of a whole-file data URL. Prefer
+// the authenticated /api/files/download HTTP path (remote already proves audio
+// works there). hermes-media:// is a known broken class for HTML5 media audio
+// on Electron 36–41 (electron#51442) — keep it only as a no-connection fallback.
 export async function resolveMediaPlaybackSrc(path: string): Promise<string> {
   if (isInlineMediaSrc(path)) {
     return path
@@ -98,6 +98,20 @@ export async function resolveMediaPlaybackSrc(path: string): Promise<string> {
   return resolveMediaDisplaySrc(path)
 }
 
+// Build the same authenticated download URL remote mode already uses for
+// playback. Local desktop backends also expose baseUrl + token on 127.0.0.1.
+function authenticatedFileDownloadUrl(path: string): string | null {
+  const conn = $connection.get()
+
+  if (!conn?.baseUrl || !conn.token) {
+    return null
+  }
+
+  const file = encodeURIComponent(filePathFromMediaPath(path))
+
+  return `${conn.baseUrl.replace(/\/+$/, '')}/api/files/download?path=${file}&token=${encodeURIComponent(conn.token)}`
+}
+
 // Resolve a media path to a URL the shell can open. Remote mode rewrites
 // gateway-local paths to an authenticated /api/files/download URL (the file
 // lives on the gateway, not this disk); local mode keeps the file:// form.
@@ -107,23 +121,21 @@ export function mediaExternalUrl(path: string): string {
   }
 
   if (isRemoteGateway()) {
-    const conn = $connection.get()
-
-    if (conn?.baseUrl && conn.token) {
-      const file = encodeURIComponent(filePathFromMediaPath(path))
-
-      return `${conn.baseUrl}/api/files/download?path=${file}&token=${encodeURIComponent(conn.token)}`
-    }
+    return authenticatedFileDownloadUrl(path) ?? (/^file:/i.test(path) ? path : `file://${path}`)
   }
 
   return /^file:/i.test(path) ? path : `file://${path}`
 }
 
-// Custom Electron scheme (registered in electron/main.ts) that streams a local
-// file with Range support. Used for audio/video so playback bypasses the data
-// URL size cap and supports seeking. `path` may be a plain path or `file://…`.
+// Local audio/video playback source. Prefer HTTP through the local hermes
+// backend (same download endpoint remote mode uses — audio works there). Fall
+// back to the Electron hermes-media protocol only when connection creds are
+// missing. `path` may be a plain path or `file://…`.
 export function mediaStreamUrl(path: string): string {
-  return `hermes-media://stream/${encodeURIComponent(filePathFromMediaPath(path))}`
+  return (
+    authenticatedFileDownloadUrl(path) ??
+    `hermes-media://stream/${encodeURIComponent(filePathFromMediaPath(path))}`
+  )
 }
 
 export function mediaPathFromMarkdownHref(href?: string): string | null {
