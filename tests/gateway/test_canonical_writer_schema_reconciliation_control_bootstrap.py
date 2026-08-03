@@ -223,6 +223,7 @@ def _observation(
     control_admin_count: int,
     membership_count: int,
     observed_at_unix: int,
+    provider_forward_role_count: int = 1,
 ) -> dict[str, Any]:
     exact = state == "exact_installed"
     return _hashed(
@@ -240,8 +241,11 @@ def _observation(
             "control_admin_forward_roles_exact": control_admin_count == 1,
             "control_admin_role_exact": control_admin_count == 1,
             "control_admin_forward_role_count": (
-                1 + membership_count if control_admin_count == 1 else 0
+                provider_forward_role_count + membership_count
+                if control_admin_count == 1
+                else 0
             ),
+            "provider_forward_role_count": provider_forward_role_count,
             "control_admin_owned_object_count": 0,
             "control_admin_shared_dependency_count": 0,
             "foreign_client_session_count": 0,
@@ -282,6 +286,7 @@ def _intermediate(
     install: Mapping[str, Any],
     *,
     initial_state: str = "absent",
+    provider_forward_role_count: int = 1,
 ) -> dict[str, Any]:
     session_hash = gate["temporary_control_admin_username_sha256"]
     before = _observation(
@@ -291,6 +296,7 @@ def _intermediate(
         control_admin_count=1,
         membership_count=0,
         observed_at_unix=960,
+        provider_forward_role_count=provider_forward_role_count,
     )
     after = _observation(
         phase="after_install",
@@ -299,6 +305,7 @@ def _intermediate(
         control_admin_count=1,
         membership_count=1 if initial_state == "absent" else 0,
         observed_at_unix=970,
+        provider_forward_role_count=provider_forward_role_count,
     )
     return _hashed(
         {
@@ -415,6 +422,9 @@ def _terminal(
         control_admin_count=0,
         membership_count=0,
         observed_at_unix=990,
+        provider_forward_role_count=intermediate["after_observation"][
+            "provider_forward_role_count"
+        ],
     )
     return _hashed(
         {
@@ -520,6 +530,7 @@ def test_fixed_observation_rejects_third_routine_and_nonroutine_objects() -> Non
         ("before_install", "control_admin_forward_roles_exact", False),
         ("before_install", "control_admin_role_exact", False),
         ("before_install", "control_admin_forward_role_count", 99),
+        ("before_install", "provider_forward_role_count", 0),
         ("before_install", "control_admin_owned_object_count", 1),
         ("before_install", "control_admin_shared_dependency_count", 1),
         ("before_install", "foreign_client_session_count", 1),
@@ -658,6 +669,7 @@ def test_terminal_binds_fresh_writer_observation_after_cleanup() -> None:
     for field, replacement in (
         ("session_user_sha256", _digest("wrong-writer")),
         ("control_admin_count", 1),
+        ("provider_forward_role_count", 2),
         ("executor_membership_count", 1),
         ("observed_at_unix", cleanup["issued_at_unix"] - 1),
     ):
@@ -691,6 +703,40 @@ def test_terminal_binds_fresh_writer_observation_after_cleanup() -> None:
                 cleanup_claim=cleanup,
                 now_unix=NOW,
             )
+
+
+def test_provider_managed_forward_role_closure_is_preserved_across_protocol() -> None:
+    key = Ed25519PrivateKey.generate()
+    gate = _gate(key)
+    install = _signed_install(key, gate)
+    intermediate = _intermediate(
+        gate,
+        install,
+        provider_forward_role_count=5,
+    )
+    assert bootstrap.validate_intermediate_for_owner(
+        intermediate,
+        gate=gate,
+        install_claim=install,
+        now_unix=NOW,
+    ) == intermediate
+    assert intermediate["before_observation"][
+        "control_admin_forward_role_count"
+    ] == 5
+    assert intermediate["after_observation"][
+        "control_admin_forward_role_count"
+    ] == 6
+
+    cleanup = _signed_cleanup(key, gate, install, intermediate)
+    terminal = _terminal(gate, install, intermediate, cleanup)
+    assert bootstrap.validate_terminal_for_owner(
+        terminal,
+        gate=gate,
+        install_claim=install,
+        intermediate=intermediate,
+        cleanup_claim=cleanup,
+        now_unix=NOW,
+    ) == terminal
 
 
 def test_protocol_success_uses_two_frames_and_zeroizes_callback_credential() -> None:
@@ -768,6 +814,7 @@ def test_fixed_observation_parser_binds_authenticated_session_and_exact_shape() 
                     "false",
                     "false",
                     "0",
+                    "1",
                     "0",
                     "0",
                     "0",
@@ -919,6 +966,7 @@ def test_fixed_observation_reports_secret_free_structural_drift_code(
         "control_admin_forward_roles_exact": "true",
         "control_admin_role_exact": "true",
         "control_admin_forward_role_count": "1",
+        "provider_forward_role_count": "1",
         "control_admin_owned_object_count": "0",
         "control_admin_shared_dependency_count": "0",
         "foreign_client_session_count": "0",
@@ -1148,6 +1196,7 @@ def test_fixed_observation_reports_exact_admin_role_component(
             "control_admin_forward_roles_exact": "true",
             "control_admin_role_exact": "true",
             "control_admin_forward_role_count": "1",
+            "provider_forward_role_count": "1",
             "non_template_database_inventory_exact": "true",
             "all_connectable_database_inventory_exact": "true",
             "latent_provider_exception_exact": "true",

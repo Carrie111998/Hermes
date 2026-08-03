@@ -139,6 +139,8 @@ CREATE ROLE {CONTROL}
     NOREPLICATION NOBYPASSRLS CONNECTION LIMIT -1;
 GRANT cloudsqlsuperuser TO {CONTROL}
     WITH ADMIN FALSE, INHERIT TRUE, SET TRUE;
+GRANT pg_monitor TO cloudsqlsuperuser
+    WITH ADMIN FALSE, INHERIT TRUE, SET TRUE;
 CREATE DATABASE {DATABASE} OWNER cloudsqlsuperuser;
 REVOKE ALL ON DATABASE {DATABASE} FROM PUBLIC;
 REVOKE ALL ON DATABASE postgres FROM PUBLIC;
@@ -1166,13 +1168,20 @@ GRANT USAGE ON SCHEMA canonical_brain TO canonical_brain_writer;
         installed = observe(CONTROL, "after_install")
         assert installed["state"] == "exact_installed"
         assert installed["executor_membership_count"] == 1
-        assert installed["control_admin_forward_role_count"] == 2
+        assert installed["provider_forward_role_count"] > 1
+        assert installed["control_admin_forward_role_count"] == (
+            installed["provider_forward_role_count"]
+            + installed["executor_membership_count"]
+        )
 
         _psql(container, f"DROP ROLE {CONTROL};")
         post_cleanup = observe(writer, "post_cleanup")
         assert post_cleanup["state"] == "exact_installed"
         assert post_cleanup["control_admin_count"] == 0
         assert post_cleanup["executor_membership_count"] == 0
+        assert post_cleanup["provider_forward_role_count"] == (
+            installed["provider_forward_role_count"]
+        )
 
         # Exact-installed adoption has no replay and no creator edge.
         _psql(
@@ -1188,7 +1197,9 @@ GRANT cloudsqlsuperuser TO {CONTROL}
         adopted = observe(CONTROL, "before_install")
         assert adopted["state"] == "exact_installed"
         assert adopted["executor_membership_count"] == 0
-        assert adopted["control_admin_forward_role_count"] == 1
+        assert adopted["control_admin_forward_role_count"] == (
+            adopted["provider_forward_role_count"]
+        )
         _psql(container, f"DROP ROLE {CONTROL};")
 
         # Same-name overload, wrong fourth dependency, grantor-only role edge,

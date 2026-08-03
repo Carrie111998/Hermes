@@ -78,7 +78,7 @@ FAILURE_SCHEMA = (
     "muncho-canonical-writer-schema-reconciliation-control-failure.v1"
 )
 FOUNDATION_OBSERVATION_SCHEMA = (
-    "muncho-canonical-writer-schema-reconciliation-control-foundation-observation.v2"
+    "muncho-canonical-writer-schema-reconciliation-control-foundation-observation.v3"
 )
 CLOUD_AUTHORITY_SCHEMA = (
     "muncho-cloud-sql-schema-reconciliation-control-admin-authority.v1"
@@ -236,6 +236,7 @@ _OBSERVATION_FIELDS = frozenset({
     "control_admin_forward_roles_exact",
     "control_admin_role_exact",
     "control_admin_forward_role_count",
+    "provider_forward_role_count",
     "control_admin_owned_object_count",
     "control_admin_shared_dependency_count",
     "foreign_client_session_count",
@@ -888,6 +889,8 @@ def _validate_observation(value: Any, *, phase: str) -> Mapping[str, Any]:
         or type(raw.get("control_admin_forward_roles_exact")) is not bool
         or type(raw.get("control_admin_role_exact")) is not bool
         or type(raw.get("control_admin_forward_role_count")) is not int
+        or type(raw.get("provider_forward_role_count")) is not int
+        or raw.get("provider_forward_role_count") < 1
         or type(raw.get("control_admin_owned_object_count")) is not int
         or type(raw.get("control_admin_shared_dependency_count")) is not int
         or type(raw.get("foreign_client_session_count")) is not int
@@ -968,7 +971,8 @@ def _validate_observation(value: Any, *, phase: str) -> Mapping[str, Any]:
             or raw["control_admin_forward_roles_exact"] is not True
             or raw["control_admin_role_exact"] is not True
             or raw["control_admin_forward_role_count"]
-            != 1 + raw["executor_membership_count"]
+            != raw["provider_forward_role_count"]
+            + raw["executor_membership_count"]
             or raw["control_admin_owned_object_count"] != 0
             or raw["control_admin_shared_dependency_count"] != 0
             or raw["foreign_client_session_count"] != 0
@@ -1045,9 +1049,13 @@ def validate_intermediate_for_owner(
         or after["control_admin_count"] != 1
         or before["control_admin_role_exact"] is not True
         or after["control_admin_role_exact"] is not True
-        or before["control_admin_forward_role_count"] != 1
+        or before["provider_forward_role_count"]
+        != after["provider_forward_role_count"]
+        or before["control_admin_forward_role_count"]
+        != before["provider_forward_role_count"]
         or after["control_admin_forward_role_count"]
-        != 1 + after["executor_membership_count"]
+        != after["provider_forward_role_count"]
+        + after["executor_membership_count"]
         or before["control_admin_owned_object_count"] != 0
         or after["control_admin_owned_object_count"] != 0
         or before["control_admin_shared_dependency_count"] != 0
@@ -1331,6 +1339,8 @@ def validate_terminal_for_owner(
         or observation["control_admin_count"] != 0
         or observation["control_admin_role_exact"] is not False
         or observation["control_admin_forward_role_count"] != 0
+        or observation["provider_forward_role_count"]
+        != intermediate["after_observation"]["provider_forward_role_count"]
         or observation["control_admin_owned_object_count"] != 0
         or observation["control_admin_shared_dependency_count"] != 0
         or observation["foreign_client_session_count"] != 0
@@ -1648,6 +1658,7 @@ _FOUNDATION_OBSERVATION_COLUMNS = (
     "control_admin_forward_roles_exact",
     "control_admin_role_exact",
     "control_admin_forward_role_count",
+    "provider_forward_role_count",
     "control_admin_owned_object_count",
     "control_admin_shared_dependency_count",
     "foreign_client_session_count",
@@ -1725,6 +1736,26 @@ WITH RECURSIVE executor AS MATERIALIZED (
       FROM pg_catalog.pg_auth_members AS membership
       JOIN forward_role_closure AS reachable
         ON reachable.roleid = membership.member
+), provider_forward_role_closure(roleid) AS (
+    SELECT role.oid
+      FROM pg_catalog.pg_roles AS role
+     WHERE role.rolname = 'cloudsqlsuperuser'
+    UNION
+    SELECT membership.roleid
+      FROM pg_catalog.pg_auth_members AS membership
+      JOIN provider_forward_role_closure AS reachable
+        ON reachable.roleid = membership.member
+), expected_control_forward_roles(roleid) AS (
+    SELECT roleid FROM provider_forward_role_closure
+    UNION
+    SELECT executor.oid
+      FROM executor
+     WHERE EXISTS (
+         SELECT 1
+           FROM pg_catalog.pg_auth_members AS membership
+           JOIN session_role ON session_role.oid = membership.member
+          WHERE membership.roleid = executor.oid
+     )
 ), control_admin_contract_observation AS MATERIALIZED (
     SELECT (
                SESSION_USER ~
@@ -1836,22 +1867,15 @@ WITH RECURSIVE executor AS MATERIALIZED (
                         ) IS TRUE THEN 2048 ELSE 0 END)
                  FROM relevant_session_edges
            )::bigint AS memberships_mask,
-           COALESCE((
-               SELECT pg_catalog.count(DISTINCT role.rolname) =
-                          1 + (
-                              SELECT pg_catalog.count(*)
-                                FROM pg_catalog.pg_auth_members
-                               WHERE roleid = (SELECT oid FROM executor)
-                          )
-                      AND pg_catalog.bool_and(
-                          role.rolname IN (
-                              'cloudsqlsuperuser', '{EXECUTOR_ROLE}'
-                          )
-                      )
-                 FROM forward_role_closure AS closure
-                 JOIN pg_catalog.pg_roles AS role
-                   ON role.oid = closure.roleid
-           ), false) AS forward_roles_exact
+           NOT EXISTS (
+               (SELECT roleid FROM forward_role_closure
+                EXCEPT
+                SELECT roleid FROM expected_control_forward_roles)
+               UNION ALL
+               (SELECT roleid FROM expected_control_forward_roles
+                EXCEPT
+                SELECT roleid FROM forward_role_closure)
+           ) AS forward_roles_exact
 ), control_admin_contract AS MATERIALIZED (
     SELECT identity_exact,
            attributes_mask = {_CONTROL_ADMIN_ATTRIBUTES_EXACT_MASK}
@@ -1977,6 +2001,10 @@ WITH RECURSIVE executor AS MATERIALIZED (
                )
                ELSE 0::bigint
            END AS control_admin_forward_role_count,
+           (
+               SELECT pg_catalog.count(*)::bigint
+                 FROM provider_forward_role_closure
+           ) AS provider_forward_role_count,
            (
                SELECT pg_catalog.count(*)::bigint
                  FROM pg_catalog.pg_roles AS control_admin
@@ -2528,7 +2556,8 @@ WITH RECURSIVE executor AS MATERIALIZED (
                        AND control_admin_count = 1
                        AND control_admin_role_exact
                        AND control_admin_forward_role_count =
-                           1 + executor_membership_count
+                           provider_forward_role_count
+                           + executor_membership_count
                    )
                    OR (
                        session_user_name = '{foundation.SQL_USER}'
@@ -2567,6 +2596,8 @@ SELECT database_name,
        control_admin_role_exact::text AS control_admin_role_exact,
        control_admin_forward_role_count::text
            AS control_admin_forward_role_count,
+       provider_forward_role_count::text
+           AS provider_forward_role_count,
        control_admin_owned_object_count::text
            AS control_admin_owned_object_count,
        control_admin_shared_dependency_count::text
@@ -2638,6 +2669,7 @@ def _foundation_drift_error_code(row: Mapping[str, Any]) -> str:
             "control_admin_attributes_mask",
             "control_admin_memberships_mask",
             "control_admin_forward_role_count",
+            "provider_forward_role_count",
             "control_admin_owned_object_count",
             "control_admin_shared_dependency_count",
             "foreign_client_session_count",
@@ -2714,7 +2746,8 @@ def _foundation_drift_error_code(row: Mapping[str, Any]) -> str:
         return "schema_reconciliation_control_admin_role_contract_drifted"
     if (
         counts["control_admin_forward_role_count"]
-        != 1 + counts["executor_membership_count"]
+        != counts["provider_forward_role_count"]
+        + counts["executor_membership_count"]
     ):
         return "schema_reconciliation_control_admin_role_closure_drifted"
     if counts["control_admin_owned_object_count"] != 0:
@@ -2778,6 +2811,7 @@ def _parse_foundation_observation_result(
         control_admin_forward_roles_exact,
         control_admin_role_exact,
         control_admin_forward_role_count,
+        provider_forward_role_count,
         control_admin_owned_object_count,
         control_admin_shared_dependency_count,
         foreign_client_session_count,
@@ -2857,6 +2891,9 @@ def _parse_foundation_observation_result(
         ),
         "control_admin_forward_role_count": _parse_decimal(
             control_admin_forward_role_count, code
+        ),
+        "provider_forward_role_count": _parse_decimal(
+            provider_forward_role_count, code
         ),
         "control_admin_owned_object_count": _parse_decimal(
             control_admin_owned_object_count, code
