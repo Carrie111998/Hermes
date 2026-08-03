@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Offline mocked tests for the native Ollama ``/api/generate`` transport
-(task HERMES_VISION_GENERATE_ROUTE_ADAPTER_V0_1).
+.
 
 Covers the 33-item offline test contract (task §14) at both layers:
 

@@ -85,20 +85,23 @@ class TestSourceAuthorization:
         assert out["execution_status"] == "POLICY_BLOCKED"
         assert out["logical_model_calls"] == 0
 
-    async def test_locator_handle_resolves(self):
-        handles = vrt._authorized_source_handles()
-        if not handles:
-            pytest.skip("no locator assets available")
-        key = next(iter(handles))
-        path = vrt._resolve_source(f"locator://{key}")
-        assert path == handles[key]
-        assert vrt._resolve_source(key) == handles[key]
+    async def test_attachment_handle_resolves(self):
+        from tools.vision_session_state import vision_session_state
+        vision_session_state.set_enabled(True)
+        vision_session_state.begin_turn()
+        vision_session_state.register_attachment(
+            "attachment://sess/synthetic", "/tmp/synthetic-vision.png")
+        key = "attachment://sess/synthetic"
+        assert vrt._resolve_source(key) == "/tmp/synthetic-vision.png"
+        assert vrt._resolve_source("attachment://sess/other") is None
 
     async def test_authorized_handle_invokes_analyze(self):
-        handles = vrt._authorized_source_handles()
-        if not handles:
-            pytest.skip("no locator assets available")
-        key = next(iter(handles))
+        from tools.vision_session_state import vision_session_state
+        vision_session_state.set_enabled(True)
+        vision_session_state.begin_turn()
+        vision_session_state.register_attachment(
+            "attachment://sess/synthetic", "/tmp/synthetic-vision.png")
+        key = "attachment://sess/synthetic"
         with patch("tools.vision_orchestrator.analyze_image",
                    new=AsyncMock(return_value=_mk_result())) as m:
             out = json.loads(await vrt._handle_vision_router(
@@ -123,10 +126,12 @@ class TestCriticalityDerivation:
 
     @pytest.mark.asyncio
     async def test_request_criticality_not_model_controlled(self):
-        handles = vrt._authorized_source_handles()
-        if not handles:
-            pytest.skip("no locator assets available")
-        key = next(iter(handles))
+        from tools.vision_session_state import vision_session_state
+        vision_session_state.set_enabled(True)
+        vision_session_state.begin_turn()
+        vision_session_state.register_attachment(
+            "attachment://sess/synthetic", "/tmp/synthetic-vision.png")
+        key = "attachment://sess/synthetic"
         captured = {}
 
         async def fake(request, **kw):
@@ -154,10 +159,12 @@ class TestEnvelope:
     pytestmark = pytest.mark.asyncio
 
     async def test_envelope_is_safe_and_bounded(self):
-        handles = vrt._authorized_source_handles()
-        if not handles:
-            pytest.skip("no locator assets available")
-        key = next(iter(handles))
+        from tools.vision_session_state import vision_session_state
+        vision_session_state.set_enabled(True)
+        vision_session_state.begin_turn()
+        vision_session_state.register_attachment(
+            "attachment://sess/synthetic", "/tmp/synthetic-vision.png")
+        key = "attachment://sess/synthetic"
         with patch("tools.vision_orchestrator.analyze_image",
                    new=AsyncMock(return_value=_mk_result())):
             out = json.loads(await vrt._handle_vision_router(
@@ -170,10 +177,12 @@ class TestEnvelope:
         assert out["logical_model_calls"] == 1
 
     async def test_ocr_excerpt_truncates_long_text(self):
-        handles = vrt._authorized_source_handles()
-        if not handles:
-            pytest.skip("no locator assets available")
-        key = next(iter(handles))
+        from tools.vision_session_state import vision_session_state
+        vision_session_state.set_enabled(True)
+        vision_session_state.begin_turn()
+        vision_session_state.register_attachment(
+            "attachment://sess/synthetic", "/tmp/synthetic-vision.png")
+        key = "attachment://sess/synthetic"
         long_text = "字" * 6000
         with patch("tools.vision_orchestrator.analyze_image",
                    new=AsyncMock(return_value=_mk_result(
@@ -188,10 +197,12 @@ class TestEnvelope:
         assert out["ocr_meta"]["full_text_policy"] == "explicit_followup_required"
 
     async def test_short_ocr_not_truncated(self):
-        handles = vrt._authorized_source_handles()
-        if not handles:
-            pytest.skip("no locator assets available")
-        key = next(iter(handles))
+        from tools.vision_session_state import vision_session_state
+        vision_session_state.set_enabled(True)
+        vision_session_state.begin_turn()
+        vision_session_state.register_attachment(
+            "attachment://sess/synthetic", "/tmp/synthetic-vision.png")
+        key = "attachment://sess/synthetic"
         with patch("tools.vision_orchestrator.analyze_image",
                    new=AsyncMock(return_value=_mk_result(
                        structured={"observed_text": ["short"]}))):
@@ -201,10 +212,12 @@ class TestEnvelope:
         assert out["observed_text"] == ["short"]
 
     async def test_fail_closed_on_orchestrator_exception(self):
-        handles = vrt._authorized_source_handles()
-        if not handles:
-            pytest.skip("no locator assets available")
-        key = next(iter(handles))
+        from tools.vision_session_state import vision_session_state
+        vision_session_state.set_enabled(True)
+        vision_session_state.begin_turn()
+        vision_session_state.register_attachment(
+            "attachment://sess/synthetic", "/tmp/synthetic-vision.png")
+        key = "attachment://sess/synthetic"
         with patch("tools.vision_orchestrator.analyze_image",
                    new=AsyncMock(side_effect=RuntimeError("boom"))):
             out = json.loads(await vrt._handle_vision_router(
@@ -348,6 +361,15 @@ class TestStage3SessionGates:
 
     pytestmark = pytest.mark.asyncio
 
+    def setup_method(self):
+        from tools.vision_session_state import vision_session_state
+        vision_session_state.set_enabled(True)
+        vision_session_state.begin_turn()
+        vision_session_state.register_attachment(
+            "attachment://sess/taobao-0003", "/tmp/synthetic-a.png")
+        vision_session_state.register_attachment(
+            "attachment://sess/taobao-0004", "/tmp/synthetic-b.png")
+
     @staticmethod
     def _real_cfg():
         import copy
@@ -369,7 +391,7 @@ class TestStage3SessionGates:
             return {"execution_status": "SUCCESS"}
 
         with patch("tools.vision_orchestrator.analyze_image", new=fake_ai):
-            raw = await handler({"source_handle": "TAOBAO-VISION-0003",
+            raw = await handler({"source_handle": "attachment://sess/taobao-0003",
                                  "task": "UI_READ"})
         env = json.loads(raw)
         assert env["error"] == "SESSION_DISABLED"
@@ -378,7 +400,6 @@ class TestStage3SessionGates:
     async def test_turn_budget_exhausted(self):
         from tools.registry import registry
         from tools.vision_session_state import vision_session_state
-        vision_session_state.set_enabled(True)
         vision_session_state.begin_turn()
         handler = registry.get_entry("vision_router_analyze").handler
         assert handler is not None
@@ -396,10 +417,10 @@ class TestStage3SessionGates:
                    return_value=self._real_cfg()), \
              patch("tools.vision_orchestrator.analyze_image", new=fake_ai):
             env1 = json.loads(await handler(
-                {"source_handle": "TAOBAO-VISION-0003", "task": "UI_READ"}))
+                {"source_handle": "attachment://sess/taobao-0003", "task": "UI_READ"}))
             # second call in same turn -> turn budget exhausted
             env2 = json.loads(await handler(
-                {"source_handle": "TAOBAO-VISION-0004", "task": "UI_READ"}))
+                {"source_handle": "attachment://sess/taobao-0004", "task": "UI_READ"}))
         assert env1["execution_status"] == "SUCCESS"
         assert env2["error"] == "TURN_BUDGET_EXHAUSTED"
         vision_session_state.set_enabled(False)
@@ -407,7 +428,6 @@ class TestStage3SessionGates:
     async def test_same_source_task_needs_authorization(self):
         from tools.registry import registry
         from tools.vision_session_state import vision_session_state
-        vision_session_state.set_enabled(True)
         vision_session_state.begin_turn()
         handler = registry.get_entry("vision_router_analyze").handler
         assert handler is not None
@@ -425,10 +445,10 @@ class TestStage3SessionGates:
                    return_value=self._real_cfg()), \
              patch("tools.vision_orchestrator.analyze_image", new=fake_ai):
             env1 = json.loads(await handler(
-                {"source_handle": "TAOBAO-VISION-0003", "task": "UI_READ"}))
+                {"source_handle": "attachment://sess/taobao-0003", "task": "UI_READ"}))
             vision_session_state.begin_turn()  # new turn (fresh budget)
             env2 = json.loads(await handler(
-                {"source_handle": "TAOBAO-VISION-0003", "task": "UI_READ"}))
+                {"source_handle": "attachment://sess/taobao-0003", "task": "UI_READ"}))
         assert env1["execution_status"] == "SUCCESS"
         assert env2["error"].startswith("NEEDS_AUTHORIZATION")
         vision_session_state.set_enabled(False)
@@ -821,6 +841,10 @@ class TestOllamaEndpointAlignment:
         from tools.vision_session_state import vision_session_state
         vision_session_state.set_enabled(True)
         vision_session_state.begin_turn()
+        vision_session_state.register_attachment(
+            "attachment://sess/taobao-0003", "/tmp/synthetic-a.png")
+        vision_session_state.register_attachment(
+            "attachment://sess/taobao-0004", "/tmp/synthetic-b.png")
 
 
     pytestmark = pytest.mark.asyncio
@@ -932,7 +956,7 @@ class TestOllamaEndpointAlignment:
 
         with patch("hermes_cli.config.load_config", return_value=cfg), \
              patch("tools.vision_orchestrator.analyze_image", new=fake_ai):
-            raw = await handler({"source_handle": "TAOBAO-VISION-0003",
+            raw = await handler({"source_handle": "attachment://sess/taobao-0003",
                                  "task": "UI_READ", "mode": "AUTO"})
         env = json.loads(raw)
         assert received.get("base_url") == "http://ollama.internal:11434"
@@ -961,7 +985,7 @@ class TestOllamaEndpointAlignment:
 
         with patch("hermes_cli.config.load_config", return_value=cfg), \
              patch("tools.vision_orchestrator.analyze_image", new=fake_ai):
-            raw = await handler({"source_handle": "TAOBAO-VISION-0003",
+            raw = await handler({"source_handle": "attachment://sess/taobao-0003",
                                  "task": "UI_READ",
                                  "base_url": "http://evil.example:9999"})
         env = json.loads(raw)
@@ -993,9 +1017,8 @@ class TestOllamaEndpointAlignment:
 
         with patch("hermes_cli.config.load_config", return_value=cfg), \
              patch("tools.vision_orchestrator.analyze_image", new=fake_ai):
-            raw = await handler({"source_handle": "TAOBAO-VISION-0003",
+            raw = await handler({"source_handle": "attachment://sess/taobao-0003",
                                  "task": "UI_READ"})
         env = json.loads(raw)
         assert reached["native"] is True
         assert env["execution_status"] == "SUCCESS"
-

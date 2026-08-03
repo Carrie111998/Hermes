@@ -484,7 +484,7 @@ class TestAuxiliaryUntouched:
 
 # ---------------------------------------------------------------------------
 # PRECISION default transport binding (task
-# HERMES_VISION_PRECISION_NATIVE_GENERATE_PROFILE_BINDING_V0_1)
+
 # ---------------------------------------------------------------------------
 
 

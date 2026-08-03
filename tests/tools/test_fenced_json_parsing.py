@@ -2,7 +2,7 @@
 """Fenced-JSON parsing tests — Vision Orchestrator.
 
 Behavioral tests for the bounded fenced-response contract
-(task HERMES_VISION_CURATOR_CONTAINMENT_AND_FENCED_JSON_FIX_V0_1):
+:
 
 - raw JSON object parses;
 - fenced ```json object parses;
