@@ -26,8 +26,8 @@ function mkTmpHome() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-bootstrap-test-'))
 }
 
-vi.mock('node:child_process', async (importOriginal) => {
-  const mod = await importOriginal<typeof import('node:child_process')>()
+vi.mock('node:child_process', async importOriginal => {
+  const mod = await importOriginal<any>()
 
   return {
     ...mod,
@@ -284,8 +284,10 @@ test('resolveInstallScript rethrows when the 404 fallback is unavailable', async
 })
 
 test('spawnPowerShell preserves explicit PYTHONUTF8 values and defaults to 1 if absent', async () => {
-  if (process.platform !== 'win32') {return}
-  
+  if (process.platform !== 'win32') {
+    return
+  }
+
   // Save original env
   const originalEnv = process.env
   process.env = { ...originalEnv }
@@ -293,20 +295,20 @@ test('spawnPowerShell preserves explicit PYTHONUTF8 values and defaults to 1 if 
   try {
     // 1. Explicit user override '0'
     process.env.PYTHONUTF8 = '0'
-    
+
     // Mock child_process spawn
     const { spawn } = await import('node:child_process')
     const spawnMock = spawn as any
     spawnMock.mockImplementation(() => {
-      return { 
-        stdout: { on: vi.fn(), setEncoding: vi.fn() }, 
-        stderr: { on: vi.fn(), setEncoding: vi.fn() }, 
-        on: vi.fn() 
+      return {
+        stdout: { on: vi.fn(), setEncoding: vi.fn() },
+        stderr: { on: vi.fn(), setEncoding: vi.fn() },
+        on: vi.fn()
       }
     })
-    
+
     spawnPowerShell('test.ps1', [], {})
-    
+
     assert.equal(spawnMock.mock.calls.length, 1)
     const callEnv1 = (spawnMock.mock.calls[0][2] as any).env
     assert.equal(callEnv1.PYTHONUTF8, '0', 'Should preserve explicit PYTHONUTF8=0')
@@ -315,13 +317,13 @@ test('spawnPowerShell preserves explicit PYTHONUTF8 values and defaults to 1 if 
 
     // 2. Absent value defaults to '1'
     delete process.env.PYTHONUTF8
-    
+
     spawnPowerShell('test.ps1', [], {})
-    
+
     assert.equal(spawnMock.mock.calls.length, 1)
     const callEnv2 = (spawnMock.mock.calls[0][2] as any).env
     assert.equal(callEnv2.PYTHONUTF8, '1', 'Should default to PYTHONUTF8=1 when absent')
-    
+
     spawnMock.mockRestore()
   } finally {
     process.env = originalEnv
