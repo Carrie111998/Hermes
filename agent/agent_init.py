@@ -1822,6 +1822,10 @@ def init_agent(
     try:
         agent._max_context_length = int(_raw_max_ctx) if _raw_max_ctx is not None else None
     except (TypeError, ValueError):
+        logger.warning(
+            "max_context_length config value %r is not parseable, ceiling disabled",
+            _raw_max_ctx,
+        )
         agent._max_context_length = None
 
     agent._ensure_lmstudio_runtime_loaded(_config_context_length)
@@ -1942,12 +1946,11 @@ def init_agent(
         _init_ceiling is not None
         and isinstance(_init_ceiling, int)
         and _init_ceiling > 0
-        and hasattr(agent, "context_compressor")
-        and agent.context_compressor
     ):
-        _init_native = getattr(agent.context_compressor, "context_length", 0)
-        if _init_native and _init_native > _init_ceiling:
-            agent.context_compressor.update_model(
+        _cc = getattr(agent, "context_compressor", None)
+        _init_native = getattr(_cc, "context_length", 0)
+        if _cc and _init_native and _init_native > _init_ceiling:
+            _cc.update_model(
                 model=agent.model,
                 context_length=_init_ceiling,
                 base_url=agent.base_url,
@@ -1955,6 +1958,9 @@ def init_agent(
                 provider=agent.provider,
                 api_mode=agent.api_mode,
             )
+        # Store the ceiling on the agent so switch_model() / first update_model()
+        # call can enforce it even when context_compressor was falsy at init time.
+        agent._max_context_length = _init_ceiling
 
     _bind_session_state = getattr(agent.context_compressor, "bind_session_state", None)
     if callable(_bind_session_state):
