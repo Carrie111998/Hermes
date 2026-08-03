@@ -448,7 +448,5 @@ test('relay emits only coarse handshake events', async t => {
   result.socket.destroy()
   await new Promise(resolve => setImmediate(resolve))
 
-  assert.ok(events.some(event => /^upstream_handshake status=/.test(event)))
-  assert.equal(events.join(' ').includes('secret-runtime-token'), false)
-  assert.equal(events.join(' ').includes('ecs.electricsheephq.com'), false)
+  assert.deepEqual(events, ['upstream_handshake status=403'])
 })

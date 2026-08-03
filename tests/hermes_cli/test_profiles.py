@@ -106,6 +106,16 @@ class TestGetProfileDir:
         result = get_profile_dir("default")
         assert result == tmp_path / ".hermes"
 
+    def test_named_profile_is_normalized_and_contained(self, profile_env):
+        tmp_path = profile_env
+        result = get_profile_dir("Coder")
+        assert result == tmp_path / ".hermes" / "profiles" / "coder"
+
+    @pytest.mark.parametrize("name", ["../escape", "../../.bashrc", "/tmp/escape", "has space"])
+    def test_unsafe_profile_name_cannot_escape_profiles_root(self, profile_env, name):
+        with pytest.raises(ValueError):
+            get_profile_dir(name)
+
 
 # ===================================================================
 # TestCreateProfile
@@ -814,6 +824,5 @@ class TestProfilesToServe:
         assert set(serve) == {"default", "coder", "writer"}
         assert serve["default"] == _get_default_hermes_home()
         assert serve["coder"] == get_profile_dir("coder")
-
 
 

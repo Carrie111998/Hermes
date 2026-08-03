@@ -369,6 +369,7 @@ def get_profile_dir(name: str) -> Path:
     canon = normalize_profile_name(name)
     if canon == "default":
         return _get_default_hermes_home()
+    validate_profile_name(canon)
     return _get_profiles_root() / canon
 
 
