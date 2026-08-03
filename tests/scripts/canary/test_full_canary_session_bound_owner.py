@@ -1809,6 +1809,120 @@ def test_schema_reconciliation_cloud_boundary_accepts_explicit_built_in_type() -
     assert resource["type"] == "BUILT_IN"
 
 
+def test_cloud_sql_cleanup_gets_full_quiet_window_after_own_late_delete(
+    monkeypatch,
+) -> None:
+    class _Clock:
+        value = 0.0
+
+        def monotonic(self):
+            return self.value
+
+        def sleep(self, seconds):
+            self.value += seconds
+
+    clock = _Clock()
+    username = "muncho_canary_admin_" + "a" * 16
+    boundary = launcher.CloudSqlTemporaryAdmin(
+        object(),
+        monotonic=clock.monotonic,
+        sleeper=clock.sleep,
+        operation_timeout_seconds=10.0,
+    )
+    boundary._expected_owner_subject_sha256 = OWNER_SHA
+    boundary._expected_mutation_context_sha256 = "f" * 64
+    deleted = False
+    delete_operation = (
+        "DELETE_USER",
+        "DONE",
+        OWNER_SHA,
+        True,
+    )
+
+    monkeypatch.setattr(boundary, "_stable_instance_operations", lambda: {})
+
+    def cleanup_snapshot(observed_username):
+        assert observed_username == username
+        if deleted:
+            return {"delete-operation": delete_operation}, False
+        return {}, True
+
+    def delete_user_once(observed_username, *, deadline):
+        nonlocal deleted
+        assert observed_username == username
+        assert deadline == 20.0
+        # The Cloud SQL ledger fence consumes nearly the whole original
+        # deadline before our own DELETE can be issued.
+        clock.value += 19.0
+        deleted = True
+        boundary._mutation_known_operations.add("delete-operation")
+        boundary._mutation_authority_known_operations.add("delete-operation")
+        return False
+
+    monkeypatch.setattr(boundary, "_cleanup_snapshot", cleanup_snapshot)
+    monkeypatch.setattr(boundary, "_delete_user_once", delete_user_once)
+
+    boundary.delete_and_confirm_absent(username)
+
+    receipt = boundary.reconciliation_receipt()
+    assert deleted is True
+    assert clock.value >= 29.0
+    assert receipt["temporary_admin_absent"] is True
+    assert receipt["quiet_window_seconds"] == 10.0
+
+
+def test_cloud_sql_cleanup_does_not_extend_for_unrelated_ledger_changes(
+    monkeypatch,
+) -> None:
+    class _Clock:
+        value = 0.0
+
+        def monotonic(self):
+            return self.value
+
+        def sleep(self, seconds):
+            self.value += seconds
+
+    clock = _Clock()
+    username = "muncho_canary_admin_" + "b" * 16
+    boundary = launcher.CloudSqlTemporaryAdmin(
+        object(),
+        monotonic=clock.monotonic,
+        sleeper=clock.sleep,
+        operation_timeout_seconds=10.0,
+    )
+    monkeypatch.setattr(boundary, "_stable_instance_operations", lambda: {})
+    # Ledger-integrity transitions are covered separately; this test isolates
+    # the deadline contract while unrelated operation signatures keep moving.
+    monkeypatch.setattr(
+        boundary,
+        "_track_operation_snapshot",
+        lambda *args, **kwargs: None,
+    )
+    snapshots = 0
+
+    def cleanup_snapshot(observed_username):
+        nonlocal snapshots
+        assert observed_username == username
+        snapshots += 1
+        return {
+            f"unrelated-{snapshots}": (
+                "MAINTENANCE",
+                "DONE",
+                "0" * 64,
+                True,
+            )
+        }, False
+
+    monkeypatch.setattr(boundary, "_cleanup_snapshot", cleanup_snapshot)
+
+    with pytest.raises(launcher.CleanupBlocked) as raised:
+        boundary.delete_and_confirm_absent(username)
+
+    assert raised.value.cause_code == "cloud_sql_quiet_window_timeout"
+    assert clock.value == 20.0
+
+
 @pytest.mark.parametrize(
     "resource_type",
     [
