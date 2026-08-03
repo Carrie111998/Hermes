@@ -69,7 +69,13 @@ def check_packages():
         _discord_available = True
         check("discord.py", True, f"v{discord.__version__}")
     except ImportError:
-        check("discord.py", False, "pip install discord.py[voice]")
+        check(
+            "discord.py",
+            False,
+            "pip install 'discord.py[voice] @ "
+            "git+https://github.com/Rapptz/discord.py.git"
+            "@1add8a0b40577186431cdb5f63f97affadab285b'",
+        )
         ok = False
 
     # PyNaCl
