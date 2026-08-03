@@ -1114,6 +1114,14 @@ def test_build_release_revalidates_runtime_around_late_dependencies(
             managed.chmod(0o755)
         elif str(artifact_wheel) in command.argv:
             install_packaged_runtime()
+            # Reproduce a managed-Python/ensurepip seed that survives the
+            # initial sync, before runtime dependency provisioning begins.
+            hook = (
+                spec.site_packages
+                / writer_release._SETUPTOOLS_DISTUTILS_SITE_HOOK_NAME
+            )
+            hook.write_bytes(writer_release._SETUPTOOLS_DISTUTILS_SITE_HOOK_BYTES)
+            hook.chmod(0o644)
         elif (
             "gateway.production_runtime_dependencies" in command.argv
             and "install" in command.argv
