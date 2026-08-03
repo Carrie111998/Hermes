@@ -135,7 +135,7 @@ Current input behavior is split across `app.tsx`, `components/textInput.tsx`, an
 | `Ctrl+C`                        | Interrupt active run, or clear the current draft, or exit if nothing is pending                                                                         |
 | `Ctrl+D`                        | Exit                                                                                                                                                    |
 | `Cmd/Ctrl+G` / `Alt+G`          | Open `$EDITOR` with the current draft (use `Alt+G` in VSCode/Cursor — they bind the primary keystroke to Find Next)                                     |
-| `Ctrl+L`                        | New session (same as `/clear`)                                                                                                                          |
+| `Ctrl+L`                        | Redraw / repaint the current screen                                                                                                                     |
 | `Ctrl+V` / `Alt+V`              | Paste text first, then fall back to image/path attachment when applicable                                                                               |
 | `Tab`                           | Apply the active completion                                                                                                                             |
 | `Up/Down`                       | Cycle completions if the completion list is open; otherwise edit queued messages first, then walk input history                                         |
