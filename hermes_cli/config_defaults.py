@@ -116,6 +116,15 @@ DEFAULT_CONFIG = {
         # identity slot (SOUL.md). Empty by default. The HERMES_ENVIRONMENT_HINT
         # env var overrides this (build-time/container mechanism).
         "environment_hint": "",
+        # Declared working-language standard (BCP-47 tag, e.g. "pt-BR",
+        # "es-MX", "de-DE").  When set, the system prompt steers the model to
+        # hold that language and linguistic variant in its responses instead
+        # of silently drifting to a different variant (pt-BR ↔ pt-PT) or to
+        # the model's dominant training language.  Prompt-side steer only —
+        # it does NOT run a post-generation grammar/spell pass; that layer
+        # belongs to a plugin (see issue #31514).  Empty by default (no
+        # directive, zero extra tokens).
+        "language_standard": "",
         # Coding posture — on interactive coding surfaces (CLI, TUI, desktop
         # app, ACP) in a code workspace, Hermes adds a coding operating brief
         # + a live git/workspace snapshot to the system prompt. See

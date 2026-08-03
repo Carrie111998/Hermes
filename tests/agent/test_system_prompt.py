@@ -226,3 +226,66 @@ class TestTelegramRichMessagesHint:
             stable = _stable_prompt(agent)
         assert "Standard Markdown is automatically converted" in stable
         assert "lean into it" not in stable
+
+
+class TestLanguageStandardGuidance:
+    """agent.language_standard — stable-tier directive holding the model to a
+    declared BCP-47 language/variant (issue #31514)."""
+
+    def test_empty_tag_renders_nothing(self):
+        from agent.prompt_builder import language_standard_guidance
+
+        assert language_standard_guidance("") == ""
+        assert language_standard_guidance("   ") == ""
+        assert language_standard_guidance(None) == ""
+
+    def test_tag_renders_directive(self):
+        from agent.prompt_builder import language_standard_guidance
+
+        out = language_standard_guidance("pt-BR")
+        assert "pt-BR" in out
+        assert "Language standard" in out
+        assert "never silently switch" in out
+
+    def test_injected_when_configured(self):
+        agent = _make_agent(_language_standard="pt-BR")
+        stable = _stable_prompt(agent)
+        assert "The user's declared working language standard is pt-BR" in stable
+
+    def test_absent_when_unset(self):
+        agent = _make_agent(_language_standard="")
+        stable = _stable_prompt(agent)
+        assert "Language standard" not in stable
+        assert "declared working language" not in stable
+
+    def test_absent_when_attribute_missing(self):
+        # Agents built before the config resolution existed (or tests that
+        # construct minimal fakes) must not crash — getattr default is "".
+        agent = SimpleNamespace(
+            load_soul_identity=False,
+            skip_context_files=False,
+            valid_tool_names=[],
+            _task_completion_guidance=False,
+            _tool_use_enforcement=False,
+            _environment_probe=False,
+            _kanban_worker_guidance="",
+            _memory_store=None,
+            _memory_manager=None,
+            model="",
+            provider="",
+            platform="",
+            pass_session_id=False,
+            session_id="",
+        )
+        stable = _stable_prompt(agent)
+        assert "Language standard" not in stable
+
+    def test_injection_is_byte_stable(self):
+        # The directive is resolved once from the agent attr; rebuilding the
+        # prompt with the same agent must yield an identical stable tier
+        # (prompt-caching invariant — never re-render mid-session).
+        agent = _make_agent(_language_standard="es-MX")
+        first = _stable_prompt(agent)
+        second = _stable_prompt(agent)
+        assert first == second
+        assert "es-MX" in first

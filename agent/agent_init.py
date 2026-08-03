@@ -1785,6 +1785,14 @@ def init_agent(
     # single turn; the runtime already executes such batches concurrently.
     agent._parallel_tool_call_guidance = bool(_agent_section.get("parallel_tool_call_guidance", True))
 
+    # Declared working-language standard (BCP-47 tag, e.g. "pt-BR", "es-MX").
+    # When non-empty, the stable system prompt carries a directive holding the
+    # model to that language/variant instead of drifting to a different
+    # variant of the same language or to its dominant training language.
+    # Resolved once here so the directive is byte-stable for the life of the
+    # conversation (prompt-cache safe); empty default costs zero tokens.
+    agent._language_standard = str(_agent_section.get("language_standard", "") or "").strip()
+
     # Local Python toolchain probe toggle.  Default True.  When False,
     # the probe is skipped entirely (no subprocess calls, no system-prompt
     # line).  Useful for users on exotic setups where the probe heuristics

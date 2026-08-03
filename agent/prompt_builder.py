@@ -397,6 +397,35 @@ PARALLEL_TOOL_CALL_GUIDANCE = (
     "in doubt and the calls are independent, batch them."
 )
 
+# Declared working-language standard.  Rendered once at agent init from the
+# `agent.language_standard` config value (BCP-47 tag) so the directive is
+# byte-stable for the life of the conversation — it joins the stable system
+# prompt tier and never changes mid-session, keeping upstream prompt caches
+# warm.  Empty tag → empty string (zero token cost for users who don't opt
+# in).  This is a prompt-side steer only; a post-generation grammar/spell
+# check (the rest of issue #31514) belongs to a plugin, not the core.
+def language_standard_guidance(language_standard: str) -> str:
+    """Return a stable-tier directive holding the model to a declared language.
+
+    ``language_standard`` is a BCP-47 tag (e.g. "pt-BR", "es-MX", "de-DE").
+    The directive tells the model to mirror the user's working language and
+    variant instead of silently drifting to a different variant of the same
+    language or to its own dominant training language.
+    """
+    tag = (language_standard or "").strip()
+    if not tag:
+        return ""
+    return (
+        "# Language standard\n"
+        f"The user's declared working language standard is {tag}. "
+        "Mirror the user's language and linguistic variant in every response: "
+        f"when the user writes in {tag}, respond in {tag} — keep its grammar, "
+        "spelling, and accentuation consistent, and never silently switch to a "
+        "different variant of the same language or to your dominant training "
+        "language. If the user writes in another language, respond in that "
+        "language unless they ask otherwise."
+    )
+
 # OpenAI GPT/Codex-specific execution guidance.  Addresses known failure modes
 # where GPT models abandon work on partial results, skip prerequisite lookups,
 # hallucinate instead of using tools, and declare "done" without verification.
