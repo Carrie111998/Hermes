@@ -35,9 +35,9 @@ from typing import Any, Dict, List, Optional, Union
 
 # Sources that are excluded from session browsing/searching by default.
 # Third-party integrations tag their sessions with HERMES_SESSION_SOURCE=tool;
-# delegate subagent runs are tagged "subagent" — neither belongs in the
-# user's session history.
-_HIDDEN_SESSION_SOURCES = ("subagent", "tool")
+# delegate subagent runs are tagged "subagent"; kanban dispatcher workers are
+# tagged "kanban" — none belongs in the user's session history.
+_HIDDEN_SESSION_SOURCES = ("kanban", "subagent", "tool")
 
 # Automation sources that are kept searchable but DEMOTED below interactive
 # sessions in discover ranking. Cron jobs run on a schedule and accumulate
@@ -247,6 +247,12 @@ def _shape_message(
     is added so callers know the payload was bounded.
     """
     raw_content = m.get("content")
+    if isinstance(raw_content, str) and "\x1b" in raw_content:
+        # Recalled messages can carry ANSI escape sequences (e.g. archived
+        # terminal output). Strip them before returning content to the model.
+        from tools.ansi_strip import strip_ansi
+
+        raw_content = strip_ansi(raw_content)
     if max_content_len and raw_content and len(raw_content) > max_content_len:
         content = raw_content[:max_content_len] + "…"
         truncated = True
