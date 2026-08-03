@@ -1337,6 +1337,22 @@ def handle_function_call(
         except Exception as _hook_err:
             logger.debug("transform_tool_result hook error: %s", _hook_err)
 
+        # Keep a single large result from consuming the next model request.
+        # Preserve the full payload as a local artifact and return only a
+        # structured preview/reference to the conversation.
+        try:
+            from tools.tool_result_artifacts import externalize_large_tool_result
+
+            result = externalize_large_tool_result(
+                tool_name=function_name,
+                result=result,
+                session_id=session_id or "",
+                task_id=task_id or "",
+                tool_call_id=tool_call_id or "",
+            )
+        except Exception as _artifact_err:
+            logger.debug("tool result externalization skipped: %s", _artifact_err)
+
         return result
 
     except Exception as e:
