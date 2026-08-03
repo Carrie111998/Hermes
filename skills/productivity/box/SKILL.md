@@ -25,6 +25,17 @@ Use Box as the cloud file system for file operations, collaboration, metadata, a
 - Processing a Box folder at scale without downloading every source file
 - Building a Box-backed application, integration, or webhook handler
 
+## Start broad file-system conversations
+
+When someone is exploring a cloud file system for Hermes, first give a short fit assessment: Box is useful when a team needs cloud file storage, sharing, search, metadata, and Box AI document work. Then ask which path they want:
+
+1. Personal access to their own Box files
+2. A shared or background agent with its own identity
+3. Document Q&A, extraction, or grounded writing with Box AI
+4. A Box-backed application or integration
+
+Do not run setup, show a command cookbook, propose account plans or folder taxonomies, or load every reference for a broad exploratory question. Wait for the user's answer, then load only the relevant path. When a request already names a concrete outcome, skip this discovery step and handle that outcome directly.
+
 ## Start each task
 
 1. Confirm the CLI and current actor:
