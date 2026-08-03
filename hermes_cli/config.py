@@ -1706,6 +1706,11 @@ def get_custom_provider_bearer_auth(
     """Return whether the matching custom provider opts into Bearer auth."""
     if custom_providers is None:
         try:
+            # Read-only fast path: this runs on the client-construction hot
+            # path (every custom-provider LLM call) and never mutates config,
+            # so skip the defensive deepcopy that load_config() applies.
+            if config is None:
+                config = load_config_readonly()
             custom_providers = get_compatible_custom_providers(config)
         except Exception:
             custom_providers = []
