@@ -7,12 +7,17 @@ used to be hardcoded to ``"hermes"``, so the placeholder could never distinguish
 anything: kanban workers running on different boards all shared a single memory
 bank even when operators configured a per-workspace template.
 
-``agent_workspace`` now follows ``HERMES_KANBAN_BOARD`` — the env var the kanban
-dispatcher pins into worker processes — and falls back to ``"hermes"`` when the
-var is unset, preserving the previous behavior for plain CLI/gateway runs.
+``agent_workspace`` now follows ``HERMES_KANBAN_BOARD``.  That env var is pinned
+by the kanban dispatcher for worker processes *and* by ``_pin_kanban_board_env()``
+in ``cmd_chat`` at chat boot, so a plain ``hermes`` CLI chat resolves
+``agent_workspace`` to the current board slug (``"default"`` on a pristine
+install), not to ``"hermes"``.  The ``"hermes"`` fallback only covers contexts
+where the var is genuinely unset — SDK/library construction and some gateway
+paths.
 """
 
 import json
+import os
 
 from agent.memory_provider import MemoryProvider
 from run_agent import AIAgent
@@ -117,3 +122,28 @@ def test_agent_workspace_follows_kanban_board(monkeypatch, tmp_path):
         "agent_workspace must follow HERMES_KANBAN_BOARD so memory providers "
         "can scope storage per board via the {workspace} placeholder"
     )
+
+
+def test_agent_workspace_follows_chat_boot_pin(monkeypatch, tmp_path):
+    """A real ``hermes`` chat boot pins the board, so the workspace is its slug.
+
+    ``cmd_chat`` calls ``_pin_kanban_board_env()`` before constructing the agent,
+    which writes ``get_current_board()`` into the environment — ``"default"`` on a
+    pristine install.  This locks in that documented CLI-chat behavior end to end
+    so a future change to the pin path cannot silently move operators' bank ids
+    (e.g. ``bank_id_template: hermes-{workspace}``) without a failing test.
+    """
+    from hermes_cli.main import _pin_kanban_board_env
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hm"))
+    # setenv-then-delenv so monkeypatch records a restore entry even when the var
+    # starts unset -- the pin below writes straight to os.environ.
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "")
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+
+    _pin_kanban_board_env()
+    assert os.environ["HERMES_KANBAN_BOARD"] == "default"
+
+    _agent, provider = _make_agent_with_recording_provider(monkeypatch, tmp_path)
+
+    assert provider._init_kwargs.get("agent_workspace") == "default"
