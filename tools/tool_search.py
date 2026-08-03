@@ -279,14 +279,16 @@ def should_activate(
 ) -> bool:
     """Decide whether tool search should activate for the current assembly.
 
-    ``"off"`` skips unconditionally. ``"on"`` and ``"auto"`` activate whenever
-    at least one deferrable tool exists (there's no point swapping a no-op).
+    ``"off"`` skips unconditionally. ``"on"`` and ``"auto"`` remain eligible
+    whenever at least one deferrable tool exists. ``assemble_tool_defs`` then
+    applies the auto-mode break-even check after building the actual bridge.
 
-    Tiered-disclosure semantics (July 2026): the presence of ANY MCP/plugin
-    tool activates the bridge — schemas always defer. What the threshold now
-    controls is the *listing budget* (see :func:`listing_token_budget`), not
-    activation. ``context_length`` is retained in the signature for
-    backward compatibility with existing callers.
+    Tiered-disclosure semantics (July 2026): forced ``on`` defers whenever an
+    MCP/plugin tool exists. ``auto`` does the same only when the assembled
+    bridge is smaller than the eager schemas. The threshold controls the
+    *listing budget* (see :func:`listing_token_budget`), not the break-even
+    decision. ``context_length`` is retained in the signature for backward
+    compatibility with existing callers.
     """
     if config.enabled == "off":
         return False
@@ -817,6 +819,21 @@ def assemble_tool_defs(
             deferrable, max_tokens=listing_budget)
     bridge = bridge_tool_schemas(len(deferrable), listing=listing,
                                  listing_form=listing_form)
+    bridge_tokens = estimate_tokens_from_schemas(bridge)
+    if config.enabled == "auto" and bridge_tokens >= deferrable_tokens:
+        logger.info(
+            "tool_search kept %d tools eager: bridge cost ~%d tokens is not "
+            "smaller than eager schemas (~%d tokens)",
+            len(deferrable), bridge_tokens, deferrable_tokens,
+        )
+        return AssemblyResult(
+            tool_defs=incoming,
+            activated=False,
+            deferred_count=len(deferrable),
+            deferred_tokens=deferrable_tokens,
+            threshold_tokens=listing_budget,
+            tier=0,
+        )
     result = visible + bridge
     # Tier 1 = per-tool listing for at least part of the catalog (full,
     # names, or mixed). Tier 2 = search-only discovery; the server-level

@@ -1152,26 +1152,13 @@ def apply_memory_pending(payload: Dict[str, Any], store: "MemoryStore") -> Dict[
 MEMORY_SCHEMA = {
     "name": "memory",
     "description": (
-        "Save durable facts to persistent memory that survive across sessions. Memory is "
-        "injected into every future turn, so keep entries compact and high-signal.\n\n"
-        "HOW: make ALL your changes in ONE call via an 'operations' array (each item: "
-        "{action, content?, old_text?}). The batch applies atomically and the char limit is "
-        "checked only on the FINAL result — so a single call can remove/replace stale entries "
-        "to free room AND add new ones, even when an add alone would overflow. The response "
-        "reports current/limit chars and confirms completion; one batch call finishes the "
-        "update, so don't repeat it. Use the bare action/content/old_text fields only for a "
-        "single lone change.\n\n"
-        "WHEN: save proactively when the user states a preference, correction, or personal "
-        "detail, or you learn a stable fact about their environment, conventions, or workflow. "
-        "Priority: user preferences & corrections > environment facts > procedures. The best "
-        "memory stops the user repeating themselves.\n\n"
-        "IF FULL: an add is rejected with the current entries shown. Reissue as ONE batch that "
-        "removes or shortens enough stale entries and adds the new one together.\n\n"
-        "TARGETS: 'user' = who the user is (name, role, preferences, style). 'memory' = your "
-        "notes (environment, conventions, tool quirks, lessons).\n\n"
-        "SKIP: trivial/obvious info, easily re-discovered facts, raw data dumps, task progress, "
-        "completed-work logs, temporary TODO state (use session_search for those). Reusable "
-        "procedures belong in a skill, not memory."
+        "Save compact, durable facts across sessions. Use target='user' for identity and "
+        "preferences; use target='memory' for stable environment facts, conventions, and "
+        "tool lessons. Do not store task progress or reusable procedures.\n\n"
+        "Prefer one atomic operations batch for multiple changes. Its final state alone is "
+        "checked against the character budget, so a full store can be shortened and updated "
+        "in the same call. Use action/content/old_text directly only for one change; do not "
+        "repeat a successful call."
     ),
     "parameters": {
         "type": "object",

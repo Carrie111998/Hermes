@@ -25,6 +25,7 @@ _SKILLS_BLOCK_RE = re.compile(r"<available_skills>.*?</available_skills>", re.DO
 # ``    - name`` when the skill has no description). Category headers use two
 # leading spaces, so the four-space + ``- `` prefix isolates skill lines.
 _SKILL_LINE_PREFIX = "    - "
+_FLAT_SKILL_LINE_PREFIX = "  - "
 
 # Posture-demoted categories render all visible skill names on one shared line.
 _NAMES_ONLY_LINE_RE = re.compile(r"^  .+ \[names only\]: (?P<names>.+)$")
@@ -183,9 +184,13 @@ def _compute_skills_breakdown(skills_block: str) -> List[Dict[str, Any]]:
                 )
             continue
 
-        if not line.startswith(_SKILL_LINE_PREFIX):
+        if line.startswith(_SKILL_LINE_PREFIX):
+            prefix = _SKILL_LINE_PREFIX
+        elif line.startswith(_FLAT_SKILL_LINE_PREFIX):
+            prefix = _FLAT_SKILL_LINE_PREFIX
+        else:
             continue
-        rest = line[len(_SKILL_LINE_PREFIX):]
+        rest = line[len(prefix):]
         # ``name: desc`` — the first ``": "`` separates name from description.
         # Namespaced names (``codex:rescue``) have no space after their colon,
         # so partitioning on ``": "`` keeps the full name intact.

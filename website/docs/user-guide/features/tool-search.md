@@ -10,7 +10,7 @@ session, their JSON schemas can consume a substantial fraction of the
 context window on every turn — even when only a few of them are relevant
 to what the user actually asked for.
 
-**Tool Search** is Hermes' opt-in progressive-disclosure layer for that
+**Tool Search** is Hermes' progressive-disclosure layer for that
 problem. When activated, MCP and plugin tools are replaced in the
 model-visible tools array by three bridge tools, and the model loads each
 specific tool's schema on demand.
@@ -55,13 +55,13 @@ see the underlying tool, not the bridge.
 
 ## When does it activate?
 
-Tool Search uses **tiered disclosure**: the presence of *any* deferrable
-(MCP/plugin) tool activates the bridge; what scales with catalog size is
-how much of the catalog stays visible, not whether schemas defer.
+Tool Search uses **tiered disclosure**. In the default `auto` mode, Hermes
+assembles the bridge and keeps tools eager unless the bridge is smaller than
+their full schemas. `on` always defers eligible tools; `off` keeps them eager.
 
 | Tier | Condition | What the model sees |
 | --- | --- | --- |
-| **0** | No MCP/plugin tools | Every tool eager, no bridge. Pass-through. |
+| **0** | No MCP/plugin tools, `off`, or `auto` finds eager schemas cheaper | Every tool eager, no bridge. Pass-through. |
 | **1** | Deferred catalog's listing fits the budget | Bridge + a skills-style manifest of every deferred tool (name + short description, degrading to names-only when over budget). Degradation is **per server**: when one oversized server (Cloudflare) is attached alongside small ones (Linear), the small servers keep their per-tool listings and only the oversized server collapses to a summary line. |
 | **2** | Per-tool listing exceeds the budget even names-only for every server (e.g. Cloudflare's flat API surface alone: ~3,300 tools whose names are ~32K tokens) | Bare bridge + a one-line-per-server summary (server name + tool count), so the model knows which domains are reachable; individual tools are discoverable only through `tool_search`. |
 
@@ -85,7 +85,7 @@ tools:
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `enabled` | `auto` | `auto`/`on` activate whenever at least one deferrable tool exists; `off` disables entirely (everything stays eager). |
+| `enabled` | `auto` | `auto` defers only when the assembled bridge is smaller than eager schemas; `on` forces deferral; `off` keeps everything eager. |
 | `threshold_pct` | `5` | Listing budget as a percentage of the active model's context length. Range 0–100. |
 | `search_default_limit` | `5` | Hits returned when the model calls `tool_search` without a `limit`. |
 | `max_search_limit` | `20` | Hard upper bound the model can request via `limit`. Range 1–50. |
@@ -120,8 +120,8 @@ round trip usually disappears — the model goes straight to
 `tool_describe`. Live benchmarking showed the listing mode matching
 eager loading's task success while costing less than the bare bridge.
 
-If you want the old always-eager behavior for a small toolset, set
-`enabled: off`.
+Small toolsets normally stay eager automatically. Set `enabled: off` to force
+always-eager behavior, or `enabled: on` to force progressive disclosure.
 
 ## Trade-offs that don't go away
 

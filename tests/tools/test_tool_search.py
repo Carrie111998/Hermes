@@ -206,6 +206,53 @@ class TestAssembly:
         )
 
 
+    def test_auto_keeps_small_catalog_eager_when_bridge_costs_more(self):
+        from tools.tool_search import assemble_tool_defs, ToolSearchConfig
+
+        name = "mcp_auto_small_action"
+        self._register_mcp(name)
+        defs = [_td(name, "Deferred capability description.")]
+
+        result = assemble_tool_defs(
+            defs,
+            context_length=200_000,
+            config=ToolSearchConfig.from_raw({"enabled": "auto"}),
+        )
+
+        assert not result.activated
+        assert result.tool_defs == defs
+
+    def test_on_force_defers_small_catalog(self):
+        from tools.tool_search import assemble_tool_defs, ToolSearchConfig
+
+        name = "mcp_forced_small_action"
+        self._register_mcp(name)
+        result = assemble_tool_defs(
+            [_td(name, "Deferred capability description.")],
+            context_length=200_000,
+            config=ToolSearchConfig.from_raw({"enabled": "on"}),
+        )
+
+        assert result.activated
+
+    def test_auto_defers_when_bridge_is_smaller(self):
+        from tools.tool_search import assemble_tool_defs, ToolSearchConfig
+
+        defs = []
+        for index in range(20):
+            name = f"mcp_auto_large_action_{index}"
+            self._register_mcp(name)
+            defs.append(_td(name, "Verbose deferred capability. " * 40))
+
+        result = assemble_tool_defs(
+            defs,
+            context_length=200_000,
+            config=ToolSearchConfig.from_raw({"enabled": "auto"}),
+        )
+
+        assert result.activated
+
+
     def test_idempotent_when_bridge_already_present(self):
         from tools.tool_search import assemble_tool_defs, ToolSearchConfig, BRIDGE_TOOL_NAMES
         defs = [_td("terminal", "Run shell"), _td("tool_search", "old")]

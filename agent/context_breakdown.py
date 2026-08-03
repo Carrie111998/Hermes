@@ -86,6 +86,23 @@ def _strip_blocks(text: str, *blocks: str) -> str:
     return out.strip()
 
 
+def _extract_skills_block(stable: str, volatile: str) -> Tuple[str, str, str]:
+    """Return the skills block and both prompt tiers with it removed.
+
+    Skills are runtime-mutable and normally live in the volatile tier. Stable
+    remains a fallback for older/restored sessions built before that move.
+    """
+    match = _SKILLS_BLOCK_RE.search(volatile)
+    if match:
+        block = match.group(0)
+        return block, stable, _strip_blocks(volatile, block)
+    match = _SKILLS_BLOCK_RE.search(stable)
+    if match:
+        block = match.group(0)
+        return block, _strip_blocks(stable, block), volatile
+    return "", stable, volatile
+
+
 def compute_session_context_breakdown(
     agent: Any,
     messages: Optional[List[dict]] = None,
@@ -99,13 +116,12 @@ def compute_session_context_breakdown(
     context = parts.get("context", "") or ""
     volatile = parts.get("volatile", "") or ""
 
-    skills_match = _SKILLS_BLOCK_RE.search(stable)
-    skills_index = skills_match.group(0) if skills_match else ""
+    skills_index, stable, volatile = _extract_skills_block(stable, volatile)
 
     memory_block, user_block = _memory_blocks(agent)
     memory_text = "\n\n".join(part for part in (memory_block, user_block) if part).strip()
 
-    system_core = _strip_blocks(stable, skills_index)
+    system_core = stable.strip()
     system_tail = _strip_blocks(volatile, memory_block, user_block)
     system_prompt_text = "\n\n".join(part for part in (system_core, system_tail) if part).strip()
 
@@ -204,8 +220,8 @@ def compute_context_details(agent: Any) -> Dict[str, Any]:
 
     parts = build_system_prompt_parts(agent)
     stable = parts.get("stable", "") or ""
-    skills_match = _SKILLS_BLOCK_RE.search(stable)
-    skills_block = skills_match.group(0) if skills_match else ""
+    volatile = parts.get("volatile", "") or ""
+    skills_block, _, _ = _extract_skills_block(stable, volatile)
 
     skills: List[Dict[str, Any]] = []
     if skills_block:

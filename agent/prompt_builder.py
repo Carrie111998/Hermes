@@ -407,15 +407,6 @@ PARALLEL_TOOL_CALL_GUIDANCE = (
 # family-agnostic; the OPENAI_ prefix reflects origin, not exclusivity.
 OPENAI_MODEL_EXECUTION_GUIDANCE = (
     "# Execution discipline\n"
-    "<tool_persistence>\n"
-    "- Use tools whenever they improve correctness, completeness, or grounding.\n"
-    "- Do not stop early when another tool call would materially improve the result.\n"
-    "- If a tool returns empty or partial results, retry with a different query or "
-    "strategy before giving up.\n"
-    "- Keep calling tools until: (1) the task is complete, AND (2) you have verified "
-    "the result.\n"
-    "</tool_persistence>\n"
-    "\n"
     "<mandatory_tool_use>\n"
     "NEVER answer these from memory or mental computation — ALWAYS use a tool:\n"
     "- Arithmetic, math, calculations → use terminal or execute_code\n"
@@ -440,13 +431,6 @@ OPENAI_MODEL_EXECUTION_GUIDANCE = (
     "you would call.\n"
     "</act_dont_ask>\n"
     "\n"
-    "<prerequisite_checks>\n"
-    "- Before taking an action, check whether prerequisite discovery, lookup, or "
-    "context-gathering steps are needed.\n"
-    "- Do not skip prerequisite steps just because the final action seems obvious.\n"
-    "- If a task depends on output from a prior step, resolve that dependency first.\n"
-    "</prerequisite_checks>\n"
-    "\n"
     "<verification>\n"
     "Before finalizing your response:\n"
     "- Correctness: does the output satisfy every stated requirement?\n"
@@ -454,15 +438,7 @@ OPENAI_MODEL_EXECUTION_GUIDANCE = (
     "- Formatting: does the output match the requested format or schema?\n"
     "- Safety: if the next step has side effects (file writes, commands, API calls), "
     "confirm scope before executing.\n"
-    "</verification>\n"
-    "\n"
-    "<missing_context>\n"
-    "- If required context is missing, do NOT guess or hallucinate an answer.\n"
-    "- Use the appropriate lookup tool when missing information is retrievable "
-    "(search_files, web_search, read_file, etc.).\n"
-    "- Ask a clarifying question only when the information cannot be retrieved by tools.\n"
-    "- If you must proceed with incomplete information, label assumptions explicitly.\n"
-    "</missing_context>"
+    "</verification>"
 )
 
 # Gemini/Gemma-specific operational guidance, adapted from OpenCode's gemini.txt.
@@ -1819,15 +1795,28 @@ def build_skills_system_prompt(
                 names = sorted({name for name, _ in skills_by_category[category]})
                 index_lines.append(f"  {category} [names only]: {', '.join(names)}")
                 continue
+            unique_skills = []
+            for name, desc in sorted(skills_by_category[category], key=lambda x: x[0]):
+                if name not in seen:
+                    seen.add(name)
+                    unique_skills.append((name, desc))
             cat_desc = category_descriptions.get(category, "")
+            # Root-level skills derive a category equal to their own name. Avoid
+            # paying to render that name twice; the flat line preserves the full
+            # trigger description and remains directly loadable by name.
+            if (
+                not cat_desc
+                and len(unique_skills) == 1
+                and unique_skills[0][0] == category
+            ):
+                name, desc = unique_skills[0]
+                index_lines.append(f"  - {name}: {desc}" if desc else f"  - {name}")
+                continue
             if cat_desc:
                 index_lines.append(f"  {category}: {cat_desc}")
             else:
                 index_lines.append(f"  {category}:")
-            for name, desc in sorted(skills_by_category[category], key=lambda x: x[0]):
-                if name in seen:
-                    continue
-                seen.add(name)
+            for name, desc in unique_skills:
                 if desc:
                     index_lines.append(f"    - {name}: {desc}")
                 else:
@@ -1835,31 +1824,15 @@ def build_skills_system_prompt(
 
         result = (
             "## Skills (mandatory)\n"
-            "Before replying, scan the skills below. If a skill matches or is even partially relevant "
-            "to your task, you MUST load it with skill_view(name) and follow its instructions. "
-            "Err on the side of loading — it is always better to have context you don't need "
-            "than to miss critical steps, pitfalls, or established workflows. "
-            "Skills contain specialized knowledge — API endpoints, tool-specific commands, "
-            "and proven workflows that outperform general-purpose approaches. Load the skill "
-            "even if you think you could handle the task with basic tools like web_search or terminal. "
-            "Skills also encode the user's preferred approach, conventions, and quality standards "
-            "for tasks like code review, planning, and testing — load them even for tasks you "
-            "already know how to do, because the skill defines how it should be done here.\n"
-            "Whenever the user asks you to configure, set up, install, enable, disable, modify, "
-            "or troubleshoot Hermes Agent itself — its CLI, config, models, providers, tools, "
-            "skills, voice, gateway, plugins, or any feature — load the `hermes-agent` skill "
-            "first. It has the actual commands (e.g. `hermes config set …`, `hermes tools`, "
-            "`hermes setup`) so you don't have to guess or invent workarounds.\n"
-            "If a skill has issues, fix it with skill_manage(action='patch').\n"
-            "After difficult/iterative tasks, offer to save as a skill. "
-            "If a skill you loaded was missing steps, had wrong commands, or needed "
-            "pitfalls you discovered, update it before finishing.\n"
-            "\n"
+            "Scan the index before replying. If a skill matches the task, load it with "
+            "skill_view(name) and follow it; proceed without one only when none are relevant. "
+            "For Hermes Agent configuration or troubleshooting, load `hermes-agent` first. "
+            "Categories marked [names only] omit descriptions; use "
+            "skills_list(category=...) when a category may fit but the skill name is unclear. "
+            "Patch stale skills and preserve reusable workflows from difficult tasks.\n\n"
             "<available_skills>\n"
             + "\n".join(index_lines) + "\n"
-            "</available_skills>\n"
-            "\n"
-            "Only proceed without loading a skill if genuinely none are relevant to the task."
+            "</available_skills>"
             + hidden_note
         )
 

@@ -293,6 +293,36 @@ class TestBuildSkillsSystemPrompt:
         # "search" should appear only once per category
         assert result.count("- search") == 1
 
+    def test_flattens_self_named_singleton_category(self, monkeypatch, tmp_path):
+        """A root skill should not repeat its name as both category and entry."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        skill_dir = tmp_path / "skills" / "amazon-dynamodb"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: amazon-dynamodb\ndescription: Design DynamoDB tables\n---\n"
+        )
+
+        result = build_skills_system_prompt()
+
+        assert "  - amazon-dynamodb: Design DynamoDB tables" in result
+        assert "  amazon-dynamodb:\n    - amazon-dynamodb:" not in result
+
+    def test_skills_header_explains_names_only_discovery(self, monkeypatch, tmp_path):
+        """Progressive disclosure must retain a path to hidden descriptions."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        skill_dir = tmp_path / "skills" / "creative" / "pixel-art"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: pixel-art\ndescription: Draw pixel art\n---\n"
+        )
+
+        result = build_skills_system_prompt(
+            compact_categories=frozenset({"creative"})
+        )
+
+        assert "skills_list(category=...)" in result
+        assert "skill_view(name)" in result
+
 
     def test_compact_categories_demote_nested_and_miss_cache_separately(
         self, monkeypatch, tmp_path

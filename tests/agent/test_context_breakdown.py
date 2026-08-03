@@ -32,12 +32,12 @@ def _make_agent(
 
 
 def test_breakdown_includes_major_categories():
-    stable = (
-        "base guidance\n"
-        "<available_skills>\n  demo:\n    - hello: hi\n</available_skills>"
-    )
+    stable = "base guidance"
     context = "# Project Context\nFollow AGENTS.md"
-    volatile = "Current time: now"
+    volatile = (
+        "<available_skills>\n  demo:\n    - hello: hi\n</available_skills>\n"
+        "Current time: now"
+    )
     history = [{"role": "user", "content": "hello there"}]
     agent, parts = _make_agent(stable=stable, context=context, volatile=volatile)
 
@@ -48,6 +48,20 @@ def test_breakdown_includes_major_categories():
     assert {"system_prompt", "tool_definitions", "rules", "skills", "mcp", "subagent_definitions", "conversation"} <= ids
     assert data["context_max"] == 200_000
     assert data["estimated_total"] > 0
+
+
+def test_context_details_reads_skills_from_volatile_tier():
+    volatile = (
+        "<available_skills>\n"
+        "  - hello: Greets the user\n"
+        "</available_skills>"
+    )
+    agent, parts = _make_agent(volatile=volatile)
+
+    with patch("agent.system_prompt.build_system_prompt_parts", return_value=parts):
+        details = compute_context_details(agent)
+
+    assert [entry["name"] for entry in details["skills"]] == ["hello"]
 
 
 

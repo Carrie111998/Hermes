@@ -117,5 +117,21 @@ def test_skills_breakdown_attributes_demoted_category_shared_line(isolated_home)
         assert entry["index_line_skill_count"] == 2
 
 
+def test_skills_breakdown_attributes_flat_singleton_line():
+    """Flattened root skills remain visible in prompt-size attribution."""
+    block = (
+        "<available_skills>\n"
+        "  - amazon-dynamodb: Design DynamoDB tables\n"
+        "</available_skills>\n"
+    )
+
+    entries = _compute_skills_breakdown(block)
+
+    assert [entry["name"] for entry in entries] == ["amazon-dynamodb"]
+    assert entries[0]["index_line_bytes"] == len(
+        "  - amazon-dynamodb: Design DynamoDB tables".encode("utf-8")
+    )
+
+
 
 
