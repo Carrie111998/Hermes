@@ -4706,6 +4706,107 @@ class GatewaySlashCommandsMixin:
             logger.warning("Skills reload failed: %s", e)
             return t("gateway.reload_skills.failed", error=e)
 
+    async def _handle_reload_plugins_command(self, event: MessageEvent) -> str:
+        """Handle /reload-plugins — deregister stale tools, force-rescan, rebuild.
+
+        Plugin tools are baked into the system prompt, so the rebuild
+        invalidates the provider prompt cache; the next turn will resend
+        full input tokens.  This follows the same 4-step flow as the CLI
+        handler:
+
+        1. Snapshot + deregister old plugin-owned tools from the registry.
+        2. Force-rescan plugins (re-exec modules, re-run register()).
+        3. Rebuild ``agent.tools`` for all cached agents.
+        4. Return a success message with the tool-name diff.
+        """
+        loop = asyncio.get_running_loop()
+        try:
+            from tools.registry import get_registry
+            from hermes_cli.plugins import discover_plugins, get_plugin_manager
+
+            registry = get_registry()
+            mgr = get_plugin_manager()
+
+            old_tool_names = set(mgr._plugin_tool_names)
+
+            for name in sorted(old_tool_names):
+                try:
+                    registry.deregister(name)
+                except Exception:
+                    pass
+
+            await loop.run_in_executor(None, discover_plugins, True)
+
+            new_tool_names = set(mgr._plugin_tool_names)
+
+            added = new_tool_names - old_tool_names
+            removed = old_tool_names - new_tool_names
+            stayed = new_tool_names & old_tool_names
+
+            lines = [" Plugins reloaded."]
+            if added:
+                lines.append(f"  + Added tools: {', '.join(sorted(added))}")
+            if removed:
+                lines.append(f"  - Removed tools: {', '.join(sorted(removed))}")
+            if stayed:
+                lines.append(f"  * Re-registered: {', '.join(sorted(stayed))}")
+            lines.append(f"  * {len(mgr._plugins)} plugin(s) loaded, {len(new_tool_names)} tool(s)")
+
+            try:
+                from tools.mcp_tool import refresh_agent_mcp_tools
+                _cache = getattr(self, "_agent_cache", None)
+                _cache_lock = getattr(self, "_agent_cache_lock", None)
+                if _cache_lock is not None and _cache:
+                    with _cache_lock:
+                        for _sess_key, _entry in list(_cache.items()):
+                            try:
+                                _agent = _entry[0] if isinstance(_entry, tuple) else _entry
+                            except Exception:
+                                continue
+                            if _agent is None:
+                                continue
+                            refresh_agent_mcp_tools(_agent, quiet_mode=True)
+            except Exception as _exc:
+                logger.debug(
+                    "Failed to update cached agent tools after plugin reload: %s",
+                    _exc,
+                )
+
+            change_parts = []
+            if added:
+                change_parts.append(f"Added: {', '.join(sorted(added))}")
+            if removed:
+                change_parts.append(f"Removed: {', '.join(sorted(removed))}")
+            tool_summary = (
+                f"{len(new_tool_names)} plugin tool(s) now available"
+                if new_tool_names
+                else "No plugin tools available"
+            )
+            change_detail = ". ".join(change_parts) + ". " if change_parts else ""
+            reload_msg = {
+                "role": "user",
+                "content": (
+                    f"[IMPORTANT: Plugins have been reloaded. {change_detail}"
+                    f"{tool_summary}. The tool list for this conversation "
+                    f"has been updated accordingly.]"
+                ),
+            }
+            try:
+                session_entry = await self.async_session_store.get_or_create_session(
+                    event.source
+                )
+                await self.async_session_store.append_to_transcript(
+                    session_entry.session_id, reload_msg
+                )
+            except Exception:
+                pass
+
+            return "\n".join(lines)
+
+        except Exception as e:
+            logger.warning("Plugin reload failed: %s", e)
+            return f" Plugin reload failed: {e}"
+
     async def _handle_bundles_command(self, event: MessageEvent) -> str:
         """Handle /bundles — list installed skill bundles.
 
