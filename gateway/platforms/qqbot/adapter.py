@@ -560,6 +560,15 @@ class QQAdapter(BasePlatformAdapter):
                             "Too many quick disconnects — check bot permissions",
                             retryable=True,
                         )
+                        # Hand off to the gateway's reconnect watcher rather
+                        # than dying silently. `retryable=True` matches the
+                        # other three exhaustion exits below: the diagnostic
+                        # ("check bot permissions") stays visible in runtime
+                        # status, and the gateway retries on its backoff
+                        # schedule so genuinely transient causes (upstream
+                        # blips, brief network wobble, session takeover
+                        # thrash) can self-heal without the user restarting.
+                        self._schedule_fatal_notify()
                         return
                 else:
                     quick_disconnect_count = 0

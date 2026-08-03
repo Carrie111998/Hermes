@@ -2287,6 +2287,14 @@ class TestReconnectExhaustionHandoff:
         adapter._fail_pending = mock.Mock()
         adapter._mark_disconnected = mock.Mock()
         adapter._set_fatal_error = mock.Mock()
+        # Adapter-side unit boundary: `_notify_fatal_error` is mocked here to
+        # isolate `_listen_loop`'s scheduling contract (retryable fatal set +
+        # detached notify task + no `_mark_disconnected` fallback). The
+        # end-to-end proof that the gateway actually enqueues the platform
+        # for reconnection lives in
+        # `TestQQBotGatewayHandoffEndToEnd` below, which drives the real
+        # `GatewayRunner._handle_adapter_fatal_error` path with no mocks on
+        # the notify chain.
         adapter._notify_fatal_error = mock.AsyncMock()
 
     async def _assert_handoff(self, adapter):
@@ -2348,3 +2356,155 @@ class TestReconnectExhaustionHandoff:
 
         await self._assert_handoff(adapter)
         adapter._reconnect.assert_not_awaited()
+
+
+class TestQuickDisconnectHandoff:
+    """Regression: the *4th* exhaustion exit — quick-disconnect detection —
+    must also hand off to the gateway watcher (retryable fatal + detached
+    notify task) instead of dying silently. The original PR fixed the three
+    exits in `_listen_loop`'s bottom half but left this one at
+    `_set_fatal_error(...); return` with no `_schedule_fatal_notify()`,
+    which meant misconfigured / permission-denied bots went into a silent
+    death exactly like the pre-fix state.
+    """
+
+    def _make_adapter(self):
+        from gateway.platforms.qqbot.adapter import QQAdapter
+        return QQAdapter(_make_config(app_id="a", client_secret="b"))
+
+    @pytest.mark.asyncio
+    async def test_quick_disconnect_exhaustion_hands_off(self, monkeypatch):
+        from gateway.platforms.qqbot.adapter import QQCloseError
+        import gateway.platforms.qqbot.adapter as qq_adapter
+
+        adapter = self._make_adapter()
+        # Trip the threshold on the first quick disconnect so the loop
+        # doesn't need to iterate.
+        monkeypatch.setattr(qq_adapter, "MAX_QUICK_DISCONNECT_COUNT", 1)
+        # A wide threshold guarantees the synthetic instant failure is
+        # classified as "quick" regardless of scheduler timing.
+        monkeypatch.setattr(qq_adapter, "QUICK_DISCONNECT_THRESHOLD", 60.0)
+        adapter._running = True
+        adapter._mark_transport_disconnected = mock.Mock()
+        adapter._fail_pending = mock.Mock()
+        adapter._mark_disconnected = mock.Mock()
+        adapter._set_fatal_error = mock.Mock()
+        # Adapter-side unit boundary — see the equivalent comment in
+        # TestReconnectExhaustionHandoff._arm for why this mock is safe here
+        # and where the real gateway-side coverage lives.
+        adapter._notify_fatal_error = mock.AsyncMock()
+
+        # Any close code works; quick-disconnect detection runs *before*
+        # close-code classification.
+        adapter._read_events = mock.AsyncMock(
+            side_effect=QQCloseError(4009, "quick close")
+        )
+
+        await adapter._listen_loop()
+
+        # Retryable fatal was set with the quick-disconnect signature.
+        adapter._set_fatal_error.assert_called_once()
+        args, kwargs = adapter._set_fatal_error.call_args
+        assert args[0] == "qq_quick_disconnect"
+        assert kwargs.get("retryable") is True
+        # The silent-death path (direct `_mark_disconnected` fallback)
+        # must NOT be taken — the gateway owns lifecycle from here.
+        adapter._mark_disconnected.assert_not_called()
+        # Notify is scheduled as a detached task so the listen loop can
+        # return before disconnect() cancels this task.
+        assert adapter._fatal_notify_task is not None
+        await adapter._fatal_notify_task
+        adapter._notify_fatal_error.assert_awaited_once()
+
+
+class TestQQBotGatewayHandoffEndToEnd:
+    """End-to-end proof that a QQBot retryable fatal error travels through
+    the *real* `GatewayRunner._handle_adapter_fatal_error` path and lands in
+    `runner._failed_platforms`, where the reconnect watcher picks it up.
+
+    This is the assertion the adapter-side mocked tests structurally cannot
+    make: they stop at `_notify_fatal_error` being scheduled. Here we drive
+    a minimal QQ-shaped adapter with the exact retryable-fatal shape the
+    real QQAdapter emits (both exhaustion families), install it into a real
+    `GatewayRunner`, and observe the queue outcome with no mocks on the
+    notify chain. Only `runner.stop` is mocked so we don't need to bring
+    up the full gateway lifecycle for this assertion — mirroring
+    `tests/gateway/test_runner_fatal_adapter.py:test_runner_queues_retryable_runtime_fatal_for_reconnection`.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "error_code,error_message",
+        [
+            ("qq_reconnect_exhausted", "Max reconnect attempts reached"),
+            (
+                "qq_quick_disconnect",
+                "Too many quick disconnects — check bot permissions",
+            ),
+        ],
+    )
+    async def test_qqbot_retryable_fatal_reaches_gateway_reconnect_queue(
+        self, tmp_path, error_code, error_message
+    ):
+        from unittest.mock import AsyncMock
+
+        from gateway.config import GatewayConfig, Platform, PlatformConfig
+        from gateway.platforms.base import BasePlatformAdapter
+        from gateway.run import GatewayRunner
+
+        class _QQFakeAdapter(BasePlatformAdapter):
+            """Minimal QQ-shaped adapter — mirrors the retryable-fatal shape
+            emitted by both `qq_reconnect_exhausted` and
+            `qq_quick_disconnect` in the real QQAdapter.
+            """
+
+            def __init__(self):
+                super().__init__(
+                    PlatformConfig(
+                        enabled=True,
+                        extra={"app_id": "a", "client_secret": "b"},
+                    ),
+                    Platform.QQBOT,
+                )
+
+            async def connect(self, *, is_reconnect: bool = False) -> bool:
+                return True
+
+            async def disconnect(self) -> None:
+                self._mark_disconnected()
+
+            async def send(self, chat_id, content, reply_to=None, metadata=None):
+                raise NotImplementedError
+
+            async def get_chat_info(self, chat_id):
+                return {"id": chat_id}
+
+        config = GatewayConfig(
+            platforms={
+                Platform.QQBOT: PlatformConfig(
+                    enabled=True,
+                    extra={"app_id": "a", "client_secret": "b"},
+                )
+            },
+            sessions_dir=tmp_path / "sessions",
+        )
+        runner = GatewayRunner(config)
+        adapter = _QQFakeAdapter()
+        adapter._set_fatal_error(error_code, error_message, retryable=True)
+
+        runner.adapters = {Platform.QQBOT: adapter}
+        runner.delivery_router.adapters = runner.adapters
+        # We don't need a full gateway lifecycle for this assertion — just
+        # prevent the runner from tearing itself down as a side effect.
+        runner.stop = AsyncMock()
+
+        await runner._handle_adapter_fatal_error(adapter)
+
+        # Gateway must remove the fatal adapter and queue it for background
+        # reconnection — this is exactly what silent death used to skip.
+        assert Platform.QQBOT not in runner.adapters
+        assert Platform.QQBOT in runner._failed_platforms
+        assert runner._failed_platforms[Platform.QQBOT]["attempts"] == 0
+        # Gateway stays alive — the watcher owns retry from here.
+        runner.stop.assert_not_awaited()
+        assert runner._exit_with_failure is False
