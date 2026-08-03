@@ -3195,12 +3195,18 @@ class APIServerAdapter(BasePlatformAdapter):
             return None, web.json_response(_openai_error(f"Session not found: {session_id}", code="session_not_found"), status=404)
         return session, None
 
-    async def _conversation_history_for_session(self, session_id: str) -> List[Dict[str, Any]]:
+    async def _conversation_history_for_session(
+        self, session_id: str, repair_alternation: bool = False
+    ) -> List[Dict[str, Any]]:
         db = await self._ensure_session_db_async()
         if db is None:
             return []
         try:
-            return await asyncio.to_thread(db.get_messages_as_conversation, session_id)
+            return await asyncio.to_thread(
+                db.get_messages_as_conversation,
+                session_id,
+                repair_alternation=repair_alternation,
+            )
         except Exception as exc:
             logger.warning("Failed to load session history for %s: %s", session_id, exc)
             return []
@@ -6325,6 +6331,21 @@ class APIServerAdapter(BasePlatformAdapter):
                     conversation_history.append({"role": msg["role"], "content": str(content)})
 
         session_id = body.get("session_id") or stored_session_id
+
+        # Auto-load persisted session history when the client supplied only a
+        # session_id (mirrors /chat, which always loads history from the
+        # session store). Explicit conversation_history, previous_response_id
+        # chaining, and multi-message input all take precedence; this only
+        # fires when none of those produced history. repair_alternation=True
+        # because this feed is LIVE REPLAY: a durable user;user wedge would
+        # otherwise re-trigger the pre-request repair on every request (see
+        # SessionDB.get_messages_as_conversation docstring). A missing session
+        # degrades to empty history, never an error — the run still starts.
+        if not conversation_history and session_id:
+            conversation_history = await self._conversation_history_for_session(
+                session_id, repair_alternation=True
+            )
+
         route = self._resolve_route(body.get("model"))
         agent_overrides = _request_agent_overrides(body, virtual_model=self._model_name)
         selection_error = self._request_route_conflict_error(

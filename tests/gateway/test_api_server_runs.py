@@ -11,7 +11,7 @@ Covers:
 import asyncio
 import threading
 import time
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from aiohttp import web
@@ -257,6 +257,175 @@ class TestStartRun:
         assert kwargs["requested_model"] == "MiniMax-M3"
         assert kwargs["requested_provider"] == "minimax"
         assert kwargs["model_options"] == model_options
+
+    @pytest.mark.asyncio
+    async def test_start_loads_session_history_when_only_session_id_provided(self, adapter):
+        """When /v1/runs receives only a session_id (no explicit history,
+        no previous_response_id, no multi-message input), history must be
+        auto-loaded from the session store so the run is not amnesiac —
+        mirroring /chat. repair_alternation must be True (live replay)."""
+        db_history = [
+            {"role": "user", "content": "stored message 1"},
+            {"role": "assistant", "content": "stored reply 1"},
+        ]
+        mock_db = MagicMock()
+        mock_db.get_messages_as_conversation.return_value = db_history
+        adapter._session_db = mock_db
+
+        captured = {}
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+
+                def _capture_run(user_message=None, conversation_history=None, task_id=None):
+                    captured["history"] = conversation_history
+                    return {"final_response": "done"}
+
+                mock_agent.run_conversation.side_effect = _capture_run
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post(
+                    "/v1/runs",
+                    json={"input": "hello", "session_id": "persisted-session"},
+                )
+                assert resp.status == 202
+                for _ in range(40):
+                    if captured.get("history") is not None:
+                        break
+                    await asyncio.sleep(0.05)
+
+        assert captured.get("history") == db_history, (
+            "session_id-only run must load persisted session history"
+        )
+        mock_db.get_messages_as_conversation.assert_called_once_with(
+            "persisted-session", repair_alternation=True
+        )
+
+    @pytest.mark.asyncio
+    async def test_start_explicit_conversation_history_wins_over_session_store(self, adapter):
+        """Explicit conversation_history in the body must take precedence and
+        the session store must not be consulted for history."""
+        mock_db = MagicMock()
+        mock_db.get_messages_as_conversation.return_value = [
+            {"role": "user", "content": "should-not-be-used"},
+        ]
+        adapter._session_db = mock_db
+
+        explicit_history = [
+            {"role": "user", "content": "client msg 1"},
+            {"role": "assistant", "content": "client reply 1"},
+        ]
+        captured = {}
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+
+                def _capture_run(user_message=None, conversation_history=None, task_id=None):
+                    captured["history"] = conversation_history
+                    return {"final_response": "done"}
+
+                mock_agent.run_conversation.side_effect = _capture_run
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post(
+                    "/v1/runs",
+                    json={
+                        "input": "hello",
+                        "session_id": "persisted-session",
+                        "conversation_history": explicit_history,
+                    },
+                )
+                assert resp.status == 202
+                for _ in range(40):
+                    if captured.get("history") is not None:
+                        break
+                    await asyncio.sleep(0.05)
+
+        assert captured.get("history") == explicit_history
+        mock_db.get_messages_as_conversation.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_start_missing_session_degrades_to_empty_history(self, adapter):
+        """A session_id with no persisted rows (or an unavailable store) must
+        not fail the run — history stays empty and the run still starts."""
+        mock_db = MagicMock()
+        mock_db.get_messages_as_conversation.return_value = []
+        adapter._session_db = mock_db
+
+        captured = {}
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+
+                def _capture_run(user_message=None, conversation_history=None, task_id=None):
+                    captured["history"] = conversation_history
+                    return {"final_response": "done"}
+
+                mock_agent.run_conversation.side_effect = _capture_run
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post(
+                    "/v1/runs",
+                    json={"input": "hello", "session_id": "no-rows-session"},
+                )
+                assert resp.status == 202
+                data = await resp.json()
+                assert data["status"] == "started"
+                for _ in range(40):
+                    if captured.get("history") is not None:
+                        break
+                    await asyncio.sleep(0.05)
+
+        assert captured.get("history") == []
+
+    @pytest.mark.asyncio
+    async def test_start_session_store_unavailable_degrades_to_empty_history(self, adapter):
+        """When the session store is unavailable (db is None), a session_id
+        run must still start with empty history instead of 500ing."""
+        adapter._session_db = None
+        with patch.object(
+            adapter, "_ensure_session_db_async", new_callable=AsyncMock
+        ) as mock_ensure:
+            mock_ensure.return_value = None
+            captured = {}
+            app = _create_runs_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                with patch.object(adapter, "_create_agent") as mock_create:
+                    mock_agent = MagicMock()
+
+                    def _capture_run(user_message=None, conversation_history=None, task_id=None):
+                        captured["history"] = conversation_history
+                        return {"final_response": "done"}
+
+                    mock_agent.run_conversation.side_effect = _capture_run
+                    mock_agent.session_prompt_tokens = 0
+                    mock_agent.session_completion_tokens = 0
+                    mock_agent.session_total_tokens = 0
+                    mock_create.return_value = mock_agent
+
+                    resp = await cli.post(
+                        "/v1/runs",
+                        json={"input": "hello", "session_id": "store-down-session"},
+                    )
+                    assert resp.status == 202
+                    for _ in range(40):
+                        if captured.get("history") is not None:
+                            break
+                        await asyncio.sleep(0.05)
+
+            assert captured.get("history") == []
 
 
 # ---------------------------------------------------------------------------
