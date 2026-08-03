@@ -262,6 +262,12 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
         return None, False
     try:
         metadata = os.fstat(descriptor)
+        if stat.S_ISDIR(metadata.st_mode):
+            # A directory cannot be an executable script. Treating it as
+            # unsafe false-positives any command whose scanned text contains
+            # a bare "/" token (e.g. Python sources with rstrip("/")),
+            # blocking benign CLIs from inside the gateway.
+            return None, False
         if not stat.S_ISREG(metadata.st_mode):
             return None, True
         # Read a bounded chunk first — even for oversized files, the first
