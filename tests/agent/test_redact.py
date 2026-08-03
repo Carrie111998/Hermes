@@ -1,10 +1,17 @@
 """Tests for agent.redact -- secret masking in logs and output."""
 
 import logging
+import os
 
 import pytest
 
-from agent.redact import redact_cdp_url, redact_sensitive_text, RedactingFormatter
+from agent.redact import (
+    mask_egress_secret_values,
+    redact_cdp_url,
+    redact_sensitive_text,
+    redact_terminal_output,
+    RedactingFormatter,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -829,5 +836,81 @@ class TestKeywordWordBoundary:
         text = "secrets: hunter2hunter2hunter2hh"
         result = redact_sensitive_text(text)
         assert "hunter2hunter2hunter2hh" not in result
+
+
+class TestEgressSecretValueMasking:
+    """Exact-value masking of applied secrets on provider-egress surfaces.
+
+    Shape-based redaction (vendor prefixes, URL userinfo, auth headers)
+    cannot catch opaque secret values under arbitrary names (DATABASE_URL,
+    FOO, arbitrary 1Password item keys). These tests cover the exact-value
+    masker the egress sanitizers apply on top of the shape passes, plus the
+    ``extra_secret_values`` plumbing on ``redact_sensitive_text`` and
+    ``redact_terminal_output``.
+    """
+
+    # No vendor prefix, no recognisable shape -- invisible to regex redaction.
+    _OPAQUE = "abc123randomstring"
+
+    def test_masks_credential_suffixed_env_value(self, monkeypatch):
+        monkeypatch.setitem(os.environ, "EGRESS_TEST_API_KEY", self._OPAQUE)
+        result = mask_egress_secret_values(f"token {self._OPAQUE} in output")
+        assert self._OPAQUE not in result
+        assert result == "token *** in output"
+
+    def test_masks_extra_values(self):
+        result = mask_egress_secret_values(
+            f"FOO={self._OPAQUE}", extra_values={self._OPAQUE}
+        )
+        assert self._OPAQUE not in result
+        assert result == "FOO=***"
+
+    def test_skips_short_values(self, monkeypatch):
+        # len < 6 is too likely to collide with ordinary prose.
+        monkeypatch.setitem(os.environ, "EGRESS_TEST_API_KEY", "abc12")
+        assert mask_egress_secret_values("abc12") == "abc12"
+        assert mask_egress_secret_values("abc12", extra_values={"abc12"}) == "abc12"
+
+    def test_falsy_text_passthrough(self):
+        assert mask_egress_secret_values("") == ""
+        assert mask_egress_secret_values("", extra_values={self._OPAQUE}) == ""
+
+    def test_never_raises_on_bad_extra_values(self):
+        result = mask_egress_secret_values(
+            f"token {self._OPAQUE} here", extra_values={None, 123, self._OPAQUE}
+        )
+        assert result == "token *** here"
+
+    def test_longest_value_masked_first(self):
+        # A longer secret embedding a shorter one must be fully masked
+        # (longest-first replacement avoids partial-mask artifacts).
+        longer = "abcdefghij"
+        shorter = "abcdefgh"
+        result = mask_egress_secret_values(
+            f"v={longer}", extra_values={shorter, longer}
+        )
+        assert result == "v=***"
+
+    def test_redact_sensitive_text_opaque_value_unchanged_by_default(self):
+        # No extra_secret_values -> exact-value masking is off; the opaque
+        # value passes through exactly as today (byte-identical behavior).
+        text = f"FOO={self._OPAQUE}"
+        assert redact_sensitive_text(text) == text
+
+    def test_redact_sensitive_text_extra_secret_values_masks_opaque(self):
+        result = redact_sensitive_text(
+            f"FOO={self._OPAQUE}", extra_secret_values={self._OPAQUE}
+        )
+        assert self._OPAQUE not in result
+        assert result == "FOO=***"
+
+    def test_redact_terminal_output_extra_secret_values_masks_opaque(self):
+        text = f"the token {self._OPAQUE} is here"
+        # Default: shape-based only -- opaque values pass through.
+        assert redact_terminal_output(text, "cat x") == text
+        result = redact_terminal_output(
+            text, "cat x", extra_secret_values={self._OPAQUE}
+        )
+        assert self._OPAQUE not in result
 
 

@@ -3037,8 +3037,16 @@ def terminal_tool(
             # (code_file=False) to mask opaque tokens with no vendor prefix.
             # Real prefixes, auth headers, JWTs, private keys are masked in
             # both modes. See issue #43025.
-            from agent.redact import redact_terminal_output
-            output = redact_terminal_output(output.strip(), command) if output else ""
+            from agent.redact import egress_applied_secret_values, redact_terminal_output
+            output = (
+                redact_terminal_output(
+                    output.strip(),
+                    command,
+                    extra_secret_values=egress_applied_secret_values(),
+                )
+                if output
+                else ""
+            )
 
             # Interpret non-zero exit codes that aren't real errors
             # (e.g. grep=1 means "no matches", diff=1 means "files differ")

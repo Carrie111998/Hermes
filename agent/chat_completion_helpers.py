@@ -1455,8 +1455,10 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
     # Respects HERMES_REDACT_SECRETS via redact_sensitive_text — no-op
     # when disabled. (#19798)
     if isinstance(_san_content, str) and _san_content:
-        from agent.redact import redact_sensitive_text
-        _san_content = redact_sensitive_text(_san_content)
+        from agent.redact import egress_applied_secret_values, redact_sensitive_text
+        _san_content = redact_sensitive_text(
+            _san_content, extra_secret_values=egress_applied_secret_values()
+        )
 
     # NOTE (empty-content class fix): textless assistant turns are NOT padded
     # here.  The single owner for "never send a turn strict wire validation

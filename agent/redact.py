@@ -656,6 +656,111 @@ def _mask_token_nonreusable(token: str) -> str:
     return f"«redacted:{label}…»" if label else "«redacted-secret»"
 
 
+# ── Exact-value masking of applied secrets (provider-egress) ─────────────
+#
+# Shape-based redaction (vendor prefixes, URL userinfo, auth headers)
+# cannot catch opaque secret values under arbitrary names (DATABASE_URL,
+# FOO, arbitrary 1Password item keys) applied from external secret sources
+# (Bitwarden / 1Password / command). These helpers mask the exact values
+# themselves. The names carry the ``egress`` prefix so they cannot collide
+# with other in-flight exact-value maskers in this file.
+
+# Environment variable name suffixes whose values are treated as
+# credentials for exact-value masking.
+_EGRESS_CREDENTIAL_VALUE_SUFFIXES = (
+    "_API_KEY",
+    "_TOKEN",
+    "_SECRET",
+    "_KEY",
+    "_PASSWORD",
+)
+
+# Values shorter than this are too likely to collide with ordinary prose
+# (e.g. "test", "local") to mask safely.
+_EGRESS_SECRET_VALUE_MIN_LEN = 6
+
+
+def _egress_known_secret_values() -> set[str]:
+    """Collect exact credential values from the process environment.
+
+    Scans ``os.environ`` for variable names ending in credential suffixes
+    (``_API_KEY`` / ``_TOKEN`` / ``_SECRET`` / ``_KEY`` / ``_PASSWORD``)
+    and returns their values, filtered to ``len >= 6``.
+    """
+    values = set()
+    for name, value in os.environ.items():
+        if (
+            value
+            and len(value) >= _EGRESS_SECRET_VALUE_MIN_LEN
+            and name.endswith(_EGRESS_CREDENTIAL_VALUE_SUFFIXES)
+        ):
+            values.add(value)
+    return values
+
+
+def mask_egress_secret_values(
+    text: str,
+    extra_values: set[str] | None = None,
+) -> str:
+    """Replace exact occurrences of known credential values with ``***``.
+
+    Combines the ``os.environ`` credential-suffixed values (see
+    :func:`_egress_known_secret_values`) with ``extra_values`` — the
+    per-home applied-secrets snapshot from external sources — and replaces
+    exact matches in ``text`` with ``***``. Longest values are replaced
+    first so a secret embedding a shorter one is fully masked.
+
+    Callers must only pass THIS home's applied values as ``extra_values``
+    (see :func:`egress_applied_secret_values`); the env scan is global but
+    restricted to credential-suffixed names.
+
+    Falsy ``text`` passes through unchanged. Never raises — unexpected
+    ``extra_values`` elements are skipped and any internal failure returns
+    ``text`` unmodified.
+    """
+    if not text:
+        return text
+    result = text
+    try:
+        values = _egress_known_secret_values()
+        if extra_values:
+            values.update(
+                v
+                for v in extra_values
+                if isinstance(v, str)
+                and v
+                and len(v) >= _EGRESS_SECRET_VALUE_MIN_LEN
+            )
+        for value in sorted(values, key=len, reverse=True):
+            if value in result:
+                result = result.replace(value, "***")
+    except Exception:
+        return text
+    return result
+
+
+def egress_applied_secret_values() -> set[str] | None:
+    """Return THIS home's applied external-secret values for egress masking.
+
+    Resolves the current hermes home and returns the raw values applied
+    from external secret sources (Bitwarden / 1Password / command) for that
+    home only — per-home scoping: another profile's applied secrets are
+    never masked into this egress.
+
+    Best-effort: any exception (home resolution, snapshot lookup) returns
+    ``None`` so callers fall back to shape-based redaction alone and never
+    break the tool call. Imports are lazy to keep this leaf module free of
+    heavy dependencies at import time.
+    """
+    try:
+        from hermes_cli.env_loader import get_secret_source_values
+        from hermes_constants import get_hermes_home
+
+        return set(get_secret_source_values(get_hermes_home()).values())
+    except Exception:
+        return None
+
+
 def redact_sensitive_text(
     text: str,
     *,
@@ -663,6 +768,7 @@ def redact_sensitive_text(
     code_file: bool = False,
     file_read: bool = False,
     redact_url_credentials: bool = False,
+    extra_secret_values: set[str] | None = None,
 ) -> str:
     """Apply all redaction patterns to a block of text.
 
@@ -691,6 +797,13 @@ def redact_sensitive_text(
     sentinel is syntactically invalid as a token, so it can't be mistaken for a
     usable key or written back as one. Implies code_file=True (config/data
     files shouldn't trigger the source-code ENV/JSON false-positive paths).
+
+    Set extra_secret_values to additionally replace exact occurrences of the
+    given credential values with ``***``. Shape-based passes cannot catch
+    opaque values applied under arbitrary names (DATABASE_URL, FOO, 1Password
+    item keys); egress callers pass the per-home applied-secrets snapshot here
+    (see :func:`egress_applied_secret_values`). Default None keeps current
+    behavior byte-identical — the exact-value pass is skipped entirely.
 
     Performance: each regex pattern is gated behind a cheap substring
     pre-check (e.g. ``"=" in text`` for ENV assignments, ``"://" in text``
@@ -876,6 +989,12 @@ def redact_sensitive_text(
             return phone[:4] + "****" + phone[-4:]
         text = _SIGNAL_PHONE_RE.sub(_redact_phone, text)
 
+    # Exact-value masking of applied secrets (per-home snapshot from
+    # external sources). Optional: default None keeps prior behavior
+    # byte-identical (prompt-cache safe — no change for existing callers).
+    if extra_secret_values:
+        text = mask_egress_secret_values(text, extra_values=extra_secret_values)
+
     return text
 
 
@@ -916,7 +1035,11 @@ def is_env_dump_command(command: str | None) -> bool:
 
 
 def redact_terminal_output(
-    output: str, command: str | None = None, *, force: bool = False
+    output: str,
+    command: str | None = None,
+    *,
+    force: bool = False,
+    extra_secret_values: set[str] | None = None,
 ) -> str:
     """Redact secrets from terminal/process stdout.
 
@@ -936,7 +1059,12 @@ def redact_terminal_output(
     if not output:
         return output
     code_file = not is_env_dump_command(command or "")
-    return redact_sensitive_text(output, force=force, code_file=code_file)
+    return redact_sensitive_text(
+        output,
+        force=force,
+        code_file=code_file,
+        extra_secret_values=extra_secret_values,
+    )
 
 
 # Substrings used to gate ``_PREFIX_RE`` execution. If none of these appear in

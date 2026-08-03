@@ -39,10 +39,16 @@ _MEMORY_CONTEXT_TRUNCATION_MARKER = "\n...[memory provider context truncated]...
 
 def sanitize_memory_context(memory_context: str) -> str:
     """Prepare provider context for a context-engine/LLM egress boundary."""
+    # Exact-value masking of THIS home's applied external secrets
+    # (Bitwarden/1Password/command) — best-effort; on any resolution
+    # failure the call falls back to shape-based redaction alone.
+    from agent.redact import egress_applied_secret_values
+
     sanitized = redact_sensitive_text(
         memory_context.strip(),
         force=True,
         redact_url_credentials=True,
+        extra_secret_values=egress_applied_secret_values(),
     )
     if len(sanitized) <= MEMORY_CONTEXT_MAX_CHARS:
         return sanitized

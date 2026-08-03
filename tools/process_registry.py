@@ -2465,13 +2465,22 @@ def _redact_process_result(result: dict) -> dict:
     """
     if not isinstance(result, dict):
         return result
-    from agent.redact import redact_sensitive_text, redact_terminal_output
+    from agent.redact import (
+        egress_applied_secret_values,
+        redact_sensitive_text,
+        redact_terminal_output,
+    )
 
     command = result.get("command") or ""
+    # Best-effort applied-secrets snapshot (THIS home only); on any
+    # resolution failure the redactor is called without extra values.
+    extra_secret_values = egress_applied_secret_values()
     for field in ("output", "output_preview"):
         value = result.get(field)
         if isinstance(value, str) and value:
-            result[field] = redact_terminal_output(value, command)
+            result[field] = redact_terminal_output(
+                value, command, extra_secret_values=extra_secret_values
+            )
     if isinstance(result.get("command"), str) and result["command"]:
         result["command"] = redact_sensitive_text(result["command"], code_file=True)
     return result
