@@ -77,7 +77,7 @@ export function UsagePage() {
     return <Loader />
   }
 
-  const totalTokens = summary.total_input_tokens + summary.total_output_tokens + summary.total_cache_read_tokens
+  const totalTokens = summary.total_input_tokens + summary.total_output_tokens + summary.total_cache_read_tokens + summary.total_cache_write_tokens
 
   return (
     <main className="flex h-full min-h-0 flex-col overflow-auto bg-(--ui-chat-surface-background) px-6 py-8">
