@@ -80,12 +80,18 @@ def test_background_and_main_agent_paths_call_refresh():
     source = (
         Path(__file__).resolve().parent.parent.parent / "gateway" / "run.py"
     ).read_text(encoding="utf-8")
+    mixin_source = (
+        Path(__file__).resolve().parent.parent.parent / "gateway" / "turn_exec_mixin.py"
+    ).read_text(encoding="utf-8")
     # The agent-construction site inside TurnRunner.run_sync (extracted from
     # the old _run_agent_inner closure) references the runner as
-    # ``self._runner``; the background-agent site still uses bare ``self``.
+    # ``self._runner``; the background-agent site (extracted with the
+    # GatewayTurnExecMixin, slice 29 of #54962) still uses bare ``self``.
     _refresh_calls = (
         source.count("fallback_model=self._refresh_fallback_model()")
         + source.count("fallback_model=self._runner._refresh_fallback_model()")
+        + mixin_source.count("fallback_model=self._refresh_fallback_model()")
+        + mixin_source.count("fallback_model=self._runner._refresh_fallback_model()")
     )
     assert _refresh_calls >= 2
     # The cached-agent reuse path (the load-bearing fix for a long-lived
@@ -93,10 +99,14 @@ def test_background_and_main_agent_paths_call_refresh():
     assert (
         "self._apply_fallback_chain_to_agent(" in source
         or "self._runner._apply_fallback_chain_to_agent(" in source
+        or "self._apply_fallback_chain_to_agent(" in mixin_source
+        or "self._runner._apply_fallback_chain_to_agent(" in mixin_source
     )
     # The stale startup-snapshot form must not remain at create sites.
     assert "fallback_model=self._fallback_model," not in source
     assert "fallback_model=self._runner._fallback_model," not in source
+    assert "fallback_model=self._fallback_model," not in mixin_source
+    assert "fallback_model=self._runner._fallback_model," not in mixin_source
 
 
 def test_load_fallback_model_static_unchanged_contract(tmp_path, monkeypatch):
