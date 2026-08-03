@@ -417,7 +417,7 @@ async function activeProjectsContext(): Promise<ActiveProjectsContext> {
   }
 
   if (!gateway || gateway !== activeGateway() || profile !== ($activeGatewayProfile.get() || 'default')) {
-    throw new Error('Active Hermes profile changed while connecting')
+    throw new Error('Active evaOS Agent profile changed while connecting')
   }
 
   return { gateway, profile }

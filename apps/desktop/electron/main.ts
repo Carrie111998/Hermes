@@ -146,6 +146,7 @@ import {
   resolveOauthRestAuth,
   resolveReadinessProbeAuth
 } from './native-auth-decisions'
+import { nativeAboutPanelOptions, nativeAppIconCandidates } from './native-branding'
 import {
   nativeRefreshUrl,
   type NativeTokenSet,
@@ -685,19 +686,15 @@ const WINDOW_BUTTON_POSITION = {
 // (pure + unit-testable); computeNativeOverlayWidth() applies it per platform.
 // It's only the pre-layout fallback — the renderer measures the exact overlay
 // width live via the Window Controls Overlay API.
-// The apple-touch PNG bakes in the macOS-style ~10% margin, which is correct
-// for the dock but renders visibly smaller than neighboring taskbar icons on
-// Windows, where icons are full-bleed. Windows prefers the full-bleed
-// assets/icon.ico (shipped to resources/ via extraResources) and only falls
-// back to the padded PNG if the ico is missing.
-const APP_ICON_PATHS = [
-  ...(IS_WINDOWS
-    ? [path.join(process.resourcesPath ?? '', 'icon.ico'), path.join(APP_ROOT, 'assets', 'icon.ico')]
-    : []),
-  path.join(APP_ROOT, 'public', 'apple-touch-icon.png'),
-  path.join(APP_ROOT, 'dist', 'apple-touch-icon.png'),
-  path.join(unpackedPathFor(APP_ROOT), 'dist', 'apple-touch-icon.png')
-]
+// Windows prefers the Eva ICO shipped through extraResources.
+// Other platforms use the same Eva portrait PNG as the renderer favicon and
+// provider brand moment, keeping native and renderer identity aligned.
+const APP_ICON_PATHS = nativeAppIconCandidates({
+  appRoot: APP_ROOT,
+  isWindows: IS_WINDOWS,
+  resourcesPath: process.resourcesPath ?? '',
+  unpackedAppRoot: unpackedPathFor(APP_ROOT)
+})
 
 let rendererTitleBarTheme = null
 const terminalSessions = new Map()
@@ -985,13 +982,14 @@ if (IS_WINDOWS) {
 // on every open via the explicit "About" menu handler (refreshAboutPanel), so
 // an in-place `hermes update` mid-session is reflected without an app restart;
 // the seed here just covers the first open and any non-menu invocation path.
-app.setAboutPanelOptions({
-  applicationName: APP_NAME,
-  applicationVersion: EVA_MANAGED_BUILD ? app.getVersion() : resolveHermesVersion(),
-  copyright: EVA_MANAGED_BUILD
-    ? 'Copyright © 2026 Electric Sheep. Built on Hermes Agent by Nous Research under the MIT License.'
-    : 'Copyright © 2026 Nous Research'
-})
+app.setAboutPanelOptions(
+  nativeAboutPanelOptions({
+    applicationName: APP_NAME,
+    appVersion: app.getVersion(),
+    managed: EVA_MANAGED_BUILD,
+    upstreamVersion: resolveHermesVersion()
+  })
+)
 
 // Custom scheme for streaming local media (video/audio) into the renderer.
 // Reading large media through `readFileDataUrl` failed: it base64-loads the
@@ -1797,7 +1795,7 @@ async function waitForUpdateToFinish() {
 
       await advanceBootProgress(
         'backend.update-wait',
-        'An update is finishing — Hermes will start automatically when it completes…',
+        `An update is finishing — ${APP_NAME} will start automatically when it completes…`,
         12
       )
     },
@@ -8947,7 +8945,7 @@ function createInstanceWindow() {
     ...nextInstanceBounds(),
     minWidth: WINDOW_MIN_WIDTH,
     minHeight: WINDOW_MIN_HEIGHT,
-    title: 'Hermes',
+    title: APP_NAME,
     titleBarStyle: 'hidden',
     titleBarOverlay: getTitleBarOverlayOptions(),
     trafficLightPosition: IS_MAC ? WINDOW_BUTTON_POSITION : undefined,
@@ -11644,11 +11642,14 @@ function resolveHermesVersion() {
 // an app restart. macOS only — `showAboutPanel()` is a no-op elsewhere, and the
 // other platforms don't use this menu item.
 function showAboutPanelFresh() {
-  app.setAboutPanelOptions({
-    applicationName: APP_NAME,
-    applicationVersion: resolveHermesVersion(),
-    copyright: 'Copyright © 2026 Nous Research'
-  })
+  app.setAboutPanelOptions(
+    nativeAboutPanelOptions({
+      applicationName: APP_NAME,
+      appVersion: app.getVersion(),
+      managed: EVA_MANAGED_BUILD,
+      upstreamVersion: resolveHermesVersion()
+    })
+  )
   app.showAboutPanel()
 }
 
@@ -11870,14 +11871,17 @@ async function runDesktopUninstall(mode) {
 
 ipcMain.handle('hermes:uninstall:summary', async () => {
   if (EVA_MANAGED_BUILD) {
-    return { available: false, managed: true, message: 'evaOS Agent does not install a local Hermes runtime.' }
+    return { available: false, managed: true, message: 'evaOS Agent does not install a local agent runtime.' }
   }
+
   return getUninstallSummary()
 })
+
 ipcMain.handle('hermes:uninstall:run', async (_event, payload) => {
   if (EVA_MANAGED_BUILD) {
-    throw new Error('evaOS Agent does not install a local Hermes runtime.')
+    throw new Error('evaOS Agent does not install a local agent runtime.')
   }
+
   const mode = payload && typeof payload === 'object' ? payload.mode : payload
 
   return runDesktopUninstall(String(mode || ''))
@@ -12117,7 +12121,7 @@ function heldQuitForActiveWork(event: Electron.Event): boolean {
     return false
   }
 
-  const prompt = quitPromptFor(mergeActiveWork(activeWorkByWebContents.values()), isQuittingForHandoff)
+  const prompt = quitPromptFor(mergeActiveWork(activeWorkByWebContents.values()), isQuittingForHandoff, APP_NAME)
   const parent = BrowserWindow.getFocusedWindow() ?? BrowserWindow.getAllWindows()[0]
 
   if (!prompt || !parent || parent.isDestroyed()) {

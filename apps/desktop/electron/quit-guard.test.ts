@@ -60,3 +60,10 @@ test('quitPromptFor speaks singular for one chat', () => {
   assert.equal(prompt.message, 'Hermes is still working on 1 chat.')
   assert.ok(prompt.detail.includes('mid-turn'))
 })
+
+test('quitPromptFor uses the managed native app identity when supplied', () => {
+  const prompt = quitPromptFor({ count: 2, titles: [] }, false, 'evaOS Agent')
+
+  assert.ok(prompt)
+  assert.equal(prompt.message, 'evaOS Agent is still working on 2 chats.')
+})

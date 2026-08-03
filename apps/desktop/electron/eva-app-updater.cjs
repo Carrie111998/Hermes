@@ -4,6 +4,16 @@ const EVA_APP_UPDATE_FEED =
   'https://github.com/electricsheephq/evaOS-hermes-desktop-app-adapter/releases/latest/download/'
 const EVA_APP_UPDATE_CHANNEL = 'latest'
 const EVA_APP_UPDATE_BRANCH = 'managed-beta'
+const MANAGED_RELEASE_NOTE_REPLACEMENTS = [
+  [/Eva by Electric Sheep/g, 'evaOS Agent'],
+  [/Hermes Desktop/g, 'evaOS Agent'],
+  [/Hermes Agent/g, 'evaOS Agent'],
+  [/Nous Portal/g, 'Electric Sheep account'],
+  [/Nous Research/g, 'Electric Sheep'],
+  [/\bHermes\b/g, 'evaOS Agent'],
+  [/\bEva\b/g, 'evaOS Agent'],
+  [/\bNous\b/g, 'Electric Sheep']
+]
 
 function messageOf(error) {
   return error instanceof Error ? error.message : String(error || 'Unknown updater error')
@@ -14,9 +24,19 @@ function normalizeVersion(info) {
   return value || null
 }
 
+function sanitizeReleaseNote(summary) {
+  return MANAGED_RELEASE_NOTE_REPLACEMENTS.reduce(
+    (current, [pattern, replacement]) => current.replace(pattern, replacement),
+    String(summary || '')
+  )
+}
+
 function releaseNoteCommits(info, now = Date.now()) {
   const raw = Array.isArray(info?.releaseNotes)
-    ? info.releaseNotes.map(item => item?.note).filter(Boolean).join('\n')
+    ? info.releaseNotes
+        .map(item => item?.note)
+        .filter(Boolean)
+        .join('\n')
     : String(info?.releaseNotes || '')
 
   return raw
@@ -26,7 +46,7 @@ function releaseNoteCommits(info, now = Date.now()) {
     .slice(0, 20)
     .map((summary, index) => ({
       sha: `release-note:${normalizeVersion(info) || 'unknown'}:${index + 1}`,
-      summary,
+      summary: sanitizeReleaseNote(summary),
       author: 'Electric Sheep',
       at: now()
     }))
@@ -118,7 +138,8 @@ function createEvaAppUpdater(options) {
     const percent = Number.isFinite(progress?.percent) ? Math.max(0, Math.min(100, progress.percent)) : null
     emitProgress({
       stage: 'fetch',
-      message: percent === null ? 'Downloading the signed update…' : `Downloading the signed update… ${Math.round(percent)}%`,
+      message:
+        percent === null ? 'Downloading the signed update…' : `Downloading the signed update… ${Math.round(percent)}%`,
       percent
     })
   })
@@ -244,6 +265,7 @@ module.exports = {
   EVA_APP_UPDATE_FEED,
   createEvaAppUpdater,
   releaseNoteCommits,
+  sanitizeReleaseNote,
   statusFor,
   unsupportedStatus
 }

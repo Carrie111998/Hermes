@@ -725,7 +725,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         const failure =
           payload?.status === 'error'
             ? {
-                error: coerceGatewayText(payload.error).trim() || finalText || 'Hermes reported an error',
+                error: coerceGatewayText(payload.error).trim() || finalText || 'evaOS Agent reported an error',
                 partial: Boolean(payload.partial)
               }
             : undefined

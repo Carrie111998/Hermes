@@ -25,6 +25,14 @@ test('evaOS Agent package identity and customer artifact contract are exact', ()
   ])
   assert.deepEqual(pkg.build.releaseInfo, { releaseNotesFile: 'release-notes.md' })
   assert.equal(pkg.build.icon, 'assets/eva')
+  assert.deepEqual(
+    pkg.build.extraResources.find(resource => resource.to === 'eva.ico'),
+    { from: 'assets/eva.ico', to: 'eva.ico' }
+  )
+  assert.equal(
+    pkg.build.mac.extendInfo.NSCameraUsageDescription,
+    'evaOS Agent uses the camera when a plugin or feature you enable requests it.'
+  )
   assert.equal(pkg.build.mac.forceCodeSigning, true)
   assert.equal(pkg.build.afterSign, 'scripts/notarize.mjs')
   assert.equal(

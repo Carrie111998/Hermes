@@ -45,6 +45,16 @@ export const ja = defineLocale({
     off: 'オフ'
   },
 
+  quickEntry: {
+    inputLabel: 'クイック入力',
+    askPlaceholder: 'evaOS Agent に質問…',
+    disconnectedPlaceholder: '未接続です — evaOS Agent を開いて再接続してください',
+    sendTo: '送信先',
+    targetLabel: '対象セッション',
+    currentChat: '現在のチャット',
+    newSession: '新しいセッション'
+  },
+
   fileMenu: {
     revealFinder: 'Finder で表示',
     revealExplorer: 'エクスプローラーで表示',

@@ -38,6 +38,37 @@ describe('desktop i18n runtime translator', () => {
     )
   })
 
+  it('uses managed branding for module-level runtime lookups in every supported customer locale', () => {
+    const originalDesktop = window.hermesDesktop
+
+    ;(window as unknown as { hermesDesktop: { eva: object } }).hermesDesktop = { eva: {} }
+
+    try {
+      const expectedReady = {
+        en: 'evaOS Agent is ready',
+        ja: 'evaOS Agent の準備ができました',
+        zh: 'evaOS Agent 桌面版已就绪',
+        'zh-hant': 'evaOS Agent 已就緒'
+      } as const
+
+      for (const [locale, expected] of Object.entries(expectedReady)) {
+        setRuntimeI18nLocale(locale as keyof typeof expectedReady)
+        expect(translateNow('boot.ready')).toBe(expected)
+      }
+
+      setRuntimeI18nLocale('zh')
+      expect(translateNow('settings.gateway.connectedTo', 'Hermes-plugin', '1.0')).toBe(
+        '已连接到 Hermes-plugin · evaOS Agent 1.0'
+      )
+    } finally {
+      if (originalDesktop) {
+        window.hermesDesktop = originalDesktop
+      } else {
+        Reflect.deleteProperty(window, 'hermesDesktop')
+      }
+    }
+  })
+
   it('translates migrated overlap keys for newly supported locales', () => {
     setRuntimeI18nLocale('ja')
     expect(translateNow('common.save')).toBe('保存')

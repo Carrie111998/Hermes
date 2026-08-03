@@ -45,6 +45,16 @@ export const zh: Translations = {
     off: '关'
   },
 
+  quickEntry: {
+    inputLabel: '快速输入',
+    askPlaceholder: '询问 evaOS Agent…',
+    disconnectedPlaceholder: '未连接 — 打开 evaOS Agent 以重新连接',
+    sendTo: '发送到',
+    targetLabel: '目标会话',
+    currentChat: '当前聊天',
+    newSession: '新会话'
+  },
+
   fileMenu: {
     revealFinder: '在访达中显示',
     revealExplorer: '在文件资源管理器中显示',

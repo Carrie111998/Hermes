@@ -5,7 +5,8 @@ const test = require('node:test')
 const {
   EVA_APP_UPDATE_FEED,
   createEvaAppUpdater,
-  releaseNoteCommits
+  releaseNoteCommits,
+  sanitizeReleaseNote
 } = require('./eva-app-updater.cjs')
 
 class FakeUpdater extends EventEmitter {
@@ -117,6 +118,26 @@ test('release notes become normal update-overlay entries without executable cont
   ])
 })
 
+test('release notes cannot restore upstream product branding', () => {
+  assert.equal(
+    sanitizeReleaseNote('Hermes Desktop by Nous Research connects through Nous Portal for Eva'),
+    'evaOS Agent by Electric Sheep connects through Electric Sheep account for evaOS Agent'
+  )
+
+  const commits = releaseNoteCommits(
+    {
+      version: '2026.7.20-es.9',
+      releaseNotes: '- Update Hermes Agent.\n- Fix Nous Portal sign-in.'
+    },
+    () => 1234
+  )
+
+  assert.deepEqual(
+    commits.map(commit => commit.summary),
+    ['Update evaOS Agent.', 'Fix Electric Sheep account sign-in.']
+  )
+})
+
 test('apply downloads, reports progress, and schedules a signed restart handoff', async () => {
   const { progress, scheduled, service, updater } = fixture()
 
@@ -130,8 +151,14 @@ test('apply downloads, reports progress, and schedules a signed restart handoff'
   assert.equal(updater.downloadCalls, 1)
   assert.equal(scheduled.length, 1)
   assert.deepEqual(updater.installCalls, [])
-  assert.equal(progress.some(item => item.stage === 'fetch' && item.percent === 42.4), true)
-  assert.equal(progress.some(item => item.stage === 'restart' && item.percent === 100), true)
+  assert.equal(
+    progress.some(item => item.stage === 'fetch' && item.percent === 42.4),
+    true
+  )
+  assert.equal(
+    progress.some(item => item.stage === 'restart' && item.percent === 100),
+    true
+  )
 
   scheduled[0]()
   assert.deepEqual(updater.installCalls, [[false, true]])

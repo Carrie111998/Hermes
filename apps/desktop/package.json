@@ -209,8 +209,8 @@
         "to": "install-stamp.json"
       },
       {
-        "from": "assets/icon.ico",
-        "to": "icon.ico"
+        "from": "assets/eva.ico",
+        "to": "eva.ico"
       },
       {
         "from": "../../LICENSE",
@@ -234,7 +234,7 @@
         "CFBundleExecutable": "evaOS Agent",
         "CFBundleName": "evaOS Agent",
         "NSAudioCaptureUsageDescription": "evaOS Agent uses audio capture for voice conversations.",
-        "NSCameraUsageDescription": "Hermes uses the camera when a plugin or feature you enable requests it.",
+        "NSCameraUsageDescription": "evaOS Agent uses the camera when a plugin or feature you enable requests it.",
         "NSMicrophoneUsageDescription": "evaOS Agent uses the microphone for voice input and voice conversations."
       },
       "gatekeeperAssess": false,

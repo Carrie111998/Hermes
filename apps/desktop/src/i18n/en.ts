@@ -45,6 +45,16 @@ export const en: Translations = {
     off: 'Off'
   },
 
+  quickEntry: {
+    inputLabel: 'Quick Entry',
+    askPlaceholder: 'Ask evaOS Agent…',
+    disconnectedPlaceholder: 'Not connected — open evaOS Agent to reconnect',
+    sendTo: 'Send to',
+    targetLabel: 'Target session',
+    currentChat: 'Current chat',
+    newSession: 'New session'
+  },
+
   fileMenu: {
     revealFinder: 'Reveal in Finder',
     revealExplorer: 'Reveal in File Explorer',
@@ -572,7 +582,7 @@ export const en: Translations = {
     quickEntry: {
       enabledTitle: 'Quick Entry',
       enabledDesc:
-        'Summon a small composer from anywhere with a global shortcut and fire a prompt without opening Hermes.',
+        'Summon a small composer from anywhere with a global shortcut and fire a prompt without opening evaOS Agent.',
       shortcutTitle: 'Quick Entry shortcut',
       shortcutDesc: 'Needs at least one modifier, e.g. CommandOrControl+Shift+Space.',
       active: 'Shortcut is active.',
@@ -2188,7 +2198,8 @@ export const en: Translations = {
     maybeLater: 'Maybe later',
     moreChanges: count => `+ ${count} more change${count === 1 ? '' : 's'} included.`,
     manualTitle: 'Update from your terminal',
-    manualBody: 'You installed evaOS Agent from the command line, so updates run there too. Paste this into your terminal:',
+    manualBody:
+      'You installed evaOS Agent from the command line, so updates run there too. Paste this into your terminal:',
     manualPickedUp: 'evaOS Agent will pick up the new version next time you launch it.',
     guiSkewTitle: 'Update the desktop app',
     guiSkewBody:
@@ -2317,7 +2328,8 @@ export const en: Translations = {
       xai: { short: 'Grok models', description: 'Direct access to xAI Grok models.' },
       local: {
         short: 'self-hosted',
-        description: 'Point evaOS Agent at a local or self-hosted OpenAI-compatible endpoint (vLLM, llama.cpp, Ollama, etc).'
+        description:
+          'Point evaOS Agent at a local or self-hosted OpenAI-compatible endpoint (vLLM, llama.cpp, Ollama, etc).'
       }
     },
     backToSignIn: 'Back to sign in',
@@ -2635,7 +2647,8 @@ export const en: Translations = {
       showConsole: 'Show preview console',
       hideDevTools: 'Hide preview DevTools',
       openDevTools: 'Open preview DevTools',
-      finishedRestarting: message => `evaOS Agent finished restarting the preview server${message ? `: ${message}` : ''}`,
+      finishedRestarting: message =>
+        `evaOS Agent finished restarting the preview server${message ? `: ${message}` : ''}`,
       failedRestarting: message => `Server restart failed: ${message}`,
       unknownError: 'unknown error',
       restartedTitle: 'Preview server restarted',

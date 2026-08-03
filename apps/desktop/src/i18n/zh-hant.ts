@@ -45,6 +45,16 @@ export const zhHant = defineLocale({
     off: '關閉'
   },
 
+  quickEntry: {
+    inputLabel: '快速輸入',
+    askPlaceholder: '詢問 evaOS Agent…',
+    disconnectedPlaceholder: '未連線 — 開啟 evaOS Agent 以重新連線',
+    sendTo: '傳送至',
+    targetLabel: '目標工作階段',
+    currentChat: '目前聊天',
+    newSession: '新工作階段'
+  },
+
   fileMenu: {
     revealFinder: '在 Finder 中顯示',
     revealExplorer: '在檔案總管中顯示',

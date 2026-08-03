@@ -1,16 +1,21 @@
 import { describe, expect, it } from 'vitest'
 
 import { en } from './en'
+import { ja } from './ja'
 import { createManagedTranslations, sanitizeManagedBrandText } from './managed-brand'
+import { zh } from './zh'
+import { zhHant } from './zh-hant'
 
 function collectRenderedCopy(value: unknown, copy: string[] = []): string[] {
   if (typeof value === 'string') {
     copy.push(value)
+
     return copy
   }
 
   if (typeof value === 'function') {
     copy.push(String(value('Example', '1', '2', '3')))
+
     return copy
   }
 
@@ -32,19 +37,21 @@ describe('managed evaOS Agent branding', () => {
     )
   })
 
-  it('rebrands both static and parameterized translation copy', () => {
-    const managed = createManagedTranslations(en)
+  it('rebrands both static and parameterized translation copy without rewriting runtime values', () => {
+    const managedEnglish = createManagedTranslations(en)
+    const managedChinese = createManagedTranslations(zh)
 
-    expect(managed.boot.ready).toBe('evaOS Agent is ready')
-    expect(managed.settings.gateway.connectedTo('https://example.invalid', '1.0')).toBe(
-      'Connected to https://example.invalid · evaOS Agent 1.0'
+    expect(managedEnglish.boot.ready).toBe('evaOS Agent is ready')
+    expect(managedChinese.settings.gateway.connectedTo('Hermes-plugin', '1.0')).toBe(
+      '已连接到 Hermes-plugin · evaOS Agent 1.0'
     )
   })
 
-  it('keeps the English customer copy free of upstream product branding', () => {
-    const visibleCopy = collectRenderedCopy(createManagedTranslations(en))
+  it('keeps managed customer copy in all four shipped locales free of upstream product branding', () => {
+    const visibleCopy = [en, ja, zh, zhHant].flatMap(locale => collectRenderedCopy(createManagedTranslations(locale)))
+
     const upstreamProductBrand =
-      /\b(?:Hermes Desktop|Hermes Agent|Nous Portal|Nous Research|Eva by Electric Sheep|Eva)\b/i
+      /\b(?:Hermes Desktop|Hermes Agent|Nous Portal|Nous Research|Eva by Electric Sheep|Hermes|Nous|Eva)\b/
 
     expect(visibleCopy.filter(value => upstreamProductBrand.test(value))).toEqual([])
     expect(visibleCopy.filter(value => /evaOS Agent agent/i.test(value))).toEqual([])
