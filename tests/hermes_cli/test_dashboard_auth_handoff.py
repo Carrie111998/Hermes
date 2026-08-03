@@ -6,6 +6,7 @@ default-deny API gate, session/profile binding and exact consume path.
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
@@ -1299,10 +1300,17 @@ def test_consume_handoff_ticket_rejects_non_exact_scopes(gated_app):
         user_id="u1",
         provider="stub",
     )
-    with ws_tickets._lock:
-        exp, info = ws_tickets._handoff_tickets[ticket]
-        evil = dict(info)
+    with ws_tickets._handoff_db() as db:
+        row = db.execute(
+            "SELECT payload_json FROM handoff_tickets WHERE ticket_hash=?",
+            (ws_tickets._handoff_hash(ticket),),
+        ).fetchone()
+        assert row is not None
+        evil = json.loads(row[0])
         evil["scopes"] = ["resume", "admin"]
-        ws_tickets._handoff_tickets[ticket] = (exp, evil)
+        db.execute(
+            "UPDATE handoff_tickets SET payload_json=? WHERE ticket_hash=?",
+            (json.dumps(evil), ws_tickets._handoff_hash(ticket)),
+        )
     with pytest.raises(ws_tickets.TicketInvalid, match="forbidden handoff scope"):
         ws_tickets.consume_handoff_ticket(ticket)

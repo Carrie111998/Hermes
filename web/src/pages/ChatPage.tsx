@@ -367,10 +367,10 @@ export default function ChatPage({
     return () => {
       cancelled = true;
     };
-  }, [resumeParam, scopedProfile, handleSessionTitleChange]);
+  }, [handleSessionTitleChange, resumeOnly, resumeParam, scopedProfile]);
 
   useEffect(() => {
-    if (!resumeParam) return;
+    if (!resumeParam || resumeOnly) return;
 
     let cancelled = false;
 

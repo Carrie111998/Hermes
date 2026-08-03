@@ -17420,7 +17420,6 @@ def start_server(
     desktop_sidecar_client = (
         host in _LOOPBACK_HOST_VALUES
         and os.environ.get("HERMES_DESKTOP") == "1"
-        and bool((os.environ.get("HERMES_HANDOFF_STORE") or "").strip())
     )
     app.state.auth_required = (
         False

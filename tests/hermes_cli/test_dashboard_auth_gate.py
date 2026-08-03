@@ -176,13 +176,9 @@ def test_start_server_loopback_public_url_enables_gate(monkeypatch):
         clear_providers()
 
 
-def test_desktop_loopback_uses_separate_gated_public_sidecar(monkeypatch, tmp_path):
+def test_desktop_loopback_uses_separate_gated_public_sidecar(monkeypatch):
     """Desktop may render a public QR without exposing its local backend."""
     monkeypatch.setenv("HERMES_DESKTOP", "1")
-    monkeypatch.setenv(
-        "HERMES_HANDOFF_STORE",
-        str(tmp_path / "runtime" / "handoff.sqlite3"),
-    )
     monkeypatch.setattr(
         "hermes_cli.dashboard_auth.prefix.resolve_public_url",
         lambda: "https://hermes.example.com",

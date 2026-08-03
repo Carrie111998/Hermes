@@ -8197,10 +8197,6 @@ async function spawnPoolBackend(profile, entry) {
         // can still point at the install dir even when spawn cwd is home.
         TERMINAL_CWD: hermesCwd,
         HERMES_DASHBOARD_SESSION_TOKEN: token,
-        // The public phone dashboard is a separate local process. Both sides
-        // use this hash-only SQLite store so a QR minted by Desktop can be
-        // consumed exactly once by the public origin.
-        HERMES_HANDOFF_STORE: path.join(HERMES_HOME, 'runtime', 'desktop-handoff.sqlite3'),
         // Marks this dashboard backend as desktop-spawned so it runs the cron
         // scheduler tick loop (the gateway isn't running under the app).
         HERMES_DESKTOP: '1',
@@ -8494,9 +8490,6 @@ async function startHermes() {
           ...backend.env,
           TERMINAL_CWD: hermesCwd,
           HERMES_DASHBOARD_SESSION_TOKEN: token,
-          // Shared only with the local public-dashboard sidecar. The database
-          // stores ticket hashes, never the one-time QR capability itself.
-          HERMES_HANDOFF_STORE: path.join(HERMES_HOME, 'runtime', 'desktop-handoff.sqlite3'),
           // Marks this dashboard backend as desktop-spawned so it runs the cron
           // scheduler tick loop (the gateway isn't running under the app).
           HERMES_DESKTOP: '1',

@@ -1,14 +1,13 @@
-"""Tests for the WS-upgrade ticket store (Phase 5 task 5.1).
-
-The store is process-local and threading-safe. Tests run with xdist so
-each worker has its own module instance — no cross-worker bleed — but we
-call ``_reset_for_tests`` between tests to keep things deterministic.
-"""
+"""Tests for WS-upgrade and cross-process handoff ticket stores."""
 
 from __future__ import annotations
 
-import threading
+import json
+import os
 import sqlite3
+import subprocess
+import sys
+import threading
 
 import pytest
 
@@ -211,19 +210,28 @@ class TestHandoffTickets:
         with pytest.raises(TicketInvalid, match="unknown"):
             ws_tickets.consume_handoff_ticket(ticket)
 
-    def test_cross_process_store_is_hash_only_and_single_use(
-        self, monkeypatch, tmp_path
-    ):
-        store = tmp_path / "runtime" / "handoff.sqlite3"
-        monkeypatch.setenv(ws_tickets.HANDOFF_STORE_ENV, str(store))
-        ticket = ws_tickets.mint_handoff_ticket(
-            session_id="shared", user_id="u", provider="desktop"
+    def test_cross_process_store_is_hash_only_and_single_use(self, tmp_path):
+        hermes_root = tmp_path / "hermes-home"
+        profile_home = hermes_root / "profiles" / "work"
+        profile_home.mkdir(parents=True)
+        store = hermes_root / "runtime" / "desktop-handoff.sqlite3"
+        mint_env = {**os.environ, "HERMES_HOME": str(profile_home)}
+        consume_env = {**os.environ, "HERMES_HOME": str(hermes_root)}
+        mint = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "from hermes_cli.dashboard_auth.ws_tickets import mint_handoff_ticket; "
+                    "print(mint_handoff_ticket(session_id='shared', user_id='u', provider='desktop'))"
+                ),
+            ],
+            capture_output=True,
+            check=True,
+            env=mint_env,
+            text=True,
         )
-
-        # Simulate the consuming dashboard having no access to the minting
-        # process's in-memory state.
-        with ws_tickets._lock:
-            ws_tickets._handoff_tickets.clear()
+        ticket = mint.stdout.strip()
 
         with sqlite3.connect(store) as db:
             row = db.execute(
@@ -233,10 +241,41 @@ class TestHandoffTickets:
         assert ticket not in row[1]
         assert ticket.encode() not in store.read_bytes()
 
-        info = ws_tickets.consume_handoff_ticket(ticket)
+        consume = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import json, sys; "
+                    "from hermes_cli.dashboard_auth.ws_tickets import consume_handoff_ticket; "
+                    "print(json.dumps(consume_handoff_ticket(sys.stdin.read().strip())))"
+                ),
+            ],
+            capture_output=True,
+            check=True,
+            env=consume_env,
+            input=ticket,
+            text=True,
+        )
+        info = json.loads(consume.stdout)
         assert info["session_id"] == "shared"
-        with pytest.raises(TicketInvalid, match="unknown"):
-            ws_tickets.consume_handoff_ticket(ticket)
+        replay = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import sys; "
+                    "from hermes_cli.dashboard_auth.ws_tickets import consume_handoff_ticket; "
+                    "consume_handoff_ticket(sys.stdin.read().strip())"
+                ),
+            ],
+            capture_output=True,
+            env=consume_env,
+            input=ticket,
+            text=True,
+        )
+        assert replay.returncode != 0
+        assert "unknown ticket" in replay.stderr
 
     def test_expired_rejected(self, monkeypatch):
         clock = {"now": 1_000_000}

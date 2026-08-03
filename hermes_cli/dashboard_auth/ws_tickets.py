@@ -32,10 +32,9 @@ token — so this module provides two credential shapes:
    ``API_SERVER_KEY`` / superuser / ``*`` scope.
 
 WS tickets and internal credentials remain process-local. Phone-handoff
-tickets use a small SQLite store when ``HERMES_HANDOFF_STORE`` is set because
-Hermes Desktop and its public dashboard can be separate local processes. The
+tickets use a small installation-scoped SQLite store because Hermes Desktop
+and its public dashboard can be separate local processes and profiles. The
 store keeps only a SHA-256 ticket hash, and consumption is an atomic delete.
-Without that environment variable the original in-memory behaviour remains.
 """
 
 from __future__ import annotations
@@ -44,7 +43,6 @@ import base64
 import hashlib
 import hmac
 import json
-import os
 import secrets
 import sqlite3
 import threading
@@ -52,6 +50,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
+from hermes_constants import get_default_hermes_root
 from hermes_cli.dashboard_auth.scopes import (
     EXACT_HANDOFF_SCOPES,
     exact_handoff_scopes_or_none,
@@ -82,13 +81,8 @@ RESUME_EVENT_CHANNEL_PREFIX = "resume-"
 #: Canonical value lives in scopes.EXACT_HANDOFF_SCOPES — single source.
 HANDOFF_SCOPES: tuple[str, ...] = EXACT_HANDOFF_SCOPES
 
-# Optional cross-process store used by Hermes Desktop plus its public dashboard
-# sidecar. The Desktop shell pins this to a profile-root-owned runtime path.
-HANDOFF_STORE_ENV = "HERMES_HANDOFF_STORE"
-
 _lock = threading.Lock()
 _tickets: Dict[str, Tuple[int, Dict[str, Any]]] = {}  # ticket -> (expires_at, info)
-_handoff_tickets: Dict[str, Tuple[int, Dict[str, Any]]] = {}
 
 
 #: The process-lifetime internal credential (see module docstring). Lazily
@@ -248,12 +242,7 @@ def mint_handoff_ticket(
         "minted_at": now,
     }
     expires_at = now + HANDOFF_TTL_SECONDS
-    if _handoff_store_path() is not None:
-        _persist_handoff_ticket(ticket, expires_at, info)
-    else:
-        with _lock:
-            _handoff_tickets[ticket] = (expires_at, info)
-            _gc_handoff_expired_locked()
+    _persist_handoff_ticket(ticket, expires_at, info)
     return ticket
 
 
@@ -267,11 +256,7 @@ def consume_handoff_ticket(ticket: str) -> Dict[str, Any]:
         raise TicketInvalid(f"ws ticket not valid as handoff ticket: {truncated}")
 
     now = int(time.time())
-    if _handoff_store_path() is not None:
-        entry = _consume_persisted_handoff_ticket(ticket)
-    else:
-        with _lock:
-            entry = _handoff_tickets.pop(ticket, None)
+    entry = _consume_persisted_handoff_ticket(ticket)
     if entry is None:
         truncated = ticket[:8] + "…"
         raise TicketInvalid(f"unknown ticket: {truncated}")
@@ -294,35 +279,25 @@ def _gc_expired_locked() -> None:
         _tickets.pop(t, None)
 
 
-def _gc_handoff_expired_locked() -> None:
-    """Drop expired handoff tickets. Caller must hold ``_lock``."""
-    now = int(time.time())
-    expired = [t for t, (exp, _) in _handoff_tickets.items() if exp < now]
-    for t in expired:
-        _handoff_tickets.pop(t, None)
+def _handoff_store_path() -> Path:
+    """Return the shared store for this Hermes installation.
 
-
-def _handoff_store_path() -> Path | None:
-    raw = (os.environ.get(HANDOFF_STORE_ENV) or "").strip()
-    if not raw:
-        return None
-    path = Path(raw).expanduser()
-    if not path.is_absolute():
-        raise RuntimeError(f"{HANDOFF_STORE_ENV} must be an absolute path")
-    return path
+    A named-profile Desktop backend mints the ticket while the installation's
+    public dashboard consumes it. Anchoring the store above ``profiles/`` makes
+    that cross-process exchange automatic without exposing or duplicating the
+    one-time capability.
+    """
+    return get_default_hermes_root() / "runtime" / "desktop-handoff.sqlite3"
 
 
 def _handoff_db() -> sqlite3.Connection:
     path = _handoff_store_path()
-    if path is None:
-        raise RuntimeError(f"{HANDOFF_STORE_ENV} is not configured")
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     try:
         path.parent.chmod(0o700)
     except OSError:
         pass
-    fd = os.open(path, os.O_CREAT | os.O_WRONLY, 0o600)
-    os.close(fd)
+    path.touch(mode=0o600, exist_ok=True)
     try:
         path.chmod(0o600)
     except OSError:
@@ -438,13 +413,11 @@ def consume_internal_credential(value: str) -> Dict[str, Any]:
 
 
 def _reset_for_tests() -> None:
-    """Test-only: drop all tickets, handoff tickets, and the internal credential."""
+    """Test-only: drop all tickets and the internal credential."""
     global _event_channel_key, _internal_credential
     with _lock:
         _tickets.clear()
-        _handoff_tickets.clear()
         _internal_credential = None
         _event_channel_key = None
-    if _handoff_store_path() is not None:
-        with _handoff_db() as db:
-            db.execute("DELETE FROM handoff_tickets")
+    with _handoff_db() as db:
+        db.execute("DELETE FROM handoff_tickets")
