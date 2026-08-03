@@ -1851,6 +1851,7 @@ class SessionStore:
                 chat_id=source.chat_id if allow_peer_fallback else None,
                 chat_type=source.chat_type if allow_peer_fallback else None,
                 thread_id=source.thread_id,
+                profile_name=source.profile,
             )
         except Exception as exc:
             logger.debug(
