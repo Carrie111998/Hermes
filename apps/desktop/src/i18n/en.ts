@@ -571,7 +571,21 @@ export const en: Translations = {
       attachmentSizeDesc:
         'How big a local file Desktop will load for previews and image attach, in MB. Default is 16. Remote non-image attach uses a separate 256 MB cap. Setting this very high loads the whole file into memory and can freeze or crash the app.',
       attachmentSizeUnit: 'MB',
-      attachmentSizeLabel: 'Max preview / image load size in megabytes'
+      attachmentSizeLabel: 'Max preview / image load size in megabytes',
+      optionLabels: {
+        auto: 'Auto',
+        default: 'Default',
+        flex: 'Flex',
+        stash: 'Stash',
+        discard: 'Discard',
+        minimal: 'Minimal',
+        low: 'Low',
+        medium: 'Medium',
+        high: 'High',
+        xhigh: 'Extra High',
+        max: 'Max',
+        ultra: 'Ultra'
+      }
     },
     quickEntry: {
       enabledTitle: 'Quick Entry',
