@@ -13482,11 +13482,12 @@ def integrate_story_to_epic(
     # candidate, or ownership controls must retain their verification semantics
     # and must never be hidden by an older integration row.
     reviewed_candidate: Optional[tuple[str, str]] = None
-    if (
+    ordinary_reconcile = (
         candidate_verify_fn is _RECONCILE_INTEGRATION_VERIFY_UNSET
         and expected_source_sha is None
         and before_apply_fn is None
-    ):
+    )
+    if ordinary_reconcile:
         reviewed_candidate = _latest_approved_review_candidate(conn, story_id)
         if reviewed_candidate is not None:
             already_integrated = conn.execute(
@@ -13509,6 +13510,8 @@ def integrate_story_to_epic(
                  WHERE integration.epic_id=?
                    AND integration.story_id=?
                    AND story.status='done'
+                   AND story.completed_at IS NOT NULL
+                   AND integration.integrated_at >= story.completed_at
                  LIMIT 1
                 """,
                 (epic_id, story_id),
@@ -13530,6 +13533,17 @@ def integrate_story_to_epic(
             or not _git_branch_exists(repo_root, story_branch)
         ):
             return None
+        if ordinary_reconcile and reviewed_candidate is None:
+            current_source_sha = _git_ref_sha(repo_root, story_branch)
+            if current_source_sha and conn.execute(
+                """
+                SELECT 1 FROM epic_story_integrations
+                 WHERE epic_id=? AND story_id=? AND source_sha=?
+                 LIMIT 1
+                """,
+                (epic_id, story_id, current_source_sha),
+            ).fetchone() is not None:
+                return "already_integrated"
     except Exception:
         return None
 

@@ -9707,6 +9707,10 @@ def test_integrate_story_to_epic_idempotent_second_call_is_noop(kanban_home, tmp
     epic, story, epic_branch, story_sha = _make_epic_and_done_story(board, repo)
 
     with kb.connect(board=board) as conn:
+        conn.execute(
+            "UPDATE tasks SET completed_at=? WHERE id=?",
+            (int(time.time()), story),
+        )
         first = kb.integrate_story_to_epic(conn, story, board=board)
     assert first == "integrated"
 
@@ -11613,6 +11617,10 @@ def test_reconcile_ten_times_does_not_reprocess_integrated_story(
     epic, story, _epic_branch, _story_sha = _make_epic_and_done_story(board, repo)
 
     with kb.connect(board=board) as conn:
+        conn.execute(
+            "UPDATE tasks SET completed_at=? WHERE id=?",
+            (int(time.time()), story),
+        )
         assert kb.integrate_story_to_epic(conn, story, board=board) == "integrated"
         before = conn.execute(
             "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind=?",
@@ -11685,6 +11693,35 @@ def test_reconcile_reintegrates_story_after_later_completion(
     assert unchanged.integrated == []
     assert unchanged_events == reworked_events
     assert calls == []
+
+
+def test_reconcile_reintegrates_unreviewed_story_without_completion_timestamp(
+    kanban_home, tmp_path
+):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    board = "v2-reconcile-unreviewed-rework"
+    _v2_product_board_with_repo(board, repo)
+    epic, story, epic_branch, _story_sha = _make_epic_and_done_story(board, repo)
+    story_branch = f"story/{epic}-s1"
+
+    with kb.connect(board=board) as conn:
+        assert kb.integrate_story_to_epic(conn, story, board=board) == "integrated"
+        subprocess.run(
+            ["git", "-C", str(repo), "switch", story_branch],
+            check=True, capture_output=True, text=True,
+        )
+        _commit_file(repo, "rework.txt", "reworked\n", "rework commit")
+        subprocess.run(
+            ["git", "-C", str(repo), "switch", "main"],
+            check=True, capture_output=True, text=True,
+        )
+        conn.commit()
+
+        result = kb.reconcile(conn, board=board, spawn_ready=False)
+
+    assert result.integrated == [story]
+    assert _git_output(repo, "show", f"{epic_branch}:rework.txt") == "reworked"
 
 
 def test_reconcile_cache_miss_integrates_approved_sha_not_advanced_story_tip(
@@ -11796,6 +11833,11 @@ def test_reconcile_keeps_prior_member_state_when_sibling_advances_tip(
     epic, first, epic_branch, _first_sha = _make_epic_and_done_story(board, repo)
 
     with kb.connect(board=board) as conn:
+        completed_at = int(time.time())
+        conn.execute(
+            "UPDATE tasks SET completed_at=? WHERE id=?",
+            (completed_at, first),
+        )
         assert kb.integrate_story_to_epic(conn, first, board=board) == "integrated"
         sibling_branch = f"story/{epic}-s2"
         subprocess.run(
@@ -11815,6 +11857,10 @@ def test_reconcile_keeps_prior_member_state_when_sibling_advances_tip(
         )
         kb.add_epic_membership(conn, epic_id=epic, task_id=sibling)
         _set_task_status(conn, sibling, "done")
+        conn.execute(
+            "UPDATE tasks SET completed_at=? WHERE id=?",
+            (completed_at, sibling),
+        )
 
     calls = _record_git_calls(monkeypatch)
     with kb.connect(board=board) as conn:
@@ -11906,6 +11952,10 @@ def test_integration_state_survives_member_event_gc_and_restart(
     _epic, story, _epic_branch, _story_sha = _make_epic_and_done_story(board, repo)
 
     with kb.connect(board=board) as conn:
+        conn.execute(
+            "UPDATE tasks SET completed_at=? WHERE id=?",
+            (int(time.time()), story),
+        )
         assert kb.integrate_story_to_epic(conn, story, board=board) == "integrated"
         with kb.write_txn(conn):
             conn.execute(
