@@ -9897,8 +9897,33 @@ def _build_oauth_catalog() -> list[Dict[str, Any]]:
     return rows
 
 
+def _oauth_status_response(status: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the authenticated Accounts API's non-secret status fields.
+
+    Provider status helpers are also used by local CLI/runtime paths and may
+    include a short token preview or a credential-store path for display.
+    Neither belongs in the HTTP response: a preview still discloses credential
+    material, and local filesystem paths disclose usernames and layout.
+    """
+    public_status = dict(status)
+    public_status.pop("token_preview", None)
+
+    source_label = public_status.get("source_label")
+    if isinstance(source_label, str):
+        # Catch direct paths as well as labels such as
+        # ``Hermes PKCE (/Users/alice/.hermes/...)``.  URLs and ordinary
+        # provider labels remain useful to the authenticated client.
+        if re.search(r"(?:^|[\s(])(?:~[/\\]|/[^/\s)]+[/\\]|[A-Za-z]:[\\/])", source_label):
+            public_status.pop("source_label", None)
+
+    return public_status
+
+
 @app.get("/api/providers/oauth")
-async def list_oauth_providers(profile: Optional[str] = None):
+async def list_oauth_providers(
+    request: Request,
+    profile: Optional[str] = None,
+):
     """Enumerate every OAuth-capable LLM provider with current status.
 
     Response shape (per provider):
@@ -9912,8 +9937,7 @@ async def list_oauth_providers(profile: Optional[str] = None):
         status:
           logged_in        bool — currently has usable creds
           source           short slug ("hermes_pkce", "claude_code", ...)
-          source_label     human-readable origin (file path, env var name)
-          token_preview    last N chars of the token, never the full token
+          source_label     human-readable non-filesystem origin, when available
           expires_at       ISO timestamp string or null
           has_refresh_token bool
 
@@ -9921,6 +9945,7 @@ async def list_oauth_providers(profile: Optional[str] = None):
     sync with the `hermes model` picker; _OAUTH_OVERRIDES supplies per-provider
     flow/status/cli metadata.
     """
+    _require_token(request)
     with _profile_scope(profile):
         providers = []
         for p in _build_oauth_catalog():
@@ -9935,7 +9960,7 @@ async def list_oauth_providers(profile: Optional[str] = None):
                 "disconnect_hint": disconnect_hint,
                 "disconnect_command": _oauth_provider_disconnect_command(p),
                 "disconnectable": disconnect_hint is None,
-                "status": status,
+                "status": _oauth_status_response(status),
             })
         return {"providers": providers}
 
@@ -10110,15 +10135,22 @@ def _new_oauth_session(
     return sid, sess
 
 
-def _oauth_session_profile(
-    session_id: str,
-    fallback: Optional[str] = None,
-) -> Optional[str]:
-    """Return the profile that owns an OAuth session, if one was provided."""
-    with _oauth_sessions_lock:
-        sess = _oauth_sessions.get(session_id)
-        profile = sess.get("profile") if sess else None
-    return profile or _oauth_profile_name(fallback)
+def _reject_oauth_profile_substitution(
+    sess: Dict[str, Any],
+    profile: Optional[str],
+) -> None:
+    """Reject an explicit profile that differs from the session owner.
+
+    Omitting ``profile`` remains backward compatible for existing clients; all
+    persistence still uses the profile captured at start.  A supplied profile
+    may only restate that captured owner, never redirect the session.
+    """
+    requested = _oauth_profile_name(profile)
+    if requested is not None and requested != sess.get("profile"):
+        raise HTTPException(
+            status_code=400,
+            detail="Profile mismatch for OAuth session",
+        )
 
 
 def _save_anthropic_oauth_creds(access_token: str, refresh_token: str, expires_at_ms: int) -> None:
@@ -10215,6 +10247,7 @@ def _submit_anthropic_pkce(
         sess = _oauth_sessions.get(session_id)
     if not sess or sess["provider"] != "anthropic" or sess["flow"] != "pkce":
         raise HTTPException(status_code=404, detail="Unknown or expired session")
+    _reject_oauth_profile_substitution(sess, profile)
     if sess["status"] != "pending":
         return {"ok": False, "status": sess["status"], "message": sess.get("error_message")}
 
@@ -10272,7 +10305,7 @@ def _submit_anthropic_pkce(
 
     expires_at_ms = int(time.time() * 1000) + (expires_in * 1000)
     try:
-        with _profile_scope(_oauth_session_profile(session_id, profile)):
+        with _profile_scope(sess.get("profile")):
             _save_anthropic_oauth_creds(access_token, refresh_token, expires_at_ms)
     except Exception as e:
         with _oauth_sessions_lock:
@@ -10509,6 +10542,7 @@ def _nous_poller(session_id: str) -> None:
         sess = _oauth_sessions.get(session_id)
     if not sess:
         return
+    session_profile = sess.get("profile")
     portal_base_url = sess["portal_base_url"]
     client_id = sess["client_id"]
     device_code = sess["device_code"]
@@ -10543,7 +10577,7 @@ def _nous_poller(session_id: str) -> None:
             ),
             "expires_in": token_ttl,
         }
-        with _profile_scope(_oauth_session_profile(session_id)):
+        with _profile_scope(session_profile):
             full_state = refresh_nous_oauth_from_state(
                 auth_state,
                 timeout_seconds=15.0,
@@ -10585,6 +10619,7 @@ def _minimax_poller(session_id: str) -> None:
         sess = _oauth_sessions.get(session_id)
     if not sess:
         return
+    session_profile = sess.get("profile")
     portal_base_url = sess["portal_base_url"]
     client_id = sess["client_id"]
     user_code = sess["user_code"]
@@ -10633,7 +10668,7 @@ def _minimax_poller(session_id: str) -> None:
             ).isoformat(),
             "expires_in": expires_in_s,
         }
-        with _profile_scope(_oauth_session_profile(session_id)):
+        with _profile_scope(session_profile):
             _minimax_save_auth_state(auth_state)
         with _oauth_sessions_lock:
             sess["status"] = "approved"
@@ -10660,6 +10695,7 @@ def _xai_device_poller(session_id: str) -> None:
         sess = _oauth_sessions.get(session_id)
     if not sess:
         return
+    session_profile = sess.get("profile")
     device_code = sess["device_code"]
     interval = int(sess["interval"])
     expires_in = max(60, int(sess["expires_at"] - time.time()))
@@ -10683,7 +10719,7 @@ def _xai_device_poller(session_id: str) -> None:
             "expires_in": token_data.get("expires_in"),
             "token_type": str(token_data.get("token_type") or "Bearer").strip() or "Bearer",
         }
-        with _profile_scope(_oauth_session_profile(session_id)):
+        with _profile_scope(session_profile):
             _save_xai_oauth_tokens(
                 tokens,
                 discovery=discovery,
@@ -10965,20 +11001,23 @@ async def submit_oauth_code(
 async def poll_oauth_session(
     provider_id: str,
     session_id: str,
+    request: Request,
     profile: Optional[str] = None,
 ):
-    """Poll a session's status (no auth — read-only state).
+    """Poll an authenticated client's profile-bound OAuth session status.
 
     Shared by the device-code flows (Nous, OpenAI Codex, MiniMax, xAI).
     Each surfaces progress through the same background-worker-updated
     ``status`` field, so a single poll endpoint serves them all.
     """
+    _require_token(request)
     with _oauth_sessions_lock:
         sess = _oauth_sessions.get(session_id)
     if not sess:
         raise HTTPException(status_code=404, detail="Session not found or expired")
     if sess["provider"] != provider_id:
         raise HTTPException(status_code=400, detail="Provider mismatch for session")
+    _reject_oauth_profile_substitution(sess, profile)
     return {
         "session_id": session_id,
         "status": sess["status"],
@@ -11005,6 +11044,7 @@ async def cancel_oauth_session(
     with _oauth_sessions_lock:
         sess = _oauth_sessions.get(session_id)
         if sess is not None:
+            _reject_oauth_profile_substitution(sess, profile)
             sess["cancelled"] = True
         _oauth_sessions.pop(session_id, None)
     if sess is None:
