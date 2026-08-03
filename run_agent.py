@@ -4266,6 +4266,8 @@ class AIAgent:
                 response_text,
                 **sync_kwargs,
             )
+            # Warm recall for every completed text turn. Relevance is decided
+            # by the model after recall, never by keyword or regex routing.
             self._memory_manager.queue_prefetch_all(
                 user_text,
                 session_id=self.session_id or "",

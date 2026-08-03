@@ -708,11 +708,6 @@ class HonchoMemoryProvider(MemoryProvider):
             self._injection_frequency == "first-turn" and self._turn_count > 1
         )
 
-        # Trivial turns start no work, but may consume a ready pending result.
-        if self._is_trivial_prompt(query):
-            ready = self._consume_pending_dialectic()
-            return self._truncate_to_budget(ready) if ready else ""
-
         parts = []
 
         # ----- Layer 1: Base context (representation + card) -----
@@ -896,10 +891,6 @@ class HonchoMemoryProvider(MemoryProvider):
             self._start_session_init_background()
             return
 
-        # Trivial prompts don't warrant either a context refresh or a dialectic call.
-        if self._is_trivial_prompt(query):
-            return
-
         # First-turn-only base context never needs a later refresh.
         context_due = (
             self._context_cadence <= 1
@@ -987,7 +978,7 @@ class HonchoMemoryProvider(MemoryProvider):
     _STALE_THREAD_MULTIPLIER = 2.0
     # Pending result whose fire-turn is older than cadence × multiplier is
     # discarded on read so we don't inject context for a stale conversational
-    # pivot after a gap of trivial-prompt turns.
+    # pivot after a gap of turns.
     _STALE_RESULT_MULTIPLIER = 2
     # Cap on the empty-streak backoff so a persistently silent backend
     # eventually settles on a ceiling instead of unbounded widening.
@@ -1195,29 +1186,6 @@ class HonchoMemoryProvider(MemoryProvider):
             if r and r.strip():
                 return r
         return ""
-
-    # Prompts that carry no semantic signal — trivial acknowledgements, slash
-    # commands, empty input. Skipping injection here saves tokens and prevents
-    # stale user-model context from derailing one-word replies.
-    _TRIVIAL_PROMPT_RE = re.compile(
-        r'^(yes|no|ok|okay|sure|thanks|thank you|y|n|yep|nope|yeah|nah|'
-        r'continue|go ahead|do it|proceed|got it|cool|nice|great|done|next|lgtm|k)$',
-        re.IGNORECASE,
-    )
-
-    @classmethod
-    def _is_trivial_prompt(cls, text: str) -> bool:
-        """Return True if the prompt is too trivial to warrant context injection."""
-        if not text:
-            return True
-        stripped = text.strip()
-        if not stripped:
-            return True
-        if stripped.startswith("/"):
-            return True
-        if cls._TRIVIAL_PROMPT_RE.match(stripped):
-            return True
-        return False
 
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
         """Track turn count for cadence and injection_frequency logic."""
