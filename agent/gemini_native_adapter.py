@@ -994,8 +994,10 @@ class GeminiNativeClient:
         **_: Any,
     ) -> Any:
         thinking_config = None
+        cached_content = None
         if isinstance(extra_body, dict):
             thinking_config = extra_body.get("thinking_config") or extra_body.get("thinkingConfig")
+            cached_content = extra_body.get("cached_content") or extra_body.get("cachedContent")
 
         request = build_gemini_request(
             messages=messages or [],
@@ -1007,6 +1009,16 @@ class GeminiNativeClient:
             stop=stop,
             thinking_config=thinking_config,
         )
+
+        if cached_content:
+            # Explicit context caching: the named cachedContents resource
+            # already carries the system instruction, tool declarations, and
+            # any cached prefix turns. Google rejects the request if those are
+            # also sent inline alongside cachedContent.
+            request["cachedContent"] = str(cached_content)
+            request.pop("systemInstruction", None)
+            request.pop("tools", None)
+            request.pop("toolConfig", None)
 
         model = bare_gemini_model_id(model)
         if stream:
