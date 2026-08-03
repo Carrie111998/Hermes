@@ -54,6 +54,7 @@ QQ_CLIENT_SECRET=your-app-secret
 | `QQ_GROUP_ALLOWED_USERS` | Comma-separated group OpenIDs for group access | — |
 | `QQ_ALLOW_ALL_USERS` | Set to `true` to allow all DMs | `false` |
 | `QQ_PORTAL_HOST` | Override the QQ portal host (set to `sandbox.q.qq.com` for sandbox routing) | `q.qq.com` |
+| `QQ_API_BASE` | Override the QQ Bot REST API base for proxies or test mirrors. Used by gateway discovery and direct-send REST calls. | `https://api.bot.qq.com` |
 | `QQ_STT_API_KEY` | API key for voice-to-text provider | — |
 | `QQ_STT_BASE_URL` | (Not read directly — set `platforms.qqbot.extra.stt.baseUrl` in `config.yaml` instead) | n/a |
 | `QQ_STT_MODEL` | STT model name | `glm-asr` |

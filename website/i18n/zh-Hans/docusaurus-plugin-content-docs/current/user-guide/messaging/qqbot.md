@@ -54,6 +54,7 @@ QQ_CLIENT_SECRET=your-app-secret
 | `QQ_GROUP_ALLOWED_USERS` | 允许群组访问的群组 OpenID 列表（逗号分隔） | — |
 | `QQ_ALLOW_ALL_USERS` | 设为 `true` 以允许所有私聊 | `false` |
 | `QQ_PORTAL_HOST` | 覆盖 QQ portal 主机（沙盒路由设为 `sandbox.q.qq.com`） | `q.qq.com` |
+| `QQ_API_BASE` | 覆盖 QQ Bot REST API 基础地址，用于代理或测试镜像。gateway 发现请求和 direct-send REST 调用都会使用它。 | `https://api.bot.qq.com` |
 | `QQ_STT_API_KEY` | 语音转文字提供商的 API 密钥 | — |
 | `QQ_STT_BASE_URL` | （不直接读取——请在 `config.yaml` 中设置 `platforms.qqbot.extra.stt.baseUrl`） | n/a |
 | `QQ_STT_MODEL` | STT 模型名称 | `glm-asr` |

@@ -375,6 +375,7 @@ description: "Hermes Agent 使用的所有环境变量完整参考"
 | `QQBOT_HOME_CHANNEL` | cron 投递和通知的 QQ 用户/群 openID |
 | `QQBOT_HOME_CHANNEL_NAME` | QQ 主频道的显示名称 |
 | `QQ_PORTAL_HOST` | 覆盖 QQ portal 主机（设为 `sandbox.q.qq.com` 可通过沙箱 gateway 路由；默认：`q.qq.com`）。 |
+| `QQ_API_BASE` | 覆盖 QQ Bot REST API 基础地址，用于代理/测试（默认：`https://api.bot.qq.com`）。gateway 发现请求和 direct-send REST 调用都会使用它。 |
 | `MATTERMOST_URL` | Mattermost 服务器 URL（例如 `https://mm.example.com`） |
 | `MATTERMOST_TOKEN` | Mattermost 的 bot token 或个人访问 token |
 | `MATTERMOST_ALLOWED_USERS` | 允许向 bot 发送消息的逗号分隔 Mattermost 用户 ID |

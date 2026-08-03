@@ -1,6 +1,7 @@
 """Tests for the QQ Bot platform adapter."""
 
 import asyncio
+import importlib
 import os
 from types import SimpleNamespace
 from unittest import mock
@@ -17,6 +18,27 @@ from gateway.config import PlatformConfig
 def _make_config(**extra):
     """Build a PlatformConfig(enabled=True, extra=extra) for testing."""
     return PlatformConfig(enabled=True, extra=extra)
+
+
+@pytest.fixture
+def _reload_qqbot_modules(monkeypatch):
+    import gateway.platforms.qqbot.adapter as adapter_mod
+    import gateway.platforms.qqbot.constants as constants_mod
+
+    def _reload(api_base=None):
+        if api_base is None:
+            monkeypatch.delenv("QQ_API_BASE", raising=False)
+        else:
+            monkeypatch.setenv("QQ_API_BASE", api_base)
+        importlib.reload(constants_mod)
+        importlib.reload(adapter_mod)
+        return constants_mod, adapter_mod
+
+    yield _reload
+
+    monkeypatch.delenv("QQ_API_BASE", raising=False)
+    importlib.reload(constants_mod)
+    importlib.reload(adapter_mod)
 
 
 # ---------------------------------------------------------------------------
@@ -248,6 +270,51 @@ class TestQQWebSocketProxy:
 
         assert seen_session_kwargs.get("trust_env") is True
         assert seen_ws_kwargs.get("proxy") == "http://127.0.0.1:7897"
+
+
+class TestQQGatewayUrl:
+    @pytest.mark.asyncio
+    async def test_get_gateway_url_uses_default_api_base(self, _reload_qqbot_modules):
+        _constants_mod, adapter_mod = _reload_qqbot_modules()
+        QQAdapter = adapter_mod.QQAdapter
+
+        adapter = QQAdapter(_make_config(app_id="a", client_secret="b"))
+        adapter._ensure_token = mock.AsyncMock(return_value="tok")
+        response = mock.Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"url": "wss://gateway.qq.test/ws"}
+        adapter._http_client = mock.AsyncMock()
+        adapter._http_client.get = mock.AsyncMock(return_value=response)
+
+        url = await adapter._get_gateway_url()
+
+        assert url == "wss://gateway.qq.test/ws"
+        adapter._http_client.get.assert_awaited_once()
+        assert (
+            adapter._http_client.get.await_args.args[0]
+            == "https://api.bot.qq.com/gateway"
+        )
+
+    @pytest.mark.asyncio
+    async def test_get_gateway_url_honors_api_base_override(self, _reload_qqbot_modules):
+        _constants_mod, adapter_mod = _reload_qqbot_modules("https://proxy.qq.example")
+        QQAdapter = adapter_mod.QQAdapter
+
+        adapter = QQAdapter(_make_config(app_id="a", client_secret="b"))
+        adapter._ensure_token = mock.AsyncMock(return_value="tok")
+        response = mock.Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"url": "wss://gateway.qq.test/ws"}
+        adapter._http_client = mock.AsyncMock()
+        adapter._http_client.get = mock.AsyncMock(return_value=response)
+
+        await adapter._get_gateway_url()
+
+        adapter._http_client.get.assert_awaited_once()
+        assert (
+            adapter._http_client.get.await_args.args[0]
+            == "https://proxy.qq.example/gateway"
+        )
 
 # ---------------------------------------------------------------------------
 # _strip_at_mention

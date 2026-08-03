@@ -1,6 +1,7 @@
 """Tests for tools/send_message_tool.py."""
 
 import asyncio
+import importlib
 import json
 import os
 import sys
@@ -232,6 +233,24 @@ class _patch_slack_standalone_sender:
 
 def _run_async_immediately(coro):
     return asyncio.run(coro)
+
+
+@pytest.fixture
+def _reload_qqbot_constants(monkeypatch):
+    import gateway.platforms.qqbot.constants as constants_mod
+
+    def _reload(api_base=None):
+        if api_base is None:
+            monkeypatch.delenv("QQ_API_BASE", raising=False)
+        else:
+            monkeypatch.setenv("QQ_API_BASE", api_base)
+        importlib.reload(constants_mod)
+        return constants_mod
+
+    yield _reload
+
+    monkeypatch.delenv("QQ_API_BASE", raising=False)
+    importlib.reload(constants_mod)
 
 
 def _make_config():
@@ -2744,6 +2763,38 @@ def _install_signal_http(monkeypatch, fake):
     monkeypatch.setattr(httpx, "AsyncClient", fake)
 
 
+class _FakeQQBotResponse:
+    def __init__(self, status_code, data):
+        self.status_code = status_code
+        self._data = data
+
+    def json(self):
+        return self._data
+
+
+class _FakeQQBotHttp:
+    """Stand-in for httpx.AsyncClient for `_send_qqbot` URL tests."""
+
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = []
+
+    def __call__(self, *_a, **_kw):
+        return self
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_a):
+        return False
+
+    async def post(self, url, json=None, headers=None):
+        self.calls.append({"url": url, "json": json, "headers": headers})
+        if not self.responses:
+            raise AssertionError("Unexpected extra POST")
+        return self.responses.pop(0)
+
+
 def _patch_sendmsg_sleep_and_time(monkeypatch, capture: list):
     """Mock asyncio.sleep + time.monotonic in the signal_rate_limit
     module so the scheduler's acquire loop sees synthetic time advancing
@@ -2794,6 +2845,59 @@ class TestSendSignalChunking:
         assert "attachments" not in params
         assert "textStyle" not in params
         assert "textStyles" not in params
+
+
+class TestSendQQBot:
+    def test_direct_send_uses_default_api_base_for_all_rest_paths(
+        self, monkeypatch, _reload_qqbot_constants
+    ):
+        _reload_qqbot_constants()
+        from tools.send_message_tool import _send_qqbot
+
+        fake = _FakeQQBotHttp(
+            [
+                _FakeQQBotResponse(200, {"access_token": "tok"}),
+                _FakeQQBotResponse(404, {}),
+                _FakeQQBotResponse(404, {}),
+                _FakeQQBotResponse(404, {}),
+            ]
+        )
+        import httpx
+
+        monkeypatch.setattr(httpx, "AsyncClient", fake)
+        pconfig = SimpleNamespace(enabled=True, token="secret", extra={"app_id": "app-1"})
+
+        result = asyncio.run(_send_qqbot(pconfig, "chat-1", "hello"))
+
+        assert "error" in result
+        assert [call["url"] for call in fake.calls] == [
+            "https://bots.qq.com/app/getAppAccessToken",
+            "https://api.bot.qq.com/channels/chat-1/messages",
+            "https://api.bot.qq.com/v2/users/chat-1/messages",
+            "https://api.bot.qq.com/v2/groups/chat-1/messages",
+        ]
+
+    def test_direct_send_honors_api_base_override(
+        self, monkeypatch, _reload_qqbot_constants
+    ):
+        _reload_qqbot_constants("https://proxy.qq.example")
+        from tools.send_message_tool import _send_qqbot
+
+        fake = _FakeQQBotHttp(
+            [
+                _FakeQQBotResponse(200, {"access_token": "tok"}),
+                _FakeQQBotResponse(200, {"id": "msg-1"}),
+            ]
+        )
+        import httpx
+
+        monkeypatch.setattr(httpx, "AsyncClient", fake)
+        pconfig = SimpleNamespace(enabled=True, token="secret", extra={"app_id": "app-1"})
+
+        result = asyncio.run(_send_qqbot(pconfig, "chat-1", "hello"))
+
+        assert result["success"] is True
+        assert fake.calls[1]["url"] == "https://proxy.qq.example/channels/chat-1/messages"
 
     def test_text_only_markdown_uses_singular_text_style(self, monkeypatch):
         fake = _FakeSignalHttp([{"result": {"timestamp": 1}}])

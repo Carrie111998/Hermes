@@ -444,6 +444,7 @@ These are set automatically by the Docker terminal backend when `proxy.enabled: 
 | `QQBOT_HOME_CHANNEL` | QQ user/group openID for cron delivery and notifications |
 | `QQBOT_HOME_CHANNEL_NAME` | Display name for the QQ home channel |
 | `QQ_PORTAL_HOST` | Override the QQ portal host (set to `sandbox.q.qq.com` to route through the sandbox gateway; default: `q.qq.com`). |
+| `QQ_API_BASE` | Override the QQ Bot REST API base for proxies/testing (default: `https://api.bot.qq.com`). Used by gateway discovery and direct-send REST calls. |
 | `QQ_SANDBOX` | Enable QQ sandbox mode for development testing (`true`/`false`) |
 | `MATTERMOST_URL` | Mattermost server URL (e.g. `https://mm.example.com`) |
 | `MATTERMOST_TOKEN` | Bot token or personal access token for Mattermost |
