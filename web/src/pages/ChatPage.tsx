@@ -63,6 +63,7 @@ import {
   transferMayContainImage,
   uploadChatImage,
 } from "@/lib/chatImagePaste";
+import { shiftEnterSequence } from "@/lib/terminalKeys";
 import { PluginSlot } from "@/plugins";
 import { useTheme } from "@/themes";
 import { useProfileScope } from "@/contexts/useProfileScope";
@@ -706,6 +707,18 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
             console.warn("[dashboard clipboard] paste failed:", message);
           }
         })();
+        return false;
+      }
+
+      // Shift+Enter must reach the TUI as a newline, not a submit. xterm.js
+      // collapses Shift+Enter into a bare \r (identical to plain Enter), so
+      // the TUI's multiline composer never sees the modifier and sends the
+      // message instead of inserting a line break. Translate the DOM keydown
+      // into the modified-key sequence the TUI already parses (ESC[13;2u).
+      const tuiSequence = shiftEnterSequence(ev);
+      if (tuiSequence) {
+        ev.preventDefault();
+        term.input(tuiSequence);
         return false;
       }
 
