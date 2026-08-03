@@ -12,6 +12,8 @@ interrupting. The gateway runner must:
 """
 from __future__ import annotations
 
+import json
+import threading
 from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -90,11 +92,116 @@ def _session_entry() -> SessionEntry:
     )
 
 
+def _enable_durable_queue(runner, adapter, profile_home) -> None:
+    runner._busy_queue_root_override = profile_home
+    runner._busy_queue_lock = threading.RLock()
+    runner._busy_queue_uncertain_sessions = set()
+    runner._busy_queue_uncertain_digests = set()
+    runner._busy_queue_restored_sessions = set()
+    runner._busy_queue_active_claims = {}
+    runner._busy_queue_claimed_events = {}
+    runner._busy_queue_cancelled_claim_tokens = set()
+    runner._busy_queue_finalized_claim_tokens = set()
+    runner._queued_events = {}
+    runner._adapter_for_source = lambda _source: adapter
+    runner._busy_queue_max_bytes = lambda: 1024 * 1024
+
+
 @pytest.mark.asyncio
-async def test_steer_calls_agent_steer_and_does_not_interrupt():
-    """When an agent is running, /steer must call agent.steer(text) and
-    leave interrupt state untouched."""
+async def test_steer_receipt_commits_only_after_model_visible_consumption(tmp_path):
     runner, adapter = _make_runner(_session_entry())
+    _enable_durable_queue(runner, adapter, tmp_path / "profile")
+    sk = build_session_key(_make_source())
+
+    class ReceiptAgent:
+        def __init__(self):
+            self.kwargs = None
+            self.interrupt = MagicMock()
+
+        def supports_steer_consumption_ack(self):
+            return True
+
+        def get_steer_generation(self):
+            return 7
+
+        def steer(self, text, **kwargs):
+            assert text == "also check auth.log"
+            self.kwargs = kwargs
+            return True
+
+    running_agent = ReceiptAgent()
+    runner._running_agents[sk] = running_agent
+
+    result = await runner._handle_message(_make_event("/steer also check auth.log"))
+
+    state_path = runner._busy_queue_state_path(sk, _make_source())
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["claim"] is not None
+    assert state["queue"] == []
+    assert running_agent.kwargs["run_generation"] == 7
+    assert callable(running_agent.kwargs["on_consumed"])
+    assert "steer" in result.lower()
+
+    assert running_agent.kwargs["on_consumed"]() is True
+    assert not state_path.exists()
+    running_agent.interrupt.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_steer_exception_after_durable_handoff_reports_uncertain(tmp_path):
+    runner, adapter = _make_runner(_session_entry())
+    _enable_durable_queue(runner, adapter, tmp_path / "profile")
+    sk = build_session_key(_make_source())
+
+    class ExplodingReceiptAgent:
+        def supports_steer_consumption_ack(self):
+            return True
+
+        def get_steer_generation(self):
+            return 11
+
+        def steer(self, _text, **_kwargs):
+            raise RuntimeError("handoff boundary failed")
+
+    runner._running_agents[sk] = ExplodingReceiptAgent()
+
+    result = await runner._handle_message(_make_event("/steer inspect ledger"))
+
+    assert result is not None
+    assert "uncertain" in result.lower()
+    assert "do not resend" in result.lower()
+    assert "rejected" not in result.lower()
+    state = json.loads(
+        runner._busy_queue_state_path(sk, _make_source()).read_text(encoding="utf-8")
+    )
+    assert state["claim"] is not None
+    assert sk in runner._busy_queue_uncertain_sessions
+
+
+@pytest.mark.asyncio
+async def test_steer_pending_sentinel_uses_durable_fifo(tmp_path):
+    from gateway.run import _AGENT_PENDING_SENTINEL
+
+    runner, adapter = _make_runner(_session_entry())
+    _enable_durable_queue(runner, adapter, tmp_path / "profile")
+    sk = build_session_key(_make_source())
+    runner._running_agents[sk] = _AGENT_PENDING_SENTINEL
+
+    result = await runner._handle_message(_make_event("/steer wait up"))
+
+    state_path = runner._busy_queue_state_path(sk, _make_source())
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["claim"] is None
+    assert state["queue"][0]["event"]["text"] == "wait up"
+    assert adapter._pending_messages[sk].text == "wait up"
+    assert "queued" in result.lower()
+
+
+@pytest.mark.asyncio
+async def test_steer_without_receipt_support_durably_falls_back(tmp_path):
+    """Legacy agents cannot own a steer receipt; keep the event in the FIFO."""
+    runner, adapter = _make_runner(_session_entry())
+    _enable_durable_queue(runner, adapter, tmp_path / "profile")
     sk = build_session_key(_make_source())
 
     running_agent = MagicMock()
@@ -103,24 +210,52 @@ async def test_steer_calls_agent_steer_and_does_not_interrupt():
 
     result = await runner._handle_message(_make_event("/steer also check auth.log"))
 
-    # The handler replied with a confirmation
     assert result is not None
-    assert "steer" in result.lower() or "queued" in result.lower()
-    # The agent's steer() was called with the payload (prefix stripped)
-    running_agent.steer.assert_called_once_with("also check auth.log")
-    # Critically: interrupt was NOT called
+    assert "queued" in result.lower()
+    running_agent.steer.assert_not_called()
     running_agent.interrupt.assert_not_called()
-    # And no user-text queueing happened — the steer doesn't go into
-    # _pending_messages (that would be turn-boundary /queue semantics).
-    assert runner._pending_messages == {}
-    assert adapter._pending_messages == {}
+    assert adapter._pending_messages[sk].text == "also check auth.log"
 
 
 @pytest.mark.asyncio
-async def test_steer_agent_without_steer_method_falls_back():
-    """If the running agent somehow lacks the steer() method (older build,
-    test stub), the handler must not explode — fall back to /queue."""
+async def test_steer_without_payload_returns_usage():
+    runner, _adapter = _make_runner(_session_entry())
+    sk = build_session_key(_make_source())
+    running_agent = MagicMock()
+    runner._running_agents[sk] = running_agent
+
+    result = await runner._handle_message(_make_event("/steer"))
+
+    assert result is not None
+    assert "Usage" in result or "usage" in result
+    running_agent.steer.assert_not_called()
+    running_agent.interrupt.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_steer_with_pending_sentinel_falls_back_to_queue(tmp_path):
+    """When the agent hasn't finished booting, persist the next-turn fallback."""
+    from gateway.run import _AGENT_PENDING_SENTINEL
+
     runner, adapter = _make_runner(_session_entry())
+    _enable_durable_queue(runner, adapter, tmp_path / "profile")
+    sk = build_session_key(_make_source())
+    runner._running_agents[sk] = _AGENT_PENDING_SENTINEL
+
+    result = await runner._handle_message(_make_event("/steer wait up"))
+
+    assert result is not None
+    assert "queued" in result.lower() or "starting" in result.lower()
+    # The fallback put the text into the adapter's pending queue.
+    assert sk in adapter._pending_messages
+    assert adapter._pending_messages[sk].text == "wait up"
+
+
+@pytest.mark.asyncio
+async def test_steer_agent_without_steer_method_falls_back(tmp_path):
+    """An older agent without steer support falls back to the durable FIFO."""
+    runner, adapter = _make_runner(_session_entry())
+    _enable_durable_queue(runner, adapter, tmp_path / "profile")
     sk = build_session_key(_make_source())
 
     # A bare object that does NOT have steer() — use a spec'd Mock so

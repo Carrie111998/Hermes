@@ -415,6 +415,48 @@ def _hermetic_environment(tmp_path, monkeypatch):
     for name in _HERMES_BEHAVIORAL_VARS:
         monkeypatch.delenv(name, raising=False)
 
+    # Managed-scope isolation belongs in the test harness, not in production
+    # security decisions. Point the fixed system tier at a missing per-test
+    # path and let explicit existing test overrides bypass the root-ownership
+    # check through an injected resolver boundary.
+    from hermes_cli import managed_scope as _managed_scope
+
+    managed_scope_absent = tmp_path / "managed_scope_absent"
+    monkeypatch.setattr(
+        _managed_scope,
+        "_DEFAULT_MANAGED_DIR",
+        managed_scope_absent,
+    )
+    monkeypatch.setattr(
+        _managed_scope,
+        "_managed_dir_is_trusted",
+        lambda path: Path(path).resolve() if Path(path).is_dir() else None,
+    )
+    monkeypatch.setattr(
+        _managed_scope,
+        "_managed_stat_is_trusted",
+        lambda _file_stat: True,
+    )
+    monkeypatch.setattr(
+        _managed_scope,
+        "_managed_ancestor_stat_is_trusted",
+        lambda _directory_stat: True,
+    )
+
+    # Python subprocesses do not inherit monkeypatches. A tests-only
+    # sitecustomize module applies the same isolation before child imports;
+    # production code has no forgeable environment-variable bypass.
+    subprocess_bootstrap = Path(__file__).resolve().parent / "subprocess_bootstrap"
+    inherited_pythonpath = os.environ.get("PYTHONPATH", "")
+    pythonpath_parts = [str(subprocess_bootstrap)]
+    if inherited_pythonpath:
+        pythonpath_parts.append(inherited_pythonpath)
+    monkeypatch.setenv("PYTHONPATH", os.pathsep.join(pythonpath_parts))
+    monkeypatch.setenv(
+        "_HERMES_TEST_MANAGED_DEFAULT",
+        str(managed_scope_absent),
+    )
+
     # Honcho's fallback host/config resolution legitimately reads the user's
     # global ~/.honcho/config.json. Keep HOME stable (subprocess tests depend
     # on it), but pin the host so ordinary tests cannot inherit a developer's

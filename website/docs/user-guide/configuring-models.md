@@ -57,11 +57,11 @@ Prompt caches are keyed to the model serving the request, so any mid-conversatio
 
 ## Setting auxiliary models
 
-Click **Show auxiliary** to reveal the 11 task slots:
+Click **Show auxiliary** to reveal the dashboard-supported task slots:
 
 ![Auxiliary panel expanded](/img/docs/dashboard-models/auxiliary-expanded.png)
 
-Every auxiliary task defaults to `auto` — meaning Hermes tries your main model for that job too. If that route is unavailable or hits a capacity-style failure, `auto` follows any task-specific `auxiliary.<task>.fallback_chain`, then the main `fallback_providers` / `fallback_model` chain, then Hermes' built-in auxiliary discovery chain. Override a specific task when you want a cheaper or faster model for a side-job.
+Dashboard-managed auxiliary tasks default to `auto` — meaning Hermes tries your main model for that job too. If that route is unavailable or hits a capacity-style failure, `auto` follows any task-specific `auxiliary.<task>.fallback_chain`, then the main `fallback_providers` / `fallback_model` chain, then Hermes' built-in auxiliary discovery chain. The privacy-sensitive SMART router is a deliberate exception: it is configured manually, defaults to disabled, and never uses those inheritance or fallback paths.
 
 ### Common override patterns
 
@@ -79,13 +79,35 @@ Every auxiliary task defaults to `auto` — meaning Hermes tries your main model
 | **Profile Describer** | Routes profile-description generation (`hermes profile describe --auto` / the dashboard auto-generate button). Short, cheap call. |
 | **Curator** | Routes the curator skill-usage review pass. Can run for minutes on reasoning models, so a cheaper aux model is often worthwhile. |
 
+### SMART router: dedicated provider, no fallback
+
+`auxiliary.smart_router` classifies text that arrives while an agent is busy **only** when `display.busy_input_mode: smart` is also enabled. Both its provider and model are empty by default. They must name one explicit route; `auto`, `main`, missing values, and a literal `custom` provider without an explicit `base_url` fail closed before any request:
+
+```yaml
+display:
+  busy_input_mode: smart
+
+auxiliary:
+  smart_router:
+    provider: openrouter
+    model: google/gemini-2.5-flash
+    base_url: ""
+    api_key: ""
+    timeout: 12
+    extra_body: {}
+```
+
+Unlike general auxiliary tasks, Hermes makes one classifier attempt with no discovery, same-provider retry, credential-rotation replay, task/main fallback, or cross-provider fallback. It ignores the live main-runtime route. Clearing `provider` or `model` disables classifier egress and queues non-alias messages; setting `display.busy_input_mode: queue` disables SMART, including deterministic aliases.
+
+The provider receives force-redacted and bounded copies of the active goal (4,000 characters), incoming message (4,000), and a small current-activity summary (1,000), plus static routing instructions. It does not receive full history, attachments, tool output, or the main runtime object. Known credential formats are masked, but ordinary PII is not anonymized, and the selected provider's logging/training/retention/residency terms still apply. Over-limit inputs make no request. Admission is capped at two calls process-wide, the absolute deadline is at most 60 seconds, late results are discarded while their worker retains its slot, and malformed/non-exact JSON queues safely. See [SMART privacy and fail-closed controls](./cli.md#smart-privacy-and-fail-closed-controls) for the complete schema and routing limits.
+
 ### Per-task override
 
 Click **Change** on any auxiliary row. Same picker opens, same behavior — pick provider + model, hit Switch. The row updates to show `provider · model` instead of `auto (use main model)`.
 
 ### Reset all to auto
 
-If you've over-tuned and want to start over, click **Reset all to auto** at the top of the auxiliary section. Every slot goes back to using your main model.
+If you've over-tuned and want to start over, click **Reset all to auto** at the top of the auxiliary section. Every dashboard-managed slot goes back to using your main model. The dedicated SMART router is intentionally not changed to `auto`.
 
 ## The "Use as" shortcut
 

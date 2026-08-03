@@ -59,8 +59,19 @@ def _make_runner(*, session_id: str = "parent-session") -> GatewayRunner:
     runner._pending_messages = {}
     runner._busy_ack_ts = {}
     runner._draining = False
+    runner._external_drain_active = False
+    runner._queued_events = {}
+    runner._busy_queue_lock = threading.RLock()
+    runner._busy_queue_claimed_events = {}
+    runner._busy_queue_uncertain_sessions = set()
+    runner._busy_queue_uncertain_digests = set()
+    runner._busy_queue_persist_ready = MagicMock(return_value=None)
+    runner._busy_queue_max_bytes = lambda: 1024 * 1024
     runner.adapters = {}
     runner.config = MagicMock()
+    runner.config.group_sessions_per_user = True
+    runner.config.thread_sessions_per_user = False
+    runner.config.multiplex_profiles = False
     runner.hooks = MagicMock()
     runner.hooks.emit = AsyncMock()
     runner.pairing_store = MagicMock()
@@ -154,4 +165,59 @@ class TestBusyHandlerDemotesInterruptForCompression:
         assert "/stop" in content
         assert "Interrupting" not in content
 
+    @pytest.mark.asyncio
+    async def test_interrupt_signal_still_fires_without_compression_lock(self) -> None:
+        runner = _make_runner()
+        adapter = _make_adapter()
+        event = _make_event(text="please stop")
+        sk = build_session_key(event.source)
+        parent = _make_parent_no_subagents()
+        runner._running_agents[sk] = parent
+        runner.adapters[event.source.platform] = adapter
+        active_event = threading.Event()
+        adapter._active_sessions = {sk: active_event}
+        runner._session_db._db.get_compression_lock_holder.return_value = None
 
+        with patch("gateway.run.merge_pending_message_event"):
+            await runner._handle_active_session_busy_message(event, sk)
+
+        # Interrupt mode now persists first and signals the adapter-owned active
+        # turn. Calling agent.interrupt() directly would be a second,
+        # unreceipted delivery path.
+        assert active_event.is_set()
+        parent.interrupt.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_lock_probe_error_does_not_interrupt_parent_session(self) -> None:
+        runner = _make_runner()
+        adapter = _make_adapter()
+        event = _make_event(text="follow up while lock state is unavailable")
+        sk = build_session_key(event.source)
+        parent = _make_parent_no_subagents()
+        runner._running_agents[sk] = parent
+        runner.adapters[event.source.platform] = adapter
+        runner._session_db._db.get_compression_lock_holder.side_effect = RuntimeError(
+            "sqlite temporarily unavailable"
+        )
+
+        with patch("gateway.run.merge_pending_message_event"):
+            handled = await runner._handle_active_session_busy_message(event, sk)
+
+        assert handled is True
+        parent.interrupt.assert_not_called()
+        assert adapter._pending_messages.get(sk) is event
+
+    @pytest.mark.asyncio
+    async def test_pending_sentinel_does_not_trigger_false_positive(self) -> None:
+        runner = _make_runner()
+        adapter = _make_adapter()
+        event = _make_event(text="hello")
+        sk = build_session_key(event.source)
+        runner._running_agents[sk] = _AGENT_PENDING_SENTINEL
+        runner.adapters[event.source.platform] = adapter
+        runner._session_db._db.get_compression_lock_holder.return_value = "compressing"
+
+        with patch("gateway.run.merge_pending_message_event"):
+            handled = await runner._handle_active_session_busy_message(event, sk)
+
+        assert handled is True

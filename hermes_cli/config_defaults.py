@@ -804,8 +804,8 @@ DEFAULT_CONFIG = {
     # Format: provider is the provider name, model is the model slug.
     # "auto" for provider = auto-detect best available provider.
     # Empty model = use provider's default auxiliary model.
-    # All tasks fall back to openrouter:google/gemini-3-flash-preview if
-    # the configured provider is unavailable.
+    # Most tasks can fall back when the configured provider is unavailable.
+    # Privacy-sensitive tasks may opt into strict single-provider execution.
     #
     # extra_body: forwarded verbatim as request body fields on every aux call
     # for that task. Use this to set provider-specific knobs (independent of
@@ -834,6 +834,18 @@ DEFAULT_CONFIG = {
         # not a meaningful recovery, so an unretried blip silently loses the
         # call.
         "transient_retries": 2,
+        # SMART busy-message routing is a privacy-sensitive control-plane
+        # classifier. Both fields intentionally default to empty: "auto", the
+        # main runtime, provider discovery, retries, and fallback chains are
+        # forbidden. When either field is unset, SMART queues fail-closed.
+        "smart_router": {
+            "provider": "",
+            "model": "",
+            "base_url": "",
+            "api_key": "",
+            "timeout": 12,
+            "extra_body": {},
+        },
         # Restrict the auxiliary auto-chain's OpenRouter fallback to free
         # (:free) SKUs. When true, the OpenRouter step is skipped entirely
         # unless the resolved fallback model ends in ":free" — a PAID lane
@@ -1084,7 +1096,8 @@ DEFAULT_CONFIG = {
         # when an exchange was tool-heavy. Set False to restore the legacy
         # behavior of showing tool-call summaries inline.
         "resume_skip_tool_only": True,
-        "busy_input_mode": "interrupt",  # interrupt | queue | steer
+        "busy_input_mode": "interrupt",  # interrupt | queue | steer | smart
+        "busy_queue_max_bytes": 1024 * 1024,
         # When busy_input_mode="steer", suppress only the visible
         # "Steered into current run" confirmation bubble by setting this false.
         # The mid-turn steering itself still happens.
@@ -1729,6 +1742,12 @@ DEFAULT_CONFIG = {
     # Never saved to sessions, logs, or trajectories.
     "prefill_messages_file": "",
 
+    "orchestration": {
+        "smart": {
+            "confidence_threshold": 0.78,
+            "classifier_timeout_seconds": 12,
+        },
+    },
     # Goals — persistent cross-turn goals (Ralph-style loop).
     # After every turn, a lightweight judge call asks the auxiliary model
     # whether the active /goal is satisfied by the assistant's last

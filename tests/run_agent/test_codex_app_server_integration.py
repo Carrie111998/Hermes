@@ -80,6 +80,9 @@ class TestRunConversationCodexPath:
             result = agent.run_conversation("hello there")
         assert result["final_response"] == "echo: hello there"
         assert result["completed"] is True
+        assert result["receipt_terminal_success"] is True
+        assert result["failed"] is False
+        assert result["interrupted"] is False
         assert result["partial"] is False
         assert result["error"] is None
         assert result["api_calls"] == 1
@@ -593,6 +596,9 @@ class TestErrorHandling:
         with patch.object(agent, "_spawn_background_review", return_value=None):
             result = agent.run_conversation("hi")
         assert result["completed"] is False
+        assert result["receipt_terminal_success"] is False
+        assert result["failed"] is True
+        assert result["interrupted"] is False
         assert result["partial"] is True
         assert "subprocess died" in result["error"]
         assert "codex-runtime auto" in result["final_response"]
@@ -616,6 +622,9 @@ class TestErrorHandling:
         with patch.object(agent, "_spawn_background_review", return_value=None):
             result = agent.run_conversation("hi")
         assert result["completed"] is False
+        assert result["receipt_terminal_success"] is False
+        assert result["failed"] is True
+        assert result["interrupted"] is True
         assert result["partial"] is True
         assert result["error"] == "user interrupted"
 

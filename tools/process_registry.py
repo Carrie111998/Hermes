@@ -138,6 +138,9 @@ class ProcessSession:
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _reader_thread: Optional[threading.Thread] = field(default=None, repr=False)
     _pty: Any = field(default=None, repr=False)  # ptyprocess handle (when use_pty=True)
+    # Appended to preserve the positional constructor order used by older
+    # integrations while still allowing exact API-run ownership by keyword.
+    owner_id: str = ""                          # Immutable owning turn/run ID
 
 
 class ProcessRegistry:
@@ -695,6 +698,7 @@ class ProcessRegistry:
         session_key: str = "",
         env_vars: dict = None,
         use_pty: bool = False,
+        owner_id: str = "",
     ) -> ProcessSession:
         """
         Spawn a background process locally.
@@ -719,6 +723,7 @@ class ProcessRegistry:
             id=f"proc_{uuid.uuid4().hex[:12]}",
             command=command,
             task_id=task_id,
+            owner_id=owner_id,
             session_key=session_key,
             cwd=_resolve_safe_cwd(cwd or os.getcwd()),
             started_at=time.time(),
@@ -843,6 +848,7 @@ class ProcessRegistry:
         task_id: str = "",
         session_key: str = "",
         timeout: int = 10,
+        owner_id: str = "",
     ) -> ProcessSession:
         """
         Spawn a background process through a non-local environment backend.
@@ -859,6 +865,7 @@ class ProcessRegistry:
             id=f"proc_{uuid.uuid4().hex[:12]}",
             command=command,
             task_id=task_id,
+            owner_id=owner_id,
             session_key=session_key,
             cwd=cwd,
             started_at=time.time(),
@@ -1974,18 +1981,25 @@ class ProcessRegistry:
         baseline_ids,
         *,
         source: str,
+        owner_id: Optional[str] = None,
     ) -> int:
-        """Kill processes created for ``task_id`` after a prior snapshot.
+        """Kill resources from an abandoned turn.
 
-        ``consume_output`` is forced on: abandoned-turn output must not
-        enqueue a synthetic follow-up that revives work the timeout
-        deliberately stopped.
+        Legacy callers select by task + baseline.  Callers that publish an
+        immutable ``owner_id`` select only that exact run, because concurrent
+        API runs may intentionally share a task/session ID and interleave
+        process creation on either side of the same baseline.
         """
+        # Fail closed on a malformed explicit owner.  Falling back to the
+        # shared task/baseline selector would reintroduce collateral kills.
+        if owner_id is not None and not owner_id:
+            return 0
         return self.kill_all(
-            task_id,
+            None if owner_id is not None else task_id,
             exclude_ids=frozenset(baseline_ids or ()),
             source=source,
             consume_output=True,
+            owner_id=owner_id,
         )
 
     def kill_all(
@@ -1995,12 +2009,14 @@ class ProcessRegistry:
         exclude_ids: frozenset = frozenset(),
         source: str = "kill_all",
         consume_output: bool = False,
+        owner_id: Optional[str] = None,
     ) -> int:
-        """Kill all running processes, optionally filtered by task_id. Returns count killed."""
+        """Kill running processes selected by task ID or exact owner ID."""
         with self._lock:
             targets = [
                 s for s in self._running.values()
                 if (task_id is None or s.task_id == task_id)
+                and (owner_id is None or s.owner_id == owner_id)
                 and s.id not in exclude_ids
                 and not s.exited
             ]
@@ -2074,6 +2090,7 @@ class ProcessRegistry:
                             "cwd": s.cwd,
                             "started_at": s.started_at,
                             "task_id": s.task_id,
+                            "owner_id": s.owner_id,
                             "session_key": s.session_key,
                             "watcher_platform": s.watcher_platform,
                             "watcher_chat_id": s.watcher_chat_id,
@@ -2146,6 +2163,7 @@ class ProcessRegistry:
                 id=entry["session_id"],
                 command=entry.get("command", "unknown"),
                 task_id=entry.get("task_id", ""),
+                owner_id=entry.get("owner_id", ""),
                 session_key=entry.get("session_key", ""),
                 pid=pid,
                 host_start_time=recorded_start,

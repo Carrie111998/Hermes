@@ -281,14 +281,64 @@ The `display.busy_input_mode` config key controls what happens when you press En
 | `"interrupt"` (default) | Your message redirects the active turn. Model generation restarts with displayed reasoning and completed work preserved; running tools finish first |
 | `"queue"` | Your message is silently queued and sent as the next turn after the agent finishes |
 | `"steer"` | Your message is injected into the current run via `/steer`, arriving at the agent after the next tool call — no interrupt, no new turn |
+| `"smart"` | A fail-closed classifier routes related updates into the active run, offers independent requests to isolated orchestration, and sends dependent/uncertain requests to the next-turn queue — never interrupts |
 
 ```yaml
 # ~/.hermes/config.yaml
 display:
-  busy_input_mode: "steer"   # or "queue" or "interrupt" (default)
+  busy_input_mode: "smart"   # or "steer", "queue", or "interrupt"
 ```
 
-`"queue"` mode prepares a separate follow-up turn. `"steer"` always waits for the next tool-result boundary. The default `"interrupt"` mode responds sooner during model generation while avoiding cancellation of a running tool. Use `/stop` when you want to cancel the turn and its foreground work. Unknown values fall back to `"interrupt"`.
+`"smart"` is the safest high-throughput mode for orchestrators: explicit `AJUSTE:`, `PARALELO:`, and `DEPOIS:` aliases bypass the classifier; malformed, low-confidence, timed-out, media, or resource-conflicting requests fall back to `"queue"`. A steer containing a parallel-orchestration directive is acknowledged only as active-run delivery until an isolated worker actually accepts ownership. Only explicit cancellation controls such as `/stop` cancel active work.
+
+#### SMART privacy and fail-closed controls
+
+SMART is a **double opt-in**. `display.busy_input_mode` defaults to `interrupt`, and the classifier's dedicated `auxiliary.smart_router.provider` and `model` fields both default to empty. Configure all three values to enable model-based routing:
+
+```yaml
+display:
+  busy_input_mode: smart
+  busy_queue_max_bytes: 1048576       # aggregate CLI/TUI/gateway ceiling; 32 obligations
+
+auxiliary:
+  smart_router:
+    provider: openrouter                 # must not be auto or main
+    model: google/gemini-2.5-flash      # an explicit model is required
+    base_url: ""                        # required for a literal custom provider
+    timeout: 12
+
+orchestration:
+  smart:
+    confidence_threshold: 0.78
+    classifier_timeout_seconds: 12
+```
+
+Set `display.busy_input_mode: queue` to disable SMART entirely. Clearing either `auxiliary.smart_router.provider` or `model` is a classifier-egress kill switch: non-alias messages fail closed to the queue instead of inheriting another route. Explicit routing aliases remain local and deterministic, so use the mode switch when you also want to disable alias routing.
+
+Queue admission precedes every positive queued acknowledgment. Gateway, TUI/Desktop and classic CLI reject work that would exceed 32 logical obligations or the configured 1-MiB aggregate payload ceiling; coalesced albums count every logical input, caption and media reference before any mutation. Accepted obligations do not expire by age and are written atomically to private profile/session-scoped recovery state before the composer is cleared or an acknowledgment is emitted. A non-idempotent steer is fenced durably before the agent mailbox accepts it, but the receipt is not committed until the agent checkpoint actually consumes it. A route is described as independent/parallel only after an isolated worker returns a durable admission ID; unavailable isolation degrades to FIFO, never inline execution or a disguised steer. If a process dies during dispatch, steering or turn execution, Hermes preserves the exact envelope as an uncertain outcome and never auto-replays it. The turn-scoped steer mailbox accepts at most eight items, 4,000 characters per item and 16,000 total. Admission rejection never interrupts the active run, never clears the composer, and is never described as queued.
+
+Every terminal SMART outcome emits one structured log line beginning with `smart_route`. It records only the surface, route/source state codes, end-to-end latency, acceptance/steer flags, queue depth, worker-receipt state, and `interrupt=false`; it never logs message text, classifier reason or confidence, credentials, or chat/session identifiers (including derived hashes).
+
+For each non-alias text message, the dedicated provider receives only:
+
+- the active goal, after forced known-secret masking and control-character removal (maximum 4,000 characters);
+- a small activity summary — API-call count, maximum iterations, and current tool when available — processed the same way (maximum 1,000 characters);
+- the incoming message, processed the same way (maximum 4,000 characters);
+- a static routing policy and strict JSON response instructions.
+
+Hermes does **not** send the full conversation history, attachments/media, tool output, or the main runtime's provider/model/key object to this classifier. Secret masking recognizes known credential patterns; it is **not PII anonymization**, so ordinary names, email addresses, business data, and other personal information in those three text fields may still reach the configured provider. That provider's own logging, training, retention, residency, and privacy terms apply.
+
+The SMART route makes exactly one Hermes-managed request to the explicit provider/model. It does not use provider discovery, same-provider retries, credential-rotation replays, task fallback chains, the main model, or cross-provider fallback. `auto`, `main`, an empty provider/model, and a literal `custom` provider without `base_url` are rejected before provider resolution.
+
+Limits are fail closed:
+
+- if cleaning and bounding the active goal, incoming message, activity summary, or explicit-alias payload would truncate it, no classifier request is made and the original message is preserved for the safe queue;
+- the absolute classifier deadline starts at entry, includes preparation/admission/parsing, and is capped at 60 seconds;
+- at most two provider calls are admitted process-wide; excess requests queue safely without starting another worker;
+- a synchronous provider call may outlive its caller's deadline, but it keeps its admission slot until it actually exits and its late result is discarded;
+- output must be one JSON object of at most 2,000 characters with exactly `route`, `confidence`, and `reason`; duplicate/missing/extra keys, booleans or non-finite confidence, unknown routes, fences/prose, and empty/control/over-180-character reasons are rejected.
+
+`"queue"` mode prepares a separate follow-up turn without canceling in-flight work. `"steer"` injects at the next safe checkpoint — for example, “also check the tests” while the mission is still running. The configured default `"interrupt"` responds sooner during model generation while avoiding cancellation of a running tool; use `/stop` to cancel the turn and its foreground work. Unknown or invalid values fail closed to `"queue"` and never silently fall back to interrupt.
 
 `"steer"` has two automatic fallbacks: if the agent hasn't started yet, or if images are attached, the message falls back to `"queue"` behavior so nothing is lost.
 

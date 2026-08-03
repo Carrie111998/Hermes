@@ -24,6 +24,7 @@ import pytest
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType
 from gateway.session import SessionSource, build_session_key
+from tests.gateway.test_steer_command import _enable_durable_queue
 
 
 class _DrainProbeAdapter(BasePlatformAdapter):
@@ -175,6 +176,7 @@ async def test_runner_goal_hook_enqueues_into_the_key_the_adapter_drains(hermes_
 
     adapter = _DrainProbeAdapter()
     runner.adapters = {Platform.SLACK: adapter}
+    _enable_durable_queue(runner, adapter, hermes_home)
 
     GoalManager(session_entry.session_id).set("ship it")
     with patch(

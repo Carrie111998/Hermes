@@ -128,43 +128,35 @@ def _(rid, params: dict) -> dict:
     # or fallback moved the session transport to stdio.
     if (t := current_transport()) is not None:
         session["transport"] = t
-    while True:
-        busy_transport = None
-        with session["history_lock"]:
-            if session.get("running"):
-                # Don't reject a mid-turn prompt — queue it (and, by default,
-                # interrupt the live turn) so it runs as the next turn. The
-                # provider interrupt itself must happen after this lock is
-                # released: a non-interruptible tool may keep it waiting.
-                busy_transport = t or session.get("transport")
-            else:
-                break
-        busy_response = _handle_busy_submit(
-            rid, sid, session, text, busy_transport,
-            queued=bool(params.get("queued")),
-        )
-        if busy_response is not None:
-            return busy_response
-        # The old turn finished between the two lock acquisitions. Retry the
-        # claim so this prompt starts normally instead of being stranded in a
-        # queue whose drain already ran.
-
+    busy_submit = False
+    initial_deferred = False
+    initial_admission_error: str | None = None
+    envelope = None
+    busy_route_context = None
+    attachment_owner, attachment_fallback_owner = _attachment_owner_keys(params)
     with session["history_lock"]:
+        if session.get("running"):
+            # Snapshot only the busy decision while holding history_lock. The
+            # SMART path may perform slow classifier I/O and must run after this
+            # lock is released so turn finalization/control RPCs stay responsive.
+            busy_submit = True
+            busy_route_context = _capture_busy_route_context_locked(session)
         # A watch session's run lives in the PARENT turn, so its own running
         # flag is False — without this, typing mid-run builds a second agent
         # racing the in-flight child on the same stored session (interleaved
         # transcript, stale fork). After the run completes, submitting is fine:
         # the upgrade resumes the child's transcript as a normal conversation.
-        if session.get("lazy") and _child_run_active(str(session.get("session_key") or "")):
+        if not busy_submit and session.get("lazy") and _child_run_active(str(session.get("session_key") or "")):
             return _err(rid, 4009, "subagent still running — wait for it to finish")
-        if truncate_user_ordinal is not None:
+        if not busy_submit and truncate_user_ordinal is not None:
             try:
                 ordinal = int(truncate_user_ordinal)
             except (TypeError, ValueError):
                 return _err(rid, 4004, "truncate_before_user_ordinal must be an integer")
             history = session.get("history", [])
             user_indices = [
-                i for i, m in enumerate(history)
+                i
+                for i, m in enumerate(history)
                 if m.get("role") == "user" and not m.get("display_kind")
             ]
             # Reject out-of-range ordinals on BOTH ends. A negative value would
@@ -175,12 +167,6 @@ def _(rid, params: dict) -> dict:
             if ordinal < 0 or ordinal >= len(user_indices):
                 return _err(rid, 4018, "target user message is no longer in session history")
             truncated = history[: user_indices[ordinal]]
-            # Stale clients can attach truncate_before_user_ordinal=0 to an
-            # ordinary submit. That resolves to history[:0] == [] and
-            # replace_messages() DELETEs every durable row — silent total
-            # transcript loss. Refuse the empty-truncation edge unless the
-            # client explicitly opts in (legitimate restore/regenerate of the
-            # first user turn).
             if (
                 not truncated
                 and history
@@ -211,13 +197,8 @@ def _(rid, params: dict) -> dict:
                 ordinal,
             )
             # Write-before-memory (mirrors gateway hygiene / manual /compress):
-            # persist the truncated transcript first. If replace_messages fails
-            # after we already rewrote session["history"], the turn still runs
-            # against the short list while state.db keeps the old tail. The
-            # agent flush is append-only for history-dict identities, so the
-            # new exchange is appended on top of the "undone" turns — durable
-            # zombie history on resume, and the edit/regenerate never sticks.
-            # Fail closed: refuse the turn and leave memory/DB unchanged.
+            # persist the truncated transcript first. If replace_messages fails,
+            # refuse the turn and leave memory/DB unchanged.
             if (db := _get_db()) is not None:
                 try:
                     db.replace_messages(session["session_key"], truncated)
@@ -238,91 +219,197 @@ def _(rid, params: dict) -> dict:
                     )
             session["history"] = truncated
             session["history_version"] = int(session.get("history_version", 0)) + 1
-        session["running"] = True
-        session["_turn_cancel_requested"] = False
-        session["last_active"] = time.time()
-        _start_inflight_turn(session, text)
+        envelope = _capture_prompt_envelope_locked(
+            session,
+            rid,
+            text,
+            t or session.get("transport"),
+            attachment_owner=attachment_owner,
+            attachment_fallback_owner=attachment_fallback_owner,
+        )
+        if not busy_submit:
+            with _prompt_queue_lock(session):
+                queued_items, _expired = _cleanup_expired_prompts_locked(session)
+                if session.get("_prompt_queue_restore_error"):
+                    initial_admission_error = "recovery_error"
+                elif session.get("_queued_prompt_claim") or session.get(
+                    "_smart_steer_claim"
+                ):
+                    initial_admission_error = "recovery_error"
+                elif queued_items:
+                    # Preserve FIFO: an obligation restored from an earlier
+                    # process owns the next turn before this new submission.
+                    initial_deferred = True
+                elif _prompt_envelope_size(envelope or {}) > int(
+                    _load_tui_busy_queue_config()["max_bytes"]
+                ):
+                    initial_admission_error = "max_bytes"
+                else:
+                    try:
+                        _store_queued_prompt_items_locked(
+                            session,
+                            queued_items,
+                            claim=envelope,
+                        )
+                    except Exception as exc:
+                        logger.error(
+                            "failed durable initial prompt admission error_type=%s",
+                            type(exc).__name__,
+                        )
+                        initial_admission_error = "persistence"
+            if initial_admission_error is None and not initial_deferred:
+                session["running"] = True
+                session["_turn_cancel_requested"] = False
+                session["last_active"] = time.time()
+                session["active_prompt_envelope"] = envelope
+                _start_inflight_turn(session, text)
+
+    if busy_submit:
+        # Deliberately outside history_lock: SMART classification can block on
+        # provider I/O, while the active turn needs this lock to finish.
+        return _handle_busy_submit(
+            rid,
+            sid,
+            session,
+            text,
+            t or session.get("transport"),
+            envelope=envelope,
+            route_context=busy_route_context,
+            queued=bool(params.get("queued")),
+        )
+
+    if initial_admission_error is not None:
+        _restore_rejected_prompt_images(session, envelope or {})
+        return _ok(
+            rid,
+            {
+                "status": "queue_rejected",
+                "accepted": False,
+                "reason": initial_admission_error,
+                "ack": "Prompt was not accepted because durable admission failed; retry after recovery.",
+            },
+        )
+
+    if initial_deferred:
+        receipt = _enqueue_prompt(
+            session,
+            text,
+            t or session.get("transport"),
+            envelope=envelope,
+        )
+        if not receipt["accepted"]:
+            return _ok(
+                rid,
+                {
+                    "status": "queue_rejected",
+                    "accepted": False,
+                    **receipt,
+                    "ack": "Prompt was not accepted by the bounded durable queue.",
+                },
+            )
+        started = _drain_queued_prompt(rid, sid, session)
+        return _ok(
+            rid,
+            {
+                "status": "smart_started" if started else "queued",
+                "accepted": True,
+                "depth": receipt["depth"],
+                "queued_bytes": receipt["queued_bytes"],
+                "ack": "Earlier accepted work kept FIFO ownership; this prompt was queued durably.",
+            },
+        )
 
     if turn_isolation:
-        isolated_response = _submit_prompt_to_compute_host(rid, sid, session, text)
+        isolated_response = _submit_prompt_to_compute_host(
+            rid,
+            sid,
+            session,
+            text,
+            envelope=envelope,
+        )
         if not isolated_response.get("error"):
             return isolated_response
-        logger.warning(
-            "compute-host dispatch failed for session %s; falling back inline: %s",
-            sid,
-            isolated_response["error"].get("message", "unknown error"),
+        state_path = _prompt_queue_state_path(session)
+        logger.error(
+            "compute-host dispatch failed mission=%s; preserving without inline fallback error_code=%s",
+            state_path.stem[:10] if state_path is not None else "unknown",
+            isolated_response["error"].get("code", "unknown"),
         )
-
-    # Persist the DB row lazily, now that the user has actually sent a message.
-    # Disk-full must fail the RPC (not stream silently): desktop maps the error
-    # string to a "disk full" toast so the user knows why the send vanished.
-    try:
-        _ensure_session_db_row(session)
-        # A branch becomes real here: copy its parent's transcript into the row so it
-        # resumes with full context (the agent won't persist the seed itself).
-        _persist_branch_seed(session)
-    except Exception as exc:
-        from hermes_state import is_disk_full_error
-
         with session["history_lock"]:
             session["running"] = False
-            session["last_active"] = time.time()
+            session.pop("active_prompt_envelope", None)
             _clear_inflight_turn(session)
-        if is_disk_full_error(exc):
-            return _err(
+        requeued = _requeue_prompt_front(session, envelope or {})
+        if requeued:
+            with _prompt_queue_lock(session):
+                queued_items = _queued_prompt_items_locked(session)
+                depth = len(queued_items)
+                queued_bytes = sum(
+                    _prompt_envelope_size(item) for item in queued_items
+                )
+            return _ok(
                 rid,
-                5070,
-                "disk full: session storage could not be written — free some disk space and try again",
+                {
+                    "status": "queued_isolation_unavailable",
+                    "accepted": True,
+                    "depth": depth,
+                    "queued_bytes": queued_bytes,
+                    "ack": "Compute host unavailable; prompt preserved for isolated retry.",
+                },
             )
-        logger.warning("prompt.submit: session persist failed: %s", exc, exc_info=True)
-        return _err(
-            rid,
-            5071,
-            f"session storage could not be written: {exc}",
-        )
+        return isolated_response
+
+    # Persist the DB row lazily, now that the user has actually sent a message.
+    _ensure_session_db_row(session)
+    # A branch becomes real here: copy its parent's transcript into the row so it
+    # resumes with full context (the agent won't persist the seed itself).
+    _persist_branch_seed(session)
     _start_agent_build(sid, session)
 
     def run_after_agent_ready() -> None:
-        # Patient wait (#63078): the user's message is already the accepted
-        # in-flight turn, so a slow deferred build must not eat it. The wait
-        # delivers the prompt when the still-running build completes, honors a
-        # cancel promptly, notices the user once past the slow threshold, and
-        # only errors when the build itself fails or the bounded cap expires.
         err = _wait_agent_for_prompt(session, rid, sid)
         if err:
-            # Terminal frame + retained snapshot (not a bare "error" event +
-            # cleared inflight): if the client is disconnected right now, the
-            # retained snapshot is the only way resume can show this failure.
-            _emit_terminal_turn_error(
-                sid,
-                session,
-                (err.get("error") or {}).get("message", "agent initialization failed"),
-            )
             with session["history_lock"]:
                 session["running"] = False
-                session["last_active"] = time.time()
-            _emit("session.info", sid, _session_info(session.get("agent"), session))
+                _clear_inflight_turn(session)
+            preserved = _requeue_prompt_front(session, envelope or {})
+            _emit(
+                "error",
+                sid,
+                {
+                    "message": (
+                        err.get("error", {}).get(
+                            "message", "agent initialization failed"
+                        )
+                        + (
+                            "; prompt preserved for retry"
+                            if preserved
+                            else "; durable recovery requires intervention"
+                        )
+                    )
+                },
+            )
             return
+        cancelled = False
         with session["history_lock"]:
             if session.get("_turn_cancel_requested") or not session.get("running"):
                 session["running"] = False
                 _clear_inflight_turn(session)
-                # Surface the cancellation to the client. Without this emit the
-                # turn vanishes silently — the Desktop sees `prompt.submit`
-                # return `{"status": "streaming"}` but never receives a
-                # `message.start` or `error` event, so the composer shows no
-                # feedback (issue #63078 server-side half). Match the
-                # `_wait_agent` error branch above: emit, then bail.
-                _emit(
-                    "error",
-                    sid,
-                    {
-                        "message": "Turn cancelled before the agent was ready"
+                cancelled = True
+        if cancelled:
+            _emit(
+                "error",
+                sid,
+                {
+                    "message": (
+                        "Turn cancelled before the agent was ready"
                         if session.get("_turn_cancel_requested")
                         else "Session no longer running before the agent was ready"
-                    },
-                )
-                return
+                    )
+                },
+            )
+            _complete_queued_prompt_claim(session, envelope or {})
+            return
         _run_prompt_submit(rid, sid, session, text)
 
     run_thread = threading.Thread(target=run_after_agent_ready, daemon=True)
@@ -344,30 +431,63 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 5027, f"clipboard unavailable: {e}")
 
     session["image_counter"] = session.get("image_counter", 0) + 1
-    img_dir = _session_images_dir(session)
-    img_dir.mkdir(parents=True, exist_ok=True)
-    img_path = (
-        img_dir
-        / f"clip_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{session['image_counter']}.png"
+    profile_home_raw = session.get("profile_home")
+    profile_home = (
+        Path(str(profile_home_raw)).expanduser().resolve()
+        if profile_home_raw
+        else _hermes_home
     )
+    img_dir = profile_home / "images"
+    img_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if os.name != "nt":
+        os.chmod(img_dir, 0o700)
+    image_name = (
+        f"clip_{datetime.now().strftime('%Y%m%d_%H%M%S')}_"
+        f"{session['image_counter']}_{uuid.uuid4().hex}.png"
+    )
+    img_path = img_dir / image_name
+    temp_path = img_dir / f".{image_name}.tmp.png"
 
-    # Save-first: mirrors CLI keybinding path; more robust than has_image() precheck
-    if not save_clipboard_image(img_path):
+    # Save to a private temporary path first, then atomically publish the
+    # attachment so a concurrent prompt never sees a partial clipboard file.
+    if not save_clipboard_image(temp_path):
         session["image_counter"] = max(0, session["image_counter"] - 1)
+        temp_path.unlink(missing_ok=True)
         msg = (
             "Clipboard has image but extraction failed"
             if has_clipboard_image()
             else "No image found in clipboard"
         )
         return _ok(rid, {"attached": False, "message": msg})
+    try:
+        if os.name != "nt":
+            os.chmod(temp_path, 0o600)
+        with temp_path.open("rb") as handle:
+            os.fsync(handle.fileno())
+        os.replace(temp_path, img_path)
+        try:
+            directory_fd = os.open(img_dir, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except OSError:
+            if os.name != "nt":
+                raise
+    except Exception as exc:
+        temp_path.unlink(missing_ok=True)
+        img_path.unlink(missing_ok=True)
+        session["image_counter"] = max(0, session["image_counter"] - 1)
+        return _err(rid, 5027, f"clipboard image persistence failed: {type(exc).__name__}")
 
-    session.setdefault("attached_images", []).append(str(img_path))
+    attachment_owner, _ = _attachment_owner_keys(params)
+    image_count = _append_attached_image(session, str(img_path), attachment_owner)
     return _ok(
         rid,
         {
             "attached": True,
             "path": str(img_path),
-            "count": len(session["attached_images"]),
+            "count": image_count,
             **_image_meta(img_path),
         },
     )
@@ -400,13 +520,38 @@ def _(rid, params: dict) -> dict:
                 return _err(rid, 4016, f"image not found: {path_token}")
         if image_path.suffix.lower() not in _IMAGE_EXTENSIONS:
             return _err(rid, 4016, f"unsupported image: {image_path.name}")
-        session.setdefault("attached_images", []).append(str(image_path))
+        attachment_owner, _ = _attachment_owner_keys(params)
+        image_bytes = Path(image_path).read_bytes()
+        if len(image_bytes) > _ATTACH_BYTES_MAX_BYTES:
+            mb = _ATTACH_BYTES_MAX_BYTES // (1024 * 1024)
+            return _err(
+                rid,
+                4018,
+                f"image too large ({len(image_bytes)} bytes; cap is {mb} MB)",
+            )
+        stored_path = _queue_attached_image(
+            session,
+            image_bytes,
+            image_path.suffix.lower(),
+            prefix="attach",
+            attachment_owner=attachment_owner,
+        )
+        if attachment_owner:
+            image_count = len(
+                session.get("attached_images_by_owner", {}).get(attachment_owner, [])
+            )
+        else:
+            image_count = len(session.get("attached_images", []))
         return _ok(
             rid,
             {
                 "attached": True,
-                "path": str(image_path),
-                "count": len(session["attached_images"]),
+                # ``path`` is the canonical handle consumed by detach/submit.
+                # Keep the user-selected path only as display metadata: the
+                # queued attachment is an immutable private copy.
+                "path": str(stored_path),
+                "source_path": str(image_path),
+                "count": image_count,
                 "remainder": remainder,
                 "text": remainder or f"[User attached image: {image_path.name}]",
                 **_image_meta(image_path),
@@ -459,7 +604,14 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 4016, f"unsupported image extension: {ext}")
 
     try:
-        img_path = _queue_attached_image(session, img_bytes, ext, prefix="upload")
+        attachment_owner, _ = _attachment_owner_keys(params)
+        img_path = _queue_attached_image(
+            session,
+            img_bytes,
+            ext,
+            prefix="upload",
+            attachment_owner=attachment_owner,
+        )
     except Exception as e:
         return _err(rid, 5027, f"write failed: {e}")
 
@@ -658,14 +810,13 @@ def _(rid, params: dict) -> dict:
     raw = str(params.get("path", "") or "").strip()
     if not raw:
         return _err(rid, 4015, "path required")
-    images = session.setdefault("attached_images", [])
-    before = len(images)
-    session["attached_images"] = [path for path in images if path != raw]
+    attachment_owner, _ = _attachment_owner_keys(params)
+    detached, image_count = _detach_attached_image(session, raw, attachment_owner)
     return _ok(
         rid,
         {
-            "detached": len(session["attached_images"]) != before,
-            "count": len(session["attached_images"]),
+            "detached": detached,
+            "count": image_count,
         },
     )
 
@@ -686,7 +837,31 @@ def _(rid, params: dict) -> dict:
         drop_path = dropped["path"]
         remainder = dropped["remainder"]
         if dropped["is_image"]:
-            session.setdefault("attached_images", []).append(str(drop_path))
+            attachment_batch_id = _attachment_batch_id(params) or uuid.uuid4().hex
+            owned_params = dict(params)
+            owned_params["attachment_batch_id"] = attachment_batch_id
+            attachment_owner, _ = _attachment_owner_keys(owned_params)
+            image_bytes = Path(drop_path).read_bytes()
+            if len(image_bytes) > _ATTACH_BYTES_MAX_BYTES:
+                mb = _ATTACH_BYTES_MAX_BYTES // (1024 * 1024)
+                return _err(
+                    rid,
+                    4018,
+                    f"image too large ({len(image_bytes)} bytes; cap is {mb} MB)",
+                )
+            extension = Path(drop_path).suffix.lower()
+            if extension not in _allowed_image_extensions():
+                extension = _sniff_image_ext(image_bytes, Path(drop_path).name)
+            _queue_attached_image(
+                session,
+                image_bytes,
+                extension,
+                prefix="drop",
+                attachment_owner=attachment_owner,
+            )
+            image_count = len(
+                session.get("attached_images_by_owner", {}).get(attachment_owner, [])
+            )
             text = remainder or f"[User attached image: {drop_path.name}]"
             return _ok(
                 rid,
@@ -694,8 +869,9 @@ def _(rid, params: dict) -> dict:
                     "matched": True,
                     "is_image": True,
                     "path": str(drop_path),
-                    "count": len(session["attached_images"]),
+                    "count": image_count,
                     "text": text,
+                    "attachment_batch_id": attachment_batch_id,
                     **_image_meta(drop_path),
                 },
             )

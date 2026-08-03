@@ -29,7 +29,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Any, Optional, List, Tuple, Set
+from typing import Dict, Any, Optional, List, Tuple, Set, cast
 
 from hermes_cli.route_identity import normalize_route_base_url
 from hermes_cli.secret_prompt import masked_secret_prompt
@@ -233,6 +233,11 @@ def _reject_denylisted_env_var(key: str) -> None:
         )
 
 _LAST_EXPANDED_CONFIG_BY_PATH: Dict[str, Any] = {}
+# Last successfully normalized user/default layer, before the managed overlay.
+# Keeping this separately is critical when the user YAML becomes invalid: the
+# current managed policy must be reapplied to the user LKG rather than serving
+# an effective LKG that already contains an obsolete managed revision.
+_LAST_NORMALIZED_USER_CONFIG_BY_PATH: Dict[str, Dict[str, Any]] = {}
 # (path, mtime_ns, size) -> cached expanded config dict.
 # load_config() returns a deepcopy of the cached value when the file
 # hasn't changed since the last load, skipping yaml.safe_load +
@@ -240,12 +245,19 @@ _LAST_EXPANDED_CONFIG_BY_PATH: Dict[str, Any] = {}
 # save_config() + migrate_config() write via atomic_yaml_write which
 # produces a fresh inode, so stat() sees a new mtime_ns and the next
 # load repopulates automatically — no explicit invalidation hook.
-# Cached tuple is (user_mtime_ns, user_size, managed_mtime_ns, managed_size,
-# merged_value, env_ref_snapshot) — the managed-file signature is folded in so
-# editing the managed-scope config.yaml invalidates the cache (see
-# managed_scope), and the env snapshot invalidates it when a referenced ${VAR}
-# changes value (late .env load, in-process rotation — #58514).
-_LOAD_CONFIG_CACHE: Dict[str, Tuple[int, int, int, int, Dict[str, Any], Dict[str, Optional[str]]]] = {}
+# Each cache entry is (signature, merged_value, env_ref_snapshot), where
+# signature is (user_mtime_ns, user_size, managed_dev, managed_ino,
+# managed_mtime_ns, managed_ctime_ns, managed_size). The managed fields come
+# from the trusted descriptor-based loader; the environment snapshot invalidates
+# expansion when a referenced ${VAR} changes value.
+_LOAD_CONFIG_CACHE: Dict[
+    str,
+    Tuple[
+        Tuple[int, ...],
+        Dict[str, Any],
+        Dict[str, Optional[str]],
+    ],
+] = {}
 # (path, mtime_ns, size) -> cached raw yaml dict. Same pattern as
 # _LOAD_CONFIG_CACHE but for read_raw_config() — used when callers want
 # the user's on-disk values without defaults merged in.
@@ -3292,45 +3304,43 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
         except FileNotFoundError:
             user_sig = None
 
-        # Managed scope: fold the managed config file's (mtime, size) into the
-        # cache signature so editing /etc/hermes/config.yaml invalidates the
-        # cached merged result. (0, 0) means "no managed config file".
+        # Managed scope: obtain the policy inode signature via the same trusted
+        # openat/fstat path as the loader. A pathname stat here would bypass the
+        # stronger signature and symlink/TOCTOU protections in managed_scope.
         from hermes_cli import managed_scope
 
-        managed_dir = managed_scope.get_managed_dir()
-        managed_cfg_path = (managed_dir / "config.yaml") if managed_dir else None
-        try:
-            mst = managed_cfg_path.stat() if managed_cfg_path else None
-            managed_sig = (mst.st_mtime_ns, mst.st_size) if mst else (0, 0)
-        except OSError:
-            managed_sig = (0, 0)
+        empty_managed_sig = (0, 0, 0, 0, 0)
+        managed_sig = (
+            managed_scope.get_managed_config_revision() or empty_managed_sig
+        )
 
         # Combined cache signature: user file + managed file. None only when the
         # user config is absent AND no managed file exists (nothing to cache on).
         if user_sig is not None:
-            cache_sig: Optional[Tuple[int, int, int, int]] = (
-                user_sig[0],
-                user_sig[1],
-                managed_sig[0],
-                managed_sig[1],
-            )
-        elif managed_sig != (0, 0):
-            cache_sig = (0, 0, managed_sig[0], managed_sig[1])
+            cache_sig: Optional[Tuple[int, ...]] = (*user_sig, *managed_sig)
+        elif managed_sig != empty_managed_sig:
+            cache_sig = (0, 0, *managed_sig)
         else:
             cache_sig = None
 
         cached = _LOAD_CONFIG_CACHE.get(path_key)
-        if cached is not None and cache_sig is not None and cached[:4] == cache_sig:
+        if (
+            cached is not None
+            and cache_sig is not None
+            and cached[0] == cache_sig
+        ):
             # File signatures match, but the cached expansion is only valid if
             # every ${VAR} it was expanded against still has the same value.
             # Without this, a load_config() that ran before load_hermes_dotenv()
             # pins unexpanded literals (e.g. auxiliary.<task>.api_key) for the
             # life of the process (#58514).
-            env_snapshot = cached[5] if len(cached) > 5 else {}
+            env_snapshot = cached[2]
             if all(os.environ.get(k) == v for k, v in env_snapshot.items()):
-                return copy.deepcopy(cached[4]) if want_deepcopy else cached[4]
+                cached_value = cached[1]
+                return copy.deepcopy(cached_value) if want_deepcopy else cached_value
 
         config = copy.deepcopy(DEFAULT_CONFIG)
+        normalized: Optional[Dict[str, Any]] = None
 
         if user_sig is not None:
             try:
@@ -3358,35 +3368,29 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
                 # loaded config — keep serving it until the file is fixed.
                 # Fresh processes with no last-known-good keep the existing
                 # DEFAULT_CONFIG fallback.
-                lkg = _LAST_EXPANDED_CONFIG_BY_PATH.get(path_key)
+                lkg = _LAST_NORMALIZED_USER_CONFIG_BY_PATH.get(path_key)
                 _warn_config_parse_failure(
                     config_path,
                     e,
                     fallback="last-known-good" if lkg is not None else "defaults",
                 )
                 if lkg is not None:
-                    # save_config() stores the pre-expansion normalized dict
-                    # (env-ref templates preserved); the load path stores the
-                    # expanded one. Expand defensively — idempotent when the
-                    # stored value is already expanded.
+                    # Keep the normalized user/default layer and continue through
+                    # the regular managed merge below. Returning here would pin
+                    # the previous effective managed overlay under the new inode
+                    # revision, allowing an invalid user YAML to mask policy
+                    # updates indefinitely.
                     from typing import cast as _cast
-                    lkg_copy: Dict[str, Any] = _cast(
-                        Dict[str, Any], _expand_env_vars(copy.deepcopy(lkg))
+                    normalized = _cast(
+                        Dict[str, Any], copy.deepcopy(lkg)
                     )
-                    if cache_sig is not None:
-                        # Cache under the corrupt file's signature (empty env
-                        # snapshot: always valid) so repeated loads don't
-                        # re-parse the broken file; fixing the file changes the
-                        # signature and triggers a normal reload.
-                        _empty_env: Dict[str, Optional[str]] = {}
-                        _LOAD_CONFIG_CACHE[path_key] = (
-                            cache_sig[0], cache_sig[1],
-                            cache_sig[2], cache_sig[3],
-                            lkg_copy, _empty_env,
-                        )
-                    return copy.deepcopy(lkg_copy) if want_deepcopy else lkg_copy
+                    config = normalized
 
-        normalized = _normalize_root_model_keys(_normalize_max_turns_config(config))
+        if normalized is None:
+            normalized = _normalize_root_model_keys(
+                _normalize_max_turns_config(config)
+            )
+            _LAST_NORMALIZED_USER_CONFIG_BY_PATH[path_key] = copy.deepcopy(normalized)
         expanded = _expand_env_vars(normalized)
         # Managed scope wins at the leaf. Applied AFTER user expansion so a user
         # ${VAR} cannot shadow a managed literal: managed values are expanded only
@@ -3402,16 +3406,16 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
             # Cache stores a separate deepcopy so subsequent ``load_config()``
             # (deepcopy=True) callers can mutate freely without affecting the
             # cached value, and ``load_config_readonly()`` (deepcopy=False)
-            # callers all see the same stable cached object. The cached tuple is
-            # (user_mtime, user_size, managed_mtime, managed_size, value,
-            # env_ref_snapshot). The snapshot records the environment values
+            # callers all see the same stable cached object. The signature nests
+            # user metadata plus the five-field managed inode revision. The
+            # snapshot records the environment values
             # this expansion was made against so later loads can detect env
             # drift (late .env load, in-process rotation) — see cache hit above.
-            cached_copy = copy.deepcopy(expanded)
+            cached_copy = cast(Dict[str, Any], copy.deepcopy(expanded))
             env_snapshot = _env_ref_snapshot(normalized)
             if managed_config:
                 _env_ref_snapshot(managed_config, env_snapshot)
-            _LOAD_CONFIG_CACHE[path_key] = (*cache_sig, cached_copy, env_snapshot)
+            _LOAD_CONFIG_CACHE[path_key] = (cache_sig, cached_copy, env_snapshot)
             # On the readonly path return the same cached object subsequent
             # calls will see — keeps "two readonly calls return the same
             # object" invariant that callers may rely on for identity checks.
@@ -3574,6 +3578,12 @@ def save_config(
                 _LAST_EXPANDED_CONFIG_BY_PATH.get(str(config_path)),
             )
 
+        # Keep the complete user/default layer before stripping schema defaults
+        # for disk. This is the loader's in-process fallback if a later edit is
+        # temporarily malformed, so it must retain both defaults and ${VAR}
+        # templates for expansion against the environment at fallback time.
+        normalized_user_lkg = cast(Dict[str, Any], copy.deepcopy(normalized))
+
         # Strip schema-default values so the user's custom settings are not
         # silently reset on every save.  Keys the user explicitly set (paths
         # from the raw pre-normalisation config) are always preserved.
@@ -3616,6 +3626,9 @@ def save_config(
         _secure_file(config_path)
         _RAW_CONFIG_CACHE.pop(str(config_path), None)
         _LAST_EXPANDED_CONFIG_BY_PATH[str(config_path)] = copy.deepcopy(current_normalized)
+        _LAST_NORMALIZED_USER_CONFIG_BY_PATH[str(config_path)] = copy.deepcopy(
+            normalized_user_lkg
+        )
 
 
 def _parse_env_value(raw_value: str) -> str:

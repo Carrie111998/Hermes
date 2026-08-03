@@ -41,6 +41,35 @@ def test_resolve_max_concurrent_sessions_values(caplog):
 
 
 
+def test_active_session_hard_exit_is_reclaimed(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    repo_root = Path(__file__).resolve().parents[2]
+    env = os.environ.copy()
+    env["HERMES_HOME"] = str(home)
+    env["PYTHONPATH"] = str(repo_root) + os.pathsep + env.get("PYTHONPATH", "")
+    child = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import os\n"
+                "from hermes_cli.active_sessions import try_acquire_active_session\n"
+                "lease, message = try_acquire_active_session("
+                "session_id='crash-session', surface='cli', "
+                "config={'max_concurrent_sessions': 1})\n"
+                "assert message is None, message\n"
+                "print(os.getpid(), flush=True)\n"
+                "os._exit(0)\n"
+            ),
+        ],
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=10,
+        check=True,
+    )
+    child_pid = int(child.stdout.strip())
 
 
 
@@ -57,7 +86,7 @@ def test_cross_process_acquire_claims_only_one_last_slot(tmp_path, monkeypatch):
     go_file = tmp_path / "go"
     env = os.environ.copy()
     env["HERMES_HOME"] = str(home)
-    env["PYTHONPATH"] = str(repo_root)
+    env["PYTHONPATH"] = str(repo_root) + os.pathsep + env.get("PYTHONPATH", "")
     script = (
         "import os, time\n"
         "from pathlib import Path\n"

@@ -88,15 +88,11 @@ from agent.skill_utils import (
 
 logger = logging.getLogger(__name__)
 
-# Per-session skill discovery cache.  _find_all_skills() re-reads every
-# SKILL.md on every call; with hundreds of skills this is wasteful.
-# Cache validation (mirrors hermes_cli/profiles.py::_count_skills, d5eee133e):
-#   - signature = per-dir max mtime of the dir AND its immediate children
-#     (one scandir per dir; catches skill add/remove inside categories,
-#     which does NOT bump the root dir's mtime), plus the disabled-set
-#     (config-driven — changes with no filesystem mtime bump at all)
-#   - a short TTL bounds staleness from in-place SKILL.md edits, which
-#     bump only the file's mtime, invisible to any directory signature.
+# Per-session skill discovery cache. _find_all_skills() parses every SKILL.md
+# on a miss; with hundreds of skills this is wasteful. Cache validation walks
+# the same recursive, symlink-aware index topology but does not open or parse
+# skill contents. The disabled set and effective platform are also part of the
+# signature. A short TTL bounds staleness from in-place SKILL.md edits.
 # skip_disabled True/False are cached separately.
 _SKILLS_CACHE: dict = {}          # {cache_key: (signature, timestamp, skills_list)}
 _SKILLS_CACHE_TTL_SECONDS = 30.0
@@ -105,35 +101,30 @@ _SKILLS_CACHE_KEY_FILTERED = "filtered"
 
 
 def _skills_scan_signature(dirs_to_scan, disabled) -> tuple:
-    """Cheap change-signature for the skill scan inputs.
+    """Change-signature for the exact skill-index topology.
 
-    O(#dirs + #categories) stat calls, not a recursive walk. Includes the
-    platform the scan's ``skill_matches_platform`` filter will use (read
-    from ``agent.skill_utils``'s ``sys`` so test patches of that module
-    are honored) — the scan result is platform-dependent.
+    Reuse the recursive, symlink-aware scanner so cache validation cannot
+    disagree with discovery about accepted depth or category symlinks. This
+    walks directory names but does not open/parse SKILL.md contents; the TTL
+    still bounds staleness for in-place edits.
     """
     from agent import skill_utils as _skill_utils
 
     platform = getattr(getattr(_skill_utils, "sys", None), "platform", "")
     sig = []
-    for d in dirs_to_scan:
+    for directory in dirs_to_scan:
+        root = Path(directory)
+        skill_paths = []
         try:
-            m = d.stat().st_mtime
-        except OSError:
-            continue
-        try:
-            with os.scandir(d) as it:
-                for entry in it:
-                    try:
-                        if entry.is_dir(follow_symlinks=False):
-                            em = entry.stat(follow_symlinks=False).st_mtime
-                            if em > m:
-                                m = em
-                    except OSError:
-                        continue
+            for skill_file in _skill_utils.iter_skill_index_files(root, "SKILL.md"):
+                try:
+                    logical_path = skill_file.relative_to(root).as_posix()
+                except ValueError:
+                    logical_path = str(skill_file)
+                skill_paths.append(logical_path)
         except OSError:
             pass
-        sig.append((str(d), m))
+        sig.append((str(root), tuple(sorted(set(skill_paths)))))
     return (tuple(sig), frozenset(disabled), platform)
 
 

@@ -4,8 +4,30 @@ import json
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from threading import Thread
 from unittest.mock import patch, MagicMock
+import urllib.request
+
+import pytest
 
 from providers.base import ProviderProfile
+
+
+class _NoProxyHandler(urllib.request.ProxyHandler):
+    """Explicit no-op proxy policy that survives opener reconstruction."""
+
+    def __init__(self):
+        super().__init__({})
+
+    def http_open(self, _request):
+        return None
+
+    https_open = http_open
+
+
+@pytest.fixture(autouse=True)
+def _disable_environment_proxies_for_loopback(monkeypatch):
+    """Keep local HTTP fixtures independent of corporate proxy env."""
+    opener = urllib.request.build_opener(_NoProxyHandler())
+    monkeypatch.setattr(urllib.request, "_opener", opener)
 
 
 class _FakeModelHandler(BaseHTTPRequestHandler):
@@ -134,7 +156,9 @@ class TestFetchModelsRedirectCredentialStripping:
 
     def test_cross_host_redirect_strips_credentials(self):
         result, headers = self._run(
-            lambda port, _: f"http://localhost:{port}/redirected"
+            # Distinct URL host, same deterministic IPv4 loopback endpoint.
+            # ``localhost`` may resolve only to ::1 on minimal Linux hosts.
+            lambda port, _: f"http://127.1:{port}/redirected"
         )
         assert result == ["redirected-model"]  # fetch itself still works
         assert "authorization" not in headers

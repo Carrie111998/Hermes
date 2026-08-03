@@ -189,24 +189,33 @@ def _fake_popen_capture(captured):
     return _fake
 
 
-def test_run_prompt_preserves_real_home_when_profile_home_available(monkeypatch, tmp_path):
+@pytest.mark.parametrize(
+    ("mode", "container", "expected_target"),
+    [
+        ("real", True, "real"),
+        ("profile", False, "profile"),
+        ("auto", False, "real"),
+        ("auto", True, "profile"),
+    ],
+)
+def test_run_prompt_home_modes_are_explicit_and_hermetic(
+    monkeypatch,
+    tmp_path,
+    mode,
+    container,
+    expected_target,
+):
     hermes_home = tmp_path / "hermes"
-    (hermes_home / "home").mkdir(parents=True)
+    profile_home = hermes_home / "home"
+    profile_home.mkdir(parents=True)
     real_home = tmp_path / "real-home"
     real_home.mkdir()
 
     monkeypatch.setenv("HOME", str(real_home))
+    monkeypatch.setenv("HERMES_REAL_HOME", str(real_home))
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
-    # Hermeticity: an ambient HERMES_REAL_HOME (exported by Hermes' own
-    # terminal contract on dev boxes) outranks HOME in the candidate ladder,
-    # and an ambient TERMINAL_HOME_MODE would change the policy under test.
-    monkeypatch.delenv("HERMES_REAL_HOME", raising=False)
-    monkeypatch.delenv("TERMINAL_HOME_MODE", raising=False)
-    # Hermeticity: get_subprocess_home()'s auto mode prefers the profile home
-    # when is_container() is True — on a containerized CI runner that real
-    # probe flips the resolution this test asserts. The host/VM branch is the
-    # contract under test; pin containment off.
-    monkeypatch.setattr("hermes_constants.is_container", lambda: False)
+    monkeypatch.setenv("TERMINAL_HOME_MODE", mode)
+    monkeypatch.setattr("hermes_constants.is_container", lambda: container)
 
     captured = {}
     client = _make_home_client(tmp_path)
@@ -215,13 +224,32 @@ def test_run_prompt_preserves_real_home_when_profile_home_available(monkeypatch,
         with pytest.raises(RuntimeError, match="Could not start Copilot ACP command"):
             client._run_prompt("hello", timeout_seconds=1)
 
-    assert captured["kwargs"]["env"]["HOME"] == str(real_home)
+    expected_home = real_home if expected_target == "real" else profile_home
+    assert captured["kwargs"]["env"]["HOME"] == str(expected_home)
+    assert expected_home.is_dir()
     assert captured["kwargs"]["env"]["HERMES_REAL_HOME"] == str(real_home)
 
 
 def test_run_prompt_passes_home_when_parent_env_is_clean(monkeypatch, tmp_path):
+    real_home = tmp_path / "real-home"
+    real_home.mkdir()
     monkeypatch.delenv("HOME", raising=False)
     monkeypatch.delenv("HERMES_HOME", raising=False)
+    monkeypatch.delenv("HERMES_REAL_HOME", raising=False)
+    monkeypatch.delenv("TERMINAL_HOME_MODE", raising=False)
+    monkeypatch.setattr(
+        "tools.environments.local._inject_context_hermes_home",
+        lambda _env: None,
+    )
+    monkeypatch.setattr("hermes_constants.get_hermes_home_override", lambda: None)
+    monkeypatch.setattr(
+        "hermes_constants._iter_real_home_candidates",
+        lambda _env=None: [str(real_home)],
+    )
+    monkeypatch.setattr(
+        "agent.copilot_acp_client.os.path.expanduser",
+        lambda _value: str(real_home),
+    )
 
     captured = {}
     client = _make_home_client(tmp_path)
@@ -231,4 +259,5 @@ def test_run_prompt_passes_home_when_parent_env_is_clean(monkeypatch, tmp_path):
             client._run_prompt("hello", timeout_seconds=1)
 
     assert "env" in captured["kwargs"]
-    assert captured["kwargs"]["env"]["HOME"]
+    assert captured["kwargs"]["env"]["HOME"] == str(real_home)
+    assert captured["kwargs"]["env"]["HERMES_REAL_HOME"] == str(real_home)

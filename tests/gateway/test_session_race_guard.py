@@ -9,6 +9,7 @@ duplicate agent.
 """
 
 import asyncio
+import threading
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -37,7 +38,7 @@ class _FakeAdapter:
             event.set()
 
 
-def _make_runner():
+def _make_runner(profile_home=None):
     runner = object.__new__(GatewayRunner)
     runner.config = GatewayConfig(
         platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")}
@@ -47,6 +48,13 @@ def _make_runner():
     runner._running_agents_ts = {}
     runner._session_run_generation = {}
     runner._pending_messages = {}
+    runner._queued_events = {}
+    runner._busy_queue_lock = threading.RLock()
+    runner._busy_queue_uncertain_sessions = set()
+    runner._busy_queue_uncertain_digests = set()
+    runner._busy_queue_persist_ready = MagicMock(return_value=None)
+    if profile_home is not None:
+        runner._busy_queue_profile_home = lambda source: profile_home
     runner._pending_approvals = {}
     runner._voice_mode = {}
     runner._background_tasks = set()
@@ -103,6 +111,246 @@ async def test_sentinel_placed_before_agent_setup():
     )
 
 
+@pytest.mark.asyncio
+async def test_durable_replay_claim_context_reaches_turn_owner():
+    runner = _make_runner()
+    event = _make_event(text="durable replay")
+    session_key = build_session_key(event.source)
+    claim_context = (session_key, event.source, "claim-token-1")
+    setattr(event, "_hermes_busy_queue_claim_context", claim_context)
+    observed = None
+
+    async def mock_inner(
+        self_inner,
+        ev,
+        src,
+        qk,
+        generation,
+        *,
+        busy_queue_claim=None,
+        busy_queue_claim_guard=None,
+    ):
+        del self_inner, ev, src, qk, generation
+        nonlocal observed
+        observed = busy_queue_claim
+        assert busy_queue_claim_guard is not None
+        busy_queue_claim_guard["handed_off"] = True
+        return "ok"
+
+    with patch.object(GatewayRunner, "_handle_message_with_agent", mock_inner):
+        await runner._handle_message(event)
+
+    assert observed == claim_context
+
+
+@pytest.mark.asyncio
+async def test_pre_turn_session_store_failure_does_not_publish_claim_handoff(
+    monkeypatch,
+):
+    runner = _make_runner()
+    event = _make_event(text="pre-turn failure")
+    session_key = build_session_key(event.source)
+    claim_context = (session_key, event.source, "claim-pre-turn")
+    guard = {"handed_off": False}
+    monkeypatch.setattr(
+        runner, "_recover_telegram_topic_thread_id", lambda source: None
+    )
+    monkeypatch.setattr(
+        runner.session_store,
+        "get_or_create_session",
+        MagicMock(side_effect=RuntimeError("pre-turn session-store failure")),
+    )
+
+    with pytest.raises(RuntimeError, match="pre-turn session-store failure"):
+        await runner._handle_message_with_agent(
+            event,
+            event.source,
+            session_key,
+            1,
+            busy_queue_claim=claim_context,
+            busy_queue_claim_guard=guard,
+        )
+
+    assert guard == {"handed_off": False}
+
+
+@pytest.mark.asyncio
+async def test_pre_turn_session_store_failure_rolls_back_durable_claim(
+    monkeypatch,
+):
+    runner = _make_runner()
+    event = _make_event(text="pre-turn rollback")
+    claim_context = (
+        build_session_key(event.source),
+        event.source,
+        "claim-pre-turn-rollback",
+    )
+    setattr(event, "_hermes_busy_queue_claim_context", claim_context)
+    monkeypatch.setattr(
+        runner, "_recover_telegram_topic_thread_id", lambda source: None
+    )
+    monkeypatch.setattr(
+        runner.session_store,
+        "get_or_create_session",
+        MagicMock(side_effect=RuntimeError("pre-turn session-store failure")),
+    )
+    rollback = MagicMock(return_value=True)
+    monkeypatch.setattr(runner, "_busy_queue_rollback_claim", rollback)
+
+    with pytest.raises(RuntimeError, match="pre-turn session-store failure"):
+        await runner._handle_message(event)
+
+    rollback.assert_called_once_with(
+        *claim_context,
+        runner.adapters[Platform.TELEGRAM],
+    )
+
+
+@pytest.mark.asyncio
+async def test_agent_start_failure_rolls_back_claim_instead_of_discard(
+    monkeypatch,
+):
+    runner = _make_runner()
+    event = _make_event(text="agent-start failure")
+    claim_context = (
+        build_session_key(event.source),
+        event.source,
+        "claim-agent-start-failure",
+    )
+    setattr(event, "_hermes_busy_queue_claim_context", claim_context)
+
+    session_entry = MagicMock()
+    session_entry.session_id = "session-agent-start-failure"
+    session_entry.message_count = 0
+    monkeypatch.setattr(
+        runner.session_store,
+        "get_or_create_session",
+        MagicMock(return_value=session_entry),
+    )
+    monkeypatch.setattr(
+        runner.session_store,
+        "load_transcript",
+        MagicMock(return_value=[]),
+    )
+
+    async def fail_agent_start(event_name, _context):
+        if event_name == "agent:start":
+            raise RuntimeError("agent-start preparation failed")
+
+    monkeypatch.setattr(
+        runner.hooks,
+        "emit",
+        AsyncMock(side_effect=fail_agent_start),
+    )
+    rollback = MagicMock(return_value=True)
+    finalize = MagicMock(return_value=True)
+    monkeypatch.setattr(runner, "_busy_queue_rollback_claim", rollback)
+    monkeypatch.setattr(runner, "_busy_queue_finalize_claim", finalize)
+
+    with pytest.raises(RuntimeError, match="agent-start preparation failed"):
+        await runner._handle_message(event)
+
+    rollback.assert_called_once_with(
+        *claim_context,
+        runner.adapters[Platform.TELEGRAM],
+    )
+    finalize.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_claim_handoff_publishes_at_terminal_turn_boundary(monkeypatch):
+    runner = _make_runner()
+    event = _make_event(text="terminal boundary")
+    session_key = build_session_key(event.source)
+    claim_context = (session_key, event.source, "claim-boundary")
+    guard = {"handed_off": False}
+    result = {"completed": True, "failed": False, "partial": False}
+    inner = AsyncMock(return_value=result)
+    monkeypatch.setattr(runner, "_run_agent_inner", inner)
+
+    observed = await runner._run_agent(
+        event.text,
+        "context",
+        [],
+        event.source,
+        "session-id",
+        session_key=session_key,
+        busy_queue_claim=claim_context,
+        busy_queue_claim_guard=guard,
+    )
+
+    assert observed == result
+    assert guard == {"handed_off": True}
+    inner.assert_awaited_once()
+    await_args = inner.await_args
+    assert await_args is not None
+    assert await_args.kwargs["busy_queue_claim"] == claim_context
+
+
+@pytest.mark.asyncio
+async def test_durable_claim_normal_early_return_commits_terminal(monkeypatch):
+    runner = _make_runner()
+    event = _make_event(text="plugin-handled")
+    claim_context = (build_session_key(event.source), event.source, "claim-normal")
+    setattr(event, "_hermes_busy_queue_claim_context", claim_context)
+    finalize = MagicMock(return_value=True)
+
+    async def early_return(_event, _context, _guard):
+        return None
+
+    monkeypatch.setattr(runner, "_handle_message_impl", early_return)
+    monkeypatch.setattr(runner, "_busy_queue_finalize_claim", finalize)
+
+    assert await runner._handle_message(event) is None
+    finalize.assert_called_once_with(
+        *claim_context,
+        runner._busy_queue_terminal_discard_result(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_durable_claim_exception_before_handoff_rolls_back(monkeypatch):
+    runner = _make_runner()
+    event = _make_event(text="prehook failure")
+    claim_context = (build_session_key(event.source), event.source, "claim-error")
+    setattr(event, "_hermes_busy_queue_claim_context", claim_context)
+    adapter = object()
+    rollback = MagicMock(return_value=True)
+
+    async def fail_before_handoff(_event, _context, _guard):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(runner, "_handle_message_impl", fail_before_handoff)
+    monkeypatch.setattr(runner, "_adapter_for_source", lambda _source: adapter)
+    monkeypatch.setattr(runner, "_busy_queue_rollback_claim", rollback)
+
+    with pytest.raises(RuntimeError, match="boom"):
+        await runner._handle_message(event)
+    rollback.assert_called_once_with(*claim_context, adapter)
+
+
+@pytest.mark.asyncio
+async def test_durable_claim_handoff_leaves_finalization_to_turn_owner(monkeypatch):
+    runner = _make_runner()
+    event = _make_event(text="turn-owned")
+    claim_context = (build_session_key(event.source), event.source, "claim-turn")
+    setattr(event, "_hermes_busy_queue_claim_context", claim_context)
+    finalize = MagicMock(return_value=True)
+    rollback = MagicMock(return_value=True)
+
+    async def handoff(_event, _context, guard):
+        guard["handed_off"] = True
+        return "started"
+
+    monkeypatch.setattr(runner, "_handle_message_impl", handoff)
+    monkeypatch.setattr(runner, "_busy_queue_finalize_claim", finalize)
+    monkeypatch.setattr(runner, "_busy_queue_rollback_claim", rollback)
+
+    assert await runner._handle_message(event) == "started"
+    finalize.assert_not_called()
+    rollback.assert_not_called()
+
+
 # ------------------------------------------------------------------
 # Test 2: Sentinel is cleaned up after _handle_message_with_agent
 # ------------------------------------------------------------------
@@ -116,6 +364,50 @@ async def test_sentinel_placed_before_agent_setup():
 # ------------------------------------------------------------------
 # Test 4: Second message during sentinel sees "already running"
 # ------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_second_message_during_sentinel_queued_not_duplicate(tmp_path):
+    """While the sentinel is set (agent setup in progress), a second
+    message for the same session must hit the 'already running' branch
+    and be queued — not start a second agent."""
+    runner = _make_runner(tmp_path)
+    event1 = _make_event(text="first message")
+    event2 = _make_event(text="second message")
+    session_key = build_session_key(event1.source)
+
+    barrier = asyncio.Event()
+
+    async def slow_inner(self_inner, ev, src, qk, generation):
+        # Simulate slow setup — wait until test tells us to proceed
+        await barrier.wait()
+        return "ok"
+
+    with patch.object(GatewayRunner, "_handle_message_with_agent", slow_inner):
+        # Start first message (will block at barrier)
+        task1 = asyncio.create_task(runner._handle_message(event1))
+        # Yield until task1 has claimed the sentinel (it crosses a few awaits
+        # before the claim; don't assume a fixed number of scheduler slices).
+        for _ in range(50):
+            await asyncio.sleep(0)
+            if runner._running_agents.get(session_key) is _AGENT_PENDING_SENTINEL:
+                break
+
+        # Verify sentinel is set
+        assert runner._running_agents.get(session_key) is _AGENT_PENDING_SENTINEL
+
+        # Second message should see "already running" and be queued
+        result2 = await runner._handle_message(event2)
+        assert result2 is None, "Second message should return None (queued)"
+
+        # The second message should have been queued in adapter pending
+        adapter = runner.adapters[Platform.TELEGRAM]
+        assert session_key in adapter._pending_messages, (
+            "Second message should be queued as pending"
+        )
+        assert adapter._pending_messages[session_key] is event2
+
+        # Let first message complete
+        barrier.set()
+        await task1
 
 
 def test_merge_pending_message_event_merges_text_and_photo_followups():
@@ -151,9 +443,62 @@ def test_merge_pending_message_event_merges_text_and_photo_followups():
     assert merged.media_types == ["image/png"]
 
 
+def test_merge_pending_message_event_promotes_document_followups_over_text():
+    pending = {}
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="12345",
+        chat_type="dm",
+        user_id="u1",
+    )
+    session_key = build_session_key(source)
+
+    text_event = MessageEvent(
+        text="please review this",
+        message_type=MessageType.TEXT,
+        source=source,
+    )
+    document_event = MessageEvent(
+        text="",
+        message_type=MessageType.DOCUMENT,
+        source=source,
+        media_urls=["/tmp/report.pdf"],
+        media_types=["application/pdf"],
+    )
+
+    merge_pending_message_event(pending, session_key, text_event, merge_text=True)
+    merge_pending_message_event(pending, session_key, document_event, merge_text=True)
+
+    merged = pending[session_key]
+    assert merged.message_type == MessageType.DOCUMENT
+    assert merged.text == "please review this"
+    assert merged.media_urls == ["/tmp/report.pdf"]
+    assert merged.media_types == ["application/pdf"]
+
+
 @pytest.mark.asyncio
-async def test_recent_telegram_followups_append_in_pending_queue():
-    runner = _make_runner()
+async def test_recent_telegram_text_followup_is_queued_without_interrupt(tmp_path):
+    runner = _make_runner(tmp_path)
+    event = _make_event(text="follow-up")
+    session_key = build_session_key(event.source)
+
+    fake_agent = MagicMock()
+    fake_agent.get_activity_summary.return_value = {"seconds_since_activity": 0}
+    runner._running_agents[session_key] = fake_agent
+    import time as _time
+    runner._running_agents_ts[session_key] = _time.time()
+
+    result = await runner._handle_message(event)
+
+    assert result is None
+    fake_agent.interrupt.assert_not_called()
+    adapter = runner.adapters[Platform.TELEGRAM]
+    assert adapter._pending_messages[session_key].text == "follow-up"
+
+
+@pytest.mark.asyncio
+async def test_recent_telegram_followups_preserve_bounded_fifo_order(tmp_path):
+    runner = _make_runner(tmp_path)
     first = _make_event(text="part one")
     second = _make_event(text="part two")
     session_key = build_session_key(first.source)
@@ -169,7 +514,8 @@ async def test_recent_telegram_followups_append_in_pending_queue():
 
     fake_agent.interrupt.assert_not_called()
     adapter = runner.adapters[Platform.TELEGRAM]
-    assert adapter._pending_messages[session_key].text == "part one\npart two"
+    assert adapter._pending_messages[session_key].text == "part one"
+    assert [event.text for event in runner._queued_events[session_key]] == ["part two"]
 
 
 # ------------------------------------------------------------------

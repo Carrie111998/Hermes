@@ -32,7 +32,7 @@ def make_spawn_fn(home: str):
             **os.environ,
             "HERMES_HOME": home,
             "HOME": home,
-            "PYTHONPATH": WT,
+            "PYTHONPATH": WT + os.pathsep + os.environ.get("PYTHONPATH", ""),
             "HERMES_KANBAN_TASK": task.id,
             "HERMES_KANBAN_WORKSPACE": workspace,
             "PATH": f"{os.path.dirname(PY)}:{os.environ.get('PATH','')}",

@@ -29,6 +29,7 @@ import re
 import threading
 import time
 from datetime import datetime
+from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -42,6 +43,15 @@ from agent.turn_context import drop_stale_api_content
 from utils import base_url_host_matches, base_url_hostname, env_var_enabled, atomic_json_write
 
 logger = logging.getLogger(__name__)
+
+
+class SmartCliDurableDisposition(Enum):
+    """Closed outcomes for durable receipt transitions and callbacks."""
+
+    COMMITTED_CURRENT = "committed_current"
+    STALE = "stale"
+    BLOCKED_BY_PREDECESSOR = "blocked_by_predecessor"
+    IO_ERROR = "io_error"
 
 
 # Max consecutive successful credential-pool token refreshes of the SAME entry
@@ -3845,12 +3855,11 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
     """
     if num_tool_msgs <= 0 or not messages:
         return
-    steer_text = agent._drain_pending_steer()
-    if not steer_text:
-        return
     # Find the last tool-role message in the recent tail. Skipping
     # non-tool messages defends against future code appending
-    # something else at the boundary.
+    # something else at the boundary. Locate the target before taking
+    # ownership of the steer envelope so a skipped/cancelled tool batch never
+    # needs to restore text separately from its durable receipt callbacks.
     target_idx = None
     for j in range(len(messages) - 1, max(len(messages) - num_tool_msgs - 1, -1), -1):
         msg = messages[j]
@@ -3858,40 +3867,14 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
             target_idx = j
             break
     if target_idx is None:
-        # No tool result in this batch (e.g. all skipped by interrupt);
-        # put the steer back so the caller's fallback path can deliver
-        # it as a normal next-turn user message.
-        _lock = getattr(agent, "_pending_steer_lock", None)
-        if _lock is not None:
-            with _lock:
-                if agent._pending_steer:
-                    agent._pending_steer = agent._pending_steer + "\n" + steer_text
-                else:
-                    agent._pending_steer = steer_text
-        else:
-            existing = getattr(agent, "_pending_steer", None)
-            agent._pending_steer = (existing + "\n" + steer_text) if existing else steer_text
         return
-    marker = format_steer_marker(steer_text)
-    existing_content = messages[target_idx].get("content", "")
-    if not isinstance(existing_content, str):
-        # Anthropic multimodal content blocks — preserve them and append
-        # a text block at the end.
-        try:
-            blocks = list(existing_content) if existing_content else []
-            blocks.append({"type": "text", "text": marker.lstrip()})
-            messages[target_idx]["content"] = blocks
-        except Exception:
-            # Fall back to string replacement if content shape is unexpected.
-            messages[target_idx]["content"] = f"{existing_content}{marker}"
-    else:
-        messages[target_idx]["content"] = existing_content + marker
-    _ra().logger.info(
-        "Delivered /steer to agent after tool batch (%d chars): %s",
-        len(steer_text),
-        steer_text[:120] + ("..." if len(steer_text) > 120 else ""),
+    steer_chars = agent._inject_pending_steer_into_tool_message(messages[target_idx])
+    if not steer_chars:
+        return
+    logger.info(
+        "Delivered /steer to agent after tool batch steer_chars=%d",
+        steer_chars,
     )
-
 
 
 def force_close_tcp_sockets(client: Any) -> int:

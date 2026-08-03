@@ -2375,6 +2375,7 @@ def run_conversation(
                             is_github_responses=agent._is_copilot_url(),
                             sanitize_harmony_tokens=agent._is_codex_backend(),
                         )
+                    agent._mark_injected_steer_receipts_requested(next_api_kwargs)
                     if _use_streaming:
                         return agent._interruptible_streaming_api_call(
                             next_api_kwargs, on_first_delta=_stop_spinner
@@ -7173,8 +7174,11 @@ def run_conversation(
                 else:
                     _turn_exit_reason = f"error_near_max_iterations({error_msg[:80]})"
                     final_response = f"I apologize, but I encountered repeated errors: {error_msg}"
-                # Append as assistant so the history stays valid for
-                # session resume (avoids consecutive user messages).
+                # A synthetic apology is user-visible recovery text, not a
+                # successfully committed model turn.  Mark the terminal state
+                # explicitly so legacy ``completed`` consumers cannot promote
+                # this error path to success merely because a string exists.
+                failed = True
                 messages.append({"role": "assistant", "content": final_response})
                 break
     

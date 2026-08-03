@@ -32,7 +32,15 @@ def _run_gateway_import(hermes_home: Path, initial_env: dict[str, str]) -> dict[
     script = textwrap.dedent(
         f"""
         import os, sys
+        from pathlib import Path
         sys.path.insert(0, {str(PROJECT_ROOT)!r})
+
+        # Isolate this bridge test at the managed-scope module seam. Do not use
+        # HERMES_MANAGED_DIR to bypass a real system policy in production code.
+        from hermes_cli import managed_scope
+        managed_scope._DEFAULT_MANAGED_DIR = Path(
+            {str(hermes_home / "managed-test-absent")!r}
+        )
 
         try:
             from gateway import run  # noqa: F401  — module import triggers bridge
@@ -57,6 +65,7 @@ def _run_gateway_import(hermes_home: Path, initial_env: dict[str, str]) -> dict[
     )
     env = dict(initial_env)
     env["HERMES_HOME"] = str(hermes_home)
+    env.pop("HERMES_MANAGED_DIR", None)
     # Keep PATH / PYTHONPATH so venv imports resolve.
     for k in ("PATH", "PYTHONPATH", "VIRTUAL_ENV", "HOME"):
         if k in os.environ and k not in env:

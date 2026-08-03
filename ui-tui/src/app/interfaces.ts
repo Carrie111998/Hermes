@@ -49,7 +49,7 @@ export interface BatteryInfo {
   plugged: null | boolean
 }
 
-export type BusyInputMode = 'interrupt' | 'queue' | 'steer'
+export type BusyInputMode = 'interrupt' | 'queue' | 'smart' | 'steer'
 
 export type NoticeLevel = 'error' | 'info' | 'success' | 'warn'
 

@@ -1090,18 +1090,16 @@ class RecallGuardMiddleware(InboundMiddleware):
     @classmethod
     def _interrupt_for_recall(cls, adapter, session_key: str, recalled_id: str,
                               group_code: str, from_account: str) -> None:
-        where = f"group {group_code}" if group_code else f"direct chat with {from_account}"
         recall_text = (
-            f"[CRITICAL — MESSAGE RECALLED] The user message that triggered "
-            f"your current task (message_id=\"{recalled_id}\") in {where} has "
-            f"been recalled/withdrawn by the sender. "
-            f"IGNORE any prior system note asking you to finish processing "
-            f"tool results — the original request is void. "
-            f"Do NOT continue the task, do NOT call more tools, do NOT "
-            f"reference the recalled content. "
-            f"Reply only with a brief acknowledgment such as "
-            f"\"The message has been recalled.\" in the "
-            f"language the user was using."
+            "[CRITICAL — MESSAGE RECALLED] The user message that triggered "
+            "your current task has been recalled/withdrawn by the sender. "
+            "IGNORE any prior system note asking you to finish processing "
+            "tool results — the original request is void. "
+            "Do NOT continue the task, do NOT call more tools, do NOT "
+            "reference the recalled content. "
+            "Reply only with a brief acknowledgment such as "
+            "\"The message has been recalled.\" in the "
+            "language the user was using."
         )
 
         synth_event = MessageEvent(
@@ -1110,14 +1108,21 @@ class RecallGuardMiddleware(InboundMiddleware):
             source=cls._build_source(adapter, group_code, from_account),
             internal=True,
         )
-        # Set pending + signal directly (bypass handle_message to avoid busy-ack).
-        # May overwrite a user message pending in the same ~200ms window — acceptable.
-        adapter._pending_messages[session_key] = synth_event
-        active_event = adapter._active_sessions.get(session_key)
-        if active_event is not None:
-            active_event.set()
-
-        logger.info("[%s] Recall interrupt: msg_id=%s session=%s", adapter.name, recalled_id, session_key[:30])
+        runner = getattr(adapter, "gateway_runner", None)
+        admit_interrupting = getattr(runner, "_admit_interrupting_event", None)
+        if not callable(admit_interrupting):
+            logger.error(
+                "[%s] Recall event rejected: durable interrupt admission is unavailable",
+                adapter.name,
+            )
+        elif admit_interrupting(
+            session_key,
+            synth_event,
+            control_interrupt_reason="Current message was recalled",
+        ):
+            logger.info("[%s] Recall interrupt durably admitted", adapter.name)
+        else:
+            logger.error("[%s] Recall interrupt durable admission failed closed", adapter.name)
 
         # The interrupted turn will persist the recalled content *after* our
         # interrupt — schedule a delayed redaction to clean it up.

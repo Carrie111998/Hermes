@@ -85,6 +85,9 @@ class _FakeAgent:
         self._stream_context_scrubber = None
         self._stream_think_scrubber = None
         # Attributes the prologue assigns; recorded for assertions.
+        self._current_task_id = ""
+        self._current_turn_id = ""
+        self._relay_pending_turn_id: str | None = None
         self._invalid_tool_retries = -1
         self._vision_supported = None
         self._persist_calls = 0
@@ -237,6 +240,16 @@ def test_turn_start_replaces_stale_parent_history_with_compression_child():
     assert ctx.conversation_history == compacted_history
     assert ctx.messages == compacted_history + [{"role": "user", "content": "hello"}]
     assert all(message.get("content") != "stale parent" for message in ctx.messages)
+
+
+def test_preseeded_relay_turn_id_becomes_tool_dispatch_owner():
+    agent = _FakeAgent()
+    agent._relay_pending_turn_id = "api-turn-owner-123"
+
+    _build(agent)
+
+    assert agent._current_turn_id == "api-turn-owner-123"
+    assert agent._relay_pending_turn_id is None
 
 
 def test_applies_agent_side_effects():

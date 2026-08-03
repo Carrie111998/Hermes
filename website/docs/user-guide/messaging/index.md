@@ -408,11 +408,16 @@ By default, messaging a busy agent redirects its active turn. Two other modes ar
 
 - `queue` — follow-up messages wait and run as the next turn after the current task finishes.
 - `steer` — follow-up messages are injected into the current run via `/steer`, arriving at the agent after the next tool call. No interrupt, no new turn. Falls back to `queue` behavior if the agent hasn't started yet.
+- `smart` — related updates steer at the next safe checkpoint; independent requests are handed to parallel orchestration; dependent, ambiguous, failed-classifier, and media requests queue. Normal SMART messages never interrupt; use `/stop` explicitly to cancel.
 
 ```yaml
 display:
-  busy_input_mode: steer   # or queue, or interrupt (default)
-  busy_ack_enabled: true   # set to false to suppress the ⚡/⏳/⏩ chat reply entirely
+  busy_input_mode: smart   # or steer, queue, or interrupt
+  busy_ack_enabled: true   # set to false to suppress chat acknowledgements
+orchestration:
+  smart:
+    confidence_threshold: 0.78
+    classifier_timeout_seconds: 12
 ```
 
 The first time you message a busy agent on any platform, Hermes appends a one-line reminder to the busy-ack explaining the knob (`"💡 First-time tip — …"`). The reminder fires once per install — a flag under `onboarding.seen.busy_input_prompt` latches it. Delete that key to see the tip again.

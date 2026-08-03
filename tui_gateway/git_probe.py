@@ -146,8 +146,14 @@ def common_repo_root(cwd: str) -> str:
         return ""
 
     def _probe() -> str:
-        gitdir = run_git(cwd, "rev-parse", "--path-format=absolute", "--git-common-dir")
+        # Resolve the path ourselves instead of relying on
+        # ``--path-format=absolute``. Git versions before 2.31 can echo that
+        # unknown rev-parse option to stdout with a zero exit status, which
+        # turns it into a bogus repo root.
+        gitdir = run_git(cwd, "rev-parse", "--git-common-dir")
         if gitdir:
+            if not os.path.isabs(gitdir):
+                gitdir = os.path.join(cwd, gitdir)
             gitdir = os.path.realpath(gitdir)
             if os.path.basename(gitdir) == ".git":
                 return os.path.dirname(gitdir)

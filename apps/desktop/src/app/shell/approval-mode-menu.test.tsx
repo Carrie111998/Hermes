@@ -8,6 +8,10 @@ import { $approvalModes } from '@/store/approval-mode'
 
 import { useApprovalModeStatusbarItem } from './approval-mode-menu'
 
+vi.mock('react-router-dom', () => ({
+  useNavigate: () => vi.fn()
+}))
+
 class TestResizeObserver {
   observe() {}
   unobserve() {}

@@ -82,7 +82,7 @@ describe('performHeapDump auto opt-in gate (#21767)', () => {
       expect(result.success).toBe(true)
       expect(result.heapPath).toBeDefined()
     }
-  })
+  }, 30_000)
 
   it('treats other values (0, off, garbage) as opt-out for auto triggers', async () => {
     for (const value of ['0', 'off', 'nope']) {

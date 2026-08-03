@@ -14,6 +14,7 @@ import pytest
 
 from gateway.run import _AGENT_PENDING_SENTINEL
 from tests.gateway.test_steer_command import (
+    _enable_durable_queue,
     _make_event,
     _make_runner,
     _session_entry,
@@ -45,17 +46,18 @@ def _prequeue(runner, adapter, sk):
         channel_context="ctx2",
         message_type=MessageType.TEXT,
     )
-    # Q1 -> pending slot (head), Q2 -> overflow tail
-    runner._enqueue_fifo(sk, q1, adapter)
-    runner._enqueue_fifo(sk, q2, adapter)
+    # Q1 -> durable head slot, Q2 -> durable overflow tail.
+    assert runner._queue_or_replace_pending_event(sk, q1, coalesce=False) is True
+    assert runner._queue_or_replace_pending_event(sk, q2, coalesce=False) is True
     assert adapter._pending_messages[sk].text == "Q1"
     assert runner._queued_events[sk][0].text == "Q2"
 
 
 @pytest.mark.asyncio
-async def test_steer_pending_sentinel_preserves_fifo_head():
+async def test_steer_pending_sentinel_preserves_fifo_head(tmp_path):
     """Issue #75164: /steer Q3 must not overwrite pre-queued Q1."""
     runner, adapter = _make_runner(_session_entry())
+    _enable_durable_queue(runner, adapter, tmp_path / "profile")
     sk = build_session_key(_make_source())
     runner._running_agents[sk] = _AGENT_PENDING_SENTINEL
 
@@ -75,9 +77,10 @@ async def test_steer_pending_sentinel_preserves_fifo_head():
 
 
 @pytest.mark.asyncio
-async def test_steer_no_steer_method_preserves_fifo_head():
+async def test_steer_no_steer_method_preserves_fifo_head(tmp_path):
     """Issue #75164: no-steer() fallback must not overwrite pre-queued Q1."""
     runner, adapter = _make_runner(_session_entry())
+    _enable_durable_queue(runner, adapter, tmp_path / "profile")
     sk = build_session_key(_make_source())
 
     # Bare mock with NO steer() method

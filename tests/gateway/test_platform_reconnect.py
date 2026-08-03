@@ -99,6 +99,9 @@ class TestStartupPlatformIsolation:
         runner._sync_voice_mode_state_to_adapter = MagicMock()
         runner._send_update_notification = AsyncMock(return_value=True)
         runner._send_restart_notification = AsyncMock()
+        restored_sessions = [("restored-session", MagicMock())]
+        runner._restore_busy_queues = MagicMock(return_value=restored_sessions)
+        runner._schedule_busy_queue_replays = MagicMock(return_value=1)
 
         adapters = {
             Platform.TELEGRAM: StubAdapter(platform=Platform.TELEGRAM),
@@ -137,6 +140,8 @@ class TestStartupPlatformIsolation:
         assert Platform.FEISHU in runner.adapters
         assert Platform.TELEGRAM not in runner.adapters
         assert runner._create_adapter.call_count == 2
+        runner._restore_busy_queues.assert_called_once_with()
+        runner._schedule_busy_queue_replays.assert_called_once_with(restored_sessions)
 
 
 class TestStartupFailureQueuing:
@@ -228,6 +233,9 @@ class TestPlatformReconnectWatcher:
         runner = _make_runner()
         runner._sync_voice_mode_state_to_adapter = MagicMock()
         runner._schedule_resume_pending_sessions = MagicMock(return_value=1)
+        restored_sessions = [("restored-session", MagicMock())]
+        runner._restore_busy_queues = MagicMock(return_value=restored_sessions)
+        runner._schedule_busy_queue_replays = MagicMock(return_value=1)
 
         platform_config = PlatformConfig(enabled=True, token="test")
         runner._failed_platforms[Platform.TELEGRAM] = {
@@ -261,6 +269,8 @@ class TestPlatformReconnectWatcher:
         runner._schedule_resume_pending_sessions.assert_called_once_with(
             platform=Platform.TELEGRAM
         )
+        runner._restore_busy_queues.assert_called_once_with()
+        runner._schedule_busy_queue_replays.assert_called_once_with(restored_sessions)
 
 
     @pytest.mark.asyncio

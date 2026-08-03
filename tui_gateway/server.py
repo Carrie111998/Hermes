@@ -43,6 +43,17 @@ from tui_gateway.turn_marker import (
     read_turn_marker,
     record_turn_start,
 )
+from tui_gateway.crash_log import (
+    append_crash_record as _append_crash_record,
+    safe_crash_text as _safe_crash_text,
+)
+from tui_gateway.private_storage import (
+    read_private_file as _read_private_file,
+    secure_private_directory as _secure_private_directory,
+    secure_private_file as _secure_private_file,
+    write_private_file_atomic as _write_private_file_atomic,
+    write_private_file_atomic_exclusive as _write_private_file_atomic_exclusive,
+)
 from tui_gateway.transport import (
     StdioTransport,
     Transport,
@@ -74,59 +85,30 @@ _CRASH_LOG = os.path.join(_hermes_home, "logs", "tui_gateway_crash.log")
 def _panic_hook(exc_type, exc_value, exc_tb):
     import traceback
 
-    trace = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
-    try:
-        os.makedirs(os.path.dirname(_CRASH_LOG), exist_ok=True)
-        with open(_CRASH_LOG, "a", encoding="utf-8") as f:
-            f.write(
-                f"\n=== unhandled exception · {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n"
-            )
-            f.write(trace)
-    except Exception:
-        pass
-    # Stderr goes through to the TUI as a gateway.stderr Activity line —
-    # the first line here is what the user will see without opening any
-    # log files.  Rest of the stack is still in the log for full context.
-    first = (
-        str(exc_value).strip().splitlines()[0]
-        if str(exc_value).strip()
-        else exc_type.__name__
-    )
-    print(f"[gateway-crash] {exc_type.__name__}: {first}", file=sys.stderr, flush=True)
-    # Chain to the default hook so the process still terminates normally.
-    sys.__excepthook__(exc_type, exc_value, exc_tb)
+    trace = "".join(traceback.format_tb(exc_tb))
+    trace += f"{getattr(exc_type, '__name__', 'Exception')}\n"
+    _append_crash_record(_CRASH_LOG, "unhandled exception", trace)
+    # Exception values routinely contain request URLs, credentials, prompts, or
+    # customer text.  The full redacted traceback is durable; stderr carries
+    # only the exception class so the activity feed cannot become a leak.
+    exc_name = _safe_crash_text(getattr(exc_type, "__name__", "Exception"))
+    print(f"[gateway-crash] {exc_name}", file=sys.stderr, flush=True)
 
 
 sys.excepthook = _panic_hook
 
 
 def _thread_panic_hook(args):
-    # threading.excepthook signature: SimpleNamespace(exc_type, exc_value, exc_traceback, thread)
+    # threading.excepthook signature: SimpleNamespace(exc_type, exc_value,
+    # exc_traceback, thread).  Thread names are intentionally excluded because
+    # integrations may derive them from session/customer identifiers.
     import traceback
 
-    trace = "".join(
-        traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback)
-    )
-    try:
-        os.makedirs(os.path.dirname(_CRASH_LOG), exist_ok=True)
-        with open(_CRASH_LOG, "a", encoding="utf-8") as f:
-            f.write(
-                f"\n=== thread exception · {time.strftime('%Y-%m-%d %H:%M:%S')} "
-                f"· thread={args.thread.name} ===\n"
-            )
-            f.write(trace)
-    except Exception:
-        pass
-    first_line = (
-        str(args.exc_value).strip().splitlines()[0]
-        if str(args.exc_value).strip()
-        else args.exc_type.__name__
-    )
-    print(
-        f"[gateway-crash] thread {args.thread.name} raised {args.exc_type.__name__}: {first_line}",
-        file=sys.stderr,
-        flush=True,
-    )
+    trace = "".join(traceback.format_tb(args.exc_traceback))
+    trace += f"{getattr(args.exc_type, '__name__', 'Exception')}\n"
+    _append_crash_record(_CRASH_LOG, "thread exception", trace)
+    exc_name = _safe_crash_text(getattr(args.exc_type, "__name__", "Exception"))
+    print(f"[gateway-crash] thread raised {exc_name}", file=sys.stderr, flush=True)
 
 
 threading.excepthook = _thread_panic_hook
@@ -239,6 +221,10 @@ _LONG_HANDLERS = frozenset(
         "pet.info",
         "pet.select",
         "pet.thumb",
+        # SMART busy routing may call an auxiliary LLM classifier. Run prompt
+        # ingress on the RPC pool so a slow classifier never blocks approval,
+        # interrupt, or heartbeat requests on the reader thread.
+        "prompt.submit",
         "learning.frames",
         "plugins.manage",
         # reload.mcp shuts down and rediscovers every MCP server — with a
@@ -461,7 +447,9 @@ def _load_busy_input_mode() -> str:
     if not isinstance(display, dict):
         display = {}
     raw = str(display.get("busy_input_mode", "") or "").strip().lower()
-    return raw if raw in {"queue", "steer", "interrupt"} else "interrupt"
+    if raw in {"queue", "steer", "smart", "interrupt"}:
+        return raw
+    return "interrupt" if not raw else "queue"
 
 
 def _load_interim_assistant_messages() -> bool:
@@ -661,6 +649,19 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
     if not session or session.get("_finalized"):
         return
     session["_finalized"] = True
+    # Accepted prompt envelopes are durable obligations. Persist them before a
+    # disconnect/restart instead of clearing process-local references; the next
+    # session instance restores text + media FIFO from the profile cache.
+    with _prompt_queue_lock(session):
+        queued_items = _queued_prompt_items_locked(session)
+        _store_queued_prompt_items_locked(session, queued_items)
+        # Release non-serializable transports from the dying process only after
+        # the durable snapshot is fsynced. Do not call the normal store helper
+        # with [] here — that would delete the recovery file.
+        session["queued_prompt"] = None
+        session.pop("queued_prompt_overflow", None)
+        session["queued_prompt_bytes"] = 0
+    session.pop("active_prompt_envelope", None)
     _release_active_session_slot(session)
     stop_event = session.get("_notif_stop")
     if stop_event is not None:
@@ -1384,20 +1385,55 @@ def _db_unavailable_error(rid, *, code: int):
 # message persistence all resolve to the right profile. Omitted/own profile → the
 # launch profile (unchanged for single-profile and per-profile-remote setups).
 def _profile_home(profile: str | None) -> Path | None:
-    """Resolve a named profile's home on THIS host, or None for the launch profile."""
-    name = (profile or "").strip()
-    if not name:
-        return None
-    try:
-        from hermes_cli import profiles as profiles_mod
+    """Resolve a local profile without traversal, symlink, or owner fallback.
 
-        home = Path(profiles_mod.get_profile_dir(name))
-    except Exception:
+    ``None`` is reserved exclusively for an omitted profile or the dashboard's
+    launch profile.  Any supplied name that is invalid, absent, or unsafe raises
+    ``ValueError`` so callers cannot silently fall back to the launch profile.
+    """
+    raw_name = (profile or "").strip()
+    if not raw_name:
         return None
-    # Already the launch profile? No override needed.
-    if home.resolve() == Path(_hermes_home).resolve():
-        return None
-    return home if (home / "state.db").exists() or home.exists() else None
+
+    from hermes_cli import profiles as profiles_mod
+
+    try:
+        name = profiles_mod.normalize_profile_name(raw_name)
+        profiles_mod.validate_profile_name(name)
+        candidate = Path(profiles_mod.get_profile_dir(name)).expanduser()
+        root = Path(profiles_mod._get_profiles_root()).expanduser()
+
+        if name != "default":
+            root_meta = root.lstat()
+            if root.is_symlink() or not root.is_dir():
+                raise ValueError("unsafe profiles root")
+            if hasattr(os, "geteuid") and root_meta.st_uid != os.geteuid():
+                raise ValueError("profiles root owner mismatch")
+            root_resolved = root.resolve(strict=True)
+            if candidate.parent.resolve(strict=True) != root_resolved:
+                raise ValueError("profile escapes profiles root")
+
+        metadata = candidate.lstat()
+        if candidate.is_symlink() or not candidate.is_dir():
+            raise ValueError("profile is not a private directory")
+        if hasattr(os, "geteuid") and metadata.st_uid != os.geteuid():
+            raise ValueError("profile owner mismatch")
+
+        resolved = candidate.resolve(strict=True)
+        if name != "default" and resolved.parent != root.resolve(strict=True):
+            raise ValueError("profile escapes profiles root")
+
+        # Profile state can include credentials, transcripts, crash logs, and
+        # durable queues.  Repair group/world access only after owner validation.
+        if os.name != "nt" and metadata.st_mode & 0o077:
+            candidate.chmod(metadata.st_mode & ~0o077)
+
+        launch = Path(_hermes_home).expanduser().resolve(strict=False)
+        return None if resolved == launch else resolved
+    except ValueError:
+        raise
+    except (OSError, RuntimeError) as exc:
+        raise ValueError("invalid or unavailable profile") from exc
 
 
 def _profile_scoped(handler):
@@ -1411,7 +1447,12 @@ def _profile_scoped(handler):
     """
 
     def wrapper(rid, params):
-        home = _profile_home(params.get("profile") if isinstance(params, dict) else None)
+        try:
+            home = _profile_home(
+                params.get("profile") if isinstance(params, dict) else None
+            )
+        except ValueError:
+            return _err(rid, 4008, "invalid or unavailable profile")
         if home is None:
             return handler(rid, params)
         token = set_hermes_home_override(home)
@@ -1631,15 +1672,21 @@ def _compute_host_turn_frame(
     text: Any,
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
+    *,
+    envelope: dict | None = None,
 ) -> dict:
     with session["history_lock"]:
         history = list(session.get("history", []))
         history_version = int(session.get("history_version", 0))
-        attached_images = (
-            list(image_paths)
-            if image_paths is not None
-            else list(session.get("attached_images", []))
-        )
+        if isinstance(envelope, dict):
+            text = envelope.get("text", text)
+            attached_images = list(envelope.get("images", []) or [])
+        else:
+            attached_images = (
+                list(image_paths)
+                if image_paths is not None
+                else list(session.get("attached_images", []))
+            )
     return {
         "type": "turn.start",
         "sid": sid,
@@ -1698,9 +1745,21 @@ def _apply_compute_host_metadata_mirror(session: dict, frame: dict | None) -> No
         session["_metadata_mirror_updated_at"] = time.time()
 
 
-def _on_compute_host_turn_done(rid: str, sid: str, session: dict, frame: dict) -> None:
+def _on_compute_host_turn_done(
+    rid: str,
+    sid: str,
+    session: dict,
+    frame: dict,
+    *,
+    expected: dict | None = None,
+) -> None:
     is_error = frame.get("type") == "turn.error"
+    disposition = _compute_host_turn_disposition(frame)
     with session["history_lock"]:
+        active_request_id = session.get("_compute_host_request_id")
+        if active_request_id is not None and str(active_request_id) != str(rid):
+            logger.warning("ignored stale compute-host terminal callback")
+            return
         if frame.get("session_key"):
             session["session_key"] = str(frame.get("session_key"))
         if frame.get("history_version") is not None:
@@ -1712,8 +1771,16 @@ def _on_compute_host_turn_done(rid: str, sid: str, session: dict, frame: dict) -
             except Exception:
                 pass
         session["running"] = False
+        session.pop("_compute_host_request_id", None)
         session["last_active"] = time.time()
         _clear_inflight_turn(session)
+    terminal_committed = False
+    if disposition == "terminal":
+        terminal_committed = _complete_queued_prompt_claim(session, expected=expected)
+    elif disposition == "not_started":
+        _restore_queued_prompt_claim_to_ready(session, expected=expected)
+    else:
+        _quarantine_queued_prompt_claim(session, expected=expected)
     if is_error:
         message = str(frame.get("message") or "compute host turn failed")
         _emit("message.complete", sid, {"text": f"Error: {message}", "status": "error"})
@@ -1724,7 +1791,8 @@ def _on_compute_host_turn_done(rid: str, sid: str, session: dict, frame: dict) -
         info = _session_info(session.get("agent"))
     if not frame.get("session_info_emitted"):
         _emit("session.info", sid, info)
-    _drain_queued_prompt(rid, sid, session)
+    if terminal_committed:
+        _drain_queued_prompt(rid, sid, session)
 
 
 def _submit_prompt_to_compute_host(
@@ -1734,6 +1802,8 @@ def _submit_prompt_to_compute_host(
     text: Any,
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
+    *,
+    envelope: dict | None = None,
 ) -> dict:
     cfg = _load_dashboard_process_isolation_config()
     frame = _compute_host_turn_frame(
@@ -1743,25 +1813,33 @@ def _submit_prompt_to_compute_host(
         text,
         image_paths=image_paths,
         queued_prompt_generation=queued_prompt_generation,
+        envelope=envelope,
     )
 
     def _complete(done: dict) -> None:
         # submit_turn reports a synchronous pipe failure through the callback
         # before re-raising. Leave the parent session untouched so prompt.submit
-        # can fail open to the historical in-process path without emitting a
-        # duplicate terminal error.
+        # can perform the single fail-closed transfer into its durable queue
+        # without emitting a duplicate terminal error.
         if done.get("reason") == "send_failed":
             return
-        _on_compute_host_turn_done(rid, sid, session, done)
+        _on_compute_host_turn_done(rid, sid, session, done, expected=envelope)
 
+    with session["history_lock"]:
+        session["_compute_host_request_id"] = rid
     try:
         _get_compute_host_supervisor(cfg).submit_turn(frame, on_complete=_complete)
     except Exception as exc:
+        with session["history_lock"]:
+            if str(session.get("_compute_host_request_id")) == str(rid):
+                session.pop("_compute_host_request_id", None)
         return _err(rid, 5019, f"compute-host dispatch failed: {exc}")
     with session["history_lock"]:
         session["_compute_host_active"] = True
-        if image_paths is None:
+        if envelope is None and image_paths is None:
             session["attached_images"] = []
+        if session.get("active_prompt_envelope") is envelope:
+            session.pop("active_prompt_envelope", None)
     return _ok(rid, {"status": "streaming", "turn_isolation": True})
 
 
@@ -5065,13 +5143,11 @@ def _session_info(agent, session: dict | None = None) -> dict:
         "update_behind": None,
         "update_command": "",
         "usage": _session_usage_snapshot(session),
-        "profile_name": _response_profile_name(
+        "profile_name": (
             Path(session["profile_home"]).name
             if isinstance(session, dict) and session.get("profile_home")
-            else None
-        )
-        if isinstance(session, dict) and session.get("profile_home")
-        else _current_profile_name(),
+            else _current_profile_name()
+        ),
     }
     try:
         from hermes_cli import __version__, __release_date__
@@ -6463,6 +6539,8 @@ def _init_session(
     session_db=None,
     source: str | None = None,
     profile_home: str | None = None,
+    *,
+    compute_host_worker: bool = False,
 ):
     now = time.time()
     with _sessions_lock:
@@ -6476,7 +6554,9 @@ def _init_session(
             "created_at": now,
             "last_active": now,
             "running": False,
+            "_compute_host_worker": bool(compute_host_worker),
             "attached_images": [],
+            "attached_images_by_owner": {},
             "image_counter": 0,
             "cwd": cwd or _completion_cwd(),
             "cols": cols,
@@ -6566,7 +6646,7 @@ def _init_session(
         pass
     _wire_callbacks(sid)
     with _sessions_lock:
-        if sid in _sessions:
+        if sid in _sessions and not _sessions[sid].get("_compute_host_worker"):
             _sessions[sid]["_notif_stop"] = _start_notification_poller(sid, _sessions[sid])
     _notify_session_boundary("on_session_reset", key, _session_source(_sessions.get(sid, {})))
     _emit("session.info", sid, _session_info(agent, _sessions.get(sid, {})))
@@ -7028,44 +7108,17 @@ def _coerce_seed_history(value: Any) -> list[dict]:
     return history
 
 
-def _content_display_text(content: Any) -> str:
-    if content is None:
-        return ""
-    if isinstance(content, str):
-        return content
-    if isinstance(content, (int, float)):
-        return str(content)
-    if isinstance(content, list):
-        parts = []
-        for part in content:
-            text = _content_display_text(part).strip()
-            if text:
-                parts.append(text)
-        return "\n".join(parts)
-    if isinstance(content, dict):
-        kind = content.get("type")
-        if kind in {"text", "input_text", "output_text"}:
-            return str(content.get("text") or content.get("content") or "")
-        if kind in {"image_url", "input_image", "image"}:
-            return "[image]"
-        if kind in {"input_audio", "audio"}:
-            return "[audio]"
-        if kind:
-            return f"[{kind}]"
-        if "text" in content:
-            return str(content.get("text") or "")
-        return "[structured content]"
-    return str(content)
-
-
 def _inflight_text(value: Any) -> str:
     return _content_display_text(value).strip()
 
 
 def _start_inflight_turn(session: dict, text: Any) -> None:
     now = time.time()
+    generation = int(session.get("turn_generation", 0) or 0) + 1
+    session["turn_generation"] = generation
     session["inflight_turn"] = {
         "assistant": "",
+        "generation": generation,
         "started_at": now,
         "streaming": True,
         "updated_at": now,
@@ -7295,42 +7348,1255 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
     )
     return {"attempt": attempt, "interrupted_at": marker["started_at"]}
 
+_PASTE_MAX_BYTES = 4 * 1024 * 1024
+_PASTE_RETENTION_PER_SESSION = 32
+_PASTE_LOCK_INIT_GUARD = threading.Lock()
+_paste_lock = threading.Lock()
+
+_PROMPT_QUEUE_CLAIM_UNCHANGED = object()
+_PROMPT_QUEUE_STEER_CLAIM_UNCHANGED = object()
+_prompt_queue_keyed_locks: dict[str, "_PromptQueueIPCMutex"] = {}
+_prompt_queue_process_token = uuid.uuid4().hex
+_prompt_queue_process_token_pid = os.getpid()
+
+try:
+    import fcntl as _prompt_queue_fcntl
+except ImportError:  # pragma: no cover - native Windows has no flock
+    _prompt_queue_fcntl = None
+
+
+_SPAWN_TREE_RETENTION = 100
+_TUI_BUSY_QUEUE_MAX_PENDING = 32
+_TUI_BUSY_QUEUE_MAX_BYTES_DEFAULT = 1024 * 1024
+_TUI_BUSY_QUEUE_TTL_SECONDS_DEFAULT = 15 * 60.0
+_prompt_queue_lock_init_guard = threading.Lock()
+
+
+def _compute_host_turn_disposition(frame: dict) -> str:
+    """Classify a host callback without guessing whether effects ran.
+
+    Only an explicit pre-execution rejection is safe to return to ``ready``.
+    Every other ``turn.error`` (crash, pipe loss, timeout, host exception, or an
+    unknown reason) is ambiguous and must quarantine the durable claim.
+    """
+
+    if frame.get("type") != "turn.error":
+        return "terminal"
+    reason = str(frame.get("reason") or "").strip().lower()
+    execution_state = str(frame.get("execution_state") or "").strip().lower()
+    if reason == "send_failed" or execution_state == "not_started":
+        return "not_started"
+    return "uncertain"
+
+
+def _turn_result_is_explicit_terminal_success(result: Any) -> bool:
+    """Accept only the typed, fully committed terminal result shape."""
+
+    return bool(
+        isinstance(result, dict)
+        and result.get("receipt_terminal_success") is True
+        and result.get("completed") is True
+        and not result.get("failed")
+        and not result.get("interrupted")
+        and not result.get("partial")
+        and not result.get("error")
+        and not result.get("cleanup_errors")
+    )
+
+
+def _quarantine_queued_prompt_claim(
+    session: dict,
+    expected: dict | None = None,
+) -> bool:
+    """Fence an ambiguous durable claim in memory; its disk claim stays intact."""
+
+    with _prompt_queue_lock(session):
+        _queued_prompt_items_locked(session)
+        claim = session.get("_queued_prompt_claim")
+        if not isinstance(claim, dict):
+            return False
+        if isinstance(expected, dict) and not _prompt_envelopes_match(claim, expected):
+            return False
+        session["_prompt_queue_uncertain_claim"] = claim
+        session["_prompt_queue_restore_error"] = True
+        return True
+
+
+def _restore_queued_prompt_claim_to_ready(
+    session: dict,
+    expected: dict | None = None,
+) -> bool:
+    """Atomically undo a claim that the host explicitly never executed."""
+
+    with _prompt_queue_lock(session):
+        items = _queued_prompt_items_locked(session)
+        claim = session.get("_queued_prompt_claim")
+        if not isinstance(claim, dict):
+            return False
+        if isinstance(expected, dict) and not _prompt_envelopes_match(claim, expected):
+            return False
+        candidate = [claim, *items]
+        if all(_prompt_arrival_ordinal(item) is not None for item in candidate):
+            candidate.sort(key=lambda item: _prompt_arrival_ordinal(item) or 0)
+        try:
+            _store_queued_prompt_items_locked(session, candidate, claim=None)
+        except Exception as exc:
+            session["_prompt_queue_uncertain_claim"] = claim
+            session["_prompt_queue_restore_error"] = True
+            logger.error(
+                "failed to restore unstarted compute-host claim error_type=%s",
+                type(exc).__name__,
+            )
+            return False
+        session.pop("_prompt_queue_uncertain_claim", None)
+        session.pop("_prompt_queue_restore_error", None)
+        return True
+
+
+def _refresh_prompt_queue_process_state() -> None:
+    """Drop inherited mutexes/tokens after fork before they can impersonate parent."""
+
+    global _prompt_queue_lock_init_guard
+    global _prompt_queue_keyed_locks
+    global _prompt_queue_process_token_pid
+    global _prompt_queue_process_token
+
+    pid = os.getpid()
+    if _prompt_queue_process_token_pid == pid:
+        return
+    # Only the forking thread survives in the child. Replacing, rather than
+    # acquiring, inherited Python mutexes avoids deadlock if another parent
+    # thread held one at fork. Each process then opens its own flock descriptor.
+    _prompt_queue_lock_init_guard = threading.Lock()
+    _prompt_queue_keyed_locks = {}
+    _prompt_queue_process_token_pid = pid
+    _prompt_queue_process_token = uuid.uuid4().hex
+
+
+class _PromptQueueCASConflict(RuntimeError):
+    """The durable generation changed after this representation loaded it."""
+
+
+class _PromptQueueIPCMutex:
+    """Re-entrant process lock plus a stable POSIX lock-file transaction fence."""
+
+    def __init__(self, state_path: Path | None) -> None:
+        self._thread_lock = threading.RLock()
+        self._lock_path = (
+            state_path.with_name(f"{state_path.name}.lock")
+            if state_path is not None
+            else None
+        )
+        self._local = threading.local()
+
+    def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+        if timeout == -1:
+            acquired = self._thread_lock.acquire(blocking)
+        else:
+            acquired = self._thread_lock.acquire(blocking, timeout)
+        if not acquired:
+            return False
+
+        depth = int(getattr(self._local, "depth", 0) or 0)
+        if depth:
+            self._local.depth = depth + 1
+            return True
+
+        descriptor: int | None = None
+        try:
+            if self._lock_path is not None and _prompt_queue_fcntl is not None:
+                self._lock_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                if os.name != "nt":
+                    os.chmod(self._lock_path.parent, 0o700)
+                flags = os.O_RDWR | os.O_CREAT
+                flags |= getattr(os, "O_CLOEXEC", 0)
+                flags |= getattr(os, "O_NOFOLLOW", 0)
+                descriptor = os.open(self._lock_path, flags, 0o600)
+                os.fchmod(descriptor, 0o600)
+                _prompt_queue_fcntl.flock(descriptor, _prompt_queue_fcntl.LOCK_EX)
+                self._local.descriptor = descriptor
+            self._local.depth = 1
+            return True
+        except BaseException:
+            if descriptor is not None:
+                os.close(descriptor)
+            self._thread_lock.release()
+            raise
+
+    def release(self) -> None:
+        depth = int(getattr(self._local, "depth", 0) or 0)
+        if depth < 1:
+            raise RuntimeError("cannot release an un-acquired prompt queue lock")
+        try:
+            if depth == 1:
+                descriptor = getattr(self._local, "descriptor", None)
+                if descriptor is not None:
+                    try:
+                        if _prompt_queue_fcntl is not None:
+                            _prompt_queue_fcntl.flock(
+                                descriptor,
+                                _prompt_queue_fcntl.LOCK_UN,
+                            )
+                    finally:
+                        os.close(descriptor)
+                        del self._local.descriptor
+                self._local.depth = 0
+            else:
+                self._local.depth = depth - 1
+        finally:
+            self._thread_lock.release()
+
+    def __enter__(self) -> "_PromptQueueIPCMutex":
+        self.acquire()
+        return self
+
+    def __exit__(self, _exc_type, _exc, _tb) -> None:
+        self.release()
+
+
+def _current_prompt_queue_process_token() -> str:
+    """Return a process-generation token that is regenerated after ``fork``."""
+
+    _refresh_prompt_queue_process_state()
+    return _prompt_queue_process_token
+
+
+def _attachment_batch_id(params: dict | None) -> str | None:
+    raw_batch = str((params or {}).get("attachment_batch_id") or "").strip()
+    if raw_batch and len(raw_batch) <= 128 and not any(ord(ch) < 32 for ch in raw_batch):
+        return raw_batch
+    return None
+
+
+def _attachment_owner_keys(params: dict | None) -> tuple[str | None, str | None]:
+    """Return per-submission and per-transport attachment ownership keys."""
+
+    batch_id = _attachment_batch_id(params)
+    batch_key = f"batch:{batch_id}" if batch_id else None
+    transport = current_transport()
+    transport_key = f"transport:{id(transport)}" if transport is not None else None
+    if batch_key:
+        return batch_key, None
+    return transport_key, None
+
+
+def _prompt_queue_state_path(session: dict) -> Path | None:
+    session_key = str(session.get("session_key") or "").strip()
+    if not session_key:
+        return None
+    import hashlib
+
+    digest = hashlib.sha256(session_key.encode("utf-8")).hexdigest()[:32]
+    profile_home_raw = session.get("profile_home")
+    profile_home = (
+        Path(str(profile_home_raw)).expanduser().resolve()
+        if profile_home_raw
+        else Path(_hermes_home).expanduser().resolve()
+    )
+    # Resolve only the trusted profile root. Each private descendant must itself
+    # be a real, owner-only directory; never follow a pre-created ``cache`` or
+    # queue-directory symlink into an arbitrary location.
+    _secure_private_directory(profile_home)
+    cache_dir = _secure_private_directory(profile_home / "cache")
+    queue_dir = _secure_private_directory(cache_dir / "tui-prompt-queue")
+    return queue_dir / f"{digest}.json"
+
+
+def _serial_prompt_envelope(item: dict) -> dict:
+    return {
+        "text": item.get("text"),
+        "images": list(item.get("images", []) or []),
+        "metadata": dict(item.get("metadata") or {}),
+    }
+
+
+def _prompt_envelopes_match(current: dict, expected: dict) -> bool:
+    """Match one durable receipt without request-id/ordinal ABA collisions."""
+
+    if current is expected:
+        return True
+    current_meta = dict(current.get("metadata") or {})
+    expected_meta = dict(expected.get("metadata") or {})
+    current_receipt = str(current_meta.get("receipt_id") or "")
+    expected_receipt = str(expected_meta.get("receipt_id") or "")
+    if current_receipt or expected_receipt:
+        return (
+            bool(current_receipt)
+            and bool(expected_receipt)
+            and current_receipt == expected_receipt
+        )
+    # Legacy records predate receipt IDs. Their complete stable envelope is the
+    # only safe fallback; request_id + per-mirror arrival ordinal can ABA.
+    return _serial_prompt_envelope(current) == _serial_prompt_envelope(expected)
+
+
+def _rehydrate_prompt_envelope(session: dict, raw: dict) -> dict:
+    if not isinstance(raw, dict):
+        raise ValueError("persisted prompt queue contains an invalid item")
+    return {
+        "text": raw.get("text"),
+        "images": [str(value) for value in list(raw.get("images") or [])],
+        "transport": session.get("transport"),
+        "metadata": dict(raw.get("metadata") or {}),
+    }
+
+
+def _clear_published_prompt_queue_state(session: dict) -> None:
+    session["queued_prompt"] = None
+    session.pop("queued_prompt_overflow", None)
+    session["queued_prompt_bytes"] = 0
+    session.pop("_queued_prompt_claim", None)
+    session.pop("_prompt_queue_uncertain_claim", None)
+    session.pop("_smart_steer_claim", None)
+    session.pop("_smart_steer_uncertain_claim", None)
+    session.pop("_prompt_queue_restore_error", None)
+
+
+def _load_persisted_prompt_items_locked(session: dict, *, force: bool = False) -> None:
+    if session.get("_prompt_queue_persistence_loaded") and not force:
+        return
+    path = _prompt_queue_state_path(session)
+    if path is None:
+        session["_prompt_queue_persistence_loaded"] = True
+        return
+    try:
+        max_bytes = int(_load_tui_busy_queue_config()["max_bytes"])
+        # JSON control-character escaping can expand one accepted payload byte
+        # to six storage bytes.  Bound reads without rejecting a valid 1 MiB
+        # payload that was admitted before the restart.
+        payload = json.loads(
+            _read_private_file(
+                path,
+                max_bytes=8 * max_bytes + 131_072,
+            ).decode("utf-8")
+        )
+        if not isinstance(payload, dict):
+            raise ValueError("persisted prompt queue is not an object")
+        try:
+            revision = int(payload.get("revision", 0))
+        except (TypeError, ValueError):
+            raise ValueError("persisted prompt queue has invalid revision") from None
+        if revision < 0:
+            raise ValueError("persisted prompt queue has invalid revision")
+        writer_token = str(payload.get("writer_token") or "")
+        if (
+            session.get("_prompt_queue_persistence_initialized")
+            and revision == int(session.get("_prompt_queue_revision", -1))
+            and writer_token
+            and writer_token == session.get("_prompt_queue_writer_token")
+            and writer_token == _current_prompt_queue_process_token()
+        ):
+            # This exact process/session already published the revision; keep
+            # live claim ownership instead of misclassifying its own claim as a
+            # crash recovery record.
+            session["_prompt_queue_persistence_loaded"] = True
+            return
+        raw_items = payload.get("items")
+        if not isinstance(raw_items, list):
+            raise ValueError("persisted prompt queue has no items list")
+        raw_claim = payload.get("claim")
+        if raw_claim is not None and not isinstance(raw_claim, dict):
+            raise ValueError("persisted prompt queue contains an invalid claim")
+        claim = (
+            _rehydrate_prompt_envelope(session, raw_claim)
+            if isinstance(raw_claim, dict)
+            else None
+        )
+        raw_steer_claim = payload.get("steer_claim")
+        if raw_steer_claim is not None and not isinstance(raw_steer_claim, dict):
+            raise ValueError("persisted prompt queue contains an invalid steer claim")
+        steer_claim = (
+            _rehydrate_prompt_envelope(session, raw_steer_claim)
+            if isinstance(raw_steer_claim, dict)
+            else None
+        )
+        claim_count = int(claim is not None) + int(steer_claim is not None)
+        if len(raw_items) + claim_count > _TUI_BUSY_QUEUE_MAX_PENDING:
+            raise ValueError("persisted prompt queue exceeds the item limit")
+        items: list[dict] = []
+        total_bytes = sum(
+            _prompt_envelope_size(candidate)
+            for candidate in (claim, steer_claim)
+            if candidate is not None
+        )
+        for raw in raw_items:
+            item = _rehydrate_prompt_envelope(session, raw)
+            item_bytes = _prompt_envelope_size(item)
+            if total_bytes + item_bytes > max_bytes:
+                raise ValueError("persisted prompt queue exceeds the payload limit")
+            total_bytes += item_bytes
+            items.append(item)
+
+        # Publish the complete disk snapshot, including empty fields.  Leaving a
+        # stale in-memory head here lets a second session object dispatch it
+        # after another owner already transitioned it to a claim.
+        _clear_published_prompt_queue_state(session)
+        if items:
+            session["queued_prompt"] = items[0]
+            session["queued_prompt_overflow"] = items[1:]
+            session["queued_prompt_bytes"] = sum(
+                _prompt_envelope_size(item) for item in items
+            )
+            logger.info(
+                "restored durable TUI prompt queue depth=%d",
+                len(items),
+            )
+        if claim is not None or steer_claim is not None:
+            # A claim loaded from another revision/process has an unknown
+            # execution point. Replaying may duplicate side effects; dropping
+            # it would lose an accepted obligation. Preserve and fence it.
+            if claim is not None:
+                session["_queued_prompt_claim"] = claim
+                session["_prompt_queue_uncertain_claim"] = claim
+            if steer_claim is not None:
+                session["_smart_steer_claim"] = steer_claim
+                session["_smart_steer_uncertain_claim"] = steer_claim
+            session["_prompt_queue_restore_error"] = True
+            logger.error("durable TUI prompt claim requires recovery")
+        session["_prompt_queue_revision"] = revision
+        session["_prompt_queue_writer_token"] = writer_token
+        session["_prompt_queue_persistence_initialized"] = True
+        session["_prompt_queue_persistence_loaded"] = True
+    except FileNotFoundError:
+        if session.get("_prompt_queue_persistence_initialized"):
+            # A missing file after this session observed a durable revision is
+            # an authoritative empty state committed by another owner.
+            _clear_published_prompt_queue_state(session)
+            session["_prompt_queue_revision"] = 0
+            session["_prompt_queue_writer_token"] = ""
+        session["_prompt_queue_persistence_loaded"] = True
+    except Exception as exc:
+        session["_prompt_queue_persistence_loaded"] = True
+        session["_prompt_queue_restore_error"] = True
+        logger.error(
+            "failed to restore durable TUI prompt queue error_type=%s",
+            type(exc).__name__,
+        )
+
+
+def _prompt_queue_disk_generation(path: Path) -> tuple[int, str]:
+    """Read the replace-file CAS generation while its stable flock is held."""
+
+    try:
+        max_bytes = int(_load_tui_busy_queue_config()["max_bytes"])
+        raw = _read_private_file(path, max_bytes=8 * max_bytes + 131_072)
+    except FileNotFoundError:
+        return 0, ""
+    payload = json.loads(raw.decode("utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("persisted prompt queue is not an object")
+    try:
+        revision = int(payload.get("revision", 0))
+    except (TypeError, ValueError):
+        raise ValueError("persisted prompt queue has invalid revision") from None
+    if revision < 0:
+        raise ValueError("persisted prompt queue has invalid revision")
+    return revision, str(payload.get("writer_token") or "")
+
+
+def _persist_prompt_items_locked(
+    session: dict,
+    items: list[dict],
+    *,
+    claim: Any = _PROMPT_QUEUE_CLAIM_UNCHANGED,
+    steer_claim: Any = _PROMPT_QUEUE_STEER_CLAIM_UNCHANGED,
+) -> tuple[int, str] | None:
+    path = _prompt_queue_state_path(session)
+    if path is None:
+        return None
+    effective_claim = (
+        session.get("_queued_prompt_claim")
+        if claim is _PROMPT_QUEUE_CLAIM_UNCHANGED
+        else claim
+    )
+    effective_steer_claim = (
+        session.get("_smart_steer_claim")
+        if steer_claim is _PROMPT_QUEUE_STEER_CLAIM_UNCHANGED
+        else steer_claim
+    )
+    serial_items = [_serial_prompt_envelope(item) for item in items]
+    serial_claim = (
+        _serial_prompt_envelope(effective_claim)
+        if isinstance(effective_claim, dict)
+        else None
+    )
+    serial_steer_claim = (
+        _serial_prompt_envelope(effective_steer_claim)
+        if isinstance(effective_steer_claim, dict)
+        else None
+    )
+    if not session.get("_prompt_queue_persistence_loaded"):
+        raise _PromptQueueCASConflict(
+            "prompt queue state must be authoritatively loaded before persistence"
+        )
+    try:
+        expected_revision = int(session.get("_prompt_queue_revision", 0))
+    except (TypeError, ValueError):
+        expected_revision = 0
+    expected_generation = (
+        max(0, expected_revision),
+        str(session.get("_prompt_queue_writer_token") or ""),
+    )
+    durable_generation = _prompt_queue_disk_generation(path)
+    if durable_generation != expected_generation:
+        raise _PromptQueueCASConflict(
+            "prompt queue durable revision changed during transaction"
+        )
+    revision = durable_generation[0] + 1
+    writer_token = _current_prompt_queue_process_token()
+    encoded = json.dumps(
+        {
+            "version": 4,
+            "revision": revision,
+            "writer_token": writer_token,
+            "claim": serial_claim,
+            "steer_claim": serial_steer_claim,
+            "items": serial_items,
+        },
+        default=str,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    _write_private_file_atomic(path, encoded)
+    # Retain the atomically committed empty tombstone. The stable lock file
+    # already persists for this scope, and keeping the revision monotonic
+    # prevents an old in-process representation from mistaking a later
+    # empty→ready cycle for its own earlier revision (generation ABA).
+    return revision, writer_token
+
+
+def _prioritize_tui_leftover_steer(session: dict, text: Any) -> dict:
+    """Preserve a late accepted steer as the next TUI turn without silent loss."""
+
+    cleaned = str(text or "").strip()
+    if not cleaned:
+        return {
+            "accepted": False,
+            "reason": "empty",
+            "depth": 0,
+            "queued_bytes": 0,
+        }
+    item = {
+        "text": cleaned,
+        "images": [],
+        "transport": session.get("transport"),
+        "metadata": {
+            "received_at": time.time(),
+            "receipt_id": uuid.uuid4().hex,
+            "request_id": f"accepted-steer-leftover-{time.time_ns()}",
+            "session_key": session.get("session_key"),
+            # Zero is reserved for an already-accepted related update that
+            # must precede newly admitted dependent/ambiguous envelopes.
+            "arrival_ordinal": 0,
+        },
+    }
+    return _requeue_prompt_front(session, item)
+
+
+def _fence_smart_steer_claim(session: dict, envelope: dict) -> bool:
+    """Durably reserve one non-idempotent steer before calling the agent."""
+
+    with _prompt_queue_lock(session):
+        items, _expired = _cleanup_expired_prompts_locked(session)
+        if session.get("_prompt_queue_restore_error") or isinstance(
+            session.get("_smart_steer_claim"), dict
+        ):
+            return False
+        active_claim = session.get("_queued_prompt_claim")
+        reserved = int(isinstance(active_claim, dict))
+        max_bytes = int(_load_tui_busy_queue_config()["max_bytes"])
+        total_bytes = sum(_prompt_envelope_size(item) for item in items)
+        if isinstance(active_claim, dict):
+            total_bytes += _prompt_envelope_size(active_claim)
+        if (
+            len(items) + reserved >= _TUI_BUSY_QUEUE_MAX_PENDING
+            or total_bytes + _prompt_envelope_size(envelope) > max_bytes
+        ):
+            return False
+        try:
+            _store_queued_prompt_items_locked(
+                session,
+                items,
+                steer_claim=envelope,
+            )
+            return True
+        except Exception as exc:
+            logger.error(
+                "failed to fence TUI steer error_type=%s",
+                type(exc).__name__,
+            )
+            return False
+
+
+def _quarantine_smart_steer_claim(
+    session: dict,
+    expected: dict | None = None,
+) -> bool:
+    """Fence an ambiguous steer while leaving its durable disk claim intact."""
+
+    with _prompt_queue_lock(session):
+        _queued_prompt_items_locked(session)
+        claim = session.get("_smart_steer_claim")
+        if not isinstance(claim, dict):
+            return False
+        if isinstance(expected, dict) and not _prompt_envelopes_match(claim, expected):
+            return False
+        session["_smart_steer_uncertain_claim"] = claim
+        session["_prompt_queue_restore_error"] = True
+        return True
+
+
+def _finish_smart_steer_claim(
+    session: dict,
+    *,
+    queue_instead: bool,
+    expected: dict | None = None,
+) -> tuple[bool, dict | None]:
+    """Commit a consumed steer or atomically convert an unconsumed one to FIFO."""
+
+    with _prompt_queue_lock(session):
+        # Reload under the stable IPC lock before checking ownership. A stale
+        # callback must never resolve a newer receipt published by another owner.
+        items, _expired = _cleanup_expired_prompts_locked(session)
+        claim = session.get("_smart_steer_claim")
+        if not isinstance(claim, dict):
+            return False, None
+        if isinstance(expected, dict) and not _prompt_envelopes_match(claim, expected):
+            return False, None
+        candidate_items = [*items, claim] if queue_instead else items
+        if queue_instead and all(
+            _prompt_arrival_ordinal(item) is not None for item in candidate_items
+        ):
+            candidate_items.sort(key=lambda item: _prompt_arrival_ordinal(item) or 0)
+        try:
+            _store_queued_prompt_items_locked(
+                session,
+                candidate_items,
+                steer_claim=None,
+            )
+        except Exception as exc:
+            session["_prompt_queue_restore_error"] = True
+            session["_smart_steer_uncertain_claim"] = claim
+            logger.error(
+                "failed to resolve TUI steer claim error_type=%s",
+                type(exc).__name__,
+            )
+            return False, None
+        if not queue_instead:
+            session.pop("_smart_steer_uncertain_claim", None)
+        receipt = None
+        if queue_instead:
+            receipt = {
+                "accepted": True,
+                "reason": "accepted",
+                "depth": len(candidate_items),
+                "queued_bytes": sum(
+                    _prompt_envelope_size(item) for item in candidate_items
+                ),
+                "expired": 0,
+            }
+        return True, receipt
+
+
+def _attempt_durable_tui_steer(
+    sid: str,
+    session: dict,
+    text: str,
+    envelope: dict,
+    *,
+    route_context: dict | None = None,
+) -> tuple[str, dict | None]:
+    """Persist and generation-bind one steer before crossing the effect boundary."""
+
+    if not isinstance(route_context, dict):
+        with session["history_lock"]:
+            route_context = _capture_busy_route_context_locked(session)
+    agent = route_context.get("agent")
+    steer_generation = route_context.get("steer_generation")
+    try:
+        compute_host_owned = bool(route_context.get("compute_host_owned")) or bool(
+            _session_uses_compute_host(session)
+        )
+    except Exception:
+        compute_host_owned = True
+    if (
+        compute_host_owned
+        or envelope.get("images")
+        or agent is None
+        or not callable(getattr(agent, "steer", None))
+        or route_context.get("supports_steer_consumption_ack") is not True
+        or not isinstance(steer_generation, int)
+        or isinstance(steer_generation, bool)
+    ):
+        return "fallback", None
+
+    callback_state: dict[str, Any] = {"disposition": None, "receipt": None}
+
+    def on_consumed() -> None:
+        resolved, _unused = _finish_smart_steer_claim(
+            session,
+            queue_instead=False,
+            expected=envelope,
+        )
+        callback_state["disposition"] = "consumed" if resolved else "uncertain"
+
+    def on_unconsumed() -> None:
+        resolved, receipt = _finish_smart_steer_claim(
+            session,
+            queue_instead=True,
+            expected=envelope,
+        )
+        if resolved:
+            callback_state["disposition"] = "unconsumed"
+            callback_state["receipt"] = receipt
+        else:
+            callback_state["disposition"] = "uncertain"
+
+    def on_uncertain() -> None:
+        quarantined = _quarantine_smart_steer_claim(session, expected=envelope)
+        callback_state["disposition"] = "uncertain"
+        if quarantined:
+            _emit(
+                "status.update",
+                sid,
+                {
+                    "kind": "warning",
+                    "text": (
+                        "Steer delivery became uncertain after durable admission; "
+                        "successors are fenced pending explicit recovery."
+                    ),
+                },
+            )
+
+    with session["history_lock"]:
+        current_inflight = session.get("inflight_turn")
+        try:
+            current_generation = int(
+                (current_inflight or {}).get("generation")
+                if isinstance(current_inflight, dict)
+                else 0
+            )
+        except (TypeError, ValueError):
+            current_generation = 0
+        same_active_run = (
+            route_context.get("generation") is not None
+            and bool(session.get("running"))
+            and session.get("agent") is agent
+            and current_generation == route_context.get("generation")
+        )
+        if not same_active_run or not _fence_smart_steer_claim(session, envelope):
+            return "fallback", None
+        try:
+            accepted = bool(
+                agent.steer(
+                    text,
+                    run_generation=steer_generation,
+                    on_consumed=on_consumed,
+                    on_unconsumed=on_unconsumed,
+                    on_uncertain=on_uncertain,
+                )
+            )
+        except Exception:
+            disposition = callback_state.get("disposition")
+            if disposition == "consumed":
+                return "steered", None
+            if disposition == "unconsumed":
+                receipt = callback_state.get("receipt")
+                return "queued", receipt if isinstance(receipt, dict) else None
+            _quarantine_smart_steer_claim(session, expected=envelope)
+            return "uncertain", None
+
+    disposition = callback_state.get("disposition")
+    if disposition == "consumed":
+        return "steered", None
+    if disposition == "unconsumed":
+        receipt = callback_state.get("receipt")
+        return "queued", receipt if isinstance(receipt, dict) else None
+    if disposition == "uncertain":
+        return "uncertain", None
+    if accepted:
+        return "steered", None
+    resolved, receipt = _finish_smart_steer_claim(
+        session,
+        queue_instead=True,
+        expected=envelope,
+    )
+    return ("queued", receipt) if resolved else ("uncertain", None)
+
+
+def _complete_queued_prompt_claim(
+    session: dict,
+    expected: dict | None = None,
+) -> bool:
+    """Atomically commit transfer/terminal ownership for one durable claim."""
+
+    with _prompt_queue_lock(session):
+        # Refresh the authoritative generation before inspecting claim identity.
+        # A stale session mirror may still hold claim A after another owner has
+        # committed A and claimed B; validating A first would then clear B.
+        items = _queued_prompt_items_locked(session)
+        current = session.get("_queued_prompt_claim")
+        if not isinstance(current, dict):
+            return True
+        if isinstance(expected, dict) and not _prompt_envelopes_match(current, expected):
+            return False
+        try:
+            _store_queued_prompt_items_locked(session, items, claim=None)
+        except Exception as exc:
+            session["_prompt_queue_restore_error"] = True
+            session["_prompt_queue_uncertain_claim"] = current
+            logger.error(
+                "failed to commit durable TUI prompt claim error_type=%s",
+                type(exc).__name__,
+            )
+            return False
+        session.pop("_prompt_queue_uncertain_claim", None)
+        session.pop("_prompt_queue_restore_error", None)
+        return True
+
+
+def _prune_spawn_tree_snapshots(session_dir: Path) -> None:
+    snapshots: list[Path] = []
+    for candidate in session_dir.glob("*.json"):
+        if candidate.name == _SPAWN_TREE_INDEX:
+            continue
+        try:
+            if _secure_private_file(candidate) is not None:
+                snapshots.append(candidate)
+        except OSError:
+            continue
+    snapshots.sort(key=lambda item: item.stat().st_mtime_ns, reverse=True)
+    for stale in snapshots[_SPAWN_TREE_RETENTION:]:
+        try:
+            _secure_private_file(stale)
+            stale.unlink()
+        except OSError:
+            continue
+
+
+def _spawn_tree_path_within(root: Path, raw_path: str) -> Path:
+    candidate = Path(raw_path)
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    try:
+        if candidate.is_symlink():
+            raise ValueError("symlinked spawn-tree artifact")
+        resolved = candidate.resolve(strict=False)
+        resolved.relative_to(root.resolve())
+    except (OSError, ValueError) as exc:
+        raise ValueError("path outside private spawn-tree root") from exc
+    return resolved
+
+
+def _load_tui_busy_queue_config() -> dict[str, float | int]:
+    """Read bounded TUI follow-up queue settings with conservative defaults."""
+
+    cfg = _load_cfg()
+    display = cfg.get("display") if isinstance(cfg, dict) else {}
+    if not isinstance(display, dict):
+        display = {}
+    try:
+        max_bytes = int(
+            display.get("busy_queue_max_bytes", _TUI_BUSY_QUEUE_MAX_BYTES_DEFAULT)
+        )
+        if max_bytes < 1:
+            raise ValueError
+    except (TypeError, ValueError):
+        max_bytes = _TUI_BUSY_QUEUE_MAX_BYTES_DEFAULT
+    return {"max_bytes": max_bytes}
+
+
+def _prompt_queue_lock(session: dict) -> Any:
+    """Return one transaction lock for a profile/session durable queue.
+
+    Lock order is ``history_lock`` (when needed) → keyed process mutex → stable
+    ``.json.lock`` flock. The lock remains distinct from the atomically replaced
+    state inode and spans authoritative reload → CAS → replace → memory publish.
+    Queue code must never acquire ``history_lock`` while holding this lock.
+    """
+
+    _refresh_prompt_queue_process_state()
+    state_path = _prompt_queue_state_path(session)
+    scope = str(state_path) if state_path is not None else f"memory:{id(session)}"
+    queue_lock = session.get("queued_prompt_lock")
+    if (
+        hasattr(queue_lock, "acquire")
+        and session.get("_queued_prompt_lock_scope") == scope
+        and session.get("_queued_prompt_lock_pid") == os.getpid()
+    ):
+        return queue_lock
+    with _prompt_queue_lock_init_guard:
+        queue_lock = _prompt_queue_keyed_locks.get(scope)
+        if queue_lock is None:
+            queue_lock = _PromptQueueIPCMutex(state_path)
+            _prompt_queue_keyed_locks[scope] = queue_lock
+        session["queued_prompt_lock"] = queue_lock
+        session["_queued_prompt_lock_scope"] = scope
+        session["_queued_prompt_lock_pid"] = os.getpid()
+    return queue_lock
+
+
+def _capture_prompt_envelope_locked(
+    session: dict,
+    rid: Any,
+    text: Any,
+    transport: Any,
+    *,
+    attachment_owner: str | None = None,
+    attachment_fallback_owner: str | None = None,
+) -> dict:
+    """Bind text, pending images, transport, and arrival metadata atomically.
+
+    The caller must hold ``history_lock``. Clearing ``attached_images`` here
+    reserves those paths for exactly this submission, so an image cannot leak
+    into whichever turn happens to drain next.
+    """
+
+    ordinal = int(session.get("prompt_arrival_ordinal", 0) or 0) + 1
+    session["prompt_arrival_ordinal"] = ordinal
+    if attachment_owner:
+        by_owner = session.setdefault("attached_images_by_owner", {})
+        images = list(by_owner.pop(attachment_owner, []) or [])
+        if (
+            attachment_fallback_owner
+            and attachment_fallback_owner != attachment_owner
+            and not attachment_owner.startswith("batch:")
+        ):
+            images.extend(by_owner.pop(attachment_fallback_owner, []) or [])
+    else:
+        images = list(session.get("attached_images", []) or [])
+        session["attached_images"] = []
+    return {
+        "text": text,
+        "images": images,
+        "transport": transport,
+        "metadata": {
+            "arrival_ordinal": ordinal,
+            "received_at": time.time(),
+            "receipt_id": uuid.uuid4().hex,
+            "request_id": rid,
+            "session_key": session.get("session_key"),
+            "attachment_owner": attachment_owner,
+            "attachment_fallback_owner": attachment_fallback_owner,
+        },
+    }
+
+
+def _append_attached_image(
+    session: dict,
+    path: str,
+    attachment_owner: str | None = None,
+) -> int:
+    """Attach an image atomically with prompt-envelope capture/detach."""
+
+    with session["history_lock"]:
+        if attachment_owner:
+            by_owner = session.setdefault("attached_images_by_owner", {})
+            images = by_owner.setdefault(attachment_owner, [])
+        else:
+            images = session.setdefault("attached_images", [])
+        images.append(path)
+        return len(images)
+
+
+def _detach_attached_image(
+    session: dict,
+    path: str,
+    attachment_owner: str | None = None,
+) -> tuple[bool, int]:
+    """Detach an image atomically with prompt-envelope capture/append."""
+
+    with session["history_lock"]:
+        by_owner = session.setdefault("attached_images_by_owner", {})
+        if attachment_owner:
+            images = list(by_owner.get(attachment_owner, []) or [])
+        else:
+            images = list(session.get("attached_images", []) or [])
+        retained = [candidate for candidate in images if candidate != path]
+        if attachment_owner:
+            if retained:
+                by_owner[attachment_owner] = retained
+            else:
+                by_owner.pop(attachment_owner, None)
+        else:
+            session["attached_images"] = retained
+        return len(retained) != len(images), len(retained)
+
+
+def _capture_busy_route_context_locked(session: dict) -> dict:
+    """Snapshot immutable run ownership at admission, before classifier waits."""
+
+    agent = session.get("agent")
+    inflight_value = session.get("inflight_turn")
+    inflight = dict(inflight_value) if isinstance(inflight_value, dict) else None
+    captured_generation = None
+    if session.get("running"):
+        try:
+            captured_generation = int((inflight or {}).get("generation") or 0)
+        except (TypeError, ValueError):
+            captured_generation = 0
+        if captured_generation <= 0:
+            captured_generation = max(
+                1,
+                int(session.get("turn_generation", 0) or 0),
+            )
+            session["turn_generation"] = captured_generation
+            if isinstance(inflight_value, dict):
+                inflight_value["generation"] = captured_generation
+            if isinstance(inflight, dict):
+                inflight["generation"] = captured_generation
+
+    steer_generation = None
+    supports_steer_consumption_ack = False
+    generation_reader = getattr(type(agent), "get_steer_generation", None)
+    ack_reader = getattr(type(agent), "supports_steer_consumption_ack", None)
+    # Capability-gate on the concrete type. Dynamic mocks otherwise appear to
+    # support every protocol and can silently exercise unsafe legacy steering.
+    if agent is not None and callable(generation_reader) and callable(ack_reader):
+        try:
+            candidate = generation_reader(agent)
+            if isinstance(candidate, int) and not isinstance(candidate, bool):
+                steer_generation = candidate
+            supports_steer_consumption_ack = bool(ack_reader(agent))
+        except Exception:
+            steer_generation = None
+            supports_steer_consumption_ack = False
+
+    return {
+        "agent": agent,
+        "generation": captured_generation,
+        "inflight": inflight,
+        "compute_host_owned": bool(session.get("_compute_host_active")),
+        "steer_generation": steer_generation,
+        "supports_steer_consumption_ack": supports_steer_consumption_ack,
+    }
+
+
+def _normalize_prompt_envelope(
+    session: dict,
+    text: Any,
+    transport: Any,
+    envelope: dict | None,
+) -> dict:
+    if not isinstance(envelope, dict):
+        with session["history_lock"]:
+            return _capture_prompt_envelope_locked(session, None, text, transport)
+
+    item = dict(envelope)
+    item["text"] = item.get("text", text)
+    item["images"] = list(item.get("images", []) or [])
+    item["transport"] = item.get("transport", transport)
+    metadata = dict(item.get("metadata") or {})
+    if not metadata.get("arrival_ordinal"):
+        with session["history_lock"]:
+            ordinal = int(session.get("prompt_arrival_ordinal", 0) or 0) + 1
+            session["prompt_arrival_ordinal"] = ordinal
+        metadata["arrival_ordinal"] = ordinal
+    metadata.setdefault("received_at", time.time())
+    metadata.setdefault("receipt_id", uuid.uuid4().hex)
+    metadata.setdefault("request_id", None)
+    metadata.setdefault("session_key", session.get("session_key"))
+    item["metadata"] = metadata
+    return item
+
+
+def _prompt_envelope_size(envelope: dict) -> int:
+    """Return deterministic serialized bytes, excluding shared transport internals."""
+
+    transport = envelope.get("transport")
+    if isinstance(transport, (str, int, float, bool)) or transport is None:
+        transport_marker: Any = transport
+    else:
+        transport_type = type(transport)
+        transport_marker = f"{transport_type.__module__}.{transport_type.__qualname__}"
+    serializable = {
+        "text": envelope.get("text"),
+        "images": envelope.get("images", []),
+        "transport": transport_marker,
+        "metadata": envelope.get("metadata", {}),
+    }
+    return len(
+        json.dumps(
+            serializable,
+            default=str,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    )
+
+
+def _queued_prompt_items_locked(session: dict) -> list[dict]:
+    # Every load-modify-store transaction revalidates its durable revision.
+    _load_persisted_prompt_items_locked(session, force=True)
+    items: list[dict] = []
+    first = session.get("queued_prompt")
+    if isinstance(first, dict):
+        items.append(first)
+    overflow = session.get("queued_prompt_overflow")
+    if isinstance(overflow, list):
+        items.extend(item for item in overflow if isinstance(item, dict))
+    return items
+
+
+def _store_queued_prompt_items_locked(
+    session: dict,
+    items: list[dict],
+    *,
+    claim: Any = _PROMPT_QUEUE_CLAIM_UNCHANGED,
+    steer_claim: Any = _PROMPT_QUEUE_STEER_CLAIM_UNCHANGED,
+) -> None:
+    # Persistence is the admission commit point.  Mutating memory first can
+    # produce a positive-looking in-process queue after the durable write
+    # failed, or leave a stale disk snapshot after a failed drain.
+    persisted_revision = _persist_prompt_items_locked(
+        session,
+        items,
+        claim=claim,
+        steer_claim=steer_claim,
+    )
+    if items:
+        session["queued_prompt"] = items[0]
+        if len(items) > 1:
+            session["queued_prompt_overflow"] = items[1:]
+        else:
+            session.pop("queued_prompt_overflow", None)
+    else:
+        session["queued_prompt"] = None
+        session.pop("queued_prompt_overflow", None)
+    if claim is not _PROMPT_QUEUE_CLAIM_UNCHANGED:
+        if isinstance(claim, dict):
+            session["_queued_prompt_claim"] = claim
+        else:
+            session.pop("_queued_prompt_claim", None)
+    if steer_claim is not _PROMPT_QUEUE_STEER_CLAIM_UNCHANGED:
+        if isinstance(steer_claim, dict):
+            session["_smart_steer_claim"] = steer_claim
+        else:
+            session.pop("_smart_steer_claim", None)
+    session["queued_prompt_bytes"] = sum(_prompt_envelope_size(item) for item in items)
+    if persisted_revision is not None:
+        revision, writer_token = persisted_revision
+        session["_prompt_queue_revision"] = revision
+        session["_prompt_queue_writer_token"] = writer_token
+        session["_prompt_queue_persistence_initialized"] = True
+        session["_prompt_queue_persistence_loaded"] = True
+
+
+def _prompt_arrival_ordinal(item: dict) -> int | None:
+    try:
+        ordinal = int((item.get("metadata") or {}).get("arrival_ordinal"))
+    except (TypeError, ValueError, AttributeError):
+        return None
+    return ordinal if ordinal > 0 else None
+
+
+def _cleanup_expired_prompts_locked(
+    session: dict,
+) -> tuple[list[dict], int]:
+    """Return accepted items unchanged; accepted receipts never expire silently."""
+
+    return _queued_prompt_items_locked(session), 0
+
+
+def _restore_rejected_prompt_images(session: dict, item: dict) -> None:
+    images = list(item.get("images", []) or [])
+    if not images or session.get("_finalized"):
+        return
+    metadata = dict(item.get("metadata") or {})
+    owner = str(metadata.get("attachment_owner") or "")
+    # Only an explicit reservation can safely own rejected media. Restoring to
+    # legacy global/per-transport staging lets the next unrelated prompt inherit
+    # the rejected envelope's private image.
+    if not owner.startswith("batch:"):
+        return
+    with session["history_lock"]:
+        by_owner = session.setdefault("attached_images_by_owner", {})
+        current = list(by_owner.get(owner, []) or [])
+        by_owner[owner] = [*images, *current]
+
+
+def _clear_queued_prompts(session: dict) -> int:
+    """Drop queued/active envelope references during terminal session cleanup."""
+
+    with _prompt_queue_lock(session):
+        count = len(_queued_prompt_items_locked(session))
+        _store_queued_prompt_items_locked(session, [])
+        session.pop("active_prompt_envelope", None)
+        return count
+
 
 def _enqueue_prompt(
     session: dict,
     text: Any,
     transport: Any,
-    image_paths: list[str] | None = None,
-) -> None:
-    """Stash a message to run as the very next turn once the live one ends.
+    *,
+    envelope: dict | None = None,
+) -> dict:
+    """Admit one intact FIFO envelope and return a truthful bounded receipt."""
 
-    Used when a prompt arrives mid-turn (see ``_handle_busy_submit``). Text-only
-    arrivals share a slot and merge losslessly (mirroring the consecutive-user
-    merge in ``repair_message_sequence``). Image-bearing submissions stay as
-    separate envelopes, so their attachment ownership and chronology survive.
-    ``transport`` is pinned so the drained turn streams back to the client that
-    sent it even if the session transport is rebound meanwhile.
-    """
-    image_paths = list(image_paths or [])
-    queued = {"text": text, "transport": transport}
-    if image_paths:
-        queued["image_paths"] = image_paths
-    existing = session.get("queued_prompt")
-    if (
-        existing
-        and isinstance(existing.get("text"), str)
-        and isinstance(text, str)
-        and not existing.get("image_paths")
-        and not image_paths
-        and not session.get("queued_prompts")
-    ):
-        prev = existing["text"]
-        existing["text"] = f"{prev}\n\n{text}" if prev and text else (prev or text)
-        return
-    if existing:
-        session.setdefault("queued_prompts", []).append(queued)
-        return
-    session["queued_prompt"] = queued
+    item = _normalize_prompt_envelope(session, text, transport, envelope)
+    item_bytes = _prompt_envelope_size(item)
+    limits = _load_tui_busy_queue_config()
+    max_bytes = int(limits["max_bytes"])
+    rejected = False
+    with _prompt_queue_lock(session):
+        items, expired = _cleanup_expired_prompts_locked(session)
+        queued_bytes = sum(_prompt_envelope_size(queued) for queued in items)
+        active_claims = (
+            session.get("_queued_prompt_claim"),
+            session.get("_smart_steer_claim"),
+        )
+        reserved_count = sum(isinstance(candidate, dict) for candidate in active_claims)
+        reserved_bytes = sum(
+            _prompt_envelope_size(candidate)
+            for candidate in active_claims
+            if isinstance(candidate, dict)
+        )
+        reason = "accepted"
+        if session.get("_prompt_queue_restore_error"):
+            # Never overwrite a corrupted/oversized durable snapshot: it may
+            # contain accepted obligations that require operator recovery.
+            reason = "recovery_error"
+            rejected = True
+        elif session.get("_finalized"):
+            reason = "session_finalized"
+            rejected = True
+        elif len(items) + reserved_count >= _TUI_BUSY_QUEUE_MAX_PENDING:
+            reason = "max_items"
+            rejected = True
+        elif queued_bytes + reserved_bytes + item_bytes > max_bytes:
+            reason = "max_bytes"
+            rejected = True
+        else:
+            candidate_items = [*items, item]
+            if all(_prompt_arrival_ordinal(queued) is not None for queued in candidate_items):
+                candidate_items.sort(
+                    key=lambda queued: _prompt_arrival_ordinal(queued) or 0
+                )
+            try:
+                _store_queued_prompt_items_locked(session, candidate_items)
+            except Exception as exc:
+                logger.error(
+                    "failed durable TUI prompt admission error_type=%s",
+                    type(exc).__name__,
+                )
+                reason = "persistence"
+                rejected = True
+            else:
+                items = candidate_items
+                queued_bytes += item_bytes
+        receipt = {
+            "accepted": not rejected,
+            "reason": reason,
+            "depth": len(items),
+            "queued_bytes": queued_bytes,
+            "expired": expired,
+        }
+    if rejected:
+        _restore_rejected_prompt_images(session, item)
+    return receipt
 
 
 def _interrupt_busy_session(sid: str, session: dict, agent: Any) -> None:
@@ -7368,56 +8634,466 @@ def _interrupt_busy_session(sid: str, session: dict, agent: Any) -> None:
     threading.Thread(target=interrupt, daemon=True, name=f"busy-interrupt-{sid}").start()
 
 
+def _requeue_prompt_front(session: dict, item: dict) -> dict:
+    """Restore a failed dispatch ahead of every still-queued TUI prompt."""
+
+    with _prompt_queue_lock(session):
+        items, expired = _cleanup_expired_prompts_locked(session)
+        if session.get("_finalized"):
+            return {
+                "accepted": False,
+                "reason": "session_finalized",
+                "depth": len(items),
+                "queued_bytes": sum(_prompt_envelope_size(queued) for queued in items),
+                "expired": expired,
+            }
+        items.insert(0, item)
+        if all(_prompt_arrival_ordinal(queued) is not None for queued in items):
+            items.sort(key=lambda queued: _prompt_arrival_ordinal(queued) or 0)
+        _store_queued_prompt_items_locked(session, items, claim=None)
+        return {
+            "accepted": True,
+            "reason": "dispatch_failed_requeued",
+            "depth": len(items),
+            "queued_bytes": int(session.get("queued_prompt_bytes", 0) or 0),
+            "expired": expired,
+        }
+
+
+def _handle_smart_busy_submit(
+    rid: Any,
+    sid: str,
+    session: dict,
+    text: Any,
+    transport: Any,
+    *,
+    envelope: dict,
+    route_context: dict | None = None,
+) -> dict:
+    """Classify a busy TUI prompt and never interrupt the active turn."""
+    from hermes_cli.smart_orchestrator import (
+        ROUTE_AMBIGUOUS,
+        ROUTE_INDEPENDENT,
+        ROUTE_RELATED,
+        SmartRouteDecision,
+        build_parallel_steer_payload,
+        classify_smart_message,
+        format_smart_ack,
+    )
+
+    route_started = time.monotonic()
+
+    cfg = _load_cfg()
+    smart_cfg = cfg.get("orchestration", {}).get("smart", {})
+    if not isinstance(smart_cfg, dict):
+        smart_cfg = {}
+    try:
+        threshold = max(
+            0.0,
+            min(1.0, float(smart_cfg.get("confidence_threshold", 0.78))),
+        )
+    except (TypeError, ValueError):
+        threshold = 0.78
+    try:
+        timeout = max(
+            1.0,
+            min(60.0, float(smart_cfg.get("classifier_timeout_seconds", 12.0))),
+        )
+    except (TypeError, ValueError):
+        timeout = 12.0
+
+    # The run lease is captured at prompt admission, before waiting behind any
+    # earlier classifier. AIAgent objects are reused between turns, so identity
+    # alone cannot stop an input admitted in run N from steering run N+1.
+    if not isinstance(route_context, dict):
+        with session["history_lock"]:
+            route_context = _capture_busy_route_context_locked(session)
+    agent = route_context.get("agent")
+    inflight = route_context.get("inflight")
+    captured_generation = route_context.get("generation")
+
+    active_goal = ""
+    if isinstance(inflight, dict):
+        active_goal = str(inflight.get("user") or "")
+    if not active_goal and agent is not None:
+        try:
+            for message in reversed(getattr(agent, "messages", []) or []):
+                if isinstance(message, dict) and message.get("role") == "user":
+                    content = message.get("content")
+                    if isinstance(content, str):
+                        active_goal = content
+                        break
+        except Exception:
+            active_goal = ""
+
+    activity = {}
+    if agent is not None:
+        try:
+            summary = agent.get_activity_summary()
+            if isinstance(summary, dict):
+                activity = {
+                    key: summary.get(key)
+                    for key in ("api_call_count", "max_iterations", "current_tool")
+                    if summary.get(key) is not None
+                }
+        except Exception:
+            activity = {}
+
+    main_runtime = {}
+    if agent is not None:
+        for key in (
+            "provider",
+            "model",
+            "api_key",
+            "base_url",
+            "api_mode",
+            "auth_mode",
+            "credential_pool",
+        ):
+            value = getattr(agent, key, None)
+            if value is not None:
+                main_runtime[key] = value
+    if not main_runtime.get("provider") or not main_runtime.get("model"):
+        main_runtime = {}
+
+    has_media = bool(envelope.get("images"))
+    try:
+        compute_host_owned = bool(session.get("_compute_host_active")) or bool(
+            _session_uses_compute_host(session)
+        )
+    except Exception:
+        # Host ownership is a fail-closed boundary: a serving-process proxy has
+        # no acknowledged steer protocol for the live child turn.
+        compute_host_owned = bool(session.get("_compute_host_active"))
+    if has_media or compute_host_owned:
+        reason = (
+            "The live turn belongs to the compute host; remote steering is unavailable."
+            if compute_host_owned
+            else "Media-bearing input is preserved as a separate queued turn."
+        )
+        decision = SmartRouteDecision(
+            route=ROUTE_AMBIGUOUS,
+            confidence=0.0,
+            reason=reason,
+            source="fallback",
+        )
+        payload = str(text or "")
+    else:
+        try:
+            decision, payload = classify_smart_message(
+                active_goal=active_goal,
+                incoming_text=str(text or ""),
+                activity_summary=json.dumps(activity, ensure_ascii=False, default=str),
+                confidence_threshold=threshold,
+                classifier_timeout_seconds=timeout,
+                main_runtime=main_runtime or None,
+            )
+        except Exception:
+            decision = SmartRouteDecision(
+                route=ROUTE_AMBIGUOUS,
+                confidence=0.0,
+                reason="Classifier unavailable; using the safe queue fallback.",
+                source="fallback",
+            )
+            payload = str(text or "")
+
+    steered = False
+    steer_fenced = False
+    callback_state: dict[str, Any] = {"disposition": None, "receipt": None}
+
+    def on_consumed() -> None:
+        resolved, _unused = _finish_smart_steer_claim(
+            session,
+            queue_instead=False,
+            expected=envelope,
+        )
+        if resolved:
+            callback_state["disposition"] = "consumed"
+        elif callback_state.get("disposition") is None:
+            callback_state["disposition"] = "uncertain"
+
+    def on_unconsumed() -> None:
+        resolved, queued_receipt = _finish_smart_steer_claim(
+            session,
+            queue_instead=True,
+            expected=envelope,
+        )
+        if resolved:
+            callback_state["disposition"] = "unconsumed"
+            callback_state["receipt"] = queued_receipt
+        elif callback_state.get("disposition") is None:
+            callback_state["disposition"] = "uncertain"
+
+    def on_uncertain() -> None:
+        quarantined = _quarantine_smart_steer_claim(session, expected=envelope)
+        if callback_state.get("disposition") is None:
+            callback_state["disposition"] = "uncertain"
+        if quarantined:
+            _emit(
+                "status.update",
+                sid,
+                {
+                    "kind": "warning",
+                    "text": (
+                        "Steer delivery became uncertain after durable admission; "
+                        "successors are fenced pending explicit recovery."
+                    ),
+                },
+            )
+
+    with session["history_lock"]:
+        current_inflight = session.get("inflight_turn")
+        try:
+            current_generation = int(
+                (current_inflight or {}).get("generation")
+                if isinstance(current_inflight, dict)
+                else 0
+            )
+        except (TypeError, ValueError):
+            current_generation = 0
+        same_active_run = (
+            captured_generation is not None
+            and bool(session.get("running"))
+            and session.get("agent") is agent
+            and current_generation == captured_generation
+        )
+        steer_generation = route_context.get("steer_generation")
+        if (
+            same_active_run
+            and not has_media
+            and decision.route in {ROUTE_RELATED, ROUTE_INDEPENDENT}
+            and agent is not None
+            and route_context.get("supports_steer_consumption_ack") is True
+            and isinstance(steer_generation, int)
+            and not isinstance(steer_generation, bool)
+        ):
+            steer_payload = payload
+            if decision.route == ROUTE_INDEPENDENT:
+                steer_payload = build_parallel_steer_payload(payload)
+            if steer_payload and callable(getattr(agent, "steer", None)):
+                steer_fenced = _fence_smart_steer_claim(session, envelope)
+            if steer_fenced and steer_payload and callable(getattr(agent, "steer", None)):
+                try:
+                    steered = bool(
+                        agent.steer(
+                            steer_payload,
+                            run_generation=steer_generation,
+                            on_consumed=on_consumed,
+                            on_unconsumed=on_unconsumed,
+                            on_uncertain=on_uncertain,
+                        )
+                    )
+                except Exception:
+                    steered = False
+
+    receipt = None
+    status = "smart_rejected"
+    disposition = callback_state.get("disposition")
+    if disposition == "consumed":
+        steered = True
+    if steered and disposition != "unconsumed":
+        if disposition == "uncertain":
+            status = "smart_uncertain"
+        else:
+            # A successful ``steer`` only stages the receipt. The durable claim
+            # remains until AIAgent invokes the terminal consumption callback.
+            if decision.route == ROUTE_INDEPENDENT:
+                # This only delivered an orchestration directive to the active run;
+                # no isolated worker has acknowledged ownership yet. Mirror the
+                # gateway and never claim parallel execution without a real receipt.
+                decision = SmartRouteDecision(
+                    route=ROUTE_RELATED,
+                    confidence=decision.confidence,
+                    reason="Parallel orchestration requested inside the active run.",
+                    source="delivery",
+                )
+            status = "smart_related"
+    else:
+        if disposition == "unconsumed":
+            queued_receipt = callback_state.get("receipt")
+            receipt = queued_receipt if isinstance(queued_receipt, dict) else None
+        elif disposition == "uncertain":
+            status = "smart_uncertain"
+        elif steer_fenced:
+            resolved, receipt = _finish_smart_steer_claim(
+                session,
+                queue_instead=True,
+                expected=envelope,
+            )
+            if not resolved:
+                status = "smart_uncertain"
+        else:
+            receipt = _enqueue_prompt(session, text, transport, envelope=envelope)
+        if receipt is not None:
+            status = "smart_queued" if receipt["accepted"] else "smart_rejected"
+            if not receipt["accepted"]:
+                decision = SmartRouteDecision(
+                    route=ROUTE_AMBIGUOUS,
+                    confidence=0.0,
+                    reason="The bounded next-turn queue rejected this message.",
+                    source="fallback",
+                )
+            elif decision.route in {ROUTE_RELATED, ROUTE_INDEPENDENT}:
+                decision = SmartRouteDecision(
+                    route=ROUTE_AMBIGUOUS,
+                    confidence=0.0,
+                    reason="The active checkpoint closed before steering; queued safely.",
+                    source="fallback",
+                )
+            # The run may have completed while classification was in flight. Drain
+            # now instead of waiting for a finalizer that has already passed its
+            # queue-drain checkpoint.
+            if receipt["accepted"] and _drain_queued_prompt(rid, sid, session):
+                status = "smart_started"
+
+    prefix = str(smart_cfg.get("ack_prefix", "") or "").strip()
+    session["last_active"] = time.time()
+    ack = format_smart_ack(decision, prefix=prefix)
+    if status == "smart_started":
+        body = "▶ O turno anterior terminou durante a classificação; a mensagem foi iniciada como o próximo turno."
+        ack = f"{prefix}\n\n{body}" if prefix else body
+    elif status == "smart_uncertain":
+        body = (
+            "⚠ A entrega ao turno ativo tem resultado incerto após o ponto de "
+            "persistência. A mensagem foi preservada para recuperação explícita; "
+            "não a reenvie automaticamente."
+        )
+        ack = f"{prefix}\n\n{body}" if prefix else body
+    elif status == "smart_rejected":
+        if receipt is not None and receipt.get("reason") == "recovery_error":
+            body = (
+                "⚠ A mensagem não foi aceita: a recuperação durável da fila requer "
+                "intervenção; o estado anterior foi preservado sem sobrescrita."
+            )
+        else:
+            body = "⚠ A mensagem não foi aceita: a fila de próximos turnos atingiu o limite seguro."
+        ack = f"{prefix}\n\n{body}" if prefix else body
+    result = {
+        "status": status,
+        "route": decision.route,
+        "ack": ack,
+        "accepted": status != "smart_rejected",
+    }
+    if receipt is not None:
+        result.update(
+            {
+                "reason": receipt["reason"],
+                "depth": receipt["depth"],
+                "queued_bytes": receipt["queued_bytes"],
+            }
+        )
+    logger.info(
+        "smart_route surface=tui route=%s source=%s "
+        "latency_ms=%d accepted=%s steered=%s "
+        "queue_depth=%d worker_accepted=false interrupt=false media=%s compute_host=%s",
+        decision.route,
+        decision.source,
+        int((time.monotonic() - route_started) * 1000),
+        bool(result["accepted"]),
+        steered,
+        int(result.get("depth") or 0),
+        has_media,
+        compute_host_owned,
+    )
+    return _ok(rid, result)
+
+
 def _handle_busy_submit(
-    rid, sid: str, session: dict, text: Any, transport: Any, queued: bool = False
+    rid,
+    sid: str,
+    session: dict,
+    text: Any,
+    transport: Any,
+    *,
+    envelope: dict | None = None,
+    route_context: dict | None = None,
+    queued: bool = False,
 ) -> dict | None:
     """Apply the ``display.busy_input_mode`` policy to a prompt that lands while
     a turn is in flight, instead of rejecting it with ``session busy``.
 
     The old rejection forced clients into a deadline-bounded busy-retry that
-    silently dropped the send when turn teardown outlived the deadline. The
-    default policy now redirects a capable core agent in place; older agents
-    retain the proven interrupt-and-queue path drained from ``run``'s tail.
+    silently dropped the send when turn teardown outlived the deadline (e.g. a
+    slow, non-interruptible tool like ``web_search`` running when the user hits
+    stop). The message is instead queued to run as the next turn — and, for the
+    default ``interrupt`` policy, the live turn is interrupted so it winds down
+    promptly. Drained in ``run``'s tail (see ``_run_prompt_submit``).
 
-    Modes: ``interrupt`` (default) → redirect the live turn, falling back to
-    hard interrupt + queue for older agents; ``queue`` → queue without
-    interrupting; ``steer`` → inject after the current atomic action.
-
-    ``queued=True`` (client's queue drain, ``prompt.submit`` param) overrides
-    the mode entirely: the message was explicitly queued as "run after", so it
-    must NEVER become a live-turn correction or interrupt. Without this, a
-    drain that loses the settle race (client observed idle, server still
-    unwinding the turn) redirected the live turn with next-turn text — queue
-    semantics betrayed by a millisecond race the user can't see.
+    Modes: ``interrupt`` (default) → interrupt + queue; ``queue`` → queue
+    without interrupting; ``steer`` → inject into the live turn if accepted,
+    else queue; ``smart`` → classify into related/parallel/dependent and never
+    interrupt.
     """
+    if not isinstance(envelope, dict):
+        with session["history_lock"]:
+            envelope = _capture_prompt_envelope_locked(
+                session,
+                rid,
+                text,
+                transport,
+            )
+    with session["history_lock"]:
+        still_running = bool(session.get("running"))
+    if not still_running:
+        _restore_rejected_prompt_images(session, envelope)
+        return None
     mode = "queue" if queued else _load_busy_input_mode()
     agent = session.get("agent")
-    with session["history_lock"]:
-        if not session.get("running"):
-            # The turn ended between prompt.submit's first busy check and this
-            # helper. Let the caller retry and claim the now-idle session.
-            return None
-    with session["history_lock"]:
-        if not session.get("running"):
-            return None
-        image_paths = list(session.get("attached_images", []))
-        if image_paths:
-            # Claim at submission time. A later paste must not be consumed by
-            # this prompt after the active turn finally yields.
-            session["attached_images"] = []
-    text_only = not image_paths and _is_text_only_busy_payload(text)
+    if mode == "smart":
+        if not isinstance(route_context, dict):
+            with session["history_lock"]:
+                route_context = _capture_busy_route_context_locked(session)
+        route_lock: Any = session.get("smart_route_lock")
+        if not hasattr(route_lock, "acquire"):
+            route_lock = threading.Lock()
+            session["smart_route_lock"] = route_lock
+        with route_lock:
+            return _handle_smart_busy_submit(
+                rid,
+                sid,
+                session,
+                text,
+                transport,
+                envelope=envelope,
+                route_context=route_context,
+            )
+    has_media = bool(envelope.get("images"))
+    text_only = not has_media and _is_text_only_busy_payload(text)
     plain_text = _coerce_message_text(text).strip() if text_only else ""
-    if mode == "steer" and text_only and plain_text and agent is not None and hasattr(agent, "steer"):
-        try:
-            if agent.steer(plain_text):
-                with session["history_lock"]:
-                    session["last_active"] = time.time()
-                return _ok(rid, {"status": "steered"})
-        except Exception:
-            pass  # fall through to queue
-    # Text-only corrections redirect the live turn in place when the runtime
-    # supports it; media/attachment payloads and older agents fall through to
-    # the proven interrupt + queue path below.
+    if not has_media and mode == "steer":
+        disposition, steer_receipt = _attempt_durable_tui_steer(
+            sid,
+            session,
+            plain_text,
+            envelope,
+            route_context=route_context,
+        )
+        session["last_active"] = time.time()
+        if disposition == "steered":
+            return _ok(rid, {"status": "steered", "accepted": True})
+        if disposition == "uncertain":
+            return _ok(
+                rid,
+                {
+                    "status": "steer_uncertain",
+                    "accepted": True,
+                    "retry_safe": False,
+                    "ack": (
+                        "A entrega do steer ficou incerta após admissão durável; "
+                        "não reenvie automaticamente."
+                    ),
+                },
+            )
+        if disposition == "queued" and isinstance(steer_receipt, dict):
+            return _ok(
+                rid,
+                {
+                    "status": "queued",
+                    "accepted": True,
+                    "depth": steer_receipt["depth"],
+                    "queued_bytes": steer_receipt["queued_bytes"],
+                },
+            )
     if (
         mode == "interrupt"
         and text_only
@@ -7433,23 +9109,38 @@ def _handle_busy_submit(
                     session["last_active"] = time.time()
                 return _ok(rid, {"status": "redirected"})
         except Exception:
-            pass  # preserve the proven interrupt + queue fallback below
-    # Queue before asking the live turn to stop. In particular, never call a
-    # provider or compute-host method while holding history_lock: an interrupt
-    # can wait behind the very operation it is trying to cancel.
-    with session["history_lock"]:
-        if not session.get("running"):
-            if image_paths:
-                session["attached_images"] = image_paths + list(session.get("attached_images", []))
-            return None
-        _enqueue_prompt(session, text, transport, image_paths=image_paths)
-        session["last_active"] = time.time()
-
-    # Attachments need a separate model invocation. Queue them without
-    # cancelling the active turn so the user gets both results in order.
-    if mode != "queue" and not image_paths:
+            pass
+    receipt = _enqueue_prompt(session, text, transport, envelope=envelope)
+    session["last_active"] = time.time()
+    if not receipt["accepted"]:
+        rejection_ack = (
+            "A mensagem não foi aceita: a recuperação durável da fila requer "
+            "intervenção; o estado anterior foi preservado sem sobrescrita."
+            if receipt["reason"] == "recovery_error"
+            else "A mensagem não foi aceita: a fila de próximos turnos atingiu o limite seguro."
+        )
+        return _ok(
+            rid,
+            {
+                "status": "queue_rejected",
+                "accepted": False,
+                "reason": receipt["reason"],
+                "depth": receipt["depth"],
+                "queued_bytes": receipt["queued_bytes"],
+                "ack": rejection_ack,
+            },
+        )
+    if mode == "interrupt" and not has_media:
         _interrupt_busy_session(sid, session, agent)
-    return _ok(rid, {"status": "queued"})
+    return _ok(
+        rid,
+        {
+            "status": "queued",
+            "accepted": True,
+            "depth": receipt["depth"],
+            "queued_bytes": receipt["queued_bytes"],
+        },
+    )
 
 
 def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
@@ -7460,63 +9151,53 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
     claim-under-lock pattern used by the goal-continuation re-fire.
     """
     with session["history_lock"]:
-        queued = session.get("queued_prompt")
-        if not queued or session.get("running"):
+        if session.get("running"):
             return False
         queue_generation = int(session.get("_queued_prompt_generation", 0))
-        queued_prompts = session.get("queued_prompts") or []
-        session["queued_prompt"] = queued_prompts.pop(0) if queued_prompts else None
-        if not queued_prompts:
-            session.pop("queued_prompts", None)
+        with _prompt_queue_lock(session):
+            items, _expired = _cleanup_expired_prompts_locked(session)
+            if session.get("_prompt_queue_restore_error"):
+                return False
+            if session.get("_queued_prompt_claim") or session.get("_smart_steer_claim"):
+                return False
+            if not items:
+                return False
+            queued = items[0]
+            _store_queued_prompt_items_locked(session, items[1:], claim=queued)
         session["running"] = True
+        session["active_prompt_envelope"] = queued
         if queued.get("transport") is not None:
             session["transport"] = queued["transport"]
-    use_compute_host = _session_uses_compute_host(session)
-    with session["history_lock"]:
-        if int(session.get("_queued_prompt_generation", 0)) != queue_generation:
-            session["running"] = False
-            return True
-    dispatch_failed = False
     try:
-        if use_compute_host:
-            if queued.get("image_paths"):
-                resp = _submit_prompt_to_compute_host(
-                    rid,
-                    sid,
-                    session,
-                    queued["text"],
-                    image_paths=queued["image_paths"],
-                    queued_prompt_generation=queue_generation,
-                )
-            else:
-                resp = _submit_prompt_to_compute_host(
-                    rid, sid, session, queued["text"], queued_prompt_generation=queue_generation
-                )
+        if _session_uses_compute_host(session):
+            resp = _submit_prompt_to_compute_host(
+                rid,
+                sid,
+                session,
+                queued["text"],
+                queued_prompt_generation=queue_generation,
+                envelope=queued,
+            )
             if resp.get("error"):
                 message = str(((resp.get("error") or {}).get("message")) or "queued prompt failed")
                 with session["history_lock"]:
                     session["running"] = False
                     _clear_inflight_turn(session)
+                    session.pop("active_prompt_envelope", None)
+                    _requeue_prompt_front(session, queued)
                 _emit("error", sid, {"message": message})
-                dispatch_failed = True
         else:
-            if queued.get("image_paths"):
-                _run_prompt_submit(
-                    rid,
-                    sid,
-                    session,
-                    queued["text"],
-                    image_paths=queued["image_paths"],
-                    queued_prompt_generation=queue_generation,
-                )
-            else:
-                _run_prompt_submit(
-                    rid,
-                    sid,
-                    session,
-                    queued["text"],
-                    queued_prompt_generation=queue_generation,
-                )
+            # ``_run_prompt_submit`` only launches its worker thread.  The
+            # durable claim is committed by that worker's terminal ``finally``;
+            # clearing it here would open a crash window before execution or
+            # transcript persistence.
+            _run_prompt_submit(
+                rid,
+                sid,
+                session,
+                queued["text"],
+                queued_prompt_generation=queue_generation,
+            )
     except Exception as exc:
         print(
             f"[tui_gateway] queued prompt dispatch failed: "
@@ -7525,14 +9206,8 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
         )
         with session["history_lock"]:
             session["running"] = False
-        dispatch_failed = True
-    if dispatch_failed:
-        with session["history_lock"]:
-            drain_next = bool(session.get("queued_prompt")) and not session.get(
-                "_turn_cancel_requested"
-            )
-        if drain_next:
-            _drain_queued_prompt(rid, sid, session)
+            session.pop("active_prompt_envelope", None)
+            _requeue_prompt_front(session, queued)
     return True
 
 
@@ -7668,6 +9343,7 @@ def _deferred_session_record(
         "agent_error": None,
         "agent_ready": threading.Event(),
         "attached_images": [],
+        "attached_images_by_owner": {},
         "close_on_disconnect": close_on_disconnect,
         "active_session_lease": lease,
         "cols": cols,
@@ -8151,7 +9827,12 @@ def _pet_state_rows(spritesheet) -> list[str]:
 
 def _pet_gen_root():
     """Profile-scoped staging dir for in-progress generation drafts."""
-    from hermes_constants import get_hermes_home
+    from hermes_constants import (
+    get_hermes_home,
+    get_hermes_home_override,
+    reset_hermes_home_override,
+    set_hermes_home_override,
+)
 
     root = get_hermes_home() / "cache" / "pet-gen"
     root.mkdir(parents=True, exist_ok=True)
@@ -8577,21 +10258,17 @@ def _serialize_subscription_preview(p) -> dict:
 # Each file contains { session_id, started_at, finished_at, subagents: [...] }.
 
 
-def _spawn_trees_root():
-    from hermes_constants import get_hermes_home
-
-    root = get_hermes_home() / "spawn-trees"
-    root.mkdir(parents=True, exist_ok=True)
-    return root
+def _spawn_trees_root(session: dict) -> Path:
+    profile_home = Path(str(session.get("profile_home") or _hermes_home)).expanduser()
+    _secure_private_directory(profile_home)
+    return _secure_private_directory(profile_home / "spawn-trees")
 
 
-def _spawn_tree_session_dir(session_id: str):
+def _spawn_tree_session_dir(session: dict, session_id: str) -> Path:
     safe = (
         "".join(c if c.isalnum() or c in "-_" else "_" for c in session_id) or "unknown"
     )
-    d = _spawn_trees_root() / safe
-    d.mkdir(parents=True, exist_ok=True)
-    return d
+    return _secure_private_directory(_spawn_trees_root(session) / safe)
 
 
 # Per-session append-only index of lightweight snapshot metadata.  Read by
@@ -8600,34 +10277,38 @@ def _spawn_tree_session_dir(session_id: str):
 _SPAWN_TREE_INDEX = "_index.jsonl"
 
 
-def _append_spawn_tree_index(session_dir, entry: dict) -> None:
-    try:
-        with (session_dir / _SPAWN_TREE_INDEX).open("a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-    except OSError as exc:
-        # Index is a cache — losing a line just means list() falls back
-        # to a directory scan for that entry.  Never block the save.
-        logger.debug("spawn_tree index append failed: %s", exc)
+def _append_spawn_tree_index(session_dir: Path, entry: dict) -> None:
+    entries = _read_spawn_tree_index(session_dir)
+    entries.append(entry)
+    entries = entries[-_SPAWN_TREE_RETENTION:]
+    payload = "".join(
+        json.dumps(item, ensure_ascii=False) + "\n" for item in entries
+    ).encode("utf-8")
+    _write_private_file_atomic(session_dir / _SPAWN_TREE_INDEX, payload)
 
 
-def _read_spawn_tree_index(session_dir) -> list[dict]:
+def _read_spawn_tree_index(session_dir: Path) -> list[dict]:
     index_path = session_dir / _SPAWN_TREE_INDEX
-    if not index_path.exists():
-        return []
-    out: list[dict] = []
     try:
-        with index_path.open("r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    out.append(json.loads(line))
-                except json.JSONDecodeError:
-                    continue
+        raw = _read_private_file(index_path, max_bytes=2 * 1024 * 1024).decode(
+            "utf-8", "replace"
+        )
+    except FileNotFoundError:
+        return []
     except OSError:
         return []
-    return out
+    out: list[dict] = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(item, dict):
+            out.append(item)
+    return out[-_SPAWN_TREE_RETENTION:]
 
 
 # ── Methods: prompt ──────────────────────────────────────────────────
@@ -9316,16 +10997,32 @@ def _run_prompt_submit(
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
 ) -> None:
+    compute_host_worker = bool(session.get("_compute_host_worker"))
+    if compute_host_worker:
+        with session["history_lock"]:
+            session["_prompt_terminal_outcome"] = {
+                "request_id": str(rid),
+                "disposition": "uncertain",
+            }
     with session["history_lock"]:
         if (
             queued_prompt_generation is not None
             and int(session.get("_queued_prompt_generation", 0)) != queued_prompt_generation
         ):
             session["running"] = False
+            stale_envelope = session.pop("active_prompt_envelope", None)
+            if isinstance(stale_envelope, dict):
+                _requeue_prompt_front(session, stale_envelope)
             return
         history = list(session["history"])
         history_version = int(session.get("history_version", 0))
-        if image_paths is None:
+        envelope = session.pop("active_prompt_envelope", None)
+        if isinstance(envelope, dict):
+            text = envelope.get("text", text)
+            images = list(envelope.get("images", []) or [])
+            if envelope.get("transport") is not None:
+                session["transport"] = envelope["transport"]
+        elif image_paths is None:
             images = list(session.get("attached_images", []))
             session["attached_images"] = []
         else:
@@ -9368,6 +11065,8 @@ def _run_prompt_submit(
         marker_text = session.pop("_auto_continue_prompt", None) or text
         if isinstance(marker_text, str) and marker_text.strip():
             record_turn_start(marker_home, marker_key, marker_text, attempts=marker_attempt)
+        history_committed = False
+        terminal_receipt_committed = False
         try:
             from tools.approval import (
                 reset_current_session_key,
@@ -9593,9 +11292,6 @@ def _run_prompt_submit(
             run_kwargs = {
                 "conversation_history": list(history),
                 "stream_callback": _stream,
-                "persist_user_message": (
-                    _build_persist_user_message(prompt, images, run_message) if images else prompt
-                ),
             }
             # Type a synthesized turn at turn START so the crash persist writes
             # its row as a timeline event, instead of leaving a raw user bubble
@@ -9607,6 +11303,15 @@ def _run_prompt_submit(
                 _run_params = inspect.signature(agent.run_conversation).parameters
             except (TypeError, ValueError):
                 _run_params = {}
+            if "persist_user_message" in _run_params or any(
+                param.kind is inspect.Parameter.VAR_KEYWORD
+                for param in _run_params.values()
+            ):
+                run_kwargs["persist_user_message"] = (
+                    _build_persist_user_message(prompt, images, run_message)
+                    if images
+                    else prompt
+                )
             if "task_id" in _run_params:
                 run_kwargs["task_id"] = session["session_key"]
             if display_kind and "persist_user_display_kind" in _run_params:
@@ -9685,6 +11390,7 @@ def _run_prompt_submit(
                         if current_version == history_version:
                             session["history"] = result["messages"]
                             session["history_version"] = history_version + 1
+                            history_committed = True
                         else:
                             # History mutated externally during the turn
                             # (undo/compress/retry/rollback now guard on
@@ -9749,6 +11455,19 @@ def _run_prompt_submit(
                 raw = str(result)
                 status = "complete"
 
+            if isinstance(result, dict):
+                leftover_steer = str(result.get("pending_steer") or "").strip()
+                if leftover_steer:
+                    leftover_receipt = _prioritize_tui_leftover_steer(
+                        session,
+                        leftover_steer,
+                    )
+                    if not leftover_receipt.get("accepted"):
+                        logger.error(
+                            "accepted TUI steer could not be restaged reason=%s",
+                            leftover_receipt.get("reason"),
+                        )
+
             payload = {"text": raw, "usage": _get_usage(agent), "status": status}
             if last_reasoning:
                 payload["reasoning"] = last_reasoning
@@ -9786,6 +11505,23 @@ def _run_prompt_submit(
                 payload["recoverable"] = True
             _retire_turn_marker(session, marker_key)
             _emit("message.complete", sid, payload)
+            terminal_receipt_committed = bool(
+                history_committed
+                and status_note is None
+                and status == "complete"
+                and _turn_result_is_explicit_terminal_success(result)
+            )
+            if compute_host_worker and terminal_receipt_committed:
+                with session["history_lock"]:
+                    outcome = session.get("_prompt_terminal_outcome")
+                    if (
+                        isinstance(outcome, dict)
+                        and str(outcome.get("request_id")) == str(rid)
+                    ):
+                        session["_prompt_terminal_outcome"] = {
+                            "request_id": str(rid),
+                            "disposition": "terminal",
+                        }
 
             # ── /goal continuation (Ralph-style loop) ─────────────────
             # After every TUI turn, if a /goal is active, ask the judge
@@ -9930,21 +11666,26 @@ def _run_prompt_submit(
                 except Exception as e:
                     logger.warning("voice TTS dispatch failed: %s", e)
         except Exception as e:
+            take_failed_steer = getattr(agent, "take_failed_turn_pending_steer", None)
+            if callable(take_failed_steer):
+                failed_leftover = take_failed_steer()
+                if failed_leftover:
+                    receipt = _prioritize_tui_leftover_steer(session, failed_leftover)
+                    if not receipt.get("accepted"):
+                        logger.error(
+                            "failed-turn TUI steer could not be restaged reason=%s",
+                            receipt.get("reason"),
+                        )
             import traceback
 
-            trace = traceback.format_exc()
-            try:
-                os.makedirs(os.path.dirname(_CRASH_LOG), exist_ok=True)
-                with open(_CRASH_LOG, "a", encoding="utf-8") as f:
-                    f.write(
-                        f"\n=== turn-dispatcher exception · "
-                        f"{time.strftime('%Y-%m-%d %H:%M:%S')} · sid={sid} ===\n"
-                    )
-                    f.write(trace)
-            except Exception:
-                pass
+            trace = "".join(traceback.format_tb(e.__traceback__))
+            trace += f"{type(e).__name__}\n"
+            _append_crash_record(_CRASH_LOG, "turn-dispatcher exception", trace)
+            safe_error = _safe_crash_text(e)
             print(
-                f"[gateway-turn] {type(e).__name__}: {e}", file=sys.stderr, flush=True
+                f"[gateway-turn] {type(e).__name__}: {safe_error}",
+                file=sys.stderr,
+                flush=True,
             )
             try:
                 # Close the turn with the same terminal error frame shape as
@@ -9959,7 +11700,7 @@ def _run_prompt_submit(
                     file=sys.stderr,
                     flush=True,
                 )
-                _emit("error", sid, {"message": str(e)})
+                _emit("error", sid, {"message": safe_error})
         finally:
             # Drop both local snapshots of the pre-turn history before asking
             # glibc to return pages. session["history"] already points at the
@@ -10020,20 +11761,22 @@ def _run_prompt_submit(
             _retire_turn_marker(session, marker_key)
             session.pop("_auto_continue_scheduled", None)
             _emit_settled_session_info(sid, session, agent)
+            if not compute_host_worker and isinstance(envelope, dict):
+                if terminal_receipt_committed:
+                    _complete_queued_prompt_claim(session, expected=envelope)
+                else:
+                    _quarantine_queued_prompt_claim(session, expected=envelope)
 
-        # A user prompt that arrived mid-turn (interrupt + queue) wins over
-        # every auto follow-up below — drain it first and skip them this cycle;
-        # the goal judge / notifications re-evaluate at the end of that turn.
-        # Leftover /steer: the steer arrived after the last tool batch (e.g.
-        # during the final API call), so the agent couldn't inject it and
-        # returned it in result["pending_steer"]. Requeue it as the next turn
-        # so it isn't silently dropped — same rule as cli.py and gateway/run.py.
-        # A real queued prompt still wins: the merge in _enqueue_prompt keeps
-        # both texts.
-        _leftover_steer = result.get("pending_steer") if isinstance(result, dict) else None
-        if isinstance(_leftover_steer, str) and _leftover_steer.strip():
-            with session["history_lock"]:
-                _enqueue_prompt(session, _leftover_steer, session.get("transport"))
+        # The serving process is the sole durable prompt-queue owner. A
+        # compute-host child executes exactly the frame it received and returns
+        # its terminal disposition; it must never claim, clear, or recursively
+        # drain the parent's durable successors.
+        if compute_host_worker:
+            return
+
+        # A user prompt that arrived mid-turn wins over every auto follow-up.
+        # Durable leftover steer has already been restaged before the terminal
+        # receipt above, so only drain the canonical queue here.
         if _drain_queued_prompt(rid, sid, session):
             return
 
@@ -10209,7 +11952,14 @@ def _session_images_dir(session: dict) -> Path:
     return base / "images"
 
 
-def _queue_attached_image(session: dict, img_bytes: bytes, ext: str, *, prefix: str) -> Path:
+def _queue_attached_image(
+    session: dict,
+    img_bytes: bytes,
+    ext: str,
+    *,
+    prefix: str,
+    attachment_owner: str | None = None,
+) -> Path:
     """Write image bytes into the gateway's images dir and queue them.
 
     Mirrors what ``image.attach`` does for a local path: appends to
@@ -10217,16 +11967,44 @@ def _queue_attached_image(session: dict, img_bytes: bytes, ext: str, *, prefix: 
     the existing native-image-attach pipeline. Returns the written path.
     """
     session["image_counter"] = session.get("image_counter", 0) + 1
-    img_dir = _session_images_dir(session)
-    img_dir.mkdir(parents=True, exist_ok=True)
+    profile_home_raw = session.get("profile_home")
+    profile_home = (
+        Path(str(profile_home_raw)).expanduser().resolve()
+        if profile_home_raw
+        else _hermes_home
+    )
+    img_dir = profile_home / "images"
+    img_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if os.name != "nt":
+        os.chmod(img_dir, 0o700)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    img_path = img_dir / f"{prefix}_{ts}_{session['image_counter']}{ext}"
+    img_path = img_dir / (
+        f"{prefix}_{ts}_{session['image_counter']}_{uuid.uuid4().hex}{ext}"
+    )
+    temp = img_path.with_name(f".{img_path.name}.tmp")
     try:
-        img_path.write_bytes(img_bytes)
+        descriptor = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(img_bytes)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp, img_path)
+        try:
+            directory_fd = os.open(img_dir, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except OSError:
+            if os.name != "nt":
+                raise
     except Exception:
         session["image_counter"] = max(0, session["image_counter"] - 1)
+        img_path.unlink(missing_ok=True)
         raise
-    session.setdefault("attached_images", []).append(str(img_path))
+    finally:
+        temp.unlink(missing_ok=True)
+    _append_attached_image(session, str(img_path), attachment_owner)
     return img_path
 
 
@@ -10266,9 +12044,9 @@ def _attachment_ref_path(session: dict, target: Path) -> str:
 
 
 def _desktop_attachment_dir(session: dict) -> Path:
-    root = Path(_session_cwd(session)).resolve() / ".hermes" / "desktop-attachments"
-    root.mkdir(parents=True, exist_ok=True)
-    return root
+    workspace = Path(_session_cwd(session)).resolve()
+    hermes_dir = _secure_private_directory(workspace / ".hermes")
+    return _secure_private_directory(hermes_dir / "desktop-attachments")
 
 
 def _sanitize_attachment_name(name: str) -> str:
@@ -10369,9 +12147,15 @@ def _stage_session_file_attachment(
         filename = _sanitize_attachment_name(name or Path(str(raw_path or "")).name)
 
     upload_dir = _desktop_attachment_dir(session)
-    target = _unique_attachment_path(upload_dir, _sanitize_attachment_name(filename))
-    target.write_bytes(payload)
-    return target.resolve(), True
+    safe_name = _sanitize_attachment_name(filename)
+    for _attempt in range(10_000):
+        target = _unique_attachment_path(upload_dir, safe_name)
+        try:
+            published = _write_private_file_atomic_exclusive(target, payload)
+            return published.resolve(), True
+        except FileExistsError:
+            continue
+    raise OSError("unable to reserve a unique private attachment path")
 
 
 # ── Methods: respond ─────────────────────────────────────────────────

@@ -123,15 +123,39 @@ class TestBusyInputMode:
         cli = _make_cli(config_overrides={"display": {"busy_input_mode": "queue"}})
         assert cli.busy_input_mode == "queue"
 
+    def test_unknown_busy_input_mode_fails_closed_to_queue(self):
+        cli = _make_cli(config_overrides={"display": {"busy_input_mode": "bogus"}})
+        assert cli.busy_input_mode == "queue"
 
     def test_queue_command_works_while_busy(self):
         """When agent is running, /queue should still put the prompt in _pending_input."""
         cli = _make_cli()
         cli._agent_running = True
         cli.process_command("/queue follow up")
-        assert cli._pending_input.get_nowait() == "follow up"
+        queued = cli._pending_input.get_nowait()
+        assert queued.payload == "follow up"
+        assert queued.durable_id
+        assert queued.durable_session_id
 
+    def test_queue_command_works_while_idle(self):
+        """When agent is idle, /queue should still queue (not reject)."""
+        cli = _make_cli()
+        cli._agent_running = False
+        cli.process_command("/queue follow up")
+        queued = cli._pending_input.get_nowait()
+        assert queued.payload == "follow up"
+        assert queued.durable_id
+        assert queued.durable_session_id
 
+    def test_q_alias_queues_prompt(self):
+        """The /q alias should resolve to /queue, not /quit."""
+        cli = _make_cli()
+        cli._agent_running = False
+        assert cli.process_command("/q follow up") is True
+        queued = cli._pending_input.get_nowait()
+        assert queued.payload == "follow up"
+        assert queued.durable_id
+        assert queued.durable_session_id
 
 
     def test_interrupt_mode_routes_busy_enter_to_interrupt(self):
@@ -145,6 +169,18 @@ class TestBusyInputMode:
             cli._interrupt_queue.put(text)
         assert cli._interrupt_queue.get_nowait() == "redirect"
         assert cli._pending_input.empty()
+
+
+class TestSmartBusyStateInit:
+    def test_constructor_initializes_smart_turn_lifecycle_state(self):
+        """A real CLI instance must not depend on test-only/manual attributes."""
+        cli = _make_cli()
+
+        assert cli._smart_cli_turn_generation == 0
+        assert cli._smart_cli_active_snapshot is None
+        assert cli._smart_cli_worker is None
+        assert cli._smart_cli_input_queue.empty()
+        assert cli._smart_cli_turn_lock is not None
 
 
 class TestPromptToolkitTerminalCompatibility:

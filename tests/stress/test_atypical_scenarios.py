@@ -226,7 +226,12 @@ def _(home, kb):
     finally:
         conn.close()
 
-    env = {**os.environ, "PYTHONPATH": str(WT), "HERMES_HOME": home, "HOME": home}
+    env = {
+        **os.environ,
+        "PYTHONPATH": str(WT) + os.pathsep + os.environ.get("PYTHONPATH", ""),
+        "HERMES_HOME": home,
+        "HOME": home,
+    }
     bad_metas = [
         "not-json",
         "[1, 2, 3]",  # array not dict

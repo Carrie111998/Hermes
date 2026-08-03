@@ -80,7 +80,13 @@ while True:  # the wedge: never observes any unwind
 def test_sigterm_on_wedged_process_forces_exit_within_leash():
     """E2E: a wedged process armed via the signal path self-exits at ~2×
     HERMES_EXIT_WATCHDOG_S; without the signal it would live forever."""
-    env = dict(os.environ, HERMES_EXIT_WATCHDOG_S="1", PYTHONPATH=_REPO_ROOT)
+    env = dict(
+        os.environ,
+        HERMES_EXIT_WATCHDOG_S="1",
+        PYTHONPATH=_REPO_ROOT
+        + os.pathsep
+        + os.environ.get("PYTHONPATH", ""),
+    )
     # _arm_exit_watchdog refuses to arm under pytest (it would kill the test
     # worker); the subprocess must look like a real CLI.
     env.pop("PYTEST_CURRENT_TEST", None)

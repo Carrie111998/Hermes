@@ -187,6 +187,7 @@ class TestDetectAudioEnvironmentTermuxFallback:
             lambda name: "/data/data/com.termux/files/usr/bin/termux-microphone-record"
             if name == "termux-microphone-record" else None,
         )
+        monkeypatch.setattr("hermes_constants.is_container", lambda: False)
 
         from tools.voice_mode import detect_audio_environment
         result = detect_audio_environment()

@@ -197,6 +197,14 @@ export function useSubmission(opts: UseSubmissionOptions) {
         sys(note)
       }
 
+      if (mode === 'smart') {
+        // Let the backend classify against the live in-flight mission. It
+        // returns a semantic acknowledgement and never calls interrupt.
+        send(item.text)
+
+        return
+      }
+
       if (mode === 'queue') {
         return enqueueText()
       }

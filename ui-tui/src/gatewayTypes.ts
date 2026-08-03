@@ -322,10 +322,27 @@ export interface SessionSteerResponse {
 // ── Prompt / submission ──────────────────────────────────────────────
 
 export interface PromptSubmitResponse {
+  ack?: string
+  accepted?: boolean
+  depth?: number
   ok?: boolean
   /** Set when the submitted text was a bare voice stop phrase consumed
    *  server-side to end the voice chat instead of starting a turn. */
   voice_stopped?: boolean
+  queued_bytes?: number
+  reason?: string
+  route?: 'ambiguous' | 'control' | 'dependent' | 'independent' | 'related'
+  status?:
+    | 'queue_rejected'
+    | 'queued'
+    | 'queued_isolation_unavailable'
+    | 'smart_parallel'
+    | 'smart_queued'
+    | 'smart_rejected'
+    | 'smart_related'
+    | 'smart_started'
+    | 'smart_uncertain'
+    | 'streaming'
 }
 
 export interface BackgroundStartResponse {
@@ -366,6 +383,7 @@ export interface ClipboardPasteResponse {
 }
 
 export interface InputDetectDropResponse {
+  attachment_batch_id?: string
   height?: number
   is_image?: boolean
   matched?: boolean

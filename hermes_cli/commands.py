@@ -235,8 +235,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
                cli_only=True, args_hint="[on|off|status]",
                subcommands=("on", "off", "status")),
     CommandDef("busy", "Control what Enter does while Hermes is working", "Configuration",
-               cli_only=True, args_hint="[queue|steer|interrupt|status]",
-               subcommands=("queue", "steer", "interrupt", "status")),
+               cli_only=True, args_hint="[smart|queue|steer|interrupt|status]",
+               subcommands=("smart", "queue", "steer", "interrupt", "status")),
 
     # Tools & Skills
     CommandDef("tools", "Manage tools: /tools [list|disable|enable] [name...]", "Tools & Skills",

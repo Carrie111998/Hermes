@@ -576,16 +576,17 @@ def _apply_managed_env() -> None:
     try:
         from hermes_cli import managed_scope
 
-        managed_dir = managed_scope.get_managed_dir()
+        managed_values = managed_scope.load_managed_env()
     except Exception:  # noqa: BLE001 — managed scope must never block startup
         return
-    if managed_dir is None:
+    if not managed_values:
         return
-    managed_env = managed_dir / ".env"
-    if not managed_env.exists():
-        return
-    _sanitize_env_file_if_needed(managed_env)
-    _load_dotenv_with_fallback(managed_env, override=True)
+    for key, value in managed_values.items():
+        try:
+            os.environ[key] = value.replace("\x00", "")
+        except (OSError, TypeError, ValueError):
+            continue
+    _sanitize_loaded_credentials()
 
 
 def _apply_external_secret_sources(home_path: Path) -> None:

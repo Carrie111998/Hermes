@@ -294,7 +294,7 @@ class TestWorkerSpawnEnv:
 def _cli(args: list[str], env_extra: dict | None = None) -> subprocess.CompletedProcess:
     """Run ``hermes kanban …`` with PYTHONPATH pinned to the worktree."""
     env = dict(os.environ)
-    env["PYTHONPATH"] = str(_WORKTREE)
+    env["PYTHONPATH"] = str(_WORKTREE) + os.pathsep + env.get("PYTHONPATH", "")
     if env_extra:
         env.update(env_extra)
     return subprocess.run(

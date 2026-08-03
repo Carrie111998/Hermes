@@ -3019,6 +3019,7 @@ class CLICommandsMixin:
         Usage:
             /busy               Show current busy input mode
             /busy status        Show current busy input mode
+            /busy smart         Classify and steer/parallelize/queue without interrupting
             /busy queue         Queue input for the next turn instead of interrupting
             /busy steer         Inject Enter mid-run via /steer (after next tool call)
             /busy interrupt     Redirect the current run on Enter (default)
@@ -3031,16 +3032,18 @@ class CLICommandsMixin:
                 _behavior = "queues for next turn"
             elif self.busy_input_mode == "steer":
                 _behavior = "steers into current run (after next tool call)"
+            elif self.busy_input_mode == "smart":
+                _behavior = "classifies and safely steers, parallelizes, or queues"
             else:
                 _behavior = "redirects current run immediately"
             _cprint(f"  {_DIM}Enter while busy: {_behavior}{_RST}")
-            _cprint(f"  {_DIM}Usage: /busy [queue|steer|interrupt|status]{_RST}")
+            _cprint(f"  {_DIM}Usage: /busy [smart|queue|steer|interrupt|status]{_RST}")
             return
 
         arg = parts[1].strip().lower()
-        if arg not in {"queue", "interrupt", "steer"}:
+        if arg not in {"queue", "interrupt", "steer", "smart"}:
             _cprint(f"  {_DIM}(._.) Unknown argument: {arg}{_RST}")
-            _cprint(f"  {_DIM}Usage: /busy [queue|steer|interrupt|status]{_RST}")
+            _cprint(f"  {_DIM}Usage: /busy [smart|queue|steer|interrupt|status]{_RST}")
             return
 
         self.busy_input_mode = arg
@@ -3049,6 +3052,8 @@ class CLICommandsMixin:
                 behavior = "Enter will queue follow-up input while Hermes is busy."
             elif arg == "steer":
                 behavior = "Enter will steer your message into the current run (after the next tool call)."
+            elif arg == "smart":
+                behavior = "Enter will classify follow-ups and safely steer, parallelize, or queue them without interrupting."
             else:
                 behavior = "Enter will redirect the current run while Hermes is busy; /stop still cancels it."
             _cprint(f"  {_ACCENT}✓ Busy input mode set to '{arg}' (saved to config){_RST}")

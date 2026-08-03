@@ -108,6 +108,151 @@ describe('submissionCore.submitPrompt — synchronous busy (queue-race fix)', ()
 
     expect(calls).toContain('prompt.submit')
   })
+
+  it('carries the detected-image reservation into its matching prompt.submit', async () => {
+    const gw = {
+      request: vi.fn((method: string) => {
+        if (method === 'input.detect_drop') {
+          return Promise.resolve({
+            attachment_batch_id: 'reservation-a',
+            is_image: true,
+            matched: true,
+            name: 'private.png',
+            text: '[User attached image: private.png]'
+          })
+        }
+
+        return Promise.resolve({ status: 'streaming' })
+      })
+    } as unknown as GatewayClient
+
+    submitPrompt('/tmp/private.png', makeDeps(gw))
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(gw.request).toHaveBeenCalledWith('prompt.submit', {
+      attachment_batch_id: 'reservation-a',
+      session_id: 'sess-1',
+      text: '[User attached image: private.png]'
+    })
+  })
+
+  it('surfaces a SMART routing acknowledgement returned by prompt.submit', async () => {
+    const sys = vi.fn()
+
+    const gw = {
+      request: vi.fn((method: string) => {
+        if (method === 'input.detect_drop') {
+          return Promise.resolve({ matched: false })
+        }
+
+        if (method === 'prompt.submit') {
+          return Promise.resolve({
+            status: 'smart_related',
+            route: 'related',
+            ack: 'SMART related; active mission continues.'
+          })
+        }
+
+        return Promise.resolve({})
+      })
+    } as unknown as GatewayClient
+
+    submitPrompt('same mission update', makeDeps(gw, { sys }))
+    await Promise.resolve()
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(sys).toHaveBeenCalledWith('SMART related; active mission continues.')
+  })
+
+  it('shows an uncertain durable steer without encouraging an automatic replay', async () => {
+    const sys = vi.fn()
+
+    const gw = {
+      request: vi.fn((method: string) => {
+        if (method === 'input.detect_drop') {
+          return Promise.resolve({ matched: false })
+        }
+
+        return Promise.resolve({
+          accepted: true,
+          ack: 'Steer delivery is uncertain; payload preserved. Do not resend automatically.',
+          status: 'smart_uncertain'
+        })
+      })
+    } as unknown as GatewayClient
+
+    submitPrompt('same mission update', makeDeps(gw, { sys }))
+    await Promise.resolve()
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(sys).toHaveBeenCalledWith(
+      'Steer delivery is uncertain; payload preserved. Do not resend automatically.'
+    )
+    expect(getUiState().busy).toBe(true)
+    expect(getUiState().status).toBe('recovery required — do not resend')
+  })
+
+  it('shows an explicit non-acceptance state when the bounded queue rejects', async () => {
+    const sys = vi.fn()
+
+    const gw = {
+      request: vi.fn((method: string) => {
+        if (method === 'input.detect_drop') {
+          return Promise.resolve({ matched: false })
+        }
+
+        if (method === 'prompt.submit') {
+          return Promise.resolve({
+            accepted: false,
+            ack: 'Message was not accepted: safe queue limit reached.',
+            reason: 'max_items',
+            status: 'smart_rejected'
+          })
+        }
+
+        return Promise.resolve({})
+      })
+    } as unknown as GatewayClient
+
+    submitPrompt('retry me later', makeDeps(gw, { sys }))
+    await Promise.resolve()
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(sys).toHaveBeenCalledWith('Message was not accepted: safe queue limit reached.')
+    expect(getUiState().busy).toBe(true)
+    expect(getUiState().status).toBe('not accepted — queue limit reached')
+  })
+
+  it('shows compute-host fail-closed preservation as queued for isolated retry', async () => {
+    const sys = vi.fn()
+
+    const gw = {
+      request: vi.fn((method: string) => {
+        if (method === 'input.detect_drop') {
+          return Promise.resolve({ matched: false })
+        }
+
+        return Promise.resolve({
+          accepted: true,
+          ack: 'Compute host unavailable; prompt preserved for isolated retry.',
+          status: 'queued_isolation_unavailable'
+        })
+      })
+    } as unknown as GatewayClient
+
+    submitPrompt('isolate this', makeDeps(gw, { sys }))
+    await Promise.resolve()
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(sys).toHaveBeenCalledWith('Compute host unavailable; prompt preserved for isolated retry.')
+    expect(getUiState().busy).toBe(true)
+    expect(getUiState().status).toBe('queued for isolated retry')
+  })
 })
 
 describe('submissionCore.markSubmitting', () => {

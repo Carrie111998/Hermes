@@ -43,7 +43,6 @@ import asyncio
 import errno
 import hashlib
 import hmac
-import itertools
 import json
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
@@ -152,6 +151,7 @@ DEFAULT_PORT = 8642
 MAX_STORED_RESPONSES = 100
 MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversations with tool calls
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
+CHAT_COMPLETIONS_SSE_CANCEL_GRACE_SECONDS = 5.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
 RESPONSES_AUTO_TRUNCATION_HISTORY_LIMIT = 100
@@ -644,106 +644,158 @@ def _multimodal_validation_error(exc: ValueError, *, param: str) -> "web.Respons
     )
 
 
+_TURN_PROCESS_OWNERSHIP_UNSET = object()
+_TurnProcessOwnershipSnapshot = tuple[
+    str, frozenset[str], str, threading.Event
+]
+
+
+def _snapshot_turn_process_ownership(
+    agent: Any,
+) -> Optional[_TurnProcessOwnershipSnapshot]:
+    """Atomically freeze the immutable ownership published for one API run."""
+    ownership = getattr(agent, "_gateway_turn_process_ownership", None)
+    if not isinstance(ownership, tuple) or len(ownership) != 4:
+        return None
+    process_task_id, process_baseline, owner_id, producer_done = ownership
+    if (
+        not isinstance(process_task_id, str)
+        or not process_task_id
+        or not isinstance(process_baseline, frozenset)
+        or not isinstance(owner_id, str)
+        or not owner_id
+        or not callable(getattr(producer_done, "wait", None))
+        or not callable(getattr(producer_done, "set", None))
+        or not callable(getattr(producer_done, "is_set", None))
+    ):
+        return None
+    return process_task_id, process_baseline, owner_id, producer_done
+
+
+def _run_owned_process_reaper(
+    process_task_id: str,
+    process_baseline: frozenset[str],
+    owner_id: str,
+    producer_done: threading.Event,
+    source: str,
+) -> int:
+    """Reap one owner until its tool-producing run has fully finalized."""
+    from tools.process_registry import process_registry
+
+    total_killed = 0
+
+    def reap_once() -> None:
+        nonlocal total_killed
+        try:
+            total_killed += process_registry.kill_started_since(
+                process_task_id,
+                process_baseline,
+                source=source,
+                owner_id=owner_id,
+            )
+        except Exception:
+            logger.warning(
+                "Failed to reap processes owned by API turn %s (%s)",
+                owner_id,
+                source,
+                exc_info=True,
+            )
+
+    # Sweep immediately, continue sweeping while an interrupted tool call may
+    # still register a process, then sweep once more after finalization. The
+    # final pass closes the registration-after-first-snapshot race. If the
+    # producer had already finalized before this thread started, one exact-owner
+    # sweep is already final and avoids redundant kill attempts.
+    producer_was_done = producer_done.is_set()
+    reap_once()
+    if not producer_was_done:
+        poll_interval = 0.1
+        while not producer_done.wait(poll_interval):
+            reap_once()
+            poll_interval = min(poll_interval * 2, 2.0)
+        reap_once()
+
+    if total_killed:
+        logger.warning(
+            "Reaped %d background process(es) owned by abandoned API turn %s (%s)",
+            total_killed,
+            owner_id,
+            source,
+        )
+    return total_killed
+
+
 def _reap_disconnected_agent_processes(
-    agent: Any, *, source: str = "api_server_sse_disconnect"
-) -> None:
-    """Reap background processes an abandoned API-server turn created.
+    agent: Any,
+    *,
+    source: str = "api_server_sse_disconnect",
+    ownership_snapshot: Any = _TURN_PROCESS_OWNERSHIP_UNSET,
+) -> Optional[threading.Thread]:
+    """Reap exactly the processes owned by one abandoned API-server run.
 
-    Mirrors the gateway-turn cleanup in ``gateway/run.py`` (#76115) for this
-    API-server surface, which runs its own agent lifecycle via ``_run_agent``
-    and never passes through ``TurnRunner`` — so it needs its own trigger for
-    the same baseline-diff reap. Fire-and-forget on a daemon thread so the
-    SSE handler's own cleanup isn't blocked on process-tree teardown.
-
-    Reaping is epoch-gated: client-provided session IDs are conversation
-    scopes, and multiple concurrent runs can intentionally share one (see
-    ``_handle_runs``). Without the gate, run A disconnecting could kill a
-    process a still-live run B (same task_id) spawned after A's baseline
-    snapshot — the same stale-reaper bug class the gateway path gates via
-    ``run_generation``. The epoch closure skips the reap when a newer run
-    has since claimed the task_id; that newer run's own baseline covers its
-    eventual cleanup.
+    Runs may intentionally overlap under the same session/task ID, so neither
+    a shared baseline nor a latest-generation fence is a safe owner identity.
+    The immutable owner ID is captured before cancellation and follows every
+    tracked process created by the run. An explicit ``None`` snapshot remains
+    a terminal no-op and cannot recapture a replacement run.
     """
-    process_task_id = getattr(agent, "_gateway_turn_process_task_id", "")
-    process_baseline = getattr(agent, "_gateway_turn_process_baseline", None)
-    if not process_task_id or process_baseline is None:
+    if ownership_snapshot is _TURN_PROCESS_OWNERSHIP_UNSET:
+        ownership_snapshot = _snapshot_turn_process_ownership(agent)
+    if ownership_snapshot is None:
         return
-    epoch = getattr(agent, "_gateway_turn_process_epoch", None)
-    is_still_current: Optional[Any] = None
-    if epoch is not None:
-        def _epoch_still_current(_task_id=process_task_id, _epoch=epoch):
-            # Skip only when a NEWER run has claimed this task_id. A missing
-            # entry means the abandoned run's own clear pruned it (worker
-            # returned after the interrupt) — no newer claimant exists, so
-            # the reap must still proceed or the leak survives. This matches
-            # the gateway gate's semantics: worker completion does not bump
-            # run_generation either.
-            with _TURN_PROCESS_EPOCH_LOCK:
-                current = _TURN_PROCESS_EPOCHS.get(_task_id)
-            return current is None or current == _epoch
-
-        is_still_current = _epoch_still_current
-
-    from gateway.run import _reap_gateway_turn_processes
-
-    threading.Thread(
-        target=_reap_gateway_turn_processes,
-        args=(process_task_id, process_baseline),
-        kwargs={"source": source, "is_still_current": is_still_current},
-        name=f"api-turn-reaper-{process_task_id[:12]}",
+    process_task_id, process_baseline, owner_id, producer_done = ownership_snapshot
+    thread = threading.Thread(
+        target=_run_owned_process_reaper,
+        args=(process_task_id, process_baseline, owner_id, producer_done, source),
+        name=f"api-turn-reaper-{owner_id[-12:]}",
         daemon=True,
-    ).start()
-
-
-# Per-task-id run epochs for the reap gate above. task_id is a conversation
-# scope shared by concurrent API runs, so each run that claims it bumps the
-# epoch; a reaper holding a stale epoch declines to kill. Epochs come from a
-# single monotonic counter (never reused), so pruning an entry and later
-# re-claiming the task_id can never resurrect a stale reaper's claim.
-# Entries are pruned on clear when still current, bounding the dict to
-# in-flight runs.
-_TURN_PROCESS_EPOCHS: Dict[str, int] = {}
-_TURN_PROCESS_EPOCH_LOCK = threading.Lock()
-_TURN_PROCESS_EPOCH_COUNTER = itertools.count(1)
+    )
+    thread.start()
+    return thread
 
 
 def _publish_turn_process_ownership(agent: Any, task_id: str) -> None:
-    """Snapshot the process baseline and claim the task_id's current epoch.
-
-    Single place all API-server agent lifecycles (chat/responses ``_run_agent``
-    and ``/v1/runs``) record turn ownership, so the marker attribute names and
-    epoch bookkeeping cannot drift between surfaces.
-    """
+    """Publish one immutable process owner before an API agent can run tools."""
     from tools.process_registry import process_registry
 
-    with _TURN_PROCESS_EPOCH_LOCK:
-        epoch = next(_TURN_PROCESS_EPOCH_COUNTER)
-        _TURN_PROCESS_EPOCHS[task_id] = epoch
+    process_baseline = process_registry.snapshot_running_ids(task_id)
+    process_owner_id = f"api-turn-{uuid.uuid4().hex}"
+
+    # The relay turn ID is the value tool dispatch forwards to terminal_tool.
+    # Set it before the ownership tuple; a cancellation racing before the tuple
+    # sees no ownership, and no process can have been spawned yet.
+    agent._relay_pending_turn_id = process_owner_id
+    producer_done = threading.Event()
+    ownership = (task_id, process_baseline, process_owner_id, producer_done)
+    agent._gateway_turn_process_ownership = ownership
+
+    # Compatibility mirrors for lightweight doubles and diagnostics. The tuple
+    # above is the sole authoritative snapshot and is published atomically.
     agent._gateway_turn_process_task_id = task_id
-    agent._gateway_turn_process_baseline = process_registry.snapshot_running_ids(
-        task_id
-    )
-    agent._gateway_turn_process_epoch = epoch
+    agent._gateway_turn_process_baseline = process_baseline
+    agent._gateway_turn_process_owner_id = process_owner_id
 
 
 def _clear_turn_process_ownership(agent: Any) -> None:
-    """Clear turn ownership the moment the turn finishes (success or crash).
+    """Retire one run's owner without disturbing concurrent owners."""
+    ownership = getattr(agent, "_gateway_turn_process_ownership", None)
+    owner_id = ownership[2] if isinstance(ownership, tuple) and len(ownership) == 4 else ""
+    producer_done = ownership[3] if isinstance(ownership, tuple) and len(ownership) == 4 else None
 
-    A disconnect/cancel landing after this point must not reap background
-    work the turn deliberately left running — mirrors the same race-window
-    guard in ``gateway/run.py``'s ``_run_sync_with_timeout_lifecycle``.
-    """
-    task_id = getattr(agent, "_gateway_turn_process_task_id", "")
-    epoch = getattr(agent, "_gateway_turn_process_epoch", None)
-    if task_id and epoch is not None:
-        with _TURN_PROCESS_EPOCH_LOCK:
-            # Prune only when this run is still the current claimant; a
-            # newer concurrent run owns the entry otherwise.
-            if _TURN_PROCESS_EPOCHS.get(task_id) == epoch:
-                del _TURN_PROCESS_EPOCHS[task_id]
+    # This function runs only from the owning worker's finalizer. Once set, no
+    # synchronous tool call can register another process for this owner.
+    producer_done_set = getattr(producer_done, "set", None)
+    if callable(producer_done_set):
+        producer_done_set()
+
+    # Linearization point: cancellation snapshots after this assignment cannot
+    # recapture stale compatibility mirrors or a replacement run.
+    agent._gateway_turn_process_ownership = None
     agent._gateway_turn_process_task_id = ""
     agent._gateway_turn_process_baseline = frozenset()
-    agent._gateway_turn_process_epoch = None
+    agent._gateway_turn_process_owner_id = ""
+    if getattr(agent, "_relay_pending_turn_id", None) == owner_id:
+        agent._relay_pending_turn_id = None
 
 
 def _session_chat_user_message(body: Dict[str, Any], *, param: str = "message") -> tuple[Any, Optional["web.Response"]]:
@@ -4053,7 +4105,7 @@ class APIServerAdapter(BasePlatformAdapter):
             # side-by-side with ``tool_start_callback``/``tool_complete_callback``.
             # The structured callbacks are strictly richer (they carry
             # the tool_call id), so they own the chat-completions SSE channel.
-            agent_ref = [None]
+            agent_ref = [None, threading.Event()]
             agent_task = asyncio.ensure_future(self._run_agent(
                 user_message=user_message,
                 conversation_history=history,
@@ -4222,9 +4274,66 @@ class APIServerAdapter(BasePlatformAdapter):
         if gateway_session_key:
             sse_headers["X-Hermes-Session-Key"] = gateway_session_key
         response = web.StreamResponse(status=200, headers=sse_headers)
-        await response.prepare(request)
+
+        async def _interrupt_and_join_agent(reason: str) -> None:
+            """Fence a failed SSE transport before returning to the caller."""
+
+            cancel_signal = (
+                agent_ref[1]
+                if agent_ref is not None
+                and len(agent_ref) > 1
+                and hasattr(agent_ref[1], "set")
+                else None
+            )
+            agent = agent_ref[0] if agent_ref else None
+            should_interrupt = agent is not None and not agent_task.done()
+            ownership_snapshot = (
+                _snapshot_turn_process_ownership(agent) if should_interrupt else None
+            )
+            if cancel_signal is not None:
+                try:
+                    cancel_signal.set()
+                except Exception:
+                    logger.debug("Failed to set SSE agent cancellation signal", exc_info=True)
+            if should_interrupt:
+                try:
+                    request_hard_interrupt(agent, reason)
+                except Exception:
+                    pass
+                _reap_disconnected_agent_processes(
+                    agent, ownership_snapshot=ownership_snapshot
+                )
+            if agent_task.done():
+                try:
+                    await agent_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+                return
+            if cancel_signal is None:
+                # Legacy callers cannot fence the executor startup race. Cancel
+                # their wrapper immediately after interrupting the live agent.
+                agent_task.cancel()
+                try:
+                    await agent_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+                return
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(agent_task),
+                    timeout=CHAT_COMPLETIONS_SSE_CANCEL_GRACE_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                agent_task.cancel()
+                try:
+                    await agent_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+            except (asyncio.CancelledError, Exception):
+                pass
 
         try:
+            await response.prepare(request)
             last_activity = time.monotonic()
 
             # Role chunk
@@ -4305,26 +4414,41 @@ class APIServerAdapter(BasePlatformAdapter):
             except Exception as exc:
                 agent_error = exc
                 logger.error(
-                    "Agent task %s failed during SSE streaming: %s", completion_id, exc
+                    "Agent task failed during SSE streaming error_type=%s",
+                    type(exc).__name__,
                 )
 
-            # Inspect the result dict for a flagged (non-exception) failure.
-            is_partial = bool(result.get("partial")) if isinstance(result, dict) else False
-            is_failed = bool(result.get("failed")) if isinstance(result, dict) else False
-            completed = bool(result.get("completed", True)) if isinstance(result, dict) else True
-            err_msg = result.get("error") if isinstance(result, dict) else None
-            if agent_error is not None:
-                is_failed = True
-                err_msg = err_msg or str(agent_error)
+            # Publish one canonical terminal envelope. [DONE] below means only
+            # framing EOF; consumers must use receipt_terminal_success.
+            result_dict = result if isinstance(result, dict) else {}
+            is_partial = result_dict.get("partial") is True
+            completed = result_dict.get("completed") is True
+            interrupted = result_dict.get("interrupted") is True
+            raw_cleanup = result_dict.get("cleanup_errors")
+            cleanup_incomplete = bool(raw_cleanup) if isinstance(raw_cleanup, list) else False
+            declared_receipt = result_dict.get("receipt_terminal_success") is True
+            declared_failed = result_dict.get("failed") is True
+            terminal_success = bool(
+                agent_error is None
+                and declared_receipt
+                and completed
+                and not declared_failed
+                and not is_partial
+                and not interrupted
+                and not cleanup_incomplete
+            )
+            terminal_failed = bool(declared_failed or agent_error is not None or not terminal_success)
 
-            # Decide finish_reason, matching the non-streaming logic: "length"
-            # for truncation, "error" for failure, "stop" for normal completion.
-            if is_partial and err_msg and "truncat" in err_msg.lower():
+            if is_partial:
                 finish_reason = "length"
-            elif agent_error is not None or is_failed or (not completed and err_msg):
-                finish_reason = "error"
-            else:
+            elif terminal_success:
                 finish_reason = "stop"
+            else:
+                finish_reason = "error"
+
+            result_session_id = result_dict.get("session_id")
+            if not isinstance(result_session_id, str) or not result_session_id.strip():
+                result_session_id = session_id or completion_id
 
             # Finish chunk
             finish_chunk = {
@@ -4336,52 +4460,66 @@ class APIServerAdapter(BasePlatformAdapter):
                     "completion_tokens": usage.get("output_tokens", 0),
                     "total_tokens": usage.get("total_tokens", 0),
                 },
-            }
-            if finish_reason != "stop":
-                finish_chunk["choices"][0]["delta"] = {}
-                if err_msg:
-                    finish_chunk["error"] = {
-                        "message": err_msg,
-                        "type": type(agent_error).__name__ if agent_error else "agent_error",
-                    }
-                finish_chunk["hermes"] = {
+                "hermes": {
+                    "receipt_terminal_success": terminal_success,
                     "completed": completed,
+                    "failed": terminal_failed,
                     "partial": is_partial,
-                    "failed": is_failed,
-                    "error": err_msg,
-                    "error_code": "output_truncated" if finish_reason == "length" else "agent_error",
+                    "interrupted": interrupted,
+                    "cleanup_errors": (
+                        ["remote_cleanup_incomplete"] if cleanup_incomplete else []
+                    ),
+                    "session_id": result_session_id,
+                    "error_code": (
+                        None
+                        if terminal_success
+                        else ("output_truncated" if finish_reason == "length" else "agent_error")
+                    ),
+                },
+            }
+            if not terminal_success:
+                finish_chunk["error"] = {
+                    "message": "Remote agent did not complete successfully",
+                    "type": type(agent_error).__name__ if agent_error else "agent_error",
                 }
             await response.write(f"data: {json.dumps(finish_chunk)}\n\n".encode())
             await response.write(b"data: [DONE]\n\n")
+        except asyncio.CancelledError:
+            await _interrupt_and_join_agent("SSE client disconnected")
+            raise
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
-            # Client disconnected mid-stream.  Interrupt the agent so it
-            # stops making LLM API calls at the next loop iteration, then
-            # cancel the asyncio task wrapper.
-            agent = agent_ref[0] if agent_ref else None
-            if agent is not None:
-                try:
-                    request_hard_interrupt(agent, "SSE client disconnected")
-                except Exception:
-                    pass
-                _reap_disconnected_agent_processes(agent)
-            if not agent_task.done():
-                agent_task.cancel()
-                try:
-                    await agent_task
-                except (asyncio.CancelledError, Exception):
-                    pass
-            logger.info("SSE client disconnected; interrupted agent task %s", completion_id)
-        except Exception as _exc:
-            # Agent crashed mid-stream.  Try to emit an error chunk
-            # so the client gets a proper response instead of a
-            # TransferEncodingError from incomplete chunked encoding.
-            import traceback as _tb
-            logger.error("Agent crashed mid-stream for %s: %s", completion_id, _tb.format_exc()[:300])
+            await _interrupt_and_join_agent("SSE client disconnected")
+            logger.info(
+                "SSE client disconnected; interrupted agent task %s",
+                completion_id,
+            )
+        except Exception as exc:
+            # A writer/runtime failure makes the stream non-authoritative. Stop
+            # and join the agent before attempting a best-effort error envelope.
+            await _interrupt_and_join_agent("SSE client disconnected")
+            logger.error(
+                "Agent crashed mid-stream error_type=%s",
+                type(exc).__name__,
+            )
             try:
                 error_chunk = {
                     "id": completion_id, "object": "chat.completion.chunk",
                     "created": created, "model": model,
                     "choices": [{"index": 0, "delta": {}, "finish_reason": "error"}],
+                    "error": {
+                        "message": "Remote agent did not complete successfully",
+                        "type": "agent_error",
+                    },
+                    "hermes": {
+                        "receipt_terminal_success": False,
+                        "completed": False,
+                        "failed": True,
+                        "partial": True,
+                        "interrupted": False,
+                        "cleanup_errors": [],
+                        "session_id": session_id or completion_id,
+                        "error_code": "agent_error",
+                    },
                 }
                 await response.write(f"data: {json.dumps(error_chunk)}\n\n".encode())
                 await response.write(b"data: [DONE]\n\n")
@@ -4939,11 +5077,14 @@ class APIServerAdapter(BasePlatformAdapter):
             # making upstream LLM calls, then cancel the task.
             agent = agent_ref[0] if agent_ref else None
             if agent is not None:
+                ownership_snapshot = _snapshot_turn_process_ownership(agent)
                 try:
                     request_hard_interrupt(agent, "SSE client disconnected")
                 except Exception:
                     pass
-                _reap_disconnected_agent_processes(agent)
+                _reap_disconnected_agent_processes(
+                    agent, ownership_snapshot=ownership_snapshot
+                )
             if not agent_task.done():
                 agent_task.cancel()
                 try:
@@ -4959,6 +5100,7 @@ class APIServerAdapter(BasePlatformAdapter):
             _persist_incomplete_if_needed()
             agent = agent_ref[0] if agent_ref else None
             if agent is not None:
+                ownership_snapshot = _snapshot_turn_process_ownership(agent)
                 try:
                     request_hard_interrupt(agent, "SSE task cancelled")
                 except Exception:
@@ -4968,7 +5110,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 # (#76115). Epoch-gated; no-op when the turn already
                 # finished and cleared its markers.
                 _reap_disconnected_agent_processes(
-                    agent, source="api_server_sse_cancelled"
+                    agent,
+                    source="api_server_sse_cancelled",
+                    ownership_snapshot=ownership_snapshot,
                 )
             if not agent_task.done():
                 agent_task.cancel()
@@ -5169,7 +5313,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "result": function_result,
                 }))
 
-            agent_ref = [None]
+            agent_ref = [None, threading.Event()]
             agent_task = asyncio.ensure_future(self._run_agent(
                 user_message=user_message,
                 conversation_history=conversation_history,
@@ -5961,6 +6105,13 @@ class APIServerAdapter(BasePlatformAdapter):
         # run_in_executor threads, so the profile scope must be re-entered
         # inside _run() from this explicit value.
         request_profile = _api_request_profile.get()
+        cancel_signal = (
+            agent_ref[1]
+            if agent_ref is not None
+            and len(agent_ref) > 1
+            and hasattr(agent_ref[1], "is_set")
+            else None
+        )
 
         def _run():
             from gateway.session_context import clear_session_vars
@@ -5990,6 +6141,28 @@ class APIServerAdapter(BasePlatformAdapter):
                     )
                     if agent_ref is not None:
                         agent_ref[0] = agent
+                    if cancel_signal is not None and cancel_signal.is_set():
+                        try:
+                            agent.interrupt("SSE client disconnected")
+                        except Exception:
+                            pass
+                        return (
+                            {
+                                "final_response": "",
+                                "completed": False,
+                                "failed": True,
+                                "partial": False,
+                                "interrupted": True,
+                                "receipt_terminal_success": False,
+                                "cleanup_errors": [],
+                                "session_id": session_id,
+                            },
+                            {
+                                "input_tokens": 0,
+                                "output_tokens": 0,
+                                "total_tokens": 0,
+                            },
+                        )
                     effective_task_id = session_id or str(uuid.uuid4())
                     # Baseline for selective background-process reaping on
                     # SSE client disconnect — mirrors gateway/run.py's
@@ -6830,6 +7003,7 @@ class APIServerAdapter(BasePlatformAdapter):
         self._stopping_run_ids.add(run_id)
 
         if agent is not None:
+            ownership_snapshot = _snapshot_turn_process_ownership(agent)
             try:
                 request_hard_interrupt(agent, "Stop requested via API")
             except Exception:
@@ -6840,7 +7014,9 @@ class APIServerAdapter(BasePlatformAdapter):
             # processes; no-op if the run already finished and cleared
             # its ownership markers.
             _reap_disconnected_agent_processes(
-                agent, source="api_server_run_stop"
+                agent,
+                source="api_server_run_stop",
+                ownership_snapshot=ownership_snapshot,
             )
 
         return web.json_response({"run_id": run_id, "status": "stopping"})

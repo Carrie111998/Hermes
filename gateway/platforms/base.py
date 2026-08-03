@@ -5693,8 +5693,16 @@ class BasePlatformAdapter(ABC):
                 try:
                     if await self._busy_session_handler(event, session_key):
                         return
-                except Exception as e:
-                    logger.error("[%s] Busy-session handler failed: %s", self.name, e, exc_info=True)
+                except Exception as exc:
+                    # The busy callback owns the durability boundary. Falling
+                    # through here would create an untracked in-memory copy (or
+                    # duplicate work already persisted before an ACK failure).
+                    logger.error(
+                        "[%s] Busy-session handler failed closed error_type=%s",
+                        self.name,
+                        type(exc).__name__,
+                    )
+                    return
 
             # Special case: photo bursts/albums frequently arrive as multiple near-
             # simultaneous messages. Queue them without interrupting the active run,

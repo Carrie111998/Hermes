@@ -31,7 +31,9 @@ def test_slash_worker_imports_from_cwd_with_colliding_utils(tmp_path):
     env = {k: v for k, v in os.environ.items() if k != "HERMES_PYTHON_SRC_ROOT"}
     # Keep the source importable via PYTHONPATH; CWD ('') still precedes it on
     # sys.path for ``-c``, so the shadow (and thus the guard) is still exercised.
-    env["PYTHONPATH"] = str(PROJECT_ROOT)
+    env["PYTHONPATH"] = (
+        str(PROJECT_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
+    )
 
     result = subprocess.run(
         [sys.executable, "-c", "import tui_gateway.slash_worker"],

@@ -31,6 +31,11 @@ def _(rid, params: dict) -> dict:
         explicit_cwd = bool(raw_cwd) and os.path.isdir(os.path.abspath(os.path.expanduser(raw_cwd)))
     except Exception:
         explicit_cwd = False
+    profile = (params.get("profile") or "").strip() or None
+    try:
+        profile_home = _profile_home(profile)
+    except (TypeError, ValueError):
+        return _err(rid, 4008, "invalid or unavailable profile")
     resolved_cwd = _completion_cwd(params)
     source = _resolve_session_source(str(params.get("source") or "").strip() or None)
     _enable_gateway_prompts()
@@ -39,9 +44,6 @@ def _(rid, params: dict) -> dict:
     # profile must build its agent + persist against THAT profile's home/state.db,
     # not the dashboard's launch profile. Stored on the session so _start_agent_build
     # and each turn re-bind HERMES_HOME. None/own profile → launch (unchanged).
-    profile = (params.get("profile") or "").strip() or None
-    profile_home = _profile_home(profile)
-
     # The desktop composer owns its model/effort/fast as plain UI state and ships
     # it on every session.create. Honor each as a PER-SESSION override (built into
     # the agent below) — never a global config write, so picking a model/effort
@@ -315,7 +317,10 @@ def _(rid, params: dict) -> dict:
     # ``profile`` (app-global remote mode): resume a session that lives in another
     # local profile's state.db. None/own profile → the launch profile (unchanged).
     profile = (params.get("profile") or "").strip() or None
-    profile_home = _profile_home(profile)
+    try:
+        profile_home = _profile_home(profile)
+    except (TypeError, ValueError):
+        return _err(rid, 4008, "invalid or unavailable profile")
 
     # In a profile scope, the agent OWNS a long-lived db handle bound to that
     # profile (do NOT auto-close it here). Otherwise reuse the shared launch db.
@@ -2514,9 +2519,12 @@ def _(rid, params: dict) -> dict:
     # Mirror the classic CLI /save: snapshot under the Hermes profile home
     # (~/.hermes/sessions/saved/) rather than the project/workspace CWD, and
     # include the system prompt so the export matches the dashboard save.
-    saved_dir = get_hermes_home() / "sessions" / "saved"
+    hermes_home = get_hermes_home()
+    saved_dir = hermes_home / "sessions" / "saved"
     try:
-        saved_dir.mkdir(parents=True, exist_ok=True)
+        _secure_private_directory(hermes_home)
+        _secure_private_directory(hermes_home / "sessions")
+        _secure_private_directory(saved_dir)
     except Exception as e:
         return _err(rid, 5011, f"failed to create save directory {saved_dir}: {e}")
 
@@ -2541,20 +2549,19 @@ def _(rid, params: dict) -> dict:
         )
 
     try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(
-                {
-                    "model": getattr(agent, "model", ""),
-                    "session_id": session_id,
-                    "session_start": session_start,
-                    "system_prompt": getattr(agent, "_cached_system_prompt", "") or "",
-                    "messages": messages,
-                },
-                f,
-                indent=2,
-                ensure_ascii=False,
-            )
-        return _ok(rid, {"file": str(path)})
+        payload = json.dumps(
+            {
+                "model": getattr(agent, "model", ""),
+                "session_id": session_id,
+                "session_start": session_start,
+                "system_prompt": getattr(agent, "_cached_system_prompt", "") or "",
+                "messages": messages,
+            },
+            indent=2,
+            ensure_ascii=False,
+        ).encode("utf-8")
+        _write_private_file_atomic(path, payload)
+        return _ok(rid, {"file": str(path.resolve())})
     except Exception as e:
         return _err(rid, 5011, str(e))
 
@@ -2732,9 +2739,6 @@ def _(rid, params: dict) -> dict:
                 return _err(rid, 5019, f"compute-host interrupt failed: {exc}")
         with session["history_lock"]:
             session["_turn_cancel_requested"] = True
-            session["queued_prompt"] = None
-            session.pop("queued_prompts", None)
-            session["_queued_prompt_generation"] = int(session.get("_queued_prompt_generation", 0)) + 1
         _clear_pending(sid)
         try:
             from tools.approval import resolve_gateway_approval
@@ -2758,9 +2762,6 @@ def _(rid, params: dict) -> dict:
     should_interrupt = bool(session.get("running"))
     with session["history_lock"]:
         session["_turn_cancel_requested"] = True
-        session["queued_prompt"] = None
-        session.pop("queued_prompts", None)
-        session["_queued_prompt_generation"] = int(session.get("_queued_prompt_generation", 0)) + 1
     if should_interrupt:
         from agent.interrupt_compat import request_hard_interrupt
 
@@ -2830,6 +2831,10 @@ def _(rid, params: dict) -> dict:
 
 @method("spawn_tree.save")
 def _(rid, params: dict) -> dict:
+    session, err = _sess_nowait(params, rid)
+    if err:
+        return err
+    assert session is not None
     session_id = str(params.get("session_id") or "").strip()
     subagents = params.get("subagents") or []
     if not isinstance(subagents, list) or not subagents:
@@ -2840,11 +2845,10 @@ def _(rid, params: dict) -> dict:
     started_at = params.get("started_at")
     finished_at = params.get("finished_at") or time.time()
     label = str(params.get("label") or "")
-    ts = datetime.utcfromtimestamp(float(finished_at)).strftime("%Y%m%dT%H%M%S")
-    fname = f"{ts}.json"
-    d = _spawn_tree_session_dir(session_id or "default")
-    path = d / fname
+    ts = datetime.utcfromtimestamp(float(finished_at)).strftime("%Y%m%dT%H%M%S%f")
     try:
+        d = _spawn_tree_session_dir(session, session_id or "default")
+        path = d / f"{ts}.json"
         payload = {
             "session_id": session_id,
             "started_at": float(started_at) if started_at else None,
@@ -2852,96 +2856,136 @@ def _(rid, params: dict) -> dict:
             "label": label,
             "subagents": subagents,
         }
-        path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-    except OSError as exc:
-        return _err(rid, 5000, f"spawn_tree.save failed: {exc}")
-
-    _append_spawn_tree_index(
-        d,
-        {
-            "path": str(path),
-            "session_id": session_id,
-            "started_at": payload["started_at"],
-            "finished_at": payload["finished_at"],
-            "label": label,
-            "count": len(subagents),
-        },
-    )
+        encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        if len(encoded) > 8 * 1024 * 1024:
+            return _err(rid, 4000, "spawn tree exceeds private artifact limit")
+        _write_private_file_atomic(path, encoded)
+        _append_spawn_tree_index(
+            d,
+            {
+                "path": str(path),
+                "session_id": session_id,
+                "started_at": payload["started_at"],
+                "finished_at": payload["finished_at"],
+                "label": label,
+                "count": len(subagents),
+            },
+        )
+        _prune_spawn_tree_snapshots(d)
+    except (OSError, TypeError, ValueError):
+        return _err(rid, 5000, "spawn_tree.save failed securely")
 
     return _ok(rid, {"path": str(path), "session_id": session_id})
 
 
 @method("spawn_tree.list")
 def _(rid, params: dict) -> dict:
+    session, err = _sess_nowait(params, rid)
+    if err:
+        return err
+    assert session is not None
     session_id = str(params.get("session_id") or "").strip()
-    limit = int(params.get("limit") or 50)
+    limit = max(1, min(int(params.get("limit") or 50), _SPAWN_TREE_RETENTION))
     cross_session = bool(params.get("cross_session"))
 
-    if cross_session:
-        root = _spawn_trees_root()
-        roots = [p for p in root.iterdir() if p.is_dir()]
-    else:
-        roots = [_spawn_tree_session_dir(session_id or "default")]
+    try:
+        root = _spawn_trees_root(session)
+        if cross_session:
+            roots: list[Path] = []
+            for candidate in root.iterdir():
+                try:
+                    if candidate.is_symlink() or not candidate.is_dir():
+                        continue
+                    roots.append(_secure_private_directory(candidate))
+                except OSError:
+                    continue
+        else:
+            roots = [_spawn_tree_session_dir(session, session_id or "default")]
+    except OSError:
+        return _err(rid, 5000, "spawn_tree.list failed securely")
 
     entries: list[dict] = []
-    for d in roots:
-        indexed = _read_spawn_tree_index(d)
+    for directory in roots:
+        indexed = _read_spawn_tree_index(directory)
         if indexed:
-            # Skip index entries whose snapshot file was manually deleted.
-            entries.extend(
-                e for e in indexed if (p := e.get("path")) and Path(p).exists()
-            )
+            for item in indexed:
+                raw_path = str(item.get("path") or "").strip()
+                if not raw_path:
+                    continue
+                try:
+                    artifact = _spawn_tree_path_within(root, raw_path)
+                    if _secure_private_file(artifact) is None:
+                        continue
+                except (OSError, ValueError):
+                    continue
+                normalized = dict(item)
+                normalized["path"] = str(artifact)
+                entries.append(normalized)
             continue
 
-        # Fallback for legacy (pre-index) sessions: full scan.  O(N) reads
-        # but only runs once per session until the next save writes the index.
-        for p in d.glob("*.json"):
-            if p.name == _SPAWN_TREE_INDEX:
+        # Legacy snapshots are migrated only after validating their private
+        # type/owner/link properties and containment under this profile root.
+        for artifact in directory.glob("*.json"):
+            if artifact.name == _SPAWN_TREE_INDEX:
                 continue
             try:
-                stat = p.stat()
-                try:
-                    raw = json.loads(p.read_text(encoding="utf-8"))
-                except Exception:
+                artifact = _spawn_tree_path_within(root, str(artifact))
+                info = _secure_private_file(artifact)
+                if info is None:
+                    continue
+                raw = json.loads(
+                    _read_private_file(artifact, max_bytes=8 * 1024 * 1024).decode(
+                        "utf-8", "replace"
+                    )
+                )
+                if not isinstance(raw, dict):
                     raw = {}
                 subagents = raw.get("subagents") or []
                 entries.append(
                     {
-                        "path": str(p),
-                        "session_id": raw.get("session_id") or d.name,
-                        "finished_at": raw.get("finished_at") or stat.st_mtime,
+                        "path": str(artifact),
+                        "session_id": raw.get("session_id") or directory.name,
+                        "finished_at": raw.get("finished_at") or info.st_mtime,
                         "started_at": raw.get("started_at"),
                         "label": raw.get("label") or "",
                         "count": len(subagents) if isinstance(subagents, list) else 0,
                     }
                 )
-            except OSError:
+            except (OSError, ValueError, json.JSONDecodeError):
                 continue
 
-    entries.sort(key=lambda e: e.get("finished_at") or 0, reverse=True)
+    entries.sort(key=lambda item: item.get("finished_at") or 0, reverse=True)
     return _ok(rid, {"entries": entries[:limit]})
 
 
 @method("spawn_tree.load")
 def _(rid, params: dict) -> dict:
-    from pathlib import Path
-
+    session, err = _sess_nowait(params, rid)
+    if err:
+        return err
+    assert session is not None
     raw_path = str(params.get("path") or "").strip()
     if not raw_path:
         return _err(rid, 4000, "path required")
 
-    # Reject paths escaping the spawn-trees root.
-    root = _spawn_trees_root().resolve()
     try:
-        resolved = Path(raw_path).resolve()
-        resolved.relative_to(root)
-    except (ValueError, OSError) as exc:
-        return _err(rid, 4030, f"path outside spawn-trees root: {exc}")
+        root = _spawn_trees_root(session)
+        resolved = _spawn_tree_path_within(root, raw_path)
+        if _secure_private_file(resolved) is None:
+            raise FileNotFoundError(resolved)
+    except (ValueError, OSError):
+        return _err(rid, 4030, "path outside private spawn-trees root")
 
     try:
-        payload = json.loads(resolved.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        return _err(rid, 5000, f"spawn_tree.load failed: {exc}")
+        payload = json.loads(
+            _read_private_file(resolved, max_bytes=8 * 1024 * 1024).decode(
+                "utf-8", "replace"
+            )
+        )
+        if not isinstance(payload, dict):
+            raise ValueError("spawn tree must be an object")
+    except (OSError, ValueError, json.JSONDecodeError):
+        return _err(rid, 5000, "spawn_tree.load failed securely")
 
     return _ok(rid, payload)
 
@@ -2964,19 +3008,65 @@ def _(rid, params: dict) -> dict:
     agent = session.get("agent")
     if agent is None or not hasattr(agent, "steer"):
         return _err(rid, 4010, "agent does not support steer")
-    try:
-        accepted = agent.steer(text)
-    except Exception as exc:
-        return _err(rid, 5000, f"steer failed: {exc}")
-    if accepted:
-        # Record the correction on the live turn exactly like session.redirect
-        # does. Without this, a resume/reconnect while the turn is running
-        # rebuilds the transcript from the inflight snapshot and the steered
-        # text has no user bubble — the "my message vanished on reload" loss.
-        with session["history_lock"]:
-            _record_inflight_correction(session, text)
-            session["last_active"] = time.time()
-    return _ok(rid, {"status": "queued" if accepted else "rejected", "text": text})
+    transport = current_transport() or session.get("transport")
+    envelope = _normalize_prompt_envelope(
+        session,
+        text,
+        transport,
+        {
+            "text": text,
+            "images": [],
+            "transport": transport,
+            "metadata": {"request_id": str(rid)},
+        },
+    )
+    with session["history_lock"]:
+        route_context = _capture_busy_route_context_locked(session)
+    disposition, receipt = _attempt_durable_tui_steer(
+        str(params.get("session_id") or ""),
+        session,
+        text,
+        envelope,
+        route_context=route_context,
+    )
+    if disposition == "steered":
+        return _ok(rid, {"status": "steered", "accepted": True})
+    if disposition == "uncertain":
+        return _ok(
+            rid,
+            {
+                "status": "steer_uncertain",
+                "accepted": True,
+                "retry_safe": False,
+            },
+        )
+    if disposition != "queued" or not isinstance(receipt, dict):
+        receipt = _enqueue_prompt(session, text, transport, envelope=envelope)
+    if not receipt["accepted"]:
+        return _ok(
+            rid,
+            {
+                "status": "rejected",
+                "accepted": False,
+                "reason": receipt["reason"],
+                "depth": receipt["depth"],
+                "queued_bytes": receipt["queued_bytes"],
+            },
+        )
+    started = False
+    with session["history_lock"]:
+        idle = not session.get("running")
+    if idle:
+        started = _drain_queued_prompt(rid, str(params.get("session_id") or ""), session)
+    return _ok(
+        rid,
+        {
+            "status": "started" if started else "queued",
+            "accepted": True,
+            "depth": receipt["depth"],
+            "queued_bytes": receipt["queued_bytes"],
+        },
+    )
 
 
 @method("session.redirect")
@@ -2995,9 +3085,27 @@ def _(rid, params: dict) -> dict:
     # model as the next turn, instead of a misleading 4010 the client silently
     # swallows into a lost follow-up.
     if agent is None and session.get("running"):
-        _enqueue_prompt(session, text, current_transport() or _stdio_transport)
+        receipt = _enqueue_prompt(
+            session,
+            text,
+            current_transport() or _stdio_transport,
+            envelope={
+                "text": text,
+                "images": [],
+                "transport": current_transport() or _stdio_transport,
+            },
+        )
         session["last_active"] = time.time()
-        return _ok(rid, {"status": "queued", "text": text})
+        if receipt["accepted"]:
+            return _ok(rid, {"status": "queued", "text": text})
+        return _ok(
+            rid,
+            {
+                "status": "rejected",
+                "text": text,
+                **receipt,
+            },
+        )
     if (
         agent is None
         or getattr(agent, "_supports_active_turn_redirect", False) is not True

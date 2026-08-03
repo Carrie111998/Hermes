@@ -264,6 +264,26 @@ class TestDetectAudioEnvironment:
         assert any("container" in w.lower() for w in result["warnings"])
         assert any("PULSE_SERVER" in w or "PIPEWIRE_REMOTE" in w for w in result["warnings"])
 
+    def test_termux_api_microphone_allows_voice_without_sounddevice(self, monkeypatch):
+        monkeypatch.setenv("TERMUX_VERSION", "0.118.3")
+        monkeypatch.setenv("PREFIX", "/data/data/com.termux/files/usr")
+        monkeypatch.delenv("SSH_CLIENT", raising=False)
+        monkeypatch.delenv("SSH_TTY", raising=False)
+        monkeypatch.delenv("SSH_CONNECTION", raising=False)
+        monkeypatch.setattr("hermes_constants.is_container", lambda: False)
+        monkeypatch.setattr("tools.voice_mode.shutil.which", lambda cmd: "/data/data/com.termux/files/usr/bin/termux-microphone-record" if cmd == "termux-microphone-record" else None)
+        monkeypatch.setattr("tools.voice_mode._termux_api_app_installed", lambda: True)
+        monkeypatch.setattr("tools.voice_mode._import_audio", lambda: (_ for _ in ()).throw(ImportError("no audio libs")))
+        monkeypatch.setattr("builtins.open", _non_wsl_proc_version(open))
+
+        from tools.voice_mode import detect_audio_environment
+        result = detect_audio_environment()
+
+        assert result["available"] is True
+        assert any("Termux:API microphone recording available" in n for n in result.get("notices", []))
+        assert result["warnings"] == []
+
+
 # ============================================================================
 # check_voice_requirements
 # ============================================================================
@@ -343,7 +363,7 @@ class TestTermuxAudioRecorder:
         monkeypatch.setenv("PREFIX", "/data/data/com.termux/files/usr")
         monkeypatch.setattr("tools.voice_mode._termux_microphone_command", lambda: "/data/data/com.termux/files/usr/bin/termux-microphone-record")
         monkeypatch.setattr("tools.voice_mode._termux_api_app_installed", lambda: True)
-        monkeypatch.setattr("tools.voice_mode.time.strftime", lambda fmt: "20260409_120000")
+        monkeypatch.setattr("tools.voice_mode._recording_timestamp", lambda: "20260409_120000")
         monkeypatch.setattr("tools.voice_mode.subprocess.run", fake_run)
 
         from tools.voice_mode import TermuxAudioRecorder
@@ -368,7 +388,7 @@ class TestTermuxAudioRecorder:
         monkeypatch.setenv("PREFIX", "/data/data/com.termux/files/usr")
         monkeypatch.setattr("tools.voice_mode._termux_microphone_command", lambda: "/data/data/com.termux/files/usr/bin/termux-microphone-record")
         monkeypatch.setattr("tools.voice_mode._termux_api_app_installed", lambda: True)
-        monkeypatch.setattr("tools.voice_mode.time.strftime", lambda fmt: "20260409_120000")
+        monkeypatch.setattr("tools.voice_mode._recording_timestamp", lambda: "20260409_120000")
         monkeypatch.setattr("tools.voice_mode.subprocess.run", fake_run)
 
         from tools.voice_mode import TermuxAudioRecorder

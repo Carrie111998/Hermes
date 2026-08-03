@@ -822,9 +822,8 @@ class TestWorktreeLockReaping:
             cwd=repo, capture_output=True,
         )
         if pid is not None:
-            subprocess.run(
-                ["git", "worktree", "lock", "--reason", f"hermes pid={pid}", str(p)],
-                cwd=repo, capture_output=True,
+            assert cli._lock_worktree(
+                str(repo), str(p), f"hermes pid={pid}"
             )
         if unpushed:
             (p / "work.txt").write_text("x")
@@ -873,22 +872,84 @@ class TestWorktreeLockReaping:
         cli._prune_stale_worktrees(str(git_repo))
         assert wt.exists(), "dirty worktree must survive even past the 72h tier"
 
+    def test_dirty_survives_between_24_and_72h(self, git_repo):
+        import cli
+        wt = self._mk(cli, git_repo, "hermes-dirty30", pid=None, dirty=True, age_h=30)
+        cli._prune_stale_worktrees(str(git_repo))
+        assert wt.exists(), "dirty worktree must survive in every stale-age tier"
+
+    def test_foreign_locked_dirty_survives_between_tiers(self, git_repo):
+        import cli
+        wt = self._mk(cli, git_repo, "hermes-foreign-dirty", dirty=True, age_h=30)
+        assert cli._lock_worktree(str(git_repo), str(wt), "some other tool")
+        cli._prune_stale_worktrees(str(git_repo))
+        assert wt.exists(), "a foreign lock and uncommitted work must fail closed"
+
+    def test_native_reasonless_lock_with_dirty_payload_survives(self, git_repo):
+        import cli
+
+        wt = self._mk(cli, git_repo, "hermes-reasonless-dirty", dirty=True, age_h=30)
+        locked = subprocess.run(
+            ["git", "worktree", "lock", str(wt)],
+            cwd=git_repo,
+            capture_output=True,
+            text=True,
+        )
+        assert locked.returncode == 0, locked.stderr
+        assert cli._worktree_lock_is_live(str(git_repo), str(wt)) == "live"
+
+        admin_dir = cli._worktree_admin_dir(str(wt))
+        assert admin_dir is not None
+        lock_path = admin_dir / "locked"
+        assert lock_path.read_text().strip() == ""
+
+        cli._prune_stale_worktrees(str(git_repo))
+
+        assert wt.exists(), "a native reasonless lock must never be reaped"
+        assert lock_path.is_file(), "the foreign lock itself must remain intact"
+
+    def test_replaced_dead_lock_is_not_unlocked_or_reaped(self, git_repo, monkeypatch):
+        import cli
+
+        wt = self._mk(cli, git_repo, "hermes-lock-race", pid=999999)
+        admin_dir = cli._worktree_admin_dir(str(wt))
+        assert admin_dir is not None
+        lock_path = admin_dir / "locked"
+        replacement = f"hermes pid={os.getpid()}"
+        classify = cli._worktree_lock_is_live
+
+        def classify_then_replace(repo_root, worktree_path, timeout=10):
+            state = classify(repo_root, worktree_path, timeout=timeout)
+            if worktree_path == str(wt) and state == "dead":
+                lock_path.write_text(replacement)
+            return state
+
+        monkeypatch.setattr(cli, "_worktree_lock_is_live", classify_then_replace)
+        cli._prune_stale_worktrees(str(git_repo))
+
+        assert wt.exists(), "a lock replaced after classification must fail closed"
+        assert lock_path.read_text().strip() == replacement
+
+    def test_recent_worktree_untouched(self, git_repo):
+        import cli
+        wt = self._mk(cli, git_repo, "hermes-fresh", pid=None, age_h=1)
+        cli._prune_stale_worktrees(str(git_repo))
+        assert wt.exists(), "worktree under 24h must never be pruned"
 
 
 class TestWorktreeLockPredicate:
     """_worktree_lock_is_live classification (real cli helper)."""
 
     def _mk_locked(self, repo, name, reason):
+        import cli
+
         p = repo / ".worktrees" / name
         (repo / ".worktrees").mkdir(exist_ok=True)
         subprocess.run(
             ["git", "worktree", "add", str(p), "-b", f"hermes/{name}", "HEAD"],
             cwd=repo, capture_output=True,
         )
-        subprocess.run(
-            ["git", "worktree", "lock", "--reason", reason, str(p)],
-            cwd=repo, capture_output=True,
-        )
+        assert cli._lock_worktree(str(repo), str(p), reason)
         return p
 
     def test_unlocked_returns_none(self, git_repo):
@@ -903,16 +964,45 @@ class TestWorktreeLockPredicate:
 
 
 
-    def test_foreign_lock_reason_returns_dead(self, git_repo):
+    def test_foreign_lock_reason_fails_closed_to_live(self, git_repo):
         import cli
         p = self._mk_locked(git_repo, "hermes-foreign", "some other tool")
-        assert cli._worktree_lock_is_live(str(git_repo), str(p)) == "dead"
+        assert cli._worktree_lock_is_live(str(git_repo), str(p)) == "live"
+
+    def test_embedded_hermes_marker_in_foreign_reason_fails_closed(self, git_repo):
+        import cli
+
+        p = self._mk_locked(
+            git_repo,
+            "hermes-foreign-embedded",
+            "foreign owner; hermes pid=999999",
+        )
+        assert cli._worktree_lock_is_live(str(git_repo), str(p)) == "live"
 
     def test_bad_repo_root_fails_safe_to_live(self, tmp_path):
         import cli
         # Not a git repo -> git query fails -> must report "live" (never delete)
         assert cli._worktree_lock_is_live(str(tmp_path), str(tmp_path / "x")) == "live"
 
+    def test_reasoned_lock_failure_does_not_try_reasonless_fallback(
+        self, monkeypatch, tmp_path
+    ):
+        import cli
+
+        calls = []
+
+        def fail_lock(args, **kwargs):
+            calls.append(args)
+            return subprocess.CompletedProcess(args, 129, "", "lock failed")
+
+        monkeypatch.setattr(subprocess, "run", fail_lock)
+        assert cli._lock_worktree(
+            str(tmp_path), str(tmp_path / "worktree"), "hermes pid=123"
+        ) is False
+        assert calls == [[
+            "git", "worktree", "lock", "--reason", "hermes pid=123",
+            str(tmp_path / "worktree"),
+        ]]
 
 class TestWidenedPruner:
     """Behavior contracts for the widened pruner (#all-.worktrees coverage,

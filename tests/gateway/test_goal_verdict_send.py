@@ -10,6 +10,7 @@ never saw verdicts. This test locks in the fix.
 from __future__ import annotations
 
 import asyncio
+import threading
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -73,6 +74,14 @@ def _make_runner_with_adapter(session_id: str = None):
     runner._running_agents = {}
     runner._running_agents_ts = {}
     runner._queued_events = {}
+    runner._draining = False
+    runner._external_drain_active = False
+    runner._busy_queue_lock = threading.RLock()
+    runner._busy_queue_claimed_events = {}
+    runner._busy_queue_uncertain_sessions = set()
+    runner._busy_queue_uncertain_digests = set()
+    runner._busy_queue_persist_ready = MagicMock(return_value=None)
+    runner._busy_queue_max_bytes = lambda: 1024 * 1024
 
     src = _make_source()
     # Default to a unique session_id so xdist parallel runs on the same worker

@@ -572,9 +572,10 @@ prompt_caching:
 # browser screenshot analysis, web page summarization, TTS audio-tag insertion,
 # and context compression.
 #
-# By default these use Gemini Flash via OpenRouter or Nous Portal and are
-# auto-detected from your credentials.  You do NOT need to change anything
-# here for normal usage.
+# Most auxiliary tasks auto-detect a provider from your credentials. The
+# privacy-sensitive SMART busy-message classifier is the exception: its
+# provider and model are empty by default and it never inherits the main
+# runtime or an auto/fallback route.
 #
 # WARNING: Overriding these with providers other than OpenRouter or Nous Portal
 # is EXPERIMENTAL and may not work.  Not all models/providers support vision,
@@ -602,6 +603,36 @@ prompt_caching:
 # Other providers pick a sensible default automatically.
 #
 # auxiliary:
+#   # SMART busy-message classifier (double opt-in; disabled by default).
+#   # First set display.busy_input_mode: smart, then name ONE dedicated provider
+#   # and model here. Empty values, "auto", and "main" fail closed to the queue.
+#   # A literal "custom" provider also requires an explicit base_url.
+#   #
+#   # Egress per non-alias text message: force-redacted active goal (max 4,000
+#   # chars), incoming message (max 4,000), and activity summary (max 1,000).
+#   # Known credential patterns and control characters are removed before the
+#   # call; ordinary names, email addresses, and other PII are NOT anonymized.
+#   # Full history, attachments, tool output, and main-runtime credentials are
+#   # not sent. Explicit AJUSTE:/PARALELO:/DEPOIS: aliases make no model call.
+#   # Any over-limit field, malformed/low-confidence response, busy admission,
+#   # timeout, or provider error preserves the message and queues it safely.
+#   #
+#   # Hermes makes one attempt only: no provider discovery, retry, credential
+#   # rotation replay, task fallback, main-model fallback, or cross-provider
+#   # fallback. The absolute deadline starts before prompt preparation (max 60s),
+#   # at most two provider calls are in flight process-wide, and a timed-out
+#   # blocking call keeps its slot until it exits; its late result is discarded.
+#   # Your provider's logging, training, retention, residency, and privacy terms
+#   # still apply. Set display.busy_input_mode: queue to disable SMART entirely;
+#   # clearing either field below disables classifier egress while failing closed.
+#   smart_router:
+#     provider: ""            # e.g. "openrouter"; never "auto" or "main"
+#     model: ""               # required explicit model slug
+#     base_url: ""            # required when provider is literal "custom"
+#     api_key: ""             # optional; prefer the provider's normal key source
+#     timeout: 12             # provider request cap within the absolute deadline
+#     extra_body: {}
+#
 #   # Image analysis: vision_analyze tool + browser screenshots
 #   vision:
 #     provider: "auto"
@@ -1287,6 +1318,17 @@ delegation:
 # honcho: {}
 
 # =============================================================================
+# SMART busy-message classifier policy
+# =============================================================================
+# The deadline is absolute from classifier entry and is capped at 60 seconds by
+# the implementation. Invalid values fail closed. Provider/model and privacy
+# controls are documented under auxiliary.smart_router above.
+# orchestration:
+#   smart:
+#     confidence_threshold: 0.78
+#     classifier_timeout_seconds: 12
+
+# =============================================================================
 # Display
 # =============================================================================
 display:
@@ -1362,9 +1404,23 @@ display:
   #              after the next tool call — no interrupt, no role violation.
   #              Falls back to 'queue' if the agent isn't running yet or if
   #              images are attached (steer only carries text).
+  #   smart:     Use the fail-closed SMART classifier. Related messages are
+  #              fenced for the next safe checkpoint; independent work is
+  #              described as parallel only after an isolated worker returns a
+  #              durable admission ID; dependent/ambiguous/error cases queue.
+  #              It never interrupts and never executes isolation fallback inline.
+  #              A steering receipt commits only when the agent checkpoint
+  #              consumes the mailbox, not merely when steer() accepts it.
+  #              Requires an explicit auxiliary.smart_router provider + model
+  #              for classifier egress; otherwise every non-alias input queues.
   # Ctrl+C (or /stop in gateway) always interrupts regardless of this setting.
-  # Toggle at runtime with /busy <interrupt|queue|steer>.
+  # Toggle in the CLI with /busy <smart|interrupt|queue|steer>.
   busy_input_mode: interrupt
+
+  # Aggregate CLI/TUI/Desktop/gateway durable-queue cap. The logical obligation
+  # count is fixed at 32 and coalesced media/captions count before mutation.
+  # Accepted receipts never expire silently.
+  busy_queue_max_bytes: 1048576
 
   # Background process notifications (gateway/messaging only).
   # Controls how chatty the process watcher is when you use

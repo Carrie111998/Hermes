@@ -18,6 +18,7 @@ import pytest
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent, MessageType
 from gateway.session import SessionEntry, SessionSource, build_session_key
+import threading
 
 
 def _make_source() -> SessionSource:
@@ -30,7 +31,7 @@ def _make_source() -> SessionSource:
     )
 
 
-def _make_runner(session_entry: SessionEntry):
+def _make_runner(session_entry: SessionEntry, profile_home=None):
     from gateway.run import GatewayRunner
 
     runner = object.__new__(GatewayRunner)
@@ -51,6 +52,11 @@ def _make_runner(session_entry: SessionEntry):
     runner._running_agents_ts = {}
     runner._pending_messages = {}
     runner._queued_events = {}
+    if profile_home is not None:
+        runner._busy_queue_root_override = profile_home
+        runner._busy_queue_lock = threading.RLock()
+        runner._busy_queue_uncertain_sessions = set()
+        runner._busy_queue_restored_sessions = set()
     runner._pending_approvals = {}
     runner._session_db = MagicMock()
     runner._session_db.get_session_title.return_value = None
@@ -88,9 +94,9 @@ def _running(runner):
 
 
 @pytest.mark.asyncio
-async def test_queue_preserves_photo_media():
+async def test_queue_preserves_photo_media(tmp_path):
     """A /queue carrying a photo must keep the attachment + type."""
-    runner, adapter = _make_runner(_session_entry())
+    runner, adapter = _make_runner(_session_entry(), tmp_path / "profile")
     sk = _running(runner)
 
     event = MessageEvent(
@@ -112,8 +118,8 @@ async def test_queue_preserves_photo_media():
 
 
 @pytest.mark.asyncio
-async def test_queue_preserves_reply_context():
-    runner, adapter = _make_runner(_session_entry())
+async def test_queue_preserves_reply_context(tmp_path):
+    runner, adapter = _make_runner(_session_entry(), tmp_path / "profile")
     sk = _running(runner)
 
     event = MessageEvent(
@@ -137,3 +143,50 @@ async def test_queue_preserves_reply_context():
 
 if __name__ == "__main__":  # pragma: no cover
     pytest.main([__file__, "-v"])
+
+
+@pytest.mark.asyncio
+async def test_queue_text_only_queues_and_does_not_interrupt(tmp_path):
+    runner, adapter = _make_runner(_session_entry(), tmp_path / "profile")
+    sk = _running(runner)
+    running_agent = runner._running_agents[sk]
+    real_admission = runner._queue_or_replace_pending_event
+    runner._queue_or_replace_pending_event = MagicMock(wraps=real_admission)
+
+    event = MessageEvent(text="/queue do this next", source=_make_source(), message_id="q1")
+    result = await runner._handle_message(event)
+
+    assert result is not None and "queued" in result.lower()
+    running_agent.interrupt.assert_not_called()
+    runner._queue_or_replace_pending_event.assert_called_once()
+    assert runner._queue_or_replace_pending_event.call_args.args[:2] == (
+        sk,
+        adapter._pending_messages[sk],
+    )
+    assert sk in adapter._pending_messages
+    queued = adapter._pending_messages[sk]
+    assert queued.text == "do this next"
+    assert queued.message_type == MessageType.TEXT
+
+
+@pytest.mark.asyncio
+async def test_queue_allows_media_without_prompt_text(tmp_path):
+    """`/queue` as a bare caption on a document is valid — media-only."""
+    runner, adapter = _make_runner(_session_entry(), tmp_path / "profile")
+    sk = _running(runner)
+
+    event = MessageEvent(
+        text="/queue",
+        message_type=MessageType.DOCUMENT,
+        source=_make_source(),
+        message_id="q-doc",
+        media_urls=["/tmp/file.pdf"],
+        media_types=["application/pdf"],
+    )
+    result = await runner._handle_message(event)
+
+    assert result is not None and "queued" in result.lower()
+    queued = adapter._pending_messages[sk]
+    assert queued.text == ""
+    assert queued.message_type == MessageType.DOCUMENT
+    assert queued.media_urls == ["/tmp/file.pdf"]

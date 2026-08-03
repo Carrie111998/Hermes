@@ -5,6 +5,7 @@ messages from non-allowlisted users must be silently dropped — matching the co
 behavior in _handle_message. Previously, the busy path skipped the auth check entirely,
 allowing unauthorized users to inject text into another user's running session.
 """
+import threading
 import time
 from unittest.mock import AsyncMock, MagicMock
 
@@ -70,8 +71,22 @@ def _make_runner(authorized_users=None):
     runner._pending_messages = {}
     runner._busy_ack_ts = {}
     runner._draining = False
+    runner._external_drain_active = False
+    runner._queued_events = {}
+    runner._busy_queue_lock = threading.RLock()
+    runner._busy_queue_claimed_events = {}
+    runner._busy_queue_uncertain_sessions = set()
+    runner._busy_queue_uncertain_digests = set()
+    # This suite exercises auth/routing, while test_busy_queue_durability.py
+    # owns the atomic-file contract. Keep the durable admission boundary
+    # present without turning these partial runners into volatile fallbacks.
+    runner._busy_queue_persist_ready = MagicMock(return_value=None)
+    runner._busy_queue_max_bytes = lambda: 1024 * 1024
     runner.adapters = {}
     runner.config = MagicMock()
+    runner.config.group_sessions_per_user = True
+    runner.config.thread_sessions_per_user = False
+    runner.config.multiplex_profiles = False
     runner.session_store = None
     runner.hooks = MagicMock()
     runner.hooks.emit = AsyncMock()
