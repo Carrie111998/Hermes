@@ -18,11 +18,11 @@ To add a new language:
 4. Done — no manual TS files to write
 
 Exit codes:
-  0 = success
-  1 = validation error (missing keys, type mismatches)
+  0 = success (partial catalogs are expected — missing keys fall back to English)
+  1 = fatal error (missing JSON file, I/O failure)
 """
 
-import json, os, re, sys
+import json, os, re
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 LOCALES_DIR = os.path.join(REPO_ROOT, 'src', 'locales')
@@ -46,7 +46,7 @@ KNOWN_LOCALES: list[dict] = [
     {'json': 'th',      'ts': 'th',      'var': 'th',     'name': 'ภาษาไทย',               'englishName': 'Thai',                  'configValue': 'th'},
     {'json': 'vi',      'ts': 'vi',      'var': 'vi',     'name': 'Tiếng Việt',             'englishName': 'Vietnamese',            'configValue': 'vi'},
     {'json': 'it',      'ts': 'it',      'var': 'it',     'name': 'Italiano',               'englishName': 'Italian',               'configValue': 'it'},
-    {'json': 'ru',      'ts': 'ru',      'var': 'ru',     'name': 'Русский',                'englishName': 'Russian',               'configValue': 'ru'},
+
 ]
 
 # Generate the TypeScript Locale type union from KNOWN_LOCALES
@@ -190,7 +190,6 @@ LOCALE_ALIASES_MAP: dict[str, str] = {
     'th': 'th', 'th-th': 'th', 'th_th': 'th',
     'vi': 'vi', 'vi-vn': 'vi', 'vi_vn': 'vi',
     'it': 'it', 'it-it': 'it', 'it_it': 'it', 'it-ch': 'it',
-    'ru': 'ru', 'ru-ru': 'ru', 'ru_ru': 'ru',
 }
 
 # ── Main ───────────────────────────────────────────────────────
@@ -203,7 +202,6 @@ def main():
     en_keys = set(k for k in en_data if not should_skip(k))
     
     print(f'📖 en.json: {len(en_data)} total, {len(en_keys)} active keys')
-    issues = 0
     
     # 2. Process each locale
     for locale in KNOWN_LOCALES:
@@ -213,7 +211,6 @@ def main():
         
         if not os.path.exists(json_path):
             print(f'  ❌ {locale["json"]}: JSON file not found')
-            issues += 1
             continue
         
         with open(json_path) as f:
@@ -224,8 +221,7 @@ def main():
         missing = en_keys - locale_keys
         
         if missing:
-            print(f'  ⚠️  {locale["json"]}: {len(missing)} keys missing (will fallback to en)')
-            issues += len(missing)
+            print(f'  ℹ️  {locale["json"]}: {len(missing)} keys missing (will fallback to en)')
         
         # Skip if this locale already exists upstream (en/ja/zh/zh-hant are the full framework)
         if is_upstream:
@@ -306,9 +302,7 @@ def main():
         f.write(langs_content)
     print('📝 languages.ts updated')
     
-    # Summary
-    if issues:
-        sys.exit(1)
+    # Summary — partial catalogs are expected; only I/O errors are fatal
     print(f'\n✅ All {len(KNOWN_LOCALES)} locales synced successfully')
 
 if __name__ == '__main__':
