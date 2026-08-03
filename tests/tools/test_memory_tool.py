@@ -270,8 +270,16 @@ class TestMemoryStorePersistence:
 
 
 class TestMemoryStoreSnapshot:
-    def test_load_from_disk_preserves_failure_for_unreadable_memory_file(self, tmp_path, monkeypatch):
-        """An I/O error must not be treated as an empty store before a write."""
+    def test_load_from_disk_read_only_degrades_on_read_failure(self, tmp_path, monkeypatch):
+        """A read-only startup load must not crash on a transient read failure.
+
+        ``load_from_disk`` never writes back, so treating an unreadable file
+        as an empty store loses nothing — and crashing the session over a
+        transient lock/permission blip would be strictly worse. The write-side
+        protection lives in ``_reload_target`` / ``_READ_FAILED`` (pinned by
+        ``TestUnreadableFileDoesNotWipeMemory``): mutations refuse instead of
+        persisting over the unreadable file.
+        """
         monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
         path = tmp_path / "MEMORY.md"
         path.write_text("existing fact", encoding="utf-8")
@@ -285,8 +293,16 @@ class TestMemoryStoreSnapshot:
 
         monkeypatch.setattr(Path, "read_text", fail_for_memory_file)
         store = MemoryStore()
-        with pytest.raises(RuntimeError, match="Unable to read memory file"):
-            store.load_from_disk()
+        store.load_from_disk()  # must not raise
+
+        assert store.memory_entries == []
+        assert store.format_for_system_prompt("memory") is None
+
+        # The next MUTATION still refuses, and the on-disk file is untouched.
+        result = store.add("memory", "new fact")
+        assert result["success"] is False
+        assert "could not be read" in result["error"]
+        assert path.read_bytes() == b"existing fact"
 
     def test_snapshot_frozen_at_load(self, store):
         assert store.format_for_system_prompt("memory") is None  # empty store

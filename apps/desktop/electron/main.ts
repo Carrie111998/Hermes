@@ -128,6 +128,7 @@ import {
   dataUrlReadMaxBytesFromMb,
   DEFAULT_FETCH_TIMEOUT_MS,
   encryptDesktopSecret as encryptDesktopSecretStrict,
+  readFileDataUrlForIpc,
   rejectSensitiveFilePath,
   resolveReadableFileForIpc,
   resolveRequestedPathForIpc,
