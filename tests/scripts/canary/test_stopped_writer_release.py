@@ -181,6 +181,66 @@ def test_plan_rejects_activation_collision_including_dangling_symlink(monkeypatc
         )
 
 
+def test_source_retention_keeps_current_plus_newest_bounded_set(
+    tmp_path, monkeypatch
+):
+    _allow_local_owner(monkeypatch)
+    source_base = tmp_path / "sources"
+    source_base.mkdir()
+    source_base.chmod(0o755)
+    monkeypatch.setattr(writer_release, "DEFAULT_SOURCE_BASE", source_base)
+
+    revisions = [REVISION]
+    revisions.extend(
+        hashlib.sha256(f"retained-source-{index}".encode()).hexdigest()[:40]
+        for index in range(15)
+    )
+    for index, revision in enumerate(revisions, start=1):
+        path = source_base / revision
+        path.mkdir()
+        path.chmod(0o755)
+        (path / "tracked").write_text(revision, encoding="ascii")
+        os.utime(path, ns=(index, index))
+
+    removed = writer_release._prune_stopped_release_sources(REVISION)
+
+    newest = set(revisions[-writer_release._STOPPED_SOURCE_RETENTION_COUNT :])
+    expected_retained = newest | {REVISION}
+    assert removed == tuple(revisions[1:4])
+    assert {path.name for path in source_base.iterdir()} == expected_retained
+
+
+@pytest.mark.parametrize("hostile_kind", ["unknown", "symlink"])
+def test_source_retention_rejects_hostile_namespace_before_deletion(
+    tmp_path, monkeypatch, hostile_kind
+):
+    _allow_local_owner(monkeypatch)
+    source_base = tmp_path / "sources"
+    source_base.mkdir()
+    source_base.chmod(0o755)
+    monkeypatch.setattr(writer_release, "DEFAULT_SOURCE_BASE", source_base)
+    revisions = [REVISION]
+    revisions.extend(
+        hashlib.sha256(f"hostile-source-{index}".encode()).hexdigest()[:40]
+        for index in range(writer_release._STOPPED_SOURCE_RETENTION_COUNT + 2)
+    )
+    for revision in revisions:
+        path = source_base / revision
+        path.mkdir()
+        path.chmod(0o755)
+    if hostile_kind == "unknown":
+        (source_base / "unexpected").write_text("blocked", encoding="ascii")
+    else:
+        hostile_revision = hashlib.sha256(b"hostile-link").hexdigest()[:40]
+        (source_base / hostile_revision).symlink_to(source_base / REVISION)
+
+    before = {path.name for path in source_base.iterdir()}
+    with pytest.raises(RuntimeError, match="unknown entry|entry is not trusted"):
+        writer_release._prune_stopped_release_sources(REVISION)
+
+    assert {path.name for path in source_base.iterdir()} == before
+
+
 def test_source_identity_rejects_nonexact_remote_framing(monkeypatch):
     _patch_plan_filesystem(monkeypatch)
 
@@ -991,11 +1051,19 @@ def test_apply_publishes_exact_receipt_and_retry_is_read_only(tmp_path, monkeypa
         lambda _plan: copy.deepcopy(host_binding),
     )
 
+    retained = False
     built = False
+
+    def retain(revision):
+        nonlocal retained
+        assert revision == REVISION
+        retained = True
+        return ()
 
     def build(current, *, runner):
         nonlocal built
         del runner
+        assert retained is True
         assert built is False
         built = True
         current.release_root.mkdir(parents=True)
@@ -1005,6 +1073,7 @@ def test_apply_publishes_exact_receipt_and_retry_is_read_only(tmp_path, monkeypa
         REVISION,
         plan["plan_sha256"],
         release_builder=build,
+        source_retainer=retain,
         clock=lambda: 123.9,
     )
 
@@ -1029,10 +1098,14 @@ def test_apply_publishes_exact_receipt_and_retry_is_read_only(tmp_path, monkeypa
         release_builder=lambda *_args, **_kwargs: (_ for _ in ()).throw(
             AssertionError("builder reran")
         ),
+        source_retainer=lambda _revision: (_ for _ in ()).throw(
+            AssertionError("source retention reran")
+        ),
         clock=lambda: (_ for _ in ()).throw(AssertionError("clock reran")),
     )
     after = os.lstat(receipt_path)
     assert retry == receipt
+    assert retained is True
     assert built is True
     assert (before.st_ino, before.st_mtime_ns) == (after.st_ino, after.st_mtime_ns)
 
@@ -1163,6 +1236,7 @@ def test_post_build_drift_blocks_final_receipt_after_host_publication(
             REVISION,
             first["plan_sha256"],
             release_builder=build,
+            source_retainer=lambda _revision: (),
         )
 
     assert spec.release_root.is_dir()
