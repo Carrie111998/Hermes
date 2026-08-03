@@ -20,6 +20,44 @@ DEFAULT_CONFIG = {
         "wal_autocheckpoint": None,
         "journal_size_limit": None,
     },
+    "compute": {
+        "provider": "modal",
+        "image": "trycua/cua:latest",
+        "capabilities": ["terminal", "files", "process", "computer_use"],
+        "modal": {
+            "cpu": 2,
+            "memory": 8192,
+            "persistent_filesystem": True,
+        },
+        "cua_fleet": {
+            "base_url": "https://run.cua.ai",
+            "token_url": "https://auth.cua.ai/realms/cyclops-cs/protocol/openid-connect/token",
+            "pool": "hermes-desktop",
+            "spec": {
+                "replicas": 1,
+                "autoscaling": None,
+                "services": [
+                    {"name": "server", "target_port": 8000, "protocol": "tcp"},
+                    {"name": "mcp", "target_port": 3000, "protocol": "tcp"},
+                ],
+                "template": {
+                    "runtime": "kubevirt",
+                    "runtime_class_name": None,
+                    "node_selector": None,
+                    "tolerations": None,
+                    "command": None,
+                    "container_disk_image": "trycua/cua:latest",
+                    "image_pull_secret": "ecr-credentials",
+                    "cpu_cores": 2,
+                    "memory": "8Gi",
+                    "firmware": "bios",
+                    "probes": None,
+                    "oidc": None,
+                },
+            },
+            "ready_timeout": 600,
+        },
+    },
     # Global active chat session cap across CLI, TUI/dashboard, and messaging.
     # None/0 = unbounded.
     "max_concurrent_sessions": None,

@@ -46,7 +46,7 @@ class TestSchema:
         assert actions >= {
             "capture", "click", "double_click", "right_click", "middle_click",
             "drag", "scroll", "type", "key", "wait", "list_apps", "list_windows",
-            "focus_app",
+            "focus_app", "launch_app", "kill_app", "bring_to_front",
         }
 
     def test_schema_max_elements_documents_default_and_upper_bound(self):
@@ -112,6 +112,33 @@ class TestDispatch:
         assert "type" in call_names
         type_kw = next(c[1] for c in noop_backend.calls if c[0] == "type")
         assert type_kw["text"] == "hello"
+
+    def test_launch_app_routes_lifecycle_arguments(self, noop_backend):
+        from tools.computer_use.tool import handle_computer_use
+
+        out = handle_computer_use({
+            "action": "launch_app",
+            "name": "Chromium",
+            "urls": ["https://example.com"],
+            "additional_arguments": ["--incognito"],
+            "creates_new_application_instance": True,
+        })
+
+        assert json.loads(out)["pid"] == 1
+        assert noop_backend.calls[-1] == ("launch_app", {
+            "bundle_id": None,
+            "name": "Chromium",
+            "urls": ["https://example.com"],
+            "additional_arguments": ["--incognito"],
+            "creates_new_application_instance": True,
+        })
+
+    def test_launch_app_requires_an_app_identifier(self):
+        from tools.computer_use.tool import handle_computer_use
+
+        out = handle_computer_use({"action": "launch_app"})
+
+        assert json.loads(out)["error"] == "launch_app requires `name` or `bundle_id`"
 
     def test_drag_action_routes_to_backend_by_element(self, noop_backend):
         """drag action must dispatch to backend.drag with element indices (issue #24170, bug 4)."""
@@ -2129,3 +2156,90 @@ class TestStartupTimeoutPhaseDetail:
                 msg = str(e)
                 assert "stuck in phase: mcp-initialize" in msg
                 assert "computer-use doctor" in msg
+
+    def test_timeout_error_defaults_to_unknown_phase(self):
+        import threading
+        from typing import Any, cast
+        from unittest.mock import MagicMock, patch as _patch
+        import asyncio
+        from tools.computer_use.cua_backend import _CuaDriverSession
+
+        session = cast(Any, _CuaDriverSession.__new__(_CuaDriverSession))
+        session._lock = threading.Lock()
+        session._ready_event = threading.Event()
+        session._setup_error = None
+        session._shutdown_event = None
+        # no _startup_phase attribute at all
+        session._signal_shutdown_locked = lambda: None
+        fake_bridge = MagicMock()
+        fake_bridge._loop = MagicMock()
+        session._bridge = fake_bridge
+
+        class _FakeEvent:
+            def set(self): pass
+            def is_set(self): return False
+            def clear(self): pass
+            def wait(self, timeout=None): return False
+
+        with _patch.object(threading, "Event", _FakeEvent), \
+             _patch.object(asyncio, "run_coroutine_threadsafe", return_value=MagicMock()), \
+             _patch.object(_CuaDriverSession, "_lifecycle_coro", lambda self: None):
+            try:
+                session._start_lifecycle_locked()
+                assert False, "expected RuntimeError"
+            except RuntimeError as e:
+                assert "stuck in phase: unknown" in str(e)
+
+
+def test_task_desktop_backend_reuses_terminal_lease(monkeypatch):
+    from tools.computer_use import tool
+
+    backend = MagicMock()
+    managed_lease = MagicMock()
+    managed_lease.environment.get_computer_backend.return_value = backend
+    manager = MagicMock()
+    manager.get.return_value = managed_lease
+
+    monkeypatch.setattr(tool, "_desktop_sandbox_enabled", lambda: True, raising=False)
+    monkeypatch.setattr(
+        tool,
+        "get_desktop_sandbox_manager",
+        lambda: manager,
+        raising=False,
+    )
+
+    assert tool._get_task_desktop_backend("task-1") is backend
+    manager.get.assert_called_once_with("task-1")
+    manager.acquire.assert_not_called()
+
+
+def test_task_desktop_backend_acquires_for_computer_first_flow(monkeypatch):
+    from tools.computer_use import tool
+
+    backend = MagicMock()
+    managed_lease = MagicMock()
+    managed_lease.environment.get_computer_backend.return_value = backend
+    manager = MagicMock()
+    manager.get.return_value = None
+    manager.acquire.return_value = managed_lease
+
+    monkeypatch.setattr(tool, "_desktop_sandbox_enabled", lambda: True, raising=False)
+    monkeypatch.setattr(
+        tool,
+        "get_desktop_sandbox_manager",
+        lambda: manager,
+        raising=False,
+    )
+
+    assert tool._get_task_desktop_backend("task-2") is backend
+    manager.get.assert_called_once_with("task-2")
+    manager.acquire.assert_called_once_with("task-2")
+
+
+def test_desktop_sandbox_tool_registers_through_builtin_discovery():
+    import tools.desktop_sandbox_tool  # noqa: F401
+    from tools.registry import registry
+
+    entry = registry._tools.get("desktop_sandbox")
+    assert entry is not None
+    assert entry.toolset == "desktop_sandbox"

@@ -10,5 +10,6 @@ based on the TERMINAL_ENV configuration.
 """
 
 from tools.environments.base import BaseEnvironment
+from tools.environments.cua_fleet import CuaFleetConfig, CuaFleetDesktopProvider
 
-__all__ = ["BaseEnvironment"]
+__all__ = ["BaseEnvironment", "CuaFleetConfig", "CuaFleetDesktopProvider"]

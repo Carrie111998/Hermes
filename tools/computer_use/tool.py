@@ -86,6 +86,7 @@ _SAFE_ACTIONS = frozenset({
 _DESTRUCTIVE_ACTIONS = frozenset({
     "click", "double_click", "right_click", "middle_click",
     "drag", "scroll", "type", "key", "set_value", "focus_app",
+    "launch_app", "kill_app", "bring_to_front",
     "cua_browser_prepare", "cua_browser_navigate", "cua_browser_click",
     "cua_browser_type", "cua_browser_pointer", "cua_browser_dialog",
     "cua_browser_set_input_files", "cua_browser_download",
@@ -432,6 +433,47 @@ class _NoopBackend(ComputerUseBackend):  # pragma: no cover
         self.calls.append(("set_value", {"value": value, "element": element}))
         return ActionResult(ok=True, action="set_value")
 
+    def launch_app(self, *, bundle_id=None, name=None, urls=None, additional_arguments=None,
+                   creates_new_application_instance=False) -> Dict[str, Any]:
+        self.calls.append(("launch_app", {
+            "bundle_id": bundle_id,
+            "name": name,
+            "urls": urls,
+            "additional_arguments": additional_arguments,
+            "creates_new_application_instance": creates_new_application_instance,
+        }))
+        return {"pid": 1, "name": name, "bundle_id": bundle_id, "windows": []}
+
+
+def get_desktop_sandbox_manager():
+    """Load the shared desktop lease manager only when desktop mode is active."""
+    from tools.environments.desktop_lease import get_desktop_sandbox_manager as get_manager
+
+    return get_manager()
+
+
+def _desktop_sandbox_enabled() -> bool:
+    """Return whether computer use should share the desktop terminal lease."""
+    try:
+        from tools.terminal_tool import _get_env_config
+
+        return _get_env_config().get("env_type") == "desktop"
+    except Exception:
+        logger.debug("desktop sandbox configuration is unavailable", exc_info=True)
+        return False
+
+
+def _get_task_desktop_backend(task_id: str | None) -> ComputerUseBackend | None:
+    """Resolve the configured task desktop without creating a local backend."""
+    if not _desktop_sandbox_enabled():
+        return None
+
+    normalized_task_id = str(task_id or "default")
+    manager = get_desktop_sandbox_manager()
+    managed = manager.get(normalized_task_id)
+    if managed is None:
+        managed = manager.acquire(normalized_task_id)
+    return managed.environment.get_computer_backend()
 
 # ---------------------------------------------------------------------------
 # Dispatch
@@ -493,7 +535,9 @@ def handle_computer_use(args: Dict[str, Any], **kwargs) -> Any:
 
     # Dispatch to backend.
     try:
-        backend = _get_backend(session_id=session_id)
+        backend = _get_task_desktop_backend(kwargs.get("task_id")) or _get_backend(
+            session_id=session_id
+        )
     except Exception as e:
         return json.dumps({
             "error": f"computer_use backend unavailable: {e}",
@@ -584,6 +628,12 @@ def _summarize_action(action: str, args: Dict[str, Any]) -> str:
         return f"key {args.get('keys', '')!r}{fg}"
     if action == "focus_app":
         return f"focus {args.get('app', '')!r}" + (" (raise)" if args.get("raise_window") else "")
+    if action == "launch_app":
+        return f"launch {(args.get('name') or args.get('bundle_id') or '')!r}"
+    if action == "kill_app":
+        return f"terminate pid {args.get('pid', '?')}"
+    if action == "bring_to_front":
+        return f"raise pid {args.get('pid', '?')}"
     return action + fg
 
 
@@ -621,6 +671,33 @@ def _dispatch(backend: ComputerUseBackend, action: str, args: Dict[str, Any]) ->
         if not app:
             return json.dumps({"error": "focus_app requires `app`"})
         res = backend.focus_app(app, raise_window=bool(args.get("raise_window")))
+        return _maybe_follow_capture(backend, res, capture_after)
+
+    if action == "launch_app":
+        bundle_id = args.get("bundle_id")
+        name = args.get("name")
+        if not bundle_id and not name:
+            return json.dumps({"error": "launch_app requires `name` or `bundle_id`"})
+        return json.dumps(backend.launch_app(
+            bundle_id=bundle_id,
+            name=name,
+            urls=args.get("urls"),
+            additional_arguments=args.get("additional_arguments"),
+            creates_new_application_instance=bool(args.get("creates_new_application_instance")),
+        ))
+
+    if action == "kill_app":
+        if args.get("pid") is None:
+            return json.dumps({"error": "kill_app requires `pid`"})
+        return _text_response(backend.kill_app(pid=int(args["pid"])))
+
+    if action == "bring_to_front":
+        if args.get("pid") is None:
+            return json.dumps({"error": "bring_to_front requires `pid`"})
+        res = backend.bring_to_front(
+            pid=int(args["pid"]),
+            window_id=args.get("window_id"),
+        )
         return _maybe_follow_capture(backend, res, capture_after)
 
     # cua-driver's typed browser surface is namespaced inside the existing
@@ -1330,6 +1407,8 @@ def check_computer_use_requirements() -> bool:
     `hermes computer-use doctor` if their session is incomplete (e.g. no
     DISPLAY set).
     """
+    if _desktop_sandbox_enabled():
+        return True
     if sys.platform not in ("darwin", "win32", "linux"):
         return False
     from tools.computer_use.cua_backend import cua_driver_binary_available

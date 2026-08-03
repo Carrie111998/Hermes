@@ -67,6 +67,13 @@ def test_unknown_terminal_env_logs_error_and_returns_false(monkeypatch, caplog):
     )
 
 
+def test_desktop_terminal_requirements_defer_to_configured_provider(monkeypatch):
+    _clear_terminal_env(monkeypatch)
+    monkeypatch.setenv("TERMINAL_ENV", "desktop")
+
+    assert terminal_tool_module.check_terminal_requirements() is True
+
+
 def test_modal_backend_managed_mode_without_feature_flag_logs_clear_error(monkeypatch, caplog, tmp_path):
     _clear_terminal_env(monkeypatch)
     monkeypatch.setenv("TERMINAL_ENV", "modal")
