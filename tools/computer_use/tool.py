@@ -1145,6 +1145,67 @@ def _capture_after_mode() -> str:
     return mode if mode in {"som", "vision", "ax"} else "som"
 
 
+def _vision_cache_dir():
+    """Return the vision scratch dir, created owner-only.
+
+    A desktop capture is as sensitive as the screen it came from — an open
+    password manager, a private chat, a bank tab. The umask-derived 0755 this
+    used to get made every local account able to list (and read) those frames
+    whenever ``HERMES_HOME`` itself is traversable, which is exactly what the
+    documented ``HERMES_HOME_MODE=0701`` web-server escape hatch arranges.
+
+    The mode is set *at creation* so there is no window between mkdir and
+    chmod where the directory sits world-readable. Policy is then reconciled
+    by ``hermes_cli.config._secure_dir`` — the house helper — on every call,
+    which is what keeps this correct for deployments that are not a single
+    desktop user:
+
+    * managed/NixOS installs are skipped (the activation script owns modes);
+    * ``HERMES_HOME_MODE`` stays honored for the web-server traversal hatch;
+    * ``HERMES_UID``/``HERMES_GID`` ownership is applied, so a root-created
+      dir does not lock out uid-mapped Docker workers (#34107).
+
+    Running it unconditionally also heals a directory an older Hermes left at
+    0755. That retroactive tighten is safe *here* specifically because this
+    is Hermes-private scratch whose files are unlinked in the same call —
+    there is no user-shared content to strand. A directory a user may have
+    deliberately relaxed (a browser profile, a served asset dir) would not
+    qualify.
+    """
+    from hermes_constants import get_hermes_dir
+
+    cache_dir = get_hermes_dir("cache/vision", "temp_vision_images")
+    # mode= is honored only for the leaf and is not masked by umask.
+    cache_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        from hermes_cli.config import _secure_dir
+
+        _secure_dir(cache_dir)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("computer_use: vision cache chmod skipped: %s", exc)
+    return cache_dir
+
+
+def _write_private_bytes(path, data: bytes) -> None:
+    """Write ``data`` to ``path`` with owner-only (0600) permissions.
+
+    ``Path.write_bytes`` would land 0644 under a default umask. POSIX mode
+    bits are advisory on Windows (``os.chmod`` there only toggles the
+    read-only flag), so this is a best-effort narrowing that falls back to a
+    plain write rather than failing the capture.
+    """
+    import os as _os_priv
+
+    flags = _os_priv.O_WRONLY | _os_priv.O_CREAT | _os_priv.O_TRUNC
+    try:
+        fd = _os_priv.open(str(path), flags, 0o600)
+    except OSError:
+        path.write_bytes(data)
+        return
+    with _os_priv.fdopen(fd, "wb") as handle:
+        handle.write(data)
+
+
 def _route_capture_through_aux_vision(
     cap: CaptureResult,
     summary: str,
@@ -1169,7 +1230,6 @@ def _route_capture_through_aux_vision(
         import os as _os
         import uuid as _uuid
 
-        from hermes_constants import get_hermes_dir
         from model_tools import _run_async
         from tools.vision_tools import vision_analyze_tool
     except Exception as exc:  # pragma: no cover - defensive
@@ -1192,11 +1252,10 @@ def _route_capture_through_aux_vision(
             ext = ".jpg"
         else:
             ext = ".png"
-        cache_dir = get_hermes_dir("cache/vision", "temp_vision_images")
-        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_dir = _vision_cache_dir()
         temp_image_path = cache_dir / f"computer_use_{_uuid.uuid4().hex}{ext}"
         raw = _shrink_capture_for_vision(raw, ext)
-        temp_image_path.write_bytes(raw)
+        _write_private_bytes(temp_image_path, raw)
 
         prompt = (
             "Describe what is visible in this desktop application screenshot in "

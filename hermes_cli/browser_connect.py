@@ -133,6 +133,69 @@ def chrome_debug_data_dir() -> str:
     return str(get_hermes_home() / "chrome-debug")
 
 
+def _ensure_chrome_debug_data_dir(data_dir: str) -> None:
+    """Create the Chromium user-data-dir owner-only (0700).
+
+    ``chrome-debug`` is a real Chromium profile: Cookies, Login Data, and
+    Local Storage live here. Created with a bare ``os.makedirs`` it inherited
+    the umask and landed 0755, so every other local account could list and
+    read those stores. ``HERMES_HOME`` is 0700 by default, which contains the
+    damage — but the documented ``HERMES_HOME_MODE=0701`` hatch (so nginx can
+    traverse to a served subdirectory) makes a 0755 child genuinely
+    world-readable. Defence in depth, at the one directory where the payoff
+    for reading it is a logged-in session.
+
+    The mode is passed to ``os.makedirs`` so it is set *at creation* — no
+    window where the profile sits world-readable before a follow-up chmod.
+    Policy is then reconciled by ``hermes_cli.config._secure_dir``, the house
+    helper, rather than a hand-rolled chmod: it skips managed/NixOS installs,
+    honours ``HERMES_HOME_MODE``, and applies ``HERMES_UID``/``HERMES_GID``
+    ownership so a root-created dir does not lock out uid-mapped Docker
+    workers (#34107).
+
+    Reconciling unconditionally also heals a profile an older Hermes left at
+    0755, which is the whole point — the exposure is on disk already. It is
+    safe against a *running* browser: only group/other bits are dropped, the
+    owner keeps ``rwx``, and POSIX checks the mode at ``open()`` rather than
+    on already-open descriptors, so an attached Chromium keeps reading and
+    writing its profile. On Windows POSIX mode bits are advisory (``chmod``
+    only toggles the read-only flag), so this is best-effort there and the
+    directory keeps its inherited ACLs.
+    """
+    os.makedirs(data_dir, mode=0o700, exist_ok=True)
+    try:
+        from hermes_cli.config import _secure_dir
+
+        _secure_dir(data_dir)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("browser debug launch: profile dir chmod skipped: %s", exc)
+
+
+def _open_launch_stderr_log(path: str):
+    """Open the launch stderr log owner-only (0600), truncating as before.
+
+    Opened with a plain ``open(path, "wb")`` this landed 0644 under a default
+    umask — a fixed, guessable name inside the profile dir hardened just
+    above. Under ``HERMES_HOME_MODE=0701`` the directory is traversable but
+    unlistable, so a predictable filename is exactly the case that stays
+    reachable; the uuid-named files elsewhere in the profile do not.
+
+    The mode is passed to ``os.open`` so it applies at creation. ``O_TRUNC``
+    keeps the existing per-candidate overwrite semantics, and on an
+    already-existing log the inode's mode is left alone — matching
+    ``tools.computer_use.tool._write_private_bytes``, the house pattern for
+    bytes Hermes itself writes. Falls back to a plain open rather than
+    failing the launch, since losing the diagnostic log is better than
+    losing the browser.
+    """
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    try:
+        fd = os.open(path, flags, 0o600)
+    except OSError:
+        return open(path, "wb")
+    return os.fdopen(fd, "wb")
+
+
 def _chrome_debug_args(port: int) -> list[str]:
     return [
         f"--remote-debugging-port={port}",
@@ -375,12 +438,12 @@ def launch_chrome_debug(
         return result
 
     data_dir = chrome_debug_data_dir()
-    os.makedirs(data_dir, exist_ok=True)
+    _ensure_chrome_debug_data_dir(data_dir)
     stderr_path = os.path.join(data_dir, _LAUNCH_STDERR_LOG)
 
     for candidate in candidates:
         try:
-            with open(stderr_path, "wb") as stderr_file:
+            with _open_launch_stderr_log(stderr_path) as stderr_file:
                 proc = subprocess.Popen(
                     [candidate, *_chrome_debug_args(port)],
                     stdout=subprocess.DEVNULL,
