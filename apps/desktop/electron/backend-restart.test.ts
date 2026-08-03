@@ -2,15 +2,25 @@ import assert from 'node:assert/strict'
 
 import { test, vi } from 'vitest'
 
-import { restartLocalBackend, waitForBackendExit } from './backend-restart'
+import { isBackendExitPending, restartLocalBackend, waitForBackendExit } from './backend-restart'
+
+test('pending exit waits for process exit even after a kill signal was sent', () => {
+  assert.equal(isBackendExitPending({ exitCode: null, signalCode: null }), true)
+  assert.equal(isBackendExitPending({ exitCode: 137, signalCode: null }), false)
+  assert.equal(isBackendExitPending({ exitCode: null, signalCode: 'SIGKILL' }), false)
+})
 
 test('backend exit wait escalates after timeout but resolves only after exit', async () => {
   vi.useFakeTimers()
 
   try {
+
     let exitListener!: () => void
+
     let forceKillCalls = 0
+
     let settled = false
+
     const child = {
       exitCode: null as number | null,
       signalCode: null as string | null,

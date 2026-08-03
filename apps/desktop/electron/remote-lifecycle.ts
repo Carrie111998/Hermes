@@ -804,6 +804,7 @@ async function connect(deps) {
       await cancelForwardSafe(deps, localPort, lock.port)
     }
 
+    assertNotAborted(signal)
     await terminateOwned(ssh, ownershipId, lock)
 
     return connect({

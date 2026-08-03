@@ -149,7 +149,7 @@ test('Windows integrated terminal uses encoded PowerShell and preserves cwd as l
   assert.match(script, /powershell\.exe -NoLogo/)
 })
 
-function windowsRestartConnection(owned = true) {
+function windowsRestartConnection(owned = true, terminated = true) {
   const oldNonce = '0123456789abcdef'
   const token = 'stored-token'
 
@@ -207,6 +207,10 @@ function windowsRestartConnection(owned = true) {
 
       if (operation === 'read-log') {
         return JSON.stringify({ content: 'HERMES_DASHBOARD_READY port=4321\n' })
+      }
+
+      if (operation === 'terminate') {
+        return JSON.stringify({ terminated })
       }
 
       return JSON.stringify({})
@@ -270,4 +274,29 @@ test('Windows force restart never terminates when process ownership proof fails'
       command => !Buffer.from(command.split(' ').pop()!, 'base64').toString('utf16le').includes("'terminate'")
     )
   )
+})
+
+test('Windows force restart preserves ownership artifacts when termination is not proven', async () => {
+  const fixture = windowsRestartConnection(true, false)
+
+  await assert.rejects(
+    () =>
+      connectWindowsRemote({
+        ssh: fixture.ssh,
+        ownershipId,
+        profile: '',
+        reuseToken: fixture.token,
+        pickLocalPort: async () => 50001,
+        forward: async () => {},
+        cancelForward: async () => {},
+        waitForHermes: async () => {},
+        probeReuseProof: async () => 'authenticated-ok',
+        forceRestart: true
+      }),
+    (error: any) => error.kind === 'ownership-failed'
+  )
+
+  const scripts = fixture.ssh.calls.map(command => Buffer.from(command.split(' ').pop()!, 'base64').toString('utf16le'))
+  assert.ok(scripts.some(script => script.includes("'terminate'")))
+  assert.ok(!scripts.some(script => script.includes("'remove-lock'")))
 })

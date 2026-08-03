@@ -8,6 +8,10 @@ type BackendChildProcess = {
   once: (event: 'exit', listener: () => void) => unknown
 }
 
+export function isBackendExitPending(child: Pick<BackendChildProcess, 'exitCode' | 'signalCode'> | null | undefined) {
+  return Boolean(child && child.exitCode === null && child.signalCode === null)
+}
+
 export async function waitForBackendExit(
   child: BackendChildProcess | null | undefined,
   { timeoutMs = 5000, onTimeout }: { timeoutMs?: number; onTimeout?: () => void } = {}

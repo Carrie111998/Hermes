@@ -45,7 +45,7 @@ import {
   verifyHermesCli
 } from './backend-probes'
 import { waitForDashboardPortAnnouncement } from './backend-ready'
-import { restartLocalBackend, waitForBackendExit } from './backend-restart'
+import { isBackendExitPending, restartLocalBackend, waitForBackendExit } from './backend-restart'
 import { shouldLatchBackendStartFailure, shouldLatchRemoteReauthFailure } from './backend-start-failure'
 import { detectRemoteDisplay, isWindowsBinaryPathInWsl, isWslEnvironment } from './bootstrap-platform'
 import { decideBootstrapRepair } from './bootstrap-repair-guard'
@@ -7419,6 +7419,7 @@ async function bootstrapSshConnectionInner(
   }
 
   const created = !ssh
+  const reusedSshForForcedRestart = Boolean(options.forceRestart && ssh && !created)
 
   if (options.forceRestart) {
     const previous = sshConnections.get(scope)
@@ -7469,7 +7470,7 @@ async function bootstrapSshConnectionInner(
       skipExistingLock: options.skipExistingLock === true
     })
   } catch (error: any) {
-    if (created) {
+    if (created || reusedSshForForcedRestart) {
       try {
         await ssh.close()
       } catch {
@@ -7962,7 +7963,10 @@ function resetHermesConnection({ soft = false } = {}) {
 async function teardownPrimaryBackendAndWait({ soft = false } = {}) {
   // Capture the reference before resetHermesConnection() invalidates it.
   const hermesProcess = backendConnectionState.getProcess()
-  const dying = hermesProcess && !hermesProcess.killed ? hermesProcess : null
+  // `.killed` means a signal was sent, not that the child exited. Keep waiting
+  // for the exit event after an earlier stop attempt or restart can overlap a
+  // still-draining backend.
+  const dying = isBackendExitPending(hermesProcess) ? hermesProcess : null
 
   if (soft) {
     softRehomeInProgress = true

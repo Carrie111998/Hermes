@@ -228,13 +228,21 @@ async function terminateOwned(ssh, runtime, ownershipId, lock) {
   }
 
   try {
-    await helper(ssh, runtime, 'terminate', [
+    const termination = await helper(ssh, runtime, 'terminate', [
       String(lock.pid),
       String(lock.creationTimeNs),
       lock.hermesPath,
       lock.spawnNonce
     ])
+
+    if (termination?.terminated !== true) {
+      throw ownershipFailure('SSH backend termination proof failed; no process was terminated.')
+    }
   } catch (cause) {
+    if (cause?.kind === 'ownership-failed') {
+      throw cause
+    }
+
     const error: any = new Error('Could not terminate the owned SSH backend.')
     error.kind = 'restart-failed'
     error.cause = cause
@@ -385,6 +393,7 @@ async function connectWindowsRemote(deps) {
       await cancelForward(localPort, lock.port)
     }
 
+    assertCurrent(signal)
     await terminateOwned(ssh, runtime, ownershipId, lock)
 
     return connectWindowsRemote({
