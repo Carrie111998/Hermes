@@ -181,6 +181,72 @@ async def test_mcp_background_exception_logs_are_sanitized(monkeypatch, caplog):
     assert "[REDACTED]" in caplog.text
 
 
+def test_mcp_transport_reconnect_exception_log_is_sanitized(caplog):
+    from tools.mcp_tool import MCPServerTask
+
+    secret = "opaque-synthetic-transport-exception-credential"
+    server = MCPServerTask("synthetic")
+    server._ready.set()
+    error = ExceptionGroup(
+        "synthetic transport failure",
+        [RuntimeError(f"api_key: {secret}")],
+    )
+
+    with caplog.at_level(logging.DEBUG, logger="tools.mcp_tool"):
+        assert server._reconnect_or_reraise_group(error) == "reconnect"
+
+    assert secret not in caplog.text
+    assert "synthetic transport failure" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_mcp_orphan_reap_exception_log_is_sanitized(monkeypatch, caplog):
+    import tools.mcp_tool as mcp_tool
+
+    secret = "opaque-synthetic-orphan-reap-credential"
+
+    async def fail_start(_self, _config):
+        raise RuntimeError("synthetic primary start failure")
+
+    async def fail_shutdown(_self):
+        raise RuntimeError(f"client_secret: {secret}")
+
+    monkeypatch.setattr(mcp_tool.MCPServerTask, "start", fail_start)
+    monkeypatch.setattr(mcp_tool.MCPServerTask, "shutdown", fail_shutdown)
+
+    with caplog.at_level(logging.DEBUG, logger="tools.mcp_tool"):
+        with pytest.raises(RuntimeError, match="synthetic primary start failure"):
+            await mcp_tool._connect_server("synthetic", {})
+
+    assert secret not in caplog.text
+    assert "[REDACTED]" in caplog.text
+
+
+def test_mcp_schema_cache_write_exception_log_is_sanitized(monkeypatch, caplog):
+    import tools.mcp_tool as mcp_tool
+    from tools.registry import ToolRegistry
+
+    secret = "opaque-synthetic-schema-cache-credential"
+    server = mcp_tool.MCPServerTask("synthetic")
+    server._tools = [_make_mcp_tool(name="synthetic_tool")]
+
+    def fail_cache_write(*_args, **_kwargs):
+        raise RuntimeError(f"password: {secret}")
+
+    monkeypatch.setattr(
+        "tools.mcp_schema_cache.write_cache_entry",
+        fail_cache_write,
+    )
+    monkeypatch.setattr(mcp_tool, "_select_utility_schemas", lambda *_args: [])
+
+    with patch("tools.registry.registry", ToolRegistry()), \
+         caplog.at_level(logging.DEBUG, logger="tools.mcp_tool"):
+        assert mcp_tool._register_server_tools("synthetic", server, {})
+
+    assert secret not in caplog.text
+    assert "[REDACTED]" in caplog.text
+
+
 def test_sanitize_error_redacts_escaped_quotes_inside_assignment():
     from tools.mcp_tool import _sanitize_error
 

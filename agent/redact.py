@@ -918,7 +918,12 @@ def _canonical_structured_key(value: object) -> str:
     text = str(value)
     text = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", text)
     text = re.sub(r"(?<=[A-Z])(?=[A-Z][a-z])", "_", text)
-    return re.sub(r"[^a-z0-9]+", "_", text.casefold()).strip("_")
+    canonical = re.sub(r"[^a-z0-9]+", "_", text.casefold()).strip("_")
+    # The generic acronym splitter sees OAuthToken as O_Auth_Token and
+    # XAPIKey as XAPI_Key. Normalize these established credential acronyms
+    # without collapsing arbitrary lexical boundaries.
+    canonical = re.sub(r"(^|_)o_auth(?=_|$)", r"\1oauth", canonical)
+    return re.sub(r"(^|_)xapi(?=_|$)", r"\1x_api", canonical)
 
 
 def _is_structured_secret_key(value: object) -> bool:

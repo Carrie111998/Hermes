@@ -3025,8 +3025,8 @@ class MCPServerTask:
             raise eg
         logger.debug(
             "MCP server '%s': transport TaskGroup exited after a live session "
-            "(%r) — reconnecting immediately instead of backing off",
-            self.name, eg,
+            "(%s) — reconnecting immediately instead of backing off",
+            self.name, _safe_exc_str(eg),
         )
         return "reconnect"
 
@@ -5003,7 +5003,7 @@ async def _connect_server(name: str, config: dict) -> MCPServerTask:
             except Exception as shutdown_exc:  # noqa: BLE001 -- best-effort reap, don't mask the real error
                 logger.debug(
                     "MCP server '%s' shutdown during orphan-reap failed: %s",
-                    name, shutdown_exc,
+                    name, _safe_exc_str(shutdown_exc),
                 )
         raise
     finally:
@@ -6317,7 +6317,11 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
                 utility_tools=utility_payload,
             )
         except Exception as exc:
-            logger.debug("MCP schema cache write failed for '%s': %s", name, exc)
+            logger.debug(
+                "MCP schema cache write failed for '%s': %s",
+                name,
+                _safe_exc_str(exc),
+            )
 
     return registered_names
 
@@ -6613,7 +6617,9 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
                 names = _register_from_cache_sync(name, cfg, entry)
             except Exception as exc:
                 logger.warning(
-                    "Failed lazy MCP registration for '%s': %s", name, exc,
+                    "Failed lazy MCP registration for '%s': %s",
+                    name,
+                    _safe_exc_str(exc),
                 )
                 with _lock:
                     _server_connecting.add(name)

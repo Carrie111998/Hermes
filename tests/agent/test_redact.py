@@ -933,7 +933,8 @@ class TestStructuredDataRedaction:
             "api_token", "apiToken", "x-api-key", "xApiKey",
             "webhook_secret", "signingSecret", "session_token",
             "proxyAuthorization", "service_webhook_token",
-            "id_token", "oauthToken", "csrf_token", "verificationToken",
+            "id_token", "oauthToken", "OAuthToken", "demoOAuthToken",
+            "XAPIKey", "demoXAPIKey", "csrf_token", "verificationToken",
             "personalAccessToken", "bot_token", "serviceToken",
         ],
     )
@@ -946,7 +947,8 @@ class TestStructuredDataRedaction:
         "key",
         [
             "publicKey", "tokenCount", "secretKeyCount", "licenseKeyId",
-            "keyMaterialCount", "hockeyMaterial", "monkeyMaterial",
+            "keyMaterialCount", "OAuthTokenCount", "XAPIKeyId",
+            "hockeyMaterial", "monkeyMaterial",
         ],
     )
     def test_non_credential_camel_case_suffixes_pass_through(self, key):
