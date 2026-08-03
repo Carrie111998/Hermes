@@ -9024,6 +9024,71 @@ def _open_private_worker_log(log_path: Path, *, dir_fd: Optional[int] = None):
         raise
 
 
+def _open_private_worker_log_for_read(log_path: Path):
+    """Open an existing worker log without following aliases or path swaps."""
+    if os.name == "nt":
+        fd = os.open(log_path, os.O_RDONLY)
+        try:
+            if not stat_module.S_ISREG(os.fstat(fd).st_mode):
+                raise OSError(
+                    errno.EINVAL,
+                    "refusing non-regular Kanban worker log",
+                    log_path,
+                )
+            return os.fdopen(fd, "rb")
+        except Exception:
+            os.close(fd)
+            raise
+
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if not nofollow:
+        raise RuntimeError("secure Kanban worker logs require O_NOFOLLOW support")
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | nofollow
+    absolute_log_dir = Path(os.path.abspath(log_path.parent))
+    dir_fd = os.open(absolute_log_dir.anchor, directory_flags)
+    try:
+        for component in absolute_log_dir.parts[1:]:
+            child_fd = os.open(component, directory_flags, dir_fd=dir_fd)
+            parent_fd = dir_fd
+            dir_fd = child_fd
+            os.close(parent_fd)
+
+        directory_stat = os.fstat(dir_fd)
+        if (
+            not stat_module.S_ISDIR(directory_stat.st_mode)
+            or directory_stat.st_uid != os.geteuid()
+            or stat_module.S_IMODE(directory_stat.st_mode) & 0o077
+        ):
+            raise OSError(
+                errno.EACCES,
+                "refusing non-private Kanban worker log directory",
+                absolute_log_dir,
+            )
+
+        flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | nofollow
+        fd = os.open(log_path.name, flags, dir_fd=dir_fd)
+        try:
+            opened_stat = os.fstat(fd)
+            path_stat = os.stat(log_path.name, dir_fd=dir_fd, follow_symlinks=False)
+            if (
+                not _is_private_worker_log_stat(opened_stat)
+                or stat_module.S_IMODE(opened_stat.st_mode) & 0o077
+                or opened_stat.st_dev != path_stat.st_dev
+                or opened_stat.st_ino != path_stat.st_ino
+            ):
+                raise OSError(
+                    errno.EINVAL,
+                    "refusing aliased or non-private Kanban worker log",
+                    log_path,
+                )
+            return os.fdopen(fd, "rb")
+        except Exception:
+            os.close(fd)
+            raise
+    finally:
+        os.close(dir_fd)
+
+
 def _assert_open_worker_log_paths(
     log_dir: Path,
     log_path: Path,
@@ -10363,6 +10428,14 @@ def worker_log_path(task_id: str, *, board: Optional[str] = None) -> Path:
     current-board file → default). The dispatcher always passes the
     board explicitly to avoid any resolution ambiguity when multiple
     boards exist."""
+    if (
+        not isinstance(task_id, str)
+        or not task_id
+        or task_id in {".", ".."}
+        or "/" in task_id
+        or "\\" in task_id
+    ):
+        raise ValueError("task_id must be a non-empty path component")
     return worker_logs_dir(board=board) / f"{task_id}.log"
 
 
@@ -10373,14 +10446,13 @@ def read_worker_log(
     """Read the worker log for ``task_id``. Returns None if the file
     doesn't exist. If ``tail_bytes`` is set, only the last N bytes are
     returned (useful for the dashboard drawer which shouldn't page megabytes)."""
-    path = worker_log_path(task_id, board=board)
-    if not path.exists():
-        return None
     try:
-        if tail_bytes is None:
-            return path.read_text(encoding="utf-8", errors="replace")
-        size = path.stat().st_size
-        with open(path, "rb") as f:
+        path = worker_log_path(task_id, board=board)
+        opened = _open_private_worker_log_for_read(path)
+        with opened as f:
+            size = os.fstat(f.fileno()).st_size
+            if tail_bytes is None:
+                return f.read().decode("utf-8", errors="replace")
             if size > tail_bytes:
                 f.seek(size - tail_bytes)
                 # Skip a partial line if we tailed mid-line. But if the
@@ -10391,9 +10463,8 @@ def read_worker_log(
                 partial = f.readline()
                 if not partial.endswith(b"\n") and f.tell() >= size:
                     f.seek(probe)
-            data = f.read()
-        return data.decode("utf-8", errors="replace")
-    except OSError:
+            return f.read().decode("utf-8", errors="replace")
+    except (OSError, ValueError):
         return None
 
 

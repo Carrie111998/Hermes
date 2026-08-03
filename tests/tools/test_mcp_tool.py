@@ -1001,6 +1001,34 @@ class TestToolHandler:
         assert secret not in caplog.text
         assert "[REDACTED]" in caplog.text
 
+    def test_session_reconnect_logs_sanitize_hostile_operation_name(self, caplog):
+        from tools import mcp_tool
+
+        secret = "opaque-synthetic-reconnect-name-credential"
+        server_name = f"api_key: {secret}"
+        operation = f"tools/call password: {secret}"
+        server = SimpleNamespace(_reconnect_event=MagicMock())
+        loop = MagicMock()
+        loop.is_running.return_value = True
+
+        mcp_tool._servers[server_name] = server
+        try:
+            with patch.object(mcp_tool, "_mcp_loop", loop), \
+                 patch.object(mcp_tool, "_signal_reconnect_and_wait", return_value=False), \
+                 caplog.at_level(logging.INFO, logger="tools.mcp_tool"):
+                result = mcp_tool._handle_session_expired_and_retry(
+                    server_name,
+                    RuntimeError("synthetic session expired"),
+                    MagicMock(),
+                    operation,
+                )
+        finally:
+            mcp_tool._servers.pop(server_name, None)
+
+        assert result is None
+        assert secret not in caplog.text
+        assert "[REDACTED]" in caplog.text
+
     @pytest.mark.parametrize("channel", ["text", "resource", "structured"])
     def test_successful_call_redacts_wordpress_option_rows(self, channel):
         from tools.mcp_tool import _make_tool_handler, _servers

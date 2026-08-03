@@ -225,10 +225,14 @@ def test_notify_claim_is_single_owner_and_rewindable(kanban_home):
 
 def test_read_worker_log_tail(kanban_home):
     log_dir = kanban_home / "kanban" / "logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
+    log_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
+    if os.name != "nt":
+        log_dir.chmod(0o700)
     p = log_dir / "t_beef.log"
     # 10 lines
     p.write_text("\n".join(f"line {i}" for i in range(10)))
+    if os.name != "nt":
+        p.chmod(0o600)
     full = kb.read_worker_log("t_beef")
     assert full is not None and "line 0" in full
     tail = kb.read_worker_log("t_beef", tail_bytes=30)
@@ -237,6 +241,27 @@ def test_read_worker_log_tail(kanban_home):
     assert "line 0" not in tail
     # Missing log returns None.
     assert kb.read_worker_log("t_missing") is None
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX link semantics")
+def test_read_worker_log_rejects_path_escape_and_file_aliases(kanban_home, tmp_path):
+    log_dir = kanban_home / "kanban" / "logs"
+    log_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
+    log_dir.chmod(0o700)
+    outside = tmp_path / "outside.log"
+    outside.write_text("opaque synthetic outside content")
+    outside.chmod(0o600)
+
+    assert kb.read_worker_log(str(outside.with_suffix(""))) is None
+
+    symlink = log_dir / "t_symlink.log"
+    symlink.symlink_to(outside)
+    assert kb.read_worker_log("t_symlink") is None
+    symlink.unlink()
+
+    hardlink = log_dir / "t_hardlink.log"
+    os.link(outside, hardlink)
+    assert kb.read_worker_log("t_hardlink") is None
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits are not portable")
