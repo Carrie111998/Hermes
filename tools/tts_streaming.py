@@ -85,23 +85,14 @@ def take_speech_interrupted() -> bool:
 SENTENCE_BOUNDARY_RE = re.compile(r"(?<=[.!?])(?:\s|\n)|(?:\n\n)")
 # Strip every reasoning-tag variant (not just ``<think>``) so a model emitting
 # ``<thinking>`` / ``<reasoning>`` / ``<thought>`` doesn't get spoken aloud.
-# Shares the canonical tag set + unclosed-tag probe with tts_text_normalize so
-# the streamed speaker path and the batch normalizer stay in lockstep.
+# Reuse tts_text_normalize's shared helpers (which draw the canonical tag set
+# from agent.think_scrubber) so the streamed speaker path and the batch
+# normalizer can't drift apart.
 from tools.tts_text_normalize import (  # noqa: E402
-    REASONING_TAG_NAMES,
     has_unclosed_reasoning_tag,
+    strip_reasoning_blocks as _strip_reasoning_blocks,
+    strip_unterminated_reasoning as _strip_unterminated_reasoning,
 )
-
-_THINK_BLOCK_RES = tuple(
-    re.compile(rf"<{_name}[\s>].*?</{_name}>", flags=re.DOTALL | re.IGNORECASE)
-    for _name in REASONING_TAG_NAMES
-)
-
-
-def _strip_reasoning_blocks(text: str) -> str:
-    for _re in _THINK_BLOCK_RES:
-        text = _re.sub("", text)
-    return text
 
 
 class SentenceChunker:
@@ -136,8 +127,15 @@ class SentenceChunker:
         return out
 
     def flush(self) -> List[str]:
-        """Drain the tail (end-of-text or long-idle flush)."""
-        tail = _strip_reasoning_blocks(self.buf).strip()
+        """Drain the tail (end-of-text or long-idle flush).
+
+        ``feed`` holds a delta back on an unclosed reasoning tag; if the stream
+        then ends (or idles out) with that tag never closed, the raw open tail
+        would otherwise be synthesised here.  Drop the unterminated block too,
+        not just closed pairs.
+        """
+        tail = _strip_reasoning_blocks(self.buf)
+        tail = _strip_unterminated_reasoning(tail).strip()
         self.buf = ""
         return [tail] if tail else []
 

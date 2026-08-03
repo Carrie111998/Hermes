@@ -13,6 +13,12 @@ from __future__ import annotations
 import html
 import re
 
+# Single source of truth for the reasoning tag set (agent/think_scrubber.py is
+# a pure-stdlib leaf; agent/__init__.py is a tiny preload shim, so this import
+# is cheap and cycle-free).  Sharing it keeps the spoken-suppression list from
+# drifting behind the display scrubber.
+from agent.think_scrubber import REASONING_TAG_NAMES
+
 # Sentinel appended to former heading lines so smooth_whitespace_for_tts can
 # fold a heading into the sentence that follows it ("Weather, it will be sunny")
 # rather than leaving a bare "Weather." label that reads abruptly aloud.
@@ -212,10 +218,9 @@ def smooth_whitespace_for_tts(text: str) -> str:
 # Reasoning blocks: models with ``/reasoning show`` enabled emit reasoning
 # blocks in the final assistant message.  Users want to SEE reasoning, not
 # hear it read aloud (#34213).  Cover every tag variant the canonical scrubber
-# recognises (``agent/think_scrubber.py`` ``_OPEN_TAG_NAMES``) — not just
-# ``<think>`` — so a model that emits ``<thinking>`` / ``<reasoning>`` /
-# ``<thought>`` (Gemini, Gemma, GLM, …) doesn't get its raw reasoning spoken.
-REASONING_TAG_NAMES = ("think", "thinking", "reasoning", "thought", "REASONING_SCRATCHPAD")
+# recognises — not just ``<think>`` — so a model that emits ``<thinking>`` /
+# ``<reasoning>`` / ``<thought>`` (Gemini, Gemma, GLM, …) doesn't get its raw
+# reasoning spoken.
 # One closed-pair pattern per tag so an open ``<think>`` can't be paired with a
 # stray ``</reasoning>``.  Case-insensitive so ``<THINK>`` / ``<Thinking>`` match.
 _THINK_BLOCK_RES = tuple(
@@ -241,6 +246,23 @@ def has_unclosed_reasoning_tag(text: str) -> bool:
         for _name in REASONING_TAG_NAMES
     )
 
+
+def strip_reasoning_blocks(text: str, replacement: str = "") -> str:
+    """Remove closed reasoning-tag pairs (any canonical variant) from *text*."""
+    for _re in _THINK_BLOCK_RES:
+        text = _re.sub(replacement, text)
+    return text
+
+
+def strip_unterminated_reasoning(text: str, replacement: str = "") -> str:
+    """Remove an unterminated reasoning block (open tag through end of text).
+
+    A stream that ends (or idles out) mid-reasoning leaves an open tag with no
+    close; the tail must be dropped, not spoken.  Used by streaming callers on
+    their end-of-stream / idle-flush path.
+    """
+    return _THINK_BLOCK_OPEN_RE.sub(replacement, text)
+
 # Turn-end file-mutation verifier footer appended by run_agent.py
 # (``_format_file_mutation_failure_footer``).  It's a UI affordance — reading
 # "warning file mutation verifier, 2 files were NOT modified..." aloud is
@@ -260,9 +282,8 @@ def strip_nonspoken_blocks(text: str) -> str:
     """
     if not text:
         return ""
-    for _think_re in _THINK_BLOCK_RES:
-        text = _think_re.sub(" ", text)
-    text = _THINK_BLOCK_OPEN_RE.sub(" ", text)
+    text = strip_reasoning_blocks(text, " ")
+    text = strip_unterminated_reasoning(text, " ")
     text = _VERIFIER_FOOTER_RE.sub(" ", text)
     return text
 

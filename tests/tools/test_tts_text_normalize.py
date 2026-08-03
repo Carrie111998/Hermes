@@ -87,3 +87,13 @@ def test_has_unclosed_reasoning_tag_probe():
     assert has_unclosed_reasoning_tag("<thinking>partial")
     assert not has_unclosed_reasoning_tag("<think>closed</think> rest")
     assert not has_unclosed_reasoning_tag("plain text, no tags")
+
+
+def test_tag_set_is_sourced_from_the_canonical_scrubber():
+    # One source of truth: the TTS suppression list must not drift behind the
+    # display scrubber. Importing the same object guarantees a new variant
+    # added to think_scrubber is covered here without a second edit.
+    from agent.think_scrubber import REASONING_TAG_NAMES as canonical
+    from tools.tts_text_normalize import REASONING_TAG_NAMES as tts
+
+    assert tts is canonical
