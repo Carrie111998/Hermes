@@ -6,20 +6,24 @@
  * proves it stays on the Electric Sheep sign-in boundary.
  */
 
-import { expect, test } from './test'
+import { allowErrorBanners, expect, test } from './test'
 
 import { type ManagedSignedOutFixture, setupManagedSignedOut } from './fixtures'
 
 let fixture: ManagedSignedOutFixture | null = null
 
 test.beforeAll(async () => {
-  // Importing and launching the production Electron bundle can exceed the
-  // generic 90 s per-test budget on a cold, single-core Linux runner. Keep the
-  // assertions on the normal timeout while giving this one shared launch a
-  // bounded allowance; the CI failure artifact showed the fully rendered
-  // managed sign-in screen immediately after the hook timed out.
-  test.setTimeout(180_000)
   fixture = await setupManagedSignedOut()
+})
+
+test.beforeEach(() => {
+  // The shared error-banner collector performs a renderer evaluate from
+  // afterEach. Electron's Linux CI transport can leave that diagnostic read
+  // pending even after this remote-only screen has rendered and all in-test
+  // page operations have completed. Assert the same no-alert contract inside
+  // each managed smoke instead, where it remains part of the test timeout and
+  // cannot strand teardown.
+  allowErrorBanners()
 })
 
 test.afterAll(async () => {
@@ -30,6 +34,7 @@ test.afterAll(async () => {
 test.describe('managed signed-out boot', () => {
   test('uses the evaOS Agent product identity', async () => {
     await expect(fixture!.page).toHaveTitle('evaOS Agent')
+    expect(await fixture!.page.locator('[role="alert"]').count()).toBe(0)
   })
 
   test('requires Electric Sheep enrollment without local-backend fallback', async () => {
@@ -55,5 +60,6 @@ test.describe('managed signed-out boot', () => {
       agentId: null,
       updateChannel: 'managed-beta',
     })
+    expect(await page.locator('[role="alert"]').count()).toBe(0)
   })
 })
