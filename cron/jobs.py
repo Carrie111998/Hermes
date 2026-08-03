@@ -1243,6 +1243,20 @@ def _normalized_inference_axes(job: Dict[str, Any]) -> Tuple[Optional[str], Opti
     )
 
 
+def _resolve_local_cron_script(script: str) -> Path:
+    """Resolve and validate a script under the active profile's scripts dir."""
+    scripts_dir = (get_hermes_home() / "scripts").resolve()
+    raw = Path(script).expanduser()
+    path = raw.resolve() if raw.is_absolute() else (scripts_dir / raw).resolve()
+    try:
+        path.relative_to(scripts_dir)
+    except ValueError as exc:
+        raise ValueError("script resolves outside the scripts directory") from exc
+    if not path.is_file():
+        raise ValueError(f"script not found: {path}")
+    return path
+
+
 def create_job(
     prompt: Optional[str],
     schedule: str,
@@ -1261,6 +1275,8 @@ def create_job(
     workdir: Optional[str] = None,
     no_agent: bool = False,
     attach_to_session: Optional[bool] = None,
+    on_failure: Optional[str] = None,
+    repair_script: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -1305,6 +1321,11 @@ def create_job(
                 and deliver its stdout directly. Empty stdout = silent (no
                 delivery). Requires ``script`` to be set. Ideal for classic
                 watchdogs and periodic alerts that don't need LLM reasoning.
+        repair_script: Trusted local executable used by opt-in no-agent failure
+                recovery. It receives JSON on stdin and returns strict JSON.
+                It runs with the scheduler user's OS authority and is not sandboxed.
+        on_failure: Optional no_agent policy: ``off``, ``repair_only``, or
+                ``rerun_once``. Non-off policies require ``repair_script``.
 
     Returns:
         The created job dict
@@ -1332,11 +1353,19 @@ def create_job(
     normalized_base_url = _normalize_job_optional_text(base_url, strip_trailing_slash=True)
     normalized_script = str(script).strip() if isinstance(script, str) else None
     normalized_script = normalized_script or None
+    normalized_repair_script = (
+        str(repair_script).strip() if isinstance(repair_script, str) else None
+    ) or None
     normalized_toolsets = [str(t).strip() for t in enabled_toolsets if str(t).strip()] if enabled_toolsets else None
     normalized_toolsets = normalized_toolsets or None
     normalized_workdir = _normalize_workdir(workdir)
     normalized_no_agent = bool(no_agent)
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
+    normalized_on_failure = (
+        str(on_failure).strip().lower() if isinstance(on_failure, str) else "off"
+    ) or "off"
+    if normalized_on_failure not in {"off", "repair_only", "rerun_once"}:
+        raise ValueError("on_failure must be one of: off, repair_only, rerun_once")
 
     # no_agent jobs are meaningless without a script — the script IS the job.
     # Surface this as a clear ValueError at create time so bad configs never
@@ -1346,6 +1375,28 @@ def create_job(
             "no_agent=True requires a script — with no agent and no script "
             "there is nothing for the job to run."
         )
+    if normalized_on_failure != "off":
+        if not normalized_no_agent:
+            raise ValueError("on_failure recovery requires no_agent=True")
+        if normalized_on_failure == "repair_only":
+            if parsed_schedule.get("kind") == "once":
+                raise ValueError(
+                    "repair_only requires a recurring schedule; use rerun_once for one-shot jobs"
+                )
+            if repeat is not None:
+                raise ValueError(
+                    "repair_only requires unlimited repeats so a future verification run remains"
+                )
+        if not normalized_repair_script:
+            raise ValueError("on_failure recovery requires repair_script")
+        if normalized_repair_script == normalized_script:
+            raise ValueError("repair_script must be different from script")
+        repair_path = _resolve_local_cron_script(normalized_repair_script)
+        script_path = _resolve_local_cron_script(normalized_script)
+        if repair_path == script_path:
+            raise ValueError("repair_script must be different from script")
+    elif normalized_repair_script:
+        raise ValueError("repair_script requires a non-off on_failure policy")
 
     # Normalize context_from: accept str or list of str, store as list or None
     if isinstance(context_from, str):
@@ -1427,6 +1478,9 @@ def create_job(
         "enabled_toolsets": normalized_toolsets,
         "workdir": normalized_workdir,
     }
+    if normalized_on_failure != "off":
+        job["on_failure"] = normalized_on_failure
+        job["repair_script"] = normalized_repair_script
     # Only persist attach_to_session when explicitly set, so existing jobs and
     # the common case stay byte-identical (absent key => fall back to the
     # global cron.mirror_delivery config, default off).
@@ -1529,9 +1583,63 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                     updates["workdir"] = None
                 else:
                     updates["workdir"] = _normalize_workdir(_wd)
+            if isinstance(updates.get("schedule"), str):
+                # Parse before validating cross-field policy invariants.
+                updates["schedule"] = parse_schedule(updates["schedule"])
 
             previous_inference_axes = _normalized_inference_axes(job)
             updated = _apply_skill_fields({**job, **updates})
+
+            policy = str(updated.get("on_failure") or "off").strip().lower()
+            if policy not in {"off", "repair_only", "rerun_once"}:
+                raise ValueError(
+                    "on_failure must be one of: off, repair_only, rerun_once"
+                )
+            repair_script = str(updated.get("repair_script") or "").strip() or None
+            if policy == "off":
+                clearing_recovery = (
+                    "on_failure" in updates
+                    and "repair_script" in updates
+                    and not str(updates.get("repair_script") or "").strip()
+                )
+                if repair_script and not clearing_recovery:
+                    raise ValueError(
+                        "clear on_failure and repair_script together"
+                    )
+                updated.pop("on_failure", None)
+                updated.pop("repair_script", None)
+            else:
+                if not updated.get("no_agent"):
+                    raise ValueError("on_failure recovery requires no_agent=True")
+                updated_schedule = updated.get("schedule")
+                if policy == "repair_only":
+                    if (
+                        isinstance(updated_schedule, dict)
+                        and updated_schedule.get("kind") == "once"
+                    ):
+                        raise ValueError(
+                            "repair_only requires a recurring schedule; use rerun_once for one-shot jobs"
+                        )
+                    repeat_state = updated.get("repeat")
+                    repeat_times = (
+                        repeat_state.get("times")
+                        if isinstance(repeat_state, dict)
+                        else repeat_state
+                    )
+                    if repeat_times is not None:
+                        raise ValueError(
+                            "repair_only requires unlimited repeats so a future verification run remains"
+                        )
+                if not repair_script:
+                    raise ValueError("on_failure recovery requires repair_script")
+                repair_path = _resolve_local_cron_script(repair_script)
+                script_value = str(updated.get("script") or "").strip()
+                script_path = _resolve_local_cron_script(script_value)
+                if repair_path == script_path:
+                    raise ValueError("repair_script must be different from script")
+                updated["on_failure"] = policy
+                updated["repair_script"] = repair_script
+
             schedule_changed = "schedule" in updates
             inference_fields_changed = bool(
                 {"provider", "model", "base_url", "no_agent"}.intersection(updates)

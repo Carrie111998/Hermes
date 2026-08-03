@@ -11,12 +11,15 @@ runs at a time if multiple processes overlap.
 import asyncio
 import atexit
 import concurrent.futures
+import contextlib
 import contextvars
+from contextlib import contextmanager
 import json
 import logging
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -51,6 +54,15 @@ from hermes_time import now as _hermes_now
 from agent.interrupt_compat import request_hard_interrupt
 
 logger = logging.getLogger(__name__)
+
+_NO_AGENT_FAILURE_POLICIES = {"off", "repair_only", "rerun_once"}
+
+
+def _normalize_no_agent_failure_policy(job: dict) -> str:
+    """Return a validated persisted policy, defaulting safely to ``off``."""
+    raw = job.get("on_failure") or "off"
+    key = str(raw).strip().lower()
+    return key if key in _NO_AGENT_FAILURE_POLICIES else "off"
 
 
 def _set_cron_session_title(session_db, session_id, base_title):
@@ -2349,21 +2361,354 @@ def _run_job_script(
         return False, f"Script execution failed: {exc}"
 
 
-def _run_job_script_with_claim_heartbeat(
-    job: dict, script_path: str, workdir: Optional[str] = None,
-) -> tuple[bool, str]:
-    """Run a cron script while keeping its owned one-shot claim fresh.
+_REPAIR_INPUT_LIMIT = 12000
+_REPAIR_OUTPUT_LIMIT = 65536
+_REPAIR_SUMMARY_LIMIT = 1000
 
-    Script execution is synchronous and may legitimately outlive the stale
-    claim TTL.  Without a concurrent heartbeat, another scheduler process can
-    mistake the live run for a dead owner and dispatch the same one-shot again.
-    Recurring jobs and unclaimed/manual runs have no durable one-shot claim and
-    therefore use the ordinary script path without starting a thread.
 
-    The claim owner is captured from the dispatched job and never re-read from
-    storage.  ``heartbeat_run_claim`` compares that stable owner before every
-    refresh, so a stale runner cannot extend a replacement owner's claim.
+def _run_bounded_repair_process(
+    argv: list[str],
+    payload: str,
+    *,
+    timeout: int,
+    cwd: str,
+    env: dict[str, str],
+    creationflags: int = 0,
+) -> tuple[int, bytes, bytes, bool]:
+    """Run a trusted repair process with bounded capture and best-effort cleanup.
+
+    This is not a sandbox: the explicitly configured local executable has the
+    scheduler user's OS authority. Process tracking prevents ordinary orphan
+    leaks, while protocol authorization remains fail-closed independently.
     """
+    import psutil
+
+    if sys.platform == "win32":
+        creationflags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    proc = subprocess.Popen(
+        argv,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        cwd=cwd,
+        env=env,
+        creationflags=creationflags,
+        start_new_session=sys.platform != "win32",
+    )
+    buffers: dict[str, list[bytes]] = {"stdout": [], "stderr": []}
+    overflow = threading.Event()
+    tracked_lock = threading.Lock()
+    tracked: dict[int, psutil.Process] = {}
+    with contextlib.suppress(psutil.Error):
+        tracked[proc.pid] = psutil.Process(proc.pid)
+    tracking_done = threading.Event()
+    kill_lock = threading.Lock()
+
+    def _track_descendants() -> None:
+        while not tracking_done.wait(0.01):
+            with tracked_lock:
+                roots = list(tracked.values())
+            discovered = []
+            for root in roots:
+                with contextlib.suppress(psutil.Error):
+                    discovered.extend(root.children(recursive=True))
+            if discovered:
+                with tracked_lock:
+                    tracked.update({child.pid: child for child in discovered})
+
+    tracker = threading.Thread(
+        target=_track_descendants,
+        daemon=True,
+        name="cron-repair-process-tree",
+    )
+    tracker.start()
+
+    def _kill_tree() -> None:
+        # A fresh POSIX session handles ordinary descendants. psutil provides
+        # best-effort cross-platform cleanup, not a sandbox boundary.
+        with kill_lock:
+            if sys.platform != "win32":
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    os.killpg(proc.pid, signal.SIGKILL)
+            with tracked_lock:
+                processes = list(tracked.values())
+            discovered = []
+            for process in processes:
+                with contextlib.suppress(psutil.Error):
+                    discovered.extend(process.children(recursive=True))
+            if discovered:
+                with tracked_lock:
+                    tracked.update({child.pid: child for child in discovered})
+                    processes = list(tracked.values())
+            for process in reversed(processes):
+                with contextlib.suppress(psutil.Error):
+                    process.kill()
+            with contextlib.suppress(Exception):
+                proc.kill()
+            psutil.wait_procs(processes, timeout=1.0)
+
+    def _reader(name: str, stream) -> None:
+        total = 0
+        try:
+            while True:
+                chunk = stream.read(8192)
+                if not chunk:
+                    return
+                remaining = _REPAIR_OUTPUT_LIMIT - total
+                if remaining > 0:
+                    buffers[name].append(chunk[:remaining])
+                    total += min(len(chunk), remaining)
+                if len(chunk) > remaining:
+                    overflow.set()
+                    _kill_tree()
+                    return
+        finally:
+            with contextlib.suppress(Exception):
+                stream.close()
+
+    def _writer() -> None:
+        try:
+            assert proc.stdin is not None
+            proc.stdin.write(payload.encode("utf-8"))
+            proc.stdin.flush()
+        except (BrokenPipeError, OSError):
+            pass
+        finally:
+            if proc.stdin is not None:
+                with contextlib.suppress(Exception):
+                    proc.stdin.close()
+
+    readers = [
+        threading.Thread(
+            target=_reader,
+            args=(name, stream),
+            daemon=True,
+            name=f"cron-repair-{name}",
+        )
+        for name, stream in (("stdout", proc.stdout), ("stderr", proc.stderr))
+    ]
+    for thread in readers:
+        thread.start()
+    writer = threading.Thread(target=_writer, daemon=True, name="cron-repair-stdin")
+    writer.start()
+
+    timed_out = False
+    try:
+        returncode = proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        _kill_tree()
+        returncode = proc.wait()
+    finally:
+        writer.join(timeout=1.0)
+
+    # Repair is a synchronous protocol; clean up observed descendants before
+    # authorizing its result.
+    _kill_tree()
+    writer.join(timeout=2.0)
+    if writer.is_alive():
+        if proc.stdin is not None:
+            with contextlib.suppress(Exception):
+                proc.stdin.close()
+        writer.join(timeout=1.0)
+    writer_incomplete = writer.is_alive()
+
+    # A descendant may retain inherited output handles after the direct process
+    # exits. Never inspect mutable capture buffers until both readers terminate.
+    for thread in readers:
+        thread.join(timeout=0.2)
+    if any(thread.is_alive() for thread in readers):
+        _kill_tree()
+        for stream in (proc.stdout, proc.stderr):
+            if stream is not None:
+                with contextlib.suppress(Exception):
+                    stream.close()
+        for thread in readers:
+            thread.join(timeout=2.0)
+    tracking_done.set()
+    tracker.join(timeout=1.0)
+    if writer_incomplete:
+        raise RuntimeError("Repair input writer did not terminate")
+    if any(thread.is_alive() for thread in readers):
+        raise RuntimeError("Repair output readers did not terminate")
+    if timed_out:
+        raise subprocess.TimeoutExpired(argv, timeout)
+
+    return (
+        returncode,
+        b"".join(buffers["stdout"]),
+        b"".join(buffers["stderr"]),
+        overflow.is_set(),
+    )
+
+
+def _resolve_repair_script_path(script_path: str) -> tuple[Optional[Path], str]:
+    """Resolve a trusted repair executable within HERMES_HOME/scripts/."""
+    scripts_dir = (_get_hermes_home() / "scripts").resolve()
+    raw = Path(script_path).expanduser()
+    path = raw.resolve() if raw.is_absolute() else (scripts_dir / raw).resolve()
+    try:
+        path.relative_to(scripts_dir)
+    except ValueError:
+        return None, "repair_script resolves outside the scripts directory"
+    if not path.is_file():
+        return None, f"Repair script not found: {path}"
+    return path, ""
+
+
+def _run_repair_script(
+    job: dict,
+    repair_script: str,
+    failed_script: str,
+    failure_output: str,
+    policy: str,
+    workdir: Optional[str] = None,
+) -> tuple[bool, str, bool, str, str]:
+    """Run a trusted repair script using a strict JSON stdin/stdout protocol.
+
+    Failure output is data on stdin only: it is never interpolated into argv,
+    a shell command, or an LLM prompt. The repair executable is an explicitly
+    configured local script under HERMES_HOME/scripts/.
+    """
+    path, path_error = _resolve_repair_script_path(repair_script)
+    if path is None:
+        return False, "not_repaired", False, "", path_error
+
+    failed_path, failed_error = _resolve_repair_script_path(failed_script)
+    if failed_path is None:
+        return False, "not_repaired", False, "", failed_error
+    if path == failed_path:
+        return False, "not_repaired", False, "", (
+            "repair_script must be different from the failed script"
+        )
+
+    suffix = path.suffix.lower()
+    if suffix in {".sh", ".bash"}:
+        bash = shutil.which("bash") or (
+            "/bin/bash" if os.path.isfile("/bin/bash") else None
+        )
+        if bash is None:
+            return False, "not_repaired", False, "", "bash not found"
+        argv = [bash, str(path)]
+        env_overlay: dict[str, str] = {}
+    else:
+        python_exe, env_overlay = _windows_cron_python_invocation(sys.executable)
+        argv = [python_exe, str(path)]
+
+    bounded_failure_output = (
+        str(failure_output or "").encode("utf-8")[:_REPAIR_INPUT_LIMIT]
+    ).decode("utf-8", errors="ignore")
+    payload = json.dumps(
+        {
+            "version": 1,
+            "job_id": str(job.get("id") or ""),
+            "failed_script": str(failed_path),
+            "failure_output": bounded_failure_output,
+        },
+        ensure_ascii=False,
+    )
+
+    try:
+        from tools.environments.local import build_subprocess_env
+
+        env = build_subprocess_env()
+        env.update(env_overlay)
+        creationflags = windows_hide_flags() if sys.platform == "win32" else 0
+        returncode, stdout_bytes, stderr_bytes, overflow = (
+            _run_bounded_repair_process(
+                argv,
+                payload,
+                timeout=_get_script_timeout(),
+                cwd=workdir or str(path.parent),
+                env=env,
+                creationflags=creationflags,
+            )
+        )
+    except subprocess.TimeoutExpired:
+        return False, "not_repaired", False, "", "Repair script timed out"
+    except Exception as exc:
+        return False, "not_repaired", False, "", f"Repair script failed: {exc}"
+
+    try:
+        stdout = stdout_bytes.decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        return False, "not_repaired", False, "", "Repair output is not valid UTF-8"
+    stderr = stderr_bytes.decode("utf-8", errors="replace")
+    try:
+        from agent.redact import redact_sensitive_text
+
+        stderr = redact_sensitive_text(stderr)
+    except Exception:
+        stderr = "[REDACTED - redaction failed]"
+    diagnostics = stderr.strip()[:_REPAIR_OUTPUT_LIMIT]
+
+    if overflow:
+        return False, "not_repaired", False, "", "Repair output is too large"
+    if returncode != 0:
+        detail = f"Repair script exited with code {returncode}"
+        if diagnostics:
+            detail += f": {diagnostics}"
+        return False, "not_repaired", False, "", detail
+    if len(stdout.encode("utf-8")) > _REPAIR_OUTPUT_LIMIT:
+        return False, "not_repaired", False, "", "Repair output is too large"
+
+    def _strict_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"Duplicate repair JSON key: {key}")
+            result[key] = value
+        return result
+
+    try:
+        parsed = json.loads(stdout, object_pairs_hook=_strict_object)
+    except (TypeError, ValueError):
+        return False, "not_repaired", False, "", "Invalid repair JSON output"
+
+    required_keys = {"version", "outcome", "rerun", "summary"}
+    if not isinstance(parsed, dict) or set(parsed) != required_keys:
+        return False, "not_repaired", False, "", "Invalid repair result fields"
+    try:
+        for value in parsed.values():
+            if isinstance(value, str):
+                value.encode("utf-8", errors="strict")
+    except UnicodeEncodeError:
+        return False, "not_repaired", False, "", "Repair result contains invalid Unicode"
+    if type(parsed["version"]) is not int or parsed["version"] != 1:
+        return False, "not_repaired", False, "", "Unsupported repair protocol version"
+    if (
+        not isinstance(parsed["outcome"], str)
+        or parsed["outcome"] not in {"repaired", "not_repaired"}
+    ):
+        return False, "not_repaired", False, "", "Invalid repair outcome"
+    if type(parsed["rerun"]) is not bool:
+        return False, "not_repaired", False, "", "Invalid repair rerun flag"
+    if not isinstance(parsed["summary"], str) or len(parsed["summary"]) > _REPAIR_SUMMARY_LIMIT:
+        return False, "not_repaired", False, "", "Invalid repair summary"
+    try:
+        from agent.redact import redact_sensitive_text
+
+        summary = redact_sensitive_text(parsed["summary"])
+    except Exception:
+        summary = "[REDACTED - redaction failed]"
+    if policy == "repair_only" and parsed["rerun"]:
+        return False, "not_repaired", False, "", (
+            "repair_only result must not authorize a rerun"
+        )
+
+    repaired = parsed["outcome"] == "repaired"
+    return (
+        repaired,
+        parsed["outcome"],
+        parsed["rerun"] if repaired else False,
+        summary,
+        diagnostics,
+    )
+
+
+@contextmanager
+def _run_claim_heartbeat(job: dict):
+    """Keep the original one-shot run claim fresh for a lifecycle scope."""
     schedule = job.get("schedule")
     claim = job.get("run_claim")
     owner = str(claim.get("by") or "") if isinstance(claim, dict) else ""
@@ -2372,7 +2717,8 @@ def _run_job_script_with_claim_heartbeat(
         and schedule.get("kind") == "once"
         and owner
     ):
-        return _run_job_script(script_path, workdir=workdir)
+        yield
+        return
 
     job_id = str(job.get("id") or "")
     stop = threading.Event()
@@ -2403,15 +2749,42 @@ def _run_job_script_with_claim_heartbeat(
             job_id,
             exc_info=True,
         )
-        return _run_job_script(script_path, workdir=workdir)
+        yield
+        return
 
     try:
-        return _run_job_script(script_path, workdir=workdir)
+        yield
     finally:
         stop.set()
-        # Event.wait() wakes immediately.  Keep completion bounded if the
-        # heartbeat is already waiting on another process's jobs-file lock.
         heartbeat_thread.join(timeout=1.0)
+
+
+def _run_job_script_with_claim_heartbeat(
+    job: dict, script_path: str, workdir: Optional[str] = None,
+) -> tuple[bool, str]:
+    """Run one cron script while keeping its one-shot claim fresh."""
+    with _run_claim_heartbeat(job):
+        return _run_job_script(script_path, workdir=workdir)
+
+
+def _run_repair_script_with_claim_heartbeat(
+    job: dict,
+    repair_script: str,
+    failed_script: str,
+    failure_output: str,
+    policy: str,
+    workdir: Optional[str] = None,
+) -> tuple[bool, str, bool, str, str]:
+    """Run repair under the original job's claim owner and identity."""
+    with _run_claim_heartbeat(job):
+        return _run_repair_script(
+            job,
+            repair_script,
+            failed_script,
+            failure_output,
+            policy,
+            workdir,
+        )
 
 
 def _parse_wake_gate(script_output: str) -> bool:
@@ -2833,9 +3206,116 @@ def run_job(
         now_iso = _hermes_now().strftime("%Y-%m-%d %H:%M:%S")
 
         if not ok:
-            # Script crashed / timed out / exited non-zero.  Deliver the
-            # error so the user knows the watchdog itself broke — silent
-            # failure for an alerting job is the worst-case outcome.
+            # Script crashed / timed out / exited non-zero. Opt-in recovery may
+            # repair the local script; otherwise preserve the established
+            # watchdog alert contract (including the script failure output).
+            recovery_policy = _normalize_no_agent_failure_policy(job)
+            if recovery_policy != "off":
+                repair_script = str(job.get("repair_script") or "").strip()
+                if repair_script:
+                    (
+                        repair_ok,
+                        repair_outcome,
+                        rerun_authorized,
+                        repair_summary,
+                        repair_diagnostics,
+                    ) = _run_repair_script_with_claim_heartbeat(
+                        job,
+                        repair_script,
+                        script_path,
+                        output,
+                        recovery_policy,
+                        workdir=_job_workdir,
+                    )
+                else:
+                    repair_ok = False
+                    repair_outcome = "not_repaired"
+                    rerun_authorized = False
+                    repair_summary = ""
+                    repair_diagnostics = "repair_script is required"
+
+                rerun_ok = False
+                rerun_output = ""
+                rerun_error = None
+                should_rerun = (
+                    recovery_policy == "rerun_once"
+                    and repair_ok
+                    and rerun_authorized
+                )
+                if should_rerun:
+                    try:
+                        rerun_ok, rerun_output = _run_job_script_with_claim_heartbeat(
+                            job, script_path, workdir=_job_workdir,
+                        )
+                    except Exception as exc:
+                        logger.exception(
+                            "Job '%s': script rerun raised unexpectedly", job_id,
+                        )
+                        rerun_ok = False
+                        rerun_output = f"Script execution failed: {exc}"
+                    if not rerun_ok:
+                        rerun_error = rerun_output
+
+                if recovery_policy == "rerun_once":
+                    if should_rerun and rerun_ok:
+                        final_response = (
+                            f"✅ Cron watchdog '{job_name}' failed, but its repair script fixed it "
+                            f"and the script rerun succeeded.\n\n{rerun_output or '(rerun produced no output)'}"
+                        )
+                    elif repair_ok and not rerun_authorized:
+                        final_response = (
+                            f"⚠ Cron watchdog '{job_name}' failed. Its repair script reported a repair "
+                            f"but did not authorize a rerun. See the cron log for details."
+                        )
+                    elif repair_ok:
+                        final_response = (
+                            f"⚠ Cron watchdog '{job_name}' failed. Repair completed, but the script "
+                            f"rerun still failed. See the cron log for details."
+                        )
+                    else:
+                        final_response = (
+                            f"⚠ Cron watchdog '{job_name}' failed and its repair script did not repair it. "
+                            f"See the cron log for details."
+                        )
+                else:
+                    final_response = (
+                        f"✅ Cron watchdog '{job_name}' failed, but its repair script repaired the script for future runs."
+                        if repair_ok
+                        else f"⚠ Cron watchdog '{job_name}' failed and its repair script did not repair it. See the cron log for details."
+                    )
+
+                recovery_succeeded = repair_ok and (
+                    recovery_policy == "repair_only" or (should_rerun and rerun_ok)
+                )
+                recovery_error = None if recovery_succeeded else (
+                    rerun_error or repair_diagnostics or repair_summary or output
+                )
+                doc = (
+                    f"# Cron Job: {job_name}\n\n"
+                    f"**Job ID:** {job_id}\n"
+                    f"**Run Time:** {now_iso}\n"
+                    f"**Mode:** no_agent (script)\n"
+                    f"**Status:** script failed; repair {'succeeded' if recovery_succeeded else 'failed'}\n"
+                    f"**Failure policy:** {recovery_policy}\n"
+                    f"**Repair script:** {repair_script or '(missing)'}\n\n"
+                    f"## Original failure\n\n{output}\n\n"
+                    f"## Repair result\n\n"
+                    f"success={repair_ok}\n"
+                    f"outcome={repair_outcome}\n"
+                    f"rerun_authorized={rerun_authorized}\n"
+                    f"summary={repair_summary}\n"
+                    f"diagnostics={repair_diagnostics}\n"
+                )
+                if recovery_policy == "rerun_once":
+                    doc += (
+                        f"\n## Rerun once result\n\n"
+                        f"attempted={should_rerun}\n"
+                        f"success={rerun_ok}\n"
+                        f"error={rerun_error or ''}\n\n"
+                        f"{rerun_output}\n"
+                    )
+                return recovery_succeeded, doc, final_response, recovery_error
+
             alert = (
                 f"⚠ Cron watchdog '{job_name}' script failed\n\n"
                 f"{output}\n\n"

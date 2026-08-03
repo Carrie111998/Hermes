@@ -586,6 +586,10 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         result["enabled_toolsets"] = job["enabled_toolsets"]
     if job.get("workdir"):
         result["workdir"] = job["workdir"]
+    if job.get("on_failure"):
+        result["on_failure"] = job["on_failure"]
+    if job.get("repair_script"):
+        result["repair_script"] = job["repair_script"]
     return result
 
 
@@ -728,6 +732,8 @@ def cronjob(
     workdir: Optional[str] = None,
     no_agent: Optional[bool] = None,
     attach_to_session: Optional[bool] = None,
+    on_failure: Optional[str] = None,
+    repair_script: Optional[str] = None,
     task_id: str = None,
 ) -> str:
     """Unified cron job management tool."""
@@ -765,6 +771,10 @@ def cronjob(
                 script_error = _validate_cron_script_path(script)
                 if script_error:
                     return tool_error(script_error, success=False)
+            if repair_script:
+                repair_error = _validate_cron_script_path(repair_script)
+                if repair_error:
+                    return tool_error(repair_error, success=False)
 
             # Reject a model-supplied base_url that would route a named
             # provider's stored credential to an attacker endpoint (F8).
@@ -796,11 +806,13 @@ def cronjob(
                 provider=_normalize_optional_job_value(provider),
                 base_url=_normalize_optional_job_value(base_url, strip_trailing_slash=True),
                 script=_normalize_optional_job_value(script),
+                repair_script=_normalize_optional_job_value(repair_script),
                 context_from=context_from,
                 enabled_toolsets=enabled_toolsets or None,
                 workdir=_normalize_optional_job_value(workdir),
                 no_agent=_no_agent,
                 attach_to_session=attach_to_session,
+                on_failure=_normalize_optional_job_value(on_failure),
             )
             _notify_provider_jobs_changed_safe()
             _create_message = f"Cron job '{job['name']}' created."
@@ -998,6 +1010,15 @@ def cronjob(
                             success=False,
                         )
                 updates["no_agent"] = target_no_agent
+            if on_failure is not None:
+                updates["on_failure"] = _normalize_optional_job_value(on_failure) or None
+            if repair_script is not None:
+                normalized_repair = _normalize_optional_job_value(repair_script)
+                if normalized_repair:
+                    repair_error = _validate_cron_script_path(normalized_repair)
+                    if repair_error:
+                        return tool_error(repair_error, success=False)
+                updates["repair_script"] = normalized_repair or None
             if repeat is not None:
                 # Normalize: treat 0 or negative as None (infinite)
                 normalized_repeat = None if repeat <= 0 else repeat
@@ -1101,6 +1122,20 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
                     "WHEN TO USE False (default): anything that needs reasoning — summarize a feed, draft a daily briefing, pick interesting items, rephrase data for a human, follow conditional logic based on content."
                 ),
             },
+            "repair_script": {
+                "type": "string",
+                "description": f"Trusted local repair executable for opt-in no_agent failure recovery. It runs with the scheduler user's OS authority and is not sandboxed. Relative paths resolve under {display_hermes_home()}/scripts/. It receives bounded JSON on stdin and must emit one strict JSON result. Required when on_failure is not off. On update, pass empty string together with on_failure='off' to clear."
+            },
+            "on_failure": {
+                "type": "string",
+                "enum": ["off", "repair_only", "rerun_once"],
+                "description": (
+                    "Optional failure policy for no_agent jobs. Default/off keeps classic no-token failure alerts. "
+                    "Non-off policies require a distinct trusted repair_script; no LLM is invoked. "
+                    "repair_only runs the repair script for future ticks. rerun_once reruns the original script exactly once only after a valid repair result explicitly authorizes it. "
+                    "On update, use 'off' and clear repair_script together."
+                ),
+            },
             "context_from": {
                 "type": "array",
                 "items": {"type": "string"},
@@ -1180,10 +1215,12 @@ registry.register(
         # Programmatic callers of cronjob() itself retain the parameters.
         reason=args.get("reason"),
         script=args.get("script"),
+        repair_script=args.get("repair_script"),
         context_from=args.get("context_from"),
         enabled_toolsets=args.get("enabled_toolsets"),
         workdir=args.get("workdir"),
         no_agent=args.get("no_agent"),
+        on_failure=args.get("on_failure"),
         task_id=kw.get("task_id"),
     ),
     check_fn=check_cronjob_requirements,
