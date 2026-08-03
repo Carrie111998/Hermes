@@ -34,8 +34,10 @@ logger = logging.getLogger(__name__)
 # Keep the drain-path going-idle ACK budget strictly under the runner's default
 # adapter disconnect timeout (5s). If go_idle consumes the whole outer budget,
 # cancellation can fire before transport.disconnect() and leave the websocket
-# open.
+# open. Paired with transport teardown budgets of 1s each for supervisor,
+# reader, and ws.close (~3s), the full drain path stays inside 5s.
 _RELAY_GO_IDLE_ON_DISCONNECT_TIMEOUT_S = 2.0
+_RELAY_REVOCATION_MONITOR_TEARDOWN_TIMEOUT_S = 1.0
 
 
 def _utf16_len(text: str) -> int:
@@ -822,8 +824,11 @@ class RelayAdapter(BasePlatformAdapter):
         if self._revocation_monitor is not None:
             self._revocation_monitor.cancel()
             try:
-                await self._revocation_monitor
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001 - best-effort teardown
+                await asyncio.wait_for(
+                    self._revocation_monitor,
+                    timeout=_RELAY_REVOCATION_MONITOR_TEARDOWN_TIMEOUT_S,
+                )
+            except (asyncio.TimeoutError, asyncio.CancelledError, Exception):  # noqa: BLE001 - best-effort teardown
                 pass
             self._revocation_monitor = None
         if self._transport is not None:
