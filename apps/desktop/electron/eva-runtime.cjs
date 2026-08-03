@@ -18,12 +18,16 @@ const {
   publicEvaEnrollmentStatus,
   revokeEvaDesktopSession
 } = require('./eva-managed.cjs')
-const { createEvaWsRelay } = require('./eva-ws-relay.cjs')
+const { createEvaWsRelay, normalizeEvaWsEndpoint, normalizeEvaWsProfile } = require('./eva-ws-relay.cjs')
 
 const RUNTIME_ENROLLMENT_RETRY_DELAYS_MS = Object.freeze([2_000, 5_000, 10_000, 20_000, 30_000])
 
 function createEvaManagedRuntime(options) {
-  if (!options?.statePath || typeof options.encryptSecret !== 'function' || typeof options.decryptSecret !== 'function') {
+  if (
+    !options?.statePath ||
+    typeof options.encryptSecret !== 'function' ||
+    typeof options.decryptSecret !== 'function'
+  ) {
     throw new TypeError('evaOS Agent managed runtime requires statePath and secret custody functions.')
   }
 
@@ -43,6 +47,7 @@ function createEvaManagedRuntime(options) {
   let pendingAuth = null
   let authGeneration = 0
   let runtimeGeneration = 0
+  let runtimeSessionGeneration = 0
   let wsRelay = null
 
   function emptyState(signedOut = false) {
@@ -138,9 +143,14 @@ function createEvaManagedRuntime(options) {
   function getWsRelay() {
     if (!wsRelay) {
       wsRelay = createWsRelay({
+        getGeneration: () => runtimeSessionGeneration,
         getUpstream: async () => {
           const runtime = await ensureRuntimeEnrollment()
-          return { baseUrl: runtime.baseUrl, token: runtime.token }
+          return {
+            baseUrl: runtime.baseUrl,
+            generation: runtimeSessionGeneration,
+            token: runtime.token
+          }
         },
         onAuthRejected: clearRuntimeEnrollment,
         onEvent: event => rememberLog(`[eva-managed] websocket relay ${event}`)
@@ -151,6 +161,7 @@ function createEvaManagedRuntime(options) {
 
   function clearRuntimeEnrollment() {
     if (!runtimeEnrollmentPromise) runtimeGeneration += 1
+    runtimeSessionGeneration += 1
     const state = readState()
     if (state.desktop) writeState({ desktop: state.desktop, runtime: null })
     resetConnection()
@@ -164,9 +175,7 @@ function createEvaManagedRuntime(options) {
   function recordRuntimeEnrollmentFailure(error) {
     const attempts = (runtimeEnrollmentFailure?.attempts ?? 0) + 1
     const delay =
-      RUNTIME_ENROLLMENT_RETRY_DELAYS_MS[
-        Math.min(attempts - 1, RUNTIME_ENROLLMENT_RETRY_DELAYS_MS.length - 1)
-      ]
+      RUNTIME_ENROLLMENT_RETRY_DELAYS_MS[Math.min(attempts - 1, RUNTIME_ENROLLMENT_RETRY_DELAYS_MS.length - 1)]
     runtimeEnrollmentFailure = {
       attempts,
       error,
@@ -177,6 +186,7 @@ function createEvaManagedRuntime(options) {
   function invalidateAuthWork() {
     authGeneration += 1
     runtimeGeneration += 1
+    runtimeSessionGeneration += 1
     try {
       pendingAuth?.controller?.abort()
     } catch {
@@ -228,9 +238,11 @@ function createEvaManagedRuntime(options) {
     })()
 
     signInPromise = task
-    void task.finally(() => {
-      if (signInPromise === task) signInPromise = null
-    }).catch(() => undefined)
+    void task
+      .finally(() => {
+        if (signInPromise === task) signInPromise = null
+      })
+      .catch(() => undefined)
     return task
   }
 
@@ -283,6 +295,7 @@ function createEvaManagedRuntime(options) {
           return requireSignIn()
         }
         assertGeneration(auth, runtime)
+        runtimeSessionGeneration += 1
         writeState({ desktop, runtime: enrollment })
         resetRuntimeEnrollmentFailure()
         return enrollment
@@ -296,14 +309,17 @@ function createEvaManagedRuntime(options) {
     })()
 
     runtimeEnrollmentPromise = task
-    void task.finally(() => {
-      if (runtimeEnrollmentPromise === task) runtimeEnrollmentPromise = null
-    }).catch(() => undefined)
+    void task
+      .finally(() => {
+        if (runtimeEnrollmentPromise === task) runtimeEnrollmentPromise = null
+      })
+      .catch(() => undefined)
     return task
   }
 
   async function resolveBackend(input = {}) {
-    let runtime = await ensureRuntimeEnrollment(input)
+    const profile = normalizeEvaWsProfile(input.profile)
+    let runtime = await ensureRuntimeEnrollment({ force: input.force })
     try {
       await options.waitForHermes(runtime.baseUrl, runtime.token)
     } catch (error) {
@@ -312,14 +328,19 @@ function createEvaManagedRuntime(options) {
       runtime = await ensureRuntimeEnrollment({ force: true })
       await options.waitForHermes(runtime.baseUrl, runtime.token)
     }
-    return {
+    const connection = {
       authMode: 'token',
       baseUrl: `eva-managed://${runtime.customerId}`,
       mode: 'remote',
       source: 'electric-sheep',
       token: '',
-      wsUrl: await getWsRelay().mintTicket()
+      wsUrl: await getWsRelay().mintTicket({
+        generation: runtimeSessionGeneration,
+        path: '/api/ws',
+        profile
+      })
     }
+    return profile ? { ...connection, profile } : connection
   }
 
   async function completeCallback(rawUrl) {
@@ -330,7 +351,8 @@ function createEvaManagedRuntime(options) {
       throw new EvaBrokerError('evaOS Agent sign-in device code did not match.', 400, 'device-code-mismatch')
     }
     const desktop = await claimEvaDeviceCode(callback.deviceCode)
-    if (pendingAuth !== pending) throw new EvaBrokerError('evaOS Agent ignored a stale sign-in callback.', 409, 'stale-auth')
+    if (pendingAuth !== pending)
+      throw new EvaBrokerError('evaOS Agent ignored a stale sign-in callback.', 409, 'stale-auth')
     assertGeneration(pending.generation)
     writeState({ desktop, runtime: null })
     pending.resolve(desktop)
@@ -398,9 +420,14 @@ function createEvaManagedRuntime(options) {
   return {
     close,
     completeCallback,
-    freshWsUrl: async () => {
+    freshWsUrl: async (input = {}) => {
       await ensureRuntimeEnrollment()
-      return getWsRelay().mintTicket()
+      const request = typeof input === 'string' ? { profile: input } : input
+      return getWsRelay().mintTicket({
+        generation: runtimeSessionGeneration,
+        path: normalizeEvaWsEndpoint(request.path).path,
+        profile: normalizeEvaWsProfile(request.profile)
+      })
     },
     requestApi,
     resolveBackend,

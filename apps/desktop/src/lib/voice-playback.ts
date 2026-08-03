@@ -104,23 +104,17 @@ async function resolveSpeakStreamUrl(): Promise<null | string> {
   }
 
   try {
-    // Mint a fresh credential (single-use ticket in OAuth mode) for the
-    // ACTIVE profile's backend, then swap the gateway endpoint for the PCM
-    // one — auth is shared across WS routes.
+    // Mint a fresh credential for the exact PCM endpoint on the ACTIVE
+    // profile's backend. Managed loopback tickets are endpoint-bound and
+    // single-use, so rewriting an /api/ws URL after minting would be rejected.
     const profile = getApiRequestProfile()
-    const wsUrl = await resolveGatewayWsUrl(desktop, await desktop.getConnection(profile))
+
+    const wsUrl = await resolveGatewayWsUrl(desktop, await desktop.getConnection(profile), '/api/audio/speak-stream')
+
     const url = new URL(wsUrl)
 
-    if (!url.pathname.endsWith('/api/ws')) {
+    if (!url.pathname.endsWith('/api/audio/speak-stream')) {
       return null
-    }
-
-    url.pathname = url.pathname.replace(/\/api\/ws$/, '/api/audio/speak-stream')
-
-    // The backend resolves the TTS provider chain from this profile's
-    // config/.env (same seam as /api/pty?profile=).
-    if (profile) {
-      url.searchParams.set('profile', profile)
     }
 
     return url.toString()

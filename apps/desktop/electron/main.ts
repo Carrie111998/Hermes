@@ -6472,9 +6472,9 @@ async function mintGatewayWsTicket(baseUrl) {
 // calls this immediately before every gateway.connect() so each WS upgrade
 // carries a freshly-minted ticket. For local/token connections this just
 // reuses the static token (no minting needed).
-async function freshGatewayWsUrl(profile) {
+async function freshGatewayWsUrl(profile, endpointPath = '/api/ws') {
   if (EVA_MANAGED_BUILD) {
-    return evaManagedRuntime.freshWsUrl()
+    return evaManagedRuntime.freshWsUrl({ path: endpointPath, profile })
   }
 
   // Mint for the requested profile's backend, NOT always the primary. The
@@ -8096,7 +8096,7 @@ function profileRouteOptions(profile) {
 // primary, so legacy callers are unchanged.
 async function ensureBackend(profile) {
   if (EVA_MANAGED_BUILD) {
-    return evaManagedRuntime.resolveBackend()
+    return evaManagedRuntime.resolveBackend({ profile })
   }
 
   const key = profile && String(profile).trim() ? String(profile).trim() : primaryProfileKey()
@@ -9647,8 +9647,8 @@ ipcMain.handle('hermes:backend:touch', async (_event, profile) => {
 
   return { ok: true }
 })
-ipcMain.handle('hermes:gateway:ws-url', async (_event, profile) => {
-  return gatewayWsUrlIpcResult(() => freshGatewayWsUrl(profile))
+ipcMain.handle('hermes:gateway:ws-url', async (_event, profile, endpointPath) => {
+  return gatewayWsUrlIpcResult(() => freshGatewayWsUrl(profile, endpointPath))
 })
 ipcMain.handle('hermes:window:openSession', async (_event, sessionId, opts) => {
   if (typeof sessionId !== 'string' || !sessionId.trim()) {

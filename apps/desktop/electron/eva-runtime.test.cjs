@@ -277,10 +277,7 @@ test('a runtime 401 clears older transient backoff before requiring sign-in', as
 
   await assert.rejects(runtime.resolveBackend(), error => error === failure)
   outcome = 'unauthorized'
-  await assert.rejects(
-    runtime.refresh(),
-    error => error instanceof EvaBrokerError && error.code === 'sign-in-required'
-  )
+  await assert.rejects(runtime.refresh(), error => error instanceof EvaBrokerError && error.code === 'sign-in-required')
   await assert.rejects(
     runtime.resolveBackend(),
     error => error instanceof EvaBrokerError && error.code === 'sign-in-required'
@@ -333,6 +330,55 @@ test('managed runtime forwards unknown APIs, bodies, uploads, and Hermes profile
   assert.equal(calls[0].options.method, 'POST')
   assert.deepEqual(calls[0].options.body, { future: true })
   assert.equal(calls[0].options.upload, upload)
+})
+
+test('managed connections and endpoint tickets preserve the selected profile and runtime generation', async t => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'eva-runtime-ws-profile-'))
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
+  const statePath = path.join(directory, 'eva-enrollment.json')
+  writeActiveEnrollment(statePath)
+
+  let relayOptions
+  const minted = []
+  const runtime = makeManagedRuntime(statePath, {
+    createWsRelay: options => {
+      relayOptions = options
+      return {
+        mintTicket: async request => {
+          minted.push(request)
+          return `ws://127.0.0.1:12345${request.path}?ticket=fresh`
+        },
+        disconnectAll: () => undefined,
+        close: async () => undefined
+      }
+    }
+  })
+  t.after(async () => runtime.close())
+
+  const connection = await runtime.resolveBackend({ profile: 'research' })
+  assert.equal(connection.profile, 'research')
+  assert.equal(connection.token, '')
+  assert.deepEqual(minted[0], {
+    generation: 0,
+    path: '/api/ws',
+    profile: 'research'
+  })
+
+  await runtime.freshWsUrl({
+    path: '/api/plugins/kanban/events?mode=live',
+    profile: 'research'
+  })
+  assert.deepEqual(minted[1], {
+    generation: 0,
+    path: '/api/plugins/kanban/events?mode=live',
+    profile: 'research'
+  })
+
+  const upstream = await relayOptions.getUpstream()
+  assert.equal(upstream.baseUrl, 'https://hermes-customer-one.ecs.electricsheephq.com')
+  assert.equal(upstream.token, 'runtime-token')
+  assert.equal(upstream.generation, minted[1].generation)
+  assert.equal(relayOptions.getGeneration(), minted[1].generation)
 })
 
 test('broker requests time out instead of leaving managed launch unresolved', async () => {

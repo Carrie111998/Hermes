@@ -57,7 +57,7 @@ test('managed build makes local startup unreachable and consumes auth callbacks 
   assert.match(runtime, /beginSignIn\(\)/)
   assert.match(main, /parsed\.hostname === 'auth'/)
   assert.match(main, /evaManagedRuntime\.completeCallback/)
-  assert.match(runtime, /wsUrl: await getWsRelay\(\)\.mintTicket\(\)/)
+  assert.match(runtime, /wsUrl: await getWsRelay\(\)\.mintTicket\(\{/)
   assert.match(runtime, /baseUrl: `eva-managed:\/\/\$\{runtime\.customerId\}`/)
   assert.match(runtime, /token: ''/)
   assert.match(runtime, /runtime = await ensureRuntimeEnrollment\(\{ force: true \}\)/)

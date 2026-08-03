@@ -7,6 +7,88 @@ const { buildEvaManagedWsUrl } = require('./eva-managed.cjs')
 const TICKET_TTL_MS = 30_000
 const MAX_UPSTREAM_HEADER_BYTES = 64 * 1024
 const UPSTREAM_SETUP_TIMEOUT_MS = 15_000
+const MANAGED_PROFILE_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
+const PLUGIN_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
+const FORBIDDEN_ENDPOINT_QUERY_KEYS = new Set(['eva_session', 'profile', 'session_token', 'ticket', 'token'])
+
+function hasAsciiControl(value) {
+  return Array.from(value).some(character => {
+    const codePoint = character.codePointAt(0)
+    return codePoint === undefined || codePoint <= 0x1f || codePoint === 0x7f
+  })
+}
+
+function normalizeEvaWsProfile(value) {
+  if (value == null || String(value).trim() === '') return null
+  const profile = String(value).trim()
+  if (!MANAGED_PROFILE_RE.test(profile)) {
+    throw new TypeError('evaOS Agent blocked an invalid Hermes profile.')
+  }
+  return profile
+}
+
+function normalizeEvaWsEndpoint(value = '/api/ws') {
+  const raw = String(value || '')
+  if (!raw.startsWith('/') || raw.startsWith('//') || raw.includes('\\') || raw.includes('#')) {
+    throw new TypeError('evaOS Agent blocked an invalid WebSocket endpoint.')
+  }
+
+  const queryIndex = raw.indexOf('?')
+  let pathname = queryIndex < 0 ? raw : raw.slice(0, queryIndex)
+  const rawQuery = queryIndex < 0 ? '' : raw.slice(queryIndex + 1)
+  const slashCount = Array.from(pathname).filter(character => character === '/').length
+  if (/%(?:2f|5c)/i.test(pathname)) {
+    throw new TypeError('evaOS Agent blocked an ambiguous WebSocket endpoint.')
+  }
+  for (let pass = 0; pass < 3; pass += 1) {
+    let decoded
+    try {
+      decoded = decodeURIComponent(pathname)
+    } catch {
+      throw new TypeError('evaOS Agent blocked an invalid WebSocket endpoint.')
+    }
+    if (decoded.includes('\\') || Array.from(decoded).filter(character => character === '/').length !== slashCount) {
+      throw new TypeError('evaOS Agent blocked an ambiguous WebSocket endpoint.')
+    }
+    if (decoded === pathname) break
+    pathname = decoded
+  }
+
+  const segments = pathname.split('/')
+  if (
+    pathname.includes('%') ||
+    pathname.includes('\\') ||
+    pathname.includes('?') ||
+    pathname.includes('#') ||
+    hasAsciiControl(pathname) ||
+    segments.slice(1).some(segment => segment === '.' || segment === '..' || segment === '')
+  ) {
+    throw new TypeError('evaOS Agent blocked an ambiguous WebSocket endpoint.')
+  }
+
+  pathname = `/${segments.slice(1).join('/')}`
+  const pluginMatch = /^\/api\/plugins\/([^/]+)\/(.+)$/.exec(pathname)
+  const allowed =
+    pathname === '/api/ws' ||
+    pathname === '/api/audio/speak-stream' ||
+    Boolean(pluginMatch && PLUGIN_ID_RE.test(pluginMatch[1]))
+  if (!allowed) {
+    throw new TypeError('evaOS Agent blocked an unsupported WebSocket endpoint.')
+  }
+
+  const searchParams = new URLSearchParams(rawQuery)
+  for (const [key, queryValue] of searchParams.entries()) {
+    if (FORBIDDEN_ENDPOINT_QUERY_KEYS.has(key) || hasAsciiControl(key) || hasAsciiControl(queryValue)) {
+      throw new TypeError('evaOS Agent blocked an invalid WebSocket query.')
+    }
+  }
+  const search = searchParams.toString()
+  return {
+    pathname,
+    search: search ? `?${search}` : '',
+    path: `${pathname}${search ? `?${search}` : ''}`
+  }
+}
 
 function safeDestroy(socket) {
   try {
@@ -95,8 +177,8 @@ function createEvaWsRelay(options) {
 
   function pruneTickets() {
     const current = now()
-    for (const [ticket, expiresAt] of tickets.entries()) {
-      if (expiresAt <= current) tickets.delete(ticket)
+    for (const [ticket, grant] of tickets.entries()) {
+      if (grant.expiresAt <= current) tickets.delete(ticket)
     }
   }
 
@@ -110,23 +192,39 @@ function createEvaWsRelay(options) {
       return
     }
 
-    const keys = [...localUrl.searchParams.keys()]
-    const ticket = localUrl.searchParams.get('ticket')
+    const presentedTickets = localUrl.searchParams.getAll('ticket')
+    const ticket = presentedTickets.length === 1 ? presentedTickets[0] : null
     pruneTickets()
-    if (
-      localUrl.pathname !== '/api/ws' ||
-      keys.length !== 1 ||
-      keys[0] !== 'ticket' ||
-      !ticket ||
-      !tickets.has(ticket)
-    ) {
+    if (!ticket || !tickets.has(ticket)) {
       writeFailure(clientSocket, 401, 'Unauthorized')
       return
     }
 
-    const expiresAt = tickets.get(ticket)
+    const grant = tickets.get(ticket)
     tickets.delete(ticket)
-    if (!expiresAt || expiresAt <= now()) {
+    if (!grant || grant.expiresAt <= now()) {
+      writeFailure(clientSocket, 401, 'Unauthorized')
+      return
+    }
+
+    localUrl.searchParams.delete('ticket')
+    let requestedEndpoint
+    try {
+      const query = localUrl.searchParams.toString()
+      requestedEndpoint = normalizeEvaWsEndpoint(`${localUrl.pathname}${query ? `?${query}` : ''}`)
+    } catch {
+      writeFailure(clientSocket, 401, 'Unauthorized')
+      return
+    }
+    if (requestedEndpoint.path !== grant.endpoint.path) {
+      writeFailure(clientSocket, 401, 'Unauthorized')
+      return
+    }
+    if (
+      grant.generation !== null &&
+      typeof options.getGeneration === 'function' &&
+      options.getGeneration() !== grant.generation
+    ) {
       writeFailure(clientSocket, 401, 'Unauthorized')
       return
     }
@@ -142,8 +240,26 @@ function createEvaWsRelay(options) {
     }, upstreamSetupTimeoutMs)
     setupTimer.unref?.()
     try {
-      const upstream = await options.getUpstream()
+      const upstream = await options.getUpstream({
+        generation: grant.generation,
+        path: grant.endpoint.path,
+        profile: grant.profile
+      })
+      if (
+        grant.expiresAt <= now() ||
+        (grant.generation !== null && upstream?.generation != null && upstream.generation !== grant.generation)
+      ) {
+        setupFinished = true
+        clearTimeout(setupTimer)
+        writeFailure(clientSocket, 401, 'Unauthorized')
+        return
+      }
       const upstreamUrl = new URL(buildEvaManagedWsUrl(upstream.baseUrl, upstream.token))
+      upstreamUrl.pathname = upstreamUrl.pathname.replace(/\/api\/ws$/, grant.endpoint.pathname)
+      for (const [key, value] of new URLSearchParams(grant.endpoint.search).entries()) {
+        upstreamUrl.searchParams.append(key, value)
+      }
+      if (grant.profile) upstreamUrl.searchParams.set('profile', grant.profile)
       upstreamSocket = track(await connectUpstream(upstreamUrl))
       if (setupFinished) {
         safeDestroy(upstreamSocket)
@@ -255,12 +371,23 @@ function createEvaWsRelay(options) {
     return startPromise
   }
 
-  async function mintTicket() {
+  async function mintTicket(input = {}) {
     const address = await start()
     pruneTickets()
+    const endpoint = normalizeEvaWsEndpoint(input.path)
+    const profile = normalizeEvaWsProfile(input.profile)
+    const generation =
+      input.generation ?? (typeof options.getGeneration === 'function' ? options.getGeneration() : null)
     const ticket = randomBytes(32).toString('base64url')
-    tickets.set(ticket, now() + TICKET_TTL_MS)
-    return `ws://127.0.0.1:${address.port}/api/ws?ticket=${encodeURIComponent(ticket)}`
+    tickets.set(ticket, {
+      endpoint,
+      expiresAt: now() + TICKET_TTL_MS,
+      generation,
+      profile
+    })
+    const localUrl = new URL(`ws://127.0.0.1:${address.port}${endpoint.path}`)
+    localUrl.searchParams.append('ticket', ticket)
+    return localUrl.toString()
   }
 
   function disconnectAll() {
@@ -283,5 +410,7 @@ function createEvaWsRelay(options) {
 module.exports = {
   TICKET_TTL_MS,
   buildUpgradeRequest,
-  createEvaWsRelay
+  createEvaWsRelay,
+  normalizeEvaWsEndpoint,
+  normalizeEvaWsProfile
 }

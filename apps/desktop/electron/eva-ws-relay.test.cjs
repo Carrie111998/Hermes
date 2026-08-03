@@ -3,7 +3,7 @@ const net = require('node:net')
 const { Duplex } = require('node:stream')
 const test = require('node:test')
 
-const { createEvaWsRelay } = require('./eva-ws-relay.cjs')
+const { TICKET_TTL_MS, createEvaWsRelay } = require('./eva-ws-relay.cjs')
 
 const BASE_URL = 'https://hermes-jackie-david.ecs.electricsheephq.com'
 
@@ -94,6 +94,137 @@ test('renderer gets a single-use loopback ticket and never the managed runtime s
   const second = await upgrade(localUrl)
   assert.match(second.response, /^HTTP\/1\.1 401/)
   second.socket.destroy()
+})
+
+test('tickets are bound to the exact voice endpoint and assigned profile', async t => {
+  const upstream = fakeUpstream()
+  await upstream.start()
+  const relay = createEvaWsRelay({
+    connectUpstream: () => upstream.connect(),
+    getUpstream: async () => ({ baseUrl: BASE_URL, generation: 4, token: 'runtime-secret' }),
+    getGeneration: () => 4
+  })
+  t.after(async () => {
+    await relay.close()
+    await upstream.stop()
+  })
+
+  const localUrl = await relay.mintTicket({
+    generation: 4,
+    path: '/api/audio/speak-stream',
+    profile: 'research'
+  })
+  assert.match(localUrl, /^ws:\/\/127\.0\.0\.1:\d+\/api\/audio\/speak-stream\?ticket=/)
+  assert.doesNotMatch(localUrl, /research|runtime-secret|eva_session/)
+
+  const result = await upgrade(localUrl)
+  assert.match(result.response, /^HTTP\/1\.1 101/)
+  result.socket.destroy()
+
+  const requestLine = upstream.observed().split('\r\n', 1)[0]
+  const upstreamUrl = new URL(`https://upstream.invalid${requestLine.split(' ')[1]}`)
+  assert.equal(upstreamUrl.pathname, '/api/audio/speak-stream')
+  assert.equal(upstreamUrl.searchParams.get('eva_session'), 'runtime-secret')
+  assert.equal(upstreamUrl.searchParams.get('profile'), 'research')
+})
+
+test('a valid ticket cannot be moved to a different WebSocket endpoint', async t => {
+  const relay = createEvaWsRelay({
+    connectUpstream: async () => {
+      throw new Error('cross-path requests must not dial upstream')
+    },
+    getUpstream: async () => ({ baseUrl: BASE_URL, token: 'runtime-secret' })
+  })
+  t.after(async () => relay.close())
+
+  const localUrl = new URL(await relay.mintTicket({ path: '/api/ws' }))
+  localUrl.pathname = '/api/audio/speak-stream'
+  const crossed = await upgrade(localUrl.toString())
+  assert.match(crossed.response, /^HTTP\/1\.1 401/)
+  crossed.socket.destroy()
+
+  localUrl.pathname = '/api/ws'
+  const replay = await upgrade(localUrl.toString())
+  assert.match(replay.response, /^HTTP\/1\.1 401/)
+  replay.socket.destroy()
+})
+
+test('validated plugin tickets preserve the namespaced path and query upstream', async t => {
+  const upstream = fakeUpstream()
+  await upstream.start()
+  const relay = createEvaWsRelay({
+    connectUpstream: () => upstream.connect(),
+    getUpstream: async () => ({ baseUrl: BASE_URL, token: 'runtime-secret' })
+  })
+  t.after(async () => {
+    await relay.close()
+    await upstream.stop()
+  })
+
+  const result = await upgrade(
+    await relay.mintTicket({
+      path: '/api/plugins/kanban/events?mode=live',
+      profile: 'research'
+    })
+  )
+  assert.match(result.response, /^HTTP\/1\.1 101/)
+  result.socket.destroy()
+
+  const requestLine = upstream.observed().split('\r\n', 1)[0]
+  const upstreamUrl = new URL(`https://upstream.invalid${requestLine.split(' ')[1]}`)
+  assert.equal(upstreamUrl.pathname, '/api/plugins/kanban/events')
+  assert.equal(upstreamUrl.searchParams.get('mode'), 'live')
+  assert.equal(upstreamUrl.searchParams.get('profile'), 'research')
+})
+
+test('relay only mints supported core and plugin WebSocket endpoints', async t => {
+  const relay = createEvaWsRelay({
+    getUpstream: async () => ({ baseUrl: BASE_URL, token: 'runtime-secret' })
+  })
+  t.after(async () => relay.close())
+
+  await assert.doesNotReject(relay.mintTicket({ path: '/api/plugins/kanban/events?mode=live', profile: 'research' }))
+  await assert.rejects(relay.mintTicket({ path: '/api/sessions' }), /unsupported WebSocket endpoint/)
+  await assert.rejects(
+    relay.mintTicket({ path: '/api/plugins/kanban/%252e%252e/other/events' }),
+    /ambiguous WebSocket endpoint/
+  )
+  await assert.rejects(
+    relay.mintTicket({ path: '/api/plugins/kanban/events?token=renderer-secret' }),
+    /invalid WebSocket query/
+  )
+  await assert.rejects(relay.mintTicket({ path: '/api/plugins/bad%2Fid/events' }), /ambiguous WebSocket endpoint/)
+  await assert.rejects(relay.mintTicket({ path: '/api/plugins/bad%252Fid/events' }), /ambiguous WebSocket endpoint/)
+})
+
+test('expired and stale-generation tickets fail before dialing upstream', async t => {
+  let clock = 0
+  let generation = 8
+  let dials = 0
+  const relay = createEvaWsRelay({
+    connectUpstream: async () => {
+      dials += 1
+      throw new Error('expired or stale tickets must not dial upstream')
+    },
+    getGeneration: () => generation,
+    getUpstream: async () => ({ baseUrl: BASE_URL, generation, token: 'runtime-secret' }),
+    now: () => clock
+  })
+  t.after(async () => relay.close())
+
+  const expiredUrl = await relay.mintTicket({ generation, path: '/api/ws' })
+  clock = TICKET_TTL_MS
+  const expired = await upgrade(expiredUrl)
+  assert.match(expired.response, /^HTTP\/1\.1 401/)
+  expired.socket.destroy()
+
+  clock += 1
+  const staleUrl = await relay.mintTicket({ generation, path: '/api/ws' })
+  generation += 1
+  const stale = await upgrade(staleUrl)
+  assert.match(stale.response, /^HTTP\/1\.1 401/)
+  stale.socket.destroy()
+  assert.equal(dials, 0)
 })
 
 test('relay passes an unknown future gateway RPC frame through unchanged', async t => {
