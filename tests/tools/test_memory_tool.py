@@ -260,9 +260,21 @@ class TestMemoryStorePersistence:
 
     def test_deduplication_on_load(self, tmp_path, monkeypatch):
         monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
-        # Write file with duplicates
+        # Write file with duplicates.
+        #
+        # UTF-8 and LF are both deliberate. Path.write_text defaults to the
+        # platform encoding and translates newlines, which on Windows wrote the
+        # delimiter as a lone cp1252 0xa7 byte — invalid UTF-8, so the store
+        # correctly refused the file as unreadable and returned no entries —
+        # and wrapped it in CRLF, which would not have matched ENTRY_DELIMITER
+        # ("\n§\n") even had it decoded. The store's own writer always emits
+        # UTF-8 with LF, so this now writes what the code under test reads.
         mem_file = tmp_path / "MEMORY.md"
-        mem_file.write_text("duplicate entry\n§\nduplicate entry\n§\nunique entry")
+        mem_file.write_text(
+            "duplicate entry\n§\nduplicate entry\n§\nunique entry",
+            encoding="utf-8",
+            newline="\n",
+        )
 
         store = MemoryStore()
         store.load_from_disk()
