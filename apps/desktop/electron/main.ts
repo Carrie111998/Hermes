@@ -1014,6 +1014,10 @@ protocol.registerSchemesAsPrivileged([
       secure: true,
       standard: true,
       stream: true,
+      // Required for HTML5 audio/video from a custom scheme: without the
+      // `media` privilege Chromium can render the video track but blocks
+      // audio output from the scheme (#76834).
+      media: true,
       supportFetchAPI: true
     }
   }
