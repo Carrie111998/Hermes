@@ -57,6 +57,7 @@ The repo ships these bundled plugins under `plugins/`. All are opt-in — enable
 |---|---|---|
 | `disk-cleanup` | hooks + slash command | Auto-track ephemeral files and clean them on session end |
 | `security-guidance` | hooks | Pattern-match dangerous code on `write_file`/`patch` and append a security warning (or block) — 25 rules (Apache-2.0 fork of Anthropic's `claude-plugins-official` patterns) |
+| `ai-firstify` | skill + slash command | Audit, re-engineer, or bootstrap a project against the 9 AI-first design principles and 7 design patterns — `/ai-firstify [audit\|reengineer\|bootstrap]` (MIT fork of `techwolf-ai/ai-first-toolkit`) |
 | `observability/langfuse` | hooks | Trace turns / LLM calls / tools to [Langfuse](https://langfuse.com) |
 | `spotify` | backend (7 tools) | Native Spotify playback, queue, search, playlists, albums, library |
 | `google_meet` | standalone | Join Meet calls, live-caption transcription, optional realtime duplex audio |
@@ -137,6 +138,26 @@ The file is still written. The model reads the warning in the next turn's tool m
 **Disabling again:** `hermes plugins disable security-guidance`.
 
 **What it does not do (yet):** the upstream Anthropic plugin has two more layers — an LLM diff review on each agent turn that touched files, and an agentic commit-time review that traces data flow across files. Neither is ported. The agent can already run those reviews on demand via `delegate_task`.
+
+### ai-firstify
+
+Audits, re-engineers, or bootstraps a project so it aligns with **AI-first design principles** — the 9 principles and 7 design patterns from the [TechWolf AI-First Bootcamp](https://ai-first.techwolf.ai). Unlike the hooks-based plugins above, this one bundles a **skill** (registered as `ai-firstify:ai-firstify`) plus an `/ai-firstify` slash command.
+
+**Modes:**
+
+| Mode | Behaviour |
+|---|---|
+| `audit` (default) | Read-only. Scores the project across 7 dimensions (project structure, agent architecture, skill usage, scope & complexity, context hygiene, safety, workflow design) and emits a prioritized report. Changes nothing. |
+| `reengineer` | Runs the audit, then actively fixes issues in 7 phases: foundation, de-agentification, skill extraction, complexity reduction, context hygiene, safety hardening, workflow optimization. |
+| `bootstrap` | Interactive scaffolding of a new AI-first project via discovery questions. |
+
+Kick a run off with `/ai-firstify audit`, `/ai-firstify reengineer .`, or `/ai-firstify bootstrap` (run `/ai-firstify help` for the mode reference). The command points the agent at the bundled skill; the agent loads the overview with `skill_view` and reads the per-mode playbooks and reference material from `plugins/ai-firstify/skills/ai-firstify/references/` on demand.
+
+The skill tree is a verbatim MIT fork of [`techwolf-ai/ai-first-toolkit`](https://github.com/techwolf-ai/ai-first-toolkit) — see the plugin's `LICENSE` and `NOTICE` for attribution.
+
+**Enabling:** `hermes plugins enable ai-firstify` (or check the box in `hermes plugins`).
+
+**Disabling again:** `hermes plugins disable ai-firstify`.
 
 ### observability/langfuse
 

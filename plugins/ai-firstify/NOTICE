@@ -1,0 +1,18 @@
+ai-firstify (Hermes plugin port)
+
+The skill bundled under `skills/ai-firstify/` — `SKILL.md`, `references/*.md`,
+and `scripts/validate-report.sh` — is a verbatim fork of the `ai-firstify`
+plugin from:
+
+    https://github.com/techwolf-ai/ai-first-toolkit
+    plugins/ai-firstify/skills/ai-firstify/
+    commit ac797fb18a75f7b584f67074a0c7b6ef9c03bd84 (2026-07-10), version 1.1.0
+
+Copyright (c) 2026 TechWolf. Licensed under the MIT License (see LICENSE).
+
+The design principles and patterns the skill encodes originate from the
+TechWolf AI-First Bootcamp: https://ai-first.techwolf.ai
+
+The Hermes plugin wrapper — `plugin.yaml`, `__init__.py`, and `README.md` —
+is original work by NousResearch, MIT-licensed alongside the rest of
+hermes-agent.

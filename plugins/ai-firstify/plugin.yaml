@@ -1,0 +1,9 @@
+name: ai-firstify
+version: "1.1.0"
+description: "Audit, re-engineer, or bootstrap a project to align with AI-first design principles — the 9 principles and 7 design patterns from the TechWolf AI-First Bootcamp. Bundles the `ai-firstify` skill (audit / re-engineer / bootstrap modes across 7 dimensions) and a `/ai-firstify` slash command. Ported from techwolf-ai/ai-first-toolkit (MIT)."
+author: "TechWolf (skill, MIT) / NousResearch (Hermes plugin port)"
+kind: standalone
+platforms:
+  - linux
+  - macos
+  - windows
