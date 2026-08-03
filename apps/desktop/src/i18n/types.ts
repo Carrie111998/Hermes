@@ -1588,6 +1588,7 @@ export interface Translations {
       copyPath: string
       removeFromSidebar: string
       createFailed: string
+      addFolderFailed: (count: number) => string
       staleBackend: string
       deleteConfirm: string
       startWork: string

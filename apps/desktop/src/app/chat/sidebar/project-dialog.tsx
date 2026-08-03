@@ -101,8 +101,21 @@ export function ProjectDialog() {
         }
 
         await runSubmit(async () => {
+          const failures: string[] = []
+
           for (const dir of dirs) {
-            await addProjectFolder(projectId, dir)
+            try {
+              await addProjectFolder(projectId, dir)
+            } catch (e) {
+              failures.push(dir)
+            }
+          }
+
+          if (failures.length > 0) {
+            notifyError(
+              new Error(failures.join(', ')),
+              p.addFolderFailed(failures.length)
+            )
           }
         })
 
