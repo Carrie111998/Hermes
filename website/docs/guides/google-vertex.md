@@ -116,11 +116,8 @@ vertex:
 
 For **API Key (Express Mode)**:
 1. Hermes reads your `GOOGLE_VERTEX_API_KEY` from the environment.
-2. It passes the key as a Bearer token in the `Authorization` header to the Vertex OpenAI-compatible endpoint.
-3. The endpoint URL includes your project ID and region in the path:
-   ```
-   https://aiplatform.googleapis.com/v1beta1/projects/{project}/locations/{region}/endpoints/openapi
-   ```
+2. It passes the key in the `x-goog-api-key` header to Vertex's native `:generateContent` API endpoint (`https://aiplatform.googleapis.com/v1/publishers/google`).
+3. Requests route through `GeminiNativeClient` which handles native Gemini payload formatting, system prompt injection, and bare model name resolution.
 4. No token refresh needed — API keys don't expire.
 
 For **OAuth2 / ADC**:

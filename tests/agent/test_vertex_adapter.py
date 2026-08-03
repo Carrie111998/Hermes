@@ -92,8 +92,8 @@ def test_get_vertex_config_uses_adc_and_default_region(vertex_adapter):
     assert token == "ya29.FAKE"
     assert auth_hdr == "Authorization"
     assert base == (
-        "https://us-central1-aiplatform.googleapis.com/v1beta1/projects/adc-project/"
-        "locations/us-central1/endpoints/openapi"
+        "https://aiplatform.googleapis.com/v1beta1/projects/adc-project/"
+        "locations/global/endpoints/openapi"
     )
 
 
@@ -277,13 +277,14 @@ def test_get_vertex_config_api_key_precedence_over_adc(vertex_adapter, monkeypat
     assert base_url == "https://aiplatform.googleapis.com/v1/publishers/google"
 
 
-def test_get_vertex_config_api_key_missing_project(vertex_adapter, monkeypatch):
-    """get_vertex_config returns (None, None, None) when API key is set but project is not."""
+def test_get_vertex_config_api_key_without_project(vertex_adapter, monkeypatch):
+    """get_vertex_config succeeds in Express Mode even when project ID is omitted."""
     monkeypatch.setenv("GOOGLE_VERTEX_API_KEY", "AIzaSyKey")
-    # No project ID set anywhere
 
-    result = vertex_adapter.get_vertex_config()
-    assert result == (None, None, None)
+    key, base_url, auth_hdr = vertex_adapter.get_vertex_config()
+    assert key == "AIzaSyKey"
+    assert base_url == "https://aiplatform.googleapis.com/v1/publishers/google"
+    assert auth_hdr == "x-goog-api-key"
 
 
 def test_has_vertex_credentials_via_api_key(vertex_adapter, monkeypatch):
@@ -292,26 +293,23 @@ def test_has_vertex_credentials_via_api_key(vertex_adapter, monkeypatch):
     assert vertex_adapter.has_vertex_credentials() is True
 
 
-def test_googole_vertex_location_region_precedence(vertex_adapter, monkeypatch):
+def test_google_vertex_location_region_precedence(vertex_adapter, monkeypatch):
     """GOOGLE_VERTEX_LOCATION takes precedence over VERTEX_REGION."""
     monkeypatch.setenv("GOOGLE_VERTEX_LOCATION", "us-west1")
     monkeypatch.setenv("VERTEX_REGION", "europe-west4")
-
     assert vertex_adapter._resolve_region() == "us-west1"
 
 
-def test_googole_vertex_project_precedence(vertex_adapter, monkeypatch):
+def test_google_vertex_project_precedence(vertex_adapter, monkeypatch):
     """GOOGLE_VERTEX_PROJECT takes precedence over VERTEX_PROJECT_ID."""
-    monkeypatch.setenv("GOOGLE_VERTEX_PROJECT", "gv-project")
-    monkeypatch.setenv("VERTEX_PROJECT_ID", "legacy-project")
+    monkeypatch.setenv("GOOGLE_VERTEX_PROJECT", "gv-proj")
+    monkeypatch.setenv("VERTEX_PROJECT_ID", "v-proj")
+    assert vertex_adapter._resolve_project_override() == "gv-proj"
 
-    assert vertex_adapter._resolve_project_override() == "gv-project"
 
-
-def test_googole_vertex_location_falls_back_to_vertex_region(vertex_adapter, monkeypatch):
+def test_google_vertex_location_falls_back_to_vertex_region(vertex_adapter, monkeypatch):
     """VERTEX_REGION is used when GOOGLE_VERTEX_LOCATION is not set."""
     monkeypatch.setenv("VERTEX_REGION", "asia-east1")
-
     assert vertex_adapter._resolve_region() == "asia-east1"
 
 

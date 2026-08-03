@@ -2615,8 +2615,7 @@ def _model_flow_vertex(config, current_model=""):
         if discovered:
             print(f"found {len(discovered)} models ✓")
         else:
-            print("not available with API keys — using curated list.")
-            print("    (Model listing requires OAuth2/ADC, not API key.)")
+            print("using curated model list.")
     else:
         print("  (Using curated model list — set GOOGLE_VERTEX_API_KEY +")
         print("   GOOGLE_VERTEX_PROJECT for dynamic discovery.)")
@@ -2630,13 +2629,16 @@ def _model_flow_vertex(config, current_model=""):
             "google/gemini-3-flash-preview",
         ]
 
-    base_url_preview = (
-        "https://aiplatform.googleapis.com/v1beta1/projects/<project>/"
-        f"locations/{region}/endpoints/openapi"
-        if region == "global"
-        else f"https://{region}-aiplatform.googleapis.com/v1beta1/projects/<project>/"
-        f"locations/{region}/endpoints/openapi"
-    )
+    if has_vertex_api_key():
+        base_url_preview = "https://aiplatform.googleapis.com/v1/publishers/google"
+    else:
+        base_url_preview = (
+            "https://aiplatform.googleapis.com/v1beta1/projects/<project>/"
+            f"locations/{region}/endpoints/openapi"
+            if region == "global"
+            else f"https://{region}-aiplatform.googleapis.com/v1beta1/projects/<project>/"
+            f"locations/{region}/endpoints/openapi"
+        )
     selected = _prompt_model_selection(
         model_list,
         current_model=current_model,

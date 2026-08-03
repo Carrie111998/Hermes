@@ -14,9 +14,8 @@ Supports two authentication methods:
       - ``GOOGLE_VERTEX_PROJECT`` — your GCP project ID.
       - ``GOOGLE_VERTEX_LOCATION`` — region (default: ``us-central1``).
 
-    When using API key auth the ``Authorization`` header carries the key as a
-    Bearer token and the request is routed to the global ``aiplatform.googleapis.com``
-    host, which internally fans out to the configured region.
+    When using API key auth, requests use the ``x-goog-api-key`` header and route
+    to the global ``aiplatform.googleapis.com`` host via ``GeminiNativeClient``.
 
 2.  **OAuth2 / ADC (legacy)**
     Requires ``pip install google-auth`` and one of:
@@ -74,10 +73,9 @@ GOOGLE_VERTEX_API_KEY = "GOOGLE_VERTEX_API_KEY"
 GOOGLE_VERTEX_PROJECT = "GOOGLE_VERTEX_PROJECT"
 GOOGLE_VERTEX_LOCATION = "GOOGLE_VERTEX_LOCATION"
 
-# Default region — us-central1 is the most widely available Vertex region.
-# The old default was "global" (required for Gemini 3.x previews via ADC),
-# but API key / Express Mode works best with an explicit region.
-DEFAULT_REGION = "us-central1"
+# Default region — global is required for Gemini 3.x preview models via Vertex OAuth2/ADC.
+# Regional overrides (e.g. us-central1) can be set via GOOGLE_VERTEX_LOCATION or VERTEX_REGION.
+DEFAULT_REGION = "global"
 
 _creds_cache: dict = {}
 
@@ -288,13 +286,7 @@ def get_vertex_config(
     # --- Path 1: API Key (Express Mode) ---
     api_key = resolve_vertex_api_key()
     if api_key:
-        project_id = _resolve_project_override()
-        if not project_id:
-            logger.warning(
-                "Vertex API key found but no project ID configured. "
-                "Set GOOGLE_VERTEX_PROJECT in ~/.hermes/.env."
-            )
-            return None, None, None
+        project_id = _resolve_project_override() or "default"
         effective_region = _resolve_region(region)
         base_url = build_vertex_api_key_base_url(project_id, effective_region)
         logger.debug(
@@ -345,17 +337,16 @@ def discover_vertex_models(
     """Query Vertex AI's ``models.list`` publisher endpoint for models
     available in the given project and region.
 
-    **Note:** The ``publishers/google/models`` endpoint is only accessible
-    via OAuth2 / ADC authentication. When using an API key (Express Mode),
-    this endpoint returns 404. The function will return an empty list with
-    API key auth, and the caller should fall back to a curated model list.
+    Supports both Express Mode API keys (via ``x-goog-api-key``) and OAuth2 / ADC
+    authentication (via ``Authorization: Bearer token``).
 
-    For OAuth2 / ADC auth, returns a sorted list of model ID strings
-    (e.g. ``gemini-2.5-flash``, ``gemini-3-flash-preview``).  Only models
-    that support ``generateContent`` (chat / text-generation) are returned.
+    Returns a sorted list of model ID strings (e.g. ``gemini-2.5-flash``,
+    ``gemini-3-flash-preview``). Only models that support ``generateContent``
+    (chat / text-generation) are returned.
 
     Returns the sorted model list on success.
-    Returns an empty list on any error (network, auth, parse, or API key auth).
+    Returns an empty list on any error (network, auth, parse), falling back
+    to the curated model catalog.
     """
     import json
     import urllib.error
@@ -366,10 +357,17 @@ def discover_vertex_models(
         f"https://{host}/v1/projects/{project_id}/locations/{region}"
         "/publishers/google/models"
     )
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
+    # Use x-goog-api-key for Express Mode API keys and Authorization Bearer for OAuth2 tokens
+    if api_key.startswith("AIza") or (has_vertex_api_key() and not api_key.startswith("ya29.")):
+        headers = {
+            "x-goog-api-key": api_key,
+            "Content-Type": "application/json",
+        }
+    else:
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
 
     try:
         req = urllib.request.Request(url, headers=headers, method="GET")
@@ -388,8 +386,8 @@ def discover_vertex_models(
         return sorted(set(models))
 
     except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError, OSError) as exc:
-        logger.warning("discover_vertex_models: failed to list models — %s", exc)
+        logger.debug("discover_vertex_models: model list endpoint unavailable (%s) — falling back to curated list", exc)
         return []
     except Exception as exc:
-        logger.warning("discover_vertex_models: unexpected error — %s", exc)
+        logger.debug("discover_vertex_models: unexpected error (%s) — falling back to curated list", exc)
         return []

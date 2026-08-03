@@ -2029,26 +2029,26 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
         return client
     from agent.gemini_native_adapter import GeminiNativeClient, is_native_gemini_base_url
 
-    if is_native_gemini_base_url(client_kwargs.get("base_url", "")):
-            base_url = str(client_kwargs.get("base_url", "") or "")
-            safe_kwargs = {
-                k: v for k, v in client_kwargs.items()
-                if k in {"api_key", "base_url", "default_headers", "timeout", "http_client"}
-            }
-            if "http_client" not in safe_kwargs:
-                keepalive_http = agent._build_keepalive_http_client(
-                    base_url, verify=httpx_verify,
-                )
-                if keepalive_http is not None:
-                    safe_kwargs["http_client"] = keepalive_http
-            client = GeminiNativeClient(**safe_kwargs)
-            _ra().logger.info(
-                "Gemini native client created (%s, shared=%s) %s",
-                reason,
-                shared,
-                agent._client_log_context(),
+    raw_base_url = str(client_kwargs.get("base_url", "") or "")
+    if is_native_gemini_base_url(raw_base_url):
+        safe_kwargs = {
+            k: v for k, v in client_kwargs.items()
+            if k in {"api_key", "base_url", "default_headers", "timeout", "http_client"}
+        }
+        if "http_client" not in safe_kwargs:
+            keepalive_http = agent._build_keepalive_http_client(
+                raw_base_url, verify=httpx_verify,
             )
-            return client
+            if keepalive_http is not None:
+                safe_kwargs["http_client"] = keepalive_http
+        client = GeminiNativeClient(**safe_kwargs)
+        _ra().logger.info(
+            "Gemini native client created (%s, shared=%s) %s",
+            reason,
+            shared,
+            agent._client_log_context(),
+        )
+        return client
     # Inject TCP keepalives so the kernel detects dead provider connections
     # instead of letting them sit silently in CLOSE-WAIT (#10324).  Without
     # this, a peer that drops mid-stream leaves the socket in a state where
@@ -2312,7 +2312,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
                 "base_url": effective_base,
             }
             # Vertex API key (Express Mode) uses x-goog-api-key header instead
-            # of Authorization: Bearer *** only works for OAuth2 tokens).
+            # of Authorization: Bearer token (Bearer token only works for OAuth2 tokens).
             if auth_header == "x-goog-api-key":
                 agent._client_kwargs["default_headers"] = {
                     "x-goog-api-key": effective_key,

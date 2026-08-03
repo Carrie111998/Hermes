@@ -615,9 +615,8 @@ def _build_apikey_providers_list() -> list:
         ("OpenCode Zen",     ("OPENCODE_ZEN_API_KEY",),                      "https://opencode.ai/zen/v1/models",  "OPENCODE_ZEN_BASE_URL", True),
         # OpenCode Go has no shared /models endpoint; skip the health check.
         ("OpenCode Go",      ("OPENCODE_GO_API_KEY",),                       None,                                  "OPENCODE_GO_BASE_URL", False),
-        # Vertex AI (Express Mode) uses ``x-goog-api-key`` header, not
-        # Authorization: Bearer. No /models endpoint available with API key auth
-        # (Google Express Mode only exposes generateContent/streamGenerateContent).
+        # Vertex AI (Express Mode) uses ``x-goog-api-key`` header. Dynamic model
+        # discovery queries publisher models endpoint; doctor skips generic Bearer check.
         ("Google Vertex AI", ("GOOGLE_VERTEX_API_KEY",),                     None,                                  None, False),
     ]
     _known_names = {t[0] for t in _static}

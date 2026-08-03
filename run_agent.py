@@ -5282,7 +5282,7 @@ class AIAgent:
             self._client_kwargs["default_headers"] = hermes_xai_default_headers()
         elif "aiplatform.googleapis.com" in (base_url or ""):
             # Vertex AI API key (Express Mode) uses x-goog-api-key header instead
-            # of Authorization: Bearer. *** set this when the key is actually
+            # of Authorization: Bearer. Only set this when the key is actually
             # a Vertex API key (not an OAuth2 token).
             if self.provider == "vertex" and self._client_kwargs.get("api_key", ""):
                 from agent.vertex_adapter import has_vertex_api_key

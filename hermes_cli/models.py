@@ -331,7 +331,6 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "google/gemini-2.5-flash-lite",
         "google/gemini-flash-latest",
         "google/gemini-flash-lite-latest",
-        "google/gemini-embedding-001",
     ],
     "zai": [
         "glm-5.2",
