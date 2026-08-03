@@ -546,6 +546,107 @@ describe('journal retention (the confidentiality axis)', () => {
   })
 })
 
+// Entry-level expiry made every INDIVIDUAL entry ageable, but the store
+// ENVELOPE had the same fail-open shape one level up: an unparseable or
+// foreign-version blob was answered with an empty store and left on disk, so
+// `pruneExpiredEntries({})` swept 0 of 0, the `if (expired)` flush never fired,
+// and the plaintext prompt + tool args stayed forever — beyond the reach of
+// expiry AND of an explicit delete, since the purge loads through the same
+// function and sees an empty store. Retention is the whole confidentiality
+// argument for this file, so a state retention cannot reach is a hole in it.
+//
+// No corruption is needed to get here: a future STORE_VERSION bump, or a user
+// downgrading the app after a newer version wrote entries, lands on the exact
+// same branch.
+describe('journal store envelope (retention must reach it too)', () => {
+  const SECRET = 'PGPASSWORD=hunter2 psql -h prod'
+
+  beforeEach(() => {
+    window.localStorage.clear()
+    vi.useFakeTimers()
+  })
+
+  afterEach(() => {
+    window.localStorage.clear()
+    vi.useRealTimers()
+  })
+
+  /** A real journal blob written by the real writer, so the fixture carries the
+   *  same plaintext an actual crashed turn would leave behind. */
+  function seededRaw(): string {
+    persistInFlightTurnState(
+      journalState({
+        messages: [user('u1', SECRET), assistant('assistant-stream-1', 'working', { pending: true })],
+        storedSessionId: 'stored-a'
+      })
+    )
+    vi.advanceTimersByTime(JOURNAL_PERSIST_THROTTLE_MS)
+
+    const raw = window.localStorage.getItem(JOURNAL_STORAGE_KEY)!
+
+    expect(raw).toContain(SECRET)
+
+    return raw
+  }
+
+  it('discards an unparseable store instead of leaving the plaintext on disk', () => {
+    const raw = seededRaw()
+    // Truncated blob: an interrupted write, a quota kill mid-`setItem`, a
+    // half-synced leveldb file.
+    window.localStorage.setItem(JOURNAL_STORAGE_KEY, raw.slice(0, Math.floor(raw.length / 2)))
+
+    sweepExpiredInFlightTurnJournals()
+
+    expect(window.localStorage.getItem(JOURNAL_STORAGE_KEY)).toBeNull()
+  })
+
+  it('discards a store written by a FUTURE version rather than stranding it unreadable', () => {
+    const raw = seededRaw()
+    const parsed = JSON.parse(raw)
+
+    // What a downgrade sees: v2 wrote this, v1 is now reading it. v1 cannot
+    // replay it and its very next write overwrites the key wholesale anyway, so
+    // "keeping" it only means keeping unreadable plaintext at rest.
+    window.localStorage.setItem(JOURNAL_STORAGE_KEY, JSON.stringify({ ...parsed, version: 99 }))
+
+    sweepExpiredInFlightTurnJournals()
+
+    expect(window.localStorage.getItem(JOURNAL_STORAGE_KEY)).toBeNull()
+  })
+
+  // `typeof null === 'object'` and `Array.isArray(null) === false`, so a null
+  // `entries` passed the envelope guard and threw inside the sweep — landing in
+  // the same silent fail-open path.
+  it('discards a store whose entries map is null', () => {
+    seededRaw()
+    window.localStorage.setItem(JOURNAL_STORAGE_KEY, JSON.stringify({ entries: null, version: 1 }))
+
+    sweepExpiredInFlightTurnJournals()
+
+    expect(window.localStorage.getItem(JOURNAL_STORAGE_KEY)).toBeNull()
+  })
+
+  // The delete gesture is the user's explicit "remove this now". It must not be
+  // silently defeated by a blob shape the reader happens not to understand.
+  it('lets an explicit purge reach a corrupt store it cannot enumerate', () => {
+    const raw = seededRaw()
+    window.localStorage.setItem(JOURNAL_STORAGE_KEY, raw.slice(0, Math.floor(raw.length / 2)))
+
+    purgeInFlightTurnJournals(['stored-a'])
+
+    expect(window.localStorage.getItem(JOURNAL_STORAGE_KEY)).toBeNull()
+  })
+
+  it('leaves a well-formed current-version store alone', () => {
+    seededRaw()
+
+    sweepExpiredInFlightTurnJournals()
+
+    expect(storedKeys()).toEqual(['stored-a'])
+    expect(readInFlightTurnJournal('stored-a')).not.toBeNull()
+  })
+})
+
 describe('purgeInFlightTurnJournals', () => {
   beforeEach(() => {
     window.localStorage.clear()
@@ -733,5 +834,56 @@ describe('stored-id rotation mid-turn', () => {
 
     expect(recovered.applied).toBe(true)
     expect(recovered.messages.map(message => message.role)).toEqual(['user', 'assistant'])
+  })
+
+  // A purge cancels the pending writes it can SEE: the ids it was handed, plus
+  // whatever `linkedKeys` finds ON DISK. A write that rotated to a brand-new tip
+  // and is still inside the 400ms throttle is in neither set — the new key has
+  // never been written, and the sidebar row still carries the old tip, so the
+  // delete names the pre-rotation ids. The purge emptied the store and then the
+  // throttle fired and put the turn straight back, AFTER an explicit delete.
+  // `persistLatest` already knows that pending write's runtime id, so the purge
+  // expands over it and not only over what happens to be on disk.
+  it('cannot be resurrected by a write that rotated to an unwritten tip', () => {
+    commit('tip-1')
+    expect(storedKeys()).toEqual(['tip-1'])
+
+    // Compression rotates to tip-2 and schedules the write; nothing on disk yet.
+    persistInFlightTurnState(journalState({ storedSessionId: 'tip-2' }), RUNTIME_ID)
+    expect(storedKeys()).toEqual(['tip-1'])
+
+    // The user deletes. The row still carries the OLD tip, so this is exactly
+    // what removeSession passes: removedIds + the closing runtime id.
+    purgeInFlightTurnJournals(['tip-1', RUNTIME_ID])
+
+    expect(storedKeys()).toEqual([])
+
+    vi.advanceTimersByTime(JOURNAL_PERSIST_THROTTLE_MS)
+
+    expect(storedKeys()).toEqual([])
+    expect(window.localStorage.getItem(JOURNAL_STORAGE_KEY)).toBeNull()
+  })
+
+  // Same window, reached from the settle path rather than a delete.
+  it('does not let a rotated pending write survive the turn settling', () => {
+    commit('tip-1')
+    persistInFlightTurnState(journalState({ storedSessionId: 'tip-2' }), RUNTIME_ID)
+
+    clearInFlightTurnJournal('tip-1')
+    vi.advanceTimersByTime(JOURNAL_PERSIST_THROTTLE_MS)
+
+    expect(storedKeys()).toEqual([])
+  })
+
+  // The guard must stay narrow: cancelling by runtime closure must not reach a
+  // DIFFERENT session's pending write.
+  it('leaves an unrelated session pending write intact', () => {
+    commit('tip-1')
+    persistInFlightTurnState(journalState({ storedSessionId: 'other-tip' }), 'runtime-other')
+
+    purgeInFlightTurnJournals(['tip-1', RUNTIME_ID])
+    vi.advanceTimersByTime(JOURNAL_PERSIST_THROTTLE_MS)
+
+    expect(storedKeys()).toEqual(['other-tip'])
   })
 })

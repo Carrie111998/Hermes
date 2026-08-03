@@ -4,6 +4,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { ChatMessage } from '@/lib/chat-messages'
 import {
+  JOURNAL_MAX_AGE_MS,
+  JOURNAL_PERSIST_THROTTLE_MS,
+  JOURNAL_STORAGE_KEY,
+  persistInFlightTurnState,
+  readInFlightTurnJournal
+} from '@/lib/inflight-turn-journal'
+import {
   $activeSessionStoredIdRotation,
   $currentFastMode,
   $currentModel,
@@ -491,5 +498,126 @@ describe('useSessionStateCache — cross-thread error isolation', () => {
     // check must reject it instead of allowing a submit into stored-B.
     cache.runtimeIdByStoredSessionIdRef.current.set('stored-A', 'runtime-B')
     expect(cache.getRuntimeIdForStoredSession('stored-A')).toBeNull()
+  })
+})
+
+// ── The journal's two wiring obligations this hook owns ───────────────────────
+// Both are call-site plumbing that the journal's own module tests cannot reach:
+// they can prove the sweep and the rotation link WORK, never that this hook
+// invokes them. Each was mutated away against the whole desktop suite and
+// nothing failed before these tests existed.
+describe('useSessionStateCache — in-flight turn journal wiring', () => {
+  beforeEach(() => {
+    window.localStorage.clear()
+  })
+
+  afterEach(() => {
+    cleanup()
+    setActiveSessionId(null)
+    window.localStorage.clear()
+    vi.useRealTimers()
+  })
+
+  function tail(): ChatMessage[] {
+    return [
+      userMessage('u1', 'PGPASSWORD=hunter2 psql -h prod'),
+      { id: 'assistant-stream-1', role: 'assistant', parts: [{ type: 'text', text: 'working' }], pending: true }
+    ]
+  }
+
+  /** Write a journal entry directly, then age it past the retention window in
+   *  one raw write — going through the public API would re-enter the sweep. */
+  function seedExpiredEntry(storedSessionId: string): void {
+    vi.useFakeTimers()
+    persistInFlightTurnState({
+      awaitingResponse: false,
+      busy: true,
+      messages: tail(),
+      storedSessionId,
+      streamId: 'assistant-stream-1',
+      turnStartedAt: 1
+    })
+    vi.advanceTimersByTime(JOURNAL_PERSIST_THROTTLE_MS)
+    vi.useRealTimers()
+
+    const raw = JSON.parse(window.localStorage.getItem(JOURNAL_STORAGE_KEY)!)
+    raw.entries[storedSessionId].updatedAt = Date.now() - (JOURNAL_MAX_AGE_MS + 60 * 60 * 1000)
+    window.localStorage.setItem(JOURNAL_STORAGE_KEY, JSON.stringify(raw))
+  }
+
+  // The journal's load-time sweep only runs when something else calls into the
+  // module. A user who launches into a fresh draft and never opens a session
+  // would never sweep, which would make the retention bound — the whole
+  // confidentiality argument for storing an unredacted prompt at rest —
+  // contingent on unrelated activity. Mounting this hook is what makes it
+  // unconditional, so mounting alone has to be enough.
+  it('sweeps an expired journal entry on mount without any session being opened', () => {
+    seedExpiredEntry('stored-stale')
+
+    expect(window.localStorage.getItem(JOURNAL_STORAGE_KEY)).not.toBeNull()
+
+    render(<Harness activeSessionId={null} onReady={() => undefined} selectedStoredSessionId={null} />)
+
+    expect(window.localStorage.getItem(JOURNAL_STORAGE_KEY)).toBeNull()
+  })
+
+  it('leaves a live journal entry alone on mount', () => {
+    vi.useFakeTimers()
+    persistInFlightTurnState({
+      awaitingResponse: false,
+      busy: true,
+      messages: tail(),
+      storedSessionId: 'stored-live',
+      streamId: 'assistant-stream-1',
+      turnStartedAt: 1
+    })
+    vi.advanceTimersByTime(JOURNAL_PERSIST_THROTTLE_MS)
+    vi.useRealTimers()
+
+    render(<Harness activeSessionId={null} onReady={() => undefined} selectedStoredSessionId={null} />)
+
+    expect(readInFlightTurnJournal('stored-live')).not.toBeNull()
+  })
+
+  // The RUNTIME id is what makes a rotated key reachable: the stored id rotates
+  // mid-turn (compression forks a continuation), so without the runtime id
+  // recorded on the entry, the superseded key is in neither `$sessions` nor a
+  // delete's `removedIds` and NO call site can name it. If this hook stops
+  // supplying it, every rotation test in the journal module still passes —
+  // they pass the id explicitly — while the real app silently orphans tails.
+  it('passes the runtime id to the journal, so a rotated key stays reachable', () => {
+    vi.useFakeTimers()
+    let cache!: Cache
+
+    setActiveSessionId('runtime-J')
+    render(
+      <Harness activeSessionId="runtime-J" onReady={value => (cache = value)} selectedStoredSessionId="stored-J1" />
+    )
+
+    act(() => {
+      cache.updateSessionState(
+        'runtime-J',
+        state => ({ ...state, busy: true, messages: tail(), streamId: 'assistant-stream-1' }),
+        'stored-J1'
+      )
+      vi.advanceTimersByTime(JOURNAL_PERSIST_THROTTLE_MS)
+    })
+
+    expect(readInFlightTurnJournal('stored-J1')?.runtimeSessionId).toBe('runtime-J')
+
+    // Compression rotates the stored tip; the same live turn keeps streaming.
+    act(() => {
+      cache.updateSessionState(
+        'runtime-J',
+        state => ({ ...state, busy: true, messages: tail(), streamId: 'assistant-stream-1' }),
+        'stored-J2'
+      )
+      vi.advanceTimersByTime(JOURNAL_PERSIST_THROTTLE_MS)
+    })
+
+    // The rotation link is what lets the write path drop the key it superseded,
+    // so the pre-rotation tail is not stranded holding the same prompt.
+    expect(readInFlightTurnJournal('stored-J1')).toBeNull()
+    expect(readInFlightTurnJournal('stored-J2')?.runtimeSessionId).toBe('runtime-J')
   })
 })

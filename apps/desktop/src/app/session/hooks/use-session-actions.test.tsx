@@ -4,8 +4,14 @@ import { useEffect } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { noteActiveTreeGroup, revealTreePane } from '@/components/pane-shell/tree/store'
-import { getSession, getSessionMessages, type SessionInfo } from '@/hermes'
+import { deleteSession, getSession, getSessionMessages, type SessionInfo } from '@/hermes'
 import { createClientSessionState } from '@/lib/chat-runtime'
+import {
+  JOURNAL_PERSIST_THROTTLE_MS,
+  JOURNAL_STORAGE_KEY,
+  persistInFlightTurnState,
+  readInFlightTurnJournal
+} from '@/lib/inflight-turn-journal'
 import { clearSessionDraft, stashSessionDraft, takeSessionDraft } from '@/store/composer'
 import { $activeGatewayProfile, $newChatProfile, ensureGatewayProfile } from '@/store/profile'
 import { $projectScope, $projectTree, ALL_PROJECTS } from '@/store/projects'
@@ -1682,5 +1688,153 @@ describe('selectSidebarItem', () => {
     expect(navigate).toHaveBeenCalledWith('/skills', undefined)
     expect(noteActiveTreeGroup).toHaveBeenCalledWith(null)
     expect(revealTreePane).toHaveBeenCalledWith('workspace')
+  })
+})
+
+// ── Deleting a session must reach its LOCAL copies ────────────────────────────
+// The in-flight turn journal keeps the running turn's tail — the user's prompt
+// plus assistant rows including tool-call args — unredacted in localStorage,
+// bounded only by retention (`lib/inflight-turn-journal.ts`). The journal module
+// tests prove `purgeInFlightTurnJournals` works; they cannot prove a DELETE
+// invokes it. Without an assertion here the call can be dropped from this hook
+// and the whole module suite still passes, which is how the original defect
+// (delete cleared the sibling composer queue but not the journal) shipped.
+describe('removeSession purges local session state', () => {
+  afterEach(() => {
+    cleanup()
+    setActiveSessionId(null)
+    setSelectedStoredSessionId(null)
+    setMessages([])
+    setSessions([])
+    window.localStorage.clear()
+    vi.restoreAllMocks()
+  })
+
+  function DeleteHarness({
+    onReady,
+    requestGateway
+  }: {
+    onReady: (remove: (storedSessionId: string) => Promise<void>) => void
+    requestGateway: <T>(method: string, params?: Record<string, unknown>) => Promise<T>
+  }) {
+    const ref = <T,>(value: T): MutableRefObject<T> => ({ current: value })
+
+    const actions = useSessionActions({
+      activeSessionId: RUNTIME_ID,
+      activeSessionIdRef: ref<string | null>(RUNTIME_ID),
+      busyRef: ref(false),
+      creatingSessionRef: ref(false),
+      ensureSessionState: () => ({}) as ClientSessionState,
+      getRouteToken: () => 'token',
+      getRoutedStoredSessionId: () => null,
+      navigate: vi.fn() as never,
+      requestGateway,
+      resetViewSync: vi.fn(),
+      runtimeIdByStoredSessionIdRef: ref(new Map<string, string>()),
+      selectedStoredSessionId: 'stored-del',
+      selectedStoredSessionIdRef: ref<string | null>('stored-del'),
+      sessionStateByRuntimeIdRef: ref(new Map<string, ClientSessionState>()),
+      syncSessionStateToView: vi.fn(),
+      updateSessionState: () => ({}) as ClientSessionState
+    })
+
+    useEffect(() => {
+      onReady(actions.removeSession)
+    }, [actions, onReady])
+
+    return null
+  }
+
+  const RUNTIME_ID = 'runtime-del'
+
+  /** Journal a live turn the way `useSessionStateCache` does, then let the
+   *  throttle land so the tail is genuinely on disk before the delete. */
+  function journalLiveTurn(storedSessionId: string, runtimeSessionId: null | string): void {
+    vi.useFakeTimers()
+    persistInFlightTurnState(
+      {
+        awaitingResponse: false,
+        busy: true,
+        messages: [
+          { id: 'u1', role: 'user', parts: [{ type: 'text', text: 'PGPASSWORD=hunter2 psql -h prod' }] },
+          { id: 'assistant-stream-1', role: 'assistant', parts: [{ type: 'text', text: 'working' }], pending: true }
+        ],
+        storedSessionId,
+        streamId: 'assistant-stream-1',
+        turnStartedAt: 1
+      },
+      runtimeSessionId
+    )
+    vi.advanceTimersByTime(JOURNAL_PERSIST_THROTTLE_MS)
+    vi.useRealTimers()
+  }
+
+  async function deleteVia(storedSessionId: string): Promise<void> {
+    const requestGateway = vi.fn(async () => ({}) as never)
+    let remove: ((storedSessionId: string) => Promise<void>) | null = null
+
+    render(<DeleteHarness onReady={r => (remove = r)} requestGateway={requestGateway} />)
+    await waitFor(() => expect(remove).not.toBeNull())
+    await act(async () => {
+      await remove!(storedSessionId)
+    })
+  }
+
+  it('clears the journaled in-flight tail for the deleted session', async () => {
+    setSessions([storedSession({ id: 'stored-del' })])
+    setSelectedStoredSessionId('stored-del')
+    setActiveSessionId(RUNTIME_ID)
+    journalLiveTurn('stored-del', RUNTIME_ID)
+
+    expect(readInFlightTurnJournal('stored-del')).not.toBeNull()
+
+    await deleteVia('stored-del')
+
+    expect(vi.mocked(deleteSession)).toHaveBeenCalledWith('stored-del', undefined)
+    expect(readInFlightTurnJournal('stored-del')).toBeNull()
+    expect(window.localStorage.getItem(JOURNAL_STORAGE_KEY)).toBeNull()
+  })
+
+  // A compression rotation leaves the turn journaled under an INTERMEDIATE tip
+  // that is in neither `$sessions` nor `removedIds`. It is reachable only via
+  // the closing runtime id recorded on the entry — so the delete has to pass it.
+  it('reaches a tail stranded under a rotated stored id via the closing runtime id', async () => {
+    setSessions([storedSession({ id: 'stored-del' })])
+    setSelectedStoredSessionId('stored-del')
+    setActiveSessionId(RUNTIME_ID)
+    journalLiveTurn('rotated-tip', RUNTIME_ID)
+
+    expect(readInFlightTurnJournal('rotated-tip')).not.toBeNull()
+
+    await deleteVia('stored-del')
+
+    expect(readInFlightTurnJournal('rotated-tip')).toBeNull()
+  })
+
+  it('leaves another session journal untouched', async () => {
+    setSessions([storedSession({ id: 'stored-del' }), storedSession({ id: 'stored-other' })])
+    setSelectedStoredSessionId('stored-del')
+    setActiveSessionId(RUNTIME_ID)
+    journalLiveTurn('stored-other', 'runtime-other')
+    journalLiveTurn('stored-del', RUNTIME_ID)
+
+    await deleteVia('stored-del')
+
+    expect(readInFlightTurnJournal('stored-del')).toBeNull()
+    expect(readInFlightTurnJournal('stored-other')).not.toBeNull()
+  })
+
+  // Rollback path: a failed delete restores the row, so the journal it would
+  // recover from must NOT have been dropped on the way.
+  it('keeps the journal when the delete RPC fails', async () => {
+    setSessions([storedSession({ id: 'stored-del' })])
+    setSelectedStoredSessionId('stored-del')
+    setActiveSessionId(RUNTIME_ID)
+    journalLiveTurn('stored-del', RUNTIME_ID)
+    vi.mocked(deleteSession).mockRejectedValueOnce(new Error('backend down'))
+
+    await deleteVia('stored-del')
+
+    expect(readInFlightTurnJournal('stored-del')).not.toBeNull()
   })
 })

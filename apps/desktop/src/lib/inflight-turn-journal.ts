@@ -33,13 +33,26 @@ import { type ChatMessage, type ChatMessagePart, chatMessageText } from '@/lib/c
  * by RETENTION, not by rewriting content. Four mechanisms carry that bargain,
  * and every one of them is load-bearing:
  *
- * 1. Expiry sweeps EVERY entry on any load, and fails closed — an entry that
- *    cannot be positively dated inside the window is dropped (`isExpired`).
+ * 1. Expiry sweeps EVERY entry on any load, and fails closed at BOTH levels —
+ *    an entry that cannot be positively dated inside the window is dropped
+ *    (`isExpired`), and a store whose envelope cannot be read as a journal at
+ *    all is discarded rather than left on disk unreadable (`discardStore`).
  * 2. The entry is cleared the moment the turn settles or recovery reports
  *    `caughtUp`.
  * 3. Deleting a session purges it (`purgeInFlightTurnJournals`).
- * 4. A stored-id rotation mid-turn self-cleans the key it supersedes, so a
- *    rotation cannot strand a tail under a key nobody can name.
+ * 4. A stored-id rotation mid-turn self-cleans the key it supersedes, and a
+ *    purge expands over pending writes by runtime id as well as over what is on
+ *    disk, so a rotation cannot leave a tail behind a settle or a delete. One
+ *    narrow residual case remains and is documented at
+ *    `InFlightTurnSnapshot.runtimeSessionId`: a crash inside the throttle
+ *    window right after a SECOND-or-later rotation. That one is reachable by
+ *    its own key or by expiry, which is why retention is the floor.
+ *
+ * Every one of the four is also asserted at its CALL SITE, not only in this
+ * module: the boot sweep and the runtime-id plumbing in
+ * `use-session-state-cache.test.tsx`, and both delete surfaces in
+ * `use-session-actions.test.tsx` / `sessions-settings.test.tsx`. A module test
+ * can prove a mechanism works; only a call-site test proves it is wired.
  *
  * Do not add masking here. Do weigh a change that weakens any of the four as a
  * security change.
@@ -104,7 +117,13 @@ export interface InFlightTurnSnapshot {
    *  orphan is reachable only by its own key (a delete names the first rotation's
    *  old tip, since that IS the lineage root) or by expiry. It is bounded by
    *  `JOURNAL_MAX_AGE_MS`, which is why retention is the floor and this link is
-   *  the optimization on top of it — not the other way round. */
+   *  the optimization on top of it — not the other way round.
+   *
+   *  A pending write inside the throttle window is a separate matter and IS
+   *  covered: `purgeLinkedEntries` expands over `persistLatest` by runtime id,
+   *  so a write that rotated to a key which is not yet on disk cannot land after
+   *  a settle or a user delete. The gap above is specifically about a process
+   *  that DIED, leaving no in-memory link for anyone to expand over. */
   runtimeSessionId?: null | string
   streamId: null | string
   turnStartedAt: null | number
@@ -145,6 +164,42 @@ function storage(): Storage | null {
 
 function emptyStore(): JournalStore {
   return { entries: {}, version: STORE_VERSION }
+}
+
+/** Drop the whole blob and answer with an empty store.
+ *
+ *  Reached when the persisted journal cannot be read as a journal at all: it
+ *  does not parse, its envelope is the wrong shape, or it carries a version this
+ *  build does not know. Returning `emptyStore()` without removing it used to
+ *  leave that blob on disk permanently — the sweep below then pruned 0 of 0
+ *  entries, so nothing flushed, and even an explicit `purgeInFlightTurnJournals`
+ *  naming the exact ids loaded through here and saw an empty store. The
+ *  unredacted prompt and tool args outlived both expiry and the user's delete
+ *  gesture, which is the same fail-open shape that was fixed one level down for
+ *  individual entries.
+ *
+ *  Discarding costs nothing that was recoverable: a blob we cannot enumerate is
+ *  by definition unreplayable — the identical argument the entry-level
+ *  structural-validity guard already makes in `isExpired`.
+ *
+ *  A FUTURE-version store is discarded too, deliberately. It looks like the one
+ *  case with something to lose (downgrade the app, then upgrade again), but the
+ *  loss is not real: `saveStore` rewrites this single key wholesale, so the
+ *  first journalled turn after the downgrade overwrites the newer blob anyway —
+ *  keeping it only buys a window where unreadable plaintext sits at rest. What
+ *  it would cost is the retention bound, which is this file's entire
+ *  confidentiality argument. A schema change that genuinely must preserve old
+ *  data has a cheaper tool: `JOURNAL_STORAGE_KEY` is itself version-suffixed, so
+ *  bump the key and migrate deliberately instead of relying on a reader that
+ *  cannot parse the data to babysit it. */
+function discardStore(store: Storage): JournalStore {
+  try {
+    store.removeItem(JOURNAL_STORAGE_KEY)
+  } catch {
+    // Best-effort, same contract as `saveStore`.
+  }
+
+  return emptyStore()
 }
 
 /** Drop every entry past `JOURNAL_MAX_AGE_MS`, not just the one being read.
@@ -191,18 +246,27 @@ function loadStore(): JournalStore {
       return emptyStore()
     }
 
-    const parsed = JSON.parse(raw)
+    let parsed: unknown
 
-    if (
-      !parsed ||
-      parsed.version !== STORE_VERSION ||
-      typeof parsed.entries !== 'object' ||
-      Array.isArray(parsed.entries)
-    ) {
-      return emptyStore()
+    try {
+      parsed = JSON.parse(raw)
+    } catch {
+      return discardStore(store)
     }
 
-    const { entries, expired } = pruneExpiredEntries(parsed.entries as Record<string, InFlightTurnSnapshot>)
+    const envelope = parsed as null | Partial<JournalStore>
+
+    if (
+      !envelope ||
+      envelope.version !== STORE_VERSION ||
+      !envelope.entries ||
+      typeof envelope.entries !== 'object' ||
+      Array.isArray(envelope.entries)
+    ) {
+      return discardStore(store)
+    }
+
+    const { entries, expired } = pruneExpiredEntries(envelope.entries as Record<string, InFlightTurnSnapshot>)
     const journal: JournalStore = { entries, version: STORE_VERSION }
 
     // Flush the sweep so the expired tail leaves disk on this load, even if the
@@ -247,7 +311,7 @@ function saveStore(journal: JournalStore): void {
 /** Fail CLOSED: anything we cannot positively date within the window is
  *  expired.
  *
- *  `now - entry.updatedAt > MAX_AGE_MS` alone fails OPEN in three ways, because
+ *  `now - entry.updatedAt > MAX_AGE_MS` alone fails OPEN in two ways, because
  *  every comparison against `NaN` — and every negative delta — is `false`:
  *
  *  - `updatedAt` missing or non-numeric (a hand-edited or truncated store, a
@@ -255,10 +319,11 @@ function saveStore(journal: JournalStore): void {
  *  - `updatedAt` in the future (the wall clock stepped backward) → negative
  *    delta → retained until the clock catches up, which may be never.
  *
- *  `loadStore` validates the store envelope but not individual entries, so one
+ *  `loadStore` validated the store envelope but not individual entries, so one
  *  such entry pinned its unredacted tail to disk permanently and the retention
  *  sweep walked straight past it. Retention is the entire confidentiality
  *  argument for this file, so an entry that cannot be aged must not be kept.
+ *  The envelope had the mirror-image hole one level up — see `discardStore`.
  *
  *  Structurally unusable entries are folded into the same predicate: an entry
  *  whose `messages` is not an array cannot be replayed (and would throw in the
@@ -535,6 +600,37 @@ export function mergeInFlightMessages(
 const persistTimers = new Map<string, ReturnType<typeof setTimeout>>()
 const persistLatest = new Map<string, { runtimeSessionId: null | string; state: JournalableSessionState }>()
 
+/** Every runtime id that identifies the same live turn as `seedIds`.
+ *
+ *  A caller-held id may itself BE a runtime id (a delete passes the closing
+ *  runtime id), which is how a rotation orphan gets reached when the
+ *  intermediate tip is in neither $sessions nor the delete's removedIds. On top
+ *  of that, any on-disk entry the caller DID name contributes the runtime id it
+ *  recorded. */
+function runtimeClosure(
+  entries: Record<string, InFlightTurnSnapshot>,
+  seedIds: readonly string[],
+  extraRuntimeIds: readonly (null | string | undefined)[] = []
+): Set<string> {
+  const runtimes = new Set<string>()
+
+  for (const id of [...seedIds, ...extraRuntimeIds]) {
+    if (id) {
+      runtimes.add(id)
+    }
+  }
+
+  for (const id of seedIds) {
+    const runtimeSessionId = entries[id]?.runtimeSessionId
+
+    if (runtimeSessionId) {
+      runtimes.add(runtimeSessionId)
+    }
+  }
+
+  return runtimes
+}
+
 /** Every key that belongs to the same live turn as `seedIds`.
  *
  *  The store keys on the rotating stored id, so one turn can own several keys
@@ -548,24 +644,7 @@ function linkedKeys(
   extraRuntimeIds: readonly (null | string | undefined)[] = []
 ): string[] {
   const named = new Set(seedIds)
-  const runtimes = new Set<string>()
-
-  for (const id of [...seedIds, ...extraRuntimeIds]) {
-    // A caller-held id may itself BE a runtime id (a delete passes the closing
-    // runtime id), which is how a rotation orphan gets reached when the
-    // intermediate tip is in neither $sessions nor the delete's removedIds.
-    if (id) {
-      runtimes.add(id)
-    }
-  }
-
-  for (const id of named) {
-    const runtimeSessionId = entries[id]?.runtimeSessionId
-
-    if (runtimeSessionId) {
-      runtimes.add(runtimeSessionId)
-    }
-  }
+  const runtimes = runtimeClosure(entries, seedIds, extraRuntimeIds)
 
   return Object.keys(entries).filter(key => {
     const runtimeSessionId = entries[key]?.runtimeSessionId
@@ -600,6 +679,28 @@ function purgeLinkedEntries(
   }
 
   const journal = loadStore()
+
+  // Cancel pending writes by RUNTIME id, not only by key. A throttled write
+  // that rotated to a brand-new tip is invisible to everything below: its key
+  // has never been written, so `linkedKeys` cannot see it, and the caller cannot
+  // name it either — a delete reads the sidebar row, which still carries the
+  // pre-rotation tip. Purging then emptied the store and the throttle fired
+  // afterwards, putting the turn back on disk AFTER an explicit user delete.
+  // `persistLatest` is the one place that already knows which runtime that
+  // pending write belongs to, so expand over it.
+  //
+  // Narrow by construction: one runtime id owns at most one live turn, so this
+  // can only ever cancel a write for the turn being purged.
+  const runtimes = runtimeClosure(journal.entries, ids, extraRuntimeIds)
+
+  for (const [key, pending] of [...persistLatest]) {
+    const runtimeSessionId = pending.runtimeSessionId
+
+    if (runtimeSessionId && runtimes.has(runtimeSessionId)) {
+      dropPendingWrite(key)
+    }
+  }
+
   const doomed = linkedKeys(journal.entries, ids, extraRuntimeIds)
 
   if (doomed.length === 0) {
@@ -770,11 +871,18 @@ export function clearInFlightTurnJournal(storedSessionId: null | string): void {
  *  Coverage, stated precisely, because retention is the confidentiality
  *  argument for this file and an overclaiming docstring is worse than none:
  *  this drains every id passed in, PLUS every entry linked to one of them by
- *  `runtimeSessionId`. The link is what covers compression rotation — a turn
+ *  `runtimeSessionId`, PLUS any throttled write still pending for one of those
+ *  runtime ids. The link is what covers compression rotation — a turn
  *  whose stored id rotated has a key that is in neither `$sessions` nor a
  *  delete's `removedIds`, so no caller can name it directly. An entry written
  *  with no runtime id (pre-existing store, non-runtime caller) is only reachable
  *  by its own key; pass every id you hold.
+ *
+ *  What it does NOT cover: a pending write with no runtime id recorded and a key
+ *  the caller did not name. Nothing links such a write to the turn, so it lands
+ *  and then ages out under `JOURNAL_MAX_AGE_MS`. The real write path always
+ *  supplies the runtime id (`use-session-state-cache.ts`), so this is a
+ *  test-and-legacy shape rather than a live one.
  *
  *  Callers pass a list because a session has more than one identity: the stored
  *  tip rotates on compression, the lineage root differs from it, and the runtime
