@@ -11,6 +11,7 @@
 import { useStore } from '@nanostores/react'
 import { useQuery } from '@tanstack/react-query'
 import { atom } from 'nanostores'
+import { useEffect, useRef } from 'react'
 import type { CSSProperties } from 'react'
 
 import { ChatPreviewRail } from '@/app/chat/right-rail/preview'
@@ -36,12 +37,43 @@ import { $currentCwd } from '@/store/session'
 // the controller) — never in a default layout, never a standing tab.
 // ---------------------------------------------------------------------------
 
+const LOGS_BOTTOM_THRESHOLD = 48
+
 export function LogsPane() {
   const { data, error } = useQuery({
     queryKey: ['contrib-logs-tail'],
     queryFn: () => getLogs({ lines: 300 }),
     refetchInterval: 5000
   })
+
+  const preRef = useRef<HTMLPreElement>(null)
+  const shouldStickRef = useRef(true)
+
+  // Stick-to-bottom: auto-scroll when the user is already near the bottom.
+  useEffect(() => {
+    const el = preRef.current
+
+    if (!el || !shouldStickRef.current) {
+      return
+    }
+
+    const raf = requestAnimationFrame(() => {
+      el.scrollTo({ top: el.scrollHeight })
+    })
+
+    return () => cancelAnimationFrame(raf)
+  }, [data])
+
+  function handleScroll() {
+    const el = preRef.current
+
+    if (!el) {
+      return
+    }
+
+    shouldStickRef.current =
+      el.scrollHeight - el.scrollTop - el.clientHeight <= LOGS_BOTTOM_THRESHOLD
+  }
 
   if (error) {
     return <div className="p-3 text-xs text-(--ui-text-quaternary)">log unavailable: {String(error)}</div>
@@ -58,7 +90,12 @@ export function LogsPane() {
   // No chrome of its own — the zone header (when the user summons it) is the
   // pane's only label. Just the tail.
   return (
-    <pre className="h-full min-h-0 overflow-auto whitespace-pre-wrap break-words p-2.5 font-mono text-[0.66rem] leading-relaxed text-(--ui-text-secondary)">
+    <pre
+      className="h-full min-h-0 overflow-auto whitespace-pre-wrap break-words p-2.5 font-mono text-[0.66rem] leading-relaxed text-(--ui-text-secondary)"
+      data-selectable-text="true"
+      onScroll={handleScroll}
+      ref={preRef}
+    >
       {data.lines.join('\n')}
     </pre>
   )
