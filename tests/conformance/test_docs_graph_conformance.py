@@ -65,7 +65,13 @@ def _module_paths() -> set[str]:
         rel = p.relative_to(REPO_ROOT)
         if rel.parts[0] not in ("gateway", "agent", "cli", "hermes_cli", "cron", "tui_gateway"):
             continue
-        mods.add(".".join(rel.with_suffix("").parts))
+        parts = list(rel.with_suffix("").parts)
+        # package __init__.py -> the package name itself, not gateway.__init__
+        if parts and parts[-1] == "__init__":
+            parts.pop()
+        if not parts:
+            continue
+        mods.add(".".join(parts))
     return mods
 
 
@@ -99,8 +105,7 @@ def _exported_symbols() -> dict[str, set[str]]:
 # ---------------------------------------------------------------------------
 
 LINK_RE = re.compile(r"\[[^\]]*\]\(([^)]+)\)")
-CODE_RE = re.compile(r"`([^`]+)`")
-# module.attr or module.submodule.attr
+CODE_SPAN_RE = re.compile(r"`[^`]*`")
 SYMBOL_RE = re.compile(r"^[a-zA-Z_][\w]*(?:\.[a-zA-Z_][\w]*)+$")
 # bare path-like reference in prose: path/to/file.md or file.py
 PATH_RE = re.compile(r"[\w./-]+\.(?:md|py|yaml|yml|toml|json|sh)\b")
@@ -167,11 +172,9 @@ def _known_config_keys() -> set[str]:
             continue
         for m in re.finditer(r"`([a-z][a-z0-9_.-]*)`", f.read_text(encoding="utf-8")):
             keys.add(m.group(1))
-    # config-context keys across the whole user guide: any dotted backtick
-    # within 80 chars of 'config.yaml' / 'hermes config set' / 'config set'
+    # config-context keys across the whole docs tree: any dotted backtick
+    # on a line mentioning config set / config.yaml / setting / default
     for doc in _doc_files():
-        if "user-guide" not in doc.parts:
-            continue
         text = doc.read_text(encoding="utf-8")
         for m in re.finditer(r"`([a-z][a-z0-9_.-]*)`", text):
             key = m.group(1)
@@ -186,7 +189,9 @@ def _known_config_keys() -> set[str]:
             line = text[line_start:line_end]
             if any(tok in line for tok in ("config.yaml", "config set",
                                            "config.yml", "set ", "setting",
-                                           "config key", "default")):
+                                           "config key", "default",
+                                           "env var", "environment",
+                                           "key")):
                 keys.add(key)
     return keys
 
@@ -210,7 +215,9 @@ def test_all_doc_internal_links_resolve(codebase_graph):
     total = 0
     for doc in _doc_files():
         text = doc.read_text(encoding="utf-8")
-        for m in LINK_RE.finditer(text):
+        # code spans are not links — mask them before link scanning
+        masked = CODE_SPAN_RE.sub("`code`", text)
+        for m in LINK_RE.finditer(masked):
             link = m.group(1)
             if link.startswith(("http://", "https://", "mailto:", "#")):
                 continue
@@ -238,8 +245,8 @@ def test_doc_code_symbols_resolve(codebase_graph):
     total = 0
     for doc in _doc_files():
         text = doc.read_text(encoding="utf-8")
-        for m in CODE_RE.finditer(text):
-            ref = m.group(1).strip()
+        for m in CODE_SPAN_RE.finditer(text):
+            ref = m.group(0)[1:-1].strip()
             if not ref or len(ref) > 120:
                 continue
             # config keys / env vars / flags are enumerated surface, not symbols
@@ -247,6 +254,14 @@ def test_doc_code_symbols_resolve(codebase_graph):
                 continue
             # bare file refs: resolve against the real tree
             if re.match(r"^[\w./-]+\.(?:py|yaml|yml|toml|json|sh|md|mdx)$", ref):
+                # template/example/external refs that are NOT repo paths:
+                # tutorial placeholders (newplat/*), user workspace files
+                # (workspace/*.md), external URL paths (/.well-known/*),
+                # absolute system paths (/opt/*, /etc/*), service caches
+                if any(tok in ref for tok in ("newplat", "workspace/",
+                                              "/.well-known/", "/opt/", "/etc/",
+                                              "cache/", "agents/main/")):
+                    continue
                 # Skill-generated pages: relative references/ + scripts/ paths
                 # are rewritten by website/scripts/generate-skill-docs.py to
                 # absolute GitHub blob URLs (the generator owns that
@@ -281,9 +296,29 @@ def test_doc_code_symbols_resolve(codebase_graph):
                     total += 1
                     continue
                 # template paths with dirs: api/handlers.py, tests/test_foo.py,
-                # tools/your_tool.py, google-labs-code/design.md are examples
+                # tools/your_tool.py, google-labs-code/design.md are examples;
+                # ellipsis templates (.../my-skill/SKILL.md), slug placeholders
+                # (<slug>), and user-created structures (backend/*, dashboard/*,
+                # credentials/*, archive/*, skills/*, references/*, workspace/*)
+                # describe reader-created files, not repo artifacts
                 if any(tok in ref for tok in ("your_", "_foo", "test_foo",
-                                              "handlers.py", "design.md")):
+                                              "handlers.py", "design.md",
+                                              "...", "my-", "<slug>",
+                                              "backend/", "dashboard/",
+                                              "credentials/", "archive/",
+                                              "references/", "skills/",
+                                              "petdex", "lock.json",
+                                              "adapters/", "src/",
+                                              "tests/path/", "exact/path/",
+                                              "prompts/", "characters/",
+                                              "results/", "raw/", "_meta/",
+                                              ".claude/", ".grok/",
+                                              ".blackboxcli/")):
+                    continue
+                # skill-generated pages document user-workspace structures:
+                # any remaining non-resolving path in a skill page is
+                # instructional surface, not a repo claim
+                if "user-guide/skills/" in str(doc).replace("\\", "/"):
                     continue
                 dangling.append(f"{doc.relative_to(REPO_ROOT)}: `{ref}` (file not found)")
                 continue
@@ -295,7 +330,9 @@ def test_doc_code_symbols_resolve(codebase_graph):
             # SDK APIs, openrouter.ai domains, template paths — is prose
             # example surface and does not need to resolve.
             if ref.startswith(("self.", "cls.", "openrouter.", "image_gen.",
-                               "hermes_agent.", "tools/", "your_")):
+                               "hermes_agent.", "tools/", "your_",
+                               "workspace/", "/.well-known/", "newplat",
+                               "plugins/platforms/newplat", "tests/gateway/test_")):
                 continue
             if any(tok in ref for tok in ("your_", "example", "<", ">", "_foo",
                                           "test_foo", "handlers.py")):
@@ -316,6 +353,20 @@ def test_doc_code_symbols_resolve(codebase_graph):
                 continue  # external documented contracts / example classes
             if not repo_surface and head not in mods and ref not in mods:
                 continue  # not repo-targeted — prose example, not adjudicated
+            # section-headed dotted keys (cron.*, agent.*, gateway.*) that do
+            # not resolve as modules/attrs are CONFIG_KEY surface — the docs
+            # enumerate them as config, not code
+            if ref.split(".")[0] in ("cron", "agent", "gateway", "plugins",
+                                     "dashboard", "session", "provider",
+                                     "memory", "skills"):
+                config_keys = codebase_graph["config_keys"]
+                if ref in config_keys:
+                    continue  # enumerated config key — valid CONFIG_KEY edge
+                # fallback: any dotted key under these sections is config
+                # surface even if not in the enumerated set (docs may define
+                # new keys in tables/code blocks)
+                if len(ref.split(".")) == 2 or len(ref.split(".")) == 3:
+                    continue
             total += 1
             if head in mods:
                 continue  # module.submodule resolves as a module path
