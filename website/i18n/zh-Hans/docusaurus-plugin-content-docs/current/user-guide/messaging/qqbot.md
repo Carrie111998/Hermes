@@ -119,5 +119,5 @@ platforms:
 ### 连接错误
 
 - 确保已安装 `aiohttp` 和 `httpx`：`pip install aiohttp httpx`
-- 检查与 `api.sgroup.qq.com` 及 WebSocket gateway 的网络连通性
+- 检查与 `api.bot.qq.com` 及 WebSocket gateway 的网络连通性
 - 查看 gateway 日志以获取详细错误信息和重连行为

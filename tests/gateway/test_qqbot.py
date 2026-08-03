@@ -211,7 +211,7 @@ class TestQQWebSocketProxy:
                 return mock.AsyncMock(closed=False)
 
         with mock.patch("gateway.platforms.qqbot.adapter.aiohttp.ClientSession", side_effect=FakeSession):
-            await adapter._open_ws("wss://api.sgroup.qq.com/websocket")
+            await adapter._open_ws("wss://api.bot.qq.com/websocket")
 
         assert seen_session_kwargs.get("trust_env") is True
         assert seen_ws_kwargs.get("proxy") == "http://127.0.0.1:7897"

@@ -2003,6 +2003,7 @@ async def _send_qqbot(pconfig, chat_id, message):
     """
     try:
         import httpx
+        from gateway.platforms.qqbot.constants import API_BASE
     except ImportError:
         return _error("QQBot direct send requires httpx. Run: pip install httpx")
 
@@ -2042,7 +2043,7 @@ async def _send_qqbot(pconfig, chat_id, message):
             payload = {"content": message[:4000], "msg_type": 0}
 
             # Try channel endpoint first (works for guild channels)
-            url = f"https://api.sgroup.qq.com/channels/{chat_id}/messages"
+            url = f"{API_BASE}/channels/{chat_id}/messages"
             resp = await client.post(url, json=payload, headers=headers)
             if resp.status_code in {200, 201}:
                 data = resp.json()
@@ -2050,7 +2051,7 @@ async def _send_qqbot(pconfig, chat_id, message):
                         "message_id": data.get("id")}
 
             # If channel endpoint failed (likely "频道不存在"), try C2C endpoint
-            url_c2c = f"https://api.sgroup.qq.com/v2/users/{chat_id}/messages"
+            url_c2c = f"{API_BASE}/v2/users/{chat_id}/messages"
             resp_c2c = await client.post(url_c2c, json=payload, headers=headers)
             if resp_c2c.status_code in {200, 201}:
                 data = resp_c2c.json()
@@ -2058,7 +2059,7 @@ async def _send_qqbot(pconfig, chat_id, message):
                         "message_id": data.get("id")}
 
             # If C2C also failed, try group endpoint
-            url_group = f"https://api.sgroup.qq.com/v2/groups/{chat_id}/messages"
+            url_group = f"{API_BASE}/v2/groups/{chat_id}/messages"
             resp_group = await client.post(url_group, json=payload, headers=headers)
             if resp_group.status_code in {200, 201}:
                 data = resp_group.json()

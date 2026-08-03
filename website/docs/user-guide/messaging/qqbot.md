@@ -119,5 +119,5 @@ This usually means:
 ### Connection errors
 
 - Ensure `aiohttp` and `httpx` are installed: `pip install aiohttp httpx`
-- Check network connectivity to `api.sgroup.qq.com` and the WebSocket gateway
+- Check network connectivity to `api.bot.qq.com` and the WebSocket gateway
 - Review gateway logs for detailed error messages and reconnect behavior
