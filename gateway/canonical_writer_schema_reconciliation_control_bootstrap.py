@@ -78,10 +78,10 @@ FAILURE_SCHEMA = (
     "muncho-canonical-writer-schema-reconciliation-control-failure.v1"
 )
 FOUNDATION_OBSERVATION_SCHEMA = (
-    "muncho-canonical-writer-schema-reconciliation-control-foundation-observation.v3"
+    "muncho-canonical-writer-schema-reconciliation-control-foundation-observation.v4"
 )
 CLOUD_AUTHORITY_SCHEMA = (
-    "muncho-cloud-sql-schema-reconciliation-control-admin-authority.v1"
+    "muncho-cloud-sql-schema-reconciliation-control-admin-authority.v2"
 )
 CLOUD_ABSENCE_SCHEMA = (
     "muncho-cloud-sql-schema-reconciliation-control-admin-absence.v1"
@@ -96,8 +96,12 @@ RETIRE_ARTIFACT_FILENAME = (
 )
 EXECUTOR_ROLE = "canonical_brain_schema_reconciler"
 CONTROL_SCHEMA = "canonical_brain_reconciliation"
+CONTROL_ADMIN_DATABASE_ROLES = (
+    "canonical_brain_migration_owner",
+    "cloudsqlsuperuser",
+)
 _CONTROL_ADMIN_ATTRIBUTES_EXACT_MASK = (1 << 10) - 1
-_CONTROL_ADMIN_MEMBERSHIPS_EXACT_MASK = (1 << 12) - 1
+_CONTROL_ADMIN_MEMBERSHIPS_EXACT_MASK = (1 << 17) - 1
 OBSERVER_SIGNATURE = (
     "canonical_brain_reconciliation."
     "observe_missing_discord_routeback_helper_v1()"
@@ -191,6 +195,7 @@ _CLOUD_AUTHORITY_FIELDS = frozenset({
     "broad_bootstrap_authority",
     "database_roles_requested",
     "normal_reconciliation_executor",
+    "resource_etag_sha256",
     "receipt_sha256",
 })
 
@@ -628,8 +633,11 @@ def _validate_cloud_authority(
         or raw.get("owner_subject_sha256") != gate["owner_subject_sha256"]
         or raw.get("mutation_context_sha256") != gate["gate_sha256"]
         or raw.get("broad_bootstrap_authority") is not True
-        or raw.get("database_roles_requested") != []
+        or raw.get("database_roles_requested")
+        != list(CONTROL_ADMIN_DATABASE_ROLES)
         or raw.get("normal_reconciliation_executor") is not False
+        or not isinstance(raw.get("resource_etag_sha256"), str)
+        or _SHA256.fullmatch(raw["resource_etag_sha256"]) is None
         or any(row[0] not in baseline_names for row in baseline_rows)
         or authority[0] in baseline_names
         or authority[1] not in {"CREATE_USER", "UPDATE_USER"}
@@ -972,6 +980,7 @@ def _validate_observation(value: Any, *, phase: str) -> Mapping[str, Any]:
             or raw["control_admin_role_exact"] is not True
             or raw["control_admin_forward_role_count"]
             != raw["provider_forward_role_count"]
+            + 1
             + raw["executor_membership_count"]
             or raw["control_admin_owned_object_count"] != 0
             or raw["control_admin_shared_dependency_count"] != 0
@@ -1052,9 +1061,10 @@ def validate_intermediate_for_owner(
         or before["provider_forward_role_count"]
         != after["provider_forward_role_count"]
         or before["control_admin_forward_role_count"]
-        != before["provider_forward_role_count"]
+        != before["provider_forward_role_count"] + 1
         or after["control_admin_forward_role_count"]
         != after["provider_forward_role_count"]
+        + 1
         + after["executor_membership_count"]
         or before["control_admin_owned_object_count"] != 0
         or after["control_admin_owned_object_count"] != 0
@@ -1712,6 +1722,10 @@ WITH RECURSIVE executor AS MATERIALIZED (
     SELECT role.*
       FROM pg_catalog.pg_roles AS role
      WHERE role.rolname = SESSION_USER
+), migration_owner AS MATERIALIZED (
+    SELECT role.*
+      FROM pg_catalog.pg_roles AS role
+     WHERE role.rolname = 'canonical_brain_migration_owner'
 ), relevant_session_edges AS MATERIALIZED (
     SELECT membership.*,
            granted.rolname AS granted_name,
@@ -1748,6 +1762,8 @@ WITH RECURSIVE executor AS MATERIALIZED (
 ), expected_control_forward_roles(roleid) AS (
     SELECT roleid FROM provider_forward_role_closure
     UNION
+    SELECT oid FROM migration_owner
+    UNION
     SELECT executor.oid
       FROM executor
      WHERE EXISTS (
@@ -1777,7 +1793,7 @@ WITH RECURSIVE executor AS MATERIALIZED (
                  FROM session_role
            ), 0)::bigint AS attributes_mask,
            (
-               SELECT (CASE WHEN pg_catalog.count(*) IN (1, 2)
+               SELECT (CASE WHEN pg_catalog.count(*) IN (2, 3)
                             THEN 1 ELSE 0 END)
                       + (CASE WHEN pg_catalog.count(*) FILTER (
                             WHERE granted_name = 'cloudsqlsuperuser'
@@ -1804,13 +1820,42 @@ WITH RECURSIVE executor AS MATERIALIZED (
                               AND set_option IS TRUE
                         ) = 1 THEN 32 ELSE 0 END)
                       + (CASE WHEN pg_catalog.count(*) FILTER (
+                            WHERE granted_name =
+                                  'canonical_brain_migration_owner'
+                              AND member_name = SESSION_USER
+                        ) = 1 THEN 64 ELSE 0 END)
+                      + (CASE WHEN pg_catalog.count(*) FILTER (
+                            WHERE granted_name =
+                                  'canonical_brain_migration_owner'
+                              AND member_name = SESSION_USER
+                              AND grantor_name = 'cloudsqladmin'
+                        ) = 1 THEN 128 ELSE 0 END)
+                      + (CASE WHEN pg_catalog.count(*) FILTER (
+                            WHERE granted_name =
+                                  'canonical_brain_migration_owner'
+                              AND member_name = SESSION_USER
+                              AND admin_option IS FALSE
+                        ) = 1 THEN 256 ELSE 0 END)
+                      + (CASE WHEN pg_catalog.count(*) FILTER (
+                            WHERE granted_name =
+                                  'canonical_brain_migration_owner'
+                              AND member_name = SESSION_USER
+                              AND inherit_option IS TRUE
+                        ) = 1 THEN 512 ELSE 0 END)
+                      + (CASE WHEN pg_catalog.count(*) FILTER (
+                            WHERE granted_name =
+                                  'canonical_brain_migration_owner'
+                              AND member_name = SESSION_USER
+                              AND set_option IS TRUE
+                        ) = 1 THEN 1024 ELSE 0 END)
+                      + (CASE WHEN pg_catalog.count(*) FILTER (
                             WHERE granted_name = '{EXECUTOR_ROLE}'
                               AND member_name = SESSION_USER
                         ) = (
                             SELECT pg_catalog.count(*)
                               FROM pg_catalog.pg_auth_members
                              WHERE roleid = (SELECT oid FROM executor)
-                        ) THEN 64 ELSE 0 END)
+                        ) THEN 2048 ELSE 0 END)
                       + (CASE WHEN pg_catalog.count(*) FILTER (
                             WHERE granted_name = '{EXECUTOR_ROLE}'
                               AND member_name = SESSION_USER
@@ -1819,7 +1864,7 @@ WITH RECURSIVE executor AS MATERIALIZED (
                             SELECT pg_catalog.count(*)
                               FROM pg_catalog.pg_auth_members
                              WHERE roleid = (SELECT oid FROM executor)
-                        ) THEN 128 ELSE 0 END)
+                        ) THEN 4096 ELSE 0 END)
                       + (CASE WHEN pg_catalog.count(*) FILTER (
                             WHERE granted_name = '{EXECUTOR_ROLE}'
                               AND member_name = SESSION_USER
@@ -1828,7 +1873,7 @@ WITH RECURSIVE executor AS MATERIALIZED (
                             SELECT pg_catalog.count(*)
                               FROM pg_catalog.pg_auth_members
                              WHERE roleid = (SELECT oid FROM executor)
-                        ) THEN 256 ELSE 0 END)
+                        ) THEN 8192 ELSE 0 END)
                       + (CASE WHEN pg_catalog.count(*) FILTER (
                             WHERE granted_name = '{EXECUTOR_ROLE}'
                               AND member_name = SESSION_USER
@@ -1837,7 +1882,7 @@ WITH RECURSIVE executor AS MATERIALIZED (
                             SELECT pg_catalog.count(*)
                               FROM pg_catalog.pg_auth_members
                              WHERE roleid = (SELECT oid FROM executor)
-                        ) THEN 512 ELSE 0 END)
+                        ) THEN 16384 ELSE 0 END)
                       + (CASE WHEN pg_catalog.count(*) FILTER (
                             WHERE granted_name = '{EXECUTOR_ROLE}'
                               AND member_name = SESSION_USER
@@ -1846,10 +1891,19 @@ WITH RECURSIVE executor AS MATERIALIZED (
                             SELECT pg_catalog.count(*)
                               FROM pg_catalog.pg_auth_members
                              WHERE roleid = (SELECT oid FROM executor)
-                        ) THEN 1024 ELSE 0 END)
+                        ) THEN 32768 ELSE 0 END)
                       + (CASE WHEN pg_catalog.bool_and(
                             (
                                 granted_name = 'cloudsqlsuperuser'
+                                AND member_name = SESSION_USER
+                                AND grantor_name = 'cloudsqladmin'
+                                AND admin_option IS FALSE
+                                AND inherit_option IS TRUE
+                                AND set_option IS TRUE
+                            )
+                            OR (
+                                granted_name =
+                                    'canonical_brain_migration_owner'
                                 AND member_name = SESSION_USER
                                 AND grantor_name = 'cloudsqladmin'
                                 AND admin_option IS FALSE
@@ -1864,7 +1918,7 @@ WITH RECURSIVE executor AS MATERIALIZED (
                                 AND inherit_option IS FALSE
                                 AND set_option IS FALSE
                             )
-                        ) IS TRUE THEN 2048 ELSE 0 END)
+                        ) IS TRUE THEN 65536 ELSE 0 END)
                  FROM relevant_session_edges
            )::bigint AS memberships_mask,
            NOT EXISTS (
@@ -2523,17 +2577,6 @@ WITH RECURSIVE executor AS MATERIALIZED (
                           'apply_missing_discord_routeback_helper_v1'
                ) = '{APPLY_DEFINITION_SHA256}'
                AND NOT EXISTS (
-                   SELECT 1
-                     FROM pg_catalog.pg_auth_members AS membership
-                     JOIN pg_catalog.pg_roles AS owner
-                       ON owner.oid = membership.roleid
-                     JOIN pg_catalog.pg_roles AS member
-                       ON member.oid = membership.member
-                    WHERE owner.rolname = 'canonical_brain_migration_owner'
-                      AND member.rolname ~
-                          '^muncho_canary_control_[0-9a-f]{{16}}$'
-               )
-               AND NOT EXISTS (
                    SELECT 1 FROM pg_catalog.pg_roles
                     WHERE rolname ~ '^muncho_canary_reconciler_[0-9a-f]{{16}}$'
                )
@@ -2557,6 +2600,7 @@ WITH RECURSIVE executor AS MATERIALIZED (
                        AND control_admin_role_exact
                        AND control_admin_forward_role_count =
                            provider_forward_role_count
+                           + 1
                            + executor_membership_count
                    )
                    OR (
@@ -2658,7 +2702,47 @@ def _parse_boolean(value: Any, code: str) -> bool:
     _fail(code)
 
 
-def _foundation_drift_error_code(row: Mapping[str, Any]) -> str:
+def _foundation_environment_drift_error_code(
+    counts: Mapping[str, int],
+    flags: Mapping[str, bool],
+) -> str:
+    if counts["control_admin_owned_object_count"] != 0:
+        return "schema_reconciliation_control_admin_owned_objects_present"
+    if counts["control_admin_shared_dependency_count"] != 0:
+        return "schema_reconciliation_control_admin_dependencies_present"
+    if counts["foreign_client_session_count"] != 0:
+        return "schema_reconciliation_control_foreign_client_sessions_present"
+    if (
+        counts["max_prepared_transactions"] != 0
+        or counts["cluster_prepared_xact_count"] != 0
+    ):
+        return "schema_reconciliation_control_prepared_transactions_drifted"
+    if (
+        flags["non_template_database_inventory_exact"] is not True
+        or flags["all_connectable_database_inventory_exact"] is not True
+    ):
+        return "schema_reconciliation_control_database_inventory_drifted"
+    if flags["latent_provider_exception_exact"] is not True:
+        return "schema_reconciliation_control_cloudsqladmin_contract_drifted"
+    if flags["executor_database_effective_privileges_exact"] is not True:
+        return "schema_reconciliation_control_executor_privileges_drifted"
+    if flags["migration_owner_role_exact"] is not True:
+        return "schema_reconciliation_control_migration_owner_role_drifted"
+    if flags["current_database_owner_exact"] is not True:
+        return "schema_reconciliation_control_database_owner_drifted"
+    if (
+        flags["helper_absent"] is not True
+        or counts["helper_same_name_count"] != 0
+    ):
+        return "schema_reconciliation_control_routeback_helper_present"
+    return "schema_reconciliation_control_foundation_objects_drifted"
+
+
+def _foundation_drift_error_code(
+    row: Mapping[str, Any],
+    *,
+    control_admin_expected: bool = True,
+) -> str:
     """Return one secret-free structural reason for a classified drift row."""
 
     invalid = "schema_reconciliation_control_database_observation_invalid"
@@ -2698,6 +2782,18 @@ def _foundation_drift_error_code(row: Mapping[str, Any]) -> str:
             "helper_absent",
         )
     }
+    if not control_admin_expected:
+        if (
+            counts["control_admin_count"] != 0
+            or counts["control_admin_forward_role_count"] != 0
+            or flags["control_admin_identity_exact"] is not False
+            or flags["control_admin_attributes_exact"] is not False
+            or flags["control_admin_memberships_exact"] is not False
+            or flags["control_admin_forward_roles_exact"] is not False
+            or flags["control_admin_role_exact"] is not False
+        ):
+            return "schema_reconciliation_control_admin_count_drifted"
+        return _foundation_environment_drift_error_code(counts, flags)
     if counts["control_admin_count"] != 1:
         return "schema_reconciliation_control_admin_count_drifted"
     if flags["control_admin_identity_exact"] is not True:
@@ -2728,6 +2824,11 @@ def _foundation_drift_error_code(row: Mapping[str, Any]) -> str:
             "schema_reconciliation_control_admin_superuser_admin_drifted",
             "schema_reconciliation_control_admin_superuser_inherit_drifted",
             "schema_reconciliation_control_admin_superuser_set_drifted",
+            "schema_reconciliation_control_admin_owner_edge_drifted",
+            "schema_reconciliation_control_admin_owner_grantor_drifted",
+            "schema_reconciliation_control_admin_owner_admin_drifted",
+            "schema_reconciliation_control_admin_owner_inherit_drifted",
+            "schema_reconciliation_control_admin_owner_set_drifted",
             "schema_reconciliation_control_admin_executor_edge_drifted",
             "schema_reconciliation_control_admin_executor_grantor_drifted",
             "schema_reconciliation_control_admin_executor_admin_drifted",
@@ -2747,39 +2848,11 @@ def _foundation_drift_error_code(row: Mapping[str, Any]) -> str:
     if (
         counts["control_admin_forward_role_count"]
         != counts["provider_forward_role_count"]
+        + 1
         + counts["executor_membership_count"]
     ):
         return "schema_reconciliation_control_admin_role_closure_drifted"
-    if counts["control_admin_owned_object_count"] != 0:
-        return "schema_reconciliation_control_admin_owned_objects_present"
-    if counts["control_admin_shared_dependency_count"] != 0:
-        return "schema_reconciliation_control_admin_dependencies_present"
-    if counts["foreign_client_session_count"] != 0:
-        return "schema_reconciliation_control_foreign_client_sessions_present"
-    if (
-        counts["max_prepared_transactions"] != 0
-        or counts["cluster_prepared_xact_count"] != 0
-    ):
-        return "schema_reconciliation_control_prepared_transactions_drifted"
-    if (
-        flags["non_template_database_inventory_exact"] is not True
-        or flags["all_connectable_database_inventory_exact"] is not True
-    ):
-        return "schema_reconciliation_control_database_inventory_drifted"
-    if flags["latent_provider_exception_exact"] is not True:
-        return "schema_reconciliation_control_cloudsqladmin_contract_drifted"
-    if flags["executor_database_effective_privileges_exact"] is not True:
-        return "schema_reconciliation_control_executor_privileges_drifted"
-    if flags["migration_owner_role_exact"] is not True:
-        return "schema_reconciliation_control_migration_owner_role_drifted"
-    if flags["current_database_owner_exact"] is not True:
-        return "schema_reconciliation_control_database_owner_drifted"
-    if (
-        flags["helper_absent"] is not True
-        or counts["helper_same_name_count"] != 0
-    ):
-        return "schema_reconciliation_control_routeback_helper_present"
-    return "schema_reconciliation_control_foundation_objects_drifted"
+    return _foundation_environment_drift_error_code(counts, flags)
 
 
 def _parse_foundation_observation_result(
@@ -2841,7 +2914,10 @@ def _parse_foundation_observation_result(
     except (TypeError, ValueError) as exc:
         raise ControlBootstrapError(code) from exc
     if state == "drift":
-        _fail(_foundation_drift_error_code(row))
+        _fail(_foundation_drift_error_code(
+            row,
+            control_admin_expected=phase in {"before_install", "after_install"},
+        ))
     parsed_control_admin_count = _parse_decimal(control_admin_count, code)
     parsed_attributes_mask = _parse_decimal(
         control_admin_attributes_mask, code

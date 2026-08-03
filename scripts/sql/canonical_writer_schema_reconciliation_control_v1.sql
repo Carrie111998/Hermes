@@ -72,6 +72,11 @@ BEGIN
                  FROM pg_catalog.pg_auth_members AS membership
                  JOIN provider_forward_role_closure AS reachable
                    ON reachable.roleid = membership.member
+           ), expected_forward_role_closure(roleid) AS (
+               SELECT roleid FROM provider_forward_role_closure
+               UNION
+               SELECT oid FROM pg_catalog.pg_roles
+                WHERE rolname = 'canonical_brain_migration_owner'
            )
            SELECT (SELECT pg_catalog.count(*) = 1 FROM bootstrap)
               AND (SELECT pg_catalog.bool_and(
@@ -81,21 +86,24 @@ BEGIN
                        AND rolconnlimit = -1 AND rolvaliduntil IS NULL
                        AND rolconfig IS NULL
                    ) FROM bootstrap)
-              AND (SELECT pg_catalog.count(*) = 1
+              AND (SELECT pg_catalog.count(*) = 2
                           AND pg_catalog.bool_and(
-                              granted_name = 'cloudsqlsuperuser'
-                              AND member_name = SESSION_USER
+                              member_name = SESSION_USER
                               AND grantor_name = 'cloudsqladmin'
                               AND admin_option IS FALSE
                               AND inherit_option IS TRUE
                               AND set_option IS TRUE
+                              AND granted_name IN (
+                                  'canonical_brain_migration_owner',
+                                  'cloudsqlsuperuser'
+                              )
                           ) FROM relevant_edges)
               AND NOT EXISTS (
                   (SELECT roleid FROM forward_role_closure
                    EXCEPT
-                   SELECT roleid FROM provider_forward_role_closure)
+                   SELECT roleid FROM expected_forward_role_closure)
                   UNION ALL
-                  (SELECT roleid FROM provider_forward_role_closure
+                  (SELECT roleid FROM expected_forward_role_closure
                    EXCEPT
                    SELECT roleid FROM forward_role_closure)
               )
@@ -180,14 +188,13 @@ CREATE ROLE canonical_brain_schema_reconciler
 
 SET LOCAL ROLE cloudsqlsuperuser;
 
--- Cloud SQL's provider-admin role may create and re-owner customer objects,
--- but the service intentionally does not promise that a freshly granted
--- customer-role edge is immediately usable by SET ROLE.  Keep the provider
--- boundary active only for this stopped, serializable bootstrap transaction;
--- install the fixed objects, transfer their ownership exactly, and persist no
--- membership edge from the one-time login to the migration owner.
+-- Cloud SQL pre-binds the one-time login to both exact roles before the first
+-- database connection.  Use the provider role only for the database grant,
+-- then return to the session identity so PostgreSQL can prove its direct
+-- migration-owner membership while creating and re-owning fixed objects.
 GRANT CONNECT ON DATABASE muncho_canary_brain
     TO canonical_brain_schema_reconciler;
+RESET ROLE;
 CREATE SCHEMA canonical_brain_reconciliation
     AUTHORIZATION canonical_brain_migration_owner;
 
@@ -1068,16 +1075,23 @@ BEGIN
            SELECT 1 FROM pg_catalog.pg_auth_members
             WHERE member = executor_oid OR grantor = executor_oid
        )
-       OR EXISTS (
-           SELECT 1
+       OR NOT (
+           SELECT pg_catalog.count(*) = 1
+                  AND pg_catalog.bool_and(
+                      member.rolname = SESSION_USER
+                      AND grantor.rolname = 'cloudsqladmin'
+                      AND membership.admin_option IS FALSE
+                      AND membership.inherit_option IS TRUE
+                      AND membership.set_option IS TRUE
+                  )
              FROM pg_catalog.pg_auth_members AS membership
              JOIN pg_catalog.pg_roles AS owner
                ON owner.oid = membership.roleid
+             JOIN pg_catalog.pg_roles AS member
+               ON member.oid = membership.member
+             JOIN pg_catalog.pg_roles AS grantor
+               ON grantor.oid = membership.grantor
             WHERE owner.rolname = 'canonical_brain_migration_owner'
-              AND membership.member = (
-                  SELECT oid FROM pg_catalog.pg_roles
-                   WHERE rolname = SESSION_USER
-              )
        )
        OR EXISTS (
            SELECT 1 FROM pg_catalog.pg_shdepend

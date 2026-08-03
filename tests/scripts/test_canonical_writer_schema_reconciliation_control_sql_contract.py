@@ -111,7 +111,8 @@ def test_install_has_exact_bootstrap_and_runtime_principal_separation() -> None:
     assert "^muncho_canary_control_[0-9a-f]{16}$" in sql
     assert sql.count("^muncho_canary_reconciler_[0-9a-f]{16}$") == 3
     assert "grantor_name = 'cloudsqladmin'" in sql
-    assert "granted_name = 'cloudsqlsuperuser'" in sql
+    assert "'canonical_brain_migration_owner',\n" in sql
+    assert "'cloudsqlsuperuser'" in sql
     assert "admin_option IS FALSE" in sql
     assert "inherit_option IS TRUE" in sql
     assert "set_option IS TRUE" in sql
@@ -136,7 +137,7 @@ def test_install_has_exact_bootstrap_and_runtime_principal_separation() -> None:
     )
 
 
-def test_install_accepts_only_the_exact_provider_managed_role_closure() -> None:
+def test_install_accepts_only_the_exact_dual_authority_role_closure() -> None:
     sql = _text(INSTALL)
 
     assert sql.count("provider_forward_role_closure(roleid) AS") == 1
@@ -144,17 +145,17 @@ def test_install_accepts_only_the_exact_provider_managed_role_closure() -> None:
     assert (
         "SELECT roleid FROM forward_role_closure\n"
         "                   EXCEPT\n"
-        "                   SELECT roleid FROM provider_forward_role_closure"
+        "                   SELECT roleid FROM expected_forward_role_closure"
     ) in sql
     assert (
-        "SELECT roleid FROM provider_forward_role_closure\n"
+        "SELECT roleid FROM expected_forward_role_closure\n"
         "                   EXCEPT\n"
         "                   SELECT roleid FROM forward_role_closure"
     ) in sql
     assert "pg_catalog.count(DISTINCT role.rolname) = 1" not in sql
 
 
-def test_retire_accepts_only_the_exact_provider_managed_role_closure() -> None:
+def test_retire_accepts_only_the_exact_dual_authority_role_closure() -> None:
     sql = _text(RETIRE)
 
     assert sql.count("provider_forward_role_closure(roleid) AS") == 1
@@ -162,10 +163,10 @@ def test_retire_accepts_only_the_exact_provider_managed_role_closure() -> None:
     assert (
         "SELECT roleid FROM forward_role_closure\n"
         "                   EXCEPT\n"
-        "                   SELECT roleid FROM provider_forward_role_closure"
+        "                   SELECT roleid FROM expected_forward_role_closure"
     ) in sql
     assert (
-        "SELECT roleid FROM provider_forward_role_closure\n"
+        "SELECT roleid FROM expected_forward_role_closure\n"
         "                   EXCEPT\n"
         "                   SELECT roleid FROM forward_role_closure"
     ) in sql
@@ -202,7 +203,7 @@ def test_retire_is_exact_drift_intolerant_and_non_cascading() -> None:
     assert "DROP FUNCTION canonical_brain._discord" not in sql
     assert "SET LOCAL ROLE cloudsqlsuperuser;" in sql
     assert "CURRENT_USER <> 'cloudsqlsuperuser'" in sql
-    assert "SET LOCAL ROLE canonical_brain_migration_owner;" not in sql
+    assert "SET LOCAL ROLE canonical_brain_migration_owner;" in sql
     assert "GRANT canonical_brain_migration_owner TO SESSION_USER" not in sql
     assert "REVOKE canonical_brain_migration_owner FROM SESSION_USER" not in sql
 

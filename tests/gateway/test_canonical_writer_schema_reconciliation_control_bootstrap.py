@@ -182,8 +182,11 @@ def _cloud_authority(gate: Mapping[str, Any]) -> dict[str, Any]:
             "baseline_user_operations": [],
             "authority_operation": authority,
             "broad_bootstrap_authority": True,
-            "database_roles_requested": [],
+            "database_roles_requested": list(
+                bootstrap.CONTROL_ADMIN_DATABASE_ROLES
+            ),
             "normal_reconciliation_executor": False,
+            "resource_etag_sha256": _digest("exact-cloud-sql-user-etag"),
         },
         "receipt_sha256",
     )
@@ -241,7 +244,7 @@ def _observation(
             "control_admin_forward_roles_exact": control_admin_count == 1,
             "control_admin_role_exact": control_admin_count == 1,
             "control_admin_forward_role_count": (
-                provider_forward_role_count + membership_count
+                provider_forward_role_count + 1 + membership_count
                 if control_admin_count == 1
                 else 0
             ),
@@ -496,6 +499,51 @@ def test_gate_binds_exact_runtime_constants_and_control_contract() -> None:
             _validate_gate(changed)
 
 
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    (
+        ("database_roles_requested", ["cloudsqlsuperuser"]),
+        (
+            "database_roles_requested",
+            [
+                *bootstrap.CONTROL_ADMIN_DATABASE_ROLES,
+                "canonical_brain_schema_reconciler",
+            ],
+        ),
+        ("resource_etag_sha256", "not-a-sha256"),
+    ),
+)
+def test_owner_install_rejects_unfenced_or_inexact_control_authority(
+    field: str,
+    replacement: Any,
+) -> None:
+    key = Ed25519PrivateKey.generate()
+    gate = _gate(key)
+    authority = _cloud_authority(gate)
+    authority[field] = replacement
+    authority = _hashed(
+        {
+            name: value
+            for name, value in authority.items()
+            if name != "receipt_sha256"
+        },
+        "receipt_sha256",
+    )
+
+    with pytest.raises(
+        bootstrap.ControlBootstrapError,
+        match="schema_reconciliation_control_cloud_authority_invalid",
+    ):
+        bootstrap.build_owner_install_claim(
+            gate=gate,
+            cloud_sql_authority_receipt=authority,
+            credential_length=bootstrap.OPAQUE_CREDENTIAL_BYTES,
+            issued_at_unix=950,
+            expires_at_unix=1_050,
+            nonce_sha256=_digest("install-nonce"),
+        )
+
+
 def test_fixed_observation_rejects_third_routine_and_nonroutine_objects() -> None:
     sql = bootstrap._FOUNDATION_OBSERVATION_SQL
     assert "pg_advisory_xact_lock" not in sql
@@ -722,10 +770,10 @@ def test_provider_managed_forward_role_closure_is_preserved_across_protocol() ->
     ) == intermediate
     assert intermediate["before_observation"][
         "control_admin_forward_role_count"
-    ] == 5
+    ] == 6
     assert intermediate["after_observation"][
         "control_admin_forward_role_count"
-    ] == 6
+    ] == 7
 
     cleanup = _signed_cleanup(key, gate, install, intermediate)
     terminal = _terminal(gate, install, intermediate, cleanup)
@@ -893,10 +941,10 @@ def test_fixed_observation_parser_binds_authenticated_session_and_exact_shape() 
             {"control_admin_count": "0"},
             "schema_reconciliation_control_admin_count_drifted",
         ),
-        (
-            {"control_admin_forward_role_count": "2"},
-            "schema_reconciliation_control_admin_role_closure_drifted",
-        ),
+            (
+                {"control_admin_forward_role_count": "3"},
+                "schema_reconciliation_control_admin_role_closure_drifted",
+            ),
         (
             {"control_admin_owned_object_count": "1"},
             "schema_reconciliation_control_admin_owned_objects_present",
@@ -965,7 +1013,7 @@ def test_fixed_observation_reports_secret_free_structural_drift_code(
         ),
         "control_admin_forward_roles_exact": "true",
         "control_admin_role_exact": "true",
-        "control_admin_forward_role_count": "1",
+        "control_admin_forward_role_count": "2",
         "provider_forward_role_count": "1",
         "control_admin_owned_object_count": "0",
         "control_admin_shared_dependency_count": "0",
@@ -1131,41 +1179,76 @@ def test_fixed_observation_reports_secret_free_structural_drift_code(
             "control_admin_memberships_mask",
             bootstrap._CONTROL_ADMIN_MEMBERSHIPS_EXACT_MASK,
             6,
-            "schema_reconciliation_control_admin_executor_edge_drifted",
+            "schema_reconciliation_control_admin_owner_edge_drifted",
         ),
         (
             "control_admin_memberships_exact",
             "control_admin_memberships_mask",
             bootstrap._CONTROL_ADMIN_MEMBERSHIPS_EXACT_MASK,
             7,
-            "schema_reconciliation_control_admin_executor_grantor_drifted",
+            "schema_reconciliation_control_admin_owner_grantor_drifted",
         ),
         (
             "control_admin_memberships_exact",
             "control_admin_memberships_mask",
             bootstrap._CONTROL_ADMIN_MEMBERSHIPS_EXACT_MASK,
             8,
-            "schema_reconciliation_control_admin_executor_admin_drifted",
+            "schema_reconciliation_control_admin_owner_admin_drifted",
         ),
         (
             "control_admin_memberships_exact",
             "control_admin_memberships_mask",
             bootstrap._CONTROL_ADMIN_MEMBERSHIPS_EXACT_MASK,
             9,
-            "schema_reconciliation_control_admin_executor_inherit_drifted",
+            "schema_reconciliation_control_admin_owner_inherit_drifted",
         ),
         (
             "control_admin_memberships_exact",
             "control_admin_memberships_mask",
             bootstrap._CONTROL_ADMIN_MEMBERSHIPS_EXACT_MASK,
             10,
-            "schema_reconciliation_control_admin_executor_set_drifted",
+            "schema_reconciliation_control_admin_owner_set_drifted",
         ),
         (
             "control_admin_memberships_exact",
             "control_admin_memberships_mask",
             bootstrap._CONTROL_ADMIN_MEMBERSHIPS_EXACT_MASK,
             11,
+            "schema_reconciliation_control_admin_executor_edge_drifted",
+        ),
+        (
+            "control_admin_memberships_exact",
+            "control_admin_memberships_mask",
+            bootstrap._CONTROL_ADMIN_MEMBERSHIPS_EXACT_MASK,
+            12,
+            "schema_reconciliation_control_admin_executor_grantor_drifted",
+        ),
+        (
+            "control_admin_memberships_exact",
+            "control_admin_memberships_mask",
+            bootstrap._CONTROL_ADMIN_MEMBERSHIPS_EXACT_MASK,
+            13,
+            "schema_reconciliation_control_admin_executor_admin_drifted",
+        ),
+        (
+            "control_admin_memberships_exact",
+            "control_admin_memberships_mask",
+            bootstrap._CONTROL_ADMIN_MEMBERSHIPS_EXACT_MASK,
+            14,
+            "schema_reconciliation_control_admin_executor_inherit_drifted",
+        ),
+        (
+            "control_admin_memberships_exact",
+            "control_admin_memberships_mask",
+            bootstrap._CONTROL_ADMIN_MEMBERSHIPS_EXACT_MASK,
+            15,
+            "schema_reconciliation_control_admin_executor_set_drifted",
+        ),
+        (
+            "control_admin_memberships_exact",
+            "control_admin_memberships_mask",
+            bootstrap._CONTROL_ADMIN_MEMBERSHIPS_EXACT_MASK,
+            16,
             "schema_reconciliation_control_admin_unexpected_role_edge",
         ),
     ),
@@ -1195,7 +1278,7 @@ def test_fixed_observation_reports_exact_admin_role_component(
             ),
             "control_admin_forward_roles_exact": "true",
             "control_admin_role_exact": "true",
-            "control_admin_forward_role_count": "1",
+            "control_admin_forward_role_count": "2",
             "provider_forward_role_count": "1",
             "non_template_database_inventory_exact": "true",
             "all_connectable_database_inventory_exact": "true",

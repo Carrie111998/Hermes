@@ -126,7 +126,7 @@ def _setup(container: str) -> None:
         f"""
 CREATE ROLE postgres NOLOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE
     NOREPLICATION NOBYPASSRLS CONNECTION LIMIT -1;
-CREATE ROLE cloudsqlsuperuser NOLOGIN NOINHERIT SUPERUSER CREATEDB CREATEROLE
+CREATE ROLE cloudsqlsuperuser LOGIN NOINHERIT NOSUPERUSER CREATEDB CREATEROLE
     NOREPLICATION NOBYPASSRLS CONNECTION LIMIT -1;
 CREATE ROLE canonical_brain_migration_owner
     NOLOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE
@@ -138,6 +138,8 @@ CREATE ROLE {CONTROL}
     LOGIN INHERIT NOSUPERUSER CREATEDB CREATEROLE
     NOREPLICATION NOBYPASSRLS CONNECTION LIMIT -1;
 GRANT cloudsqlsuperuser TO {CONTROL}
+    WITH ADMIN FALSE, INHERIT TRUE, SET TRUE;
+GRANT canonical_brain_migration_owner TO {CONTROL}
     WITH ADMIN FALSE, INHERIT TRUE, SET TRUE;
 GRANT pg_monitor TO cloudsqlsuperuser
     WITH ADMIN FALSE, INHERIT TRUE, SET TRUE;
@@ -562,13 +564,19 @@ SELECT granted.rolname, member.rolname, grantor.rolname,
         assert _psql(
             container,
             f"""
-SELECT count(*)
+SELECT pg_catalog.count(*),
+       pg_catalog.bool_and(grantor.rolname = 'cloudsqladmin'
+                           AND membership.admin_option IS FALSE
+                           AND membership.inherit_option IS TRUE
+                           AND membership.set_option IS TRUE)
   FROM pg_catalog.pg_auth_members AS membership
+  JOIN pg_catalog.pg_roles AS grantor
+    ON grantor.oid = membership.grantor
  WHERE membership.roleid =
            'canonical_brain_migration_owner'::pg_catalog.regrole
    AND membership.member = '{CONTROL}'::pg_catalog.regrole;
 """,
-        ).strip() == "0"
+        ).strip() == "1|t"
         assert _psql(
             container,
             """
@@ -599,17 +607,13 @@ SELECT count(*)
             f"'{EXECUTOR}'::regrole;",
         ).strip() == "0"
 
-        # Vanilla PostgreSQL cannot model Cloud SQL's provider-only GRANT
-        # authority while keeping pg_roles/pg_auth_members byte-equivalent.
-        # The SUPERUSER surrogate is confined to the sealed artifact above;
-        # every product/runtime assertion below sees the live Cloud role shape.
-        _psql(
+        # The entire install and retire lifecycle ran with the same restricted
+        # provider-role shape exposed by Cloud SQL, never with true SUPERUSER.
+        assert _psql(
             container,
-            """
-ALTER ROLE cloudsqlsuperuser LOGIN NOSUPERUSER CREATEDB CREATEROLE
-    NOREPLICATION NOBYPASSRLS;
-""",
-        )
+            "SELECT rolsuper, rolcreatedb, rolcreaterole "
+            "FROM pg_roles WHERE rolname = 'cloudsqlsuperuser';",
+        ).strip() == "f|t|t"
 
         _psql(
             container,
@@ -1013,6 +1017,8 @@ CREATE ROLE {CONTROL}
     NOREPLICATION NOBYPASSRLS CONNECTION LIMIT -1;
 GRANT cloudsqlsuperuser TO {CONTROL}
     WITH ADMIN FALSE, INHERIT TRUE, SET TRUE;
+GRANT canonical_brain_migration_owner TO {CONTROL}
+    WITH ADMIN FALSE, INHERIT TRUE, SET TRUE;
 CREATE ROLE rogue_reconciler NOLOGIN;
 GRANT {EXECUTOR} TO rogue_reconciler
     WITH ADMIN FALSE, INHERIT TRUE, SET FALSE;
@@ -1123,15 +1129,16 @@ ALTER ROLE cloudsqlsuperuser NOLOGIN SUPERUSER CREATEDB CREATEROLE
         finally:
             session.close()
 
-    def reject_observation(user: str, phase: str = "post_cleanup") -> None:
+    def reject_observation(
+        user: str,
+        expected_code: str,
+        phase: str = "post_cleanup",
+    ) -> None:
         session = _PersistentPsqlSession(container, user)
         try:
             with pytest.raises(
                 control_bootstrap.ControlBootstrapError,
-                match=(
-                    "schema_reconciliation_control_"
-                    "database_observation_invalid"
-                ),
+                match=expected_code,
             ):
                 control_bootstrap._observe_foundation(
                     session,
@@ -1193,6 +1200,7 @@ GRANT USAGE ON SCHEMA canonical_brain TO canonical_brain_writer;
         assert installed["provider_forward_role_count"] > 1
         assert installed["control_admin_forward_role_count"] == (
             installed["provider_forward_role_count"]
+            + 1
             + installed["executor_membership_count"]
         )
 
@@ -1214,6 +1222,8 @@ CREATE ROLE {CONTROL}
     NOREPLICATION NOBYPASSRLS CONNECTION LIMIT -1;
 GRANT cloudsqlsuperuser TO {CONTROL}
     WITH ADMIN FALSE, INHERIT TRUE, SET TRUE;
+GRANT canonical_brain_migration_owner TO {CONTROL}
+    WITH ADMIN FALSE, INHERIT TRUE, SET TRUE;
 """,
         )
         adopted = observe(CONTROL, "before_install")
@@ -1221,6 +1231,7 @@ GRANT cloudsqlsuperuser TO {CONTROL}
         assert adopted["executor_membership_count"] == 0
         assert adopted["control_admin_forward_role_count"] == (
             adopted["provider_forward_role_count"]
+            + 1
         )
         _psql(container, f"DROP ROLE {CONTROL};")
 
@@ -1238,7 +1249,10 @@ AS $function$ SELECT value $function$;
 RESET ROLE;
 """,
         )
-        reject_observation(writer)
+        reject_observation(
+            writer,
+            "schema_reconciliation_control_foundation_objects_drifted",
+        )
         _psql(
             container,
             """
@@ -1258,7 +1272,10 @@ GRANT USAGE ON SCHEMA canonical_brain TO {EXECUTOR};
 RESET ROLE;
 """,
         )
-        reject_observation(writer)
+        reject_observation(
+            writer,
+            "schema_reconciliation_control_executor_privileges_drifted",
+        )
         _psql(
             container,
             f"""
@@ -1281,7 +1298,10 @@ UPDATE pg_catalog.pg_auth_members
    AND member = 'adversarial_member'::regrole;
 """,
         )
-        reject_observation(writer)
+        reject_observation(
+            writer,
+            "schema_reconciliation_control_foundation_objects_drifted",
+        )
         _psql(
             container,
             """
@@ -1296,18 +1316,27 @@ DROP ROLE adversarial_member;
         )
 
         _psql(container, "GRANT CONNECT ON DATABASE template1 TO PUBLIC;")
-        reject_observation(writer)
+        reject_observation(
+            writer,
+            "schema_reconciliation_control_executor_privileges_drifted",
+        )
         _psql(container, "REVOKE CONNECT ON DATABASE template1 FROM PUBLIC;")
 
         _psql(container, "ALTER ROLE canonical_brain_migration_owner LOGIN;")
-        reject_observation(writer)
+        reject_observation(
+            writer,
+            "schema_reconciliation_control_migration_owner_role_drifted",
+        )
         _psql(container, "ALTER ROLE canonical_brain_migration_owner NOLOGIN;")
 
         _psql(
             container,
             f"ALTER DATABASE {DATABASE} OWNER TO cloudsqladmin;",
         )
-        reject_observation(writer)
+        reject_observation(
+            writer,
+            "schema_reconciliation_control_database_owner_drifted",
+        )
         _psql(
             container,
             f"ALTER DATABASE {DATABASE} OWNER TO cloudsqlsuperuser;",

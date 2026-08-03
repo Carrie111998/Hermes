@@ -196,13 +196,17 @@ SCHEMA_RECONCILIATION_EXECUTOR_ABSENCE_RECEIPT_SCHEMA = (
     "muncho-cloud-sql-executor-absence-evidence.v2"
 )
 SCHEMA_RECONCILIATION_CONTROL_ADMIN_AUTHORITY_RECEIPT_SCHEMA = (
-    "muncho-cloud-sql-schema-reconciliation-control-admin-authority.v1"
+    "muncho-cloud-sql-schema-reconciliation-control-admin-authority.v2"
 )
 SCHEMA_RECONCILIATION_CONTROL_ADMIN_ABSENCE_RECEIPT_SCHEMA = (
     "muncho-cloud-sql-schema-reconciliation-control-admin-absence.v1"
 )
 SCHEMA_RECONCILIATION_DATABASE_ROLES = (
     "canonical_brain_schema_reconciler",
+)
+SCHEMA_RECONCILIATION_CONTROL_DATABASE_ROLES = (
+    "canonical_brain_migration_owner",
+    "cloudsqlsuperuser",
 )
 CANARY_BOOTSTRAP_LOGIN = "canonical_brain_canary_bootstrap_login"
 CANARY_BOOTSTRAP_DATABASE_ROLE = "canonical_brain_canary_bootstrap"
@@ -9910,8 +9914,19 @@ class CloudSqlSchemaReconciliationExecutor(CloudSqlTemporaryAdmin):
 CloudSqlSchemaReconciliationAdmin = CloudSqlSchemaReconciliationExecutor
 
 
-class CloudSqlSchemaReconciliationControlAdmin(CloudSqlTemporaryAdmin):
-    """Broad one-time installer login; never used by normal reconciliation."""
+class CloudSqlSchemaReconciliationControlAdmin(
+    CloudSqlSchemaReconciliationExecutor
+):
+    """Exact dual-role one-time installer; never used by normal reconciliation.
+
+    Cloud SQL does not expose a real PostgreSQL superuser.  The temporary login
+    therefore receives both fixed roles through the Cloud SQL control plane
+    before its first database connection.  The role-bearing resource is fenced
+    through two stable ``users.get`` observations and the outer protocol proves
+    the whole login absent before accepting the terminal receipt.
+    """
+
+    _DATABASE_ROLES = SCHEMA_RECONCILIATION_CONTROL_DATABASE_ROLES
 
     def _valid_target_username(self, username: object) -> bool:
         return (
@@ -9934,16 +9949,33 @@ class CloudSqlSchemaReconciliationControlAdmin(CloudSqlTemporaryAdmin):
         self,
         username: str,
     ) -> Mapping[str, Any]:
-        base = dict(super().temporary_admin_authority_receipt(username))
+        base = dict(
+            CloudSqlTemporaryAdmin.temporary_admin_authority_receipt(
+                self,
+                username,
+            )
+        )
         base.pop("receipt_sha256", None)
+        resource = self._role_bound_resource(
+            username,
+            require_exact_roles=True,
+        )
+        if resource is None:
+            raise OwnerLauncherError(
+                "cloud_sql_schema_reconciliation_control_authority_unconfirmed"
+            )
+        self.require_current_authority(username)
         unsigned = {
             **base,
             "schema": (
                 SCHEMA_RECONCILIATION_CONTROL_ADMIN_AUTHORITY_RECEIPT_SCHEMA
             ),
             "broad_bootstrap_authority": True,
-            "database_roles_requested": [],
+            "database_roles_requested": list(self._DATABASE_ROLES),
             "normal_reconciliation_executor": False,
+            "resource_etag_sha256": _sha256(
+                str(resource["etag"]).encode("ascii")
+            ),
         }
         return {
             **unsigned,
@@ -22515,6 +22547,7 @@ __all__ = [
     "SCHEMA_RECONCILIATION_CONTROL_ADMIN_ABSENCE_RECEIPT_SCHEMA",
     "SCHEMA_RECONCILIATION_CONTROL_ADMIN_AUTHORITY_RECEIPT_SCHEMA",
     "SCHEMA_RECONCILIATION_CONTROL_ADMIN_USERNAME_PREFIX",
+    "SCHEMA_RECONCILIATION_CONTROL_DATABASE_ROLES",
     "SCHEMA_RECONCILIATION_CONTROL_CLEANUP_MAGIC",
     "SCHEMA_RECONCILIATION_CONTROL_CLEANUP_SSHSIG_NAMESPACE",
     "SCHEMA_RECONCILIATION_CONTROL_CREDENTIAL_BYTES",
