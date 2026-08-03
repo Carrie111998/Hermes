@@ -193,6 +193,67 @@ def test_two_records_and_two_finalizers_attempt_credits_once():
     assert len(emitter.bus.calls) == 1
 
 
+@pytest.mark.parametrize(
+    "response",
+    [
+        '<AGENT_ITERATION_JSON>{"agent":"scout","summary":"done"}'
+        "</AGENT_ITERATION_JSON>",
+        "plain response",
+        "<AGENT_ITERATION_JSON>{bad json}</AGENT_ITERATION_JSON>",
+    ],
+    ids=["valid", "missing", "malformed"],
+)
+def test_successful_finalizer_retry_is_silent_after_ambiguous_credits_emit(
+    response,
+):
+    class FailCreditsOnceBus(RecordingBus):
+        def emit(self, **kwargs):
+            self.calls.append(kwargs)
+            if kwargs["payload"].get("action_kind") == "credits":
+                raise RuntimeError("ambiguous credits failure")
+
+    bus = FailCreditsOnceBus()
+    emitter = _emitter(bus)
+    run, token = _install_open_run()
+    try:
+        scheduler._finalize_agent_iteration_event(
+            emitter, _scout_job(), response, success=True, firecrawl_state=run
+        )
+        calls_after_first = len(bus.calls)
+        scheduler._finalize_agent_iteration_event(
+            emitter, _scout_job(), response, success=True, firecrawl_state=run
+        )
+    finally:
+        state.reset_firecrawl_run(token)
+
+    assert len(bus.calls) == calls_after_first
+
+
+def test_malformed_error_emit_failure_still_attempts_credits_once():
+    class FailErrorBus(RecordingBus):
+        def emit(self, **kwargs):
+            self.calls.append(kwargs)
+            if kwargs["event_type"] == EventType.AGENT_ERROR:
+                raise RuntimeError("diagnostic emit failure")
+
+    bus = FailErrorBus()
+    emitter = _emitter(bus)
+    run, token = _install_open_run()
+    malformed = "<AGENT_ITERATION_JSON>{bad json}</AGENT_ITERATION_JSON>"
+    try:
+        scheduler._finalize_agent_iteration_event(
+            emitter, _scout_job(), malformed, success=True, firecrawl_state=run
+        )
+    finally:
+        state.reset_firecrawl_run(token)
+
+    assert [call["event_type"] for call in bus.calls] == [
+        EventType.AGENT_ERROR,
+        EventType.AGENT_ITERATION,
+    ]
+    assert bus.calls[1]["payload"]["action_kind"] == "credits"
+
+
 def _patch_execution_pipeline(monkeypatch, emitter):
     monkeypatch.setattr(scheduler, "_get_event_emitter", lambda: emitter)
     monkeypatch.setattr(

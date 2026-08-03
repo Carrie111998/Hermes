@@ -82,6 +82,11 @@ class FirecrawlRunState:
             )
             return selected
 
+    @property
+    def credits_action_claimed(self) -> bool:
+        with self._lock:
+            return self._credits_action_claimed
+
     def claim_credits_action(self) -> bool:
         with self._lock:
             if self._first_failure is None or self._credits_action_claimed:

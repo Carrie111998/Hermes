@@ -1515,10 +1515,7 @@ def _emit_agent_iteration_event(
             if credits_owed:
                 synth_payload.update(_credits_iteration_fields())
                 if not _claim_credits_iteration(firecrawl_state):
-                    if credits_only:
-                        return
-                    for key in _credits_iteration_fields():
-                        synth_payload.pop(key, None)
+                    return
             bus.emit(
                 event_type=EventType.AGENT_ITERATION,
                 source=canonical_name,
@@ -1563,10 +1560,7 @@ def _emit_agent_iteration_event(
             if firecrawl_state and firecrawl_state.first_failure:
                 payload.update(_credits_iteration_fields())
                 if not _claim_credits_iteration(firecrawl_state):
-                    if credits_only:
-                        return
-                    for key in _credits_iteration_fields():
-                        payload.pop(key, None)
+                    return
             bus.emit(
                 event_type=EventType.AGENT_ITERATION,
                 source=payload.get("agent") or job_name or "unknown",
@@ -1577,6 +1571,14 @@ def _emit_agent_iteration_event(
             return
 
         # Marker-present-but-malformed → AGENT_ERROR with diagnostic detail.
+        # A prior credits attempt makes the entire finalizer retry silent,
+        # including this diagnostic event.
+        if (
+            firecrawl_state
+            and firecrawl_state.first_failure
+            and firecrawl_state.credits_action_claimed
+        ):
+            return
         err_payload = {
             "reason": error_reason,
             "job_id": job_id,
@@ -1584,13 +1586,16 @@ def _emit_agent_iteration_event(
         }
         if raw_block is not None:
             err_payload["detail"] = raw_block[:2000]
-        bus.emit(
-            event_type=EventType.AGENT_ERROR,
-            source=job_name or "cron",
-            payload=err_payload,
-            correlation_id=job_id or None,
-            job_id=job_id or None,
-        )
+        try:
+            bus.emit(
+                event_type=EventType.AGENT_ERROR,
+                source=job_name or "cron",
+                payload=err_payload,
+                correlation_id=job_id or None,
+                job_id=job_id or None,
+            )
+        except Exception as e:  # Preserve the independently gated credits attempt.
+            logger.debug("agent_iteration diagnostic emit failed: %s", e)
         if firecrawl_state and firecrawl_state.first_failure:
             canonical_name = canonical_agent_source(job_name)
             if is_canonical_agent(canonical_name):
