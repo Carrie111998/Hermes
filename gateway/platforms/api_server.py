@@ -19,6 +19,8 @@ Exposes an HTTP server with endpoints:
 - GET  /v1/runs/{run_id}/events    — SSE stream of structured lifecycle events
 - POST /v1/runs/{run_id}/approval — resolve a pending run approval
 - POST /v1/runs/{run_id}/stop       — interrupt a running agent
+- GET  /v1/membrane/outbound       — list pending membrane TG outbox (L2 poller)
+- POST /v1/membrane/outbound/ack   — ack delivered membrane outbox rows
 - GET  /health                     — health check
 - GET  /health/detailed            — rich status for cross-container dashboard probing
 
@@ -1975,6 +1977,8 @@ class APIServerAdapter(BasePlatformAdapter):
             ("GET", "/v1/runs/{run_id}/events", self._handle_run_events),
             ("POST", "/v1/runs/{run_id}/approval", self._handle_run_approval),
             ("POST", "/v1/runs/{run_id}/stop", self._handle_stop_run),
+            ("GET", "/v1/membrane/outbound", self._handle_membrane_outbound_list),
+            ("POST", "/v1/membrane/outbound/ack", self._handle_membrane_outbound_ack),
         ]
         if _CRON_AVAILABLE:
             # Chronos managed-cron fire webhook (NAS → agent). Authenticated
@@ -6281,7 +6285,8 @@ class APIServerAdapter(BasePlatformAdapter):
         previous_response_id = body.get("previous_response_id")
 
         # Accept explicit conversation_history from the request body.
-        # Precedence: explicit conversation_history > previous_response_id.
+        # Precedence: explicit conversation_history > previous_response_id >
+        # multi-message input array > SessionDB load when session_id is set.
         conversation_history: List[Dict[str, str]] = []
         raw_history = body.get("conversation_history")
         if raw_history:
@@ -6324,7 +6329,32 @@ class APIServerAdapter(BasePlatformAdapter):
                         )
                     conversation_history.append({"role": msg["role"], "content": str(content)})
 
-        session_id = body.get("session_id") or stored_session_id
+        # Client-provided session_id (e.g. tg_router membrane: telegram:dm:<uid>).
+        # When no history was supplied in the body, hydrate from SessionDB so
+        # consecutive /v1/runs share context — same contract as X-Hermes-Session-Id
+        # on /v1/chat/completions. Without this, every membrane turn lands with
+        # history=0 even though messages are persisted under the stable session_id.
+        client_session_id = body.get("session_id") or stored_session_id
+        if client_session_id is not None:
+            client_session_id = str(client_session_id).strip() or None
+        if not conversation_history and client_session_id:
+            try:
+                loaded = await self._conversation_history_for_session(client_session_id)
+                if loaded:
+                    conversation_history = list(loaded)
+                    logger.info(
+                        "Hydrated %d history message(s) from SessionDB for session_id=%s",
+                        len(conversation_history),
+                        client_session_id,
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to load session history for /v1/runs session_id=%s: %s",
+                    client_session_id,
+                    exc,
+                )
+
+        session_id = client_session_id
         route = self._resolve_route(body.get("model"))
         agent_overrides = _request_agent_overrides(body, virtual_model=self._model_name)
         selection_error = self._request_route_conflict_error(
@@ -7130,9 +7160,85 @@ class APIServerAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """
-        Not used — HTTP request/response cycle handles delivery directly.
+        Push outbound text for membrane Telegram targets into the L1 outbox.
+
+        The HTTP API itself is request/response (interactive replies are pulled
+        by the caller of /v1/runs). Cron and async delivery still call
+        ``adapter.send()`` with the origin chat id stamped by tg_router
+        (``telegram:dm:<uid>``). Those cannot reach Bot API from L1 — the fleet
+        token lives only on L2 — so we durable-queue and let L2 poll
+        ``GET /v1/membrane/outbound``.
         """
-        return SendResult(success=False, error="API server uses HTTP request/response, not send()")
+        from gateway.membrane_outbound import enqueue, is_membrane_telegram_target
+
+        if is_membrane_telegram_target(chat_id):
+            meta = dict(metadata or {})
+            if reply_to and "reply_to" not in meta:
+                meta["reply_to"] = reply_to
+            row_id = enqueue(
+                chat_id=str(chat_id),
+                content=content or "",
+                thread_id=meta.get("thread_id"),
+                metadata=meta,
+            )
+            if row_id:
+                return SendResult(success=True, message_id=row_id)
+            return SendResult(
+                success=False,
+                error="membrane outbound enqueue failed",
+            )
+        return SendResult(
+            success=False,
+            error="API server uses HTTP request/response, not send()",
+        )
+
+    async def _handle_membrane_outbound_list(self, request: "web.Request") -> "web.Response":
+        """GET /v1/membrane/outbound — L2 poller pulls pending TG deliveries."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            limit = int(request.query.get("limit") or 20)
+        except (TypeError, ValueError):
+            limit = 20
+        from gateway.membrane_outbound import claim, list_pending
+
+        pending = await asyncio.to_thread(list_pending, limit)
+        ids = [p["id"] for p in pending if p.get("id")]
+        claim_token = request.headers.get("X-Hermes-Claim-Token") or None
+        claimed_ids = await asyncio.to_thread(claim, ids, claim_token=claim_token) if ids else []
+        claimed_set = set(claimed_ids)
+        items = [p for p in pending if p.get("id") in claimed_set]
+        return web.json_response(
+            {
+                "object": "hermes.membrane_outbound.list",
+                "items": items,
+                "count": len(items),
+            }
+        )
+
+    async def _handle_membrane_outbound_ack(self, request: "web.Request") -> "web.Response":
+        """POST /v1/membrane/outbound/ack — L2 confirms Bot API delivery."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+        ids = body.get("ids") or body.get("id") or []
+        if isinstance(ids, str):
+            ids = [ids]
+        if not isinstance(ids, list) or not ids:
+            return web.json_response(_openai_error("Missing 'ids'"), status=400)
+        ok = body.get("ok", True)
+        if isinstance(ok, str):
+            ok = ok.strip().lower() not in {"0", "false", "no", "off"}
+        error = body.get("error")
+        from gateway.membrane_outbound import ack
+
+        n = await asyncio.to_thread(ack, [str(i) for i in ids], ok=bool(ok), error=error)
+        return web.json_response({"object": "hermes.membrane_outbound.ack", "acked": n})
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Return basic info about the API server."""
