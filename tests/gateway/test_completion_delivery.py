@@ -186,6 +186,74 @@ def test_failed_async_injection_is_retried_and_only_success_is_acked(
     assert acknowledgements == ["deleg_duplicate"]
 
 
+@pytest.mark.parametrize(
+    ("event", "expected_identity"),
+    [
+        (
+            {
+                **_async_event("deleg_api_stable"),
+                "session_key": "raw-api-target",
+                "origin_session_id": "raw-api-target",
+            },
+            ("async_delegation", "deleg_api_stable", ""),
+        ),
+        (
+            {
+                **_completion_event(
+                    started_at=1234.5,
+                    session_id="proc_api_stable",
+                ),
+                "session_key": "raw-api-target",
+                "origin_session_id": "raw-api-target",
+                "platform": "",
+                "chat_id": "",
+            },
+            ("completion", "proc_api_stable", 1234.5),
+        ),
+    ],
+)
+def test_apiserver_durable_completion_passes_stable_producer_identity(
+    monkeypatch, event, expected_identity,
+):
+    """Replayable delegation/process events retain identity at self-post."""
+    adapter = SimpleNamespace(supports_async_delivery=False)
+    runner = _runner(adapter)
+    runner.adapters = {Platform.API_SERVER: adapter}
+    deliveries = []
+
+    async def fake_deliver_wake(
+        _adapter,
+        *,
+        text,
+        session_id,
+        producer_identity=None,
+    ):
+        deliveries.append({
+            "text": text,
+            "session_id": session_id,
+            "producer_identity": producer_identity,
+        })
+
+    import gateway.wake as wake_mod
+
+    monkeypatch.setattr(wake_mod, "deliver_wake", fake_deliver_wake)
+
+    async def exercise():
+        assert await runner._inject_watch_notification("done", dict(event)) is True
+        assert await runner._inject_watch_notification("done", dict(event)) is True
+
+    asyncio.run(exercise())
+
+    assert [d["session_id"] for d in deliveries] == [
+        "raw-api-target",
+        "raw-api-target",
+    ]
+    assert [d["producer_identity"] for d in deliveries] == [
+        expected_identity,
+        expected_identity,
+    ]
+
+
 def _persist_pending_completion(event):
     from tools import async_delegation
 
