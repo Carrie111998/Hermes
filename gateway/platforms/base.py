@@ -5313,13 +5313,28 @@ class BasePlatformAdapter(ABC):
         _enqueue = getattr(_runner, "_queue_or_replace_pending_event", None)
         _resolve = getattr(_runner, "_adapter_for_source", None)
         _depth = getattr(_runner, "_queue_depth", None)
+        # A media occupant needs the caption-merge semantics that
+        # ``_queue_or_replace_pending_event`` applies internally, and that
+        # merge succeeds WITHOUT growing the queue -- which the depth check
+        # below would misread as a decline and merge a second time. Keep the
+        # historical path for that case; it is what the FIFO would do anyway.
+        _slot = self._pending_messages.get(session_key)
+        _slot_is_media = _slot is not None and (
+            getattr(_slot, "message_type", None) == MessageType.PHOTO
+            or bool(getattr(_slot, "media_urls", None))
+        )
         _target = None
-        if callable(_resolve):
+        if callable(_resolve) and not _slot_is_media:
             try:
                 _target = _resolve(getattr(state.event, "source", None))
             except Exception:
                 _target = None
-        if callable(_enqueue) and callable(_depth) and _target is not None:
+        # Delegate only when the runner routes this source back to THIS
+        # adapter: another adapter owns a different pending slot, and the
+        # drain that delivers this burst runs on ours. Declining to delegate
+        # costs the fix on exotic topologies; delegating blindly would risk
+        # the burst landing where nothing drains it.
+        if callable(_enqueue) and callable(_depth) and _target is self:
             try:
                 _before = _depth(session_key, adapter=_target)
                 _enqueue(session_key, state.event)
