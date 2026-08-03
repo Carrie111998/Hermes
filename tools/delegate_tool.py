@@ -2827,7 +2827,7 @@ def _load_skills_into_context(
 
         try:
             loaded = _json.loads(skill_view(normalize_skill_lookup_name(skill_name)))
-        except (json.JSONDecodeError, TypeError):
+        except (_json.JSONDecodeError, TypeError):
             logger.warning(
                 "%s: skill '%s' returned invalid JSON, skipping",
                 caller_label, skill_name,
