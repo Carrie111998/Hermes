@@ -120,7 +120,7 @@ def _stopped_release_source_transport(monkeypatch, *, initially_exists=True):
                 stdout=RELEASE_SHA.encode("ascii") if exists else b"",
             )
         if "clone" in argv:
-            raise launcher.OwnerLauncherError("stopped_release_remote_failed")
+            raise launcher.OwnerLauncherError(str(kwargs["failure_code"]))
         if argv[-3:] == ("remote", "get-url", "origin"):
             stdout = f"{launcher.STOPPED_RELEASE_SOURCE_REPOSITORY}\n".encode()
         elif argv[-2:] == ("rev-parse", "--is-inside-work-tree"):
@@ -151,6 +151,9 @@ def test_stopped_release_source_prepare_resumes_exact_no_checkout_clone(
     ) == f"{launcher.STOPPED_RELEASE_SOURCE_BASE}/{RELEASE_SHA}"
 
     commands = [command for command, _kwargs in calls]
+    failure_codes = {
+        command: kwargs.get("failure_code") for command, kwargs in calls
+    }
     checkout = next(command for command in commands if "checkout" in command)
     assert checkout[-3:] == ("checkout", "--detach", RELEASE_SHA)
     assert any(command[-3:] == ("remote", "get-url", "origin") for command in commands)
@@ -159,11 +162,70 @@ def test_stopped_release_source_prepare_resumes_exact_no_checkout_clone(
         for command in commands
     )
     assert any("--porcelain=v1" in command for command in commands)
+    assert failure_codes[commands[0]] == "stopped_release_source_probe_failed"
+    assert failure_codes[checkout] == "stopped_release_source_checkout_failed"
+    assert {
+        kwargs.get("failure_code")
+        for command, kwargs in calls
+        if command[-3:] == ("remote", "get-url", "origin")
+    } == {"stopped_release_repository_probe_failed"}
+    assert {
+        kwargs.get("failure_code")
+        for command, kwargs in calls
+        if "--porcelain=v1" in command
+    } == {"stopped_release_status_probe_failed"}
     assert all(shlex.join(command) == " ".join(command) for command in commands)
     if initially_exists:
         assert not any("clone" in command for command in commands)
     else:
         assert sum("clone" in command for command in commands) == 1
+        assert {
+            kwargs.get("failure_code")
+            for command, kwargs in calls
+            if "clone" in command
+        } == {"stopped_release_source_clone_failed"}
+
+
+@pytest.mark.parametrize(
+    ("command", "expected_failure_code"),
+    (
+        ("plan", "stopped_release_plan_remote_failed"),
+        ("apply", "stopped_release_apply_remote_failed"),
+    ),
+)
+def test_stopped_release_command_binds_secret_free_remote_failure_stage(
+    monkeypatch,
+    command,
+    expected_failure_code,
+):
+    transport = object.__new__(launcher.IapStoppedReleaseTransport)
+    captured: dict[str, object] = {}
+
+    def run_remote(remote, **kwargs):
+        captured["remote"] = tuple(remote)
+        captured.update(kwargs)
+        return subprocess.CompletedProcess(
+            remote,
+            0,
+            stdout=b'{}\n',
+        )
+
+    monkeypatch.setattr(transport, "_run_remote", run_remote)
+    if command == "plan":
+        transport._run_release_command(
+            RELEASE_SHA,
+            command,
+            account="owner@example.com",
+        )
+    else:
+        transport._run_release_command(
+            RELEASE_SHA,
+            command,
+            account="owner@example.com",
+            approved_plan_sha256="a" * 64,
+        )
+
+    assert captured["failure_code"] == expected_failure_code
 
 
 def test_stopped_release_source_prepare_rejects_wrong_repository(monkeypatch):
