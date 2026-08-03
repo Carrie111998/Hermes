@@ -352,3 +352,36 @@ def test_do_search_json_flag_emits_full_identifiers(capsys):
     # Table render must be suppressed — sink should be empty (no "Searching for:" header).
     assert "Searching for:" not in sink.getvalue()
 
+
+# ---------------------------------------------------------------------------
+#  Slash command --group parsing edge cases (#76985 salvage)
+# ---------------------------------------------------------------------------
+
+def test_slash_list_group_missing_value(capsys, monkeypatch):
+    """`/skills list --group` (no value) prints an error, not unfiltered output."""
+    import hermes_cli.skills_groups as groups_mod
+
+    monkeypatch.setattr(
+        groups_mod,
+        "get_skill_groups",
+        lambda config=None: {"security": ["godmode"]},
+    )
+    handle_skills_slash("/skills list --group")
+    captured = capsys.readouterr().out
+    assert "requires a group name" in captured
+
+
+def test_slash_list_group_flag_value(capsys, monkeypatch):
+    """`/skills list --group --source hub` rejects a flag-like value."""
+    import hermes_cli.skills_groups as groups_mod
+
+    monkeypatch.setattr(
+        groups_mod,
+        "get_skill_groups",
+        lambda config=None: {"security": ["godmode"]},
+    )
+    handle_skills_slash("/skills list --group --source hub")
+    captured = capsys.readouterr().out
+    assert "looks like a flag" in captured
+    assert "--source" in captured
+

@@ -1951,9 +1951,33 @@ def handle_skills_slash(cmd: str, console: Optional[Console] = None) -> None:
             if idx + 1 < len(args):
                 source_filter = args[idx + 1]
         if "--group" in args:
+            from hermes_cli.skills_groups import get_skill_groups  # noqa: E402
             idx = args.index("--group")
             if idx + 1 < len(args):
-                group_filter = args[idx + 1]
+                raw_group = args[idx + 1]
+                if raw_group.startswith("--"):
+                    c.print(
+                        f"[bold red]Error:[/] Missing value for --group "
+                        f"(got '{raw_group}', which looks like a flag)."
+                    )
+                    groups = get_skill_groups()
+                    if groups:
+                        c.print(f"[dim]Available groups: {', '.join(sorted(groups))}[/]")
+                    else:
+                        c.print(
+                            "[dim]No groups configured. Create one with: "
+                            "hermes skills group add <group> <skill> [skill ...][/]"
+                        )
+                    c.print()
+                    return
+                group_filter = raw_group
+            else:
+                c.print("[bold red]Error:[/] --group requires a group name.")
+                groups = get_skill_groups()
+                if groups:
+                    c.print(f"[dim]Available groups: {', '.join(sorted(groups))}[/]")
+                c.print()
+                return
         do_list(source_filter=source_filter, enabled_only=enabled_only,
                 group_filter=group_filter, console=c)
 
