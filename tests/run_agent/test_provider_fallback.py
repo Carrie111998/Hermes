@@ -201,6 +201,66 @@ class TestFallbackChainAdvancement:
         assert rebuilt["base_url"] == portal
         assert agent._anthropic_client is not None
 
+    def test_kimi_coding_fallback_uses_the_messages_wire(self):
+        """Kimi Coding fallbacks must route over Anthropic Messages.
+
+        ``resolve_provider_client`` can normalize the user-supplied
+        ``.../coding/v1`` hint to the canonical ``.../coding`` base URL, but
+        fallback activation still has to re-derive ``api_mode`` from that
+        resolved endpoint or the retry POSTs ``/chat/completions`` and 404s.
+        """
+        fbs = [
+            {
+                "provider": "kimi-coding",
+                "model": "kimi-for-coding",
+                "base_url": "https://api.kimi.com/coding/v1",
+            }
+        ]
+        agent = _make_agent(fallback_model=fbs)
+        rebuilt = {"count": 0}
+
+        def _fake_build(api_key, base_url, timeout=None, **kwargs):
+            rebuilt["count"] += 1
+            rebuilt["api_key"] = api_key
+            rebuilt["base_url"] = base_url
+            return MagicMock(name="anthropic-client")
+
+        with (
+            patch(
+                "agent.chat_completion_helpers._fallback_entry_unavailable_without_network",
+                return_value=None,
+            ),
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(
+                    _mock_client(
+                        base_url="https://api.kimi.com/coding",
+                        api_key="sk-kimi-test",
+                    ),
+                    "kimi-for-coding",
+                ),
+            ) as mock_resolve,
+            patch(
+                "hermes_cli.model_normalize.normalize_model_for_provider",
+                side_effect=lambda m, p: m,
+            ),
+            patch(
+                "agent.anthropic_adapter.build_anthropic_client",
+                side_effect=_fake_build,
+            ),
+        ):
+            assert agent._try_activate_fallback() is True
+
+        assert mock_resolve.call_args.kwargs["explicit_base_url"] == "https://api.kimi.com/coding/v1"
+        assert agent.api_mode == "anthropic_messages"
+        assert agent.provider == "kimi-coding"
+        assert agent.model == "kimi-for-coding"
+        assert agent.client is None
+        assert rebuilt["count"] == 1
+        assert rebuilt["api_key"] == "sk-kimi-test"
+        assert rebuilt["base_url"] == "https://api.kimi.com/coding"
+        assert agent._anthropic_client is not None
+
     def test_nous_non_anthropic_fallback_stays_on_chat_completions(self):
         portal = "https://inference-api.nousresearch.com/v1"
         fbs = [{"provider": "nous", "model": "hermes-4-405b"}]
