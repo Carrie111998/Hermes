@@ -1061,7 +1061,9 @@ def validate_intermediate_for_owner(
         or before["provider_forward_role_count"]
         != after["provider_forward_role_count"]
         or before["control_admin_forward_role_count"]
-        != before["provider_forward_role_count"] + 1
+        != before["provider_forward_role_count"]
+        + 1
+        + before["executor_membership_count"]
         or after["control_admin_forward_role_count"]
         != after["provider_forward_role_count"]
         + 1
@@ -1076,7 +1078,10 @@ def validate_intermediate_for_owner(
         or after["max_prepared_transactions"] != 0
         or before["cluster_prepared_xact_count"] != 0
         or after["cluster_prepared_xact_count"] != 0
-        or before["executor_membership_count"] != 0
+        or (
+            before["state"] == "absent"
+            and before["executor_membership_count"] != 0
+        )
         # PostgreSQL 18 may materialize the creator's implicit ADMIN edge,
         # while Cloud SQL exposes the same creator authority without a
         # pg_auth_members row.  The observation's exact membership and
@@ -1088,7 +1093,11 @@ def validate_intermediate_for_owner(
         )
         or (
             before["state"] == "exact_installed"
-            and after["executor_membership_count"] != 0
+            and (
+                before["executor_membership_count"] not in {0, 1}
+                or after["executor_membership_count"]
+                != before["executor_membership_count"]
+            )
         )
         or raw.get("before_observation") != before
         or raw.get("before_observation_sha256")

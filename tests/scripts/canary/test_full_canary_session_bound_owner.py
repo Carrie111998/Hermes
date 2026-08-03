@@ -2325,8 +2325,12 @@ def test_schema_reconciliation_cloud_update_revokes_every_stale_role_in_query() 
         "name": [username],
         "revokeExistingRoles": ["true"],
     }
-    assert body["etag"] == "stale-user-etag"
-    assert body["revokeExistingRoles"] is True
+    assert body == {
+        "etag": "stale-user-etag",
+        "name": username,
+        "password": "q" * 64,
+        "type": "BUILT_IN",
+    }
 
 
 def test_schema_reconciliation_control_admin_is_separate_broad_one_time_login():
