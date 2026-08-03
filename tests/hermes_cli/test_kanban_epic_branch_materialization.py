@@ -176,13 +176,10 @@ def test_resolve_workspace_derives_the_epic_base_without_an_explicit_argument(
 def test_reusing_an_existing_story_worktree_restores_a_missing_epic_base(
     epic_home, tmp_path
 ):
-    """The state the incident left behind: story worktrees present, epic base
-    gone. The next dispatch must restore it rather than reuse the worktree and
-    fail again in Review target preparation."""
+    """A missing historical epic base must not follow a moved current HEAD."""
     repo = _repo(tmp_path)
     board = "epic-reuse-heals"
     _v2_board(board, repo)
-    base_sha = _git(repo, "rev-parse", "HEAD")
     with kb.connect(board=board) as conn:
         epic_id, story_id = _epic_with_story(conn, board, repo, "Story one")
         story = kb.get_task(conn, story_id)
@@ -192,19 +189,20 @@ def test_reusing_an_existing_story_worktree_restores_a_missing_epic_base(
         )
         epic_branch = kb.epic_branch_for(epic_id)
         _git(repo, "branch", "-D", epic_branch)
-        with pytest.raises(subprocess.CalledProcessError):
-            _git(repo, "rev-parse", "--verify", epic_branch)
+        (repo / "moved.txt").write_text("later\n", encoding="utf-8")
+        _git(repo, "add", "moved.txt")
+        _git(repo, "commit", "-m", "main moves on")
 
         kb.set_workspace_path(conn, story_id, str(workspace))
         kb.set_branch_name(conn, story_id, branch)
         reused = kb.get_task(conn, story_id)
         assert reused is not None
-        again, _branch = kb._resolve_worktree_workspace(
-            reused, board=board, conn=conn
-        )
+        with pytest.raises(RuntimeError, match="historical base cannot be established") as exc:
+            kb._resolve_worktree_workspace(reused, board=board, conn=conn)
 
-    assert Path(again) == Path(workspace)
-    assert _git(repo, "rev-parse", epic_branch) == base_sha
+    assert Path(workspace).exists()
+    assert epic_branch in str(exc.value)
+    assert not kb._git_branch_exists(repo, epic_branch)
 
 
 def test_missing_epic_base_fails_materialization_loudly(

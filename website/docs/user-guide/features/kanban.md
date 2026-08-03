@@ -735,7 +735,7 @@ hermes kanban comment <id> "<text>" [--author NAME]
 
 hermes kanban release <id> --note "<measurement>"      # operator gate: release a product card
         [--metadata '{"pull_request": "..."}']         # from release_measure (integrates the
-        [--released-by NAME]                           # reviewed candidate, then finishes it)
+        [--operator-label NAME]                         # reviewed candidate, then finishes it)
 
 # Bulk verbs — accept multiple ids:
 hermes kanban complete <id>... [--result "..."]
@@ -766,6 +766,15 @@ hermes kanban specify [<id> | --all] [--tenant T]      # flesh out a triage-colu
 hermes kanban gc [--event-retention-days N]            # workspaces + old events + old logs
         [--log-retention-days N]
 ```
+
+### Product release gate
+
+The CLI release surface supports `manual` and `not_required`; a `required` policy is refused before mutation because it needs an adapter-backed controller, which this CLI does not supply. Invalid policies and missing required pull-request metadata are also refused before mutation.
+
+For handoff-v2 stories, ambiguous missing `epic/<id>` bases fail closed instead of being guessed from current `HEAD`; the existing spawn-failure path retries and then blocks the card with its diagnostic. The operator remedy is to recreate `epic/<id>` manually at the verified historical SHA, as was done for `t_c29de776`, then resume dispatch; never point it at current `HEAD` merely to unblock the card.
+
+`--operator-label` records caller-supplied text, not authenticated identity.
+The `HERMES_KANBAN_TASK` worker check is defense in depth, not authorization: a program able to alter its own environment can defeat it. Hard enforcement is not part of this branch.
 
 All commands are also available as a slash command in the interactive CLI and in the messaging gateway (see [`/kanban` slash command](#kanban-slash-command) below).
 

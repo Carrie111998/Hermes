@@ -703,12 +703,12 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         default=None,
         help='JSON dict of completion metadata (e.g. \'{"pull_request": '
              '"https://..."}\' on boards that require a PR). Stored on the '
-             "closing run alongside the operator identity.",
+             "closing run alongside the caller-supplied operator label.",
     )
     p_release.add_argument(
-        "--released-by",
+        "--operator-label",
         default=None,
-        help="Operator identity recorded on the closing run "
+        help="Caller-supplied operator label recorded on the closing run "
              "(default: $HERMES_PROFILE or 'user')",
     )
 
@@ -2453,11 +2453,12 @@ def _cmd_release(args: argparse.Namespace) -> int:
     through it. This is that way: the same ``release_product_task`` the
     worker-side tool calls, driven by an operator, with every gate intact
     (board/task scoping, lifecycle state, release evidence, deployment policy,
-    smoke/rollback evidence) and the operator recorded on the closing run.
+    smoke/rollback evidence). The worker-environment check below is defense in
+    depth, not authorization: a program that controls its own environment can
+    bypass it.
     """
     task_id = args.task_id
-    # The gate is human. A dispatcher worker shelling out to the CLI must not
-    # be able to walk through it just because the CLI is on its PATH.
+    # Defense in depth only; the process can alter its own environment.
     if os.environ.get("HERMES_KANBAN_TASK"):
         print(
             "kanban: release is the human operator gate — a kanban worker "
@@ -2484,7 +2485,7 @@ def _cmd_release(args: argparse.Namespace) -> int:
         except (ValueError, json.JSONDecodeError) as exc:
             print(f"kanban: --metadata: {exc}", file=sys.stderr)
             return 2
-    released_by = getattr(args, "released_by", None) or _profile_author()
+    operator_label = getattr(args, "operator_label", None) or _profile_author()
     board = kb.get_current_board()
     with kb.connect_closing(board=board) as conn:
         task = kb.get_task(conn, task_id)
@@ -2511,9 +2512,38 @@ def _cmd_release(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 1
+        board_meta = kb.product_board_metadata(board)
+        workflow = kb._product_workflow_dict(board_meta)
+        policy_name = str(workflow.get("deployment_policy") or "manual").strip()
+        # Keep these names in sync with release_product_task and
+        # _validate_release_completion_evidence.
+        if policy_name not in {"manual", "not_required", "required"}:
+            print(
+                f"kanban: cannot release {task_id}: unsupported deployment policy "
+                f"{policy_name!r}; no changes were made.",
+                file=sys.stderr,
+            )
+            return 1
+        if policy_name == "required":
+            print(
+                f"kanban: cannot release {task_id}: deployment policy 'required': "
+                "an adapter-backed controller is required; the CLI supplies no adapter "
+                "and no changes were made.",
+                file=sys.stderr,
+            )
+            return 1
+        if workflow.get("pull_request_required") is True and not (
+            isinstance(metadata, dict) and metadata.get("pull_request")
+        ):
+            print(
+                f"kanban: cannot release {task_id}: missing required pull_request "
+                "metadata; no changes were made.",
+                file=sys.stderr,
+            )
+            return 1
         completion_metadata = dict(metadata or {})
         completion_metadata.update(
-            released_by=released_by, release_surface="cli"
+            release_operator_label=operator_label, release_surface="cli"
         )
         try:
             result = kb.release_product_task(
@@ -2547,7 +2577,7 @@ def _cmd_release(args: argparse.Namespace) -> int:
         return 1
     sha = (result.integration_sha or "")[:12]
     print(
-        f"Released {task_id} by {released_by}"
+        f"Released {task_id} (operator label: {operator_label})"
         + (f" (integrated {sha})" if sha else "")
     )
     return 0

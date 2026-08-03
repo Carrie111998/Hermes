@@ -12326,11 +12326,15 @@ def epic_branch_for(epic_id: str) -> str:
     return f"epic/{epic_id}"
 
 
-def _ensure_epic_branch(repo_root: Path, epic_branch: str) -> None:
-    """Create ``epic_branch`` off the repo's current ``HEAD`` if it doesn't
-    already exist. Idempotent; a no-op when the branch is already there, so
-    sibling story materialization never moves an epic base that is already
-    correct.
+def _ensure_epic_branch(
+    repo_root: Path, epic_branch: str, *, allow_create_at_head: bool = True
+) -> None:
+    """Ensure an epic base exists, creating it at ``HEAD`` only when allowed.
+
+    A missing base is ambiguous once any member story has materialized: the
+    current ``HEAD`` may have moved, so recreating the ref would fabricate its
+    historical base. Callers must explicitly identify genuine first
+    materialization before allowing creation.
 
     Raises when the branch still does not exist afterwards. The epic base is
     a precondition of the story worktree that branches off it and of the
@@ -12341,15 +12345,32 @@ def _ensure_epic_branch(repo_root: Path, epic_branch: str) -> None:
     """
     if _git_branch_exists(repo_root, epic_branch):
         return
+    if not allow_create_at_head:
+        raise RuntimeError(
+            f"epic base branch {epic_branch} is missing; its historical base "
+            "cannot be established, so it will not be recreated from current HEAD"
+        )
+    error = ""
     try:
-        result = subprocess.run(
-            ["git", "-C", str(repo_root), "branch", epic_branch, "HEAD"],
+        head = subprocess.run(
+            ["git", "-C", str(repo_root), "rev-parse", "HEAD"],
             capture_output=True,
             text=True,
             timeout=30,
             check=False,
         )
-        error = (result.stderr or result.stdout or "").strip()
+        head_sha = (head.stdout or "").strip()
+        if head.returncode != 0 or not head_sha:
+            error = (head.stderr or head.stdout or "").strip()
+        else:
+            result = subprocess.run(
+                ["git", "-C", str(repo_root), "branch", epic_branch, head_sha],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            error = (result.stderr or result.stdout or "").strip()
     except Exception as exc:  # timeout / OS-level failure
         error = str(exc)
     if not _git_branch_exists(repo_root, epic_branch):
@@ -12374,6 +12395,22 @@ def _story_base_branch(
     if epic_id is None:
         return None
     return epic_branch_for(epic_id)
+
+
+def _allow_epic_base_creation(
+    conn: Optional[sqlite3.Connection], task: Task, repo_root: Path
+) -> bool:
+    if conn is None:
+        return False
+    epic_id = epic_id_for_task(conn, task.id)
+    if epic_id is None:
+        return False
+    for member_id in list_epic_members(conn, epic_id):
+        member = get_task(conn, member_id)
+        branch = (member.branch_name if member is not None else None) or f"wt/{member_id}"
+        if _git_branch_exists(repo_root, branch):
+            return False
+    return True
 
 
 def _is_epic_task(conn: sqlite3.Connection, task_id: str) -> bool:
@@ -12561,6 +12598,15 @@ def _resolve_worktree_workspace(
     if base_branch is None and conn is not None:
         base_branch = _story_base_branch(conn, task.id, board=board)
     base = base_branch or "HEAD"
+
+    def ensure_epic_base(repo_root: Path) -> None:
+        if base_branch is not None:
+            _ensure_epic_branch(
+                repo_root,
+                base_branch,
+                allow_create_at_head=_allow_epic_base_creation(conn, task, repo_root),
+            )
+
     if not task.workspace_path:
         # Anchor on the board's configured default_workdir, not Path.cwd().
         # The dispatcher's CWD is incidental (gateway launch dir) and using it
@@ -12587,8 +12633,7 @@ def _resolve_worktree_workspace(
                 f"{board_slug!r} default_workdir {board_default!r} is not inside a git repo"
             )
         target = repo_root / ".worktrees" / task.id
-        if base_branch is not None:
-            _ensure_epic_branch(repo_root, base_branch)
+        ensure_epic_base(repo_root)
         _materialize_worktree_with_dependencies(
             repo_root,
             target,
@@ -12614,12 +12659,7 @@ def _resolve_worktree_workspace(
                 conn, task.id, requested
             )
             primary_root = _primary_checkout_root(requested)
-            if base_branch is not None:
-                # Reuse path: the worktree already exists, but the epic base
-                # it is measured against may not (that is exactly the state
-                # the incident left behind). Idempotent — an existing epic
-                # branch is never moved.
-                _ensure_epic_branch(primary_root, base_branch)
+            ensure_epic_base(primary_root)
             _provision_node_dependencies(primary_root, requested)
             return requested_resolved, actual_branch
         # The requested path is an existing checkout of a DIFFERENT
@@ -12633,8 +12673,7 @@ def _resolve_worktree_workspace(
         if fallback_root is not None:
             fallback = fallback_root / ".worktrees" / task.id
             if fallback.resolve(strict=False) != requested_resolved:
-                if base_branch is not None:
-                    _ensure_epic_branch(fallback_root, base_branch)
+                ensure_epic_base(fallback_root)
                 _materialize_worktree_with_dependencies(
                     fallback_root,
                     fallback,
@@ -12652,8 +12691,7 @@ def _resolve_worktree_workspace(
     repo_root = _git_toplevel(requested)
     if repo_root is not None and requested_resolved == repo_root:
         target = repo_root / ".worktrees" / task.id
-        if base_branch is not None:
-            _ensure_epic_branch(repo_root, base_branch)
+        ensure_epic_base(repo_root)
         _materialize_worktree_with_dependencies(
             repo_root,
             target,
@@ -12671,7 +12709,11 @@ def _resolve_worktree_workspace(
             "and does not point at a git repo root"
         )
     if base_branch is not None:
-        _ensure_epic_branch(repo_root, base_branch)
+        _ensure_epic_branch(
+            repo_root,
+            base_branch,
+            allow_create_at_head=_allow_epic_base_creation(conn, task, repo_root),
+        )
     _materialize_worktree_with_dependencies(
         repo_root,
         requested,
@@ -12965,7 +13007,7 @@ def _default_epic_verify(epic_branch: str) -> bool:
         repo_root = _git_toplevel(Path(board_default).expanduser())
         if repo_root is None:
             return False
-        _ensure_epic_branch(repo_root, epic_branch)
+        _ensure_epic_branch(repo_root, epic_branch, allow_create_at_head=False)
         target = repo_root / ".worktrees" / f"epic-verify-{epic_branch.replace('/', '-')}"
         from hermes_cli.worktree_dependencies import _acquire_project_lock
 

@@ -5,7 +5,7 @@
 that ran `release_product_task` was the worker-side `kanban_complete` tool, so
 the human whose gate it is had no way through it — `hermes kanban complete`
 calls plain `complete_task`, which correctly refuses for lack of release
-orchestration. These tests pin the operator path and its refusals.
+orchestration. These tests exercise the real mechanism with a controlled test-created `scripts/run_tests.sh`; they do not run the repository's production verification suite.
 """
 
 from __future__ import annotations
@@ -47,9 +47,6 @@ def _repo_with_story_branch(tmp_path: Path) -> tuple[Path, str, str]:
     _git(repo, "config", "user.email", "release@example.com")
     _git(repo, "config", "user.name", "Release Test")
     (repo / "README.md").write_text("base\n", encoding="utf-8")
-    # With no explicit candidate_verify_fn the kernel verifies the integration
-    # candidate by running scripts/run_tests.sh inside it — the operator path
-    # passes None, so the real default gate is what these tests exercise.
     scripts = repo / "scripts"
     scripts.mkdir()
     (scripts / "run_tests.sh").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
@@ -65,11 +62,14 @@ def _repo_with_story_branch(tmp_path: Path) -> tuple[Path, str, str]:
     return repo, branch, source_sha
 
 
-def _release_board(board: str, repo: Path, *, policy: str = "manual") -> None:
+def _release_board(board: str, repo: Path, *, policy: str = "manual", pull_request_required: bool = False) -> None:
     kb.ensure_product_board_defaults(board, default_workdir=str(repo))
     path = kb.board_metadata_path(board)
     meta = json.loads(path.read_text(encoding="utf-8"))
-    meta.setdefault("product_workflow", {})["deployment_policy"] = policy
+    workflow = meta.setdefault("product_workflow", {})
+    workflow["deployment_policy"] = policy
+    if pull_request_required:
+        workflow["pull_request_required"] = True
     path.write_text(json.dumps(meta), encoding="utf-8")
     if _git(repo, "status", "--porcelain"):
         _git(repo, "add", ".gitignore")
@@ -147,6 +147,28 @@ def _release(task_id: str, board: str, *extra: str) -> str:
     return kc.run_slash(f"--board {board} release {task_id} {args}")
 
 
+def _release_snapshot(conn, repo: Path, task_id: str):
+    task = kb.get_task(conn, task_id)
+    assert task is not None
+    return (
+        _git(repo, "rev-parse", "main"),
+        task.status,
+        task.current_step_key,
+        task.current_run_id,
+        tuple((event.kind, event.payload) for event in kb.list_events(conn, task_id)),
+    )
+
+
+def _assert_release_refused(task_id: str, board: str, repo: Path, expected: str):
+    with kb.connect(board=board) as conn:
+        before = _release_snapshot(conn, repo, task_id)
+    out = _release(task_id, board)
+    with kb.connect(board=board) as conn:
+        after = _release_snapshot(conn, repo, task_id)
+    assert expected in out and "no changes were made" in out.lower()
+    assert after == before
+
+
 def test_release_cli_completes_an_evidenced_release_measure_card(
     release_home, tmp_path
 ):
@@ -156,7 +178,7 @@ def test_release_cli_completes_an_evidenced_release_measure_card(
     with kb.connect(board=board) as conn:
         task_id = _seed_reviewed_card(conn, board, repo, branch, source_sha)
 
-    out = _release(task_id, board, '--note "Released and measured by operator"')
+    out = _release(task_id, board, '--note "Released and measured by operator" --operator-label Ole')
 
     assert "Released" in out
     with kb.connect(board=board) as conn:
@@ -169,10 +191,47 @@ def test_release_cli_completes_an_evidenced_release_measure_card(
     # Integration really happened — release is orchestration, not a status flip.
     assert (repo / "story.txt").read_text(encoding="utf-8") == "released\n"
     assert "deployment_policy_evaluated" in events
-    # The operator run is auditable: who released it is on the closing run.
+    # The caller label is recorded without claiming authenticated identity.
     assert run is not None and isinstance(run.metadata, dict)
-    assert run.metadata.get("released_by")
+    assert run.metadata.get("release_operator_label") == "Ole"
     assert run.metadata.get("release_surface") == "cli"
+    assert "released_by" not in run.metadata
+
+
+def test_release_cli_refuses_invalid_deployment_policy_before_mutation(
+    release_home, tmp_path
+):
+    repo, branch, source_sha = _repo_with_story_branch(tmp_path)
+    board = "release-cli-invalid-policy"
+    _release_board(board, repo, policy="unsupported")
+    with kb.connect(board=board) as conn:
+        task_id = _seed_reviewed_card(conn, board, repo, branch, source_sha)
+
+    _assert_release_refused(task_id, board, repo, "unsupported deployment policy 'unsupported'")
+
+
+def test_release_cli_refuses_required_policy_without_adapter_before_mutation(
+    release_home, tmp_path
+):
+    repo, branch, source_sha = _repo_with_story_branch(tmp_path)
+    board = "release-cli-required-policy"
+    _release_board(board, repo, policy="required")
+    with kb.connect(board=board) as conn:
+        task_id = _seed_reviewed_card(conn, board, repo, branch, source_sha)
+
+    _assert_release_refused(task_id, board, repo, "adapter-backed controller is required")
+
+
+def test_release_cli_refuses_missing_required_pull_request_before_mutation(
+    release_home, tmp_path
+):
+    repo, branch, source_sha = _repo_with_story_branch(tmp_path)
+    board = "release-cli-required-pr"
+    _release_board(board, repo, pull_request_required=True)
+    with kb.connect(board=board) as conn:
+        task_id = _seed_reviewed_card(conn, board, repo, branch, source_sha)
+
+    _assert_release_refused(task_id, board, repo, "missing required pull_request metadata")
 
 
 def test_release_cli_refuses_a_card_outside_release_measure(release_home, tmp_path):
@@ -226,8 +285,7 @@ def test_release_cli_refuses_an_unresolved_preflight(release_home, tmp_path):
 def test_release_cli_refuses_inside_a_kanban_worker(
     release_home, tmp_path, monkeypatch
 ):
-    """Release/Measure is a human gate. A dispatcher worker that shells out
-    to the CLI must not be able to walk through it."""
+    """Release/Measure is a human gate; the env check is defense in depth, not authorization: a process controlling its environment can bypass it."""
     repo, branch, source_sha = _repo_with_story_branch(tmp_path)
     board = "release-cli-worker"
     _release_board(board, repo)
