@@ -652,7 +652,20 @@ def _discard_staged(staged) -> None:
             logger.warning("could not remove staging path %s: %s", staging, exc)
 
 
-def _commit_staged_replacements(staged) -> None:
+# Locally built artifacts that live INSIDE swapped top-level entries. The
+# GitHub source ZIP carries no build outputs, so a plain swap of ``apps/``
+# deletes the built desktop app (apps/desktop/dist + release, incl. the
+# win-unpacked exe the user launched this update from) and its nested
+# node_modules (#70337). ``_commit_staged_replacements`` grafts these back
+# from the swap backup before the backups are dropped.
+_ZIP_PRESERVE_NESTED: tuple[tuple[str, ...], ...] = (
+    ("apps", "desktop", "dist"),
+    ("apps", "desktop", "release"),
+    ("apps", "desktop", "node_modules"),
+)
+
+
+def _commit_staged_replacements(staged, preserve_nested=None) -> None:
     """Phase 2: swap every staged entry into place, rolling back all on failure.
 
     ``_atomic_replace_dir`` makes each *individual* directory swap safe, but
@@ -701,7 +714,32 @@ def _commit_staged_replacements(staged) -> None:
                 # so say so rather than swallowing it.
                 logger.warning("rollback failed for %s: %s", dst, exc)
         raise
-    # All swaps succeeded — drop the backups (best-effort, never fatal).
+    # All swaps succeeded — graft preserved nested paths (locally built
+    # artifacts the source archive cannot contain) from each entry's backup
+    # into the swapped-in tree. Same-filesystem renames, so this costs
+    # nothing; best-effort, because a failed graft loses a rebuildable
+    # artifact, never the committed update's consistency.
+    for parts in preserve_nested or ():
+        top, rest = parts[0], parts[1:]
+        if not rest:
+            continue  # top-level entries belong in the caller's preserve set
+        for dst, backup in swapped:
+            if not backup or os.path.basename(dst) != top:
+                continue
+            old_sub = os.path.join(backup, *rest)
+            new_sub = os.path.join(dst, *rest)
+            if not os.path.exists(old_sub) or os.path.exists(new_sub):
+                continue
+            try:
+                os.makedirs(os.path.dirname(new_sub), exist_ok=True)
+                os.rename(old_sub, new_sub)
+            except OSError as exc:
+                logger.warning(
+                    "could not preserve %s across ZIP update: %s",
+                    os.path.join(*parts),
+                    exc,
+                )
+    # Drop the backups (best-effort, never fatal).
     for _dst, backup in swapped:
         if backup and os.path.isdir(backup):
             shutil.rmtree(backup, ignore_errors=True)
@@ -841,7 +879,7 @@ def _update_via_zip(args):
             raise
 
         try:
-            _commit_staged_replacements(staged)
+            _commit_staged_replacements(staged, preserve_nested=_ZIP_PRESERVE_NESTED)
         except Exception:
             # The rollback already restored every swapped entry, but staging
             # copies for the not-yet-swapped entries (potentially most of a
