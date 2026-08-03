@@ -2200,6 +2200,11 @@ class APIServerAdapter(BasePlatformAdapter):
             provider, raw = text.split("::", 1)
             if re.match(r"^[a-zA-Z0-9_.-]{2,64}$", provider) and raw.strip():
                 return provider, raw.strip()
+        # @provider:model format (used by Open WebUI and other clients)
+        if text.startswith("@") and ":" in text[1:]:
+            provider, raw = text[1:].split(":", 1)
+            if re.match(r"^[a-zA-Z0-9_.-]{2,64}$", provider) and raw.strip():
+                return provider, raw.strip()
         return "", text
 
     @classmethod
