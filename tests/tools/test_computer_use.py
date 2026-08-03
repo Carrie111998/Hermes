@@ -46,7 +46,7 @@ class TestSchema:
         assert actions >= {
             "capture", "click", "double_click", "right_click", "middle_click",
             "drag", "scroll", "type", "key", "wait", "list_apps", "list_windows",
-            "focus_app",
+            "focus_app", "launch_app", "kill_app", "bring_to_front",
         }
 
     def test_schema_max_elements_documents_default_and_upper_bound(self):
@@ -112,6 +112,33 @@ class TestDispatch:
         assert "type" in call_names
         type_kw = next(c[1] for c in noop_backend.calls if c[0] == "type")
         assert type_kw["text"] == "hello"
+
+    def test_launch_app_routes_lifecycle_arguments(self, noop_backend):
+        from tools.computer_use.tool import handle_computer_use
+
+        out = handle_computer_use({
+            "action": "launch_app",
+            "name": "Chromium",
+            "urls": ["https://example.com"],
+            "additional_arguments": ["--incognito"],
+            "creates_new_application_instance": True,
+        })
+
+        assert json.loads(out)["pid"] == 1
+        assert noop_backend.calls[-1] == ("launch_app", {
+            "bundle_id": None,
+            "name": "Chromium",
+            "urls": ["https://example.com"],
+            "additional_arguments": ["--incognito"],
+            "creates_new_application_instance": True,
+        })
+
+    def test_launch_app_requires_an_app_identifier(self):
+        from tools.computer_use.tool import handle_computer_use
+
+        out = handle_computer_use({"action": "launch_app"})
+
+        assert json.loads(out)["error"] == "launch_app requires `name` or `bundle_id`"
 
     def test_drag_action_routes_to_backend_by_element(self, noop_backend):
         """drag action must dispatch to backend.drag with element indices (issue #24170, bug 4)."""

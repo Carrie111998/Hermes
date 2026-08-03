@@ -20,7 +20,11 @@ from tools.environments.cua_fleet import (
     _provider_from_config,
 )
 from tools.environments.desktop_lease import DesktopSandboxManager
-from tools.environments.modal_desktop import ModalDesktopConfig, ModalDesktopEnvironment
+from tools.environments.modal_desktop import (
+    ModalDesktopConfig,
+    ModalDesktopEnvironment,
+    _TransportComputerBackend,
+)
 
 
 def test_compute_lease_fields() -> None:
@@ -213,6 +217,39 @@ def test_modal_desktop_backend_uses_the_lease_bound_transport() -> None:
         backend = environment.get_computer_backend()
 
     assert isinstance(backend.transport, ModalSandboxMcpTransport)
+
+
+def test_modal_transport_backend_forwards_app_lifecycle_actions() -> None:
+    transport = Mock()
+    transport.call_tool.side_effect = [
+        {"structuredContent": {"pid": 42, "name": "Chromium", "windows": []}},
+        {"structuredContent": {"ok": True, "message": "focused"}},
+        {"structuredContent": {"ok": True, "message": "terminated"}},
+    ]
+    backend = _TransportComputerBackend(transport)
+
+    launched = backend.launch_app(
+        name="Chromium",
+        urls=["https://example.com"],
+        additional_arguments=["--incognito"],
+        creates_new_application_instance=True,
+    )
+    focused = backend.bring_to_front(pid=42, window_id=7)
+    terminated = backend.kill_app(pid=42)
+
+    assert launched == {"pid": 42, "name": "Chromium", "windows": []}
+    assert focused.ok is True
+    assert terminated.ok is True
+    assert transport.call_tool.call_args_list[0].args == ("launch_app", {
+        "name": "Chromium",
+        "urls": ["https://example.com"],
+        "additional_arguments": ["--incognito"],
+        "creates_new_application_instance": True,
+    })
+    assert transport.call_tool.call_args_list[1].args == (
+        "bring_to_front", {"pid": 42, "window_id": 7},
+    )
+    assert transport.call_tool.call_args_list[2].args == ("kill_app", {"pid": 42})
 
 def test_modal_desktop_config_defaults() -> None:
     config = ModalDesktopConfig()

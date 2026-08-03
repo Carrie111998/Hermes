@@ -87,6 +87,39 @@ class _TransportComputerBackend(ComputerUseBackend):
     def focus_app(self, app: str, raise_window: bool = False) -> ActionResult:
         return self._action("focus_app", {"app": app, "raise_window": raise_window})
 
+    def launch_app(
+        self,
+        *,
+        bundle_id: Optional[str] = None,
+        name: Optional[str] = None,
+        urls: Optional[List[str]] = None,
+        additional_arguments: Optional[List[str]] = None,
+        creates_new_application_instance: bool = False,
+    ) -> Dict[str, Any]:
+        if not bundle_id and not name:
+            raise ValueError("launch_app requires either bundle_id or name")
+        arguments: Dict[str, Any] = {}
+        if bundle_id:
+            arguments["bundle_id"] = bundle_id
+        if name:
+            arguments["name"] = name
+        if urls:
+            arguments["urls"] = list(urls)
+        if additional_arguments:
+            arguments["additional_arguments"] = list(additional_arguments)
+        if creates_new_application_instance:
+            arguments["creates_new_application_instance"] = True
+        return dict(_result_data(self.transport.call_tool("launch_app", arguments)))
+
+    def kill_app(self, *, pid: int) -> ActionResult:
+        return self._action("kill_app", {"pid": int(pid)})
+
+    def bring_to_front(self, *, pid: int, window_id: Optional[int] = None) -> ActionResult:
+        arguments: Dict[str, Any] = {"pid": int(pid)}
+        if window_id is not None:
+            arguments["window_id"] = int(window_id)
+        return self._action("bring_to_front", arguments)
+
     def set_value(self, value: str, element: Optional[int] = None) -> ActionResult:
         return self._action("set_value", {"value": value, "element": element})
 
