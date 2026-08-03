@@ -1363,6 +1363,9 @@ export interface AuthMeResponse {
   org_id: string;
   provider: string;
   expires_at: number;
+  scopes: string[];
+  bound_session_id: string;
+  bound_profile: string;
 }
 
 export interface ActionResponse {

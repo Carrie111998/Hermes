@@ -106,6 +106,7 @@ import { isDashboardEmbeddedChatEnabled } from "@/lib/dashboard-flags";
 import { latchChatActivation } from "@/lib/chat-activation";
 import { api } from "@/lib/api";
 import type { StatusResponse, UpdateCheckResponse } from "@/lib/api";
+import { isResumeOnlySession } from "@/lib/resume-session";
 
 function RouteFallback({ label = "Loading…" }: { label?: string }) {
   return (
@@ -126,12 +127,22 @@ function RootRedirect() {
   return <Navigate to="/sessions" replace />;
 }
 
-function UnknownRouteFallback({ pluginsLoading }: { pluginsLoading: boolean }) {
+function ResumeRootRedirect() {
+  return <Navigate to="/chat" replace />;
+}
+
+function UnknownRouteFallback({
+  pluginsLoading,
+  resumeOnly = false,
+}: {
+  pluginsLoading: boolean;
+  resumeOnly?: boolean;
+}) {
   if (pluginsLoading) {
     // Render nothing during the plugin-load window — a spinner here would just flash.
     return null;
   }
-  return <Navigate to="/sessions" replace />;
+  return <Navigate to={resumeOnly ? "/chat" : "/sessions"} replace />;
 }
 
 const CHAT_NAV_ITEM: NavItem = {
@@ -375,6 +386,35 @@ export default function App() {
   const { theme } = useTheme();
   const [mobileOpen, setMobileOpen] = useState(false);
   const closeMobile = useCallback(() => setMobileOpen(false), []);
+  const authRequired =
+    typeof window !== "undefined" && !!window.__HERMES_AUTH_REQUIRED__;
+  const [resumeOnly, setResumeOnly] = useState(() => {
+    if (!authRequired || typeof window === "undefined") return false;
+    return new URLSearchParams(window.location.search).has("resume");
+  });
+
+  useEffect(() => {
+    if (!authRequired) return;
+    let cancelled = false;
+    api
+      .getAuthMe()
+      .then((me) => {
+        if (!cancelled) setResumeOnly(isResumeOnlySession(me));
+      })
+      .catch(() => {
+        // The auth gate still protects every route. Keep the conservative URL
+        // hint so a transient identity-probe failure never flashes admin UI.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [authRequired]);
+
+  const visibleManifests = useMemo(
+    () => (resumeOnly ? [] : manifests),
+    [manifests, resumeOnly],
+  );
+  const visiblePluginsLoading = resumeOnly ? false : pluginsLoading;
 
   const [collapsed, setCollapsed] = useState(() => {
     try {
@@ -414,6 +454,7 @@ export default function App() {
   // surfacing misleading token/cost numbers in the sidebar.  Default off.
   const [showTokenAnalytics, setShowTokenAnalytics] = useState(false);
   useEffect(() => {
+    if (resumeOnly) return;
     api
       .getConfig()
       .then((cfg) => {
@@ -423,7 +464,7 @@ export default function App() {
         setShowTokenAnalytics(dash.show_token_analytics === true);
       })
       .catch(() => setShowTokenAnalytics(false));
-  }, []);
+  }, [resumeOnly]);
 
   // A plugin can replace the built-in /chat page via `tab.override: "/chat"`
   // in its manifest.  When one does, `buildRoutes` already swaps the route
@@ -443,44 +484,49 @@ export default function App() {
   // plugin-load window (typically <50ms, worst case 2s safety timeout)
   // is the cheaper trade-off.
   const chatOverriddenByPlugin = useMemo(
-    () => manifests.some((m) => m.tab.override === "/chat"),
-    [manifests],
+    () => visibleManifests.some((m) => m.tab.override === "/chat"),
+    [visibleManifests],
   );
 
-  const builtinRoutes = useMemo(
-    () => ({
-      ...BUILTIN_ROUTES_CORE,
-      ...(embeddedChat ? { "/chat": ChatRouteSink } : {}),
-    }),
-    [embeddedChat],
+  const builtinRoutes = useMemo<Record<string, ComponentType>>(
+    () => {
+      if (resumeOnly) {
+        return { "/": ResumeRootRedirect, "/chat": ChatRouteSink };
+      }
+      const next: Record<string, ComponentType> = { ...BUILTIN_ROUTES_CORE };
+      if (embeddedChat) next["/chat"] = ChatRouteSink;
+      return next;
+    },
+    [embeddedChat, resumeOnly],
   );
 
   const builtinNav = useMemo(() => {
+    if (resumeOnly) return [CHAT_NAV_ITEM];
     const base = embeddedChat
       ? [CHAT_NAV_ITEM, ...BUILTIN_NAV_REST]
       : BUILTIN_NAV_REST;
     return showTokenAnalytics
       ? base
       : base.filter((n) => n.path !== "/analytics");
-  }, [embeddedChat, showTokenAnalytics]);
+  }, [embeddedChat, resumeOnly, showTokenAnalytics]);
 
   const sidebarNav = useMemo(
-    () => partitionSidebarNav(builtinNav, manifests),
-    [builtinNav, manifests],
+    () => partitionSidebarNav(builtinNav, visibleManifests),
+    [builtinNav, visibleManifests],
   );
   const routes = useMemo(
-    () => buildRoutes(builtinRoutes, manifests),
-    [builtinRoutes, manifests],
+    () => buildRoutes(builtinRoutes, visibleManifests),
+    [builtinRoutes, visibleManifests],
   );
   const pluginTabMeta = useMemo(
     () =>
-      manifests
+      visibleManifests
         .filter((m) => !m.tab.hidden)
         .map((m) => ({
           path: m.tab.override ?? m.tab.path,
           label: m.label,
         })),
-    [manifests],
+    [visibleManifests],
   );
 
   const layoutVariant = theme.layoutVariant ?? "standard";
@@ -536,17 +582,19 @@ export default function App() {
           clipPath: "var(--component-header-clip-path)",
         }}
       >
-        <Button
-          ghost
-          size="icon"
-          onClick={() => setMobileOpen(true)}
-          aria-label={t.app.openNavigation}
-          aria-expanded={mobileOpen}
-          aria-controls="app-sidebar"
-          className="text-text-secondary hover:text-midground"
-        >
-          <Menu />
-        </Button>
+        {!resumeOnly && (
+          <Button
+            ghost
+            size="icon"
+            onClick={() => setMobileOpen(true)}
+            aria-label={t.app.openNavigation}
+            aria-expanded={mobileOpen}
+            aria-controls="app-sidebar"
+            className="text-text-secondary hover:text-midground"
+          >
+            <Menu />
+          </Button>
+        )}
 
         <Typography className="font-bold text-[0.95rem] leading-[0.95] tracking-[0.05em] text-midground">
           {t.app.brand}
@@ -565,15 +613,16 @@ export default function App() {
         />
       )}
 
-      <PluginSlot name="header-banner" />
-      <ProfileScopeBanner />
+      {!resumeOnly && <PluginSlot name="header-banner" />}
+      {!resumeOnly && <ProfileScopeBanner />}
 
       <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden pt-14 lg:pt-0">
         <div className="flex min-h-0 min-w-0 flex-1">
-          <aside
-            id="app-sidebar"
-            aria-label={t.app.navigation}
-            className={cn(
+          {!resumeOnly && (
+            <aside
+              id="app-sidebar"
+              aria-label={t.app.navigation}
+              className={cn(
               "fixed top-0 left-0 z-50 flex h-dvh max-h-dvh w-64 min-h-0 flex-col font-sans",
               "border-r border-current/20",
               "bg-background-base",
@@ -582,13 +631,13 @@ export default function App() {
               "lg:sticky lg:top-0 lg:translate-x-0 lg:shrink-0 lg:overflow-hidden",
               "lg:transition-[width] lg:duration-300 lg:ease-[cubic-bezier(0.23,1,0.32,1)]",
               collapsed && "lg:w-14",
-            )}
-            style={{
-              background: "var(--component-sidebar-background)",
-              clipPath: "var(--component-sidebar-clip-path)",
-              borderImage: "var(--component-sidebar-border-image)",
-            }}
-          >
+              )}
+              style={{
+                background: "var(--component-sidebar-background)",
+                clipPath: "var(--component-sidebar-clip-path)",
+                borderImage: "var(--component-sidebar-border-image)",
+              }}
+            >
             <div
               className={cn(
                 "flex h-14 shrink-0 items-center gap-2",
@@ -742,7 +791,8 @@ export default function App() {
               <AuthWidget />
               <SidebarFooter status={sidebarStatus} />
             </div>
-          </aside>
+            </aside>
+          )}
 
           <PageHeaderProvider pluginTabs={pluginTabMeta}>
             <div
@@ -755,7 +805,7 @@ export default function App() {
                 isDocsRoute && "min-h-0 flex-1",
               )}
             >
-              <PluginSlot name="pre-main" />
+              {!resumeOnly && <PluginSlot name="pre-main" />}
               <div
                 className={cn(
                   "w-full min-w-0",
@@ -774,7 +824,10 @@ export default function App() {
                       <Route
                         path="*"
                         element={
-                          <UnknownRouteFallback pluginsLoading={pluginsLoading} />
+                          <UnknownRouteFallback
+                            pluginsLoading={visiblePluginsLoading}
+                            resumeOnly={resumeOnly}
+                          />
                         }
                       />
                     </Routes>
@@ -783,7 +836,7 @@ export default function App() {
 
                 {embeddedChat &&
                   !chatOverriddenByPlugin &&
-                  (pluginsLoading ? (
+                  (visiblePluginsLoading ? (
                     isChatRoute ? (
                       <RouteFallback label="Loading chat…" />
                     ) : null
@@ -803,20 +856,23 @@ export default function App() {
                           ) : null
                         }
                       >
-                        <ChatPage isActive={isChatRoute} />
+                        <ChatPage
+                          isActive={isChatRoute}
+                          resumeOnly={resumeOnly}
+                        />
                       </Suspense>
                     </div>
                   ) : isChatRoute ? (
                     <RouteFallback label="Loading chat…" />
                   ) : null)}
               </div>
-              <PluginSlot name="post-main" />
+              {!resumeOnly && <PluginSlot name="post-main" />}
             </div>
           </PageHeaderProvider>
         </div>
       </div>
 
-      <PluginSlot name="overlay" />
+      {!resumeOnly && <PluginSlot name="overlay" />}
     </div>
     </ProfileProvider>
   );
