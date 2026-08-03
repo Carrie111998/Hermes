@@ -642,8 +642,8 @@ class TestPromptBuilderConstants:
         strikethrough, headers, bullets). Their hints previously told the
         agent "do not use markdown", which made it strip bullets/bold the
         adapter would have rendered. The hint must affirm markdown, not
-        forbid it."""
-        for key in ("whatsapp", "signal"):
+        forbid it. Discord renders markdown natively — same guidance applies."""
+        for key in ("whatsapp", "signal", "discord"):
             hint = PLATFORM_HINTS[key]
             assert "do not use markdown" not in hint.lower()
             assert "markdown" in hint.lower()

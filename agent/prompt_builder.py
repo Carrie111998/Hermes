@@ -732,6 +732,11 @@ PLATFORM_HINTS = {
     ),
     "discord": (
         "You are in a Discord server or group chat communicating with your user. "
+        "Discord renders standard markdown natively — use **bold**, *italic*, "
+        "__underline__, ~~strikethrough~~, `inline code`, ```code blocks```, "
+        "> blockquotes, ||spoilers||, and [labeled links](url). Prefer bullet "
+        "lists ('- item') for structured data; pipe tables are auto-converted to "
+        "bullet groups. "
         "You can send media files natively: include MEDIA:/absolute/path/to/file "
         "in your response. Images (.png, .jpg, .webp) are sent as photo "
         "attachments, audio as file attachments. You can also include image URLs "

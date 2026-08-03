@@ -9552,6 +9552,11 @@ async def _standalone_send(
         last_data = None
         warnings = []
 
+        if message:
+            message = convert_table_to_bullets(message)
+        if caption:
+            caption = convert_table_to_bullets(caption)
+
         # Thread endpoint: Discord threads are channels; send directly to the thread ID.
         if thread_id:
             url = f"https://discord.com/api/v10/channels/{thread_id}/messages"
