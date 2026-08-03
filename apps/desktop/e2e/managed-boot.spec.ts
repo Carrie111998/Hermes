@@ -13,6 +13,12 @@ import { type ManagedSignedOutFixture, setupManagedSignedOut } from './fixtures'
 let fixture: ManagedSignedOutFixture | null = null
 
 test.beforeAll(async () => {
+  // Importing and launching the production Electron bundle can exceed the
+  // generic 90 s per-test budget on a cold, single-core Linux runner. Keep the
+  // assertions on the normal timeout while giving this one shared launch a
+  // bounded allowance; the CI failure artifact showed the fully rendered
+  // managed sign-in screen immediately after the hook timed out.
+  test.setTimeout(180_000)
   fixture = await setupManagedSignedOut()
 })
 
