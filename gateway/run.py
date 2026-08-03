@@ -814,10 +814,13 @@ from gateway.delivery import DeliveryRouter
 from gateway.platforms.base import (
     BasePlatformAdapter,
     EphemeralReply,
+    MEDIA_DIRECTIVE_EXTENSION_PATTERN,
     MessageEvent,
     MessageType,
     _reply_anchor_for_event,
+    media_delivery_correlation_id,
     merge_pending_message_event,
+    report_media_delivery_failure,
 )
 from gateway.restart import (
     DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
@@ -834,6 +837,11 @@ from gateway.whatsapp_identity import (
 
 
 logger = logging.getLogger(__name__)
+
+_TOOL_MEDIA_RE = re.compile(
+    rf'MEDIA:((?:/|~\/)\S+\.(?:{MEDIA_DIRECTIVE_EXTENSION_PATTERN}))',
+    re.IGNORECASE,
+)
 
 
 # Sentinel placed into _running_agents immediately when a session starts
@@ -11157,6 +11165,36 @@ class GatewayRunner:
         from pathlib import Path
         from urllib.parse import quote as _quote
 
+        async def _report_failure(file_path: str, detail: str) -> None:
+            await report_media_delivery_failure(
+                adapter,
+                chat_id=event.source.chat_id,
+                thread_id=getattr(event.source, "thread_id", None),
+                file_path=file_path,
+                metadata=_thread_meta,
+                detail=detail,
+            )
+
+        async def _check_result(file_path: str, result) -> None:
+            correlation_id = media_delivery_correlation_id(file_path)
+            if not getattr(result, "success", False):
+                await _report_failure(
+                    file_path,
+                    str(getattr(result, "error", None) or "upload returned no success confirmation"),
+                )
+                return
+            logger.info(
+                "artifact_delivery correlation_id=%s stage=upload_result "
+                "platform=%s chat_id=%s thread_id=%s filename=%s "
+                "message_id=%s success=true",
+                correlation_id,
+                adapter.name,
+                event.source.chat_id,
+                getattr(event.source, "thread_id", None),
+                Path(file_path).name,
+                getattr(result, "message_id", None),
+            )
+
         try:
             # Capture [[as_document]] before extract_media strips it, so the
             # dispatch partition below can route image-extension files
@@ -11167,6 +11205,17 @@ class GatewayRunner:
             media_files, _ = adapter.extract_media(response)
             _, cleaned = adapter.extract_images(response)
             local_files, _ = adapter.extract_local_files(cleaned)
+
+            for file_path, _ in media_files:
+                logger.info(
+                    "artifact_delivery correlation_id=%s stage=response_rendering "
+                    "platform=%s chat_id=%s thread_id=%s filename=%s parsed=true",
+                    media_delivery_correlation_id(file_path),
+                    adapter.name,
+                    event.source.chat_id,
+                    getattr(event.source, "thread_id", None),
+                    Path(file_path).name,
+                )
 
             _thread_meta = self._thread_metadata_for_source(event.source, self._reply_anchor_for_event(event))
 
@@ -11213,43 +11262,47 @@ class GatewayRunner:
                 try:
                     ext = Path(media_path).suffix.lower()
                     if should_send_media_as_audio(event.source.platform, ext, is_voice=is_voice):
-                        await adapter.send_voice(
+                        result = await adapter.send_voice(
                             chat_id=event.source.chat_id,
                             audio_path=media_path,
                             metadata=_thread_meta,
                         )
                     elif ext in _VIDEO_EXTS:
-                        await adapter.send_video(
+                        result = await adapter.send_video(
                             chat_id=event.source.chat_id,
                             video_path=media_path,
                             metadata=_thread_meta,
                         )
                     else:
-                        await adapter.send_document(
+                        result = await adapter.send_document(
                             chat_id=event.source.chat_id,
                             file_path=media_path,
                             metadata=_thread_meta,
                         )
+                    await _check_result(media_path, result)
                 except Exception as e:
                     logger.warning("[%s] Post-stream media delivery failed: %s", adapter.name, e)
+                    await _report_failure(media_path, str(e))
 
             for file_path in non_image_local:
                 try:
                     ext = Path(file_path).suffix.lower()
                     if ext in _VIDEO_EXTS:
-                        await adapter.send_video(
+                        result = await adapter.send_video(
                             chat_id=event.source.chat_id,
                             video_path=file_path,
                             metadata=_thread_meta,
                         )
                     else:
-                        await adapter.send_document(
+                        result = await adapter.send_document(
                             chat_id=event.source.chat_id,
                             file_path=file_path,
                             metadata=_thread_meta,
                         )
+                    await _check_result(file_path, result)
                 except Exception as e:
                     logger.warning("[%s] Post-stream file delivery failed: %s", adapter.name, e)
+                    await _report_failure(file_path, str(e))
 
         except Exception as e:
             logger.warning("Post-stream media extraction failed: %s", e)
@@ -16518,13 +16571,6 @@ class GatewayRunner:
                 if _hm.get("role") in {"tool", "function"}:
                     _hc = _hm.get("content", "")
                     if "MEDIA:" in _hc:
-                        _TOOL_MEDIA_RE = re.compile(
-                            r'MEDIA:((?:/|~\/)\S+\.(?:png|jpe?g|gif|webp|'
-                            r'mp4|mov|avi|mkv|webm|ogg|opus|mp3|wav|m4a|'
-                            r'flac|epub|pdf|zip|rar|7z|docx?|xlsx?|pptx?|'
-                            r'txt|csv|apk|ipa))',
-                            re.IGNORECASE
-                        )
                         for _match in _TOOL_MEDIA_RE.finditer(_hc):
                             _p = _match.group(1).strip().rstrip('",}')
                             if _p:
@@ -16814,13 +16860,6 @@ class GatewayRunner:
                     if msg.get("role") in {"tool", "function"}:
                         content = msg.get("content", "")
                         if "MEDIA:" in content:
-                            _TOOL_MEDIA_RE = re.compile(
-                                r'MEDIA:((?:/|~\/)\S+\.(?:png|jpe?g|gif|webp|'
-                                r'mp4|mov|avi|mkv|webm|ogg|opus|mp3|wav|m4a|'
-                                r'flac|epub|pdf|zip|rar|7z|docx?|xlsx?|pptx?|'
-                                r'txt|csv|apk|ipa))',
-                                re.IGNORECASE
-                            )
                             for match in _TOOL_MEDIA_RE.finditer(content):
                                 path = match.group(1).strip().rstrip('",}')
                                 if path and path not in _history_media_paths:

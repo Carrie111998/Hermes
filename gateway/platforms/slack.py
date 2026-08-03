@@ -52,6 +52,7 @@ from gateway.platforms.base import (
     SendResult,
     SUPPORTED_DOCUMENT_TYPES,
     is_host_excluded_by_no_proxy,
+    media_delivery_correlation_id,
     resolve_proxy_url,
     safe_url_for_log,
     cache_document_from_bytes,
@@ -96,6 +97,39 @@ class _SlackAttachmentError(ValueError):
 
 class _SlackUploadPolicyError(PermissionError):
     """Local path is not an approved generated-artifact upload source."""
+
+
+def _verified_upload_file_id(
+    result: Any, expected_filename: str, expected_size: int
+) -> str:
+    """Validate Slack's upload acknowledgement and return its file ID."""
+    response = getattr(result, "data", result)
+    if not isinstance(response, dict) or response.get("ok") is False:
+        raise RuntimeError("Slack did not confirm the file upload")
+    files = response.get("files")
+    file_obj = files[0] if isinstance(files, list) and files else response.get("file")
+    if not isinstance(file_obj, dict) or not file_obj.get("id"):
+        raise RuntimeError("Slack upload response did not include a file ID")
+
+    actual_name = str(file_obj.get("name") or "")
+    if actual_name and actual_name != expected_filename:
+        raise RuntimeError(
+            f"Slack confirmed the wrong filename ({actual_name!r})"
+        )
+    expected_type = _Path(expected_filename).suffix.lower().lstrip(".")
+    actual_type = str(file_obj.get("filetype") or "").lower()
+    if not actual_type:
+        raise RuntimeError("Slack upload response did not include a file type")
+    if expected_type in {"htm", "html"} and actual_type != "html":
+        raise RuntimeError(
+            f"Slack confirmed the wrong file type ({actual_type!r})"
+        )
+    actual_size = file_obj.get("size")
+    if actual_size is not None and int(actual_size) != expected_size:
+        raise RuntimeError(
+            f"Slack confirmed the wrong file size ({actual_size!r})"
+        )
+    return str(file_obj["id"])
 
 
 @dataclass(frozen=True)
@@ -1914,6 +1948,17 @@ class SlackAdapter(BasePlatformAdapter):
             for attempt in range(3):
                 try:
                     self._authorize_file_upload()
+                    correlation_id = media_delivery_correlation_id(file_path)
+                    logger.info(
+                        "artifact_delivery correlation_id=%s stage=upload_request "
+                        "platform=slack chat_id=%s thread_id=%s filename=%s "
+                        "bytes=%s",
+                        correlation_id,
+                        chat_id,
+                        thread_ts,
+                        display_name,
+                        len(file_bytes),
+                    )
                     result = await self._get_client(chat_id).files_upload_v2(
                         channel=chat_id,
                         content=file_bytes,
@@ -1921,8 +1966,25 @@ class SlackAdapter(BasePlatformAdapter):
                         initial_comment=caption or "",
                         thread_ts=thread_ts,
                     )
+                    file_id = _verified_upload_file_id(
+                        result, display_name, len(file_bytes)
+                    )
+                    logger.info(
+                        "artifact_delivery correlation_id=%s stage=upload_result "
+                        "platform=slack chat_id=%s thread_id=%s filename=%s "
+                        "file_id=%s success=true",
+                        correlation_id,
+                        chat_id,
+                        thread_ts,
+                        display_name,
+                        file_id,
+                    )
                     self._record_uploaded_file_thread(chat_id, thread_ts)
-                    return SendResult(success=True, raw_response=result)
+                    return SendResult(
+                        success=True,
+                        message_id=file_id,
+                        raw_response=result,
+                    )
                 except Exception as exc:
                     last_exc = exc
                     if not self._is_retryable_upload_error(exc) or attempt >= 2:
@@ -1945,10 +2007,10 @@ class SlackAdapter(BasePlatformAdapter):
                 e,
                 exc_info=True,
             )
-            text = f"📎 File: {file_path}"
-            if caption:
-                text = f"{caption}\n{text}"
-            return await self.send(chat_id, text, reply_to=reply_to, metadata=metadata)
+            return SendResult(
+                success=False,
+                error=f"Slack document upload failed: {e}",
+            )
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Get information about a Slack channel."""

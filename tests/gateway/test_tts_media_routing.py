@@ -50,6 +50,21 @@ def _event(thread_id=None):
     )
 
 
+def _slack_event(*, chat_id="C123", chat_type="channel", thread_id=None):
+    source = SessionSource(
+        platform=Platform.SLACK,
+        chat_id=chat_id,
+        chat_type=chat_type,
+        thread_id=thread_id,
+    )
+    return MessageEvent(
+        text="make report",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="1785782926.578209",
+    )
+
+
 @pytest.mark.asyncio
 async def test_base_adapter_routes_telegram_flac_media_tag_to_document_sender():
     adapter = _MediaRoutingAdapter()
@@ -106,6 +121,26 @@ async def test_base_adapter_routes_voice_tagged_telegram_ogg_media_tag_to_voice_
     adapter.send_document.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_base_adapter_surfaces_html_upload_failure_in_same_thread():
+    adapter = _MediaRoutingAdapter()
+    event = _event(thread_id="topic-1")
+    adapter._message_handler = AsyncMock(return_value="MEDIA:/tmp/report.html")
+    adapter.send_document = AsyncMock(
+        return_value=SendResult(success=False, error="artifact path rejected")
+    )
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="notice"))
+
+    await adapter._process_message_background(event, build_session_key(event.source))
+
+    adapter.send.assert_awaited_once()
+    assert adapter.send.await_args is not None
+    notice = adapter.send.await_args.kwargs
+    assert notice["metadata"]["thread_id"] == "topic-1"
+    assert "was not attached" in notice["content"]
+    assert "artifact path rejected" in notice["content"]
+
+
 def _fake_runner(thread_meta):
     """Build a fake GatewayRunner-like object with the helper methods needed by
     _deliver_media_from_response."""
@@ -143,6 +178,98 @@ async def test_streaming_delivery_routes_telegram_flac_media_tag_to_document_sen
         metadata={"thread_id": "topic-1"},
     )
     adapter.send_voice.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("event", "thread_meta"),
+    [
+        (_slack_event(), None),
+        (
+            _slack_event(thread_id="1785782926.578209"),
+            {"thread_ts": "1785782926.578209"},
+        ),
+        (
+            _slack_event(
+                chat_id="G123",
+                chat_type="group",
+                thread_id="1785782926.578209",
+            ),
+            {"thread_ts": "1785782926.578209"},
+        ),
+    ],
+    ids=["root-channel", "channel-thread", "group-dm-thread"],
+)
+async def test_streaming_delivery_routes_html_media_to_slack_destination(
+    event, thread_meta
+):
+    adapter = SimpleNamespace(
+        name="slack",
+        extract_media=BasePlatformAdapter.extract_media,
+        extract_images=BasePlatformAdapter.extract_images,
+        extract_local_files=BasePlatformAdapter.extract_local_files,
+        send_voice=AsyncMock(return_value=SendResult(success=True, message_id="voice")),
+        send_document=AsyncMock(
+            return_value=SendResult(success=True, message_id="F123")
+        ),
+        send_multiple_images=AsyncMock(
+            return_value=SendResult(success=True, message_id="images")
+        ),
+        send_video=AsyncMock(return_value=SendResult(success=True, message_id="video")),
+        send=AsyncMock(return_value=SendResult(success=True, message_id="notice")),
+    )
+    artifact = "/opt/data/artifacts/slack/abc-leadership-recap.html"
+
+    await GatewayRunner._deliver_media_from_response(
+        _fake_runner(thread_meta),
+        f"Your report is attached.\nMEDIA:{artifact}",
+        event,
+        adapter,
+    )
+
+    adapter.send_document.assert_awaited_once_with(
+        chat_id=event.source.chat_id,
+        file_path=artifact,
+        metadata=thread_meta,
+    )
+
+
+@pytest.mark.asyncio
+async def test_streaming_delivery_surfaces_html_upload_rejection_in_same_thread():
+    thread_ts = "1785782926.578209"
+    event = _slack_event(thread_id=thread_ts)
+    adapter = SimpleNamespace(
+        name="slack",
+        extract_media=BasePlatformAdapter.extract_media,
+        extract_images=BasePlatformAdapter.extract_images,
+        extract_local_files=BasePlatformAdapter.extract_local_files,
+        send_voice=AsyncMock(return_value=SendResult(success=True)),
+        send_document=AsyncMock(
+            return_value=SendResult(
+                success=False,
+                error="Slack upload denied: file is outside approved generated-artifact roots.",
+            )
+        ),
+        send_multiple_images=AsyncMock(return_value=SendResult(success=True)),
+        send_video=AsyncMock(return_value=SendResult(success=True)),
+        send=AsyncMock(return_value=SendResult(success=True, message_id="notice")),
+    )
+    untrusted = "/tmp/not-a-trusted-artifact.html"
+
+    await GatewayRunner._deliver_media_from_response(
+        _fake_runner({"thread_ts": thread_ts}),
+        f"MEDIA:{untrusted}",
+        event,
+        adapter,
+    )
+
+    adapter.send.assert_awaited_once()
+    assert adapter.send.await_args is not None
+    notice = adapter.send.await_args.kwargs
+    assert notice["chat_id"] == "C123"
+    assert notice["metadata"] == {"thread_ts": thread_ts}
+    assert "was not attached" in notice["content"]
+    assert "outside approved generated-artifact roots" in notice["content"]
 
 
 @pytest.mark.asyncio
