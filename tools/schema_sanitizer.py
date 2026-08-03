@@ -349,13 +349,11 @@ def _sanitize_node(node: Any, path: str) -> Any:
     # Array nodes without items: inject a permissive empty items schema.
     # Gemini's function-declaration validator rejects array parameters that
     # lack ``items`` (HTTP 400 ``properties[...].items: missing field``);
-    # other backends accept ``items: {}`` fine. ``prefixItems`` (tuple form)
-    # already constrains the array, so leave those nodes alone.
-    if (
-        out.get("type") == "array"
-        and "items" not in out
-        and "prefixItems" not in out
-    ):
+    # other backends accept ``items: {}`` fine. Tuple-form arrays that carry
+    # ``prefixItems`` are already constrained per-position, but Gemini still
+    # requires ``items`` to be present on every array node, so we backfill
+    # for those too.
+    if out.get("type") == "array" and "items" not in out:
         out["items"] = {}
 
     # Prune ``required`` entries that don't exist in properties (defense
