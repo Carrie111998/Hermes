@@ -6793,8 +6793,11 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
 
     ``"active_pr"``
         A GitHub PR URL appears in a recent task comment (within
-        ``_RESPAWN_GUARD_PR_WINDOW`` seconds).  A prior worker already
-        opened a PR; re-spawning risks a duplicate PR on the same task.
+        ``_RESPAWN_GUARD_PR_WINDOW`` seconds) after the task's most recent
+        deliberate unblock. A prior worker already opened a PR; re-spawning
+        otherwise risks a duplicate PR on the same task. A manual unblock is
+        explicit operator intent to retry, so it supersedes earlier PR
+        comments (including a PR that has since been merged or closed).
 
     Stale / dead claim locks are NOT a guard reason — they are handled
     by ``release_stale_claims`` and ``detect_crashed_workers`` which
@@ -6861,11 +6864,24 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         return "recent_success"
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
+    # A manual unblock is an explicit operator decision to retry. Ignore PR
+    # comments written before (or in the same second as) that event; otherwise
+    # a merged/closed PR can strand a deliberately unblocked task for 24 hours.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
-    for c in conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
-        (task_id, pr_cutoff),
-    ).fetchall():
+    last_unblocked = conn.execute(
+        "SELECT MAX(created_at) AS created_at FROM task_events "
+        "WHERE task_id = ? AND kind = 'unblocked'",
+        (task_id,),
+    ).fetchone()
+    unblocked_at = last_unblocked["created_at"] if last_unblocked else None
+    comments_query = (
+        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?"
+    )
+    params: tuple[object, ...] = (task_id, pr_cutoff)
+    if unblocked_at is not None:
+        comments_query += " AND created_at > ?"
+        params += (unblocked_at,)
+    for c in conn.execute(comments_query, params).fetchall():
         if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
             return "active_pr"
 
