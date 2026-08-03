@@ -56,6 +56,24 @@ VALID_PHASES = frozenset({
 TERMINAL_STATUSES = frozenset({"failed", "completed"})
 SUSPENDED_STATUSES = frozenset({"blocked", "human_gate", "queue_exhausted"})
 
+# R1 mission_state allowed top-level properties (additionalProperties: false)
+_VALID_STATE_KEYS = frozenset({
+    "document_type", "schema_version", "mission_id", "generation",
+    "status", "phase", "identity", "planner_import", "card_ref",
+    "execution_ref", "evidence_refs", "decision_refs", "consultation_refs",
+    "active_blocker", "active_human_gate", "queue_exhausted",
+    "completion", "next_safe_action", "last_operation",
+})
+
+# R1 consultationRef required fields
+_CONSULTATION_REQUIRED_KEYS = frozenset({
+    "execution_id", "mode", "snapshot_head", "tree_sha",
+    "plan_fingerprint", "checkpoint_fingerprint", "bundle_fingerprint",
+    "expected_question_ids", "schema_version", "status",
+    "detailed_status", "verdict", "response_fingerprint",
+    "response_artifact",
+})
+
 # R1-aligned outcome vocabulary for TransitionResult.
 # The R1 schema defines: applied, replayed, stale_generation, conflict, invalid.
 # "not-found" and "failed" map to "invalid" with appropriate error codes.
@@ -308,6 +326,11 @@ def _validate_state_shape(state: dict) -> list[str]:
     Returns a list of error strings; empty means valid.
     Enforces all R1 structural invariants including status-dependent
     payload requirements and mutual exclusions.
+
+    Strategy (R2.1 senior consultation):
+      Product-only validator implementing R1 structural + semantic invariants.
+      No JSON Schema dependency, no R1 worktree path dependency.
+      R1 schema/tests remain the normative development reference.
     """
     errors: list[str] = []
     if state.get("document_type") != DOCUMENT_TYPE_STATE:
@@ -327,39 +350,97 @@ def _validate_state_shape(state: dict) -> list[str]:
     if not isinstance(generation, int) or generation < 0:
         errors.append("generation must be a non-negative integer")
 
-    # Terminal status invariant
+    # Reject unknown top-level keys (R1 additionalProperties: false)
+    unknown_keys = set(state.keys()) - _VALID_STATE_KEYS
+    if unknown_keys:
+        errors.append(f"unknown top-level properties: {sorted(unknown_keys)}")
+
+    # Structural check for consultation_refs entries
+    for i, ref in enumerate(state.get("consultation_refs", [])):
+        if isinstance(ref, dict):
+            missing = _CONSULTATION_REQUIRED_KEYS - set(ref.keys())
+            if missing:
+                errors.append(
+                    f"consultation_refs[{i}] missing required fields: "
+                    f"{sorted(missing)}"
+                )
+
+    # Reject extra properties in planner_import (R1 additionalProperties: false)
+    pi = state.get("planner_import")
+    if isinstance(pi, dict):
+        _valid_pi_keys = {"board", "import_id", "envelope_fingerprint"}
+        pi_unknown = set(pi.keys()) - _valid_pi_keys
+        if pi_unknown:
+            errors.append(
+                f"planner_import has unknown properties: {sorted(pi_unknown)}"
+            )
+
+    # --- Terminal status invariant ---
     if status in TERMINAL_STATUSES:
         if phase != "terminal":
             errors.append(f"terminal status '{status}' requires phase 'terminal'")
         if state.get("next_safe_action") is not None:
             errors.append(f"terminal status '{status}' requires null next_safe_action")
 
-    # completed requires final_review
+    # --- completed: final_review binding + merge_gate implication ---
     if status == "completed":
         completion = state.get("completion")
         if not isinstance(completion, dict):
             errors.append("completed status requires completion object")
-        elif completion.get("final_review") is None:
-            errors.append("completed status requires non-null completion.final_review")
+        else:
+            if completion.get("final_review") is None:
+                errors.append("completed status requires non-null completion.final_review")
+            else:
+                fr = completion["final_review"]
+                identity = state.get("identity") or {}
+                if isinstance(fr, dict):
+                    if fr.get("commit_sha") != identity.get("head_sha"):
+                        errors.append(
+                            "final_review.commit_sha must match identity.head_sha"
+                        )
+                    if fr.get("tree_sha") != identity.get("tree_sha"):
+                        errors.append(
+                            "final_review.tree_sha must match identity.tree_sha"
+                        )
+            if completion.get("merge_required") is True:
+                if completion.get("merge_gate") is None:
+                    errors.append(
+                        "merge_required=True requires non-null completion.merge_gate"
+                    )
 
-    # blocked: requires blocker, mutual exclusion
+    # --- blocked: blocker + resume_condition + next_safe_action required ---
     if status == "blocked":
-        if not isinstance(state.get("active_blocker"), dict):
+        blocker = state.get("active_blocker")
+        if not isinstance(blocker, dict):
             errors.append("blocked status requires active_blocker object")
+        else:
+            if "resume_condition" not in blocker or blocker["resume_condition"] is None:
+                errors.append(
+                    "blocked active_blocker requires non-null resume_condition"
+                )
         if state.get("active_human_gate") is not None:
             errors.append("blocked status requires null active_human_gate")
         if state.get("queue_exhausted") is not None:
             errors.append("blocked status requires null queue_exhausted")
         nsa = state.get("next_safe_action")
-        if isinstance(nsa, dict) and nsa.get("executable") is not False:
-            errors.append("blocked status requires non-executable next_safe_action")
+        if not isinstance(nsa, dict):
+            errors.append("blocked status requires structured next_safe_action")
+        else:
+            if nsa.get("executable") is not False:
+                errors.append("blocked status requires non-executable next_safe_action")
 
-    # human_gate: requires gate, mutual exclusion
+    # --- human_gate: gate + next_safe_action exact match ---
     if status == "human_gate":
         hg = state.get("active_human_gate")
         if not isinstance(hg, dict):
             errors.append("human_gate status requires active_human_gate object")
         else:
+            for field in ("gate_id", "gate_type", "version", "status",
+                          "prompt_fingerprint", "resolution_ref"):
+                if field not in hg:
+                    errors.append(
+                        f"active_human_gate requires field '{field}'"
+                    )
             if hg.get("status") != "pending":
                 errors.append("human_gate requires active_human_gate.status='pending'")
         if state.get("active_blocker") is not None:
@@ -367,23 +448,39 @@ def _validate_state_shape(state: dict) -> list[str]:
         if state.get("queue_exhausted") is not None:
             errors.append("human_gate status requires null queue_exhausted")
         nsa = state.get("next_safe_action")
-        if isinstance(nsa, dict):
-            if nsa.get("action") != "await_human":
-                errors.append("human_gate requires next_safe_action.action='await_human'")
-            if nsa.get("executable") is not False:
-                errors.append("human_gate requires non-executable next_safe_action")
+        if not isinstance(nsa, dict):
+            errors.append("human_gate status requires structured next_safe_action")
+        else:
+            _expected_nsa = {
+                "action": "await_human",
+                "executable": False,
+                "card_id": None,
+                "reason_code": "human_gate_pending",
+            }
+            if nsa != _expected_nsa:
+                errors.append(
+                    "human_gate requires exact next_safe_action "
+                    "{action='await_human', executable=false, ...}"
+                )
 
-    # queue_exhausted: requires payload, mutual exclusion
+    # --- queue_exhausted: payload + resume_condition + next_safe_action ---
     if status == "queue_exhausted":
         qe = state.get("queue_exhausted")
         if not isinstance(qe, dict):
             errors.append("queue_exhausted status requires queue_exhausted object")
+        else:
+            if "resume_condition" not in qe or qe["resume_condition"] is None:
+                errors.append(
+                    "queue_exhausted requires non-null resume_condition"
+                )
         if state.get("active_blocker") is not None:
             errors.append("queue_exhausted status requires null active_blocker")
         if state.get("active_human_gate") is not None:
             errors.append("queue_exhausted status requires null active_human_gate")
         nsa = state.get("next_safe_action")
-        if isinstance(nsa, dict):
+        if not isinstance(nsa, dict):
+            errors.append("queue_exhausted status requires structured next_safe_action")
+        else:
             if nsa.get("action") not in ("replan", "await_resume_condition"):
                 errors.append(
                     "queue_exhausted requires next_safe_action.action "
@@ -557,6 +654,8 @@ def compare_and_transition(
     expected_generation: int,
     operation_id: str,
     next_state: dict,
+    consumes_consultation: str | None = None,
+    decision_id: str | None = None,
 ) -> TransitionResult:
     """Atomically compare-and-transition a mission.
 
@@ -604,10 +703,31 @@ def compare_and_transition(
             },
         )
 
+    # Normalize generation in next_state BEFORE fingerprinting.
+    # (R2.1 senior decision: option (c) — caller-supplied generation is noise;
+    #  the canonical representation is expected_generation + 1.)
+    _normalized_next_state = dict(next_state)
+    _normalized_next_state["generation"] = expected_generation + 1
+
+    # Consultation consumption requires a local decision (R1 invariant)
+    if consumes_consultation and not decision_id:
+        return TransitionResult(
+            outcome=R1_OUTCOMES_INVALID,
+            mission_id=mission_id,
+            operation_id=operation_id,
+            request_fingerprint="",
+            generation=0,
+            state_fingerprint="",
+            error={
+                "code": "missing_local_decision",
+                "message": "consultation consumption requires a local decision",
+            },
+        )
+
     request_fingerprint = canonical_fingerprint({
         "operation_id": operation_id,
         "expected_generation": expected_generation,
-        "next_state": next_state,
+        "next_state": _normalized_next_state,
     })
 
     with _write_txn(conn):
@@ -684,10 +804,9 @@ def compare_and_transition(
                 },
             )
 
-        # 4. Compute new state
-        new_generation = current_generation + 1
-        next_state_copy = dict(next_state)
-        next_state_copy["generation"] = new_generation
+        # 4. Compute new state — generation already normalized above
+        new_generation = expected_generation + 1
+        next_state_copy = dict(_normalized_next_state)
         new_fingerprint = canonical_fingerprint(next_state_copy)
         now = _now_ms()
 

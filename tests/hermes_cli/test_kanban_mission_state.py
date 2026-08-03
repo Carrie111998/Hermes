@@ -1550,3 +1550,341 @@ class TestConnectIntegration:
             assert "mission_journal" in tables
         finally:
             conn.close()
+
+
+# ---------------------------------------------------------------------------
+# P2-1 RED: validation gap closure — suspended status invariants
+# ---------------------------------------------------------------------------
+
+class TestP2_ValidationGap_Blocked:
+    """blocked requires structured next_safe_action (not None/absent) and
+    active_blocker with mandatory fields including resume_condition."""
+
+    def test_blocked_without_next_safe_action_rejected(self, db):
+        """blocked status with next_safe_action=None must be invalid."""
+        state = _make_state()
+        ms.create_mission(db, state=state, operation_id="op-1")
+        bad = _make_state(
+            status="blocked", phase="execution",
+            active_blocker={
+                "blocker_id": "b1", "reason_code": "dep",
+                "summary": "test", "evidence_ids": [],
+                "resume_condition": {
+                    "type": "retry_after", "description": "r", "reference": "r",
+                },
+            },
+            active_human_gate=None, queue_exhausted=None,
+            next_safe_action=None,
+        )
+        result = ms.compare_and_transition(
+            db, mission_id="mission-1", expected_generation=0,
+            operation_id="op-bad", next_state=bad,
+        )
+        assert result.outcome == "invalid"
+
+    def test_blocked_blocker_without_resume_condition_rejected(self, db):
+        """blocked with active_blocker lacking resume_condition is invalid."""
+        state = _make_state()
+        ms.create_mission(db, state=state, operation_id="op-1")
+        bad = _make_state(
+            status="blocked", phase="execution",
+            active_blocker={
+                "blocker_id": "b1", "reason_code": "dep",
+                "summary": "test", "evidence_ids": [],
+            },
+            active_human_gate=None, queue_exhausted=None,
+            next_safe_action={
+                "action": "plan", "executable": False,
+                "card_id": None, "reason_code": "x",
+            },
+        )
+        result = ms.compare_and_transition(
+            db, mission_id="mission-1", expected_generation=0,
+            operation_id="op-bad", next_state=bad,
+        )
+        assert result.outcome == "invalid"
+
+
+class TestP2_ValidationGap_HumanGate:
+    """human_gate requires structured next_safe_action and full gate fields."""
+
+    def test_human_gate_without_next_safe_action_rejected(self, db):
+        """human_gate with next_safe_action=None must be invalid."""
+        state = _make_state()
+        ms.create_mission(db, state=state, operation_id="op-1")
+        bad = _make_state(
+            status="human_gate", phase="review",
+            active_human_gate={
+                "gate_id": "g1", "gate_type": "approval", "version": 1,
+                "status": "pending", "prompt_fingerprint": _sha64(),
+                "resolution_ref": None,
+            },
+            active_blocker=None, queue_exhausted=None,
+            next_safe_action=None,
+        )
+        result = ms.compare_and_transition(
+            db, mission_id="mission-1", expected_generation=0,
+            operation_id="op-bad", next_state=bad,
+        )
+        assert result.outcome == "invalid"
+
+    def test_human_gate_missing_gate_fields_rejected(self, db):
+        """active_human_gate missing required schema fields is invalid."""
+        state = _make_state()
+        ms.create_mission(db, state=state, operation_id="op-1")
+        bad = _make_state(
+            status="human_gate", phase="review",
+            active_human_gate={"gate_id": "g1"},
+            active_blocker=None, queue_exhausted=None,
+            next_safe_action={
+                "action": "await_human", "executable": False,
+                "card_id": None, "reason_code": "x",
+            },
+        )
+        result = ms.compare_and_transition(
+            db, mission_id="mission-1", expected_generation=0,
+            operation_id="op-bad", next_state=bad,
+        )
+        assert result.outcome == "invalid"
+
+
+class TestP2_ValidationGap_QueueExhausted:
+    """queue_exhausted requires structured next_safe_action and resume_condition."""
+
+    def test_queue_exhausted_without_next_safe_action_rejected(self, db):
+        """queue_exhausted with next_safe_action=None must be invalid."""
+        state = _make_state()
+        ms.create_mission(db, state=state, operation_id="op-1")
+        bad = _make_state(
+            status="queue_exhausted", phase="execution",
+            queue_exhausted={
+                "decision_id": "d1", "reason_code": "empty",
+                "summary": "no work", "exhausted_at_generation": 0,
+                "evidence_ids": [],
+                "resume_condition": {
+                    "type": "manual_replan", "description": "r",
+                    "reference": "ref",
+                },
+            },
+            active_blocker=None, active_human_gate=None,
+            next_safe_action=None,
+        )
+        result = ms.compare_and_transition(
+            db, mission_id="mission-1", expected_generation=0,
+            operation_id="op-bad", next_state=bad,
+        )
+        assert result.outcome == "invalid"
+
+    def test_queue_exhausted_without_resume_condition_rejected(self, db):
+        """queue_exhausted with resume_condition=None is invalid (R1 fixture)."""
+        state = _make_state()
+        ms.create_mission(db, state=state, operation_id="op-1")
+        bad = _make_state(
+            status="queue_exhausted", phase="execution",
+            queue_exhausted={
+                "decision_id": "d1", "reason_code": "empty",
+                "summary": "no work", "exhausted_at_generation": 0,
+                "evidence_ids": [],
+                "resume_condition": None,
+            },
+            active_blocker=None, active_human_gate=None,
+            next_safe_action={
+                "action": "replan", "executable": False,
+                "card_id": None, "reason_code": "queue_exhausted",
+            },
+        )
+        result = ms.compare_and_transition(
+            db, mission_id="mission-1", expected_generation=0,
+            operation_id="op-bad", next_state=bad,
+        )
+        assert result.outcome == "invalid"
+
+
+class TestP2_ValidationGap_Completed:
+    """completed.final_review must bind to identity head/tree SHAs."""
+
+    def test_completed_final_review_wrong_head_rejected(self, db):
+        """final_review.commit_sha != identity.head_sha must be invalid."""
+        state = _make_state()
+        ms.create_mission(db, state=state, operation_id="op-1")
+        bad = _make_completed_state()
+        bad["completion"]["final_review"]["commit_sha"] = "0" * 40
+        result = ms.compare_and_transition(
+            db, mission_id="mission-1", expected_generation=0,
+            operation_id="op-bad", next_state=bad,
+        )
+        assert result.outcome == "invalid"
+
+    def test_completed_merge_required_without_merge_gate_rejected(self, db):
+        """merge_required=True with null merge_gate must be invalid."""
+        state = _make_state()
+        ms.create_mission(db, state=state, operation_id="op-1")
+        bad = _make_completed_state()
+        bad["completion"]["merge_required"] = True
+        bad["completion"]["merge_gate"] = None
+        result = ms.compare_and_transition(
+            db, mission_id="mission-1", expected_generation=0,
+            operation_id="op-bad", next_state=bad,
+        )
+        assert result.outcome == "invalid"
+
+
+# ---------------------------------------------------------------------------
+# P2-1 RED: R1 fixture roundtrip
+# ---------------------------------------------------------------------------
+
+class TestP2_R1FixtureRoundtrip:
+    """Run R1 normative fixtures through the productive validator."""
+
+    R1_FIXTURES = Path("/home/ubuntu/.hermes-worktrees/kanban-long-runtime-r0"
+                        "/tests/fixtures/kanban_mission_state")
+
+    def test_r1_valid_fixtures_accepted(self, db):
+        """Every R1 valid fixture must pass _validate_state_shape."""
+        for name in sorted((self.R1_FIXTURES / "valid").glob("*.json")):
+            state = json.loads(name.read_text())
+            errors = ms._validate_state_shape(state)
+            assert errors == [], f"{name.name}: {errors}"
+
+    def test_r1_invalid_fixtures_rejected(self, db):
+        """Every R1 invalid fixture must fail _validate_state_shape."""
+        for name in sorted((self.R1_FIXTURES / "invalid").glob("*.json")):
+            state = json.loads(name.read_text())
+            errors = ms._validate_state_shape(state)
+            assert errors, f"{name.name}: expected errors but got none"
+
+
+# ---------------------------------------------------------------------------
+# P2-1 RED: consultation without local decision
+# ---------------------------------------------------------------------------
+
+class TestP2_ConsultationDecision:
+    """Consultation consumption requires a local decision."""
+
+    def test_consultation_without_decision_id_rejected(self, db):
+        """Transition with consumes_consultation but no decision_id is invalid."""
+        state = _make_state()
+        state["consultation_refs"] = [{
+            "execution_id": "exec-1", "mode": "plan-review",
+            "snapshot_head": _sha40(), "tree_sha": _sha40(),
+            "plan_fingerprint": _sha64(), "checkpoint_fingerprint": _sha64(),
+            "bundle_fingerprint": _sha64(), "expected_question_ids": ["Q1"],
+            "schema_version": "codex-senior-consult-response/v3",
+            "status": "COMPLETED", "detailed_status": "VALID_ADVISORY_VERDICT",
+            "verdict": "accept", "response_fingerprint": _sha64(),
+            "response_artifact": "responses/abc.json",
+        }]
+        ms.create_mission(db, state=state, operation_id="op-1")
+        next_state = _make_state(status="active", phase="execution")
+        result = ms.compare_and_transition(
+            db, mission_id="mission-1", expected_generation=0,
+            operation_id="op-consult", next_state=next_state,
+            consumes_consultation="exec-1",
+        )
+        assert result.outcome == "invalid"
+
+
+# ---------------------------------------------------------------------------
+# P2-2 RED: canonical fingerprint normalization
+# ---------------------------------------------------------------------------
+
+class TestP2_FingerprintNormalization:
+    """next_state.generation must be normalized before fingerprinting so
+    two semantically identical retries produce 'replayed'."""
+
+    def test_replay_despite_generation_difference(self, db):
+        """Two retries with same content but different next_state.generation
+        must produce 'replayed', not 'conflict'."""
+        state = _make_state()
+        ms.create_mission(db, state=state, operation_id="op-1")
+
+        next_a = _make_state(status="active", phase="execution")
+        next_a["generation"] = 99  # wrong generation — should be normalized
+        r1 = ms.compare_and_transition(
+            db, mission_id="mission-1", expected_generation=0,
+            operation_id="op-idem", next_state=next_a,
+        )
+        assert r1.outcome == "applied"
+
+        next_b = _make_state(status="active", phase="execution")
+        next_b["generation"] = 0  # different generation, same semantics
+        r2 = ms.compare_and_transition(
+            db, mission_id="mission-1", expected_generation=0,
+            operation_id="op-idem", next_state=next_b,
+        )
+        assert r2.outcome == "replayed", (
+            f"Expected replayed but got {r2.outcome} — "
+            "generation field in next_state caused fingerprint divergence"
+        )
+
+    def test_material_change_produces_conflict(self, db):
+        """Same operation_id but materially different content → conflict."""
+        state = _make_state()
+        ms.create_mission(db, state=state, operation_id="op-1")
+
+        next_a = _make_state(status="active", phase="execution")
+        r1 = ms.compare_and_transition(
+            db, mission_id="mission-1", expected_generation=0,
+            operation_id="op-diff", next_state=next_a,
+        )
+        assert r1.outcome == "applied"
+
+        next_b = _make_state(status="blocked", phase="execution")
+        next_b["active_blocker"] = {
+            "blocker_id": "b1", "reason_code": "dep",
+            "summary": "x", "evidence_ids": [],
+            "resume_condition": {
+                "type": "retry_after", "description": "r", "reference": "r",
+            },
+        }
+        next_b["active_human_gate"] = None
+        next_b["queue_exhausted"] = None
+        next_b["next_safe_action"] = {
+            "action": "plan", "executable": False,
+            "card_id": None, "reason_code": "blocked",
+        }
+        r2 = ms.compare_and_transition(
+            db, mission_id="mission-1", expected_generation=1,
+            operation_id="op-diff", next_state=next_b,
+        )
+        assert r2.outcome == "conflict"
+
+    def test_fingerprint_deterministic_after_reopen(self, tmp_path):
+        """Fingerprint stored in SQLite must be reproducible after reopen."""
+        db_path = tmp_path / "fp_reopen.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        ms.migrate_mission_state(conn)
+        state = _make_state()
+        ms.create_mission(conn, state=state, operation_id="op-1")
+        next_state = _make_state(status="active", phase="execution")
+        r1 = ms.compare_and_transition(
+            conn, mission_id="mission-1", expected_generation=0,
+            operation_id="op-t", next_state=next_state,
+        )
+        fp_original = r1.state_fingerprint
+        conn.close()
+
+        conn2 = sqlite3.connect(str(db_path))
+        conn2.row_factory = sqlite3.Row
+        ms.migrate_mission_state(conn2)
+        record = ms.get_mission(conn2, "mission-1")
+        conn2.close()
+
+        assert record.state_fingerprint == fp_original
+
+    def test_nan_rejected(self, db):
+        """NaN value in state must be rejected (not representable canonically)."""
+        state = _make_state()
+        ms.create_mission(db, state=state, operation_id="op-1")
+        bad = _make_state(generation=float("nan"))
+        result = ms.create_mission(db, state=bad, operation_id="op-nan")
+        assert result.outcome == "invalid"
+
+    def test_unicode_stable_fingerprint(self):
+        """Unicode content produces stable, reproducible fingerprint."""
+        a = {"key": "\u00f1aci\u00f3n"}
+        b = {"key": "\u00f1aci\u00f3n"}
+        assert ms.canonical_fingerprint(a) == ms.canonical_fingerprint(b)
+        fp = ms.canonical_fingerprint(a)
+        assert len(fp) == 64
