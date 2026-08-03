@@ -51,7 +51,7 @@ _TERMINAL_BACKEND_NAMES = LateState("_TERMINAL_BACKEND_NAMES")
 
 
 @router.get("/api/tools/toolsets")
-async def get_toolsets(profile: Optional[str] = None):
+def get_toolsets(profile: Optional[str] = None):
     from hermes_cli.tools_config import (
         _CONFIG_ONLY_TOOLSETS,
         _get_effective_configurable_toolsets,
@@ -173,7 +173,7 @@ async def toggle_toolset(name: str, body: ToolsetToggle, profile: Optional[str] 
 
 
 @router.get("/api/tools/toolsets/{name}/config")
-async def get_toolset_config(name: str, profile: Optional[str] = None):
+def get_toolset_config(name: str, profile: Optional[str] = None):
     """Return the provider matrix + key status for a toolset's config panel.
 
     Surfaces the same provider rows the CLI ``hermes tools`` picker shows
@@ -390,7 +390,7 @@ async def select_toolset_model(
 
 
 @router.put("/api/tools/toolsets/{name}/provider")
-async def select_toolset_provider(
+def select_toolset_provider(
     name: str, body: ToolsetProviderSelect, profile: Optional[str] = None
 ):
     """Persist a provider selection for a toolset (no key prompting).

@@ -156,7 +156,23 @@ def _toolset_enabled(config: Dict[str, object], toolset_key: str) -> bool:
     return False
 
 
+# Short-TTL cache for _has_agent_browser: [monotonic timestamp, verdict].
+# The agent-browser exec probe costs ~1s per call on Windows; the binary only
+# changes on `hermes update`, so 30s of staleness is harmless while it keeps
+# per-toolset /api/tools/toolsets checks from re-spawning a subprocess each time.
+_HAS_AGENT_BROWSER_CACHE: list = [None, False]
+
+
 def _has_agent_browser() -> bool:
+    # agent-browser resolution + exec probe is expensive (~1s subprocess on
+    # Windows). The binary only changes on `hermes update`, so cache the
+    # verdict briefly to keep /api/tools/toolsets (which calls this per
+    # toolset) from re-probing on every request.
+    import time as _time
+    now = _time.monotonic()
+    if _HAS_AGENT_BROWSER_CACHE[0] is not None and now - _HAS_AGENT_BROWSER_CACHE[0] < 30.0:
+        return _HAS_AGENT_BROWSER_CACHE[1]
+
     import shutil
 
     from hermes_constants import agent_browser_runnable, with_hermes_node_path
@@ -165,6 +181,8 @@ def _has_agent_browser() -> bool:
     # (issue #48521) is reported by ``which`` but fails at exec. Fall through to
     # the local node_modules copy, which the validator also checks.
     if agent_browser_runnable(shutil.which("agent-browser")):
+        _HAS_AGENT_BROWSER_CACHE[0] = now
+        _HAS_AGENT_BROWSER_CACHE[1] = True
         return True
 
     # Hermes-managed Node dirs (Windows installer / POSIX $HERMES_HOME/node)
@@ -175,6 +193,8 @@ def _has_agent_browser() -> bool:
     if managed_path:
         managed_hit = shutil.which("agent-browser", path=managed_path)
         if managed_hit and agent_browser_runnable(managed_hit):
+            _HAS_AGENT_BROWSER_CACHE[0] = now
+            _HAS_AGENT_BROWSER_CACHE[1] = True
             return True
 
     # Local node_modules/.bin: resolve via PATHEXT-aware ``shutil.which`` so
@@ -186,7 +206,11 @@ def _has_agent_browser() -> bool:
     if local_bin_dir.is_dir():
         local_which = shutil.which("agent-browser", path=str(local_bin_dir))
         if local_which and agent_browser_runnable(local_which):
+            _HAS_AGENT_BROWSER_CACHE[0] = now
+            _HAS_AGENT_BROWSER_CACHE[1] = True
             return True
+    _HAS_AGENT_BROWSER_CACHE[0] = now
+    _HAS_AGENT_BROWSER_CACHE[1] = False
     return False
 
 

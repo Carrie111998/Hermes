@@ -392,7 +392,7 @@ async def scan_skill_hub(identifier: str = "", profile: Optional[str] = None):
 
 
 @router.get("/api/skills")
-async def get_skills(profile: Optional[str] = None):
+def get_skills(profile: Optional[str] = None):
     from tools.skills_tool import _find_all_skills
     from hermes_cli.skills_config import get_disabled_skills
     from tools.skill_usage import (
@@ -401,6 +401,9 @@ async def get_skills(profile: Optional[str] = None):
         activity_count,
         load_usage,
     )
+    # Sync file-system scan (skill discovery + usage load) — a plain def
+    # route runs in FastAPI's threadpool, so a large skills dir never
+    # freezes the desktop event loop / WS.
     with _profile_scope(profile):
         config = load_config()
         disabled = get_disabled_skills(config)
