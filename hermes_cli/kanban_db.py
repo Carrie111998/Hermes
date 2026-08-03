@@ -4338,7 +4338,8 @@ def release_stale_claims(
     reclaimed = 0
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
     stale = conn.execute(
-        "SELECT id, claim_lock, worker_pid, claim_expires, last_heartbeat_at "
+        "SELECT id, current_run_id, claim_lock, worker_pid, "
+        "       claim_expires, last_heartbeat_at "
         "FROM tasks "
         "WHERE status = 'running' AND claim_expires IS NOT NULL "
         "  AND claim_expires < ?",
@@ -4398,9 +4399,52 @@ def release_stale_claims(
                 )
             continue
 
-        termination = _terminate_reclaimed_worker(
-            row["worker_pid"], row["claim_lock"], signal_fn=signal_fn,
+        run_id = (
+            int(row["current_run_id"])
+            if row["current_run_id"] is not None
+            else None
         )
+        if (
+            not host_local
+            and row["worker_pid"]
+            and _pid_alive(row["worker_pid"])
+        ):
+            if _verify_pid_matches_kanban_worker(
+                int(row["worker_pid"]),
+                task_id=row["id"],
+                run_id=run_id,
+                claim_lock=row["claim_lock"],
+            ):
+                termination = _terminate_reclaimed_worker(
+                    row["worker_pid"],
+                    row["claim_lock"],
+                    task_id=row["id"],
+                    run_id=run_id,
+                    signal_fn=signal_fn,
+                    force_local=True,
+                )
+            else:
+                _defer_reclaim_for_live_worker(
+                    conn,
+                    row["id"],
+                    row["claim_lock"],
+                    now,
+                    {
+                        "prev_pid": int(row["worker_pid"]),
+                        "host_local": False,
+                        "termination_attempted": False,
+                        "terminated": False,
+                        "sigkill": False,
+                        "force_local": False,
+                        "identity_verified": False,
+                    },
+                    reason="ttl_expired_worker_identity_unverified",
+                )
+                continue
+        else:
+            termination = _terminate_reclaimed_worker(
+                row["worker_pid"], row["claim_lock"], signal_fn=signal_fn,
+            )
         # Never release a claim while our own worker is still alive: that would
         # spawn a duplicate beside it. Hold the claim and retry next tick.
         if _worker_survived_termination(termination):
@@ -4476,7 +4520,8 @@ def reclaim_task(
     reclaimable state (not running, or doesn't exist).
     """
     row = conn.execute(
-        "SELECT status, claim_lock, worker_pid FROM tasks WHERE id = ?",
+        "SELECT status, current_run_id, claim_lock, worker_pid "
+        "FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if not row:
@@ -4487,6 +4532,12 @@ def reclaim_task(
     prev_lock = row["claim_lock"]
     termination = _terminate_reclaimed_worker(
         row["worker_pid"], prev_lock, signal_fn=signal_fn,
+        task_id=task_id,
+        run_id=(
+            int(row["current_run_id"])
+            if row["current_run_id"] is not None
+            else None
+        ),
         force_local=force_local,
     )
     with write_txn(conn):
@@ -6878,15 +6929,9 @@ def _pid_alive(pid: Optional[int]) -> bool:
     return True
 
 
-def _verify_pid_is_hermes_worker(pid: int) -> bool:
+def _pid_looks_like_hermes_worker(pid: int) -> bool:
     """Return True when *pid* is a live local process whose command line
-    looks like a Hermes kanban worker.
-
-    Used as the safety check when ``--force-local`` overrides a hostname
-    mismatch in claim_lock.  Reading the process command line provides
-    the "additional local proof" required by #73277: we never signal a
-    PID just because it exists — it must *look like* a Hermes worker.
-    """
+    looks like a Hermes worker."""
     if not _pid_alive(pid):
         return False
     try:
@@ -6896,13 +6941,10 @@ def _verify_pid_is_hermes_worker(pid: int) -> bool:
         cmdline = None
     if not cmdline:
         return False
-    # Hermes workers are launched as ``hermes -p <profile> --cli chat -q ...``
-    # and always carry HERMES_KANBAN_TASK in their environment.  The command
-    # line must contain the hermes entrypoint and "chat" (the worker subcmd).
-    # This is intentionally broad — we're confirming the PID *is* a Hermes
-    # process, not that it's a specific task's worker.  The narrower check
-    # (matching a specific task_id) would require /proc/<pid>/environ on
-    # Linux which is fragile and platform-dependent.
+    # Hermes workers are launched as ``hermes -p <profile> --cli chat -q ...``.
+    # This is intentionally broad — it only answers "does this look like a
+    # Hermes worker at all?" Exact task/run/claim ownership is enforced by
+    # ``_verify_pid_matches_kanban_worker`` via process environment checks.
     cli_name = os.path.basename(sys.argv[0]) if sys.argv else "hermes"
     # Match either the bare name (e.g. "hermes") or the full python invocation
     # (e.g. "python -m hermes_cli.main").
@@ -6913,10 +6955,60 @@ def _verify_pid_is_hermes_worker(pid: int) -> bool:
     )
 
 
+def _read_process_environ(pid: int) -> dict[str, str]:
+    """Best-effort environment read for a live local process."""
+    environ_path = Path(f"/proc/{pid}/environ")
+    try:
+        raw = environ_path.read_bytes()
+    except (FileNotFoundError, PermissionError, OSError):
+        raw = b""
+    if raw:
+        env: dict[str, str] = {}
+        for item in raw.split(b"\x00"):
+            if not item or b"=" not in item:
+                continue
+            key, value = item.split(b"=", 1)
+            env[key.decode("utf-8", errors="ignore")] = value.decode(
+                "utf-8", errors="ignore",
+            )
+        if env:
+            return env
+
+    try:
+        import psutil  # type: ignore
+
+        proc = psutil.Process(pid)
+        return dict(proc.environ() or {})
+    except Exception:
+        return {}
+
+
+def _verify_pid_matches_kanban_worker(
+    pid: int,
+    *,
+    task_id: str,
+    run_id: Optional[int],
+    claim_lock: Optional[str],
+) -> bool:
+    """Return True only for the exact kanban worker that owns this claim."""
+    if run_id is None or not claim_lock:
+        return False
+    if not _pid_looks_like_hermes_worker(pid):
+        return False
+    env = _read_process_environ(pid)
+    return (
+        env.get("HERMES_KANBAN_TASK") == task_id
+        and env.get("HERMES_KANBAN_RUN_ID") == str(int(run_id))
+        and env.get("HERMES_KANBAN_CLAIM_LOCK") == str(claim_lock)
+    )
+
+
 def _terminate_reclaimed_worker(
     pid: Optional[int],
     claim_lock: Optional[str],
     *,
+    task_id: Optional[str] = None,
+    run_id: Optional[int] = None,
     signal_fn=None,
     force_local: bool = False,
 ) -> dict[str, Any]:
@@ -6925,12 +7017,14 @@ def _terminate_reclaimed_worker(
     When *force_local* is True and the hostname in *claim_lock* no longer
     matches the current host (e.g. after a macOS hostname change between
     network contexts), the function still attempts termination **iff**
-    the PID is alive and its command line looks like a Hermes worker.
+    the PID is alive and its kanban identity matches this exact
+    ``task_id`` / ``run_id`` / ``claim_lock``.
     This closes the #73277 gap where a hostname change silently skips
     termination of a proven-local worker.
 
     Safety: ``force_local`` never signals a PID without additional proof
-    that it belongs to Hermes — see :func:`_verify_pid_is_hermes_worker`.
+    that it belongs to this exact worker — see
+    :func:`_verify_pid_matches_kanban_worker`.
     """
     import signal
 
@@ -6941,6 +7035,7 @@ def _terminate_reclaimed_worker(
         "terminated": False,
         "sigkill": False,
         "force_local": False,
+        "identity_verified": False,
     }
     if not pid or pid <= 0 or not claim_lock:
         return info
@@ -6948,11 +7043,21 @@ def _terminate_reclaimed_worker(
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
     if str(claim_lock).startswith(host_prefix):
         info["host_local"] = True
-    elif force_local and _verify_pid_is_hermes_worker(int(pid)):
-        # Hostname changed since claim creation, but PID is alive and
-        # its command line matches a Hermes worker — treat as local.
+    elif (
+        force_local
+        and task_id is not None
+        and _verify_pid_matches_kanban_worker(
+            int(pid),
+            task_id=task_id,
+            run_id=run_id,
+            claim_lock=claim_lock,
+        )
+    ):
+        # Hostname changed since claim creation, but the live PID still
+        # proves it is the exact worker that owns this claim.
         info["host_local"] = True
         info["force_local"] = True
+        info["identity_verified"] = True
 
     if not info["host_local"]:
         return info
@@ -7261,7 +7366,8 @@ def detect_stale_running(
     reclaimed: list[str] = []
 
     rows = conn.execute(
-        "SELECT t.id, t.worker_pid, t.last_heartbeat_at, t.claim_lock, "
+        "SELECT t.id, t.current_run_id, t.worker_pid, "
+        "       t.last_heartbeat_at, t.claim_lock, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
@@ -7285,11 +7391,50 @@ def detect_stale_running(
         pid = row["worker_pid"]
         tid = row["id"]
         lock = row["claim_lock"] or ""
+        run_id = (
+            int(row["current_run_id"])
+            if row["current_run_id"] is not None
+            else None
+        )
 
         # Terminate the worker if it's still host-local.
-        termination = _terminate_reclaimed_worker(
-            pid, lock, signal_fn=signal_fn,
-        )
+        if pid and not lock.startswith(host_prefix) and _pid_alive(pid):
+            if _verify_pid_matches_kanban_worker(
+                int(pid),
+                task_id=tid,
+                run_id=run_id,
+                claim_lock=row["claim_lock"],
+            ):
+                termination = _terminate_reclaimed_worker(
+                    pid,
+                    lock,
+                    task_id=tid,
+                    run_id=run_id,
+                    signal_fn=signal_fn,
+                    force_local=True,
+                )
+            else:
+                _defer_reclaim_for_live_worker(
+                    conn,
+                    tid,
+                    lock,
+                    now,
+                    {
+                        "prev_pid": int(pid),
+                        "host_local": False,
+                        "termination_attempted": False,
+                        "terminated": False,
+                        "sigkill": False,
+                        "force_local": False,
+                        "identity_verified": False,
+                    },
+                    reason="heartbeat_stale_worker_identity_unverified",
+                )
+                continue
+        else:
+            termination = _terminate_reclaimed_worker(
+                pid, lock, signal_fn=signal_fn,
+            )
 
         # Never release a claim while our own worker is still alive: that would
         # spawn a duplicate beside it. Hold the claim and retry next tick.

@@ -688,6 +688,61 @@ def test_detect_stale_defers_when_live_worker_survives(kanban_home, monkeypatch)
         assert "reclaim_deferred" in kinds
 
 
+def test_detect_stale_holds_when_hostname_changed_and_identity_unverified(
+    kanban_home, monkeypatch,
+):
+    """Heartbeat-stale reclaim must also hold on hostname mismatch unless the
+    live PID proves it is the exact worker."""
+    import json
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="hostname changed", assignee="worker")
+        old_claim_lock = "host-a:12345"
+        conn.execute(
+            "UPDATE tasks SET status='running', claim_lock=?, worker_pid=?, "
+            "started_at=?, last_heartbeat_at=? WHERE id=?",
+            (
+                old_claim_lock,
+                12345,
+                int(time.time()) - 20000,
+                None,
+                t,
+            ),
+        )
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, claim_lock, worker_pid, started_at) "
+            "VALUES (?, 'running', ?, ?, ?)",
+            (t, old_claim_lock, 12345, int(time.time()) - 20000),
+        )
+        rid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.execute("UPDATE tasks SET current_run_id=? WHERE id=?", (rid, t))
+        conn.commit()
+
+    monkeypatch.setattr(_kb, "_claimer_id", lambda: "host-b:99999")
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: True)
+    monkeypatch.setattr(
+        _kb, "_verify_pid_matches_kanban_worker",
+        lambda _pid, **_kwargs: False,
+    )
+
+    with kb.connect() as conn:
+        stale = kb.detect_stale_running(
+            conn, stale_timeout_seconds=14400, signal_fn=lambda _p, _s: None,
+        )
+        assert stale == []
+        assert kb.get_task(conn, t).status == "running"
+
+        ev = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id=? AND kind='reclaim_deferred'",
+            (t,),
+        ).fetchone()
+        payload = json.loads(ev["payload"])
+        assert payload["reason"] == "heartbeat_stale_worker_identity_unverified"
+        assert payload["identity_verified"] is False
+
+
 def test_stale_claim_reclaim_event_records_diagnostic_payload(
     kanban_home, monkeypatch,
 ):
@@ -5013,9 +5068,9 @@ class TestHostnameChangeReclaimBug:
     remote and left alive after reclaim, creating duplicate-spawn risk.
 
     The fix adds ``force_local`` to ``reclaim_task`` /
-    ``_terminate_reclaimed_worker`` and a PID command-line safety check
-    (``_verify_pid_is_hermes_worker``) so that hostname-mismatched claims
-    can still be terminated when the PID proves to be a Hermes worker.
+    ``_terminate_reclaimed_worker`` and exact kanban identity checks so
+    hostname-mismatched claims can still be terminated when the PID proves
+    to be the same worker via env + claim metadata.
     """
 
     def test_terminate_reclaimed_worker_skips_on_hostname_mismatch(self, kanban_home, monkeypatch):
@@ -5034,49 +5089,93 @@ class TestHostnameChangeReclaimBug:
         assert result["termination_attempted"] is False
         assert result["terminated"] is False
 
+    def test_verify_pid_matches_kanban_worker_rejects_unrelated_hermes_pid(self, kanban_home, monkeypatch):
+        """A Hermes-looking PID is still rejected unless task/run/claim all
+        match the target worker identity."""
+        import hermes_cli.kanban_db as _kb
+
+        monkeypatch.setattr(_kb, "_pid_looks_like_hermes_worker", lambda _pid: True)
+        monkeypatch.setattr(
+            _kb,
+            "_read_process_environ",
+            lambda _pid: {
+                "HERMES_KANBAN_TASK": "t_other",
+                "HERMES_KANBAN_RUN_ID": "42",
+                "HERMES_KANBAN_CLAIM_LOCK": "host-a:other",
+            },
+        )
+
+        assert _kb._verify_pid_matches_kanban_worker(
+            12345,
+            task_id="t_target",
+            run_id=7,
+            claim_lock="host-a:12345",
+        ) is False
+
+    def test_verify_pid_matches_kanban_worker_accepts_exact_identity(self, kanban_home, monkeypatch):
+        import hermes_cli.kanban_db as _kb
+
+        monkeypatch.setattr(_kb, "_pid_looks_like_hermes_worker", lambda _pid: True)
+        monkeypatch.setattr(
+            _kb,
+            "_read_process_environ",
+            lambda _pid: {
+                "HERMES_KANBAN_TASK": "t_target",
+                "HERMES_KANBAN_RUN_ID": "7",
+                "HERMES_KANBAN_CLAIM_LOCK": "host-a:12345",
+            },
+        )
+
+        assert _kb._verify_pid_matches_kanban_worker(
+            12345,
+            task_id="t_target",
+            run_id=7,
+            claim_lock="host-a:12345",
+        ) is True
+
     def test_terminate_reclaimed_worker_force_local_uses_pid_verification(self, kanban_home, monkeypatch):
         """With force_local=True, _terminate_reclaimed_worker checks PID
-        command line when hostname doesn't match, and treats the worker as
-        local if the PID looks like a Hermes process."""
+        identity when hostname doesn't match, and treats the worker as
+        local only if the PID matches the exact kanban worker."""
         import hermes_cli.kanban_db as _kb
 
         old_claim_lock = "host-a:12345"
         monkeypatch.setattr(_kb, "_claimer_id", lambda: "host-b:99999")
 
-        # PID doesn't exist → _verify_pid_is_hermes_worker returns False
-        # → still treated as remote
-        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+        # Missing run identity → still treated as remote.
         result = _kb._terminate_reclaimed_worker(
-            12345, old_claim_lock, force_local=True,
+            12345, old_claim_lock, task_id="t1", run_id=None, force_local=True,
         )
         assert result["host_local"] is False
         assert result["force_local"] is False
 
-        # PID exists but _read_process_cmdline says it's not a Hermes process
-        # → still treated as remote (safety: never signal non-Hermes PIDs)
-        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: True)
+        # PID exists but exact identity does not match.
         monkeypatch.setattr(
-            _kb, "_verify_pid_is_hermes_worker", lambda _pid: False,
+            _kb, "_verify_pid_matches_kanban_worker",
+            lambda _pid, **_kwargs: False,
         )
         result = _kb._terminate_reclaimed_worker(
-            12345, old_claim_lock, force_local=True,
+            12345, old_claim_lock, task_id="t1", run_id=7, force_local=True,
         )
         assert result["host_local"] is False
         assert result["force_local"] is False
 
-        # PID exists AND looks like Hermes → treated as local via force_local
-        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: True)
+        # Exact PID/task/run/claim match → treated as local via force_local.
         monkeypatch.setattr(
-            _kb, "_verify_pid_is_hermes_worker", lambda _pid: True,
+            _kb, "_verify_pid_matches_kanban_worker",
+            lambda _pid, **_kwargs: True,
         )
         # Need signal_fn since the PID isn't real
         result = _kb._terminate_reclaimed_worker(
             12345, old_claim_lock,
+            task_id="t1",
+            run_id=7,
             signal_fn=lambda _pid, _sig: None,
             force_local=True,
         )
         assert result["host_local"] is True
         assert result["force_local"] is True
+        assert result["identity_verified"] is True
         assert result["termination_attempted"] is True
 
     def test_terminate_reclaimed_worker_force_local_noop_when_hostname_matches(self, kanban_home, monkeypatch):
@@ -5162,7 +5261,8 @@ class TestHostnameChangeReclaimBug:
         monkeypatch.setattr(_kb, "_claimer_id", lambda: "host-b:99999")
         monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: True)
         monkeypatch.setattr(
-            _kb, "_verify_pid_is_hermes_worker", lambda _pid: True,
+            _kb, "_verify_pid_matches_kanban_worker",
+            lambda _pid, **_kwargs: True,
         )
 
         with kb.connect() as conn:
@@ -5179,15 +5279,14 @@ class TestHostnameChangeReclaimBug:
             payload = json.loads(ev["payload"])
             assert payload["host_local"] is True
             assert payload["force_local"] is True
+            assert payload["identity_verified"] is True
             assert payload["termination_attempted"] is True
 
-    def test_release_stale_claims_misidentifies_local_after_hostname_change(self, kanban_home, monkeypatch):
-        """release_stale_claims treats a local worker as remote after hostname
-        change, so it releases the claim instead of extending it — creating
-        duplicate-spawn risk. This is the unfixable path: release_stale_claims
-        is an automated dispatcher path and does not get a force_local flag
-        (operator intervention is required via explicit reclaim)."""
+    def test_release_stale_claims_holds_when_hostname_changed_and_identity_unverified(self, kanban_home, monkeypatch):
+        """Automated stale reclaim must hold when a live PID cannot be proven
+        to be the exact worker after a hostname mismatch."""
         import hermes_cli.kanban_db as _kb
+        import json
 
         with kb.connect() as conn:
             t = kb.create_task(conn, title="stale-hostname task", assignee="a")
@@ -5201,13 +5300,80 @@ class TestHostnameChangeReclaimBug:
 
         monkeypatch.setattr(_kb, "_claimer_id", lambda: "host-b:99999")
         monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: True)
+        monkeypatch.setattr(
+            _kb, "_verify_pid_matches_kanban_worker",
+            lambda _pid, **_kwargs: False,
+        )
 
         with kb.connect() as conn:
             reclaimed = kb.release_stale_claims(conn, signal_fn=lambda _p, _s: None)
-            # BUG: because host_local is False, the claim is released even
-            # though the worker is still alive on this machine.
+            assert reclaimed == 0
+            task = kb.get_task(conn, t)
+            assert task.status == "running"
+
+            ev = conn.execute(
+                "SELECT payload FROM task_events "
+                "WHERE task_id=? AND kind='reclaim_deferred'",
+                (t,),
+            ).fetchone()
+            payload = json.loads(ev["payload"])
+            assert payload["reason"] == "ttl_expired_worker_identity_unverified"
+            assert payload["identity_verified"] is False
+
+    def test_release_stale_claims_force_local_exact_match_after_hostname_change(self, kanban_home, monkeypatch):
+        """Automated stale reclaim may still terminate a hostname-mismatched
+        worker when the PID proves it owns the exact task/run/claim."""
+        import hermes_cli.kanban_db as _kb
+        import json
+
+        with kb.connect() as conn:
+            t = kb.create_task(conn, title="stale-hostname exact", assignee="a")
+            old_claim_lock = "host-a:12345"
+            conn.execute(
+                "UPDATE tasks SET status='running', claim_lock=?, "
+                "claim_expires=?, worker_pid=? WHERE id=?",
+                (old_claim_lock, int(time.time()) - 60, 12345, t),
+            )
+            conn.execute(
+                "INSERT INTO task_runs (task_id, status, claim_lock, "
+                "claim_expires, worker_pid, started_at) "
+                "VALUES (?, 'running', ?, ?, ?, ?)",
+                (t, old_claim_lock, int(time.time()) - 60, 12345, int(time.time()) - 600),
+            )
+            rid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            conn.execute("UPDATE tasks SET current_run_id=? WHERE id=?", (rid, t))
+            conn.commit()
+
+        monkeypatch.setattr(_kb, "_claimer_id", lambda: "host-b:99999")
+        monkeypatch.setattr(
+            _kb, "_verify_pid_matches_kanban_worker",
+            lambda _pid, **_kwargs: True,
+        )
+        monkeypatch.setattr(
+            _kb, "_terminate_reclaimed_worker",
+            lambda *args, **kwargs: {
+                "prev_pid": 12345,
+                "host_local": True,
+                "termination_attempted": True,
+                "terminated": True,
+                "sigkill": False,
+                "force_local": True,
+                "identity_verified": True,
+            },
+        )
+        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: True)
+
+        with kb.connect() as conn:
+            reclaimed = kb.release_stale_claims(conn, signal_fn=lambda _p, _s: None)
             assert reclaimed == 1
             task = kb.get_task(conn, t)
-            # Task goes back to "ready" while PID 12345 is still "alive" —
-            # next dispatch tick will spawn a duplicate worker.
             assert task.status == "ready"
+
+            ev = conn.execute(
+                "SELECT payload FROM task_events "
+                "WHERE task_id=? AND kind='reclaimed'",
+                (t,),
+            ).fetchone()
+            payload = json.loads(ev["payload"])
+            assert payload["force_local"] is True
+            assert payload["identity_verified"] is True
