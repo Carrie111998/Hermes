@@ -391,6 +391,142 @@ class TestStartRun:
         assert captured.get("history") == []
 
     @pytest.mark.asyncio
+    async def test_start_load_session_history_opt_out_keeps_run_stateless(self, adapter):
+        """load_session_history=false must skip the session store entirely so
+        clients using session_id as a tracking token keep stateless runs."""
+        mock_db = MagicMock()
+        mock_db.get_messages_as_conversation.return_value = [
+            {"role": "user", "content": "should-not-be-loaded"},
+        ]
+        adapter._session_db = mock_db
+
+        captured = {}
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+
+                def _capture_run(user_message=None, conversation_history=None, task_id=None):
+                    captured["history"] = conversation_history
+                    return {"final_response": "done"}
+
+                mock_agent.run_conversation.side_effect = _capture_run
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post(
+                    "/v1/runs",
+                    json={
+                        "input": "hello",
+                        "session_id": "tracking-only-session",
+                        "load_session_history": False,
+                    },
+                )
+                assert resp.status == 202
+                for _ in range(40):
+                    if captured.get("history") is not None:
+                        break
+                    await asyncio.sleep(0.05)
+
+        assert captured.get("history") == []
+        mock_db.get_messages_as_conversation.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_start_loads_session_history_capped_at_limit(self, adapter, monkeypatch):
+        """Auto-loaded history must be tail-windowed to RUNS_SESSION_HISTORY_LIMIT
+        so a long transcript cannot blow the model context."""
+        from gateway.platforms import api_server as api_server_mod
+
+        monkeypatch.setattr(api_server_mod, "RUNS_SESSION_HISTORY_LIMIT", 5)
+        big_history = [
+            {"role": "user", "content": f"msg {i}"} if i % 2 == 0
+            else {"role": "assistant", "content": f"reply {i}"}
+            for i in range(20)
+        ]
+        mock_db = MagicMock()
+        mock_db.get_messages_as_conversation.return_value = big_history
+        adapter._session_db = mock_db
+
+        captured = {}
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+
+                def _capture_run(user_message=None, conversation_history=None, task_id=None):
+                    captured["history"] = conversation_history
+                    return {"final_response": "done"}
+
+                mock_agent.run_conversation.side_effect = _capture_run
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post(
+                    "/v1/runs",
+                    json={"input": "hello", "session_id": "long-session"},
+                )
+                assert resp.status == 202
+                for _ in range(40):
+                    if captured.get("history") is not None:
+                        break
+                    await asyncio.sleep(0.05)
+
+        assert captured.get("history") == big_history[-5:], (
+            "history must be tail-windowed to the limit"
+        )
+
+    @pytest.mark.asyncio
+    async def test_start_session_history_with_tool_rows_replays_safely(self, adapter):
+        """Session transcripts containing tool-call/tool-response rows must
+        replay without error and preserve the message roles (repair_alternation
+        must not corrupt tool pairs)."""
+        db_history = [
+            {"role": "user", "content": "query"},
+            {"role": "assistant", "content": "", "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "search", "arguments": "{}"}}]},
+            {"role": "tool", "content": "results", "tool_call_id": "call_1"},
+            {"role": "assistant", "content": "final answer"},
+        ]
+        mock_db = MagicMock()
+        mock_db.get_messages_as_conversation.return_value = db_history
+        adapter._session_db = mock_db
+
+        captured = {}
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+
+                def _capture_run(user_message=None, conversation_history=None, task_id=None):
+                    captured["history"] = conversation_history
+                    return {"final_response": "done"}
+
+                mock_agent.run_conversation.side_effect = _capture_run
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post(
+                    "/v1/runs",
+                    json={"input": "hello", "session_id": "tool-session"},
+                )
+                assert resp.status == 202
+                for _ in range(40):
+                    if captured.get("history") is not None:
+                        break
+                    await asyncio.sleep(0.05)
+
+        assert captured.get("history") == db_history
+        roles = [m["role"] for m in captured["history"]]
+        assert roles == ["user", "assistant", "tool", "assistant"], (
+            "tool-call/tool-response pairs must survive replay"
+        )
+
+    @pytest.mark.asyncio
     async def test_start_session_store_unavailable_degrades_to_empty_history(self, adapter):
         """When the session store is unavailable (db is None), a session_id
         run must still start with empty history instead of 500ing."""

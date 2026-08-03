@@ -155,6 +155,12 @@ CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
 RESPONSES_AUTO_TRUNCATION_HISTORY_LIMIT = 100
+
+# Cap on messages auto-loaded from the session store by /v1/runs when the
+# client supplies only a session_id. Prevents an arbitrarily long transcript
+# from blowing the model context on replay; compaction summaries survive the
+# window (see _auto_truncate_response_history).
+RUNS_SESSION_HISTORY_LIMIT = 100
 _COMPRESSED_SUMMARY_METADATA_KEY = "_compressed_summary"
 
 
@@ -6341,10 +6347,25 @@ class APIServerAdapter(BasePlatformAdapter):
         # otherwise re-trigger the pre-request repair on every request (see
         # SessionDB.get_messages_as_conversation docstring). A missing session
         # degrades to empty history, never an error — the run still starts.
-        if not conversation_history and session_id:
+        # Callers that use session_id purely as a tracking/telemetry token
+        # (and want each run stateless) can opt out with
+        # load_session_history=false. Loaded history is tail-windowed to
+        # RUNS_SESSION_HISTORY_LIMIT so an arbitrarily long transcript cannot
+        # blow the model context (compaction summaries are preserved).
+        if not conversation_history and session_id and body.get("load_session_history", True):
             conversation_history = await self._conversation_history_for_session(
                 session_id, repair_alternation=True
             )
+            if len(conversation_history) > RUNS_SESSION_HISTORY_LIMIT:
+                logger.info(
+                    "runs_history_load session_id=%s rows=%d windowed_to=%d",
+                    session_id,
+                    len(conversation_history),
+                    RUNS_SESSION_HISTORY_LIMIT,
+                )
+                conversation_history = _auto_truncate_response_history(
+                    conversation_history, limit=RUNS_SESSION_HISTORY_LIMIT
+                )
 
         route = self._resolve_route(body.get("model"))
         agent_overrides = _request_agent_overrides(body, virtual_model=self._model_name)
