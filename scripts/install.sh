@@ -652,8 +652,8 @@ check_python() {
         log_info "The current Termux repository only ships Python 3.14; older 3.12/3.13"
         log_info "binaries are available bundled with the aws-cli package. To use one:"
         log_info "  pkg install aws-cli"
-        log_info "  ln -sf \$PREFIX/lib/aws-cli/python3.13 \$PREFIX/bin/python3.13"
-        log_info "  ln -sf \$PREFIX/bin/python3.13 \$PREFIX/bin/python"
+        log_info "  ln -sf \$PREFIX/lib/aws-cli/python3 \$PREFIX/bin/python3"
+        log_info "  ln -sf \$PREFIX/bin/python3 \$PREFIX/bin/python"
         log_info "Then re-run this script. See issue #76901 for context."
         exit 1
     fi
