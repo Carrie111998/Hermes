@@ -158,6 +158,17 @@ class CronPromptInjectionBlocked(Exception):
     """
 
 
+class CronAllSkillsFailed(Exception):
+    """Raised by _build_job_prompt when every declared skill failed to load.
+
+    Without this guard the scheduler falls through to a contextless LLM call
+    that has no idea how to perform the task, often returns ``[SILENT]``, and
+    suppresses delivery — producing a silent multi-week failure
+    indistinguishable from "nothing happened" (#77362).  Caught in ``run_job``
+    so the operator sees a clear "skills missing" delivery instead of silence.
+    """
+
+
 def _resolve_cron_disabled_toolsets(cfg: dict) -> list[str]:
     """Toolsets a cron-spawned agent must never receive.
 
@@ -2631,6 +2642,16 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
             ]
         )
 
+    if skipped and len(skipped) == len(skill_names):
+        # Every declared skill failed to load — abort instead of falling
+        # through to a contextless LLM call that returns [SILENT] and
+        # suppresses delivery for weeks (#77362).
+        raise CronAllSkillsFailed(
+            f"All {len(skipped)} skill(s) failed to load and were skipped: "
+            f"{', '.join(skipped)}.  "
+            f"The job cannot run without its required skill context."
+        )
+
     if skipped:
         notice = (
             f"[IMPORTANT: The following skill(s) were listed for this job but could not be found "
@@ -3009,6 +3030,24 @@ def run_job(
             "the threat pattern (`tools/cronjob_tools.py::_CRON_THREAT_PATTERNS`)."
         )
         return False, blocked_doc, "", str(block_exc)
+    except CronAllSkillsFailed as skill_exc:
+        # Every declared skill failed to load — the job has no usable skill
+        # context.  Abort with a delivered error instead of running a
+        # contextless LLM that returns [SILENT] (#77362).
+        logger.error(
+            "Job '%s' (ID: %s): all skills failed to load — %s",
+            job_name, job_id, skill_exc,
+        )
+        error_doc = (
+            f"# Cron Job: {job_name}\n\n"
+            f"**Job ID:** {job_id}\n"
+            f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"**Status:** SKIPPED — all skills failed to load\n\n"
+            f"{skill_exc}\n\n"
+            "Fix the skill references in this job (check for typos, "
+            "ambiguous names, or missing files) and re-enable it."
+        )
+        return False, error_doc, "", str(skill_exc)
     if prompt is None:
         logger.info("Job '%s': script produced no output, skipping AI call.", job_name)
         return True, "", SILENT_MARKER, None
