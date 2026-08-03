@@ -223,3 +223,25 @@ async def test_merge_preserved_when_adapter_unresolvable():
 
     assert not runner.queued
     assert adapter._pending_messages[session_key].text == "one\ntwo"
+
+
+@pytest.mark.asyncio
+async def test_merge_preserved_when_fifo_declines_silently():
+    """A silent FIFO decline must fall back to the merge, not vanish.
+
+    _queue_or_replace_pending_event returns WITHOUT queueing and WITHOUT
+    raising once _BUSY_QUEUE_MAX_PENDING is reached. Treating that as
+    success would drop the burst. The cap was also effectively unreachable
+    before this change, since the old merge collapsed every follow-up into
+    one slot instead of one entry each.
+    """
+    adapter, runner, session_key = await _busy_adapter_with(True)
+    runner._queue_or_replace_pending_event = lambda session_key, event: None
+
+    await adapter.handle_message(_make_event("one"))
+    await adapter._flush_text_debounce_now(session_key)
+    await adapter.handle_message(_make_event("two"))
+    await adapter._flush_text_debounce_now(session_key)
+
+    assert not runner.queued
+    assert adapter._pending_messages[session_key].text == "one\ntwo"
