@@ -443,18 +443,24 @@ _PREFIX_RE = re.compile(
     r"(?<![A-Za-z0-9_-])(" + "|".join(_PREFIX_PATTERNS) + r")(?![A-Za-z0-9_-])"
 )
 
-# C0 control chars (except \n and \t, which carry real line structure) plus
-# zero-width / format chars. \r is dropped too: it is redundant with \n in
-# CRLF and never carries meaning alone in modern output, so removing it can't
-# corrupt structure — and it fixes CR-split secrets (issue #77484). Dropping
-# \n/\t would merge lines and break the line-anchored _CFG_*_RE passes, so a
-# token split by a raw newline stays split (pathological — real secrets are
-# single-line). Gate + full pattern (see redact_sensitive_text).
-_HAS_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\u200b-\u200f\u202a-\u202e\u2060-\u2064]")
+# C0 control chars (except \n and \t, which carry real line structure), C1
+# controls (0x80-0x9F), DEL (0x7F), plus zero-width / format chars. \r is
+# dropped too: it is redundant with \n in CRLF and never carries meaning alone
+# in modern output, so removing it can't corrupt structure — and it fixes
+# CR-split secrets (issue #77484). Dropping \n/\t would merge lines and break
+# the line-anchored _CFG_*_RE passes, so a token split by a raw newline stays
+# split (pathological — real secrets are single-line).
+# Gate + full pattern (see redact_sensitive_text).
+_HAS_CONTROL_RE = re.compile(
+    r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\x80-\x9f\u200b-\u200f\u202a-\u202e\u2060-\u2064]"
+)
 _CONTROL_RE = _HAS_CONTROL_RE
 # \r additionally dropped (redundant with \n in CRLF).
 _HAS_CR_RE = re.compile(r"\r")
 _CRLF_RE = re.compile(r"\r\n?")
+# Display-mask strip: EVERY control incl. \n/\t — a masked secret must never
+# emit multiline or tabbed output into config/status/dump display (#55319).
+_DISPLAY_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f\x80-\x9f\u200b-\u200f\u202a-\u202e\u2060-\u2064]")
 
 
 def mask_secret(
@@ -497,6 +503,12 @@ def mask_secret(
         >>> mask_secret("long-token", head=6, tail=4, floor=18)
         '***'
     """
+    if not value:
+        return empty
+    # Visible head/tail must not carry control bytes (newline, NUL, DEL, C1)
+    # into config/status/dump output (#55319, #55321). Strip them before
+    # slicing — the length check below then sees the displayable length.
+    value = _DISPLAY_CONTROL_RE.sub("", value)
     if not value:
         return empty
     if len(value) < floor:
