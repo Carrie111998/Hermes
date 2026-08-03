@@ -291,7 +291,7 @@ class TestMem0Prefetch:
         assert kind == "search"
         assert query == "what theme do I like?"
         assert opts["filters"] == {"user_id": "u123"}
-        assert opts["top_k"] == 15
+        assert opts["top_k"] == 10
         assert opts["rerank"] is False
         assert "## Mem0 Memory" in result
         assert "user prefers dark mode" in result
