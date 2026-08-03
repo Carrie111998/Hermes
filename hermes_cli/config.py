@@ -2928,6 +2928,12 @@ DEFAULT_CONFIG = {
             "search_default_limit": 5,
             # Hard upper bound the model can request via ``limit``. Range 1..50.
             "max_search_limit": 20,
+            # Maximum description characters returned for each search hit.
+            # Full metadata remains available through tool_describe.
+            "max_description_chars": 400,
+            # Cap the top-level description returned by tool_describe. The
+            # parameter schema is preserved so calls remain reliable.
+            "max_schema_description_chars": 1200,
         },
     },
 

@@ -82,6 +82,19 @@ class TestConfigParsing:
         assert cfg.max_search_limit == 50
         assert cfg.search_default_limit <= cfg.max_search_limit
 
+    def test_description_limit_clamped(self):
+        from tools.tool_search import ToolSearchConfig
+
+        assert ToolSearchConfig.from_raw(
+            {"max_description_chars": 1}
+        ).max_description_chars == 80
+        assert ToolSearchConfig.from_raw(
+            {"max_description_chars": 5000}
+        ).max_description_chars == 1000
+        assert ToolSearchConfig.from_raw(
+            {"max_schema_description_chars": 1}
+        ).max_schema_description_chars == 200
+
 
 # ---------------------------------------------------------------------------
 # Classification — the hard invariant: core tools NEVER defer.
@@ -294,6 +307,31 @@ class TestBridgeDispatch:
         from tools.tool_search import dispatch_tool_describe
         result = dispatch_tool_describe({}, current_tool_defs=[])
         assert "error" in json.loads(result)
+
+    def test_tool_search_bounds_match_descriptions(self, monkeypatch):
+        from tools import tool_search
+
+        entry = tool_search.CatalogEntry(
+            name="mcp_long_description",
+            description="x" * 500,
+            schema=_td("mcp_long_description", "x" * 500),
+            source="mcp",
+            source_name="mcp-test",
+        )
+        entry._tokens = tool_search._tokenize(
+            tool_search._entry_search_text(entry.schema)
+        )
+        monkeypatch.setattr(
+            tool_search, "build_catalog", lambda _defs: [entry]
+        )
+        result = tool_search.dispatch_tool_search(
+            {"query": "long description"},
+            current_tool_defs=[],
+            config=tool_search.ToolSearchConfig.from_raw(
+                {"max_description_chars": 120}
+            ),
+        )
+        assert len(json.loads(result)["matches"][0]["description"]) == 120
 
     def test_tool_describe_rejects_non_deferrable(self):
         """If the model asks to describe a core tool, refuse — it's already

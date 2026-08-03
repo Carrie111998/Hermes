@@ -68,6 +68,8 @@ class ToolSearchConfig:
     threshold_pct: float  # 0..100 — only used when enabled == "auto"
     search_default_limit: int
     max_search_limit: int
+    max_description_chars: int
+    max_schema_description_chars: int
 
     @classmethod
     def from_raw(cls, raw: Any) -> "ToolSearchConfig":
@@ -81,13 +83,19 @@ class ToolSearchConfig:
         """
         if raw is True:
             return cls(enabled="auto", threshold_pct=10.0,
-                       search_default_limit=5, max_search_limit=20)
+                       search_default_limit=5, max_search_limit=20,
+                       max_description_chars=400,
+                       max_schema_description_chars=1200)
         if raw is False:
             return cls(enabled="off", threshold_pct=10.0,
-                       search_default_limit=5, max_search_limit=20)
+                       search_default_limit=5, max_search_limit=20,
+                       max_description_chars=400,
+                       max_schema_description_chars=1200)
         if not isinstance(raw, dict):
             return cls(enabled="auto", threshold_pct=10.0,
-                       search_default_limit=5, max_search_limit=20)
+                       search_default_limit=5, max_search_limit=20,
+                       max_description_chars=400,
+                       max_schema_description_chars=1200)
 
         enabled_raw = str(raw.get("enabled", "auto")).strip().lower()
         if enabled_raw in ("true", "1", "yes"):
@@ -105,12 +113,24 @@ class ToolSearchConfig:
         max_search_limit = max(1, min(50, _safe_int(raw.get("max_search_limit"), 20)))
         search_default_limit = max(1, min(max_search_limit,
                                           _safe_int(raw.get("search_default_limit"), 5)))
+        max_description_chars = max(
+            80, min(1000, _safe_int(raw.get("max_description_chars"), 400))
+        )
+        max_schema_description_chars = max(
+            200,
+            min(
+                4000,
+                _safe_int(raw.get("max_schema_description_chars"), 1200),
+            ),
+        )
 
         return cls(
             enabled=enabled,
             threshold_pct=threshold_pct,
             search_default_limit=search_default_limit,
             max_search_limit=max_search_limit,
+            max_description_chars=max_description_chars,
+            max_schema_description_chars=max_schema_description_chars,
         )
 
 
@@ -592,13 +612,15 @@ def is_bridge_tool(name: str) -> bool:
     return name in BRIDGE_TOOL_NAMES
 
 
-def _format_search_hit(entry: CatalogEntry) -> Dict[str, Any]:
+def _format_search_hit(
+    entry: CatalogEntry, *, max_description_chars: int = 400
+) -> Dict[str, Any]:
     return {
         "name": entry.name,
         "source": entry.source,
         "source_name": entry.source_name,
         # Cap description so a chatty MCP server doesn't blow up the result.
-        "description": (entry.description or "")[:400],
+        "description": (entry.description or "")[:max_description_chars],
     }
 
 
@@ -625,13 +647,19 @@ def dispatch_tool_search(args: Dict[str, Any],
     return json.dumps({
         "query": query,
         "total_available": len(catalog),
-        "matches": [_format_search_hit(h) for h in hits],
+        "matches": [
+            _format_search_hit(
+                h, max_description_chars=config.max_description_chars
+            )
+            for h in hits
+        ],
     }, ensure_ascii=False)
 
 
 def dispatch_tool_describe(args: Dict[str, Any],
                            *,
-                           current_tool_defs: List[Dict[str, Any]]) -> str:
+                           current_tool_defs: List[Dict[str, Any]],
+                           config: Optional[ToolSearchConfig] = None) -> str:
     """Execute the ``tool_describe`` bridge tool. Returns a JSON string."""
     name = str(args.get("name") or "").strip()
     if not name:
@@ -643,13 +671,18 @@ def dispatch_tool_describe(args: Dict[str, Any],
                 "already, call it directly; otherwise check the spelling against tool_search."
             ),
         }, ensure_ascii=False)
+    if config is None:
+        config = load_config()
     _, deferrable = classify_tools(current_tool_defs)
     for td in deferrable:
         fn = td.get("function") or {}
         if fn.get("name") == name:
             return json.dumps({
                 "name": name,
-                "description": fn.get("description", ""),
+                "description": (
+                    fn.get("description", "")
+                    or ""
+                )[:config.max_schema_description_chars],
                 "parameters": fn.get("parameters", {}),
             }, ensure_ascii=False)
     return json.dumps({
