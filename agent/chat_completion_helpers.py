@@ -2111,6 +2111,19 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
             agent._copy_reasoning_content_for_api(msg, api_msg)
             for internal_field in ("reasoning", "finish_reason", "_thinking_prefill"):
                 api_msg.pop(internal_field, None)
+            # Display-only timeline metadata and tool dispositions. Never
+            # provider fields — the main loop's api_messages build strips
+            # display_kind/display_metadata/_row_id per copy
+            # (agent/conversation_loop.py) and the transport additionally
+            # strips effect_disposition (agent/transports/chat_completions.py),
+            # but this summary path bypasses both. TUI/gateway sessions carry
+            # these on live rows (compaction references marked "hidden",
+            # model_switch, skill_invocation, async_delegation_complete), and
+            # strict OpenAI-compatible backends (Fireworks) reject the extras
+            # with 400 "Extra inputs are not permitted".
+            api_msg.pop("display_kind", None)
+            api_msg.pop("display_metadata", None)
+            api_msg.pop("effect_disposition", None)
             # Strict OpenAI-compatible gateways (Fireworks-backed OpenCode Go,
             # Mistral, Moonshot/Kimi) reject any message key outside the Chat
             # Completions schema. The main loop drops these via

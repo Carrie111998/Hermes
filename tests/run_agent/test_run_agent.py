@@ -2478,6 +2478,47 @@ class TestHandleMaxIterations:
         assert messages[1]["codex_reasoning_items"] == [{"id": "rs_1"}]
 
 
+    def test_summary_strips_display_timeline_fields(self, agent):
+        """Regression: the max-iterations summary request must NOT carry
+        display-only timeline metadata — display_kind (compaction references
+        marked "hidden", model_switch, skill_invocation, async_delegation_complete),
+        display_metadata, or effect_disposition. These reach the live message
+        list on TUI/gateway sessions and interrupt checkpoints; the main loop's
+        api_messages build strips them (agent/conversation_loop.py) and the
+        transport strips effect_disposition, but this hand-built summary path
+        bypasses both. Strict backends (Fireworks) reject them with 400
+        'Extra inputs are not permitted, field: messages[N].display_kind'."""
+        agent.client.chat.completions.create.return_value = _mock_response(content="Summary")
+        agent._cached_system_prompt = "You are helpful."
+        messages = [
+            {"role": "user", "content": "do stuff"},
+            {
+                "role": "assistant",
+                "tool_calls": [{"id": "call_1", "function": {"name": "execute_code", "arguments": "{}"}}],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "result", "effect_disposition": "none"},
+            {
+                "role": "assistant",
+                "content": "[This response was interrupted by a user correction.]",
+                "display_kind": "hidden",
+                "display_metadata": {"kind": "checkpoint"},
+            },
+            {"role": "user", "content": "more stuff"},
+        ]
+
+        result = agent._handle_max_iterations(messages, 60)
+
+        assert result == "Summary"
+        sent_msgs = agent.client.chat.completions.create.call_args.kwargs.get("messages", [])
+        for m in sent_msgs:
+            assert "display_kind" not in m, m
+            assert "display_metadata" not in m, m
+            assert "effect_disposition" not in m, m
+        # Internal history is untouched — the path copies each message.
+        assert messages[2]["effect_disposition"] == "none"
+        assert messages[3]["display_kind"] == "hidden"
+
+
 
 
 
