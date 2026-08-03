@@ -223,12 +223,22 @@ def _parse_manifest(path: Path) -> CatalogEntry:
     if not isinstance(env_list_raw, list):
         raise CatalogError(f"{path}: auth.env must be a list")
     env_list = [_parse_env_spec(e) for e in env_list_raw]
+    env_var = auth_raw.get("env_var")
+    if env_var is not None:
+        if not isinstance(env_var, str) or not re.match(
+            r"^[A-Za-z_][A-Za-z0-9_]*$", env_var
+        ):
+            raise CatalogError(f"{path}: invalid auth.env_var: {env_var!r}")
+        if env_var not in {spec.name for spec in env_list}:
+            raise CatalogError(
+                f"{path}: auth.env_var {env_var!r} must name an auth.env entry"
+            )
     auth = AuthSpec(
         type=a_type,
         env=env_list,
         provider=auth_raw.get("provider"),
         scopes=list(auth_raw.get("scopes") or []),
-        env_var=auth_raw.get("env_var"),
+        env_var=env_var,
     )
 
     tools_raw = data.get("tools") or {}
@@ -506,6 +516,14 @@ def _build_server_config(
         cfg["url"] = t.url
         if entry.auth.type == "oauth":
             cfg["auth"] = "oauth"
+        elif entry.auth.type == "api_key" and entry.auth.env_var:
+            # Bearer-token remote server: mirror the `hermes mcp add`
+            # convention (_bearer_auth_headers) — the token itself is
+            # prompted via auth.env and stored in ~/.hermes/.env; only an
+            # interpolated header reference lands in config.yaml.
+            cfg["headers"] = {
+                "Authorization": f"Bearer ${{{entry.auth.env_var}}}"
+            }
     return cfg
 
 
