@@ -3,6 +3,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-libra
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { DesktopBootstrapEvent, DesktopBootstrapState, DesktopConnectionProbeResult } from '@/global'
+import { en } from '@/i18n/en'
 
 import { DesktopInstallOverlay } from './desktop-install-overlay'
 
@@ -530,7 +531,7 @@ describe('DesktopInstallOverlay first-run setup', () => {
 
     render(<DesktopInstallOverlay />)
 
-    expect(await screen.findByText('Hermes needs a one-time install')).toBeTruthy()
+    expect(await screen.findByText(en.install.oneTimeTitle)).toBeTruthy()
 
     fireEvent.click(screen.getByText('Connect existing'))
 

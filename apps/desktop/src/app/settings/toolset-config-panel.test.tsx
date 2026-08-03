@@ -5,6 +5,7 @@ import { MemoryRouter } from 'react-router'
 import type * as ReactRouterDom from 'react-router'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { en } from '@/i18n/en'
 import type { ToolsetConfig } from '@/types/hermes'
 
 // EnvVarField navigates to Settings → Keys via useNavigate, so every render
@@ -589,7 +590,7 @@ describe('ToolsetConfigPanel', () => {
       expect(screen.getAllByText('Active')).toHaveLength(1)
       expect(screen.queryByText('Ready')).toBeNull()
       expect(screen.getByText('Needs sign-in')).toBeTruthy()
-      expect(screen.getByText('Setup required')).toBeTruthy()
+      expect(screen.getByText(en.settings.toolsets.needsSetup)).toBeTruthy()
     })
 
     it('shows no Ready pill for a keyed provider the server marks needs_keys', async () => {

@@ -4126,7 +4126,11 @@ describe('usePromptActions busy-gateway churn tolerance (#64327)', () => {
 
     expect(await handle!.submitText('first message across reconnect')).toBe(true)
     expect(calls.map(call => call.method)).toEqual(['prompt.submit', 'session.resume', 'prompt.submit'])
-    expect(calls[1]?.params).toEqual({ session_id: 'stored-new-chat', source: 'desktop' })
+    expect(calls[1]?.params).toEqual({
+      session_id: 'stored-new-chat',
+      source: 'desktop',
+      omit_messages: true
+    })
     expect(calls[2]?.params).toEqual({
       session_id: 'rt-new-chat-recovered',
       text: 'first message across reconnect'

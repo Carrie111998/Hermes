@@ -6,6 +6,7 @@ import type * as ReactRouterDom from 'react-router'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type * as HermesApi from '@/hermes'
+import { en } from '@/i18n/en'
 import { queryClient } from '@/lib/query-client'
 
 const getSkills = vi.fn()
@@ -175,7 +176,7 @@ describe('evaOS managed upstream capabilities', () => {
     await renderSkills()
 
     expect((await screen.findAllByText('Web Search')).length).toBeGreaterThan(0)
-    expect(screen.getByRole('switch', { name: 'Toggle Web Search toolset' })).toBeTruthy()
+    expect(screen.getByRole('switch', { name: en.skills.toggleToolset('Web Search', false) })).toBeTruthy()
     expect(screen.getByText('MCP')).toBeTruthy()
     expect(screen.getByText('Browse Hub')).toBeTruthy()
     await waitFor(() => expect(getToolsetConfig).toHaveBeenCalledWith('web'))

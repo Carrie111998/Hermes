@@ -7,6 +7,8 @@ import { AssistantRuntimeProvider, type ThreadMessage, useExternalStoreRuntime }
 import { cleanup, render, screen } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
+import { en } from '@/i18n/en'
+
 import { Thread } from '.'
 
 const createdAt = new Date('2026-05-01T00:00:00.000Z')
@@ -82,7 +84,7 @@ describe('thinking indicator is tail-only', () => {
   it('shows the loading indicator on a running placeholder at the tail', async () => {
     const { container } = render(<Harness messages={[user('u1', 'question'), assistant('a1', '', true)]} />)
 
-    expect(await screen.findByRole('status', { name: 'Hermes is loading a response' })).toBeTruthy()
+    expect(await screen.findByRole('status', { name: en.assistant.thread.loadingResponse })).toBeTruthy()
     expect(container.querySelector('[data-slot="aui_response-loading"]')).toBeTruthy()
   })
 
