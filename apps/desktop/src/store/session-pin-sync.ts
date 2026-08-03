@@ -20,34 +20,100 @@
  * the local set untouched.
  */
 
+import type { HermesConnection } from '@/global'
 import { setSessionPinnedRemote } from '@/hermes'
+import { desktopConnectionScope } from '@/lib/connection-scope'
 import { $pinnedSessionIds, pinSession, unpinSession } from '@/store/layout'
-import { $sessions, sessionMatchesStoredId, sessionPinId } from '@/store/session'
+import { $connection, $sessions, sessionMatchesStoredId, sessionPinId } from '@/store/session'
+import {
+  activatePinnedSessionConnection,
+  initializePinnedSessionScope,
+  legacyPinnedSessionIds,
+  pinnedSessionScopeInitialized
+} from '@/store/session-pins'
 
-// pin ids we've successfully PATCHed pinned=true this session.
-const mirrored = new Set<string>()
-// pin ids awaiting their row so we can resolve the owning profile before PATCH.
-const pending = new Set<string>()
-// Writes we've issued but not yet had acked, id -> value written. A list page
-// already in flight when we PATCH still carries the old value, so it must not
-// be read as the server disagreeing with us. Cleared when the write settles —
-// the request's own lifetime is the guard, so nothing can leave one open.
-const unconfirmed = new Map<string, boolean>()
+interface PinSyncState {
+  // Pin ids awaiting their row so we can resolve the owning profile before PATCH.
+  pending: Set<string>
+  // Pin ids we've successfully PATCHed pinned=true during this activation.
+  mirrored: Set<string>
+  // Object identity prevents an older write from clearing a newer guard.
+  unconfirmed: Map<string, { pinned: boolean }>
+}
+
+let activeSyncScope: null | string = null
+let activeSyncState: null | PinSyncState = null
+let hydratingPinScope = false
+
+function activatePinSyncConnection(connection: HermesConnection | null): void {
+  const scope = desktopConnectionScope(connection)
+
+  activeSyncScope = scope
+  activeSyncState = scope
+    ? { mirrored: new Set<string>(), pending: new Set<string>(), unconfirmed: new Map<string, { pinned: boolean }>() }
+    : null
+}
+
+function hydratePinScope(connection: HermesConnection | null): void {
+  activatePinSyncConnection(connection)
+  hydratingPinScope = true
+
+  try {
+    activatePinnedSessionConnection(connection)
+  } finally {
+    hydratingPinScope = false
+  }
+
+  // A scoped localStorage value is a cache, not new user intent. Treat it as
+  // already mirrored so the first modern session page can correct it without
+  // echoing the stale cache back to the backend.
+  if (activeSyncState) {
+    activeSyncState.mirrored = new Set($pinnedSessionIds.get())
+  }
+}
+
+function initializePinScopeFromSessions(): void {
+  if (pinnedSessionScopeInitialized()) {
+    return
+  }
+
+  const sessions = $sessions.get()
+
+  if (sessions.length === 0) {
+    return
+  }
+
+  // Modern backends own pin truth, so start their cache empty and let the pull
+  // below populate it. For a backend predating `sessions.pinned`, preserve only
+  // legacy local pins that resolve to a row on this connection; copying the old
+  // global list wholesale is the cross-gateway leak fixed by #77318.
+  const ids = sessions.some(row => typeof row.pinned === 'boolean')
+    ? []
+    : legacyPinnedSessionIds().filter(id => sessions.some(row => sessionMatchesStoredId(row, id)))
+
+  initializePinnedSessionScope(ids)
+}
 
 function profileFor(pinId: string): null | string | undefined {
   return $sessions.get().find(row => sessionMatchesStoredId(row, pinId))?.profile
 }
 
 /** PATCH the flag, guarding reads against pages that predate the write. */
-function writePin(id: string, pinned: boolean, profile?: null | string): Promise<void> {
-  unconfirmed.set(id, pinned)
+function writePin(state: PinSyncState, id: string, pinned: boolean, profile?: null | string): Promise<void> {
+  const confirmation = { pinned }
+  state.unconfirmed.set(id, confirmation)
 
   return setSessionPinnedRemote(id, pinned, profile).then(
     () => {
-      unconfirmed.delete(id)
+      if (state.unconfirmed.get(id) === confirmation) {
+        state.unconfirmed.delete(id)
+      }
     },
     (err: unknown) => {
-      unconfirmed.delete(id)
+      if (state.unconfirmed.get(id) === confirmation) {
+        state.unconfirmed.delete(id)
+      }
+
       throw err
     }
   )
@@ -62,7 +128,7 @@ function writePin(id: string, pinned: boolean, profile?: null | string): Promise
  * (#74570). Remote pins adopted here are marked mirrored before the local set
  * changes, so the re-entrant reconcile doesn't echo them back as a PATCH.
  */
-function pullRemotePins(): void {
+function pullRemotePins(state: PinSyncState): void {
   const local = new Set($pinnedSessionIds.get())
 
   for (const row of $sessions.get()) {
@@ -77,7 +143,7 @@ function pullRemotePins(): void {
     const heldLocally = local.has(pinId) || local.has(row.id)
 
     // A write of ours the page hasn't caught up to yet is newer than the page.
-    const awaited = unconfirmed.has(pinId) ? unconfirmed.get(pinId) : unconfirmed.get(row.id)
+    const awaited = state.unconfirmed.get(pinId)?.pinned ?? state.unconfirmed.get(row.id)?.pinned
 
     if (awaited !== undefined && awaited !== row.pinned) {
       continue
@@ -85,20 +151,20 @@ function pullRemotePins(): void {
 
     // Local intent still waiting on its PATCH (row unresolved when the push
     // pass ran) is also newer than the page — never revert it.
-    if (pending.has(pinId) || pending.has(row.id)) {
+    if (state.pending.has(pinId) || state.pending.has(row.id)) {
       continue
     }
 
     if (row.pinned && !heldLocally) {
       // Mark mirrored first: pinSession fires the pin listener synchronously,
       // and the nested reconcile must not see this as a new pin to PATCH.
-      mirrored.add(pinId)
+      state.mirrored.add(pinId)
       pinSession(pinId)
     } else if (!row.pinned && heldLocally) {
       // Same discipline on the way down: forget the mirror before the nested
       // reconcile runs, or it re-PATCHes pinned=false the server already has.
-      mirrored.delete(pinId)
-      mirrored.delete(row.id)
+      state.mirrored.delete(pinId)
+      state.mirrored.delete(row.id)
       unpinSession(local.has(pinId) ? pinId : row.id)
     }
   }
@@ -110,6 +176,20 @@ function reconcile(): void {
     return
   }
 
+  const connection = $connection.get()
+
+  if (!connection || desktopConnectionScope(connection) !== activeSyncScope) {
+    return
+  }
+
+  const state = activeSyncState
+
+  if (!state) {
+    return
+  }
+
+  initializePinScopeFromSessions()
+
   // Push before pull. The pin listener fires synchronously on a local toggle,
   // so this reconcile runs before the PATCH for that toggle exists anywhere.
   // The push pass below records the intent (`pending`, then `unconfirmed` via
@@ -118,45 +198,64 @@ function reconcile(): void {
   const current = new Set($pinnedSessionIds.get())
 
   // Unpinned: anything we were tracking that's no longer in the set.
-  for (const id of [...mirrored, ...pending]) {
+  for (const id of [...state.mirrored, ...state.pending]) {
     if (!current.has(id)) {
-      mirrored.delete(id)
-      pending.delete(id)
-      void writePin(id, false, profileFor(id)).catch(() => {})
+      state.mirrored.delete(id)
+      state.pending.delete(id)
+      void writePin(state, id, false, profileFor(id)).catch(() => {})
     }
   }
 
   // Newly pinned: hold until we can resolve the row (for its profile).
   for (const id of current) {
-    if (!mirrored.has(id)) {
-      pending.add(id)
+    if (!state.mirrored.has(id)) {
+      state.pending.add(id)
     }
   }
 
   // Flush whatever we can resolve now; unresolved ids (row not loaded yet)
   // retry on the next $sessions change.
-  for (const id of [...pending]) {
+  for (const id of [...state.pending]) {
     const row = $sessions.get().find(entry => sessionMatchesStoredId(entry, id))
 
     if (!row) {
       continue
     }
 
-    pending.delete(id)
-    mirrored.add(id)
-    void writePin(id, true, row.profile).catch(() => {
+    state.pending.delete(id)
+    state.mirrored.add(id)
+    void writePin(state, id, true, row.profile).catch(() => {
       // Let a later reconcile retry the mirror.
-      mirrored.delete(id)
-      pending.add(id)
+      state.mirrored.delete(id)
+      state.pending.add(id)
     })
   }
 
-  pullRemotePins()
+  pullRemotePins(state)
 }
 
-// Sync once, then re-sync on pin-set and session-list changes. Call once per app.
-export function watchSessionPins(): void {
+// Sync once, then re-sync on connection, pin-set, and session-list changes.
+// Call once per app; the returned cleanup keeps tests/HMR from stacking listeners.
+export function watchSessionPins(): () => void {
+  const offPins = $pinnedSessionIds.listen(() => {
+    if (!hydratingPinScope) {
+      reconcile()
+    }
+  })
+
+  const offSessions = $sessions.listen(reconcile)
+
+  const offConnection = $connection.listen(connection => {
+    hydratePinScope(connection)
+    reconcile()
+  })
+
+  hydratePinScope($connection.get())
   reconcile()
-  $pinnedSessionIds.listen(reconcile)
-  $sessions.listen(reconcile)
+
+  return () => {
+    offConnection()
+    offSessions()
+    offPins()
+  }
 }
