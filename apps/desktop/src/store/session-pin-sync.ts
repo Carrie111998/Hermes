@@ -28,11 +28,19 @@ import { $sessions, sessionMatchesStoredId, sessionPinId } from '@/store/session
 const mirrored = new Set<string>()
 // pin ids awaiting their row so we can resolve the owning profile before PATCH.
 const pending = new Set<string>()
-// Writes we've issued but not yet had acked, id -> value written. A list page
-// already in flight when we PATCH still carries the old value, so it must not
-// be read as the server disagreeing with us. Cleared when the write settles —
-// the request's own lifetime is the guard, so nothing can leave one open.
-const unconfirmed = new Map<string, boolean>()
+// Writes we've issued: id -> { value, seq, acked }. The guard survives the
+// PATCH ack until a session-list page reflecting the written value arrives:
+// a page issued BEFORE the write can land AFTER the ack still carrying the
+// old value, and reading it as server truth would revert the user's toggle
+// and re-PATCH the wrong value durable (#76919, follow-up to #74570).
+// `seq` lets a later write's guard outlive a stale ack from an earlier one.
+interface PinWrite {
+  value: boolean
+  seq: number
+  acked: boolean
+}
+const writes = new Map<string, PinWrite>()
+let writeSeq = 0
 
 function profileFor(pinId: string): null | string | undefined {
   return $sessions.get().find(row => sessionMatchesStoredId(row, pinId))?.profile
@@ -40,14 +48,23 @@ function profileFor(pinId: string): null | string | undefined {
 
 /** PATCH the flag, guarding reads against pages that predate the write. */
 function writePin(id: string, pinned: boolean, profile?: null | string): Promise<void> {
-  unconfirmed.set(id, pinned)
+  const seq = ++writeSeq
+  writes.set(id, { value: pinned, seq, acked: false })
 
   return setSessionPinnedRemote(id, pinned, profile).then(
     () => {
-      unconfirmed.delete(id)
+      const entry = writes.get(id)
+      // Only the LATEST write's ack may settle the guard; a stale ack from a
+      // superseded write must not clear a newer intent.
+      if (entry && entry.seq === seq) {
+        entry.acked = true
+      }
     },
     (err: unknown) => {
-      unconfirmed.delete(id)
+      const entry = writes.get(id)
+      if (entry && entry.seq === seq) {
+        writes.delete(id)
+      }
       throw err
     }
   )
@@ -77,10 +94,16 @@ function pullRemotePins(): void {
     const heldLocally = local.has(pinId) || local.has(row.id)
 
     // A write of ours the page hasn't caught up to yet is newer than the page.
-    const awaited = unconfirmed.has(pinId) ? unconfirmed.get(pinId) : unconfirmed.get(row.id)
-
-    if (awaited !== undefined && awaited !== row.pinned) {
-      continue
+    const awaited = writes.get(pinId) ?? writes.get(row.id)
+    if (awaited) {
+      if (!awaited.acked || awaited.value !== row.pinned) {
+        // In flight, or the page predates the write (still carries the old
+        // value even though the PATCH acked) — never adopt it.
+        continue
+      }
+      // The page reflects our write — the guard has done its job.
+      writes.delete(pinId)
+      writes.delete(row.id)
     }
 
     // Local intent still waiting on its PATCH (row unresolved when the push
@@ -112,9 +135,10 @@ function reconcile(): void {
 
   // Push before pull. The pin listener fires synchronously on a local toggle,
   // so this reconcile runs before the PATCH for that toggle exists anywhere.
-  // The push pass below records the intent (`pending`, then `unconfirmed` via
+  // The push pass below records the intent (`pending`, then a write guard via
   // writePin) — only then may the pull read the page, where those fences stop
-  // the still-stale row from silently reverting the user's action (#74570).
+  // the still-stale row from silently reverting the user's action (#74570,
+  // #76919).
   const current = new Set($pinnedSessionIds.get())
 
   // Unpinned: anything we were tracking that's no longer in the set.
@@ -159,4 +183,12 @@ export function watchSessionPins(): void {
   reconcile()
   $pinnedSessionIds.listen(reconcile)
   $sessions.listen(reconcile)
+}
+
+// Test-only: clear module state between tests (mirrors _resetCodingStatusForTests).
+export function _resetSessionPinSyncStateForTests(): void {
+  mirrored.clear()
+  pending.clear()
+  writes.clear()
+  writeSeq = 0
 }

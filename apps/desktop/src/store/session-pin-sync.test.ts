@@ -13,7 +13,7 @@ vi.mock('@/hermes', () => ({
 import { $pinnedSessionIds } from '@/store/layout'
 import { $sessions } from '@/store/session'
 
-import { watchSessionPins } from './session-pin-sync'
+import { watchSessionPins, _resetSessionPinSyncStateForTests } from './session-pin-sync'
 
 const row = (id: string, extra: Partial<SessionInfo> = {}): SessionInfo =>
   ({ id, message_count: 1, source: 'cli', started_at: 0, title: id, ...extra }) as SessionInfo
@@ -30,6 +30,7 @@ beforeAll(() => {
 beforeEach(() => {
   $sessions.set([])
   $pinnedSessionIds.set([])
+  _resetSessionPinSyncStateForTests()
   patch.mockClear()
 })
 
@@ -122,7 +123,14 @@ describe('watchSessionPins remote pull', () => {
     await flush()
     patch.mockClear()
 
-    // Another app unpinned it; our next refresh carries the new truth.
+    // Our mirror PATCH acks; the next refresh reflects it (pinned=true),
+    // which clears the write guard…
+    $sessions.set([row('gone', { pinned: true })])
+    await flush()
+    expect($pinnedSessionIds.get()).toContain('gone')
+
+    // …after which a page carrying genuine server truth (another app
+    // unpinned it) is honored.
     $sessions.set([row('gone', { pinned: false })])
     await flush()
 
@@ -181,31 +189,79 @@ describe('watchSessionPins remote pull', () => {
     expect(patch).toHaveBeenCalledWith('deferred', true, undefined)
   })
 
-  it('ignores a stale page that contradicts a write still in flight', async () => {
+  it('never reverts a write when a stale page lands after the PATCH ack (#76919)', async () => {
     let settle: (v: { ok: boolean }) => void = () => {}
 
     patch.mockImplementationOnce(() => new Promise(resolve => (settle = resolve)))
 
-    $sessions.set([row('race')])
-    $pinnedSessionIds.set(['race'])
+    $sessions.set([row('postack')])
+    $pinnedSessionIds.set(['postack'])
     await flush()
-    expect(patch).toHaveBeenCalledWith('race', true, undefined)
+    expect(patch).toHaveBeenCalledWith('postack', true, undefined)
 
-    // A list request issued before the PATCH lands still says pinned=false.
+    // A list request issued BEFORE the PATCH lands while it's still in flight.
     // Honouring it would silently undo the pin the user just made.
-    $sessions.set([row('race', { pinned: false })])
+    $sessions.set([row('postack', { pinned: false })])
     await flush()
+    expect($pinnedSessionIds.get()).toContain('postack')
 
-    expect($pinnedSessionIds.get()).toContain('race')
-
-    // Once the write is acked, later server truth is honoured again.
+    // The PATCH acks — but the in-flight page STILL hasn't landed.
     settle({ ok: true })
     await flush()
     await flush()
 
-    $sessions.set([row('race', { pinned: false }), row('other')])
+    // The stale page (issued before the write) finally lands AFTER the ack,
+    // still carrying the pre-write value. Reading it as server truth would
+    // resurrect the pin and re-PATCH pinned=false... wait, pinned=true back.
+    $sessions.set([row('postack', { pinned: false }), row('other')])
+    await flush()
+    expect($pinnedSessionIds.get()).toContain('postack')
+    expect(patch).not.toHaveBeenCalledWith('postack', false, undefined)
+
+    // Only a page reflecting the written value clears the guard…
+    $sessions.set([row('postack', { pinned: true }), row('other')])
+    await flush()
+    expect($pinnedSessionIds.get()).toContain('postack')
+
+    // …after which genuine server truth is honoured again.
+    $sessions.set([row('postack', { pinned: false }), row('other')])
+    await flush()
+    expect($pinnedSessionIds.get()).not.toContain('postack')
+  })
+
+  it('lets a later write outlive a stale ack from a superseded one', async () => {
+    let first: (v: { ok: boolean }) => void = () => {}
+    let second: (v: { ok: boolean }) => void = () => {}
+
+    patch.mockImplementationOnce(() => new Promise(resolve => (first = resolve)))
+    patch.mockImplementationOnce(() => new Promise(resolve => (second = resolve)))
+
+    // Local pin (write 1 in flight), then quickly unpin (write 2 in flight).
+    $pinnedSessionIds.set(['flap'])
+    $sessions.set([row('flap', { pinned: true })])
+    await flush()
+    expect(patch).toHaveBeenCalledWith('flap', true, undefined)
+    $pinnedSessionIds.set([])
+    await flush()
+    expect(patch).toHaveBeenCalledTimes(2)
+
+    // The FIRST (superseded) ack arrives — it must not clear the guard for
+    // the unpin write that is still in flight.
+    first({ ok: true })
+    await flush()
     await flush()
 
-    expect($pinnedSessionIds.get()).not.toContain('race')
+    // A stale page still says pinned=true; the unpin must hold.
+    $sessions.set([row('flap', { pinned: true })])
+    await flush()
+    expect($pinnedSessionIds.get()).not.toContain('flap')
+
+    // Second ack lands; a page reflecting pinned=false clears the guard.
+    second({ ok: true })
+    await flush()
+    await flush()
+    $sessions.set([row('flap', { pinned: false })])
+    await flush()
+    expect($pinnedSessionIds.get()).not.toContain('flap')
   })
 })
