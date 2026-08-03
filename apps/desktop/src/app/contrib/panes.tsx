@@ -11,6 +11,7 @@
 import { useStore } from '@nanostores/react'
 import { useQuery } from '@tanstack/react-query'
 import { atom } from 'nanostores'
+import { useRef, useEffect } from 'react'
 import type { CSSProperties } from 'react'
 
 import { ChatPreviewRail } from '@/app/chat/right-rail/preview'
@@ -43,6 +44,22 @@ export function LogsPane() {
     refetchInterval: 5000
   })
 
+  const preRef = useRef<HTMLPreElement>(null)
+  const isNearBottom = useRef(true)
+
+  useEffect(() => {
+    if (!preRef.current) return
+    if (isNearBottom.current) {
+      preRef.current.scrollTop = preRef.current.scrollHeight
+    }
+  }, [data])
+
+  const handleScroll = () => {
+    if (!preRef.current) return
+    const el = preRef.current
+    isNearBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight <= 80
+  }
+
   if (error) {
     return <div className="p-3 text-xs text-(--ui-text-quaternary)">log unavailable: {String(error)}</div>
   }
@@ -58,7 +75,7 @@ export function LogsPane() {
   // No chrome of its own — the zone header (when the user summons it) is the
   // pane's only label. Just the tail.
   return (
-    <pre className="h-full min-h-0 overflow-auto whitespace-pre-wrap break-words p-2.5 font-mono text-[0.66rem] leading-relaxed text-(--ui-text-secondary)">
+    <pre ref={preRef} onScroll={handleScroll} data-selectable-text="true" className="h-full min-h-0 overflow-auto whitespace-pre-wrap break-words p-2.5 font-mono text-[0.66rem] leading-relaxed text-(--ui-text-secondary)">
       {data.lines.join('\n')}
     </pre>
   )
