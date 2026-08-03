@@ -78,7 +78,7 @@ FAILURE_SCHEMA = (
     "muncho-canonical-writer-schema-reconciliation-control-failure.v1"
 )
 FOUNDATION_OBSERVATION_SCHEMA = (
-    "muncho-canonical-writer-schema-reconciliation-control-foundation-observation.v1"
+    "muncho-canonical-writer-schema-reconciliation-control-foundation-observation.v2"
 )
 CLOUD_AUTHORITY_SCHEMA = (
     "muncho-cloud-sql-schema-reconciliation-control-admin-authority.v1"
@@ -96,6 +96,8 @@ RETIRE_ARTIFACT_FILENAME = (
 )
 EXECUTOR_ROLE = "canonical_brain_schema_reconciler"
 CONTROL_SCHEMA = "canonical_brain_reconciliation"
+_CONTROL_ADMIN_ATTRIBUTES_EXACT_MASK = (1 << 10) - 1
+_CONTROL_ADMIN_MEMBERSHIPS_EXACT_MASK = (1 << 12) - 1
 OBSERVER_SIGNATURE = (
     "canonical_brain_reconciliation."
     "observe_missing_discord_routeback_helper_v1()"
@@ -228,6 +230,10 @@ _OBSERVATION_FIELDS = frozenset({
     "postgresql_major",
     "session_user_sha256",
     "control_admin_count",
+    "control_admin_identity_exact",
+    "control_admin_attributes_exact",
+    "control_admin_memberships_exact",
+    "control_admin_forward_roles_exact",
     "control_admin_role_exact",
     "control_admin_forward_role_count",
     "control_admin_owned_object_count",
@@ -876,6 +882,10 @@ def _validate_observation(value: Any, *, phase: str) -> Mapping[str, Any]:
         or raw.get("database") != foundation.SQL_DATABASE
         or raw.get("postgresql_major") != 18
         or type(raw.get("control_admin_count")) is not int
+        or type(raw.get("control_admin_identity_exact")) is not bool
+        or type(raw.get("control_admin_attributes_exact")) is not bool
+        or type(raw.get("control_admin_memberships_exact")) is not bool
+        or type(raw.get("control_admin_forward_roles_exact")) is not bool
         or type(raw.get("control_admin_role_exact")) is not bool
         or type(raw.get("control_admin_forward_role_count")) is not int
         or type(raw.get("control_admin_owned_object_count")) is not int
@@ -952,6 +962,10 @@ def _validate_observation(value: Any, *, phase: str) -> Mapping[str, Any]:
     if phase in {"before_install", "after_install"}:
         if (
             raw["control_admin_count"] != 1
+            or raw["control_admin_identity_exact"] is not True
+            or raw["control_admin_attributes_exact"] is not True
+            or raw["control_admin_memberships_exact"] is not True
+            or raw["control_admin_forward_roles_exact"] is not True
             or raw["control_admin_role_exact"] is not True
             or raw["control_admin_forward_role_count"]
             != 1 + raw["executor_membership_count"]
@@ -965,6 +979,10 @@ def _validate_observation(value: Any, *, phase: str) -> Mapping[str, Any]:
     elif (
         raw["state"] != "exact_installed"
         or raw["control_admin_count"] != 0
+        or raw["control_admin_identity_exact"] is not False
+        or raw["control_admin_attributes_exact"] is not False
+        or raw["control_admin_memberships_exact"] is not False
+        or raw["control_admin_forward_roles_exact"] is not False
         or raw["control_admin_role_exact"] is not False
         or raw["control_admin_forward_role_count"] != 0
         or raw["control_admin_owned_object_count"] != 0
@@ -1622,6 +1640,12 @@ _FOUNDATION_OBSERVATION_COLUMNS = (
     "version_num",
     "session_user_name",
     "control_admin_count",
+    "control_admin_identity_exact",
+    "control_admin_attributes_exact",
+    "control_admin_attributes_mask",
+    "control_admin_memberships_exact",
+    "control_admin_memberships_mask",
+    "control_admin_forward_roles_exact",
     "control_admin_role_exact",
     "control_admin_forward_role_count",
     "control_admin_owned_object_count",
@@ -1701,6 +1725,143 @@ WITH RECURSIVE executor AS MATERIALIZED (
       FROM pg_catalog.pg_auth_members AS membership
       JOIN forward_role_closure AS reachable
         ON reachable.roleid = membership.member
+), control_admin_contract_observation AS MATERIALIZED (
+    SELECT (
+               SESSION_USER ~
+                   '^muncho_canary_control_[0-9a-f]{{16}}$'
+               AND CURRENT_USER = SESSION_USER
+               AND (SELECT pg_catalog.count(*) FROM session_role) = 1
+           ) AS identity_exact,
+           COALESCE((
+               SELECT (CASE WHEN rolcanlogin THEN 1 ELSE 0 END)
+                      + (CASE WHEN rolinherit THEN 2 ELSE 0 END)
+                      + (CASE WHEN NOT rolsuper THEN 4 ELSE 0 END)
+                      + (CASE WHEN rolcreatedb THEN 8 ELSE 0 END)
+                      + (CASE WHEN rolcreaterole THEN 16 ELSE 0 END)
+                      + (CASE WHEN NOT rolreplication THEN 32 ELSE 0 END)
+                      + (CASE WHEN NOT rolbypassrls THEN 64 ELSE 0 END)
+                      + (CASE WHEN rolconnlimit = -1 THEN 128 ELSE 0 END)
+                      + (CASE WHEN rolvaliduntil IS NULL THEN 256 ELSE 0 END)
+                      + (CASE WHEN rolconfig IS NULL THEN 512 ELSE 0 END)
+                 FROM session_role
+           ), 0)::bigint AS attributes_mask,
+           (
+               SELECT (CASE WHEN pg_catalog.count(*) IN (1, 2)
+                            THEN 1 ELSE 0 END)
+                      + (CASE WHEN pg_catalog.count(*) FILTER (
+                            WHERE granted_name = 'cloudsqlsuperuser'
+                              AND member_name = SESSION_USER
+                        ) = 1 THEN 2 ELSE 0 END)
+                      + (CASE WHEN pg_catalog.count(*) FILTER (
+                            WHERE granted_name = 'cloudsqlsuperuser'
+                              AND member_name = SESSION_USER
+                              AND grantor_name = 'cloudsqladmin'
+                        ) = 1 THEN 4 ELSE 0 END)
+                      + (CASE WHEN pg_catalog.count(*) FILTER (
+                            WHERE granted_name = 'cloudsqlsuperuser'
+                              AND member_name = SESSION_USER
+                              AND admin_option IS FALSE
+                        ) = 1 THEN 8 ELSE 0 END)
+                      + (CASE WHEN pg_catalog.count(*) FILTER (
+                            WHERE granted_name = 'cloudsqlsuperuser'
+                              AND member_name = SESSION_USER
+                              AND inherit_option IS TRUE
+                        ) = 1 THEN 16 ELSE 0 END)
+                      + (CASE WHEN pg_catalog.count(*) FILTER (
+                            WHERE granted_name = 'cloudsqlsuperuser'
+                              AND member_name = SESSION_USER
+                              AND set_option IS TRUE
+                        ) = 1 THEN 32 ELSE 0 END)
+                      + (CASE WHEN pg_catalog.count(*) FILTER (
+                            WHERE granted_name = '{EXECUTOR_ROLE}'
+                              AND member_name = SESSION_USER
+                        ) = (
+                            SELECT pg_catalog.count(*)
+                              FROM pg_catalog.pg_auth_members
+                             WHERE roleid = (SELECT oid FROM executor)
+                        ) THEN 64 ELSE 0 END)
+                      + (CASE WHEN pg_catalog.count(*) FILTER (
+                            WHERE granted_name = '{EXECUTOR_ROLE}'
+                              AND member_name = SESSION_USER
+                              AND grantor_name = 'cloudsqladmin'
+                        ) = (
+                            SELECT pg_catalog.count(*)
+                              FROM pg_catalog.pg_auth_members
+                             WHERE roleid = (SELECT oid FROM executor)
+                        ) THEN 128 ELSE 0 END)
+                      + (CASE WHEN pg_catalog.count(*) FILTER (
+                            WHERE granted_name = '{EXECUTOR_ROLE}'
+                              AND member_name = SESSION_USER
+                              AND admin_option IS TRUE
+                        ) = (
+                            SELECT pg_catalog.count(*)
+                              FROM pg_catalog.pg_auth_members
+                             WHERE roleid = (SELECT oid FROM executor)
+                        ) THEN 256 ELSE 0 END)
+                      + (CASE WHEN pg_catalog.count(*) FILTER (
+                            WHERE granted_name = '{EXECUTOR_ROLE}'
+                              AND member_name = SESSION_USER
+                              AND inherit_option IS FALSE
+                        ) = (
+                            SELECT pg_catalog.count(*)
+                              FROM pg_catalog.pg_auth_members
+                             WHERE roleid = (SELECT oid FROM executor)
+                        ) THEN 512 ELSE 0 END)
+                      + (CASE WHEN pg_catalog.count(*) FILTER (
+                            WHERE granted_name = '{EXECUTOR_ROLE}'
+                              AND member_name = SESSION_USER
+                              AND set_option IS FALSE
+                        ) = (
+                            SELECT pg_catalog.count(*)
+                              FROM pg_catalog.pg_auth_members
+                             WHERE roleid = (SELECT oid FROM executor)
+                        ) THEN 1024 ELSE 0 END)
+                      + (CASE WHEN pg_catalog.bool_and(
+                            (
+                                granted_name = 'cloudsqlsuperuser'
+                                AND member_name = SESSION_USER
+                                AND grantor_name = 'cloudsqladmin'
+                                AND admin_option IS FALSE
+                                AND inherit_option IS TRUE
+                                AND set_option IS TRUE
+                            )
+                            OR (
+                                granted_name = '{EXECUTOR_ROLE}'
+                                AND member_name = SESSION_USER
+                                AND grantor_name = 'cloudsqladmin'
+                                AND admin_option IS TRUE
+                                AND inherit_option IS FALSE
+                                AND set_option IS FALSE
+                            )
+                        ) IS TRUE THEN 2048 ELSE 0 END)
+                 FROM relevant_session_edges
+           )::bigint AS memberships_mask,
+           COALESCE((
+               SELECT pg_catalog.count(DISTINCT role.rolname) =
+                          1 + (
+                              SELECT pg_catalog.count(*)
+                                FROM pg_catalog.pg_auth_members
+                               WHERE roleid = (SELECT oid FROM executor)
+                          )
+                      AND pg_catalog.bool_and(
+                          role.rolname IN (
+                              'cloudsqlsuperuser', '{EXECUTOR_ROLE}'
+                          )
+                      )
+                 FROM forward_role_closure AS closure
+                 JOIN pg_catalog.pg_roles AS role
+                   ON role.oid = closure.roleid
+           ), false) AS forward_roles_exact
+), control_admin_contract AS MATERIALIZED (
+    SELECT identity_exact,
+           attributes_mask = {_CONTROL_ADMIN_ATTRIBUTES_EXACT_MASK}
+               AS attributes_exact,
+           attributes_mask,
+           memberships_mask = {_CONTROL_ADMIN_MEMBERSHIPS_EXACT_MASK}
+               AS memberships_exact,
+           memberships_mask,
+           forward_roles_exact
+      FROM control_admin_contract_observation
 ), control_namespace AS MATERIALIZED (
     SELECT namespace.*
       FROM pg_catalog.pg_namespace AS namespace
@@ -1794,75 +1955,18 @@ WITH RECURSIVE executor AS MATERIALIZED (
                  FROM pg_catalog.pg_roles
                 WHERE rolname ~ '^muncho_canary_control_[0-9a-f]{{16}}$'
            ) AS control_admin_count,
+           contract.identity_exact AS control_admin_identity_exact,
+           contract.attributes_exact AS control_admin_attributes_exact,
+           contract.attributes_mask AS control_admin_attributes_mask,
+           contract.memberships_exact AS control_admin_memberships_exact,
+           contract.memberships_mask AS control_admin_memberships_mask,
+           contract.forward_roles_exact
+               AS control_admin_forward_roles_exact,
            (
-               SESSION_USER ~ '^muncho_canary_control_[0-9a-f]{{16}}$'
-               AND CURRENT_USER = SESSION_USER
-               AND (SELECT pg_catalog.count(*) FROM session_role) = 1
-               AND (SELECT pg_catalog.bool_and(
-                       rolcanlogin AND rolinherit AND NOT rolsuper
-                       AND rolcreatedb AND rolcreaterole
-                       AND NOT rolreplication AND NOT rolbypassrls
-                       AND rolconnlimit = -1 AND rolvaliduntil IS NULL
-                       AND rolconfig IS NULL
-                   ) FROM session_role)
-               AND (
-                   SELECT pg_catalog.count(*) IN (1, 2)
-                          AND pg_catalog.count(*) FILTER (
-                              WHERE granted_name = 'cloudsqlsuperuser'
-                                AND member_name = SESSION_USER
-                                AND grantor_name = 'cloudsqladmin'
-                                AND admin_option IS FALSE
-                                AND inherit_option IS TRUE
-                                AND set_option IS TRUE
-                          ) = 1
-                          AND pg_catalog.count(*) FILTER (
-                              WHERE granted_name = '{EXECUTOR_ROLE}'
-                                AND member_name = SESSION_USER
-                                AND grantor_name = 'cloudsqladmin'
-                                AND admin_option IS TRUE
-                                AND inherit_option IS FALSE
-                                AND set_option IS FALSE
-                          ) = (
-                              SELECT pg_catalog.count(*)
-                                FROM pg_catalog.pg_auth_members
-                               WHERE roleid = (SELECT oid FROM executor)
-                          )
-                          AND pg_catalog.bool_and(
-                              (
-                                  granted_name = 'cloudsqlsuperuser'
-                                  AND member_name = SESSION_USER
-                                  AND grantor_name = 'cloudsqladmin'
-                                  AND admin_option IS FALSE
-                                  AND inherit_option IS TRUE
-                                  AND set_option IS TRUE
-                              )
-                              OR (
-                                  granted_name = '{EXECUTOR_ROLE}'
-                                  AND member_name = SESSION_USER
-                                  AND grantor_name = 'cloudsqladmin'
-                                  AND admin_option IS TRUE
-                                  AND inherit_option IS FALSE
-                                  AND set_option IS FALSE
-                              )
-                          )
-                     FROM relevant_session_edges
-               )
-               AND (
-                   SELECT pg_catalog.count(DISTINCT role.rolname) =
-                              1 + (
-                                  SELECT pg_catalog.count(*)
-                                    FROM pg_catalog.pg_auth_members
-                                   WHERE roleid = (SELECT oid FROM executor)
-                              )
-                          AND pg_catalog.bool_and(
-                              role.rolname IN (
-                                  'cloudsqlsuperuser', '{EXECUTOR_ROLE}'
-                              )
-                          )
-                     FROM forward_role_closure AS closure
-                     JOIN pg_catalog.pg_roles AS role
-                       ON role.oid = closure.roleid
-               )
+               contract.identity_exact
+               AND contract.attributes_exact
+               AND contract.memberships_exact
+               AND contract.forward_roles_exact
            ) AS control_admin_role_exact,
            CASE
                WHEN SESSION_USER ~
@@ -2407,6 +2511,7 @@ WITH RECURSIVE executor AS MATERIALIZED (
                )
                AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_event_trigger)
            ) AS installed_exact
+      FROM control_admin_contract AS contract
 ), classified AS MATERIALIZED (
     SELECT facts.*,
            (
@@ -2447,6 +2552,18 @@ SELECT database_name,
        version_num,
        session_user_name,
        control_admin_count::text AS control_admin_count,
+       control_admin_identity_exact::text
+           AS control_admin_identity_exact,
+       control_admin_attributes_exact::text
+           AS control_admin_attributes_exact,
+       control_admin_attributes_mask::text
+           AS control_admin_attributes_mask,
+       control_admin_memberships_exact::text
+           AS control_admin_memberships_exact,
+       control_admin_memberships_mask::text
+           AS control_admin_memberships_mask,
+       control_admin_forward_roles_exact::text
+           AS control_admin_forward_roles_exact,
        control_admin_role_exact::text AS control_admin_role_exact,
        control_admin_forward_role_count::text
            AS control_admin_forward_role_count,
@@ -2518,6 +2635,8 @@ def _foundation_drift_error_code(row: Mapping[str, Any]) -> str:
         name: _parse_decimal(row.get(name), invalid)
         for name in (
             "control_admin_count",
+            "control_admin_attributes_mask",
+            "control_admin_memberships_mask",
             "control_admin_forward_role_count",
             "control_admin_owned_object_count",
             "control_admin_shared_dependency_count",
@@ -2533,6 +2652,10 @@ def _foundation_drift_error_code(row: Mapping[str, Any]) -> str:
     flags = {
         name: _parse_boolean(row.get(name), invalid)
         for name in (
+            "control_admin_identity_exact",
+            "control_admin_attributes_exact",
+            "control_admin_memberships_exact",
+            "control_admin_forward_roles_exact",
             "control_admin_role_exact",
             "non_template_database_inventory_exact",
             "all_connectable_database_inventory_exact",
@@ -2545,6 +2668,48 @@ def _foundation_drift_error_code(row: Mapping[str, Any]) -> str:
     }
     if counts["control_admin_count"] != 1:
         return "schema_reconciliation_control_admin_count_drifted"
+    if flags["control_admin_identity_exact"] is not True:
+        return "schema_reconciliation_control_admin_identity_drifted"
+    if flags["control_admin_attributes_exact"] is not True:
+        attribute_errors = (
+            "schema_reconciliation_control_admin_role_login_drifted",
+            "schema_reconciliation_control_admin_role_inherit_drifted",
+            "schema_reconciliation_control_admin_role_superuser_drifted",
+            "schema_reconciliation_control_admin_role_createdb_drifted",
+            "schema_reconciliation_control_admin_role_createrole_drifted",
+            "schema_reconciliation_control_admin_role_replication_drifted",
+            "schema_reconciliation_control_admin_role_bypassrls_drifted",
+            "schema_reconciliation_control_admin_role_connlimit_drifted",
+            "schema_reconciliation_control_admin_role_validuntil_drifted",
+            "schema_reconciliation_control_admin_role_config_drifted",
+        )
+        mask = counts["control_admin_attributes_mask"]
+        for bit, error in enumerate(attribute_errors):
+            if mask & (1 << bit) == 0:
+                return error
+        return "schema_reconciliation_control_admin_role_attributes_drifted"
+    if flags["control_admin_memberships_exact"] is not True:
+        membership_errors = (
+            "schema_reconciliation_control_admin_role_edge_count_drifted",
+            "schema_reconciliation_control_admin_superuser_edge_drifted",
+            "schema_reconciliation_control_admin_superuser_grantor_drifted",
+            "schema_reconciliation_control_admin_superuser_admin_drifted",
+            "schema_reconciliation_control_admin_superuser_inherit_drifted",
+            "schema_reconciliation_control_admin_superuser_set_drifted",
+            "schema_reconciliation_control_admin_executor_edge_drifted",
+            "schema_reconciliation_control_admin_executor_grantor_drifted",
+            "schema_reconciliation_control_admin_executor_admin_drifted",
+            "schema_reconciliation_control_admin_executor_inherit_drifted",
+            "schema_reconciliation_control_admin_executor_set_drifted",
+            "schema_reconciliation_control_admin_unexpected_role_edge",
+        )
+        mask = counts["control_admin_memberships_mask"]
+        for bit, error in enumerate(membership_errors):
+            if mask & (1 << bit) == 0:
+                return error
+        return "schema_reconciliation_control_admin_role_memberships_drifted"
+    if flags["control_admin_forward_roles_exact"] is not True:
+        return "schema_reconciliation_control_admin_role_closure_drifted"
     if flags["control_admin_role_exact"] is not True:
         return "schema_reconciliation_control_admin_role_contract_drifted"
     if (
@@ -2605,6 +2770,12 @@ def _parse_foundation_observation_result(
         version_text,
         session_user,
         control_admin_count,
+        control_admin_identity_exact,
+        control_admin_attributes_exact,
+        control_admin_attributes_mask,
+        control_admin_memberships_exact,
+        control_admin_memberships_mask,
+        control_admin_forward_roles_exact,
         control_admin_role_exact,
         control_admin_forward_role_count,
         control_admin_owned_object_count,
@@ -2637,6 +2808,21 @@ def _parse_foundation_observation_result(
         raise ControlBootstrapError(code) from exc
     if state == "drift":
         _fail(_foundation_drift_error_code(row))
+    parsed_control_admin_count = _parse_decimal(control_admin_count, code)
+    parsed_attributes_mask = _parse_decimal(
+        control_admin_attributes_mask, code
+    )
+    parsed_memberships_mask = _parse_decimal(
+        control_admin_memberships_mask, code
+    )
+    if (
+        parsed_attributes_mask != _CONTROL_ADMIN_ATTRIBUTES_EXACT_MASK
+        and parsed_control_admin_count == 1
+    ) or (
+        parsed_memberships_mask != _CONTROL_ADMIN_MEMBERSHIPS_EXACT_MASK
+        and parsed_control_admin_count == 1
+    ):
+        _fail(code)
     if (
         database != foundation.SQL_DATABASE
         or version // 10000 != 18
@@ -2653,7 +2839,19 @@ def _parse_foundation_observation_result(
         "database": database,
         "postgresql_major": version // 10000,
         "session_user_sha256": _sha256_bytes(session_user.encode("utf-8")),
-        "control_admin_count": _parse_decimal(control_admin_count, code),
+        "control_admin_count": parsed_control_admin_count,
+        "control_admin_identity_exact": _parse_boolean(
+            control_admin_identity_exact, code
+        ),
+        "control_admin_attributes_exact": _parse_boolean(
+            control_admin_attributes_exact, code
+        ),
+        "control_admin_memberships_exact": _parse_boolean(
+            control_admin_memberships_exact, code
+        ),
+        "control_admin_forward_roles_exact": _parse_boolean(
+            control_admin_forward_roles_exact, code
+        ),
         "control_admin_role_exact": _parse_boolean(
             control_admin_role_exact, code
         ),
