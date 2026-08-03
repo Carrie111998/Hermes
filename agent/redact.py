@@ -964,7 +964,7 @@ def _known_secret_values() -> set[str]:
         if (
             value
             and len(value) >= _SECRET_VALUE_MIN_LEN
-            and name.endswith(_CREDENTIAL_VALUE_SUFFIXES)
+            and name.upper().endswith(_CREDENTIAL_VALUE_SUFFIXES)
         ):
             values.add(value)
     return values

@@ -853,6 +853,14 @@ class TestExactValueMasking:
         assert "opaque-secret-value-xyz" not in result
         assert "***" in result
 
+    def test_masks_lowercase_env_name_value(self, monkeypatch):
+        """Suffix match is case-insensitive — a lowercase env var name
+        (e.g. from a .env carrying ``db_password=``) must still be caught."""
+        monkeypatch.setenv("db_password", "opaque-lowercase-pw-value")
+        result = mask_known_secret_values("the db password is opaque-lowercase-pw-value")
+        assert "opaque-lowercase-pw-value" not in result
+        assert "***" in result
+
     def test_masks_extra_values(self):
         result = mask_known_secret_values(
             "connecting to postgres://user:supersecret@db",
