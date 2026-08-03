@@ -13575,19 +13575,23 @@ def integrate_story_to_epic(
             candidate_source_branch = story_branch
             candidate_expected_source_sha = expected_source_sha
             reviewed_source_ref: Optional[str] = None
-            if reviewed_candidate is not None:
-                reviewed_source_ref = f"hermes/reviewed-{secrets.token_hex(6)}"
-                retained = _integration_git(
-                    repo_root,
-                    ["update-ref", f"refs/heads/{reviewed_source_ref}", reviewed_candidate[1]],
-                )
-                if retained.returncode != 0:
-                    raise IntegrationCandidateError(
-                        "could not retain reviewed source candidate"
-                    )
-                candidate_source_branch = reviewed_source_ref
-                candidate_expected_source_sha = reviewed_candidate[1]
             try:
+                if reviewed_candidate is not None:
+                    reviewed_source_ref = f"hermes/reviewed-{secrets.token_hex(6)}"
+                    retained = _integration_git(
+                        repo_root,
+                        [
+                            "update-ref",
+                            f"refs/heads/{reviewed_source_ref}",
+                            reviewed_candidate[1],
+                        ],
+                    )
+                    if retained.returncode != 0:
+                        raise IntegrationCandidateError(
+                            "could not retain reviewed source candidate"
+                        )
+                    candidate_source_branch = reviewed_source_ref
+                    candidate_expected_source_sha = reviewed_candidate[1]
                 effective_verify_fn = (
                     (lambda _path: True)
                     if reviewed_candidate is not None
@@ -13609,7 +13613,7 @@ def integrate_story_to_epic(
                     )
                 finally:
                     if reviewed_source_ref is not None:
-                        _integration_git(
+                        released = _integration_git(
                             repo_root,
                             [
                                 "update-ref",
@@ -13617,6 +13621,10 @@ def integrate_story_to_epic(
                                 f"refs/heads/{reviewed_source_ref}",
                             ],
                         )
+                        if released.returncode != 0:
+                            raise IntegrationCandidateError(
+                                "could not remove reviewed source candidate"
+                            )
                 if before_apply_fn is not None and not before_apply_fn():
                     return "ownership_conflict"
                 if not _fast_forward_target(candidate):

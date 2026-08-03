@@ -11727,6 +11727,63 @@ def test_reconcile_cache_miss_integrates_approved_sha_not_advanced_story_tip(
         ["git", "-C", str(repo), "show", f"{epic_branch}:unreviewed.txt"],
         capture_output=True, text=True,
     ).returncode != 0
+    assert _git_output(repo, "for-each-ref", "--format=%(refname)", "refs/heads/hermes/reviewed-") == ""
+
+
+def test_integrate_story_to_epic_reports_reviewed_ref_creation_failure(
+    kanban_home, tmp_path, monkeypatch
+):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    board = "v2-reviewed-ref-create-failure"
+    _v2_product_board_with_repo(board, repo)
+    _epic, story, _epic_branch, approved_sha = _make_epic_and_done_story(board, repo)
+
+    with kb.connect(board=board) as conn:
+        _add_approved_review_candidate(conn, story, f"story/{_epic}-s1", approved_sha)
+
+    real_integration_git = kb._integration_git
+
+    def fail_reviewed_ref_creation(cwd, args, *, timeout=120):
+        if (
+            args[:1] == ["update-ref"]
+            and len(args) > 1
+            and args[1].startswith("refs/heads/hermes/reviewed-")
+        ):
+            return subprocess.CompletedProcess(["git"], 1, "", "forced failure")
+        return real_integration_git(cwd, args, timeout=timeout)
+
+    monkeypatch.setattr(kb, "_integration_git", fail_reviewed_ref_creation)
+    with kb.connect(board=board) as conn:
+        assert kb.integrate_story_to_epic(conn, story, board=board) == "verify_failed"
+
+
+def test_integrate_story_to_epic_reports_reviewed_ref_deletion_failure(
+    kanban_home, tmp_path, monkeypatch
+):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    board = "v2-reviewed-ref-delete-failure"
+    _v2_product_board_with_repo(board, repo)
+    _epic, story, _epic_branch, approved_sha = _make_epic_and_done_story(board, repo)
+
+    with kb.connect(board=board) as conn:
+        _add_approved_review_candidate(conn, story, f"story/{_epic}-s1", approved_sha)
+
+    real_integration_git = kb._integration_git
+
+    def fail_reviewed_ref_deletion(cwd, args, *, timeout=120):
+        if (
+            args[:2] == ["update-ref", "-d"]
+            and len(args) > 2
+            and args[2].startswith("refs/heads/hermes/reviewed-")
+        ):
+            return subprocess.CompletedProcess(["git"], 1, "", "forced failure")
+        return real_integration_git(cwd, args, timeout=timeout)
+
+    monkeypatch.setattr(kb, "_integration_git", fail_reviewed_ref_deletion)
+    with kb.connect(board=board) as conn:
+        assert kb.integrate_story_to_epic(conn, story, board=board) == "verify_failed"
 
 
 def test_reconcile_keeps_prior_member_state_when_sibling_advances_tip(
