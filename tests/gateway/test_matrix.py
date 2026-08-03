@@ -1814,7 +1814,7 @@ class TestMatrixDynamicRoomNames:
             call.args[2]["name"]
             for call in self.adapter._client.send_state_event.await_args_list
         ]
-        assert names == ["🟡 Add dynamic Matrix room names", "✅ Add dynamic Matrix room names"]
+        assert names == ["🟡 Add dynamic Matrix room names", "🟢 Add dynamic Matrix room names"]
 
     @pytest.mark.asyncio
     async def test_restart_preserves_existing_semantic_room_name(self):
@@ -1836,7 +1836,7 @@ class TestMatrixDynamicRoomNames:
         ]
         assert names == [
             "🟡 Existing semantic title",
-            "✅ Existing semantic title",
+            "🟢 Existing semantic title",
         ]
         assert self.adapter._client.get_state_event.await_count == 2
         self.adapter._client.get_state_event.assert_awaited_with(
@@ -1861,7 +1861,7 @@ class TestMatrixDynamicRoomNames:
         await self._drain_room_name_tasks()
 
         assert self.adapter._client.send_state_event.await_args.args[2]["name"] == (
-            "✅ Fortress"
+            "🟢 Fortress"
         )
 
     @pytest.mark.asyncio
@@ -1881,7 +1881,7 @@ class TestMatrixDynamicRoomNames:
         await self.adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
         await self._drain_room_name_tasks()
 
-        assert self.adapter._client.send_state_event.await_args.args[2]["name"] == "✅ Hermes"
+        assert self.adapter._client.send_state_event.await_args.args[2]["name"] == "🟢 Hermes"
 
     @pytest.mark.asyncio
     async def test_stale_state_after_tool_title_does_not_roll_back_on_completion(self):
@@ -1903,7 +1903,7 @@ class TestMatrixDynamicRoomNames:
         await self.adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
         await self._drain_room_name_tasks()
 
-        assert self.adapter._client.send_state_event.await_args.args[2]["name"] == "✅ New"
+        assert self.adapter._client.send_state_event.await_args.args[2]["name"] == "🟢 New"
         assert self.adapter._dynamic_room_name_bases["!room:ex"] == "New"
 
     @pytest.mark.asyncio
@@ -1917,7 +1917,6 @@ class TestMatrixDynamicRoomNames:
         self.adapter._dynamic_room_name_last_sent[room_id] = "🟡 A"
         self.adapter._dynamic_room_name_active_turns.add((room_id, "$msg1"))
         self.adapter._dynamic_room_name_active[room_id] = 1
-        self.adapter._dynamic_room_name_status[room_id] = "working"
 
         assert await self.adapter.on_session_semantic_base_changed(event.source, "B")
         assert await self.adapter.on_session_semantic_base_changed(event.source, "C")
@@ -1930,7 +1929,7 @@ class TestMatrixDynamicRoomNames:
         await self.adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
         await self._drain_room_name_tasks()
 
-        assert self.adapter._client.send_state_event.await_args.args[2]["name"] == "✅ C"
+        assert self.adapter._client.send_state_event.await_args.args[2]["name"] == "🟢 C"
         assert self.adapter._dynamic_room_name_bases[room_id] == "C"
         assert room_id not in self.adapter._dynamic_room_name_superseded_sent
         assert room_id not in self.adapter._dynamic_room_name_terminal_external_checks
@@ -1946,7 +1945,7 @@ class TestMatrixDynamicRoomNames:
         await self._drain_room_name_tasks()
 
         assert self.adapter._client.send_state_event.await_args.args[2]["name"] == (
-            "✅ Fortress"
+            "🟢 Fortress"
         )
         assert self.adapter._dynamic_room_name_bases[room_id] == "Fortress"
 
@@ -1984,7 +1983,7 @@ class TestMatrixDynamicRoomNames:
             call.args[2]["name"]
             for call in self.adapter._client.send_state_event.await_args_list
         ]
-        assert names[-1] == "✅ New authoritative base"
+        assert names[-1] == "🟢 New authoritative base"
         assert self.adapter._dynamic_room_name_bases["!room:ex"] == (
             "New authoritative base"
         )
@@ -2039,7 +2038,7 @@ class TestMatrixDynamicRoomNames:
             call.args[2]["name"]
             for call in self.adapter._client.send_state_event.await_args_list
         ]
-        assert names == ["🟡 Semantic title", "✅ Semantic title"]
+        assert names == ["🟡 Semantic title", "🟢 Semantic title"]
 
     @pytest.mark.asyncio
     async def test_newer_semantic_title_wins_over_delayed_initial_state_read(self):
@@ -2067,7 +2066,7 @@ class TestMatrixDynamicRoomNames:
             call.args[2]["name"]
             for call in self.adapter._client.send_state_event.await_args_list
         ]
-        assert names == ["Newer authoritative epic"]
+        assert names == ["🟢 Newer authoritative epic"]
         assert self.adapter._dynamic_room_name_bases["!room:ex"] == (
             "Newer authoritative epic"
         )
@@ -2091,7 +2090,7 @@ class TestMatrixDynamicRoomNames:
             call.args[2]["name"]
             for call in self.adapter._client.send_state_event.await_args_list
         ]
-        assert names == ["Active epic", "Original Matrix room"]
+        assert names == ["🟢 Active epic", "🟢 Original Matrix room"]
         assert self.adapter._dynamic_room_name_bases["!room:ex"] == (
             "Original Matrix room"
         )
@@ -2121,7 +2120,7 @@ class TestMatrixDynamicRoomNames:
         assert "!room:ex" not in self.adapter._dynamic_room_name_bases
 
     @pytest.mark.asyncio
-    async def test_failure_and_cancelled_share_unsuccessful_terminal_state(self):
+    async def test_failure_and_cancelled_return_room_name_to_idle(self):
         from gateway.platforms.base import ProcessingOutcome
 
         event = self._event()
@@ -2140,18 +2139,61 @@ class TestMatrixDynamicRoomNames:
             for call in self.adapter._client.send_state_event.await_args_list
         ]
         assert names == [
-            "🟡 Existing epic", "🔴 Existing epic",
-            "🟡 Existing epic", "🔴 Existing epic",
+            "🟡 Existing epic", "🟢 Existing epic",
+            "🟡 Existing epic", "🟢 Existing epic",
         ]
 
-    def test_title_sanitization_strips_lifecycle_prefixes_and_truncates(self):
+    def test_title_sanitization_strips_all_lifecycle_icons_and_truncates(self):
         sanitize = self.adapter._sanitize_dynamic_room_name
 
-        assert sanitize("🟡 ✅ 🔴 ❌ ⏹ Task title") == "Task title"
+        assert sanitize("🟡 🟢 ✅ 🔴 ❌ ⏹ Task title") == "Task title"
+        assert sanitize("Task 🟡 🟢 ✅ 🔴 ❌ ⏹ title") == "Task title"
         title = "界" * 61
         sanitized = sanitize(title)
         assert sanitized == ("界" * 57) + "..."
         assert len(sanitized) == 60
+
+    @pytest.mark.asyncio
+    async def test_semantic_titles_cannot_override_runtime_room_name_status(self):
+        """AI-supplied lifecycle icons are base text only, never room state."""
+        event = self._event()
+        status_icons = "🟢 🟡 ✅ 🔴 ❌ ⏹"
+
+        await self.adapter.set_semantic_room_name(
+            "!room:ex", f"{status_icons} Direct title"
+        )
+        await self.adapter.on_session_title_changed(
+            event.source, f"{status_icons} Session title"
+        )
+        await self.adapter.on_session_semantic_base_changed(
+            event.source, f"{status_icons} Goal title"
+        )
+        await self.adapter.on_processing_start(event)
+        await self._drain_room_name_tasks()
+        await self.adapter.set_semantic_room_name(
+            "!room:ex", f"{status_icons} Direct working"
+        )
+        await self.adapter.on_session_title_changed(
+            event.source, f"{status_icons} Session working"
+        )
+        await self.adapter.on_session_semantic_base_changed(
+            event.source, f"{status_icons} Goal working"
+        )
+
+        names = [
+            call.args[2]["name"]
+            for call in self.adapter._client.send_state_event.await_args_list
+        ]
+        assert names == [
+            "🟢 Direct title",
+            "🟢 Session title",
+            "🟢 Goal title",
+            "🟡 Goal title",
+            "🟡 Direct working",
+            "🟡 Session working",
+            "🟡 Goal working",
+        ]
+        assert self.adapter._dynamic_room_name_bases["!room:ex"] == "Goal working"
 
     @pytest.mark.asyncio
     async def test_truncated_base_stays_stable_across_lifecycle_transitions(self):
@@ -2171,7 +2213,7 @@ class TestMatrixDynamicRoomNames:
             call.args[2]["name"]
             for call in self.adapter._client.send_state_event.await_args_list
         ]
-        assert names == [expected_base, f"🟡 {expected_base}", f"🔴 {expected_base}"]
+        assert names == [f"🟢 {expected_base}", f"🟡 {expected_base}", f"🟢 {expected_base}"]
         assert len(expected_base) == 60
 
     @pytest.mark.asyncio
@@ -2222,7 +2264,7 @@ class TestMatrixDynamicRoomNames:
             call.args[2]["name"]
             for call in self.adapter._client.send_state_event.await_args_list
         ]
-        assert names == ["🟡 Existing epic", "✅ Existing epic"]
+        assert names == ["🟡 Existing epic", "🟢 Existing epic"]
 
     @pytest.mark.asyncio
     async def test_state_event_failure_is_best_effort(self):
@@ -2260,7 +2302,6 @@ class TestMatrixDynamicRoomNames:
         await self.adapter.on_processing_complete(first, ProcessingOutcome.CANCELLED)
 
         assert self.adapter._dynamic_room_name_active["!room:ex"] == 1
-        assert self.adapter._dynamic_room_name_status["!room:ex"] == "working"
 
         await self.adapter.on_processing_complete(second, ProcessingOutcome.SUCCESS)
         assert self.adapter._dynamic_room_name_active["!room:ex"] == 0
@@ -2297,7 +2338,7 @@ class TestMatrixDynamicRoomNames:
             call.args[2]["name"]
             for call in self.adapter._client.send_state_event.await_args_list
         ]
-        assert names == ["🟡 Existing epic", "✅ Existing epic"]
+        assert names == ["🟡 Existing epic", "🟢 Existing epic"]
 
     def test_yaml_config_bridge_enables_feature(self, monkeypatch):
         from plugins.platforms.matrix.adapter import MatrixAdapter, _apply_yaml_config

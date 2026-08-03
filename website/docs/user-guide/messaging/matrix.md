@@ -97,7 +97,7 @@ matrix:
   session_scope: room             # auto|room|thread; room is recommended for project rooms
   auto_thread: true               # Auto-create threads for responses (default: true)
   dm_mention_threads: false       # Create thread when @mentioned in DM (default: false)
-  dynamic_room_name: false        # Rename DMs to show task state/title (default: false)
+  dynamic_room_name: false        # Rename DMs to show Hermes activity/title (default: false)
   max_message_length: 16000       # Outbound chunk size in chars (default: 16000, max: 65535)
 ```
 
@@ -131,18 +131,19 @@ Set `matrix.dynamic_room_name: true` to show the current Hermes activity in
 Matrix DM room names. This setting defaults to `false` and applies only to DMs.
 Hermes adds a status icon to the title:
 
-- `🟡` while Hermes is processing
-- `✅` after success
-- `🔴` after failure or cancellation
+- `🟡` while one or more Hermes turns are active
+- `🟢` when no Hermes turns are active
 
 Hermes chooses the title from the active goal first, then the session title,
 and finally the existing room name. If none is available, the room name stays
-unchanged. For example, a successful chat might be named
-`✅ Project planning`. Long names may be shortened.
+unchanged. For example, an idle chat might be named `🟢 Project planning`.
+Long names may be shortened.
 
 You can also ask Hermes to rename the current chat; provide the meaningful
-title and Hermes will add the appropriate status icon. Meaningful names you set
-manually are respected rather than replaced unnecessarily.
+title and Hermes will add the current runtime icon. Status icons in generated
+titles are ignored, so the model cannot override whether the room is working
+or idle. Meaningful names you set manually are respected rather than replaced
+unnecessarily.
 
 Complete both setup steps:
 
@@ -166,7 +167,7 @@ every other power-level field.
 :::
 
 To verify the setup, send a message in the DM. The room title should move from
-`🟡` to `✅`. If it remains unchanged, check the room permissions; Hermes should
+`🟡` to `🟢`. If it remains unchanged, check the room permissions; Hermes should
 still answer normally even when it cannot rename the room.
 
 :::note

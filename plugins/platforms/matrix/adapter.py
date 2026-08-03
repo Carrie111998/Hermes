@@ -1156,7 +1156,6 @@ class MatrixAdapter(BasePlatformAdapter):
         self._dynamic_room_name_bases: Dict[str, str] = {}
         self._dynamic_room_name_recovered_bases: Dict[str, str] = {}
         self._dynamic_room_name_initialized: Set[str] = set()
-        self._dynamic_room_name_status: Dict[str, str] = {}
         self._dynamic_room_name_active: Dict[str, int] = {}
         self._dynamic_room_name_active_turns: Set[tuple[str, str]] = set()
         self._dynamic_room_name_last_sent: Dict[str, str] = {}
@@ -3633,9 +3632,10 @@ class MatrixAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _sanitize_dynamic_room_name(title: str) -> str:
-        """Return a short, stable Matrix room name without nested status icons."""
+        """Return a short base name without model-controlled status icons."""
         cleaned = re.sub(r"\s+", " ", str(title or "")).strip()
-        cleaned = re.sub(r"^(?:[🟡✅🔴❌⏹]\s*)+", "", cleaned).strip()
+        cleaned = re.sub(r"[🟡🟢✅🔴❌⏹]", "", cleaned)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
         if not cleaned:
             return ""
         if len(cleaned) > 60:
@@ -3700,7 +3700,7 @@ class MatrixAdapter(BasePlatformAdapter):
 
     async def _render_dynamic_room_name(self, room_id: str) -> bool:
         # Serialize each room's state writes. Recompute after acquiring the lock
-        # so a delayed working update cannot overwrite a newer terminal state.
+        # so a delayed working update cannot overwrite a newer idle state.
         lock = self._dynamic_room_name_locks.setdefault(room_id, asyncio.Lock())
         async with lock:
             await self._initialize_dynamic_room_name_base(room_id)
@@ -3708,8 +3708,7 @@ class MatrixAdapter(BasePlatformAdapter):
 
     async def _render_dynamic_room_name_locked(self, room_id: str) -> bool:
         """Render while the caller holds this room's dynamic-name lock."""
-        status = self._dynamic_room_name_status.get(room_id, "idle")
-        # Immediately before a terminal render, notice a human/client rename
+        # Immediately before an idle render, notice a human/client rename
         # that happened while Hermes was working.  Only a value different from
         # our last successful write is external.  This read runs under the same
         # room lock as authoritative semantic-base updates, so a delayed read
@@ -3739,13 +3738,11 @@ class MatrixAdapter(BasePlatformAdapter):
         base = self._dynamic_room_name_base(room_id)
         if not base:
             return False
-        prefix = {
-            "working": "🟡",
-            "success": "✅",
-            "failure": "🔴",
-            "cancelled": "🔴",
-        }.get(status)
-        name = f"{prefix} {base}" if prefix else base
+        # Room-name state is intentionally runtime-owned and binary. Outcomes
+        # remain visible through message reactions, but can never control or be
+        # smuggled into the room title by an AI-generated semantic title.
+        prefix = "🟡" if self._dynamic_room_name_active.get(room_id, 0) else "🟢"
+        name = f"{prefix} {base}"
         return await self._send_dynamic_room_name(room_id, name)
 
     def _schedule_dynamic_room_name_render(self, room_id: str) -> None:
@@ -3798,7 +3795,6 @@ class MatrixAdapter(BasePlatformAdapter):
         self._dynamic_room_name_active[room_id] = (
             self._dynamic_room_name_active.get(room_id, 0) + 1
         )
-        self._dynamic_room_name_status[room_id] = "working"
         self._schedule_dynamic_room_name_render(room_id)
         return True
 
@@ -3816,21 +3812,13 @@ class MatrixAdapter(BasePlatformAdapter):
         self._dynamic_room_name_active_turns.remove(turn_key)
         remaining = max(0, self._dynamic_room_name_active.get(room_id, 1) - 1)
         self._dynamic_room_name_active[room_id] = remaining
-        if remaining:
-            self._dynamic_room_name_status[room_id] = "working"
-        elif outcome == ProcessingOutcome.SUCCESS:
-            self._dynamic_room_name_status[room_id] = "success"
-        elif outcome == ProcessingOutcome.CANCELLED:
-            self._dynamic_room_name_status[room_id] = "cancelled"
-        else:
-            self._dynamic_room_name_status[room_id] = "failure"
         if not remaining:
             self._dynamic_room_name_terminal_external_checks.add(room_id)
         self._schedule_dynamic_room_name_render(room_id)
         return True
 
     async def set_semantic_room_name(self, room_id: str, title: str) -> bool:
-        """Apply an auto-generated session title while preserving task status."""
+        """Apply an auto-generated session title while preserving runtime activity."""
         if not self._dynamic_room_name_enabled or not room_id:
             return False
         room_id = str(room_id)
@@ -3870,7 +3858,7 @@ class MatrixAdapter(BasePlatformAdapter):
                     # Matrix state reads can briefly return any preceding write
                     # from a chain of authoritative tool-driven semantic
                     # updates. Remember the whole superseded chain until the
-                    # single terminal reconciliation consumes it, so no stale
+                    # single idle reconciliation consumes it, so no stale
                     # echo can be mistaken for a human rename.
                     self._dynamic_room_name_superseded_sent.setdefault(
                         room_id, set()
