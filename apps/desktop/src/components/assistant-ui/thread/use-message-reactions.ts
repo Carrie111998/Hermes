@@ -5,7 +5,8 @@ import { type MouseEvent, useCallback } from 'react'
 import type { ChatMessage } from '@/lib/chat-messages'
 import { triggerHaptic } from '@/lib/haptics'
 import { QUICK_REACTIONS, toggleMessageReaction } from '@/store/reactions'
-import { $reactionsEnabled } from '@/store/reactions-enabled'
+import { $reactionsStyle } from '@/store/reactions-style'
+import type { ReactionsStyle } from '@/store/reactions-style'
 import { $agentReactions, $localReactions, mergeReactions, setLocalReaction } from '@/store/reactions-local'
 import type { MessageReaction } from '@/types/hermes'
 
@@ -65,6 +66,7 @@ export function useMessageReactions(
   enabled: boolean
   react: (emoji: null | string) => void
   reactions: MessageReaction[]
+  style: ReactionsStyle
 } {
   const reactions = useAuiState(s => {
     const custom = (s.message.metadata?.custom ?? {}) as { reactions?: MessageReaction[] }
@@ -78,12 +80,13 @@ export function useMessageReactions(
     return custom.rowId
   })
 
-  const enabled = useStore($reactionsEnabled)
+  const style = useStore($reactionsStyle)
   const localAll = useStore($localReactions)
   const agentLive = useStore($agentReactions)
 
   return {
-    enabled,
+    enabled: style !== 'off',
+    style,
     react: useCallback(
       (emoji: null | string) => commitReaction(messageId, role, rowId, reactions, emoji),
       [messageId, reactions, role, rowId]
@@ -105,7 +108,7 @@ export function useTapbackDoubleClick(
   messageId: string,
   role: ChatMessage['role']
 ): ((event: MouseEvent<HTMLElement>) => void) | undefined {
-  const enabled = useStore($reactionsEnabled)
+  const style = useStore($reactionsStyle)
   const messageRuntime = useMessageRuntime()
 
   const onDoubleClick = useCallback(
@@ -142,5 +145,5 @@ export function useTapbackDoubleClick(
     [messageId, messageRuntime, role]
   )
 
-  return enabled ? onDoubleClick : undefined
+  return style !== 'off' ? onDoubleClick : undefined
 }

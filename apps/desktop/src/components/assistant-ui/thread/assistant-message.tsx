@@ -16,6 +16,7 @@ import {
   pickPrimaryPreviewTarget
 } from '@/components/assistant-ui/thread/content'
 import { MESSAGE_PARTS_COMPONENTS } from '@/components/assistant-ui/thread/message-parts'
+import { MessageTrace } from '@/components/assistant-ui/thread/message-trace'
 import { ReactionPicker } from '@/components/assistant-ui/thread/message-reactions'
 import { ResponseLoadingIndicator, StreamStallIndicator } from '@/components/assistant-ui/thread/status'
 import { formatMessageTimestamp } from '@/components/assistant-ui/thread/timestamp'
@@ -173,7 +174,7 @@ const AssistantActionBar: FC<MessageActionProps> = ({ messageId, getMessageText,
   const copy = t.assistant.thread
 
   const [pickerOpen, setPickerOpen] = useState(false)
-  const { enabled: reactionsEnabled, react, reactions: shownReactions } = useMessageReactions(messageId, 'assistant')
+  const { enabled: reactionsEnabled, react, reactions: shownReactions, style } = useMessageReactions(messageId, 'assistant')
 
   const pickEmoji = useCallback(
     (emoji: null | string) => {
@@ -226,7 +227,14 @@ const AssistantActionBar: FC<MessageActionProps> = ({ messageId, getMessageText,
           clicking it reopens the picker to switch or retract. Outside
           ActionBarPrimitive.Root so a landed reaction doesn't ride the bar's
           hover opacity. */}
-      {(reactionsEnabled || shownReactions.length > 0) && (
+      {(reactionsEnabled || shownReactions.length > 0) && style === 'ambient' ? (
+        <MessageTrace
+          onTrace={pos => {
+            // Store trace score — placeholder until trace persistence lands
+            // (future: store per-message in reactions-local or session metadata)
+          }}
+        />
+      ) : (reactionsEnabled || shownReactions.length > 0) ? (
         <ReactionPicker
           onOpenChange={setPickerOpen}
           onSelect={pickEmoji}
@@ -253,7 +261,7 @@ const AssistantActionBar: FC<MessageActionProps> = ({ messageId, getMessageText,
             )}
           </TooltipIconButton>
         </ReactionPicker>
-      )}
+      ) : null}
     </div>
   )
 }
