@@ -11,6 +11,7 @@ import json
 import posixpath
 import re
 import zipfile
+from io import BytesIO
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
@@ -30,6 +31,11 @@ _NS_A = "http://schemas.openxmlformats.org/drawingml/2006/main"
 _NS_MC = "http://schemas.openxmlformats.org/markup-compatibility/2006"
 
 _SLIDE_RE = re.compile(r"^ppt/slides/slide(\d+)\.xml$")
+_PPTX_SLIDE_REL_TYPES = frozenset({
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide",
+    "https://schemas.openxmlformats.org/officeDocument/2006/relationships/slide",
+})
+_SUPPORTED_MCE_NAMESPACES = frozenset({_NS_P, _NS_A})
 
 
 class ExtractionError(Exception):
@@ -302,10 +308,18 @@ def _pptx_slide_parts(zf: zipfile.ZipFile, names: set[str]) -> list[str]:
         rids = []
 
     rels = _pptx_rels(zf, names)
-    ordered = [_pptx_part(rels[rid]) for rid in rids if rid and rid in rels]
-    ordered = [part for part in ordered if part in names]
-    if ordered:
-        return ordered
+    if rids:
+        ordered: list[str] = []
+        for rid in rids:
+            target = rels.get(rid or "")
+            if not target:
+                break
+            part = _pptx_part(target)
+            if part not in names:
+                break
+            ordered.append(part)
+        else:
+            return ordered
 
     # Fallback: every ppt/slides/slideN.xml, in numeric (not lexical) order so
     # slide10 sorts after slide2.
@@ -322,7 +336,15 @@ def _pptx_rels(zf: zipfile.ZipFile, names: set[str]) -> dict[str, str]:
     except ET.ParseError:
         return {}
     rel_tag = f"{{{_NS_PKG_REL}}}Relationship"
-    return {rel.get("Id", ""): rel.get("Target", "") for rel in root.iter(rel_tag) if rel.get("Id")}
+    rels: dict[str, str] = {}
+    for rel in root.iter(rel_tag):
+        rid = rel.get("Id", "")
+        is_slide = rel.get("Type") in _PPTX_SLIDE_REL_TYPES
+        is_internal = rel.get("TargetMode", "Internal") == "Internal"
+        if not rid or not is_slide or not is_internal:
+            continue
+        rels[rid] = rel.get("Target", "")
+    return rels
 
 
 def _pptx_part(target: str) -> str:
@@ -330,31 +352,86 @@ def _pptx_part(target: str) -> str:
     return posixpath.normpath(target if target.startswith("ppt/") else f"ppt/{target}")
 
 
+def _xml_with_choice_scopes(
+    xml_bytes: bytes,
+) -> tuple[ET.Element, dict[ET.Element, dict[str, str]]]:
+    """Parse XML while retaining namespace scopes for MCE Choice elements."""
+    pending: dict[str, str] = {}
+    stack: list[dict[str, str]] = []
+    scopes: dict[ET.Element, dict[str, str]] = {}
+    choice_tag = f"{{{_NS_MC}}}Choice"
+    parser = ET.iterparse(BytesIO(xml_bytes), events=("start-ns", "start", "end"))
+    for event, value in parser:
+        if event == "start-ns":
+            prefix, uri = value
+            pending[prefix or ""] = uri
+        elif event == "start":
+            scope = stack[-1] if stack else {}
+            if pending:
+                scope = scope.copy()
+                scope.update(pending)
+                pending.clear()
+            stack.append(scope)
+            if value.tag == choice_tag:
+                scopes[value] = scope
+        else:
+            stack.pop()
+    return parser.root, scopes
+
+
+def _ignored_mce_elements(
+    root: ET.Element,
+    scopes: dict[ET.Element, dict[str, str]],
+) -> set[ET.Element]:
+    """Elements in unselected mc:AlternateContent branches."""
+    mc = f"{{{_NS_MC}}}"
+    choice_tag, fallback_tag = f"{mc}Choice", f"{mc}Fallback"
+    ignored: set[ET.Element] = set()
+    for alternate in root.iter(f"{mc}AlternateContent"):
+        branches = [child for child in alternate if child.tag in {choice_tag, fallback_tag}]
+        selected: ET.Element | None = None
+        fallback: ET.Element | None = None
+        for branch in branches:
+            if branch.tag == fallback_tag:
+                if fallback is None:
+                    fallback = branch
+                continue
+            required = branch.get("Requires", "").split()
+            scope = scopes.get(branch, {})
+            requirements_met = required and all(
+                scope.get(prefix) in _SUPPORTED_MCE_NAMESPACES
+                for prefix in required
+            )
+            if selected is None and requirements_met:
+                selected = branch
+        if selected is None:
+            selected = fallback
+        for child in alternate:
+            if child is not selected:
+                ignored.update(child.iter())
+    return ignored
+
+
 def _slide_text(xml_bytes: bytes) -> list[str]:
-    root = ET.fromstring(xml_bytes)
+    root, scopes = _xml_with_choice_scopes(xml_bytes)
     a = f"{{{_NS_A}}}"
     lines: list[str] = []
-    # Shapes that use markup-compatibility extensions (WordArt, a14/a16 text
-    # effects, …) are wrapped in <mc:AlternateContent> with the *same* text
-    # repeated in both the <mc:Choice> and <mc:Fallback> branches. root.iter()
-    # walks both, so counting every <a:p> would emit each such run twice. Drop
-    # the paragraphs under any <mc:Fallback> and keep the <mc:Choice> copy (the
-    # higher-fidelity representation, always present per the MCE spec). Elements
-    # are tracked by identity — a duplicated *value* in two independent shapes
-    # is still kept.
-    fallback_paras = {
-        para
-        for fb in root.iter(f"{{{_NS_MC}}}Fallback")
-        for para in fb.iter(f"{a}p")
-    }
+    # MCE AlternateContent is a choice, not a container whose branches should
+    # all be traversed. Select the first Choice whose required namespaces this
+    # extractor understands, or its Fallback, and ignore every node in the
+    # other branches. This covers both whole-paragraph and inline alternatives.
+    # Element identity keeps genuinely repeated text elsewhere.
+    ignored_elements = _ignored_mce_elements(root, scopes)
     # Each DrawingML paragraph (<a:p>) — including those inside text boxes,
     # tables and placeholders — is one logical line. <a:t> holds the runs;
     # <a:br> is a soft line break within a paragraph.
     for para in root.iter(f"{a}p"):
-        if para in fallback_paras:
+        if para in ignored_elements:
             continue
         buf: list[str] = []
         for node in para.iter():
+            if node in ignored_elements:
+                continue
             if node.tag == f"{a}t":
                 buf.append(node.text or "")
             elif node.tag == f"{a}br":

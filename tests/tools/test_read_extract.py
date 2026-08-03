@@ -71,7 +71,7 @@ def _pptx_slide(paragraphs):
             f'</p:spTree></p:cSld></p:sld>')
 
 
-def _write_pptx(path, slides, *, presentation=True, order=None):
+def _write_pptx(path, slides, *, presentation=True, order=None, rel_slides=None):
     """slides: dict slideN (int) -> raw slide xml. order: r:id slide numbers."""
     with zipfile.ZipFile(path, "w") as z:
         z.writestr("[Content_Types].xml", "<Types/>")
@@ -85,9 +85,12 @@ def _write_pptx(path, slides, *, presentation=True, order=None):
             z.writestr("ppt/presentation.xml",
                        f'<p:presentation xmlns:p="{_NS_P}" xmlns:r="{_NS_R}">'
                        f'<p:sldIdLst>{sldids}</p:sldIdLst></p:presentation>')
+            related = slides if rel_slides is None else rel_slides
             rels = "".join(
-                f'<Relationship Id="rId{n}" Type="x" Target="slides/slide{n}.xml"/>'
-                for n in slides
+                f'<Relationship Id="rId{n}" '
+                'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" '
+                f'Target="slides/slide{n}.xml"/>'
+                for n in related
             )
             z.writestr("ppt/_rels/presentation.xml.rels",
                        f'<Relationships xmlns="{_NS_PKG_R}">{rels}</Relationships>')
@@ -261,6 +264,17 @@ class TestPptxExtraction(unittest.TestCase):
         text = extract_document_text(p)
         self.assertLess(text.index("Two"), text.index("Ten"))
 
+    def test_incomplete_relationships_fall_back_without_losing_slides(self):
+        p = os.path.join(self.tmp, "partial-rels.pptx")
+        _write_pptx(p, {
+            1: _pptx_slide([["One"]]),
+            2: _pptx_slide([["Two"]]),
+        }, order=[1, 2], rel_slides=[1])
+        text = extract_document_text(p)
+        self.assertIn("One", text)
+        self.assertIn("Two", text)
+        self.assertLess(text.index("One"), text.index("Two"))
+
     def test_alternate_content_not_duplicated(self):
         # WordArt and shapes with modern text effects are serialized inside
         # <mc:AlternateContent>, carrying the SAME text in both the <mc:Choice>
@@ -268,7 +282,8 @@ class TestPptxExtraction(unittest.TestCase):
         # genuinely repeated value in a separate shape must survive.
         p = os.path.join(self.tmp, "wordart.pptx")
         slide = (
-            f'<p:sld xmlns:p="{_NS_P}" xmlns:a="{_NS_A}" xmlns:mc="{_NS_MC}">'
+            f'<p:sld xmlns:p="{_NS_P}" xmlns:a="{_NS_A}" xmlns:mc="{_NS_MC}" '
+            'xmlns:a14="http://schemas.microsoft.com/office/drawing/2010/main">'
             '<p:cSld><p:spTree>'
             '<mc:AlternateContent>'
             '<mc:Choice Requires="a14">'
@@ -285,6 +300,60 @@ class TestPptxExtraction(unittest.TestCase):
         text = extract_document_text(p)
         # one AlternateContent copy dropped, the standalone shape kept → 2, not 3
         self.assertEqual(text.count("Fancy Title"), 2)
+
+    def test_alternate_content_selects_one_supported_choice(self):
+        p = os.path.join(self.tmp, "choices.pptx")
+        slide = (
+            f'<p:sld xmlns:p="{_NS_P}" xmlns:a="{_NS_A}" xmlns:mc="{_NS_MC}" '
+            'xmlns:a14="http://schemas.microsoft.com/office/drawing/2010/main">'
+            '<p:cSld><p:spTree><mc:AlternateContent>'
+            '<mc:Choice Requires="a14"><a:p><a:r><a:t>Future</a:t></a:r></a:p></mc:Choice>'
+            '<mc:Choice Requires="a"><a:p><a:r><a:t>Supported</a:t></a:r></a:p></mc:Choice>'
+            '<mc:Fallback><a:p><a:r><a:t>Fallback</a:t></a:r></a:p></mc:Fallback>'
+            '</mc:AlternateContent></p:spTree></p:cSld></p:sld>'
+        )
+        _write_pptx(p, {1: slide})
+        text = extract_document_text(p)
+        self.assertIn("Supported", text)
+        self.assertNotIn("Future", text)
+        self.assertNotIn("Fallback", text)
+
+    def test_alternate_content_uses_fallback_when_choices_are_unknown(self):
+        p = os.path.join(self.tmp, "fallback.pptx")
+        slide = (
+            f'<p:sld xmlns:p="{_NS_P}" xmlns:a="{_NS_A}" xmlns:mc="{_NS_MC}" '
+            'xmlns:a14="http://schemas.microsoft.com/office/drawing/2010/main">'
+            '<p:cSld><p:spTree><mc:AlternateContent>'
+            '<mc:Choice Requires="a14"><a:p><a:r><a:t>Future</a:t></a:r></a:p></mc:Choice>'
+            '<mc:Fallback><a:p><a:r><a:t>Compatible</a:t></a:r></a:p></mc:Fallback>'
+            '</mc:AlternateContent></p:spTree></p:cSld></p:sld>'
+        )
+        _write_pptx(p, {1: slide})
+        text = extract_document_text(p)
+        self.assertIn("Compatible", text)
+        self.assertNotIn("Future", text)
+
+    def test_inline_alternate_content_ignores_unselected_runs(self):
+        p = os.path.join(self.tmp, "inline-choice.pptx")
+        slide = (
+            f'<p:sld xmlns:p="{_NS_P}" xmlns:a="{_NS_A}" xmlns:mc="{_NS_MC}" '
+            'xmlns:a14="http://schemas.microsoft.com/office/drawing/2010/main">'
+            '<p:cSld><p:spTree><a:p>'
+            '<mc:AlternateContent>'
+            '<mc:Choice Requires="a14"><a:r><a:t>Future</a:t></a:r></mc:Choice>'
+            '<mc:Fallback><a:r><a:t>Compatible</a:t></a:r></mc:Fallback>'
+            '</mc:AlternateContent>'
+            '<mc:AlternateContent>'
+            '<mc:Choice Requires="a"><a:r><a:t>Supported</a:t></a:r></mc:Choice>'
+            '<mc:Fallback><a:r><a:t>Wrong</a:t></a:r></mc:Fallback>'
+            '</mc:AlternateContent>'
+            '</a:p></p:spTree></p:cSld></p:sld>'
+        )
+        _write_pptx(p, {1: slide})
+        text = extract_document_text(p)
+        self.assertIn("CompatibleSupported", text)
+        self.assertNotIn("Future", text)
+        self.assertNotIn("Wrong", text)
 
     def test_not_a_zip_raises(self):
         p = os.path.join(self.tmp, "bad.pptx")
