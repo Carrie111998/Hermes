@@ -868,7 +868,11 @@ describe('ToolsetConfigPanel', () => {
       const { ToolsetConfigPanel } = await import('./toolset-config-panel')
       render(<ToolsetConfigPanel onConfiguredChange={vi.fn()} toolset="browser" />)
 
-      await screen.findByRole('button', { name: /Electric Sheep managed service/ })
+      const managedRow = await screen.findByRole('button', { name: /Electric Sheep managed service/ })
+      if (managedRow.getAttribute('aria-expanded') !== 'true') {
+        fireEvent.click(managedRow)
+      }
+      await waitFor(() => expect(managedRow.getAttribute('aria-expanded')).toBe('true'))
       expect(screen.getByText('managed')).toBeTruthy()
       expect(screen.getByText('Managed Browser Use included with your managed agent')).toBeTruthy()
       expect(screen.queryByText(/Nous Subscription/)).toBeNull()
@@ -959,7 +963,11 @@ describe('ToolsetConfigPanel', () => {
       const { ToolsetConfigPanel } = await import('./toolset-config-panel')
       render(<ToolsetConfigPanel onConfiguredChange={vi.fn()} toolset="browser" />)
 
-      await screen.findByRole('button', { name: /Electric Sheep managed service/ })
+      const managedRow = await screen.findByRole('button', { name: /Electric Sheep managed service/ })
+      if (managedRow.getAttribute('aria-expanded') !== 'true') {
+        fireEvent.click(managedRow)
+      }
+      await waitFor(() => expect(managedRow.getAttribute('aria-expanded')).toBe('true'))
       fireEvent.click(await screen.findByRole('button', { name: /Use this backend/ }))
 
       await waitFor(() =>
