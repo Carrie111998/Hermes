@@ -25,7 +25,7 @@ For the full feature reference, see [Subagent Delegation](/user-guide/features/d
 - Mechanical multi-step work with logic between steps → `execute_code`
 - Tasks needing user interaction → subagents can't use `clarify`
 - Quick file edits → do them directly
-- Durable long-running work that must survive session closure or process restart → `cronjob` or `terminal(background=True, notify_on_complete=True)`. Top-level delegation is asynchronous but still process-local.
+- Durable long-running work that must survive session closure or process restart → `cronjob` or `terminal(background=True, notify_on_complete=True)`. Top-level model-facing delegation is asynchronous by default where the session supports later delivery; `wait=true` keeps the call inline. Either mode is still process-local.
 
 ---
 
@@ -58,10 +58,10 @@ delegate_task(tasks=[
         "goal": "Research practical quantum computing applications",
         "context": "Focus on: error correction breakthroughs, real-world use cases, key companies"
     }
-])
+], wait=True)
 ```
 
-All three run concurrently. Each subagent searches the web independently and returns a summary. The parent agent then synthesizes them into a coherent briefing.
+All three run concurrently. `wait=True` keeps the parent in the current turn until every summary is available, then the parent synthesizes them into a coherent briefing. Omit it when the research is optional background work that can return in a later turn.
 
 ---
 
@@ -221,7 +221,7 @@ delegation:
 - **Separate terminals** — each subagent gets its own terminal session with separate working directory and state
 - **No conversation history** — subagents see only the `goal` and `context` the parent agent passes when calling `delegate_task`
 - **Default 50 iterations** — set `max_iterations` lower for simple tasks to save cost
-- **Not durable** — top-level delegation runs in the background and posts its result back later, but it remains tied to the owning session and Hermes process. Session closure, `/stop`, `/new`, or a process restart can cancel or strand in-progress work. Use `cronjob` or `terminal(background=True, notify_on_complete=True)` for work that must survive those boundaries.
+- **Not durable** — when top-level model-facing `wait` is omitted or `false` and later delivery is supported, delegation runs in the background and posts its result back later. With `wait=true`, the ordered aggregate returns inline in the current turn. Both modes remain tied to the owning session and Hermes process: session closure, `/stop`, `/new`, or a process restart can cancel or strand in-progress work. Use `cronjob` or `terminal(background=True, notify_on_complete=True)` for work that must survive those boundaries.
 
 ---
 

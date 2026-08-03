@@ -8,7 +8,7 @@ description: "Spawn isolated child agents for parallel workstreams with delegate
 
 The `delegate_task` tool spawns child AIAgent instances with isolated context, inherited tool access, and their own terminal sessions. Each child gets a fresh conversation and works independently — only its final summary enters the parent's context.
 
-Top-level model calls run in the background automatically. Hermes returns a handle immediately so the conversation can continue, then posts the result back as a new message. An orchestrator subagent waits for its own workers so it can synthesize their results before returning.
+Top-level model calls run in the background by default. Hermes returns a handle immediately so the conversation can continue, then posts the result back as a new message. When the parent's answer depends on delegated findings, `wait=true` keeps the parent in the current turn until every worker finishes and returns one consolidated result. An orchestrator subagent waits for its own workers automatically.
 
 ## Single Task
 
@@ -28,7 +28,7 @@ delegate_task(tasks=[
     {"goal": "Research topic A", "context": "Focus on recent primary sources"},
     {"goal": "Research topic B", "context": "Compare the leading explanations"},
     {"goal": "Fix the build", "context": "Project root: /home/user/project"}
-])
+], wait=True)
 ```
 
 ## How Subagent Context Works
@@ -115,7 +115,7 @@ delegate_task(
 
 ## Batch Mode Details
 
-When a top-level agent provides a `tasks` array, Hermes returns one background handle, runs the subagents in parallel, and posts one consolidated result after every child finishes. An orchestrator subagent waits for its batch in the current turn so it can synthesize the results.
+When a top-level agent provides a `tasks` array, Hermes runs the subagents in parallel. By default it returns one background handle and posts one consolidated result after every child finishes. With `wait=true`, it blocks the parent until the whole batch finishes and returns that consolidated result inline. An orchestrator subagent always waits for its batch in the current turn so it can synthesize the results.
 
 - **Maximum concurrency:** 3 tasks by default (configurable via `delegation.max_concurrent_children` or the `DELEGATION_MAX_CONCURRENT_CHILDREN` env var; floor of 1, no hard ceiling). Batches larger than the limit return a tool error rather than being silently truncated.
 - **Thread pool:** Uses `ThreadPoolExecutor` with the configured concurrency limit as max workers
@@ -208,10 +208,11 @@ With a hard cap configured, if a subagent times out having made **zero** API cal
 
 ## Stall Detection for Background Subagents
 
-Background delegations (`delegate_task(background=true)`) are watched by a
-**progress-based stall monitor** — on by default, zero config. Unlike a
-wall-clock timeout, it never touches a child that is making progress, no
-matter how long it runs.
+Detached background delegations — the default for top-level model-facing calls
+when `wait` is omitted or `false` and later delivery is supported — are watched
+by a **progress-based stall monitor**. It is on by default with zero config.
+Unlike a wall-clock timeout, it never touches a child that is making progress,
+no matter how long it runs.
 
 The monitor samples each detached child's progress signals — API-call count,
 current tool, and last-activity timestamp (which ticks on **every streamed
@@ -308,7 +309,7 @@ delegate_task(
 ## Lifetime and Durability
 
 :::warning Background completion durability is not durable execution
-Top-level model-facing `delegate_task` calls run in the background automatically where the session supports later delivery. Hermes returns a handle immediately, and the result re-enters the conversation after the child or batch finishes. Orchestrator subagents wait for their workers in the current turn because they must synthesize those results before returning. Stateless request/response endpoints fall back to synchronous execution when they cannot deliver a detached result later.
+Where the session supports later delivery, top-level model-facing `delegate_task` calls with `wait` omitted or `wait=false` return a handle immediately, and the aggregate result re-enters the conversation after the child or batch finishes. With `wait=true`, the call stays inline and returns the aggregate in the current turn. Nested orchestrators wait for their workers automatically because they must synthesize those results before returning. Stateless request/response endpoints fall back to synchronous execution when they cannot deliver a detached result later.
 
 - Normal follow-up messages do not cancel background children. `/stop` cancels running background delegations, and closing or resetting the owning session discards its active children.
 - Explicit session close/reset interrupts that session's background children. Closing a TUI viewer of a gateway-owned session does not kill the gateway's work.

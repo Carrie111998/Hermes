@@ -17,12 +17,14 @@ const RUNNING = (s: SubagentProgress) => s.status === 'running' || s.status === 
 /**
  * "Parked" background-delegation signal for the active session.
  *
- * A top-level `delegate_task` always runs in the background: the parent turn
- * ends (`$busy` -> false) while the subagent keeps running, and its result
- * re-enters the conversation as a fresh turn when it finishes. During that
- * window the app is genuinely idle but work is still happening elsewhere, so we
- * surface a calm, shimmering status line (its latest activity, or a generic
- * "will resume" fallback) instead of a spinner that reads as "stuck."
+ * A detached top-level `delegate_task` call runs in the background: the parent
+ * turn ends (`$busy` -> false) while the subagent keeps running, and its result
+ * re-enters the conversation as a fresh turn when it finishes. A model-facing
+ * call with `wait=true` stays inline and never enters this parked state. During
+ * the detached window the app is genuinely idle but work is still happening
+ * elsewhere, so we surface a calm, shimmering status line (its latest activity,
+ * or a generic "will resume" fallback) instead of a spinner that reads as
+ * "stuck."
  *
  * Null while `$busy`: an active turn already owns the main loader, and subagents
  * spawned inside a running turn (synchronous orchestrator children) are part of

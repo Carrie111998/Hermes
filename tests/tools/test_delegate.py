@@ -80,6 +80,15 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertNotIn("acp_command", props["tasks"]["items"]["properties"])
         self.assertNotIn("acp_args", props["tasks"]["items"]["properties"])
         self.assertNotIn("maxItems", props["tasks"])  # removed — limit is now runtime-configurable
+        self.assertIn("wait", props)
+        self.assertNotIn("background", props)
+
+    def test_schema_explains_when_to_wait(self):
+        from tools.delegate_tool import _build_dynamic_schema_overrides
+
+        description = _build_dynamic_schema_overrides()["description"]
+        self.assertIn("wait=true", description)
+        self.assertIn("final answer depends", description)
 
 class TestChildSystemPrompt(unittest.TestCase):
     def test_goal_only(self):
@@ -1106,6 +1115,72 @@ class TestDelegationReasoningEffort(unittest.TestCase):
 
 class TestDispatchDelegateTask(unittest.TestCase):
     """Tests for the _dispatch_delegate_task helper and full param forwarding."""
+
+    def test_model_wait_policy_matches_live_dispatch(self):
+        import run_agent
+        from tools.delegate_tool import _model_background_value
+
+        top = _make_mock_parent(depth=0)
+        nested = _make_mock_parent(depth=1)
+        cases = [
+            ({"goal": "single"}, top, True),
+            ({"goal": "single", "wait": False}, top, True),
+            ({"goal": "single", "wait": True}, top, False),
+            ({"tasks": [{"goal": "a"}, {"goal": "b"}]}, top, True),
+            (
+                {"tasks": [{"goal": "a"}, {"goal": "b"}], "wait": True},
+                top,
+                False,
+            ),
+            ({"goal": "single", "wait": "true"}, top, True),
+            ({"goal": "nested"}, nested, False),
+            ({"goal": "nested", "wait": False}, nested, False),
+        ]
+
+        captured = []
+
+        def fake_delegate_task(**kwargs):
+            captured.append(kwargs["background"])
+            return "{}"
+
+        with patch("tools.delegate_tool.delegate_task", fake_delegate_task):
+            for function_args, parent, expected_background in cases:
+                with self.subTest(args=function_args, depth=parent._delegate_depth):
+                    self.assertIs(
+                        _model_background_value(function_args, parent),
+                        expected_background,
+                    )
+                    run_agent.AIAgent._dispatch_delegate_task(parent, function_args)
+
+        self.assertEqual(captured, [expected for _, _, expected in cases])
+
+    def test_direct_python_default_stays_synchronous(self):
+        parent = _make_mock_parent(depth=0)
+        with patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = _make_role_mock_child()
+            result = json.loads(
+                delegate_task(goal="direct caller", parent_agent=parent)
+            )
+
+        self.assertIn("results", result)
+        self.assertNotEqual(result.get("status"), "dispatched")
+
+    def test_live_wait_dispatch_returns_inline_result(self):
+        import run_agent
+
+        parent = _make_mock_parent(depth=0)
+        dispatch = run_agent.AIAgent._dispatch_delegate_task
+        with patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = _make_role_mock_child()
+            result = json.loads(
+                dispatch(
+                    parent,
+                    {"goal": "required evidence", "wait": True},
+                )
+            )
+
+        self.assertIn("results", result)
+        self.assertEqual(result["results"][0]["summary"], "done")
 
     def test_model_acp_args_not_forwarded(self):
         """The live model dispatch path strips hidden ACP transport args."""

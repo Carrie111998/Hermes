@@ -982,11 +982,13 @@ Enable/disable per platform via `hermes tools` (the curses UI) or the
 
 ## Delegation (`delegate_task`)
 
-`tools/delegate_tool.py` spawns a subagent with an isolated
-context + terminal session. By default the parent waits for the
-child's summary before continuing its own loop. With `background=true`,
-Hermes returns a delegation id immediately and the result re-enters the
-conversation later through the async-delegation completion queue.
+`tools/delegate_tool.py` spawns a subagent with an isolated context + terminal
+session. Top-level model calls run in the background by default: Hermes returns
+a delegation id immediately and the result re-enters the conversation later
+through the async-delegation completion queue. Set `wait=true` when the
+parent's current-turn answer depends on the workers. Batch workers still run in
+parallel, but the parent waits for all of them and receives one consolidated
+result inline. Nested orchestrators wait automatically.
 
 Two shapes:
 
