@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from unittest.mock import patch, MagicMock
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "optional-skills", "agent-architecture", "win-gui-test"))
 
 from scripts.utils.config import load_config, DEFAULT_CONFIG
 from scripts.utils.screenshot import capture
@@ -57,7 +57,7 @@ class TestScreenshotDefaults(unittest.TestCase):
     def test_default_output_dir_uses_os_path(self):
         """Verify core.py has os imported so default path resolution works."""
         import ast, pathlib
-        core_src = pathlib.Path(__file__).resolve().parent.parent / "scripts" / "core.py"
+        core_src = (pathlib.Path(__file__).resolve().parent.parent.parent / "optional-skills" / "agent-architecture" / "win-gui-test" / "scripts" / "core.py")
         tree = ast.parse(core_src.read_text())
         # Verify 'import os' exists at module level
         imports = [node for node in ast.walk(tree) if isinstance(node, ast.Import)]
@@ -93,7 +93,7 @@ class TestOsImport(unittest.TestCase):
     def test_os_imported_in_core(self):
         """Verify 'import os' exists in core.py source without importing pywinauto."""
         import ast, pathlib
-        core_src = pathlib.Path(__file__).resolve().parent.parent / "scripts" / "core.py"
+        core_src = (pathlib.Path(__file__).resolve().parent.parent.parent / "optional-skills" / "agent-architecture" / "win-gui-test" / "scripts" / "core.py")
         tree = ast.parse(core_src.read_text())
         # Collect all import names at module level
         imported = set()

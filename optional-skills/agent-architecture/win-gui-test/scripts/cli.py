@@ -72,12 +72,13 @@ def cmd_screenshot(args) -> None:
             title=args.title,
             output_dir=args.out_dir or "",
             fallback=not args.no_fallback,
+            config=getattr(args, 'cfg', None),
         )
     )
 
 
 def cmd_click(args) -> None:
-    _out(click(args.title, args.target, timeout=args.timeout))
+    _out(click(args.title, args.target, timeout=args.timeout, config=getattr(args, 'cfg', None)))
 
 
 def cmd_click_coords(args) -> None:
@@ -214,6 +215,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # Config + logger
     cfg = load_config(args.config)
+    args.cfg = cfg  # attach to args so command handlers can use it
     log_dir = args.log_dir or cfg.get("log_dir", "")
     setup_logger(log_dir=log_dir)
 

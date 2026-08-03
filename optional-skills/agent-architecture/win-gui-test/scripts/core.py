@@ -6,6 +6,7 @@ All public functions return a ``Result`` dict with at least ``{"success": bool}`
 
 from __future__ import annotations
 
+import os
 import time
 import logging
 from typing import Any, Callable
@@ -60,6 +61,12 @@ def _first_window(title: str, timeout: float = 10) -> Any:
             return wins[0]
         time.sleep(0.3)
     raise ElementNotFoundError(f"Window containing '{title}' not found after {timeout}s")
+
+
+
+def _get_config(cfg: dict | None = None) -> dict:
+    """Return *cfg* if provided, otherwise load default config."""
+    return cfg if cfg is not None else load_config()
 
 
 # ---------------------------------------------------------------------------
@@ -122,12 +129,13 @@ def screenshot(
     output_dir: str = "",
     filename: str | None = None,
     fallback: bool = True,
+    config: dict | None = None,
 ) -> Result:
     """Take a screenshot, optionally focusing *title* first.
 
     Returns dict with ``filepath`` on success.
     """
-    out_dir = output_dir or load_config().get("screenshot_dir", os.path.expanduser("~/Desktop/gui_screenshots"))
+    out_dir = output_dir or _get_config(config).get("screenshot_dir", os.path.expanduser("~/Desktop/gui_screenshots"))
     ts = time.strftime("%Y%m%d_%H%M%S")
     label = (title or "screen").replace(" ", "_")[:40]
     name = filename or f"{label}_{ts}.png"
@@ -139,7 +147,7 @@ def screenshot(
     return {"success": False, "error": "All screenshot methods failed"}
 
 
-def click(title: str, target: str, timeout: float = 10) -> Result:
+def click(title: str, target: str, timeout: float = 10, config: dict | None = None) -> Result:
     """Click a control by name within the first matching window."""
     try:
         w = _retry(lambda: _first_window(title, timeout), retries=1)
@@ -168,7 +176,7 @@ def click(title: str, target: str, timeout: float = 10) -> Result:
         raise ElementNotFoundError(f"No control containing '{target}' found")
 
     try:
-        _retry(_do, retries=load_config().get("retry", {}).get("count", 3))
+        _retry(_do, retries=_get_config(config).get("retry", {}).get("count", 3))
         return {"success": True, "action": "click", "target": target}
     except Exception as exc:
         return {"success": False, "action": "click", "target": target, "error": str(exc)}
