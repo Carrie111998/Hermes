@@ -2151,6 +2151,22 @@ def test_session_db_merge_ignores_private_runtime_attachment_descriptors():
     assert _merge_runtime_session_history(caller, session) == session
 
 
+def test_session_db_merge_ignores_flattened_runtime_attachment_descriptors():
+    prompt = "describe the uploaded image"
+    caller = [{"role": "user", "content": prompt}]
+    session = [{
+        "role": "user",
+        "content": (
+            prompt
+            + "\n[Attached image: reference.png; role=user_upload; "
+            "asset_id=asset_1. When pixel analysis is required, call "
+            "image_analyze with image_url=/tmp/runtime/reference.png.]"
+        ),
+    }]
+
+    assert _merge_runtime_session_history(caller, session) == session
+
+
 def test_session_db_resume_survives_database_reopen(tmp_path):
     db_path = tmp_path / "state.db"
     session_id = "thread_restart"

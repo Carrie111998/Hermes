@@ -94,7 +94,11 @@ def _anchor_content(content: Any) -> str:
             )
         )
     else:
-        text = _message_text(content)
+        text = "\n".join(
+            line
+            for line in _message_text(content).splitlines()
+            if not line.strip().startswith(_RUNTIME_ATTACHMENT_TEXT_PREFIXES)
+        )
     return "\n".join(
         line
         for line in text.splitlines()
