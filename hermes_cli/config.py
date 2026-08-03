@@ -5004,12 +5004,15 @@ def set_config_value(key: str, value: str, force: bool = False):
             decoded = _decode_json_value(value)
             if isinstance(decoded, list):
                 coerced_value = decoded
-        elif _decode_json_value(value) is not None and (_is_mapping_section_key(key) or isinstance(existing_value, dict)):
+        else:
             # JSON object literal → YAML mapping, per the spec's ``{`` trigger.
             # Only for mapping-typed keys (schema default is a mapping section,
-            # or the existing config holds a dict at that path).  Unknown keys
-            # and non-mapping defaults keep their historical stringification.
-            coerced_value = _decode_json_value(value)
+            # or the existing config holds a dict at that path) AND only when
+            # the decoded value is actually a dict — a JSON array on a
+            # mapping-only key stays a string (GottZ triage, PR #76470).
+            _mapping_decoded = _decode_json_value(value)
+            if isinstance(_mapping_decoded, dict) and (_is_mapping_section_key(key) or isinstance(existing_value, dict)):
+                coerced_value = _mapping_decoded
 
     value = coerced_value
     # Normalize a scalar ``model`` key before writing sub-keys so that

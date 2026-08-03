@@ -778,6 +778,17 @@ class TestJsonListValues:
         reloaded = yaml.safe_load(_read_config(_isolated_hermes_home))
         assert reloaded["terminal"] == {"backend": "local", "cwd": "/repo"}
 
+    def test_json_array_on_mapping_key_stays_a_string(self, _isolated_hermes_home):
+        # A JSON array on a mapping-typed key must NOT be decoded — only JSON
+        # objects should become YAML mappings.  Without this guard, the mapping
+        # branch would accept any structured _decode_json_value result and turn
+        # an array into a YAML sequence (GottZ triage, PR #76470).
+        set_config_value("terminal", '["a", "b"]')
+
+        import yaml
+        reloaded = yaml.safe_load(_read_config(_isolated_hermes_home))
+        assert reloaded["terminal"] == '["a", "b"]'
+
     def test_string_default_key_keeps_json_array_as_string(self, _isolated_hermes_home):
         # String-typed defaults must not be decoded — the user asked for the
         # literal text (e.g. a JSON document stored as a string).
