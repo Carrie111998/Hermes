@@ -1035,7 +1035,10 @@ def _write_agent_summary(data: Dict[str, Any]) -> None:
     try:
         path = agent_summary_path()
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(_build_agent_summary(data), indent=2, default=str))
+        path.write_text(
+            json.dumps(_build_agent_summary(data), indent=2, default=str),
+            encoding="utf-8",
+        )
     except Exception:
         pass  # Non-critical: the summary is a best-effort context artifact.
 
