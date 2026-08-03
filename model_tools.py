@@ -291,11 +291,38 @@ def _clear_tool_defs_cache() -> None:
     _tool_defs_cache.clear()
 
 
+def _is_mcp_toolset_name(name: str) -> bool:
+    """Return True for canonical MCP toolsets (``mcp-<server>``)."""
+    return bool(name) and str(name).startswith("mcp-")
+
+
+def _registered_mcp_toolsets() -> List[str]:
+    """Every MCP toolset currently registered in the tool registry.
+
+    MCP toolsets are named ``mcp-<server>`` and only come into existence once
+    that server connects and registers its tools, so a caller assembling a
+    static allowlist has no way to name them up front.
+
+    Canonical names are read straight from the registry: ``get_all_toolsets()``
+    deliberately surfaces an MCP toolset under its bare server alias (e.g.
+    ``dynserver`` rather than ``mcp-dynserver``), so it cannot be used here.
+    """
+    try:
+        return sorted(
+            name
+            for name in registry.get_registered_toolset_names()
+            if _is_mcp_toolset_name(name)
+        )
+    except Exception:
+        return []
+
+
 def get_tool_definitions(
     enabled_toolsets: Optional[List[str]] = None,
     disabled_toolsets: Optional[List[str]] = None,
     quiet_mode: bool = False,
     skip_tool_search_assembly: bool = False,
+    preserve_mcp_toolsets: bool = True,
 ) -> List[Dict[str, Any]]:
     """
     Get tool definitions for model API calls with toolset-based filtering.
@@ -306,6 +333,11 @@ def get_tool_definitions(
         enabled_toolsets: Only include tools from these toolsets.
         disabled_toolsets: Exclude tools from these toolsets (if enabled_toolsets is None).
         quiet_mode: Suppress status prints.
+        preserve_mcp_toolsets: When an ``enabled_toolsets`` allowlist is given,
+            still include dynamically-registered ``mcp-<server>`` toolsets the
+            allowlist does not name. Defaults to True because such an omission
+            is almost always an oversight — see :func:`_compute_tool_definitions`.
+            Pass False for a strict, literal allowlist.
         skip_tool_search_assembly: When True, return the pre-assembly tool list
             (raw schemas for every enabled tool). Used internally by the
             tool_search / tool_describe bridge handlers so they can read the
@@ -343,6 +375,7 @@ def get_tool_definitions(
                 bool(skip_tool_search_assembly),
                 _is_delegated_child_context(),
                 profile_scope,
+                bool(preserve_mcp_toolsets),
             )
         cached = _tool_defs_cache.get(cache_key) if cache_key is not None else None
         if cached is not None:
@@ -355,7 +388,8 @@ def get_tool_definitions(
             return list(cached)
 
     result = _compute_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode,
-                                       skip_tool_search_assembly=skip_tool_search_assembly)
+                                       skip_tool_search_assembly=skip_tool_search_assembly,
+                                       preserve_mcp_toolsets=preserve_mcp_toolsets)
     if quiet_mode and cache_key is not None:
         # Cache the freshly-computed list, but hand callers a shallow copy so
         # downstream mutations (e.g. run_agent appending memory/LCM tool
@@ -381,6 +415,7 @@ def _compute_tool_definitions(
     disabled_toolsets: Optional[List[str]] = None,
     quiet_mode: bool = False,
     skip_tool_search_assembly: bool = False,
+    preserve_mcp_toolsets: bool = True,
 ) -> List[Dict[str, Any]]:
     """Uncached implementation of :func:`get_tool_definitions`."""
     # Determine which tool names the caller wants
@@ -388,6 +423,38 @@ def _compute_tool_definitions(
 
     if enabled_toolsets is not None:
         effective_enabled_toolsets = list(enabled_toolsets)
+        # MCP toolsets are registered dynamically as ``mcp-<server>`` when a
+        # server connects, so a caller narrowing enabled_toolsets — usually to
+        # cut input-token overhead — cannot name them in advance and silently
+        # loses every MCP tool. The failure is invisible: the tools *are*
+        # registered, then filtered straight back out, and the model is simply
+        # told they "do not exist".
+        #
+        # Delegation already guarded its own path (delegation.inherit_mcp_toolsets
+        # / _preserve_parent_mcp_toolsets in tools/delegate_tool.py). Hoisting the
+        # rule here means every other narrowing path inherits it too — cron jobs,
+        # platform_toolsets, ACP sessions, CLI.
+        #
+        # Delegated children are skipped: delegate_tool has already intersected
+        # the child's toolsets with the parent's and re-added only the *parent's*
+        # MCP toolsets, and widening that here would let a child reach servers
+        # its parent cannot.
+        #
+        # An explicit disabled_toolsets entry always wins — that is a deliberate
+        # exclusion, not an oversight, so it is never re-added here.
+        if preserve_mcp_toolsets and not _is_delegated_child_context():
+            _explicitly_disabled = set(disabled_toolsets or ())
+            for _mcp_toolset in _registered_mcp_toolsets():
+                if (
+                    _mcp_toolset not in effective_enabled_toolsets
+                    and _mcp_toolset not in _explicitly_disabled
+                ):
+                    effective_enabled_toolsets.append(_mcp_toolset)
+                    if not quiet_mode:
+                        print(
+                            f"🔌 Preserved MCP toolset '{_mcp_toolset}' "
+                            "(not named in enabled_toolsets)"
+                        )
         if (
             os.environ.get("HERMES_KANBAN_TASK")
             and not _is_delegated_child_context()
