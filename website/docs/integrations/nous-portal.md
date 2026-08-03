@@ -135,10 +135,47 @@ hermes portal            # log in to Nous Portal + set it up (one-shot onboardin
 hermes portal info       # login status, subscription info, model + gateway routing
 hermes portal status     # alias for `portal info`
 hermes portal tools      # detailed Tool Gateway catalog with per-tool routing
+hermes portal usage --json  # stable, sanitized balance/allowance telemetry for local automation
 hermes portal open       # open the subscription management page in your browser
 ```
 
 `hermes portal` (with no subcommand) is the human-readable alias for `hermes auth add nous --type oauth` — it logs you in, lets you pick a Nous model, sets Nous as your inference provider, and offers the Tool Gateway opt-in (identical to `hermes setup --portal`, and the same Nous flow as the first-time quick setup).
+
+### Machine-readable usage telemetry
+
+`hermes portal usage --json` emits a versioned, sanitized account-usage
+snapshot for local integrations such as status bars. Hermes resolves and
+refreshes its own Portal credential; the output never contains OAuth tokens,
+raw Portal responses, user identifiers, organisation identifiers, or inference
+routing data.
+
+```bash
+hermes portal usage --json
+```
+
+```json
+{
+  "schema_version": 1,
+  "available": true,
+  "status": "healthy",
+  "plan": "Plus",
+  "renews_at": "2026-08-31T00:00:00Z",
+  "subscription": {
+    "remaining_usd": 14.0,
+    "monthly_allowance_usd": 20.0,
+    "used_percent": 30
+  },
+  "top_up": { "remaining_usd": 12.0 },
+  "total_usable_usd": 26.0
+}
+```
+
+`subscription` is `null` when Hermes cannot prove a positive monthly allowance,
+and `top_up` is `null` when no top-up balance is reported. Consumers must not
+invent a percentage from the top-up balance. When no Portal account is available,
+the command prints an `available: false` payload and exits with status `1`.
+The current schema uses USD values despite legacy upstream field names that
+contain `credits`.
 
 `hermes portal info` gives you the high-level overview:
 
