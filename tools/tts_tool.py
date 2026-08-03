@@ -1467,6 +1467,7 @@ def _generate_openai_tts(
     voice: Optional[str] = None,
     speed: Optional[float] = None,
     instructions: Optional[str] = None,
+    extra_body: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Generate audio via the OpenAI ``audio.speech.create`` SDK shape.
 
@@ -1492,6 +1493,9 @@ def _generate_openai_tts(
             truthy; omitted otherwise so ``tts-1``/``tts-1-hd`` and strict
             OpenAI-compatible servers that reject unknown kwargs are
             unaffected.
+        extra_body: Optional provider-specific request fields. These are
+            sent instead of inheriting ``tts.openai.language``; an empty dict
+            keeps provider configuration isolated without adding request fields.
 
     Returns:
         Path to the saved audio file.
@@ -1522,7 +1526,7 @@ def _generate_openai_tts(
     if speed is None:
         speed_default = tts_config.get("speed", 1.0) if isinstance(tts_config, dict) else 1.0
         speed = float(oai_config.get("speed", speed_default))
-    language = oai_config.get("language")
+    language = oai_config.get("language") if extra_body is None else None
 
     # The managed OpenAI audio gateway only proxies MANAGED_OPENAI_TTS_MODELS.
     # A model set for direct OpenAI (e.g. "tts-1-hd") 400s there with
@@ -1558,8 +1562,13 @@ def _generate_openai_tts(
             create_kwargs["speed"] = max(0.25, min(4.0, speed))
         if instructions:
             create_kwargs["instructions"] = instructions
+        request_extra_body: Dict[str, Any] = {}
         if language:
-            create_kwargs["extra_body"] = {"lang_code": language}
+            request_extra_body["lang_code"] = language
+        if extra_body:
+            request_extra_body.update(extra_body)
+        if request_extra_body:
+            create_kwargs["extra_body"] = request_extra_body
         response = client.audio.speech.create(**create_kwargs)
 
         response.stream_to_file(output_path)
@@ -1616,6 +1625,7 @@ def _generate_deepinfra_tts(text: str, output_path: str, tts_config: Dict[str, A
                 "api.deepinfra.com so the live catalog can be fetched."
             )
         model = candidates[0]
+    language = di_config.get("language")
     return _generate_openai_tts(
         text,
         output_path,
@@ -1625,6 +1635,7 @@ def _generate_deepinfra_tts(text: str, output_path: str, tts_config: Dict[str, A
         model=model,
         voice=di_config.get("voice", DEFAULT_DEEPINFRA_TTS_VOICE),
         speed=float(di_config.get("speed", tts_config.get("speed", 1.0))),
+        extra_body={"language": language} if language else {},
     )
 
 

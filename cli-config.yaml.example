@@ -1205,6 +1205,7 @@ stt:
 #     # live result.
 #     model: ""
 #     voice: "default"
+#     language: "PT_BR"  # Language hint for realtime-tts-2; ignored by unsupported models.
 
 # Image generation. Each provider plugin reads its own ``image_gen.<name>``
 # block; deepinfra discovers models live from
