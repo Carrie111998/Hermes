@@ -133,12 +133,14 @@ def _make_hermes_provider_class() -> Optional[type]:
             self,
             *args: Any,
             server_name: str = "",
+            oauth_config: dict | None = None,
             preregistered: bool = False,
             **kwargs: Any,
         ):
             super().__init__(*args, **kwargs)
             self._hermes_server_name = server_name
             self._hermes_home = ""
+            self._hermes_oauth_config = oauth_config or {}
             # When the client_id comes from config.yaml (pre-registered), an
             # invalid_client rejection means the *config* is wrong — deleting
             # client.json would just be re-seeded from config and re-running
@@ -179,6 +181,28 @@ def _make_hermes_provider_class() -> Optional[type]:
             remaining TTL we compute here reflects real wall-clock age.
             """
             await super()._initialize()
+            # Pre-populate OAuth metadata from user-pinned endpoints in config
+            # (mcp_servers.<name>.oauth.authorization_endpoint etc.)
+            # When present, skip well-known discovery entirely.
+            pinned = self._hermes_oauth_config
+            if pinned and self.context.oauth_metadata is None:
+                meta_fields = ["issuer", "authorization_endpoint",
+                               "token_endpoint", "registration_endpoint"]
+                if any(pinned.get(f) for f in meta_fields):
+                    try:
+                        from mcp.client.auth.oauth2 import OAuthMetadata
+                        meta_kwargs = {k: pinned[k] for k in meta_fields if pinned.get(k)}
+                        self.context.oauth_metadata = OAuthMetadata(**meta_kwargs)
+                        logger.debug(
+                            "MCP OAuth '%s': pinned endpoints from config %s",
+                            self._hermes_server_name, meta_kwargs,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "MCP OAuth '%s': failed to parse pinned endpoints: %s",
+                            self._hermes_server_name, exc,
+                        )
+
             tokens = self.context.current_tokens
             if tokens is not None and tokens.expires_in is not None:
                 self.context.update_token_expiry(tokens)
@@ -578,6 +602,7 @@ class MCPOAuthManager:
 
         return _HERMES_PROVIDER_CLS(
             server_name=server_name,
+            oauth_config=cfg,
             preregistered=bool(cfg.get("client_id")),
             server_url=entry.server_url,
             client_metadata=client_metadata,
