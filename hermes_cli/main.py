@@ -12058,6 +12058,26 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     print("  Close all Hermes windows/gateways and re-run: hermes update")
             else:
                 print("✓ Already up to date!")
+
+            # A current checkout does NOT imply healthy Node.js dependencies.
+            # A previous update may have failed at the npm step (e.g.
+            # EBADENGINE from a mismatched system node/npm), leaving
+            # node_modules stale while the Python venv remained fine.
+            # _update_node_dependencies() is self-guarded via
+            # _npm_lockfile_changed() — healthy installs return [] in
+            # milliseconds — so calling it unconditionally here is cheap.
+            # The web UI build is similarly self-guarded via
+            # _web_ui_build_needed(). This mirrors the Python venv probe
+            # above (line 12018) that was added after ryanc's incident
+            # (#3882-#3921): "checkout is current" ≠ "install is healthy".
+            if (PROJECT_ROOT / "package.json").exists():
+                node_failures = _update_node_dependencies()
+                _build_web_ui(PROJECT_ROOT / "web")
+                if node_failures:
+                    print(
+                        f"⚠ Node.js dependencies are stale ({', '.join(node_failures)}). "
+                        "Fix npm and re-run `hermes update`."
+                    )
             if runtime_repaired is not None and not _is_windows():
                 print()
                 print(

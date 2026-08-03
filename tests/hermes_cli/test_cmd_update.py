@@ -1236,3 +1236,83 @@ class TestNodeRuntimeNpmResolution:
             not call.args or not call.args[0] or call.args[0][0] != windows_npm
             for call in mock_run.call_args_list
         )
+
+
+class TestCmdUpdateAlreadyUpToDateNodeRepair:
+    """Regression tests for #77211: the \"Already up to date!\" path must also
+    self-heal stale Node.js dependencies and the web UI build, mirroring the
+    Python venv health probe (_venv_core_imports_healthy) added in July 2026.
+    A current checkout does NOT imply a healthy Node install.
+    """
+
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
+    def test_already_up_to_date_calls_node_deps_when_package_json_exists(
+        self, mock_run, _mock_which, monkeypatch, capsys, tmp_path
+    ):
+        from hermes_cli import main as hm
+
+        (tmp_path / "package.json").write_text("{}")
+        (tmp_path / "web").mkdir()
+        (tmp_path / "web" / "package.json").write_text("{}")
+        (tmp_path / ".git").mkdir()
+        monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path)
+
+        # Checkout is current (0 commits)
+        mock_run.side_effect = _make_run_side_effect(branch="main", verify_ok=True, commit_count="0")
+
+        with patch.object(hm, "_venv_core_imports_healthy", return_value=(True, "")), \
+             patch.object(hm, "_update_node_dependencies", return_value=[]) as mock_node, \
+             patch.object(hm, "_build_web_ui", return_value=True) as mock_web:
+            cmd_update(SimpleNamespace())
+
+        mock_node.assert_called_once()
+        mock_web.assert_called_once()
+        out = capsys.readouterr().out
+        assert "Already up to date!" in out
+
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
+    def test_already_up_to_date_warns_on_node_failure(
+        self, mock_run, _mock_which, monkeypatch, capsys, tmp_path
+    ):
+        from hermes_cli import main as hm
+
+        (tmp_path / "package.json").write_text("{}")
+        (tmp_path / ".git").mkdir()
+        monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path)
+
+        mock_run.side_effect = _make_run_side_effect(branch="main", verify_ok=True, commit_count="0")
+
+        with patch.object(hm, "_venv_core_imports_healthy", return_value=(True, "")), \
+             patch.object(hm, "_update_node_dependencies", return_value=["repo root"]) as mock_node, \
+             patch.object(hm, "_build_web_ui", return_value=True):
+            cmd_update(SimpleNamespace())
+
+        mock_node.assert_called_once()
+        out = capsys.readouterr().out
+        assert "Already up to date!" in out
+        assert "Node.js dependencies are stale" in out
+
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
+    def test_already_up_to_date_skips_node_when_no_package_json(
+        self, mock_run, _mock_which, monkeypatch, capsys, tmp_path
+    ):
+        from hermes_cli import main as hm
+
+        # No package.json — no Node deps to refresh.
+        (tmp_path / ".git").mkdir()
+        monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path)
+
+        mock_run.side_effect = _make_run_side_effect(branch="main", verify_ok=True, commit_count="0")
+
+        with patch.object(hm, "_venv_core_imports_healthy", return_value=(True, "")), \
+             patch.object(hm, "_update_node_dependencies", return_value=[]) as mock_node, \
+             patch.object(hm, "_build_web_ui", return_value=True) as mock_web:
+            cmd_update(SimpleNamespace())
+
+        mock_node.assert_not_called()
+        mock_web.assert_not_called()
+        out = capsys.readouterr().out
+        assert "Already up to date!" in out
