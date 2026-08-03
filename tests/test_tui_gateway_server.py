@@ -11675,6 +11675,11 @@ def test_model_save_key_uses_credential_lifecycle_and_picker_context(monkeypatch
         "name": "Test Provider",
         "models": ["test-model"],
         "total_models": 1,
+        # A real build_models_payload(picker_hints=True) call always sets
+        # this via _apply_picker_hints; the mock below bypasses that, so it
+        # must supply the field itself (RAH-04: model.save_key no longer
+        # force-overwrites whatever the real inventory computed).
+        "authenticated": True,
     }
     server._sessions["save-key-session"] = _session(agent=agent)
     monkeypatch.setattr(
@@ -11721,6 +11726,55 @@ def test_model_save_key_uses_credential_lifecycle_and_picker_context(monkeypatch
         picker_hints=True,
         max_models=50,
     )
+
+
+def test_model_save_key_does_not_force_authenticated_when_inventory_says_false(
+    monkeypatch,
+):
+    """RAH-04: a saved key that the rebuilt inventory still treats as an
+    unauthenticated skeleton row (e.g. the model-list probe failed) must be
+    reported that way, not silently upgraded to authenticated=True."""
+    env_var = "TEST_PROVIDER_API_KEY"
+    agent = object()
+    provider = {
+        "slug": "test-provider",
+        "name": "Test Provider",
+        "models": [],
+        "total_models": 0,
+        "authenticated": False,
+    }
+    server._sessions["save-key-session-2"] = _session(agent=agent)
+    monkeypatch.setattr(
+        "hermes_cli.auth.PROVIDER_REGISTRY",
+        {
+            "test-provider": types.SimpleNamespace(
+                name="Test Provider",
+                auth_type="api_key",
+                api_key_env_vars=(env_var,),
+            )
+        },
+    )
+    monkeypatch.setattr("hermes_cli.config.is_managed", lambda: False)
+    monkeypatch.setattr(
+        "hermes_cli.credential_lifecycle.save_provider_env_credential", Mock()
+    )
+    monkeypatch.setattr(server, "_model_picker_context", Mock(return_value=object()))
+    monkeypatch.setattr(
+        "hermes_cli.inventory.build_models_payload",
+        Mock(return_value={"providers": [provider]}),
+    )
+
+    resp = server._methods["model.save_key"](
+        104,
+        {
+            "slug": "test-provider",
+            "api_key": "some-key",
+            "session_id": "save-key-session-2",
+        },
+    )
+
+    assert "result" in resp, resp
+    assert resp["result"]["provider"]["authenticated"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -14227,7 +14281,21 @@ def test_close_sessions_for_transport_skips_session_reattached_mid_teardown(monk
     """Regression for the disconnect/reconnect race: if session.resume rebinds
     a session onto a new (live) transport between the ownership snapshot and
     this function's per-session claim, the old transport's teardown must not
-    close it or stomp its transport back to the detached sentinel."""
+    close it or stomp its transport back to the detached sentinel.
+
+    Unlike a naive version of this test that starts both sessions already on
+    ``new_transport`` (which never even enters ``owned_sids`` and exercises
+    nothing beyond the initial filter), this drives the actual interleaving
+    the fix revalidates against: the session starts on ``old_transport`` so
+    the snapshot captures it, and the reattach happens strictly between that
+    snapshot and this function's per-sid claim under ``_session_resume_lock``
+    — the exact TOCTOU window closed by the WS disconnect/reconnect fix. A
+    ``_RaceLock`` stand-in for the module's real resume lock performs the
+    reattach the first time the loop acquires it, modeling session.resume
+    winning the lock race before teardown's revalidation runs. Against the
+    pre-fix implementation (no per-sid lock/revalidation at all) the injected
+    mutation never fires and the session is torn down/stomped regardless —
+    this test fails there and passes only once the race window is closed."""
     seen = []
     monkeypatch.setattr(
         server, "_teardown_popped_session",
@@ -14237,22 +14305,41 @@ def test_close_sessions_for_transport_skips_session_reattached_mid_teardown(monk
     old_transport = object()
     new_transport = object()
     server._sessions.clear()
-    # "reattached" simulates session.resume's warm-reuse winning the race and
-    # rebinding the transport (under _session_resume_lock) before this
-    # function's snapshot is acted on.
-    server._sessions["reattached"] = {"transport": new_transport, "close_on_disconnect": True}
-    server._sessions["detached-reattached"] = {
-        "transport": new_transport, "close_on_disconnect": False,
-    }
+    server._sessions["x"] = {"transport": old_transport, "close_on_disconnect": True}
+
+    real_resume_lock = server._session_resume_lock
+
+    class _RaceLock:
+        """Wraps the real resume lock. The first acquire simulates
+        session.resume winning the race: it rebinds "x" onto new_transport
+        right after the snapshot above already captured it as owned by
+        old_transport, but before this function's own per-sid claim (which
+        also needs this lock) gets to revalidate."""
+
+        def __init__(self):
+            self._fired = False
+
+        def __enter__(self):
+            real_resume_lock.acquire()
+            if not self._fired:
+                self._fired = True
+                with server._sessions_lock:
+                    server._sessions["x"]["transport"] = new_transport
+            return self
+
+        def __exit__(self, *exc_info):
+            real_resume_lock.release()
+            return False
+
+    monkeypatch.setattr(server, "_session_resume_lock", _RaceLock())
     try:
         reaped, detached = server._close_sessions_for_transport(
             old_transport, end_reason="ws_disconnect"
         )
         assert reaped == 0 and detached == 0
-        assert seen == []
-        assert "reattached" in server._sessions  # not closed
-        assert server._sessions["reattached"]["transport"] is new_transport
-        assert server._sessions["detached-reattached"]["transport"] is new_transport  # untouched
+        assert seen == []  # teardown must not have claimed the reattached session
+        assert "x" in server._sessions  # not closed
+        assert server._sessions["x"]["transport"] is new_transport  # not stomped back
     finally:
         server._sessions.clear()
 
