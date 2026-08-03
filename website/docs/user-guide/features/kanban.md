@@ -733,6 +733,10 @@ hermes kanban unlink <parent_id> <child_id>
 hermes kanban claim <id> [--ttl SECONDS]
 hermes kanban comment <id> "<text>" [--author NAME]
 
+hermes kanban release <id> --note "<measurement>"      # operator gate: release a product card
+        [--metadata '{"pull_request": "..."}']         # from release_measure (integrates the
+        [--released-by NAME]                           # reviewed candidate, then finishes it)
+
 # Bulk verbs — accept multiple ids:
 hermes kanban complete <id>... [--result "..."]
 hermes kanban block <id> "<reason>" [--ids <id>...]

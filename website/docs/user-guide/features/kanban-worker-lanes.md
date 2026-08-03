@@ -58,13 +58,15 @@ The kanban kernel enforces that exactly one of these terminates each run. A work
 
 ## Outputs and the review-required convention
 
-For most code-changing tasks, the work isn't truly *done* the moment the worker finishes — it needs a human reviewer. The kanban kernel doesn't enforce this distinction (a "code-changing task" is fuzzy and forcing block-instead-of-complete on every code worker would break flows where no review is wanted). It's a convention layered on top:
+This convention applies **outside the product workflow only** — on default and legacy boards. On a product board, Development ends with `kanban_complete`: that completion is what commits the candidate SHA the downstream Test and Review steps read, and Review is the approval gate. A product Development worker that blocks with `review-required` instead of completing leaves Test and Review with no candidate to consume and the card deadlocks (2026-08-02 incident).
+
+For most code-changing tasks on a non-product board, the work isn't truly *done* the moment the worker finishes — it needs a human reviewer. The kanban kernel doesn't enforce this distinction (a "code-changing task" is fuzzy and forcing block-instead-of-complete on every code worker would break flows where no review is wanted). It's a convention layered on top:
 
 - **Block instead of complete**, with `reason` prefixed `review-required: ` so the dashboard / `hermes kanban show` surfaces the row as awaiting review.
 - **Drop structured metadata into a `kanban_comment` first** since `kanban_block` only carries the human-readable `reason`. Comments are the durable annotation channel — every audit-relevant field (changed_files, tests_run, diff_path or PR url, decisions) belongs there.
 - **Reviewer either approves and unblocks**, which respawns the worker with the comment thread for follow-ups; or asks for changes via another comment, which the next worker run sees as part of `kanban_show`'s context.
 
-The injected `KANBAN_GUIDANCE` covers both `kanban_complete` (truly terminal tasks — typo fixes, docs changes, research writeups) and the `review-required` block pattern.
+The injected `KANBAN_GUIDANCE` describes one lifecycle per board kind: product workflow Development ends with `kanban_complete` (commit-first — Hermes commits the diff and Test/Review consume that candidate), while non-product boards use `kanban_complete` for truly terminal tasks (typo fixes, docs changes, research writeups) and the `review-required` block pattern for code that still needs human eyes.
 
 ## Logs and audit trail
 

@@ -2320,6 +2320,42 @@ def has_unresolved_product_preflight(
     return _latest_unresolved_product_preflight(conn, task_id) is not None
 
 
+#: The privileged repair profile. Not an ordinary worker: ``_default_spawn``
+#: pins it to exactly ``resolver_readonly`` and ``_check_ordinary_worker_mode``
+#: withholds every ordinary lifecycle exit from it.
+RESOLVER_PROFILE = "resolver"
+
+
+def resolver_routing_error(
+    conn: sqlite3.Connection,
+    task_id: str,
+    assignee: Optional[str],
+) -> Optional[str]:
+    """Diagnose an incompatible task -> Resolver routing; ``None`` when valid.
+
+    Resolver's only mutation is ``kanban_resolve``, which applies to an
+    unresolved product preflight. Routed to a card without one it holds no
+    lifecycle exit at all — not ``kanban_complete``, ``kanban_block``,
+    attachments, creation, or linking — so the worker runs, finds nothing
+    that can end its run, and the card deadlocks (2026-08-02 default-board
+    incident: four goal cards assigned to ``resolver`` by hand).
+
+    The rejection names the contract rather than letting the run fail later
+    as "the worker never called kanban_complete".
+    """
+    if _canonical_assignee(assignee) != RESOLVER_PROFILE:
+        return None
+    if has_unresolved_product_preflight(conn, task_id):
+        return None
+    return (
+        f"routing: task {task_id} has no unresolved product preflight, so it "
+        f"cannot be assigned to the privileged '{RESOLVER_PROFILE}' profile. "
+        "Resolver runs read-only (resolver_readonly) and its only mutation is "
+        "kanban_resolve; it has no kanban_complete/kanban_block exit. Assign an "
+        "ordinary worker profile instead."
+    )
+
+
 def _complete_product_workflow_step(
     conn: sqlite3.Connection,
     task_id: str,
@@ -7676,6 +7712,17 @@ def create_task(
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
     assignee = _canonical_assignee(assignee)
+    if assignee == RESOLVER_PROFILE:
+        # A card being created has no preflight yet, so this routing can
+        # never be valid. Resolver reaches a card only by displacement from
+        # an ordinary worker's product preflight, never by authorship.
+        raise ValueError(
+            f"a new task cannot be assigned to the privileged "
+            f"'{RESOLVER_PROFILE}' profile: Resolver only resolves an "
+            "unresolved product preflight on an existing card, and holds no "
+            "kanban_complete/kanban_block exit of its own. Assign an ordinary "
+            "worker profile instead."
+        )
     if not title or not title.strip():
         raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:
@@ -8281,6 +8328,9 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
                 f"cannot reassign {task_id}: currently running (claimed). "
                 "Wait for completion or reclaim the stale lock first."
             )
+        routing_error = resolver_routing_error(conn, task_id, profile)
+        if routing_error is not None:
+            raise ValueError(routing_error)
         if row["assignee"] != profile:
             # The retry guard is scoped to the task/profile combination. A
             # human reassigning the task is an explicit recovery action, so the
@@ -12278,26 +12328,35 @@ def epic_branch_for(epic_id: str) -> str:
 
 def _ensure_epic_branch(repo_root: Path, epic_branch: str) -> None:
     """Create ``epic_branch`` off the repo's current ``HEAD`` if it doesn't
-    already exist. Idempotent; a no-op when the branch is already there.
+    already exist. Idempotent; a no-op when the branch is already there, so
+    sibling story materialization never moves an epic base that is already
+    correct.
 
-    Defensive subprocess idiom (mirrors ``_git_branch_exists`` et al.): any
-    failure is swallowed here rather than raised. If branch creation
-    genuinely failed, the caller's subsequent ``_ensure_git_worktree(...,
-    base=epic_branch)`` will fail loudly (missing base ref) and that error
-    surfaces through the normal worktree-creation failure path instead.
+    Raises when the branch still does not exist afterwards. The epic base is
+    a precondition of the story worktree that branches off it and of the
+    Review target preparation that later runs ``git merge-base`` against it —
+    a story ref materialized without it looks healthy and fails much later,
+    off-site (2026-07-30 epic ``t_c29de776``: Review runs 531/532 died before
+    reviewer spawn and an operator had to create the ref by hand).
     """
     if _git_branch_exists(repo_root, epic_branch):
         return
     try:
-        subprocess.run(
+        result = subprocess.run(
             ["git", "-C", str(repo_root), "branch", epic_branch, "HEAD"],
             capture_output=True,
             text=True,
             timeout=30,
             check=False,
         )
-    except Exception:
-        pass
+        error = (result.stderr or result.stdout or "").strip()
+    except Exception as exc:  # timeout / OS-level failure
+        error = str(exc)
+    if not _git_branch_exists(repo_root, epic_branch):
+        raise RuntimeError(
+            f"could not create epic base branch {epic_branch} in {repo_root}"
+            + (f": {error}" if error else "")
+        )
 
 
 def _story_base_branch(
@@ -12482,14 +12541,25 @@ def _resolve_worktree_workspace(
     launched from, e.g. the Hermes checkout). If no anchor is configured
     anywhere, we fail loudly rather than guess.
 
-    ``base_branch`` (v2 only; ``None`` for every live dispatch call site today)
-    is the ref a brand-new worktree branch should be created from -- e.g. an
-    epic's integration branch, so a story's worktree contains a previously-
-    integrated sibling story's code. ``None`` preserves legacy behavior
-    (branch off ``HEAD``). When set, the epic branch is created first (off the
-    repo's current ``HEAD``) if it doesn't exist yet.
+    ``base_branch`` is the ref a brand-new worktree branch should be created
+    from -- e.g. an epic's integration branch, so a story's worktree contains a
+    previously-integrated sibling story's code. When set, the epic branch is
+    created first (off the repo's current ``HEAD``) if it doesn't exist yet.
+
+    Callers do not have to supply it: when ``conn`` is available and
+    ``base_branch`` is omitted it is derived here via
+    :func:`_story_base_branch`, which returns ``None`` (legacy behavior, branch
+    off ``HEAD``) for anything that is not a handoff_v2 story with explicit
+    Epic membership. Deriving it at this single shared seam is deliberate --
+    only ``_spawn_one_v2`` used to pass it, so a story dispatched by the ready
+    loop, the review loop, or any other ``resolve_workspace`` caller
+    materialized with its epic base missing and Review target preparation then
+    failed on an unresolvable ``git merge-base`` (2026-07-30 epic
+    ``t_c29de776``).
     """
     branch_name = (task.branch_name or "").strip() or f"wt/{task.id}"
+    if base_branch is None and conn is not None:
+        base_branch = _story_base_branch(conn, task.id, board=board)
     base = base_branch or "HEAD"
     if not task.workspace_path:
         # Anchor on the board's configured default_workdir, not Path.cwd().
@@ -12543,7 +12613,14 @@ def _resolve_worktree_workspace(
             _assert_worktree_has_no_other_running_consumer(
                 conn, task.id, requested
             )
-            _provision_node_dependencies(_primary_checkout_root(requested), requested)
+            primary_root = _primary_checkout_root(requested)
+            if base_branch is not None:
+                # Reuse path: the worktree already exists, but the epic base
+                # it is measured against may not (that is exactly the state
+                # the incident left behind). Idempotent — an existing epic
+                # branch is never moved.
+                _ensure_epic_branch(primary_root, base_branch)
+            _provision_node_dependencies(primary_root, requested)
             return requested_resolved, actual_branch
         # The requested path is an existing checkout of a DIFFERENT
         # task's branch. Decompose children inherit the root's
@@ -12556,11 +12633,13 @@ def _resolve_worktree_workspace(
         if fallback_root is not None:
             fallback = fallback_root / ".worktrees" / task.id
             if fallback.resolve(strict=False) != requested_resolved:
+                if base_branch is not None:
+                    _ensure_epic_branch(fallback_root, base_branch)
                 _materialize_worktree_with_dependencies(
                     fallback_root,
                     fallback,
                     branch_name,
-                    base="HEAD",
+                    base=base,
                     conn=conn,
                     task_id=task.id,
                 )
@@ -14824,6 +14903,13 @@ def _spawn_one_v2(
         # Already claimed (or no longer ready) -- the CAS fire-once
         # guarantee: nothing to do on this or any later pass.
         return None
+    routing_error = resolver_routing_error(conn, claimed.id, claimed.assignee)
+    if routing_error is not None:
+        # Deterministic contract violation: a retry cannot change it, so
+        # block on the first occurrence with the diagnostic rather than
+        # spawning a worker that has no way to end its own run.
+        _record_spawn_failure(conn, claimed.id, routing_error, failure_limit=1)
+        return None
     try:
         _stamp_run_executor_identity(conn, claimed)
     except WorkerRuntimeIdentityError as exc:
@@ -17086,6 +17172,16 @@ def _dispatch_once_locked(
         claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
             continue
+        routing_error = resolver_routing_error(conn, claimed.id, claimed.assignee)
+        if routing_error is not None:
+            # See _spawn_one_v2: an ordinary card routed to the privileged
+            # Resolver has no lifecycle exit, so block it now with the
+            # contract diagnostic instead of deadlocking a worker.
+            if _record_spawn_failure(
+                conn, claimed.id, routing_error, failure_limit=1
+            ):
+                result.auto_blocked.append(claimed.id)
+            continue
         try:
             _stamp_run_executor_identity(conn, claimed)
         except WorkerRuntimeIdentityError as exc:
@@ -17194,6 +17290,15 @@ def _dispatch_once_locked(
             continue
         claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
+            continue
+        routing_error = resolver_routing_error(conn, claimed.id, claimed.assignee)
+        if routing_error is not None:
+            # Same contract as the ready loop — every dispatch path refuses
+            # an ordinary card routed to the privileged Resolver.
+            if _record_spawn_failure(
+                conn, claimed.id, routing_error, failure_limit=1
+            ):
+                result.auto_blocked.append(claimed.id)
             continue
         try:
             _stamp_run_executor_identity(conn, claimed)

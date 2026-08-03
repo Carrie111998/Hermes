@@ -960,6 +960,93 @@ def _full_tables_state(conn) -> dict:
     }
 
 
+def test_create_task_refuses_resolver_assignee(kanban_home):
+    """A card cannot be authored into the privileged Resolver lane.
+
+    A brand-new card has no preflight, so the Resolver it would spawn
+    would hold `resolver_readonly` and no lifecycle exit at all.
+    """
+    with kb.connect() as conn:
+        with pytest.raises(ValueError, match="resolver"):
+            kb.create_task(conn, title="Ordinary goal", assignee="resolver")
+        assert kb.list_tasks(conn) == []
+
+
+def test_assign_task_refuses_resolver_without_unresolved_preflight(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="Ordinary goal", assignee="developer")
+        with pytest.raises(ValueError, match="resolver"):
+            kb.assign_task(conn, tid, "resolver")
+        task = kb.get_task(conn, tid)
+    assert task is not None and task.assignee == "developer"
+
+
+def test_assign_task_allows_resolver_on_unresolved_preflight(kanban_home):
+    """The valid path: a product card already displaced to a preflight."""
+    board = "resolver-assign-valid"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        tid, _run_id = _route_task_to_resolver(conn, board)
+        assert kb.has_unresolved_product_preflight(conn, tid)
+        conn.execute(
+            "UPDATE tasks SET claim_lock=NULL, status='ready' WHERE id=?", (tid,)
+        )
+        conn.commit()
+        assert kb.assign_task(conn, tid, "resolver")
+        task = kb.get_task(conn, tid)
+    assert task is not None and task.assignee == "resolver"
+
+
+def test_dispatch_refuses_resolver_routing_for_ordinary_task(
+    kanban_home, all_assignees_spawnable
+):
+    """The 2026-08-02 deadlock: an ordinary goal card assigned to
+    ``resolver`` spawned a worker with no lifecycle exit and hung."""
+    spawned_ids = []
+
+    def fake_spawn(task, workspace):
+        spawned_ids.append(task.id)
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="Ordinary goal", assignee="developer")
+        # Bypass the routing guard the way the incident's cards got there.
+        conn.execute("UPDATE tasks SET assignee='resolver' WHERE id=?", (tid,))
+        conn.commit()
+        res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+        task = kb.get_task(conn, tid)
+        error = conn.execute(
+            "SELECT last_failure_error FROM tasks WHERE id=?", (tid,)
+        ).fetchone()[0]
+
+    assert tid not in spawned_ids
+    assert task is not None and task.status == "blocked"
+    assert "resolver" in (error or "")
+    assert "preflight" in (error or "")
+
+
+def test_dispatch_allows_resolver_on_unresolved_preflight(
+    kanban_home, all_assignees_spawnable
+):
+    board = "resolver-dispatch-valid"
+    _v2_product_board(board)
+    spawned_ids = []
+
+    def fake_spawn(task, workspace):
+        spawned_ids.append(task.id)
+
+    with kb.connect(board=board) as conn:
+        tid, _run_id = _route_task_to_resolver(conn, board)
+        conn.execute(
+            "UPDATE tasks SET claim_lock=NULL, claim_expires=NULL, "
+            "current_run_id=NULL, status='ready', running=0 WHERE id=?",
+            (tid,),
+        )
+        conn.commit()
+        kb.dispatch_once(conn, spawn_fn=fake_spawn, board=board)
+
+    assert spawned_ids == [tid]
+
+
 def test_complete_task_refuses_unresolved_preflight_without_mutation(kanban_home):
     board = "resolver-complete-refusal"
     _v2_product_board(board)
