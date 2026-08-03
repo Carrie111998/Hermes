@@ -65,11 +65,18 @@ class CuaFleetConfig:
     timeout: int = 60
     ready_timeout: float = 600
     request_timeout: float = 30
+    bind_deadline: int | None = None
 
     def __post_init__(self) -> None:
         replicas = self.spec.get("replicas")
         if isinstance(replicas, bool) or not isinstance(replicas, int) or replicas < 1:
             raise ValueError("spec.replicas must be a positive integer")
+        if self.bind_deadline is not None and (
+            isinstance(self.bind_deadline, bool)
+            or not isinstance(self.bind_deadline, int)
+            or self.bind_deadline < 1
+        ):
+            raise ValueError("bind_deadline must be a positive integer or None")
 
     @property
     def replicas(self) -> int:
@@ -446,7 +453,13 @@ class CuaFleetDesktopProvider:
                     sandbox_api.Pool.reconcile(request),
                     self.config.request_timeout,
                 )
-            claim_context = pool.claim()
+            claim_spec = sandbox_api.ClaimSpec(
+                sandbox_template_ref=sandbox_api.SandboxTemplateRef(name=pool.name),
+                warmpool=None,
+                bind_deadline=self.config.bind_deadline,
+                lifecycle=None,
+            )
+            claim_context = pool.claim(spec=claim_spec)
             sandbox = worker.run(claim_context.__aenter__(), self.config.ready_timeout)
             entered_claim = True
         except BaseException:

@@ -352,8 +352,10 @@ class _FakePool:
     def __init__(self):
         self.name = "hermes-desktop"
         self.claim_contexts: list[_FakeClaimContext] = []
+        self.claim_specs: list[object | None] = []
 
-    def claim(self):
+    def claim(self, *, spec=None):
+        self.claim_specs.append(spec)
         context = _FakeClaimContext(_FakeSandbox())
         self.claim_contexts.append(context)
         return context
@@ -442,13 +444,28 @@ class _FakeCreatePoolRequest:
         self.spec = spec
 
 
+class _FakeSandboxTemplateRef:
+    def __init__(self, *, name: str):
+        self.name = name
+
+
+class _FakeClaimSpec:
+    def __init__(self, *, sandbox_template_ref, warmpool, bind_deadline, lifecycle):
+        self.sandbox_template_ref = sandbox_template_ref
+        self.warmpool = warmpool
+        self.bind_deadline = bind_deadline
+        self.lifecycle = lifecycle
+
+
 class _FakeSandboxApi:
     configure_calls: list[dict[str, str]] = []
     reconcile_requests: list[_FakeCreatePoolRequest] = []
     pool = _FakePool()
     CreatePoolRequest = _FakeCreatePoolRequest
+    ClaimSpec = _FakeClaimSpec
     PoolSpec = _FakePoolSpec
     PoolTemplate = _FakePoolTemplate
+    SandboxTemplateRef = _FakeSandboxTemplateRef
     SandboxService = _FakeSandboxService
     ServiceProtocol = _FakeServiceProtocol
     Firmware = _FakeFirmware
@@ -468,6 +485,7 @@ class _FakeSandboxApi:
         @classmethod
         async def reconcile(cls, request):
             _FakeSandboxApi.reconcile_requests.append(request)
+            _FakeSandboxApi.pool.name = request.namespace
             return _FakeSandboxApi.pool
 
 
@@ -592,6 +610,31 @@ def test_cua_fleet_passes_native_pool_request_fields_to_reconcile() -> None:
     provider.release(lease)
 
 
+def test_cua_fleet_passes_configured_bind_deadline_to_public_claim_spec() -> None:
+    _FakeSandboxApi.reset()
+    provider = CuaFleetDesktopProvider(
+        CuaFleetConfig(
+            client_id="ukey-test",
+            client_secret="secret",
+            pool="hermes-cua-pool",
+            spec=_pool_spec(),
+            bind_deadline=900,
+        ),
+        sandbox_module=_FakeSandboxApi,
+    )
+
+    lease = provider.acquire("task-bind-deadline")
+
+    claim_spec = _FakeSandboxApi.pool.claim_specs[0]
+    assert isinstance(claim_spec, _FakeClaimSpec)
+    assert claim_spec.sandbox_template_ref.name == "hermes-cua-pool"
+    assert claim_spec.warmpool is None
+    assert claim_spec.bind_deadline == 900
+    assert claim_spec.lifecycle is None
+
+    provider.release(lease)
+
+
 def test_cua_fleet_environment_routes_terminal_through_named_server_service() -> None:
     provider = _fleet_provider()
     lease = provider.acquire("task-2")
@@ -694,7 +737,7 @@ def test_cua_fleet_terminal_parses_sse_command_response() -> None:
 def test_cua_fleet_sandbox_package_is_lazy_installable() -> None:
     from tools.lazy_deps import LAZY_DEPS
 
-    assert LAZY_DEPS["terminal.cua_fleet"] == ("cua-sandbox==0.1.23",)
+    assert LAZY_DEPS["terminal.cua_fleet"] == ("cua-sandbox==0.1.24",)
 
 
 def test_desktop_terminal_reuses_existing_task_lease_without_incrementing(monkeypatch):
@@ -722,7 +765,7 @@ def test_desktop_terminal_reuses_existing_task_lease_without_incrementing(monkey
 def test_cua_fleet_provider_uses_public_sandbox_facade() -> None:
     from tools.lazy_deps import LAZY_DEPS
 
-    assert LAZY_DEPS["terminal.cua_fleet"] == ("cua-sandbox==0.1.23",)
+    assert LAZY_DEPS["terminal.cua_fleet"] == ("cua-sandbox==0.1.24",)
 
 
 def test_cua_fleet_nix_build_declares_evdev_build_system() -> None:
