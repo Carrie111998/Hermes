@@ -392,10 +392,29 @@ def check_gateway_lifecycle(
     surfaces this as a tool error; the CLI prints it in red and exits 1).
     """
     combined = prompt or ""
+    is_python = False
     if script:
+        is_python = Path(script).expanduser().suffix == ".py"
         script_text = _read_script_for_scanning(script)
         if script_text:
             combined = f"{combined}\n{script_text}"
+
+    # For Python scripts, skip the shell-script reference walk.
+    # Python files are executed by the interpreter, never through a POSIX
+    # shell, so shell-reference analysis produces false positives (e.g.
+    # pathlib's ``/`` operator is misinterpreted as a path separator).
+    # The direct command regex scan still catches actual lifecycle commands
+    # like ``hermes gateway restart`` written in the script text.
+    if is_python:
+        if contains_gateway_lifecycle_command(combined):
+            raise GatewayLifecycleBlocked(
+                "Blocked: cron job contains a gateway lifecycle command or persistent "
+                "launchctl submit operation. This is blocked to prevent agent-driven "
+                "SIGTERM-respawn loops under launchd/systemd supervision "
+                "(#30719). Run `hermes gateway restart` from a shell outside "
+                "the running gateway instead."
+            )
+        return
 
     script_dir = _resolve_script_directory(script) if script else None
     if contains_gateway_lifecycle_command_or_referenced_script(
