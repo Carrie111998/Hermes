@@ -42,9 +42,7 @@ Acceptance criteria:
 Test command: <exact command to verify the work, e.g. python -m pytest tests/ -q>
 Relevant files: <list any key files the subagent should read first>
 """,
-    toolsets=["terminal", "file", "code_intel", "memory", "web"],
     skills=["delegate-task-guide", "read-write-safety"],
-    profile="code-worker",
 )
 ```
 

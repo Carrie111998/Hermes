@@ -3063,10 +3063,42 @@ def delegate_task(
         # Per-task role beats top-level; normalise again so unknown
         # per-task values warn and degrade to leaf uniformly.
         effective_role = _normalize_role(t.get("role") or top_role)
+
+        # Per-task skills: merge top-level skills with task-specific skills.
+        # Task skills are loaded and prepended to the task's context (same
+        # pattern as single-task mode above).
+        task_context = t.get("context")
+        task_skills = t.get("skills", [])
+        merged_skill_names = list(skill_names)  # Copy top-level skills
+        if task_skills:
+            if isinstance(task_skills, str):
+                merged_skill_names.append(task_skills)
+            elif isinstance(task_skills, list):
+                merged_skill_names.extend([str(s).strip() for s in task_skills if str(s).strip()])
+
+        if merged_skill_names:
+            try:
+                task_skills_content = _load_skills_into_context(
+                    merged_skill_names,
+                    caller_label=f"delegate_task(task[{i}])",
+                )
+            except Exception as exc:
+                logger.warning(
+                    "delegate_task(task[%d]): skill loading failed, proceeding without skills: %s",
+                    i, exc
+                )
+                task_skills_content = ""
+            if task_skills_content:
+                # Prepend skill content to the task's context.
+                if task_context and task_context.strip():
+                    task_context = task_skills_content + "\n\n" + task_context
+                else:
+                    task_context = task_skills_content
+
         child = _build_child_preserving_parent_tools(
             task_index=i,
             goal=t["goal"],
-            context=t.get("context"),
+            context=task_context,
             # Subagents always inherit the parent's toolsets; the model
             # cannot choose or narrow them (no model-facing toolsets arg).
             toolsets=None,

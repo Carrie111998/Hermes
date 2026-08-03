@@ -40,9 +40,7 @@ Output format: <what to produce — e.g. bullet list, comparison table, draft do
 Constraints: <anything to avoid or prefer — e.g. "do not modify any files">
 Relevant starting points: <key files, entry points, or URLs to read first>
 """,
-    toolsets=["terminal", "file", "web", "code_intel"],
     skills=["delegate-task-guide"],
-    profile="knowledge-worker",
 )
 ```
 
