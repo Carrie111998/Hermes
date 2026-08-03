@@ -736,6 +736,58 @@ class TestLifecycleGuardModule:
         )
         assert result is False
 
+    def test_nul_byte_in_command_token_does_not_crash_guard(self):
+        """#77988: a NUL byte in a command token / path string (as opposed
+        to a NUL byte in a file's content, #76762) must not crash the guard
+        with ``ValueError: embedded null byte``.
+
+        Before the fix, unguarded ``Path()``/``os.open()`` calls on the raw
+        token raised ValueError on every terminal-tool invocation once a NUL
+        byte appeared in a command token, taking down completely benign
+        commands. NUL-laden tokens are not path-like; treat them as
+        "nothing to scan".
+        """
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+        # Exact repro from the issue: NUL in a script-path argument.
+        assert contains_gateway_lifecycle_command_or_referenced_script(
+            "bash \x00engine/scripts/portfolio_report.py --date 2026-08-03"
+        ) is False
+        # NUL inside a -c payload token.
+        assert contains_gateway_lifecycle_command_or_referenced_script(
+            'bash -c "echo \x00hi"'
+        ) is False
+        # NUL inside a referenced .sh path token.
+        assert contains_gateway_lifecycle_command_or_referenced_script(
+            "bash ./we\x00ird.sh"
+        ) is False
+
+    def test_nul_byte_in_launchctl_token_does_not_crash_guard(self):
+        """#77988: the label-independent launchctl submit check tolerates a
+        NUL byte in the executable token the same way."""
+        from cron.lifecycle_guard import contains_launchctl_submit_command
+        assert contains_launchctl_submit_command(
+            "launchctl \x00submit -l ai.hermes.svc -- /bin/echo hi"
+        ) is False
+
+    def test_nul_byte_tolerance_does_not_weaken_guard(self):
+        """#77988: treating NUL-laden tokens as "nothing to scan" must not
+        weaken the guard — real lifecycle commands are still blocked."""
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+            contains_launchctl_submit_command,
+        )
+        assert contains_gateway_lifecycle_command_or_referenced_script(
+            "hermes gateway restart"
+        ) is True
+        assert contains_launchctl_submit_command(
+            "launchctl submit -l ai.hermes.svc-reload-tmp -- /bin/echo hi"
+        ) is True
+        assert contains_gateway_lifecycle_command_or_referenced_script(
+            "ls -la /tmp"
+        ) is False
+
     def test_shell_script_reference_walk_still_works(self, tmp_path):
         """The referenced-script walk still applies to real shell scripts:
         a .sh script that itself invokes a lifecycle command is caught."""

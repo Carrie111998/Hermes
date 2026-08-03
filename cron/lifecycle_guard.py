@@ -149,6 +149,20 @@ def _command_token_index(segment: list[str]) -> Optional[int]:
     return None
 
 
+def _safe_path_name(token: str) -> Optional[str]:
+    """Like ``Path(token).name`` but returns ``None`` instead of raising.
+
+    A command token can contain a character pathlib rejects (e.g. an
+    embedded NUL byte) without being path-like at all — a guarded path
+    must never crash the guard (mirrors the #76762 fix for binary script
+    content).
+    """
+    try:
+        return Path(token).name
+    except ValueError:
+        return None
+
+
 def contains_launchctl_submit_command(command: str) -> bool:
     """Detect an executed ``launchctl submit``/``bootstrap``, not quoted text.
 
@@ -163,17 +177,25 @@ def contains_launchctl_submit_command(command: str) -> bool:
         index = _command_token_index(segment)
         if index is None:
             continue
-        if Path(segment[index]).name == "launchctl":
+        if _safe_path_name(segment[index]) == "launchctl":
             arguments = segment[index + 1 :]
             if arguments and arguments[0].lower() in {"submit", "bootstrap"}:
                 return True
     return False
 
 
-def _resolve_terminal_script_path(candidate: str, cwd: Optional[str]) -> Path:
-    path = Path(candidate).expanduser()
-    if not path.is_absolute():
-        path = Path(cwd or Path.cwd()) / path
+def _resolve_terminal_script_path(
+    candidate: str, cwd: Optional[str]
+) -> Optional[Path]:
+    try:
+        path = Path(candidate).expanduser()
+        if not path.is_absolute():
+            path = Path(cwd or Path.cwd()) / path
+    except ValueError:
+        # Embedded NUL byte (or other pathlib-rejected character) in the
+        # candidate — treat as "nothing to scan" rather than crashing the
+        # guard (#77988).
+        return None
     return path
 
 
@@ -188,11 +210,13 @@ def _iter_referenced_shell_scripts(
         if index is None:
             continue
         executable = segment[index]
-        executable_name = Path(executable).name
+        executable_name = _safe_path_name(executable)
 
         if executable_name in {".", "source"}:
             if len(segment) > index + 1:
-                yield _resolve_terminal_script_path(segment[index + 1], cwd)
+                resolved = _resolve_terminal_script_path(segment[index + 1], cwd)
+                if resolved is not None:
+                    yield resolved
             continue
 
         if executable_name in _SHELL_EXECUTABLES:
@@ -216,7 +240,9 @@ def _iter_referenced_shell_scripts(
                 "-c",
                 "--command",
             }:
-                yield _resolve_terminal_script_path(arguments[arg_index], cwd)
+                resolved = _resolve_terminal_script_path(arguments[arg_index], cwd)
+                if resolved is not None:
+                    yield resolved
             continue
 
         # A bare "/" token is pathlib's division operator in Python sources
@@ -226,14 +252,16 @@ def _iter_referenced_shell_scripts(
         # (#77131). Skip pure-separator tokens.
         if executable.strip("/"):
             if "/" in executable or executable.endswith((".sh", ".bash", ".zsh")):
-                yield _resolve_terminal_script_path(executable, cwd)
+                resolved = _resolve_terminal_script_path(executable, cwd)
+                if resolved is not None:
+                    yield resolved
 
 
 def _iter_shell_command_payloads(command: str) -> Iterator[str]:
     """Yield code passed through ``sh|bash|... -c`` for recursive scanning."""
     for segment in _iter_command_segments(command):
         index = _command_token_index(segment)
-        if index is None or Path(segment[index]).name not in _SHELL_EXECUTABLES:
+        if index is None or _safe_path_name(segment[index]) not in _SHELL_EXECUTABLES:
             continue
         arguments = segment[index + 1 :]
         for arg_index, argument in enumerate(arguments[:-1]):
@@ -264,6 +292,11 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
         # tokenized into a bogus script path by the recursion (#77703). A
         # guarded read must never crash the guard, so treat either as
         # "nothing to scan" (mirrors the resolve() ValueError guard below).
+        return None, False
+    except ValueError:
+        # Embedded NUL byte in the path string itself, distinct from a
+        # NUL byte in the file's content (handled below) — treat as
+        # "nothing to scan" rather than crashing the guard (#77988).
         return None, False
     try:
         metadata = os.fstat(descriptor)
