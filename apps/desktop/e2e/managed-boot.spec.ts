@@ -8,16 +8,7 @@
 
 import { expect, test } from './test'
 
-import {
-  IS_MANAGED_EVAOS_AGENT,
-  type ManagedSignedOutFixture,
-  setupManagedSignedOut,
-} from './fixtures'
-
-test.skip(
-  !IS_MANAGED_EVAOS_AGENT,
-  'This contract applies only to the managed evaOS Agent product.',
-)
+import { type ManagedSignedOutFixture, setupManagedSignedOut } from './fixtures'
 
 let fixture: ManagedSignedOutFixture | null = null
 

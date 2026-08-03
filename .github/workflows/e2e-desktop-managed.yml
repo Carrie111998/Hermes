@@ -1,0 +1,88 @@
+name: Managed Desktop E2E
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2e-desktop-managed-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  e2e-managed:
+    name: Managed Playwright E2E (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install system dependencies for Electron
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            xvfb \
+            libgtk-3-0 libnotify4 libnss3 libxss1 libxtst6 \
+            xdg-utils libatspi2.0-0 libdrm2 libgbm1 libasound2t64
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 26
+          cache: npm
+
+      - name: Grab npm 12
+        run: npm i -g npm@12
+
+      - uses: ./.github/actions/retry
+        with:
+          # Electron's postinstall supplies the binary launched by Playwright.
+          command: npm ci
+
+      - name: Build and run managed Playwright specs
+        working-directory: apps/desktop
+        env:
+          CI: 'true'
+          OPENROUTER_API_KEY: ''
+          OPENAI_API_KEY: ''
+          NOUS_API_KEY: ''
+        run: |
+          npm run build
+          xvfb-run -a --server-args="-screen 0 1280x1024x24" \
+            npx playwright test e2e/managed-boot.spec.ts
+
+      - name: Require every managed scenario to execute
+        working-directory: apps/desktop
+        run: |
+          node -e '
+          const fs = require("node:fs");
+          const report = JSON.parse(fs.readFileSync("playwright-report/results.json", "utf8"));
+          const stats = report.stats || {};
+          const expected = Number(stats.expected || 0);
+          const skipped = Number(stats.skipped || 0);
+          const unexpected = Number(stats.unexpected || 0);
+          if (expected === 0 || skipped !== 0 || unexpected !== 0) {
+            console.error("::error::Managed E2E must execute every scenario (passed=" + expected + ", skipped=" + skipped + ", failed=" + unexpected + ").");
+            process.exit(1);
+          }
+          console.log("Managed E2E executed " + expected + " scenarios with no skips.");
+          '
+
+      - name: Upload managed Playwright report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: managed-playwright-report-${{ github.sha }}
+          path: apps/desktop/playwright-report
+          retention-days: 14
+          overwrite: true
+
+      - name: Upload managed test results
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: managed-playwright-test-results-${{ github.sha }}
+          path: apps/desktop/test-results
+          retention-days: 14
+          overwrite: true
+          if-no-files-found: ignore
