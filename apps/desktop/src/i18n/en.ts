@@ -591,6 +591,7 @@ export const en: Translations = {
       enabledTitle: 'Quick Entry',
       enabledDesc:
         'Summon a small composer from anywhere with a global shortcut and fire a prompt without opening Hermes.',
+      commandOrControl: 'Command or Control',
       shortcutTitle: 'Quick Entry shortcut',
       shortcutDesc: 'Needs at least one modifier, e.g. CommandOrControl+Shift+Space.',
       active: 'Shortcut is active.',

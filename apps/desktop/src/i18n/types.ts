@@ -488,6 +488,7 @@ export interface Translations {
     quickEntry: {
       enabledTitle: string
       enabledDesc: string
+      commandOrControl: string
       shortcutTitle: string
       shortcutDesc: string
       active: string
