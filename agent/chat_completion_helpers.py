@@ -33,9 +33,8 @@ from agent.error_classifier import FailoverReason
 from agent.errors import EmptyStreamError
 from agent.turn_context import substitute_api_content
 from agent.gemini_native_adapter import is_native_gemini_base_url
-from agent.internal_user_messages import MAX_ITERATIONS_SUMMARY_REQUEST
 from agent.model_metadata import is_local_endpoint
-from agent.message_content import flatten_message_text
+from agent.message_content import MAX_ITERATIONS_SUMMARY_REQUEST, flatten_message_text
 from agent.message_sanitization import (
     _sanitize_surrogates,
     _repair_tool_call_arguments,

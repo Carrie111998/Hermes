@@ -817,6 +817,111 @@ def test_restored_anchor_never_creates_consecutive_user_roles() -> None:
     assert not compressed[0].get("_todo_snapshot_synthetic")
 
 
+@pytest.mark.parametrize(
+    "media_part",
+    [
+        {
+            "type": "image_url",
+            "image_url": {"url": "https://example.test/cat.png"},
+        },
+        {"type": "input_audio", "input_audio": {"data": "AA=="}},
+    ],
+    ids=["image", "audio"],
+)
+def test_media_todo_anchor_restoration_does_not_duplicate(media_part) -> None:
+    from agent.context_compressor import ContextCompressor
+    from agent.conversation_compression import (
+        _ensure_compressed_has_user_turn,
+        is_real_user_message,
+    )
+    from tools.todo_tool import TODO_INJECTION_HEADER
+
+    original = [
+        {
+            "role": "user",
+            "content": [
+                media_part,
+                {
+                    "type": "text",
+                    "text": f"{TODO_INJECTION_HEADER}\n- [>] Finish the task",
+                },
+            ],
+        }
+    ]
+    compressed = []
+
+    _ensure_compressed_has_user_turn(original, compressed)
+    _ensure_compressed_has_user_turn(original, compressed)
+
+    assert len(compressed) == 1
+    assert is_real_user_message(compressed[0])
+    assert compressed[0]["content"][0] == media_part
+
+    with patch(
+        "agent.context_compressor.get_model_context_length", return_value=100_000
+    ):
+        compressor = ContextCompressor(model="test", quiet_mode=True)
+    assert compressor._transcript_has_real_user_turn(original)
+    assert compressor._find_last_user_message_idx(original, head_end=0) == 0
+
+    tail_history = [
+        {"role": "user", "content": "head"},
+        {"role": "assistant", "content": "reply"},
+        original[0],
+        {"role": "assistant", "content": "media handled"},
+        {"role": "user", "content": "latest"},
+    ]
+    assert (
+        compressor._ensure_last_n_user_messages_in_tail(
+            tail_history, cut_idx=4, head_end=1, n=2
+        )
+        == 2
+    )
+
+
+def test_internal_runtime_rows_do_not_establish_compressor_user_provenance() -> None:
+    from agent.context_compressor import ContextCompressor
+    from agent.message_content import MAX_ITERATIONS_SUMMARY_REQUEST
+
+    messages = [
+        {"role": "user", "content": MAX_ITERATIONS_SUMMARY_REQUEST},
+    ]
+    with patch(
+        "agent.context_compressor.get_model_context_length", return_value=100_000
+    ):
+        compressor = ContextCompressor(model="test", quiet_mode=True)
+
+    assert not compressor._transcript_has_real_user_turn(messages)
+    assert compressor._find_last_user_message_idx(messages, head_end=0) == 0
+
+
+def test_internal_notification_remains_an_actionable_tail_anchor() -> None:
+    from agent.context_compressor import ContextCompressor
+    from tools.process_registry import format_process_notification
+
+    notification = format_process_notification(
+        {
+            "type": "async_delegation",
+            "delegation_id": "deleg-1",
+            "goal": "Inspect the title gate",
+            "status": "completed",
+            "summary": "The classifier was audited.",
+        }
+    )
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "Inspect the title gate"},
+        {"role": "assistant", "content": "Delegating."},
+        {"role": "user", "content": notification},
+    ]
+    with patch(
+        "agent.context_compressor.get_model_context_length", return_value=100_000
+    ):
+        compressor = ContextCompressor(model="test", quiet_mode=True)
+
+    assert compressor._find_last_user_message_idx(messages, head_end=1) == 3
+
+
 
 
 def test_compression_persists_child_handoff_immediately(tmp_path: Path) -> None:

@@ -380,7 +380,7 @@ def maybe_auto_title(
     user_msg_count = sum(
         1 for message in (conversation_history or []) if is_real_user_message(message)
     )
-    if user_msg_count > 2:
+    if not 1 <= user_msg_count <= 2:
         return
 
     # Config read comes after the cheap first-exchange guard so the file

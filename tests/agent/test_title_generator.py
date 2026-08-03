@@ -1,6 +1,5 @@
 """Tests for agent.title_generator — auto-generated session titles."""
 
-import pytest
 from unittest.mock import MagicMock, patch
 
 
@@ -11,6 +10,11 @@ from agent.title_generator import (
     _title_language,
 )
 from agent.context_compressor import SUMMARY_PREFIX
+from agent.message_content import (
+    EXACT_INTERNAL_USER_REQUESTS,
+    MAX_ITERATIONS_SUMMARY_REQUEST,
+    build_tool_call_stream_continuation_request,
+)
 from hermes_state import SessionDB
 from tools.todo_tool import TODO_INJECTION_HEADER
 
@@ -192,6 +196,8 @@ class TestRealUserMessageClassification:
     """Shared classifier coverage for the title gate and compression."""
 
     def test_compaction_metadata_and_projected_content_are_internal(self):
+        from collections import UserDict
+
         from agent.context_compressor import (
             COMPRESSED_SUMMARY_METADATA_KEY,
             LEGACY_SUMMARY_PREFIX,
@@ -205,6 +211,7 @@ class TestRealUserMessageClassification:
             "content": "summary body",
             COMPRESSED_SUMMARY_METADATA_KEY: True,
         }
+        marked_mapping = UserDict(marked)
         projected = {
             "role": "user",
             "content": f"{SUMMARY_PREFIX}\nsummary body",
@@ -227,10 +234,19 @@ class TestRealUserMessageClassification:
             ],
         }
 
-        for message in (marked, projected, legacy, historical, structured):
+        for message in (
+            marked,
+            marked_mapping,
+            projected,
+            legacy,
+            historical,
+            structured,
+        ):
             assert not is_real_user_message(message)
 
     def test_todo_and_compression_continuation_rows_are_internal(self):
+        from collections import UserDict
+
         from agent.context_compressor import (
             COMPRESSION_CONTINUATION_USER_CONTENT,
             _LEGACY_COMPRESSION_CONTINUATION_USER_CONTENT,
@@ -239,6 +255,7 @@ class TestRealUserMessageClassification:
         from tools.todo_tool import TODO_INJECTION_HEADER
 
         messages = [
+            {"role": "user", "content": TODO_INJECTION_HEADER},
             {
                 "role": "user",
                 "content": f"{TODO_INJECTION_HEADER}\n- [>] Continue",
@@ -260,27 +277,41 @@ class TestRealUserMessageClassification:
                 "role": "user",
                 "content": _LEGACY_COMPRESSION_CONTINUATION_USER_CONTENT,
             },
+            UserDict(
+                {
+                    "role": "user",
+                    "content": f"{TODO_INJECTION_HEADER}\n- [>] Continue",
+                }
+            ),
         ]
 
         assert all(not is_real_user_message(message) for message in messages)
 
-    def test_exact_max_iteration_summary_request_is_internal(self):
+    def test_exact_runtime_requests_are_internal(self):
         from agent.conversation_compression import is_real_user_message
-        from agent.internal_user_messages import MAX_ITERATIONS_SUMMARY_REQUEST
 
-        assert not is_real_user_message(
-            {"role": "user", "content": MAX_ITERATIONS_SUMMARY_REQUEST}
+        for request in EXACT_INTERNAL_USER_REQUESTS:
+            assert not is_real_user_message({"role": "user", "content": request})
+            assert not is_real_user_message(
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": request}],
+                }
+            )
+
+    def test_dynamic_tool_continuation_is_matched_as_a_complete_wire_message(self):
+        from agent.conversation_compression import is_real_user_message
+
+        request = build_tool_call_stream_continuation_request(
+            ["write_file", "patch"]
         )
-        assert not is_real_user_message(
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": MAX_ITERATIONS_SUMMARY_REQUEST,
-                    }
-                ],
-            }
+
+        assert not is_real_user_message({"role": "user", "content": request})
+        assert is_real_user_message(
+            {"role": "user", "content": f"Please explain this message:\n{request}"}
+        )
+        assert is_real_user_message(
+            {"role": "user", "content": f"{request}\nWhy did Hermes send it?"}
         )
 
     def test_existing_synthetic_flags_are_internal(self):
@@ -292,15 +323,15 @@ class TestRealUserMessageClassification:
         for flag in _SYNTHETIC_USER_FLAGS:
             message = {"role": "user", "content": "runtime row", flag: True}
             assert not is_real_user_message(message), flag
+        assert "_kanban_stop_synthetic" in _SYNTHETIC_USER_FLAGS
 
-    def test_internal_phrases_inside_ordinary_user_content_remain_real(self):
+    def test_runtime_requests_inside_ordinary_user_content_remain_real(self):
         from agent.context_compressor import SUMMARY_PREFIX
         from agent.conversation_compression import is_real_user_message
-        from agent.internal_user_messages import MAX_ITERATIONS_SUMMARY_REQUEST
         from tools.todo_tool import TODO_INJECTION_HEADER
 
         contents = [
-            f"Why did Hermes say: {MAX_ITERATIONS_SUMMARY_REQUEST}",
+            *(f'Why did Hermes say: "{request}"?' for request in EXACT_INTERNAL_USER_REQUESTS),
             f"Please explain this marker: {TODO_INJECTION_HEADER}",
             f"Please analyze this header:\n{SUMMARY_PREFIX}",
         ]
@@ -308,6 +339,185 @@ class TestRealUserMessageClassification:
         assert all(
             is_real_user_message({"role": "user", "content": content})
             for content in contents
+        )
+
+    def test_media_and_other_structured_user_inputs_are_real(self):
+        from agent.conversation_compression import is_real_user_message
+
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "https://example.test/cat.png"},
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_audio", "input_audio": {"data": "AA=="}}
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "document", "document": {"name": "notes.pdf"}}
+                ],
+            },
+        ]
+
+        assert all(is_real_user_message(message) for message in messages)
+
+    def test_media_with_merged_todo_text_remains_real(self):
+        from agent.conversation_compression import is_real_user_message
+
+        for media_part in (
+            {
+                "type": "image_url",
+                "image_url": {"url": "https://example.test/cat.png"},
+            },
+            {"type": "input_audio", "input_audio": {"data": "AA=="}},
+        ):
+            message = {
+                "role": "user",
+                "content": [
+                    media_part,
+                    {
+                        "type": "text",
+                        "text": f"{TODO_INJECTION_HEADER}\n- [>] Finish the task",
+                    },
+                ],
+            }
+            assert is_real_user_message(message)
+
+    def test_display_bookkeeping_rows_are_internal(self):
+        from agent.conversation_compression import is_real_user_message
+
+        for display_kind in (
+            "model_switch",
+            "auto_continue",
+            "async_delegation_complete",
+            "hidden",
+        ):
+            assert not is_real_user_message(
+                {
+                    "role": "user",
+                    "content": "timeline bookkeeping",
+                    "display_kind": display_kind,
+                }
+            )
+        assert is_real_user_message(
+            {"role": "user", "content": "timeline bookkeeping", "display_kind": ""}
+        )
+
+    def test_async_delegation_wire_messages_are_internal(self):
+        from agent.conversation_compression import is_real_user_message
+        from tools.process_registry import format_process_notification
+
+        single = format_process_notification(
+            {
+                "type": "async_delegation",
+                "delegation_id": "deleg-1",
+                "goal": "Inspect the title gate",
+                "status": "completed",
+                "summary": "The gate counted synthetic rows.",
+            }
+        )
+        batch = format_process_notification(
+            {
+                "type": "async_delegation",
+                "delegation_id": "deleg-batch",
+                "is_batch": True,
+                "goals": ["Inspect compression"],
+                "results": [
+                    {
+                        "task_index": 0,
+                        "status": "completed",
+                        "summary": "Compression audited.",
+                    }
+                ],
+            }
+        )
+
+        assert isinstance(single, str)
+        assert isinstance(batch, str)
+        assert not is_real_user_message({"role": "user", "content": single})
+        assert not is_real_user_message({"role": "user", "content": batch})
+
+    def test_background_process_wire_messages_are_internal(self):
+        from agent.conversation_compression import is_real_user_message
+        from tools.process_registry import format_process_notification
+
+        multiline_command = "python - <<'PY'\nprint('ok')\nPY"
+        notifications = [
+            format_process_notification(
+                {
+                    "type": "completion",
+                    "session_id": "proc-1",
+                    "command": "tests",
+                    "exit_code": 0,
+                    "output": "passed",
+                }
+            ),
+            format_process_notification(
+                {
+                    "type": "watch_match",
+                    "session_id": "proc-2",
+                    "command": "tests",
+                    "pattern": "FAILED",
+                    "output": "FAILED test_title",
+                }
+            ),
+            format_process_notification(
+                {
+                    "type": "completion",
+                    "session_id": "proc-3",
+                    "command": multiline_command,
+                    "exit_code": 0,
+                    "output": "ok",
+                }
+            ),
+            format_process_notification(
+                {
+                    "type": "watch_match",
+                    "session_id": "proc-4",
+                    "command": multiline_command,
+                    "pattern": "ok",
+                    "output": "ok",
+                }
+            ),
+        ]
+
+        assert all(isinstance(item, str) for item in notifications)
+        assert all(
+            not is_real_user_message({"role": "user", "content": item})
+            for item in notifications
+        )
+        watch_discussion = f"{notifications[-1][:-1]}\nWhy did Hermes send this?"
+        assert is_real_user_message(
+            {"role": "user", "content": watch_discussion}
+        )
+
+    def test_blank_malformed_and_non_user_rows_are_not_genuine(self):
+        from types import SimpleNamespace
+
+        from agent.conversation_compression import is_real_user_message
+
+        assert not is_real_user_message(None)
+        assert not is_real_user_message({"role": "assistant", "content": "hello"})
+        assert not is_real_user_message({"role": "user", "content": "  "})
+        assert not is_real_user_message({"role": "user", "content": []})
+        assert not is_real_user_message({"role": "user", "content": {}})
+        assert not is_real_user_message(
+            {"role": "user", "content": {"type": "text", "text": ""}}
+        )
+        assert not is_real_user_message(
+            {
+                "role": "user",
+                "content": SimpleNamespace(type="output_text", text=""),
+            }
         )
 
 
@@ -362,12 +572,10 @@ class TestMaybeAutoTitle:
             {"role": "assistant", "content": "response 3"},
         ]
 
-        with patch("agent.title_generator.auto_title_session") as mock_auto:
+        with patch("agent.title_generator.threading.Thread") as thread_cls:
             maybe_auto_title(db, "sess-1", "third", "response 3", history)
-            # Wait briefly for any thread to start
-            import time
-            time.sleep(0.1)
-            mock_auto.assert_not_called()
+
+        thread_cls.assert_not_called()
 
     def test_fires_on_first_exchange(self):
         """Should fire a background thread for the first exchange."""
@@ -408,32 +616,19 @@ class TestMaybeAutoTitle:
             },
             {
                 "role": "user",
-                "content": (
-                    "[CONTEXT COMPACTION — REFERENCE ONLY] Earlier turns were "
-                    "compacted into this summary."
-                ),
+                "content": f"{SUMMARY_PREFIX}\nEarlier turns were compacted.",
             },
             {"role": "assistant", "content": "Continuing the investigation."},
             {
                 "role": "user",
-                "content": (
-                    "[Your active task list was preserved across context compression]\n"
-                    "- [>] Find the root cause"
-                ),
+                "content": f"{TODO_INJECTION_HEADER}\n- [>] Find the root cause",
             },
             {
                 "role": "assistant",
                 "content": "",
                 "tool_calls": [{"id": "call-2"}],
             },
-            {
-                "role": "user",
-                "content": (
-                    "You've reached the maximum number of tool-calling iterations allowed. "
-                    "Please provide a final response summarizing what you've found and "
-                    "accomplished so far, without calling any more tools."
-                ),
-            },
+            {"role": "user", "content": MAX_ITERATIONS_SUMMARY_REQUEST},
             {"role": "assistant", "content": "The title gate counted scaffolding."},
         ]
 
@@ -453,12 +648,44 @@ class TestMaybeAutoTitle:
 
         mock_auto.assert_called_once()
 
+    def test_repeated_continuation_nudges_do_not_consume_the_allowance(self):
+        db = MagicMock()
+        continuation_requests = sorted(
+            EXACT_INTERNAL_USER_REQUESTS - {MAX_ITERATIONS_SUMMARY_REQUEST}
+        )
+        history = [{"role": "user", "content": "Fix the title gate"}]
+        for index, request in enumerate(continuation_requests):
+            history.extend(
+                [
+                    {"role": "assistant", "content": f"retry {index}"},
+                    {"role": "user", "content": request},
+                    {"role": "assistant", "content": f"retry {index} again"},
+                    {"role": "user", "content": request},
+                ]
+            )
+        history.append({"role": "assistant", "content": "Fixed."})
+
+        with patch("agent.title_generator.auto_title_session") as mock_auto:
+            import threading
+
+            called = threading.Event()
+            mock_auto.side_effect = lambda *_args, **_kwargs: called.set()
+            maybe_auto_title(
+                db,
+                "sess-1",
+                "Fix the title gate",
+                "Fixed.",
+                history,
+            )
+            assert called.wait(timeout=10), "auto_title thread never ran"
+
+        mock_auto.assert_called_once()
+
     def test_fires_with_two_real_user_turns_plus_internal_scaffolding(self):
         from agent.context_compressor import (
             COMPRESSION_CONTINUATION_USER_CONTENT,
             SUMMARY_PREFIX,
         )
-        from agent.internal_user_messages import MAX_ITERATIONS_SUMMARY_REQUEST
 
         db = MagicMock()
         history = [
@@ -495,15 +722,15 @@ class TestMaybeAutoTitle:
 
         mock_auto.assert_called_once()
 
-    def test_skips_with_three_real_user_turns_plus_internal_scaffolding(self):
+    def test_skips_with_three_repeated_real_turns_plus_internal_scaffolding(self):
         from agent.context_compressor import SUMMARY_PREFIX
 
         db = MagicMock()
         history = [
-            {"role": "user", "content": "first request"},
+            {"role": "user", "content": "same request"},
             {"role": "assistant", "content": "first response"},
             {"role": "user", "content": f"{SUMMARY_PREFIX}\nsummary body"},
-            {"role": "user", "content": "second request"},
+            {"role": "user", "content": "same request"},
             {"role": "assistant", "content": "second response"},
             {
                 "role": "user",
@@ -512,7 +739,7 @@ class TestMaybeAutoTitle:
                     "- [>] Continue"
                 ),
             },
-            {"role": "user", "content": "third request"},
+            {"role": "user", "content": "same request"},
             {"role": "assistant", "content": "third response"},
         ]
 
@@ -523,13 +750,48 @@ class TestMaybeAutoTitle:
             maybe_auto_title(
                 db,
                 "sess-1",
-                "third request",
+                "same request",
                 "third response",
                 history,
             )
 
         mock_thread.assert_not_called()
         mock_auto.assert_not_called()
+
+    def test_internal_only_history_never_starts_a_title_thread(self):
+        from tools.process_registry import format_process_notification
+
+        delegation = format_process_notification(
+            {
+                "type": "async_delegation",
+                "delegation_id": "deleg-1",
+                "goal": "Inspect the title gate",
+                "status": "completed",
+                "summary": "Done.",
+            }
+        )
+        history = [
+            {"role": "user", "content": MAX_ITERATIONS_SUMMARY_REQUEST},
+            {"role": "assistant", "content": "summary"},
+            {
+                "role": "user",
+                "content": "model changed",
+                "display_kind": "model_switch",
+            },
+            {"role": "user", "content": delegation},
+            {"role": "assistant", "content": "notification handled"},
+        ]
+
+        with patch("agent.title_generator.threading.Thread") as thread_cls:
+            maybe_auto_title(
+                MagicMock(),
+                "sess-internal",
+                MAX_ITERATIONS_SUMMARY_REQUEST,
+                "notification handled",
+                history,
+            )
+
+        thread_cls.assert_not_called()
 
 
 class TestAutoTitleDuplicateHandling:

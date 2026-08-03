@@ -46,6 +46,15 @@ from agent.turn_context import (
 )
 from agent.turn_retry_state import TurnRetryState
 from agent.runtime_cwd import resolve_agent_cwd
+from agent.message_content import (
+    CODEX_INCOMPLETE_CONTINUATION_REQUEST,
+    DROPPED_TOOL_CALL_CONTINUATION_REQUEST,
+    EMPTY_TOOL_RESPONSE_CONTINUATION_REQUEST,
+    INTENT_ACK_CONTINUATION_REQUEST,
+    NETWORK_STREAM_CONTINUATION_REQUEST,
+    OUTPUT_LIMIT_CONTINUATION_REQUEST,
+    build_tool_call_stream_continuation_request,
+)
 from agent.message_sanitization import (
     close_interrupted_tool_sequence,
     _repair_tool_call_arguments,
@@ -688,48 +697,10 @@ def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
 
 def _get_continuation_prompt(is_partial_stub: bool, dropped_tools: Optional[List[str]] = None) -> str:
     if is_partial_stub and dropped_tools:
-        tool_list = ", ".join(dropped_tools[:3])
-        return (
-            "[System: Your previous tool call "
-            f"({tool_list}) was too large and "
-            "the stream timed out before it "
-            "could be delivered. Do NOT retry "
-            "the same tool call with the same "
-            "large content. Instead, break the "
-            "content into multiple smaller tool "
-            "calls (e.g. use multiple patch calls "
-            "or write smaller files). Each tool "
-            "call's arguments must be under ~8K "
-            "tokens to avoid stream timeouts.]"
-        )
-    elif is_partial_stub:
-        return (
-            "[System: The previous response was cut off by a "
-            "network error mid-stream. Continue exactly where "
-            "you left off. Do not restart or repeat prior text. "
-            "Finish the answer directly.]"
-        )
-    else:
-        return (
-            "[System: Your previous response was truncated by the output "
-            "length limit. Continue exactly where you left off. Do not "
-            "restart or repeat prior text. Finish the answer directly.]"
-        )
-
-
-# Continuation nudge for Codex/Responses turns that came back with only
-# internal reasoning (no visible content, no tool calls).  When the interim
-# assistant message also carries no encrypted reasoning items and no
-# replayable message items, _chat_messages_to_responses_input emits nothing
-# for it — a bare retry would be byte-identical to the request that just
-# failed, so the model (observed: grok-4.20 on xai-oauth) deterministically
-# repeats the reasoning-only response until the retry budget is exhausted.
-_CODEX_INCOMPLETE_NUDGE = (
-    "[System: Your previous response contained only internal reasoning and "
-    "never produced a visible answer or tool call. Do not keep thinking. "
-    "Produce your final answer as plain text now (or make the tool call "
-    "you were planning).]"
-)
+        return build_tool_call_stream_continuation_request(dropped_tools)
+    if is_partial_stub:
+        return NETWORK_STREAM_CONTINUATION_REQUEST
+    return OUTPUT_LIMIT_CONTINUATION_REQUEST
 
 
 # Shared recovery hint appended to every content-policy refusal message. Both
@@ -5876,7 +5847,8 @@ def run_conversation(
                         _already_nudged = (
                             isinstance(_last_msg, dict)
                             and _last_msg.get("role") == "user"
-                            and _last_msg.get("content") == _CODEX_INCOMPLETE_NUDGE
+                            and _last_msg.get("content")
+                            == CODEX_INCOMPLETE_CONTINUATION_REQUEST
                         )
                         # Alternation guard: the nudge is a user-role message,
                         # so it may only follow an assistant message. When the
@@ -5892,7 +5864,7 @@ def run_conversation(
                         if not _already_nudged and _last_is_assistant:
                             messages.append({
                                 "role": "user",
-                                "content": _CODEX_INCOMPLETE_NUDGE,
+                                "content": CODEX_INCOMPLETE_CONTINUATION_REQUEST,
                             })
                     if not agent.quiet_mode:
                         agent._vprint(f"{agent.log_prefix}↻ Codex response incomplete; continuing turn ({agent._codex_incomplete_retries}/3)")
@@ -6670,11 +6642,7 @@ def run_conversation(
                         messages.append(_nudge_msg)
                         messages.append({
                             "role": "user",
-                            "content": (
-                                "You just executed tool calls but returned an "
-                                "empty response. Please process the tool "
-                                "results above and continue with the task."
-                            ),
+                            "content": EMPTY_TOOL_RESPONSE_CONTINUATION_REQUEST,
                             "_empty_recovery_synthetic": True,
                         })
                         continue
@@ -6907,10 +6875,7 @@ def run_conversation(
 
                     continue_msg = {
                         "role": "user",
-                        "content": (
-                            "[System: Continue now. Execute the required tool calls and only "
-                            "send your final answer after completing the task.]"
-                        ),
+                        "content": INTENT_ACK_CONTINUATION_REQUEST,
                     }
                     messages.append(continue_msg)
                     agent._session_messages = messages
@@ -6973,11 +6938,7 @@ def run_conversation(
                     messages.append(final_msg)
                     messages.append({
                         "role": "user",
-                        "content": (
-                            "Your previous turn indicated a tool call but none was "
-                            "included. Do not narrate a plan or restate intent — issue "
-                            "the actual tool call now to continue the task."
-                        ),
+                        "content": DROPPED_TOOL_CALL_CONTINUATION_REQUEST,
                         "_dropped_toolcall_nudge": True,
                     })
                     agent._session_messages = messages

@@ -477,6 +477,8 @@ class TestNonStringContent:
         those, the deterministic snapshot must look past it to the real ask
         (and return None when no real ask exists at all).
         """
+        from agent.message_content import OUTPUT_LIMIT_CONTINUATION_REQUEST
+
         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
             c = ContextCompressor(model="test", quiet_mode=True)
 
@@ -495,7 +497,7 @@ class TestNonStringContent:
         assert "task list was preserved" not in snapshot
 
         only_synthetic = [
-            {"role": "user", "content": "[System: Your previous response was truncated ...]"},
+            {"role": "user", "content": OUTPUT_LIMIT_CONTINUATION_REQUEST},
         ]
         assert c._latest_user_task_snapshot(only_synthetic) is None
 

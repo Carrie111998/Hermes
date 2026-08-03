@@ -1,7 +1,0 @@
-"""Stable content markers for Hermes-authored user-role messages."""
-
-MAX_ITERATIONS_SUMMARY_REQUEST = (
-    "You've reached the maximum number of tool-calling iterations allowed. "
-    "Please provide a final response summarizing what you've found and accomplished so far, "
-    "without calling any more tools."
-)
