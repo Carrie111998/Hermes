@@ -695,6 +695,20 @@ class TestLifecycleGuardModule:
         )
         assert result is False
 
+    def test_script_path_with_nul_does_not_crash_guard(self):
+        """#77780: malformed cron script paths must not leak ``ValueError``.
+
+        The lifecycle guard is advisory validation.  A malformed path should
+        remain the scheduler's concern; it must not crash cron-job creation
+        while the guard is inspecting it.
+        """
+        from cron.lifecycle_guard import GatewayLifecycleBlocked, check_gateway_lifecycle
+
+        # The malformed path is ignored, but the normal lifecycle command
+        # detection must still reach its intended policy decision.
+        with pytest.raises(GatewayLifecycleBlocked):
+            check_gateway_lifecycle("hermes gateway restart", "invalid\x00script.sh")
+
     def test_shell_script_reference_walk_still_works(self, tmp_path):
         """The referenced-script walk still applies to real shell scripts:
         a .sh script that itself invokes a lifecycle command is caught."""

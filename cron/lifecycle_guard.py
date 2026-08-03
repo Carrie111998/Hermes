@@ -258,7 +258,10 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
     try:
         descriptor = os.open(path, flags)
-    except OSError:
+    except (OSError, ValueError):
+        # A malformed user-supplied path (notably one with an embedded NUL)
+        # is outside this guard's remit. Leave its validation to the scheduler
+        # rather than leaking ValueError from lifecycle inspection (#77780).
         return None, False
     try:
         metadata = os.fstat(descriptor)
