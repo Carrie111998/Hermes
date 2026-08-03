@@ -263,8 +263,10 @@ def _apply_addition_only_hunk(content: str, hunk: Hunk) -> Tuple[str, Optional[s
     if hunk.context_hint:
         occurrences = _count_occurrences(content, hunk.context_hint)
         if occurrences == 0:
-            # Hint not found — append at end as a safe fallback
-            return content.rstrip('\n') + '\n' + insert_text + '\n', None
+            return content, (
+                f"addition-only hunk: context hint '{hunk.context_hint}' "
+                "not found"
+            )
         if occurrences > 1:
             return content, (
                 f"addition-only hunk: context hint '{hunk.context_hint}' is ambiguous "
@@ -289,7 +291,10 @@ def _candidate_validation_error(
         return None
     try:
         result = candidate_validator(path, content)
-        return str(result) if result else None
+        # The interface contract is Optional[str]. Ignore other truthy values
+        # so duck-typed backends and unspecced mocks do not become accidental
+        # hard rejections merely because they expose a callable attribute.
+        return result if isinstance(result, str) and result else None
     except Exception as exc:
         return f"candidate preflight raised {type(exc).__name__}: {exc}"
 
