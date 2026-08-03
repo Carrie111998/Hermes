@@ -9,17 +9,24 @@ import time
 import unittest
 from unittest.mock import MagicMock
 
-from tools.interrupt import set_interrupt, is_interrupted
+from tools.interrupt import (
+    set_interrupt,
+    is_interrupted,
+    _clear_all_interrupts_for_tests,
+)
 
 
 class TestInterruptPropagationToChild(unittest.TestCase):
     """Verify interrupt propagates from parent to child agent."""
 
     def setUp(self):
-        set_interrupt(False)
+        # Wipe the whole per-thread registry: tests below use both the real
+        # current-thread ident and synthetic idents (e.g. 99990001) which
+        # set_interrupt(False) cannot reach from the main thread.
+        _clear_all_interrupts_for_tests()
 
     def tearDown(self):
-        set_interrupt(False)
+        _clear_all_interrupts_for_tests()
 
     def _make_bare_agent(self):
         """Create a bare AIAgent via __new__ with all interrupt-related attrs."""
@@ -208,10 +215,12 @@ class TestPerThreadInterruptIsolation(unittest.TestCase):
     """
 
     def setUp(self):
-        set_interrupt(False)
+        # Full registry wipe — these tests deliberately set bits on synthetic
+        # idents that set_interrupt(False) cannot reach from the main thread.
+        _clear_all_interrupts_for_tests()
 
     def tearDown(self):
-        set_interrupt(False)
+        _clear_all_interrupts_for_tests()
 
     def test_interrupt_only_affects_target_thread(self):
         """set_interrupt(True, tid) only makes is_interrupted() True on that thread."""

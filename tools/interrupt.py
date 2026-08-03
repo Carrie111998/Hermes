@@ -85,6 +85,25 @@ def clear_current_thread_interrupt() -> None:
     set_interrupt(False)  # thread_id=None -> current thread (see set_interrupt)
 
 
+def _clear_all_interrupts_for_tests() -> None:
+    """Drop EVERY entry from the per-thread interrupt registry.
+
+    Test-only / internal helper.  Thread idents are recycled by the OS, and
+    ``set_interrupt(False)`` / ``clear_current_thread_interrupt()`` only touch
+    the calling thread, so a synthetic tid left in ``_interrupted_threads``
+    by a prior test (e.g. ``99990001``) can poison a fresh worker that later
+    reuses the ident.  Use this in ``setUp``/``tearDown`` (or a fixture) to
+    guarantee isolation between tests that exercise per-thread semantics.
+
+    Must NEVER be called from production interrupt / cancellation paths:
+    production code only signals or clears the bit on a specific execution
+    thread; clearing the whole registry would silently drop a genuine
+    interrupt that landed on a sibling thread since the last poll.
+    """
+    with _lock:
+        _interrupted_threads.clear()
+
+
 # ---------------------------------------------------------------------------
 # Backward-compatible _interrupt_event proxy
 # ---------------------------------------------------------------------------
