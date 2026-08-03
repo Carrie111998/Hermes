@@ -5667,6 +5667,7 @@ def run_conversation(
                         turn_id=turn_id,
                         api_request_id=api_request_id,
                         session_id=agent.session_id or "",
+                        **agent._hook_session_context(),
                         platform=agent.platform or "",
                         model=agent.model,
                         provider=agent.provider,
