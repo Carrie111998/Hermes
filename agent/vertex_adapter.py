@@ -333,20 +333,25 @@ def discover_vertex_models(
     project_id: str,
     region: str = DEFAULT_REGION,
     timeout: float = 10.0,
+    auth_header: str = "x-goog-api-key",
 ) -> list[str]:
-    """Query Vertex AI's ``models.list`` publisher endpoint for models
-    available in the given project and region.
+    """Query Vertex AI's publisher ``models`` endpoint for models available
+    in the given project and region.
 
-    Supports both Express Mode API keys (via ``x-goog-api-key``) and OAuth2 / ADC
-    authentication (via ``Authorization: Bearer token``).
+    ``auth_header`` must match the credential type: ``"x-goog-api-key"`` for
+    Express Mode API keys and ``"Authorization"`` for OAuth2 / ADC tokens —
+    pass the third element of the ``get_vertex_config()`` tuple. The header
+    is selected explicitly rather than sniffed from the key prefix, because
+    key formats (``AQ.``, ``AIza``, ``ya29.``, JWTs) are not a reliable
+    discriminator.
 
-    Returns a sorted list of model ID strings (e.g. ``gemini-2.5-flash``,
-    ``gemini-3-flash-preview``). Only models that support ``generateContent``
-    (chat / text-generation) are returned.
+    Note: Google's ``publishers.google/models`` list endpoint is not part of
+    the public Express Mode API surface and 404s in practice, so this
+    typically returns an empty list and callers fall back to the curated
+    model catalog.
 
-    Returns the sorted model list on success.
-    Returns an empty list on any error (network, auth, parse), falling back
-    to the curated model catalog.
+    Returns the sorted model list on success; an empty list on any error
+    (network, auth, parse), so callers can fall back to the curated catalog.
     """
     import json
     import urllib.error
@@ -357,8 +362,9 @@ def discover_vertex_models(
         f"https://{host}/v1/projects/{project_id}/locations/{region}"
         "/publishers/google/models"
     )
-    # Use x-goog-api-key for Express Mode API keys and Authorization Bearer for OAuth2 tokens
-    if api_key.startswith("AIza") or (has_vertex_api_key() and not api_key.startswith("ya29.")):
+    # Explicit auth mode (from get_vertex_config's 3rd tuple element):
+    # x-goog-api-key for Express Mode API keys, Bearer for OAuth2/ADC tokens.
+    if auth_header == "x-goog-api-key":
         headers = {
             "x-goog-api-key": api_key,
             "Content-Type": "application/json",

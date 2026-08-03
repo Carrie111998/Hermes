@@ -2611,14 +2611,15 @@ def _model_flow_vertex(config, current_model=""):
     discovered: list[str] | None = None
     if api_key and project_id:
         print(f"  Discovering models in {region}...", end=" ", flush=True)
-        discovered = discover_vertex_models(api_key, project_id, region)
+        auth_header = "x-goog-api-key" if has_vertex_api_key() else "Authorization"
+        discovered = discover_vertex_models(api_key, project_id, region, auth_header=auth_header)
         if discovered:
             print(f"found {len(discovered)} models ✓")
         else:
             print("using curated model list.")
     else:
-        print("  (Using curated model list — set GOOGLE_VERTEX_API_KEY +")
-        print("   GOOGLE_VERTEX_PROJECT for dynamic discovery.)")
+        print("  (Using curated model list — Vertex's public API exposes no")
+        print("   models.list endpoint for Express Mode API keys.)")
 
     if discovered:
         # Prefix with ``google/`` to match Hermes model naming convention

@@ -59,14 +59,16 @@ class VertexProfile(ProviderProfile):
         base_url: str | None = None,
         timeout: float = 8.0,
     ) -> list[str] | None:
-        """Discover models via Vertex AI's publisher ``models.list`` API.
+        """Best-effort model discovery for the API key (Express Mode) path.
 
-        Unlike the legacy OAuth2 path (which has no ``/models`` route on the
-        OpenAI-compatible endpoint), the API key path can query the publisher
-        models endpoint for region-specific model availability.
+        Note: Google's ``publishers.google/models`` list endpoint is not part
+        of the public Express Mode API surface and 404s in practice, so this
+        usually returns None and the setup wizard falls back to its curated
+        model list. It exists so the call path is exercised when Google ever
+        exposes listing.
 
-        If discovery fails (network, auth, or the OAuth2 path), returns None
-        and the setup wizard falls back to its curated model list.
+        Returns None on any failure (network, auth, or no credentials) so
+        callers fall back to the curated catalog.
         """
         from agent.vertex_adapter import (
             discover_vertex_models,
@@ -75,7 +77,7 @@ class VertexProfile(ProviderProfile):
             _resolve_region,
         )
 
-        # Only API key auth supports model discovery
+        # Only the API key (Express Mode) path can reach the publisher endpoint.
         resolved_key = api_key or resolve_vertex_api_key()
         if not resolved_key:
             return None
@@ -85,7 +87,9 @@ class VertexProfile(ProviderProfile):
             return None
 
         region = _resolve_region()
-        models = discover_vertex_models(resolved_key, project_id, region, timeout)
+        models = discover_vertex_models(
+            resolved_key, project_id, region, timeout, auth_header="x-goog-api-key"
+        )
         return models if models else None
 
 

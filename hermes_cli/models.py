@@ -599,8 +599,9 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
     # /model picker only ever shows the currently-configured model.
     # Model IDs use the "google/" publisher prefix Vertex's openapi
     # endpoint expects (see hermes_cli/model_setup_flows.py).
-    # Entries validated live against a GCP project (global region,
-    # HTTP 200) as of 2026-07-21 (PR #68767).
+    # The gemini-2.5 entries were validated live against a GCP project
+    # (global region, HTTP 200) as of 2026-07-21 (PR #68767); the newer
+    # 3.x preview entries were added without live validation.
     "vertex": [
         "google/gemini-3.6-flash",
         "google/gemini-3.5-flash",

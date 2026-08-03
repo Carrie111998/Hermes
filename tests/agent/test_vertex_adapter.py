@@ -387,6 +387,31 @@ def test_discover_vertex_models_empty_when_no_generate_content(vertex_adapter, m
     assert models == []
 
 
+def test_discover_vertex_models_auth_header_selection(vertex_adapter, monkeypatch):
+    """discover_vertex_models honors the explicit auth_header (no key sniffing)."""
+    import urllib.request
+    import json
+
+    captured = {}
+
+    def fake_urlopen(req, timeout=10):
+        # urllib normalizes custom header keys (X-goog-api-key); compare lowercased.
+        captured["headers"] = {k.lower(): v for k, v in req.headers.items()}
+        return _FakeUrlopenResult(json.dumps({"models": []}).encode())
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+    # OAuth token via explicit Authorization mode.
+    vertex_adapter.discover_vertex_models("ya29.FAKE", "p", "us-central1", auth_header="Authorization")
+    assert captured["headers"].get("authorization") == "Bearer ya29.FAKE"
+    assert "x-goog-api-key" not in captured["headers"]
+
+    # Express Mode key via explicit x-goog-api-key mode.
+    vertex_adapter.discover_vertex_models("AQ.FAKEKEY", "p", "us-central1", auth_header="x-goog-api-key")
+    assert captured["headers"].get("x-goog-api-key") == "AQ.FAKEKEY"
+    assert "authorization" not in captured["headers"]
+
+
 def test_discover_vertex_models_network_failure_returns_empty(vertex_adapter, monkeypatch):
     """Network errors during discovery return an empty list without crashing."""
     import urllib.error

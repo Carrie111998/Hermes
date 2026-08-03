@@ -31,7 +31,8 @@ Vertex now supports **API key authentication** through Express Mode. This is the
    # → Choose "More providers..." → "Google Vertex AI"
    # → Verify API key is detected
    # → Enter your GCP project ID
-   # → Models will be auto-discovered from your region
+   # → Models will be picked from the curated Vertex list
+   #    (no models.list endpoint for API keys)
    # → Select a model
    ```
 
@@ -40,8 +41,8 @@ Vertex now supports **API key authentication** through Express Mode. This is the
    hermes chat
    ```
 
-:::tip API key model discovery
-When using API key auth, Hermes queries Vertex's `models.list` publisher API to show only models actually available in your project and region. You won't see models that are unavailable or region-locked.
+:::note API key model discovery
+Vertex's public API exposes no `models.list` endpoint for Express Mode API keys (the publisher models endpoint 404s), so Hermes always uses its curated Vertex model list with API key auth. Model availability may vary by region and project; unavailable models fail with a 404 at request time.
 :::
 
 ### Method 2: OAuth2 / Service Account (Legacy)
@@ -128,9 +129,7 @@ For **OAuth2 / ADC**:
 
 ## Available Models
 
-When using **API key auth**, Hermes automatically discovers models available in your project and region by querying Vertex's `models.list` publisher API. This means you'll only see models that are actually accessible.
-
-When using **OAuth2 / ADC** (or if discovery fails), the model picker falls back to a curated list:
+Vertex's public API exposes no `models.list` endpoint for Express Mode API keys (the publisher models endpoint 404s), so Hermes always uses its curated model list with API key auth. The picker falls back to the same curated list for OAuth2 / ADC:
 
 | Model | ID |
 |-------|-----|
