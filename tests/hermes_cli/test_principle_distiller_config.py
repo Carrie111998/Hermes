@@ -157,6 +157,21 @@ class TestConfigSetRoundTrip:
         assert cfg_path.exists()
         assert "principle_distiller" in cfg_path.read_text(encoding="utf-8")
 
+    @pytest.mark.parametrize("off_value", ["false", "off", "no"])
+    def test_set_off_variants_coerce_to_bool_false(self, tmp_path, monkeypatch, capsys, off_value):
+        """Every user-facing 'off' spelling of the switch writes a real YAML
+        boolean False (never a truthy string) and keeps the distiller off."""
+        monkeypatch.delenv("HERMES_PRINCIPLE_DISTILLER", raising=False)
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        set_config_value("principle_distiller.enabled", off_value)
+        capsys.readouterr()
+        assert principle_distiller_enabled() is False
+        cfg_path = tmp_path / "config.yaml"
+        assert cfg_path.exists()
+        # Coerced to a genuine bool, not stored as the raw string (a string
+        # would trip the strict-bool validation warning on the next load).
+        assert "enabled: false" in cfg_path.read_text(encoding="utf-8")
+
 
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch):
