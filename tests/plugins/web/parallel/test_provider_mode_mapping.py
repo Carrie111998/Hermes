@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Offline mocked tests for the Parallel provider search-depth → mode mapping.
 
-Covers HERMES_PARALLEL_PROVIDER_FAST_MODE_MAPPING_FIX_V0_1 requirements:
+Requirements covered:
 
 1. search_depth="fast" sends mode="fast".
 2. search_depth="fast" never sends mode="turbo".

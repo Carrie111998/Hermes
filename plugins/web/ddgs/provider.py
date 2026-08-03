@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 # loop has no overall cap, so a slow/rate-limited DuckDuckGo response can hang
 # the (single, shared) agent loop indefinitely (#36776). Enforce a hard cap
 # here by killing a disposable worker process (#68096).
-_SEARCH_TIMEOUT_SECS = 30
+_SEARCH_TIMEOUT_SECS = 45
 
 # How often the parent polls stdout / interrupt flag while waiting.
 _POLL_INTERVAL_SECS = 0.1
