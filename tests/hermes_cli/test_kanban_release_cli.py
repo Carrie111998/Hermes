@@ -191,7 +191,6 @@ def test_release_cli_completes_an_evidenced_release_measure_card(
     # Integration really happened — release is orchestration, not a status flip.
     assert (repo / "story.txt").read_text(encoding="utf-8") == "released\n"
     assert "deployment_policy_evaluated" in events
-    # The caller label is recorded without claiming authenticated identity.
     assert run is not None and isinstance(run.metadata, dict)
     assert run.metadata.get("release_operator_label") == "Ole"
     assert run.metadata.get("release_surface") == "cli"
@@ -285,7 +284,7 @@ def test_release_cli_refuses_an_unresolved_preflight(release_home, tmp_path):
 def test_release_cli_refuses_inside_a_kanban_worker(
     release_home, tmp_path, monkeypatch
 ):
-    """Release/Measure is a human gate; the env check is defense in depth, not authorization: a process controlling its environment can bypass it."""
+    """Release/Measure is a human gate; the env check is defense in depth, not authorization: a caller controlling its environment can bypass it."""
     repo, branch, source_sha = _repo_with_story_branch(tmp_path)
     board = "release-cli-worker"
     _release_board(board, repo)

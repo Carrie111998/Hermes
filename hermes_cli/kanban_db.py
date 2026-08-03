@@ -12327,7 +12327,7 @@ def epic_branch_for(epic_id: str) -> str:
 
 
 def _ensure_epic_branch(
-    repo_root: Path, epic_branch: str, *, allow_create_at_head: bool = True
+    repo_root: Path, epic_branch: str, *, allow_create_at_head: bool
 ) -> None:
     """Ensure an epic base exists, creating it at ``HEAD`` only when allowed.
 

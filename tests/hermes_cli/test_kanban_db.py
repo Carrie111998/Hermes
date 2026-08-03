@@ -3370,7 +3370,7 @@ def test_ensure_epic_branch_creates_off_head_idempotently(tmp_path):
     _init_git_repo(repo)
     epic_branch = kb.epic_branch_for("epic-1")
 
-    kb._ensure_epic_branch(repo, epic_branch)
+    kb._ensure_epic_branch(repo, epic_branch, allow_create_at_head=True)
     assert kb._git_branch_exists(repo, epic_branch)
     head_sha = subprocess.run(
         ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True,
@@ -3381,7 +3381,7 @@ def test_ensure_epic_branch_creates_off_head_idempotently(tmp_path):
     assert branch_sha == head_sha
 
     # Idempotent: calling again does not error or move the branch.
-    kb._ensure_epic_branch(repo, epic_branch)
+    kb._ensure_epic_branch(repo, epic_branch, allow_create_at_head=True)
     branch_sha_again = subprocess.run(
         ["git", "-C", str(repo), "rev-parse", epic_branch], check=True, capture_output=True, text=True,
     ).stdout.strip()
@@ -3450,7 +3450,7 @@ def test_story_worktree_branches_off_epic_branch_contains_upstream_commit(kanban
         epic_branch = kb.epic_branch_for(epic)
 
     # Simulate an upstream story's integrated commit landing on the epic branch.
-    kb._ensure_epic_branch(repo, epic_branch)
+    kb._ensure_epic_branch(repo, epic_branch, allow_create_at_head=True)
     subprocess.run(["git", "-C", str(repo), "checkout", epic_branch], check=True, capture_output=True, text=True)
     upstream_sha = _commit_file(repo, "upstream.txt", "upstream story code\n", "upstream story")
     subprocess.run(["git", "-C", str(repo), "checkout", "main"], check=True, capture_output=True, text=True)
@@ -3490,7 +3490,7 @@ def test_spawn_one_v2_wires_story_base_branch_to_epic(kanban_home, tmp_path, mon
         epic = kb.create_task(conn, title="Epic", board=board, work_item_kind="epic")
         epic_branch = kb.epic_branch_for(epic)
 
-    kb._ensure_epic_branch(repo, epic_branch)
+    kb._ensure_epic_branch(repo, epic_branch, allow_create_at_head=True)
     subprocess.run(["git", "-C", str(repo), "checkout", epic_branch], check=True, capture_output=True, text=True)
     upstream_sha = _commit_file(repo, "upstream.txt", "upstream story code\n", "upstream story")
     subprocess.run(["git", "-C", str(repo), "checkout", "main"], check=True, capture_output=True, text=True)

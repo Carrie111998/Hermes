@@ -2454,7 +2454,7 @@ def _cmd_release(args: argparse.Namespace) -> int:
     worker-side tool calls, driven by an operator, with every gate intact
     (board/task scoping, lifecycle state, release evidence, deployment policy,
     smoke/rollback evidence). The worker-environment check below is defense in
-    depth, not authorization: a program that controls its own environment can
+    depth, not authorization: a caller that controls its own environment can
     bypass it.
     """
     task_id = args.task_id
