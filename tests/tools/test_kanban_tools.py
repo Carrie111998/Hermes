@@ -2777,6 +2777,37 @@ def test_kanban_guidance_states_commit_first_handoff_contract():
     assert "git push" in lowered or "push" in lowered
 
 
+def test_kanban_guidance_scopes_review_required_away_from_product_development():
+    """Product Development must end with `kanban_complete`, never with a
+    ``review-required`` block.
+
+    Both instructions were injected unconditionally until the 2026-08-02
+    default-board incident: the Developer read "end with review-required"
+    and never called `kanban_complete`, so no candidate SHA was ever
+    created and Test/Review had nothing to consume. Operator comments
+    cannot reliably override a contradictory system instruction, so the
+    contradiction has to be absent from the prompt: whenever commit-first
+    product guidance is present, every ``review-required`` instruction
+    must be explicitly scoped outside the product workflow.
+    """
+    from agent.prompt_builder import KANBAN_GUIDANCE
+
+    lowered = KANBAN_GUIDANCE.lower()
+    assert "commit-first" in lowered
+    # The product path names its terminal action and what that action produces.
+    assert "product workflow development ends with `kanban_complete`" in lowered
+    assert "candidate" in lowered
+
+    # Every review-required instruction carries its own non-product scope.
+    lines = [ln for ln in lowered.split("\n") if "review-required" in ln]
+    assert lines, "the non-product review-required convention disappeared"
+    for line in lines:
+        assert "outside the product workflow" in line, (
+            "a review-required instruction is not scoped away from product "
+            f"Development: {line!r}"
+        )
+
+
 def test_kanban_guidance_prompt_size_bounded(monkeypatch, tmp_path):
     """Sanity: the guidance block stays lean so it doesn't blow up the
     cached prompt.
@@ -2790,7 +2821,10 @@ def test_kanban_guidance_prompt_size_bounded(monkeypatch, tmp_path):
     again to fit the commit-first handoff contract and the structured
     rework/resolver action vocabulary (step 5): on
     product/handoff boards `kanban_complete` commits the worker's diff for
-    them, so the guidance must say so explicitly.
+    them, so the guidance must say so explicitly. The last bump (2026-08-02)
+    paid for splitting the product commit-first path and the non-product
+    ``review-required`` convention into separate, separately-scoped
+    paragraphs — the two used to read as one contradictory instruction.
     """
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_fake")
     home = tmp_path / ".hermes"
@@ -2800,7 +2834,7 @@ def test_kanban_guidance_prompt_size_bounded(monkeypatch, tmp_path):
     monkeypatch.setattr(_P, "home", lambda: tmp_path)
 
     from agent.prompt_builder import KANBAN_GUIDANCE
-    assert 1_500 < len(KANBAN_GUIDANCE) < 6_300, (
+    assert 1_500 < len(KANBAN_GUIDANCE) < 6_600, (
         f"KANBAN_GUIDANCE is {len(KANBAN_GUIDANCE)} chars — too short (missing?) or too long"
     )
 

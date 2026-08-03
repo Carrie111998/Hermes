@@ -2320,11 +2320,48 @@ def has_unresolved_product_preflight(
     return _latest_unresolved_product_preflight(conn, task_id) is not None
 
 
+#: The privileged repair profile. Not an ordinary worker: ``_default_spawn``
+#: pins it to exactly ``resolver_readonly`` and ``_check_ordinary_worker_mode``
+#: withholds every ordinary lifecycle exit from it.
+RESOLVER_PROFILE = "resolver"
+
+
+def resolver_routing_error(
+    conn: sqlite3.Connection,
+    task_id: str,
+    assignee: Optional[str],
+) -> Optional[str]:
+    """Diagnose an incompatible task -> Resolver routing; ``None`` when valid.
+
+    Resolver's only mutation is ``kanban_resolve``, which applies to an
+    unresolved product preflight. Routed to a card without one it holds no
+    lifecycle exit at all — not ``kanban_complete``, ``kanban_block``,
+    attachments, creation, or linking — so the worker runs, finds nothing
+    that can end its run, and the card deadlocks (2026-08-02 default-board
+    incident: four goal cards assigned to ``resolver`` by hand).
+
+    The rejection names the contract rather than letting the run fail later
+    as "the worker never called kanban_complete".
+    """
+    if _canonical_assignee(assignee) != RESOLVER_PROFILE:
+        return None
+    if has_unresolved_product_preflight(conn, task_id):
+        return None
+    return (
+        f"routing: task {task_id} has no unresolved product preflight, so it "
+        f"cannot be assigned to the privileged '{RESOLVER_PROFILE}' profile. "
+        "Resolver runs read-only (resolver_readonly) and its only mutation is "
+        "kanban_resolve; it has no kanban_complete/kanban_block exit. Assign an "
+        "ordinary worker profile instead."
+    )
+
+
 def _complete_product_workflow_step(
     conn: sqlite3.Connection,
     task_id: str,
     *,
     board: Optional[str] = None,
+    board_meta: Optional[dict] = None,
     result: Optional[str] = None,
     summary: Optional[str] = None,
     metadata: Optional[dict] = None,
@@ -2336,7 +2373,7 @@ def _complete_product_workflow_step(
     Returns ``None`` when normal terminal completion should run. Returns a
     boolean when the product workflow consumed the completion.
     """
-    meta = product_board_metadata(board)
+    meta = board_meta if board_meta is not None else product_board_metadata(board)
     if meta is None:
         return None
 
@@ -7676,6 +7713,17 @@ def create_task(
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
     assignee = _canonical_assignee(assignee)
+    if assignee == RESOLVER_PROFILE:
+        # A card being created has no preflight yet, so this routing can
+        # never be valid. Resolver reaches a card only by displacement from
+        # an ordinary worker's product preflight, never by authorship.
+        raise ValueError(
+            f"a new task cannot be assigned to the privileged "
+            f"'{RESOLVER_PROFILE}' profile: Resolver only resolves an "
+            "unresolved product preflight on an existing card, and holds no "
+            "kanban_complete/kanban_block exit of its own. Assign an ordinary "
+            "worker profile instead."
+        )
     if not title or not title.strip():
         raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:
@@ -8281,6 +8329,9 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
                 f"cannot reassign {task_id}: currently running (claimed). "
                 "Wait for completion or reclaim the stale lock first."
             )
+        routing_error = resolver_routing_error(conn, task_id, profile)
+        if routing_error is not None:
+            raise ValueError(routing_error)
         if row["assignee"] != profile:
             # The retry guard is scoped to the task/profile combination. A
             # human reassigning the task is an explicit recovery action, so the
@@ -9247,6 +9298,34 @@ def claim_task(
     board_meta = product_board_metadata(_board_slug)
     release_measure_unblocks = _product_release_measure_unblocks_dependents(board_meta)
     with write_txn(conn):
+        # FIRST statement in the transaction, deliberately. A card routed to
+        # the privileged Resolver incompatibly must be refused before anything
+        # else can touch it — the workflow-metadata repair preflight and the
+        # parents demotion below both mutate, and neither should run for a card
+        # that can never dispatch. No run row, no `claimed` event, no worker.
+        # Blocked rather than retried: a retry cannot change the contract.
+        routing_row = conn.execute(
+            "SELECT assignee FROM tasks WHERE id = ? AND status = 'ready'",
+            (task_id,),
+        ).fetchone()
+        if routing_row is not None:
+            routing_error = resolver_routing_error(
+                conn, task_id, routing_row["assignee"]
+            )
+            if routing_error is not None:
+                conn.execute(
+                    "UPDATE tasks SET status = 'blocked', last_failure_error = ? "
+                    "WHERE id = ? AND status = 'ready'",
+                    (routing_error, task_id),
+                )
+                _apply_v2_flags(
+                    conn, task_id, board_meta, running=False, blocked=True
+                )
+                _append_event(
+                    conn, task_id, "claim_rejected",
+                    {"reason": "resolver_routing", "error": routing_error},
+                )
+                return None
         candidate = conn.execute(
             "SELECT t.work_item_kind, t.workflow_template_id, t.current_step_key, "
             "       json_extract(w.canonical_json, '$.po_evidence.surface') "
@@ -10114,6 +10193,7 @@ def complete_task(
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
     board: Optional[str] = None,
+    board_meta: Optional[dict] = None,
     product_role_assignees: Optional[dict[str, str]] = None,
     product_workflow_enabled: bool = True,
     _release_evidence: Optional[dict] = None,
@@ -10145,6 +10225,11 @@ def complete_task(
     Any suspected phantom references are recorded as a
     ``suspected_hallucinated_references`` event. This pass is advisory
     and never blocks.
+    
+    ``board_meta`` is an already-read board metadata snapshot. Release
+    orchestration passes the one snapshot it validated policy against, so a
+    board edit mid-operation cannot make a later step disagree with the gate
+    that admitted it. ``None`` reads fresh, exactly as before.
     """
     board = board or _board_slug_for_connection(conn)
     now = int(time.time())
@@ -10194,7 +10279,7 @@ def complete_task(
         verified_cards = []
 
     if product_workflow_enabled:
-        meta = product_board_metadata(board)
+        meta = board_meta if board_meta is not None else product_board_metadata(board)
         if meta is not None and _handoff_v2_enabled(meta):
             validated_positive_phase: Optional[str] = None
             _validate_stored_product_workflow_state(conn, task_id)
@@ -10203,6 +10288,7 @@ def complete_task(
                     conn,
                     task_id,
                     board=board,
+                    board_meta=board_meta,
                     result=result,
                     summary=summary,
                     metadata=metadata,
@@ -10281,6 +10367,7 @@ def complete_task(
             conn,
             task_id,
             board=board,
+            board_meta=board_meta,
             result=result,
             summary=summary,
             metadata=metadata,
@@ -10297,7 +10384,7 @@ def complete_task(
         terminal_row = conn.execute(
             "SELECT current_step_key FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
-        terminal_meta = product_board_metadata(board)
+        terminal_meta = board_meta if board_meta is not None else product_board_metadata(board)
         if (
             terminal_row is not None
             and terminal_row["current_step_key"] == "release_measure"
@@ -10354,7 +10441,7 @@ def complete_task(
         # current_step_key is a general step-tracking field also used by
         # non-v2 workflow_template boards, so it must stay v2-gated to avoid
         # corrupting their step semantics).
-        term_meta = product_board_metadata(board)
+        term_meta = board_meta if board_meta is not None else product_board_metadata(board)
         if term_meta is not None and _handoff_v2_enabled(term_meta):
             conn.execute(
                 "UPDATE tasks SET current_step_key = 'done' WHERE id = ?",
@@ -12276,28 +12363,62 @@ def epic_branch_for(epic_id: str) -> str:
     return f"epic/{epic_id}"
 
 
-def _ensure_epic_branch(repo_root: Path, epic_branch: str) -> None:
-    """Create ``epic_branch`` off the repo's current ``HEAD`` if it doesn't
-    already exist. Idempotent; a no-op when the branch is already there.
-
-    Defensive subprocess idiom (mirrors ``_git_branch_exists`` et al.): any
-    failure is swallowed here rather than raised. If branch creation
-    genuinely failed, the caller's subsequent ``_ensure_git_worktree(...,
-    base=epic_branch)`` will fail loudly (missing base ref) and that error
-    surfaces through the normal worktree-creation failure path instead.
-    """
-    if _git_branch_exists(repo_root, epic_branch):
-        return
+def _git_head_sha(repo_root: Path) -> Optional[str]:
+    """Resolve ``HEAD`` to a full 40-character SHA, or ``None``."""
     try:
-        subprocess.run(
-            ["git", "-C", str(repo_root), "branch", epic_branch, "HEAD"],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=30, check=False,
         )
     except Exception:
-        pass
+        return None
+    sha = (result.stdout or "").strip()
+    return sha if result.returncode == 0 and len(sha) == 40 else None
+
+
+def _ensure_epic_branch(
+    repo_root: Path, epic_branch: str, *, start_point: Optional[str]
+) -> bool:
+    """Ensure an epic base exists; create it only at an explicit full SHA.
+
+    Returns whether this call created the ref. ``start_point`` is the exact
+    commit the base must be created at — ``None`` means the caller could not
+    establish one, and this raises rather than inventing history.
+
+    A missing base is ambiguous once the epic has materialized anything: the
+    current ``HEAD`` has probably moved, and recreating the ref there silently
+    shifts every story's review baseline. The epic base is a precondition of
+    the story worktree that branches off it and of the Review target
+    preparation that later runs ``git merge-base`` against it — a story ref
+    materialized without it looks healthy and fails much later, off-site
+    (2026-07-30 epic ``t_c29de776``: Review runs 531/532 died before reviewer
+    spawn and an operator had to create the ref by hand).
+    """
+    if _git_branch_exists(repo_root, epic_branch):
+        return False
+    if not start_point:
+        raise RuntimeError(
+            f"epic base branch {epic_branch} is missing and its historical base "
+            "cannot be established from the event ledger; it will not be "
+            "recreated from current HEAD. Recreate the ref at the verified "
+            "historical commit, then resume dispatch."
+        )
+    error = ""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), "branch", epic_branch, start_point],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+        error = (result.stderr or result.stdout or "").strip()
+    except Exception as exc:  # timeout / OS-level failure
+        error = str(exc)
+    created_sha = _git_ref_sha(repo_root, epic_branch)
+    if created_sha != start_point:
+        raise RuntimeError(
+            f"could not create epic base branch {epic_branch} in {repo_root} at "
+            f"{start_point}" + (f": {error}" if error else "")
+        )
+    return True
 
 
 def _story_base_branch(
@@ -12315,6 +12436,129 @@ def _story_base_branch(
     if epic_id is None:
         return None
     return epic_branch_for(epic_id)
+
+
+#: Durable record of the exact commit an epic base branch was created at.
+#: Written to the epic's own event stream, so the base survives branch
+#: cleanup and re-cloning — local refs are not evidence of history.
+EPIC_BASE_PINNED_EVENT = "epic_base_pinned"
+
+
+def _record_epic_base_pin(
+    conn: sqlite3.Connection, epic_id: str, branch: str, base_sha: str
+) -> None:
+    """Persist the epic base SHA, unless an identical pin is already recorded."""
+    existing = _epic_base_pinned_sha(conn, epic_id)
+    if existing == base_sha:
+        return
+    with write_txn(conn):
+        _append_event(
+            conn, epic_id, EPIC_BASE_PINNED_EVENT,
+            {"branch": branch, "base_sha": base_sha},
+        )
+
+
+def _epic_base_pinned_sha(
+    conn: sqlite3.Connection, epic_id: str
+) -> Optional[str]:
+    row = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? "
+        "ORDER BY id DESC LIMIT 1",
+        (epic_id, EPIC_BASE_PINNED_EVENT),
+    ).fetchone()
+    if row is None or not row["payload"]:
+        return None
+    try:
+        sha = str((json.loads(row["payload"]) or {}).get("base_sha") or "").strip()
+    except Exception:
+        return None
+    return sha or None
+
+
+def _latest_epic_integration_sha(
+    conn: sqlite3.Connection, epic_id: str
+) -> Optional[str]:
+    """Newest successful story integration tip for this epic, if any.
+
+    A story integrated into the epic advances its branch, so the last
+    integration is the epic base every later sibling must branch from —
+    a strictly better answer than the original pin once one exists.
+    """
+    members = list_epic_members(conn, epic_id)
+    if not members:
+        return None
+    placeholders = ",".join("?" for _ in members)
+    rows = conn.execute(
+        f"SELECT payload FROM task_events WHERE kind = 'story_integrated_to_epic' "  # noqa: S608 — placeholders only
+        f"AND task_id IN ({placeholders}) ORDER BY id DESC",
+        tuple(members),
+    ).fetchall()
+    target = epic_branch_for(epic_id)
+    for row in rows:
+        if not row["payload"]:
+            continue
+        try:
+            payload = json.loads(row["payload"]) or {}
+        except Exception:
+            continue
+        if payload.get("target_branch") != target:
+            continue
+        sha = str(payload.get("candidate_sha") or "").strip()
+        if sha:
+            return sha
+    return None
+
+
+def _epic_has_materialization_history(
+    conn: sqlite3.Connection, epic_id: str, *, excluding: Optional[str] = None
+) -> bool:
+    """Whether this epic materialized anything before ``excluding``, from the DB.
+
+    Deliberately not derived from local Git refs: a re-clone or a branch
+    cleanup removes those, and a mature epic would then look brand new and
+    pin its base to whatever ``HEAD`` happens to be.
+
+    ``excluding`` is the member currently being materialized. The dispatcher
+    claims a card — creating its run row — before resolving its workspace, so
+    without this the very first story of a fresh epic would read its own run
+    as prior history and fail closed on every new epic.
+    """
+    if _epic_base_pinned_sha(conn, epic_id) is not None:
+        return True
+    members = [m for m in list_epic_members(conn, epic_id) if m != excluding]
+    if not members:
+        return False
+    placeholders = ",".join("?" for _ in members)
+    row = conn.execute(
+        f"SELECT 1 FROM task_runs WHERE task_id IN ({placeholders}) LIMIT 1",  # noqa: S608 — placeholders only
+        tuple(members),
+    ).fetchone()
+    return row is not None
+
+
+def _epic_base_start_point(
+    conn: Optional[sqlite3.Connection], task: Task, repo_root: Path
+) -> tuple[Optional[str], Optional[str]]:
+    """Resolve ``(epic_id, start_point)`` for ``task``'s missing epic base.
+
+    ``start_point`` is ``None`` when no commit can be established honestly —
+    the caller must then fail closed rather than guess.
+    """
+    if conn is None:
+        return None, None
+    epic_id = epic_id_for_task(conn, task.id)
+    if epic_id is None:
+        return None, None
+    recovered = (
+        _latest_epic_integration_sha(conn, epic_id)
+        or _epic_base_pinned_sha(conn, epic_id)
+    )
+    if recovered:
+        return epic_id, recovered
+    if _epic_has_materialization_history(conn, epic_id, excluding=task.id):
+        return epic_id, None
+    # Genuinely fresh epic: this story is the first, so HEAD really is the base.
+    return epic_id, _git_head_sha(repo_root)
 
 
 def _is_epic_task(conn: sqlite3.Connection, task_id: str) -> bool:
@@ -12482,15 +12726,37 @@ def _resolve_worktree_workspace(
     launched from, e.g. the Hermes checkout). If no anchor is configured
     anywhere, we fail loudly rather than guess.
 
-    ``base_branch`` (v2 only; ``None`` for every live dispatch call site today)
-    is the ref a brand-new worktree branch should be created from -- e.g. an
-    epic's integration branch, so a story's worktree contains a previously-
-    integrated sibling story's code. ``None`` preserves legacy behavior
-    (branch off ``HEAD``). When set, the epic branch is created first (off the
-    repo's current ``HEAD``) if it doesn't exist yet.
+    ``base_branch`` is the ref a brand-new worktree branch should be created
+    from -- e.g. an epic's integration branch, so a story's worktree contains a
+    previously-integrated sibling story's code. When set, the epic branch is
+    created first (off the repo's current ``HEAD``) if it doesn't exist yet.
+
+    Callers do not have to supply it: when ``conn`` is available and
+    ``base_branch`` is omitted it is derived here via
+    :func:`_story_base_branch`, which returns ``None`` (legacy behavior, branch
+    off ``HEAD``) for anything that is not a handoff_v2 story with explicit
+    Epic membership. Deriving it at this single shared seam is deliberate --
+    only ``_spawn_one_v2`` used to pass it, so a story dispatched by the ready
+    loop, the review loop, or any other ``resolve_workspace`` caller
+    materialized with its epic base missing and Review target preparation then
+    failed on an unresolvable ``git merge-base`` (2026-07-30 epic
+    ``t_c29de776``).
     """
     branch_name = (task.branch_name or "").strip() or f"wt/{task.id}"
+    if base_branch is None and conn is not None:
+        base_branch = _story_base_branch(conn, task.id, board=board)
     base = base_branch or "HEAD"
+
+    def ensure_epic_base(repo_root: Path) -> None:
+        if base_branch is None or _git_branch_exists(repo_root, base_branch):
+            return
+        epic_id, start_point = _epic_base_start_point(conn, task, repo_root)
+        if _ensure_epic_branch(repo_root, base_branch, start_point=start_point):
+            # Persist the base the moment it exists, so a later branch
+            # cleanup or fresh clone can recover it from the ledger.
+            if conn is not None and epic_id and start_point:
+                _record_epic_base_pin(conn, epic_id, base_branch, start_point)
+
     if not task.workspace_path:
         # Anchor on the board's configured default_workdir, not Path.cwd().
         # The dispatcher's CWD is incidental (gateway launch dir) and using it
@@ -12517,8 +12783,7 @@ def _resolve_worktree_workspace(
                 f"{board_slug!r} default_workdir {board_default!r} is not inside a git repo"
             )
         target = repo_root / ".worktrees" / task.id
-        if base_branch is not None:
-            _ensure_epic_branch(repo_root, base_branch)
+        ensure_epic_base(repo_root)
         _materialize_worktree_with_dependencies(
             repo_root,
             target,
@@ -12543,7 +12808,9 @@ def _resolve_worktree_workspace(
             _assert_worktree_has_no_other_running_consumer(
                 conn, task.id, requested
             )
-            _provision_node_dependencies(_primary_checkout_root(requested), requested)
+            primary_root = _primary_checkout_root(requested)
+            ensure_epic_base(primary_root)
+            _provision_node_dependencies(primary_root, requested)
             return requested_resolved, actual_branch
         # The requested path is an existing checkout of a DIFFERENT
         # task's branch. Decompose children inherit the root's
@@ -12556,11 +12823,12 @@ def _resolve_worktree_workspace(
         if fallback_root is not None:
             fallback = fallback_root / ".worktrees" / task.id
             if fallback.resolve(strict=False) != requested_resolved:
+                ensure_epic_base(fallback_root)
                 _materialize_worktree_with_dependencies(
                     fallback_root,
                     fallback,
                     branch_name,
-                    base="HEAD",
+                    base=base,
                     conn=conn,
                     task_id=task.id,
                 )
@@ -12573,8 +12841,7 @@ def _resolve_worktree_workspace(
     repo_root = _git_toplevel(requested)
     if repo_root is not None and requested_resolved == repo_root:
         target = repo_root / ".worktrees" / task.id
-        if base_branch is not None:
-            _ensure_epic_branch(repo_root, base_branch)
+        ensure_epic_base(repo_root)
         _materialize_worktree_with_dependencies(
             repo_root,
             target,
@@ -12591,8 +12858,7 @@ def _resolve_worktree_workspace(
             f"task {task.id} worktree path {task.workspace_path!r} is not inside a git repo "
             "and does not point at a git repo root"
         )
-    if base_branch is not None:
-        _ensure_epic_branch(repo_root, base_branch)
+    ensure_epic_base(repo_root)
     _materialize_worktree_with_dependencies(
         repo_root,
         requested,
@@ -12886,7 +13152,7 @@ def _default_epic_verify(epic_branch: str) -> bool:
         repo_root = _git_toplevel(Path(board_default).expanduser())
         if repo_root is None:
             return False
-        _ensure_epic_branch(repo_root, epic_branch)
+        _ensure_epic_branch(repo_root, epic_branch, start_point=None)
         target = repo_root / ".worktrees" / f"epic-verify-{epic_branch.replace('/', '-')}"
         from hermes_cli.worktree_dependencies import _acquire_project_lock
 
@@ -12993,6 +13259,7 @@ def merge_epic_to_main(
     epic_id: str,
     *,
     board: Optional[str] = None,
+    board_meta: Optional[dict] = None,
     main_branch: str = "main",
     verify_fn: Optional[Callable[[str], bool]] = None,
     candidate_verify_fn: Optional[Callable[[Path], bool]] = None,
@@ -13015,6 +13282,11 @@ def merge_epic_to_main(
     :func:`_merge_epic_fail_safe`. Every subprocess call uses the file's
     defensive idiom (``capture_output=True, text=True, timeout=...,
     check=False``); no exception escapes this function.
+    
+    ``board_meta`` is an already-read board metadata snapshot. Release
+    orchestration passes the one snapshot it validated policy against, so a
+    board edit mid-operation cannot make a later step disagree with the gate
+    that admitted it. ``None`` reads fresh, exactly as before.
     """
     # =========================================================================
     # LOCAL main only -- never `git push` / touch origin. Production deploys
@@ -13024,7 +13296,7 @@ def merge_epic_to_main(
     # `review_push` / `review_create_pr`). Only local git verbs below:
     # rev-parse, worktree, merge, merge --abort, status, and update-ref.
     # =========================================================================
-    meta = product_board_metadata(board)
+    meta = board_meta if board_meta is not None else product_board_metadata(board)
     if meta is None or not _handoff_v2_enabled(meta):
         return None
     _validate_stored_product_workflow_state(conn, epic_id)
@@ -13135,6 +13407,7 @@ def integrate_story_to_epic(
     story_id: str,
     *,
     board: Optional[str] = None,
+    board_meta: Optional[dict] = None,
     notify_fn: Optional[Callable[[str, str, Optional[str]], None]] = None,
     candidate_verify_fn: Any = _RECONCILE_INTEGRATION_VERIFY_UNSET,
     expected_source_sha: Optional[str] = None,
@@ -13167,6 +13440,11 @@ def integrate_story_to_epic(
     (``<repo_root>/.worktrees/epic-<epic_id>``) -- never in ``repo_root``'s
     own checkout -- so this never disturbs whatever branch ``repo_root`` (or
     any other card's worktree) happens to have checked out.
+    
+    ``board_meta`` is an already-read board metadata snapshot. Release
+    orchestration passes the one snapshot it validated policy against, so a
+    board edit mid-operation cannot make a later step disagree with the gate
+    that admitted it. ``None`` reads fresh, exactly as before.
     """
     # =========================================================================
     # LOCAL only -- never `git push` / touch origin. Production deploys and
@@ -13175,7 +13453,7 @@ def integrate_story_to_epic(
     # (`_review_push` / `review_push` / `review_create_pr`). Only local git
     # verbs below: merge-base, worktree add, merge, merge --abort.
     # =========================================================================
-    meta = product_board_metadata(board)
+    meta = board_meta if board_meta is not None else product_board_metadata(board)
     if meta is None or not _handoff_v2_enabled(meta):
         return None
     _validate_stored_product_workflow_state(conn, story_id)
@@ -13225,19 +13503,16 @@ def integrate_story_to_epic(
             and candidate_verify_fn is _RECONCILE_INTEGRATION_VERIFY_UNSET
             and expected_source_sha is None
         ):
-            with write_txn(conn):
-                _append_event(
-                    conn,
-                    story_id,
-                    "story_integrated_to_epic",
-                    {
-                        "source_branch": story_branch,
-                        "source_sha": _git_ref_sha(repo_root, story_branch),
-                        "target_branch": epic_branch,
-                        "candidate_sha": _git_ref_sha(repo_root, epic_branch),
-                        "already_integrated": True,
-                    },
-                )
+            _record_story_integration(
+                conn, story_id, epic_id, epic_branch,
+                {
+                    "source_branch": story_branch,
+                    "source_sha": _git_ref_sha(repo_root, story_branch),
+                    "target_branch": epic_branch,
+                    "candidate_sha": _git_ref_sha(repo_root, epic_branch),
+                    "already_integrated": True,
+                },
+            )
             return "already_integrated"
 
         if (
@@ -13283,22 +13558,19 @@ def integrate_story_to_epic(
                     )
                 return "conflict" if "merge conflict" in str(exc) else "verify_failed"
 
-            with write_txn(conn):
-                _append_event(
-                    conn,
-                    story_id,
-                    "story_integrated_to_epic",
-                    {
-                        "source_branch": story_branch,
-                        "source_sha": candidate.source_sha,
-                        "target_branch": epic_branch,
-                        "pre_sha": candidate.pre_sha,
-                        "candidate_sha": candidate.candidate_sha,
-                        "target": str(candidate.target_worktree or epic_branch),
-                        "test_command": "bash scripts/run_tests.sh",
-                        "already_integrated": already_integrated,
-                    },
-                )
+            _record_story_integration(
+                conn, story_id, epic_id, epic_branch,
+                {
+                    "source_branch": story_branch,
+                    "source_sha": candidate.source_sha,
+                    "target_branch": epic_branch,
+                    "pre_sha": candidate.pre_sha,
+                    "candidate_sha": candidate.candidate_sha,
+                    "target": str(candidate.target_worktree or epic_branch),
+                    "test_command": "bash scripts/run_tests.sh",
+                    "already_integrated": already_integrated,
+                },
+            )
             return "already_integrated" if already_integrated else "integrated"
 
         epic_worktree = repo_root / ".worktrees" / f"epic-{epic_id}"
@@ -13324,21 +13596,44 @@ def integrate_story_to_epic(
             _integrate_story_fail_safe(conn, story_id, reason, board=board, notify_fn=notify_fn)
             return "conflict"
 
-        with write_txn(conn):
-            _append_event(
-                conn,
-                story_id,
-                "story_integrated_to_epic",
-                {
-                    "source_branch": story_branch,
-                    "source_sha": _git_ref_sha(repo_root, story_branch),
-                    "target_branch": epic_branch,
-                    "candidate_sha": _git_ref_sha(repo_root, epic_branch),
-                },
-            )
+        _record_story_integration(
+            conn, story_id, epic_id, epic_branch,
+            {
+                "source_branch": story_branch,
+                "source_sha": _git_ref_sha(repo_root, story_branch),
+                "target_branch": epic_branch,
+                "candidate_sha": _git_ref_sha(repo_root, epic_branch),
+            },
+        )
         return "integrated"
     except Exception:
         return None
+
+
+def _record_story_integration(
+    conn: sqlite3.Connection,
+    story_id: str,
+    epic_id: str,
+    epic_branch: str,
+    payload: dict,
+) -> None:
+    """Record a story→epic integration and refresh the epic's base pin.
+
+    The pin must follow the epic tip, not stay at the original base. Story
+    cards go ``done`` after integration, so ``gc_events`` prunes their
+    ``story_integrated_to_epic`` rows after its retention window — recovery
+    would then fall back to the first pin and branch a later sibling off a
+    base missing every already-integrated story. The epic itself stays
+    non-terminal until release, so its own events survive.
+    """
+    candidate_sha = str(payload.get("candidate_sha") or "").strip()
+    with write_txn(conn):
+        _append_event(conn, story_id, "story_integrated_to_epic", payload)
+        if candidate_sha:
+            _append_event(
+                conn, epic_id, EPIC_BASE_PINNED_EVENT,
+                {"branch": epic_branch, "base_sha": candidate_sha},
+            )
 
 
 def _merge_standalone_story_to_main(
@@ -13346,6 +13641,7 @@ def _merge_standalone_story_to_main(
     story_id: str,
     *,
     board: Optional[str] = None,
+    board_meta: Optional[dict] = None,
     main_branch: str = "main",
     verify_fn: Optional[Callable[[str], bool]] = None,
     candidate_verify_fn: Optional[Callable[[Path], bool]] = None,
@@ -13379,7 +13675,7 @@ def _merge_standalone_story_to_main(
     # boundary as merge_epic_to_main: production deploys and `git push origin`
     # are HUMAN-ONLY. Only local git verbs below.
     # =========================================================================
-    meta = product_board_metadata(board)
+    meta = board_meta if board_meta is not None else product_board_metadata(board)
     if meta is None or not _handoff_v2_enabled(meta):
         return None
     _validate_stored_product_workflow_state(conn, story_id)
@@ -13847,6 +14143,33 @@ def release_product_task(
     if not note:
         raise ReleaseEvidenceError(task_id, ["measurement_note"])
 
+    # Deterministic gates first, from one metadata snapshot, BEFORE any
+    # candidate construction, verification run, or Git integration. These
+    # outcomes are already decided by board policy and caller metadata, so
+    # evaluating them after integration meant a predictable refusal landed
+    # with the target branch already moved.
+    workflow = _product_workflow_dict(meta)
+    policy_name = str(workflow.get("deployment_policy") or "manual").strip()
+    if policy_name not in {"manual", "not_required", "required"}:
+        raise ReleaseEvidenceError(task_id, ["deployment_policy"])
+    if policy_name == "required" and release_adapter is None:
+        with write_txn(conn):
+            if not _release_run_is_current(conn, task_id, expected_run_id):
+                return ReleaseResult(False, "completion_conflict")
+            _append_event(
+                conn, task_id, "release_adapter_missing",
+                {"policy": policy_name, "source_sha": source_sha},
+            )
+        return ReleaseResult(False, "release_adapter_missing")
+    pr_required = workflow.get("pull_request_required") is True
+    pull_request = (
+        completion_metadata.get("pull_request")
+        if isinstance(completion_metadata, dict)
+        else None
+    )
+    if pr_required and not pull_request:
+        raise ReleaseEvidenceError(task_id, ["pull_request"])
+
     is_epic = _is_epic_task(conn, task_id)
     epic_id = epic_id_for_task(conn, task_id)
     if is_epic:
@@ -13869,6 +14192,7 @@ def release_product_task(
             conn,
             task_id,
             board=board,
+            board_meta=meta,
             candidate_verify_fn=candidate_verify_fn,
             expected_source_sha=source_sha,
             before_apply_fn=before_apply_fn,
@@ -13879,6 +14203,7 @@ def release_product_task(
             conn,
             task_id,
             board=board,
+            board_meta=meta,
             candidate_verify_fn=candidate_verify_fn,
             expected_source_sha=source_sha,
             before_apply_fn=before_apply_fn,
@@ -13889,6 +14214,7 @@ def release_product_task(
             conn,
             task_id,
             board=board,
+            board_meta=meta,
             candidate_verify_fn=candidate_verify_fn,
             expected_source_sha=source_sha,
             before_apply_fn=before_apply_fn,
@@ -13914,10 +14240,6 @@ def release_product_task(
         measurement_note=note,
     )
 
-    workflow = _product_workflow_dict(meta)
-    policy_name = str(workflow.get("deployment_policy") or "manual").strip()
-    if policy_name not in {"manual", "not_required", "required"}:
-        raise ReleaseEvidenceError(task_id, ["deployment_policy"])
     with write_txn(conn):
         if not _release_run_is_current(conn, task_id, expected_run_id):
             return ReleaseResult(False, "completion_conflict")
@@ -13941,24 +14263,8 @@ def release_product_task(
     evidence["rollback_target"] = None
 
     if policy_name == "required":
-        if release_adapter is None:
-            with write_txn(conn):
-                if not _release_run_is_current(conn, task_id, expected_run_id):
-                    return ReleaseResult(False, "completion_conflict")
-                _append_event(
-                    conn,
-                    task_id,
-                    "release_adapter_missing",
-                    {"policy": policy_name, "integration_sha": integration_sha},
-                )
-            return ReleaseResult(
-                False,
-                "release_adapter_missing",
-                integration.id,
-                integration_sha,
-                policy_event.id if policy_event else None,
-                None,
-            )
+        # release_adapter is guaranteed non-None here: the deterministic gate
+        # above refuses a required policy without one before integration.
         if not _release_run_is_current(conn, task_id, expected_run_id):
             return ReleaseResult(False, "completion_conflict")
         deployment = release_adapter.release(task_id, integration_sha)
@@ -14000,14 +14306,6 @@ def release_product_task(
         evidence["smoke_result"] = deployment.get("smoke_result")
         evidence["rollback_target"] = deployment.get("rollback_target")
 
-    pr_required = workflow.get("pull_request_required") is True
-    pull_request = (
-        completion_metadata.get("pull_request")
-        if isinstance(completion_metadata, dict)
-        else None
-    )
-    if pr_required and not pull_request:
-        raise ReleaseEvidenceError(task_id, ["pull_request"])
     evidence["pull_request"] = pull_request
 
     released = complete_task(
@@ -14019,6 +14317,7 @@ def release_product_task(
         created_cards=created_cards,
         expected_run_id=expected_run_id,
         board=board,
+        board_meta=meta,
         _release_evidence=evidence,
     )
     if not released:
@@ -17071,6 +17370,12 @@ def _dispatch_once_locked(
                         conn, row["id"], "respawn_guarded",
                         {"reason": guard_reason},
                     )
+            continue
+        if dry_run and resolver_routing_error(conn, row["id"], row_assignee) is not None:
+            # Dry-run must not promise a card the claim seam will refuse. In a
+            # real pass we deliberately fall through to `claim_task`, which
+            # refuses and blocks the card inside its own transaction.
+            result.skipped_nonspawnable.append(row["id"])
             continue
         if dry_run:
             result.spawned.append((row["id"], row_assignee, ""))

@@ -680,6 +680,38 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                             help='JSON dict of structured facts (e.g. \'{"changed_files": [...], '
                                  '"tests_run": 12}\'). Stored on the closing run.')
 
+    p_release = sub.add_parser(
+        "release",
+        help="Operator gate: release a product card from Release / Measure",
+        description=(
+            "Run release orchestration (integrate the reviewed candidate, "
+            "evaluate deployment policy, then finish the card) for a product "
+            "card sitting at release_measure. This is the human merge gate: "
+            "no worker profile owns it, and generic `complete` cannot perform "
+            "the orchestration it requires."
+        ),
+    )
+    p_release.add_argument("task_id")
+    p_release.add_argument(
+        "--note",
+        required=True,
+        help="Measurement note — release evidence, stored as the card's "
+             "terminal summary. Required and must be non-empty.",
+    )
+    p_release.add_argument(
+        "--metadata",
+        default=None,
+        help='JSON dict of completion metadata (e.g. \'{"pull_request": '
+             '"https://..."}\' on boards that require a PR). Stored on the '
+             "closing run alongside the caller-supplied operator label.",
+    )
+    p_release.add_argument(
+        "--operator-label",
+        default=None,
+        help="Caller-supplied operator label recorded on the closing run "
+             "(default: $HERMES_PROFILE or 'user')",
+    )
+
     p_edit = sub.add_parser(
         "edit",
         help="Edit recovery fields on an already-completed task",
@@ -1164,6 +1196,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "attachments": _cmd_attachments,
             "attach-rm": _cmd_attach_rm,
             "complete": _cmd_complete,
+            "release":  _cmd_release,
             "edit":     _cmd_edit,
             "block":    _cmd_block,
             "schedule": _cmd_schedule,
@@ -1230,6 +1263,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "attach",
     "attach-rm",
     "complete",
+    "release",
     "edit",
     "block",
     "schedule",
@@ -2409,6 +2443,223 @@ def _worker_run_id_for(task_id: str) -> Optional[int]:
         return None
 
 
+def _acquire_release_lock(task_id: str):
+    """Exclusive host-wide advisory lock for one card's release.
+
+    Reuses the kernel's existing flock helper — no second locking scheme.
+    Raises RuntimeError when another release of the same card holds it.
+    """
+    from hermes_cli.worktree_dependencies import _acquire_project_lock
+    from pathlib import Path as _Path
+
+    hermes_home = _Path(os.environ.get("HERMES_HOME", _Path.home() / ".hermes"))
+    return _acquire_project_lock(hermes_home / "release-lease" / task_id)
+
+
+def _release_release_lock(lock) -> None:
+    if lock is None:
+        return
+    try:
+        lock.release()
+    except Exception:
+        pass
+
+
+def _cmd_release(args: argparse.Namespace) -> int:
+    """Run release orchestration for a product card at Release / Measure.
+
+    ``release_measure`` is deliberately unassigned — no ordinary worker may
+    hold it (see ``kanban_qualifier``), and generic ``complete`` runs plain
+    ``complete_task``, which correctly refuses the step for lack of release
+    orchestration. That left the human whose gate it is with no supported way
+    through it. This is that way: the same ``release_product_task`` the
+    worker-side tool calls, driven by an operator, with every gate intact
+    (board/task scoping, lifecycle state, release evidence, deployment policy,
+    smoke/rollback evidence). The worker-environment check below is defense in
+    depth, not authorization: a caller that controls its own environment can
+    bypass it.
+    """
+    task_id = args.task_id
+    # Defense in depth only; the process can alter its own environment.
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        print(
+            "kanban: release is the human operator gate — a kanban worker "
+            "cannot release a card. Complete your own step and let the "
+            "operator run `hermes kanban release`.",
+            file=sys.stderr,
+        )
+        return 2
+    note = (getattr(args, "note", None) or "").strip()
+    if not note:
+        print(
+            "kanban: --note is required and must be non-empty: the measurement "
+            "note is release evidence, recorded as the card's terminal summary.",
+            file=sys.stderr,
+        )
+        return 2
+    metadata: Optional[dict] = None
+    raw_meta = getattr(args, "metadata", None)
+    if raw_meta:
+        try:
+            metadata = json.loads(raw_meta)
+            if not isinstance(metadata, dict):
+                raise ValueError("must be a JSON object")
+        except (ValueError, json.JSONDecodeError) as exc:
+            print(f"kanban: --metadata: {exc}", file=sys.stderr)
+            return 2
+    operator_label = getattr(args, "operator_label", None) or _profile_author()
+    board = kb.get_current_board()
+    with kb.connect_closing(board=board) as conn:
+        task = kb.get_task(conn, task_id)
+        if task is None:
+            print(f"kanban: unknown task {task_id}", file=sys.stderr)
+            return 1
+        is_epic = task.work_item_kind == "epic"
+        # Legacy epics predate product-workflow metadata: work_item_kind is
+        # 'epic' while workflow_template_id and current_step_key are null. The
+        # kernel accepts those for release, so the CLI must not refuse them
+        # ahead of it — only ordinary cards carry the step requirement.
+        if not is_epic and (
+            task.workflow_template_id != "product"
+            or task.current_step_key != "release_measure"
+        ):
+            print(
+                f"kanban: cannot release {task_id}: release orchestration "
+                f"applies only to a product card at release_measure "
+                f"(this card is workflow={task.workflow_template_id or 'none'} "
+                f"step={task.current_step_key or 'none'}).",
+                file=sys.stderr,
+            )
+            return 1
+        if kb.has_unresolved_product_preflight(conn, task_id):
+            print(
+                f"kanban: cannot release {task_id}: it has an unresolved "
+                "product preflight. Resolve it first (Resolver, or "
+                "`hermes kanban answer-escalation`), then release.",
+                file=sys.stderr,
+            )
+            return 1
+        board_meta = kb.product_board_metadata(board)
+        workflow = kb._product_workflow_dict(board_meta)
+        policy_name = str(workflow.get("deployment_policy") or "manual").strip()
+        # Keep this name in sync with release_product_task.
+        if policy_name not in {"manual", "not_required", "required"}:
+            print(
+                f"kanban: cannot release {task_id}: unsupported deployment policy "
+                f"{policy_name!r}; no changes were made.",
+                file=sys.stderr,
+            )
+            return 1
+        if policy_name == "required":
+            print(
+                f"kanban: cannot release {task_id}: deployment policy 'required': "
+                "an adapter-backed controller is required; the CLI supplies no adapter "
+                "and no changes were made.",
+                file=sys.stderr,
+            )
+            return 1
+        if workflow.get("pull_request_required") is True and not (
+            isinstance(metadata, dict) and metadata.get("pull_request")
+        ):
+            print(
+                f"kanban: cannot release {task_id}: missing required pull_request "
+                "metadata; no changes were made.",
+                file=sys.stderr,
+            )
+            return 1
+        completion_metadata = dict(metadata or {})
+        completion_metadata.update(
+            release_operator_label=operator_label, release_surface="cli"
+        )
+        # Take the card's run lease before mutating anything. Two operators
+        # (or an operator and a dispatcher) releasing the same card would
+        # otherwise both pass their preflight and both integrate. Epics are
+        # deliberately unclaimable (`claim_task` refuses work_item_kind=epic),
+        # so they release without a lease exactly as before.
+        expected_run_id = None
+        epic_lock = None
+        if is_epic:
+            # Epics are deliberately unclaimable (`claim_task` refuses
+            # work_item_kind=epic), so the run-lease CAS is unavailable to
+            # them. Serialize on the same advisory file lock the kernel
+            # already uses for verification worktrees rather than inventing a
+            # second locking scheme. Host-scoped, which matches the threat:
+            # two operator terminals on this machine.
+            try:
+                epic_lock = _acquire_release_lock(task_id)
+            except RuntimeError:
+                print(
+                    f"kanban: cannot release {task_id}: another release of this "
+                    "epic is already running on this host. Nothing was changed.",
+                    file=sys.stderr,
+                )
+                return 1
+        else:
+            claimed = kb.claim_task(conn, task_id)
+            if claimed is None:
+                print(
+                    f"kanban: cannot release {task_id}: it is already claimed — "
+                    "another operator or a worker holds the run lease. Nothing "
+                    "was changed.",
+                    file=sys.stderr,
+                )
+                return 1
+            expected_run_id = claimed.current_run_id
+
+        def _release_lease() -> None:
+            """Return an unmutated card to ready after an early refusal."""
+            if expected_run_id is not None:
+                kb.reclaim_task(conn, task_id, reason="release refused")
+
+        try:
+            result = kb.release_product_task(
+                conn,
+                task_id,
+                board,
+                None,
+                None,
+                measurement_note=note,
+                completion_metadata=completion_metadata,
+                expected_run_id=expected_run_id,
+            )
+        except kb.ReleaseEvidenceError as exc:
+            _release_lease()
+            _release_release_lock(epic_lock)
+            print(
+                f"kanban: release of {task_id} blocked by release evidence "
+                f"policy. Missing: {', '.join(exc.missing)}. The card remains "
+                "at release_measure.",
+                file=sys.stderr,
+            )
+            return 1
+        except ValueError as exc:
+            _release_lease()
+            _release_release_lock(epic_lock)
+            print(f"kanban: cannot release {task_id}: {exc}", file=sys.stderr)
+            return 1
+        except Exception:
+            _release_lease()
+            _release_release_lock(epic_lock)
+            raise
+        if not result.released:
+            _release_lease()
+    if epic_lock is not None:
+        _release_release_lock(epic_lock)
+    if not result.released:
+        print(
+            f"kanban: release of {task_id} did not complete: {result.status}. "
+            "The card remains at release_measure.",
+            file=sys.stderr,
+        )
+        return 1
+    sha = (result.integration_sha or "")[:12]
+    print(
+        f"Released {task_id} (operator label: {operator_label})"
+        + (f" (integrated {sha})" if sha else "")
+    )
+    return 0
+
+
 def _cmd_complete(args: argparse.Namespace) -> int:
     """Mark one or more tasks done. Supports a single id or a list."""
     ids = list(args.task_ids or [])
@@ -3455,6 +3706,7 @@ Common subcommands:
   `comment <id> <msg>`  Append a comment
   `attach <id> <path>`  Attach a local file; `attachments <id>` to list
   `complete <id>…`      Mark task(s) done
+  `release <id> --note` Operator gate: release a product card from Release / Measure
   `block <id> [reason]` Mark blocked; `schedule <id> [reason]` parks time-delay work; `unblock <id>` to revive
   `assign <id> <profile>`  Reassign
   `boards list`         Show all boards
