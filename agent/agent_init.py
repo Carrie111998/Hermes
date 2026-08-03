@@ -921,23 +921,25 @@ def init_agent(
     # channel that lands straight in the request body
     # (transports/chat_completions.py: api_kwargs.update(overrides)).
     #
-    # setdefault, so an explicit per-turn override still wins. Temperature is
-    # skipped for models whose contract says the server picks it (Kimi):
-    # re-introducing the field there is exactly what OMIT_TEMPERATURE prevents.
+    # Scoped to deepseek-v4-flash, the model these values were tuned for
+    # (Patrick 2026-08-03). Every other model keeps the provider default, which
+    # also keeps the knob away from transports that reject it: the Codex
+    # Responses adapter validates against a strict allowlist that has
+    # temperature but not top_p (codex_responses_adapter.py), so an unscoped
+    # top_p raised ValueError on every request to gpt-5.6-luna -- breaking the
+    # fallback provider at the exact moment the fallback was needed.
+    #
+    # setdefault, so an explicit per-turn override still wins.
     try:
         from hermes_cli.config import load_config_readonly as _load_sampling_cfg, cfg_get as _sampling_get
-        from agent.auxiliary_client import _fixed_temperature_for_model, OMIT_TEMPERATURE
 
-        _sampling_cfg = _load_sampling_cfg()
-        _omit_temp = (
-            _fixed_temperature_for_model(agent.model, agent.base_url) is OMIT_TEMPERATURE
-        )
-        for _sampling_key in ("temperature", "top_p"):
-            if _sampling_key == "temperature" and _omit_temp:
-                continue
-            _sampling_val = _sampling_get(_sampling_cfg, "model", _sampling_key)
-            if _sampling_val is not None:
-                agent.request_overrides.setdefault(_sampling_key, _sampling_val)
+        _bare_model = (agent.model or "").strip().lower().rsplit("/", 1)[-1]
+        if _bare_model == "deepseek-v4-flash":
+            _sampling_cfg = _load_sampling_cfg()
+            for _sampling_key in ("temperature", "top_p"):
+                _sampling_val = _sampling_get(_sampling_cfg, "model", _sampling_key)
+                if _sampling_val is not None:
+                    agent.request_overrides.setdefault(_sampling_key, _sampling_val)
     except Exception as e:
         logger.debug("sampling params from config skipped: %s", e)
 

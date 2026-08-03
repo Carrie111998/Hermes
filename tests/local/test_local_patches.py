@@ -162,8 +162,8 @@ def _init_agent_with_sampling(monkeypatch, *, model, request_overrides=None):
 
 class TestSamplingOverrides:
     """Commit 6122d85ec: model.temperature / model.top_p from config.yaml land
-    in agent.request_overrides (setdefault, so an explicit turn override wins;
-    temperature skipped for Kimi, where the server owns it)."""
+    in agent.request_overrides (setdefault, so an explicit turn override wins),
+    scoped to deepseek-v4-flash — the model those values were tuned for."""
 
     def test_temperature_and_top_p_enter_request_overrides(self, monkeypatch):
         agent = _init_agent_with_sampling(monkeypatch, model="deepseek-v4-flash")
@@ -181,11 +181,35 @@ class TestSamplingOverrides:
         assert agent.request_overrides["temperature"] == 0.7  # setdefault: turn wins
         assert agent.request_overrides["top_p"] == 0.95
 
-    def test_kimi_skips_temperature_keeps_top_p(self, monkeypatch):
+    def test_provider_prefixed_model_still_matches(self, monkeypatch):
+        """Routers hand the model through as ``<provider>/<model>``; the gate
+        compares the bare name so the knob survives that shape."""
+        agent = _init_agent_with_sampling(
+            monkeypatch, model="opencode-go/deepseek-v4-flash"
+        )
+
+        assert agent.request_overrides.get("temperature") == 1.0
+        assert agent.request_overrides.get("top_p") == 0.95
+
+    def test_codex_model_gets_no_sampling_params(self, monkeypatch):
+        """The regression this scoping exists for: the Codex Responses adapter
+        validates against an allowlist holding ``temperature`` but not
+        ``top_p`` (codex_responses_adapter.py). An unscoped top_p raised
+        ValueError on every gpt-5.6-luna request, killing the fallback
+        provider precisely when the primary one was down."""
+        agent = _init_agent_with_sampling(monkeypatch, model="gpt-5.6-luna")
+
+        assert "top_p" not in agent.request_overrides
+        assert "temperature" not in agent.request_overrides
+
+    def test_kimi_gets_no_sampling_params(self, monkeypatch):
+        """Kimi is out of scope like every other non-deepseek model, so the
+        server keeps owning temperature without needing the OMIT_TEMPERATURE
+        special case the unscoped version required."""
         agent = _init_agent_with_sampling(monkeypatch, model="kimi-k2.7-code")
 
         assert "temperature" not in agent.request_overrides
-        assert agent.request_overrides["top_p"] == 0.95
+        assert "top_p" not in agent.request_overrides
 
 
 class TestSamplingWire:
@@ -212,8 +236,26 @@ class TestSamplingWire:
             messages=[{"role": "user", "content": "hi"}],
             request_overrides={
                 "top_p": 0.95
-            },  # exactly what init_agent produces for Kimi
+            },  # an explicit per-turn override, not what init_agent emits
         )
 
         assert kw.get("top_p") == 0.95
         assert "temperature" not in kw
+
+    def test_codex_responses_still_rejects_top_p(self):
+        """Why TestSamplingOverrides scopes the knob to deepseek-v4-flash. If
+        this ever fails, upstream started accepting top_p on the Responses API
+        and the scoping could widen."""
+        from agent.codex_responses_adapter import _preflight_codex_api_kwargs
+
+        base = {
+            "model": "gpt-5.6-luna",
+            "instructions": "hi",
+            "input": [{"role": "user", "content": "hi"}],
+            "store": False,
+        }
+
+        _preflight_codex_api_kwargs({**base, "temperature": 1.0})  # allowlisted
+
+        with pytest.raises(ValueError, match="unsupported field"):
+            _preflight_codex_api_kwargs({**base, "top_p": 0.95})
