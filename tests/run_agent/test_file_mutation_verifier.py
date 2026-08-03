@@ -166,6 +166,26 @@ class TestRecordFileMutationResult:
         assert state["/tmp/a.md"]["kind"] == "args_missing"
         assert AIAgent._format_file_mutation_failure_footer(state) == ""
 
+    def test_real_patch_failure_supersedes_missing_args(self):
+        agent = _bare_agent()
+        agent._record_file_mutation_result(
+            "patch", {"mode": "replace", "path": "/tmp/a.md"},
+            json.dumps({"success": False, "error": "old_string and new_string required"}),
+            is_error=True,
+        )
+        assert agent._turn_failed_file_mutations["/tmp/a.md"]["kind"] == "args_missing"
+
+        agent._record_file_mutation_result(
+            "patch",
+            {"mode": "replace", "path": "/tmp/a.md", "old_string": "x", "new_string": "y"},
+            json.dumps({"success": False, "error": "Could not find old_string"}),
+            is_error=True,
+        )
+
+        state = agent._turn_failed_file_mutations
+        assert state["/tmp/a.md"]["kind"] == "apply_failed"
+        assert "/tmp/a.md" in AIAgent._format_file_mutation_failure_footer(state)
+
     def test_success_removes_prior_failure(self):
         agent = _bare_agent()
         # First attempt fails
