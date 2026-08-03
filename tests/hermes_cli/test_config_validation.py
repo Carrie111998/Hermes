@@ -5,6 +5,7 @@ from hermes_cli.config import (
     DEFAULT_CONFIG,
     _EXTRA_KNOWN_ROOT_KEYS,
     _KNOWN_ROOT_KEYS,
+    _known_top_level_keys,
     validate_config_structure,
     ConfigIssue,
 )
@@ -106,6 +107,23 @@ class TestUnknownTopLevelKeys:
         assert set(DEFAULT_CONFIG.keys()).issubset(_KNOWN_ROOT_KEYS)
         assert _EXTRA_KNOWN_ROOT_KEYS.issubset(_KNOWN_ROOT_KEYS)
         assert _KNOWN_ROOT_KEYS == frozenset(DEFAULT_CONFIG.keys()) | _EXTRA_KNOWN_ROOT_KEYS
+
+    def test_validator_knows_every_extra_root_key(self):
+        """`hermes config set` must accept every root the module calls known.
+
+        The test above asserts _EXTRA_KNOWN_ROOT_KEYS is part of
+        _KNOWN_ROOT_KEYS. _known_top_level_keys() feeds _validate_config_key and
+        was built from a different union that omitted them, so the CLI warned
+        "not a recognized config key" on 20 roots this file already declares
+        known — including ones the setup wizard writes and the gateway reads.
+        Two registries, one of them narrower, and only the narrow one visible to
+        the user.
+        """
+        missing = _EXTRA_KNOWN_ROOT_KEYS - _known_top_level_keys()
+        assert not missing, (
+            "_known_top_level_keys() omits roots that _KNOWN_ROOT_KEYS declares known, so "
+            f"`hermes config set` will false-warn on them: {sorted(missing)}"
+        )
 
     def test_provider_like_unknown_root_keeps_misplaced_message(self):
         """Preserve existing base_url/api_key root-level guidance."""

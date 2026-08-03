@@ -4707,6 +4707,11 @@ def _known_top_level_keys() -> set[str]:
     keys.update(_OPEN_DICT_TOP_LEVEL_KEYS)
     keys.update(_DYNAMIC_TOP_LEVEL_KEYS)
     keys.update(_SCHEMA_DEFINED_DICT_KEYS)
+    # _KNOWN_ROOT_KEYS is built as DEFAULT_CONFIG | _EXTRA_KNOWN_ROOT_KEYS, so
+    # omitting the extras here gave the module two different notions of "known
+    # root" and left this one narrower. Roots the setup wizard writes and the
+    # gateway reads were reported to the user as unrecognized.
+    keys.update(_EXTRA_KNOWN_ROOT_KEYS)
     return keys
 
 
