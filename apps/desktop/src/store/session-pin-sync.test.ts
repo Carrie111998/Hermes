@@ -11,7 +11,12 @@ vi.mock('@/hermes', () => ({
 }))
 
 import { $pinnedSessionIds } from '@/store/layout'
-import { $sessions } from '@/store/session'
+import {
+  $sessions,
+  _resetSessionListGenerationForTests,
+  beginSessionListRequest,
+  markSessionListApplied
+} from '@/store/session'
 
 import { _resetSessionPinSyncStateForTests, watchSessionPins } from './session-pin-sync'
 
@@ -19,6 +24,19 @@ const row = (id: string, extra: Partial<SessionInfo> = {}): SessionInfo =>
   ({ id, message_count: 1, source: 'cli', started_at: 0, title: id, ...extra }) as SessionInfo
 
 const flush = () => Promise.resolve()
+
+/**
+ * Apply a session-list response the way the real refresh does: claim a
+ * generation when the request is ISSUED, then mark it applied when its rows
+ * land. Splitting the two is the whole point — a response can only be judged
+ * stale by comparing when its request went out against when the write did.
+ */
+const issueSessionListRequest = (): number => beginSessionListRequest()
+
+const applySessionListResponse = (generation: number, rows: SessionInfo[]): void => {
+  markSessionListApplied(generation)
+  $sessions.set(rows)
+}
 
 beforeAll(() => {
   ;(globalThis as { window?: unknown }).window ??= {}
@@ -31,6 +49,7 @@ beforeEach(() => {
   $sessions.set([])
   $pinnedSessionIds.set([])
   _resetSessionPinSyncStateForTests()
+  _resetSessionListGenerationForTests()
   patch.mockClear()
 })
 
@@ -189,13 +208,19 @@ describe('watchSessionPins remote pull', () => {
     patch.mockImplementationOnce(() => new Promise(resolve => (settle = resolve)))
 
     $sessions.set([row('postack')])
+
+    // Two list requests go out BEFORE the user's write. Both are in flight and
+    // neither can possibly observe it.
+    const preWriteRequest = issueSessionListRequest()
+    const secondPreWriteRequest = issueSessionListRequest()
+
     $pinnedSessionIds.set(['postack'])
     await flush()
     expect(patch).toHaveBeenCalledWith('postack', true, undefined)
 
-    // A list request issued BEFORE the PATCH lands while it's still in flight.
-    // Honouring it would silently undo the pin the user just made.
-    $sessions.set([row('postack', { pinned: false })])
+    // One of them lands while the PATCH is still in flight. Honouring it would
+    // silently undo the pin the user just made.
+    applySessionListResponse(preWriteRequest, [row('postack', { pinned: false })])
     await flush()
     expect($pinnedSessionIds.get()).toContain('postack')
 
@@ -204,29 +229,37 @@ describe('watchSessionPins remote pull', () => {
     await flush()
     await flush()
 
-    // The stale page (issued before the write) finally lands AFTER the ack,
-    // still carrying the pre-write value. Must not revert the toggle — and
-    // must not re-PATCH the wrong value durable.
-    const stalePage = [row('postack', { pinned: false }), row('other')]
-
-    $sessions.set(stalePage)
+    // The stale response (its request issued before the write) finally lands
+    // AFTER the ack, still carrying the pre-write value. Must not revert the
+    // toggle — and must not re-PATCH the wrong value durable.
+    applySessionListResponse(preWriteRequest, [row('postack', { pinned: false }), row('other')])
     await flush()
     expect($pinnedSessionIds.get()).toContain('postack')
     expect(patch).not.toHaveBeenCalledWith('postack', false, undefined)
 
-    // Reconcile against the same page identity must keep refusing it.
-    $pinnedSessionIds.set(['postack'])
+    // A SECOND response whose request also predates the write. This is what an
+    // identity-based skip could not handle: distinct rows, distinct array, but
+    // still a page that never saw the write. Ordering refuses it too.
+    applySessionListResponse(secondPreWriteRequest, [
+      row('postack', { pinned: false }),
+      row('other'),
+      row('third')
+    ])
     await flush()
     expect($pinnedSessionIds.get()).toContain('postack')
+    expect(patch).not.toHaveBeenCalledWith('postack', false, undefined)
 
-    // A later distinct page with genuine opposite server truth is honored
-    // (no intervening reflecting page required — multi-client unpin).
-    $sessions.set([row('postack', { pinned: false }), row('other')])
+    // A response to a request issued AFTER the write is genuine server truth,
+    // even though it disagrees — another Desktop instance unpinned it.
+    applySessionListResponse(beginSessionListRequest(), [
+      row('postack', { pinned: false }),
+      row('other')
+    ])
     await flush()
     expect($pinnedSessionIds.get()).not.toContain('postack')
   })
 
-  it('honors a remote opposite pin without an intervening reflecting page', async () => {
+  it('honors a remote opposite pin on the first response issued after the write', async () => {
     let settle: (v: { ok: boolean }) => void = () => {}
 
     patch.mockImplementationOnce(() => new Promise(resolve => (settle = resolve)))
@@ -239,13 +272,11 @@ describe('watchSessionPins remote pull', () => {
     await flush()
     patch.mockClear()
 
-    // First post-ack page disagrees (could be stale). Local pin holds.
-    $sessions.set([row('remote-flip', { pinned: false })])
-    await flush()
-    expect($pinnedSessionIds.get()).toContain('remote-flip')
-
-    // Next distinct page still says unpinned — that is server truth now.
-    $sessions.set([row('remote-flip', { pinned: false }), row('peer')])
+    // Another Desktop instance unpins it. The very next request we issue
+    // observes that, so its response is authoritative immediately — no
+    // intervening reflecting page, and no second round trip wasted proving
+    // what ordering already establishes.
+    applySessionListResponse(beginSessionListRequest(), [row('remote-flip', { pinned: false })])
     await flush()
     expect($pinnedSessionIds.get()).not.toContain('remote-flip')
   })

@@ -24,60 +24,53 @@ import type { SessionInfo } from '@/types/hermes'
 
 import { setSessionPinnedRemote } from '@/hermes'
 import { $pinnedSessionIds, pinSession, unpinSession } from '@/store/layout'
-import { $sessions, sessionMatchesStoredId, sessionPinId } from '@/store/session'
+import {
+  $sessions,
+  appliedSessionListGeneration,
+  issuedSessionListGeneration,
+  sessionMatchesStoredId,
+  sessionPinId
+} from '@/store/session'
 
 // pin ids we've successfully PATCHed pinned=true this session.
 const mirrored = new Set<string>()
 // pin ids awaiting their row so we can resolve the owning profile before PATCH.
 const pending = new Set<string>()
-// Writes we've issued: id -> { value, seq, acked }. The guard survives the
-// PATCH ack because a page issued BEFORE the write can land AFTER the ack
-// still carrying the old value (#76919, follow-up to #74570). `seq` lets a
-// later write's guard outlive a stale ack from an earlier one.
+// Writes we've issued: id -> { value, seq, acked, issuedAt }. The guard
+// survives the PATCH ack because a list request issued BEFORE the write can
+// land AFTER the ack still carrying the old value (#76919, follow-up to
+// #74570). `seq` lets a later write's guard outlive a stale ack from an
+// earlier one.
 //
-// Post-ack mismatches clear the guard without adopting THAT page snapshot
-// (keyed by `$sessions` array identity): the next distinct page is treated
-// as authoritative. That fences the stale-after-ack race without forever
-// discarding a genuine opposite value from another Desktop instance.
+// A contradicting page is judged by REQUEST ORDER, not by its contents or its
+// array identity: `issuedAt` records the newest list-request generation at
+// write time, so any response at or below it demonstrably never saw the write.
+// That covers every pre-write response rather than only the first, and it
+// leaves a genuine later write from another Desktop instance free to be
+// adopted the moment a request issued after ours comes back.
 interface PinWrite {
   value: boolean
   seq: number
   acked: boolean
+  /**
+   * The newest list-request generation that had been issued when this write
+   * went out. Any response at or below it was in flight before the write and
+   * therefore cannot reflect it, however many such responses arrive.
+   */
+  issuedAt: number
 }
 const writes = new Map<string, PinWrite>()
 let writeSeq = 0
-// Session-list page identities that must not drive pin adoption for a given
-// id (stale post-ack snapshot). WeakSet so pages can be GC'd.
-const skippedPages = new WeakMap<SessionInfo[], Set<string>>()
 
 function profileFor(pinId: string): null | string | undefined {
   return $sessions.get().find(row => sessionMatchesStoredId(row, pinId))?.profile
-}
-
-function skipPageFor(page: SessionInfo[], ...ids: string[]): void {
-  let held = skippedPages.get(page)
-
-  if (!held) {
-    held = new Set<string>()
-    skippedPages.set(page, held)
-  }
-
-  for (const id of ids) {
-    held.add(id)
-  }
-}
-
-function isSkippedOnPage(page: SessionInfo[], ...ids: string[]): boolean {
-  const held = skippedPages.get(page)
-
-  return !!held && ids.some(id => held.has(id))
 }
 
 /** PATCH the flag, guarding reads against pages that predate the write. */
 function writePin(id: string, pinned: boolean, profile?: null | string): Promise<void> {
   const seq = ++writeSeq
 
-  writes.set(id, { value: pinned, seq, acked: false })
+  writes.set(id, { value: pinned, seq, acked: false, issuedAt: issuedSessionListGeneration() })
 
   return setSessionPinnedRemote(id, pinned, profile).then(
     () => {
@@ -134,23 +127,19 @@ function pullRemotePins(): void {
         continue
       }
 
-      if (awaited.acked && awaited.value !== row.pinned) {
-        // Post-ack mismatch: drop the guard and refuse THIS page snapshot for
-        // this id. A later distinct `$sessions` array is authoritative again
-        // (genuine remote flip, or a reflecting refresh).
-        writes.delete(pinId)
-        writes.delete(row.id)
-        skipPageFor(page, pinId, row.id)
+      if (awaited.value !== row.pinned && appliedSessionListGeneration() <= awaited.issuedAt) {
+        // This page answers a request issued no later than our write, so it
+        // cannot have observed it. Stale by ordering, not by guesswork — and
+        // this holds for every such response, not just the first, which is
+        // what a page-identity heuristic could not do.
         continue
       }
 
-      // Page reflects our write — the guard has done its job.
+      // Either the page reflects our write, or it answers a request issued
+      // after it. Both mean the guard is spent; a genuine opposite value from
+      // another Desktop instance falls through here and is adopted below.
       writes.delete(pinId)
       writes.delete(row.id)
-    }
-
-    if (isSkippedOnPage(page, pinId, row.id)) {
-      continue
     }
 
     // Local intent still waiting on its PATCH (row unresolved when the push

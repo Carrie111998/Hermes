@@ -16,7 +16,9 @@ import {
   $messagingSessions,
   $selectedStoredSessionId,
   $sessions,
+  beginSessionListRequest,
   CRON_SECTION_LIMIT,
+  markSessionListApplied,
   mergeSessionPage,
   MESSAGING_SECTION_LIMIT,
   setCronSessions,
@@ -139,7 +141,11 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
   }, [profileScope])
 
   const refreshSessions = useCallback(async () => {
-    const requestId = refreshSessionsRequestRef.current + 1
+    // Claim a generation from the shared store counter rather than a local
+    // ref. The pin sync compares list-request order against its own writes to
+    // tell a pre-write page from a genuine remote change (#76919), and it can
+    // only do that if both sides count from the same place.
+    const requestId = beginSessionListRequest()
     refreshSessionsRequestRef.current = requestId
     // The loading flag exists to drive the initial skeletons (they only render
     // while the list is empty). Turn-complete / reconnect refreshes over a
@@ -179,6 +185,10 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
       })
 
       if (refreshSessionsRequestRef.current === requestId) {
+        // Record which request the rows about to land answer, before they
+        // land: the pin sync reads this the moment `$sessions` changes.
+        markSessionListApplied(requestId)
+
         const recents = result.recents
 
         // Drop rows the user just deleted/archived: a refresh can race an

@@ -465,6 +465,45 @@ export const $contextSuggestions = atom<ContextSuggestion[]>([])
 export const $modelPickerOpen = atom(false)
 export const $sessionPickerOpen = atom(false)
 
+/**
+ * Ordering for session-list requests, so a response can be placed relative to
+ * a local write instead of guessed at from its contents.
+ *
+ * A list request issued before a pin write can land after that write's PATCH
+ * ack still carrying the pre-write value (#76919). Comparing values cannot
+ * tell that page apart from a genuine later write by another Desktop instance;
+ * comparing issue order can, and it does so for every pre-write response
+ * rather than only the first one.
+ *
+ * Module-scoped rather than a hook ref: the hook that issues refreshes can
+ * remount, which would restart a ref at zero and silently break monotonicity,
+ * and the pin sync needs to read the same counter.
+ */
+let sessionListIssued = 0
+let sessionListApplied = 0
+
+/** Claim the next generation. Call when a list request is ISSUED. */
+export const beginSessionListRequest = (): number => ++sessionListIssued
+
+/** The newest generation whose response has been applied to `$sessions`. */
+export const appliedSessionListGeneration = (): number => sessionListApplied
+
+/** The latest generation issued, whether or not its response has landed. */
+export const issuedSessionListGeneration = (): number => sessionListIssued
+
+/** Record that `generation`'s response is the one now in `$sessions`. */
+export const markSessionListApplied = (generation: number): void => {
+  if (generation > sessionListApplied) {
+    sessionListApplied = generation
+  }
+}
+
+/** Tests only — mirrors the reset convention used elsewhere in this store. */
+export const _resetSessionListGenerationForTests = (): void => {
+  sessionListIssued = 0
+  sessionListApplied = 0
+}
+
 export const setConnection = (next: Updater<HermesConnection | null>) => updateAtom($connection, next)
 export const setGatewayState = (next: Updater<ConnectionState>) => updateAtom($gatewayState, next)
 export const setSessions = (next: Updater<SessionInfo[]>) => updateAtom($sessions, next)
