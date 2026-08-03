@@ -1576,6 +1576,8 @@ def fetch_openrouter_models(
         if not _openrouter_model_supports_tools(live_item):
             continue
         if preferred_id == silent_default:
+            # Keep the silent-default badge through the live refresh so the
+            # picker shows which model Hermes lands on when none is selected.
             desc = "default"
         else:
             desc = "free" if _openrouter_model_is_free(live_item.get("pricing")) else ""
