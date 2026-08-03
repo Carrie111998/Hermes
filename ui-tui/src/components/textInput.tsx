@@ -178,7 +178,7 @@ export function shouldPreserveCtrlJNewline(env: MinimalEnv = process.env): boole
     return true
   }
 
-  return (env.WSL_DISTRO_NAME ?? '').toLowerCase().includes('microsoft')
+  return Boolean(env.WSL_INTEROP || env.WSL_DISTRO_NAME)
 }
 
 function prevPos(s: string, p: number) {

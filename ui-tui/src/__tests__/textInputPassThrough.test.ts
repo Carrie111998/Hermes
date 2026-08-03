@@ -16,6 +16,10 @@ describe('shouldPreserveCtrlJNewline', () => {
     ).toBe(true)
   })
 
+  it('preserves Ctrl+J as newline on WSL when WSL_DISTRO_NAME is set', () => {
+    expect(shouldPreserveCtrlJNewline({ TERM: 'xterm-256color', WSL_DISTRO_NAME: 'Ubuntu' })).toBe(true)
+  })
+
   it('keeps bare local POSIX LF-compatible prompts submitting on Ctrl+J', () => {
     expect(shouldPreserveCtrlJNewline({ TERM: 'xterm-256color' })).toBe(false)
   })
