@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 
 import { en } from './en'
 import { ja } from './ja'
-import { createManagedTranslations, sanitizeManagedBrandText } from './managed-brand'
+import { createManagedTranslations, managedProviderDisplayValue, sanitizeManagedBrandText } from './managed-brand'
 import { zh } from './zh'
 import { zhHant } from './zh-hant'
 
@@ -34,6 +34,32 @@ describe('managed evaOS Agent branding', () => {
   it('rebrands visible upstream product and provider names', () => {
     expect(sanitizeManagedBrandText('Start Hermes Desktop with Eva and Nous Portal')).toBe(
       'Start evaOS Agent with evaOS Agent and Electric Sheep account'
+    )
+  })
+
+  it('sanitizes managed Nous provider labels while preserving unmanaged and other-provider labels', () => {
+    expect(managedProviderDisplayValue('nous', 'Nous Portal', true)).toBe('Electric Sheep account')
+    expect(managedProviderDisplayValue('Nous Subscription (Browser Use cloud)', 'subscription', true)).toBe('managed')
+    expect(
+      managedProviderDisplayValue(
+        'Nous Subscription (Browser Use cloud)',
+        'Managed Browser Use billed to your subscription',
+        true
+      )
+    ).toBe('Managed Browser Use included with your managed agent')
+    expect(managedProviderDisplayValue('nous', 'Nous Portal', false)).toBe('Nous Portal')
+    expect(managedProviderDisplayValue('openai', 'Nous-compatible proxy', true)).toBe('Nous-compatible proxy')
+  })
+
+  it('sanitizes function-valued provider copy after dynamic backend labels are rendered', () => {
+    const selectedMessage = managedProviderDisplayValue(
+      'nous',
+      (provider: string) => `Selected ${provider}; Hermes will use it.`,
+      true
+    )
+
+    expect(selectedMessage('Nous Subscription')).toBe(
+      'Selected Electric Sheep managed service; evaOS Agent will use it.'
     )
   })
 

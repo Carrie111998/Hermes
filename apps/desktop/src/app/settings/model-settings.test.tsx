@@ -82,6 +82,7 @@ afterEach(() => {
   cleanup()
   vi.clearAllMocks()
   profileSwitchHandler = null
+  Reflect.deleteProperty(window, 'hermesDesktop')
 })
 
 async function renderModelSettings() {
@@ -113,6 +114,31 @@ describe('ModelSettings', () => {
     // "Nous" shows in both the trigger and the open list.
     expect((await screen.findAllByText('Nous')).length).toBeGreaterThan(0)
     expect(screen.queryByText(/DeepSeek/)).toBeNull()
+  })
+
+  it('renders backend Nous labels and setup copy with managed customer branding', async () => {
+    Object.defineProperty(window, 'hermesDesktop', {
+      configurable: true,
+      value: { eva: {} },
+      writable: true
+    })
+    getGlobalModelOptions.mockResolvedValue({
+      providers: [
+        {
+          name: 'Nous Portal',
+          slug: 'nous',
+          models: [],
+          authenticated: false,
+          auth_type: 'oauth_device'
+        }
+      ]
+    })
+
+    await renderModelSettings()
+
+    expect(await screen.findByText('Electric Sheep account')).toBeTruthy()
+    expect(screen.getByText(/evaOS Agent runs the flow for you/)).toBeTruthy()
+    expect(screen.queryByText(/Nous Portal|Hermes runs the flow/)).toBeNull()
   })
 
   it.each(['custom', 'local', 'custom:lab'])(

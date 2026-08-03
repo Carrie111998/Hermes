@@ -38,6 +38,7 @@ beforeEach(() => {
 afterEach(() => {
   cleanup()
   vi.clearAllMocks()
+  Reflect.deleteProperty(window, 'hermesDesktop')
 })
 
 // A minimal controller — these tests are about the CATALOG's own behaviour
@@ -73,6 +74,22 @@ function renderMenu() {
 // the kanban board would end up disagreeing about what "my models" means —
 // which is exactly the drift extracting this component was meant to prevent.
 describe('the catalog owns model curation', () => {
+  it('renders a backend Nous provider label with managed customer branding', async () => {
+    Object.defineProperty(window, 'hermesDesktop', {
+      configurable: true,
+      value: { eva: {} },
+      writable: true
+    })
+    getGlobalModelOptions.mockResolvedValue({
+      providers: [{ models: ['hermes-4'], name: 'Nous Portal', slug: 'nous' }]
+    })
+
+    renderMenu()
+
+    expect(await screen.findByText('Electric Sheep account')).toBeTruthy()
+    expect(screen.queryByText('Nous Portal')).toBeNull()
+  })
+
   it('honours the stored Edit Models shortlist', async () => {
     setVisibleModels(new Set([modelVisibilityKey('google', 'gemini-2.5-flash')]))
 

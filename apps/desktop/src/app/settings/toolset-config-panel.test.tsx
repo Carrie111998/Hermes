@@ -868,7 +868,10 @@ describe('ToolsetConfigPanel', () => {
       const { ToolsetConfigPanel } = await import('./toolset-config-panel')
       render(<ToolsetConfigPanel onConfiguredChange={vi.fn()} toolset="browser" />)
 
-      await screen.findByRole('button', { name: /Nous Subscription/ })
+      await screen.findByRole('button', { name: /Electric Sheep managed service/ })
+      expect(screen.getByText('managed')).toBeTruthy()
+      expect(screen.getByText('Managed Browser Use included with your managed agent')).toBeTruthy()
+      expect(screen.queryByText(/Nous Subscription/)).toBeNull()
       fireEvent.click(await screen.findByRole('button', { name: /Use this backend/ }))
 
       await waitFor(() =>
@@ -940,6 +943,11 @@ describe('ToolsetConfigPanel', () => {
 
     it('shows the plain success toast when the managed row is already entitled', async () => {
       const { notify } = await import('@/store/notifications')
+      Object.defineProperty(window, 'hermesDesktop', {
+        configurable: true,
+        value: { eva: {} },
+        writable: true
+      })
 
       getToolsetConfig.mockResolvedValue(nousBrowserConfig())
       selectToolsetProvider.mockResolvedValue({
@@ -951,10 +959,16 @@ describe('ToolsetConfigPanel', () => {
       const { ToolsetConfigPanel } = await import('./toolset-config-panel')
       render(<ToolsetConfigPanel onConfiguredChange={vi.fn()} toolset="browser" />)
 
-      await screen.findByRole('button', { name: /Nous Subscription/ })
+      await screen.findByRole('button', { name: /Electric Sheep managed service/ })
       fireEvent.click(await screen.findByRole('button', { name: /Use this backend/ }))
 
-      await waitFor(() => expect(notify).toHaveBeenCalledWith(expect.objectContaining({ kind: 'success' })))
+      await waitFor(() =>
+        expect(notify).toHaveBeenCalledWith({
+          kind: 'success',
+          title: 'Provider selected',
+          message: 'Electric Sheep managed service (Browser Use cloud) is now active.'
+        })
+      )
       expect(startOAuthLogin).not.toHaveBeenCalled()
     })
   })

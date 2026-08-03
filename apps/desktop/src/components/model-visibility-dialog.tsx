@@ -11,6 +11,7 @@ import { HighlightMatches } from '@/components/ui/highlight-matches'
 import { Switch } from '@/components/ui/switch'
 import type { HermesGateway } from '@/hermes'
 import { useI18n } from '@/i18n'
+import { isManagedEvaosAgent, managedProviderDisplayValue } from '@/i18n/managed-brand'
 import { Search } from '@/lib/icons'
 import { modelOptionsQueryKey, requestModelOptions } from '@/lib/model-options'
 import { displayModelName, modelDisplayParts } from '@/lib/model-status-label'
@@ -46,6 +47,7 @@ export function ModelVisibilityDialog({
 }: ModelVisibilityDialogProps) {
   const { t } = useI18n()
   const copy = t.modelVisibility
+  const managedEva = isManagedEvaosAgent()
   const [search, setSearch] = useState('')
   const stored = useStore($visibleModels)
   const collapsedProviders = useStore($collapsedProviders)
@@ -74,7 +76,10 @@ export function ModelVisibilityDialog({
   const q = normalize(search)
 
   const matches = (provider: ModelOptionProvider, model: string) =>
-    !q || `${model} ${provider.name} ${provider.slug} ${displayModelName(model)}`.toLowerCase().includes(q)
+    !q ||
+    `${model} ${managedProviderDisplayValue(provider.slug, provider.name, managedEva)} ${provider.slug} ${displayModelName(model)}`
+      .toLowerCase()
+      .includes(q)
 
   return (
     <Dialog onOpenChange={onOpenChange} open={open}>
@@ -127,7 +132,10 @@ export function ModelVisibilityDialog({
                       type="button"
                     >
                       <span className="min-w-0 truncate">
-                        <HighlightMatches query={search} text={provider.name} />
+                        <HighlightMatches
+                          query={search}
+                          text={managedProviderDisplayValue(provider.slug, provider.name, managedEva)}
+                        />
                       </span>
                       <DisclosureCaret
                         className="shrink-0 opacity-0 transition group-hover/label:opacity-100"

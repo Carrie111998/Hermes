@@ -22,6 +22,61 @@ export function sanitizeManagedBrandText(value: string): string {
   return BRAND_REPLACEMENTS.reduce((current, [pattern, replacement]) => current.replace(pattern, replacement), value)
 }
 
+function isNousProviderIdentity(providerIdentity: null | string | undefined): boolean {
+  const normalized = providerIdentity?.trim().toLowerCase() ?? ''
+
+  return (
+    normalized === 'nous' ||
+    normalized === 'nous portal' ||
+    normalized === 'nous research' ||
+    normalized.startsWith('nous subscription')
+  )
+}
+
+function sanitizeManagedProviderText(value: string): string {
+  const trimmed = value.trim().toLowerCase()
+
+  if (trimmed === 'subscription') {
+    return 'managed'
+  }
+
+  return sanitizeManagedBrandText(
+    value
+      .replace(/Nous Subscription/g, 'Electric Sheep managed service')
+      .replace(/billed to your subscription/gi, 'included with your managed agent')
+  )
+}
+
+/**
+ * Sanitize backend-owned provider copy at customer display seams without
+ * changing the provider identity sent back over the wire. Non-Nous providers,
+ * unmanaged builds, and non-string values pass through unchanged.
+ *
+ * Function values are wrapped so translation/copy callbacks that interpolate
+ * a backend label are sanitized after rendering as well.
+ */
+export function managedProviderDisplayValue<T>(
+  providerIdentity: null | string | undefined,
+  value: T,
+  managed = isManagedEvaosAgent()
+): T {
+  if (!managed || !isNousProviderIdentity(providerIdentity)) {
+    return value
+  }
+
+  if (typeof value === 'string') {
+    return sanitizeManagedProviderText(value) as T
+  }
+
+  if (typeof value === 'function') {
+    const render = value as (...args: unknown[]) => unknown
+
+    return ((...args: unknown[]) => sanitizeManagedProviderText(String(render(...args)))) as T
+  }
+
+  return value
+}
+
 function sanitizeFunctionResult(value: unknown, args: unknown[]): string {
   let rendered = String(value)
 
