@@ -1047,9 +1047,10 @@ class TestConcurrentWriters:
         Exactly one should succeed (applied), the other should detect stale.
         """
         db_path = tmp_path / "test_concurrent.db"
-        # Pre-populate
+        # Pre-populate with WAL mode enabled (persists in file header)
         conn = sqlite3.connect(str(db_path))
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
         ms.migrate_mission_state(conn)
         state = _make_state()
         ms.create_mission(conn, state=state, operation_id="op-1")
@@ -1061,7 +1062,6 @@ class TestConcurrentWriters:
         def writer(name: str, op_id: str, status: str, phase: str):
             conn = sqlite3.connect(str(db_path), timeout=10)
             conn.row_factory = sqlite3.Row
-            conn.execute("PRAGMA journal_mode=WAL")
             barrier.wait()  # synchronize start
             next_s = _make_state(status=status, phase=phase, mission_id="mission-1")
             if status == "blocked":
@@ -1116,6 +1116,7 @@ class TestConcurrentWriters:
         db_path = tmp_path / "test_replay_concurrent.db"
         conn = sqlite3.connect(str(db_path))
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
         ms.migrate_mission_state(conn)
         state = _make_state()
         ms.create_mission(conn, state=state, operation_id="op-1")
@@ -1128,7 +1129,6 @@ class TestConcurrentWriters:
         def writer(name: str):
             conn = sqlite3.connect(str(db_path), timeout=10)
             conn.row_factory = sqlite3.Row
-            conn.execute("PRAGMA journal_mode=WAL")
             barrier.wait()
             try:
                 r = ms.compare_and_transition(
