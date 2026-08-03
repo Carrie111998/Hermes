@@ -2634,6 +2634,24 @@ def prompt_dangerous_approval(command: str, description: str,
 
     os.environ["HERMES_SPINNER_PAUSE"] = "1"
     try:
+        # This raw-input fallback bypasses HermesCLI's modal callbacks, so emit
+        # its own BEL when the unified input alert is enabled.
+        try:
+            from hermes_cli.config import load_config_readonly as _load_cfg
+            input_alert = (_load_cfg() or {}).get("display", {}).get("input_alert", True)
+        except Exception:
+            input_alert = True
+        if input_alert and sys.stdout.isatty():
+            try:
+                sys.stdout.write("\x1b]9;Hermes: command approval\x07")
+            except Exception:
+                pass
+            try:
+                sys.stdout.write("\a")
+                sys.stdout.flush()
+            except Exception:
+                pass
+
         # Resolve the active UI language once per prompt so we don't re-read
         # config/YAML inside the retry loop below.
         from agent.i18n import t

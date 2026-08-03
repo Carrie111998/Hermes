@@ -2863,6 +2863,40 @@ def _accent_hex() -> str:
         return "#FFBF00"
 
 
+def _notify_input_needed(body: str = "Hermes needs your input") -> None:
+    """Best-effort OSC 9 + BEL alert for blocking interactive prompts."""
+    try:
+        from hermes_cli.config import load_config_readonly
+        display = (load_config_readonly() or {}).get("display", {})
+        if not display.get("input_alert", True) or not sys.stdout.isatty():
+            return
+    except Exception:
+        return
+
+    safe_body = re.sub(r"[\x00-\x1f\x7f]", "", body)
+    osc9 = f"\x1b]9;{safe_body}\x07"
+    try:
+        with open("/dev/tty", "w", buffering=1, encoding="utf-8") as tty:
+            tty.write(osc9)
+            tty.write("\a")
+        return
+    except Exception:
+        pass
+
+    # /dev/tty is absent on native Windows and can be unavailable in sandboxes.
+    # Keep OSC 9 and BEL independent so either can fail without suppressing the
+    # other signal.
+    try:
+        sys.stdout.write(osc9)
+    except Exception:
+        pass
+    try:
+        sys.stdout.write("\a")
+        sys.stdout.flush()
+    except Exception:
+        pass
+
+
 def _rich_text_from_ansi(text: str) -> _RichText:
     """Safely render assistant/tool output that may contain ANSI escapes.
 
@@ -8707,6 +8741,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # If prompt_toolkit is not running (unit tests / non-interactive calls),
         # keep the simple stdin fallback.
         if not getattr(self, "_app", None):
+            _notify_input_needed(f"Hermes: {title}")
             return self._prompt_text_input("Choice [1/2/3]: ")
 
         try:
@@ -8724,6 +8759,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             if sys.platform == "win32" and not in_main_thread:
                 self._invalidate()
                 return None
+            _notify_input_needed(f"Hermes: {title}")
             return self._prompt_text_input("Choice [1/2/3]: ")
 
         if not in_main_thread and app_loop is None:
@@ -8770,6 +8806,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         if not _run_on_app_loop(_setup_modal):
             return _stdin_fallback()
 
+        _notify_input_needed(f"Hermes: {title}")
         _last_countdown_refresh = _time.monotonic()
         try:
             while True:
@@ -13142,6 +13179,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # thread. Modal prompts must paint at once and must not be gated by the
         # _invalidate throttle / resize guard — see _paint_now / _invalidate (#41098).
         self._paint_now()
+        _notify_input_needed("Hermes: clarify question")
 
         # Poll for the user's response. The countdown in the hint line updates
         # on each repaint; refresh it once a second so the timer stays visible
@@ -13199,6 +13237,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # Modal prompt — paint immediately, bypassing the throttle/resize guard
         # so the prompt can't be dropped and time out unseen (#41098).
         self._paint_now()
+        _notify_input_needed("Hermes: sudo password")
 
         while True:
             try:
@@ -13267,6 +13306,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # the command is denied on timeout without the user ever seeing it
             # (#41098). The countdown refreshes below paint the same way.
             self._paint_now()
+            _notify_input_needed("Hermes: command approval")
 
             _last_countdown_refresh = _time.monotonic()
             while True:
@@ -13536,6 +13576,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         return lines
 
     def _secret_capture_callback(self, var_name: str, prompt: str, metadata=None) -> dict:
+        _notify_input_needed(f"Hermes: secret needed ({var_name})")
         return prompt_for_secret(self, var_name, prompt, metadata)
 
     def _capture_modal_input_snapshot(self) -> None:

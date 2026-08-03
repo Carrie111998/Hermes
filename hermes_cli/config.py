@@ -4336,7 +4336,8 @@ def show_config():
     display = config.get('display', {})
     print(f"  Personality:  {display.get('personality') or 'none'}")
     print(f"  Reasoning:    {'on' if display.get('show_reasoning', True) else 'off'}")
-    print(f"  Bell:         {'on' if display.get('bell_on_complete', False) else 'off'}")
+    print(f"  Bell:         {'on' if display.get('bell_on_complete', False) else 'off'} (turn-end), "
+          f"{'on' if display.get('input_alert', True) else 'off'} (input alert)")
     ump = display.get('user_message_preview', {}) if isinstance(display.get('user_message_preview', {}), dict) else {}
     ump_first = ump.get('first_lines', 2)
     ump_last = ump.get('last_lines', 2)

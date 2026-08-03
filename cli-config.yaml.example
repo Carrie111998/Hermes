@@ -1383,6 +1383,12 @@ display:
   #   false: Silent (default)
   bell_on_complete: false
 
+  # Emit a terminal notification whenever Hermes blocks on an interactive
+  # prompt (clarify, approval, sudo, secret capture, or confirmation).
+  # Sends OSC 9 for notification-aware terminals and BEL as a universal
+  # fallback. Disabled automatically when stdout is not a TTY.
+  input_alert: true
+
   # Show model reasoning/thinking before each response.
   # When enabled, a dim box shows the model's thought process above the response.
   # Toggle at runtime with /reasoning show or /reasoning hide.
