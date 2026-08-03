@@ -46,6 +46,7 @@ QUOTE_MAX_LEN = 1000
 STATEMENT_MAX_LEN = 500
 IMPACT_MAX_LEN = 500
 RECOMMENDATION_MAX_LEN = 500
+OBJECTIVE_TEXT_MAX_LEN = 10_000
 
 STALE_PENALTY = 0.50
 UNKNOWN_PENALTY = 0.60
@@ -826,6 +827,10 @@ class EvidencePackEngine:
 
     # ── public API ──────────────────────────────────────────────
 
+    def _effective_objective_text(self, objective_text: str) -> str:
+        """Return the normalized objective text used by every downstream stage."""
+        return (objective_text or "")[:OBJECTIVE_TEXT_MAX_LEN]
+
     def dry_run(
         self,
         objective_id: str,
@@ -842,8 +847,9 @@ class EvidencePackEngine:
         """Build an EvidencePack without persisting anywhere."""
         t0 = self._monotonic()
         observed_at = _now_iso8601()
-        if not objective_text:
-            objective_text = ""
+        raw_objective_text = objective_text or ""
+        objective_text = self._effective_objective_text(raw_objective_text)
+        objective_text_was_clamped = len(raw_objective_text) > OBJECTIVE_TEXT_MAX_LEN
         if max_hits_per_source < 1:
             max_hits_per_source = 1
         if max_hits_total < 1:
@@ -894,10 +900,10 @@ class EvidencePackEngine:
                     continue
                 all_hits.append(h)
 
-        # Bound objective_text for spec
-        if len(objective_text) > 10_000:
-            objective_text = objective_text[:10_000]
-            missing.append("objective_text clamped to 10000 chars")
+        if objective_text_was_clamped:
+            missing.append(
+                f"objective_text clamped to {OBJECTIVE_TEXT_MAX_LEN} chars"
+            )
 
         # Rank, dedup, cap
         ranked = _rank_hits(
@@ -1080,6 +1086,7 @@ class EvidencePackEngine:
         max_hits_per_source = kwargs.get("max_hits_per_source", MAX_HITS_PER_SOURCE_DEFAULT)
         timeout_seconds = kwargs.get("timeout_seconds", TIMEOUT_SECONDS_DEFAULT)
         sources_requested = kwargs.get("sources_requested", tuple(self._sources.keys()))
+        objective_text = self._effective_objective_text(objective_text)
         return _sha256_hex({
             "objective_id": objective_id,
             "objective_text": objective_text,
