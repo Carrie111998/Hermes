@@ -306,6 +306,24 @@ class TestScrubbedProviderCredentialNotes:
         )
         assert "OPENAI_API_KEY" not in names
 
+    def test_blocklist_absence_reported_even_if_passthrough_claimed(self, monkeypatch):
+        """Authoritative provider blocklist wins over passthrough claims (#71788)."""
+        from tools.env_passthrough import (
+            clear_env_passthrough,
+            list_scrubbed_provider_credentials,
+            register_env_passthrough,
+        )
+
+        clear_env_passthrough()
+        # register is refused for provider creds, but even if something set the
+        # allow set, absence from child must still surface in the note.
+        register_env_passthrough(["OPENAI_API_KEY"])
+        names = list_scrubbed_provider_credentials(
+            {"OPENAI_API_KEY": "sk-x", "PATH": "/usr/bin"},
+            {"PATH": "/usr/bin"},
+        )
+        assert "OPENAI_API_KEY" in names
+
 
 class TestCredentialScrubNoteResultPaths:
     """Result-level regression for #71788 review: note matches actual child env."""

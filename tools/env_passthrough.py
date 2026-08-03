@@ -187,9 +187,11 @@ def list_scrubbed_provider_credentials(
             continue
         if name in child:
             continue
-        # Honor explicit passthrough — those are preserved in child env.
-        if is_env_passthrough(name):
-            continue
+        # Report blocklist absences even if a skill/config tried to mark the
+        # name as passthrough: register_env_passthrough refuses Hermes provider
+        # credentials (GHSA-rhgp-j443-p4rf), so is_env_passthrough is always
+        # false for real blocklist names. Skipping on passthrough here would
+        # create a false-negative note if that guard ever regressed.
         scrubbed.append(name)
     return scrubbed
 
