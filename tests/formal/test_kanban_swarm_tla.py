@@ -12,6 +12,20 @@ import subprocess
 import sys
 
 import pytest
+import yaml
+
+
+def test_formal_workflow_triggers_when_its_own_definition_changes():
+    repo = Path(__file__).resolve().parents[2]
+    workflow = yaml.safe_load(
+        (repo / ".github/workflows/kanban-formal.yml").read_text(encoding="utf-8")
+    )
+
+    self_path = ".github/workflows/kanban-formal.yml"
+    triggers = workflow.get("on", workflow.get(True))
+    for event in ("pull_request", "push"):
+        paths = triggers[event]["paths"]
+        assert paths.count(self_path) == 1
 
 
 def test_kanban_swarm_tlc_model_executes_fresh(tmp_path):

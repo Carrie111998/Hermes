@@ -939,6 +939,7 @@ class Task:
     tenant: Optional[str]
     branch_name: Optional[str] = None
     project_id: Optional[str] = None
+    project_slug: Optional[str] = None
     result: Optional[str] = None
     idempotency_key: Optional[str] = None
     # Unified non-success counter. Incremented on any of:
@@ -1038,6 +1039,7 @@ class Task:
             workspace_path=row["workspace_path"],
             branch_name=row["branch_name"] if "branch_name" in keys else None,
             project_id=row["project_id"] if "project_id" in keys else None,
+            project_slug=row["project_slug"] if "project_slug" in keys else None,
             claim_lock=row["claim_lock"],
             claim_expires=row["claim_expires"],
             tenant=row["tenant"] if "tenant" in keys else None,
@@ -1225,6 +1227,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- the task's worktree is anchored under the project's primary repo with a
     -- deterministic branch name instead of a random wt/<task-id> fallback.
     project_id           TEXT,
+    -- Canonical slug carried with project_id so cross-profile workers can
+    -- authenticate the deterministic branch prefix without projects.db.
+    project_slug         TEXT,
     claim_lock           TEXT,
     claim_expires        INTEGER,
     tenant               TEXT,
@@ -2379,6 +2384,8 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(conn, "tasks", "branch_name", "branch_name TEXT")
     if "project_id" not in cols:
         _add_column_if_missing(conn, "tasks", "project_id", "project_id TEXT")
+    if "project_slug" not in cols:
+        _add_column_if_missing(conn, "tasks", "project_slug", "project_slug TEXT")
     if "idempotency_key" not in cols:
         _add_column_if_missing(conn, "tasks", "idempotency_key", "idempotency_key TEXT")
     # ``idx_tasks_idempotency`` is created unconditionally below alongside
@@ -3081,6 +3088,7 @@ def create_task(
     # path is absolute (profile-independent) and the branch name is pure, so the
     # cross-profile dispatcher needs no projects.db access at dispatch time.
     project_obj = None
+    project_slug: Optional[str] = None
     # Primary repo of a project-linked worktree task whose path we still need to
     # derive (a fresh worktree dir under the repo, computed once task_id exists).
     project_repo: Optional[str] = None
@@ -3108,29 +3116,34 @@ def create_task(
                 and source_task.project_id == project_id
                 and source_task.workspace_kind == "worktree"
                 and source_task.workspace_path
+                and source_task.project_slug
             ):
                 source_path = Path(source_task.workspace_path)
+                try:
+                    source_project_slug = _pdb.normalize_slug(source_task.project_slug)
+                except ValueError:
+                    source_project_slug = None
                 if (
                     source_path.is_absolute()
+                    and ".." not in source_path.parts
                     and source_path.name == source_task.id
                     and source_path.parent.name == ".worktrees"
+                    and source_project_slug == source_task.project_slug
                 ):
-                    project_slug = None
-                    if source_task.branch_name:
-                        prefix, separator, leaf = source_task.branch_name.partition("/")
-                        if separator and (
-                            leaf == source_task.id
-                            or leaf.startswith(f"{source_task.id}-")
-                        ):
-                            try:
-                                project_slug = _pdb.normalize_slug(prefix)
-                            except ValueError:
-                                project_slug = None
-                    if project_slug is None:
-                        try:
-                            project_slug = _pdb.normalize_slug(project_id)
-                        except ValueError:
-                            project_slug = None
+                    source_project = _pdb.Project(
+                        id=source_task.project_id,
+                        slug=source_project_slug,
+                        name=source_project_slug,
+                        created_at=0,
+                    )
+                    expected_source_branch = _pdb.branch_name_for(
+                        source_project, source_task.id, title=source_task.title
+                    )
+                    project_slug = (
+                        source_project_slug
+                        if source_task.branch_name == expected_source_branch
+                        else None
+                    )
                     if project_slug:
                         project_repo = str(source_path.parent.parent)
                         project_obj = _pdb.Project(
@@ -3153,6 +3166,7 @@ def create_task(
             # Canonicalise (a slug may have been passed) and anchor the
             # worktree under the project's primary repo.
             project_id = project_obj.id
+            project_slug = project_obj.slug
             if workspace_kind == "scratch" and project_obj.primary_path:
                 workspace_kind = "worktree"
             if (
@@ -3355,12 +3369,12 @@ def create_task(
                     INSERT INTO tasks (
                         id, title, body, assignee, status, priority,
                         created_by, created_at, workspace_kind, workspace_path,
-                        branch_name, project_id, tenant, idempotency_key,
+                        branch_name, project_id, project_slug, tenant, idempotency_key,
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
                         goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3375,6 +3389,7 @@ def create_task(
                         workspace_path,
                         branch_name,
                         project_id,
+                        project_slug,
                         tenant,
                         idempotency_key,
                         int(max_runtime_seconds)
@@ -6664,7 +6679,8 @@ def decompose_triage_task(
     child_ids: list[str] = []
     with write_txn(conn):
         root_row = conn.execute(
-            "SELECT id, status, tenant, workspace_kind, workspace_path "
+            "SELECT id, status, tenant, workspace_kind, workspace_path, "
+            "project_id, project_slug "
             "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
@@ -6679,6 +6695,12 @@ def decompose_triage_task(
         # override with its own 'workspace_kind' / 'workspace_path'.
         root_ws_kind = root_row["workspace_kind"] or "scratch"
         root_ws_path = root_row["workspace_path"]
+        root_project_id = root_row["project_id"]
+        root_project_slug = root_row["project_slug"]
+        if root_project_id and not root_project_slug:
+            raise ValueError("project-scoped triage task lacks canonical project_slug")
+        if root_project_id and root_ws_kind != "worktree":
+            raise ValueError("project-scoped triage task must use a worktree")
 
         # Create children. Status is 'todo' regardless of parents — we
         # link them under the root AFTER creation so the dispatcher
@@ -6689,6 +6711,13 @@ def decompose_triage_task(
             title = child["title"].strip()
             body = child.get("body")
             assignee = _canonical_assignee(child.get("assignee"))
+            if root_project_id and (
+                child.get("workspace_path")
+                or child.get("workspace_kind") not in (None, "", "worktree")
+            ):
+                raise ValueError(
+                    "project-scoped child cannot override worktree authority"
+                )
             # Per-child override wins; otherwise inherit the root's
             # workspace. A child that sets workspace_kind without a path
             # falls back to the root path only when kinds match (so a
@@ -6710,11 +6739,30 @@ def decompose_triage_task(
                 child_ws_path = root_ws_path
             else:
                 child_ws_path = None
+            child_branch_name = None
+            if root_project_id and child_ws_kind == "worktree":
+                from hermes_cli import projects_db as _pdb
+
+                canonical_slug = _pdb.normalize_slug(root_project_slug)
+                if canonical_slug != root_project_slug:
+                    raise ValueError(
+                        "project-scoped triage task has invalid project_slug"
+                    )
+                child_project = _pdb.Project(
+                    id=root_project_id,
+                    slug=canonical_slug,
+                    name=canonical_slug,
+                    created_at=0,
+                )
+                child_branch_name = _pdb.branch_name_for(
+                    child_project, new_id, title=title
+                )
             conn.execute(
                 "INSERT INTO tasks "
                 "(id, title, body, assignee, status, workspace_kind, "
-                " workspace_path, tenant, created_at, created_by) "
-                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?)",
+                " workspace_path, branch_name, project_id, project_slug, tenant, "
+                " created_at, created_by) "
+                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     new_id,
                     title,
@@ -6722,6 +6770,9 @@ def decompose_triage_task(
                     assignee,
                     child_ws_kind,
                     child_ws_path,
+                    child_branch_name,
+                    root_project_id,
+                    root_project_slug,
                     tenant,
                     now,
                     (author or "decomposer"),
@@ -6731,7 +6782,13 @@ def decompose_triage_task(
                 conn,
                 new_id,
                 "created",
-                {"by": author or "decomposer", "from_decompose_of": task_id},
+                {
+                    "by": author or "decomposer",
+                    "from_decompose_of": task_id,
+                    "project_id": root_project_id,
+                    "project_slug": root_project_slug,
+                    "branch_name": child_branch_name,
+                },
             )
             _inherit_notify_subs(conn, new_id, (task_id,), created_at=now)
             child_ids.append(new_id)

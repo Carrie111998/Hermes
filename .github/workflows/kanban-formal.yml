@@ -3,6 +3,7 @@ name: Kanban formal verification
 on:
   pull_request:
     paths:
+      - ".github/workflows/kanban-formal.yml"
       - "formal/kanban_swarm/**"
       - "hermes_cli/kanban_db.py"
       - "hermes_cli/kanban_decompose.py"
@@ -12,6 +13,7 @@ on:
       - "tests/formal/test_kanban_swarm_tla.py"
   push:
     paths:
+      - ".github/workflows/kanban-formal.yml"
       - "formal/kanban_swarm/**"
       - "hermes_cli/kanban_db.py"
       - "hermes_cli/kanban_decompose.py"
