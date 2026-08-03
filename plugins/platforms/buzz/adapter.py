@@ -1079,7 +1079,15 @@ class BuzzAdapter(BasePlatformAdapter):
         """True when ``event`` is shaped like a direct message to us: a chat
         message from another user, p-tagged to our pubkey, whose content does
         NOT visibly mention us — i.e. the p-tag is structural DM addressing,
-        not the artifact of a typed @mention (see block comment above)."""
+        not the artifact of a typed @mention (see block comment above).
+
+        The visible-mention exclusion applies only when the conversation is
+        NOT already known to be a DM.  When ``channels list`` metadata marks
+        the conversation as a DM (name == "DM" and empty description), the
+        p-tag alone latches it: a DM message often names the agent in prose
+        ("Hey Orion, ...") without being a typed @mention, and requiring no
+        visible mention here would keep the first such message classified as
+        group, splitting the DM into two sessions (group then dm)."""
         if not self._self_pubkey or not self._may_reclassify_as_dm(channel_id):
             return False
         if int(event.get("kind") or 0) != _CHAT_KIND:
@@ -1100,7 +1108,20 @@ class BuzzAdapter(BasePlatformAdapter):
         if not p_tagged_to_self:
             return False
         content = event.get("content")
-        return isinstance(content, str) and not self._is_mentioned(content)
+        if not isinstance(content, str):
+            return False
+        # A conversation whose channel metadata already says "DM" is a DM even
+        # when the message prose names us ("Hey Orion, ...").  Only
+        # metadata-less conversations need the visible-mention exclusion to
+        # avoid reclassifying real community channels that p-tag us on a
+        # typed mention (see block comment above).
+        meta = self._channel_meta.get(channel_id)
+        if meta is not None:
+            name = str(meta.get("name") or "").strip()
+            description = str(meta.get("description") or "").strip()
+            if name == "DM" and not description:
+                return True
+        return not self._is_mentioned(content)
 
     def _maybe_latch_dm(self, channel_id: str, state: dict, event: dict) -> None:
         """Latch a group conversation to chat_type="dm" once any direct
