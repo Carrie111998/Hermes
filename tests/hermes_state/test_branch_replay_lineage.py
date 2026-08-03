@@ -126,7 +126,14 @@ def test_compression_after_branch_replays_from_branch_boundary(db):
     _append_turn(db, "branch", "branch before compression")
     db.end_session("branch", "compression")
 
-    db.create_session("continuation", source="desktop", parent_session_id="branch")
+    db.create_session(
+        "continuation",
+        source="desktop",
+        parent_session_id="branch",
+        # Compression continuations inherit model_config. The branch marker
+        # still names the original fork edge, not this continuation edge.
+        model_config={"_branched_from": "root"},
+    )
     _append_turn(db, "continuation", "branch after compression")
 
     _, display_history = db.get_resume_conversations("continuation")
