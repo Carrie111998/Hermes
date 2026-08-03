@@ -317,14 +317,15 @@ class OSSBackend(Mem0Backend):
             except Exception as exc:
                 logger.warning("OSSBackend.close: memory close error: %s", exc)
         vs = getattr(self._memory, "vector_store", None)
-        if vs and hasattr(vs, "close"):
-            try:
-                vs.close()
-            except Exception as exc:
-                logger.warning("OSSBackend.close: vector store close error: %s", exc)
-        client = getattr(vs, "client", None)
-        if client and hasattr(client, "close"):
-            try:
-                client.close()
-            except Exception as exc:
-                logger.warning("OSSBackend.close: vector store client close error: %s", exc)
+        if vs:
+            if hasattr(vs, "close"):
+                try:
+                    vs.close()
+                except Exception as exc:
+                    logger.warning("OSSBackend.close: vector store close error: %s", exc)
+            client = getattr(vs, "client", None)
+            if client and hasattr(client, "close"):
+                try:
+                    client.close()
+                except Exception as exc:
+                    logger.warning("OSSBackend.close: vector store client close error: %s", exc)
