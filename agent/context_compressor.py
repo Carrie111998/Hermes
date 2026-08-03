@@ -1048,10 +1048,15 @@ Use this exact structure:
         # Inject focus topic guidance when the user provides one via /compress <focus>.
         # This goes at the end of the prompt so it takes precedence.
         if focus_topic:
+            # Sanitize focus_topic to prevent prompt injection — escape quotes,
+            # strip control characters, and limit length.
+            safe_focus = focus_topic.replace('"', '\\"').replace('\n', ' ').replace('\r', ' ')
+            # Limit to reasonable length to prevent token exhaustion
+            safe_focus = safe_focus[:200]
             prompt += f"""
 
-FOCUS TOPIC: "{focus_topic}"
-The user has requested that this compaction PRIORITISE preserving all information related to the focus topic above. For content related to "{focus_topic}", include full detail — exact values, file paths, command outputs, error messages, and decisions. For content NOT related to the focus topic, summarise more aggressively (brief one-liners or omit if truly irrelevant). The focus topic sections should receive roughly 60-70% of the summary token budget. Even for the focus topic, NEVER preserve API keys, tokens, passwords, or credentials — use [REDACTED]."""
+FOCUS TOPIC: "{safe_focus}"
+The user has requested that this compaction PRIORITISE preserving all information related to the focus topic above. For content related to "{safe_focus}", include full detail — exact values, file paths, command outputs, error messages, and decisions. For content NOT related to the focus topic, summarise more aggressively (brief one-liners or omit if truly irrelevant). The focus topic sections should receive roughly 60-70% of the summary token budget. Even for the focus topic, NEVER preserve API keys, tokens, passwords, or credentials — use [REDACTED]."""
 
         try:
             call_kwargs = {
