@@ -30,7 +30,7 @@ import secrets
 import sqlite3
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass
 from typing import Any, Optional
 
 _log = logging.getLogger(__name__)
@@ -55,6 +55,15 @@ VALID_PHASES = frozenset({
 
 TERMINAL_STATUSES = frozenset({"failed", "completed"})
 SUSPENDED_STATUSES = frozenset({"blocked", "human_gate", "queue_exhausted"})
+
+# R1-aligned outcome vocabulary for TransitionResult.
+# The R1 schema defines: applied, replayed, stale_generation, conflict, invalid.
+# "not-found" and "failed" map to "invalid" with appropriate error codes.
+R1_OUTCOMES_TRANSITIONED = "applied"
+R1_OUTCOMES_REPLAYED = "replayed"
+R1_OUTCOMES_STALE = "stale_generation"
+R1_OUTCOMES_CONFLICT = "conflict"
+R1_OUTCOMES_INVALID = "invalid"
 
 
 # ---------------------------------------------------------------------------
@@ -86,7 +95,7 @@ def canonical_fingerprint(value: Any) -> str:
 @dataclass(frozen=True)
 class CreateResult:
     """Result of :func:`create_mission`."""
-    outcome: str  # "created" | "already-applied" | "conflict"
+    outcome: str  # "created" | "already-applied" | "conflict" | "invalid"
     mission_id: str
     generation: int
     state_fingerprint: str
@@ -96,8 +105,17 @@ class CreateResult:
 
 @dataclass(frozen=True)
 class TransitionResult:
-    """Result of :func:`compare_and_transition`."""
-    outcome: str  # "transitioned" | "already-applied" | "conflict" | "stale" | "not-found" | "invalid" | "failed"
+    """Result of :func:`compare_and_transition`.
+
+    Outcomes follow R1 vocabulary exactly:
+    - ``applied``: generation advanced, new state persisted.
+    - ``replayed``: same operation_id + same fingerprint → replay.
+    - ``stale_generation``: expected_generation doesn't match current.
+    - ``conflict``: same operation_id + different fingerprint → rejected.
+    - ``invalid``: next_state fails validation, mission not found, or
+      unexpected error.
+    """
+    outcome: str  # "applied" | "replayed" | "stale_generation" | "conflict" | "invalid"
     mission_id: str
     operation_id: str
     request_fingerprint: str
@@ -160,6 +178,9 @@ CREATE TABLE IF NOT EXISTS mission_journal (
     created_at         INTEGER NOT NULL,
     PRIMARY KEY (mission_id, operation_id)
 );
+
+CREATE INDEX IF NOT EXISTS idx_mission_journal_request_fingerprint
+    ON mission_journal (request_fingerprint);
 """
 
 
@@ -171,7 +192,7 @@ def migrate_mission_state(conn: sqlite3.Connection) -> None:
     """Idempotently add mission-state tables to an existing database.
 
     Safe to call on:
-    - a fresh database (creates both tables);
+    - a fresh database (creates both tables + index);
     - an existing K9 database (adds tables without touching K9);
     - a database that already has the tables (no-op).
 
@@ -180,13 +201,38 @@ def migrate_mission_state(conn: sqlite3.Connection) -> None:
     conn.executescript(MISSION_SCHEMA_SQL)
 
 
+def ensure_mission_state_schema(conn: sqlite3.Connection) -> None:
+    """Public alias for :func:`migrate_mission_state`.
+
+    Intended for callers that open a connection outside the normal
+    ``kanban_db.connect()`` path and need to guarantee the mission-state
+    tables exist before using the API.
+    """
+    migrate_mission_state(conn)
+
+
 # ---------------------------------------------------------------------------
 # Connection helpers
 # ---------------------------------------------------------------------------
 
+def _get_write_txn():
+    """Return the write-transaction context manager.
+
+    Prefers ``kanban_db.write_txn`` (which includes retry, delegated-child
+    mutation guard, and file-length invariant) when available.  Falls back
+    to a minimal local implementation for test isolation.
+    """
+    try:
+        from hermes_cli.kanban_db import write_txn as _canonical_write_txn
+        return _canonical_write_txn
+    except (ImportError, AttributeError):
+        pass
+    return _local_write_txn
+
+
 @contextmanager
-def _write_txn(conn: sqlite3.Connection):
-    """IMMEDIATE write transaction with rollback on exception."""
+def _local_write_txn(conn: sqlite3.Connection):
+    """Fallback IMMEDIATE write transaction with rollback on exception."""
     conn.execute("BEGIN IMMEDIATE")
     try:
         yield conn
@@ -198,6 +244,22 @@ def _write_txn(conn: sqlite3.Connection):
         raise
     else:
         conn.execute("COMMIT")
+
+
+# Cache the resolved context manager at module load.
+_write_txn_ctx = None
+
+
+def _write_txn(conn: sqlite3.Connection):
+    """Context manager for an IMMEDIATE write transaction.
+
+    Delegates to ``kanban_db.write_txn`` when available, providing retry,
+    delegated-child mutation guard, and file-length invariant.
+    """
+    global _write_txn_ctx
+    if _write_txn_ctx is None:
+        _write_txn_ctx = _get_write_txn()
+    return _write_txn_ctx(conn)
 
 
 # ---------------------------------------------------------------------------
@@ -244,7 +306,8 @@ def _validate_state_shape(state: dict) -> list[str]:
     """Validate that *state* matches the R1 mission_state document shape.
 
     Returns a list of error strings; empty means valid.
-    This is a structural/schema check, not a semantic oracle.
+    Enforces all R1 structural invariants including status-dependent
+    payload requirements and mutual exclusions.
     """
     errors: list[str] = []
     if state.get("document_type") != DOCUMENT_TYPE_STATE:
@@ -263,12 +326,72 @@ def _validate_state_shape(state: dict) -> list[str]:
     generation = state.get("generation")
     if not isinstance(generation, int) or generation < 0:
         errors.append("generation must be a non-negative integer")
+
     # Terminal status invariant
     if status in TERMINAL_STATUSES:
         if phase != "terminal":
             errors.append(f"terminal status '{status}' requires phase 'terminal'")
         if state.get("next_safe_action") is not None:
             errors.append(f"terminal status '{status}' requires null next_safe_action")
+
+    # completed requires final_review
+    if status == "completed":
+        completion = state.get("completion")
+        if not isinstance(completion, dict):
+            errors.append("completed status requires completion object")
+        elif completion.get("final_review") is None:
+            errors.append("completed status requires non-null completion.final_review")
+
+    # blocked: requires blocker, mutual exclusion
+    if status == "blocked":
+        if not isinstance(state.get("active_blocker"), dict):
+            errors.append("blocked status requires active_blocker object")
+        if state.get("active_human_gate") is not None:
+            errors.append("blocked status requires null active_human_gate")
+        if state.get("queue_exhausted") is not None:
+            errors.append("blocked status requires null queue_exhausted")
+        nsa = state.get("next_safe_action")
+        if isinstance(nsa, dict) and nsa.get("executable") is not False:
+            errors.append("blocked status requires non-executable next_safe_action")
+
+    # human_gate: requires gate, mutual exclusion
+    if status == "human_gate":
+        hg = state.get("active_human_gate")
+        if not isinstance(hg, dict):
+            errors.append("human_gate status requires active_human_gate object")
+        else:
+            if hg.get("status") != "pending":
+                errors.append("human_gate requires active_human_gate.status='pending'")
+        if state.get("active_blocker") is not None:
+            errors.append("human_gate status requires null active_blocker")
+        if state.get("queue_exhausted") is not None:
+            errors.append("human_gate status requires null queue_exhausted")
+        nsa = state.get("next_safe_action")
+        if isinstance(nsa, dict):
+            if nsa.get("action") != "await_human":
+                errors.append("human_gate requires next_safe_action.action='await_human'")
+            if nsa.get("executable") is not False:
+                errors.append("human_gate requires non-executable next_safe_action")
+
+    # queue_exhausted: requires payload, mutual exclusion
+    if status == "queue_exhausted":
+        qe = state.get("queue_exhausted")
+        if not isinstance(qe, dict):
+            errors.append("queue_exhausted status requires queue_exhausted object")
+        if state.get("active_blocker") is not None:
+            errors.append("queue_exhausted status requires null active_blocker")
+        if state.get("active_human_gate") is not None:
+            errors.append("queue_exhausted status requires null active_human_gate")
+        nsa = state.get("next_safe_action")
+        if isinstance(nsa, dict):
+            if nsa.get("action") not in ("replan", "await_resume_condition"):
+                errors.append(
+                    "queue_exhausted requires next_safe_action.action "
+                    "in {'replan', 'await_resume_condition'}"
+                )
+            if nsa.get("executable") is not False:
+                errors.append("queue_exhausted requires non-executable next_safe_action")
+
     return errors
 
 
@@ -445,19 +568,18 @@ def compare_and_transition(
     4. Within one IMMEDIATE transaction: update mission, write journal, increment
        generation.
 
-    Outcomes:
-    - ``transitioned``: generation advanced, new state persisted.
-    - ``already-applied``: same operation_id + same fingerprint → replay.
+    Outcomes (R1-aligned):
+    - ``applied``: generation advanced, new state persisted.
+    - ``replayed``: same operation_id + same fingerprint → replay.
+    - ``stale_generation``: expected_generation doesn't match current.
     - ``conflict``: same operation_id + different fingerprint → rejected.
-    - ``stale``: expected_generation doesn't match current.
-    - ``not-found``: mission doesn't exist.
-    - ``invalid``: next_state fails validation.
-    - ``failed``: unexpected error.
+    - ``invalid``: next_state fails validation, mission not found, or
+      unexpected error.
     """
     errors = _validate_state_shape(next_state)
     if errors:
         return TransitionResult(
-            outcome="invalid",
+            outcome=R1_OUTCOMES_INVALID,
             mission_id=mission_id,
             operation_id=operation_id,
             request_fingerprint="",
@@ -469,7 +591,7 @@ def compare_and_transition(
     # Verify mission_id consistency
     if next_state.get("mission_id") != mission_id:
         return TransitionResult(
-            outcome="invalid",
+            outcome=R1_OUTCOMES_INVALID,
             mission_id=mission_id,
             operation_id=operation_id,
             request_fingerprint="",
@@ -497,7 +619,7 @@ def compare_and_transition(
         ).fetchone()
         if current is None:
             return TransitionResult(
-                outcome="not-found",
+                outcome=R1_OUTCOMES_INVALID,
                 mission_id=mission_id,
                 operation_id=operation_id,
                 request_fingerprint=request_fingerprint,
@@ -524,7 +646,7 @@ def compare_and_transition(
             if journal_row["request_fingerprint"] == request_fingerprint:
                 # Same operation + same fingerprint → replay
                 return TransitionResult(
-                    outcome="already-applied",
+                    outcome=R1_OUTCOMES_REPLAYED,
                     mission_id=mission_id,
                     operation_id=operation_id,
                     request_fingerprint=request_fingerprint,
@@ -534,7 +656,7 @@ def compare_and_transition(
             else:
                 # Same operation + different fingerprint → conflict
                 return TransitionResult(
-                    outcome="conflict",
+                    outcome=R1_OUTCOMES_CONFLICT,
                     mission_id=mission_id,
                     operation_id=operation_id,
                     request_fingerprint=request_fingerprint,
@@ -549,14 +671,14 @@ def compare_and_transition(
         # 3. CAS check: generation must match
         if current_generation != expected_generation:
             return TransitionResult(
-                outcome="stale",
+                outcome=R1_OUTCOMES_STALE,
                 mission_id=mission_id,
                 operation_id=operation_id,
                 request_fingerprint=request_fingerprint,
                 generation=current_generation,
                 state_fingerprint=current["state_fingerprint"],
                 error={
-                    "code": "stale",
+                    "code": "stale_generation",
                     "message": f"expected generation {expected_generation}, "
                                f"current is {current_generation}",
                 },
@@ -603,7 +725,7 @@ def compare_and_transition(
         )
 
     return TransitionResult(
-        outcome="transitioned",
+        outcome=R1_OUTCOMES_TRANSITIONED,
         mission_id=mission_id,
         operation_id=operation_id,
         request_fingerprint=request_fingerprint,

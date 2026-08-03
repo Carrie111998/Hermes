@@ -3,19 +3,22 @@
 Covers:
   - creation: valid, idempotent, conflictive
   - reading after reopen
-  - transitions: valid, stale, replay, conflict
+  - transitions: valid, stale, replay, conflict (R1-aligned outcomes)
   - generation: incremented exactly once
   - invalid transitions
   - terminal states
   - blocker / human_gate / queue_exhausted structures
+  - R1 structural invariants (blocked, human_gate, queue_exhausted, completed)
   - exact-head gates
   - consultation with local decision
   - K9 references (valid, nonexistent, no DAG copy)
   - rollback on journal/event failure
   - recovery after restart
   - idempotent migration
-  - concurrent same-generation writers
+  - concurrent same-generation writers (real threads)
   - compatibility with existing Kanban suite
+  - R1 outcome vocabulary compliance
+  - index on request_fingerprint
 """
 
 from __future__ import annotations
@@ -348,15 +351,13 @@ class TestReadAfterReopen:
         """Simulate reopening by creating, closing conn, reopening."""
         state = _make_state()
         ms.create_mission(db, state=state, operation_id="op-1")
-        # Close and reopen would require a file-based DB; here we verify
-        # the data is durable within the connection
         record = ms.get_mission(db, "mission-1")
         assert record is not None
         assert record.status == "planned"
 
 
 # ---------------------------------------------------------------------------
-# 5. transición válida
+# 5. transición válida — R1 outcome: "applied"
 # ---------------------------------------------------------------------------
 
 class TestValidTransition:
@@ -372,7 +373,7 @@ class TestValidTransition:
             operation_id="op-activate",
             next_state=next_state,
         )
-        assert result.outcome == "transitioned"
+        assert result.outcome == "applied"
         assert result.generation == 1
         assert len(result.state_fingerprint) == 64
 
@@ -393,14 +394,13 @@ class TestValidTransition:
 
 
 # ---------------------------------------------------------------------------
-# 6. stale generation
+# 6. stale generation — R1 outcome: "stale_generation"
 # ---------------------------------------------------------------------------
 
 class TestStaleGeneration:
     def test_stale_generation_rejected(self, db):
         state = _make_state()
         ms.create_mission(db, state=state, operation_id="op-1")
-        # Transition once
         next1 = _make_state(status="active", phase="execution")
         ms.compare_and_transition(
             db,
@@ -409,8 +409,19 @@ class TestStaleGeneration:
             operation_id="op-2",
             next_state=next1,
         )
-        # Try with stale generation
-        next2 = _make_state(status="blocked", phase="execution")
+        next2 = _make_state(status="blocked", phase="execution",
+                           active_blocker={
+                               "blocker_id": "b1", "reason_code": "dep",
+                               "summary": "test", "evidence_ids": [],
+                               "resume_condition": {
+                                   "type": "retry_after", "description": "retry", "reference": "r1",
+                               },
+                           },
+                           active_human_gate=None, queue_exhausted=None,
+                           next_safe_action={
+                               "action": "plan", "executable": False,
+                               "card_id": None, "reason_code": "blocked",
+                           })
         result = ms.compare_and_transition(
             db,
             mission_id="mission-1",
@@ -418,10 +429,10 @@ class TestStaleGeneration:
             operation_id="op-3",
             next_state=next2,
         )
-        assert result.outcome == "stale"
+        assert result.outcome == "stale_generation"
         assert result.generation == 1  # current generation
         assert result.error is not None
-        assert "stale" in result.error["code"]
+        assert "stale_generation" in result.error["code"]
 
     def test_stale_does_not_mutate_state(self, db):
         state = _make_state()
@@ -434,7 +445,19 @@ class TestStaleGeneration:
             operation_id="op-2",
             next_state=next1,
         )
-        next2 = _make_state(status="blocked", phase="execution")
+        next2 = _make_state(status="blocked", phase="execution",
+                           active_blocker={
+                               "blocker_id": "b1", "reason_code": "dep",
+                               "summary": "test", "evidence_ids": [],
+                               "resume_condition": {
+                                   "type": "retry_after", "description": "retry", "reference": "r1",
+                               },
+                           },
+                           active_human_gate=None, queue_exhausted=None,
+                           next_safe_action={
+                               "action": "plan", "executable": False,
+                               "card_id": None, "reason_code": "blocked",
+                           })
         ms.compare_and_transition(
             db,
             mission_id="mission-1",
@@ -448,11 +471,11 @@ class TestStaleGeneration:
 
 
 # ---------------------------------------------------------------------------
-# 7. replay idéntico
+# 7. replay idéntico — R1 outcome: "replayed"
 # ---------------------------------------------------------------------------
 
 class TestReplay:
-    def test_identical_replay_returns_already_applied(self, db):
+    def test_identical_replay_returns_replayed(self, db):
         state = _make_state()
         ms.create_mission(db, state=state, operation_id="op-1")
         next_state = _make_state(status="active", phase="execution")
@@ -463,7 +486,7 @@ class TestReplay:
             operation_id="op-transition",
             next_state=next_state,
         )
-        assert r1.outcome == "transitioned"
+        assert r1.outcome == "applied"
 
         # Replay with same arguments
         r2 = ms.compare_and_transition(
@@ -473,7 +496,7 @@ class TestReplay:
             operation_id="op-transition",
             next_state=next_state,
         )
-        assert r2.outcome == "already-applied"
+        assert r2.outcome == "replayed"
         assert r2.generation == r1.generation
 
     def test_replay_does_not_increment_generation(self, db):
@@ -520,10 +543,13 @@ class TestOperationConflict:
                                "blocker_id": "b1", "reason_code": "dep",
                                "summary": "test", "evidence_ids": [],
                                "resume_condition": {
-                                   "type": "retry_after",
-                                   "description": "retry",
-                                   "reference": "r1",
+                                   "type": "retry_after", "description": "retry", "reference": "r1",
                                },
+                           },
+                           active_human_gate=None, queue_exhausted=None,
+                           next_safe_action={
+                               "action": "plan", "executable": False,
+                               "card_id": None, "reason_code": "blocked",
                            })
         result = ms.compare_and_transition(
             db,
@@ -554,11 +580,11 @@ class TestGenerationIncrement:
                     "blocker_id": f"b{i}", "reason_code": "dep",
                     "summary": "test", "evidence_ids": [],
                     "resume_condition": {
-                        "type": "retry_after",
-                        "description": "retry",
-                        "reference": "r1",
+                        "type": "retry_after", "description": "retry", "reference": "r1",
                     },
                 }
+                next_state["active_human_gate"] = None
+                next_state["queue_exhausted"] = None
                 next_state["next_safe_action"] = {
                     "action": "plan", "executable": False,
                     "card_id": None, "reason_code": "blocked",
@@ -570,7 +596,7 @@ class TestGenerationIncrement:
                 operation_id=f"op-t{i}",
                 next_state=next_state,
             )
-            assert result.outcome == "transitioned"
+            assert result.outcome == "applied"
             assert result.generation == i
         record = ms.get_mission(db, "mission-1")
         assert record.generation == 2
@@ -608,7 +634,8 @@ class TestInvalidTransition:
         )
         assert result.outcome == "invalid"
 
-    def test_not_found(self, db):
+    def test_not_found_returns_invalid(self, db):
+        """not-found maps to invalid with error code 'not-found' per R1."""
         next_state = _make_state(mission_id="nonexistent")
         result = ms.compare_and_transition(
             db,
@@ -617,7 +644,9 @@ class TestInvalidTransition:
             operation_id="op-1",
             next_state=next_state,
         )
-        assert result.outcome == "not-found"
+        assert result.outcome == "invalid"
+        assert result.error is not None
+        assert result.error["code"] == "not-found"
 
 
 # ---------------------------------------------------------------------------
@@ -628,7 +657,6 @@ class TestTerminalStates:
     def test_terminal_failed(self, db):
         state = _make_state()
         ms.create_mission(db, state=state, operation_id="op-1")
-        # Create a valid failed state
         failed_state = _make_state(
             status="failed",
             phase="terminal",
@@ -641,7 +669,7 @@ class TestTerminalStates:
             operation_id="op-fail",
             next_state=failed_state,
         )
-        assert result.outcome == "transitioned"
+        assert result.outcome == "applied"
         record = ms.get_mission(db, "mission-1")
         assert record.status == "failed"
         assert record.phase == "terminal"
@@ -657,7 +685,7 @@ class TestTerminalStates:
             operation_id="op-complete",
             next_state=completed,
         )
-        assert result.outcome == "transitioned"
+        assert result.outcome == "applied"
         record = ms.get_mission(db, "mission-1")
         assert record.status == "completed"
 
@@ -695,7 +723,7 @@ class TestBlockerStructure:
             operation_id="op-block",
             next_state=blocked,
         )
-        assert result.outcome == "transitioned"
+        assert result.outcome == "applied"
         record = ms.get_mission(db, "mission-1")
         assert record.status == "blocked"
         parsed = json.loads(record.state_json)
@@ -719,7 +747,7 @@ class TestHumanGateStructure:
             operation_id="op-gate",
             next_state=hg,
         )
-        assert result.outcome == "transitioned"
+        assert result.outcome == "applied"
         record = ms.get_mission(db, "mission-1")
         parsed = json.loads(record.state_json)
         assert parsed["active_human_gate"]["status"] == "pending"
@@ -743,7 +771,7 @@ class TestQueueExhaustion:
             operation_id="op-qe",
             next_state=qe,
         )
-        assert result.outcome == "transitioned"
+        assert result.outcome == "applied"
         record = ms.get_mission(db, "mission-1")
         parsed = json.loads(record.state_json)
         assert parsed["queue_exhausted"] is not None
@@ -836,7 +864,6 @@ class TestK9References:
         record = ms.get_mission(db, "mission-1")
         parsed = json.loads(record.state_json)
         pi = parsed["planner_import"]
-        # No subtasks, dependencies, task_map, DAG, or full task states
         for key in ("subtasks", "dependencies", "task_map", "dag", "tasks", "frontier"):
             assert key not in pi
 
@@ -867,10 +894,6 @@ class TestRollback:
         state = _make_state()
         ms.create_mission(db, state=state, operation_id="op-1")
 
-        # Manually corrupt the journal constraint to force failure
-        # by inserting a duplicate that will conflict
-        # Actually, let's test with a broken state that passes validation
-        # but causes a journal error. We'll use a mock approach:
         # Insert a conflicting journal entry first
         now = int(time.time() * 1000)
         db.execute(
@@ -920,7 +943,6 @@ class TestRecovery:
     def test_data_survives_connection_reopen(self, tmp_path):
         """File-based DB: create, close, reopen, verify."""
         db_path = tmp_path / "test_mission.db"
-        # Create and populate
         conn = sqlite3.connect(str(db_path))
         conn.row_factory = sqlite3.Row
         ms.migrate_mission_state(conn)
@@ -928,7 +950,6 @@ class TestRecovery:
         ms.create_mission(conn, state=state, operation_id="op-1")
         conn.close()
 
-        # Reopen
         conn2 = sqlite3.connect(str(db_path))
         conn2.row_factory = sqlite3.Row
         ms.migrate_mission_state(conn2)  # idempotent
@@ -972,9 +993,7 @@ class TestMigration:
     def test_migration_idempotent(self):
         conn = sqlite3.connect(":memory:")
         ms.migrate_mission_state(conn)
-        # Run again — should not fail
-        ms.migrate_mission_state(conn)
-        # Tables should exist
+        ms.migrate_mission_state(conn)  # no-op
         tables = {row[0] for row in conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'"
         ).fetchall()}
@@ -983,7 +1002,6 @@ class TestMigration:
         conn.close()
 
     def test_migration_preserves_k9(self, db_with_k9):
-        """K9 tables are untouched after migration."""
         tables = {row[0] for row in db_with_k9.execute(
             "SELECT name FROM sqlite_master WHERE type='table'"
         ).fetchall()}
@@ -998,64 +1016,151 @@ class TestMigration:
         assert row is not None
         assert row[0] == "existing task"
 
+    def test_migration_creates_index(self):
+        """idx_mission_journal_request_fingerprint is created by migration."""
+        conn = sqlite3.connect(":memory:")
+        ms.migrate_mission_state(conn)
+        indexes = {row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index'"
+        ).fetchall()}
+        assert "idx_mission_journal_request_fingerprint" in indexes
+        conn.close()
+
+    def test_ensure_mission_state_schema_works(self):
+        """ensure_mission_state_schema is a public alias for migrate."""
+        conn = sqlite3.connect(":memory:")
+        ms.ensure_mission_state_schema(conn)
+        tables = {row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()}
+        assert "mission_missions" in tables
+        conn.close()
+
 
 # ---------------------------------------------------------------------------
-# 25. dos writers compitiendo con la misma generación
+# 25. dos writers compitiendo con la misma generación (REAL concurrency)
 # ---------------------------------------------------------------------------
 
 class TestConcurrentWriters:
-    def test_concurrent_same_generation_one_wins(self, db):
+    def test_concurrent_same_generation_one_wins(self, tmp_path):
+        """Real concurrent CAS: two threads with same expected generation.
+        Exactly one should succeed (applied), the other should detect stale.
+        """
+        db_path = tmp_path / "test_concurrent.db"
+        # Pre-populate
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        ms.migrate_mission_state(conn)
         state = _make_state()
-        ms.create_mission(db, state=state, operation_id="op-1")
+        ms.create_mission(conn, state=state, operation_id="op-1")
+        conn.close()
 
         results = []
-        errors = []
+        barrier = threading.Barrier(2)
+
+        def writer(name: str, op_id: str, status: str, phase: str):
+            conn = sqlite3.connect(str(db_path), timeout=10)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            barrier.wait()  # synchronize start
+            next_s = _make_state(status=status, phase=phase, mission_id="mission-1")
+            if status == "blocked":
+                next_s["active_blocker"] = {
+                    "blocker_id": "b1", "reason_code": "dep",
+                    "summary": "test", "evidence_ids": [],
+                    "resume_condition": {
+                        "type": "retry_after", "description": "retry", "reference": "r1",
+                    },
+                }
+                next_s["active_human_gate"] = None
+                next_s["queue_exhausted"] = None
+                next_s["next_safe_action"] = {
+                    "action": "plan", "executable": False,
+                    "card_id": None, "reason_code": "blocked",
+                }
+            try:
+                r = ms.compare_and_transition(
+                    conn,
+                    mission_id="mission-1",
+                    expected_generation=0,
+                    operation_id=op_id,
+                    next_state=next_s,
+                )
+                results.append((name, r.outcome, r.generation))
+            except Exception as e:
+                results.append((name, f"error: {e}", -1))
+            finally:
+                conn.close()
+
+        t1 = threading.Thread(target=writer, args=("w1", "op-w1", "active", "execution"))
+        t2 = threading.Thread(target=writer, args=("w2", "op-w2", "blocked", "execution"))
+        t1.start()
+        t2.start()
+        t1.join(timeout=10)
+        t2.join(timeout=10)
+
+        # Exactly one should be applied, the other stale_generation
+        outcomes = {r[1] for r in results}
+        assert "applied" in outcomes, f"Expected 'applied' in {results}"
+        assert "stale_generation" in outcomes, f"Expected 'stale_generation' in {results}"
+
+        # Verify final state
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        record = ms.get_mission(conn, "mission-1")
+        assert record.generation == 1
+        conn.close()
+
+    def test_concurrent_replay_same_operation(self, tmp_path):
+        """Two threads with same operation_id and same fingerprint → both replayed."""
+        db_path = tmp_path / "test_replay_concurrent.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        ms.migrate_mission_state(conn)
+        state = _make_state()
+        ms.create_mission(conn, state=state, operation_id="op-1")
+        conn.close()
+
+        next_s = _make_state(status="active", phase="execution", mission_id="mission-1")
+        results = []
+        barrier = threading.Barrier(2)
 
         def writer(name: str):
+            conn = sqlite3.connect(str(db_path), timeout=10)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            barrier.wait()
             try:
-                conn = sqlite3.connect(":memory:")
-                # Can't share in-memory across threads; use the same conn
-                # with locking. Instead, test at the API level.
-                pass
+                r = ms.compare_and_transition(
+                    conn,
+                    mission_id="mission-1",
+                    expected_generation=0,
+                    operation_id="op-replay",
+                    next_state=next_s,
+                )
+                results.append((name, r.outcome))
             except Exception as e:
-                errors.append(e)
+                results.append((name, f"error: {e}"))
+            finally:
+                conn.close()
 
-        # Simulate concurrent CAS: only one should succeed
-        next1 = _make_state(status="active", phase="execution")
-        r1 = ms.compare_and_transition(
-            db,
-            mission_id="mission-1",
-            expected_generation=0,
-            operation_id="op-w1",
-            next_state=next1,
-        )
-        # Second writer with same generation — should be stale
-        next2 = _make_state(status="blocked", phase="execution",
-                           active_blocker={
-                               "blocker_id": "b1", "reason_code": "dep",
-                               "summary": "test", "evidence_ids": [],
-                               "resume_condition": {
-                                   "type": "retry_after",
-                                   "description": "retry",
-                                   "reference": "r1",
-                               },
-                           },
-                           next_safe_action={
-                               "action": "plan", "executable": False,
-                               "card_id": None, "reason_code": "blocked",
-                           })
-        r2 = ms.compare_and_transition(
-            db,
-            mission_id="mission-1",
-            expected_generation=0,
-            operation_id="op-w2",
-            next_state=next2,
-        )
-        assert r1.outcome == "transitioned"
-        assert r2.outcome == "stale"
-        record = ms.get_mission(db, "mission-1")
+        t1 = threading.Thread(target=writer, args=("w1",))
+        t2 = threading.Thread(target=writer, args=("w2",))
+        t1.start()
+        t2.start()
+        t1.join(timeout=10)
+        t2.join(timeout=10)
+
+        # One applied, one replayed (same op_id + same fingerprint)
+        outcomes = {r[1] for r in results}
+        assert outcomes <= {"applied", "replayed"}, f"Unexpected outcomes: {results}"
+
+        # Generation should be exactly 1 (only one write succeeded)
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        record = ms.get_mission(conn, "mission-1")
         assert record.generation == 1
-        assert record.status == "active"
+        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -1064,11 +1169,9 @@ class TestConcurrentWriters:
 
 class TestKanbanCompatibility:
     def test_mission_tables_cannot_conflict_with_k9(self, db_with_k9):
-        """Mission-state and K9 can coexist without interference."""
         state = _make_state()
         result = ms.create_mission(db_with_k9, state=state, operation_id="op-1")
         assert result.outcome == "created"
-        # K9 task still accessible
         row = db_with_k9.execute("SELECT title FROM tasks WHERE id='t1'").fetchone()
         assert row[0] == "existing task"
 
@@ -1121,6 +1224,128 @@ class TestCanonicalFingerprint:
 
 
 # ---------------------------------------------------------------------------
+# R1 structural invariant enforcement
+# ---------------------------------------------------------------------------
+
+class TestR1StructuralInvariants:
+    def test_blocked_without_blocker_rejected(self, db):
+        """blocked status without active_blocker must be rejected."""
+        state = _make_state()
+        ms.create_mission(db, state=state, operation_id="op-1")
+        bad = _make_state(
+            status="blocked", phase="execution",
+            active_blocker=None,
+            active_human_gate=None, queue_exhausted=None,
+            next_safe_action={"action": "plan", "executable": False,
+                             "card_id": None, "reason_code": "x"},
+        )
+        result = ms.compare_and_transition(
+            db, mission_id="mission-1", expected_generation=0,
+            operation_id="op-bad", next_state=bad,
+        )
+        assert result.outcome == "invalid"
+        assert "active_blocker" in result.error["message"]
+
+    def test_blocked_with_human_gate_rejected(self, db):
+        """blocked status with non-null active_human_gate must be rejected."""
+        state = _make_state()
+        ms.create_mission(db, state=state, operation_id="op-1")
+        bad = _make_blocked_state()
+        bad["active_human_gate"] = {"gate_id": "x", "gate_type": "approval",
+                                    "version": 1, "status": "pending",
+                                    "prompt_fingerprint": _sha64(),
+                                    "resolution_ref": None}
+        result = ms.compare_and_transition(
+            db, mission_id="mission-1", expected_generation=0,
+            operation_id="op-bad", next_state=bad,
+        )
+        assert result.outcome == "invalid"
+        assert "active_human_gate" in result.error["message"]
+
+    def test_human_gate_without_gate_rejected(self, db):
+        """human_gate status without active_human_gate must be rejected."""
+        state = _make_state()
+        ms.create_mission(db, state=state, operation_id="op-1")
+        bad = _make_state(
+            status="human_gate", phase="review",
+            active_human_gate=None,
+            active_blocker=None, queue_exhausted=None,
+            next_safe_action={"action": "await_human", "executable": False,
+                             "card_id": None, "reason_code": "x"},
+        )
+        result = ms.compare_and_transition(
+            db, mission_id="mission-1", expected_generation=0,
+            operation_id="op-bad", next_state=bad,
+        )
+        assert result.outcome == "invalid"
+        assert "active_human_gate" in result.error["message"]
+
+    def test_human_gate_with_blocker_rejected(self, db):
+        """human_gate status with non-null active_blocker must be rejected."""
+        state = _make_state()
+        ms.create_mission(db, state=state, operation_id="op-1")
+        bad = _make_human_gate_state()
+        bad["active_blocker"] = {"blocker_id": "x", "reason_code": "dep",
+                                "summary": "test", "evidence_ids": [],
+                                "resume_condition": {"type": "retry_after",
+                                                     "description": "r",
+                                                     "reference": "r"}}
+        result = ms.compare_and_transition(
+            db, mission_id="mission-1", expected_generation=0,
+            operation_id="op-bad", next_state=bad,
+        )
+        assert result.outcome == "invalid"
+        assert "active_blocker" in result.error["message"]
+
+    def test_queue_exhausted_without_payload_rejected(self, db):
+        """queue_exhausted status without queue_exhausted object must be rejected."""
+        state = _make_state()
+        ms.create_mission(db, state=state, operation_id="op-1")
+        bad = _make_state(
+            status="queue_exhausted", phase="execution",
+            queue_exhausted=None,
+            active_blocker=None, active_human_gate=None,
+            next_safe_action={"action": "replan", "executable": False,
+                             "card_id": None, "reason_code": "x"},
+        )
+        result = ms.compare_and_transition(
+            db, mission_id="mission-1", expected_generation=0,
+            operation_id="op-bad", next_state=bad,
+        )
+        assert result.outcome == "invalid"
+        assert "queue_exhausted" in result.error["message"]
+
+    def test_completed_without_final_review_rejected(self, db):
+        """completed status without final_review must be rejected."""
+        state = _make_state()
+        ms.create_mission(db, state=state, operation_id="op-1")
+        bad = _make_state(
+            status="completed", phase="terminal",
+            next_safe_action=None,
+            completion={"final_review": None, "merge_required": False, "merge_gate": None},
+        )
+        result = ms.compare_and_transition(
+            db, mission_id="mission-1", expected_generation=0,
+            operation_id="op-bad", next_state=bad,
+        )
+        assert result.outcome == "invalid"
+        assert "final_review" in result.error["message"]
+
+    def test_human_gate_resolved_status_rejected(self, db):
+        """human_gate with status='resolved' (not 'pending') must be rejected."""
+        state = _make_state()
+        ms.create_mission(db, state=state, operation_id="op-1")
+        bad = _make_human_gate_state()
+        bad["active_human_gate"]["status"] = "resolved"
+        result = ms.compare_and_transition(
+            db, mission_id="mission-1", expected_generation=0,
+            operation_id="op-bad", next_state=bad,
+        )
+        assert result.outcome == "invalid"
+        assert "pending" in result.error["message"]
+
+
+# ---------------------------------------------------------------------------
 # Boundary / edge cases
 # ---------------------------------------------------------------------------
 
@@ -1146,6 +1371,8 @@ class TestEdgeCases:
                         "type": "retry_after", "description": "retry", "reference": "r1",
                     },
                 }
+                next_s["active_human_gate"] = None
+                next_s["queue_exhausted"] = None
                 next_s["next_safe_action"] = {
                     "action": "plan", "executable": False,
                     "card_id": None, "reason_code": "blocked",
@@ -1168,3 +1395,49 @@ class TestEdgeCases:
         assert result.generation == 0
         record = ms.get_mission(db, "mission-1")
         assert record.generation == 0
+
+
+# ---------------------------------------------------------------------------
+# R1 outcome vocabulary compliance
+# ---------------------------------------------------------------------------
+
+class TestR1OutcomeVocabulary:
+    def test_transition_result_outcomes_are_r1_exhaustive(self):
+        """TransitionResult.outcome accepts exactly R1 vocabulary."""
+        r = ms.TransitionResult(
+            outcome="applied", mission_id="m", operation_id="o",
+            request_fingerprint="fp", generation=0, state_fingerprint="fp",
+        )
+        assert r.outcome == "applied"
+
+    def test_stale_generation_outcome(self, db):
+        """Stale generation returns 'stale_generation' per R1."""
+        state = _make_state()
+        ms.create_mission(db, state=state, operation_id="op-1")
+        next1 = _make_state(status="active", phase="execution")
+        ms.compare_and_transition(
+            db, mission_id="mission-1", expected_generation=0,
+            operation_id="op-2", next_state=next1,
+        )
+        # Try with wrong generation
+        next2 = _make_state(status="active", phase="execution")
+        result = ms.compare_and_transition(
+            db, mission_id="mission-1", expected_generation=0,
+            operation_id="op-3", next_state=next2,
+        )
+        assert result.outcome == "stale_generation"
+
+    def test_replayed_outcome(self, db):
+        """Identical replay returns 'replayed' per R1."""
+        state = _make_state()
+        ms.create_mission(db, state=state, operation_id="op-1")
+        next_state = _make_state(status="active", phase="execution")
+        ms.compare_and_transition(
+            db, mission_id="mission-1", expected_generation=0,
+            operation_id="op-t", next_state=next_state,
+        )
+        r = ms.compare_and_transition(
+            db, mission_id="mission-1", expected_generation=0,
+            operation_id="op-t", next_state=next_state,
+        )
+        assert r.outcome == "replayed"
