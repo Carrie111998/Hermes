@@ -164,3 +164,65 @@ class TestSupervisedChildIgnoresStickyProfile:
         assert result is not None
         assert result.endswith("coder")
 
+
+class TestCronEditProfileIsJobField:
+    """Issue #32045: `hermes cron edit <id> --profile <name>` sets the job's
+    profile FIELD — it must NOT switch the active profile context (HERMES_HOME).
+
+    Before the fix, _apply_profile_override consumed --profile after
+    ``cron edit``, redirected HERMES_HOME to the target profile, and
+    cron_edit then looked for the job in the WRONG store -> 'Job not found'.
+    """
+
+    def test_cron_edit_profile_does_not_switch_hermes_home(self, tmp_path, monkeypatch):
+        result = _run_apply_profile_override(
+            tmp_path,
+            monkeypatch,
+            hermes_home=str(tmp_path / ".hermes"),
+            active_profile=None,
+            argv=["hermes", "cron", "edit", "job123", "--profile", "trading"],
+        )
+        # HERMES_HOME must stay at the root — cron edit's --profile is a job field.
+        assert result == str(tmp_path / ".hermes")
+
+    def test_cron_edit_profile_equals_form_does_not_switch(self, tmp_path, monkeypatch):
+        result = _run_apply_profile_override(
+            tmp_path,
+            monkeypatch,
+            hermes_home=str(tmp_path / ".hermes"),
+            active_profile=None,
+            argv=["hermes", "cron", "edit", "job123", "--profile=trading"],
+        )
+        assert result == str(tmp_path / ".hermes")
+
+    def test_cron_edit_short_p_flag_still_switches(self, tmp_path, monkeypatch):
+        """-p remains the profile-context flag everywhere EXCEPT cron edit's --profile.
+
+        A bare `-p` before the subcommand (e.g. `hermes -p coder cron edit job123`)
+        is the operator selecting WHICH profile's store to operate on — that must
+        still switch HERMES_HOME.
+        """
+        (tmp_path / ".hermes" / "profiles" / "coder").mkdir(parents=True, exist_ok=True)
+        result = _run_apply_profile_override(
+            tmp_path,
+            monkeypatch,
+            hermes_home=str(tmp_path / ".hermes"),
+            active_profile=None,
+            argv=["hermes", "-p", "coder", "cron", "edit", "job123", "--profile", "trading"],
+        )
+        assert result is not None
+        assert result.endswith("coder")
+
+    def test_plain_chat_profile_still_switches(self, tmp_path, monkeypatch):
+        """Sanity: --profile on non-cron commands still switches context."""
+        (tmp_path / ".hermes" / "profiles" / "coder").mkdir(parents=True, exist_ok=True)
+        result = _run_apply_profile_override(
+            tmp_path,
+            monkeypatch,
+            hermes_home=str(tmp_path / ".hermes"),
+            active_profile=None,
+            argv=["hermes", "chat", "-q", "hi", "--profile", "coder"],
+        )
+        assert result is not None
+        assert result.endswith("coder")
+

@@ -174,6 +174,7 @@ The `<job_id>` placeholder below (and in [Lifecycle actions](#lifecycle-actions)
 /cron edit <job_id> --skill blogwatcher --skill maps
 /cron edit <job_id> --remove-skill blogwatcher
 /cron edit <job_id> --clear-skills
+/cron edit <job_id> --profile trading
 ```
 
 ### Standalone CLI
@@ -185,6 +186,7 @@ hermes cron edit <job_id> --skill blogwatcher --skill maps
 hermes cron edit <job_id> --add-skill maps
 hermes cron edit <job_id> --remove-skill blogwatcher
 hermes cron edit <job_id> --clear-skills
+hermes cron edit <job_id> --profile trading
 ```
 
 Notes:
@@ -193,6 +195,7 @@ Notes:
 - `--add-skill` appends to the existing list without replacing it
 - `--remove-skill` removes specific attached skills
 - `--clear-skills` removes all attached skills
+- `--profile <name>` pins the job to a profile: the job's cron data (db, output) stays in that profile's home. Pass an empty string (`--profile ""`) to clear the pin. On the CLI, `--profile` after `cron edit` is the **job field**, not the profile-context switch — `hermes cron edit <id> --profile trading` edits the job in your current profile's store and pins it to `trading`, it does not switch which store is read. (Use `hermes -p <name> cron ...` to operate on another profile's store directly.)
 
 ## Lifecycle actions
 
