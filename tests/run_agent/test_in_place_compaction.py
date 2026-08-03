@@ -302,3 +302,45 @@ class TestCompactedTurnsStaySearchable:
                 "ZEBRAWORD", role_filter=["user", "assistant"], include_inactive=True
             )
             assert len(recovered) == 1
+
+
+class TestInPlaceArchiveFailureFallback:
+    """Regression for #71097: when archive_and_compact raises (e.g. contended
+    write or schema-migration race), compress_context must fall back to
+    replace_messages so the compressed transcript is still persisted and
+    _last_compaction_in_place remains True for the gateway."""
+
+    def test_archive_and_compact_failure_falls_back_to_replace(self):
+        from hermes_state import SessionDB
+        from agent.conversation_compression import compress_context
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = "20260725_71097_fb"
+            _seed(db, sid, "archive-fail", n=8)
+            agent = _make_agent(db, sid, in_place=True)
+
+            # Make archive_and_compact raise to simulate a contended write.
+            _original = db.archive_and_compact
+
+            def _boom(*a, **kw):
+                raise RuntimeError("database is locked")
+
+            db.archive_and_compact = _boom
+
+            messages = [{"role": "user", "content": f"m{i}"} for i in range(8)]
+            compressed, _sp = compress_context(
+                agent, messages, approx_tokens=100_000, system_message="sys"
+            )
+
+            # The fallback persisted via replace_messages so the live
+            # transcript is the compacted set.
+            live = db.get_messages_as_conversation(sid)
+            assert len(live) == 2
+            assert [m.get("content") for m in live] == [
+                "[CONTEXT COMPACTION] summary of prior turns",
+                "recent reply",
+            ]
+            # The gateway signal must be True so the hygiene path consumes
+            # the result instead of discarding it.
+            assert agent._last_compaction_in_place is True

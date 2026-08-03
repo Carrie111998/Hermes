@@ -3192,7 +3192,27 @@ def compress_context(
                     # for search/recovery (Teknium review — keep one durable id
                     # WITHOUT destroying history, unlike a hard replace_messages).
                     # See #38763.
-                    agent._session_db.archive_and_compact(agent.session_id, compressed)
+                    try:
+                        agent._session_db.archive_and_compact(
+                            agent.session_id, compressed
+                        )
+                    except Exception as _archive_err:
+                        # archive_and_compact can fail on contended writes
+                        # or schema-migration races.  Fall back to a
+                        # destructive active-only replace so the compressed
+                        # transcript is still persisted for the gateway to
+                        # consume — losing the soft-archive history is
+                        # preferable to silently dropping the compaction
+                        # result (#71097).
+                        logger.warning(
+                            "archive_and_compact failed for session %s, "
+                            "falling back to replace_messages: %s",
+                            agent.session_id or "?",
+                            _archive_err,
+                        )
+                        agent._session_db.replace_messages(
+                            agent.session_id, compressed, active_only=True,
+                        )
                     split_status = "in_place_committed"
                     # Reset the flush identity set so the next turn's appends are
                     # diffed against the COMPACTED transcript: the compacted dicts
