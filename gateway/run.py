@@ -11872,9 +11872,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if canonical == "reload-skills":
             return await self._handle_reload_skills_command(event)
 
-        if canonical == "reload-plugins":
-            return await self._handle_reload_plugins_command(event)
-
         if canonical == "bundles":
             return await self._handle_bundles_command(event)
 

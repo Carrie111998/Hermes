@@ -6330,8 +6330,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             return "Reloading MCP servers..."
         if cmd_lower == "/reload-skills" or cmd_lower == "/reload_skills":
             return "Reloading skills..."
-        if cmd_lower == "/reload-plugins" or cmd_lower == "/reload_plugins":
-            return "Reloading plugins..."
         if cmd_lower.startswith("/browser"):
             return "Configuring browser..."
         return "Processing command..."
@@ -9365,9 +9363,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         elif canonical == "reload-skills":
             with self._busy_command(self._slow_command_status(cmd_original)):
                 self._reload_skills()
-        elif canonical == "reload-plugins":
-            with self._busy_command(self._slow_command_status(cmd_original)):
-                self._reload_plugins(cmd_original)
         elif canonical == "bundles":
             self._handle_bundles_command(cmd_original)
         elif canonical == "browser":
@@ -11009,94 +11004,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
         except Exception as e:
             print(f"  ❌ Skills reload failed: {e}")
-
-    def _reload_plugins(self, cmd_original: str = "") -> None:
-        """Reload plugins: deregister stale tools, force-rescan, rebuild agent.
-
-        Follows the same shape as ``_reload_skills`` but adds a
-        ``refresh_agent_mcp_tools`` rebuild (like ``_reload_mcp``) because
-        plugin tools are baked into the system prompt.  The 4-step flow:
-
-        1. Snapshot + deregister old plugin-owned tools from the registry.
-        2. Force-rescan plugins (re-exec modules, re-run register()).
-        3. Rebuild ``agent.tools`` via ``refresh_agent_mcp_tools``.
-        4. Print a tool-name diff and append a note to conversation_history.
-        """
-        try:
-            from tools.registry import get_registry
-            from hermes_cli.plugins import discover_plugins, get_plugin_manager
-
-            registry = get_registry()
-            mgr = get_plugin_manager()
-
-            if not self._command_running:
-                print("  Reloading plugins...")
-
-            old_tool_names = set(mgr._plugin_tool_names)
-
-            for name in sorted(old_tool_names):
-                try:
-                    registry.deregister(name)
-                except Exception:
-                    pass
-
-            discover_plugins(force=True)
-
-            new_tool_names = set(mgr._plugin_tool_names)
-
-            added = new_tool_names - old_tool_names
-            removed = old_tool_names - new_tool_names
-            stayed = new_tool_names & old_tool_names
-
-            if added:
-                print(f"  + Added tools: {', '.join(sorted(added))}")
-            if removed:
-                print(f"  - Removed tools: {', '.join(sorted(removed))}")
-            if stayed:
-                print(f"  * Re-registered: {', '.join(sorted(stayed))}")
-            print(f"  * {len(mgr._plugins)} plugin(s) loaded, {len(new_tool_names)} tool(s)")
-
-            if self.agent is not None:
-                from tools.mcp_tool import refresh_agent_mcp_tools
-
-                refresh_agent_mcp_tools(
-                    self.agent,
-                    quiet_mode=getattr(self.agent, "quiet_mode", True),
-                )
-
-                print(f"  OK Agent updated — {len(self.agent.tools)} tool(s) available")
-
-            change_parts = []
-            if added:
-                change_parts.append(f"Added: {', '.join(sorted(added))}")
-            if removed:
-                change_parts.append(f"Removed: {', '.join(sorted(removed))}")
-            tool_summary = (
-                f"{len(new_tool_names)} plugin tool(s) now available"
-                if new_tool_names
-                else "No plugin tools available"
-            )
-            change_detail = ". ".join(change_parts) + ". " if change_parts else ""
-            self.conversation_history.append({
-                "role": "user",
-                "content": (
-                    f"[IMPORTANT: Plugins have been reloaded. {change_detail}"
-                    f"{tool_summary}. The tool list for this conversation "
-                    f"has been updated accordingly.]"
-                ),
-            })
-
-            if self.agent is not None:
-                try:
-                    self.agent._persist_session(
-                        self.conversation_history,
-                        self.conversation_history,
-                    )
-                except Exception:
-                    pass
-
-        except Exception as e:
-            print(f"  * Plugin reload failed: {e}")
 
     # ====================================================================
     # Tool-call generation indicator (shown during streaming)
