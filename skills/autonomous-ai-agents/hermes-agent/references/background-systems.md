@@ -1,7 +1,8 @@
 # Durable & Background Systems
 
 Four systems run alongside the main conversation loop. Quick reference
-here; full developer notes live in `AGENTS.md`, user-facing docs under
+here; full developer notes live in `docs/development/architecture-core.md`
+and `docs/development/subsystems.md`, with user-facing docs under
 `website/docs/user-guide/features/`.
 
 ### Delegation (`delegate_task`)
@@ -10,10 +11,11 @@ Spawn a subagent with an isolated context + terminal session.
 
 - **Single:** `delegate_task(goal, context)`.
 - **Batch:** `delegate_task(tasks=[{goal, ...}, ...])` runs children in
-  parallel, capped by `delegation.max_concurrent_children` (default 3).
-- **Background:** `delegate_task(background=true)` returns a handle
-  immediately and keeps the parent loop going; the child's result
-  re-enters the conversation as a new turn when it finishes.
+  parallel, capped by `delegation.max_concurrent_children`.
+- **Background:** top-level calls normally return immediately and re-enter the
+  result later. Finite/non-routable sessions and rejected or capacity-limited
+  dispatches fall back synchronously. The model-facing `background` parameter
+  is deprecated and ignored.
 - **Roles:** `leaf` (default; cannot re-delegate) vs `orchestrator`
   (can spawn its own workers, bounded by `delegation.max_spawn_depth`).
 - **Not durable.** A backgrounded child is still process-local — if the
@@ -36,11 +38,11 @@ the `cronjob` tool, the `hermes cron` CLI (`list`, `add`, `edit`,
   job), `context_from` (chain job A's output into job B), `workdir`
   (run in a specific dir with its `AGENTS.md` / `CLAUDE.md` loaded),
   multi-platform delivery.
-- **Invariants:** 3-minute hard interrupt per run, `.tick.lock` file
-  prevents duplicate ticks across processes, cron sessions pass
-  `skip_memory=True` by default, and cron deliveries are framed with a
-  header/footer instead of being mirrored into the target gateway
-  session (keeps role alternation intact).
+- **Invariants:** a 600-second inactivity watchdog by default (`0` disables
+  it), `.tick.lock` prevents duplicate ticks across processes, cron sessions
+  pass `skip_memory=True` by default, and cron deliveries are framed with a
+  header/footer instead of being mirrored into the target gateway session
+  (keeps role alternation intact).
 
 User docs: https://hermes-agent.nousresearch.com/docs/user-guide/features/cron
 
@@ -54,10 +56,11 @@ so nothing is lost.
   `resume`, `pin`, `unpin`, `archive`, `restore`, `list-archived`, `prune`,
   `backup`, `rollback`.
 - **Slash:** `/curator <subcommand>` mirrors the CLI.
-- **Scope:** only touches skills with `created_by: "agent"` provenance.
-  Bundled + hub-installed skills are off-limits. **Never deletes** —
-  max destructive action is archive. Pinned skills are exempt from
-  every auto-transition and every LLM review pass.
+- **Scope:** agent-created/adopted local skills are eligible. Bundled built-ins
+  are also eligible when `curator.prune_builtins` is true (the default), except
+  for the protected set; hub-installed and external skills are off-limits.
+  **Never deletes** — max destructive action is archive. Pinned skills are
+  exempt from every auto-transition and every LLM review pass.
 - **Cost:** the deterministic inactivity/prune sweep runs for free. The
   aux-model "consolidate overlapping skills into umbrellas" pass is
   **off by default** — opt in with `curator.consolidate: true` or
