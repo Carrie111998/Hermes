@@ -6,6 +6,7 @@ and implement the required methods.
 """
 
 import asyncio
+import hashlib
 import inspect
 import ipaddress
 import logging
@@ -32,6 +33,66 @@ _AUDIO_EXTS = frozenset({'.ogg', '.opus', '.mp3', '.wav', '.m4a', '.flac'})
 # delivered as a regular document.
 _TELEGRAM_AUDIO_ATTACHMENT_EXTS = frozenset({'.mp3', '.m4a'})
 _TELEGRAM_VOICE_EXTS = frozenset({'.ogg', '.opus'})
+
+# Extensions accepted by the explicit ``MEDIA:<path>`` response directive.
+# Keep this list at least as broad as the generated-artifact types supported by
+# ``extract_local_files``.  HTML was historically present only in the latter,
+# which meant the streaming renderer hid an HTML MEDIA directive without ever
+# dispatching the file.
+MEDIA_DIRECTIVE_EXTENSION_PATTERN = (
+    r"png|jpe?g|gif|webp|mp4|mov|avi|mkv|webm|ogg|opus|mp3|wav|m4a|flac|"
+    r"epub|pdf|zip|rar|7z|docx?|xlsx?|pptx?|txt|csv|html?|apk|ipa"
+)
+
+
+def media_delivery_correlation_id(file_path: str) -> str:
+    """Return a stable, content-free correlation ID for artifact delivery."""
+    normalized = os.path.abspath(os.path.expanduser(str(file_path or "")))
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:12]
+
+
+async def report_media_delivery_failure(
+    adapter,
+    *,
+    chat_id: str,
+    thread_id: str | None,
+    file_path: str,
+    metadata: dict | None,
+    detail: str,
+) -> None:
+    """Log a structured artifact failure and make it visible to the user."""
+    from agent.redact import redact_sensitive_text
+
+    correlation_id = media_delivery_correlation_id(file_path)
+    filename = Path(file_path).name or "generated artifact"
+    safe_detail = redact_sensitive_text(str(detail or "upload failed"), force=True)
+    safe_detail = " ".join(safe_detail.split())[:300]
+    logger.error(
+        "artifact_delivery correlation_id=%s stage=upload_result "
+        "platform=%s chat_id=%s thread_id=%s filename=%s success=false detail=%s",
+        correlation_id,
+        getattr(adapter, "name", "unknown"),
+        chat_id,
+        thread_id,
+        filename,
+        safe_detail,
+    )
+    try:
+        await adapter.send(
+            chat_id=chat_id,
+            content=(
+                f"⚠️ I created `{filename}`, but it was not attached: "
+                f"{safe_detail} (reference `{correlation_id}`)."
+            ),
+            metadata=metadata,
+        )
+    except Exception as notice_error:
+        logger.error(
+            "artifact_delivery correlation_id=%s stage=user_notice "
+            "success=false detail=%s",
+            correlation_id,
+            notice_error,
+        )
 
 
 def _platform_name(platform) -> str:
@@ -2159,7 +2220,8 @@ class BasePlatformAdapter(ABC):
         # Extract MEDIA:<path> tags, allowing optional whitespace after the colon
         # and quoted/backticked paths for LLM-formatted outputs.
         media_pattern = re.compile(
-            r'''[`"']?MEDIA:\s*(?P<path>`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|(?:~/|/)\S+(?:[^\S\n]+\S+)*?\.(?:png|jpe?g|gif|webp|mp4|mov|avi|mkv|webm|ogg|opus|mp3|wav|m4a|flac|epub|pdf|zip|rar|7z|docx?|xlsx?|pptx?|txt|csv|apk|ipa)(?=[\s`"',;:)\]}]|$))[`"']?'''
+            rf'''[`"']?MEDIA:\s*(?P<path>`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|(?:~/|/)\S+(?:[^\S\n]+\S+)*?\.(?:{MEDIA_DIRECTIVE_EXTENSION_PATTERN})(?=[\s`"',;:)\]}}]|$))[`"']?''',
+            re.IGNORECASE,
         )
         for match in media_pattern.finditer(content):
             path = match.group("path").strip()
@@ -3355,8 +3417,24 @@ class BasePlatformAdapter(ABC):
 
                         if not media_result.success:
                             logger.warning("[%s] Failed to send media (%s): %s", self.name, ext, media_result.error)
+                            await report_media_delivery_failure(
+                                self,
+                                chat_id=event.source.chat_id,
+                                thread_id=getattr(event.source, "thread_id", None),
+                                file_path=media_path,
+                                metadata=_thread_metadata,
+                                detail=str(media_result.error or "upload returned no success confirmation"),
+                            )
                     except Exception as media_err:
                         logger.warning("[%s] Error sending media: %s", self.name, media_err)
+                        await report_media_delivery_failure(
+                            self,
+                            chat_id=event.source.chat_id,
+                            thread_id=getattr(event.source, "thread_id", None),
+                            file_path=media_path,
+                            metadata=_thread_metadata,
+                            detail=str(media_err),
+                        )
 
                 # Send auto-detected local non-image files as native attachments
                 for file_path in _non_image_local:
@@ -3365,19 +3443,36 @@ class BasePlatformAdapter(ABC):
                     try:
                         ext = Path(file_path).suffix.lower()
                         if ext in _VIDEO_EXTS:
-                            await self.send_video(
+                            file_result = await self.send_video(
                                 chat_id=event.source.chat_id,
                                 video_path=file_path,
                                 metadata=_thread_metadata,
                             )
                         else:
-                            await self.send_document(
+                            file_result = await self.send_document(
                                 chat_id=event.source.chat_id,
                                 file_path=file_path,
                                 metadata=_thread_metadata,
                             )
+                        if not file_result.success:
+                            await report_media_delivery_failure(
+                                self,
+                                chat_id=event.source.chat_id,
+                                thread_id=getattr(event.source, "thread_id", None),
+                                file_path=file_path,
+                                metadata=_thread_metadata,
+                                detail=str(file_result.error or "upload returned no success confirmation"),
+                            )
                     except Exception as file_err:
                         logger.error("[%s] Error sending local file %s: %s", self.name, file_path, file_err)
+                        await report_media_delivery_failure(
+                            self,
+                            chat_id=event.source.chat_id,
+                            thread_id=getattr(event.source, "thread_id", None),
+                            file_path=file_path,
+                            metadata=_thread_metadata,
+                            detail=str(file_err),
+                        )
 
             # Determine overall success for the processing hook
             processing_ok = delivery_succeeded if delivery_attempted else not bool(response)

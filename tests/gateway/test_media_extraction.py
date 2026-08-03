@@ -10,6 +10,8 @@ times per reply. (Regression test for #160)
 import pytest
 import re
 
+from gateway.run import _TOOL_MEDIA_RE
+
 
 def extract_media_tags_fixed(result_messages, history_len):
     """
@@ -67,6 +69,15 @@ def extract_media_tags_broken(result_messages):
 
 class TestMediaExtraction:
     """Tests for MEDIA tag extraction from tool results."""
+
+    def test_tool_result_parser_accepts_html_artifacts(self):
+        content = (
+            '{"path":"MEDIA:/opt/data/artifacts/slack/abc-report.html"}'
+        )
+
+        paths = [match.group(1) for match in _TOOL_MEDIA_RE.finditer(content)]
+
+        assert paths == ["/opt/data/artifacts/slack/abc-report.html"]
     
     def test_media_tags_not_extracted_from_history(self):
         """MEDIA tags from previous turns should NOT be extracted again."""
