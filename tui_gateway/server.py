@@ -658,21 +658,21 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
     force-quit (double Ctrl‑C, terminal‑close, SIGHUP) while the agent
     is mid‑turn.
     """
-    if not session or session.get("_finalized"):
+    if not session:
         return
-    session["_finalized"] = True
+    lock = session.get("history_lock")
+    guard = lock if lock is not None else contextlib.nullcontext()
+    with guard:
+        if session.get("_finalized"):
+            return
+        session["_finalized"] = True
+        history = list(session.get("history", []))
     _release_active_session_slot(session)
     stop_event = session.get("_notif_stop")
     if stop_event is not None:
         stop_event.set()
 
     agent = session.get("agent")
-    lock = session.get("history_lock")
-    if lock is not None:
-        with lock:
-            history = list(session.get("history", []))
-    else:
-        history = list(session.get("history", []))
 
     # ── Persist unflushed messages to SQLite ──────────────────────────
     # Flush ``agent._session_messages`` via ``_persist_session``'s marker-based
@@ -7403,11 +7403,14 @@ def _handle_busy_submit(
     mode = "queue" if queued else _load_busy_input_mode()
     agent = session.get("agent")
     with session["history_lock"]:
+        if session.get("_finalized"):
+            return _err(rid, 4001, "session not found")
         if not session.get("running"):
-            # The turn ended between prompt.submit's first busy check and this
             # helper. Let the caller retry and claim the now-idle session.
             return None
     with session["history_lock"]:
+        if session.get("_finalized"):
+            return _err(rid, 4001, "session not found")
         if not session.get("running"):
             return None
         image_paths = list(session.get("attached_images", []))
@@ -7448,6 +7451,8 @@ def _handle_busy_submit(
     # provider or compute-host method while holding history_lock: an interrupt
     # can wait behind the very operation it is trying to cancel.
     with session["history_lock"]:
+        if session.get("_finalized"):
+            return _err(rid, 4001, "session not found")
         if not session.get("running"):
             if image_paths:
                 session["attached_images"] = image_paths + list(session.get("attached_images", []))
@@ -10113,7 +10118,7 @@ def _run_prompt_submit(
         # we check that guard before re-firing.
         if goal_followup:
             with session["history_lock"]:
-                if session.get("running"):
+                if session.get("_finalized") or session.get("running"):
                     # User already sent something — their turn wins,
                     # the judge will re-run on the next turn anyway.
                     return
@@ -10146,6 +10151,9 @@ def _run_prompt_submit(
             # adopt another session's addressed notification while a
             # post-compression session still claims its own pre-compression
             # dispatches (#55578).
+            with session["history_lock"]:
+                if session.get("_finalized"):
+                    return
             drained = process_registry.drain_notifications(
                 session_key=session.get("session_key", ""),
                 owns_event=lambda e: _session_owns_notification_event(sid, session, e),
@@ -10153,7 +10161,7 @@ def _run_prompt_submit(
             )
             for index, (_evt, synth) in enumerate(drained):
                 with session["history_lock"]:
-                    if session.get("running"):
+                    if session.get("_finalized") or session.get("running"):
                         for pending_evt, _pending_synth in drained[index:]:
                             process_registry.completion_queue.put(pending_evt)
                         break
@@ -10177,6 +10185,8 @@ def _run_prompt_submit(
                     )
                     with session["history_lock"]:
                         session["running"] = False
+                        if session.get("_finalized"):
+                            process_registry.completion_queue.put(_evt)
         except Exception as _drain_exc:
             print(
                 f"[tui_gateway] completion queue drain failed: "

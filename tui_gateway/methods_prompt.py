@@ -131,6 +131,8 @@ def _(rid, params: dict) -> dict:
     while True:
         busy_transport = None
         with session["history_lock"]:
+            if session.get("_finalized"):
+                return _err(rid, 4001, "session not found")
             if session.get("running"):
                 # Don't reject a mid-turn prompt — queue it (and, by default,
                 # interrupt the live turn) so it runs as the next turn. The
@@ -150,6 +152,8 @@ def _(rid, params: dict) -> dict:
         # queue whose drain already ran.
 
     with session["history_lock"]:
+        if session.get("_finalized"):
+            return _err(rid, 4001, "session not found")
         # A watch session's run lives in the PARENT turn, so its own running
         # flag is False — without this, typing mid-run builds a second agent
         # racing the in-flight child on the same stored session (interleaved
@@ -304,7 +308,11 @@ def _(rid, params: dict) -> dict:
             _emit("session.info", sid, _session_info(session.get("agent"), session))
             return
         with session["history_lock"]:
-            if session.get("_turn_cancel_requested") or not session.get("running"):
+            if (
+                session.get("_finalized")
+                or session.get("_turn_cancel_requested")
+                or not session.get("running")
+            ):
                 session["running"] = False
                 _clear_inflight_turn(session)
                 # Surface the cancellation to the client. Without this emit the

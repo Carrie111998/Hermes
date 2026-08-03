@@ -16184,3 +16184,152 @@ def test_prompt_submit_releases_old_history_before_heap_trim(monkeypatch):
         assert cleanup_order == ["trim", "reset_home"]
     finally:
         server._sessions.pop("sid_trim", None)
+
+
+def test_prompt_submit_rejects_when_finalization_wins_before_acceptance(monkeypatch):
+    """A resolved session reference cannot be accepted after finalization."""
+    session = _session(agent=None, attached_images=["still-attached.png"])
+    server._sessions["finalize-race"] = session
+    resolved = threading.Event()
+    finalized = threading.Event()
+    response = []
+    errors = []
+    side_effects = []
+    real_thread = threading.Thread
+
+    def _pause_after_session_lookup():
+        resolved.set()
+        if not finalized.wait(5):
+            raise TimeoutError("timed out waiting for finalization")
+        return {
+            "turn_isolation": False,
+            "compute_host_heartbeat_secs": 15,
+            "compute_host_respawn_max": 3,
+        }
+
+    def _submit():
+        try:
+            response.append(
+                server.handle_request(
+                    {
+                        "id": "submit",
+                        "method": "prompt.submit",
+                        "params": {
+                            "session_id": "finalize-race",
+                            "text": "must not be accepted",
+                        },
+                    }
+                )
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    class _CapturedRunThread:
+        def __init__(self, *args, **kwargs):
+            side_effects.append("run-thread-created")
+
+        def start(self):
+            side_effects.append("run-thread-started")
+
+    monkeypatch.setattr(
+        server, "_load_dashboard_process_isolation_config", _pause_after_session_lookup
+    )
+    monkeypatch.setattr(
+        server,
+        "_ensure_session_db_row",
+        lambda *_args: side_effects.append("db-row"),
+    )
+    monkeypatch.setattr(
+        server,
+        "_persist_branch_seed",
+        lambda *_args: side_effects.append("branch-seed"),
+    )
+    monkeypatch.setattr(
+        server,
+        "_start_agent_build",
+        lambda *_args: side_effects.append("agent-build"),
+    )
+    monkeypatch.setattr(server, "_emit", lambda event, *_args: side_effects.append(event))
+    monkeypatch.setattr(server.threading, "Thread", _CapturedRunThread)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(server, "_notify_session_boundary", lambda *_args: None)
+    monkeypatch.setattr(
+        "tools.async_delegation.interrupt_for_session", lambda **_kwargs: None
+    )
+
+    submitter = real_thread(target=_submit, name="prompt-finalize-race")
+    try:
+        submitter.start()
+        assert resolved.wait(5)
+        assert server._close_session_by_id("finalize-race") is True
+        finalized.set()
+        submitter.join(5)
+        assert not submitter.is_alive()
+
+        assert errors == []
+        assert response and "error" in response[0]
+        assert response[0].get("result") != {"status": "streaming"}
+        assert side_effects == []
+        assert session.get("_finalized") is True
+        assert session["running"] is False
+        assert "inflight_turn" not in session
+        assert "_run_thread" not in session
+        assert session["attached_images"] == ["still-attached.png"]
+    finally:
+        finalized.set()
+        submitter.join(5)
+        server._sessions.pop("finalize-race", None)
+
+
+def test_busy_prompt_submit_rejects_when_finalization_wins_before_queue(monkeypatch):
+    session = _session(running=True)
+    server._sessions["busy-finalize-race"] = session
+    entered = threading.Event()
+    finalized = threading.Event()
+    response = []
+    real_handle_busy_submit = server._handle_busy_submit
+
+    def _pause_before_busy_acceptance(*args, **kwargs):
+        entered.set()
+        if not finalized.wait(5):
+            raise TimeoutError("timed out waiting for finalization")
+        return real_handle_busy_submit(*args, **kwargs)
+
+    monkeypatch.setattr(server, "_handle_busy_submit", _pause_before_busy_acceptance)
+    monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "queue")
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(server, "_notify_session_boundary", lambda *_args: None)
+    monkeypatch.setattr(
+        "tools.async_delegation.interrupt_for_session", lambda **_kwargs: None
+    )
+
+    submitter = threading.Thread(
+        target=lambda: response.append(
+            server.handle_request(
+                {
+                    "id": "submit",
+                    "method": "prompt.submit",
+                    "params": {
+                        "session_id": "busy-finalize-race",
+                        "text": "must not be queued",
+                    },
+                }
+            )
+        ),
+        name="busy-prompt-finalize-race",
+    )
+    try:
+        submitter.start()
+        assert entered.wait(5)
+        server._finalize_session(session)
+        finalized.set()
+        submitter.join(5)
+        assert not submitter.is_alive()
+
+        assert response and "error" in response[0]
+        assert session.get("queued_prompt") is None
+        assert session.get("_finalized") is True
+    finally:
+        finalized.set()
+        submitter.join(5)
+        server._sessions.pop("busy-finalize-race", None)
