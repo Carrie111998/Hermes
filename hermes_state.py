@@ -10275,11 +10275,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         - ``model_history`` — the tip session's active rows, alternation-repaired
           (the live-replay working conversation). Equivalent to
           ``get_messages_as_conversation(session_id, repair_alternation=True)``.
-        - ``display_history`` — the full compression lineage (ancestors → tip),
-          verbatim, with replayed-user dedup. Explicit ``/branch`` sessions are
-          excluded from this lineage because their own rows already contain the
-          copied transcript; including the live parent's rows would let messages
-          written to the original after the fork leak into the branch.
+        - ``display_history`` — the replay lineage (compression ancestors since
+          the nearest explicit branch boundary → tip), verbatim, with replayed-user
+          dedup. Equivalent to ``get_messages_as_conversation(session_id,
+          include_ancestors=True)``.
 
         The display fetch already reads a superset of the model fetch (the tip
         rows are part of the lineage), so serving both from one lineage SELECT
