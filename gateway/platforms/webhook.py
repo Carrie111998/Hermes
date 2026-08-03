@@ -646,9 +646,16 @@ class WebhookAdapter(BasePlatformAdapter):
 
         def _resolve(match: re.Match) -> str:
             key = match.group(1)
-            # Special token: dump the entire payload as JSON
+            # Special tokens
             if key == "__raw__":
                 return json.dumps(payload, indent=2)[:4000]
+            if key in ("__received_at__", "__received_at_utc__"):
+                from datetime import datetime, timezone
+                return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+            if key == "__received_at_jst__":
+                from datetime import datetime, timezone, timedelta
+                jst = timezone(timedelta(hours=9))
+                return datetime.now(jst).strftime("%Y-%m-%d %H:%M:%S JST")
             value: Any = payload
             for part in key.split("."):
                 if isinstance(value, dict):

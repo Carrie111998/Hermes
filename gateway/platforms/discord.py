@@ -759,6 +759,31 @@ class DiscordAdapter(BasePlatformAdapter):
                 if message.type not in {discord.MessageType.default, discord.MessageType.reply}:
                     return
 
+                # Ignore messages containing configured substrings (e.g. Frigate monitoring test notifications).
+                # Checks plain content and all embed text fields (title, description, fields, footer, author).
+                _ignored_content = os.getenv("DISCORD_IGNORED_CONTENT", "")
+                if _ignored_content:
+                    _ignored_items = [item.strip() for item in _ignored_content.split(",") if item.strip()]
+                    _message_text = message.content or ""
+                    for embed in message.embeds:
+                        if embed.title:
+                            _message_text += "\n" + embed.title
+                        if embed.description:
+                            _message_text += "\n" + embed.description
+                        for field in getattr(embed, "fields", None) or []:
+                            if getattr(field, "name", None):
+                                _message_text += "\n" + field.name
+                            if getattr(field, "value", None):
+                                _message_text += "\n" + field.value
+                        footer = getattr(embed, "footer", None)
+                        if footer and getattr(footer, "text", None):
+                            _message_text += "\n" + footer.text
+                        author = getattr(embed, "author", None)
+                        if author and getattr(author, "name", None):
+                            _message_text += "\n" + author.name
+                    if any(item in _message_text for item in _ignored_items):
+                        return
+
                 # Bot message filtering (DISCORD_ALLOW_BOTS):
                 #   "none"     — ignore all other bots (default)
                 #   "mentions" — accept bot messages only when they @mention us
@@ -875,15 +900,17 @@ class DiscordAdapter(BasePlatformAdapter):
             # Wait for ready
             await asyncio.wait_for(self._ready_event.wait(), timeout=30)
 
-            self._running = True
+            self._mark_connected()
             return True
 
         except asyncio.TimeoutError:
             logger.error("[%s] Timeout waiting for connection to Discord", self.name, exc_info=True)
+            self._set_fatal_error("timeout", "Connection timeout", retryable=True)
             self._release_platform_lock()
             return False
         except Exception as e:  # pragma: no cover - defensive logging
             logger.error("[%s] Failed to connect to Discord: %s", self.name, e, exc_info=True)
+            self._set_fatal_error("connection_failed", str(e), retryable=True)
             self._release_platform_lock()
             return False
 
@@ -909,7 +936,7 @@ class DiscordAdapter(BasePlatformAdapter):
             except asyncio.CancelledError:
                 pass
 
-        self._running = False
+        self._mark_disconnected()
         self._client = None
         self._ready_event.clear()
         self._post_connect_task = None
@@ -2856,9 +2883,50 @@ class DiscordAdapter(BasePlatformAdapter):
         Format message for Discord.
 
         Discord uses its own markdown variant.
+        Collapses consecutive blank lines and trims each line to reduce vertical whitespace,
+        while preserving code blocks exactly as-is.
         """
-        # Discord markdown is fairly standard, no special escaping needed
-        return content
+        # Normalise Windows line endings
+        lines = content.replace("\r\n", "\n").split("\n")
+        result: list[str] = []
+        in_code_block = False
+        prev_blank = False
+
+        for line in lines:
+            # Toggle code-block state on triple backticks
+            if line.strip().startswith("```"):
+                in_code_block = not in_code_block
+                result.append(line)
+                prev_blank = False
+                continue
+
+            if in_code_block:
+                # Preserve code blocks unchanged (indent, blank lines, etc.)
+                result.append(line)
+                prev_blank = False
+                continue
+
+            stripped = line.strip()
+            if stripped == "":
+                # Collapse consecutive blank lines to a single blank line
+                if not prev_blank:
+                    result.append("")
+                    prev_blank = True
+            else:
+                result.append(stripped)
+                prev_blank = False
+
+        # Auto-close unclosed code blocks
+        if in_code_block:
+            result.append("```")
+
+        # Strip leading/trailing blank lines from the whole message
+        while result and result[0] == "":
+            result.pop(0)
+        while result and result[-1] == "":
+            result.pop()
+
+        return "\n".join(result)
 
     async def _run_simple_slash(
         self,

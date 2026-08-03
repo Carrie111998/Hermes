@@ -94,7 +94,7 @@ from gateway.platforms.base import (
     SendResult,
     cache_image_from_bytes,
 )
-from gateway.config import Platform
+from gateway.config import Platform, LINE_WEBHOOK_EVENTS_MAX
 from gateway.session import SessionSource
 
 
@@ -806,6 +806,12 @@ class LineAdapter(BasePlatformAdapter):
         self._dedup = _MessageDeduplicator()
         self._bot_user_id: Optional[str] = None
         self._lock_key: Optional[str] = None
+        self._state_lock = asyncio.Lock()
+        # Protected by _state_lock (async methods):
+        #   _reply_tokens, _member_name_cache, _pending_buttons, _media_tokens
+        # Not protected (sync, await-free within asyncio event loop):
+        #   _clear_expired_reply_tokens, _cleanup_member_name_cache,
+        #   _register_media, _media_url (media serving is read-heavy)
 
         # Media state
         self._media_tokens: Dict[str, Tuple[str, float]] = {}  # token → (path, expiry)
@@ -1052,10 +1058,21 @@ class LineAdapter(BasePlatformAdapter):
             if not verify_line_signature(body, signature, self.channel_secret):
                 return web.Response(status=401, text="invalid signature")
         else:
-            logger.warning(
-                "[LINE] Webhook signature verification skipped — "
-                "channel_secret is unset (insecure for production)"
-            )
+            # Reject unauthenticated webhooks unless explicitly opted-in
+            # for development (LINE_SKIP_SIGNATURE_VERIFY=true).
+            skip = os.getenv("LINE_SKIP_SIGNATURE_VERIFY", "").lower() in {"true", "1", "yes"}
+            if skip:
+                logger.warning(
+                    "[LINE] Webhook signature verification SKIPPED — "
+                    "channel_secret is unset (LINE_SKIP_SIGNATURE_VERIFY=true — "
+                    "insecure, do not use in production)"
+                )
+            else:
+                logger.error(
+                    "[LINE] Channel secret not set; rejecting webhook "
+                    "(set LINE_CHANNEL_SECRET or LINE_SKIP_SIGNATURE_VERIFY=true for dev)"
+                )
+                return web.Response(status=403, text="channel_secret required")
 
         try:
             payload = json.loads(body.decode("utf-8"))
@@ -1063,7 +1080,17 @@ class LineAdapter(BasePlatformAdapter):
             return web.Response(status=400, text="bad json")
 
         events = payload.get("events", []) or []
+        if len(events) > LINE_WEBHOOK_EVENTS_MAX:
+            logger.warning(
+                "[LINE] Webhook contains %d events (limit %d); processing first %d",
+                len(events), LINE_WEBHOOK_EVENTS_MAX, LINE_WEBHOOK_EVENTS_MAX,
+            )
+            events = events[:LINE_WEBHOOK_EVENTS_MAX]
+
         for event in events:
+            if not isinstance(event, dict) or "type" not in event:
+                logger.debug("[LINE] Skipping malformed webhook event: %s", type(event).__name__)
+                continue
             try:
                 await self._dispatch_event(event)
             except Exception:
@@ -1117,10 +1144,11 @@ class LineAdapter(BasePlatformAdapter):
 
         # Stash the reply token for outbound use.
         if chat_id and reply_token:
-            self._reply_tokens[chat_id] = (
-                reply_token,
-                time.time() + LINE_REPLY_TOKEN_TTL_SECONDS,
-            )
+            async with self._state_lock:
+                self._reply_tokens[chat_id] = (
+                    reply_token,
+                    time.time() + LINE_REPLY_TOKEN_TTL_SECONDS,
+                )
 
         # Handle media inbound — fetch the binary, cache it, and surface a
         # vision-tool-friendly local path on the MessageEvent.
@@ -1155,16 +1183,18 @@ class LineAdapter(BasePlatformAdapter):
         if chat_type in ("group", "room") and user_id and chat_id and self._client:
             cache_key = (chat_type, chat_id, user_id)
             now = time.monotonic()
-            if cache_key in self._member_name_cache:
-                cached_name, inserted_at = self._member_name_cache[cache_key]
-                if now - inserted_at <= self._MEMBER_NAME_CACHE_TTL:
-                    user_name = cached_name
+            async with self._state_lock:
+                if cache_key in self._member_name_cache:
+                    cached_name, inserted_at = self._member_name_cache[cache_key]
+                    if now - inserted_at <= self._MEMBER_NAME_CACHE_TTL:
+                        user_name = cached_name
             if user_name == user_id:
                 # Not in cache or expired — fetch from LINE API.
                 profile = await self._client.get_member_profile(chat_type, chat_id, user_id)
                 if profile and profile.get("displayName"):
                     user_name = profile["displayName"]
-                    self._member_name_cache[cache_key] = (user_name, time.monotonic())
+                    async with self._state_lock:
+                        self._member_name_cache[cache_key] = (user_name, time.monotonic())
                     self._evict_oldest_if_needed()
 
         # Best-effort typing indicator (DM only).
@@ -1260,13 +1290,15 @@ class LineAdapter(BasePlatformAdapter):
             try:
                 await self._client.reply(reply_token, messages)
                 self._cache.mark_delivered(request_id)
-                self._pending_buttons.pop(chat_id, None)
+                async with self._state_lock:
+                    self._pending_buttons.pop(chat_id, None)
             except Exception as exc:
                 logger.warning("LINE: postback reply failed (%s); falling back to push", exc)
                 try:
                     await self._client.push(chat_id, messages)
                     self._cache.mark_delivered(request_id)
-                    self._pending_buttons.pop(chat_id, None)
+                    async with self._state_lock:
+                        self._pending_buttons.pop(chat_id, None)
                 except Exception as exc2:
                     logger.error("LINE: postback push fallback failed: %s", exc2)
         elif entry.state is State.ERROR:
@@ -1274,7 +1306,8 @@ class LineAdapter(BasePlatformAdapter):
             try:
                 await self._client.reply(reply_token, [_text_message(text)])
                 self._cache.mark_delivered(request_id)
-                self._pending_buttons.pop(chat_id, None)
+                async with self._state_lock:
+                    self._pending_buttons.pop(chat_id, None)
             except Exception as exc:
                 logger.warning("LINE: postback ERROR reply failed: %s", exc)
         elif entry.state is State.DELIVERED:
@@ -1344,7 +1377,8 @@ class LineAdapter(BasePlatformAdapter):
 
         # If the chat has a PENDING postback button outstanding, route the
         # response into the cache for the user to fetch via tap.
-        pending_rid = self._pending_buttons.get(chat_id)
+        async with self._state_lock:
+            pending_rid = self._pending_buttons.get(chat_id)
         if pending_rid:
             self._cache.set_ready(pending_rid, content)
             self._record_group_response(chat_id)
@@ -1377,7 +1411,7 @@ class LineAdapter(BasePlatformAdapter):
             return SendResult(success=True, message_id=None)
         messages = [_text_message(c) for c in chunks][:LINE_MAX_MESSAGES_PER_CALL]
 
-        token, used_reply = self._consume_reply_token(chat_id)
+        token, used_reply = await self._consume_reply_token(chat_id)
         if used_reply and not force_push:
             try:
                 await self._client.reply(token, messages)
@@ -1393,12 +1427,13 @@ class LineAdapter(BasePlatformAdapter):
             logger.error("LINE: push send failed: %s", exc)
             return SendResult(success=False, error=str(exc))
 
-    def _consume_reply_token(self, chat_id: str) -> Tuple[str, bool]:
+    async def _consume_reply_token(self, chat_id: str) -> Tuple[str, bool]:
         """Consume a stashed reply token if present and unexpired.
 
         Returns ``(token, used_reply)``.
         """
-        entry = self._reply_tokens.pop(chat_id, None)
+        async with self._state_lock:
+            entry = self._reply_tokens.pop(chat_id, None)
         if not entry:
             return "", False
         token, expires_at = entry
@@ -1454,7 +1489,11 @@ class LineAdapter(BasePlatformAdapter):
                 )
 
     def _clear_expired_reply_tokens(self) -> None:
-        """Remove reply tokens past their TTL."""
+        """Remove reply tokens past their TTL.
+
+        No lock needed: synchronous scan+pop with no await points is atomic
+        within the asyncio event loop.
+        """
         now = time.time()
         expired = [
             cid for cid, (_, exp) in self._reply_tokens.items() if now >= exp
@@ -1465,7 +1504,10 @@ class LineAdapter(BasePlatformAdapter):
             logger.debug("LINE: cleared %d expired reply token(s)", len(expired))
 
     def _cleanup_member_name_cache(self) -> None:
-        """Remove member name cache entries older than the TTL."""
+        """Remove member name cache entries older than the TTL.
+
+        No lock needed: synchronous scan+del with no await points.
+        """
         now = time.monotonic()
         expired = [
             key for key, (_, inserted_at) in self._member_name_cache.items()
@@ -1567,15 +1609,17 @@ class LineAdapter(BasePlatformAdapter):
                 raise
             # Only fire if we still have a usable reply token. If the agent
             # already responded, _consume_reply_token has cleared it.
-            if chat_id not in self._reply_tokens:
-                return
-            if chat_id in self._pending_buttons:
-                return
-            rid = self._cache.register_pending(chat_id)
-            self._pending_buttons[chat_id] = rid
-            token, used = self._consume_reply_token(chat_id)
+            async with self._state_lock:
+                if chat_id not in self._reply_tokens:
+                    return
+                if chat_id in self._pending_buttons:
+                    return
+                rid = self._cache.register_pending(chat_id)
+                self._pending_buttons[chat_id] = rid
+            token, used = await self._consume_reply_token(chat_id)
             if not used:
-                self._pending_buttons.pop(chat_id, None)
+                async with self._state_lock:
+                    self._pending_buttons.pop(chat_id, None)
                 return
             msg = build_postback_button_message(
                 self.pending_text, self.button_label, rid
@@ -1585,7 +1629,8 @@ class LineAdapter(BasePlatformAdapter):
                 logger.info("LINE: sent slow-LLM postback button for chat %s (rid=%s)", chat_id, rid)
             except Exception as exc:
                 logger.warning("LINE: postback button send failed: %s", exc)
-                self._pending_buttons.pop(chat_id, None)
+                async with self._state_lock:
+                    self._pending_buttons.pop(chat_id, None)
 
         post_task = asyncio.create_task(_fire_postback())
         try:
@@ -1601,7 +1646,8 @@ class LineAdapter(BasePlatformAdapter):
     async def interrupt_session_activity(self, session_key: str, chat_id: str) -> None:
         """Resolve any orphan PENDING postback so the button doesn't loop."""
         await super().interrupt_session_activity(session_key, chat_id)
-        rid = self._pending_buttons.pop(chat_id, None)
+        async with self._state_lock:
+            rid = self._pending_buttons.pop(chat_id, None)
         if rid:
             self._cache.set_error(rid, self.interrupted_text)
 
@@ -1610,7 +1656,11 @@ class LineAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
 
     def _register_media(self, file_path: str, *, cleanup: bool = False) -> str:
-        """Register a local file for HTTPS serving; return the URL token."""
+        """Register a local file for HTTPS serving; return the URL token.
+        
+        No lock needed: synchronous scan+pop with no await points, atomic
+        within the asyncio event loop.
+        """
         # Evict expired tokens first.
         now = time.time()
         for token in list(self._media_tokens.keys()):
@@ -1806,7 +1856,7 @@ class LineAdapter(BasePlatformAdapter):
         rest = messages[LINE_MAX_MESSAGES_PER_CALL:]
 
         # First batch: try reply token, fall back to push.
-        token, used_reply = self._consume_reply_token(chat_id)
+        token, used_reply = await self._consume_reply_token(chat_id)
         if used_reply:
             try:
                 await self._client.reply(token, first_batch)

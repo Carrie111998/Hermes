@@ -479,11 +479,15 @@ class TestEnvEnablement:
     def test_returns_dict_with_credentials(self, monkeypatch):
         monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "tok")
         monkeypatch.setenv("LINE_CHANNEL_SECRET", "sec")
+        for k in ("LINE_PUBLIC_URL", "LINE_HOME_CHANNEL", "LINE_WEBHOOK_PATH", "LINE_HOST"):
+            monkeypatch.delenv(k, raising=False)
         assert _env_enablement() == {}
 
     def test_seeds_port_from_env(self, monkeypatch):
         monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "tok")
         monkeypatch.setenv("LINE_CHANNEL_SECRET", "sec")
+        for k in ("LINE_PUBLIC_URL", "LINE_HOME_CHANNEL", "LINE_WEBHOOK_PATH", "LINE_HOST"):
+            monkeypatch.delenv(k, raising=False)
         monkeypatch.setenv("LINE_PORT", "8080")
         assert _env_enablement() == {"port": 8080}
 
@@ -594,7 +598,7 @@ class TestValidateConfig:
 class TestAdapterInit:
 
     def test_init_from_config_extra(self, monkeypatch):
-        for k in ("LINE_CHANNEL_ACCESS_TOKEN", "LINE_CHANNEL_SECRET", "LINE_PORT"):
+        for k in ("LINE_CHANNEL_ACCESS_TOKEN", "LINE_CHANNEL_SECRET", "LINE_PORT", "LINE_PUBLIC_URL"):
             monkeypatch.delenv(k, raising=False)
         from gateway.config import PlatformConfig
         cfg = PlatformConfig(

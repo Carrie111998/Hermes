@@ -8,6 +8,15 @@ Starts a local HTTP server to receive webhooks from LINE Platform.
 Supports bidirectional communication:
 - Inbound: LINE webhook → message queue → Agent processing
 - Outbound: Reply API (within 24h) or Push API (anytime) → LINE user
+
+.. deprecated::
+    This gateway-embedded adapter is superseded by the plugin version at
+    ``plugins/platforms/line/adapter.py`` (``LineAdapter``).  The plugin
+    version provides richer features (group member name resolution, media
+    handling, postback buttons, retry logic).  This module will be kept as a
+    thin shim during the migration period and removed once the plugin is the
+    sole LINE adapter.  Do not add new features here — extend the plugin
+    instead.
 """
 
 from __future__ import annotations
@@ -25,7 +34,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set
 
-from gateway.config import Platform, PlatformConfig
+from gateway.config import Platform, PlatformConfig, LINE_WEBHOOK_EVENTS_MAX
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -296,10 +305,29 @@ class LineAdapter(BasePlatformAdapter):
                 logger.error("[%s] Invalid webhook signature", self.name)
                 return web.Response(status=403, text="invalid signature")
         else:
-            logger.debug("[%s] Channel secret not set; skipping signature verification", self.name)
+            # Reject unauthenticated webhooks unless explicitly opted-in
+            # for development (LINE_SKIP_SIGNATURE_VERIFY=true).
+            skip = os.getenv("LINE_SKIP_SIGNATURE_VERIFY", "").lower() in {"true", "1", "yes"}
+            if skip:
+                logger.warning(
+                    "[%s] Channel secret not set; signature verification SKIPPED "
+                    "(LINE_SKIP_SIGNATURE_VERIFY=true — insecure, do not use in production)",
+                    self.name,
+                )
+            else:
+                logger.error("[%s] Channel secret not set; rejecting webhook (set LINE_CHANNEL_SECRET or LINE_SKIP_SIGNATURE_VERIFY=true for dev)", self.name)
+                return web.Response(status=403, text="channel_secret required")
 
         count = 0
+        if len(events_data) > LINE_WEBHOOK_EVENTS_MAX:
+            logger.warning(
+                "[%s] Webhook contains %d events (limit %d); processing first %d",
+                self.name, len(events_data), LINE_WEBHOOK_EVENTS_MAX, LINE_WEBHOOK_EVENTS_MAX,
+            )
+            events_data = events_data[:LINE_WEBHOOK_EVENTS_MAX]
         for item in events_data:
+            if not isinstance(item, dict):
+                continue
             processed = await self._process_webhook_event(item)
             for event in processed:
                 await self._message_queue.put(event)
