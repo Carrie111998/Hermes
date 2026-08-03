@@ -179,15 +179,16 @@ CONTEXT_PROBE_TIERS = [
 # Default context length when no detection method succeeds.
 DEFAULT_FALLBACK_CONTEXT = CONTEXT_PROBE_TIERS[0]
 
-# Minimum context length required to run Hermes Agent.  Models with fewer
-# tokens cannot maintain enough working memory for tool-calling workflows.
-# Sessions, model switches, and cron jobs should reject models below this.
-# Support 16K self-hosted models by default while allowing operators to raise
-# the reliability floor. The compressor's degenerate-window guard still
-# triggers before the configured window fills.
-MINIMUM_CONTEXT_LENGTH = max(
+# Reliability floor for compression models, fallbacks, and context probing.
+# Keep this stable because auxiliary workflows may need more room than the
+# main tool-calling model.
+MINIMUM_CONTEXT_LENGTH = 64_000
+
+# Minimum context accepted for the main agent. Smaller self-hosted models can
+# run against their real budget without weakening auxiliary-model screening.
+MINIMUM_AGENT_CONTEXT_LENGTH = max(
     8_000,
-    int(os.environ.get("HERMES_MINIMUM_CONTEXT_LENGTH", "16384")),
+    int(os.environ.get("HERMES_MINIMUM_AGENT_CONTEXT_LENGTH", "16384")),
 )
 
 # Short-lived in-process cache for local-server context probes. Bounds the
