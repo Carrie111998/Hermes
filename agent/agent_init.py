@@ -884,6 +884,14 @@ def init_agent(
     agent._last_activity_desc: str = "initializing"
     agent._current_tool: str | None = None
     agent._api_call_count: int = 0
+    agent._progress_seq: int = 0
+    agent._progress_evidence: str = "init"
+    agent._action_fingerprint: str | None = None
+    agent._last_tool_result_marker: str | None = None
+    agent._failure_seq: int = 0
+    agent._failure_streak: int = 0
+    agent._is_non_retryable_failure: bool = False
+    agent._last_error_code: int | None = None
     # Opt-out flag for the between-turns MCP tool refresh (build_turn_context).
     # Set on internal forks (e.g. background_review) that must keep ``tools[]``
     # byte-identical to a parent for provider cache parity.

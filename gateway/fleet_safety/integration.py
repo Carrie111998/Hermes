@@ -1,0 +1,607 @@
+"""Live wiring: bind the deterministic guard engine to the real gateway.
+
+This is the only module in the package that touches gateway internals, and it
+does so lazily (imports inside functions) so the engine stays importable and
+unit-testable on its own and there is no import cycle with ``gateway.run``.
+
+Two entry points:
+
+- :func:`run_guard_tick` — called once per housekeeping tick. Samples every
+  running agent, feeds the persistent :class:`RunawayGuard`, and on a trip
+  hard-stops that session (interrupt + lease release) and reports it.
+- :func:`verified_usage_for` / :func:`decide_routing` — the wallet-cap seam a
+  router calls before sending heavy work to a provider. Reconciles the cached
+  usage figure against the authoritative provider source, then decides.
+
+Everything here is best-effort and defensive: any failure is logged and
+swallowed so a guard bug can never take down the housekeeping loop or a turn.
+"""
+
+from __future__ import annotations
+
+import logging
+import time
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+from agent.usage_provenance import UsageProvenance, usage_aggregate_from_mapping
+from hermes_constants import get_hermes_home
+
+from gateway.fleet_safety.deadloop_guard import (
+    GuardOutcome,
+    GuardThresholds,
+    RunawayGuard,
+    SessionFamilyGuard,
+    SessionObservation,
+)
+from gateway.fleet_safety.enforcer import GuardEnforcer, KillActions
+from gateway.fleet_safety.extension_lifecycle import ExtensionRegistry
+from gateway.fleet_safety.wallet_cap import (
+    RoutingRequest,
+    WalletCap,
+    WalletCapConfig,
+    WalletDecision,
+)
+from gateway.fleet_safety.usage_verify import (
+    VerifiedUsage,
+    extract_authoritative,
+    load_cached_percent,
+    verified_usage_for,
+    verify_usage,
+)
+from gateway.fleet_safety.selector import (
+    SelectedLane,
+    select_best_lane,
+)
+
+logger = logging.getLogger(__name__)
+
+# Default estimate for the context size (tokens) of a single model call when
+# the live runtime doesn't expose a real token count. The 2026-07-25 incident
+# re-sent ~160k tokens per call; using that as the per-call estimate makes the
+# token-rate detector meaningful from call-count data alone. Configurable via
+# ``fleet_safety.deadloop_guard.assumed_context_tokens``.
+DEFAULT_ASSUMED_CONTEXT_TOKENS = 160_000
+_EXTENSION_REGISTRIES: dict[str, ExtensionRegistry] = {}
+
+
+def _extension_state_path(config: dict) -> str:
+    configured = config.get("extension_state_path")
+    if configured:
+        return str(Path(configured).expanduser())
+    return str(get_hermes_home() / "fleet_safety" / "extensions.json")
+
+
+def _get_extension_registry(config: dict) -> ExtensionRegistry:
+    path = _extension_state_path(config)
+    registry = _EXTENSION_REGISTRIES.get(path)
+    if registry is None:
+        registry = ExtensionRegistry(path)
+        _EXTENSION_REGISTRIES[path] = registry
+    return registry
+
+
+def _load_full_config() -> dict:
+    try:
+        from hermes_cli.config import load_config
+        return load_config() or {}
+    except Exception as e:  # pragma: no cover - defensive
+        logger.debug("config load failed: %s", e)
+        return {}
+
+
+def _load_fleet_safety_config() -> dict:
+    return _load_full_config().get("fleet_safety") or {}
+
+
+# --------------------------------------------------------------------------
+# Detector / kill wiring
+# --------------------------------------------------------------------------
+
+
+def _get_or_create_guard(
+    runner: Any,
+    thresholds: GuardThresholds,
+    registry: Optional[ExtensionRegistry] = None,
+) -> RunawayGuard:
+    if registry is None:
+        path = getattr(runner, "_deadloop_extension_registry_path", None)
+        registry = _get_extension_registry(
+            {"extension_state_path": path} if path else {}
+        )
+    guard = getattr(runner, "_deadloop_guard", None)
+    if guard is None:
+        guard = RunawayGuard(thresholds, extension_registry=registry)
+        try:
+            runner._deadloop_guard = guard
+        except Exception:
+            pass
+    else:
+        guard.thresholds = thresholds  # pick up live config changes each tick
+        guard.extension_registry = registry
+    return guard
+
+
+def deny_active_extensions(
+    runner_or_session: Any,
+    session_ids: Optional[List[str]] = None,
+    *,
+    now: Optional[float] = None,
+) -> int:
+    """Persist exact STOP denial for active checkpoints.
+
+    The ``(runner, session_ids)`` form is used by gateway STOP routing. The
+    one-argument session-id form remains available to small integrations.
+    """
+
+    if session_ids is None:
+        ids = [str(runner_or_session)]
+        registries = tuple(_EXTENSION_REGISTRIES.values())
+    else:
+        ids = [str(value) for value in session_ids if str(value).strip()]
+        guard = getattr(runner_or_session, "_deadloop_guard", None)
+        registry = getattr(guard, "extension_registry", None)
+        registries = (registry,) if registry is not None else ()
+    denied = 0
+    decision_at = time.time() if now is None else float(now)
+    for session_id in ids:
+        per_session = 0
+        for registry in registries:
+            per_session += len(
+                registry.deny_active_for_session(session_id, now=decision_at)
+            )
+        if per_session:
+            denied += 1
+    return denied
+
+
+def _collect_observations(
+    runner: Any, now: float, assumed_context_tokens: int
+) -> Tuple[List[SessionObservation], Dict[str, Tuple[str, Any, Optional[int]]]]:
+    """Sample every running agent into observations keyed by the agent's
+    session_id. Returns (observations, {session_id: (session_key, agent)})."""
+    observations: List[SessionObservation] = []
+    mapping: Dict[str, Tuple[str, Any, Optional[int]]] = {}
+
+    running = getattr(runner, "_running_agents", {}) or {}
+    started_ts = getattr(runner, "_running_agents_ts", {}) or {}
+    session_parent_map: Dict[str, str] = {}
+    for _session_key, _agent in list(running.items()):
+        if _agent is None:
+            continue
+        _sid = str(getattr(_agent, "session_id", None) or _session_key).strip()
+        _parent = str(
+            getattr(_agent, "_parent_session_id", None)
+            or getattr(_agent, "parent_session_id", None)
+            or ""
+        ).strip()
+        session_parent_map[_sid] = _parent
+
+    def _family_root(session_id: str, parent_id: str) -> str:
+        current = parent_id
+        seen = {session_id}
+        while current and current not in seen:
+            seen.add(current)
+            next_parent = session_parent_map.get(current, "")
+            if not next_parent:
+                return current
+            current = next_parent
+        return current or session_id
+    # The pending sentinel marks a session whose agent object doesn't exist yet.
+    try:
+        from gateway.run import _AGENT_PENDING_SENTINEL
+    except Exception:
+        _AGENT_PENDING_SENTINEL = object()
+
+    for session_key, agent in list(running.items()):
+        if agent is _AGENT_PENDING_SENTINEL or agent is None:
+            continue
+        if bool(getattr(agent, "_hermes_guard_interrupt_pending", False)):
+            continue
+        try:
+            summary = agent.get_activity_summary() or {}
+        except Exception:
+            summary = {}
+        session_id = str(getattr(agent, "session_id", None) or session_key).strip()
+        started_at = float(started_ts.get(session_key, now) or now)
+        api_calls = int(summary.get("api_call_count", 0) or 0)
+        attempt_seq = summary.get("attempt_seq")
+        failure_seq = summary.get("failure_seq")
+        progress_seq = summary.get("progress_seq")
+        no_progress_streak = summary.get("no_progress_streak")
+        turn_generation = summary.get("turn_generation")
+        is_non_retryable = bool(summary.get("is_non_retryable_failure", False))
+        last_error_code = summary.get("last_error_code")
+        terminal_session_id = (
+            summary.get("last_session_id") or summary.get("session_id") or session_id
+        )
+        usage = usage_aggregate_from_mapping(
+            session_id,
+            summary.get("usage"),
+            default_component_id="activity-summary-usage",
+            fallback_session_id=str(terminal_session_id or ""),
+            missing_reason="missing_activity_usage",
+        )
+        # Prefer sanitized backend receipts. When none exist, retain the
+        # conservative call-count estimate for the rate detector only.
+        estimated_tokens = api_calls * int(assumed_context_tokens)
+        tokens_used = (
+            usage.total_tokens
+            if usage.usage_verified
+            else max(usage.total_tokens, estimated_tokens)
+        )
+        try:
+            context_tokens = max(0, int(summary.get("context_tokens", 0) or 0))
+        except (TypeError, ValueError, OverflowError):
+            context_tokens = 0
+        # No-progress is about verified state advancement, not heartbeat/API
+        # activity. Timestamps and current-tool labels would change during a
+        # dead loop and falsely reset the stall detector.
+        state_hash = f"progress:{progress_seq}"
+        parent_session_id = str(
+            getattr(agent, "_parent_session_id", None)
+            or getattr(agent, "parent_session_id", None)
+            or ""
+        ).strip() or None
+        action_fingerprint = (
+            summary.get("action_fingerprint")
+            or summary.get("last_tool_fingerprint")
+            or summary.get("last_action_fingerprint")
+        )
+        progress_evidence = summary.get("progress_evidence") or (
+            f"progress:{progress_seq}" if progress_seq is not None else None
+        )
+
+        observations.append(
+            SessionObservation(
+                session_id=session_id,
+                started_at=started_at,
+                api_call_count=api_calls,
+                tokens_used=tokens_used,
+                token_count_provenance=(
+                    UsageProvenance.MEASURED
+                    if usage.usage_verified
+                    else UsageProvenance.ESTIMATED
+                ),
+                context_tokens=context_tokens,
+                state_hash=state_hash,
+                error_code=last_error_code if is_non_retryable else None,
+                turn_generation=(
+                    int(turn_generation) if turn_generation is not None else None
+                ),
+                family_id=_family_root(session_id, parent_session_id or session_id),
+                parent_session_id=parent_session_id,
+                action_fingerprint=str(action_fingerprint) if action_fingerprint else None,
+                progress_evidence=str(progress_evidence) if progress_evidence else None,
+                current_tool=str(summary.get("current_tool") or "") or None,
+                attempt_seq=(int(attempt_seq) if attempt_seq is not None else None),
+                progress_seq=(int(progress_seq) if progress_seq is not None else None),
+                no_progress_streak=(
+                    int(no_progress_streak)
+                    if no_progress_streak is not None
+                    else None
+                ),
+                failure_seq=(int(failure_seq) if failure_seq is not None else None),
+                failure_streak=int(summary.get("failure_streak", 0) or 0),
+                is_non_retryable_failure=is_non_retryable,
+                last_event_id=summary.get("last_event_id"),
+                last_event_sequence=summary.get("last_event_sequence"),
+                last_call_id=summary.get("last_call_id"),
+                last_adapter=summary.get("last_adapter"),
+                last_source=summary.get("last_source"),
+                last_retryability=summary.get("last_retryability"),
+                last_status=summary.get("last_status"),
+                usage=usage,
+                terminal_session_id=terminal_session_id,
+                provider=str(getattr(agent, "provider", "") or ""),
+                model=str(getattr(agent, "model", "") or ""),
+                effort=_agent_effort(agent),
+            )
+        )
+        generation = getattr(agent, "_hermes_run_generation", None)
+        mapping[session_id] = (
+            session_key,
+            agent,
+            int(generation) if generation is not None else None,
+        )
+
+    return observations, mapping
+
+
+def _agent_effort(agent: Any) -> str:
+    try:
+        rc = getattr(agent, "reasoning_config", None)
+        if isinstance(rc, dict):
+            return str(rc.get("effort", "") or "")
+    except Exception:
+        pass
+    return ""
+
+
+class _LiveKillActions(KillActions):
+    """Adapts the running gateway to the enforcer's three effects."""
+
+    def __init__(
+        self,
+        runner: Any,
+        loop: Any,
+        mapping: Dict[str, Tuple[str, Any, Optional[int]]],
+    ) -> None:
+        self._runner = runner
+        self._loop = loop
+        self._mapping = mapping
+        self._notification_target: Optional[str] = None
+        self.interrupt_pending = False
+
+    def interrupt(self, session_id: str, reason: str) -> bool:
+        entry = self._mapping.get(session_id)
+        if not entry:
+            return False
+        session_key, agent, generation = entry
+        self._notification_target = session_id
+        if generation is None:
+            logger.warning(
+                "dead-loop guard: refusing unbound interrupt for %s", session_id
+            )
+            return False
+        is_current = getattr(self._runner, "_is_session_run_current", None)
+        if not callable(is_current) or not is_current(session_key, generation):
+            return False
+        try:
+            agent.interrupt(reason)
+            self.interrupt_pending = True
+            setattr(agent, "_hermes_guard_interrupt_pending", True)
+            evict = getattr(self._runner, "_evict_cached_agent", None)
+            if callable(evict):
+                evict(session_key)
+            # Acceptance is not termination. The generation-owned running slot
+            # and turn lease remain until the worker's normal unwind removes
+            # them; housekeeping must never publish a reusable slot early.
+            return True
+        except Exception as e:
+            logger.warning("fleet-safety guard: interrupt failed for %s: %s", session_id, e)
+            return False
+
+    def release_lease(self, session_id: str) -> bool:
+        entry = self._mapping.get(session_id)
+        if not entry:
+            return False
+        session_key, _agent, generation = entry
+        if generation is None:
+            return False
+        release = getattr(self._runner, "_release_turn_lease", None)
+        if not callable(release):
+            return False
+        return bool(release(session_key, generation))
+
+    def notify(self, text: str) -> bool:
+        # 1) Always log at ERROR — guaranteed to surface in errors.log and the
+        #    desktop/gateway log views. A kill is never silent even if no
+        #    messaging channel is reachable.
+        logger.warning("FLEET-SAFETY NOTICE\n%s", text)
+        # 2) Best-effort delivery only to the originating route. Broadcasting
+        #    session/provider details to unrelated home channels crosses tenant
+        #    and project boundaries.
+        try:
+            return self._notify_origin(text)
+        except Exception as e:  # pragma: no cover - defensive
+            logger.debug("dead-loop guard: origin notification failed: %s", e)
+            return False
+
+    def _notify_origin(self, text: str) -> bool:
+        runner = self._runner
+        loop = self._loop
+        entry = self._mapping.get(self._notification_target or "")
+        if not entry or loop is None:
+            return False
+        session_key, _agent, _generation = entry
+        get_source = getattr(runner, "_get_cached_session_source", None)
+        source = get_source(session_key) if callable(get_source) else None
+        if source is None:
+            return False
+        get_adapter = getattr(runner, "_adapter_for_source", None)
+        adapter = get_adapter(source) if callable(get_adapter) else None
+        if adapter is None:
+            return False
+        try:
+            from gateway.run import safe_schedule_threadsafe
+        except Exception:
+            return False
+
+        async def _send_origin() -> bool:
+            try:
+                metadata = runner._thread_metadata_for_source(source)
+            except Exception:
+                metadata = None
+            result = await adapter.send(source.chat_id, text, metadata=metadata)
+            if result is False:
+                return False
+            if isinstance(result, dict):
+                return result.get("success", True) is not False
+            return result is None or getattr(result, "success", True) is not False
+
+        fut = safe_schedule_threadsafe(
+            _send_origin(), loop,
+            logger=logger,
+            log_message="dead-loop guard alert scheduling error",
+        )
+        if fut is None:
+            return False
+        try:
+            return bool(fut.result(timeout=20))
+        except Exception:
+            return False
+
+
+def run_guard_tick(runner: Any, loop: Any = None, now: Optional[float] = None) -> None:
+    """Sample running agents, evaluate the guard, and kill+report any trips.
+
+    Safe to call from the housekeeping thread every tick. Never raises.
+    """
+    if now is None:
+        now = time.time()
+    try:
+        cfg = _load_fleet_safety_config()
+        guard_cfg = cfg.get("deadloop_guard") or {}
+        thresholds = GuardThresholds.from_config(guard_cfg)
+        if not thresholds.enabled:
+            return
+
+        try:
+            assumed = int(
+                guard_cfg.get("assumed_context_tokens", DEFAULT_ASSUMED_CONTEXT_TOKENS)
+                or DEFAULT_ASSUMED_CONTEXT_TOKENS
+            )
+            if assumed <= 0:
+                raise ValueError("assumed context must be positive")
+        except (TypeError, ValueError, OverflowError):
+            assumed = DEFAULT_ASSUMED_CONTEXT_TOKENS
+        registry = _get_extension_registry(guard_cfg)
+        guard = _get_or_create_guard(runner, thresholds, registry)
+        family_guard = getattr(runner, "_deadloop_family_guard", None)
+        if family_guard is None:
+            family_guard = SessionFamilyGuard(thresholds)
+            try:
+                runner._deadloop_family_guard = family_guard
+            except Exception:
+                pass
+        else:
+            family_guard.thresholds = thresholds
+
+        observations, mapping = _collect_observations(runner, now, assumed)
+
+        # Prune sessions the guard is tracking that are no longer running, so a
+        # finished session's latched state is released and its id can be reused.
+        live_ids = {o.session_id for o in observations}
+        for sid in guard.active_session_ids():
+            if sid not in live_ids:
+                guard.forget(sid)
+
+        if not observations:
+            return
+
+        actions = _LiveKillActions(runner, loop, mapping)
+        enforcer = GuardEnforcer(actions)
+
+        family_result = family_guard.observe(observations, now)
+        family_stopped_ids: set[str] = set()
+        if family_result is not None:
+            family_id, family_detail = family_result
+            member = max(
+                (o for o in observations if o.family_id == family_id),
+                key=lambda o: (int(o.api_call_count or 0), int(o.attempt_seq or 0)),
+                default=observations[0],
+            )
+            trip = guard.family_no_progress_trip(member, now, family_detail)
+            family_stopped_ids.add(member.session_id)
+            stopped_families = getattr(runner, "_deadloop_watchdog_families", None)
+            if stopped_families is None:
+                stopped_families = {}
+                try:
+                    runner._deadloop_watchdog_families = stopped_families
+                except Exception:
+                    pass
+            stopped_families[family_id] = {
+                "state": "WATCHDOG_STOP",
+                "result": "COLLECTION_INCOMPLETE",
+                "reason": family_detail,
+                "stopped_at": now,
+                "member_ids": [o.session_id for o in observations if o.family_id == family_id],
+            }
+            for family_obs in observations:
+                if family_obs.family_id != family_id:
+                    continue
+                entry = mapping.get(family_obs.session_id)
+                if entry:
+                    try:
+                        setattr(entry[1], "_hermes_watchdog_state", "WATCHDOG_STOP")
+                        setattr(entry[1], "_hermes_watchdog_family", family_id)
+                    except Exception:
+                        pass
+            result = enforcer.enforce(trip)
+            logger.error(
+                "dead-loop family watchdog stopped %s (family=%s): %s; "
+                "parent family marked WATCHDOG_STOP/COLLECTION_INCOMPLETE",
+                member.session_id, family_id, family_detail,
+            )
+            if result.notified:
+                family_guard.forget(family_id)
+            else:
+                # Delivery failure must not create a permanent silent latch;
+                # retry notification/enforcement on the next housekeeping tick.
+                family_guard.retry(family_id)
+
+        for obs in observations:
+            if obs.session_id in family_stopped_ids:
+                continue
+            trip = guard.observe(obs, now)
+            if trip is None:
+                continue
+            result = enforcer.enforce(trip)
+            if trip.extension_event_id and result.notified:
+                guard.mark_extension_notice_delivered(trip.extension_event_id)
+            logger.warning(
+                "dead-loop guard tripped on %s (%s): interrupted=%s lease_released=%s "
+                "notified=%s errors=%s",
+                trip.session_id, trip.reason.value, result.interrupted,
+                result.lease_released, result.notified, result.errors,
+            )
+            # Continuation notices keep accumulating progress and resource
+            # deltas. Only a verified hard stop tears down the guard state.
+            if trip.outcome is GuardOutcome.VERIFIED_HARD_STOP:
+                guard.forget(trip.session_id)
+    except Exception as e:  # pragma: no cover - defensive top-level guard
+        logger.debug("dead-loop guard tick error: %s", e)
+
+
+# --------------------------------------------------------------------------
+# Wallet-cap / usage-verification seam
+# --------------------------------------------------------------------------
+
+
+def select_best_lane_for(
+    current_provider: str = "",
+    *,
+    is_heavy: bool = True,
+    now: Optional[float] = None,
+    importance: str = "normal",
+) -> SelectedLane:
+    """Select the best fallback routing lane using usage-headroom rules.
+
+    Args:
+        importance: Task importance level. One of "ultra", "critically_important",
+                   "semi_critical", "normal" (default). Applies importance-based grading
+                   to Claude/Codex/Kimi; Grok and Antigravity always pin to "high".
+    """
+    cfg = _load_full_config()
+    return select_best_lane(cfg, current_provider=current_provider, is_heavy=is_heavy, now=now, importance=importance)
+
+
+def decide_routing(
+    provider: str,
+    effort: str = "medium",
+    *,
+    is_heavy: bool = False,
+    now: Optional[float] = None,
+) -> WalletDecision:
+    """Wallet-cap decision for routing heavy work to ``provider``.
+
+    Reads config (``fleet_safety.wallet_cap``), verifies usage against the
+    authoritative source, and returns an ALLOW / DOWNGRADE_EFFORT /
+    FALLBACK_PROVIDER decision. The router applies it; this never mutates any
+    wallet or places any call.
+    """
+    cfg = _load_fleet_safety_config()
+    wallet_cfg = WalletCapConfig.from_config(cfg.get("wallet_cap") or {})
+    verify_cfg = cfg.get("usage_verify") or {}
+    verified = verified_usage_for(
+        provider,
+        now=now,
+        max_age_seconds=float(verify_cfg.get("max_age_seconds", 900.0) or 900.0),
+        divergence_points=float(verify_cfg.get("divergence_points", 15.0) or 15.0),
+    )
+    cap = WalletCap(wallet_cfg)
+    return cap.decide(
+        RoutingRequest(provider=provider, effort=effort, is_heavy=is_heavy),
+        verified.used_percent,
+    )

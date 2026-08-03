@@ -24980,7 +24980,13 @@ def _run_planned_stop_watcher(
         stop_event.wait(poll_interval)
 
 
-def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop=None, interval: int = 60):
+def _start_gateway_housekeeping(
+    stop_event: threading.Event,
+    adapters=None,
+    loop=None,
+    interval: int = 60,
+    runner=None,
+):
     """Background thread for gateway-only periodic chores (NOT cron).
 
     Split out of the historical ``_start_cron_ticker`` so the cron *trigger*
@@ -25023,6 +25029,13 @@ def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop
     tick_count = 0
     while not stop_event.is_set():
         tick_count += 1
+
+        if runner is not None:
+            try:
+                from gateway.fleet_safety.integration import run_guard_tick
+                run_guard_tick(runner, loop=loop)
+            except Exception as e:
+                logger.debug("Dead-loop family guard tick error: %s", e)
 
         if tick_count % CHANNEL_DIR_EVERY == 0 and adapters:
             try:
@@ -25758,7 +25771,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     housekeeping_thread = threading.Thread(
         target=_start_gateway_housekeeping,
         args=(cron_stop,),
-        kwargs={"adapters": runner.adapters, "loop": asyncio.get_running_loop()},
+        kwargs={"adapters": runner.adapters, "loop": asyncio.get_running_loop(), "runner": runner},
         daemon=True,
         name="gateway-housekeeping",
     )

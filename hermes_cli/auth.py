@@ -1459,6 +1459,16 @@ def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
     if not isinstance(pool, dict):
         pool = {}
 
+    # New Hermes keeps xAI device-code credentials isolated from the legacy
+    # root store. xAI refresh tokens rotate on use, so borrowing a root-pool
+    # row across the profile boundary can replay a stale grant after a desktop
+    # sign-in. The explicit launcher flag affects xAI only; all other provider
+    # fallback behaviour remains unchanged.
+    isolate_xai_oauth = (
+        provider_id == "xai-oauth"
+        and os.environ.get("HERMES_ISOLATE_XAI_OAUTH", "").strip() == "1"
+    )
+
     global_pool: Dict[str, Any] = {}
     global_store = _load_global_auth_store()
     maybe_global_pool = global_store.get("credential_pool") if global_store else None
@@ -1480,6 +1490,8 @@ def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
     provider_entries = pool.get(provider_id)
     if isinstance(provider_entries, list) and provider_entries:
         return list(provider_entries)
+    if isolate_xai_oauth:
+        return []
     # Profile has no entries for this provider — fall back to global.
     global_entries = global_pool.get(provider_id)
     return list(global_entries) if isinstance(global_entries, list) else []
