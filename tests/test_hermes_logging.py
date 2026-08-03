@@ -1182,3 +1182,17 @@ class TestAsyncQueueLogging:
         # INFO must not reach the WARNING+ errors.log even through the queue.
         if errors_log.exists():
             assert "info-level line" not in errors_log.read_text()
+
+    def test_queue_emit_after_temporary_home_removal_is_silent(self, hermes_home, capsys):
+        hermes_logging.setup_logging(hermes_home=hermes_home)
+        logger = logging.getLogger("test_async.teardown")
+        hermes_logging.flush_log_queue()
+
+        import shutil
+        shutil.rmtree(hermes_home / "logs")
+        logger.warning("late teardown record")
+        hermes_logging.flush_log_queue()
+
+        captured = capsys.readouterr()
+        assert "FileNotFoundError" not in captured.err
+        assert "late teardown record" not in captured.err

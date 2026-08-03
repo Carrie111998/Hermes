@@ -512,6 +512,14 @@ class _ManagedRotatingFileHandler(RotatingFileHandler):
                 pass
 
     def emit(self, record: logging.LogRecord) -> None:
+        # A QueueListener can outlive a short-lived test/worker home.  Once the
+        # log directory has been removed, RotatingFileHandler would call
+        # handleError() and print an asynchronous FileNotFoundError traceback
+        # for every late record.  Dropping records whose parent is gone is the
+        # only safe behavior: the owner has already torn down the destination,
+        # and a later emit will retry automatically if the directory returns.
+        if not os.path.isdir(os.path.dirname(self.baseFilename)):
+            return
         # Cheap-ish stat-per-record check; the kernel caches inode metadata
         # so the syscall is sub-microsecond on a hot file.
         if self.stream is not None or os.path.exists(self.baseFilename):
