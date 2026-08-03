@@ -36,10 +36,31 @@ def _gateway_platform_value(platform: Any) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _resolve_progress_thread_id(platform: Any, source_thread_id: Any, event_message_id: Any) -> Optional[str]:
-    """Return thread/root ID that progress/status bubbles should target."""
+def _resolve_progress_thread_id(
+    platform: Any,
+    source_thread_id: Any,
+    event_message_id: Any,
+    *,
+    reply_in_thread: bool = True,
+) -> Optional[str]:
+    """Return thread/root ID that progress/status bubbles should target.
+
+    ``reply_in_thread=False`` (Slack ``platforms.slack.extra.reply_in_thread``)
+    disables the synthetic-thread fallback: progress messages must not create
+    a thread the final flat reply would then inherit. A source.thread_id equal
+    to the event's own message id is the adapter's synthetic session-keying
+    thread, not a real thread — treat it as "no thread" too (#18859).
+    """
     platform_value = getattr(platform, "value", platform)
     platform_key = str(platform_value or "").lower()
+    if not reply_in_thread:
+        if (
+            source_thread_id
+            and event_message_id
+            and str(source_thread_id) == str(event_message_id)
+        ):
+            return None
+        return str(source_thread_id) if source_thread_id else None
     if source_thread_id:
         return str(source_thread_id)
     if platform_key in {"slack", "mattermost"} and event_message_id:
@@ -170,20 +191,19 @@ def _coerce_gateway_timestamp(value: Any) -> Optional[float]:
 def _auto_continue_freshness_window() -> float:
     """Return the configured auto-continue freshness window in seconds.
 
-    Reads ``HERMES_AUTO_CONTINUE_FRESHNESS`` (bridged from
-    ``config.yaml`` ``agent.gateway_auto_continue_freshness`` at gateway
-    startup, same pattern as ``HERMES_AGENT_TIMEOUT``).  Falls back to the
-    module default when unset or malformed.  Non-positive values disable
-    the freshness gate (restores the pre-fix "always fresh" behaviour for
-    users who want to opt out).
+    Thin wrapper that delegates to the canonical implementation in
+    ``gateway.session`` (the single source of truth shared with the
+    routing-time zombie gate in ``get_or_create_session``).  Reads
+    ``HERMES_AUTO_CONTINUE_FRESHNESS`` (bridged from ``config.yaml``
+    ``agent.gateway_auto_continue_freshness`` at gateway startup, same
+    pattern as ``HERMES_AGENT_TIMEOUT``).  Falls back to the module default
+    when unset or malformed.  Non-positive values disable the freshness gate
+    (restores the pre-fix "always fresh" behaviour for users who want to opt
+    out).  Kept here so existing call sites and test patches importing it
+    from ``gateway.run`` continue to work.
     """
-    raw = os.environ.get("HERMES_AUTO_CONTINUE_FRESHNESS")
-    if raw is None or raw == "":
-        return float(_AUTO_CONTINUE_FRESHNESS_SECS_DEFAULT)
-    try:
-        return float(raw)
-    except (TypeError, ValueError):
-        return float(_AUTO_CONTINUE_FRESHNESS_SECS_DEFAULT)
+    from gateway.session import auto_continue_freshness_window
+    return auto_continue_freshness_window()
 
 
 def _float_env(name: str, default: float) -> float:
