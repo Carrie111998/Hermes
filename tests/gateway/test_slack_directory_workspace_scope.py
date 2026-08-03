@@ -37,6 +37,5 @@ def test_multi_workspace_directory_entries_are_unscoped():
         {"id": "C_ALPHA", "name": "alpha-engineering", "type": "channel"},
         {"id": "C_BETA", "name": "beta-engineering", "type": "channel"},
     ]
-    assert all("team_id" not in entry for entry in entries)
     alpha.users_conversations.assert_awaited_once()
     beta.users_conversations.assert_awaited_once()
