@@ -371,6 +371,58 @@ class TestLoadGatewayConfig:
             config.platforms[Platform.SLACK].typing_status_text == "chasing yarn…"
         )
 
+    def test_slack_allow_bots_apps_bridges_from_nested_platforms_block(
+        self, tmp_path, monkeypatch
+    ):
+        """``platforms.slack.allow_bots_apps`` must reach config.extra even
+        when a top-level ``slack:`` block also exists.
+
+        Regression (2026-08-03): with both blocks present, the shared-key
+        loop's platform_cfg points at the top-level ``slack:`` block, so the
+        nested-block fallback never ran and ``allow_bots_apps`` under
+        ``platforms.slack`` was silently dropped — the fail-closed app gate
+        then denied every app-relayed message despite correct config.
+        """
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "slack:\n"
+            "  require_mention: true\n"
+            "platforms:\n"
+            "  slack:\n"
+            "    enabled: true\n"
+            "    allow_bots_apps: A08SKDT6QUW\n"
+            "    allow_bots: mentions\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        extra = config.platforms[Platform.SLACK].extra
+        assert extra.get("allow_bots_apps") == "A08SKDT6QUW"
+        assert extra.get("allow_bots") == "mentions"
+
+    def test_slack_allow_bots_apps_bridges_from_toplevel_block(
+        self, tmp_path, monkeypatch
+    ):
+        """``slack.allow_bots_apps`` in a top-level block also bridges."""
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "slack:\n"
+            "  allow_bots_apps: A08SKDT6QUW\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        assert (
+            config.platforms[Platform.SLACK].extra.get("allow_bots_apps")
+            == "A08SKDT6QUW"
+        )
+
     def test_multiplex_profiles_from_nested_gateway_section(self, tmp_path, monkeypatch):
         """``gateway.multiplex_profiles: true`` (the nested form written by
         ``hermes config set gateway.multiplex_profiles true``) must enable

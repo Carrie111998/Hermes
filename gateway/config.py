@@ -1584,6 +1584,27 @@ def load_gateway_config() -> GatewayConfig:
                     bridged["group_user_allowed_commands"] = platform_cfg["group_user_allowed_commands"]
                 if plat in {Platform.DISCORD, Platform.SLACK} and "channel_skill_bindings" in platform_cfg:
                     bridged["channel_skill_bindings"] = platform_cfg["channel_skill_bindings"]
+                # Bridge Slack bot/app-relay gate settings into extra — the
+                # adapter reads both exclusively from config.extra, so a
+                # ``allow_bots_apps`` key outside ``extra`` would otherwise be
+                # silently dropped (fail-closed gate then denies everything).
+                # Unlike other bridged keys, check the nested platforms.slack /
+                # gateway.platforms.slack blocks too: when a top-level
+                # ``slack:`` block exists, platform_cfg points at it and the
+                # nested-block fallback above never runs, yet users configure
+                # these keys under ``platforms.slack``.
+                if plat == Platform.SLACK:
+                    _slack_gate_sources = [platform_cfg]
+                    for _src in (gateway_platforms, yaml_cfg.get("platforms")):
+                        if isinstance(_src, dict) and isinstance(_src.get("slack"), dict):
+                            _slack_gate_sources.append(_src["slack"])
+                    for _bridge_key in ("allow_bots", "allow_bots_apps"):
+                        if _bridge_key in platform_cfg.get("extra", {}):
+                            continue
+                        for _gate_src in _slack_gate_sources:
+                            if _bridge_key in _gate_src:
+                                bridged[_bridge_key] = _gate_src[_bridge_key]
+                                break
                 if "channel_prompts" in platform_cfg:
                     channel_prompts = platform_cfg["channel_prompts"]
                     if isinstance(channel_prompts, dict):
