@@ -216,6 +216,36 @@ def test_user_message_preserves_platform_event_timestamp():
     ctx = _build(agent, persist_user_timestamp=123.5)
 
     assert ctx.messages[-1]["timestamp"] == 123.5
+# ── Trivial-prompt prefetch gate (PR #25350 salvage) ─────────────────────────
+#
+# The prologue is the ONLY place the per-turn synchronous
+# memory_manager.prefetch_all() fires; a bare greeting must not block the
+# turn on provider network round-trips, while a substantive question must
+# still prefetch. These assert the gate at the call site (the classifier
+# itself is covered in tests/agent/test_memory_provider.py).
+
+
+def _agent_with_memory_manager():
+    agent = _FakeAgent()
+    mm = MagicMock()
+    mm.prefetch_all.return_value = "REMEMBERED CONTEXT"
+    agent._memory_manager = mm
+    return agent, mm
+
+
+def test_prefetch_skipped_for_trivial_user_message():
+    agent, mm = _agent_with_memory_manager()
+    ctx = _build(agent, user_message="hi!")
+    mm.prefetch_all.assert_not_called()
+    assert ctx.ext_prefetch_cache == ""
+
+
+def test_prefetch_runs_for_substantive_user_message():
+    agent, mm = _agent_with_memory_manager()
+    query = "what did we decide about the deploy pipeline?"
+    ctx = _build(agent, user_message=query)
+    mm.prefetch_all.assert_called_once_with(query)
+    assert ctx.ext_prefetch_cache == "REMEMBERED CONTEXT"
 
 
 def test_turn_start_replaces_stale_parent_history_with_compression_child():
@@ -345,7 +375,6 @@ def test_between_turns_refresh_adds_late_tool_when_servers_registered():
 
     assert "mcp_x_tool" in agent.valid_tool_names
     assert any(t["function"]["name"] == "mcp_x_tool" for t in agent.tools)
-
 
 
 
