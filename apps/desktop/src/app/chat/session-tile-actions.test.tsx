@@ -68,9 +68,8 @@ interface Handle {
 function Harness({ onReady }: { onReady: (handle: Handle) => void }) {
   const scope: ComposerScope = {
     $awaitingInput: atom(false),
+    $messages: atom(originalMessages),
     attachments: createComposerAttachmentScope(),
-    popoutAllowed: false,
-    readMessages: () => originalMessages,
     target: `tile:${STORED_ID}`
   }
 
