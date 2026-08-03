@@ -506,6 +506,13 @@ def _build_server_config(
         cfg["url"] = t.url
         if entry.auth.type == "oauth":
             cfg["auth"] = "oauth"
+        elif entry.auth.type == "api_key" and entry.auth.env:
+            # The auth.env vars are saved to .env by install_entry.
+            # Build Bearer auth header referencing the first env var
+            # so the runtime resolves ${VAR} from .env at connect time.
+            cfg["headers"] = {
+                "Authorization": f"Bearer ${{{entry.auth.env[0].name}}}"
+            }
     return cfg
 
 
