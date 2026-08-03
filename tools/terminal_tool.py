@@ -2533,6 +2533,14 @@ def terminal_tool(
                 For local backends the script path is on the host filesystem. For
                 SSH/Modal/Daytona the same path is remote; the local read misses, so we
                 fall back to ``env.execute('cat ...')``.
+
+                Mirrors ``cron.lifecycle_guard._read_referenced_script``: content with
+                NUL bytes is a binary, not a shell script, and must be treated as
+                "nothing to scan". Without this check a referenced binary (e.g.
+                ``.venv/bin/python``) gets decoded as UTF-8 text and the guard's
+                recursion re-tokenizes machine code — crashing on NUL-containing
+                paths or false-positive blocking when the bytes happen to contain a
+                lifecycle-looking string.
                 """
                 if env is None:
                     return None
@@ -2545,6 +2553,8 @@ def terminal_tool(
                         if stat.S_ISREG(metadata.st_mode) and metadata.st_size <= 1024 * 1024:
                             data = local_path.read_bytes()
                             if len(data) <= 1024 * 1024:
+                                if b"\x00" in data:
+                                    return None
                                 return data.decode("utf-8", errors="replace")
                 except Exception:
                     pass
@@ -2552,7 +2562,10 @@ def terminal_tool(
                 try:
                     result = env.execute(f"cat {shlex.quote(script_path)}")
                     if result.get("returncode", -1) == 0:
-                        return result.get("output", "")
+                        output = result.get("output", "")
+                        if "\x00" in output:
+                            return None
+                        return output
                 except Exception:
                     pass
                 return None

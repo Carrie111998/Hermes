@@ -258,7 +258,11 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
     try:
         descriptor = os.open(path, flags)
-    except OSError:
+    except (OSError, ValueError):
+        # OSError: unreadable/long paths. ValueError: a NUL byte embedded in
+        # the path itself (e.g. a binary's decoded contents re-tokenized as a
+        # path). A guarded path must never crash the guard (#76762) — treat
+        # both as "nothing to scan".
         return None, False
     try:
         metadata = os.fstat(descriptor)
@@ -330,8 +334,19 @@ def _contains_unsafe_gateway_action(
         if not script_text:
             continue
         # Relative references inside a script resolve against that script's
-        # directory, not the original command's cwd.
-        script_dir = _resolve_script_directory(str(resolved)) or cwd
+        # directory, not the original command's cwd. The path may contain a
+        # NUL byte (binary content decoded as text and re-tokenized); the
+        # directory resolver must not crash the guard (#76762) — fall back to
+        # the command's cwd.
+        script_dir = cwd
+        try:
+            script_dir = _resolve_script_directory(str(resolved)) or cwd
+        except (OSError, ValueError):
+            pass
+        if script_text and len(script_text) > _MAX_REFERENCED_SCRIPT_BYTES:
+            # Oversized fallback text (e.g. a hostile/unbounded remote read):
+            # fail closed, mirroring the local read path's oversized handling.
+            return True
         if script_text and _contains_unsafe_gateway_action(
             script_text,
             cwd=script_dir,

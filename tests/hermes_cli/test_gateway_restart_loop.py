@@ -705,6 +705,42 @@ class TestLifecycleGuardModule:
         with pytest.raises(GatewayLifecycleBlocked):
             check_gateway_lifecycle("daily ops", str(script))
 
+    def test_binary_with_text_returning_fallback_does_not_crash_guard(self, tmp_path):
+        """#76762 sibling: terminal_tool ALWAYS passes read_remote_script, and
+        that fallback re-reads a binary as decoded text (``cat`` succeeds on
+        binaries). The recursion then re-tokenizes machine code containing NUL
+        bytes and path-touching calls (os.open, the script-directory resolver)
+        receive NUL-containing paths — ValueError must be tolerated at every
+        site so a guarded path never crashes the guard, regardless of what the
+        fallback returns.
+
+        Before this fix the production call shape (binary exists at the
+        resolved path + read_remote_script provided) raised
+        ``ValueError: embedded null byte`` — the existing #76762 regression
+        only exercised the no-fallback shape.
+        """
+        from pathlib import Path
+
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+        binary = tmp_path / "tool.bin"
+        binary.write_bytes(b"\x7fELF\x00\x00/usr/bin/foo\x00bar\x00\x01~junk\x00")
+
+        def text_returning_fallback(script_path: str):
+            # Emulates terminal_tool._read_script_in_env decoding a binary as
+            # UTF-8 text (NUL bytes preserved) — the pre-fix behavior.
+            try:
+                return Path(script_path).read_bytes().decode("utf-8", errors="replace")
+            except Exception:
+                return None
+
+        result = contains_gateway_lifecycle_command_or_referenced_script(
+            f"{binary} -c 'print(1)'",
+            read_remote_script=text_returning_fallback,
+        )
+        assert result is False
+
 
 # ---------------------------------------------------------------------------
 # Defense 2 (chokepoint): cron.jobs.create_job blocks the AGENT model-tool path
@@ -821,6 +857,68 @@ class TestTerminalToolGatewayLifecycleGuardRemote:
 
         assert result["exit_code"] == 1
         assert "referenced script" in result["error"]
+        assert any("cat" in c for c in calls)
+
+    def test_local_binary_reference_is_not_scanned_as_text(self, monkeypatch, tmp_path):
+        """A command referencing an existing local binary (e.g. a venv python)
+        must not have its bytes decoded and scanned as shell text.
+
+        Before this fix the remote-fallback reader decoded the binary as
+        UTF-8 (NULs preserved) and the recursion treated the decoded machine
+        code as a shell script — either crashing the guard (ValueError:
+        embedded null byte) or false-positive blocking when the bytes
+        contained a lifecycle-looking string.
+        """
+        import tools.terminal_tool as tt
+
+        binary = tmp_path / "tool.bin"
+        binary.write_bytes(b"\x7fELF\x00\x00" + b"hermes gateway restart\x00")
+        calls = []
+
+        class _LocalEnv:
+            env = {}
+            cwd = str(tmp_path)
+
+            def execute(self, command, **kwargs):
+                calls.append(command)
+                return {"output": "", "returncode": 0}
+
+        fake_env = _LocalEnv()
+        self._patch_env(monkeypatch, fake_env, inside_gateway=True)
+
+        result = json.loads(tt.terminal_tool(command=str(binary)))
+
+        assert "Blocked" not in (result.get("error") or "")
+        # The command itself runs through env.execute, but the guard's script
+        # fallback (cat <path>) must never fire for a local binary.
+        assert not any("cat " in c for c in calls)
+
+    def test_remote_binary_output_is_not_scanned_as_text(self, monkeypatch, tmp_path):
+        """A REMOTE binary (local file absent, env.execute cat returns its
+        bytes) must be treated like the local case: NUL-containing output is
+        "nothing to scan", not a script whose contents are then scanned."""
+        import tools.terminal_tool as tt
+
+        script = "/remote/workspace/tool.bin"
+        calls = []
+
+        class _RemoteEnv:
+            env = {}
+            cwd = str(tmp_path)
+
+            def execute(self, command, **kwargs):
+                calls.append(command)
+                if "cat" in command and "/remote/workspace/tool.bin" in command:
+                    return {"output": "\x7fELF\x00hermes gateway restart\x00junk", "returncode": 0}
+                return {"output": "", "returncode": 0}
+
+        fake_env = _RemoteEnv()
+        fake_env.cwd = "/remote/workspace"
+        self._patch_env(monkeypatch, fake_env, inside_gateway=True)
+
+        result = json.loads(tt.terminal_tool(command=f"/bin/bash {script}"))
+
+        assert "Blocked" not in (result.get("error") or "")
         assert any("cat" in c for c in calls)
 
 
