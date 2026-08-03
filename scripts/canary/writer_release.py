@@ -2277,6 +2277,11 @@ def build_release(
         )
         _materialize_copied_interpreter(spec, managed_python)
         _remove_exact_virtualenv_site_hook(spec)
+        # CPython 3.11's ensurepip seed can retain setuptools' executable
+        # distutils shim before the first installed-runtime gate. Remove only
+        # its already pinned exact bytes here; dependency provisioning may
+        # create the same shim again and is independently cleaned below.
+        _remove_exact_setuptools_distutils_site_hook(spec)
         _validate_installed_runtime(spec, managed_python)
         install_runtime, verify_runtime = runtime_dependency_commands(spec)
         _run_checked(
