@@ -4,7 +4,7 @@ import { type MutableRefObject, useEffect, useMemo, useRef, useState } from 'rea
 
 import { setInputSelection } from '../app/inputSelectionStore.js'
 import { highlightMask, highlightsStable } from '../domain/composerHighlights.js'
-import { readClipboardText, writeClipboardText } from '../lib/clipboard.js'
+import { copyTextToClipboard, readClipboardText, writeClipboardText } from '../lib/clipboard.js'
 import { cursorLayout, offsetFromPosition } from '../lib/inputMetrics.js'
 import {
   DEFAULT_VOICE_RECORD_KEY,
@@ -961,7 +961,7 @@ export function TextInput({
         const range = selRange()
 
         if (range) {
-          void writeClipboardText(vRef.current.slice(range.start, range.end))
+          void copyTextToClipboard(vRef.current.slice(range.start, range.end))
         }
       },
       cut: () => {
@@ -1318,7 +1318,7 @@ export function TextInput({
     const normalized = selRange()
 
     if (isMac && normalized) {
-      void writeClipboardText(vRef.current.slice(normalized.start, normalized.end))
+      void copyTextToClipboard(vRef.current.slice(normalized.start, normalized.end))
     }
   }
 
@@ -1706,7 +1706,7 @@ export function TextInput({
           const decision = decideRightClickAction(vRef.current, selRange())
 
           if (decision.action === 'copy') {
-            void writeClipboardText(decision.text)
+            void copyTextToClipboard(decision.text)
 
             return
           }
