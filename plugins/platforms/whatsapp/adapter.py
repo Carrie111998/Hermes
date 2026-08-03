@@ -34,7 +34,7 @@ from hermes_constants import (
     with_hermes_node_path,
 )
 
-def _wenv(name: str, default: str = "") -> str:
+def _wenv(name: str, default: Any = "") -> Any:
     """Read a WHATSAPP_* env var through the profile secret scope.
 
     Under multiplexing, ``os.getenv`` bypasses the per-profile ``.env`` and
@@ -480,14 +480,23 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         self._allow_from = self._coerce_allow_list(allow_raw)
         self._group_policy = str(config.extra.get("group_policy") or _wenv("WHATSAPP_GROUP_POLICY", "pairing")).strip().lower()
         if "group_allow_from" in config.extra:
+            self._group_allowlist_source = "config"
             group_allow_raw = config.extra.get("group_allow_from")
         elif "groupAllowFrom" in config.extra:
+            self._group_allowlist_source = "config"
             group_allow_raw = config.extra.get("groupAllowFrom")
         else:
-            group_allow_raw = (
-                _wenv("WHATSAPP_GROUP_ALLOWED_USERS")
-                or _wenv("WHATSAPP_GROUP_ALLOW_FROM")
-            )
+            canonical_group_allow = _wenv("WHATSAPP_GROUP_ALLOWED_USERS", None)
+            legacy_group_allow = _wenv("WHATSAPP_GROUP_ALLOW_FROM", None)
+            if canonical_group_allow is not None:
+                self._group_allowlist_source = "WHATSAPP_GROUP_ALLOWED_USERS"
+                group_allow_raw = canonical_group_allow
+            elif legacy_group_allow is not None:
+                self._group_allowlist_source = "WHATSAPP_GROUP_ALLOW_FROM"
+                group_allow_raw = legacy_group_allow
+            else:
+                self._group_allowlist_source = None
+                group_allow_raw = None
         self._group_allow_from = self._coerce_allow_list(group_allow_raw)
         read_receipts = config.extra.get("send_read_receipts", False)
         self._send_read_receipts = (
@@ -684,11 +693,20 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 "_group_policy",
                 str(_wenv("WHATSAPP_GROUP_POLICY", "pairing")).strip().lower(),
             )
-            effective_group_allowed_users = getattr(
-                self,
-                "_group_allow_from",
-                self._coerce_allow_list(_wenv("WHATSAPP_GROUP_ALLOWED_USERS", "")),
-            )
+            group_allowlist_source = getattr(self, "_group_allowlist_source", None)
+            if group_allowlist_source == "config":
+                effective_group_allowed_users = set(
+                    getattr(self, "_group_allow_from", ()) or ()
+                )
+            elif isinstance(group_allowlist_source, str):
+                live_group_allow = _wenv(group_allowlist_source, None)
+                effective_group_allowed_users = self._coerce_allow_list(
+                    live_group_allow
+                )
+            elif hasattr(self, "_group_allow_from"):
+                effective_group_allowed_users = set(self._group_allow_from or ())
+            else:
+                effective_group_allowed_users = set()
             effective_forward_owner_messages = _wenv(
                 "WHATSAPP_FORWARD_OWNER_MESSAGES", "false"
             ).strip().lower() in {"1", "true", "yes", "on"}

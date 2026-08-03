@@ -458,10 +458,12 @@ class TestCacheDirEnvPassthrough:
             "WHATSAPP_ALLOWED_USERS", "15550000002,15550000001"
         )
         adapter._group_policy = "allowlist"
-        adapter._group_allow_from = {
-            "120363009999999999@g.us",
-            "120363001234567890@g.us",
-        }
+        adapter._group_allow_from = {"stale-group@g.us"}
+        adapter._group_allowlist_source = "WHATSAPP_GROUP_ALLOWED_USERS"
+        monkeypatch.setenv(
+            "WHATSAPP_GROUP_ALLOWED_USERS",
+            "120363009999999999@g.us,120363001234567890@g.us",
+        )
         adapter._send_read_receipts = True
         mock_proc = MagicMock()
         mock_proc.poll.return_value = 1
