@@ -88,6 +88,7 @@ from plugins.memory.config_schema import (
     get_provider_config_schema,
 )
 from gateway.status import (
+    GatewayLiveness,
     derive_gateway_busy,
     derive_gateway_drainable,
     get_running_pid_cached,
@@ -8095,6 +8096,7 @@ def _messaging_platform_payload(
     runtime: dict | None,
     scoped: bool = False,
     profile_home: Optional[Path] = None,
+    liveness: Optional[GatewayLiveness] = None,
 ) -> dict[str, Any]:
     platform_id = entry["id"]
     runtime_platforms = runtime.get("platforms") if runtime else {}
@@ -8115,16 +8117,23 @@ def _messaging_platform_payload(
     # HERMES_HOME contextvar override (#56986 / #69143), so the profile's
     # directory has to be handed over explicitly or messaging silently reports
     # another profile's gateway (#71211).
-    liveness = resolve_gateway_liveness(
-        profile_dir=profile_home,
-        runtime=runtime,
-        health_probe=(
-            _probe_gateway_health if _GATEWAY_HEALTH_URL else None
-        ),
-        pid_probe=get_running_pid_cached,
-        runtime_reader=read_runtime_status,
-        runtime_pid_probe=get_runtime_status_running_pid,
-    )
+    #
+    # ``liveness`` is optional: the catalog endpoint resolves it ONCE per
+    # request and shares it across every platform entry (it reads the same
+    # gateway state for all of them — resolving 32x per poll is what stalled
+    # the event loop 6-12s in #77048). Callers with a single platform (the
+    # /test endpoint) leave it None and get the same per-call resolution.
+    if liveness is None:
+        liveness = resolve_gateway_liveness(
+            profile_dir=profile_home,
+            runtime=runtime,
+            health_probe=(
+                _probe_gateway_health if _GATEWAY_HEALTH_URL else None
+            ),
+            pid_probe=get_running_pid_cached,
+            runtime_reader=read_runtime_status,
+            runtime_pid_probe=get_runtime_status_running_pid,
+        )
     gateway_running = liveness.running
     env_vars = []
 
@@ -9130,27 +9139,54 @@ async def get_messaging_platforms(profile: Optional[str] = None):
     # load_env() honors the HERMES_HOME contextvar override; the gateway
     # status readers do NOT (they resolve process-level paths), so the
     # profile directory is passed explicitly for those (#71211).
-    with _profile_scope(profile) as scoped_dir:
-        env_on_disk = load_env()
-        runtime = (
-            read_runtime_status(path=scoped_dir / "gateway_state.json")
-            if scoped_dir is not None
-            else read_runtime_status()
-        )
-        return {
-            "env_path": str(get_env_path()),
-            "gateway_start_command": _gateway_display_command(profile, "start"),
-            "platforms": [
-                _messaging_platform_payload(
-                    entry,
-                    env_on_disk,
-                    runtime,
-                    scoped=scoped_dir is not None,
-                    profile_home=scoped_dir,
-                )
-                for entry in _messaging_platform_catalog()
-            ]
-        }
+    #
+    # The catalog build is fully synchronous and slow: _messaging_platform_payload
+    # resolves gateway liveness per platform, and resolve_gateway_liveness does
+    # PID/process-table probing + file I/O. On a stock install the catalog has
+    # ~32 entries, so running the whole build inline stalled the event loop for
+    # 6-12s per poll (#77048) and tripped the Desktop's readiness timeout.
+    # Run it off the loop via run_in_threadpool, the same pattern /api/status's
+    # topology scan and /api/model/options already use, and resolve liveness
+    # ONCE for the request instead of once per platform — it reads the same
+    # gateway state for every catalog entry.
+    def _build_payload_scoped() -> dict:
+        # Keep the profile override inside the worker thread so the full
+        # sync catalog build (config load, env read, liveness probes) runs
+        # off the event loop under the requested profile.
+        with _profile_scope(profile) as scoped_dir:
+            env_on_disk = load_env()
+            runtime = (
+                read_runtime_status(path=scoped_dir / "gateway_state.json")
+                if scoped_dir is not None
+                else read_runtime_status()
+            )
+            liveness = resolve_gateway_liveness(
+                profile_dir=scoped_dir,
+                runtime=runtime,
+                health_probe=(
+                    _probe_gateway_health if _GATEWAY_HEALTH_URL else None
+                ),
+                pid_probe=get_running_pid_cached,
+                runtime_reader=read_runtime_status,
+                runtime_pid_probe=get_runtime_status_running_pid,
+            )
+            return {
+                "env_path": str(get_env_path()),
+                "gateway_start_command": _gateway_display_command(profile, "start"),
+                "platforms": [
+                    _messaging_platform_payload(
+                        entry,
+                        env_on_disk,
+                        runtime,
+                        scoped=scoped_dir is not None,
+                        profile_home=scoped_dir,
+                        liveness=liveness,
+                    )
+                    for entry in _messaging_platform_catalog()
+                ],
+            }
+
+    return await run_in_threadpool(_build_payload_scoped)
 
 
 def _multiplex_port_binding_conflict(

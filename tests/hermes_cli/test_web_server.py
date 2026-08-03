@@ -306,6 +306,42 @@ class TestWebServerEndpoints:
 
 
 
+    def test_messaging_platforms_resolves_liveness_once(self, monkeypatch):
+        """#77048: the catalog must resolve gateway liveness ONCE per request.
+
+        Every catalog entry shares the same gateway state, so the old code's
+        per-platform resolve_gateway_liveness() — each doing PID/process-table
+        probing + file I/O — ran ~32 sync probes on the event-loop thread and
+        stalled it 6-12s, tripping the Desktop's 15s readiness timeout. The
+        endpoint now resolves liveness a single time and reuses it across all
+        entries, off the loop via run_in_threadpool.
+        """
+        import hermes_cli.web_server as web_server
+
+        _real_resolve = web_server.resolve_gateway_liveness
+        resolve_calls = []
+
+        def _counting_resolve(*args, **kwargs):
+            resolve_calls.append(kwargs)
+            return _real_resolve(*args, **kwargs)
+
+        monkeypatch.setattr(web_server, "resolve_gateway_liveness", _counting_resolve)
+        monkeypatch.setattr(web_server, "_GATEWAY_HEALTH_URL", None)
+
+        resp = self.client.get("/api/messaging/platforms")
+
+        assert resp.status_code == 200
+        platforms = resp.json()["platforms"]
+        assert len(platforms) > 1
+        # One shared liveness resolution for the whole catalog, not one per
+        # platform entry (previously ~32 per poll, #77048).
+        assert len(resolve_calls) == 1
+        # Every payload reflects the same shared liveness result.
+        assert all(p["gateway_running"] is False for p in platforms)
+
+
+
+
     def test_gateway_drain_bad_action_400(self):
         resp = self.client.post("/api/gateway/drain", json={"action": "explode"})
         assert resp.status_code == 400
