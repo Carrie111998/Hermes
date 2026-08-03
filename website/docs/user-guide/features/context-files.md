@@ -27,6 +27,8 @@ Only **one** project context type is loaded per session (first match wins): `.he
 
 `AGENTS.md` is the primary project context file. It tells the agent how your project is structured, what conventions to follow, and any special instructions.
 
+`AGENTS.md` is project context and resolves from the working directory, so it is not scoped to a profile. For instructions that belong to a profile rather than a project, use that profile's `SOUL.md`. For a scheduled job that needs project context, set the job's working directory and Hermes injects that directory's `AGENTS.md`, `CLAUDE.md` and `.cursorrules`.
+
 ### Progressive Subdirectory Discovery
 
 At session start, Hermes loads the `AGENTS.md` from your working directory into the system prompt. As the agent navigates into subdirectories during the session (via `read_file`, `terminal`, `search_files`, etc.), it **progressively discovers** context files in those directories and injects them into the conversation at the moment they become relevant.
@@ -85,6 +87,8 @@ This is a Next.js 14 web application with a Python FastAPI backend.
 
 - `~/.hermes/SOUL.md`
 - or `$HERMES_HOME/SOUL.md` if you run Hermes with a custom home directory
+
+Profiles set `HERMES_HOME` to their own directory, so each profile has its own `SOUL.md` at `~/.hermes/profiles/<name>/SOUL.md`. Switching profiles switches which `SOUL.md` is loaded.
 
 Important details:
 
