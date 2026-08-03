@@ -67,7 +67,12 @@ def _patch_managed_uv(request):
 
     with patch("hermes_cli.managed_uv.resolve_uv", side_effect=_fake_resolve_uv), \
          patch("hermes_cli.managed_uv.ensure_uv", side_effect=_fake_ensure_uv), \
-         patch("hermes_cli.managed_uv.update_managed_uv", side_effect=_fake_update_managed_uv):
+         patch("hermes_cli.managed_uv.update_managed_uv", side_effect=_fake_update_managed_uv), \
+         patch("hermes_cli.main._get_pid_cgroup_path", return_value=None), \
+         patch("hermes_cli.main._get_systemd_service_for_pid", return_value=None), \
+         patch("hermes_cli.gateway._get_service_pids", return_value=set()), \
+         patch("hermes_cli.gateway.find_gateway_pids", return_value=[]), \
+         patch("hermes_cli.gateway.find_profile_gateway_processes", return_value=[]):
         yield
 
 

@@ -5427,6 +5427,9 @@ class GatewaySlashCommandsMixin:
         pending_path = _hermes_home / ".update_pending.json"
         output_path = _hermes_home / ".update_output.txt"
         exit_code_path = _hermes_home / ".update_exit_code"
+        owner_restart_pending_path = (
+            _hermes_home / ".update_owner_restart_pending.json"
+        )
         session_key = self._session_key_for_source(event.source)
         pending = {
             "platform": event.source.platform.value,
@@ -5444,6 +5447,7 @@ class GatewaySlashCommandsMixin:
         _tmp_pending.write_text(json.dumps(pending), encoding="utf-8")
         _tmp_pending.replace(pending_path)
         exit_code_path.unlink(missing_ok=True)
+        owner_restart_pending_path.unlink(missing_ok=True)
 
         # Spawn `hermes update --gateway` detached so it survives gateway restart.
         # --gateway enables file-based IPC for interactive prompts (stash
@@ -5510,7 +5514,13 @@ class GatewaySlashCommandsMixin:
                     # in zsh, and this command string is copied/reused in macOS/zsh
                     # operator wrappers. Keep the template zsh-safe even though this
                     # specific subprocess currently runs under bash.
-                    f"rc=$?; printf '%s' \"$rc\" > {shlex.quote(str(exit_code_path))}"
+                    #
+                    # When updater finalization must restart the service whose cgroup
+                    # owns this shell, it stages a non-terminal result for the new
+                    # owner to promote.  Do not publish the shell's return code first:
+                    # the old gateway watcher could consume that as false success.
+                    f"rc=$?; if [ ! -e {shlex.quote(str(owner_restart_pending_path))} ]; "
+                    f"then printf '%s' \"$rc\" > {shlex.quote(str(exit_code_path))}; fi"
                 )
                 setsid_bin = shutil.which("setsid")
                 if setsid_bin:

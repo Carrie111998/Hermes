@@ -1699,8 +1699,71 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 # Resolve Hermes home directory (respects HERMES_HOME override)
 from hermes_constants import get_hermes_home, get_hermes_home_override
-from utils import atomic_json_write, is_truthy_value
+from utils import atomic_json_write, atomic_write_text, is_truthy_value
 _hermes_home = get_hermes_home()
+_OWNER_RESTART_PENDING_FILE = ".update_owner_restart_pending.json"
+
+
+def _current_systemd_gateway_service() -> str | None:
+    """Return the gateway service component that contains this process."""
+    if not sys.platform.startswith("linux"):
+        return None
+    try:
+        cgroup_text = Path("/proc/self/cgroup").read_text(
+            encoding="utf-8", errors="replace"
+        )
+    except OSError:
+        return None
+    for line in cgroup_text.splitlines():
+        cgroup_path = line.split(":", 2)[-1]
+        for component in reversed(cgroup_path.split("/")):
+            if component.startswith("hermes-gateway") and component.endswith(
+                ".service"
+            ):
+                return component.removesuffix(".service")
+    return None
+
+
+def _promote_deferred_owner_update_result() -> bool:
+    """Publish a staged updater result only from the restarted gateway owner.
+
+    The old owner has the PID recorded in the marker and must leave the result
+    non-terminal.  A new process with a different PID proves the owner
+    transition happened and may atomically expose the final exit code to the
+    existing notification paths.
+    """
+    pending_path = _hermes_home / _OWNER_RESTART_PENDING_FILE
+    if not pending_path.exists():
+        return False
+    try:
+        payload = json.loads(pending_path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict) or payload.get("version") != 1:
+            raise ValueError("unsupported owner restart marker")
+        owner_pid = int(payload.get("owner_pid") or 0)
+        exit_code = int(payload.get("exit_code"))
+        owner_service = payload.get("owner_service")
+        if (
+            owner_pid <= 0
+            or exit_code not in {0, 1}
+            or not isinstance(owner_service, str)
+            or not owner_service.startswith("hermes-gateway")
+        ):
+            raise ValueError("invalid owner restart marker")
+        if owner_pid == os.getpid():
+            return False
+        if owner_service != _current_systemd_gateway_service():
+            return False
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        logger.warning("Invalid deferred owner update result: %s", exc)
+        return False
+
+    try:
+        atomic_write_text(_hermes_home / ".update_exit_code", str(exit_code))
+        pending_path.unlink(missing_ok=True)
+    except OSError as exc:
+        logger.warning("Could not promote deferred owner update result: %s", exc)
+        return False
+    return True
 
 # Load environment variables from ~/.hermes/.env first.
 # User-managed env files should override stale shell exports on restart.
@@ -20824,6 +20887,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return True
 
             pending = json.loads(claimed_path.read_text(encoding="utf-8"))
+            _promote_deferred_owner_update_result()
             platform_str = pending.get("platform")
             chat_id = pending.get("chat_id")
             chat_type = pending.get("chat_type")

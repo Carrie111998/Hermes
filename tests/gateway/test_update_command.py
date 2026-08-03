@@ -5,6 +5,7 @@ the _send_update_notification startup hook (sends results after restart).
 """
 
 import json
+import os
 from pathlib import Path
 from unittest.mock import patch, MagicMock, AsyncMock
 
@@ -171,6 +172,8 @@ class TestHandleUpdateCommand:
         assert call_args[0] == "bash"
         assert "nohup" not in call_args[2]
         assert ".update_exit_code" in call_args[2]
+        assert ".update_owner_restart_pending.json" in call_args[2]
+        assert "if [ ! -e" in call_args[2]
         # start_new_session=True should be in kwargs
         call_kwargs = mock_popen.call_args[1]
         assert call_kwargs.get("start_new_session") is True
@@ -264,6 +267,20 @@ class TestUpdateCommandPlatformGate:
 class TestSendUpdateNotification:
     """Tests for GatewayRunner._send_update_notification."""
 
+    def test_current_systemd_gateway_service_reads_nested_owner_cgroup(self):
+        from gateway import run as gateway_run
+
+        cgroup = (
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/"
+            "hermes-gateway-coding_lead.service/worker.scope\n"
+        )
+        with patch.object(gateway_run.sys, "platform", "linux"), patch.object(
+            gateway_run.Path, "read_text", return_value=cgroup
+        ):
+            assert (
+                gateway_run._current_systemd_gateway_service()
+                == "hermes-gateway-coding_lead"
+            )
 
     @pytest.mark.asyncio
     async def test_defers_notification_while_update_still_running(self, tmp_path):
@@ -287,6 +304,121 @@ class TestSendUpdateNotification:
         assert result is False
         mock_adapter.send.assert_not_called()
         assert pending_path.exists()
+
+    @pytest.mark.asyncio
+    async def test_new_owner_promotes_deferred_result_before_notification(self, tmp_path):
+        runner = _make_runner()
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / ".update_pending.json").write_text(json.dumps({
+            "platform": "telegram", "chat_id": "67890", "user_id": "12345",
+        }))
+        (hermes_home / ".update_output.txt").write_text("finalization complete")
+        owner_pending = hermes_home / ".update_owner_restart_pending.json"
+        owner_pending.write_text(json.dumps({
+            "version": 1,
+            "exit_code": 0,
+            "owner_pid": os.getpid() + 1000,
+            "owner_service": "hermes-gateway-default",
+        }))
+
+        mock_adapter = AsyncMock()
+        runner.adapters = {Platform.TELEGRAM: mock_adapter}
+        with patch("gateway.run._hermes_home", hermes_home), patch(
+            "gateway.run._current_systemd_gateway_service",
+            return_value="hermes-gateway-default",
+            create=True,
+        ):
+            assert await runner._send_update_notification() is True
+
+        assert mock_adapter.send.await_count == 1
+        assert not owner_pending.exists()
+        assert not (hermes_home / ".update_exit_code").exists()
+
+    @pytest.mark.asyncio
+    async def test_old_owner_does_not_publish_deferred_success(self, tmp_path):
+        runner = _make_runner()
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        pending_path = hermes_home / ".update_pending.json"
+        pending_path.write_text(json.dumps({
+            "platform": "telegram", "chat_id": "67890", "user_id": "12345",
+        }))
+        owner_pending = hermes_home / ".update_owner_restart_pending.json"
+        owner_pending.write_text(json.dumps({
+            "version": 1,
+            "exit_code": 0,
+            "owner_pid": os.getpid(),
+            "owner_service": "hermes-gateway-default",
+        }))
+
+        mock_adapter = AsyncMock()
+        runner.adapters = {Platform.TELEGRAM: mock_adapter}
+        with patch("gateway.run._hermes_home", hermes_home), patch(
+            "gateway.run._current_systemd_gateway_service",
+            return_value="hermes-gateway-default",
+            create=True,
+        ):
+            assert await runner._send_update_notification() is False
+
+        mock_adapter.send.assert_not_awaited()
+        assert owner_pending.exists()
+        assert pending_path.exists()
+        assert not (hermes_home / ".update_exit_code").exists()
+
+    @pytest.mark.asyncio
+    async def test_other_gateway_cannot_promote_deferred_result(self, tmp_path):
+        runner = _make_runner()
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        pending_path = hermes_home / ".update_pending.json"
+        pending_path.write_text(json.dumps({
+            "platform": "telegram", "chat_id": "67890", "user_id": "12345",
+        }))
+        owner_pending = hermes_home / ".update_owner_restart_pending.json"
+        owner_pending.write_text(json.dumps({
+            "version": 1,
+            "exit_code": 0,
+            "owner_pid": os.getpid() + 1000,
+            "owner_service": "hermes-gateway-coding_lead",
+        }))
+
+        mock_adapter = AsyncMock()
+        runner.adapters = {Platform.TELEGRAM: mock_adapter}
+        with patch("gateway.run._hermes_home", hermes_home), patch(
+            "gateway.run._current_systemd_gateway_service",
+            return_value="hermes-gateway-default",
+            create=True,
+        ):
+            assert await runner._send_update_notification() is False
+
+        mock_adapter.send.assert_not_awaited()
+        assert owner_pending.exists()
+        assert pending_path.exists()
+        assert not (hermes_home / ".update_exit_code").exists()
+
+    @pytest.mark.asyncio
+    async def test_deferred_result_without_update_claim_is_not_promoted(self, tmp_path):
+        runner = _make_runner()
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        owner_pending = hermes_home / ".update_owner_restart_pending.json"
+        owner_pending.write_text(json.dumps({
+            "version": 1,
+            "exit_code": 0,
+            "owner_pid": os.getpid() + 1000,
+            "owner_service": "hermes-gateway-default",
+        }))
+
+        with patch("gateway.run._hermes_home", hermes_home), patch(
+            "gateway.run._current_systemd_gateway_service",
+            return_value="hermes-gateway-default",
+            create=True,
+        ):
+            assert await runner._send_update_notification() is False
+
+        assert owner_pending.exists()
+        assert not (hermes_home / ".update_exit_code").exists()
 
     @pytest.mark.asyncio
     async def test_recovers_from_claimed_pending_file(self, tmp_path):
