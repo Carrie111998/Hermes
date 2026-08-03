@@ -3518,16 +3518,26 @@ def compress_context(
                 if _adopted_durable_revision is not None:
                     agent._durable_transcript_revision = expected_revision
                 observed_revision = revision_loader(_lock_db, _lock_sid)
-                if (
-                    expected_revision is not None
-                    and expected_revision.session_id != _lock_sid
-                ):
-                    # Legacy/plugin callers may assign ``session_id`` directly
-                    # after agent construction. A revision belongs only to the
-                    # session it names; rebaseline instead of comparing across
-                    # unrelated sessions.
-                    agent._durable_transcript_revision = observed_revision
-                    expected_revision = observed_revision
+                if expected_revision is None:
+                    # A durable revision is the only proof that the supplied
+                    # projection and the active rows were read atomically.
+                    # Observing the target now cannot authenticate bytes that
+                    # arrived without that identity.
+                    raise CompressionSnapshotStaleError(
+                        session_id=_lock_sid,
+                        expected_revision=None,
+                        observed_revision=observed_revision,
+                    )
+                if expected_revision.session_id != _lock_sid:
+                    # The revision authenticates the caller's projection. A
+                    # direct session switch without a matching atomic reload
+                    # leaves that projection unverifiable; adopting the target
+                    # revision alone would bless bytes from the old session.
+                    raise CompressionSnapshotStaleError(
+                        session_id=_lock_sid,
+                        expected_revision=expected_revision,
+                        observed_revision=observed_revision,
+                    )
                 if expected_revision is not None and expected_revision != observed_revision:
                     raise CompressionSnapshotStaleError(
                         session_id=_lock_sid,
@@ -4188,7 +4198,9 @@ def compress_context(
                             PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY: None,
                         },
                         watermark=_commit_watermark,
-                        lock_holder=_lock_holder,
+                        system_prompt=new_system_prompt,
+                        compression_lock_holder=_lock_holder,
+                        require_compression_lease=_lock_holder is not None,
                         expected_revision=getattr(
                             agent, "_durable_transcript_revision", None
                         ),
@@ -4561,12 +4573,9 @@ def compress_context(
                                         _src_err,
                                     )
 
-                # In-place mode still updates/replaces the current row here.
-                # Rotation already published prompt + compacted handoff atomically.
+                # Rotation publishes prompt + compacted handoff atomically.
+                # In-place mode does the same inside archive_and_compact().
                 if in_place:
-                    agent._session_db.update_system_prompt(
-                        agent.session_id, new_system_prompt
-                    )
                     agent._last_flushed_db_idx = 0
                 else:
                     agent._last_flushed_db_idx = len(compressed)

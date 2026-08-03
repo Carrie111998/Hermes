@@ -4058,7 +4058,7 @@ def _assert_compression_write_allowed(
         and float(lock_row["expires_at"]) > time.time()
         and lock_row["holder"] != compression_lock_holder
     ):
-        raise CompressionSessionBusyError(
+        raise SessionCompressionInProgressError(
             f"Session {session_id!r} is being compressed by another writer"
         )
 
@@ -12094,16 +12094,18 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         watermark: Optional[int] = None,
         lock_holder: Optional[str] = None,
         *,
+        system_prompt: Optional[str] = None,
         compression_lock_holder: Optional[str] = None,
         require_compression_lease: bool = False,
         expected_revision: Optional[DurableTranscriptRevision] = None,
     ) -> int:
         """Non-destructive in-place compaction for a single durable session id.
 
-        Soft-archives the active messages (``active = 0``) and inserts
-        *compacted_messages* as fresh active rows — atomically, in one write
-        transaction. The conversation keeps ONE session id for life (#38763)
-        WITHOUT destroying history:
+        Soft-archives every currently-active message (``active = 0``) and
+        inserts *compacted_messages* as fresh active rows and, when supplied,
+        updates *system_prompt* — atomically, in one write transaction. The
+        conversation keeps ONE session id for life
+        (#38763) WITHOUT destroying history:
 
         - The live-context load (:meth:`get_messages_as_conversation`,
           :meth:`get_messages`) filters ``active = 1`` by default, so the model
@@ -12259,6 +12261,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     "UPDATE sessions SET message_count = ?, tool_call_count = ?, "
                     "model_config = ? WHERE id = ?",
                     (inserted, tool_calls_total, patched_model_config, session_id),
+                )
+            if system_prompt is not None:
+                conn.execute(
+                    "UPDATE sessions SET system_prompt = ? WHERE id = ?",
+                    (system_prompt, session_id),
                 )
             return inserted
 
