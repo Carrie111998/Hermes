@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import shlex
+from pathlib import Path
 from urllib.parse import unquote_plus
 
 logger = logging.getLogger(__name__)
@@ -656,6 +657,148 @@ def _mask_token_nonreusable(token: str) -> str:
     return f"«redacted:{label}…»" if label else "«redacted-secret»"
 
 
+# ── Exact-value applied-secret masking (#77162, #77165) ─────────────────────
+#
+# Values applied from external secret sources (Bitwarden / 1Password /
+# command) under ANY env name — including non-credential-shaped names like
+# ``DATABASE_URL``, ``FOO``, or arbitrary 1Password item keys — pass every
+# shape-based regex above when a tool echoes the raw value (config/env
+# artifact read, ``printenv``, a backend error quoting a key). This pass
+# masks the exact VALUES from the per-home applied-secrets snapshot plus
+# values of credential-suffixed env vars, closing the provider-egress gap.
+
+# Env-var name suffixes whose values are treated as credentials for the
+# exact-value pass even when NOT applied from an external source (plain
+# .env / shell export). Upper-cased key matching.
+_CREDENTIAL_ENV_SUFFIXES = (
+    "_API_KEY",
+    "_TOKEN",
+    "_SECRET",
+    "_KEY",
+    "_PASSWORD",
+)
+
+# Minimum length for a value to participate in exact-value masking. A
+# 1-char secret would otherwise match inside every word of ordinary text
+# and destroy unrelated content; real credentials are far longer. Mirrors
+# the module's conservative short-token treatment (mask_secret's floor).
+_EXACT_SECRET_MIN_LEN = 8
+
+
+def _resolve_secret_home(home: str | os.PathLike | None):
+    """Resolve the Hermes home whose applied secrets should mask ``text``.
+
+    Defaults to the ACTIVE home exactly as ``hermes_cli.env_loader`` keys
+    its per-home snapshot: ``hermes_constants.get_hermes_home()``
+    (context-local per-profile override → ``HERMES_HOME`` env → platform
+    default), so a multiplexed gateway masks each profile with its OWN
+    applied secrets. Falls back to ``$HERMES_HOME``/``~/.hermes`` if the
+    constants module is unavailable (early bootstrap / import isolation).
+    """
+    if home is not None:
+        return Path(home)
+    try:
+        from hermes_constants import get_hermes_home  # lazy: avoid cycles
+        return get_hermes_home()
+    except Exception:
+        return Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
+
+
+def _collect_exact_secret_values(home: Path) -> tuple[str, ...]:
+    """Collect values eligible for exact-value masking for ``home``.
+
+    Sources, in order:
+
+    1. the per-home applied-secrets snapshot
+       (``hermes_cli.env_loader.get_secret_source_values``) — values
+       injected from Bitwarden/1Password/command sources under ANY env
+       name, including non-credential-shaped names like ``DATABASE_URL``;
+    2. values of credential-suffixed env vars (``*_API_KEY``/``_TOKEN``/
+       ``_SECRET``/``_KEY``/``_PASSWORD``) in the current process env.
+
+    Values shorter than ``_EXACT_SECRET_MIN_LEN`` are excluded. Returns a
+    deterministic tuple (longest first, ties by codepoint) so the compiled
+    alternation always prefers the longest match at a position.
+    """
+    values: set[str] = set()
+    try:
+        from hermes_cli.env_loader import get_secret_source_values  # lazy: avoid cycles
+        snapshot = get_secret_source_values(home)
+    except Exception:
+        logger.debug(
+            "exact-value secret snapshot unavailable for %s", home, exc_info=True
+        )
+        snapshot = {}
+    for value in snapshot.values():
+        if isinstance(value, str):
+            values.add(value)
+    for name, value in os.environ.items():
+        if name.upper().endswith(_CREDENTIAL_ENV_SUFFIXES) and isinstance(value, str):
+            values.add(value)
+    return tuple(
+        sorted(
+            (v for v in values if len(v) >= _EXACT_SECRET_MIN_LEN),
+            key=lambda v: (-len(v), v),
+        )
+    )
+
+
+def redact_known_secret_values(
+    text: str,
+    home: str | os.PathLike | None = None,
+    *,
+    force: bool = False,
+) -> str:
+    """Mask exact values of applied external secrets in ``text``.
+
+    Closes the provider-egress gap (#77162, #77165): secrets applied from
+    external sources (Bitwarden / 1Password / command) under ANY env name —
+    including non-credential-shaped names like ``DATABASE_URL`` or arbitrary
+    1Password item keys — pass every shape-based redaction pass when a tool
+    echoes the raw value. This pass masks the exact VALUES from the current
+    home's applied-secrets snapshot, plus values of credential-suffixed env
+    vars (``*_API_KEY``/``_TOKEN``/``_SECRET``/``_KEY``/``_PASSWORD``),
+    replacing each with the module-standard ``***`` placeholder.
+
+    Design invariants:
+
+    * **Deterministic & side-effect-free** — returns a masked copy, never
+      mutates ``text``; the replacement is a fixed ``***`` placeholder, so
+      output depends only on the input and the current snapshot. Safe for
+      prompt-cache / message-alternation invariants.
+    * **Regex-safe** — values are ``re.escape``d before alternation, so
+      metacharacter values (``p@ss:word{1}``, connection strings) match
+      literally.
+    * **Min-length guarded** — values shorter than ``_EXACT_SECRET_MIN_LEN``
+      are skipped, so a 1-char secret can't nuke surrounding text.
+    * **Per-home isolated** — ``home`` defaults to the ACTIVE Hermes home
+      (``hermes_constants.get_hermes_home()``, profile-aware); values come
+      from that home's snapshot only — a multiplexed gateway never masks
+      with another profile's values.
+    * **Config-gated** — respects ``security.redact_secrets``
+      (``_REDACT_ENABLED``) unless ``force=True``; degrades gracefully to a
+      no-op when the snapshot is empty or the env_loader import fails.
+    """
+    if text is None:
+        return None
+    if not isinstance(text, str):
+        text = str(text)
+    if not text:
+        return text
+    if not (force or _REDACT_ENABLED):
+        return text
+
+    values = _collect_exact_secret_values(_resolve_secret_home(home))
+    if not values:
+        return text
+    # Cheap pre-screen mirroring the module's substring gates: if no value
+    # appears in the text, the compiled alternation cannot match.
+    if not any(value in text for value in values):
+        return text
+    pattern = re.compile("|".join(re.escape(value) for value in values))
+    return pattern.sub("***", text)
+
+
 def redact_sensitive_text(
     text: str,
     *,
@@ -876,6 +1019,15 @@ def redact_sensitive_text(
             return phone[:4] + "****" + phone[-4:]
         text = _SIGNAL_PHONE_RE.sub(_redact_phone, text)
 
+    # Exact-value pass (#77162, #77165): applied external secrets
+    # (Bitwarden/1Password/command) under ANY env name — including
+    # non-credential-shaped names like DATABASE_URL — pass the shape-based
+    # passes above when a tool echoes the raw value. Mask the exact values
+    # from the per-home applied-secrets snapshot plus credential-suffixed
+    # env values. Runs LAST so no later pass can re-expose a value; force
+    # propagates the safety-boundary contract.
+    text = redact_known_secret_values(text, force=force)
+
     return text
 
 
@@ -929,6 +1081,11 @@ def redact_terminal_output(
       → ``code_file=False`` so the ENV-assignment pass masks opaque tokens.
     - anything else (or unknown command) → ``code_file=True`` to avoid
       false positives on source/config dumps.
+
+    Inherits the exact-value applied-secret pass from
+    :func:`redact_sensitive_text` (#77162, #77165), so a ``printenv`` echo
+    of an externally applied secret under an arbitrary name (e.g.
+    ``DATABASE_URL``) is masked regardless of the command class.
 
     ``force=True`` bypasses the global ``security.redact_secrets`` preference
     for safety boundaries that must never emit raw credentials.

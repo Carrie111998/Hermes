@@ -556,6 +556,13 @@ def make_tool_result_message(
     callers should compare by value, not by ``is``.
     """
     wrapped = _maybe_wrap_untrusted(name, content)
+    # Exact-value applied-secret masking (#77162, #77165) — AFTER the
+    # untrusted-result wrapping so the delimiter framing survives, and so
+    # opaque applied secrets under arbitrary names (DATABASE_URL, FOO,
+    # arbitrary 1Password item keys) that the shape-based passes miss never
+    # reach the provider verbatim. Deterministic: returns masked copies,
+    # never mutates ``content``.
+    wrapped = _mask_applied_secret_values(wrapped)
     message = {
         "role": "tool",
         "name": name,
@@ -705,6 +712,53 @@ def _maybe_wrap_untrusted(name: str, content: Any) -> Any:
     return content
 
 
+def _mask_applied_secret_values(content: Any) -> Any:
+    """Mask exact applied-secret values in tool-result content (egress).
+
+    Provider-egress exact-value pass for #77162/#77165: secrets applied
+    from external sources (Bitwarden/1Password/command) under ANY env name
+    — including non-credential-shaped names like ``DATABASE_URL`` — that a
+    tool echoes into its result pass the shape-based redaction passes and
+    would otherwise be transmitted VERBATIM to the model provider. This
+    masks the exact values (via ``agent.redact.redact_known_secret_values``)
+    on the primary wire.
+
+    Handles plain string content, multimodal content lists
+    (``[{"type": "text", "text": ...}, ...]`` — each text-type part is
+    masked individually, non-text parts preserved by identity), and dict
+    content (multimodal envelopes like computer_use's
+    ``{"error": ..., "text_summary": ...}`` and raw error dicts — every
+    string value is masked in a shallow copy). Any other content shape
+    passes through unchanged. Returns a masked copy — never mutates the
+    input. No-op when redaction is disabled or no applied secrets exist.
+    """
+    from agent.redact import redact_known_secret_values  # lazy: avoid cycles
+
+    if isinstance(content, str):
+        return redact_known_secret_values(content)
+    if isinstance(content, list):
+        return [
+            redact_known_secret_values(item)
+            if isinstance(item, str)
+            else (
+                {**item, "text": redact_known_secret_values(item["text"])}
+                if isinstance(item, dict)
+                and item.get("type") == "text"
+                and isinstance(item.get("text"), str)
+                else item
+            )
+            for item in content
+        ]
+    if isinstance(content, dict):
+        return {
+            key: _mask_applied_secret_values(value)
+            if isinstance(value, (str, list, dict))
+            else value
+            for key, value in content.items()
+        }
+    return content
+
+
 __all__ = [
     "_NEVER_PARALLEL_TOOLS",
     "_PARALLEL_SAFE_TOOLS",
@@ -727,5 +781,6 @@ __all__ = [
     "_extract_landed_file_mutation_paths",
     "_extract_error_preview",
     "_trajectory_normalize_msg",
+    "_mask_applied_secret_values",
     "make_tool_result_message",
 ]

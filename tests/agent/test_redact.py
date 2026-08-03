@@ -831,3 +831,216 @@ class TestKeywordWordBoundary:
         assert "hunter2hunter2hunter2hh" not in result
 
 
+class TestExactValueAppliedSecrets:
+    """#77162/#77165 — exact-value masking of externally applied secrets.
+
+    Values applied from external secret sources (Bitwarden/1Password/
+    command) under ANY name — including non-credential-shaped names like
+    ``DATABASE_URL``, ``FOO``, or arbitrary 1Password item keys — pass the
+    shape-based passes when a tool echoes them verbatim. The exact-value
+    pass masks the raw values from the per-home applied-secrets snapshot
+    (``hermes_cli.env_loader._SECRET_SOURCE_VALUES_BY_HOME``) plus values
+    of credential-suffixed env vars.
+    """
+
+    SECRET_A = "opaque-applied-value-x9q2"
+    SECRET_B = "another-applied-value-77k3m"
+    META_VALUE = "p@ss:word{1}?x=9&y=[z]"
+
+    @pytest.fixture(autouse=True)
+    def _seed_active_home_snapshot(self, tmp_path, monkeypatch):
+        """Point HERMES_HOME at a tmp home and seed its applied snapshot."""
+        from hermes_cli import env_loader
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setitem(
+            env_loader._SECRET_SOURCE_VALUES_BY_HOME,
+            str(tmp_path.resolve()),
+            {
+                "DATABASE_URL": self.SECRET_B,
+                "FOO": self.SECRET_A,
+                "BITWARDEN_ITEM_KEY": self.META_VALUE,
+                "SHORT1": "a",        # 1 char — must never nuke text
+                "SHORT7": "7chrs!x",  # 7 chars — below the floor
+            },
+        )
+        return str(tmp_path.resolve())
+
+    def test_masks_applied_value_in_plain_text(self):
+        result = redact_sensitive_text(f"leaked credential: {self.SECRET_A}")
+        assert self.SECRET_A not in result
+        assert "***" in result
+
+    def test_masks_applied_value_under_database_url_name(self):
+        result = redact_sensitive_text(f"cat .env -> DATABASE_URL={self.SECRET_B}")
+        assert self.SECRET_B not in result
+        assert "DATABASE_URL=" in result
+        assert "***" in result
+
+    def test_masks_applied_value_in_tool_result_message(self):
+        from agent.tool_dispatch_helpers import make_tool_result_message
+
+        msg = make_tool_result_message(
+            "terminal",
+            f"$ cat .env\nDATABASE_URL={self.SECRET_B}\nFOO={self.SECRET_A}\nOTHER=1",
+            "call_abc123",
+        )
+        content = msg["content"]
+        assert self.SECRET_B not in content
+        assert self.SECRET_A not in content
+        assert "***" in content
+        assert "DATABASE_URL=" in content  # key survives; value masked
+
+    def test_multimodal_text_parts_masked(self):
+        from agent.tool_dispatch_helpers import make_tool_result_message
+
+        text_part = {"type": "text", "text": f"snapshot shows {self.SECRET_A} here"}
+        image_part = {"type": "image_url", "image_url": {"url": "data:..."}}
+        msg = make_tool_result_message("browser_snapshot", [text_part, image_part], "call_2")
+        parts = msg["content"]
+        assert self.SECRET_A not in parts[0]["text"]
+        assert "***" in parts[0]["text"]
+        assert parts[1] is image_part  # non-text parts preserved by identity
+
+    def test_plain_string_list_items_masked(self):
+        """Plain str items in a content list must be masked too (QA residual:
+        only dict text-parts were covered originally)."""
+        from agent.tool_dispatch_helpers import make_tool_result_message
+
+        msg = make_tool_result_message(
+            "some_tool", [f"first {self.SECRET_A}", "clean", self.SECRET_B], "call_5"
+        )
+        parts = msg["content"]
+        assert isinstance(parts, list)
+        assert self.SECRET_A not in parts[0]
+        assert "***" in parts[0]
+        assert parts[1] == "clean"
+        assert self.SECRET_B not in parts[2]
+        assert "***" in parts[2]
+
+    def test_dict_content_string_values_masked(self):
+        from agent.tool_dispatch_helpers import make_tool_result_message
+
+        envelope = {
+            "error": "vision unavailable",
+            "text_summary": f"screen shows {self.SECRET_A}",
+        }
+        msg = make_tool_result_message("computer_use", envelope, "call_4")
+        content = msg["content"]
+        assert self.SECRET_A not in content["text_summary"]
+        assert "***" in content["text_summary"]
+        assert content["error"] == "vision unavailable"  # non-secret preserved
+
+    def test_tool_result_message_does_not_mutate_input(self):
+        from agent.tool_dispatch_helpers import make_tool_result_message
+
+        original = f"$ printenv\nFOO={self.SECRET_A}"
+        msg = make_tool_result_message("terminal", original, "call_3")
+        assert self.SECRET_A not in msg["content"]
+        assert original == f"$ printenv\nFOO={self.SECRET_A}"  # input untouched
+
+    def test_masks_applied_value_in_terminal_output(self):
+        from agent.redact import redact_terminal_output
+
+        out = redact_terminal_output(
+            f"$ printenv\nFOO={self.SECRET_A}\nDATABASE_URL={self.SECRET_B}", "printenv"
+        )
+        assert self.SECRET_A not in out
+        assert self.SECRET_B not in out
+        assert "FOO=" in out
+
+    def test_regex_metachar_values_masked_literally(self):
+        result = redact_sensitive_text(f"meta {self.META_VALUE} here")
+        assert self.META_VALUE not in result
+        assert "***" in result
+
+    def test_short_values_never_nuke_surrounding_text(self):
+        # 1-char and sub-floor values in the snapshot must not destroy text.
+        result = redact_sensitive_text(f"a a a a and {self.SECRET_A}")
+        assert result.startswith("a a a a")
+        assert self.SECRET_A not in result
+
+    def test_min_length_boundary(self):
+        from agent.redact import redact_known_secret_values, _EXACT_SECRET_MIN_LEN
+        from hermes_cli import env_loader
+
+        # 7-char value below the floor is untouched…
+        assert "7chrs!x" in redact_sensitive_text("7chrs!x")
+        # …an 8-char value at the floor is masked.
+        eight = "8chrsval"
+        assert len(eight) == _EXACT_SECRET_MIN_LEN
+        # seed under a fresh home to keep the shared fixture snapshot intact
+        import tempfile
+        from pathlib import Path
+
+        fresh = Path(tempfile.mkdtemp())
+        env_loader._SECRET_SOURCE_VALUES_BY_HOME[str(fresh.resolve())] = {"X": eight}
+        assert "8chrsval" not in redact_known_secret_values(f"v {eight}", home=fresh)
+
+    def test_per_home_isolation(self, tmp_path, monkeypatch):
+        from hermes_cli import env_loader
+        from agent.redact import redact_known_secret_values
+
+        home_a = tmp_path / "home_a"
+        home_b = tmp_path / "home_b"
+        home_a.mkdir()
+        home_b.mkdir()
+        value_a = "value-a-only-123456"
+        value_b = "value-b-only-789012"
+        monkeypatch.setitem(
+            env_loader._SECRET_SOURCE_VALUES_BY_HOME, str(home_a.resolve()), {"FOO": value_a}
+        )
+        monkeypatch.setitem(
+            env_loader._SECRET_SOURCE_VALUES_BY_HOME, str(home_b.resolve()), {"FOO": value_b}
+        )
+        text = f"{value_a} and {value_b}"
+
+        masked_a = redact_known_secret_values(text, home=home_a)
+        assert value_a not in masked_a
+        assert value_b in masked_a  # other home's value must survive
+
+        masked_b = redact_known_secret_values(text, home=home_b)
+        assert value_b not in masked_b
+        assert value_a in masked_b  # other home's value must survive
+
+    def test_empty_snapshot_is_noop(self, tmp_path, monkeypatch):
+        from hermes_cli import env_loader
+        from agent.redact import redact_known_secret_values
+
+        monkeypatch.setattr(env_loader, "_SECRET_SOURCE_VALUES_BY_HOME", {})
+        text = f"nothing to hide {self.SECRET_A}"
+        assert redact_known_secret_values(text, home=tmp_path) == text
+
+    def test_credential_suffixed_env_value_masked(self, monkeypatch):
+        from agent.redact import redact_known_secret_values
+
+        monkeypatch.setenv("MYAPP_API_KEY", "env-key-value-12345678")
+        result = redact_known_secret_values("token is env-key-value-12345678")
+        assert "env-key-value-12345678" not in result
+        assert "***" in result
+
+    def test_credential_suffixed_env_value_not_masked_when_short(self, monkeypatch):
+        from agent.redact import redact_known_secret_values
+
+        monkeypatch.setenv("MYAPP_API_KEY", "short")
+        text = "short is fine to show"
+        assert redact_known_secret_values(text) == text
+
+    def test_disabled_respects_redact_secrets_flag(self, monkeypatch):
+        from agent.redact import redact_known_secret_values
+
+        monkeypatch.setattr("agent.redact._REDACT_ENABLED", False)
+        text = f"value {self.SECRET_A} here"
+        # Config off → exact-value pass is a no-op…
+        assert redact_sensitive_text(text) == text
+        assert redact_known_secret_values(text) == text
+        # …but force=True (safety boundary) still masks.
+        assert self.SECRET_A not in redact_known_secret_values(text, force=True)
+
+    def test_deterministic_output(self):
+        from agent.redact import redact_known_secret_values
+
+        text = f"x {self.SECRET_A} y {self.SECRET_B} z"
+        assert redact_known_secret_values(text) == redact_known_secret_values(text)
+
+
