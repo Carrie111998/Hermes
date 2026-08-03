@@ -69,6 +69,11 @@ BEGIN
                  FROM pg_catalog.pg_auth_members AS membership
                  JOIN provider_forward_role_closure AS reachable
                    ON reachable.roleid = membership.member
+           ), expected_forward_role_closure(roleid) AS (
+               SELECT roleid FROM provider_forward_role_closure
+               UNION
+               SELECT oid FROM pg_catalog.pg_roles
+                WHERE rolname = 'canonical_brain_migration_owner'
            )
            SELECT (SELECT pg_catalog.count(*) = 1 FROM bootstrap)
               AND (SELECT pg_catalog.bool_and(
@@ -78,21 +83,24 @@ BEGIN
                        AND rolconnlimit = -1 AND rolvaliduntil IS NULL
                        AND rolconfig IS NULL
                    ) FROM bootstrap)
-              AND (SELECT pg_catalog.count(*) = 1
+              AND (SELECT pg_catalog.count(*) = 2
                           AND pg_catalog.bool_and(
-                              granted_name = 'cloudsqlsuperuser'
-                              AND member_name = SESSION_USER
+                              member_name = SESSION_USER
                               AND grantor_name = 'cloudsqladmin'
                               AND admin_option IS FALSE
                               AND inherit_option IS TRUE
                               AND set_option IS TRUE
+                              AND granted_name IN (
+                                  'canonical_brain_migration_owner',
+                                  'cloudsqlsuperuser'
+                              )
                           ) FROM relevant_edges)
               AND NOT EXISTS (
                   (SELECT roleid FROM forward_role_closure
                    EXCEPT
-                   SELECT roleid FROM provider_forward_role_closure)
+                   SELECT roleid FROM expected_forward_role_closure)
                   UNION ALL
-                  (SELECT roleid FROM provider_forward_role_closure
+                  (SELECT roleid FROM expected_forward_role_closure
                    EXCEPT
                    SELECT roleid FROM forward_role_closure)
               )
@@ -510,6 +518,9 @@ BEGIN
 END
 $control_retire_foundation_preflight$;
 
+RESET ROLE;
+SET LOCAL ROLE canonical_brain_migration_owner;
+
 REVOKE EXECUTE ON FUNCTION canonical_brain_reconciliation.
 apply_missing_discord_routeback_helper_v1()
     FROM canonical_brain_schema_reconciler;
@@ -525,6 +536,8 @@ DROP FUNCTION canonical_brain_reconciliation.
 observe_missing_discord_routeback_helper_v1();
 DROP SCHEMA canonical_brain_reconciliation;
 
+RESET ROLE;
+SET LOCAL ROLE cloudsqlsuperuser;
 REVOKE CONNECT ON DATABASE muncho_canary_brain
     FROM canonical_brain_schema_reconciler;
 DROP ROLE canonical_brain_schema_reconciler;
@@ -598,16 +611,23 @@ BEGIN
            SELECT 1 FROM pg_catalog.pg_namespace
             WHERE nspname = 'canonical_brain_reconciliation'
        )
-       OR EXISTS (
-           SELECT 1
+       OR NOT (
+           SELECT pg_catalog.count(*) = 1
+                  AND pg_catalog.bool_and(
+                      member.rolname = SESSION_USER
+                      AND grantor.rolname = 'cloudsqladmin'
+                      AND membership.admin_option IS FALSE
+                      AND membership.inherit_option IS TRUE
+                      AND membership.set_option IS TRUE
+                  )
              FROM pg_catalog.pg_auth_members AS membership
              JOIN pg_catalog.pg_roles AS owner
                ON owner.oid = membership.roleid
+             JOIN pg_catalog.pg_roles AS member
+               ON member.oid = membership.member
+             JOIN pg_catalog.pg_roles AS grantor
+               ON grantor.oid = membership.grantor
             WHERE owner.rolname = 'canonical_brain_migration_owner'
-              AND membership.member = (
-                  SELECT oid FROM pg_catalog.pg_roles
-                   WHERE rolname = SESSION_USER
-              )
        )
        OR NOT (
            SELECT pg_catalog.count(*) = 3

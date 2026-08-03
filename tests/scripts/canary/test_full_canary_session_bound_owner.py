@@ -1755,6 +1755,25 @@ def _role_bound_schema_reconciliation_cloud_boundary(
     return boundary
 
 
+def _role_bound_schema_reconciliation_control_boundary(
+    database_roles: list[str],
+) -> launcher.CloudSqlSchemaReconciliationControlAdmin:
+    username = "muncho_canary_control_" + "a" * 16
+    operation = ("CREATE_USER", "DONE", OWNER_SHA, True)
+    operations = {"authority-operation": operation}
+    client = _RoleBoundReconciliationClient(username, database_roles)
+    boundary = launcher.CloudSqlSchemaReconciliationControlAdmin(client)
+    boundary._mutation_operation_baseline = frozenset()
+    boundary._mutation_relevant_baseline = {}
+    boundary._confirmed_authority_operation_name = "authority-operation"
+    boundary._confirmed_authority_operation_type = "CREATE_USER"
+    boundary._expected_owner_subject_sha256 = OWNER_SHA
+    boundary._expected_mutation_context_sha256 = "f" * 64
+    boundary._instance_operations = lambda: operations
+    boundary._stable_instance_operations = lambda: operations
+    return boundary
+
+
 def test_schema_reconciliation_cloud_boundary_uses_fenced_describes_for_partial_list() -> None:
     username = "muncho_canary_reconciler_" + "a" * 16
     boundary = _role_bound_schema_reconciliation_cloud_boundary(
@@ -2129,22 +2148,14 @@ def test_schema_reconciliation_cloud_update_revokes_every_stale_role_in_query() 
 
 def test_schema_reconciliation_control_admin_is_separate_broad_one_time_login():
     username = "muncho_canary_control_" + "a" * 16
-    operation = ("CREATE_USER", "DONE", OWNER_SHA, True)
-    boundary = launcher.CloudSqlSchemaReconciliationControlAdmin(object())
-    boundary._mutation_operation_baseline = frozenset()
-    boundary._mutation_relevant_baseline = {}
-    boundary._confirmed_authority_operation_name = "authority-operation"
-    boundary._confirmed_authority_operation_type = "CREATE_USER"
-    boundary._expected_owner_subject_sha256 = OWNER_SHA
-    boundary._expected_mutation_context_sha256 = "f" * 64
-    boundary._stable_instance_operations = lambda: {
-        "authority-operation": operation
-    }
-    boundary.require_current_authority = lambda value: (
-        None if value == username else pytest.fail("wrong control username")
+    boundary = _role_bound_schema_reconciliation_control_boundary(
+        list(launcher.SCHEMA_RECONCILIATION_CONTROL_DATABASE_ROLES)
     )
 
     assert boundary._create_user_body(username, "q" * 64) == {
+        "databaseRoles": list(
+            launcher.SCHEMA_RECONCILIATION_CONTROL_DATABASE_ROLES
+        ),
         "instance": launcher.SQL_INSTANCE,
         "name": username,
         "password": "q" * 64,
@@ -2156,8 +2167,13 @@ def test_schema_reconciliation_control_admin_is_separate_broad_one_time_login():
         launcher.SCHEMA_RECONCILIATION_CONTROL_ADMIN_AUTHORITY_RECEIPT_SCHEMA
     )
     assert receipt["broad_bootstrap_authority"] is True
-    assert receipt["database_roles_requested"] == []
+    assert receipt["database_roles_requested"] == list(
+        launcher.SCHEMA_RECONCILIATION_CONTROL_DATABASE_ROLES
+    )
     assert receipt["normal_reconciliation_executor"] is False
+    assert receipt["resource_etag_sha256"] == hashlib.sha256(
+        b"exact-etag-v1"
+    ).hexdigest()
     assert receipt["receipt_sha256"] == hashlib.sha256(
         _canonical({
             key: value
@@ -2171,6 +2187,46 @@ def test_schema_reconciliation_control_admin_is_separate_broad_one_time_login():
         ),
         "temporary_control_admin_absent": True,
     }
+
+
+@pytest.mark.parametrize(
+    "database_roles",
+    (
+        ["cloudsqlsuperuser"],
+        ["canonical_brain_migration_owner"],
+        [
+            *launcher.SCHEMA_RECONCILIATION_CONTROL_DATABASE_ROLES,
+            "canonical_brain_schema_reconciler",
+        ],
+    ),
+)
+def test_schema_reconciliation_control_admin_rejects_inexact_roles(
+    database_roles: list[str],
+) -> None:
+    username = "muncho_canary_control_" + "a" * 16
+    boundary = _role_bound_schema_reconciliation_control_boundary(
+        database_roles
+    )
+
+    with pytest.raises(
+        launcher.OwnerLauncherError,
+        match="cloud_sql_schema_reconciliation_executor_resource_invalid",
+    ):
+        boundary.temporary_control_admin_authority_receipt(username)
+
+
+def test_schema_reconciliation_control_admin_rejects_invalid_etag() -> None:
+    username = "muncho_canary_control_" + "a" * 16
+    boundary = _role_bound_schema_reconciliation_control_boundary(
+        list(launcher.SCHEMA_RECONCILIATION_CONTROL_DATABASE_ROLES)
+    )
+    boundary._client.describe_payload["etag"] = ""
+
+    with pytest.raises(
+        launcher.OwnerLauncherError,
+        match="cloud_sql_schema_reconciliation_executor_resource_invalid",
+    ):
+        boundary.temporary_control_admin_authority_receipt(username)
 
 
 def test_schema_reconciliation_uses_role_bound_cloud_boundary_by_default() -> None:
