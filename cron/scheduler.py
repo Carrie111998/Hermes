@@ -41,6 +41,19 @@ from hermes_time import now as _hermes_now
 
 logger = logging.getLogger(__name__)
 
+# Ensure file logging is set up for standalone cron invocations.
+# The gateway calls setup_logging(mode="gateway") at startup, so this is a
+# no-op when tick() runs inside the gateway process. Standalone runs (testing,
+# debugging, direct invocation) get their own log file output via this guard.
+_setup_logging_done = False
+if not _setup_logging_done:
+    try:
+        from hermes_logging import setup_logging
+        setup_logging(mode="cron")
+        _setup_logging_done = True
+    except Exception:
+        pass  # logging setup is best-effort — proceed without file handlers
+
 
 class CronPromptInjectionBlocked(Exception):
     """Raised by _build_job_prompt when the fully-assembled prompt trips the
@@ -1691,7 +1704,7 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
         due_jobs = get_due_jobs()
 
         if verbose and not due_jobs:
-            logger.info("%s - No jobs due", _hermes_now().strftime('%H:%M:%S'))
+            logger.debug("%s - No jobs due", _hermes_now().strftime('%H:%M:%S'))
             return 0
 
         if verbose:

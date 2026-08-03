@@ -47,11 +47,16 @@ services:
       # API keys — read from ~/.hermes/.env or host environment
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - GLM_API_KEY=${GLM_API_KEY}
+      - GLM_BASE_URL=${GLM_BASE_URL:-https://api.z.ai/api/coding/paas/v4}
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
       - DISCORD_BOT_TOKEN=${DISCORD_BOT_TOKEN}
       - DISCORD_FORWARD_TO_LINE=${DISCORD_FORWARD_TO_LINE}
       # LINE Messaging API
       - LINE_CHANNEL_ACCESS_TOKEN=${LINE_CHANNEL_ACCESS_TOKEN}
       - LINE_CHANNEL_SECRET=${LINE_CHANNEL_SECRET}
+      # Set to "true" to skip webhook signature verification (dev only — insecure in production).
+      - LINE_SKIP_SIGNATURE_VERIFY=${LINE_SKIP_SIGNATURE_VERIFY:-false}
       - LINE_PORT=${LINE_PORT:-8645}
       - LINE_WEBHOOK_PATH=${LINE_WEBHOOK_PATH:-/webhook/line}
       - LINE_GROUP_POLICY=${LINE_GROUP_POLICY:-open}
@@ -96,7 +101,7 @@ services:
       start_period: 15s
 
   dashboard:
-    image: hermes-dashboard
+    image: hermes-agent
     container_name: dashboard
     restart: unless-stopped
     network_mode: host

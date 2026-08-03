@@ -6,7 +6,10 @@ import os
 import sys
 from pathlib import Path
 
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv
+except ModuleNotFoundError:
+    load_dotenv = None  # type: ignore[assignment]
 from utils import atomic_replace
 
 
@@ -82,6 +85,8 @@ def _sanitize_loaded_credentials() -> None:
 
 
 def _load_dotenv_with_fallback(path: Path, *, override: bool) -> None:
+    if load_dotenv is None:
+        return  # dotenv not installed — skip .env loading
     try:
         load_dotenv(dotenv_path=path, override=override, encoding="utf-8")
     except UnicodeDecodeError:
