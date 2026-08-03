@@ -57,45 +57,63 @@ def db_file(tmp_path):
 
 
 def _connect_attempt_during(monkeypatch, db_path):
-    """Patch ``shutil.copy2`` so a tracked connect races the first copy.
+    """Patch ``shutil.copy2`` to probe lock ordering, not scheduling timing.
 
-    The verdict is taken INSIDE the patched copy, while the raw I/O is still
-    in flight -- once the site under test returns, its guard has released the
-    lifecycle lock and the queued connect is free to land, so a check after
-    the return would race the very thing it measures.
+    The fixture parks the copy thread inside the patched ``copy2`` using a
+    park/release event pair, starts the connector thread, waits until the
+    connector has actually called into ``connect_tracked``, then checks whether
+    the connection opened while the copy still holds the lifecycle lock.  Only
+    after that does it release the copy so both threads can finish cleanly.
 
-    Returns (thread, holder, verdict): ``verdict["landed_during_copy"]`` says
-    whether the connect got through mid-copy; ``holder`` collects the
-    connection so the test can close it.
+    This is scheduling-independent: the assertion is about lock ordering
+    (``connect_tracked`` must block while the copy holds the lock), not about
+    which thread the scheduler happens to resume first within a fixed timeout.
+
+    Returns ``(copier, connector, events)`` where ``events`` is a namespace
+    with ``inside_copy``, ``release_copy``, ``connect_attempted``,
+    ``connection_opened``, and ``holder`` (list collecting the opened conn).
     """
     real_copy2 = shutil.copy2
-    started = threading.Event()
+    inside_copy = threading.Event()
+    release_copy = threading.Event()
+    connect_attempted = threading.Event()
+    connection_opened = threading.Event()
     holder: list[sqlite3.Connection] = []
-    verdict: dict = {"landed_during_copy": None}
-
-    def _racing_connect():
-        started.set()
-        conn = connect_tracked(str(db_path), check_same_thread=False)
-        holder.append(conn)
-
-    thread = threading.Thread(target=_racing_connect, daemon=True)
+    errors: list[str] = []
     fired = threading.Event()
 
-    def _copy2_with_race(src, dst, *a, **kw):
+    def _slow_copy2(src, dst, *a, **kw):
+        result = real_copy2(src, dst, *a, **kw)
         if not fired.is_set():
             fired.set()
-            thread.start()
-            started.wait(timeout=5)
-            # Give the connector every chance to slip in if nothing blocks it.
-            thread.join(timeout=0.5)
-            verdict["landed_during_copy"] = bool(holder)
-        return real_copy2(src, dst, *a, **kw)
+            inside_copy.set()
+            release_copy.wait(timeout=30)
+        return result
 
-    # Both call sites bind the stdlib module object (kanban_db at module
-    # level, hermes_state via a function-local ``import shutil``), so one
-    # patch on the module covers both.
-    monkeypatch.setattr(shutil, "copy2", _copy2_with_race)
-    return thread, holder, verdict
+    def _racing_connect():
+        # Signal immediately *before* the blocking call so a timed
+        # "still blocked" assertion cannot pass merely because this thread
+        # had not been scheduled yet.
+        connect_attempted.set()
+        try:
+            conn = connect_tracked(str(db_path), check_same_thread=False)
+            connection_opened.set()
+            holder.append(conn)
+        except Exception as exc:  # pragma: no cover
+            errors.append(f"connect failed: {exc}")
+
+    monkeypatch.setattr(shutil, "copy2", _slow_copy2)
+
+    import types
+    ns = types.SimpleNamespace(
+        inside_copy=inside_copy,
+        release_copy=release_copy,
+        connect_attempted=connect_attempted,
+        connection_opened=connection_opened,
+        holder=holder,
+        errors=errors,
+    )
+    return ns
 
 
 # ---------------------------------------------------------------------------
@@ -112,19 +130,54 @@ def test_backup_db_file_refuses_with_live_connection(db_file):
 
 
 def test_backup_db_file_copy_is_atomic_with_the_registry(db_file, monkeypatch):
-    """A connect attempted mid-copy must wait, not land in the gap."""
-    thread, holder, verdict = _connect_attempt_during(monkeypatch, db_file)
+    """A connect attempted mid-copy must block on the lock, not slip in the gap."""
+    ev = _connect_attempt_during(monkeypatch, db_file)
 
-    result = hermes_state._backup_db_file(db_file)
-
-    assert result is not None and result.exists()
-    assert verdict["landed_during_copy"] is False, (
-        "a connection was opened while the raw copy was in flight -- its "
-        "POSIX locks would be cancelled by the copy's close()"
+    copier = threading.Thread(
+        target=lambda: hermes_state._backup_db_file(db_file), daemon=True
     )
-    thread.join(timeout=5)
-    assert holder, "the queued connect must succeed once the copy is done"
-    holder[0].close()
+    connector = threading.Thread(target=lambda: None, daemon=True)  # replaced below
+
+    connect_attempted = ev.connect_attempted
+    connection_opened = ev.connection_opened
+
+    def _do_connect():
+        connect_attempted.set()
+        try:
+            conn = connect_tracked(str(db_file), check_same_thread=False)
+            connection_opened.set()
+            ev.holder.append(conn)
+        except Exception as exc:  # pragma: no cover
+            ev.errors.append(f"connect failed: {exc}")
+
+    connector = threading.Thread(target=_do_connect, daemon=True)
+
+    try:
+        copier.start()
+        assert ev.inside_copy.wait(30), "copy never reached the patched operation"
+
+        connector.start()
+        assert ev.connect_attempted.wait(30), "connector thread never started"
+        # The connector is at the lock. While the copy holds it the connection
+        # must not open.
+        assert not ev.connection_opened.wait(1.0), (
+            "connect_tracked() completed while the raw copy was in flight -- "
+            "its POSIX locks would be cancelled by the copy's close()"
+        )
+
+        ev.release_copy.set()
+        # Once the copy releases the lock the connection must open promptly.
+        assert ev.connection_opened.wait(30), (
+            "connect_tracked() never completed after the copy released the lock"
+        )
+    finally:
+        ev.release_copy.set()
+        copier.join(30)
+        connector.join(30)
+
+    assert not ev.errors, ev.errors[0]
+    assert ev.holder, "the queued connect must succeed once the copy is done"
+    ev.holder[0].close()
 
 
 def test_backup_db_file_still_copies_without_the_registry(db_file, monkeypatch):
@@ -158,18 +211,49 @@ def test_backup_corrupt_db_refuses_with_live_connection(db_file):
 
 
 def test_backup_corrupt_db_copy_is_atomic_with_the_registry(db_file, monkeypatch):
-    thread, holder, verdict = _connect_attempt_during(monkeypatch, db_file)
+    """A connect attempted mid-quarantine must block, not land in the gap."""
+    ev = _connect_attempt_during(monkeypatch, db_file)
 
-    result = kanban_db._backup_corrupt_db(db_file)
+    connect_attempted = ev.connect_attempted
+    connection_opened = ev.connection_opened
 
-    assert result is not None and result.exists()
-    assert verdict["landed_during_copy"] is False, (
-        "a connection was opened while the quarantine fingerprint/copy was "
-        "in flight -- its POSIX locks would be cancelled by our close()"
+    def _do_connect():
+        connect_attempted.set()
+        try:
+            conn = connect_tracked(str(db_file), check_same_thread=False)
+            connection_opened.set()
+            ev.holder.append(conn)
+        except Exception as exc:  # pragma: no cover
+            ev.errors.append(f"connect failed: {exc}")
+
+    copier = threading.Thread(
+        target=lambda: kanban_db._backup_corrupt_db(db_file), daemon=True
     )
-    thread.join(timeout=5)
-    assert holder, "the queued connect must succeed once the quarantine is done"
-    holder[0].close()
+    connector = threading.Thread(target=_do_connect, daemon=True)
+
+    try:
+        copier.start()
+        assert ev.inside_copy.wait(30), "copy never reached the patched operation"
+
+        connector.start()
+        assert ev.connect_attempted.wait(30), "connector thread never started"
+        assert not ev.connection_opened.wait(1.0), (
+            "connect_tracked() completed while the quarantine fingerprint/copy "
+            "was in flight -- its POSIX locks would be cancelled by our close()"
+        )
+
+        ev.release_copy.set()
+        assert ev.connection_opened.wait(30), (
+            "connect_tracked() never completed after the quarantine released the lock"
+        )
+    finally:
+        ev.release_copy.set()
+        copier.join(30)
+        connector.join(30)
+
+    assert not ev.errors, ev.errors[0]
+    assert ev.holder, "the queued connect must succeed once the quarantine is done"
+    ev.holder[0].close()
 
 
 def test_backup_corrupt_db_still_copies_sidecars(db_file):
