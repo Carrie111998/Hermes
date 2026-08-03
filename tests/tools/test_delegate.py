@@ -1312,13 +1312,12 @@ class TestMaxSpawnDepth(unittest.TestCase):
 
     @patch("tools.delegate_tool._load_config",
            return_value={"max_spawn_depth": 0})
-    def test_max_spawn_depth_clamped_below_one(self, mock_cfg):
+    def test_max_spawn_depth_zero_disables(self, mock_cfg):
         import logging
         from tools.delegate_tool import _get_max_spawn_depth
-        with self.assertLogs("tools.delegate_tool", level=logging.WARNING) as cm:
+        with self.assertNoLogs("tools.delegate_tool", level=logging.WARNING):
             result = _get_max_spawn_depth()
-        self.assertEqual(result, 1)
-        self.assertTrue(any("below floor 1" in m for m in cm.output))
+        self.assertEqual(result, 0)
 
 # =========================================================================
 # role param plumbing

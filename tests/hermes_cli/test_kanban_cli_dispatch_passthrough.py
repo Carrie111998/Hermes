@@ -39,6 +39,7 @@ def test_cli_dispatch_passes_max_in_progress_from_config(isolated_kanban_home, m
     # Configure max_in_progress in the loaded config.
     fake_config = {
         "kanban": {
+            "dispatch_in_gateway": False,
             "max_in_progress": 3,
             "max_spawn": 5,
             "default_assignee": "default",
@@ -77,7 +78,7 @@ def test_cli_max_flag_overrides_config_max_spawn(isolated_kanban_home, monkeypat
     from hermes_cli import kanban as kb_cli
     from hermes_cli import kanban_db
 
-    fake_config = {"kanban": {"max_spawn": 10}}
+    fake_config = {"kanban": {"dispatch_in_gateway": False, "max_spawn": 10}}
     monkeypatch.setattr("hermes_cli.config.load_config", lambda: fake_config)
 
     captured = {}

@@ -30,5 +30,6 @@ def test_dynamic_schema_explains_when_delegation_is_disabled():
     with patch("tools.delegate_tool._load_config", return_value={"max_spawn_depth": 0}):
         schema = _build_dynamic_schema_overrides()
 
-    assert "Delegation is DISABLED" in schema["description"]
+    assert "Delegation is DISABLED" not in schema["description"]
+    assert "Delegation is disabled" in schema["parameters"]["properties"]["role"]["description"]
     assert "no child can be spawned" in schema["parameters"]["properties"]["role"]["description"]
