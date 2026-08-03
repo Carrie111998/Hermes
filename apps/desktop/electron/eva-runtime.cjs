@@ -1,0 +1,418 @@
+const fs = require('node:fs')
+const path = require('node:path')
+
+const {
+  EVA_MANAGED_POLICY,
+  EvaBrokerError,
+  assertEvaManagedApiRequestAllowed,
+  buildEvaDesktopAuthUrl,
+  claimEvaDeviceCode,
+  expiresSoon,
+  launchEvaHermesRuntime,
+  makeAuthState,
+  makeDeviceCode,
+  normalizeDesktopSession,
+  normalizeHermesEnrollment,
+  parseEvaDesktopAuthCallback,
+  pollEvaDeviceCode,
+  publicEvaEnrollmentStatus,
+  revokeEvaDesktopSession
+} = require('./eva-managed.cjs')
+const { createEvaWsRelay } = require('./eva-ws-relay.cjs')
+
+const RUNTIME_ENROLLMENT_RETRY_DELAYS_MS = Object.freeze([2_000, 5_000, 10_000, 20_000, 30_000])
+
+function createEvaManagedRuntime(options) {
+  if (!options?.statePath || typeof options.encryptSecret !== 'function' || typeof options.decryptSecret !== 'function') {
+    throw new TypeError('evaOS Agent managed runtime requires statePath and secret custody functions.')
+  }
+
+  const rememberLog = options.rememberLog ?? (() => undefined)
+  const advanceBootProgress = options.advanceBootProgress ?? (async () => undefined)
+  const updateBootProgress = options.updateBootProgress ?? (() => undefined)
+  const resetConnection = options.resetConnection ?? (() => undefined)
+  const resetRenderer = options.resetRenderer ?? (async () => undefined)
+  const launchRuntime = options.launchRuntime ?? launchEvaHermesRuntime
+  const createWsRelay = options.createWsRelay ?? createEvaWsRelay
+  const statePath = options.statePath
+  const now = options.now ?? Date.now
+
+  let signInPromise = null
+  let runtimeEnrollmentPromise = null
+  let runtimeEnrollmentFailure = null
+  let pendingAuth = null
+  let authGeneration = 0
+  let runtimeGeneration = 0
+  let wsRelay = null
+
+  function emptyState(signedOut = false) {
+    return { desktop: null, runtime: null, signedOut }
+  }
+
+  function readState() {
+    let parsed
+    try {
+      parsed = JSON.parse(fs.readFileSync(statePath, 'utf8'))
+    } catch {
+      return emptyState()
+    }
+    if (!parsed || parsed.schema_version !== EVA_MANAGED_POLICY.schemaVersion) return emptyState()
+
+    let desktop = null
+    try {
+      desktop = normalizeDesktopSession({
+        desktop_session: options.decryptSecret(parsed.desktop?.token),
+        desktop_session_expires_at: parsed.desktop?.expires_at,
+        email: parsed.desktop?.email
+      })
+    } catch {
+      desktop = null
+    }
+
+    let runtime = null
+    if (desktop) {
+      try {
+        runtime = normalizeHermesEnrollment({
+          schema_version: EVA_MANAGED_POLICY.enrollmentSchemaVersion,
+          runtime: parsed.runtime?.runtime,
+          customer_id: parsed.runtime?.customer_id,
+          remote_backend: {
+            base_url: parsed.runtime?.base_url,
+            session_token: options.decryptSecret(parsed.runtime?.token),
+            expires_at: parsed.runtime?.expires_at,
+            agent_id: parsed.runtime?.agent_id
+          }
+        })
+      } catch {
+        runtime = null
+      }
+    }
+    return { desktop, runtime, signedOut: parsed.signed_out === true }
+  }
+
+  function atomicWrite(payload) {
+    fs.mkdirSync(path.dirname(statePath), { recursive: true, mode: 0o700 })
+    try {
+      fs.chmodSync(path.dirname(statePath), 0o700)
+    } catch {
+      // The OS may own the parent directory; the state file remains 0600.
+    }
+    const tempPath = `${statePath}.tmp`
+    fs.writeFileSync(tempPath, JSON.stringify(payload, null, 2), { encoding: 'utf8', mode: 0o600 })
+    fs.chmodSync(tempPath, 0o600)
+    fs.renameSync(tempPath, statePath)
+    fs.chmodSync(statePath, 0o600)
+  }
+
+  function writeState(state) {
+    if (!state?.desktop) {
+      if (!state?.signedOut) {
+        fs.rmSync(statePath, { force: true })
+        return
+      }
+      atomicWrite({ schema_version: EVA_MANAGED_POLICY.schemaVersion, signed_out: true })
+      return
+    }
+
+    atomicWrite({
+      schema_version: EVA_MANAGED_POLICY.schemaVersion,
+      signed_out: false,
+      desktop: {
+        token: options.encryptSecret(state.desktop.token),
+        expires_at: state.desktop.expiresAt,
+        email: state.desktop.email
+      },
+      runtime: state.runtime
+        ? {
+            token: options.encryptSecret(state.runtime.token),
+            expires_at: state.runtime.expiresAt,
+            base_url: state.runtime.baseUrl,
+            agent_id: state.runtime.agentId,
+            customer_id: state.runtime.customerId,
+            runtime: state.runtime.runtime
+          }
+        : null
+    })
+  }
+
+  function getWsRelay() {
+    if (!wsRelay) {
+      wsRelay = createWsRelay({
+        getUpstream: async () => {
+          const runtime = await ensureRuntimeEnrollment()
+          return { baseUrl: runtime.baseUrl, token: runtime.token }
+        },
+        onAuthRejected: clearRuntimeEnrollment,
+        onEvent: event => rememberLog(`[eva-managed] websocket relay ${event}`)
+      })
+    }
+    return wsRelay
+  }
+
+  function clearRuntimeEnrollment() {
+    if (!runtimeEnrollmentPromise) runtimeGeneration += 1
+    const state = readState()
+    if (state.desktop) writeState({ desktop: state.desktop, runtime: null })
+    resetConnection()
+    wsRelay?.disconnectAll()
+  }
+
+  function resetRuntimeEnrollmentFailure() {
+    runtimeEnrollmentFailure = null
+  }
+
+  function recordRuntimeEnrollmentFailure(error) {
+    const attempts = (runtimeEnrollmentFailure?.attempts ?? 0) + 1
+    const delay =
+      RUNTIME_ENROLLMENT_RETRY_DELAYS_MS[
+        Math.min(attempts - 1, RUNTIME_ENROLLMENT_RETRY_DELAYS_MS.length - 1)
+      ]
+    runtimeEnrollmentFailure = {
+      attempts,
+      error,
+      nextRetryAt: now() + delay
+    }
+  }
+
+  function invalidateAuthWork() {
+    authGeneration += 1
+    runtimeGeneration += 1
+    try {
+      pendingAuth?.controller?.abort()
+    } catch {
+      // The pending request already completed.
+    }
+    pendingAuth = null
+    signInPromise = null
+    runtimeEnrollmentPromise = null
+    resetRuntimeEnrollmentFailure()
+    resetConnection()
+    wsRelay?.disconnectAll()
+  }
+
+  function assertGeneration(auth, runtime = null) {
+    if (auth !== authGeneration || (runtime !== null && runtime !== runtimeGeneration)) {
+      throw new EvaBrokerError('evaOS Agent ignored a stale sign-in response.', 409, 'stale-auth')
+    }
+  }
+
+  async function beginSignIn() {
+    if (signInPromise) return signInPromise
+
+    const generation = authGeneration
+    const task = (async () => {
+      const deviceCode = makeDeviceCode()
+      const authState = makeAuthState()
+      const controller = new AbortController()
+      let resolveCallback
+      const callbackPromise = new Promise(resolve => {
+        resolveCallback = resolve
+      })
+      pendingAuth = { authState, controller, deviceCode, generation, resolve: resolveCallback }
+      try {
+        await advanceBootProgress('eva.sign-in', 'Complete evaOS Agent sign-in in your browser', 14)
+        await options.openExternal(buildEvaDesktopAuthUrl(deviceCode, authState))
+        const desktop = await Promise.race([
+          pollEvaDeviceCode(deviceCode, { signal: controller.signal }),
+          callbackPromise
+        ])
+        controller.abort()
+        assertGeneration(generation)
+        writeState({ desktop, runtime: null })
+        await advanceBootProgress('eva.authorized', 'Electric Sheep sign-in complete', 22)
+        return desktop
+      } finally {
+        controller.abort()
+        if (pendingAuth?.authState === authState && pendingAuth?.generation === generation) pendingAuth = null
+      }
+    })()
+
+    signInPromise = task
+    void task.finally(() => {
+      if (signInPromise === task) signInPromise = null
+    }).catch(() => undefined)
+    return task
+  }
+
+  function requireSignIn() {
+    resetRuntimeEnrollmentFailure()
+    writeState(emptyState(true))
+    updateBootProgress(
+      {
+        phase: 'eva.sign-in-required',
+        message: 'Sign in to evaOS Agent from Settings.',
+        progress: 8,
+        running: false,
+        error: null
+      },
+      { allowDecrease: true }
+    )
+    throw new EvaBrokerError('Sign in to evaOS Agent from Settings.', 401, 'sign-in-required')
+  }
+
+  async function ensureDesktopSession() {
+    const state = readState()
+    if (state.desktop && !expiresSoon(state.desktop.expiresAt, 0)) return state.desktop
+    return requireSignIn()
+  }
+
+  async function ensureRuntimeEnrollment(input = {}) {
+    const force = input.force === true
+    if (runtimeEnrollmentPromise) return runtimeEnrollmentPromise
+    if (force) runtimeGeneration += 1
+    const auth = authGeneration
+    const runtime = runtimeGeneration
+    const current = readState()
+    if (!force && current.runtime && !expiresSoon(current.runtime.expiresAt)) return current.runtime
+    if (!force && runtimeEnrollmentFailure && now() < runtimeEnrollmentFailure.nextRetryAt) {
+      throw runtimeEnrollmentFailure.error
+    }
+    if (force && current.desktop) writeState({ desktop: current.desktop, runtime: null })
+
+    const task = (async () => {
+      try {
+        const desktop = await ensureDesktopSession()
+        assertGeneration(auth, runtime)
+        await advanceBootProgress('eva.enroll', 'Resolving your assigned evaOS agent', 26)
+        let enrollment
+        try {
+          enrollment = await launchRuntime(desktop.token)
+        } catch (error) {
+          if (!(error instanceof EvaBrokerError) || error.statusCode !== 401) throw error
+          assertGeneration(auth, runtime)
+          return requireSignIn()
+        }
+        assertGeneration(auth, runtime)
+        writeState({ desktop, runtime: enrollment })
+        resetRuntimeEnrollmentFailure()
+        return enrollment
+      } catch (error) {
+        if (error?.statusCode !== 401 && error?.code !== 'stale-auth') {
+          assertGeneration(auth, runtime)
+          recordRuntimeEnrollmentFailure(error)
+        }
+        throw error
+      }
+    })()
+
+    runtimeEnrollmentPromise = task
+    void task.finally(() => {
+      if (runtimeEnrollmentPromise === task) runtimeEnrollmentPromise = null
+    }).catch(() => undefined)
+    return task
+  }
+
+  async function resolveBackend(input = {}) {
+    let runtime = await ensureRuntimeEnrollment(input)
+    try {
+      await options.waitForHermes(runtime.baseUrl, runtime.token)
+    } catch (error) {
+      if (error?.statusCode !== 401) throw error
+      clearRuntimeEnrollment()
+      runtime = await ensureRuntimeEnrollment({ force: true })
+      await options.waitForHermes(runtime.baseUrl, runtime.token)
+    }
+    return {
+      authMode: 'token',
+      baseUrl: `eva-managed://${runtime.customerId}`,
+      mode: 'remote',
+      source: 'electric-sheep',
+      token: '',
+      wsUrl: await getWsRelay().mintTicket()
+    }
+  }
+
+  async function completeCallback(rawUrl) {
+    const pending = pendingAuth
+    if (!pending) return false
+    const callback = parseEvaDesktopAuthCallback(rawUrl, pending.authState)
+    if (callback.deviceCode !== pending.deviceCode) {
+      throw new EvaBrokerError('evaOS Agent sign-in device code did not match.', 400, 'device-code-mismatch')
+    }
+    const desktop = await claimEvaDeviceCode(callback.deviceCode)
+    if (pendingAuth !== pending) throw new EvaBrokerError('evaOS Agent ignored a stale sign-in callback.', 409, 'stale-auth')
+    assertGeneration(pending.generation)
+    writeState({ desktop, runtime: null })
+    pending.resolve(desktop)
+    options.focusWindow?.()
+    return true
+  }
+
+  async function signIn() {
+    invalidateAuthWork()
+    writeState(emptyState())
+    const desktop = await beginSignIn()
+    const runtime = await ensureRuntimeEnrollment({ force: true })
+    resetConnection()
+    return publicEvaEnrollmentStatus({ desktop, runtime })
+  }
+
+  async function signOut() {
+    const state = readState()
+    invalidateAuthWork()
+    writeState(emptyState(true))
+    if (state.desktop) await revokeEvaDesktopSession(state.desktop.token).catch(() => false)
+    await resetRenderer()
+    return { ok: true }
+  }
+
+  async function refresh() {
+    clearRuntimeEnrollment()
+    const runtime = await ensureRuntimeEnrollment({ force: true })
+    const status = publicEvaEnrollmentStatus({ ...readState(), runtime })
+    await resetRenderer()
+    return status
+  }
+
+  async function requestApi(request, retry = true) {
+    const runtime = await ensureRuntimeEnrollment()
+    const allowed = assertEvaManagedApiRequestAllowed(request)
+    const timeoutMs = options.resolveTimeoutMs(request?.timeoutMs)
+    try {
+      return await options.fetchJson(`${runtime.baseUrl}${allowed.path}`, runtime.token, {
+        method: allowed.method,
+        body: request?.body,
+        upload: request?.upload,
+        timeoutMs
+      })
+    } catch (error) {
+      if (!retry || error?.statusCode !== 401) throw error
+      clearRuntimeEnrollment()
+      const refreshed = await ensureRuntimeEnrollment({ force: true })
+      const next = assertEvaManagedApiRequestAllowed(request)
+      return options.fetchJson(`${refreshed.baseUrl}${next.path}`, refreshed.token, {
+        method: next.method,
+        body: request?.body,
+        upload: request?.upload,
+        timeoutMs
+      })
+    }
+  }
+
+  async function close() {
+    invalidateAuthWork()
+    await wsRelay?.close()
+    rememberLog('[eva-managed] local relay closed')
+  }
+
+  return {
+    close,
+    completeCallback,
+    freshWsUrl: async () => {
+      await ensureRuntimeEnrollment()
+      return getWsRelay().mintTicket()
+    },
+    requestApi,
+    resolveBackend,
+    signIn: async () => {
+      const status = await signIn()
+      await resetRenderer()
+      return status
+    },
+    signOut,
+    refresh,
+    status: () => publicEvaEnrollmentStatus(readState())
+  }
+}
+
+module.exports = { createEvaManagedRuntime }
