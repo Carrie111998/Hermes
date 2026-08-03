@@ -555,7 +555,7 @@ def check_compression_model_feasibility(agent: Any) -> None:
         )
 
         # Hard floor: the auxiliary compression model must have at least
-        # MINIMUM_CONTEXT_LENGTH (64K) tokens of context.  The main model
+        # MINIMUM_CONTEXT_LENGTH (64K by default) tokens of context. The main model
         # is already required to meet this floor (checked earlier in
         # __init__), so the compression model must too — otherwise it
         # cannot summarise a full threshold-sized window of main-model
