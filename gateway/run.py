@@ -658,6 +658,7 @@ async def _send_or_update_status_coro(adapter, chat_id, status_key, content, met
 # --- Display / resolution helpers (extracted to gateway.display_helpers) ---
 from gateway.display_helpers import (  # noqa: E402
     _AUTO_CONTINUE_FRESHNESS_SECS_DEFAULT,
+    _STARTUP_RESTORE_DRAIN_TIMEOUT_SECS_DEFAULT,
     _TELEGRAM_COMMAND_MENTION_RE,
     _auto_continue_freshness_window,
     _coerce_gateway_timestamp,
@@ -666,6 +667,7 @@ from gateway.display_helpers import (  # noqa: E402
     _has_platform_display_override,
     _resolve_gateway_display_bool,
     _resolve_progress_thread_id,
+    _startup_restore_drain_timeout_secs,
     _telegramize_command_mentions,
 )
 

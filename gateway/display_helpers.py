@@ -206,6 +206,51 @@ def _auto_continue_freshness_window() -> float:
     return auto_continue_freshness_window()
 
 
+# ---------------------------------------------------------------------------
+# Auto-continue / startup-restore timing helpers
+# ---------------------------------------------------------------------------
+
+
+# Startup-restore inbound-gate drain bound: longer than a normal resume
+# turn's first response yet short enough that one pathologically
+# long resumed turn can't hold every channel's inbound queued for minutes.
+# Override via ``config.yaml`` ``agent.gateway_startup_restore_drain_timeout``.
+_STARTUP_RESTORE_DRAIN_TIMEOUT_SECS_DEFAULT = 30.0
+
+
+def _startup_restore_drain_timeout_secs() -> float:
+    """Max seconds ``_finish_startup_restore`` waits on boot auto-resume turns
+    before releasing the inbound gate and draining the queue.
+
+    While startup restore is in progress the gateway QUEUES every inbound
+    message (``_queue_startup_restore_event``) instead of processing it, so no
+    channel gets a reply until the gate opens.  The gate is opened by
+    ``_finish_startup_restore``, which waits for the synthetic boot
+    auto-resume turns to finish.  A single long resumed turn therefore held
+    the gate shut for every channel — inbound piled up unanswered for as long
+    as that one turn ran.
+
+    This bounds that wait.  Duplicate-agent safety does NOT depend on the
+    wait: ``_schedule_resume_pending_sessions`` claims each session's
+    ``_running_agents`` slot SYNCHRONOUSLY (before the gate ever runs), so a
+    message drained while a resume turn is still running queues behind that
+    slot rather than spawning a second agent.  So on timeout we release the
+    gate and let the slow turn finish in the background.
+
+    Reads ``HERMES_STARTUP_RESTORE_DRAIN_TIMEOUT`` (bridged from
+    ``config.yaml`` ``agent.gateway_startup_restore_drain_timeout`` at gateway
+    startup, same pattern as the other ``agent.*`` knobs).  Non-positive
+    disables the bound (restores the historical "wait forever" behaviour).
+    """
+    raw = os.environ.get("HERMES_STARTUP_RESTORE_DRAIN_TIMEOUT")
+    if raw is None or raw == "":
+        return float(_STARTUP_RESTORE_DRAIN_TIMEOUT_SECS_DEFAULT)
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return float(_STARTUP_RESTORE_DRAIN_TIMEOUT_SECS_DEFAULT)
+
+
 def _float_env(name: str, default: float) -> float:
     """Read an env var as float, falling back to ``default`` on typos/empty.
 
