@@ -10,6 +10,7 @@ reasoning configuration, temperature handling, and extra_body assembly.
 """
 
 import json
+import re
 from typing import Any, Dict
 
 from agent.lmstudio_reasoning import resolve_lmstudio_effort
@@ -17,6 +18,37 @@ from agent.moonshot_schema import is_moonshot_model, sanitize_moonshot_tools
 from agent.prompt_builder import DEVELOPER_ROLE_MODELS
 from agent.transports.base import ProviderTransport
 from agent.transports.types import NormalizedResponse, ToolCall, Usage
+
+
+def _parse_gemma_tool_marker(content: Any) -> tuple[str, str] | None:
+    """Parse Gemma-style text tool markers into (name, arguments_json).
+
+    Some local/Gemma chat-completions backends emit tool calls as content
+    markers (`<|tool|>name({...})`) instead of structured `tool_calls`.
+    Keep this fork helper so those responses normalize like real tool calls.
+    """
+    if not isinstance(content, str):
+        return None
+    match = re.match(
+        r"^\s*(?:<\|tool\|>|<\|call:)(?P<name>[A-Za-z_][A-Za-z0-9_.-]*)"
+        r"\((?P<arguments>[^)]*)\)"
+        r"(?:\s*(?:>|<\|turn\|>|<\|end\|>).*)?$",
+        content,
+        flags=re.DOTALL,
+    )
+    if match is None:
+        return None
+    raw_arguments = match.group("arguments").strip()
+    if not raw_arguments:
+        arguments: dict[str, Any] = {}
+    else:
+        try:
+            arguments = json.loads(raw_arguments)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(arguments, dict):
+            return None
+    return match.group("name"), json.dumps(arguments, separators=(",", ":"))
 
 
 def _static_prompt_instructions(messages: list[dict[str, Any]]) -> str:

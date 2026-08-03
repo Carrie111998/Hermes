@@ -199,15 +199,8 @@ export function useGatewayBoot({
           reauthNotified = true
           notifyError(err, translateNow('boot.errors.gatewaySignInRequired'))
         }
-
-        if (!cancelled) {
-          failedReconnectAttempts += 1
-
-          if (failedReconnectAttempts >= 6 && !$desktopBoot.get().error) {
-            const message = err instanceof Error ? err.message : String(err)
-            failDesktopBoot(message || 'Hermes gateway reconnect failed.')
-          }
-        }
+        // Escalation to a recoverable boot error is time-based in finally
+        // (RECONNECT_ESCALATE_AFTER_MS), not attempt-count — see reconnectFailingSince.
       } finally {
         reconnecting = false
 
