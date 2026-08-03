@@ -249,8 +249,8 @@ class TestMarkdownRendering:
         mod = _load_module(monkeypatch, tmp_path)
         md = mod.render_markdown("my-id", {"data": "hello world", "agent_id": "hermes"})
         assert "---" in md
-        assert "id: my-id" in md
-        assert "agent_id: hermes" in md
+        assert 'id: "my-id"' in md
+        assert 'agent_id: "hermes"' in md
         assert "hello world" in md
 
     def test_extract_text_prefers_data(self, tmp_path, monkeypatch):

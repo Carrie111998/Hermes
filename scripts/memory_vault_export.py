@@ -260,14 +260,15 @@ def render_markdown(point_id: str, payload: dict) -> str:
 
     text = extract_text(payload)
 
-    # Build frontmatter — keep it terse and machine-parseable
+    # Build frontmatter — quote string values to prevent YAML injection
+    # (values may contain colons, brackets, or other YAML special characters).
     frontmatter_lines = [
         "---",
-        f"id: {point_id}",
-        f"agent_id: {agent_id}",
+        f'id: "{point_id}"',
+        f'agent_id: "{agent_id}"',
         f"score: {score}",
-        f"created_at: {created_at}",
-        f"updated_at: {updated_at}",
+        f'created_at: "{created_at}"',
+        f'updated_at: "{updated_at}"',
         "---",
     ]
     return "\n".join(frontmatter_lines) + "\n" + text + "\n"
@@ -324,9 +325,15 @@ def parse_args() -> argparse.Namespace:
     mem0_cfg = load_mem0_json()
     default_collection = load_collection_from_mem0_json() or "mem0"
     auto_path, auto_url = detect_qdrant_mode(mem0_cfg)
-    default_qdrant_url = os.environ.get("QDRANT_URL", auto_url or "http://localhost:6333")
+    # Embedded path from mem0.json takes precedence over the QDRANT_URL env var so
+    # that a stale env var cannot silently redirect an embedded deployment to HTTP.
     default_qdrant_path = os.environ.get("QDRANT_PATH", auto_path or "")
-    default_output_dir = Path.home() / ".hermes" / "memories" / "vault"
+    if default_qdrant_path:
+        # Embedded mode: ignore QDRANT_URL entirely.
+        default_qdrant_url = None
+    else:
+        default_qdrant_url = os.environ.get("QDRANT_URL", auto_url or "http://localhost:6333")
+    default_output_dir = get_hermes_home() / "memories" / "vault"
 
     parser = argparse.ArgumentParser(
         description="Export mem0/Qdrant memories to human-readable Markdown vault files.",
