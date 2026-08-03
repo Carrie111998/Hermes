@@ -37,7 +37,6 @@ SCHEMA_VERSION = "evidence_pack.v1"
 MAX_HITS_TOTAL_DEFAULT = 20
 TOP_N_CITATIONS_DEFAULT = 10
 MAX_HITS_PER_SOURCE_DEFAULT = 5
-TIMEOUT_SECONDS_DEFAULT = 30.0
 SUMMARY_TEXT_MAX_LEN = 2000
 SNIPPET_MAX_LEN = 500
 TITLE_MAX_LEN = 256
@@ -251,7 +250,6 @@ class KnowledgeQuery:
     complexity: str = "S"
     max_hits_per_source: int = MAX_HITS_PER_SOURCE_DEFAULT
     max_hits_total: int = MAX_HITS_TOTAL_DEFAULT
-    timeout_seconds: float = TIMEOUT_SECONDS_DEFAULT
     sources_requested: tuple[str, ...] = ("policy", "contract", "report", "gbrain", "obsidian")
     schema_version: str = SCHEMA_VERSION
 
@@ -263,7 +261,6 @@ class KnowledgeQuery:
             "risk_profile": self.risk_profile,
             "complexity": self.complexity,
             "max_hits_per_source": self.max_hits_per_source,
-            "timeout_seconds": self.timeout_seconds,
             "sources_requested": sorted(self.sources_requested),
             "schema_version": self.schema_version,
         })
@@ -842,7 +839,6 @@ class EvidencePackEngine:
         sources_requested: Optional[tuple[str, ...]] = None,
         max_hits_per_source: int = MAX_HITS_PER_SOURCE_DEFAULT,
         max_hits_total: int = MAX_HITS_TOTAL_DEFAULT,
-        timeout_seconds: float = TIMEOUT_SECONDS_DEFAULT,
     ) -> EvidencePack:
         """Build an EvidencePack without persisting anywhere."""
         t0 = self._monotonic()
@@ -854,8 +850,6 @@ class EvidencePackEngine:
             max_hits_per_source = 1
         if max_hits_total < 1:
             max_hits_total = 1
-        if timeout_seconds < 0:
-            timeout_seconds = TIMEOUT_SECONDS_DEFAULT
 
         sources = sources_requested or tuple(self._sources.keys())
         # Filter to known sources only
@@ -868,7 +862,6 @@ class EvidencePackEngine:
             complexity=complexity,
             max_hits_per_source=max_hits_per_source,
             max_hits_total=max_hits_total,
-            timeout_seconds=timeout_seconds,
             sources_requested=sources,
         )
 
@@ -1084,7 +1077,6 @@ class EvidencePackEngine:
         risk_profile = kwargs.get("risk_profile", "low")
         complexity = kwargs.get("complexity", "S")
         max_hits_per_source = kwargs.get("max_hits_per_source", MAX_HITS_PER_SOURCE_DEFAULT)
-        timeout_seconds = kwargs.get("timeout_seconds", TIMEOUT_SECONDS_DEFAULT)
         sources_requested = kwargs.get("sources_requested", tuple(self._sources.keys()))
         objective_text = self._effective_objective_text(objective_text)
         return _sha256_hex({
@@ -1094,7 +1086,6 @@ class EvidencePackEngine:
             "risk_profile": risk_profile,
             "complexity": complexity,
             "max_hits_per_source": max_hits_per_source,
-            "timeout_seconds": timeout_seconds,
             "sources_requested": sorted(sources_requested) if sources_requested else [],
             "schema_version": SCHEMA_VERSION,
         })
