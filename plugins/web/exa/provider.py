@@ -101,10 +101,25 @@ class ExaWebSearchProvider(WebSearchProvider):
         return "Exa"
 
     def is_available(self) -> bool:
-        """Return True when ``EXA_API_KEY`` is set to a non-empty value."""
+        """Return True when Exa can service calls.
+
+        Requires BOTH the ``EXA_API_KEY`` credential AND the ``exa_py``
+        SDK to be importable. The SDK check is part of the WebSearchProvider
+        ABC contract ("optional Python dep importable") — a key without the
+        SDK would fail at request time, so it must not be reported as
+        available (see post-B1 readiness audit). Cheap and offline:
+        ``find_spec`` does not import the module.
+        """
         from agent.web_search_provider import get_provider_env
 
-        return bool(get_provider_env("EXA_API_KEY"))
+        if not get_provider_env("EXA_API_KEY"):
+            return False
+        try:
+            import importlib.util
+
+            return importlib.util.find_spec("exa_py") is not None
+        except Exception:  # noqa: BLE001 — a broken import probe means "not ready"
+            return False
 
     def supports_search(self) -> bool:
         return True
