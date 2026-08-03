@@ -36,15 +36,25 @@ auth:
       secret: true
 
 # Tool selection at install time:
-# postfast-mcp@0.1.23 exposes 13 tools. Read/discovery tools (list_accounts,
-# list_posts, get_post_analytics, get_follower_history, list_pinterest_boards,
-# list_youtube_playlists, list_gbp_locations, search_places) are safe; the
-# mutating ones (create_posts, delete_post, upload_media, get_upload_urls,
-# generate_connect_link) publish or change real workspace state. Each tool
-# carries a thorough description and a typed input schema. We leave
-# default_enabled unset so the install-time checklist starts with everything
-# pre-checked; users prune with `hermes mcp configure postfast`. Happy to
-# encode a read-mostly default subset if reviewers prefer (as n8n does).
+# postfast-mcp@0.1.23 exposes 13 tools. The five mutating ones (create_posts,
+# delete_post, upload_media, get_upload_urls, generate_connect_link) publish
+# to real social accounts, delete scheduled posts, or mint workspace connect
+# links — side effects that are public and mostly not reversible. They are
+# pruned from the default so a casual install gets a read-mostly surface, the
+# same posture as the n8n and blender entries. The eight below are
+# read/discovery calls. Users still see all 13 in the install-time checklist
+# and can opt into the mutating ones per their threat model; this list is
+# also what gets applied directly if the install-time probe fails.
+tools:
+  default_enabled:
+    - list_accounts
+    - list_posts
+    - get_post_analytics
+    - get_follower_history
+    - list_pinterest_boards
+    - list_youtube_playlists
+    - list_gbp_locations
+    - search_places
 
 post_install: |
   Get an API key: sign up at https://app.postfa.st/register (7-day free
@@ -52,5 +62,8 @@ post_install: |
   Set it as POSTFAST_API_KEY. Regenerating the key invalidates the previous
   one.
 
-  You can re-run the tool checklist any time with:
+  The publishing tools (create_posts, delete_post, upload_media,
+  get_upload_urls, generate_connect_link) are OFF by default — they post to
+  real social accounts and a deleted post is not recoverable. Opt into them,
+  or re-run the tool checklist any time, with:
     hermes mcp configure postfast
