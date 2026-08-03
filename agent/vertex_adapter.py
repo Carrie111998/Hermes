@@ -32,7 +32,8 @@ path is used. Otherwise the adapter falls back to OAuth2 / ADC.
 
 API key env vars (all optional):
   GOOGLE_VERTEX_API_KEY       — Vertex AI API key for Express Mode (secret).
-  GOOGLE_VERTEX_PROJECT       — GCP project ID (secret — read at runtime).
+  GOOGLE_VERTEX_PROJECT       — GCP project ID (non-secret routing config; shown
+                                on the Keys tab, used for regional endpoints).
   GOOGLE_VERTEX_LOCATION      — Vertex region (default: us-central1).
 
 OAuth2 / ADC env vars (all optional):

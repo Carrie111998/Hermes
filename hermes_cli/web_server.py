@@ -6761,6 +6761,15 @@ async def update_config(body: ConfigUpdate, profile: Optional[str] = None):
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
+# The only env vars the Keys/Env endpoint returns in cleartext. Non-secret
+# Vertex routing config (project id + region) — the user must be able to read
+# these to configure Express Mode. Everything else stays redacted even when
+# catalogued is_password=False (base-URL overrides can embed credentials).
+_ENV_CLEARTEXT_ALLOWLIST = frozenset(
+    {"GOOGLE_VERTEX_PROJECT", "GOOGLE_VERTEX_LOCATION"}
+)
+
+
 def _catalog_provider_env_metadata() -> dict:
     """Map provider env vars → desktop card metadata, derived from the catalog.
 
@@ -6897,9 +6906,13 @@ async def get_env_vars(profile: Optional[str] = None):
         # Hand OPTIONAL_ENV_VARS prose wins where present; the catalog fills any
         # gaps (description/url) and always supplies provider grouping hints.
         is_password = info.get("password") if "password" in info else cat_meta.get("is_password", False)
+        # Non-secret Vertex routing config the Keys tab may display as-is.
+        # Everything else — including other providers' non-password vars
+        # (base-URL overrides can embed user:pass@ userinfo) — stays redacted.
+        cleartext = var_name in _ENV_CLEARTEXT_ALLOWLIST
         return {
             "is_set": bool(value),
-            "redacted_value": (redact_key(value) if is_password else value) if value else None,
+            "redacted_value": (value if cleartext else redact_key(value)) if value else None,
             "description": info.get("description") or cat_meta.get("description", ""),
             "url": info.get("url") if info.get("url") is not None else cat_meta.get("url"),
             "category": info.get("category") or cat_meta.get("category", ""),
