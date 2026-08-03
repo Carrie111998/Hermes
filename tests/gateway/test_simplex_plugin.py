@@ -9,6 +9,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
+import types
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -161,6 +164,56 @@ async def test_send_group():
     assert result.success is True
 
 
+def test_prepare_image_uses_unique_temp_png(monkeypatch, tmp_path):
+    class _FakeImage:
+        def save(self, target, _format, quality=None):
+            if hasattr(target, "write"):
+                target.write(b"jpeg")
+            else:
+                Path(target).write_bytes(b"png")
+
+        def copy(self):
+            return self
+
+        def thumbnail(self, _size):
+            return None
+
+    pil = types.ModuleType("PIL")
+    pil.Image = types.SimpleNamespace(open=lambda _path: _FakeImage())
+    monkeypatch.setitem(sys.modules, "PIL", pil)
+    source = tmp_path / "source.webp"
+    source.write_bytes(b"webp")
+
+    png_path, thumb_uri = SimplexAdapter._prepare_image(str(source))
+
+    try:
+        assert Path(png_path).is_file()
+        assert Path(png_path) != source.with_suffix(".png")
+        assert not source.with_suffix(".png").exists()
+        assert thumb_uri.startswith("data:image/jpg;base64,")
+    finally:
+        Path(png_path).unlink(missing_ok=True)
+
+
+@pytest.mark.asyncio
+async def test_send_image_cleans_generated_png(monkeypatch, tmp_path):
+    adapter = _adapter_with_ws()
+    source = tmp_path / "source.webp"
+    source.write_bytes(b"webp")
+    generated = tmp_path / "generated.png"
+    generated.write_bytes(b"png")
+    monkeypatch.setattr(
+        adapter, "_prepare_image", lambda _path: (str(generated), "data:image/jpg;base64,eA==")
+    )
+    adapter._send_command = AsyncMock(return_value={"ok": True})
+
+    result = await adapter.send_image_file("alice", str(source))
+
+    assert result.success is True
+    assert source.exists()
+    assert not generated.exists()
+
+
 # ---------------------------------------------------------------------------
 # 7b. Channel directory enumeration (list_channels)
 # ---------------------------------------------------------------------------
@@ -299,5 +352,4 @@ def _make_file_chat_item(file_path: str, file_name: str) -> dict:
             },
         },
     }
-
 
