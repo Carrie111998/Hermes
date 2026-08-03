@@ -1643,10 +1643,12 @@ class ContextCompressor(ContextEngine):
         self._fallback_compression_streak = 0
         self._ineffective_compression_count = 0
         self._prellm_skip_count = 0
+        self.compression_count = 0
         self._anti_thrash_recovery_deadline = 0.0
         self.get_active_compression_failure_cooldown()
         self._load_fallback_compression_streak()
         self._load_ineffective_compression_count()
+        self._load_compression_count()
 
     def on_session_start(self, session_id: str, **kwargs) -> None:
         """Bind session-scoped compression state for a new or resumed session."""
@@ -1656,6 +1658,7 @@ class ContextCompressor(ContextEngine):
         session_db = kwargs.get("session_db", getattr(self, "_session_db", None))
         previous_fallback_streak = self._fallback_compression_streak
         previous_ineffective_count = self._ineffective_compression_count
+        previous_compression_count = self.compression_count
         if boundary_reason == "compression" and old_session_id:
             getter = getattr(session_db, "get_compression_fallback_streak", None)
             if callable(getter):
@@ -1687,12 +1690,35 @@ class ContextCompressor(ContextEngine):
                         "compression parent ineffective count lookup failed (non-sqlite): %s",
                         exc,
                     )
+            compression_getter = getattr(session_db, "get_compression_count", None)
+            if callable(compression_getter):
+                try:
+                    stored_count = compression_getter(old_session_id)
+                    if isinstance(stored_count, (int, float, str)):
+                        previous_compression_count = max(
+                            previous_compression_count,
+                            max(0, int(stored_count)),
+                        )
+                except (TypeError, ValueError, sqlite3.Error) as exc:
+                    logger.debug("compression parent count lookup failed: %s", exc)
+                except Exception as exc:
+                    logger.debug("compression parent count lookup failed (non-sqlite): %s", exc)
         self.bind_session_state(session_db, session_id)
         if boundary_reason == "compression":
+            # A recovery path may re-adopt a child row that already has a
+            # newer durable count. Compression depth is monotonic within the
+            # logical conversation, so preserve the newest valid value from
+            # live state, the parent row, or the destination row.
+            previous_compression_count = max(
+                previous_compression_count,
+                self.compression_count,
+            )
             # Rotation creates a fresh child row before this callback. Preserve
             # the logical conversation's streak until boundary bookkeeping
             # persists the updated value onto the child row.
             self._fallback_compression_streak = previous_fallback_streak
+            self.compression_count = previous_compression_count
+            self._persist_compression_count()
             # Same for the anti-thrash strike counter — but unlike the streak,
             # no later boundary bookkeeping writes it, so persist the carried
             # value onto the (fresh) child row now. Otherwise a restart between
@@ -1720,6 +1746,38 @@ class ContextCompressor(ContextEngine):
             logger.debug("compression fallback streak lookup failed: %s", exc)
         except Exception as exc:
             logger.debug("compression fallback streak lookup failed (non-sqlite): %s", exc)
+
+    def _load_compression_count(self) -> None:
+        session_db = getattr(self, "_session_db", None)
+        session_id = getattr(self, "_session_id", "")
+        getter = getattr(session_db, "get_compression_count", None)
+        if not session_id or not callable(getter):
+            return
+        try:
+            stored_count = getter(session_id)
+            self.compression_count = max(
+                0,
+                int(stored_count)
+                if isinstance(stored_count, (int, float, str))
+                else 0,
+            )
+        except (TypeError, ValueError, sqlite3.Error) as exc:
+            logger.debug("compression count lookup failed: %s", exc)
+        except Exception as exc:
+            logger.debug("compression count lookup failed (non-sqlite): %s", exc)
+
+    def _persist_compression_count(self) -> None:
+        session_db = getattr(self, "_session_db", None)
+        session_id = getattr(self, "_session_id", "")
+        setter = getattr(session_db, "set_compression_count", None)
+        if not session_id or not callable(setter):
+            return
+        try:
+            setter(session_id, self.compression_count)
+        except sqlite3.Error as exc:
+            logger.debug("compression count persist failed: %s", exc)
+        except Exception as exc:
+            logger.debug("compression count persist failed (non-sqlite): %s", exc)
 
     def _persist_fallback_compression_streak(self) -> None:
         session_db = getattr(self, "_session_db", None)
@@ -1801,6 +1859,7 @@ class ContextCompressor(ContextEngine):
         breaker exists for, and its recovery probe bounds the block.
         """
         self._verify_compaction_cleared_threshold = True
+        self._persist_compression_count()
         if feasibility_skip:
             # A deliberate pre-LLM feasibility skip (#60451) is not a
             # summary-quality verdict: it must neither extend a fallback

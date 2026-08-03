@@ -3747,6 +3747,40 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         self._execute_write(_do)
 
+    def get_compression_count(self, session_id: str) -> int:
+        """Return the durable completed-compaction count for a session."""
+        if not session_id:
+            return 0
+        with self._lock:
+            conn = self._conn
+            if conn is None:
+                return 0
+            row = conn.execute(
+                "SELECT compression_count FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+        if row is None:
+            return 0
+        value = row["compression_count"] if isinstance(row, sqlite3.Row) else row[0]
+        try:
+            return max(0, int(value or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    def set_compression_count(self, session_id: str, count: int) -> None:
+        """Persist the completed-compaction count for a session."""
+        if not session_id:
+            return
+        normalized = max(0, int(count))
+
+        def _do(conn):
+            conn.execute(
+                "UPDATE sessions SET compression_count = ? WHERE id = ?",
+                (normalized, session_id),
+            )
+
+        self._execute_write(_do)
+
     def get_compression_ineffective_count(self, session_id: str) -> int:
         """Return the persisted ineffective-compaction strike count.
 

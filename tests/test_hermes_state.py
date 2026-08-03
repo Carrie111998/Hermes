@@ -3641,3 +3641,14 @@ class TestApplyDatabasePragmas:
             assert conn.execute("PRAGMA wal_autocheckpoint").fetchone()[0] == before
         finally:
             conn.close()
+
+
+def test_compression_count_round_trips(db):
+    db.create_session("s1", "cli")
+
+    assert db.get_compression_count("s1") == 0
+    db.set_compression_count("s1", 3)
+    assert db.get_compression_count("s1") == 3
+    db.set_compression_count("s1", -2)
+    assert db.get_compression_count("s1") == 0
+    assert db.get_compression_count("missing") == 0

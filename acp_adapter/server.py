@@ -845,9 +845,9 @@ class HermesACPAgent(acp.Agent):
 
         Zed's circular context indicator is driven by ACP ``usage_update``
         session updates: ``size`` is the model context window and ``used`` is
-        the current request pressure.  Hermes estimates ``used`` from the same
-        buckets it sends to providers: system prompt, conversation history, and
-        tool schemas.
+        the current request pressure. Prefer the provider-reported prompt size
+        from the most recent model call; before any call has completed, fall
+        back to a rough estimate of the same request buckets.
         """
         agent = state.agent
         compressor = getattr(agent, "context_compressor", None)
@@ -856,21 +856,32 @@ class HermesACPAgent(acp.Agent):
             return None
 
         try:
-            from agent.model_metadata import estimate_request_tokens_rough
-
-            used = estimate_request_tokens_rough(
-                state.history,
-                system_prompt=getattr(agent, "_cached_system_prompt", "") or "",
-                tools=getattr(agent, "tools", None) or None,
-            )
-        except Exception:
-            logger.debug("Could not estimate ACP native context usage", exc_info=True)
             used = int(getattr(compressor, "last_prompt_tokens", 0) or 0)
+        except (TypeError, ValueError):
+            used = 0
+        if used <= 0:
+            try:
+                from agent.model_metadata import estimate_request_tokens_rough
+
+                used = estimate_request_tokens_rough(
+                    state.history,
+                    system_prompt=getattr(agent, "_cached_system_prompt", "") or "",
+                    tools=getattr(agent, "tools", None) or None,
+                )
+            except Exception:
+                logger.debug("Could not estimate ACP native context usage", exc_info=True)
+                used = 0
+
+        try:
+            compression_count = max(0, int(getattr(compressor, "compression_count", 0) or 0))
+        except (TypeError, ValueError):
+            compression_count = 0
 
         return UsageUpdate(
             session_update="usage_update",
             size=max(size, 0),
             used=max(used, 0),
+            field_meta={"hermes": {"compressionCount": compression_count}},
         )
 
     async def _send_usage_update(self, state: SessionState) -> None:
@@ -966,6 +977,24 @@ class HermesACPAgent(acp.Agent):
             return
         loop = asyncio.get_running_loop()
         loop.call_soon(asyncio.create_task, self._send_usage_update(state))
+
+    def _schedule_usage_update_from_thread(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        state: SessionState,
+    ) -> None:
+        """Publish current context pressure after a worker-thread model step."""
+
+        def _schedule_on_loop() -> None:
+            asyncio.create_task(self._send_usage_update(state))
+
+        try:
+            loop.call_soon_threadsafe(_schedule_on_loop)
+        except RuntimeError:
+            logger.debug(
+                "ACP event loop closed before usage update for %s",
+                state.session_id,
+            )
 
     async def _register_session_mcp_servers(
         self,
@@ -1492,7 +1521,13 @@ class HermesACPAgent(acp.Agent):
                 exc_info=True,
             )
         self._schedule_available_commands_update(session_id)
-        self._schedule_usage_update(state)
+        # Unlike session/new, session/load already has a client-side routing
+        # binding before the request starts so replay notifications can be
+        # consumed. Publish restored context/compression telemetry in the same
+        # request lifetime; deferring it until after return can lose the update
+        # during transport/task handoff and leaves a resumed client stale until
+        # its first prompt.
+        await self._send_usage_update(state)
         return LoadSessionResponse(
             models=self._build_model_state(state),
             modes=self._session_modes(state),
@@ -1528,7 +1563,11 @@ class HermesACPAgent(acp.Agent):
                 exc_info=True,
             )
         self._schedule_available_commands_update(state.session_id)
-        self._schedule_usage_update(state)
+        # `session/resume` has the same response-boundary contract as
+        # `session/load`: the client routing entry already exists, so restored
+        # context/compression telemetry must be delivered before this request
+        # returns rather than via a task that can lose the update on handoff.
+        await self._send_usage_update(state)
         return ResumeSessionResponse(
             models=self._build_model_state(state),
             modes=self._session_modes(state),
@@ -1792,8 +1831,14 @@ class HermesACPAgent(acp.Agent):
                 edit_approval_policy_getter=lambda: self._edit_approval_policy_for_state(state),
             )
             reasoning_cb = make_thinking_cb(conn, session_id, loop)
-            step_cb = make_step_cb(conn, session_id, loop, tool_call_ids, tool_call_meta)
+            base_step_cb = make_step_cb(conn, session_id, loop, tool_call_ids, tool_call_meta)
             message_cb = make_message_cb(conn, session_id, loop)
+
+            def _step_cb(api_call_count: int, prev_tools: Any = None) -> None:
+                base_step_cb(api_call_count, prev_tools)
+                self._schedule_usage_update_from_thread(loop, state)
+
+            step_cb = _step_cb
 
             def stream_delta_cb(text: str) -> None:
                 nonlocal streamed_message
@@ -2340,6 +2385,15 @@ class HermesACPAgent(acp.Agent):
             reset_session_state = getattr(state.agent, "reset_session_state", None)
             if callable(reset_session_state):
                 reset_session_state()
+            compressor = getattr(state.agent, "context_compressor", None)
+            persist_compression_count = getattr(
+                compressor, "_persist_compression_count", None
+            )
+            if callable(persist_compression_count):
+                # ACP /reset clears the existing stable session in place. Other
+                # hosts may call on_session_reset while switching to a new id,
+                # where persisting here would erase the old session's history.
+                persist_compression_count()
         except Exception:
             reset_failed = True
             logger.warning("ACP session state reset failed for %s", state.session_id, exc_info=True)
