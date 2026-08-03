@@ -212,6 +212,12 @@ class TestDetectAudioEnvironment:
         # (a WSL machine with both sees available=True via the fallback and
         # this test flakes). The fallback path is covered by its own test.
         monkeypatch.setattr("tools.voice_mode._wsl_powershell_tts_available", lambda: False)
+        # Also pin container detection: on container-like hosts (WSL, CI
+        # containers) is_container() is True, which diverts the diagnostic to
+        # the "container" branch — the warning then says "container", not
+        # "WSL", failing assert any("WSL" in w ...). Deterministic on every
+        # host requires pinning both detection paths.
+        monkeypatch.setattr("hermes_constants.is_container", lambda: False)
 
         proc_version = tmp_path / "proc_version"
         proc_version.write_text("Linux 5.15.0-microsoft-standard-WSL2")
