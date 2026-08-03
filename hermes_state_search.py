@@ -1242,7 +1242,6 @@ class SessionSearchMixin:
                 m.session_id,
                 m.role,
                 snippet({table}, -1, '>>>', '<<<', '...', 40) AS snippet,
-                m.content,
                 m.timestamp,
                 m.tool_name,
                 s.source,
@@ -1435,7 +1434,6 @@ class SessionSearchMixin:
                 m.session_id,
                 m.role,
                 snippet(messages_fts, -1, '>>>', '<<<', '...', 40) AS snippet,
-                m.content,
                 m.timestamp,
                 m.tool_name,
                 s.source,
@@ -1524,7 +1522,6 @@ class SessionSearchMixin:
                         m.session_id,
                         m.role,
                         snippet(messages_fts_cjk, -1, '>>>', '<<<', '...', 40) AS snippet,
-                        m.content,
                         m.timestamp,
                         m.tool_name,
                         s.source,
@@ -1613,7 +1610,6 @@ class SessionSearchMixin:
                         m.session_id,
                         m.role,
                         snippet(messages_fts_trigram, -1, '>>>', '<<<', '...', 40) AS snippet,
-                        m.content,
                         m.timestamp,
                         m.tool_name,
                         s.source,
@@ -1706,7 +1702,7 @@ class SessionSearchMixin:
                            substr(m.content,
                                   max(1, instr(m.content, ?) - 40),
                                   120) AS snippet,
-                           m.content, m.timestamp, m.tool_name,
+                           m.timestamp, m.tool_name,
                            s.source, s.model, s.started_at AS session_started
                     FROM messages m
                     JOIN sessions s ON s.id = m.session_id
