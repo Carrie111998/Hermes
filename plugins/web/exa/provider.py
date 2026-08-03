@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from agent.web_search_provider import WebSearchProvider
 
@@ -112,12 +112,18 @@ class ExaWebSearchProvider(WebSearchProvider):
     def supports_extract(self) -> bool:
         return True
 
-    def search(self, query: str, limit: int = 5) -> Dict[str, Any]:
+    def search(self, query: str, limit: int = 5, search_depth: Optional[str] = None) -> Dict[str, Any]:
         """Execute an Exa search.
 
         Returns ``{"success": True, "data": {"web": [{...}, ...]}}`` on
         success, ``{"success": False, "error": str}`` on failure (incl.
         missing API key and SDK install errors).
+
+        search_depth maps to Exa's ``type`` parameter:
+            "fast" → "fast" (~450ms, optimized)
+            "auto" / None → "auto" (~1s, balanced, default)
+            "deep" → "deep" (4-15s, multi-step with reasoning)
+            "deepest" → "deep-reasoning" (12-40s, maximum reasoning)
         """
         try:
             from tools.interrupt import is_interrupted
@@ -125,10 +131,19 @@ class ExaWebSearchProvider(WebSearchProvider):
             if is_interrupted():
                 return {"success": False, "error": "Interrupted"}
 
-            logger.info("Exa search: '%s' (limit=%d)", query, limit)
+            # Map search_depth to Exa type
+            _type_map = {
+                "fast": "fast",
+                "deep": "deep",
+                "deepest": "deep-reasoning",
+            }
+            exa_type = _type_map.get((search_depth or "").lower(), "auto")
+
+            logger.info("Exa search: '%s' (limit=%d, type=%s)", query, limit, exa_type)
             response = _get_exa_client().search(
                 query,
                 num_results=limit,
+                type=exa_type,
                 contents={"highlights": True},
             )
 

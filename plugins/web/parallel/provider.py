@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from agent.web_search_provider import WebSearchProvider
 
@@ -167,12 +167,15 @@ class ParallelWebSearchProvider(WebSearchProvider):
     def supports_extract(self) -> bool:
         return True
 
-    def search(self, query: str, limit: int = 5) -> Dict[str, Any]:
+    def search(self, query: str, limit: int = 5, search_depth: Optional[str] = None) -> Dict[str, Any]:
         """Execute a Parallel search (sync).
 
-        Uses the ``beta.search`` endpoint with the configured mode
-        (``PARALLEL_SEARCH_MODE`` env var, default "agentic"). Limit is
-        capped at 20 server-side.
+        Uses the ``beta.search`` endpoint. search_depth overrides
+        PARALLEL_SEARCH_MODE when provided:
+            "fast" → mode="turbo" (lowest latency, ~200ms)
+            "auto" / None → env var or "agentic" (default)
+            "deep" / "deepest" → mode="agentic" (highest quality)
+        Limit is capped at 20 server-side.
         """
         try:
             from tools.interrupt import is_interrupted
@@ -180,7 +183,11 @@ class ParallelWebSearchProvider(WebSearchProvider):
             if is_interrupted():
                 return {"success": False, "error": "Interrupted"}
 
-            mode = _resolve_search_mode()
+            _depth = (search_depth or "").lower()
+            if _depth == "fast":
+                mode = "turbo"
+            else:
+                mode = _resolve_search_mode()  # "agentic" by default
             logger.info(
                 "Parallel search: '%s' (mode=%s, limit=%d)", query, mode, limit
             )

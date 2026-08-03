@@ -615,7 +615,11 @@ def _ensure_web_plugins_loaded() -> None:
         logger.warning("Web plugin discovery failed (non-fatal): %s", exc)
 
 
-def web_search_tool(query: str, limit: int = 5) -> str:
+def web_search_tool(
+    query: str,
+    limit: int = 5,
+    search_depth: str = None,
+) -> str:
     """
     Search the web for information using available search API backend.
 
@@ -628,6 +632,11 @@ def web_search_tool(query: str, limit: int = 5) -> str:
     Args:
         query (str): The search query to look up
         limit (int): Maximum number of results to return (default: 5)
+        search_depth (str, optional): Search depth/quality level.
+            "fast"   — lowest latency, basic results
+            "auto"   — balanced speed/quality (default if not specified)
+            "deep"   — thorough search, multi-step, higher quality
+            "deepest" — maximum depth, reasoning-grade results (slowest)
     
     Returns:
         str: JSON string containing search results with the following structure:
@@ -658,7 +667,8 @@ def web_search_tool(query: str, limit: int = 5) -> str:
     debug_call_data = {
         "parameters": {
             "query": query,
-            "limit": limit
+            "limit": limit,
+            "search_depth": search_depth,
         },
         "error": None,
         "results_count": 0,
@@ -719,7 +729,7 @@ def web_search_tool(query: str, limit: int = 5) -> str:
                 "Web search via %s: '%s' (limit: %d)",
                 provider.name, query, limit,
             )
-            response_data = provider.search(query, limit)
+            response_data = provider.search(query, limit, search_depth=search_depth)
 
         debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
         result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
