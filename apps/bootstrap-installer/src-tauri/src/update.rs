@@ -480,6 +480,16 @@ async fn run_update(app: AppHandle) -> Result<()> {
         }
     }
 
+    // ---- restage installer from checkout --------------------------------
+    // `copy_self_to_hermes_home()` no-ops during `--update` (the running exe
+    // IS the destination), so the staged installer is always the original
+    // install-era binary. If that binary predates a protocol change (e.g.
+    // #74782 self-PID exclusion), every future update wedges in a loop.
+    // The freshly-updated checkout may contain a rebuilt installer (from a
+    // prior `cargo build -p hermes-bootstrap-installer`); copy it over if
+    // present and newer. Best-effort: the update itself already succeeded.
+    crate::paths::restage_from_checkout(&install_root);
+
     // ---- stage 3: hermes desktop --build-only ----------------------------
     // `hermes update` deliberately does NOT build apps/desktop (it installs
     // repo-root deps with --workspaces=false). This is the rebuild it skips.

@@ -129,6 +129,72 @@ pub fn copy_self_to_hermes_home() -> std::io::Result<()> {
     Ok(())
 }
 
+/// After a successful `hermes update`, copy the freshly-built installer binary
+/// from the checkout to `installer_dest()`. This repairs the stale-binary
+/// problem: `copy_self_to_hermes_home()` no-ops during `--update` (it IS the
+/// destination), so without this the original install-era binary orchestrates
+/// every future update forever. An installer that predates a protocol change
+/// (e.g. #74782 self-PID exclusion) then wedges the update loop.
+///
+/// The freshly-built binary lives in the Tauri output dir under the checkout.
+/// Best-effort: if cargo hasn't been run (no binary exists), or the copy fails,
+/// we log and continue — the update itself already succeeded, and the desktop
+/// gate (`stagedUpdaterSupportsPrewrittenMarker`) degrades gracefully for old
+/// binaries.
+pub fn restage_from_checkout(install_root: &Path) {
+    let dest = installer_dest();
+
+    // Build the expected path to the freshly-compiled installer in the checkout.
+    let binary_name = if cfg!(target_os = "windows") {
+        "hermes-setup.exe"
+    } else {
+        "hermes-setup"
+    };
+    let src = install_root
+        .join("apps")
+        .join("bootstrap-installer")
+        .join("src-tauri")
+        .join("target")
+        .join("release")
+        .join(binary_name);
+
+    // No binary → cargo hasn't been run in this checkout; nothing to restage.
+    let src_meta = match std::fs::metadata(&src) {
+        Ok(m) => m,
+        Err(_) => {
+            tracing::info!(?src, "restage: no built installer in checkout; skipping");
+            return;
+        }
+    };
+
+    // Only overwrite if the source is newer (or the dest doesn't exist yet).
+    if let Ok(dest_meta) = std::fs::metadata(&dest) {
+        if src_meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+            <= dest_meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+        {
+            tracing::info!(
+                ?src,
+                ?dest,
+                "restage: staged installer is already newer or equal; skipping"
+            );
+            return;
+        }
+    }
+
+    if let Some(parent) = dest.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    match std::fs::copy(&src, &dest) {
+        Ok(bytes) => {
+            tracing::info!(?src, ?dest, bytes, "restage: updated staged installer from checkout");
+            repair_macos_installer_helper(&dest);
+        }
+        Err(err) => {
+            tracing::warn!(?src, ?dest, %err, "restage: failed to copy installer (non-fatal)");
+        }
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn repair_macos_installer_helper(path: &Path) {
     // The staged helper may inherit quarantine from the downloaded installer.
