@@ -17,6 +17,12 @@ def _write_auth_store(tmp_path, payload: dict) -> None:
     (hermes_home / "auth.json").write_text(json.dumps(payload, indent=2))
 
 
+def _write_env(tmp_path, body: str) -> None:
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir(parents=True, exist_ok=True)
+    (hermes_home / ".env").write_text(body)
+
+
 @pytest.fixture(autouse=True)
 def _clean_anthropic_env(monkeypatch):
     """Strip Anthropic env vars so CI secrets don't leak into tests."""
@@ -97,6 +103,38 @@ def test_stale_env_pool_entry_does_not_count_when_var_unset(tmp_path, monkeypatc
     from hermes_cli.auth import is_provider_explicitly_configured
     assert is_provider_explicitly_configured("deepseek") is False
 
+
+def test_dotenv_api_key_counts_as_explicit_configuration(tmp_path, monkeypatch):
+    """Live .env edits should count immediately without a process restart (#77007)."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_env(tmp_path, "ANTHROPIC_API_KEY=sk-live-dotenv\n")
+
+    from hermes_cli.auth import is_provider_explicitly_configured
+
+    assert is_provider_explicitly_configured("anthropic") is True
+
+
+def test_env_seeded_pool_entry_resolves_live_dotenv_value(tmp_path, monkeypatch):
+    """Env-backed pool entries should reuse the live-dotenv credential resolver."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    _write_auth_store(tmp_path, {
+        "version": 1,
+        "providers": {},
+        "active_provider": None,
+        "credential_pool": {
+            "deepseek": [{
+                "id": "pool-1",
+                "source": "env:DEEPSEEK_API_KEY",
+                "auth_type": "api_key",
+            }],
+        },
+    })
+    _write_env(tmp_path, "DEEPSEEK_API_KEY=sk-live-dotenv\n")
+
+    from hermes_cli.auth import is_provider_explicitly_configured
+
+    assert is_provider_explicitly_configured("deepseek") is True
 
 
 

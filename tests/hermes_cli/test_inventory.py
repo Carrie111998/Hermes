@@ -208,6 +208,32 @@ def test_explicit_only_filters_ambient_credentials_but_keeps_current_and_custom_
     ]
 
 
+def test_explicit_only_accepts_live_dotenv_provider_without_restart(tmp_path, monkeypatch):
+    """Regression for #77007: explicit_only should reflect live .env edits."""
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir(parents=True, exist_ok=True)
+    (hermes_home / ".env").write_text("ANTHROPIC_API_KEY=sk-live-dotenv\n")
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+    rows = [
+        {"slug": "anthropic", "name": "Anthropic", "models": ["claude-sonnet-4.5"],
+         "total_models": 1, "is_current": False, "is_user_defined": False,
+         "source": "built-in"},
+    ]
+    ctx = _empty_ctx(provider="openai-codex", model="gpt-5.4")
+    with (
+        _list_auth_returning(rows),
+        patch("hermes_cli.config.read_raw_config", return_value={}),
+    ):
+        payload = build_models_payload(ctx, explicit_only=True)
+
+    assert [row["slug"] for row in payload["providers"]] == [
+        "anthropic",
+        "openai-codex",
+    ]
+
+
 
 # ─── picker_hints ──────────────────────────────────────────────────────
 
@@ -509,7 +535,5 @@ def _apply_featured_with_dates(rows, dates: dict[str, str]):
 
     with patch("agent.models_dev.get_model_info", side_effect=_fake_get_model_info):
         inventory._apply_featured(rows)
-
-
 
 
