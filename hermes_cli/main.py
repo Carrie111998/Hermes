@@ -12530,11 +12530,10 @@ def main():
     # None are treated as success (exit 0).
     if hasattr(args, "func"):
         rc = args.func(args)
-        if isinstance(rc, int) and rc != 0:
-            sys.exit(rc)
+        return rc
     else:
         parser.print_help()
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

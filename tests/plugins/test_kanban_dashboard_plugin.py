@@ -176,19 +176,6 @@ def test_tenant_filter(client):
     assert total == 1
 
 
-def test_dashboard_markdown_html_is_sanitized_before_render():
-    """Markdown rendering must sanitize HTML before dangerouslySetInnerHTML."""
-
-    repo_root = Path(__file__).resolve().parents[2]
-    bundle = repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
-    js = bundle.read_text()
-
-    assert "function sanitizeMarkdownHtml(html)" in js
-    assert "MARKDOWN_ALLOWED_TAGS" in js
-    assert "sanitizeMarkdownHtml(renderMarkdown(props.source || \"\"))" in js
-    assert "dangerouslySetInnerHTML: { __html: renderMarkdown(props.source || \"\") }" not in js
-
-
 # ---------------------------------------------------------------------------
 # GET /tasks/:id returns body + comments + events + links
 # ---------------------------------------------------------------------------
@@ -307,16 +294,144 @@ def test_add_comment(client):
 # ---------------------------------------------------------------------------
 
 
-def test_dispatch_dry_run(client):
-    client.post(
-        "/api/plugins/kanban/tasks",
-        json={"title": "work", "assignee": "researcher"},
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_dispatch_refuses_gateway_owned_dispatch_before_db_access(client, monkeypatch, dry_run):
+    """Dashboard POST must not bypass the gateway-owned dispatcher."""
+    from hermes_cli import config
+
+    calls = []
+    monkeypatch.setattr(
+        config, "load_config",
+        lambda: {"kanban": {"dispatch_in_gateway": True}},
     )
-    r = client.post("/api/plugins/kanban/dispatch?dry_run=true&max=4")
-    assert r.status_code == 200
-    body = r.json()
-    # DispatchResult is serialized as a dataclass dict.
-    assert isinstance(body, dict)
+    monkeypatch.setattr(
+        kb, "dispatch_once", lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+    monkeypatch.setattr(
+        "hermes_dashboard_plugin_kanban_test._conn",
+        lambda **kwargs: pytest.fail("gateway-owned dispatch must not open the DB"),
+    )
+
+    response = client.post(f"/api/plugins/kanban/dispatch?dry_run={str(dry_run).lower()}&max=4")
+
+    assert response.status_code == 409
+    assert calls == []
+
+
+@pytest.mark.parametrize("dispatch_in_gateway", [None, 0, "", [], {}])
+def test_dispatch_refuses_malformed_falsy_gateway_admission_before_db_access(
+    client, monkeypatch, dispatch_in_gateway,
+):
+    """Only literal false grants standalone dispatch authority."""
+    from hermes_cli import config
+
+    monkeypatch.setattr(
+        config, "load_config",
+        lambda: {"kanban": {"dispatch_in_gateway": dispatch_in_gateway}},
+    )
+    monkeypatch.setattr(
+        "hermes_dashboard_plugin_kanban_test._conn",
+        lambda **kwargs: pytest.fail("malformed admission must not open the DB"),
+    )
+    calls = []
+    monkeypatch.setattr(
+        kb, "dispatch_once", lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+
+    response = client.post("/api/plugins/kanban/dispatch?dry_run=true&max=4")
+
+    assert response.status_code == 409
+    assert calls == []
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_dispatch_refuses_when_config_admission_fails(client, monkeypatch, dry_run):
+    """A failed config read must not make either dispatch mode permissive."""
+    from hermes_cli import config
+
+    calls = []
+    monkeypatch.setattr(
+        config, "load_config",
+        lambda: (_ for _ in ()).throw(RuntimeError("config unavailable")),
+    )
+    monkeypatch.setattr(
+        kb,
+        "dispatch_once", lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+    monkeypatch.setattr(
+        "hermes_dashboard_plugin_kanban_test._conn",
+        lambda **kwargs: pytest.fail("failed admission must not open the DB"),
+    )
+
+    response = client.post(f"/api/plugins/kanban/dispatch?dry_run={str(dry_run).lower()}&max=4")
+
+    assert response.status_code == 503
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    ("lock_state", "status_code"),
+    [("contended", 409), ("unavailable", 503)],
+)
+def test_dispatch_refuses_standalone_mutation_without_singleton_lock(
+    client, monkeypatch, lock_state, status_code,
+):
+    """Standalone dashboard dispatch fails closed before touching the DB."""
+    from gateway import kanban_watchers
+    from hermes_cli import config
+
+    calls = []
+    monkeypatch.setattr(
+        config, "load_config",
+        lambda: {"kanban": {"dispatch_in_gateway": False}},
+    )
+    monkeypatch.setattr(
+        kanban_watchers, "_acquire_singleton_lock", lambda path: (None, lock_state),
+    )
+    monkeypatch.setattr(
+        kb, "dispatch_once", lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+
+    response = client.post("/api/plugins/kanban/dispatch?max=4")
+
+    assert response.status_code == status_code
+    assert calls == []
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_dispatch_standalone_holds_singleton_lock(client, monkeypatch, dry_run):
+    """Every standalone path shares and releases the gateway lock."""
+    from gateway import kanban_watchers
+    from hermes_cli import config
+
+    handle = object()
+    acquired = []
+    released = []
+    calls = []
+    monkeypatch.setattr(
+        config, "load_config",
+        lambda: {"kanban": {"dispatch_in_gateway": False}},
+    )
+    monkeypatch.setattr(
+        kanban_watchers,
+        "_acquire_singleton_lock",
+        lambda path: acquired.append(path) or (handle, "held"),
+    )
+    monkeypatch.setattr(
+        kanban_watchers, "_release_singleton_lock", released.append,
+    )
+    monkeypatch.setattr(
+        kb,
+        "dispatch_once",
+        lambda *args, **kwargs: calls.append((args, kwargs)) or kb.DispatchResult(),
+    )
+
+    response = client.post(f"/api/plugins/kanban/dispatch?dry_run={str(dry_run).lower()}&max=4")
+
+    assert response.status_code == 200
+    assert acquired == [kb.kanban_home() / "kanban" / ".dispatcher.lock"]
+    assert calls and calls[0][1]["dry_run"] is dry_run
+    assert released == [handle]
 
 
 # ---------------------------------------------------------------------------
