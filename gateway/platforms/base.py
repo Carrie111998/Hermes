@@ -5287,6 +5287,30 @@ class BasePlatformAdapter(ABC):
         state = store.pop(session_key, None)
         if state is None:
             return False
+        # Hand the flushed burst to the runner's FIFO so each follow-up gets
+        # its OWN turn in arrival order. The historical
+        # call below newline-merged it into the single pending slot with no
+        # time bound, so everything sent during a long turn arrived as one
+        # mashed-together turn -- the #43066 sub-bug, fixed for interrupt /
+        # steer-fallback / /queue but never for this path.
+        #
+        # The runner is reachable through the bound busy-session handler it
+        # already installed on this adapter, so no extra wiring is required.
+        # Photo/album merge semantics are preserved inside
+        # _queue_or_replace_pending_event itself.
+        _busy_handler = getattr(self, "_busy_session_handler", None)
+        _runner = getattr(_busy_handler, "__self__", None)
+        _enqueue = getattr(_runner, "_queue_or_replace_pending_event", None)
+        if callable(_enqueue):
+            try:
+                _enqueue(session_key, state.event)
+                return True
+            except Exception:
+                logger.warning(
+                    "[%s] FIFO enqueue of debounced burst failed for %s; "
+                    "falling back to pending-slot merge",
+                    self.name, session_key, exc_info=True,
+                )
         merge_pending_message_event(
             self._pending_messages,
             session_key,
