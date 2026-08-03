@@ -2192,6 +2192,57 @@ class TestNewEndpoints:
         assert top_skill["total_count"] == 1
         assert top_skill["last_used_at"] is not None
 
+    def test_models_analytics_folds_aux_usage_into_single_card(self):
+        """Aux usage must fold into the model's one card, not split per task.
+
+        Regression: _get_models_analytics used to append each (model, task)
+        aux row as its own entry, so a model with vision + compression usage
+        rendered as one card per aux task (duplicate model cards).
+        """
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            db.create_session(
+                session_id="aux-fold-test",
+                source="cli",
+                model="deepseek-v4",
+            )
+            db.update_token_counts(
+                "aux-fold-test",
+                input_tokens=1000,
+                output_tokens=100,
+                billing_provider="opencode-zen",
+                api_call_count=5,
+            )
+            db.record_auxiliary_usage(
+                "aux-fold-test", "vision", model="deepseek-v4",
+                billing_provider="opencode-zen",
+                input_tokens=200, output_tokens=20,
+            )
+            db.record_auxiliary_usage(
+                "aux-fold-test", "compression", model="deepseek-v4",
+                billing_provider="opencode-zen",
+                input_tokens=300, output_tokens=30,
+            )
+        finally:
+            db.close()
+
+        resp = self.client.get("/api/analytics/models?days=7")
+        assert resp.status_code == 200
+
+        rows = [
+            row for row in resp.json()["models"]
+            if row["model"] == "deepseek-v4"
+        ]
+        # One card, not one per aux task (vision + compression + main).
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["provider"] == "opencode-zen"
+        assert row["input_tokens"] == 1500
+        assert row["output_tokens"] == 150
+        assert row["api_calls"] == 7
+
 
 # ---------------------------------------------------------------------------
 # Model context length: normalize/denormalize + /api/model/info
