@@ -11,7 +11,7 @@
 import { useStore } from '@nanostores/react'
 import { useQuery } from '@tanstack/react-query'
 import { atom } from 'nanostores'
-import type { CSSProperties } from 'react'
+import { type CSSProperties, useEffect, useRef } from 'react'
 
 import { ChatPreviewRail } from '@/app/chat/right-rail/preview'
 import { RightSidebarPane } from '@/app/right-sidebar'
@@ -37,11 +37,22 @@ import { $currentCwd } from '@/store/session'
 // ---------------------------------------------------------------------------
 
 export function LogsPane() {
+  const logsRef = useRef<HTMLPreElement>(null)
+  const followTailRef = useRef(true)
   const { data, error } = useQuery({
     queryKey: ['contrib-logs-tail'],
     queryFn: () => getLogs({ lines: 300 }),
     refetchInterval: 5000
   })
+
+  useEffect(() => {
+    if (data && followTailRef.current) {
+      const logs = logsRef.current
+      if (logs) {
+        logs.scrollTop = logs.scrollHeight
+      }
+    }
+  }, [data])
 
   if (error) {
     return <div className="p-3 text-xs text-(--ui-text-quaternary)">log unavailable: {String(error)}</div>
@@ -58,7 +69,15 @@ export function LogsPane() {
   // No chrome of its own — the zone header (when the user summons it) is the
   // pane's only label. Just the tail.
   return (
-    <pre className="h-full min-h-0 overflow-auto whitespace-pre-wrap break-words p-2.5 font-mono text-[0.66rem] leading-relaxed text-(--ui-text-secondary)">
+    <pre
+      aria-label="Agent logs"
+      className="h-full min-h-0 select-text overflow-auto whitespace-pre-wrap break-words p-2.5 font-mono text-[0.66rem] leading-relaxed text-(--ui-text-secondary)"
+      onScroll={event => {
+        const { clientHeight, scrollHeight, scrollTop } = event.currentTarget
+        followTailRef.current = scrollHeight - scrollTop - clientHeight <= 1
+      }}
+      ref={logsRef}
+    >
       {data.lines.join('\n')}
     </pre>
   )
