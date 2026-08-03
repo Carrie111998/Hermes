@@ -4222,6 +4222,32 @@ describe('usePromptActions eager attachment upload (drop-time)', () => {
   })
 })
 
+describe('uploadComposerAttachment upload timeout', () => {
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  it('uses the long request timeout when uploading a remote file', async () => {
+    Object.defineProperty(window, 'hermesDesktop', {
+      configurable: true,
+      value: { readFileDataUrl: vi.fn(async () => 'data:application/pdf;base64,AA==') }
+    })
+
+    const requestGateway = vi.fn(async () => ({ attached: true, ref_text: '@file:test.pdf' }) as never)
+
+    await uploadComposerAttachment(
+      { id: 'file:test', kind: 'file', label: 'test.pdf', path: 'C:/test.pdf' },
+      { remote: true, requestGateway, sessionId: RUNTIME_SESSION_ID }
+    )
+
+    expect(requestGateway).toHaveBeenCalledWith(
+      'file.attach',
+      expect.objectContaining({ session_id: RUNTIME_SESSION_ID }),
+      1_800_000
+    )
+  })
+})
+
 describe('uploadComposerAttachment remote read failures', () => {
   afterEach(() => {
     vi.restoreAllMocks()

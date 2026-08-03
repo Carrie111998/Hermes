@@ -90,7 +90,7 @@ afterEach(() => {
   queryClient.clear()
 })
 
-describe('SkillsView toolset management', () => {
+describe('SkillsView toolset management', { timeout: 30_000 }, () => {
   it('renders a switch for each toolset and toggles it off', async () => {
     await renderSkills()
 

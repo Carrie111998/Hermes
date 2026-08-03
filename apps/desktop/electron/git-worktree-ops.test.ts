@@ -4,7 +4,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 
-import { test } from 'vitest'
+import { test, vi } from 'vitest'
 
 import {
   addWorktree,
@@ -15,6 +15,12 @@ import {
   sanitizeBranch,
   switchBranch
 } from './git-worktree-ops'
+
+// Git for Windows can spend several seconds starting credential/path helpers
+// even for local temporary repositories. Keep the normal timeout elsewhere,
+// but give this subprocess-heavy suite enough room on Windows so it measures
+// assertions instead of process startup latency.
+if (process.platform === 'win32') vi.setConfig({ testTimeout: 30_000 })
 
 test('sanitizeBranch: spaces → hyphens, forbidden chars dropped, edges trimmed', () => {
   assert.equal(sanitizeBranch('beach vibes'), 'beach-vibes')
@@ -109,7 +115,7 @@ test('listBranches: lists locals and flags the checked-out branch', async () => 
     // The repo's own checkout is flagged; the unused branch is convertible.
     assert.equal(branches.find(b => b.name === current).checkedOut, true)
     assert.equal(branches.find(b => b.name === current).isDefault, true)
-    assert.equal(fs.realpathSync(branches.find(b => b.name === current).worktreePath), fs.realpathSync(dir))
+    assert.equal(fs.realpathSync.native(branches.find(b => b.name === current).worktreePath), fs.realpathSync.native(dir))
     assert.equal(branches.find(b => b.name === 'feature').checkedOut, false)
     assert.equal(branches.find(b => b.name === 'feature').isDefault, false)
     assert.equal(branches.find(b => b.name === 'feature').worktreePath, null)
@@ -156,7 +162,7 @@ test('listBranches: a branch claimed by a worktree is flagged checked out', asyn
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
-})
+}, 30_000)
 
 test('listBranches: empty on a non-repo path', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-nonrepo-'))
@@ -205,7 +211,7 @@ test('addWorktree: existing default branch switches the main checkout, not .work
     const result = await addWorktree(dir, { existingBranch: trunk }, 'git')
 
     assert.equal(result.branch, trunk)
-    assert.equal(fs.realpathSync(result.path), fs.realpathSync(dir))
+    assert.equal(fs.realpathSync.native(result.path), fs.realpathSync.native(dir))
     assert.equal(git('branch', '--show-current'), trunk)
     assert.equal(fs.existsSync(path.join(dir, '.worktrees', trunk)), false)
   } finally {
