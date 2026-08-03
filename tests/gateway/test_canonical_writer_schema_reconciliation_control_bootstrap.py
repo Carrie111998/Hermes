@@ -234,6 +234,10 @@ def _observation(
             "postgresql_major": 18,
             "session_user_sha256": session_user_sha256,
             "control_admin_count": control_admin_count,
+            "control_admin_identity_exact": control_admin_count == 1,
+            "control_admin_attributes_exact": control_admin_count == 1,
+            "control_admin_memberships_exact": control_admin_count == 1,
+            "control_admin_forward_roles_exact": control_admin_count == 1,
             "control_admin_role_exact": control_admin_count == 1,
             "control_admin_forward_role_count": (
                 1 + membership_count if control_admin_count == 1 else 0
@@ -510,6 +514,10 @@ def test_fixed_observation_rejects_third_routine_and_nonroutine_objects() -> Non
     ("phase", "field", "replacement"),
     (
         ("before_install", "control_admin_count", 2),
+        ("before_install", "control_admin_identity_exact", False),
+        ("before_install", "control_admin_attributes_exact", False),
+        ("before_install", "control_admin_memberships_exact", False),
+        ("before_install", "control_admin_forward_roles_exact", False),
         ("before_install", "control_admin_role_exact", False),
         ("before_install", "control_admin_forward_role_count", 99),
         ("before_install", "control_admin_owned_object_count", 1),
@@ -532,6 +540,10 @@ def test_fixed_observation_rejects_third_routine_and_nonroutine_objects() -> Non
         ("before_install", "migration_owner_role_exact", False),
         ("before_install", "current_database_owner_exact", False),
         ("post_cleanup", "control_admin_count", 1),
+        ("post_cleanup", "control_admin_identity_exact", True),
+        ("post_cleanup", "control_admin_attributes_exact", True),
+        ("post_cleanup", "control_admin_memberships_exact", True),
+        ("post_cleanup", "control_admin_forward_roles_exact", True),
         ("post_cleanup", "control_admin_role_exact", True),
         ("post_cleanup", "control_admin_forward_role_count", 1),
         ("post_cleanup", "control_admin_owned_object_count", 1),
@@ -749,6 +761,12 @@ def test_fixed_observation_parser_binds_authenticated_session_and_exact_shape() 
                     self.username,
                     "0",
                     "false",
+                    "false",
+                    "0",
+                    "false",
+                    "0",
+                    "false",
+                    "false",
                     "0",
                     "0",
                     "0",
@@ -804,6 +822,22 @@ def test_fixed_observation_parser_binds_authenticated_session_and_exact_shape() 
 @pytest.mark.parametrize(
     ("replacement", "expected_code"),
     (
+        (
+            {"control_admin_identity_exact": "false"},
+            "schema_reconciliation_control_admin_identity_drifted",
+        ),
+        (
+            {"control_admin_attributes_exact": "false"},
+            "schema_reconciliation_control_admin_role_attributes_drifted",
+        ),
+        (
+            {"control_admin_memberships_exact": "false"},
+            "schema_reconciliation_control_admin_role_memberships_drifted",
+        ),
+        (
+            {"control_admin_forward_roles_exact": "false"},
+            "schema_reconciliation_control_admin_role_closure_drifted",
+        ),
         (
             {"control_admin_role_exact": "false"},
             "schema_reconciliation_control_admin_role_contract_drifted",
@@ -873,6 +907,16 @@ def test_fixed_observation_reports_secret_free_structural_drift_code(
         "version_num": "180002",
         "session_user_name": username,
         "control_admin_count": "1",
+        "control_admin_identity_exact": "true",
+        "control_admin_attributes_exact": "true",
+        "control_admin_attributes_mask": str(
+            bootstrap._CONTROL_ADMIN_ATTRIBUTES_EXACT_MASK
+        ),
+        "control_admin_memberships_exact": "true",
+        "control_admin_memberships_mask": str(
+            bootstrap._CONTROL_ADMIN_MEMBERSHIPS_EXACT_MASK
+        ),
+        "control_admin_forward_roles_exact": "true",
         "control_admin_role_exact": "true",
         "control_admin_forward_role_count": "1",
         "control_admin_owned_object_count": "0",
@@ -919,12 +963,216 @@ def test_fixed_observation_reports_secret_free_structural_drift_code(
         )
 
 
+@pytest.mark.parametrize(
+    ("flag", "mask_name", "exact_mask", "missing_bit", "expected_code"),
+    (
+        (
+            "control_admin_attributes_exact",
+            "control_admin_attributes_mask",
+            bootstrap._CONTROL_ADMIN_ATTRIBUTES_EXACT_MASK,
+            0,
+            "schema_reconciliation_control_admin_role_login_drifted",
+        ),
+        (
+            "control_admin_attributes_exact",
+            "control_admin_attributes_mask",
+            bootstrap._CONTROL_ADMIN_ATTRIBUTES_EXACT_MASK,
+            1,
+            "schema_reconciliation_control_admin_role_inherit_drifted",
+        ),
+        (
+            "control_admin_attributes_exact",
+            "control_admin_attributes_mask",
+            bootstrap._CONTROL_ADMIN_ATTRIBUTES_EXACT_MASK,
+            2,
+            "schema_reconciliation_control_admin_role_superuser_drifted",
+        ),
+        (
+            "control_admin_attributes_exact",
+            "control_admin_attributes_mask",
+            bootstrap._CONTROL_ADMIN_ATTRIBUTES_EXACT_MASK,
+            3,
+            "schema_reconciliation_control_admin_role_createdb_drifted",
+        ),
+        (
+            "control_admin_attributes_exact",
+            "control_admin_attributes_mask",
+            bootstrap._CONTROL_ADMIN_ATTRIBUTES_EXACT_MASK,
+            4,
+            "schema_reconciliation_control_admin_role_createrole_drifted",
+        ),
+        (
+            "control_admin_attributes_exact",
+            "control_admin_attributes_mask",
+            bootstrap._CONTROL_ADMIN_ATTRIBUTES_EXACT_MASK,
+            5,
+            "schema_reconciliation_control_admin_role_replication_drifted",
+        ),
+        (
+            "control_admin_attributes_exact",
+            "control_admin_attributes_mask",
+            bootstrap._CONTROL_ADMIN_ATTRIBUTES_EXACT_MASK,
+            6,
+            "schema_reconciliation_control_admin_role_bypassrls_drifted",
+        ),
+        (
+            "control_admin_attributes_exact",
+            "control_admin_attributes_mask",
+            bootstrap._CONTROL_ADMIN_ATTRIBUTES_EXACT_MASK,
+            7,
+            "schema_reconciliation_control_admin_role_connlimit_drifted",
+        ),
+        (
+            "control_admin_attributes_exact",
+            "control_admin_attributes_mask",
+            bootstrap._CONTROL_ADMIN_ATTRIBUTES_EXACT_MASK,
+            8,
+            "schema_reconciliation_control_admin_role_validuntil_drifted",
+        ),
+        (
+            "control_admin_attributes_exact",
+            "control_admin_attributes_mask",
+            bootstrap._CONTROL_ADMIN_ATTRIBUTES_EXACT_MASK,
+            9,
+            "schema_reconciliation_control_admin_role_config_drifted",
+        ),
+        (
+            "control_admin_memberships_exact",
+            "control_admin_memberships_mask",
+            bootstrap._CONTROL_ADMIN_MEMBERSHIPS_EXACT_MASK,
+            0,
+            "schema_reconciliation_control_admin_role_edge_count_drifted",
+        ),
+        (
+            "control_admin_memberships_exact",
+            "control_admin_memberships_mask",
+            bootstrap._CONTROL_ADMIN_MEMBERSHIPS_EXACT_MASK,
+            1,
+            "schema_reconciliation_control_admin_superuser_edge_drifted",
+        ),
+        (
+            "control_admin_memberships_exact",
+            "control_admin_memberships_mask",
+            bootstrap._CONTROL_ADMIN_MEMBERSHIPS_EXACT_MASK,
+            2,
+            "schema_reconciliation_control_admin_superuser_grantor_drifted",
+        ),
+        (
+            "control_admin_memberships_exact",
+            "control_admin_memberships_mask",
+            bootstrap._CONTROL_ADMIN_MEMBERSHIPS_EXACT_MASK,
+            3,
+            "schema_reconciliation_control_admin_superuser_admin_drifted",
+        ),
+        (
+            "control_admin_memberships_exact",
+            "control_admin_memberships_mask",
+            bootstrap._CONTROL_ADMIN_MEMBERSHIPS_EXACT_MASK,
+            4,
+            "schema_reconciliation_control_admin_superuser_inherit_drifted",
+        ),
+        (
+            "control_admin_memberships_exact",
+            "control_admin_memberships_mask",
+            bootstrap._CONTROL_ADMIN_MEMBERSHIPS_EXACT_MASK,
+            5,
+            "schema_reconciliation_control_admin_superuser_set_drifted",
+        ),
+        (
+            "control_admin_memberships_exact",
+            "control_admin_memberships_mask",
+            bootstrap._CONTROL_ADMIN_MEMBERSHIPS_EXACT_MASK,
+            6,
+            "schema_reconciliation_control_admin_executor_edge_drifted",
+        ),
+        (
+            "control_admin_memberships_exact",
+            "control_admin_memberships_mask",
+            bootstrap._CONTROL_ADMIN_MEMBERSHIPS_EXACT_MASK,
+            7,
+            "schema_reconciliation_control_admin_executor_grantor_drifted",
+        ),
+        (
+            "control_admin_memberships_exact",
+            "control_admin_memberships_mask",
+            bootstrap._CONTROL_ADMIN_MEMBERSHIPS_EXACT_MASK,
+            8,
+            "schema_reconciliation_control_admin_executor_admin_drifted",
+        ),
+        (
+            "control_admin_memberships_exact",
+            "control_admin_memberships_mask",
+            bootstrap._CONTROL_ADMIN_MEMBERSHIPS_EXACT_MASK,
+            9,
+            "schema_reconciliation_control_admin_executor_inherit_drifted",
+        ),
+        (
+            "control_admin_memberships_exact",
+            "control_admin_memberships_mask",
+            bootstrap._CONTROL_ADMIN_MEMBERSHIPS_EXACT_MASK,
+            10,
+            "schema_reconciliation_control_admin_executor_set_drifted",
+        ),
+        (
+            "control_admin_memberships_exact",
+            "control_admin_memberships_mask",
+            bootstrap._CONTROL_ADMIN_MEMBERSHIPS_EXACT_MASK,
+            11,
+            "schema_reconciliation_control_admin_unexpected_role_edge",
+        ),
+    ),
+)
+def test_fixed_observation_reports_exact_admin_role_component(
+    flag: str,
+    mask_name: str,
+    exact_mask: int,
+    missing_bit: int,
+    expected_code: str,
+) -> None:
+    assert bootstrap._STABLE_ERROR.fullmatch(expected_code)
+    row = {
+        name: "0" for name in bootstrap._FOUNDATION_OBSERVATION_COLUMNS
+    }
+    row.update(
+        {
+            "control_admin_count": "1",
+            "control_admin_identity_exact": "true",
+            "control_admin_attributes_exact": "true",
+            "control_admin_attributes_mask": str(
+                bootstrap._CONTROL_ADMIN_ATTRIBUTES_EXACT_MASK
+            ),
+            "control_admin_memberships_exact": "true",
+            "control_admin_memberships_mask": str(
+                bootstrap._CONTROL_ADMIN_MEMBERSHIPS_EXACT_MASK
+            ),
+            "control_admin_forward_roles_exact": "true",
+            "control_admin_role_exact": "true",
+            "control_admin_forward_role_count": "1",
+            "non_template_database_inventory_exact": "true",
+            "all_connectable_database_inventory_exact": "true",
+            "latent_provider_exception_exact": "true",
+            "executor_database_effective_privileges_exact": "true",
+            "migration_owner_role_exact": "true",
+            "current_database_owner_exact": "true",
+            "helper_absent": "true",
+        }
+    )
+    row[flag] = "false"
+    row[mask_name] = str(exact_mask & ~(1 << missing_bit))
+
+    assert bootstrap._foundation_drift_error_code(row) == expected_code
+
+
 def test_fixed_observation_does_not_classify_malformed_drift_value() -> None:
     row = {
         name: "0" for name in bootstrap._FOUNDATION_OBSERVATION_COLUMNS
     }
     row.update(
         {
+            "control_admin_identity_exact": "true",
+            "control_admin_attributes_exact": "true",
+            "control_admin_memberships_exact": "true",
+            "control_admin_forward_roles_exact": "true",
             "control_admin_role_exact": "true",
             "non_template_database_inventory_exact": "true",
             "all_connectable_database_inventory_exact": "true",
