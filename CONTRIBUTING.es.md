@@ -121,12 +121,12 @@ hermes chat -q "Hola"
 ### Ejecutar tests
 
 ```bash
-# Preferido — coincide con CI (entorno hermético, 4 workers xdist); ver AGENTS.md
+# Preferido — coincide con CI (entorno hermético, un subproceso por archivo,
+# workers autoescalados); ver AGENTS.md
 scripts/run_tests.sh
 
-# Alternativa (activa el venv primero). El wrapper sigue recomendándose
-# para paridad con GitHub Actions antes de abrir un PR:
-pytest tests/ -v
+# Ejecución enfocada mediante el mismo wrapper hermético:
+scripts/run_tests.sh tests/agent/test_foo.py -v
 ```
 
 ---
@@ -314,7 +314,8 @@ Todavía debes añadir el nombre de la herramienta a la lista apropiada en `tool
 (por ejemplo `_HERMES_CORE_TOOLS` o un toolset dedicado); de lo contrario la herramienta
 se registra pero nunca se expone al agente.
 
-Consulta `AGENTS.md` (sección **Adding New Tools**) para rutas conscientes del perfil y
+Consulta la sección **Footprint ladder** de `AGENTS.md` y
+`website/docs/developer-guide/adding-tools.md` para rutas conscientes del perfil y
 orientación sobre plugins vs. núcleo.
 
 ---
@@ -537,7 +538,7 @@ refactor/descripcion   # Reestructuración de código
 
 ### Antes de enviar
 
-1. **Ejecutar tests**: `scripts/run_tests.sh` (recomendado; igual que CI) o `pytest tests/ -v` con el venv del proyecto activado
+1. **Ejecutar tests**: `scripts/run_tests.sh` (igual que CI; pasa rutas/flags para ejecuciones enfocadas)
 2. **Probar manualmente**: Ejecuta `hermes` y ejercita la ruta de código que cambiaste
 3. **Verificar impacto multiplataforma**: Si tocas E/S de archivos, gestión de procesos o manejo del terminal, considera macOS, Linux y WSL2
 4. **Mantén los PRs enfocados**: Un cambio lógico por PR. No mezcles una corrección de error con una refactorización con una nueva funcionalidad.

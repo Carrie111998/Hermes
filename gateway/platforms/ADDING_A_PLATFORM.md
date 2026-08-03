@@ -362,7 +362,7 @@ identifiers are masked in ALL log output, not just your adapter's logs.
 | File | What to update |
 |------|---------------|
 | `README.md` | Platform list in feature table + documentation table |
-| `AGENTS.md` | Gateway description + env var config section |
+| `AGENTS.md` / `docs/development/` | Only when a global invariant or shared architecture changes; do not add per-platform inventory |
 | `website/docs/user-guide/messaging/<platform>.md` | **NEW** — Full setup guide (see existing platform docs for template) |
 | `website/docs/user-guide/messaging/index.md` | Architecture diagram, toolset table, security examples, Next Steps links |
 | `website/docs/reference/environment-variables.md` | All env vars for the platform |
@@ -394,8 +394,8 @@ Optional but valuable:
 After implementing everything, verify with:
 
 ```bash
-# All tests pass
-python -m pytest tests/ -q
+# Focused gateway tests pass through the CI-parity wrapper
+scripts/run_tests.sh tests/gateway/test_<platform>.py -q
 
 # Grep for your platform name to find any missed integration points
 grep -r "telegram\|discord\|whatsapp\|slack" gateway/ tools/ agent/ cron/ hermes_cli/ toolsets.py \
