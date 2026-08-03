@@ -32,7 +32,7 @@ const EMPTY_SUMMARY: UsageSummary = {
 const formatUsd = (value: number) => {
   const v = value || 0
   const fractionDigits = v > 0 && v < 0.01 ? 6 : 2
-  return new Intl.NumberFormat(undefined, { currency: 'USD', style: 'currency', minimumFractionDigits: fractionDigits, maximumFractionDigits: fractionDigits }).format(v)
+  return new Intl.NumberFormat('en-US', { currency: 'USD', style: 'currency', minimumFractionDigits: fractionDigits, maximumFractionDigits: fractionDigits }).format(v)
 }
 
 function SummaryCard({ label, value }: { label: string; value: string }) {

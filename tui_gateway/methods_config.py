@@ -85,21 +85,28 @@ def _(rid, params: dict) -> dict:
             ).fetchone()
             by_session = db._conn.execute(
                 """
-                SELECT COALESCE(SUM(estimated_cost_usd), 0) AS estimated_cost_usd
-                FROM session_model_usage
-                WHERE COALESCE(estimated_cost_usd, 0) > 0
-                GROUP BY session_id
+                SELECT MAX(session_cost) AS most_expensive_session_usd,
+                       MIN(session_cost) AS cheapest_session_usd
+                FROM (
+                    SELECT SUM(COALESCE(estimated_cost_usd, 0)) AS session_cost
+                    FROM session_model_usage
+                    WHERE COALESCE(estimated_cost_usd, 0) > 0
+                    GROUP BY session_id
+                )
                 """
-            ).fetchall()
-            session_costs = [float(row["estimated_cost_usd"] or 0.0) for row in by_session]
+            ).fetchone()
             payload.update(
                 total_estimated_cost_usd=float(usage["estimated_cost_usd"] or 0.0),
                 total_input_tokens=int(usage["input_tokens"] or 0),
                 total_output_tokens=int(usage["output_tokens"] or 0),
                 total_cache_read_tokens=int(usage["cache_read_tokens"] or 0),
                 total_cache_write_tokens=int(usage["cache_write_tokens"] or 0),
-                most_expensive_session_usd=max(session_costs, default=0.0),
-                cheapest_session_usd=min(session_costs, default=0.0),
+                most_expensive_session_usd=float(
+                    by_session["most_expensive_session_usd"] or 0.0
+                ),
+                cheapest_session_usd=float(
+                    by_session["cheapest_session_usd"] or 0.0
+                ),
             )
         except Exception:
             fallback = db._conn.execute(
