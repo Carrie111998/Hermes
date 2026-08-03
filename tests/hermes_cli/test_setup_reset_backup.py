@@ -100,7 +100,7 @@ class TestResetBackupOrdering:
     def test_run_without_reset_still_backs_up_the_pre_setup_config(
         self, tmp_path, monkeypatch
     ):
-        """Non---reset runs keep backing up the pre-setup file exactly as before."""
+        """Runs without --reset back up the pre-setup file exactly as before."""
         from hermes_cli.setup import run_setup_wizard
 
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
