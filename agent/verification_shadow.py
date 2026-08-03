@@ -123,8 +123,6 @@ _EVIDENCE_PATTERNS: List[re.Pattern] = [
     re.compile(r"(?:screenshot|SCREENSHOT|vision|browser_vision)", re.IGNORECASE),
     # Explicit "not yet verified"
     re.compile(r"(?:not\s+yet\s+verified|haven't\s+(?:tested|verified|checked)|need\s+to\s+verify)", re.IGNORECASE),
-    # Prescription marker (from fix-fidelity guidance)
-    re.compile(r"Prescription:\s+", re.IGNORECASE),
     # JSON output from a tool
     re.compile(r"(?:exit_code|output|status|content)\s*:", re.IGNORECASE),
     # "returned" / "output:" / "result:"

@@ -150,6 +150,11 @@ class TestHasEvidence:
     def test_claim_without_evidence(self):
         assert has_evidence("The fix works and tests pass.") is False
 
+    def test_prescription_marker_is_not_evidence(self):
+        text = "Prescription: update the parser. The fix works."
+        assert has_evidence(text) is False
+        assert detect_verifiable_claims(text)
+
 
 # ── shadow_check ───────────────────────────────────────────────────────
 
