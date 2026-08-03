@@ -1097,6 +1097,24 @@ class TestRunJobWakeGate:
         assert success is True
         assert err is None
 
+    def test_script_failure_stays_failed_and_suppresses_agent_delivery(self):
+        """Collector failures remain scheduler failures instead of becoming
+        persona-authored user alerts with an overall successful status."""
+        import cron.scheduler as scheduler
+
+        script_error = "ModuleNotFoundError: No module named 'agents'"
+        with patch.object(scheduler, "_run_job_script",
+                          return_value=(False, script_error)), \
+             patch("run_agent.AIAgent") as agent_cls:
+            success, doc, final, err = scheduler.run_job(self._make_job())
+
+        assert success is False
+        assert final == ""
+        assert err == script_error
+        assert "user delivery were suppressed" in doc
+        assert script_error in doc
+        agent_cls.assert_not_called()
+
 
 class TestBuildJobPromptMissingSkill:
     """Verify that a missing skill logs a warning and does not crash the job."""
@@ -1899,5 +1917,4 @@ class TestSetCronSessionTitle:
         out = _set_cron_session_title(db, "sess-1", "Nightly Synthesis")
         assert out == "Nightly Synthesis #2"
         db.get_next_title_in_lineage.assert_called_once_with("Nightly Synthesis")
-
 

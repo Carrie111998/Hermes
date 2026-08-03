@@ -2971,6 +2971,30 @@ def run_job(
     if script_path:
         prerun_script = _run_job_script_with_claim_heartbeat(job, script_path)
         _ran_ok, _script_output = prerun_script
+        if not _ran_ok:
+            # A pre-run script is part of the scheduler's collection layer,
+            # not persona/business content.  Do not hand infrastructure
+            # failures to the agent to narrate to the user: doing so can turn
+            # a broken collector into a successful cron run and bypass the
+            # operator's failed-run monitoring.  Preserve the failure in the
+            # cron ledger; the control plane can then triage it through the
+            # normal system-finding path.
+            logger.error(
+                "Job '%s' (ID: %s): pre-run script failed; suppressing agent and delivery",
+                job_name, job_id,
+            )
+            error_text = str(_script_output or "Pre-run script failed without output")
+            failed_doc = (
+                f"# Cron Job: {job_name}\n\n"
+                f"**Job ID:** {job_id}\n"
+                f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                "**Status:** ERROR\n\n"
+                "The pre-run data-collection script failed. The agent and "
+                "user delivery were suppressed so this remains a system "
+                "failure for operator triage.\n\n"
+                f"```\n{error_text}\n```\n"
+            )
+            return False, failed_doc, "", error_text
         if _ran_ok and not _parse_wake_gate(_script_output):
             logger.info(
                 "Job '%s' (ID: %s): wakeAgent=false, skipping agent run",
