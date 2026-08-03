@@ -9351,6 +9351,33 @@ def claim_task(
                 {"reason": "parents_not_done"},
             )
             return None
+        # Privileged-profile routing contract. Refused inside the claim
+        # transaction so an incompatible card never becomes a run: no run row,
+        # no `claimed` event, no worker. The card is blocked with the
+        # diagnostic instead of retried, because a retry cannot change it.
+        routing_row = conn.execute(
+            "SELECT assignee FROM tasks WHERE id = ? AND status = 'ready'",
+            (task_id,),
+        ).fetchone()
+        if routing_row is not None:
+            routing_error = resolver_routing_error(
+                conn, task_id, routing_row["assignee"]
+            )
+            if routing_error is not None:
+                conn.execute(
+                    "UPDATE tasks SET status = 'blocked', last_failure_error = ? "
+                    "WHERE id = ? AND status = 'ready'",
+                    (routing_error, task_id),
+                )
+                _apply_v2_flags(
+                    conn, task_id, board_meta, running=False, blocked=True
+                )
+                _append_event(
+                    conn, task_id, "claim_rejected",
+                    {"reason": "resolver_routing", "error": routing_error},
+                )
+                return None
+
         # Defensive: if a prior run somehow leaked (invariant violation from
         # an unknown code path), close it as 'reclaimed' so we don't strand
         # it when the CAS resets the pointer below. No-op when the invariant
@@ -12326,58 +12353,62 @@ def epic_branch_for(epic_id: str) -> str:
     return f"epic/{epic_id}"
 
 
+def _git_head_sha(repo_root: Path) -> Optional[str]:
+    """Resolve ``HEAD`` to a full 40-character SHA, or ``None``."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+    except Exception:
+        return None
+    sha = (result.stdout or "").strip()
+    return sha if result.returncode == 0 and len(sha) == 40 else None
+
+
 def _ensure_epic_branch(
-    repo_root: Path, epic_branch: str, *, allow_create_at_head: bool
-) -> None:
-    """Ensure an epic base exists, creating it at ``HEAD`` only when allowed.
+    repo_root: Path, epic_branch: str, *, start_point: Optional[str]
+) -> bool:
+    """Ensure an epic base exists; create it only at an explicit full SHA.
 
-    A missing base is ambiguous once any member story has materialized: the
-    current ``HEAD`` may have moved, so recreating the ref would fabricate its
-    historical base. Callers must explicitly identify genuine first
-    materialization before allowing creation.
+    Returns whether this call created the ref. ``start_point`` is the exact
+    commit the base must be created at — ``None`` means the caller could not
+    establish one, and this raises rather than inventing history.
 
-    Raises when the branch still does not exist afterwards. The epic base is
-    a precondition of the story worktree that branches off it and of the
-    Review target preparation that later runs ``git merge-base`` against it —
-    a story ref materialized without it looks healthy and fails much later,
-    off-site (2026-07-30 epic ``t_c29de776``: Review runs 531/532 died before
-    reviewer spawn and an operator had to create the ref by hand).
+    A missing base is ambiguous once the epic has materialized anything: the
+    current ``HEAD`` has probably moved, and recreating the ref there silently
+    shifts every story's review baseline. The epic base is a precondition of
+    the story worktree that branches off it and of the Review target
+    preparation that later runs ``git merge-base`` against it — a story ref
+    materialized without it looks healthy and fails much later, off-site
+    (2026-07-30 epic ``t_c29de776``: Review runs 531/532 died before reviewer
+    spawn and an operator had to create the ref by hand).
     """
     if _git_branch_exists(repo_root, epic_branch):
-        return
-    if not allow_create_at_head:
+        return False
+    if not start_point:
         raise RuntimeError(
-            f"epic base branch {epic_branch} is missing; its historical base "
-            "cannot be established, so it will not be recreated from current HEAD"
+            f"epic base branch {epic_branch} is missing and its historical base "
+            "cannot be established from the event ledger; it will not be "
+            "recreated from current HEAD. Recreate the ref at the verified "
+            "historical commit, then resume dispatch."
         )
     error = ""
     try:
-        head = subprocess.run(
-            ["git", "-C", str(repo_root), "rev-parse", "HEAD"],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), "branch", epic_branch, start_point],
+            capture_output=True, text=True, timeout=30, check=False,
         )
-        head_sha = (head.stdout or "").strip()
-        if head.returncode != 0 or not head_sha:
-            error = (head.stderr or head.stdout or "").strip()
-        else:
-            result = subprocess.run(
-                ["git", "-C", str(repo_root), "branch", epic_branch, head_sha],
-                capture_output=True,
-                text=True,
-                timeout=30,
-                check=False,
-            )
-            error = (result.stderr or result.stdout or "").strip()
+        error = (result.stderr or result.stdout or "").strip()
     except Exception as exc:  # timeout / OS-level failure
         error = str(exc)
-    if not _git_branch_exists(repo_root, epic_branch):
+    created_sha = _git_ref_sha(repo_root, epic_branch)
+    if created_sha != start_point:
         raise RuntimeError(
-            f"could not create epic base branch {epic_branch} in {repo_root}"
-            + (f": {error}" if error else "")
+            f"could not create epic base branch {epic_branch} in {repo_root} at "
+            f"{start_point}" + (f": {error}" if error else "")
         )
+    return True
 
 
 def _story_base_branch(
@@ -12397,20 +12428,127 @@ def _story_base_branch(
     return epic_branch_for(epic_id)
 
 
-def _allow_epic_base_creation(
-    conn: Optional[sqlite3.Connection], task: Task, repo_root: Path
+#: Durable record of the exact commit an epic base branch was created at.
+#: Written to the epic's own event stream, so the base survives branch
+#: cleanup and re-cloning — local refs are not evidence of history.
+EPIC_BASE_PINNED_EVENT = "epic_base_pinned"
+
+
+def _record_epic_base_pin(
+    conn: sqlite3.Connection, epic_id: str, branch: str, base_sha: str
+) -> None:
+    """Persist the epic base SHA, unless an identical pin is already recorded."""
+    existing = _epic_base_pinned_sha(conn, epic_id)
+    if existing == base_sha:
+        return
+    with write_txn(conn):
+        _append_event(
+            conn, epic_id, EPIC_BASE_PINNED_EVENT,
+            {"branch": branch, "base_sha": base_sha},
+        )
+
+
+def _epic_base_pinned_sha(
+    conn: sqlite3.Connection, epic_id: str
+) -> Optional[str]:
+    row = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? "
+        "ORDER BY id DESC LIMIT 1",
+        (epic_id, EPIC_BASE_PINNED_EVENT),
+    ).fetchone()
+    if row is None or not row["payload"]:
+        return None
+    try:
+        sha = str((json.loads(row["payload"]) or {}).get("base_sha") or "").strip()
+    except Exception:
+        return None
+    return sha or None
+
+
+def _latest_epic_integration_sha(
+    conn: sqlite3.Connection, epic_id: str
+) -> Optional[str]:
+    """Newest successful story integration tip for this epic, if any.
+
+    A story integrated into the epic advances its branch, so the last
+    integration is the epic base every later sibling must branch from —
+    a strictly better answer than the original pin once one exists.
+    """
+    members = list_epic_members(conn, epic_id)
+    if not members:
+        return None
+    placeholders = ",".join("?" for _ in members)
+    rows = conn.execute(
+        f"SELECT payload FROM task_events WHERE kind = 'story_integrated_to_epic' "  # noqa: S608 — placeholders only
+        f"AND task_id IN ({placeholders}) ORDER BY id DESC",
+        tuple(members),
+    ).fetchall()
+    target = epic_branch_for(epic_id)
+    for row in rows:
+        if not row["payload"]:
+            continue
+        try:
+            payload = json.loads(row["payload"]) or {}
+        except Exception:
+            continue
+        if payload.get("target_branch") != target:
+            continue
+        sha = str(payload.get("candidate_sha") or "").strip()
+        if sha:
+            return sha
+    return None
+
+
+def _epic_has_materialization_history(
+    conn: sqlite3.Connection, epic_id: str, *, excluding: Optional[str] = None
 ) -> bool:
-    if conn is None:
+    """Whether this epic materialized anything before ``excluding``, from the DB.
+
+    Deliberately not derived from local Git refs: a re-clone or a branch
+    cleanup removes those, and a mature epic would then look brand new and
+    pin its base to whatever ``HEAD`` happens to be.
+
+    ``excluding`` is the member currently being materialized. The dispatcher
+    claims a card — creating its run row — before resolving its workspace, so
+    without this the very first story of a fresh epic would read its own run
+    as prior history and fail closed on every new epic.
+    """
+    if _epic_base_pinned_sha(conn, epic_id) is not None:
+        return True
+    members = [m for m in list_epic_members(conn, epic_id) if m != excluding]
+    if not members:
         return False
+    placeholders = ",".join("?" for _ in members)
+    row = conn.execute(
+        f"SELECT 1 FROM task_runs WHERE task_id IN ({placeholders}) LIMIT 1",  # noqa: S608 — placeholders only
+        tuple(members),
+    ).fetchone()
+    return row is not None
+
+
+def _epic_base_start_point(
+    conn: Optional[sqlite3.Connection], task: Task, repo_root: Path
+) -> tuple[Optional[str], Optional[str]]:
+    """Resolve ``(epic_id, start_point)`` for ``task``'s missing epic base.
+
+    ``start_point`` is ``None`` when no commit can be established honestly —
+    the caller must then fail closed rather than guess.
+    """
+    if conn is None:
+        return None, None
     epic_id = epic_id_for_task(conn, task.id)
     if epic_id is None:
-        return False
-    for member_id in list_epic_members(conn, epic_id):
-        member = get_task(conn, member_id)
-        branch = (member.branch_name if member is not None else None) or f"wt/{member_id}"
-        if _git_branch_exists(repo_root, branch):
-            return False
-    return True
+        return None, None
+    recovered = (
+        _latest_epic_integration_sha(conn, epic_id)
+        or _epic_base_pinned_sha(conn, epic_id)
+    )
+    if recovered:
+        return epic_id, recovered
+    if _epic_has_materialization_history(conn, epic_id, excluding=task.id):
+        return epic_id, None
+    # Genuinely fresh epic: this story is the first, so HEAD really is the base.
+    return epic_id, _git_head_sha(repo_root)
 
 
 def _is_epic_task(conn: sqlite3.Connection, task_id: str) -> bool:
@@ -12600,12 +12738,14 @@ def _resolve_worktree_workspace(
     base = base_branch or "HEAD"
 
     def ensure_epic_base(repo_root: Path) -> None:
-        if base_branch is not None and not _git_branch_exists(repo_root, base_branch):
-            _ensure_epic_branch(
-                repo_root,
-                base_branch,
-                allow_create_at_head=_allow_epic_base_creation(conn, task, repo_root),
-            )
+        if base_branch is None or _git_branch_exists(repo_root, base_branch):
+            return
+        epic_id, start_point = _epic_base_start_point(conn, task, repo_root)
+        if _ensure_epic_branch(repo_root, base_branch, start_point=start_point):
+            # Persist the base the moment it exists, so a later branch
+            # cleanup or fresh clone can recover it from the ledger.
+            if conn is not None and epic_id and start_point:
+                _record_epic_base_pin(conn, epic_id, base_branch, start_point)
 
     if not task.workspace_path:
         # Anchor on the board's configured default_workdir, not Path.cwd().
@@ -12708,12 +12848,7 @@ def _resolve_worktree_workspace(
             f"task {task.id} worktree path {task.workspace_path!r} is not inside a git repo "
             "and does not point at a git repo root"
         )
-    if base_branch is not None and not _git_branch_exists(repo_root, base_branch):
-        _ensure_epic_branch(
-            repo_root,
-            base_branch,
-            allow_create_at_head=_allow_epic_base_creation(conn, task, repo_root),
-        )
+    ensure_epic_base(repo_root)
     _materialize_worktree_with_dependencies(
         repo_root,
         requested,
@@ -13007,7 +13142,7 @@ def _default_epic_verify(epic_branch: str) -> bool:
         repo_root = _git_toplevel(Path(board_default).expanduser())
         if repo_root is None:
             return False
-        _ensure_epic_branch(repo_root, epic_branch, allow_create_at_head=False)
+        _ensure_epic_branch(repo_root, epic_branch, start_point=None)
         target = repo_root / ".worktrees" / f"epic-verify-{epic_branch.replace('/', '-')}"
         from hermes_cli.worktree_dependencies import _acquire_project_lock
 
@@ -13968,6 +14103,33 @@ def release_product_task(
     if not note:
         raise ReleaseEvidenceError(task_id, ["measurement_note"])
 
+    # Deterministic gates first, from one metadata snapshot, BEFORE any
+    # candidate construction, verification run, or Git integration. These
+    # outcomes are already decided by board policy and caller metadata, so
+    # evaluating them after integration meant a predictable refusal landed
+    # with the target branch already moved.
+    workflow = _product_workflow_dict(meta)
+    policy_name = str(workflow.get("deployment_policy") or "manual").strip()
+    if policy_name not in {"manual", "not_required", "required"}:
+        raise ReleaseEvidenceError(task_id, ["deployment_policy"])
+    if policy_name == "required" and release_adapter is None:
+        with write_txn(conn):
+            if not _release_run_is_current(conn, task_id, expected_run_id):
+                return ReleaseResult(False, "completion_conflict")
+            _append_event(
+                conn, task_id, "release_adapter_missing",
+                {"policy": policy_name, "source_sha": source_sha},
+            )
+        return ReleaseResult(False, "release_adapter_missing")
+    pr_required = workflow.get("pull_request_required") is True
+    pull_request = (
+        completion_metadata.get("pull_request")
+        if isinstance(completion_metadata, dict)
+        else None
+    )
+    if pr_required and not pull_request:
+        raise ReleaseEvidenceError(task_id, ["pull_request"])
+
     is_epic = _is_epic_task(conn, task_id)
     epic_id = epic_id_for_task(conn, task_id)
     if is_epic:
@@ -14035,10 +14197,6 @@ def release_product_task(
         measurement_note=note,
     )
 
-    workflow = _product_workflow_dict(meta)
-    policy_name = str(workflow.get("deployment_policy") or "manual").strip()
-    if policy_name not in {"manual", "not_required", "required"}:
-        raise ReleaseEvidenceError(task_id, ["deployment_policy"])
     with write_txn(conn):
         if not _release_run_is_current(conn, task_id, expected_run_id):
             return ReleaseResult(False, "completion_conflict")
@@ -14062,24 +14220,8 @@ def release_product_task(
     evidence["rollback_target"] = None
 
     if policy_name == "required":
-        if release_adapter is None:
-            with write_txn(conn):
-                if not _release_run_is_current(conn, task_id, expected_run_id):
-                    return ReleaseResult(False, "completion_conflict")
-                _append_event(
-                    conn,
-                    task_id,
-                    "release_adapter_missing",
-                    {"policy": policy_name, "integration_sha": integration_sha},
-                )
-            return ReleaseResult(
-                False,
-                "release_adapter_missing",
-                integration.id,
-                integration_sha,
-                policy_event.id if policy_event else None,
-                None,
-            )
+        # release_adapter is guaranteed non-None here: the deterministic gate
+        # above refuses a required policy without one before integration.
         if not _release_run_is_current(conn, task_id, expected_run_id):
             return ReleaseResult(False, "completion_conflict")
         deployment = release_adapter.release(task_id, integration_sha)
@@ -14121,14 +14263,6 @@ def release_product_task(
         evidence["smoke_result"] = deployment.get("smoke_result")
         evidence["rollback_target"] = deployment.get("rollback_target")
 
-    pr_required = workflow.get("pull_request_required") is True
-    pull_request = (
-        completion_metadata.get("pull_request")
-        if isinstance(completion_metadata, dict)
-        else None
-    )
-    if pr_required and not pull_request:
-        raise ReleaseEvidenceError(task_id, ["pull_request"])
     evidence["pull_request"] = pull_request
 
     released = complete_task(
@@ -14944,13 +15078,6 @@ def _spawn_one_v2(
     if claimed is None:
         # Already claimed (or no longer ready) -- the CAS fire-once
         # guarantee: nothing to do on this or any later pass.
-        return None
-    routing_error = resolver_routing_error(conn, claimed.id, claimed.assignee)
-    if routing_error is not None:
-        # Deterministic contract violation: a retry cannot change it, so
-        # block on the first occurrence with the diagnostic rather than
-        # spawning a worker that has no way to end its own run.
-        _record_spawn_failure(conn, claimed.id, routing_error, failure_limit=1)
         return None
     try:
         _stamp_run_executor_identity(conn, claimed)
@@ -17200,6 +17327,12 @@ def _dispatch_once_locked(
                         {"reason": guard_reason},
                     )
             continue
+        if dry_run and resolver_routing_error(conn, row["id"], row_assignee) is not None:
+            # Dry-run must not promise a card the claim seam will refuse. In a
+            # real pass we deliberately fall through to `claim_task`, which
+            # refuses and blocks the card inside its own transaction.
+            result.skipped_nonspawnable.append(row["id"])
+            continue
         if dry_run:
             result.spawned.append((row["id"], row_assignee, ""))
             # Increment per-profile counter even in dry_run so the cap
@@ -17213,16 +17346,6 @@ def _dispatch_once_locked(
             continue
         claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
-            continue
-        routing_error = resolver_routing_error(conn, claimed.id, claimed.assignee)
-        if routing_error is not None:
-            # See _spawn_one_v2: an ordinary card routed to the privileged
-            # Resolver has no lifecycle exit, so block it now with the
-            # contract diagnostic instead of deadlocking a worker.
-            if _record_spawn_failure(
-                conn, claimed.id, routing_error, failure_limit=1
-            ):
-                result.auto_blocked.append(claimed.id)
             continue
         try:
             _stamp_run_executor_identity(conn, claimed)
@@ -17332,15 +17455,6 @@ def _dispatch_once_locked(
             continue
         claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
-            continue
-        routing_error = resolver_routing_error(conn, claimed.id, claimed.assignee)
-        if routing_error is not None:
-            # Same contract as the ready loop — every dispatch path refuses
-            # an ordinary card routed to the privileged Resolver.
-            if _record_spawn_failure(
-                conn, claimed.id, routing_error, failure_limit=1
-            ):
-                result.auto_blocked.append(claimed.id)
             continue
         try:
             _stamp_run_executor_identity(conn, claimed)

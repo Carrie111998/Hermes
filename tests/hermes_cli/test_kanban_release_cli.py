@@ -341,3 +341,99 @@ def test_release_cli_reports_missing_release_evidence(release_home, tmp_path):
     assert task is not None
     assert task.status != "done"
     assert task.current_step_key == "release_measure"
+
+
+def test_release_cli_refuses_when_another_holder_owns_the_run_lease(
+    release_home, tmp_path
+):
+    """Two operators releasing the same card: one wins, the other refuses and
+    does not disturb the winner's claim."""
+    repo, branch, source_sha = _repo_with_story_branch(tmp_path)
+    board = "release-cli-lease"
+    _release_board(board, repo)
+    with kb.connect(board=board) as conn:
+        task_id = _seed_reviewed_card(conn, board, repo, branch, source_sha)
+        # Operator A takes the lease first.
+        winner = kb.claim_task(conn, task_id)
+        assert winner is not None and winner.current_run_id is not None
+        before = _release_snapshot(conn, repo, task_id)
+
+    out = _release(task_id, board)
+
+    assert "already claimed" in out
+    with kb.connect(board=board) as conn:
+        after = _release_snapshot(conn, repo, task_id)
+        task = kb.get_task(conn, task_id)
+    # B changed nothing, and A still holds a live claim on a card that is
+    # neither blocked nor advanced.
+    assert after == before
+    assert task is not None
+    assert task.status == "running"
+    assert task.current_run_id == winner.current_run_id
+
+
+def test_release_cli_returns_the_lease_after_an_evidence_refusal(
+    release_home, tmp_path
+):
+    """An early refusal must not strand the card in `running`."""
+    repo, branch, _source_sha = _repo_with_story_branch(tmp_path)
+    board = "release-cli-lease-return"
+    _release_board(board, repo)
+    with kb.connect(board=board) as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Story: unevidenced",
+            board=board,
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+            branch_name=branch,
+            workflow_template_id="product",
+            current_step_key="release_measure",
+        )
+
+    out = _release(task_id, board)
+
+    assert "evidence" in out.lower()
+    with kb.connect(board=board) as conn:
+        task = kb.get_task(conn, task_id)
+    assert task is not None
+    assert task.status == "ready"
+    assert task.current_run_id is None
+    assert task.current_step_key == "release_measure"
+
+
+def test_release_kernel_refuses_a_policy_changed_after_cli_preflight(
+    release_home, tmp_path, monkeypatch
+):
+    """The metadata race: policy flips between the CLI preflight and the
+    kernel. The kernel reads its own snapshot and refuses before integration."""
+    repo, branch, source_sha = _repo_with_story_branch(tmp_path)
+    board = "release-cli-policy-race"
+    _release_board(board, repo)
+    with kb.connect(board=board) as conn:
+        task_id = _seed_reviewed_card(conn, board, repo, branch, source_sha)
+        before = _release_snapshot(conn, repo, task_id)
+
+    real_metadata = kb.product_board_metadata
+    calls = {"n": 0}
+
+    def flipping_metadata(*args, **kwargs):
+        meta = real_metadata(*args, **kwargs)
+        calls["n"] += 1
+        # First read is the CLI preflight and sees `manual`; every later read
+        # — including the kernel's — sees the policy an operator just changed.
+        if calls["n"] > 1 and isinstance(meta, dict):
+            meta = json.loads(json.dumps(meta))
+            meta.setdefault("product_workflow", {})["deployment_policy"] = "required"
+        return meta
+
+    monkeypatch.setattr(kb, "product_board_metadata", flipping_metadata)
+    out = _release(task_id, board)
+
+    assert calls["n"] > 1
+    assert "did not complete" in out or "release_adapter_missing" in out
+    with kb.connect(board=board) as conn:
+        after = _release_snapshot(conn, repo, task_id)
+    # The target branch never moved: the kernel refused before integration.
+    assert after[0] == before[0]
+    assert (repo / "story.txt").exists() is False

@@ -2544,6 +2544,29 @@ def _cmd_release(args: argparse.Namespace) -> int:
         completion_metadata.update(
             release_operator_label=operator_label, release_surface="cli"
         )
+        # Take the card's run lease before mutating anything. Two operators
+        # (or an operator and a dispatcher) releasing the same card would
+        # otherwise both pass their preflight and both integrate. Epics are
+        # deliberately unclaimable (`claim_task` refuses work_item_kind=epic),
+        # so they release without a lease exactly as before.
+        expected_run_id = None
+        if not is_epic:
+            claimed = kb.claim_task(conn, task_id)
+            if claimed is None:
+                print(
+                    f"kanban: cannot release {task_id}: it is already claimed — "
+                    "another operator or a worker holds the run lease. Nothing "
+                    "was changed.",
+                    file=sys.stderr,
+                )
+                return 1
+            expected_run_id = claimed.current_run_id
+
+        def _release_lease() -> None:
+            """Return an unmutated card to ready after an early refusal."""
+            if expected_run_id is not None:
+                kb.reclaim_task(conn, task_id, reason="release refused")
+
         try:
             result = kb.release_product_task(
                 conn,
@@ -2553,10 +2576,10 @@ def _cmd_release(args: argparse.Namespace) -> int:
                 None,
                 measurement_note=note,
                 completion_metadata=completion_metadata,
-                # No run lease: the operator path is not a claimed worker run.
-                expected_run_id=None,
+                expected_run_id=expected_run_id,
             )
         except kb.ReleaseEvidenceError as exc:
+            _release_lease()
             print(
                 f"kanban: release of {task_id} blocked by release evidence "
                 f"policy. Missing: {', '.join(exc.missing)}. The card remains "
@@ -2565,8 +2588,14 @@ def _cmd_release(args: argparse.Namespace) -> int:
             )
             return 1
         except ValueError as exc:
+            _release_lease()
             print(f"kanban: cannot release {task_id}: {exc}", file=sys.stderr)
             return 1
+        except Exception:
+            _release_lease()
+            raise
+        if not result.released:
+            _release_lease()
     if not result.released:
         print(
             f"kanban: release of {task_id} did not complete: {result.status}. "

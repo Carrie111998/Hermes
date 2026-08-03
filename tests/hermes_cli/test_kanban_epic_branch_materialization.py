@@ -173,12 +173,17 @@ def test_resolve_workspace_derives_the_epic_base_without_an_explicit_argument(
     assert _git(repo, "rev-parse", epic_branch) == base_sha
 
 
-def test_reusing_a_story_worktree_refuses_to_recreate_a_missing_epic_base(
+def test_reusing_a_story_worktree_recovers_the_pinned_epic_base(
     epic_home, tmp_path
 ):
-    """A missing historical epic base must not follow a moved current HEAD."""
+    """A deleted epic base is restored from the persisted SHA, not from HEAD.
+
+    The base is pinned to the event ledger when it is first created, so branch
+    cleanup and re-cloning are both safe: recovery uses the recorded commit
+    even after `main` has moved on.
+    """
     repo = _repo(tmp_path)
-    board = "epic-reuse-heals"
+    board = "epic-reuse-recovers"
     _v2_board(board, repo)
     with kb.connect(board=board) as conn:
         epic_id, story_id = _epic_with_story(conn, board, repo, "Story one")
@@ -188,21 +193,80 @@ def test_reusing_a_story_worktree_refuses_to_recreate_a_missing_epic_base(
             story, board=board, conn=conn
         )
         epic_branch = kb.epic_branch_for(epic_id)
+        original = _git(repo, "rev-parse", epic_branch)
+        assert kb._epic_base_pinned_sha(conn, epic_id) == original
+
         _git(repo, "branch", "-D", epic_branch)
         (repo / "moved.txt").write_text("later\n", encoding="utf-8")
         _git(repo, "add", "moved.txt")
         _git(repo, "commit", "-m", "main moves on")
+        assert _git(repo, "rev-parse", "HEAD") != original
 
         kb.set_workspace_path(conn, story_id, str(workspace))
         kb.set_branch_name(conn, story_id, branch)
         reused = kb.get_task(conn, story_id)
         assert reused is not None
-        with pytest.raises(RuntimeError, match="historical base cannot be established") as exc:
-            kb._resolve_worktree_workspace(reused, board=board, conn=conn)
+        kb._resolve_worktree_workspace(reused, board=board, conn=conn)
 
-    assert Path(workspace).exists()
-    assert epic_branch in str(exc.value)
-    assert not kb._git_branch_exists(repo, epic_branch)
+    assert _git(repo, "rev-parse", epic_branch) == original
+
+
+def test_mature_epic_recovers_after_every_local_ref_is_removed(
+    epic_home, tmp_path
+):
+    """The re-clone case: local branches are gone, the ledger is not."""
+    repo = _repo(tmp_path)
+    board = "epic-reclone"
+    _v2_board(board, repo)
+    with kb.connect(board=board) as conn:
+        epic_id, story_id = _epic_with_story(conn, board, repo, "Story one")
+        story = kb.get_task(conn, story_id)
+        assert story is not None
+        workspace, branch = kb._resolve_worktree_workspace(
+            story, board=board, conn=conn
+        )
+        epic_branch = kb.epic_branch_for(epic_id)
+        original = _git(repo, "rev-parse", epic_branch)
+
+        # Simulate a fresh clone / aggressive cleanup: every ref this epic
+        # produced is gone, and main has advanced.
+        _git(repo, "worktree", "remove", str(workspace), "--force")
+        _git(repo, "branch", "-D", epic_branch)
+        _git(repo, "branch", "-D", branch)
+        (repo / "moved.txt").write_text("later\n", encoding="utf-8")
+        _git(repo, "add", "moved.txt")
+        _git(repo, "commit", "-m", "main moves on")
+
+        sibling_id = _add_story(conn, board, repo, epic_id, "Story two")
+        sibling = kb.get_task(conn, sibling_id)
+        assert sibling is not None
+        kb._resolve_worktree_workspace(sibling, board=board, conn=conn)
+
+    # Recovered from the ledger, not from the moved HEAD.
+    assert _git(repo, "rev-parse", epic_branch) == original
+
+
+def test_legacy_epic_without_a_pin_fails_closed(epic_home, tmp_path):
+    """No pin, no integration, but prior materialization history: refuse."""
+    repo = _repo(tmp_path)
+    board = "epic-legacy-no-pin"
+    _v2_board(board, repo)
+    with kb.connect(board=board) as conn:
+        epic_id, first_id = _epic_with_story(conn, board, repo, "Story one")
+        sibling_id = _add_story(conn, board, repo, epic_id, "Story two")
+        # A legacy epic: the first story really ran, but predates base pinning.
+        with kb.write_txn(conn):
+            kb._synthesize_ended_run(
+                conn, first_id, outcome="advanced", step_key="development",
+            )
+        assert kb._epic_base_pinned_sha(conn, epic_id) is None
+
+        sibling = kb.get_task(conn, sibling_id)
+        assert sibling is not None
+        with pytest.raises(RuntimeError, match="cannot be established"):
+            kb._resolve_worktree_workspace(sibling, board=board, conn=conn)
+
+    assert not kb._git_branch_exists(repo, kb.epic_branch_for(epic_id))
 
 
 def test_missing_epic_base_fails_materialization_loudly(

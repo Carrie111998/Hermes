@@ -997,11 +997,15 @@ def test_assign_task_allows_resolver_on_unresolved_preflight(kanban_home):
     assert task is not None and task.assignee == "resolver"
 
 
-def test_dispatch_refuses_resolver_routing_for_ordinary_task(
+def test_dispatch_refuses_resolver_routing_before_creating_a_run(
     kanban_home, all_assignees_spawnable
 ):
-    """The 2026-08-02 deadlock: an ordinary goal card assigned to
-    ``resolver`` spawned a worker with no lifecycle exit and hung."""
+    """The 2026-08-02 deadlock: an ordinary goal card assigned to ``resolver``
+    spawned a worker with no lifecycle exit and hung.
+
+    The refusal lives in the claim transaction, so an incompatible card never
+    becomes a run at all — no run row, no ``claimed`` event, no subprocess.
+    """
     spawned_ids = []
 
     def fake_spawn(task, workspace):
@@ -1012,16 +1016,28 @@ def test_dispatch_refuses_resolver_routing_for_ordinary_task(
         # Bypass the routing guard the way the incident's cards got there.
         conn.execute("UPDATE tasks SET assignee='resolver' WHERE id=?", (tid,))
         conn.commit()
+
+        dry = kb.dispatch_once(conn, spawn_fn=fake_spawn, dry_run=True)
+        assert tid not in [row[0] for row in dry.spawned]
+        assert tid in dry.skipped_nonspawnable
+
         res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
         task = kb.get_task(conn, tid)
+        runs = conn.execute(
+            "SELECT COUNT(*) FROM task_runs WHERE task_id=?", (tid,)
+        ).fetchone()[0]
+        kinds = [event.kind for event in kb.list_events(conn, tid)]
         error = conn.execute(
             "SELECT last_failure_error FROM tasks WHERE id=?", (tid,)
         ).fetchone()[0]
 
     assert tid not in spawned_ids
+    assert tid not in [row[0] for row in res.spawned]
     assert task is not None and task.status == "blocked"
-    assert "resolver" in (error or "")
-    assert "preflight" in (error or "")
+    assert runs == 0
+    assert "claimed" not in kinds
+    assert "claim_rejected" in kinds
+    assert "resolver" in (error or "") and "preflight" in (error or "")
 
 
 def test_dispatch_allows_resolver_on_unresolved_preflight(
@@ -3370,7 +3386,7 @@ def test_ensure_epic_branch_creates_off_head_idempotently(tmp_path):
     _init_git_repo(repo)
     epic_branch = kb.epic_branch_for("epic-1")
 
-    kb._ensure_epic_branch(repo, epic_branch, allow_create_at_head=True)
+    kb._ensure_epic_branch(repo, epic_branch, start_point=kb._git_head_sha(repo))
     assert kb._git_branch_exists(repo, epic_branch)
     head_sha = subprocess.run(
         ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True,
@@ -3381,7 +3397,7 @@ def test_ensure_epic_branch_creates_off_head_idempotently(tmp_path):
     assert branch_sha == head_sha
 
     # Idempotent: calling again does not error or move the branch.
-    kb._ensure_epic_branch(repo, epic_branch, allow_create_at_head=True)
+    kb._ensure_epic_branch(repo, epic_branch, start_point=kb._git_head_sha(repo))
     branch_sha_again = subprocess.run(
         ["git", "-C", str(repo), "rev-parse", epic_branch], check=True, capture_output=True, text=True,
     ).stdout.strip()
@@ -3450,7 +3466,7 @@ def test_story_worktree_branches_off_epic_branch_contains_upstream_commit(kanban
         epic_branch = kb.epic_branch_for(epic)
 
     # Simulate an upstream story's integrated commit landing on the epic branch.
-    kb._ensure_epic_branch(repo, epic_branch, allow_create_at_head=True)
+    kb._ensure_epic_branch(repo, epic_branch, start_point=kb._git_head_sha(repo))
     subprocess.run(["git", "-C", str(repo), "checkout", epic_branch], check=True, capture_output=True, text=True)
     upstream_sha = _commit_file(repo, "upstream.txt", "upstream story code\n", "upstream story")
     subprocess.run(["git", "-C", str(repo), "checkout", "main"], check=True, capture_output=True, text=True)
@@ -3490,7 +3506,7 @@ def test_spawn_one_v2_wires_story_base_branch_to_epic(kanban_home, tmp_path, mon
         epic = kb.create_task(conn, title="Epic", board=board, work_item_kind="epic")
         epic_branch = kb.epic_branch_for(epic)
 
-    kb._ensure_epic_branch(repo, epic_branch, allow_create_at_head=True)
+    kb._ensure_epic_branch(repo, epic_branch, start_point=kb._git_head_sha(repo))
     subprocess.run(["git", "-C", str(repo), "checkout", epic_branch], check=True, capture_output=True, text=True)
     upstream_sha = _commit_file(repo, "upstream.txt", "upstream story code\n", "upstream story")
     subprocess.run(["git", "-C", str(repo), "checkout", "main"], check=True, capture_output=True, text=True)
