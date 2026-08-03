@@ -283,6 +283,7 @@ describe('watchSessionPins remote pull', () => {
 
   it('lets a later write outlive a stale ack from a superseded one', async () => {
     let first: (v: { ok: boolean }) => void = () => {}
+
     let second: (v: { ok: boolean }) => void = () => {}
 
     patch.mockImplementationOnce(() => new Promise(resolve => (first = resolve)))
