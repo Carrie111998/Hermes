@@ -28,6 +28,16 @@ def run(cmd: list[str], *, cwd: Path = REPO_ROOT) -> subprocess.CompletedProcess
     )
 
 
+def _write_text_atomic(target: Path, text: str) -> None:
+    """Write UTF-8 text via temp+replace to avoid Windows open() Errno 22 locks."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_name(f".{target.name}.overlay-tmp")
+    # Normalize to LF; avoid pathlib newline= which can fail under file locks on Win.
+    payload = text.replace("\r\n", "\n").encode("utf-8")
+    tmp.write_bytes(payload)
+    tmp.replace(target)
+
+
 def overlay_path(path: str, upstream_ref: str, base_sha: str, old_head: str, *, sanitizers: dict) -> tuple[str, str]:
     from apply_three_way_overlay import three_way_merge, git_show
 
@@ -38,14 +48,12 @@ def overlay_path(path: str, upstream_ref: str, base_sha: str, old_head: str, *, 
         fork_text = git_show(old_head, path)
         if up_text is not None:
             target = REPO_ROOT / path
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(up_text, encoding="utf-8", newline="\n")
+            _write_text_atomic(target, up_text)
             run(["git", "add", "--", path])
             return path, "applied-upstream-fallback"
         if fork_text is not None:
             target = REPO_ROOT / path
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(fork_text, encoding="utf-8", newline="\n")
+            _write_text_atomic(target, fork_text)
             run(["git", "add", "--", path])
             return path, "applied-fork-fallback"
         return path, f"failed: missing version for {path}"
@@ -60,7 +68,7 @@ def overlay_path(path: str, upstream_ref: str, base_sha: str, old_head: str, *, 
         status = "applied"
 
     target = REPO_ROOT / path
-    target.write_text(merged, encoding="utf-8", newline="\n")
+    _write_text_atomic(target, merged)
     run(["git", "add", "--", path])
     return path, status
 
