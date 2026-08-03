@@ -62,12 +62,90 @@ class TestContextFileCwd:
         assert _captured_context_cwd(_make_agent()) == tmp_path
 
 
+class TestUniversalProfilePolicy:
+    def test_named_profile_injects_root_policy_and_keeps_cwd_agents_local(
+        self, tmp_path, monkeypatch
+    ):
+        """Exercise the real profile, policy, and cwd context-file loaders."""
+        root = tmp_path / "hermes"
+        profile = root / "profiles" / "recall-specialist"
+        project = tmp_path / "project"
+        profile.mkdir(parents=True)
+        project.mkdir()
+        (root / "AGENTS.md").write_text(
+            "# SoLo Briefs / SoLoRecall Agent Hub\n\n"
+            "Universal reporting policy.\n\n"
+            "# SoLoRecall Deliverable Persistence Rule\n\n"
+            "Persist deliverables in SoLoRecall.\n",
+            encoding="utf-8",
+        )
+        (project / "AGENTS.md").write_text(
+            "CWD_LOCAL_AGENTS_POLICY", encoding="utf-8"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(profile))
+        monkeypatch.setenv("TERMINAL_CWD", str(project))
+
+        parts = build_system_prompt_parts(_make_agent())
+
+        assert "SoLo Briefs / SoLoRecall Agent Hub" in parts["stable"]
+        assert "SoLoRecall Deliverable Persistence Rule" in parts["stable"]
+        assert "CWD_LOCAL_AGENTS_POLICY" not in parts["stable"]
+        assert "CWD_LOCAL_AGENTS_POLICY" in parts["context"]
+        assert "SoLo Briefs / SoLoRecall Agent Hub" not in parts["context"]
+
+    def test_named_profile_policy_is_stable_and_not_project_context(self):
+        agent = _make_agent()
+        marker = "UNIVERSAL_SOLORECALL_POLICY_MARKER"
+        with (
+            patch("run_agent.load_soul_md", return_value=""),
+            patch("run_agent.build_nous_subscription_prompt", return_value=""),
+            patch("run_agent.build_environment_hints", return_value=""),
+            patch("run_agent.build_context_files_prompt", return_value=""),
+            patch("run_agent.load_universal_policy_md", return_value=marker),
+        ):
+            parts = build_system_prompt_parts(agent)
+
+        assert marker in parts["stable"]
+        assert "Universal Profile Policy" in parts["stable"]
+        assert marker not in parts["context"]
+
+    def test_policy_is_not_injected_twice_when_root_cwd_loaded_it(self):
+        agent = _make_agent()
+        marker = "UNIVERSAL_SOLORECALL_POLICY_MARKER"
+        root_context = f"# Project Context\n\n## AGENTS.md\n\n{marker}"
+        with (
+            patch("run_agent.load_soul_md", return_value=""),
+            patch("run_agent.build_nous_subscription_prompt", return_value=""),
+            patch("run_agent.build_environment_hints", return_value=""),
+            patch("run_agent.build_context_files_prompt", return_value=root_context),
+            patch("run_agent.load_universal_policy_md", return_value=marker),
+        ):
+            parts = build_system_prompt_parts(agent)
+
+        assert marker not in parts["stable"]
+        assert parts["context"].count(marker) == 1
+
+    def test_ignore_rules_skips_universal_policy(self):
+        agent = _make_agent(skip_context_files=True)
+        with (
+            patch("run_agent.load_soul_md", return_value=""),
+            patch("run_agent.build_nous_subscription_prompt", return_value=""),
+            patch("run_agent.build_environment_hints", return_value=""),
+            patch("run_agent.load_universal_policy_md", return_value="policy") as policy_loader,
+        ):
+            parts = build_system_prompt_parts(agent)
+
+        policy_loader.assert_not_called()
+        assert "policy" not in parts["stable"]
+
+
 def _stable_prompt(agent):
     with (
         patch("run_agent.load_soul_md", return_value=""),
         patch("run_agent.build_nous_subscription_prompt", return_value=""),
         patch("run_agent.build_environment_hints", return_value=""),
         patch("run_agent.build_context_files_prompt", return_value=""),
+        patch("run_agent.load_universal_policy_md", return_value=""),
     ):
         return build_system_prompt_parts(agent)["stable"]
 
