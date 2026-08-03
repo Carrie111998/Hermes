@@ -78,11 +78,22 @@ def _read_only_db_with_probe_error(tmp_path, monkeypatch, message, sql_needle):
         # __class__ swap (object layout differs from TrackedConnection).
         base = kwargs.get("factory", sqlite3.Connection)
 
-        class _ProbeErrorConnection(base):
+        class _ProbeErrorCursor(sqlite3.Cursor):
             def execute(self, sql, *eargs, **ekwargs):
-                if sql_needle in sql:
+                if isinstance(sql, str) and sql_needle in sql:
                     raise sqlite3.OperationalError(message)
                 return super().execute(sql, *eargs, **ekwargs)
+
+        class _ProbeErrorConnection(base):
+            def execute(self, sql, *eargs, **ekwargs):
+                if isinstance(sql, str) and sql_needle in sql:
+                    raise sqlite3.OperationalError(message)
+                return super().execute(sql, *eargs, **ekwargs)
+
+            def cursor(self, factory=_ProbeErrorCursor):
+                # The RO-open probe goes through cursor().execute — the
+                # connection-level override alone never sees it.
+                return super().cursor(factory)
 
         kwargs["factory"] = _ProbeErrorConnection
         return real_connect(*args, **kwargs)
@@ -99,37 +110,22 @@ def _read_only_db_with_trigram_probe_error(tmp_path, monkeypatch, message):
     )
 
 
-def test_primary_fts_probe_transient_error_keeps_search_enabled(
-    tmp_path, monkeypatch
-):
-    # The transient-vs-absent rule on the PRIMARY messages_fts probe itself
-    # (the trigram tests below exercise only the second probe): a lock during
-    # a checkpoint must classify as transient and keep _fts_enabled=True, so
-    # a silent false-empty is confined to the query that hits the error
-    # instead of latching for the handle's lifetime.
-    db = _read_only_db_with_probe_error(
-        tmp_path, monkeypatch, "database is locked", sql_needle="messages_fts LIMIT"
-    )
-    try:
-        assert db._fts_enabled is True
-    finally:
-        db.close()
+def test_probe_transient_error_surfaces_and_closes(tmp_path, monkeypatch):
+    # Transient probe failures (lock during a checkpoint) SURFACE at open —
+    # upstream's _fts_table_probe re-raises anything that isn't a missing
+    # module/table, and the RO-open path closes the tracked connection on
+    # the way out so _backup_db_file's raw-copy is never blocked by a leaked
+    # handle. (Earlier revisions of this branch kept the handle open with
+    # the flag latched True; upstream's raise-with-cleanup supersedes that.)
+    import pytest
 
+    import sqlite3 as _sqlite3
 
-def test_trigram_probe_transient_error_keeps_trigram_available(tmp_path, monkeypatch):
-    # Same transient-vs-absent rule as the messages_fts probe directly above
-    # it: a lock during a checkpoint must not latch the LIKE fallback (which
-    # ORs tokens and drops NOT/rank) for the handle's lifetime. A wrongly-kept
-    # True costs nothing — search_messages catches the per-query error and
-    # falls through to LIKE.
-    db = _read_only_db_with_trigram_probe_error(
-        tmp_path, monkeypatch, "database is locked"
-    )
-    try:
-        assert db._trigram_available is True
-        assert db._fts_enabled is True
-    finally:
-        db.close()
+    with pytest.raises(_sqlite3.OperationalError, match="locked"):
+        _read_only_db_with_probe_error(
+            tmp_path, monkeypatch, "database is locked",
+            sql_needle="messages_fts",
+        )
 
 
 def test_trigram_probe_missing_table_disables_trigram(tmp_path, monkeypatch):
