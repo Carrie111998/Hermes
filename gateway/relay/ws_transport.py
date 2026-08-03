@@ -53,6 +53,9 @@ WEBSOCKETS_AVAILABLE = websockets is not None
 # How long to wait for the handshake descriptor and for each outbound result.
 _HANDSHAKE_TIMEOUT_S = 30.0
 _OUTBOUND_TIMEOUT_S = 30.0
+# Bound supervisor/reader/ws.close awaits so a wedged peer cannot stall
+# adapter.disconnect beyond the runner's outer disconnect budget.
+_TEARDOWN_AWAIT_TIMEOUT_S = 2.0
 
 # Phase 7 Unit 7d-B: the application close code the connector sends when it
 # rejects/revokes a gateway's WS upgrade auth (mirrors the connector's
@@ -501,20 +504,22 @@ class WebSocketRelayTransport:
         if self._supervisor is not None:
             self._supervisor.cancel()
             try:
-                await self._supervisor
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001 - best-effort teardown
+                await asyncio.wait_for(
+                    self._supervisor, timeout=_TEARDOWN_AWAIT_TIMEOUT_S
+                )
+            except (asyncio.TimeoutError, asyncio.CancelledError, Exception):  # noqa: BLE001 - best-effort teardown
                 pass
             self._supervisor = None
         if self._reader is not None:
             self._reader.cancel()
             try:
-                await self._reader
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001 - best-effort teardown
+                await asyncio.wait_for(self._reader, timeout=_TEARDOWN_AWAIT_TIMEOUT_S)
+            except (asyncio.TimeoutError, asyncio.CancelledError, Exception):  # noqa: BLE001 - best-effort teardown
                 pass
             self._reader = None
         if self._ws is not None:
             try:
-                await self._ws.close()
+                await asyncio.wait_for(self._ws.close(), timeout=_TEARDOWN_AWAIT_TIMEOUT_S)
             except Exception:  # noqa: BLE001
                 pass
             self._ws = None
