@@ -650,6 +650,14 @@ def repair_message_sequence(agent, messages: List[Dict]) -> int:
                 prev["tool_calls"] = prev_calls + new_calls
             elif prev_calls:
                 prev["tool_calls"] = prev_calls
+            else:
+                # Both sides have empty-or-absent tool_calls — remove the
+                # stale key so strict providers (DeepSeek v4, newer OpenAI)
+                # don't 400 on ``tool_calls: []``. Without this branch,
+                # a pre-existing empty ``[]`` on the surviving turn stays
+                # in place and later triggers HTTP 400 "Invalid
+                # 'messages[N].tool_calls': empty array." (#69280 / PR #77944)
+                prev.pop("tool_calls", None)
             # Concatenate plain-text content; leave multimodal (list)
             # content on either side alone to avoid mangling attachment
             # blocks — fall back to keeping the existing content.
