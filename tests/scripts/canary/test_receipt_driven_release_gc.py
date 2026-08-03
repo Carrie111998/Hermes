@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sys
 from contextlib import nullcontext
 from pathlib import Path
 
@@ -14,16 +15,17 @@ from scripts.canary import receipt_driven_release_gc as gc
 @pytest.fixture(autouse=True)
 def _local_lifecycle(monkeypatch):
     monkeypatch.setattr(gc, "host_release_lifecycle_lock", lambda: nullcontext())
-    monkeypatch.setattr(
-        gc,
-        "_rename_noreplace",
-        lambda old_fd, old, new_fd, new: os.rename(
-            old,
-            new,
-            src_dir_fd=old_fd,
-            dst_dir_fd=new_fd,
-        ),
-    )
+    if not sys.platform.startswith("linux"):
+        monkeypatch.setattr(
+            gc,
+            "_rename_noreplace",
+            lambda old_fd, old, new_fd, new: os.rename(
+                old,
+                new,
+                src_dir_fd=old_fd,
+                dst_dir_fd=new_fd,
+            ),
+        )
 
 
 def _sha(index: int) -> str:
@@ -49,10 +51,16 @@ def _layout(tmp_path: Path, **kwargs) -> gc.GCLayout:
     releases.mkdir()
     sources.mkdir()
     evidence.mkdir()
+    trusted_uid = kwargs.pop("trusted_uid", os.geteuid())
+    trusted_gid = kwargs.pop("trusted_gid", os.getegid())
+    validate_parent_chain = kwargs.pop("validate_parent_chain", False)
     return gc.GCLayout(
         release_base=releases,
         source_base=sources,
         evidence_base=evidence,
+        trusted_uid=trusted_uid,
+        trusted_gid=trusted_gid,
+        validate_parent_chain=validate_parent_chain,
         **kwargs,
     )
 
@@ -419,9 +427,9 @@ def test_apply_resumes_idempotent_physical_purge_after_crash(tmp_path, monkeypat
     original_purge = gc._purge_tree_at
     calls = 0
 
-    def crash_after_first_purge(root, name):
+    def crash_after_first_purge(root, name, expected_anchor):
         nonlocal calls
-        original_purge(root, name)
+        original_purge(root, name, expected_anchor)
         calls += 1
         if calls == 1:
             raise RuntimeError("simulated crash after first physical purge")
@@ -466,9 +474,10 @@ def test_apply_resumes_after_crash_between_no_replace_tombstones(tmp_path, monke
 
     def crash_on_second_rename(old_fd, old, new_fd, new):
         nonlocal calls
-        calls += 1
-        if calls == 2:
-            raise RuntimeError("simulated crash between tombstones")
+        if old == candidate:
+            calls += 1
+            if calls == 2:
+                raise RuntimeError("simulated crash between tombstones")
         original_rename(old_fd, old, new_fd, new)
 
     monkeypatch.setattr(gc, "_rename_noreplace", crash_on_second_rename)
@@ -495,6 +504,346 @@ def test_apply_resumes_after_crash_between_no_replace_tombstones(tmp_path, monke
     assert result["removed_release_source_pairs"] == [candidate]
     assert (evidence / gc.LOGICAL_DELETE_NAME).is_file()
     assert (evidence / gc.PURGE_NAME).is_file()
+
+
+def test_apply_resumes_remaining_units_from_durable_plan_anchor(tmp_path, monkeypatch):
+    layout = _layout(tmp_path)
+    revisions = [_sha(index) for index in range(1, 6)]
+    for created, revision in enumerate(revisions, start=1):
+        _pair(layout, revision, created)
+    plan = gc.build_plan(layout, production_sha=_sha(99))
+    candidates = [
+        unit["revision"] for unit in plan["units"] if unit["action"] == "delete_pair"
+    ]
+    assert candidates == revisions[:2]
+    original_apply = gc._apply_unit
+    calls = 0
+
+    def crash_after_first_complete(layout_arg, unit, approved):
+        nonlocal calls
+        original_apply(layout_arg, unit, approved)
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("simulated crash after first unit")
+
+    monkeypatch.setattr(gc, "_apply_unit", crash_after_first_complete)
+    with pytest.raises(RuntimeError, match="after first unit"):
+        gc.apply_plan(
+            layout,
+            production_sha=_sha(99),
+            approved_plan_sha256=plan["plan_sha256"],
+            require_root_linux=False,
+        )
+
+    anchor = layout.evidence_base / gc._plan_anchor_name(plan["plan_sha256"])
+    assert anchor.is_file()
+    assert not (layout.release_base / candidates[0]).exists()
+    assert (layout.release_base / candidates[1]).is_dir()
+    monkeypatch.setattr(gc, "_apply_unit", original_apply)
+
+    result = gc.apply_plan(
+        layout,
+        production_sha=_sha(99),
+        approved_plan_sha256=plan["plan_sha256"],
+        require_root_linux=False,
+    )
+
+    assert result["removed_release_source_pairs"] == candidates
+    assert all(not (layout.release_base / item).exists() for item in candidates)
+    assert all(not (layout.source_base / item).exists() for item in candidates)
+
+
+def test_retry_distinguishes_complete_unit_and_protects_remaining_unit(
+    tmp_path, monkeypatch
+):
+    protected_ref = tmp_path / "pending.json"
+    protected_ref.write_bytes(_canonical({"revisions": []}))
+    layout = _layout(tmp_path, protected_refs=(protected_ref,))
+    revisions = [_sha(index) for index in range(1, 6)]
+    for created, revision in enumerate(revisions, start=1):
+        _pair(layout, revision, created)
+    plan = gc.build_plan(layout, production_sha=_sha(99))
+    candidates = [
+        unit["revision"] for unit in plan["units"] if unit["action"] == "delete_pair"
+    ]
+    original_apply = gc._apply_unit
+    calls = 0
+
+    def crash_after_first_complete(layout_arg, unit, approved):
+        nonlocal calls
+        original_apply(layout_arg, unit, approved)
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("simulated crash after first unit")
+
+    monkeypatch.setattr(gc, "_apply_unit", crash_after_first_complete)
+    with pytest.raises(RuntimeError, match="after first unit"):
+        gc.apply_plan(
+            layout,
+            production_sha=_sha(99),
+            approved_plan_sha256=plan["plan_sha256"],
+            require_root_linux=False,
+        )
+    protected_ref.write_bytes(_canonical({"revisions": [candidates[1]]}))
+    monkeypatch.setattr(gc, "_apply_unit", original_apply)
+
+    with pytest.raises(RuntimeError, match="became protected"):
+        gc.apply_plan(
+            layout,
+            production_sha=_sha(99),
+            approved_plan_sha256=plan["plan_sha256"],
+            require_root_linux=False,
+        )
+    assert not (layout.release_base / candidates[0]).exists()
+    assert (layout.evidence_base / candidates[0] / gc.PURGE_NAME).is_file()
+    assert (layout.release_base / candidates[1]).is_dir()
+    assert (layout.source_base / candidates[1]).is_dir()
+
+
+def test_receipt_candidate_recovers_after_fsync_before_noreplace(tmp_path, monkeypatch):
+    layout = _layout(tmp_path)
+    revisions = [_sha(index) for index in range(1, 5)]
+    for created, revision in enumerate(revisions, start=1):
+        _pair(layout, revision, created)
+    plan = gc.build_plan(layout, production_sha=_sha(99))
+    original_rename = gc._rename_noreplace
+    crashed = False
+
+    def crash_intent_publication(old_fd, old, new_fd, new):
+        nonlocal crashed
+        if new == gc.INTENT_NAME and not crashed:
+            crashed = True
+            raise RuntimeError("simulated crash before receipt rename")
+        original_rename(old_fd, old, new_fd, new)
+
+    monkeypatch.setattr(gc, "_rename_noreplace", crash_intent_publication)
+    with pytest.raises(RuntimeError, match="before receipt rename"):
+        gc.apply_plan(
+            layout,
+            production_sha=_sha(99),
+            approved_plan_sha256=plan["plan_sha256"],
+            require_root_linux=False,
+        )
+    evidence = layout.evidence_base / revisions[0]
+    assert not (evidence / gc.INTENT_NAME).exists()
+    assert any(path.name.endswith(".candidate") for path in evidence.iterdir())
+
+    monkeypatch.setattr(gc, "_rename_noreplace", original_rename)
+    result = gc.apply_plan(
+        layout,
+        production_sha=_sha(99),
+        approved_plan_sha256=plan["plan_sha256"],
+        require_root_linux=False,
+    )
+
+    assert result["removed_release_source_pairs"] == [revisions[0]]
+    assert (evidence / gc.INTENT_NAME).is_file()
+    assert not any(path.name.endswith(".candidate") for path in evidence.iterdir())
+
+
+def test_approved_plan_anchor_candidate_recovers_before_any_mutation(
+    tmp_path, monkeypatch
+):
+    layout = _layout(tmp_path)
+    revisions = [_sha(index) for index in range(1, 5)]
+    for created, revision in enumerate(revisions, start=1):
+        _pair(layout, revision, created)
+    plan = gc.build_plan(layout, production_sha=_sha(99))
+    anchor_name = gc._plan_anchor_name(plan["plan_sha256"])
+    original_rename = gc._rename_noreplace
+    crashed = False
+
+    def crash_anchor_publication(old_fd, old, new_fd, new):
+        nonlocal crashed
+        if new == anchor_name and not crashed:
+            crashed = True
+            raise RuntimeError("simulated crash before plan-anchor rename")
+        original_rename(old_fd, old, new_fd, new)
+
+    monkeypatch.setattr(gc, "_rename_noreplace", crash_anchor_publication)
+    with pytest.raises(RuntimeError, match="plan-anchor rename"):
+        gc.apply_plan(
+            layout,
+            production_sha=_sha(99),
+            approved_plan_sha256=plan["plan_sha256"],
+            require_root_linux=False,
+        )
+    assert not (layout.evidence_base / anchor_name).exists()
+    assert (layout.release_base / revisions[0]).is_dir()
+
+    monkeypatch.setattr(gc, "_rename_noreplace", original_rename)
+    result = gc.apply_plan(
+        layout,
+        production_sha=_sha(99),
+        approved_plan_sha256=plan["plan_sha256"],
+        require_root_linux=False,
+    )
+
+    assert result["removed_release_source_pairs"] == [revisions[0]]
+    assert (layout.evidence_base / anchor_name).is_file()
+
+
+def test_mid_tree_unlink_crash_is_monotonic_and_resumable(tmp_path, monkeypatch):
+    layout = _layout(tmp_path)
+    revisions = [_sha(index) for index in range(1, 5)]
+    for created, revision in enumerate(revisions, start=1):
+        _pair(layout, revision, created)
+    candidate = revisions[0]
+    nested = layout.source_base / candidate / "nested" / "deeper"
+    nested.mkdir(parents=True)
+    (nested / "one").write_text("one", encoding="ascii")
+    (nested / "two").write_text("two", encoding="ascii")
+    plan = gc.build_plan(layout, production_sha=_sha(99))
+    original_unlink = gc.os.unlink
+    crashed = False
+
+    def crash_after_unlink(path, *args, **kwargs):
+        nonlocal crashed
+        original_unlink(path, *args, **kwargs)
+        if path in {"one", "two"} and not crashed:
+            crashed = True
+            raise RuntimeError("simulated mid-tree crash")
+
+    monkeypatch.setattr(gc.os, "unlink", crash_after_unlink)
+    with pytest.raises(RuntimeError, match="mid-tree crash"):
+        gc.apply_plan(
+            layout,
+            production_sha=_sha(99),
+            approved_plan_sha256=plan["plan_sha256"],
+            require_root_linux=False,
+        )
+    monkeypatch.setattr(gc.os, "unlink", original_unlink)
+
+    result = gc.apply_plan(
+        layout,
+        production_sha=_sha(99),
+        approved_plan_sha256=plan["plan_sha256"],
+        require_root_linux=False,
+    )
+
+    assert result["removed_release_source_pairs"] == [candidate]
+    assert not (layout.source_base / candidate).exists()
+    assert not (layout.release_base / candidate).exists()
+
+
+def test_purge_unlinks_pinned_symlink_without_following_target(tmp_path):
+    layout = _layout(tmp_path)
+    revisions = [_sha(index) for index in range(1, 5)]
+    for created, revision in enumerate(revisions, start=1):
+        _pair(layout, revision, created)
+    candidate = revisions[0]
+    outside = tmp_path / "outside-must-survive"
+    outside.write_text("survives", encoding="ascii")
+    (layout.source_base / candidate / "outside-link").symlink_to(outside)
+    plan = gc.build_plan(layout, production_sha=_sha(99))
+
+    gc.apply_plan(
+        layout,
+        production_sha=_sha(99),
+        approved_plan_sha256=plan["plan_sha256"],
+        require_root_linux=False,
+    )
+
+    assert outside.read_text(encoding="ascii") == "survives"
+
+
+def test_foreign_tombstone_swap_is_rejected_without_purging_it(tmp_path, monkeypatch):
+    layout = _layout(tmp_path)
+    revisions = [_sha(index) for index in range(1, 5)]
+    for created, revision in enumerate(revisions, start=1):
+        _pair(layout, revision, created)
+    candidate = revisions[0]
+    plan = gc.build_plan(layout, production_sha=_sha(99))
+    original_purge = gc._purge_tree_at
+
+    def crash_before_purge(_root, _name, _anchor):
+        raise RuntimeError("simulated crash before purge")
+
+    monkeypatch.setattr(gc, "_purge_tree_at", crash_before_purge)
+    with pytest.raises(RuntimeError, match="before purge"):
+        gc.apply_plan(
+            layout,
+            production_sha=_sha(99),
+            approved_plan_sha256=plan["plan_sha256"],
+            require_root_linux=False,
+        )
+    logical = json.loads(
+        (layout.evidence_base / candidate / gc.LOGICAL_DELETE_NAME).read_text()
+    )
+    tombstone = layout.source_base / logical["source_tombstone"]
+    saved = layout.source_base / ".saved-pinned-tombstone"
+    tombstone.rename(saved)
+    tombstone.mkdir()
+    marker = tombstone / "foreign"
+    marker.write_text("do not delete", encoding="ascii")
+    monkeypatch.setattr(gc, "_purge_tree_at", original_purge)
+
+    with pytest.raises(RuntimeError, match="identity changed"):
+        gc.apply_plan(
+            layout,
+            production_sha=_sha(99),
+            approved_plan_sha256=plan["plan_sha256"],
+            require_root_linux=False,
+        )
+    assert marker.read_text(encoding="ascii") == "do not delete"
+    assert saved.is_dir()
+
+
+def test_physical_receipt_is_not_written_until_exact_final_absence(
+    tmp_path, monkeypatch
+):
+    layout = _layout(tmp_path)
+    revisions = [_sha(index) for index in range(1, 5)]
+    for created, revision in enumerate(revisions, start=1):
+        _pair(layout, revision, created)
+    candidate = revisions[0]
+    plan = gc.build_plan(layout, production_sha=_sha(99))
+    monkeypatch.setattr(gc, "_purge_tree_at", lambda *_args: None)
+
+    with pytest.raises(RuntimeError, match="final absence"):
+        gc.apply_plan(
+            layout,
+            production_sha=_sha(99),
+            approved_plan_sha256=plan["plan_sha256"],
+            require_root_linux=False,
+        )
+    assert not (layout.evidence_base / candidate / gc.PURGE_NAME).exists()
+
+
+def test_root_swap_during_plan_is_detected(tmp_path, monkeypatch):
+    layout = _layout(tmp_path)
+    _pair(layout, _sha(1), 1)
+    original_inventory = gc._inventory_root
+    swapped = False
+
+    def swap_after_inventory(root):
+        nonlocal swapped
+        result = original_inventory(root)
+        if root.path == layout.release_base and not swapped:
+            swapped = True
+            saved = layout.release_base.with_name("releases-pinned")
+            layout.release_base.rename(saved)
+            layout.release_base.mkdir()
+        return result
+
+    monkeypatch.setattr(gc, "_inventory_root", swap_after_inventory)
+    with pytest.raises(RuntimeError, match="identity changed while in use"):
+        gc.build_plan(layout, production_sha=_sha(99))
+
+
+def test_untrusted_writable_gc_root_is_rejected(tmp_path):
+    layout = _layout(tmp_path)
+    layout.release_base.chmod(0o777)
+
+    with pytest.raises(PermissionError, match="exact trusted directory"):
+        gc.build_plan(layout, production_sha=_sha(99))
+
+
+def test_untrusted_parent_chain_is_rejected(tmp_path):
+    layout = _layout(tmp_path, validate_parent_chain=True)
+
+    with pytest.raises(PermissionError, match="parent chain is not trusted"):
+        gc.build_plan(layout, production_sha=_sha(99))
 
 
 def test_unknown_entries_are_reported_and_never_removed(tmp_path):
@@ -594,4 +943,9 @@ def test_protection_inventory_must_contain_every_nonempty_class(tmp_path):
     )
 
     with pytest.raises(RuntimeError, match="incomplete or invalid"):
-        gc.load_protection_inventory(path)
+        gc.load_protection_inventory(
+            path,
+            trusted_uid=os.geteuid(),
+            trusted_gid=os.getegid(),
+            validate_parent_chain=False,
+        )
