@@ -380,7 +380,17 @@ def _sanitize_node(node: Any, path: str) -> Any:
                 continue
             if len(non_null) >= 2:
                 # Preserve all branches as a union instead of dropping them.
-                out["anyOf"] = [{"type": t} for t in non_null]
+                # Route each synthesized branch back through _sanitize_node so
+                # a branch that is itself hostile gets repaired — notably an
+                # ``"array"`` branch gains ``items: {}`` and an ``"object"``
+                # branch gains ``properties: {}``. A bare ``{"type": "array"}``
+                # here would otherwise skip the array-``items`` injection below
+                # (that runs on ``out.type``, not on anyOf members) and Gemini
+                # would still 400 the declaration (#71804).
+                out["anyOf"] = [
+                    _sanitize_node({"type": t}, f"{path}.anyOf[{i}]")
+                    for i, t in enumerate(non_null)
+                ]
                 if has_null:
                     out.setdefault("nullable", True)
                 continue
