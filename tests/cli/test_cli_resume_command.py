@@ -282,11 +282,16 @@ class TestListRecentSessionsSources:
 
         db = SessionDB(db_path=tmp_path / "picker.db")
         # Human surfaces, each must be visible (the bug hid tui/webui).
+        # ACP, webhook, and custom sources are user-facing per the shared
+        # contract (methods_session.py) and must stay visible too.
         for sid, src in [
             ("h_cli", "cli"),
             ("h_tui", "tui"),
             ("h_webui", "webui"),
             ("h_telegram", "telegram"),
+            ("h_acp", "acp"),
+            ("h_webhook", "webhook"),
+            ("h_custom", "custom"),
         ]:
             db.create_session(sid, src)
             db.set_session_title(sid, f"Title {sid}")
@@ -296,8 +301,6 @@ class TestListRecentSessionsSources:
             ("a_tool", "tool"),
             ("a_kanban", "kanban"),
             ("a_sub", "subagent"),
-            ("a_acp", "acp"),
-            ("a_batch", "batch"),
         ]:
             db.create_session(sid, src)
             db.set_session_title(sid, f"Title {sid}")
@@ -316,12 +319,15 @@ class TestListRecentSessionsSources:
 
     def test_picker_lists_all_human_surfaces(self, db):
         ids = {r["id"] for r in self._picker(db)._list_recent_sessions(limit=20)}
-        assert {"h_cli", "h_tui", "h_webui", "h_telegram"} <= ids
+        assert {
+            "h_cli", "h_tui", "h_webui", "h_telegram",
+            "h_acp", "h_webhook", "h_custom",
+        } <= ids
 
     def test_picker_hides_automation_sources(self, db):
         ids = {r["id"] for r in self._picker(db)._list_recent_sessions(limit=20)}
         assert ids.isdisjoint(
-            {"a_cron", "a_tool", "a_kanban", "a_sub", "a_acp", "a_batch"}
+            {"a_cron", "a_tool", "a_kanban", "a_sub"}
         )
 
     def test_picker_excludes_current_session(self, db):
