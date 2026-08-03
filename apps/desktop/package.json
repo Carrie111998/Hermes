@@ -269,8 +269,7 @@
       "perMachine": false,
       "shortcutName": "Hermes",
       "uninstallDisplayName": "Hermes",
-      "warningsAsErrors": false,
-      "include": "build/installer.nsh"
+      "warningsAsErrors": false
     }
   }
 }
