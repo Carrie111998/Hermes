@@ -11,10 +11,13 @@ import logging
 import shlex
 import tarfile
 import threading
+import time
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
 from hermes_constants import get_hermes_home
+from agent.monitoring.modal_lifecycle import record as record_modal_lifecycle
+from agent.monitoring.modal_lifecycle import sandbox_id as modal_sandbox_id
 from tools.environments.base import (
     BaseEnvironment,
     _ThreadedProcessHandle,
@@ -185,6 +188,8 @@ class ModalEnvironment(BaseEnvironment):
 
         self._persistent = persistent_filesystem
         self._task_id = task_id
+        self._modal_image = image
+        self._lease_id = None
         self._sandbox = None
         self._app = None
         self._worker = _AsyncWorker()
@@ -256,6 +261,7 @@ class ModalEnvironment(BaseEnvironment):
             )
             return app, sandbox
 
+        create_started = time.monotonic()
         try:
             target_image_spec = restored_snapshot_id or image
             try:
@@ -278,9 +284,18 @@ class ModalEnvironment(BaseEnvironment):
             else:
                 if restored_snapshot_id and restored_from_legacy_key:
                     _store_direct_snapshot(self._task_id, restored_snapshot_id)
-        except Exception:
+        except Exception as exc:
+            record_modal_lifecycle(
+                "sandbox.create", task_id=self._task_id, image=self._modal_image,
+                duration_ms=(time.monotonic() - create_started) * 1000, error=exc,
+            )
             self._worker.stop()
             raise
+        record_modal_lifecycle(
+            "sandbox.create", task_id=self._task_id, lease_id=self._lease_id,
+            sandbox_id=modal_sandbox_id(self._sandbox), image=self._modal_image,
+            duration_ms=(time.monotonic() - create_started) * 1000,
+        )
 
         logger.info("Modal: sandbox created (task=%s)", self._task_id)
 
@@ -291,7 +306,21 @@ class ModalEnvironment(BaseEnvironment):
             bulk_upload_fn=self._modal_bulk_upload,
             bulk_download_fn=self._modal_bulk_download,
         )
-        self._sync_manager.sync(force=True)
+        sync_started = time.monotonic()
+        try:
+            self._sync_manager.sync(force=True)
+        except Exception as exc:
+            record_modal_lifecycle(
+                "file_sync.initial", task_id=self._task_id, lease_id=self._lease_id,
+                sandbox_id=modal_sandbox_id(self._sandbox), image=self._modal_image,
+                duration_ms=(time.monotonic() - sync_started) * 1000, error=exc,
+            )
+            raise
+        record_modal_lifecycle(
+            "file_sync.initial", task_id=self._task_id, lease_id=self._lease_id,
+            sandbox_id=modal_sandbox_id(self._sandbox), image=self._modal_image,
+            duration_ms=(time.monotonic() - sync_started) * 1000,
+        )
         self.init_session()
 
     def _modal_upload(self, host_path: str, remote_path: str) -> None:
@@ -401,7 +430,21 @@ class ModalEnvironment(BaseEnvironment):
 
     def _before_execute(self) -> None:
         """Sync files to sandbox via FileSyncManager (rate-limited internally)."""
-        self._sync_manager.sync()
+        sync_started = time.monotonic()
+        try:
+            self._sync_manager.sync()
+        except Exception as exc:
+            record_modal_lifecycle(
+                "file_sync.before_execute", task_id=self._task_id, lease_id=self._lease_id,
+                sandbox_id=modal_sandbox_id(self._sandbox), image=self._modal_image,
+                duration_ms=(time.monotonic() - sync_started) * 1000, error=exc,
+            )
+            raise
+        record_modal_lifecycle(
+            "file_sync.before_execute", task_id=self._task_id, lease_id=self._lease_id,
+            sandbox_id=modal_sandbox_id(self._sandbox), image=self._modal_image,
+            duration_ms=(time.monotonic() - sync_started) * 1000,
+        )
 
     # ------------------------------------------------------------------
     # Execution
@@ -448,7 +491,21 @@ class ModalEnvironment(BaseEnvironment):
 
         if self._sync_manager:
             logger.info("Modal: syncing files from sandbox...")
-            self._sync_manager.sync_back()
+            sync_started = time.monotonic()
+            try:
+                self._sync_manager.sync_back()
+            except Exception as exc:
+                record_modal_lifecycle(
+                    "file_sync.cleanup", task_id=self._task_id, lease_id=self._lease_id,
+                    sandbox_id=modal_sandbox_id(self._sandbox), image=self._modal_image,
+                    duration_ms=(time.monotonic() - sync_started) * 1000, error=exc,
+                )
+                raise
+            record_modal_lifecycle(
+                "file_sync.cleanup", task_id=self._task_id, lease_id=self._lease_id,
+                sandbox_id=modal_sandbox_id(self._sandbox), image=self._modal_image,
+                duration_ms=(time.monotonic() - sync_started) * 1000,
+            )
 
         if self._persistent:
             try:
@@ -470,10 +527,21 @@ class ModalEnvironment(BaseEnvironment):
             except Exception as e:
                 logger.warning("Modal: filesystem snapshot failed: %s", e)
 
+        terminate_started = time.monotonic()
         try:
             self._worker.run_coroutine(self._sandbox.terminate.aio(), timeout=15)
-        except Exception:
-            pass
+        except Exception as exc:
+            record_modal_lifecycle(
+                "sandbox.cleanup", task_id=self._task_id, lease_id=self._lease_id,
+                sandbox_id=modal_sandbox_id(self._sandbox), image=self._modal_image,
+                duration_ms=(time.monotonic() - terminate_started) * 1000, error=exc,
+            )
+        else:
+            record_modal_lifecycle(
+                "sandbox.cleanup", task_id=self._task_id, lease_id=self._lease_id,
+                sandbox_id=modal_sandbox_id(self._sandbox), image=self._modal_image,
+                duration_ms=(time.monotonic() - terminate_started) * 1000,
+            )
         finally:
             self._worker.stop()
             self._sandbox = None

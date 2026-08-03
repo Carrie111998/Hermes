@@ -173,6 +173,7 @@ class ModalDesktopEnvironment(ModalEnvironment):
             persistent_filesystem=config.persistent_filesystem, task_id=compute_lease.task_id,
             sandbox_command=config.cua_driver_runtime_command,
         )
+        self._lease_id = compute_lease.lease_id
 
     @property
     def compute_lease(self) -> ComputeLease:
@@ -183,6 +184,7 @@ class ModalDesktopEnvironment(ModalEnvironment):
             self._computer_backend = _TransportComputerBackend(
                 ModalSandboxMcpTransport(
                     self._sandbox, self._worker,
+                    task_id=getattr(self, "_task_id", None), lease_id=getattr(self, "_lease_id", None), image=getattr(self, "_modal_image", None),
                     port=self._desktop_config.cua_driver_port,
                     path=self._desktop_config.cua_driver_path,
                 )

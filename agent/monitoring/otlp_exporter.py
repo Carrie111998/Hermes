@@ -151,6 +151,10 @@ def _span_attrs(ev: Dict[str, Any]) -> Dict[str, Any]:
                                "version", "severity"),
         "cron_execution": ("status", "job_key", "source", "duration_ms",
                            "delivery_outcome", "error_class"),
+        "modal_lifecycle": (
+            "provider", "operation", "result", "duration_ms", "error_class",
+            "task_id_hash", "lease_id_hash", "sandbox_id_hash", "image_ref",
+        ),
     }
     for col in keep_by_kind.get(kind, ()):  # type: ignore[arg-type]
         v = ev.get(col)

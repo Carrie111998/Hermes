@@ -40,6 +40,14 @@ _DIAGNOSTIC_ATTRIBUTE_KEYS = frozenset({
     "new_state",
     "version",
     "severity",
+    "provider",
+    "operation",
+    "result",
+    "duration_ms",
+    "task_id_hash",
+    "lease_id_hash",
+    "sandbox_id_hash",
+    "image_ref",
 })
 _SAFE_RESOURCE_VALUE = re.compile(r"^[A-Za-z0-9._:/-]{1,128}$")
 
@@ -506,7 +514,7 @@ class GatewayDiagnosticLogStreamer:
         from agent.monitoring.gateway_health import source_logger_for_export
 
         for ev in batch:
-            if ev.get("event") != "gateway_diagnostic":
+            if ev.get("event") not in {"gateway_diagnostic", "modal_lifecycle"}:
                 continue
             attrs = _diagnostic_log_attributes(ev)
             # Preserve the source-controlled Python logger as the OTel
@@ -522,7 +530,7 @@ class GatewayDiagnosticLogStreamer:
                 if source_logger is not None
                 else self._logger
             )
-            body = "gateway diagnostic"
+            body = "modal lifecycle" if ev.get("event") == "modal_lifecycle" else "gateway diagnostic"
             record = self._LogRecord(
                 timestamp=ev.get("ts_ns"),
                 trace_id=self._sdk["INVALID_TRACE_ID"],
@@ -581,7 +589,7 @@ def _attach_log_handler(config: Dict[str, Any]) -> Any:
 
 
 def _gateway_health_event(ev: Dict[str, Any]) -> bool:
-    return ev.get("event") in {"gateway_health", "cron_execution"}
+    return ev.get("event") in {"gateway_health", "cron_execution", "modal_lifecycle"}
 
 
 def start_gateway_health_export(config: Dict[str, Any]) -> GatewayHealthExportRuntime:
