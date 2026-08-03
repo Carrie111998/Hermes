@@ -56,10 +56,17 @@ def _host_of(url: str) -> str:
     return u.split("/")[0].split("?")[0].split("#")[0].lower()
 
 
+def _registrable(host: str) -> str:
+    """Best-effort registrable domain: the last two labels (sld.tld)."""
+    labels = host.split(".")
+    return ".".join(labels[-2:]) if len(labels) >= 2 else host
+
+
 def score_urls(urls, url_cfg):
     """Return (weights, notes) for URL-based signals."""
     weights, notes = [], []
     w = url_cfg.get("weights", {})
+    brands = url_cfg.get("protected_brands", {})
     for url in urls:
         host = _host_of(url)
         if not host:
@@ -81,17 +88,29 @@ def score_urls(urls, url_cfg):
         if tld in url_cfg.get("suspicious_tlds", []):
             weights.append(w.get("suspicious_tld", 0.4))
             notes.append(f"подозрительная зона .{tld}")
-        labels = host.split(".")
-        if len(labels) >= 5:
+        if len(host.split(".")) >= 5:
             weights.append(w.get("many_subdomains", 0.3))
             notes.append(f"много поддоменов в хосте ({host})")
-        sld = labels[-2] if len(labels) >= 2 else host  # registrable second-level label
-        for brand in url_cfg.get("lookalike_targets", []):
-            # Brand name is present in the host, but the registrable label is not
-            # exactly the brand (e.g. "metamask-verify", "metamask.top") -> lookalike.
-            if brand in host and sld != brand:
+        # Lookalike: a protected brand appears as a distinct token in the host,
+        # but the registrable domain is not one of that brand's official ones.
+        # Token-boundary matching (split on non-alphanumeric) avoids false
+        # positives on unrelated words that merely contain a short brand string
+        # (e.g. "colgate.com" / "gateway.com" are NOT flagged for brand "gate").
+        # For brands >= 6 chars a concatenated prefix ("binancelogin.top") also
+        # matches. Bare-brand deceptive domains ("metamask.top") are caught,
+        # while official domains ("metamask.io", "support.metamask.io") are not.
+        reg = _registrable(host)
+        host_tokens = [t for t in re.split(r"[^a-z0-9]+", host) if t]
+        sld = host.split(".")[-2] if len(host.split(".")) >= 2 else host
+        for brand, official in brands.items():
+            if reg in official:
+                continue
+            if brand in host_tokens or (len(brand) >= 6 and sld.startswith(brand)):
                 weights.append(w.get("lookalike_domain", 0.75))
-                notes.append(f"домен маскируется под '{brand}' ({host})")
+                official_str = ", ".join(official)
+                notes.append(
+                    f"домен маскируется под '{brand}' ({host}) — официальный: {official_str}"
+                )
                 break
     return weights, notes
 

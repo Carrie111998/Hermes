@@ -6,7 +6,7 @@ import pytest
 
 # Locate the skill's scanner relative to the repo root (tests/skills/ -> repo).
 _REPO = Path(__file__).resolve().parents[2]
-_SCAN = _REPO / "skills" / "security" / "scam-shield" / "scripts" / "scan.py"
+_SCAN = _REPO / "optional-skills" / "security" / "scam-shield" / "scripts" / "scan.py"
 
 
 def _load_scan():
@@ -20,11 +20,26 @@ scan = _load_scan()
 PATTERNS = scan.load_patterns(_SCAN.parent.parent / "references" / "patterns.json")
 
 
+def _findings(text):
+    return scan.build_report(text, PATTERNS)["url_findings"]
+
+
+def _is_lookalike(text):
+    return any("маскируется" in n for n in _findings(text))
+
+
 def test_patterns_file_loads_and_has_signals():
     assert PATTERNS["signals"]
     for sig in PATTERNS["signals"]:
         assert 0.0 <= sig["weight"] <= 1.0
         assert sig["id"] and sig["scheme_tag"] and sig["safe_action"]
+
+
+def test_protected_brands_have_verified_domains():
+    brands = PATTERNS["url_config"]["protected_brands"]
+    assert len(brands) >= 20
+    for brand, official in brands.items():
+        assert official and all("." in d for d in official), brand
 
 
 def test_seed_phrase_scam_scores_high():
@@ -57,11 +72,28 @@ def test_otp_request_flags_account_takeover():
     assert "account_takeover" in rep["scheme_tags"]
 
 
-def test_lookalike_domain_detected_but_legit_subdomain_is_not():
-    fake = scan.build_report("open https://metamask-verify.top now", PATTERNS)
-    assert any("маскируется" in n for n in fake["url_findings"])
-    legit = scan.build_report("see https://support.metamask.io/help", PATTERNS)
-    assert not any("маскируется" in n for n in legit["url_findings"])
+def test_hyphenated_and_bare_brand_lookalikes_detected():
+    assert _is_lookalike("open https://metamask-verify.top")   # hyphenated
+    assert _is_lookalike("verify at https://metamask.top")     # bare brand
+    assert _is_lookalike("login https://binance-login.top")    # hyphenated
+
+
+def test_concatenated_lookalike_for_long_brand():
+    # brand >= 6 chars: concatenated prefix in the SLD is caught
+    assert _is_lookalike("go to https://binancelogin.top")
+
+
+def test_official_domains_never_flagged():
+    for url in ("https://metamask.io", "https://support.metamask.io/help",
+                "https://binance.com", "https://gate.io", "https://gate.com",
+                "https://ledger.com", "https://curve.finance"):
+        assert not _is_lookalike(f"open {url}"), url
+
+
+def test_no_false_positive_on_unrelated_words():
+    # short brand token "gate" must NOT flag unrelated words containing it
+    for url in ("https://colgate.com", "https://gateway.com", "https://floodgate.io"):
+        assert not _is_lookalike(f"see {url}"), url
 
 
 def test_report_always_has_disclaimer():

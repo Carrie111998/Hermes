@@ -80,8 +80,8 @@ Output fields (JSON): `risk_score` (0–100), `risk_band`, `confidence`,
 ## Verification
 
 ```
-python scripts/scan.py --text "подтверди кошелёк и введи сид фразу на https://metamask-verify.top" --json
+python scripts/scan.py --text "подтверди кошелёк и введи сид фразу на https://metamask.top" --json
 ```
 
-Expect a high `risk_score` with `credential_theft` and `wallet_drainer` in
+Expect a high `risk_score` with `credential_theft` + `wallet_drainer` in
 `scheme_tags` and a lookalike-domain entry in `url_findings`.
