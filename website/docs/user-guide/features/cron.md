@@ -94,6 +94,96 @@ global defaults. A switch to a paid provider or model can therefore spend money
 on every scheduled run.
 :::
 
+## Auditing model pinning
+
+`hermes cron audit-models` inspects every cron job's model and provider
+pinning state and tells you which jobs the drift guard would skip on their next
+run. It is read-only: it never modifies jobs, config, or scheduler state.
+
+```bash
+hermes cron audit-models
+hermes cron audit-models --json   # machine-readable output
+```
+
+### What it reports
+
+Each job is classified by pinning status:
+
+| Status | Meaning |
+|-------|---------|
+| `pinned` | Both `--model` and `--provider` are set on the job. |
+| `partial` | Only one of model or provider is pinned. |
+| `inherited` | Neither is pinned; the job follows the effective default. |
+| `script-only` | `no_agent` job; no model resolution applies. |
+
+The risk column tells you what the drift guard would do right now:
+
+| Risk | Meaning |
+|------|---------|
+| `none` | Pinned or fully covered by a fleet default; no drift exposure. |
+| `guarded` | Unpinned axis has a creation-time snapshot and the guard is enabled, but current resolution still matches the snapshot. |
+| `unguarded: <axes>` | Unpinned axis has no snapshot (or the guard is disabled); the job follows current configuration without protection. |
+| `SKIP: <axes>` | The guard would skip this job on its next run because current resolution differs from the snapshot. |
+| `paused` | Job is not active; no skip regardless of drift. |
+| `paused; drift on resume: <axes>` | Job is paused but will skip when resumed if the drift is not resolved first. |
+
+The summary line counts pinned, inherited, partial, and script-only jobs and
+reports how many would be skipped now.
+
+### Remediation
+
+When jobs are marked `SKIP`, the audit output names the remediation command:
+
+```bash
+hermes cron edit <job_id> --model <model> --provider <provider>
+```
+
+This pins the job to explicit values so the drift guard no longer applies to
+those axes. Alternatively, set a cron-fleet default so all unpinned jobs share
+one model:
+
+```bash
+hermes config set cron.model <model>
+hermes config set cron.model_provider <provider>
+```
+
+A fleet default covers every unpinned axis, so the guard will not skip those
+jobs even if the global default later changes.
+
+### JSON output
+
+Pass `--json` for a structured payload suitable for scripts or monitoring:
+
+```json
+{
+  "effective_default_model": "global-model",
+  "effective_default_provider": "global-provider",
+  "cron_fleet_model_configured": true,
+  "cron_fleet_provider_configured": true,
+  "drift_guard_enabled": true,
+  "jobs": [
+    {
+      "id": "a1b2c3d4",
+      "name": "Morning feeds",
+      "model": "(inherited)",
+      "provider": "(inherited)",
+      "effective_model": "global-model",
+      "effective_provider": "global-provider",
+      "status": "inherited",
+      "active": true,
+      "guarded_axes": ["model", "provider"],
+      "drifted_axes": [],
+      "unprotected_axes": [],
+      "at_risk": false
+    }
+  ]
+}
+```
+
+Each job entry includes `model_snapshot` and `provider_snapshot` (the
+creation-time values the guard compares against), plus `enabled` and `state`
+so you can filter active vs paused jobs in automation.
+
 ## Skill-backed cron jobs
 
 A cron job can load one or more skills before it runs the prompt.
