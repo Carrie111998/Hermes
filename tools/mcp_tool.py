@@ -5380,7 +5380,9 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             )
             logger.error(
                 "MCP tool %s/%s call failed: %s",
-                server_name, tool_name, safe_error,
+                _sanitize_error(server_name),
+                _sanitize_error(tool_name),
+                safe_error,
             )
             return tool_error(safe_error)
 

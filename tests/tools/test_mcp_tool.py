@@ -978,6 +978,29 @@ class TestToolHandler:
         assert secret not in caplog.text
         assert "[REDACTED]" in caplog.text
 
+    def test_call_failure_log_sanitizes_server_and_tool_names(self, caplog):
+        from tools.mcp_tool import _make_tool_handler, _servers
+
+        secret = "opaque-synthetic-call-name-credential"
+        server_name = f"api_key: {secret}"
+        tool_name = f"password: {secret}"
+        mock_session = MagicMock()
+        mock_session.call_tool = AsyncMock(
+            side_effect=RuntimeError("synthetic diagnostic retained")
+        )
+        _servers[server_name] = _make_mock_server(server_name, session=mock_session)
+        try:
+            handler = _make_tool_handler(server_name, tool_name, 120)
+            with caplog.at_level(logging.ERROR, logger="tools.mcp_tool"), \
+                 self._patch_mcp_loop():
+                result = json.loads(handler({}))
+        finally:
+            _servers.pop(server_name, None)
+
+        assert "synthetic diagnostic retained" in result["error"]
+        assert secret not in caplog.text
+        assert "[REDACTED]" in caplog.text
+
     @pytest.mark.parametrize("channel", ["text", "resource", "structured"])
     def test_successful_call_redacts_wordpress_option_rows(self, channel):
         from tools.mcp_tool import _make_tool_handler, _servers

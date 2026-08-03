@@ -134,6 +134,24 @@ def _coerce_id_list(raw: Any) -> FrozenSet[str]:
     return frozenset(out)
 
 
+def _id_list_is_well_formed(raw: Any) -> bool:
+    """Whether an identity allowlist contains only supported scalar IDs."""
+    if raw is None:
+        return True
+    if isinstance(raw, (list, tuple, set, frozenset)):
+        items: Iterable[Any] = raw
+    elif isinstance(raw, str):
+        items = (s for s in raw.split(",") if s.strip())
+    else:
+        items = (raw,)
+    return all(
+        not isinstance(item, bool)
+        and isinstance(item, (str, int))
+        and bool(str(item).strip())
+        for item in items
+    )
+
+
 def _coerce_command_list(raw: Any) -> FrozenSet[str]:
     """Normalize a slash command allowlist.
 
@@ -195,7 +213,8 @@ def policy_from_extra(extra: dict, scope: str) -> SlashAccessPolicy:
     DMs is not implicitly an admin in a group.
     """
     admin_key, cmd_key = _keys_for_scope(scope)
-    admin_ids = _coerce_id_list(extra.get(admin_key))
+    raw_admin_ids = extra.get(admin_key)
+    admin_ids = _coerce_id_list(raw_admin_ids)
     cmds = _coerce_command_list(extra.get(cmd_key))
 
     if scope == "dm" and not cmds:
@@ -203,7 +222,10 @@ def policy_from_extra(extra: dict, scope: str) -> SlashAccessPolicy:
         # so operators only need to list it once if it's the same.
         cmds = _coerce_command_list(extra.get("group_user_allowed_commands"))
 
-    enabled = bool(admin_ids)
+    # A malformed configured policy must not collapse into the legacy
+    # unrestricted mode. Keep gating active with no admins so authorization
+    # fails closed; only an absent or valid-empty list disables gating.
+    enabled = bool(admin_ids) or not _id_list_is_well_formed(raw_admin_ids)
     return SlashAccessPolicy(
         enabled=enabled,
         admin_user_ids=admin_ids,
