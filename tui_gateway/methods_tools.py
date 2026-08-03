@@ -1867,22 +1867,26 @@ def _(rid, params: dict) -> dict:
 
             # Prefer the canonical key — bare names are ambiguous when two
             # category plugins share one (image_gen/fal vs video_gen/fal).
-            ident = (params.get("key") or params.get("name") or "").strip()
-            if not ident:
+            input_name = (params.get("name") or "").strip()
+            identifier = (params.get("key") or input_name).strip()
+            if not identifier:
                 return _err(rid, 4019, "plugins.toggle requires a 'key' or 'name'")
             enable = bool(params.get("enable"))
-            result = dashboard_set_agent_plugin_enabled(ident, enabled=enable)
+            result = dashboard_set_agent_plugin_enabled(identifier, enabled=enable)
             if not result.get("ok"):
                 return _err(rid, 5026, result.get("error") or "toggle failed")
-            row = next(
-                (r for r in _rows() if ident in (r["key"], r["name"])), None
-            )
+            resolved_key = result.get("key") or identifier
+            rows = _rows()
+            row = next((r for r in rows if r["key"] == resolved_key), None)
+            if row is None:
+                row = next((r for r in rows if r["name"] == input_name), None)
             return _ok(
                 rid,
                 {
                     "ok": True,
                     "unchanged": bool(result.get("unchanged")),
-                    "name": ident,
+                    "name": input_name or identifier,
+                    "key": resolved_key,
                     "plugin": row,
                 },
             )
