@@ -9490,7 +9490,8 @@ class CloudSqlTemporaryAdmin:
     ) -> None:
         quiet_window = self._operation_timeout_seconds
         started = self._monotonic()
-        hard_deadline = started + max(quiet_window * 2.0, quiet_window + 1.0)
+        mutation_window = max(quiet_window * 2.0, quiet_window + 1.0)
+        hard_deadline = started + mutation_window
         quiet_since: float | None = None
         previous_signature: (
             tuple[tuple[str, tuple[str, str, str, bool]], ...] | None
@@ -9508,7 +9509,10 @@ class CloudSqlTemporaryAdmin:
         )
         delete_attempts = 0
         polls = 0
-        maximum_polls = max(8, int(hard_deadline - started) + 8)
+        maximum_polls = max(
+            8,
+            int(mutation_window * (self._SETTLE_ATTEMPTS + 1)) + 8,
+        )
         poll_interval = min(5.0, max(0.1, quiet_window / 2.0))
         while polls < maximum_polls:
             polls += 1
@@ -9534,7 +9538,19 @@ class CloudSqlTemporaryAdmin:
                     self._delete_user_once(username, deadline=hard_deadline)
                     or ambiguity_observed
                 )
+                # The absence proof requires one *full* quiet window after
+                # our own final user mutation.  Cloud SQL operation-ledger
+                # fencing can legitimately consume most of the initial
+                # bounded window before DELETE is issued; retaining the old
+                # deadline would then make the required proof impossible.
+                # A fresh bounded window is safe because DELETE attempts are
+                # themselves capped, while unrelated ledger changes still do
+                # not extend this deadline.
                 quiet_since = self._monotonic()
+                hard_deadline = max(
+                    hard_deadline,
+                    quiet_since + mutation_window,
+                )
                 previous_signature = None
                 previous_present = None
             elif (
