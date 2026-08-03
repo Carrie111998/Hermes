@@ -686,7 +686,7 @@ class SlackAdapter(BasePlatformAdapter):
             _apply_slack_proxy(self._handler.client, proxy_url)
             self._socket_mode_task = asyncio.create_task(self._handler.start_async())
 
-            self._running = True
+            self._mark_connected()
             logger.info(
                 "[Slack] Socket Mode connected (%d workspace(s))",
                 len(self._team_clients),
@@ -742,7 +742,7 @@ class SlackAdapter(BasePlatformAdapter):
                 await self._handler.close_async()
             except Exception as e:  # pragma: no cover - defensive logging
                 logger.warning("[Slack] Error while closing Socket Mode handler: %s", e, exc_info=True)
-        self._running = False
+        self._mark_disconnected()
 
         self._release_platform_lock()
 
