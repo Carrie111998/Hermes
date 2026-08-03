@@ -290,6 +290,7 @@ export interface Translations {
     desktopLoginItem: {
       title: string
       description: string
+      saveFailed: string
     }
     nav: {
       providers: string

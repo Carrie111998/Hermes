@@ -1,6 +1,13 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
+vi.mock('@/store/notifications', () => ({
+  notify: vi.fn(),
+  notifyError: vi.fn()
+}))
+
+import { notifyError } from '@/store/notifications'
+
 const loginItemGet = vi.fn()
 const loginItemSet = vi.fn()
 
@@ -9,6 +16,8 @@ beforeEach(() => {
   loginItemSet.mockReset()
   loginItemGet.mockResolvedValue({ openAtLogin: false, supported: true })
   loginItemSet.mockResolvedValue({ openAtLogin: true, supported: true })
+
+  vi.mocked(notifyError).mockClear()
 
   Object.defineProperty(window, 'hermesDesktop', {
     configurable: true,
@@ -64,6 +73,22 @@ describe('LoginItemSetting', () => {
 
     await waitFor(() => expect(loginItemSet).toHaveBeenCalled())
     expect(toggle.getAttribute('aria-checked')).toBe('false')
+  })
+
+  it('surfaces a rejected write as a visible error notification', async () => {
+    loginItemSet.mockRejectedValue(new Error('bridge failure'))
+    const { LoginItemSetting } = await import('./config-settings')
+
+    render(<LoginItemSetting />)
+
+    const toggle = await screen.findByRole('switch', { name: 'Launch Hermes Desktop at login' })
+    fireEvent.click(toggle)
+
+    await waitFor(() => expect(loginItemSet).toHaveBeenCalled())
+    expect(notifyError).toHaveBeenCalledWith(
+      expect.any(Error),
+      expect.stringContaining("Couldn't save")
+    )
   })
 
   it('hides the toggle when the platform does not support login items', async () => {

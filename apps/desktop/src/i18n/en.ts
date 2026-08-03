@@ -338,7 +338,8 @@ export const en: Translations = {
     desktopLoginItem: {
       title: 'Launch Hermes Desktop at login',
       description:
-        'Open the Hermes Desktop app when you sign in to your computer. This is separate from the background gateway autostart (hermes gateway install --start-on-login).'
+        'Open the Hermes Desktop app when you sign in to your computer. This is separate from the background gateway autostart (hermes gateway install --start-on-login).',
+      saveFailed: "Couldn't save the launch-at-login setting"
     },
     nav: {
       providers: 'Providers',

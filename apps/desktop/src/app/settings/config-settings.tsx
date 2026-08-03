@@ -489,9 +489,12 @@ export function LoginItemSetting() {
       // actually landed, and never claim success for a rejected write.
       setSupported(state?.supported ?? true)
       setOpenAtLogin(state?.openAtLogin ?? previous)
-    } catch {
-      // A failed or unsupported write must not flip the toggle.
+    } catch (err) {
+      // A failed or unsupported write must not flip the toggle — but the
+      // failure must be visible, not silent (keep_open review requirement:
+      // surface or report login-item write failures).
       setOpenAtLogin(previous)
+      notifyError(err, t.settings.desktopLoginItem.saveFailed)
     } finally {
       setBusy(false)
     }
