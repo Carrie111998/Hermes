@@ -131,7 +131,7 @@ def _load_policy_config(config_path: Optional[Path] = None) -> Dict[str, Any]:
     if unknown:
         logger.warning(
             "Unknown keys in security.website_blocklist (ignored): %s",
-            ", ".join(sorted(unknown)),
+            ", ".join(sorted(str(k) for k in unknown)),
         )
 
     policy.update(website_blocklist)
