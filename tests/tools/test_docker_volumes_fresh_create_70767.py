@@ -292,3 +292,177 @@ def test_reuse_path_removes_container_missing_a_bind_mount(monkeypatch, tmp_path
         "fresh docker run after rm must carry the previously-missing NEW mount"
     assert _has_arg_pair(run_cmd, "-v", "/host/OLD:/c/OLD"), \
         "fresh docker run after rm must still carry the OLD mount"
+
+
+# ---- regression: Windows drive-letter volume specs (#73814 review) ----
+
+def test_volume_destination_parses_windows_drive_letter():
+    """Windows bind-mount specs like ``C:\\Users:/data`` must yield
+    ``/data`` as the container destination, not ``\\Users``.
+
+    The drive-letter colon must not be mistaken for the host/container
+    field separator.  Covers forward-slash, backslash, and mode-suffixed
+    variants.
+    """
+    cases = [
+        ("C:\\Users:/data", "/data"),
+        ("C:\\Users:/data:ro", "/data"),
+        ("C:/Users:/data", "/data"),
+        ("C:/Users:/data:rw", "/data"),
+        ("D:\\code\\repo:/workspace", "/workspace"),
+        ("E:/media:/mnt:z", "/mnt"),
+    ]
+    for spec, expect in cases:
+        got = docker_env._volume_destination(spec)
+        assert got == expect, (
+            f"_volume_destination({spec!r}) returned {got!r}, expected {expect!r}"
+        )
+
+
+def test_volume_destination_preserves_linux_specs():
+    """Linux/POSIX specs are unaffected by the Windows drive-letter fix."""
+    assert docker_env._volume_destination("/host/dir:/container/dir") == "/container/dir"
+    assert docker_env._volume_destination("/host/dir:/container/dir:ro") == "/container/dir"
+    assert docker_env._volume_destination("named-volume:/data") == "/data"
+    assert docker_env._volume_destination("/just-a-host-path") is None
+    assert docker_env._volume_destination("") is None
+
+
+# ---- regression: inspect failure skips stale-mount check (#73814 review) ----
+
+def test_reuse_path_skips_rm_when_inspect_fails(monkeypatch, tmp_path):
+    """When ``docker inspect`` fails (non-zero exit, timeout, or OSError),
+    ``_container_bind_mounts`` returns ``None`` and the constructor must
+    **skip** the stale-mount check rather than treating every configured
+    destination as missing and ``rm -f``'ing a potentially-healthy
+    container.
+
+    Black-box: drive the real ``DockerEnvironment(...)`` constructor.
+    Mock ``docker ps`` to report a running container, ``docker inspect``
+    to fail (non-zero exit), and assert that **no** ``docker rm -f`` is
+    issued — the container is reused as-is (fail-open).
+    """
+    docker_env._cgroup_limits_ok = True
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+
+    calls = []
+
+    def _run(cmd, **kwargs):
+        calls.append((list(cmd), kwargs))
+        if isinstance(cmd, list) and len(cmd) >= 2:
+            if cmd[1] == "ps":
+                return subprocess.CompletedProcess(
+                    cmd, 0, stdout="healthy-cid\trunning\t\n", stderr=""
+                )
+            # inspect fails — daemon blip / permission error / etc.
+            if cmd[1] == "inspect":
+                return subprocess.CompletedProcess(
+                    cmd, 1, stdout="", stderr="Error: No such container"
+                )
+            if cmd[1] == "rm":
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            if cmd[1] == "run":
+                return subprocess.CompletedProcess(
+                    cmd, 0, stdout="new-cid\n", stderr=""
+                )
+            # start / other — succeed
+            if cmd[1] == "start":
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(docker_env.subprocess, "run", _run)
+    _stub_load_config(
+        monkeypatch,
+        {"docker_volumes": ["/host/OLD:/c/OLD", "/host/NEW:/c/NEW"]},
+    )
+
+    env = docker_env.DockerEnvironment(
+        image="python:3.11",
+        cwd="/root",
+        timeout=60,
+        cpu=0,
+        memory=0,
+        disk=0,
+        persistent_filesystem=False,
+        task_id="test-task",
+        volumes=["/host/OLD:/c/OLD"],
+        forward_env=None,
+        network=True,
+        host_cwd=None,
+        auto_mount_cwd=False,
+        env=None,
+        run_as_host_user=False,
+        extra_args=[],
+        persist_across_processes=True,
+    )
+
+    # No docker rm -f should have been issued — inspect failed, so the
+    # stale-mount check is skipped (fail-open) and the healthy container
+    # is reused.
+    rm_calls = [
+        c[0] for c in calls
+        if isinstance(c[0], list) and len(c[0]) >= 4
+        and c[0][1] == "rm" and c[0][2] == "-f"
+    ]
+    assert not rm_calls, (
+        "constructor must NOT issue `docker rm -f` when inspect fails — "
+        "the stale-mount check should be skipped (fail-open)"
+    )
+
+
+def test_reuse_path_skips_rm_when_inspect_times_out(monkeypatch, tmp_path):
+    """Same fail-open contract, but ``docker inspect`` raises
+    ``TimeoutExpired`` instead of returning non-zero."""
+    docker_env._cgroup_limits_ok = True
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+
+    calls = []
+
+    def _run(cmd, **kwargs):
+        calls.append((list(cmd), kwargs))
+        if isinstance(cmd, list) and len(cmd) >= 2:
+            if cmd[1] == "ps":
+                return subprocess.CompletedProcess(
+                    cmd, 0, stdout="healthy-cid\trunning\t\n", stderr=""
+                )
+            if cmd[1] == "inspect":
+                raise subprocess.TimeoutExpired(cmd, 10)
+            if cmd[1] == "start":
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(docker_env.subprocess, "run", _run)
+    _stub_load_config(
+        monkeypatch,
+        {"docker_volumes": ["/host/OLD:/c/OLD"]},
+    )
+
+    env = docker_env.DockerEnvironment(
+        image="python:3.11",
+        cwd="/root",
+        timeout=60,
+        cpu=0,
+        memory=0,
+        disk=0,
+        persistent_filesystem=False,
+        task_id="test-task",
+        volumes=["/host/OLD:/c/OLD"],
+        forward_env=None,
+        network=True,
+        host_cwd=None,
+        auto_mount_cwd=False,
+        env=None,
+        run_as_host_user=False,
+        extra_args=[],
+        persist_across_processes=True,
+    )
+
+    rm_calls = [
+        c[0] for c in calls
+        if isinstance(c[0], list) and len(c[0]) >= 4
+        and c[0][1] == "rm" and c[0][2] == "-f"
+    ]
+    assert not rm_calls, (
+        "constructor must NOT issue `docker rm -f` when inspect times out — "
+        "fail-open"
+    )

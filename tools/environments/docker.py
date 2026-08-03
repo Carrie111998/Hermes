@@ -273,14 +273,17 @@ def _container_finished_at(docker_exe: str, container_id: str):
 def _volume_destination(vol: str) -> Optional[str]:
     """Extract the container-side destination from a ``host:container[:mode]`` spec.
 
-    Mirrors the loose parsing DockerEnvironment already uses to build
-    ``-v`` args (a colon separates the fields).  Linux/POSIX host paths
-    don't contain colons, so the destination is the second colon-separated
-    segment; a trailing ``:ro`` / ``:rw`` / ``:z`` mode token, if present,
-    is a third segment and ignored.  Returns ``None`` if there is no
-    container side.
+    A leading Windows drive-letter prefix (``C:`` or ``C:\\``) is
+    stripped first so its colon is not mistaken for the host/container
+    field separator — e.g. ``C:\\Users:/data`` must yield ``/data``,
+    not ``\\Users``.  After stripping, ``rsplit(":", 2)`` from the
+    right isolates the container segment (and an optional trailing
+    ``:ro`` / ``:rw`` / ``:z`` mode token).  Returns ``None`` if there
+    is no container side.
     """
-    parts = vol.split(":")
+    if len(vol) >= 2 and vol[0].isalpha() and vol[1] == ":":
+        vol = vol[2:]
+    parts = vol.rsplit(":", 2)
     if len(parts) < 2:
         return None
     return parts[1]
@@ -327,15 +330,16 @@ def _resolved_docker_volumes(passed_volumes) -> list[str]:
     return merged
 
 
-def _container_bind_mounts(docker_exe: str, container_id: str) -> set[str]:
+def _container_bind_mounts(docker_exe: str, container_id: str) -> Optional[set[str]]:
     """Return the set of bind-mount ``Destination`` paths in *container_id*.
 
     Black-box: asks the Docker daemon via ``inspect`` (the same source the
     reuse path already trusts for NetworkMode / FinishedAt).  ``tmpfs`` and
     named-volume mounts are excluded — only ``bind`` mounts correspond to
-    ``docker_volumes`` entries.  Returns an empty set on any failure so the
-    reuse-path staleness check fails *open* (no churn) rather than removing
-    a healthy container on a transient inspect error.
+    ``docker_volumes`` entries.  Returns ``None`` on any failure so the
+    caller can *skip* the stale-mount check rather than treating every
+    configured mount as missing and ``rm -f``'ing a healthy container on
+    a transient inspect error.
     """
     try:
         result = subprocess.run(
@@ -350,13 +354,13 @@ def _container_bind_mounts(docker_exe: str, container_id: str) -> set[str]:
         )
     except (subprocess.TimeoutExpired, OSError) as e:
         logger.debug("docker inspect Mounts failed for %s: %s", container_id[:12], e)
-        return set()
+        return None
     if result.returncode != 0:
         logger.debug(
             "docker inspect Mounts returned %d for %s: %s",
             result.returncode, container_id[:12], result.stderr.strip(),
         )
-        return set()
+        return None
     dests: set[str] = set()
     for ln in result.stdout.splitlines():
         ln = ln.strip()
@@ -1549,30 +1553,42 @@ class DockerEnvironment(BaseEnvironment):
                     actual_dests = _container_bind_mounts(
                         self._docker_exe, container_id,
                     )
-                    missing = required_dests - actual_dests
-                    if missing:
-                        logger.warning(
-                            "Existing container %s is missing configured "
-                            "docker_volumes destination(s) %s — removing it "
-                            "and starting fresh so the new mounts apply "
-                            "(task=%s, profile=%s).",
-                            container_id[:12], sorted(missing),
-                            task_label, profile_name,
+                    if actual_dests is None:
+                        # Inspection failed (timeout / non-zero exit /
+                        # transient daemon blip).  Skip the stale-mount
+                        # check rather than treating every configured
+                        # destination as missing and rm -f'ing a
+                        # potentially-healthy container — fail open.
+                        logger.info(
+                            "Skipping stale-bind-mount check for %s: "
+                            "docker inspect failed (task=%s, profile=%s).",
+                            container_id[:12], task_label, profile_name,
                         )
-                        try:
-                            subprocess.run(
-                                [self._docker_exe, "rm", "-f", container_id],
-                                capture_output=True,
-                                text=True, encoding="utf-8",
-                                errors="replace", timeout=30, check=False,
-                                stdin=subprocess.DEVNULL,
-                            )
-                        except (subprocess.TimeoutExpired, OSError) as e:
+                    else:
+                        missing = required_dests - actual_dests
+                        if missing:
                             logger.warning(
-                                "Failed to remove stale-mount container %s: %s",
-                                container_id[:12], e,
+                                "Existing container %s is missing configured "
+                                "docker_volumes destination(s) %s — removing it "
+                                "and starting fresh so the new mounts apply "
+                                "(task=%s, profile=%s).",
+                                container_id[:12], sorted(missing),
+                                task_label, profile_name,
                             )
-                        existing = None
+                            try:
+                                subprocess.run(
+                                    [self._docker_exe, "rm", "-f", container_id],
+                                    capture_output=True,
+                                    text=True, encoding="utf-8",
+                                    errors="replace", timeout=30, check=False,
+                                    stdin=subprocess.DEVNULL,
+                                )
+                            except (subprocess.TimeoutExpired, OSError) as e:
+                                logger.warning(
+                                    "Failed to remove stale-mount container %s: %s",
+                                    container_id[:12], e,
+                                )
+                            existing = None
             if existing is not None:
                 container_id, state = existing
                 self._container_id = container_id
