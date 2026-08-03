@@ -448,6 +448,7 @@ export function useMainApp(gw: GatewayClient) {
       const target = Number(virtualHistory.offsets[index] ?? 0)
 
       scroll.scrollTo(Math.max(0, target))
+
       return true
     },
     [virtualHistory.offsets, virtualRows]

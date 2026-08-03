@@ -6,10 +6,10 @@ import {
   clampOrchestratorSelection,
   closeFallbackAfterClose,
   currentSessionSelectionIndex,
-  filterSessionsOverlayRows,
   draftModelArgFromPickerValue,
   draftModelDisplayLabel,
   draftTitleFromPrompt,
+  filterSessionsOverlayRows,
   fixedSessionColumnStyle,
   isNewSessionRow,
   newSessionMarkerColor,
@@ -212,6 +212,7 @@ describe('unified Sessions overlay helpers', () => {
       { id: 'live-a', model: 'anthropic/claude', preview: 'debug gateway issue', status: 'working', title: 'Gateway Debug' },
       { id: 'live-b', model: 'openai/gpt-5.6', preview: 'write docs', status: 'idle', title: 'Docs Draft' }
     ] satisfies SessionActiveItem[]
+
     const history = [
       { id: 'hist-a', message_count: 3, preview: 'kanban branch review', source: 'tui', started_at: 0, title: 'TUI History' },
       { id: 'hist-b', message_count: 4, preview: 'pricing table', source: 'telegram', started_at: 0, title: 'Research' }

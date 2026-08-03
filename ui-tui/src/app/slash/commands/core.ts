@@ -1,9 +1,9 @@
 import { forceRedraw, type MouseTrackingMode } from '@hermes/ink'
 
+import { buildHistoryTimelineState } from '../../../components/historyTimelineOverlay.js'
 import { DASHBOARD_TUI_MODE, NO_CONFIRM_DESTRUCTIVE } from '../../../config/env.js'
 import { dailyFortune, randomFortune } from '../../../content/fortunes.js'
 import { HOTKEYS } from '../../../content/hotkeys.js'
-import { buildHistoryTimelineState } from '../../../components/historyTimelineOverlay.js'
 import { isSectionName, nextDetailsMode, parseDetailsMode, SECTION_NAMES } from '../../../domain/details.js'
 import { toTranscriptMessages } from '../../../domain/messages.js'
 import type {
@@ -531,9 +531,11 @@ export const coreCommands: SlashCommand[] = [
         .then(
           ctx.guarded<SessionHistoryResponse>(r => {
             const persisted = toTranscriptMessages(r?.messages ?? [])
+
             const localTail = ctx.local.getHistoryItems().filter(m =>
               (m.role === 'user' || m.role === 'assistant' || m.role === 'tool' || m.role === 'system') && typeof m.dbId !== 'number'
             )
+
             const fresh = persisted.length ? [...persisted, ...localTail] : ctx.local.getHistoryItems()
 
             patchOverlayState({

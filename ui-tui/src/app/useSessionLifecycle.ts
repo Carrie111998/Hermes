@@ -9,8 +9,8 @@ import { introMsg, toTranscriptMessages } from '../domain/messages.js'
 import { ZERO } from '../domain/usage.js'
 import { type GatewayClient } from '../gatewayClient.js'
 import type {
-  SessionActivateResponse,
   PromptSubmitResponse,
+  SessionActivateResponse,
   SessionBranchResponse,
   SessionCloseResponse,
   SessionCreateResponse,

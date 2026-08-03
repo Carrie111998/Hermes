@@ -969,6 +969,7 @@ describe('createSlashHandler', () => {
 
   it('/history prefers the latest persisted branch target over unpersisted optimistic tail rows', async () => {
     patchUiState({ sid: 'sid-abc' })
+
     const rpc = vi.fn(() =>
       Promise.resolve({
         messages: [
@@ -977,6 +978,7 @@ describe('createSlashHandler', () => {
         ]
       })
     )
+
     const ctx = buildCtx({
       gateway: { ...buildGateway(), rpc },
       local: {

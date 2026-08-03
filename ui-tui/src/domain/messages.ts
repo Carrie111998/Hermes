@@ -38,6 +38,7 @@ export const toTranscriptMessages = (rows: unknown): Msg[] => {
       role,
       text
     } = row as TranscriptRow
+
     const dbMeta = {
       ...(typeof dbId === 'number' && { dbId }),
       ...(typeof dbSessionId === 'string' && dbSessionId ? { dbSessionId } : {})

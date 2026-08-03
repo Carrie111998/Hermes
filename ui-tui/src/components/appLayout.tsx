@@ -558,9 +558,9 @@ export const AppLayout = memo(function AppLayout({
                 cols={composer.cols}
                 onApprovalChoice={actions.answerApproval}
                 onClarifyAnswer={actions.answerClarify}
-                pagerPageSize={composer.pagerPageSize}
                 onSecretSubmit={actions.answerSecret}
                 onSudoSubmit={actions.answerSudo}
+                pagerPageSize={composer.pagerPageSize}
               />
             </PerfPane>
 
