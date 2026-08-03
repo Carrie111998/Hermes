@@ -91,7 +91,7 @@ import {
 import { describeDevCdpDecision, resolveDevCdpPort } from './dev-cdp'
 import { installEmbedReferer } from './embed-referer'
 const { createEvaAppUpdater } = require('./eva-app-updater.cjs')
-const { EVA_MANAGED_POLICY } = require('./eva-managed.cjs')
+const { assertEvaManagedLocalTerminalAllowed, EVA_MANAGED_POLICY } = require('./eva-managed.cjs')
 const { createEvaManagedRuntime } = require('./eva-runtime.cjs')
 import { createEventDeduper } from './event-dedupe'
 import { findGitBash as _findGitBash } from './find-git-bash'
@@ -11487,6 +11487,7 @@ function ensureNodePtySpawnHelper() {
 }
 
 ipcMain.handle('hermes:terminal:start', async (event, payload = {}) => {
+  assertEvaManagedLocalTerminalAllowed(EVA_MANAGED_BUILD)
   ensureNodePtySpawnHelper()
 
   const id = crypto.randomUUID()

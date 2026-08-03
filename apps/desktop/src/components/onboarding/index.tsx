@@ -439,6 +439,7 @@ const persistShowAll = (value: boolean) => {
 export function Picker({ ctx }: { ctx: OnboardingContext }) {
   const { t } = useI18n()
   const { localEndpoint, manual, mode, providers } = useStore($desktopOnboarding)
+  const managedEva = isManagedEvaosAgent()
   const [showAll, setShowAll] = useState(readShowAll)
   // Which key-form option to preselect when we flip to 'apikey' mode. The
   // OpenRouter row selects its key; the generic link lands on the first option.
@@ -481,8 +482,12 @@ export function Picker({ ctx }: { ctx: OnboardingContext }) {
   }
 
   const select = (p: OAuthProvider) => void startProviderOAuth(p, ctx)
-  const featured = ordered.find(p => p.id === FEATURED_ID) ?? null
-  const rest = featured ? ordered.filter(p => p.id !== FEATURED_ID) : ordered
+  const featured = managedEva ? null : (ordered.find(p => p.id === FEATURED_ID) ?? null)
+  const rest = managedEva
+    ? ordered.filter(p => p.id !== FEATURED_ID)
+    : featured
+      ? ordered.filter(p => p.id !== FEATURED_ID)
+      : ordered
   // Collapse the secondary providers behind a disclosure only when Nous
   // Portal is present to anchor the choice — otherwise show the full list.
   const collapsible = Boolean(featured) && rest.length > 0
@@ -492,8 +497,8 @@ export function Picker({ ctx }: { ctx: OnboardingContext }) {
     <div className="grid gap-2">
       <div className="grid max-h-[60dvh] gap-2 overflow-y-auto p-1">
         {featured ? <FeaturedProviderRow onSelect={select} provider={featured} /> : null}
-        {/* Slot #2 — always visible, matching CANONICAL_PROVIDERS (Nous → Fireworks). */}
-        <FireworksProviderRow onClick={() => openKeyForm('FIREWORKS_API_KEY')} />
+        {/* Slot #2 in unmanaged mode, matching CANONICAL_PROVIDERS (Nous → Fireworks). */}
+        {managedEva ? null : <FireworksProviderRow onClick={() => openKeyForm('FIREWORKS_API_KEY')} />}
         {showRest ? (
           <>
             {rest.map(p => (

@@ -156,6 +156,16 @@ function assertEvaManagedApiRequestAllowed(request) {
   return { method, pathname, path: `${pathname}${query ? `?${query}` : ''}` }
 }
 
+function assertEvaManagedLocalTerminalAllowed(managed) {
+  if (managed) {
+    throw new EvaBrokerError(
+      'Terminal access is unavailable for this managed remote agent.',
+      403,
+      'managed-terminal-unavailable'
+    )
+  }
+}
+
 function makeDeviceCode(cryptoApi = crypto) {
   const value = String(cryptoApi.randomUUID())
     .toUpperCase()
@@ -491,6 +501,7 @@ module.exports = {
   EVA_MANAGED_POLICY,
   EvaBrokerError,
   assertEvaManagedApiRequestAllowed,
+  assertEvaManagedLocalTerminalAllowed,
   brokerPost,
   buildEvaDesktopAuthUrl,
   buildEvaManagedWsUrl,

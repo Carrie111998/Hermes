@@ -102,6 +102,27 @@ describe('onboarding Picker', () => {
     expect(screen.getByRole('button', { name: 'Close' })).toBeTruthy()
   })
 
+  it('keeps OpenAI available without managed Nous or Fireworks promotions', () => {
+    Object.defineProperty(window, 'hermesDesktop', {
+      configurable: true,
+      value: { eva: {} },
+      writable: true
+    })
+    setProviders([
+      provider('nous', 'Nous Portal'),
+      provider('openai-codex', 'OpenAI Codex / ChatGPT'),
+      provider('anthropic', 'Anthropic Claude')
+    ])
+    $desktopOnboarding.set({ ...$desktopOnboarding.get(), manual: true })
+
+    render(<Picker ctx={ctx} />)
+
+    expect(screen.queryByText('Electric Sheep account')).toBeNull()
+    expect(screen.queryByText('Fireworks AI')).toBeNull()
+    expect(screen.getByText('OpenAI OAuth (ChatGPT)')).toBeTruthy()
+    expect(screen.getByText('Anthropic API Key')).toBeTruthy()
+  })
+
   it('features the Electric Sheep account and hides other providers behind a disclosure', () => {
     setProviders([provider('anthropic', 'Anthropic Claude'), provider('nous', 'Nous Portal')])
     render(<Picker ctx={ctx} />)
