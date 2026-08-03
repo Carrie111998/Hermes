@@ -936,6 +936,25 @@ def test_claude_visibility_registered_retry_code_is_current_error() -> None:
     assert work["code"] == "creation_ambiguous"
 
 
+def test_repaired_provider_and_mirror_semantics_close_required_summaries() -> None:
+    evidence = build_session_health_evidence(**healthy_inputs())
+
+    assert evidence["catalog"]["providers"]["hermes"]["freshness"]["state"] == (
+        "healthy"
+    )
+    assert evidence["queues"]["mirror_jobs"]["ledger_integrity"]["state"] == (
+        "healthy"
+    )
+    assert evidence["service_impact_summary"] == {
+        "state": "healthy",
+        "code": "required_capabilities_healthy",
+    }
+    assert evidence["governance_summary"] == {
+        "state": "unknown",
+        "code": "required_governance_evidence_unknown",
+    }
+
+
 def test_provider_canonical_timestamp_boundary_and_conflict() -> None:
     canonical = healthy_inputs()
     provider = canonical["coordinator_health"]["providers"]["claude"]
