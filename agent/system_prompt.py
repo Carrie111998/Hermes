@@ -47,6 +47,7 @@ from agent.prompt_builder import (
     TOOL_USE_ENFORCEMENT_GUIDANCE,
     TOOL_USE_ENFORCEMENT_MODELS,
     drain_truncation_warnings,
+    language_standard_guidance,
 )
 from agent.runtime_cwd import resolve_context_cwd
 from hermes_constants import get_hermes_home
@@ -202,6 +203,17 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
 
     # Pointer to the hermes-agent skill + docs for user questions about Hermes itself.
     stable_parts.append(HERMES_AGENT_HELP_GUIDANCE)
+
+    # Declared working-language standard — when the user sets
+    # agent.language_standard (BCP-47 tag), hold the model to that language
+    # and variant instead of drifting to a different variant of the same
+    # language or its dominant training language.  Resolved once at agent
+    # init (agent._language_standard), so it is byte-stable for the life of
+    # the conversation and never threatens prompt caching.  Empty by default
+    # → zero tokens.
+    _lang_standard = getattr(agent, "_language_standard", "")
+    if _lang_standard:
+        stable_parts.append(language_standard_guidance(_lang_standard))
 
     # Universal task-completion / no-fabrication guidance.  Applied to ALL
     # models regardless of tool_use_enforcement gating — the failure modes
