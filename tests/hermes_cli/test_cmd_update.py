@@ -503,6 +503,7 @@ class TestCmdUpdateBranchFallback:
             "--include=dev",
             "--no-fund",
             "--no-audit",
+            "--prefer-offline",
             "--progress=false",
             "--workspaces=false",
         ]
@@ -512,6 +513,7 @@ class TestCmdUpdateBranchFallback:
             "--include=dev",
             "--no-fund",
             "--no-audit",
+            "--prefer-offline",
             "--progress=false",
             "--workspace",
             "ui-tui",
@@ -526,7 +528,18 @@ class TestCmdUpdateBranchFallback:
             # The web/ install runs from the workspace root when the root
             # lockfile exists (npm workspaces hoist node_modules upward).
             assert npm_calls[2:] == [
-                (["/usr/bin/npm", "ci", "--include=dev", "--workspace", "web", "--silent"], PROJECT_ROOT),
+                (
+                    [
+                        "/usr/bin/npm",
+                        "ci",
+                        "--include=dev",
+                        "--workspace",
+                        "web",
+                        "--silent",
+                        "--prefer-offline",
+                    ],
+                    PROJECT_ROOT,
+                ),
             ]
 
         # The web UI build itself went through the streaming helper.
