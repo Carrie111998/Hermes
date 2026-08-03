@@ -731,3 +731,27 @@ class TestPromptCacheKeyCapability:
         assert first == second
         assert first != key("cron_job_2026-07-15T10:05:00Z", instructions="You are different.")
         assert first != key("cron_job_2026-07-15T10:05:00Z", tool_name="search")
+
+
+class TestNativeGeminiExtraBodyAllowlist:
+    def test_cached_content_survives_native_gemini_filter(self, transport):
+        from providers import get_provider_profile
+
+        profile = get_provider_profile("gemini")
+        kw = transport.build_kwargs(
+            model="gemini-2.5-flash",
+            messages=[{"role": "user", "content": "Hi"}],
+            provider_profile=profile,
+            provider_name="gemini",
+            base_url="https://generativelanguage.googleapis.com/v1beta",
+            request_overrides={
+                "extra_body": {
+                    "cached_content": "cachedContents/abc123",
+                    "tags": ["portal"],
+                }
+            },
+        )
+        # cached_content joins thinking_config on the allowlist; unknown
+        # OpenAI-style keys still get dropped (Gemini 400s on unknown fields).
+        assert kw["extra_body"]["cached_content"] == "cachedContents/abc123"
+        assert "tags" not in kw["extra_body"]

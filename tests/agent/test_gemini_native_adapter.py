@@ -259,3 +259,87 @@ def test_stream_event_translation_emits_tool_call_delta_with_stable_index():
 
 
 
+
+
+def _dummy_http_recording(recorded):
+    class DummyHTTP:
+        def post(self, url, json=None, headers=None, timeout=None):
+            recorded["url"] = url
+            recorded["json"] = json
+            recorded["headers"] = headers
+            return DummyResponse(
+                payload={
+                    "candidates": [
+                        {
+                            "content": {"parts": [{"text": "ok"}]},
+                            "finishReason": "STOP",
+                        }
+                    ],
+                    "usageMetadata": {
+                        "promptTokenCount": 1,
+                        "candidatesTokenCount": 1,
+                        "totalTokenCount": 2,
+                    },
+                }
+            )
+
+        def close(self):
+            return None
+
+    return DummyHTTP()
+
+
+def test_cached_content_forwarded_and_inline_duplicates_dropped(monkeypatch):
+    from agent.gemini_native_adapter import GeminiNativeClient
+
+    recorded = {}
+    monkeypatch.setattr(
+        "agent.gemini_native_adapter.httpx.Client",
+        lambda *a, **k: _dummy_http_recording(recorded),
+    )
+
+    client = GeminiNativeClient(api_key="AIza-test")
+    client.chat.completions.create(
+        model="gemini-2.5-flash",
+        messages=[
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "Hello"},
+        ],
+        tools=[
+            {
+                "type": "function",
+                "function": {"name": "lookup", "parameters": {"type": "object"}},
+            }
+        ],
+        extra_body={"cached_content": "cachedContents/abc123"},
+    )
+
+    # The cache resource already carries systemInstruction/tools/toolConfig;
+    # sending them inline alongside cachedContent is a Google-side error.
+    assert recorded["json"]["cachedContent"] == "cachedContents/abc123"
+    assert "systemInstruction" not in recorded["json"]
+    assert "tools" not in recorded["json"]
+    assert "toolConfig" not in recorded["json"]
+
+
+def test_no_cached_content_key_leaves_request_unchanged(monkeypatch):
+    from agent.gemini_native_adapter import GeminiNativeClient
+
+    recorded = {}
+    monkeypatch.setattr(
+        "agent.gemini_native_adapter.httpx.Client",
+        lambda *a, **k: _dummy_http_recording(recorded),
+    )
+
+    client = GeminiNativeClient(api_key="AIza-test")
+    client.chat.completions.create(
+        model="gemini-2.5-flash",
+        messages=[
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "Hello"},
+        ],
+        extra_body={"thinking_config": {"include_thoughts": True}},
+    )
+
+    assert "cachedContent" not in recorded["json"]
+    assert "systemInstruction" in recorded["json"]

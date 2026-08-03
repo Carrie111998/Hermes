@@ -723,7 +723,7 @@ class ChatCompletionsTransport(ProviderTransport):
             if _native_gemini:
                 extra_body = {
                     k: v for k, v in extra_body.items()
-                    if k in ("thinking_config", "thinkingConfig")
+                    if k in ("thinking_config", "thinkingConfig", "cached_content", "cachedContent")
                 }
             if extra_body:
                 api_kwargs["extra_body"] = extra_body
