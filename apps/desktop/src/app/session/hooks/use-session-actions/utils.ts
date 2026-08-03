@@ -418,7 +418,8 @@ export function preserveLocalPendingTurnMessages(
       }
 
       if (
-        textWithoutReferenceLines(chatMessageText(authoritative)) === textWithoutReferenceLines(chatMessageText(message))
+        textWithoutReferenceLines(chatMessageText(authoritative)) ===
+        textWithoutReferenceLines(chatMessageText(message))
       ) {
         continue
       }
