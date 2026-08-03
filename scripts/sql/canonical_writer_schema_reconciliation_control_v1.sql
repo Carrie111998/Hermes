@@ -181,10 +181,12 @@ CREATE ROLE canonical_brain_schema_reconciler
     CONNECTION LIMIT -1
     PASSWORD NULL;
 
--- PostgreSQL 18 gives a CREATEROLE creator one implicit ADMIN membership.
--- Its grantor is the provider bootstrap role, so the member cannot revoke it.
--- The terminal check admits only that exact edge; the outer Cloud deletion
--- must prove that it disappeared before any normal reconciliation session.
+-- Vanilla PostgreSQL 18 materializes one implicit ADMIN membership for a
+-- CREATEROLE creator.  Cloud SQL grants the same implicit creator authority
+-- without materializing that pg_auth_members edge.  The terminal check admits
+-- only those two provider-safe shapes: no edge, or the one exact vanilla edge.
+-- If materialized, outer Cloud deletion must prove that it disappeared before
+-- any normal reconciliation session.
 
 SET LOCAL ROLE cloudsqlsuperuser;
 
@@ -1057,13 +1059,16 @@ BEGIN
             WHERE oid = database_oid
        )) <> 'cloudsqlsuperuser'
        OR NOT (
-           SELECT pg_catalog.count(*) = 1
-                  AND pg_catalog.bool_and(
-                      member.rolname = SESSION_USER
-                      AND grantor.rolname = 'cloudsqladmin'
-                      AND membership.admin_option IS TRUE
-                      AND membership.inherit_option IS FALSE
-                      AND membership.set_option IS FALSE
+           SELECT pg_catalog.count(*) = 0
+                  OR (
+                      pg_catalog.count(*) = 1
+                      AND pg_catalog.bool_and(
+                          member.rolname = SESSION_USER
+                          AND grantor.rolname = 'cloudsqladmin'
+                          AND membership.admin_option IS TRUE
+                          AND membership.inherit_option IS FALSE
+                          AND membership.set_option IS FALSE
+                      )
                   )
              FROM pg_catalog.pg_auth_members AS membership
              JOIN pg_catalog.pg_roles AS member
@@ -1330,13 +1335,16 @@ BEGIN
                  WHERE membership.roleid = executor_oid
             ),
             'executor_control_membership_exact', (
-                SELECT pg_catalog.count(*) = 1
-                       AND pg_catalog.bool_and(
-                           member.rolname = SESSION_USER
-                           AND grantor.rolname = 'cloudsqladmin'
-                           AND membership.admin_option IS TRUE
-                           AND membership.inherit_option IS FALSE
-                           AND membership.set_option IS FALSE
+                SELECT pg_catalog.count(*) = 0
+                       OR (
+                           pg_catalog.count(*) = 1
+                           AND pg_catalog.bool_and(
+                               member.rolname = SESSION_USER
+                               AND grantor.rolname = 'cloudsqladmin'
+                               AND membership.admin_option IS TRUE
+                               AND membership.inherit_option IS FALSE
+                               AND membership.set_option IS FALSE
+                           )
                        )
                   FROM pg_catalog.pg_auth_members AS membership
                   JOIN pg_catalog.pg_roles AS member
