@@ -564,15 +564,6 @@ function resolveHermesHome() {
     const localappdata = path.join(process.env.LOCALAPPDATA, 'hermes')
     const legacy = path.join(app.getPath('home'), '.hermes')
 
-    // If the application is installed in a custom directory (not in LOCALAPPDATA),
-    // default HERMES_HOME to a folder alongside the executable to avoid long paths
-    // or Cyrillic characters in the user profile directory.
-    const exeDir = path.dirname(app.getPath('exe'))
-
-    if (!exeDir.toLowerCase().startsWith(process.env.LOCALAPPDATA.toLowerCase())) {
-      return path.join(exeDir, 'hermes-home')
-    }
-
     // Migrate transparently to LOCALAPPDATA, but honour an existing legacy
     // ~/.hermes setup (no LOCALAPPDATA install yet) so users don't lose state.
     if (!directoryExists(localappdata) && directoryExists(legacy)) {
