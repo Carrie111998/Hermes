@@ -986,32 +986,138 @@ class EvidencePackEngine:
             total_hits=len(ranked),
         )
 
+    # ── public metadata API (idempotency contract) ───────────────────────────
+
+    def get_meta(self, key: str) -> Optional[dict]:
+        """Public API: retrieve metadata by key.
+
+        Returns None if key does not exist or storage is unavailable.
+        Detects storage by public methods only (get_meta), not by private attributes.
+        """
+        if self._storage is None:
+            return None
+        # Detect storage by public get_meta method only
+        if not hasattr(self._storage, "get_meta") or not callable(self._storage.get_meta):
+            return None
+        try:
+            raw = self._storage.get_meta(key)
+        except Exception:
+            return None
+        if raw is None:
+            return None
+        if isinstance(raw, str):
+            try:
+                return json.loads(raw)
+            except (TypeError, ValueError):
+                return None
+        if isinstance(raw, dict):
+            return dict(raw)
+        return None
+
+    def set_meta(self, key: str, value: dict) -> None:
+        """Public API: store metadata by key.
+
+        Detects storage by public methods only (set_meta), not by private attributes.
+        Raises RuntimeError if storage is unavailable or write fails.
+        """
+        if self._storage is None:
+            raise RuntimeError("No storage configured")
+        if not hasattr(self._storage, "set_meta") or not callable(self._storage.set_meta):
+            raise RuntimeError("Storage does not support set_meta")
+        try:
+            self._storage.set_meta(key, json.dumps(value))
+        except Exception as e:
+            raise RuntimeError(f"Failed to set metadata: {e}")
+
+    # ── discover (idempotent) ─────────────────────────────────────────────
+
     def discover(
         self,
         objective_id: str,
         objective_text: str,
         **kwargs: Any,
     ) -> EvidencePack:
-        """dry_run + persist single state_meta key (if storage present). Idempotent."""
-        pack = self.dry_run(objective_id, objective_text, **kwargs)
-        if self._storage is not None and hasattr(self._storage, "_state_meta"):
+        """dry_run + persist single metadata key (if storage supports get_meta/set_meta). Idempotent."""
+        # Check cache BEFORE running dry_run to avoid unnecessary provider calls
+        if self._storage is not None and hasattr(self._storage, "get_meta") and callable(self._storage.get_meta):
             key = f"{self.STATE_META_PREFIX}{objective_id}:{self.STATE_META_KEY_VERSION}"
-            existing = self._state_meta_get(key)
-            if existing is not None and existing.get("query_fingerprint") == pack.query_fingerprint:
-                pack.is_idempotent_reuse = True
+            existing = self.get_meta(key)
+            if existing is not None and existing.get("query_fingerprint") == self._compute_fingerprint(objective_id, objective_text, **kwargs):
+                # Reconstruct EvidencePack from cached metadata
+                pack = EvidencePack(
+                    objective_id=existing.get("objective_id", objective_id),
+                    query_fingerprint=existing.get("query_fingerprint", ""),
+                    sources_queried=existing.get("sources_queried", []),
+                    sources_failed=existing.get("sources_failed", []),
+                    hits=[],
+                    citations=[],
+                    conflicts=[],
+                    missing_information=existing.get("missing_information", []),
+                    overall_freshness_score=existing.get("overall_freshness_score", 0.0),
+                    overall_confidence=existing.get("overall_confidence", 0.0),
+                    summary_text=existing.get("summary_text", ""),
+                    summary_fingerprint=existing.get("summary_fingerprint", ""),
+                    duration_ms=existing.get("duration_ms", 0),
+                    created_at=existing.get("created_at", ""),
+                    schema_version=existing.get("schema_version", SCHEMA_VERSION),
+                    is_idempotent_reuse=True,
+                    total_hits=existing.get("total_hits", 0),
+                )
                 return pack
-            self._state_meta_set(key, pack.to_dict())
+
+        # Cache miss - run dry_run and persist
+        pack = self.dry_run(objective_id, objective_text, **kwargs)
+        if self._storage is not None and hasattr(self._storage, "get_meta") and callable(self._storage.get_meta):
+            key = f"{self.STATE_META_PREFIX}{objective_id}:{self.STATE_META_KEY_VERSION}"
+            self.set_meta(key, pack.to_dict())
         return pack
 
+    def _compute_fingerprint(self, objective_id: str, objective_text: str, **kwargs) -> str:
+        """Compute query fingerprint for cache key matching."""
+        goal_class = kwargs.get("goal_class", "OTHER")
+        risk_profile = kwargs.get("risk_profile", "low")
+        complexity = kwargs.get("complexity", "S")
+        max_hits_per_source = kwargs.get("max_hits_per_source", MAX_HITS_PER_SOURCE_DEFAULT)
+        timeout_seconds = kwargs.get("timeout_seconds", TIMEOUT_SECONDS_DEFAULT)
+        sources_requested = kwargs.get("sources_requested", tuple(self._sources.keys()))
+        return _sha256_hex({
+            "objective_id": objective_id,
+            "objective_text": objective_text,
+            "goal_class": goal_class,
+            "risk_profile": risk_profile,
+            "complexity": complexity,
+            "max_hits_per_source": max_hits_per_source,
+            "timeout_seconds": timeout_seconds,
+            "sources_requested": sorted(sources_requested) if sources_requested else [],
+            "schema_version": SCHEMA_VERSION,
+        })
+
     def rollback(self, objective_id: str) -> bool:
-        """Idempotent: returns True if something was deleted, False otherwise."""
-        if self._storage is None or not hasattr(self._storage, "_state_meta"):
+        """Idempotent: returns True if something was deleted, False otherwise.
+
+        Uses public get_meta/set_meta for detection and deletion.
+        """
+        if self._storage is None:
+            return False
+        # Detect storage by public methods only
+        if not hasattr(self._storage, "get_meta") or not callable(self._storage.get_meta):
             return False
         key = f"{self.STATE_META_PREFIX}{objective_id}:{self.STATE_META_KEY_VERSION}"
-        existing = self._state_meta_get(key)
+        existing = self.get_meta(key)
         if existing is None:
             return False
-        self._state_meta_delete(key)
+        # Use delete_meta if available, otherwise set to None to mark as deleted
+        if hasattr(self._storage, "delete_meta") and callable(self._storage.delete_meta):
+            try:
+                self._storage.delete_meta(key)
+            except Exception:
+                return False
+        else:
+            # Fallback: set to empty to indicate deletion
+            try:
+                self.set_meta(key, {"_deleted": True})
+            except Exception:
+                return False
         return True
 
     # ── state_meta adapter (works with both ObjectiveStateStorage and FakeDB) ──

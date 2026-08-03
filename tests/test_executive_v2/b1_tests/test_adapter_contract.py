@@ -17,8 +17,9 @@ modes) to verify each provider satisfies the EvidencePack v2 contract:
 Total: 27 test cases (parametrized expansions of 8 contract tests).
 """
 from __future__ import annotations
+from typing import Optional
 import pytest
-from agent.executive.knowledge_discovery import EvidencePackEngine, KnowledgeHitV2, KnowledgeQuery
+from agent.executive.knowledge_discovery import EvidencePackEngine, KnowledgeHitV2, KnowledgeQuery, ProvenanceEnvelope, FreshnessPolicy
 from tests.test_executive_v2.b1_tests.support import _InMemoryStorage
 from tests.test_executive_v2.b1_tests.fake_providers import PRODUCER_NAME, contract_provider, empty_spec, failing_spec, gbrain_provider, obsidian_provider, policy_provider, report_provider, FakeProviderSpec
 OBS = '2026-07-08T20:00:00+00:00'
@@ -129,3 +130,262 @@ def test_contract_08_provider_with_no_hits_returns_empty_list():
     assert len(pack.hits) == 0
     assert 'gbrain' in pack.sources_queried
     assert 'obsidian' in pack.sources_queried
+
+
+# ── Idempotency contract tests (using public-only storage) ──
+
+
+class _PublicOnlyStorage:
+    """Storage with ONLY public get_meta/set_meta methods (no _state_meta, no delete_meta).
+
+    Uses closure for state instead of private attribute.
+    """
+
+    def __init__(self):
+        # Use closure-based storage: list with one dict
+        self.storage_ref = [{}]
+
+    def get_meta(self, k: str) -> Optional[str]:
+        """Public get_meta: returns JSON string or None."""
+        return self.storage_ref[0].get(k)
+
+    def set_meta(self, k: str, v: str) -> None:
+        """Public set_meta: stores JSON string."""
+        self.storage_ref[0][k] = v
+
+
+class _StorageWithWriteCount:
+    """Storage that counts set_meta calls."""
+
+    def __init__(self):
+        self.storage_ref = [{}]
+        self.set_meta_calls = 0
+
+    def get_meta(self, k: str) -> Optional[str]:
+        return self.storage_ref[0].get(k)
+
+    def set_meta(self, k: str, v: str) -> None:
+        self.set_meta_calls += 1
+        self.storage_ref[0][k] = v
+
+
+class _SimpleAuditSink:
+    """Minimal audit sink that records events."""
+
+    def __init__(self):
+        self.events_ref = [[]]
+
+    def emit(self, event: dict) -> None:
+        self.events_ref[0].append(dict(event))
+
+    def get_events(self) -> list[dict]:
+        return list(self.events_ref[0])
+
+
+@pytest.fixture
+def public_only_storage():
+    """Fresh storage with only public get_meta/set_meta methods (no _state_meta, no delete_meta)."""
+    return _PublicOnlyStorage()
+
+
+def _make_provider_call_counting_bundle():
+    """Create a bundle that counts how many times the provider is called."""
+    call_count = [0]
+    def counting_provider(query, *, max_hits, observed_at):
+        call_count[0] += 1
+        # Use public constructors instead of private helpers
+        hit = KnowledgeHitV2(
+            source='gbrain',
+            hit_id=f'hit-{query.objective_id}',
+            title=f'Title for {query.objective_id}',
+            relevance_score=0.9,
+            snippet=f'Snippet for {query.objective_text}',
+            location='test://location',
+            fingerprint='test-fingerprint',
+            created_at=observed_at,
+            provenance=ProvenanceEnvelope(
+                producer='test-producer',
+                produced_at=observed_at,
+                source_type='test',
+                source_uri='test://uri',
+                retrieval_mode='test',
+                read_only=True,
+            ),
+            freshness=FreshnessPolicy(
+                observed_at=observed_at,
+                source_updated_at=observed_at,
+                staleness_days=0,
+                freshness='current',
+                freshness_score=1.0,
+            ),
+        )
+        return [hit]
+    return {'gbrain': counting_provider}, call_count
+
+
+def test_idempotency_first_call_invokes_provider_and_writes_metadata(public_only_storage):
+    """First discover call invokes provider once and writes metadata."""
+    bundle, call_count = _make_provider_call_counting_bundle()
+    engine = EvidencePackEngine(sources=bundle, storage=public_only_storage)
+
+    pack = engine.discover(objective_id='idem-001', objective_text='test query')
+
+    assert call_count[0] == 1, f'Provider should be called once, got {call_count[0]}'
+    assert pack.is_idempotent_reuse is False
+    # Verify metadata was written via public API
+    meta = engine.get_meta(f'objective_knowledge_discovery:idem-001:v2')
+    assert meta is not None
+    assert meta.get('objective_id') == 'idem-001'
+
+
+def test_idempotency_second_call_reuses_cache_without_new_provider_call(public_only_storage):
+    """Second discover call with same objective_id reuses cache, no new provider call."""
+    bundle, call_count = _make_provider_call_counting_bundle()
+    engine = EvidencePackEngine(sources=bundle, storage=public_only_storage)
+
+    # First call
+    pack1 = engine.discover(objective_id='idem-002', objective_text='test query')
+    assert call_count[0] == 1
+
+    # Second call with same objective_id - should hit cache
+    pack2 = engine.discover(objective_id='idem-002', objective_text='test query')
+
+    assert call_count[0] == 1, f'Provider should not be called again, got {call_count[0]}'
+    assert pack2.is_idempotent_reuse is True
+
+
+def test_idempotency_different_objective_text_causes_cache_miss(public_only_storage):
+    """Same objective_id with different objective_text causes cache miss and invokes provider."""
+    bundle, call_count = _make_provider_call_counting_bundle()
+    engine = EvidencePackEngine(sources=bundle, storage=public_only_storage)
+
+    # First call
+    pack1 = engine.discover(objective_id='idem-003', objective_text='first query')
+    assert call_count[0] == 1
+
+    # Second call with different text - should miss cache
+    pack2 = engine.discover(objective_id='idem-003', objective_text='different query')
+
+    assert call_count[0] == 2, f'Provider should be called again for different text, got {call_count[0]}'
+    assert pack2.is_idempotent_reuse is False
+
+
+def test_idempotency_no_storage_preserved():
+    """When storage is None, discover works without persisting."""
+    bundle, call_count = _make_provider_call_counting_bundle()
+    engine = EvidencePackEngine(sources=bundle, storage=None)
+
+    pack = engine.discover(objective_id='idem-004', objective_text='test query')
+
+    assert call_count[0] == 1
+    # get_meta should return None when storage is None
+    meta = engine.get_meta('objective_knowledge_discovery:idem-004:v2')
+    assert meta is None
+
+
+def test_idempotency_get_meta_returns_none_for_missing_key(public_only_storage):
+    """get_meta returns None for non-existent key."""
+    engine = EvidencePackEngine(sources={}, storage=public_only_storage)
+    meta = engine.get_meta('nonexistent-key')
+    assert meta is None
+
+
+def test_idempotency_get_meta_returns_valid_metadata(public_only_storage):
+    """get_meta returns valid metadata when present."""
+    bundle, _ = _make_provider_call_counting_bundle()
+    engine = EvidencePackEngine(sources=bundle, storage=public_only_storage)
+
+    engine.discover(objective_id='idem-005', objective_text='test')
+
+    meta = engine.get_meta('objective_knowledge_discovery:idem-005:v2')
+    assert meta is not None
+    assert 'objective_id' in meta
+    assert 'query_fingerprint' in meta
+
+
+def test_idempotency_corrupted_metadata_does_not_cause_false_hit(public_only_storage):
+    """Corrupted metadata (invalid JSON) does not cause false cache hit."""
+    # Manually write corrupted metadata
+    public_only_storage.set_meta('objective_knowledge_discovery:idem-006:v2', 'not valid json {{{')
+
+    bundle, call_count = _make_provider_call_counting_bundle()
+    engine = EvidencePackEngine(sources=bundle, storage=public_only_storage)
+
+    pack = engine.discover(objective_id='idem-006', objective_text='test query')
+
+    # Should invoke provider because corrupted metadata can't be parsed
+    assert call_count[0] == 1
+    assert pack.is_idempotent_reuse is False
+
+
+def test_idempotency_get_meta_raises_on_storage_error():
+    """get_meta returns None when storage raises exception (not raises)."""
+    class BadStorage:
+        def get_meta(self, k):
+            raise RuntimeError("storage error")
+        def set_meta(self, k, v):
+            pass
+
+    engine = EvidencePackEngine(sources={}, storage=BadStorage())
+    # Should return None, not raise
+    meta = engine.get_meta('some-key')
+    assert meta is None
+
+
+def test_idempotency_set_meta_raises_on_no_storage():
+    """set_meta raises RuntimeError when storage is None."""
+    engine = EvidencePackEngine(sources={}, storage=None)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        engine.set_meta('key', {'value': 1})
+
+    assert 'No storage' in str(exc_info.value)
+
+
+def test_idempotency_set_meta_raises_on_missing_method():
+    """set_meta raises RuntimeError when storage lacks set_meta method."""
+    class BadStorage:
+        def get_meta(self, k):
+            return None
+
+    engine = EvidencePackEngine(sources={}, storage=BadStorage())
+
+    with pytest.raises(RuntimeError) as exc_info:
+        engine.set_meta('key', {'value': 1})
+
+    assert 'does not support set_meta' in str(exc_info.value)
+
+
+def test_idempotency_set_meta_raises_on_storage_failure():
+    """set_meta raises RuntimeError when storage write fails."""
+    class BadStorage:
+        def get_meta(self, k):
+            return None
+        def set_meta(self, k, v):
+            raise IOError("write failed")
+
+    engine = EvidencePackEngine(sources={}, storage=BadStorage())
+
+    with pytest.raises(RuntimeError) as exc_info:
+        engine.set_meta('key', {'value': 1})
+
+    assert 'Failed to set metadata' in str(exc_info.value)
+
+
+def test_idempotency_second_call_does_not_write_metadata():
+    """Second discover call with same params does not call set_meta."""
+    storage = _StorageWithWriteCount()
+    bundle, call_count = _make_provider_call_counting_bundle()
+    engine = EvidencePackEngine(sources=bundle, storage=storage)
+
+    # First call - should write metadata
+    pack1 = engine.discover(objective_id='idem-007', objective_text='test query')
+    first_writes = storage.set_meta_calls
+    assert first_writes == 1, f'First call should write once, got {first_writes}'
+
+    # Second call with same params - should NOT write metadata
+    pack2 = engine.discover(objective_id='idem-007', objective_text='test query')
+    second_writes = storage.set_meta_calls - first_writes
+
+    assert second_writes == 0, f'Second call should not write, got {second_writes}'
+    assert pack2.is_idempotent_reuse is True
