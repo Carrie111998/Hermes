@@ -13,7 +13,7 @@ vi.mock('@/hermes', () => ({
 import { $pinnedSessionIds } from '@/store/layout'
 import { $sessions } from '@/store/session'
 
-import { watchSessionPins, _resetSessionPinSyncStateForTests } from './session-pin-sync'
+import { _resetSessionPinSyncStateForTests, watchSessionPins } from './session-pin-sync'
 
 const row = (id: string, extra: Partial<SessionInfo> = {}): SessionInfo =>
   ({ id, message_count: 1, source: 'cli', started_at: 0, title: id, ...extra }) as SessionInfo
@@ -123,14 +123,8 @@ describe('watchSessionPins remote pull', () => {
     await flush()
     patch.mockClear()
 
-    // Our mirror PATCH acks; the next refresh reflects it (pinned=true),
-    // which clears the write guard…
-    $sessions.set([row('gone', { pinned: true })])
-    await flush()
-    expect($pinnedSessionIds.get()).toContain('gone')
-
-    // …after which a page carrying genuine server truth (another app
-    // unpinned it) is honored.
+    // Mirror PATCH settles; a later page with genuine server truth (another
+    // app unpinned it) must be honored without requiring a reflecting page.
     $sessions.set([row('gone', { pinned: false })])
     await flush()
 
@@ -211,22 +205,49 @@ describe('watchSessionPins remote pull', () => {
     await flush()
 
     // The stale page (issued before the write) finally lands AFTER the ack,
-    // still carrying the pre-write value. Reading it as server truth would
-    // resurrect the pin and re-PATCH pinned=false... wait, pinned=true back.
-    $sessions.set([row('postack', { pinned: false }), row('other')])
+    // still carrying the pre-write value. Must not revert the toggle — and
+    // must not re-PATCH the wrong value durable.
+    const stalePage = [row('postack', { pinned: false }), row('other')]
+
+    $sessions.set(stalePage)
     await flush()
     expect($pinnedSessionIds.get()).toContain('postack')
     expect(patch).not.toHaveBeenCalledWith('postack', false, undefined)
 
-    // Only a page reflecting the written value clears the guard…
-    $sessions.set([row('postack', { pinned: true }), row('other')])
+    // Reconcile against the same page identity must keep refusing it.
+    $pinnedSessionIds.set(['postack'])
     await flush()
     expect($pinnedSessionIds.get()).toContain('postack')
 
-    // …after which genuine server truth is honoured again.
+    // A later distinct page with genuine opposite server truth is honored
+    // (no intervening reflecting page required — multi-client unpin).
     $sessions.set([row('postack', { pinned: false }), row('other')])
     await flush()
     expect($pinnedSessionIds.get()).not.toContain('postack')
+  })
+
+  it('honors a remote opposite pin without an intervening reflecting page', async () => {
+    let settle: (v: { ok: boolean }) => void = () => {}
+
+    patch.mockImplementationOnce(() => new Promise(resolve => (settle = resolve)))
+
+    $sessions.set([row('remote-flip')])
+    $pinnedSessionIds.set(['remote-flip'])
+    await flush()
+    settle({ ok: true })
+    await flush()
+    await flush()
+    patch.mockClear()
+
+    // First post-ack page disagrees (could be stale). Local pin holds.
+    $sessions.set([row('remote-flip', { pinned: false })])
+    await flush()
+    expect($pinnedSessionIds.get()).toContain('remote-flip')
+
+    // Next distinct page still says unpinned — that is server truth now.
+    $sessions.set([row('remote-flip', { pinned: false }), row('peer')])
+    await flush()
+    expect($pinnedSessionIds.get()).not.toContain('remote-flip')
   })
 
   it('lets a later write outlive a stale ack from a superseded one', async () => {

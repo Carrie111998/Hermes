@@ -20,6 +20,8 @@
  * the local set untouched.
  */
 
+import type { SessionInfo } from '@/types/hermes'
+
 import { setSessionPinnedRemote } from '@/hermes'
 import { $pinnedSessionIds, pinSession, unpinSession } from '@/store/layout'
 import { $sessions, sessionMatchesStoredId, sessionPinId } from '@/store/session'
@@ -29,11 +31,14 @@ const mirrored = new Set<string>()
 // pin ids awaiting their row so we can resolve the owning profile before PATCH.
 const pending = new Set<string>()
 // Writes we've issued: id -> { value, seq, acked }. The guard survives the
-// PATCH ack until a session-list page reflecting the written value arrives:
-// a page issued BEFORE the write can land AFTER the ack still carrying the
-// old value, and reading it as server truth would revert the user's toggle
-// and re-PATCH the wrong value durable (#76919, follow-up to #74570).
-// `seq` lets a later write's guard outlive a stale ack from an earlier one.
+// PATCH ack because a page issued BEFORE the write can land AFTER the ack
+// still carrying the old value (#76919, follow-up to #74570). `seq` lets a
+// later write's guard outlive a stale ack from an earlier one.
+//
+// Post-ack mismatches clear the guard without adopting THAT page snapshot
+// (keyed by `$sessions` array identity): the next distinct page is treated
+// as authoritative. That fences the stale-after-ack race without forever
+// discarding a genuine opposite value from another Desktop instance.
 interface PinWrite {
   value: boolean
   seq: number
@@ -41,19 +46,43 @@ interface PinWrite {
 }
 const writes = new Map<string, PinWrite>()
 let writeSeq = 0
+// Session-list page identities that must not drive pin adoption for a given
+// id (stale post-ack snapshot). WeakSet so pages can be GC'd.
+const skippedPages = new WeakMap<SessionInfo[], Set<string>>()
 
 function profileFor(pinId: string): null | string | undefined {
   return $sessions.get().find(row => sessionMatchesStoredId(row, pinId))?.profile
 }
 
+function skipPageFor(page: SessionInfo[], ...ids: string[]): void {
+  let held = skippedPages.get(page)
+
+  if (!held) {
+    held = new Set<string>()
+    skippedPages.set(page, held)
+  }
+
+  for (const id of ids) {
+    held.add(id)
+  }
+}
+
+function isSkippedOnPage(page: SessionInfo[], ...ids: string[]): boolean {
+  const held = skippedPages.get(page)
+
+  return !!held && ids.some(id => held.has(id))
+}
+
 /** PATCH the flag, guarding reads against pages that predate the write. */
 function writePin(id: string, pinned: boolean, profile?: null | string): Promise<void> {
   const seq = ++writeSeq
+
   writes.set(id, { value: pinned, seq, acked: false })
 
   return setSessionPinnedRemote(id, pinned, profile).then(
     () => {
       const entry = writes.get(id)
+
       // Only the LATEST write's ack may settle the guard; a stale ack from a
       // superseded write must not clear a newer intent.
       if (entry && entry.seq === seq) {
@@ -62,9 +91,11 @@ function writePin(id: string, pinned: boolean, profile?: null | string): Promise
     },
     (err: unknown) => {
       const entry = writes.get(id)
+
       if (entry && entry.seq === seq) {
         writes.delete(id)
       }
+
       throw err
     }
   )
@@ -74,15 +105,16 @@ function writePin(id: string, pinned: boolean, profile?: null | string): Promise
  * Adopt the server's pin state for every row in the current page.
  *
  * Runs after the push pass so local intent is already fenced (`pending` /
- * `unconfirmed`) by the time the page is read — a fresh local toggle whose
+ * write guard) by the time the page is read — a fresh local toggle whose
  * PATCH hasn't landed yet must win over the stale row, not be reverted by it
  * (#74570). Remote pins adopted here are marked mirrored before the local set
  * changes, so the re-entrant reconcile doesn't echo them back as a PATCH.
  */
 function pullRemotePins(): void {
   const local = new Set($pinnedSessionIds.get())
+  const page = $sessions.get()
 
-  for (const row of $sessions.get()) {
+  for (const row of page) {
     // A backend without the flag has no opinion; never act on `undefined`.
     if (typeof row.pinned !== 'boolean') {
       continue
@@ -95,15 +127,30 @@ function pullRemotePins(): void {
 
     // A write of ours the page hasn't caught up to yet is newer than the page.
     const awaited = writes.get(pinId) ?? writes.get(row.id)
+
     if (awaited) {
-      if (!awaited.acked || awaited.value !== row.pinned) {
-        // In flight, or the page predates the write (still carries the old
-        // value even though the PATCH acked) — never adopt it.
+      if (!awaited.acked && awaited.value !== row.pinned) {
+        // Still in flight — never adopt a contradicting page.
         continue
       }
-      // The page reflects our write — the guard has done its job.
+
+      if (awaited.acked && awaited.value !== row.pinned) {
+        // Post-ack mismatch: drop the guard and refuse THIS page snapshot for
+        // this id. A later distinct `$sessions` array is authoritative again
+        // (genuine remote flip, or a reflecting refresh).
+        writes.delete(pinId)
+        writes.delete(row.id)
+        skipPageFor(page, pinId, row.id)
+        continue
+      }
+
+      // Page reflects our write — the guard has done its job.
       writes.delete(pinId)
       writes.delete(row.id)
+    }
+
+    if (isSkippedOnPage(page, pinId, row.id)) {
+      continue
     }
 
     // Local intent still waiting on its PATCH (row unresolved when the push
