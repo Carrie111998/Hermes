@@ -14,7 +14,6 @@ test('backend exit wait escalates after timeout but resolves only after exit', a
   vi.useFakeTimers()
 
   try {
-
     let exitListener!: () => void
 
     let forceKillCalls = 0
