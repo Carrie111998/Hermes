@@ -46,6 +46,9 @@ COMPUTER_USE_SCHEMA: Dict[str, Any] = {
                     "list_apps",
                     "list_windows",
                     "focus_app",
+                    "launch_app",
+                    "kill_app",
+                    "bring_to_front",
                     "cua_browser_state",
                     "cua_browser_prepare",
                     "cua_browser_navigate",
@@ -226,6 +229,28 @@ COMPUTER_USE_SCHEMA: Dict[str, Any] = {
                     "— input is routed to the app without raising, "
                     "matching the background co-work model."
                 ),
+            },
+            "bundle_id": {
+                "type": "string",
+                "description": "For action='launch_app': native bundle or application ID.",
+            },
+            "name": {
+                "type": "string",
+                "description": "For action='launch_app': application name, e.g. 'Chromium'.",
+            },
+            "urls": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "For action='launch_app': optional URLs to open after launch.",
+            },
+            "additional_arguments": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "For action='launch_app': optional native command-line arguments.",
+            },
+            "creates_new_application_instance": {
+                "type": "boolean",
+                "description": "For action='launch_app': force a separate application instance.",
             },
             # ── delivery (verify → escalate ladder) ────────────────
             "delivery_mode": {

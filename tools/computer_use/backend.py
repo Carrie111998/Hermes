@@ -204,6 +204,42 @@ class ComputerUseBackend(ABC):
     def focus_app(self, app: str, raise_window: bool = False) -> ActionResult:
         """Route input to `app` (by name or bundle ID). Default: focus without raise."""
 
+    # ── App lifecycle ────────────────────────────────────────────────
+    def launch_app(
+        self,
+        *,
+        bundle_id: Optional[str] = None,
+        name: Optional[str] = None,
+        urls: Optional[List[str]] = None,
+        additional_arguments: Optional[List[str]] = None,
+        creates_new_application_instance: bool = False,
+    ) -> Dict[str, Any]:
+        """Start an app when the backend exposes CUA's lifecycle tools."""
+        return {
+            "ok": False,
+            "status": "refused",
+            "code": "app_lifecycle_unavailable",
+            "message": "This computer-use backend cannot launch native applications.",
+        }
+
+    def kill_app(self, *, pid: int) -> ActionResult:
+        """Terminate an app when the backend exposes CUA's lifecycle tools."""
+        return ActionResult(
+            ok=False,
+            action="kill_app",
+            code="app_lifecycle_unavailable",
+            message="This computer-use backend cannot terminate native applications.",
+        )
+
+    def bring_to_front(self, *, pid: int, window_id: Optional[int] = None) -> ActionResult:
+        """Raise an app window when the backend exposes CUA's lifecycle tools."""
+        return ActionResult(
+            ok=False,
+            action="bring_to_front",
+            code="app_lifecycle_unavailable",
+            message="This computer-use backend cannot raise native application windows.",
+        )
+
     # ── Native-value mutation ────────────────────────────────────────
     @abstractmethod
     def set_value(self, value: str, element: Optional[int] = None) -> ActionResult:
