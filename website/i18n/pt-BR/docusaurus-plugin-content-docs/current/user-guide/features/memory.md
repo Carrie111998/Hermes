@@ -89,7 +89,7 @@ Para informação sobre identidade, preferências e estilo de comunicação do u
 - Preferências de comunicação (conciso vs detalhado, preferências de formato)
 - Pet peeves e coisas a evitar
 - Hábitos de fluxo de trabalho
-- Nível de habilidade técnica
+- Nível de skill técnica
 
 ## O que salvar vs ignorar {#what-to-save-vs-skip}
 

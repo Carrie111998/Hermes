@@ -1389,7 +1389,7 @@ model:
 | **Modelos de IA chineses** | z.ai (GLM), Kimi/Moonshot (`kimi-coding` ou `kimi-coding-cn`), MiniMax, Xiaomi MiMo, ou Tencent TokenHub (provedores de primeira classe) |
 
 :::tip
-Você pode alternar entre provedores a qualquer momento com `hermes model` — sem necessidade de reiniciar. Seu histórico de conversa, memória e habilidades são mantidos independentemente do provedor usado.
+Você pode alternar entre provedores a qualquer momento com `hermes model` — sem necessidade de reiniciar. Seu histórico de conversa, memória e skills são mantidos independentemente do provedor usado.
 :::
 
 ## Chaves de API Opcionais {#optional-api-keys}

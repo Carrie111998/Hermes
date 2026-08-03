@@ -345,7 +345,7 @@ entregas explícitas em outros chats) nunca são tornados continuáveis. O espel
 escrito como um turn de usuário rotulado (`[Cron delivery: <task name>]`), o que mantém
 o histórico de conversa seguro para alternância em todos os providers de model.
 
-#### Continuação plana no canal (Slack)
+#### Continuação plana no canal (Slack) {#flat-in-channel-continuation-slack}
 
 O comportamento thread-preferred acima cria uma thread dedicada a cada
 entrega. Se você preferir que um job continuável caia **plano na timeline do canal
