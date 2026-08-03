@@ -255,7 +255,7 @@ def _apply_addition_only_hunk(content: str, hunk: Hunk) -> Tuple[str, Optional[s
 
     Insertion rules (mirrored exactly by both phases):
     - context hint present and unique → insert after the line holding the hint;
-    - context hint present but missing → append at end of file (safe fallback);
+    - context hint present but missing → error (caller rejects the patch);
     - context hint present but ambiguous → error (caller rejects the patch);
     - no context hint → append at end of file.
     """
@@ -451,7 +451,8 @@ def _validate_operations(
                 pending_content.pop(op.file_path, None)
                 removed_paths.add(op.file_path)
 
-        # ADD: parent directory creation handled by write_file; no pre-check needed.
+        # ADD parent creation and mutation remain apply-phase responsibilities;
+        # candidate policy/syntax was preflighted above.
 
     if not errors and real_change_count == 0:
         errors.append("Patch contains no changes (only context lines were provided)")
