@@ -117,6 +117,9 @@ class _FifoRunner:
     async def busy_handler(self, event, session_key):
         return False
 
+    def _adapter_for_source(self, source):
+        return self._adapter
+
     def _queue_or_replace_pending_event(self, session_key, event):
         slot = self._adapter._pending_messages
         if session_key in slot:
@@ -197,4 +200,26 @@ async def test_enqueue_failure_falls_back_to_merge():
     await adapter.handle_message(_make_event("two"))
     await adapter._flush_text_debounce_now(session_key)
 
+    assert adapter._pending_messages[session_key].text == "one\ntwo"
+
+
+@pytest.mark.asyncio
+async def test_merge_preserved_when_adapter_unresolvable():
+    """An unresolvable source must fall back to the merge, not vanish.
+
+    _queue_or_replace_pending_event returns early WITHOUT queueing when
+    _adapter_for_source yields nothing. Delegating into that path
+    unconditionally would drop the burst where the previous merge kept it,
+    so the flush only delegates once the runner resolves the source back to
+    this adapter.
+    """
+    adapter, runner, session_key = await _busy_adapter_with(True)
+    runner._adapter_for_source = lambda source: None
+
+    await adapter.handle_message(_make_event("one"))
+    await adapter._flush_text_debounce_now(session_key)
+    await adapter.handle_message(_make_event("two"))
+    await adapter._flush_text_debounce_now(session_key)
+
+    assert not runner.queued
     assert adapter._pending_messages[session_key].text == "one\ntwo"
