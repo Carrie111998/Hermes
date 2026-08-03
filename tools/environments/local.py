@@ -394,6 +394,56 @@ def _is_hermes_internal_secret(key: str) -> bool:
     return False
 
 
+# Per-home cache of applied-secret KEY NAMES (never values).  The snapshot in
+# ``hermes_cli.env_loader`` is immutable per home for the life of the process
+# (``reset_secret_source_cache`` clears it, e.g. in tests), so caching the
+# names avoids re-resolving the home path on every spawn.
+_applied_secret_names_cache: dict[str, frozenset[str]] = {}
+
+
+def _applied_secret_names() -> frozenset[str]:
+    """Return the KEY names of externally-applied secret values for the
+    effective Hermes home.
+
+    Provenance-aware complement to :func:`_is_hermes_internal_secret` and the
+    static blocklists.  External secret sources (Bitwarden / 1Password /
+    secret-source command) can apply values under ANY name —
+    ``DATABASE_URL``, ``FOO``, arbitrary 1Password item keys — that no shape
+    predicate matches, and those values were previously inherited verbatim by
+    every spawned child (issue #77164).  ``hermes_cli.env_loader`` records
+    exactly which keys an external source contributed per home; consulting
+    that snapshot decides by provenance instead of guessing by name shape.
+
+    Only the KEY names are returned — values are never read out of the
+    snapshot; the scrub only needs names to strip them from child envs.
+
+    Fail open: any failure to resolve the snapshot (missing ``env_loader``,
+    unresolvable home) yields an empty set so a secret-source problem can
+    never break child-process spawning.
+    """
+    try:
+        from hermes_cli.env_loader import get_secret_source_values
+        from hermes_constants import get_hermes_home
+    except Exception:
+        return frozenset()
+
+    try:
+        home_key = str(Path(get_hermes_home()).resolve())
+    except Exception:
+        return frozenset()
+
+    cached = _applied_secret_names_cache.get(home_key)
+    if cached is not None:
+        return cached
+
+    try:
+        names = frozenset(get_secret_source_values(home_key).keys())
+    except Exception:
+        names = frozenset()
+    _applied_secret_names_cache[home_key] = names
+    return names
+
+
 def _inject_context_hermes_home(env: dict) -> None:
     """Bridge the context-local Hermes home override into subprocess env."""
     try:
@@ -465,6 +515,7 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
         _resolve_passthrough_value = lambda _name, fallback: fallback  # noqa: E731
 
     sanitized: dict[str, str] = {}
+    applied_secret_names = _applied_secret_names()
 
     for key, value in (base_env or {}).items():
         if key.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
@@ -473,6 +524,12 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
             continue
         passthrough = _is_passthrough(key)
         if key in _HERMES_PROVIDER_ENV_BLOCKLIST and not passthrough:
+            continue
+        # Provenance scrub: externally-applied secrets (Bitwarden / 1Password
+        # / secret-source command) are recorded per-home under any name shape
+        # (DATABASE_URL, FOO, ...).  An explicit env_passthrough registration
+        # still wins, exactly like the blocklist behavior above.
+        if key in applied_secret_names and not passthrough:
             continue
         resolved = _resolve_passthrough_value(key, value) if passthrough else value
         if resolved is not None:
@@ -489,6 +546,8 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
         else:
             passthrough = _is_passthrough(key)
             if key in _HERMES_PROVIDER_ENV_BLOCKLIST and not passthrough:
+                continue
+            if key in applied_secret_names and not passthrough:
                 continue
             resolved = _resolve_passthrough_value(key, value) if passthrough else value
             if resolved is not None:
@@ -583,7 +642,7 @@ def hermes_subprocess_env(*, inherit_credentials: bool = False) -> dict[str, str
     skill-aware (``env_passthrough``); this helper is for spawns that have no
     skill-passthrough concept.
 
-    Two-tier stripping:
+    Two-tier stripping, plus a provenance pass:
 
     * **Tier 1 (always):** ``_ALWAYS_STRIP_KEYS`` — gateway bot tokens, GitHub
       auth, and remote-compute secrets are removed regardless of
@@ -591,6 +650,12 @@ def hermes_subprocess_env(*, inherit_credentials: bool = False) -> dict[str, str
     * **Tier 2 (conditional):** the rest of ``_HERMES_PROVIDER_ENV_BLOCKLIST``
       (LLM provider API keys, tool secrets) is removed unless the caller passes
       ``inherit_credentials=True``.
+    * **Provenance (always):** any key recorded in the current home's
+      applied-secrets snapshot (``hermes_cli.env_loader`` — values applied
+      from Bitwarden / 1Password / a secret-source command, under any name
+      shape) is removed, even with ``inherit_credentials=True``.  Vault-applied
+      secrets are exactly the ones a child must never read from its
+      environment (issue #77164).
 
     Pass ``inherit_credentials=True`` **only** when the child legitimately
     needs LLM provider credentials — a user-blessed ``claude`` / ``codex`` /
@@ -618,6 +683,17 @@ def hermes_subprocess_env(*, inherit_credentials: bool = False) -> dict[str, str
             env.pop(key, None)
         elif _is_hermes_internal_secret(key):
             env.pop(key, None)
+
+    # Applied-secrets provenance scrub (issue #77164): keys contributed by
+    # external secret sources (Bitwarden / 1Password / secret-source command)
+    # are recorded per-home in ``hermes_cli.env_loader`` under ANY name —
+    # including non-credential-shaped names (``DATABASE_URL``, ``FOO``,
+    # arbitrary 1Password item keys) that no shape predicate matches.  Strip
+    # them unconditionally, same class as ``_ALWAYS_STRIP_KEYS``: no child
+    # Hermes spawns, even a model-driving CLI with ``inherit_credentials=True``,
+    # needs vault-applied secrets read from its environment.
+    for key in _applied_secret_names():
+        env.pop(key, None)
 
     if not inherit_credentials:
         # Tier 2 — strip provider/tool credentials unless explicitly inherited.
