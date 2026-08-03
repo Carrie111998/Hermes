@@ -5,7 +5,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/re
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type * as ReactionsStore from '@/store/reactions'
-import { $reactionsEnabled } from '@/store/reactions-enabled'
+import { $reactionsStyle } from '@/store/reactions-style'
 import { $localReactions } from '@/store/reactions-local'
 
 import { isTapbackDoubleClick } from './use-message-reactions'
@@ -62,7 +62,7 @@ function Harness() {
 
 beforeEach(() => {
   $localReactions.set({})
-  $reactionsEnabled.set(false)
+  $reactionsStyle.set('off')
 })
 
 afterEach(() => {
@@ -92,7 +92,7 @@ describe('isTapbackDoubleClick', () => {
 
 describe('double-click to heart an assistant message', () => {
   it('hearts the message, and a second double-click retracts it', async () => {
-    $reactionsEnabled.set(true)
+    $reactionsStyle.set('emoji')
     render(<Harness />)
 
     const message = (await screen.findByText('done')).closest('[data-slot="aui_assistant-message-root"]')

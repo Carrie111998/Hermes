@@ -1,5 +1,5 @@
 import { DATA_IMAGE_URL_RE, dataUrlToBlob } from '@/lib/embedded-images'
-import { $reactionsEnabled } from '@/store/reactions-enabled'
+import { $reactionsStyle } from '@/store/reactions-style'
 
 import { serializeTextBefore } from './rich-editor'
 
@@ -221,7 +221,7 @@ export function detectTrigger(textBefore: string): TriggerState | null {
   // After `@` so a directive starter's colon (`@file:`) stays an `@` query.
   // Rides the reactions opt-in (Settings → Appearance) — both are one
   // "emoji features" surface, off by default.
-  const emoji = $reactionsEnabled.get() ? EMOJI_TRIGGER_RE.exec(textBefore) : null
+  const emoji = $reactionsStyle.get() !== 'off' ? EMOJI_TRIGGER_RE.exec(textBefore) : null
 
   if (emoji) {
     return { kind: ':', query: emoji[2], tokenLength: 1 + emoji[2].length, value: emoji[2] }
