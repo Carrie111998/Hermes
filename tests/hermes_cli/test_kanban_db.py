@@ -592,11 +592,26 @@ def test_respawn_guard_stale_success_not_guarded(kanban_home):
 
 
 def test_respawn_guard_active_pr_in_comment(kanban_home):
-    """A GitHub PR URL in a recent comment triggers active_pr when the PR is OPEN."""
+    """A GitHub PR URL in a recent comment by an OWN-WORKER triggers active_pr
+    when the PR is OPEN (composed guard: own-worker author + OPEN state)."""
     with kb.connect() as conn:
         t = kb.create_task(conn, title="has-pr", assignee="alice")
+        # Seed a prior run so the comment author "worker" counts as an
+        # own-worker (task_runs.profile) for the author-restriction half.
+        kb.claim_task(conn, t)
+        run_id = kb.get_task(conn, t).current_run_id
+        conn.execute(
+            "UPDATE task_runs SET outcome='completed', status='completed', "
+            "ended_at=? WHERE id=?",
+            (int(time.time()) - 7200, run_id),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='ready', current_run_id=NULL, "
+            "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL WHERE id=?",
+            (t,),
+        )
         kb.add_comment(
-            conn, t, "worker",
+            conn, t, "alice",
             "PR created: https://github.com/totemx-AI/subsidysmart/pull/42",
         )
         with unittest.mock.patch.object(kb, "_github_pr_state", return_value="OPEN"):
@@ -608,8 +623,20 @@ def test_respawn_guard_active_pr_unknown_state_fails_closed(kanban_home):
     """When gh cannot resolve PR state (None), the guard stays (fail closed)."""
     with kb.connect() as conn:
         t = kb.create_task(conn, title="unknown-pr", assignee="alice")
+        kb.claim_task(conn, t)
+        run_id = kb.get_task(conn, t).current_run_id
+        conn.execute(
+            "UPDATE task_runs SET outcome='completed', status='completed', "
+            "ended_at=? WHERE id=?",
+            (int(time.time()) - 7200, run_id),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='ready', current_run_id=NULL, "
+            "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL WHERE id=?",
+            (t,),
+        )
         kb.add_comment(
-            conn, t, "worker",
+            conn, t, "alice",
             "PR created: https://github.com/totemx-AI/subsidysmart/pull/43",
         )
         with unittest.mock.patch.object(kb, "_github_pr_state", return_value=None):
@@ -620,13 +647,17 @@ def test_respawn_guard_active_pr_unknown_state_fails_closed(kanban_home):
 def test_respawn_guard_merged_pr_not_guarded(kanban_home):
     """A MERGED GitHub PR in a recent comment must NOT block re-spawn (t_9799c507).
 
+    The PR-state-blind guard used to stall MERGED-PR cards; here a third-party
+    comment references a MERGED PR and the card was never spawned by that
+    commenter, so the composed guard returns None regardless.
+
     Replay of the sycode-trading/t_30c13209 stall: PR #856 is MERGED, so the
     active_pr guard must not fire even though the PR URL is in recent comments.
     """
     with kb.connect() as conn:
         t = kb.create_task(conn, title="merged-pr", assignee="alice")
         kb.add_comment(
-            conn, t, "worker",
+            conn, t, "fable-reviewer",
             "PR merged: https://github.com/sycamoregroupltd/sycode-trading/pull/856",
         )
         with unittest.mock.patch.object(kb, "_github_pr_state", return_value="MERGED"):
@@ -635,11 +666,15 @@ def test_respawn_guard_merged_pr_not_guarded(kanban_home):
 
 
 def test_respawn_guard_closed_pr_not_guarded(kanban_home):
-    """A CLOSED GitHub PR in a recent comment must NOT block re-spawn."""
+    """A CLOSED GitHub PR in a recent comment must NOT block re-spawn.
+
+    Third-party comment (reviewer lane pattern) — never spawned by the
+    commenter — so the author-restriction half keeps the card dispatchable.
+    """
     with kb.connect() as conn:
         t = kb.create_task(conn, title="closed-pr", assignee="alice")
         kb.add_comment(
-            conn, t, "worker",
+            conn, t, "fable-reviewer",
             "PR closed: https://github.com/totemx-AI/subsidysmart/pull/44",
         )
         with unittest.mock.patch.object(kb, "_github_pr_state", return_value="CLOSED"):
@@ -648,11 +683,28 @@ def test_respawn_guard_closed_pr_not_guarded(kanban_home):
 
 
 def test_respawn_guard_mixed_pr_states_guards_on_open(kanban_home):
-    """One OPEN PR among MERGED/CLOSED PRs still blocks re-spawn."""
+    """One OPEN PR among MERGED/CLOSED PRs still blocks re-spawn.
+
+    The comment is authored by an own-worker (seeded prior run) so the
+    author-restriction half admits the scan, and the OPEN PR wins (fail
+    closed) over the MERGED one.
+    """
     with kb.connect() as conn:
         t = kb.create_task(conn, title="mixed-pr", assignee="alice")
+        kb.claim_task(conn, t)
+        run_id = kb.get_task(conn, t).current_run_id
+        conn.execute(
+            "UPDATE task_runs SET outcome='completed', status='completed', "
+            "ended_at=? WHERE id=?",
+            (int(time.time()) - 7200, run_id),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='ready', current_run_id=NULL, "
+            "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL WHERE id=?",
+            (t,),
+        )
         kb.add_comment(
-            conn, t, "worker",
+            conn, t, "alice",
             "https://github.com/a/b/pull/1 https://github.com/c/d/pull/2",
         )
 
@@ -665,12 +717,29 @@ def test_respawn_guard_mixed_pr_states_guards_on_open(kanban_home):
 
 
 def test_respawn_guard_pr_state_check_disabled_keeps_legacy(kanban_home):
-    """HERMES_KANBAN_PR_STATE_CHECK=0 keeps the legacy URL-only guard."""
+    """HERMES_KANBAN_PR_STATE_CHECK=0 keeps the legacy URL-only guard.
+
+    With the state check disabled, an own-worker recent PR comment (seeded
+    prior run) defers regardless of PR state — legacy behaviour preserved
+    under the author-restriction half.
+    """
     with unittest.mock.patch.dict(os.environ, {"HERMES_KANBAN_PR_STATE_CHECK": "0"}):
         with kb.connect() as conn:
             t = kb.create_task(conn, title="legacy-pr", assignee="alice")
+            kb.claim_task(conn, t)
+            run_id = kb.get_task(conn, t).current_run_id
+            conn.execute(
+                "UPDATE task_runs SET outcome='completed', status='completed', "
+                "ended_at=? WHERE id=?",
+                (int(time.time()) - 7200, run_id),
+            )
+            conn.execute(
+                "UPDATE tasks SET status='ready', current_run_id=NULL, "
+                "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL WHERE id=?",
+                (t,),
+            )
             kb.add_comment(
-                conn, t, "worker",
+                conn, t, "alice",
                 "PR created: https://github.com/totemx-AI/subsidysmart/pull/45",
             )
             reason = kb.check_respawn_guard(conn, t)
@@ -766,7 +835,9 @@ def test_dispatch_respawn_guard_skips_recent_success(
 def test_dispatch_respawn_guard_skips_active_pr(
     kanban_home, all_assignees_spawnable
 ):
-    """dispatch_once skips (but does not block) a task with an active PR comment."""
+    """dispatch_once defers (does NOT auto-block) a ready task whose own worker
+    previously opened an OPEN PR (composed guard: own-worker author + OPEN state).
+    """
     spawned_ids = []
 
     def fake_spawn(task, workspace):
@@ -774,8 +845,20 @@ def test_dispatch_respawn_guard_skips_active_pr(
 
     with kb.connect() as conn:
         t = kb.create_task(conn, title="has-pr", assignee="alice")
+        kb.claim_task(conn, t)
+        run_id = kb.get_task(conn, t).current_run_id
+        conn.execute(
+            "UPDATE task_runs SET outcome='completed', status='completed', "
+            "ended_at=? WHERE id=?",
+            (int(time.time()) - 7200, run_id),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='ready', current_run_id=NULL, "
+            "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL WHERE id=?",
+            (t,),
+        )
         kb.add_comment(
-            conn, t, "worker",
+            conn, t, "alice",
             "Opened https://github.com/totemx-AI/subsidysmart/pull/99",
         )
         with unittest.mock.patch.object(kb, "_github_pr_state", return_value="OPEN"):
@@ -791,8 +874,10 @@ def test_dispatch_respawn_guard_skips_active_pr(
 def test_dispatch_respawn_guard_spawns_when_pr_merged(
     kanban_home, all_assignees_spawnable
 ):
-    """dispatch_once SPAWNS a ready task whose recent PR comment is MERGED
-    (t_9799c507 regression: the PR-state-blind guard used to block it)."""
+    """dispatch_once SPAWNS a ready task whose own worker's recent PR comment is
+    MERGED (t_9799c507 regression: the PR-state-blind guard used to block it;
+    t_0536fe58 keeps the own-worker scan, but a MERGED PR does not block).
+    """
     spawned_ids = []
 
     def fake_spawn(task, workspace):
@@ -800,8 +885,20 @@ def test_dispatch_respawn_guard_spawns_when_pr_merged(
 
     with kb.connect() as conn:
         t = kb.create_task(conn, title="merged-pr", assignee="alice")
+        kb.claim_task(conn, t)
+        run_id = kb.get_task(conn, t).current_run_id
+        conn.execute(
+            "UPDATE task_runs SET outcome='completed', status='completed', "
+            "ended_at=? WHERE id=?",
+            (int(time.time()) - 7200, run_id),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='ready', current_run_id=NULL, "
+            "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL WHERE id=?",
+            (t,),
+        )
         kb.add_comment(
-            conn, t, "worker",
+            conn, t, "alice",
             "Opened https://github.com/sycamoregroupltd/sycode-trading/pull/856",
         )
         with unittest.mock.patch.object(kb, "_github_pr_state", return_value="MERGED"):
@@ -2002,3 +2099,879 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
     # Still usable after with-block exit (the leak).
     conn.execute("SELECT 1").fetchone()
     conn.close()  # explicit close to avoid leaking THIS test
+
+
+# ---------------------------------------------------------------------------
+# Review-lane and service-gate de-dup helpers (Phase 2F)
+# ---------------------------------------------------------------------------
+
+def test_review_lane_dependency_warning_flags_inverted_reviewer_child(kanban_home):
+    with kb.connect() as conn:
+        source = kb.create_task(conn, title="ship ACL change", assignee="worker")
+        kb.block_task(conn, source, reason="review-required: guardian eyes before landing")
+        review = kb.create_task(
+            conn,
+            title="REVIEW: ACL change",
+            body=f"Source task {source}; post REVIEW_VERDICT=APPROVE or CHANGES_REQUESTED.",
+            assignee="os-reviewer",
+            parents=[source],
+        )
+
+        warning = kb.review_lane_dependency_warning(conn, review)
+
+    assert warning is not None
+    assert warning["source_task_id"] == source
+    assert warning["source_status"] == "blocked"
+
+
+def test_review_lane_dependency_warning_ignores_implementation_child(kanban_home):
+    with kb.connect() as conn:
+        source = kb.create_task(conn, title="ship ACL change", assignee="worker")
+        kb.block_task(conn, source, reason="review-required: guardian eyes before landing")
+        impl = kb.create_task(
+            conn,
+            title="IMPLEMENT: reviewed ACL change",
+            body=f"Run only after source {source} is terminal.",
+            assignee="worker",
+            parents=[source],
+        )
+
+        warning = kb.review_lane_dependency_warning(conn, impl)
+
+    assert warning is None
+
+
+def test_service_gate_dedupe_suppresses_duplicate_for_active_lane(kanban_home):
+    with kb.connect() as conn:
+        source = kb.create_task(conn, title="Discord delivery blocked", assignee="pm")
+        lane = kb.create_task(
+            conn,
+            title="SERVICE-GATE delivery-health repair",
+            body=f"source={source} delivery-health config-owner repair lane",
+            assignee="infra-optimizer",
+        )
+
+        decision = kb.service_gate_dedupe_decision(
+            conn,
+            source_task_id=source,
+            gate_family="delivery-health",
+            candidate_text="SERVICE-GATE delivery-health scan",
+        )
+
+    assert decision["create_escalation"] is False
+    assert decision["decision"] == "dedupe_to_active_lane"
+    assert decision["active_lane"]["task_id"] == lane
+    assert "SERVICE-GATE-DEDUPE" in decision["pointer_comment"]
+    assert f"active_lane={lane}" in decision["pointer_comment"]
+
+
+def test_service_gate_create_task_writes_pointer_comment_without_duplicate(kanban_home):
+    with kb.connect() as conn:
+        source = kb.create_task(conn, title="Discord delivery blocked", assignee="pm")
+        lane = kb.create_task(
+            conn,
+            title="SERVICE-GATE delivery-health repair",
+            body=f"source={source} delivery-health config-owner repair lane",
+            assignee="infra-optimizer",
+        )
+
+        duplicate = kb.create_task(
+            conn,
+            title="SERVICE-GATE delivery-health repair retry",
+            body=f"source={source} delivery-health duplicate scan",
+            assignee="infra-optimizer",
+            created_by="jarvis-os-pm",
+        )
+        comments = kb.list_comments(conn, source)
+        service_gate_rows = [
+            task
+            for task in kb.list_tasks(conn, include_archived=True)
+            if (task.title or "").startswith("SERVICE-GATE delivery-health")
+        ]
+
+    assert duplicate == lane
+    assert len(service_gate_rows) == 1
+    assert any(
+        comment.author == "jarvis-os-pm"
+        and "SERVICE-GATE-DEDUPE" in comment.body
+        and f"active_lane={lane}" in comment.body
+        and "no_duplicate_escalation=true" in comment.body
+        for comment in comments
+    )
+
+
+def test_service_gate_dedupe_keeps_true_critical_approval_packet(kanban_home):
+    with kb.connect() as conn:
+        source = kb.create_task(
+            conn,
+            title="Need credential approval",
+            body="credentials/secrets rotation requires Frank approval",
+            assignee="pm",
+        )
+        first = kb.service_gate_dedupe_decision(
+            conn,
+            source_task_id=source,
+            gate_family="config-owner",
+            candidate_text="SERVICE-GATE config-owner credentials blocker",
+        )
+        approval = kb.create_task(
+            conn,
+            title="SERVICE-GATE config-owner approval packet",
+            body=f"source={source} config-owner credentials/secrets approval packet",
+            assignee="jarvis-os-pm",
+            initial_status="blocked",
+        )
+        second = kb.service_gate_dedupe_decision(
+            conn,
+            source_task_id=source,
+            gate_family="config-owner",
+            candidate_text="SERVICE-GATE config-owner credentials blocker",
+        )
+
+    assert first["create_escalation"] is True
+    assert first["decision"] == "create_approval_packet"
+    assert first["critical_list_blocker"] is True
+    assert second["create_escalation"] is False
+    assert second["decision"] == "hold_for_existing_approval_packet"
+    assert second["active_lane"]["task_id"] == approval
+
+
+def test_service_gate_create_task_preserves_one_true_critical_approval_packet(kanban_home):
+    with kb.connect() as conn:
+        source = kb.create_task(
+            conn,
+            title="Need credential approval",
+            body="credentials/secrets rotation requires Frank approval",
+            assignee="pm",
+        )
+
+        approval = kb.create_task(
+            conn,
+            title="SERVICE-GATE config-owner approval packet",
+            body=f"source={source} config-owner credentials/secrets approval packet",
+            assignee="jarvis-os-pm",
+            initial_status="blocked",
+        )
+        duplicate = kb.create_task(
+            conn,
+            title="SERVICE-GATE config-owner approval packet retry",
+            body=f"source={source} config-owner credentials/secrets approval packet duplicate",
+            assignee="jarvis-os-pm",
+            initial_status="blocked",
+        )
+        comments = kb.list_comments(conn, source)
+        approval_rows = [
+            task
+            for task in kb.list_tasks(conn, include_archived=True)
+            if "config-owner approval packet" in (task.title or "")
+        ]
+
+    assert duplicate == approval
+    assert len(approval_rows) == 1
+    assert any(
+        "SERVICE-GATE-DEDUPE" in comment.body
+        and f"active_lane={approval}" in comment.body
+        and "no_duplicate_escalation=true" in comment.body
+        for comment in comments
+    )
+
+
+def test_service_gate_dedupe_treats_workforce_scaler_activation_as_critical(kanban_home):
+    with kb.connect() as conn:
+        source = kb.create_task(
+            conn,
+            title="Runtime hold requires operator packet",
+            body="Generic source body without critical-list wording.",
+            assignee="pm",
+        )
+
+        decision = kb.service_gate_dedupe_decision(
+            conn,
+            source_task_id=source,
+            gate_family="runtime-hold",
+            candidate_text="SERVICE-GATE runtime-hold workforce-scaler dynamic-spawning activation",
+        )
+        ordinary = kb.service_gate_dedupe_decision(
+            conn,
+            source_task_id=source,
+            gate_family="runtime-hold",
+            candidate_text="SERVICE-GATE runtime-hold ordinary retry lane",
+        )
+
+    assert decision["create_escalation"] is True
+    assert decision["decision"] == "create_approval_packet"
+    assert decision["critical_list_blocker"] is True
+    assert ordinary["decision"] == "create_triage_or_service_gate_lane"
+    assert ordinary["critical_list_blocker"] is False
+
+
+def test_service_gate_dedupe_treats_guardrail_weakening_as_critical(kanban_home):
+    with kb.connect() as conn:
+        source = kb.create_task(
+            conn,
+            title="Guardrail boundary repair",
+            body="Generic source body without critical-list wording.",
+            assignee="pm",
+        )
+
+        weakening = kb.service_gate_dedupe_decision(
+            conn,
+            source_task_id=source,
+            gate_family="runtime-hold",
+            candidate_text="SERVICE-GATE runtime-hold guardrail weakening request",
+        )
+        disablement = kb.service_gate_dedupe_decision(
+            conn,
+            source_task_id=source,
+            gate_family="runtime-hold",
+            candidate_text="SERVICE-GATE runtime-hold disable guardrail request",
+        )
+
+    assert weakening["create_escalation"] is True
+    assert weakening["decision"] == "create_approval_packet"
+    assert weakening["critical_list_blocker"] is True
+    assert disablement["decision"] == "create_approval_packet"
+    assert disablement["critical_list_blocker"] is True
+
+
+def test_phase2f_inverted_reviewer_child_warning_does_not_weaken_parent_claim_gate(kanban_home):
+    """Phase 2F warning is advisory: unfinished parents still block claims."""
+    with kb.connect() as conn:
+        source = kb.create_task(conn, title="landing handoff", assignee="worker")
+        kb.block_task(conn, source, reason="review-required: os-reviewer must approve")
+        review = kb.create_task(
+            conn,
+            title="REVIEW: landing handoff",
+            body=f"Review source {source} and post REVIEW_VERDICT=APPROVE.",
+            assignee="os-reviewer",
+            parents=[source],
+        )
+        # Simulate a stale/dry-run writer accidentally marking the child ready.
+        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (review,))
+        conn.commit()
+
+        warning = kb.review_lane_dependency_warning(conn, review)
+        claimed = kb.claim_task(conn, review, claimer="test-reviewer")
+        review_after = kb.get_task(conn, review)
+        events = kb.list_events(conn, review)
+
+    assert warning is not None
+    assert warning["source_task_id"] == source
+    assert claimed is None
+    assert review_after is not None
+    assert review_after.status == "todo"
+    assert any(
+        ev.kind == "claim_rejected" and ev.payload == {"reason": "parents_not_done"}
+        for ev in events
+    )
+
+
+def test_phase2f_independent_reviewer_lane_is_claimable_without_parent_warning(kanban_home):
+    """Reviewer lanes linked by source text/comment stay independent and runnable."""
+    with kb.connect() as conn:
+        source = kb.create_task(conn, title="feature implementation", assignee="worker")
+        kb.block_task(conn, source, reason="review-required: guardian review before closure")
+        review = kb.create_task(
+            conn,
+            title="REVIEW: feature implementation",
+            body=f"Independent review lane for source {source}; post REVIEW_VERDICT.",
+            assignee="guardian-reviewer",
+        )
+        kb.add_comment(conn, review, "pm", f"source={source} review-required packet")
+
+        warning = kb.review_lane_dependency_warning(conn, review)
+        claimed = kb.claim_task(conn, review, claimer="test-reviewer")
+        review_after = kb.get_task(conn, review)
+
+    assert warning is None
+    assert claimed is not None
+    assert claimed.id == review
+    assert review_after is not None
+    assert review_after.status == "running"
+
+
+def test_phase2f_service_gate_dedupe_requires_same_source_and_gate_family(kanban_home):
+    """Active lanes suppress duplicates only for the exact source + gate family."""
+    with kb.connect() as conn:
+        source = kb.create_task(conn, title="Gateway alert", assignee="pm")
+        other_source = kb.create_task(conn, title="Other alert", assignee="pm")
+        same_source_wrong_family = kb.create_task(
+            conn,
+            title="SERVICE-GATE billing repair",
+            body=f"source={source} billing repair lane",
+            assignee="infra-optimizer",
+        )
+        same_family_wrong_source = kb.create_task(
+            conn,
+            title="SERVICE-GATE delivery-health repair",
+            body=f"source={other_source} delivery-health repair lane",
+            assignee="infra-optimizer",
+        )
+        matching_lane = kb.create_task(
+            conn,
+            title="SERVICE-GATE delivery-health repair",
+            body=f"source={source} delivery-health repair lane",
+            assignee="infra-optimizer",
+        )
+
+        no_match = kb.find_active_service_gate_lane(
+            conn,
+            source_task_id=source,
+            gate_family="runtime-owner",
+        )
+        match = kb.find_active_service_gate_lane(
+            conn,
+            source_task_id=source,
+            gate_family="delivery-health",
+        )
+
+    assert no_match is None
+    assert match is not None
+    assert match["task_id"] == matching_lane
+    assert match["task_id"] not in {same_source_wrong_family, same_family_wrong_source}
+
+
+def test_phase2f_service_gate_dedupe_does_not_match_shared_runtime_token(kanban_home):
+    """Same source still needs the same gate family; shared tokens are too broad."""
+    with kb.connect() as conn:
+        source = kb.create_task(conn, title="Runtime alert", assignee="pm")
+        runtime_hold_lane = kb.create_task(
+            conn,
+            title="SERVICE-GATE runtime-hold repair",
+            body=f"source={source} runtime-hold repair lane",
+            assignee="infra-optimizer",
+        )
+
+        wrong_family = kb.service_gate_dedupe_decision(
+            conn,
+            source_task_id=source,
+            gate_family="runtime-owner",
+            candidate_text="SERVICE-GATE runtime-owner scan",
+        )
+        same_family = kb.service_gate_dedupe_decision(
+            conn,
+            source_task_id=source,
+            gate_family="runtime-hold",
+            candidate_text="SERVICE-GATE runtime-hold scan",
+        )
+
+    assert wrong_family["create_escalation"] is True
+    assert wrong_family["decision"] == "create_triage_or_service_gate_lane"
+    assert wrong_family["active_lane"] is None
+    assert same_family["create_escalation"] is False
+    assert same_family["decision"] == "dedupe_to_active_lane"
+    assert same_family["active_lane"]["task_id"] == runtime_hold_lane
+
+
+def test_phase2f_service_gate_dedupe_does_not_match_gate_family_prefix_or_suffix(kanban_home):
+    """Exact family matching rejects longer families that only share a token prefix."""
+    with kb.connect() as conn:
+        source = kb.create_task(conn, title="Runtime owner alert", assignee="pm")
+        suffix_lane = kb.create_task(
+            conn,
+            title="SERVICE-GATE runtime-owner-extra repair",
+            body=f"source={source} runtime-owner-extra repair lane",
+            assignee="infra-optimizer",
+        )
+        underscore_suffix_lane = kb.create_task(
+            conn,
+            title="SERVICE-GATE runtime_owner_extra repair",
+            body=f"source={source} runtime_owner_extra repair lane",
+            assignee="infra-optimizer",
+        )
+
+        suffix_candidate = kb.service_gate_dedupe_decision(
+            conn,
+            source_task_id=source,
+            gate_family="runtime-owner",
+            candidate_text="SERVICE-GATE runtime-owner scan",
+        )
+        exact_lane = kb.create_task(
+            conn,
+            title="SERVICE-GATE runtime_owner repair",
+            body=f"source={source} runtime_owner repair lane",
+            assignee="infra-optimizer",
+        )
+        exact_candidate = kb.service_gate_dedupe_decision(
+            conn,
+            source_task_id=source,
+            gate_family="runtime-owner",
+            candidate_text="SERVICE-GATE runtime-owner scan",
+        )
+
+    assert suffix_candidate["create_escalation"] is True
+    assert suffix_candidate["decision"] == "create_triage_or_service_gate_lane"
+    assert suffix_candidate["active_lane"] is None
+    assert exact_candidate["create_escalation"] is False
+    assert exact_candidate["decision"] == "dedupe_to_active_lane"
+    assert exact_candidate["active_lane"]["task_id"] == exact_lane
+    assert exact_candidate["active_lane"]["task_id"] not in {suffix_lane, underscore_suffix_lane}
+
+
+def test_phase2f_service_gate_dedupe_does_not_bypass_completion_created_cards_or_running_app_gates(kanban_home):
+    """De-dupe is advisory only; existing completion and evidence gates still apply."""
+    with kb.connect() as conn:
+        source = kb.create_task(
+            conn,
+            title="Build frontend dashboard route",
+            body="Implement apps/web dashboard route component. Running-app VERIFY_PASS is required.",
+            assignee="web-worker",
+        )
+        lane = kb.create_task(
+            conn,
+            title="SERVICE-GATE delivery-health repair",
+            body=f"source={source} delivery-health diagnostics lane",
+            assignee="infra-optimizer",
+        )
+        conn.execute("UPDATE tasks SET status = 'todo' WHERE id = ?", (source,))
+        conn.commit()
+
+        decision = kb.service_gate_dedupe_decision(
+            conn,
+            source_task_id=source,
+            gate_family="delivery-health",
+            candidate_text="SERVICE-GATE delivery-health duplicate scan",
+        )
+        not_completed_from_todo = kb.complete_task(conn, source, summary="deduped but not claimed")
+        task_after_todo_completion = kb.get_task(conn, source)
+
+        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (source,))
+        conn.commit()
+        claimed = kb.claim_task(conn, source, claimer="web-worker")
+        assert claimed is not None
+        wrong_run_id = int(claimed.current_run_id or 0) + 1
+        not_completed_with_wrong_run = kb.complete_task(
+            conn,
+            source,
+            summary="deduped with stale completion run id",
+            expected_run_id=wrong_run_id,
+        )
+        task_after_wrong_run = kb.get_task(conn, source)
+
+        with pytest.raises(kb.HallucinatedCardsError) as exc_info:
+            kb.complete_task(
+                conn,
+                source,
+                summary="deduped but claimed phantom child",
+                created_cards=["t_deadbeefcafe"],
+            )
+        task_after_phantom = kb.get_task(conn, source)
+        events = kb.list_events(conn, source)
+
+    assert decision["create_escalation"] is False
+    assert decision["decision"] == "dedupe_to_active_lane"
+    assert decision["active_lane"]["task_id"] == lane
+    # The generated pointer is not running-app evidence; the external completion
+    # hook accepts VERIFY_PASS only from current completion input or explicit
+    # RUNNING_APP_VERIFICATION comments.
+    assert "SERVICE-GATE-DEDUPE" in decision["pointer_comment"]
+    assert "VERIFY_PASS" not in decision["pointer_comment"]
+    assert "RUNNING_APP_VERIFICATION" not in decision["pointer_comment"]
+    assert not_completed_from_todo is False
+    assert task_after_todo_completion is not None
+    assert task_after_todo_completion.status == "todo"
+    assert not_completed_with_wrong_run is False
+    assert task_after_wrong_run is not None
+    assert task_after_wrong_run.status == "running"
+    assert exc_info.value.phantom == ["t_deadbeefcafe"]
+    assert task_after_phantom is not None
+    assert task_after_phantom.status == "running"
+    assert any(ev.kind == "completion_blocked_hallucination" for ev in events)
+
+
+def test_phase2f_true_critical_source_requires_explicit_approval_packet_not_generic_lane(kanban_home):
+    """Critical-list blockers surface one approval packet instead of hiding behind repair lanes."""
+    with kb.connect() as conn:
+        source = kb.create_task(
+            conn,
+            title="Enable gateway runtime activation",
+            body="unapproved gateway/runtime activation requires operator approval",
+            assignee="pm",
+        )
+        repair_lane = kb.create_task(
+            conn,
+            title="SERVICE-GATE runtime-owner repair lane",
+            body=f"source={source} runtime-owner diagnostics repair lane",
+            assignee="infra-optimizer",
+        )
+
+        first = kb.service_gate_dedupe_decision(
+            conn,
+            source_task_id=source,
+            gate_family="runtime-owner",
+            candidate_text="SERVICE-GATE runtime-owner gateway restart blocker",
+        )
+        approval = kb.create_task(
+            conn,
+            title="SERVICE-GATE runtime-owner approval packet",
+            body=f"source={source} runtime-owner gateway restart approval packet",
+            assignee="jarvis-os-pm",
+            initial_status="blocked",
+        )
+        second = kb.service_gate_dedupe_decision(
+            conn,
+            source_task_id=source,
+            gate_family="runtime-owner",
+            candidate_text="SERVICE-GATE runtime-owner gateway restart blocker",
+        )
+
+    assert first["create_escalation"] is True
+    assert first["decision"] == "create_approval_packet"
+    assert first["critical_list_blocker"] is True
+    assert first["active_lane"] is None
+    assert repair_lane != approval
+    assert second["create_escalation"] is False
+    assert second["decision"] == "hold_for_existing_approval_packet"
+    assert second["active_lane"]["task_id"] == approval
+
+
+def test_phase2f_dedupe_does_not_bypass_completion_run_gate(kanban_home):
+    """De-duping an active running-app lane must not let stale completions land."""
+    with kb.connect() as conn:
+        source = kb.create_task(conn, title="Route changed", assignee="web-worker")
+        claimed = kb.claim_task(conn, source, claimer="web-worker")
+        assert claimed is not None
+        lane = kb.create_task(
+            conn,
+            title="SERVICE-GATE running-app verification",
+            body=f"source={source} running-app VERIFY_FAIL route probe lane",
+            assignee="test-engineer",
+        )
+
+        decision = kb.service_gate_dedupe_decision(
+            conn,
+            source_task_id=source,
+            gate_family="running-app",
+            candidate_text="SERVICE-GATE running-app verify-running-app probe failed",
+        )
+        completed = kb.complete_task(
+            conn,
+            source,
+            summary="stale completion after duplicate running-app lane",
+            expected_run_id=(claimed.current_run_id or 0) + 1,
+        )
+        task_after = kb.get_task(conn, source)
+        events = kb.list_events(conn, source)
+
+    assert decision["create_escalation"] is False
+    assert decision["decision"] == "dedupe_to_active_lane"
+    assert decision["active_lane"]["task_id"] == lane
+    assert "VERIFY_PASS" not in (decision["pointer_comment"] or "")
+    assert completed is False
+    assert task_after is not None
+    assert task_after.status == "running"
+    assert all(ev.kind != "completed" for ev in events)
+
+
+def test_phase2f_dedupe_does_not_bypass_created_cards_gate(kanban_home):
+    """Duplicate service-gate suppression cannot weaken created_cards validation."""
+    phantom_child = "t_deadbeefcafe"
+    with kb.connect() as conn:
+        source = kb.create_task(conn, title="Review-required source", assignee="worker")
+        kb.claim_task(conn, source, claimer="worker")
+        lane = kb.create_task(
+            conn,
+            title="SERVICE-GATE completion-contract review",
+            body=f"source={source} completion-contract review lane",
+            assignee="guardian-reviewer",
+        )
+
+        decision = kb.service_gate_dedupe_decision(
+            conn,
+            source_task_id=source,
+            gate_family="completion-contract",
+            candidate_text="SERVICE-GATE completion-contract duplicate scan",
+        )
+        with pytest.raises(kb.HallucinatedCardsError) as exc_info:
+            kb.complete_task(
+                conn,
+                source,
+                summary=f"claimed duplicate child {phantom_child}",
+                created_cards=[phantom_child],
+            )
+        task_after = kb.get_task(conn, source)
+        events = kb.list_events(conn, source)
+
+    assert decision["create_escalation"] is False
+    assert decision["decision"] == "dedupe_to_active_lane"
+    assert decision["active_lane"]["task_id"] == lane
+    assert exc_info.value.phantom == [phantom_child]
+    assert task_after is not None
+    assert task_after.status == "running"
+
+
+# ---------------------------------------------------------------------------
+# Regression: triage-lifecycle dead end + false "unknown id or terminal state"
+# ---------------------------------------------------------------------------
+
+class TestTriageLifecycleRegression:
+    """Cover the three defects named in the task body.
+
+    D1 — ``complete_task`` must be able to close a ``triage``-parked card
+         whose work is done and approved.
+    D2 — the CLI failure message must name the REAL status, never the
+         factually false "unknown id or terminal state".
+    """
+
+    def test_complete_task_accepts_triage_status(self, kanban_home):
+        """RED->GREEN: a triage-stranded, work-complete card closes as done."""
+        with kb.connect() as conn:
+            tid = kb.create_task(conn, title="triage-stranded", assignee="os-architect")
+            # Simulate the loop-breaker parking the card in triage.
+            conn.execute("UPDATE tasks SET status = 'triage' WHERE id = ?", (tid,))
+            ok = kb.complete_task(conn, tid, result="approved work done")
+            assert ok is True
+            t = kb.get_task(conn, tid)
+            assert t.status == "done"
+
+    def test_complete_task_rejects_unknown_id(self, kanban_home):
+        """An id that truly does not exist still returns False."""
+        with kb.connect() as conn:
+            assert kb.complete_task(conn, "does-not-exist") is False
+
+    def test_cli_message_names_real_status(self, kanban_home, monkeypatch, capsys):
+        """_cmd_complete must report the actual status, not a false diagnosis."""
+        from hermes_cli import kanban as kc
+        tid = kb.create_task(kb.connect(), title="triage-stranded-cli", assignee="os-architect")
+        with kb.connect() as conn:
+            # A status OUTSIDE the accepted gate set -> complete_task fails,
+            # so the CLI surfaces the REAL status instead of the false string.
+            conn.execute("UPDATE tasks SET status = 'todo' WHERE id = ?", (tid,))
+        ns = argparse.Namespace(task_ids=[tid], summary=None, metadata=None, result="ok")
+        try:
+            kc._cmd_complete(ns)
+        except SystemExit:
+            pass
+        err = capsys.readouterr().err
+        assert "triage" in err.lower() or "cannot complete" in err.lower()
+        assert "unknown id or terminal state" not in err
+
+    def test_promote_task_accepts_triage_to_todo(self, kanban_home):
+        """D1 candidate (b): a triage-parked card routes back to the intake
+        lane (`todo`), never directly to `ready`."""
+        with kb.connect() as conn:
+            tid = kb.create_task(conn, title="triage-promote", assignee="os-architect")
+            conn.execute("UPDATE tasks SET status = 'triage' WHERE id = ?", (tid,))
+            ok, err = kb.promote_task(conn, tid, actor="ops")
+            assert ok is True, err
+            t = kb.get_task(conn, tid)
+            assert t.status == "todo"
+            kinds = [e.kind for e in kb.list_events(conn, tid)]
+            assert kinds.count("promoted_manual") == 1
+
+    def test_promote_task_triage_skips_parent_gate(self, kanban_home):
+        """Routing triage -> todo must NOT be refused by an unsatisfied
+        parent: `todo` is the dependency-waiting lane and recompute_ready
+        gates the later todo -> ready hop."""
+        with kb.connect() as conn:
+            parent = kb.create_task(conn, title="parent", assignee="a")
+            child = kb.create_task(
+                conn, title="child", assignee="b", parents=[parent],
+            )
+            # Child lands in `todo` waiting on parent; park it in triage.
+            conn.execute("UPDATE tasks SET status = 'triage' WHERE id = ?", (child,))
+            ok, err = kb.promote_task(conn, child, actor="ops")
+            assert ok is True, err
+            assert kb.get_task(conn, child).status == "todo"
+
+    def test_promote_task_rejects_other_statuses(self, kanban_home):
+        """Statuses outside todo/blocked/triage still refuse with the real
+        status named — never a 'unknown id or terminal state' style guess."""
+        with kb.connect() as conn:
+            for st in ("done", "archived", "running"):
+                tid = kb.create_task(conn, title=f"st-{st}", assignee="a")
+                conn.execute(
+                    "UPDATE tasks SET status = ? WHERE id = ?", (st, tid)
+                )
+                ok, err = kb.promote_task(conn, tid, actor="ops")
+                assert ok is False
+                assert st in err
+
+    def test_cli_promote_triage_reports_todo_target(self, kanban_home, monkeypatch, capsys):
+        """_cmd_promote must print the ACTUAL target (`todo`) for a triage
+        card, not a hard-coded `ready`."""
+        from hermes_cli import kanban as kc
+        tid = kb.create_task(kb.connect(), title="triage-promote-cli", assignee="os-architect")
+        with kb.connect() as conn:
+            conn.execute("UPDATE tasks SET status = 'triage' WHERE id = ?", (tid,))
+        ns = argparse.Namespace(
+            task_id=tid, ids=None, reason=[], force=False,
+            dry_run=False, json=False,
+        )
+        rc = kc._cmd_promote(ns)
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "-> todo" in out
+        assert "-> ready" not in out
+
+    def test_cli_unblock_names_real_status(self, kanban_home, monkeypatch, capsys):
+        """_cmd_unblock must report the ACTUAL status when it refuses, not
+        the factually thin '(not blocked/scheduled?)' guess."""
+        from hermes_cli import kanban as kc
+        tid = kb.create_task(kb.connect(), title="triage-unblock-cli", assignee="os-architect")
+        with kb.connect() as conn:
+            conn.execute("UPDATE tasks SET status = 'triage' WHERE id = ?", (tid,))
+        ns = argparse.Namespace(task_ids=[tid], reason=None)
+        rc = kc._cmd_unblock(ns)
+        err = capsys.readouterr().err
+        assert rc == 1
+        assert "current status is 'triage'" in err
+
+
+# ---------------------------------------------------------------------------
+# Respawn guard author-restriction regression tests (t_0536fe58 / t_ed7ed09c)
+# These verify the composed guard (t_ac710e3f) preserves BOTH halves:
+# the own-worker author restriction AND the PR-state resolution.
+# ---------------------------------------------------------------------------
+
+def test_respawn_guard_active_pr_defers_own_worker_pr_comment(kanban_home):
+    """A GitHub PR URL in a recent comment triggers active_pr ONLY when the
+    comment author is a profile that has actually run this task (the prior
+    worker opened the PR). Dedupe behaviour is preserved for cards whose own
+    worker opened a PR.
+    """
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="has-pr", assignee="alice")
+        # Simulate a prior worker run under the assignee profile, then a
+        # PR reference authored by that same worker. The completed run is
+        # OLDER than the success window (3600s) but inside the PR window
+        # (86400s), so the guard reaches the active_pr check instead of
+        # short-circuiting on recent_success.
+        kb.claim_task(conn, t)
+        run_id = kb.get_task(conn, t).current_run_id
+        conn.execute(
+            "UPDATE task_runs SET outcome='completed', status='completed', "
+            "ended_at=? WHERE id=?",
+            (int(time.time()) - 7200, run_id),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='ready', current_run_id=NULL, "
+            "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL WHERE id=?",
+            (t,),
+        )
+        kb.add_comment(
+            conn, t, "alice",
+            "PR created: https://github.com/totemx-AI/subsidysmart/pull/42",
+        )
+        with unittest.mock.patch.object(kb, "_github_pr_state", return_value="OPEN"):
+            reason = kb.check_respawn_guard(conn, t)
+    assert reason == "active_pr"
+
+
+def test_respawn_guard_active_pr_ignores_third_party_pr_comment(kanban_home):
+    """REGRESSION (t_24c405ba / t_439547d4): a PR URL in a comment authored
+    by a THIRD PARTY (e.g. a reviewer lane card referencing the PR it
+    reviews) must NOT trigger active_pr when this task never spawned — there
+    is no prior worker to dedupe against, so the card must be dispatched.
+    """
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="review-pr", assignee="alice")
+        kb.add_comment(
+            conn, t, "fable-reviewer",
+            "Independent review: https://github.com/totemx-AI/subsidysmart/pull/42",
+        )
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason is None
+
+
+def test_respawn_guard_active_pr_ignores_third_party_comment_even_with_prior_run(
+    kanban_home,
+):
+    """A PR URL in a THIRD-PARTY comment must not defer even when the task
+    HAS a prior run: the run belongs to a different profile, so the PR was
+    not opened by this task's own worker (reviewer lane pattern).
+    """
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="review-pr-2", assignee="alice")
+        kb.claim_task(conn, t)
+        run_id = kb.get_task(conn, t).current_run_id
+        conn.execute(
+            "UPDATE task_runs SET outcome='blocked', status='blocked', "
+            "ended_at=? WHERE id=?",
+            (int(time.time()) - 60, run_id),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='ready', current_run_id=NULL, "
+            "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL WHERE id=?",
+            (t,),
+        )
+        kb.add_comment(
+            conn, t, "fable-reviewer",
+            "reviewed https://github.com/totemx-AI/subsidysmart/pull/42",
+        )
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason is None
+
+
+def test_dispatch_spawns_ready_card_with_third_party_pr_comment(
+    kanban_home, all_assignees_spawnable
+):
+    """REGRESSION (t_24c405ba / t_439547d4): a ready card with a real
+    profile assignee and a PR-url comment from a third party, with no prior
+    run, IS spawned by dispatch_once and does NOT appear in respawn_guarded.
+    """
+    spawned_ids = []
+
+    def fake_spawn(task, workspace):
+        spawned_ids.append(task.id)
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="reviewer-lane", assignee="alice")
+        kb.add_comment(
+            conn, t, "fable-reviewer",
+            "Independent review: https://github.com/totemx-AI/subsidysmart/pull/42",
+        )
+        res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+
+    assert t in spawned_ids, (
+        f"never-spawned card with third-party PR comment must spawn; "
+        f"spawned={spawned_ids!r}"
+    )
+    assert (t, "active_pr") not in res.respawn_guarded, (
+        f"third-party PR comment must not respawn-guard a never-spawned "
+        f"card; respawn_guarded={res.respawn_guarded!r}"
+    )
+
+
+def test_dispatch_respawn_guard_skips_own_worker_active_pr(
+    kanban_home, all_assignees_spawnable
+):
+    """dispatch_once still skips (but does not block) a card whose own
+    worker previously opened an OPEN PR (composed guard: own-worker author +
+    OPEN state). The PR state is mocked OPEN so the test isolates the
+    composed guard's behaviour from live GitHub resolution.
+    """
+    spawned_ids = []
+
+    def fake_spawn(task, workspace):
+        spawned_ids.append(task.id)
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="has-pr", assignee="alice")
+        kb.claim_task(conn, t)
+        run_id = kb.get_task(conn, t).current_run_id
+        # Completed run older than the success window (3600s) but inside
+        # the PR window (86400s) so the guard reaches active_pr instead of
+        # short-circuiting on recent_success.
+        conn.execute(
+            "UPDATE task_runs SET outcome='completed', status='completed', "
+            "ended_at=? WHERE id=?",
+            (int(time.time()) - 7200, run_id),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='ready', current_run_id=NULL, "
+            "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL WHERE id=?",
+            (t,),
+        )
+        kb.add_comment(
+            conn, t, "alice",
+            "Opened https://github.com/totemx-AI/subsidysmart/pull/99",
+        )
+        with unittest.mock.patch.object(kb, "_github_pr_state", return_value="OPEN"):
+            res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+
+    assert (t, "active_pr") in res.respawn_guarded
+    assert t not in spawned_ids
+    assert t not in res.auto_blocked
+    with kb.connect() as conn:
+        assert kb.get_task(conn, t).status == "ready"
