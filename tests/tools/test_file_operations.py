@@ -275,6 +275,122 @@ def make_real_subprocess_env(cwd: str, include_stderr: bool = False) -> MagicMoc
 
 
 class TestShellFileOpsHelpers:
+    @pytest.mark.parametrize(
+        "timeout_prefix",
+        ["wc -c", "head -c", "sed -n", "wc -l"],
+    )
+    def test_read_file_bounds_each_shell_read(self, mock_env, timeout_prefix):
+        def execute(command, **kwargs):
+            assert kwargs["timeout"] == 30
+            if command.startswith(timeout_prefix):
+                return {"output": "[Command timed out after 30s]", "returncode": 124}
+            if command.startswith("wc -c"):
+                return {"output": "12", "returncode": 0}
+            if command.startswith("head -c"):
+                return {"output": "first\nsecond\n", "returncode": 0}
+            if command.startswith("sed -n"):
+                return {"output": "first\nsecond\n", "returncode": 0}
+            if command.startswith("wc -l"):
+                return {"output": "2", "returncode": 0}
+            raise AssertionError(f"unexpected command: {command}")
+
+        mock_env.execute.side_effect = execute
+
+        result = ShellFileOperations(mock_env).read_file("/mnt/remote/notes.md")
+
+        assert result.error == (
+            "Timed out reading /mnt/remote/notes.md after 30 seconds. "
+            "The file or its filesystem may be temporarily unavailable."
+        )
+
+    @pytest.mark.parametrize("timeout_prefix", ["wc -c", "head -c", "cat "])
+    def test_read_file_raw_bounds_each_shell_read(self, mock_env, timeout_prefix):
+        def execute(command, **kwargs):
+            assert kwargs["timeout"] == 30
+            if command.startswith(timeout_prefix):
+                return {"output": "[Command timed out after 30s]", "returncode": 124}
+            if command.startswith("wc -c"):
+                return {"output": "12", "returncode": 0}
+            if command.startswith("head -c"):
+                return {"output": "first\nsecond\n", "returncode": 0}
+            if command.startswith("cat "):
+                return {"output": "first\nsecond\n", "returncode": 0}
+            raise AssertionError(f"unexpected command: {command}")
+
+        mock_env.execute.side_effect = execute
+
+        result = ShellFileOperations(mock_env).read_file_raw("/mnt/remote/notes.md")
+
+        assert result.error == (
+            "Timed out reading /mnt/remote/notes.md after 30 seconds. "
+            "The file or its filesystem may be temporarily unavailable."
+        )
+
+    def test_missing_file_similarity_scan_is_bounded(self, mock_env):
+        def execute(command, **kwargs):
+            assert kwargs["timeout"] == 30
+            if command.startswith("wc -c"):
+                return {"output": "", "returncode": 1}
+            if command.startswith("ls -1"):
+                return {"output": "[Command timed out after 30s]", "returncode": 124}
+            raise AssertionError(f"unexpected command: {command}")
+
+        mock_env.execute.side_effect = execute
+
+        result = ShellFileOperations(mock_env).read_file("/mnt/remote/missing.md")
+
+        assert result.error == (
+            "Timed out reading /mnt/remote/missing.md after 30 seconds. "
+            "The file or its filesystem may be temporarily unavailable."
+        )
+
+    def test_write_file_bounds_pre_content_read_and_aborts(self, mock_env):
+        def execute(command, **kwargs):
+            if command.startswith("cat "):
+                assert kwargs["timeout"] == 30
+                return {"output": "[Command timed out after 30s]", "returncode": 124}
+            raise AssertionError(f"unexpected command: {command}")
+
+        mock_env.execute.side_effect = execute
+
+        result = ShellFileOperations(mock_env).write_file(
+            "/mnt/remote/module.py", "print('updated')\n"
+        )
+
+        assert result.error == (
+            "Timed out reading /mnt/remote/module.py after 30 seconds. "
+            "The file or its filesystem may be temporarily unavailable. "
+            "The file was not modified."
+        )
+        assert not any(
+            call.kwargs.get("stdin_data") is not None
+            for call in mock_env.execute.call_args_list
+        )
+
+    @pytest.mark.parametrize("timeout_prefix", ["head -c 4096", "head -c 3"])
+    def test_write_file_bounds_metadata_reads_and_aborts(
+        self, mock_env, timeout_prefix
+    ):
+        def execute(command, **kwargs):
+            if command.startswith("head -c"):
+                assert kwargs["timeout"] == 30
+                if command.startswith(timeout_prefix):
+                    return {
+                        "output": "[Command timed out after 30s]",
+                        "returncode": 124,
+                    }
+                return {"output": "", "returncode": 0}
+            raise AssertionError(f"unexpected command: {command}")
+
+        mock_env.execute.side_effect = execute
+
+        result = ShellFileOperations(mock_env).write_file(
+            "/mnt/remote/notes.txt", "updated\n"
+        )
+
+        assert "Timed out reading /mnt/remote/notes.txt after 30 seconds" in result.error
+        assert "The file was not modified" in result.error
+
     def test_normalize_read_pagination_clamps_invalid_values(self):
         assert normalize_read_pagination(offset=0, limit=0) == (1, 1)
         assert normalize_read_pagination(offset=-10, limit=-5) == (1, 1)
@@ -489,6 +605,45 @@ class TestPatchReplacePostWriteVerification:
     appears to succeed but the bytes on disk don't match new_content) is
     surfaced as an error instead of being reported as a successful patch.
     """
+
+    def test_patch_replace_bounds_initial_read_and_aborts(self, mock_env):
+        def side_effect(command, **kwargs):
+            assert command.startswith("cat ")
+            assert kwargs["timeout"] == 30
+            return {"output": "[Command timed out after 30s]", "returncode": 124}
+
+        mock_env.execute.side_effect = side_effect
+
+        result = ShellFileOperations(mock_env).patch_replace(
+            "/mnt/remote/notes.md", "before", "after"
+        )
+
+        assert result.error == (
+            "Timed out reading /mnt/remote/notes.md after 30 seconds. "
+            "The file or its filesystem may be temporarily unavailable."
+        )
+
+    def test_patch_replace_bounds_verify_read(self, mock_env, monkeypatch):
+        cat_calls = 0
+
+        def side_effect(command, **kwargs):
+            nonlocal cat_calls
+            assert command.startswith("cat ")
+            assert kwargs["timeout"] == 30
+            cat_calls += 1
+            if cat_calls == 1:
+                return {"output": "before\n", "returncode": 0}
+            return {"output": "[Command timed out after 30s]", "returncode": 124}
+
+        mock_env.execute.side_effect = side_effect
+        ops = ShellFileOperations(mock_env)
+        monkeypatch.setattr(ops, "write_file", lambda *_args: WriteResult(bytes_written=6))
+
+        result = ops.patch_replace("/mnt/remote/notes.md", "before", "after")
+
+        assert "Post-write verification timed out" in result.error
+        assert "The patch may have been applied" in result.error
+        assert cat_calls == 2
 
     def test_patch_replace_fails_when_file_not_persisted(self, mock_env):
         """write_file reports success but the re-read returns old content:

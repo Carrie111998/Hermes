@@ -128,6 +128,22 @@ def _normalize_line_endings(text: str, target: str) -> str:
 # preservation above (detect on disk, preserve across the edit).
 _UTF8_BOM = "\ufeff"
 
+# Internal reads are interactive tool calls. Do not let an unresponsive cloud,
+# network, or FUSE filesystem inherit the much longer terminal/gateway timeout
+# and wedge the entire agent turn.
+_FILE_READ_TIMEOUT_SECONDS = 30
+
+
+def _file_read_timeout_message(path: str) -> str:
+    return (
+        f"Timed out reading {path} after {_FILE_READ_TIMEOUT_SECONDS} seconds. "
+        "The file or its filesystem may be temporarily unavailable."
+    )
+
+
+class _FileReadTimeout(RuntimeError):
+    """Raised when a bounded internal filesystem read reaches its deadline."""
+
 
 def _strip_bom(text: str) -> tuple[str, bool]:
     """Return (text-without-leading-BOM, had_bom).
@@ -879,6 +895,10 @@ class ShellFileOperations(FileOperations):
             stdout=result.get("output", ""),
             exit_code=result.get("returncode", 0)
         )
+
+    @staticmethod
+    def _read_timeout_result(path: str) -> ReadResult:
+        return ReadResult(error=_file_read_timeout_message(path))
     
     def _has_command(self, cmd: str) -> bool:
         """Check if a command exists in the environment (cached)."""
@@ -1094,7 +1114,9 @@ class ShellFileOperations(FileOperations):
         # File may not exist (new write) — `head` exits 0 with empty
         # stdout in that case which yields None below.  Cheap probe.
         head_cmd = f"head -c 4096 {self._escape_shell_arg(path)} 2>/dev/null"
-        head_result = self._exec(head_cmd)
+        head_result = self._exec(head_cmd, timeout=_FILE_READ_TIMEOUT_SECONDS)
+        if head_result.exit_code == 124:
+            raise _FileReadTimeout(_file_read_timeout_message(path))
         if head_result.exit_code != 0 or not head_result.stdout:
             return None
         return _detect_line_ending(head_result.stdout)
@@ -1110,7 +1132,9 @@ class ShellFileOperations(FileOperations):
         if pre_content is not None:
             return _has_bom(pre_content)
         head_cmd = f"head -c 3 {self._escape_shell_arg(path)} 2>/dev/null"
-        head_result = self._exec(head_cmd)
+        head_result = self._exec(head_cmd, timeout=_FILE_READ_TIMEOUT_SECONDS)
+        if head_result.exit_code == 124:
+            raise _FileReadTimeout(_file_read_timeout_message(path))
         if head_result.exit_code != 0 or not head_result.stdout:
             return False
         return _has_bom(head_result.stdout)
@@ -1150,7 +1174,10 @@ class ShellFileOperations(FileOperations):
         
         # Check if file exists and get size (wc -c is POSIX, works on Linux + macOS)
         stat_cmd = f"wc -c < {self._escape_shell_arg(path)} 2>/dev/null"
-        stat_result = self._exec(stat_cmd)
+        stat_result = self._exec(stat_cmd, timeout=_FILE_READ_TIMEOUT_SECONDS)
+
+        if stat_result.exit_code == 124:
+            return self._read_timeout_result(path)
         
         if stat_result.exit_code != 0:
             # File not found - try to suggest similar files
@@ -1181,7 +1208,9 @@ class ShellFileOperations(FileOperations):
         
         # Read a sample to check for binary content
         sample_cmd = f"head -c 1000 {self._escape_shell_arg(path)} 2>/dev/null"
-        sample_result = self._exec(sample_cmd)
+        sample_result = self._exec(sample_cmd, timeout=_FILE_READ_TIMEOUT_SECONDS)
+        if sample_result.exit_code == 124:
+            return self._read_timeout_result(path)
         sample_output = _strip_terminal_fence_leaks(sample_result.stdout)
         
         if self._is_likely_binary(path, sample_output):
@@ -1194,7 +1223,10 @@ class ShellFileOperations(FileOperations):
         # Read with pagination using sed
         end_line = offset + limit - 1
         read_cmd = f"sed -n '{offset},{end_line}p' {self._escape_shell_arg(path)}"
-        read_result = self._exec(read_cmd)
+        read_result = self._exec(read_cmd, timeout=_FILE_READ_TIMEOUT_SECONDS)
+
+        if read_result.exit_code == 124:
+            return self._read_timeout_result(path)
         
         if read_result.exit_code != 0:
             return ReadResult(error=f"Failed to read file: {read_result.stdout}")
@@ -1207,7 +1239,9 @@ class ShellFileOperations(FileOperations):
         
         # Get total line count
         wc_cmd = f"wc -l < {self._escape_shell_arg(path)}"
-        wc_result = self._exec(wc_cmd)
+        wc_result = self._exec(wc_cmd, timeout=_FILE_READ_TIMEOUT_SECONDS)
+        if wc_result.exit_code == 124:
+            return self._read_timeout_result(path)
         wc_output = _strip_terminal_fence_leaks(wc_result.stdout)
         try:
             total_lines = int(wc_output.strip())
@@ -1238,7 +1272,10 @@ class ShellFileOperations(FileOperations):
 
         # List files in the target directory
         ls_cmd = f"ls -1 {self._escape_shell_arg(dir_path)} 2>/dev/null | head -50"
-        ls_result = self._exec(ls_cmd)
+        ls_result = self._exec(ls_cmd, timeout=_FILE_READ_TIMEOUT_SECONDS)
+
+        if ls_result.exit_code == 124:
+            return self._read_timeout_result(path)
 
         scored: list = []  # (score, filepath) — higher is better
         if ls_result.exit_code == 0 and ls_result.stdout.strip():
@@ -1288,7 +1325,9 @@ class ShellFileOperations(FileOperations):
         """
         path = self._expand_path(path)
         stat_cmd = f"wc -c < {self._escape_shell_arg(path)} 2>/dev/null"
-        stat_result = self._exec(stat_cmd)
+        stat_result = self._exec(stat_cmd, timeout=_FILE_READ_TIMEOUT_SECONDS)
+        if stat_result.exit_code == 124:
+            return self._read_timeout_result(path)
         if stat_result.exit_code != 0:
             return self._suggest_similar_files(path)
         stat_output = _strip_terminal_fence_leaks(stat_result.stdout)
@@ -1298,14 +1337,24 @@ class ShellFileOperations(FileOperations):
             file_size = 0
         if self._is_image(path):
             return ReadResult(is_image=True, is_binary=True, file_size=file_size)
-        sample_result = self._exec(f"head -c 1000 {self._escape_shell_arg(path)} 2>/dev/null")
+        sample_result = self._exec(
+            f"head -c 1000 {self._escape_shell_arg(path)} 2>/dev/null",
+            timeout=_FILE_READ_TIMEOUT_SECONDS,
+        )
+        if sample_result.exit_code == 124:
+            return self._read_timeout_result(path)
         sample_output = _strip_terminal_fence_leaks(sample_result.stdout)
         if self._is_likely_binary(path, sample_output):
             return ReadResult(
                 is_binary=True, file_size=file_size,
                 error="Binary file — cannot display as text."
             )
-        cat_result = self._exec(f"cat {self._escape_shell_arg(path)}")
+        cat_result = self._exec(
+            f"cat {self._escape_shell_arg(path)}",
+            timeout=_FILE_READ_TIMEOUT_SECONDS,
+        )
+        if cat_result.exit_code == 124:
+            return self._read_timeout_result(path)
         if cat_result.exit_code != 0:
             return ReadResult(error=f"Failed to read file: {cat_result.stdout}")
         # Strip a leading UTF-8 BOM so patch's fuzzy matcher operates on
@@ -1500,7 +1549,11 @@ class ShellFileOperations(FileOperations):
             # degrade gracefully (lint reports all errors; LSP skips the
             # shift map).
             read_cmd = f"cat {self._escape_shell_arg(path)} 2>/dev/null"
-            read_result = self._exec(read_cmd)
+            read_result = self._exec(read_cmd, timeout=_FILE_READ_TIMEOUT_SECONDS)
+            if read_result.exit_code == 124:
+                return WriteResult(
+                    error=f"{_file_read_timeout_message(path)} The file was not modified."
+                )
             if read_result.exit_code == 0 and read_result.stdout:
                 pre_content = read_result.stdout
 
@@ -1511,21 +1564,20 @@ class ShellFileOperations(FileOperations):
         # produces mixed endings when only a substituted region changes).
         # Detect from a small head sample to avoid reading the full file
         # for line-ending purposes alone.
-        original_ending = self._detect_file_line_ending(path, pre_content)
-        if original_ending == "\r\n":
-            content = _normalize_line_endings(content, "\r\n")
+        try:
+            original_ending = self._detect_file_line_ending(path, pre_content)
+            if original_ending == "\r\n":
+                content = _normalize_line_endings(content, "\r\n")
 
-        # ── BOM preservation ──────────────────────────────────────────
-        # If the file on disk started with a UTF-8 BOM, keep it. read_file
-        # strips the BOM so the agent never sees it, which means the
-        # content it hands back to write_file / patch has no BOM either —
-        # without restoring it here a round-trip would silently strip the
-        # marker and change the file's byte signature (some Windows
-        # toolchains key on it). Only prepend when the original had a BOM
-        # and the new content doesn't already carry one (guards against
-        # double-BOM if a caller passed raw bytes).
-        if self._file_has_bom(path, pre_content) and not _has_bom(content):
-            content = _UTF8_BOM + content
+            # ── BOM preservation ──────────────────────────────────────
+            # If the file on disk started with a UTF-8 BOM, keep it.
+            # read_file strips the BOM so the agent never sees it, which
+            # means the content handed back to write_file / patch has no
+            # BOM either. Only prepend when the new content lacks one.
+            if self._file_has_bom(path, pre_content) and not _has_bom(content):
+                content = _UTF8_BOM + content
+        except _FileReadTimeout as exc:
+            return WriteResult(error=f"{exc} The file was not modified.")
 
         # Snapshot LSP diagnostics for this file (best-effort) so the
         # post-write LSP layer can return only diagnostics introduced
@@ -1566,7 +1618,7 @@ class ShellFileOperations(FileOperations):
 
         # Get bytes written (wc -c is POSIX, works on Linux + macOS)
         stat_cmd = f"wc -c < {self._escape_shell_arg(path)} 2>/dev/null"
-        stat_result = self._exec(stat_cmd)
+        stat_result = self._exec(stat_cmd, timeout=_FILE_READ_TIMEOUT_SECONDS)
 
         try:
             bytes_written = int(stat_result.stdout.strip())
@@ -1653,7 +1705,10 @@ class ShellFileOperations(FileOperations):
 
         # Read current content
         read_cmd = f"cat {self._escape_shell_arg(path)} 2>/dev/null"
-        read_result = self._exec(read_cmd)
+        read_result = self._exec(read_cmd, timeout=_FILE_READ_TIMEOUT_SECONDS)
+
+        if read_result.exit_code == 124:
+            return PatchResult(error=_file_read_timeout_message(path))
         
         if read_result.exit_code != 0:
             return PatchResult(error=f"Failed to read file: {path}")
@@ -1722,7 +1777,13 @@ class ShellFileOperations(FileOperations):
         # pipe, etc.) that would otherwise return success-with-diff while the
         # file is unchanged on disk.
         verify_cmd = f"cat {self._escape_shell_arg(path)} 2>/dev/null"
-        verify_result = self._exec(verify_cmd)
+        verify_result = self._exec(verify_cmd, timeout=_FILE_READ_TIMEOUT_SECONDS)
+        if verify_result.exit_code == 124:
+            return PatchResult(error=(
+                f"Post-write verification timed out for {path} after "
+                f"{_FILE_READ_TIMEOUT_SECONDS} seconds. The patch may have been "
+                "applied; re-read the file before retrying."
+            ))
         if verify_result.exit_code != 0:
             return PatchResult(error=f"Post-write verification failed: could not re-read {path}")
         # Normalize line endings before comparing.  On Windows, Python's
@@ -1828,7 +1889,7 @@ class ShellFileOperations(FileOperations):
             # Need content — either passed in or read from disk.
             if content is None:
                 read_cmd = f"cat {self._escape_shell_arg(path)} 2>/dev/null"
-                read_result = self._exec(read_cmd)
+                read_result = self._exec(read_cmd, timeout=_FILE_READ_TIMEOUT_SECONDS)
                 if read_result.exit_code != 0:
                     return LintResult(skipped=True, message=f"Failed to read {path} for lint")
                 content = read_result.stdout

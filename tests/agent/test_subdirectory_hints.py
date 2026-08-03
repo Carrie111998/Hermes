@@ -1,9 +1,12 @@
 """Tests for progressive subdirectory hint discovery."""
 
+import subprocess
+
 import pytest
 from pathlib import Path
 from unittest.mock import patch
 
+from agent import subdirectory_hints
 from agent.subdirectory_hints import SubdirectoryHintTracker
 
 
@@ -156,6 +159,44 @@ class TestPermissionErrorHandling:
             )
             # Result may be None (backend skipped) — the key point is no crash
             assert result is None or isinstance(result, str)
+
+
+class TestBoundedHintReads:
+    """Regression tests for filesystems that block while opening hint files."""
+
+    def test_timeout_skips_hint_instead_of_blocking_agent(self, tmp_path, caplog):
+        hint = tmp_path / "AGENTS.md"
+        hint.write_text("instructions")
+
+        with patch.object(
+            subdirectory_hints.subprocess,
+            "run",
+            side_effect=subprocess.TimeoutExpired("hint-reader", 1.0),
+        ):
+            assert subdirectory_hints._read_hint_text(hint) is None
+
+        assert "did not open within" in caplog.text
+
+    def test_case_alias_is_read_only_once(self, tmp_path):
+        sub = tmp_path / "project"
+        sub.mkdir()
+        hint = sub / "AGENTS.md"
+        hint.write_text("instructions")
+        tracker = SubdirectoryHintTracker(working_dir=str(tmp_path))
+
+        with patch.object(
+            subdirectory_hints,
+            "_HINT_FILENAMES",
+            ["AGENTS.md", "AGENTS.md"],
+        ), patch.object(
+            subdirectory_hints,
+            "_read_hint_text",
+            wraps=subdirectory_hints._read_hint_text,
+        ) as read_hint:
+            result = tracker._load_hints_for_directory(sub)
+
+        assert result is not None
+        assert read_hint.call_count == 1
 
 
 class TestOutsideWorkspaceRejection:

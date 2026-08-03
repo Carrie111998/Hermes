@@ -16,6 +16,8 @@ Inspired by Block/goose's SubdirectoryHintTracker.
 import logging
 import os
 import shlex
+import subprocess
+import sys
 from pathlib import Path
 from typing import Dict, Any, Optional, Set
 
@@ -35,6 +37,21 @@ _HINT_FILENAMES = [
 # Maximum chars per hint file to prevent context bloat
 _MAX_HINT_CHARS = 8_000
 
+# Hint discovery is best-effort and runs on the conversation's tool-result
+# path.  A cloud-backed placeholder or unhealthy filesystem can block open(2)
+# indefinitely even when stat(2) reports a tiny regular file.  Keep the read in
+# a disposable child so a single context file can never freeze the agent.
+_HINT_READ_TIMEOUT_SECONDS = 1.0
+_MAX_HINT_READ_BYTES = (_MAX_HINT_CHARS + 1) * 4
+_HINT_READER = (
+    "import sys; "
+    "path = sys.argv[1]; limit = int(sys.argv[2]); "
+    "stream = open(path, 'rb'); "
+    "data = stream.read(limit); "
+    "stream.close(); "
+    "sys.stdout.buffer.write(data)"
+)
+
 # Tool argument keys that typically contain file paths
 _PATH_ARG_KEYS = {"path", "file_path", "workdir"}
 
@@ -53,6 +70,57 @@ def _is_ancestor_or_same(a: Path, b: Path) -> bool:
         return True
     except ValueError:
         return False
+
+
+def _read_hint_text(path: Path) -> Optional[str]:
+    """Read one hint file without letting filesystem I/O stall the agent."""
+    try:
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                _HINT_READER,
+                os.fspath(path),
+                str(_MAX_HINT_READ_BYTES),
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=_HINT_READ_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        logger.warning(
+            "Skipping subdirectory hint that did not open within %.1fs: %s",
+            _HINT_READ_TIMEOUT_SECONDS,
+            path,
+        )
+        return None
+    except (OSError, ValueError) as exc:
+        logger.debug("Could not start subdirectory hint reader for %s: %s", path, exc)
+        return None
+
+    if completed.returncode != 0:
+        logger.debug(
+            "Could not read subdirectory hint %s (reader exit %s)",
+            path,
+            completed.returncode,
+        )
+        return None
+    try:
+        return completed.stdout.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        # A valid UTF-8 file can end in a partial code point because the child
+        # intentionally caps bytes.  Only tolerate that boundary condition;
+        # malformed bytes in the body retain the previous skip-on-error behavior.
+        if exc.end != len(completed.stdout):
+            logger.debug("Could not decode subdirectory hint %s: %s", path, exc)
+            return None
+        try:
+            return completed.stdout[: exc.start].decode("utf-8")
+        except UnicodeDecodeError:
+            logger.debug("Could not decode subdirectory hint %s: %s", path, exc)
+            return None
 
 class SubdirectoryHintTracker:
     """Track which directories the agent visits and load hints on first access.
@@ -219,15 +287,24 @@ class SubdirectoryHintTracker:
                 return None
 
         found_hints = []
+        seen_files: Set[tuple[int, int]] = set()
         for filename in _HINT_FILENAMES:
             hint_path = directory / filename
             try:
                 if not hint_path.is_file():
                     continue
+                stat_result = hint_path.stat()
+                file_identity = (stat_result.st_dev, stat_result.st_ino)
+                if file_identity in seen_files:
+                    continue
+                seen_files.add(file_identity)
             except OSError:
                 continue
             try:
-                content = hint_path.read_text(encoding="utf-8").strip()
+                raw_content = _read_hint_text(hint_path)
+                if raw_content is None:
+                    continue
+                content = raw_content.strip()
                 if not content:
                     continue
                 # Same security scan as startup context loading
