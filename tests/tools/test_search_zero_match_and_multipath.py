@@ -113,6 +113,91 @@ class TestZeroMatchProbeGrepFallback:
         assert engine == "rg"
         assert "count-matches" in flags
 
+    def test_end_to_end_search_real_hint_via_forced_grep(self, tmp_path):
+        """End-to-end ``search()`` with grep forced attaches a real probe hint.
+
+        The whole pipeline — engine pick, ``_search_with_grep``, zero-count
+        detection, and the probe itself — runs for real (no sentinel, no
+        probe stub). Regression for the probe silently dying when rg is
+        absent while the main search itself falls back to grep.
+        """
+        ops, d = self._grep_ops(tmp_path)
+        (d / "a.py").write_text("TOKEN_ALPHA = 'x'\n")
+        r = ops.search("token_alpha", path=str(d), target="content")
+        assert r.total_count == 0
+        assert r.warning and "case-insensitive" in r.warning
+
+
+class TestNativePathBackendGating:
+    """rg native-path conversion is limited to the local Windows backend.
+
+    Commands run through ``self.env.execute``, so the executed backend —
+    not the host OS — decides whether the MSYS→native path rewrite
+    applies. A Windows host driving a remote backend (SSH, WSL, Docker,
+    ...) must never rewrite valid remote paths like ``/mnt/d/...`` into
+    ``D:\\...`` (issue #67914). These tests pin the split: conversion on
+    the local backend only, pass-through on remote backend paths.
+    """
+
+    @staticmethod
+    def _local_ops(tmp_path):
+        from tools.environments.local import LocalEnvironment
+        from tools.file_operations import ShellFileOperations
+
+        d = tmp_path / "proj"
+        d.mkdir()
+        return ShellFileOperations(LocalEnvironment(cwd=str(d.parent)), cwd=str(d.parent))
+
+    @staticmethod
+    def _remote_ops(commands=None):
+        from tools.file_operations import ShellFileOperations
+
+        class RemoteEnv:
+            """Minimal POSIX backend (SSH/WSL-like); no MSYS path rewriting."""
+
+            cwd = "/home/me"
+
+            def execute(self, command, cwd=None, **kwargs):
+                if commands is not None:
+                    commands.append(command)
+                return {"output": "", "returncode": 0}
+
+        return ShellFileOperations(RemoteEnv())
+
+    def test_local_windows_backend_converts_msys_path(self, tmp_path, monkeypatch):
+        import tools.environments.local as local_mod
+
+        ops = self._local_ops(tmp_path)
+        monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
+        out = ops._escape_native_arg("/c/Users/alice/notes.txt")
+        assert "C:" in out  # native drive form for the native rg.exe
+        assert "/c/Users" not in out
+
+    def test_remote_backend_keeps_remote_path_unchanged(self, monkeypatch):
+        import tools.environments.local as local_mod
+
+        ops = self._remote_ops()
+        # Simulate a Windows host driving a remote backend: conversion
+        # must still be skipped — the remote POSIX side owns these paths.
+        monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
+        assert ops._escape_native_arg("/mnt/d/data") == "'/mnt/d/data'"
+        assert ops._escape_native_arg("/mnt/c/Users/alice") == "'/mnt/c/Users/alice'"
+        assert ops._escape_native_arg("/home/user/proj") == "'/home/user/proj'"
+
+    def test_remote_backend_probe_command_keeps_remote_path(self, monkeypatch):
+        """The zero-match probe emits the raw remote path in its command."""
+        import tools.environments.local as local_mod
+
+        commands = []
+        ops = self._remote_ops(commands)
+        ops._has_command = lambda cmd: cmd == "rg"
+        monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)  # Windows host, remote backend
+        assert ops._zero_match_probe("needle", "/mnt/d/data", None) is None
+        assert commands, "probe should have executed shell commands"
+        for cmd in commands:
+            assert "/mnt/d/data" in cmd
+            assert "D:" not in cmd
+
 
 class TestMultiPathRecovery:
     def test_two_existing_paths_merged(self, proj):

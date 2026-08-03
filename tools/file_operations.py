@@ -1010,13 +1010,42 @@ class ShellFileOperations(FileOperations):
         as the WinGet ``rg.exe`` cannot read ``/c/...`` when MSYS argument
         conversion is disabled (``MSYS2_ARG_CONV_EXCL=*``, which the Hermes
         local env sets deliberately to stop flag mangling). Native tools
-        need the ``C:/Users/x`` form. On non-Windows hosts this is a no-op
-        — POSIX paths are identical either way.
+        need the ``C:/Users/x`` form.
+
+        The rewrite is limited to the local Windows backend (see
+        :meth:`_local_windows_backend`): commands execute through
+        ``self.env.execute`` on whatever backend is wired in, so the host
+        OS alone must never trigger it. A Windows host driving a remote
+        SSH/WSL/Docker backend would otherwise rewrite valid remote paths
+        such as ``/mnt/d/...`` into ``D:\\...`` and break the remote
+        search (issue #67914). Remote paths pass through unchanged.
         """
         from tools.environments.local import _msys_to_windows_path
 
-        native = _msys_to_windows_path(arg) if os.name == "nt" else arg
+        native = _msys_to_windows_path(arg) if self._local_windows_backend() else arg
         return "'" + native.replace("'", "'\"'\"'") + "'"
+
+    def _local_windows_backend(self) -> bool:
+        """Return True iff commands execute on the local Git Bash on a Windows host.
+
+        This gates on the executed *backend*, not the host OS: every
+        backend (local, SSH, WSL, Docker, Modal, ...) runs commands
+        through ``self.env.execute``, and only the local environment on a
+        Windows host speaks Git Bash with MSYS argument conversion
+        disabled and a native ``rg.exe`` — the one place the MSYS→native
+        path rewrite in :meth:`_escape_native_arg` is valid. Mirrors the
+        ``_lsp_local_only`` gate used for the LSP path.
+        """
+        env = getattr(self, "env", None)
+        if env is None:
+            # Defensive: some tests construct ShellFileOperations via
+            # ``__new__`` without going through ``__init__``.
+            return False
+        try:
+            from tools.environments.local import LocalEnvironment, _IS_WINDOWS
+        except Exception:  # noqa: BLE001
+            return False
+        return isinstance(env, LocalEnvironment) and _IS_WINDOWS
 
     def _atomic_write(self, path: str, content: str) -> "ExecuteResult":
         """Write ``content`` to ``path`` atomically via temp-file + rename.
