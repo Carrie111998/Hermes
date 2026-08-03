@@ -1737,7 +1737,12 @@ def init_agent(
                         from hermes_cli.profiles import get_active_profile_name
                         _profile = get_active_profile_name()
                         _init_kwargs["agent_identity"] = _profile
-                        _init_kwargs["agent_workspace"] = "hermes"
+                        # Kanban worker processes get HERMES_KANBAN_BOARD pinned
+                        # by the dispatcher, so using it here lets memory
+                        # providers scope storage per board via their
+                        # {workspace} placeholder.  Unset (normal CLI/gateway
+                        # runs) falls back to "hermes", the previous behavior.
+                        _init_kwargs["agent_workspace"] = os.environ.get("HERMES_KANBAN_BOARD") or "hermes"
                     except Exception:
                         pass
                     agent._memory_manager.initialize_all(**_init_kwargs)
