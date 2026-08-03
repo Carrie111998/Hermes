@@ -156,6 +156,7 @@ export interface Translations {
     reconnectingInput: string;
     disconnected: string;
     reconnectNow: string;
+    resumeLoading: string;
     sessionEnded: string;
     sessionEndedTerminal: string;
     sessionEndedTerminalCode: string;
@@ -247,8 +248,21 @@ export interface Translations {
     title: string;
     history: string;
     overview: string;
+    filterChats: string;
+    filterAutomation: string;
+    filterAll: string;
+    sourceFilter: string;
+    anySource: string;
+    anyChatSource: string;
+    anyAutomationSource: string;
+    chatSources: string;
+    automationSources: string;
+    noSources: string;
+    sourceCount: string;
+    sources: string;
     searchPlaceholder: string;
     noSessions: string;
+    noSessionsInFilter: string;
     noMatch: string;
     startConversation: string;
     noMessages: string;
@@ -309,6 +323,11 @@ export interface Translations {
     messageCount: string;
     toolCallAria: string;
     sourceLocal: string;
+    sourceApiServer: string;
+    sourceCron: string;
+    sourceTool: string;
+    sourceHermesFlow: string;
+    sourceVulcanDelegate: string;
     roles: {
       user: string;
       assistant: string;
@@ -1144,6 +1163,7 @@ export interface Translations {
   pairing: {
     loadFailed: string;
     missingCode: string;
+    missingRequest: string;
     approved: string;
     error: string;
     clearConfirm: string;

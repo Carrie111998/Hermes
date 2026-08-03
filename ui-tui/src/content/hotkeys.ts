@@ -22,9 +22,11 @@ export const HOTKEYS: [string, TranslationKey][] = [
   [action + '+G / Alt+G', 'hotkey.openEditor'],
   [action + '+L', 'hotkey.redraw'],
   [paste + '+V / /paste', 'hotkey.pasteTextOrImage'],
+  ['Esc Esc', 'hotkey.discardDraft'],
   ['Tab', 'hotkey.applyCompletion'],
   ['↑/↓', 'hotkey.navigateOrEdit'],
-  ['Ctrl+X', 'hotkey.deleteQueuedMsg'],
+  ['Ctrl+X', 'hotkey.openSessionsOrDeleteQueued'],
+  ['Ctrl+O', 'hotkey.openModelPicker'],
   [action + '+A/E', 'hotkey.lineStartEnd'],
   [action + '+Z / ' + action + '+Y', 'hotkey.undoRedo'],
   [action + '+W', 'hotkey.deleteWord'],
@@ -32,7 +34,7 @@ export const HOTKEYS: [string, TranslationKey][] = [
   [action + '+←/→', 'hotkey.jumpWord'],
   ['Home/End', 'hotkey.lineStartEnd'],
   ['Shift+Enter / Alt+Enter', 'hotkey.insertNewline'],
-  ['\\\\+Enter', 'hotkey.multilineCont'],
+  ['\\+Enter', 'hotkey.multilineCont'],
   ['!<cmd>', 'hotkey.runShellCmd'],
   ['{!<cmd>}', 'hotkey.inlineShellCmd']
 ]

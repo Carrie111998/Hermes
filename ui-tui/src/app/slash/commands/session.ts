@@ -1,11 +1,10 @@
 import { usageBarsText } from '../../../components/overlayPrimitives.js'
-import { attachedImageNotice, introMsg, toTranscriptMessages } from '../../../domain/messages.js'
+import { introMsg, toTranscriptMessages } from '../../../domain/messages.js'
 import { sessionScopedModelArg, TUI_SESSION_MODEL_FLAG } from '../../../domain/slash.js'
 import type {
   BackgroundStartResponse,
   ConfigGetValueResponse,
   ConfigSetResponse,
-  ImageAttachResponse,
   SessionBranchResponse,
   SessionCompressResponse,
   SessionUsageResponse,
@@ -187,10 +186,11 @@ export const sessionCommands: SlashCommand[] = [
   {
     name: 'model',
     run: (arg, ctx) => {
-      if (ctx.session.guardBusySessionSwitch(translate(ctx.ui.locale, 'action.switchModel'))) {
-        return
-      }
-
+      // No busy guard here (unlike session switching). A model change is a
+      // session-scoped config.set: idle it switches immediately; mid-turn the
+      // gateway QUEUES it and applies it at the next turn start (returning
+      // deferred:true) instead of rejecting. Either way the pick sticks without
+      // interrupting the stream or waiting on the swap.
       if (!arg.trim()) {
         return patchOverlayState({ modelPicker: true })
       }
@@ -233,7 +233,11 @@ export const sessionCommands: SlashCommand[] = [
               }
 
               ctx.transcript.sys(
-                translate(ctx.ui.locale, r.scope === 'once' ? 'sys.modelSetOnce' : 'sys.modelSet', { model: r.value })
+                translate(
+                  ctx.ui.locale,
+                  r.scope === 'once' ? 'sys.modelSetOnce' : r.deferred ? 'sys.modelSetDeferred' : 'sys.modelSet',
+                  { model: r.value }
+                )
               )
               ctx.local.maybeWarn(r)
 
@@ -278,17 +282,7 @@ export const sessionCommands: SlashCommand[] = [
 
   {
     name: 'image',
-    run: (arg, ctx) => {
-      ctx.gateway.rpc<ImageAttachResponse>('image.attach', { path: arg, session_id: ctx.sid }).then(
-        ctx.guarded<ImageAttachResponse>(r => {
-          ctx.transcript.sys(attachedImageNotice(r, ctx.ui.locale))
-
-          if (r.remainder) {
-            ctx.composer.setInput(r.remainder)
-          }
-        })
-      )
-    }
+    run: (arg, ctx) => ctx.composer.attachImagePath(arg)
   },
 
   {
@@ -486,6 +480,13 @@ export const sessionCommands: SlashCommand[] = [
             const tts = r.tts ? ti('voice.ttsEnabledSuffix') : ''
             ctx.transcript.sys(ti('voice.modeEnabled', { tts }))
             ctx.transcript.sys(ti('voice.recordHint', { key: recordKeyLabel }))
+
+            // Backend-sourced so custom stop phrases remain truthful. Empty
+            // means spoken stop is disabled and no hint should be rendered.
+            if (r.stop_hint) {
+              ctx.transcript.sys(r.stop_hint)
+            }
+
             ctx.transcript.sys(ti('voice.ttsToggleHint'))
             ctx.transcript.sys(ti('voice.disableHint'))
           } else {

@@ -208,8 +208,8 @@ def _configured_language() -> str | None:
     CLI or messaging-platform presentation during this rollout.
     """
     try:
-        from hermes_cli.config import load_config
-        cfg = load_config()
+        from hermes_cli.config import load_config_readonly
+        cfg = load_config_readonly()
         lang = (cfg.get("display") or {}).get("language")
         if lang:
             return _normalize_lang(lang)

@@ -1,4 +1,3 @@
-import { attachedImageNotice } from '../domain/messages.js'
 import type { GatewayClient } from '../gatewayClient.js'
 import type { InputDetectDropResponse, PromptSubmitResponse } from '../gatewayTypes.js'
 import { translate } from '../i18n/index.js'
@@ -54,7 +53,6 @@ export function submitPrompt(
   displayOverride?: string
 ): void {
   const sid = getUiState().sid
-
   const tr = (key: Parameters<typeof translate>[1], vars?: Record<string, string | number>) =>
     translate(getUiState().locale, key, vars)
 
@@ -85,6 +83,14 @@ export function submitPrompt(
 
     deps.gw
       .request<PromptSubmitResponse>('prompt.submit', { session_id: liveSid, text: submitText })
+      .then(r => {
+        // The gateway consumed a typed voice stop phrase server-side (voice
+        // chat ended, no turn started) — release the busy latch; the
+        // voice.transcript {stop_phrase} event handles the mode flags + notice.
+        if (r?.voice_stopped) {
+          patchUiState({ busy: false, status: 'ready' })
+        }
+      })
       .catch((e: Error) => {
         // Defensive: prompt.submit no longer rejects a mid-turn send with
         // "session busy" (the gateway queues it and returns success), but keep
@@ -109,17 +115,16 @@ export function submitPrompt(
   // Always ask the backend whether this looks like a file drop. The backend's
   // _detect_file_drop handles paths with spaces, quotes, Windows drive letters,
   // and escaped characters correctly.
+  //
+  // No notice is emitted for a match: an image dropped into the composer already
+  // shows as an `[[ Image N ]]` token, and a matched non-image path is rewritten
+  // in place. Announcing it a second time above the status bar was the old
+  // out-of-band attachment UI.
   deps.gw
     .request<InputDetectDropResponse>('input.detect_drop', { session_id: sid, text })
     .then(r => {
       if (!r?.matched) {
         return startSubmit(text, deps.expand(text), showUserMessage)
-      }
-
-      if (r.is_image) {
-        turnController.pushActivity(attachedImageNotice(r, getUiState().locale))
-      } else {
-        turnController.pushActivity(tr('submission.detectedFile', { name: r.name ?? r.text ?? text }))
       }
 
       startSubmit(r.text || text, deps.expand(r.text || text), showUserMessage)

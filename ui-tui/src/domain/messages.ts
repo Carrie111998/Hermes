@@ -1,30 +1,9 @@
 import { LONG_MSG } from '../config/limits.js'
 import { type Locale, translate } from '../i18n/index.js'
-import { buildToolTrailLine, fmtK } from '../lib/text.js'
+import { buildToolTrailLine } from '../lib/text.js'
 import type { Msg, SessionInfo } from '../types.js'
 
 export const introMsg = (info: SessionInfo): Msg => ({ info, kind: 'intro', role: 'system', text: '' })
-
-export const imageTokenMeta = (info?: ImageMeta | null, locale: Locale = 'en') => {
-  const { width, height, token_estimate: t } = info ?? {}
-
-  return [
-    width && height ? `${width}x${height}` : '',
-    (t ?? 0) > 0 ? `~${fmtK(t!)}${translate(locale, 'image.tok')}` : ''
-  ]
-    .filter(Boolean)
-    .join(' · ')
-}
-
-export const attachedImageNotice = (info?: ({ name?: string } & ImageMeta) | null, locale: Locale = 'en') => {
-  const meta = imageTokenMeta(info, locale)
-
-  const label = info?.name
-    ? translate(locale, 'image.attachNoticeName', { name: info.name })
-    : translate(locale, 'image.attachNotice')
-
-  return `${label}${meta ? ` · ${meta}` : ''}`
-}
 
 export const userDisplay = (text: string, locale: Locale = 'en') => {
   if (text.length <= LONG_MSG) {
@@ -119,12 +98,6 @@ export const fmtDuration = (ms: number) => {
   const s = t % 60
 
   return h > 0 ? `${h}h ${m}m` : m > 0 ? `${m}m ${s}s` : `${s}s`
-}
-
-interface ImageMeta {
-  height?: number
-  token_estimate?: number
-  width?: number
 }
 
 interface TranscriptRow {
