@@ -183,9 +183,21 @@ async def preprocess_context_references_async(
                 allowed_root=allowed_root_path,
             )
             for ref in refs
-        )
+        ),
+        return_exceptions=True,
     )
-    for warning, block in expanded:
+    for i, result in enumerate(expanded):
+        # return_exceptions=True surfaces an exception as the element rather
+        # than aborting the whole gather (which would leak the still-running
+        # sibling coroutines). Treat a raised exception as a failed expansion
+        # and surface it as a warning instead of crashing the caller.
+        if isinstance(result, BaseException):
+            ref = refs[i]
+            warnings.append(
+                f"@ {ref.kind} reference expansion failed: {result}"
+            )
+            continue
+        warning, block = result
         if warning:
             warnings.append(warning)
         if block:
