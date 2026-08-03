@@ -322,6 +322,7 @@ _wal_fallback_warned_lock = threading.Lock()
 # Dedup WARNING for the WAL-reset vulnerability fallback (issue #69784).
 _wal_reset_bug_warned_paths: set[str] = set()
 _wal_reset_bug_warned_lock = threading.Lock()
+_SESSION_SPOOL_STARTUP_ONCE: set[str] = set()
 
 def _set_last_init_error(msg: Optional[str]) -> None:
     """Record (or clear) the most recent state.db init failure.
@@ -2241,6 +2242,25 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 if not report.get("repaired"):
                     raise
                 _connect_and_init_with_lock_patience()
+
+            if not read_only:
+                try:
+                    canonical_db_path = (get_hermes_home() / "state.db").resolve()
+                    current_db_path = Path(self.db_path).resolve()
+                except Exception:
+                    canonical_db_path = None
+                    current_db_path = None
+                if canonical_db_path is not None and current_db_path == canonical_db_path:
+                    replay_key = str(current_db_path)
+                    if replay_key not in _SESSION_SPOOL_STARTUP_ONCE:
+                        import session_fallback_spool as session_spool
+
+                        replay_result = session_spool.replay_to_session_db(self, trigger="startup")
+                        if replay_result.state in {
+                            session_spool.ReplayRunState.EMPTY,
+                            session_spool.ReplayRunState.REPLAYED,
+                        }:
+                            _SESSION_SPOOL_STARTUP_ONCE.add(replay_key)
 
             # NOTE: the v23 FTS optimization is OPT-IN (`hermes db optimize`),
             # never auto-started on open. Legacy installs keep their working
@@ -6686,6 +6706,284 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         return self._execute_write(
             _do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S
         )
+
+    def reconcile_bootstrap_and_append_messages_batch(
+        self,
+        bootstrap,
+        messages: Sequence[SessionDBBatchMessage],
+        *,
+        replay_patience_s: float,
+    ) -> AppendMessagesBatchResult:
+        if not messages:
+            return AppendMessagesBatchResult(inserted_count=0, duplicate_count=0)
+
+        batch_messages = list(messages)
+        message_keys = [msg.persistence_message_key for msg in batch_messages]
+        if any(not key for key in message_keys):
+            raise AppendMessagesBatchConflictError(
+                "append_messages_batch requires non-empty persistence_message_key values"
+            )
+
+        unit_ids = {msg.persistence_unit_id for msg in batch_messages}
+        if any(not unit_id for unit_id in unit_ids) or len(unit_ids) != 1:
+            raise AppendMessagesBatchConflictError(
+                "append_messages_batch requires one shared non-empty persistence_unit_id"
+            )
+
+        if len(set(message_keys)) != len(message_keys):
+            raise AppendMessagesBatchConflictError(
+                "append_messages_batch requires unique persistence_message_key values"
+            )
+
+        ordinals: List[int] = []
+        for msg in batch_messages:
+            ordinal = msg.persistence_ordinal
+            if isinstance(ordinal, bool) or not isinstance(ordinal, int):
+                raise AppendMessagesBatchConflictError(
+                    "append_messages_batch requires integer persistence_ordinal values"
+                )
+            ordinals.append(ordinal)
+        if sorted(ordinals) != list(range(len(batch_messages))):
+            raise AppendMessagesBatchConflictError(
+                "append_messages_batch requires contiguous persistence_ordinal values"
+            )
+
+        ordered_messages = [
+            msg for _, msg in sorted(zip(ordinals, batch_messages), key=lambda item: item[0])
+        ]
+        unit_id = ordered_messages[0].persistence_unit_id
+        prepared_messages = [
+            self._prepare_message_storage_values(
+                role=msg.role,
+                content=msg.content,
+                tool_name=msg.tool_name,
+                tool_calls=msg.tool_calls,
+                tool_call_id=msg.tool_call_id,
+                finish_reason=msg.finish_reason,
+                reasoning=msg.reasoning,
+                reasoning_content=msg.reasoning_content,
+                reasoning_details=msg.reasoning_details,
+                codex_reasoning_items=msg.codex_reasoning_items,
+                codex_message_items=msg.codex_message_items,
+                timestamp=msg.timestamp,
+                api_content=msg.api_content,
+                display_kind=msg.display_kind,
+                display_metadata=msg.display_metadata,
+                persistence_unit_id=msg.persistence_unit_id,
+                persistence_message_key=msg.persistence_message_key,
+                persistence_ordinal=msg.persistence_ordinal,
+            )
+            for msg in ordered_messages
+        ]
+        ordered_keys = [prepared["persistence_message_key"] for prepared in prepared_messages]
+        select_columns = (
+            "id, persistence_unit_id, persistence_message_key, persistence_ordinal, "
+            "role, content, tool_name, tool_calls, tool_call_id, finish_reason, "
+            "reasoning, reasoning_content, reasoning_details, codex_reasoning_items, "
+            "codex_message_items, timestamp, api_content, display_kind, display_metadata"
+        )
+
+        bootstrap_session_id = getattr(bootstrap, "session_id", None)
+        bootstrap_source = getattr(bootstrap, "source", None)
+        bootstrap_parent_session_id = getattr(bootstrap, "parent_session_id", None)
+        bootstrap_model_config = getattr(bootstrap, "model_config", None)
+        bootstrap_model_config_json = (
+            json.dumps(bootstrap_model_config) if bootstrap_model_config is not None else None
+        )
+
+        def _require_matching_session_value(
+            session_row: sqlite3.Row,
+            column: str,
+            bootstrap_value,
+        ) -> None:
+            existing_value = session_row[column]
+            if existing_value is not None and bootstrap_value is not None and existing_value != bootstrap_value:
+                raise AppendMessagesBatchConflictError(
+                    f"replay bootstrap {column} conflicts with the stored session row"
+                )
+
+        def _do(conn):
+            if not isinstance(bootstrap_session_id, str) or not bootstrap_session_id:
+                raise AppendMessagesBatchConflictError(
+                    "replay bootstrap requires a non-empty session_id"
+                )
+            if not isinstance(bootstrap_source, str) or not bootstrap_source:
+                raise AppendMessagesBatchConflictError(
+                    "replay bootstrap requires a non-empty source"
+                )
+            if bootstrap_parent_session_id:
+                parent_row = conn.execute(
+                    "SELECT 1 FROM sessions WHERE id = ? LIMIT 1",
+                    (bootstrap_parent_session_id,),
+                ).fetchone()
+                if parent_row is None:
+                    raise AppendMessagesBatchConflictError(
+                        "replay bootstrap parent session is missing"
+                    )
+
+            session_row = conn.execute(
+                "SELECT source, parent_session_id, model, model_config, system_prompt, "
+                "cwd, profile_name, user_id, session_key, chat_id, chat_type, "
+                "thread_id, started_at, message_count FROM sessions WHERE id = ?",
+                (bootstrap_session_id,),
+            ).fetchone()
+
+            if session_row is None:
+                started_at = getattr(bootstrap, "started_at", None)
+                if started_at is None:
+                    raise AppendMessagesBatchConflictError(
+                        "replay bootstrap requires started_at for a missing session row"
+                    )
+                conn.execute(
+                    """INSERT INTO sessions (
+                       id, source, user_id, session_key, chat_id, chat_type, thread_id,
+                       model, model_config, system_prompt, parent_session_id, cwd,
+                       profile_name, started_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        bootstrap_session_id,
+                        bootstrap_source,
+                        getattr(bootstrap, "user_id", None),
+                        getattr(bootstrap, "session_key", None),
+                        getattr(bootstrap, "chat_id", None),
+                        getattr(bootstrap, "chat_type", None),
+                        getattr(bootstrap, "thread_id", None),
+                        getattr(bootstrap, "model", None),
+                        bootstrap_model_config_json,
+                        getattr(bootstrap, "system_prompt", None),
+                        bootstrap_parent_session_id,
+                        getattr(bootstrap, "cwd", None),
+                        getattr(bootstrap, "profile_name", None),
+                        started_at,
+                    ),
+                )
+            else:
+                existing_row_backfill_values = (
+                    ("source", bootstrap_source),
+                    ("parent_session_id", bootstrap_parent_session_id),
+                    ("profile_name", getattr(bootstrap, "profile_name", None)),
+                    ("user_id", getattr(bootstrap, "user_id", None)),
+                    ("session_key", getattr(bootstrap, "session_key", None)),
+                    ("chat_id", getattr(bootstrap, "chat_id", None)),
+                    ("chat_type", getattr(bootstrap, "chat_type", None)),
+                    ("thread_id", getattr(bootstrap, "thread_id", None)),
+                )
+                for column, value in (
+                    *existing_row_backfill_values,
+                ):
+                    _require_matching_session_value(session_row, column, value)
+
+                updates = []
+                params: List[Any] = []
+                for column, value in existing_row_backfill_values:
+                    existing_value = session_row[column]
+                    if existing_value is None and value is not None:
+                        updates.append(f"{column} = ?")
+                        params.append(value)
+                for column, value in (
+                    ("model", getattr(bootstrap, "model", None)),
+                    ("model_config", bootstrap_model_config_json),
+                    ("system_prompt", getattr(bootstrap, "system_prompt", None)),
+                    ("cwd", getattr(bootstrap, "cwd", None)),
+                ):
+                    existing_value = session_row[column]
+                    if existing_value is None and value is not None:
+                        updates.append(f"{column} = ?")
+                        params.append(value)
+                    elif existing_value is not None and value is not None and existing_value != value:
+                        raise AppendMessagesBatchConflictError(
+                            f"replay bootstrap {column} conflicts with the stored session row"
+                        )
+
+                bootstrap_started_at = getattr(bootstrap, "started_at", None)
+                if session_row["started_at"] != bootstrap_started_at:
+                    if bootstrap_started_at is None or int(session_row["message_count"] or 0) != 0:
+                        raise AppendMessagesBatchConflictError(
+                            "replay bootstrap started_at conflicts with the stored session row"
+                        )
+                    updates.append("started_at = ?")
+                    params.append(bootstrap_started_at)
+
+                if updates:
+                    conn.execute(
+                        f"UPDATE sessions SET {', '.join(updates)} WHERE id = ?",
+                        [*params, bootstrap_session_id],
+                    )
+
+            self._assert_append_allowed(conn, bootstrap_session_id, None)
+
+            key_placeholders = ",".join("?" for _ in ordered_keys)
+            key_rows = conn.execute(
+                f"SELECT {select_columns} FROM messages WHERE session_id = ? "
+                f"AND persistence_message_key IN ({key_placeholders})",
+                [bootstrap_session_id, *ordered_keys],
+            ).fetchall()
+            unit_rows = conn.execute(
+                f"SELECT {select_columns} FROM messages WHERE session_id = ? "
+                "AND persistence_unit_id = ?",
+                [bootstrap_session_id, unit_id],
+            ).fetchall()
+
+            rows_by_key: Dict[str, sqlite3.Row] = {}
+            for row in key_rows:
+                key = row["persistence_message_key"]
+                if key in rows_by_key and rows_by_key[key]["id"] != row["id"]:
+                    raise AppendMessagesBatchConflictError(
+                        "duplicate persisted rows share one persistence_message_key"
+                    )
+                rows_by_key[key] = row
+
+            rows_by_ordinal: Dict[int, sqlite3.Row] = {}
+            for row in unit_rows:
+                ordinal = int(row["persistence_ordinal"])
+                if ordinal in rows_by_ordinal and rows_by_ordinal[ordinal]["id"] != row["id"]:
+                    raise AppendMessagesBatchConflictError(
+                        "duplicate persisted rows share one persistence_unit_id/persistence_ordinal"
+                    )
+                rows_by_ordinal[ordinal] = row
+
+            if not rows_by_key and not rows_by_ordinal:
+                tool_call_total = sum(prepared["tool_call_count"] for prepared in prepared_messages)
+                try:
+                    for prepared in prepared_messages:
+                        self._insert_prepared_message_row(conn, bootstrap_session_id, prepared)
+                except sqlite3.IntegrityError as exc:
+                    raise AppendMessagesBatchConflictError(
+                        "append_messages_batch encountered a persistence identity collision"
+                    ) from exc
+                conn.execute(
+                    "UPDATE sessions SET message_count = message_count + ?, "
+                    "tool_call_count = tool_call_count + ? WHERE id = ?",
+                    (len(prepared_messages), tool_call_total, bootstrap_session_id),
+                )
+                return AppendMessagesBatchResult(
+                    inserted_count=len(prepared_messages),
+                    duplicate_count=0,
+                )
+
+            if len(rows_by_key) != len(prepared_messages) or len(rows_by_ordinal) != len(prepared_messages):
+                raise AppendMessagesBatchConflictError(
+                    "append_messages_batch found a partial existing persistence unit"
+                )
+
+            for prepared in prepared_messages:
+                key_row = rows_by_key.get(prepared["persistence_message_key"])
+                ordinal_row = rows_by_ordinal.get(int(prepared["persistence_ordinal"]))
+                if key_row is None or ordinal_row is None or key_row["id"] != ordinal_row["id"]:
+                    raise AppendMessagesBatchConflictError(
+                        "append_messages_batch detected a persistence identity collision"
+                    )
+                if not self._batch_row_matches_prepared(key_row, prepared):
+                    raise AppendMessagesBatchConflictError(
+                        "append_messages_batch replay does not match the stored immutable row"
+                    )
+
+            return AppendMessagesBatchResult(
+                inserted_count=0,
+                duplicate_count=len(prepared_messages),
+            )
+
+        return self._execute_write(_do, patience_s=replay_patience_s)
 
     def set_latest_matching_message_display_kind(
         self, session_id: str, *, role: str, content: str, display_kind: str,

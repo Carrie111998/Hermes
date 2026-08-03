@@ -2232,6 +2232,28 @@ class AIAgent:
             for index, unit in enumerate(units)
         )
 
+    def _replay_pending_session_spool(self, *, trigger: str):
+        if getattr(self, "_persist_disabled", False):
+            return None
+        session_db = getattr(self, "_session_db", None)
+        if session_db is None:
+            return None
+        return session_spool.replay_to_session_db(session_db, trigger=trigger)
+
+    @staticmethod
+    def _replay_result_blocks_canonical_persist(replay_result) -> Tuple[bool, Optional[str]]:
+        if replay_result is None:
+            return False, None
+        state = getattr(replay_result, "state", None)
+        state_value = getattr(state, "value", state)
+        if state_value in {
+            session_spool.ReplayRunState.BLOCKED_INTEGRITY.value,
+            session_spool.ReplayRunState.NOT_DURABLE.value,
+            session_spool.ReplayRunState.RETRY_PENDING.value,
+        }:
+            return True, state_value
+        return False, state_value
+
     def _persist_session(self, messages: List[Dict], conversation_history: List[Dict] = None):
         """Save session state, preferring canonical DB writes and falling back to the spool."""
         from agent.agent_runtime_helpers import note_turn_persisted
@@ -2242,6 +2264,17 @@ class AIAgent:
             self._drop_trailing_empty_response_scaffolding(messages)
             self._session_messages = messages
             self._save_session_log(messages)
+
+            replay_result = self._replay_pending_session_spool(trigger="pre_persist")
+            blocked, replay_state_value = self._replay_result_blocks_canonical_persist(
+                replay_result
+            )
+            if blocked:
+                return SessionPersistResult(
+                    state=SessionPersistState.NOT_DURABLE,
+                    error_class=replay_state_value,
+                    error_message="session spool replay blocked canonical persistence",
+                )
 
             if getattr(self, "_persist_disabled", False):
                 return SessionPersistResult(
@@ -2461,6 +2494,12 @@ class AIAgent:
         if not self._session_db:
             return None
         try:
+            replay_result = self._replay_pending_session_spool(trigger="pre_persist")
+            blocked, _replay_state_value = self._replay_result_blocks_canonical_persist(
+                replay_result
+            )
+            if blocked:
+                return False
             plan = self._plan_session_persistence_units(messages, conversation_history)
             if not plan.pending_units:
                 self._finalize_full_canonical_flush(messages)

@@ -610,6 +610,293 @@ def test_capacity_includes_quarantine_bytes_and_refuses_before_append(spool_home
     assert first.frame_length == len(before)
 
 
+def _capacity_artifact_payload(*, family: str) -> bytes:
+    if family in {"clean_sealed_spool", "prefix_sealed_spool"}:
+        return b"X" * 257
+    if family == "ack_json":
+        return json.dumps(
+            {
+                "acked_prefix_bytes": 5,
+                "last_frame_checksum_hex": "1" * 32,
+                "last_frame_length": 5,
+                "last_frame_offset": 0,
+                "schema_version": 1,
+                "segment_kind": "clean",
+                "segment_name": "00000000000000000001.spool",
+                "segment_sequence": "00000000000000000001",
+                "segment_size_bytes": 5,
+                "tail_status": "clean",
+                "valid_prefix_bytes": 5,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    if family == "blocker_json":
+        return json.dumps(
+            {
+                "acked_prefix_bytes": 0,
+                "blocking_offset": 0,
+                "evidence_sidecar_name": "seq-00000000000000000001-invalid_json-vp0.json",
+                "evidence_spool_name": "seq-00000000000000000001-invalid_json-vp0.spool",
+                "original_size_bytes": 5,
+                "prefix_segment_name": None,
+                "schema_version": 1,
+                "segment_sequence": "00000000000000000001",
+                "source_kind": "sealed",
+                "tail_status": "invalid_json",
+                "valid_prefix_bytes": 0,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    if family == "highwater_json":
+        return json.dumps(
+            {
+                "last_reserved_sequence": "00000000000000000001",
+                "schema_version": 1,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    if family in {"replay_quarantine_json", "legacy_quarantine_json"}:
+        return json.dumps(
+            {
+                "original_size": 5,
+                "quarantined_at": 1.0,
+                "sequence": 1,
+                "tail_status": "clean",
+                "valid_prefix_bytes": 0,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    if family in {"replay_quarantine_spool", "legacy_quarantine_spool"}:
+        return b"Q" * 257
+    raise AssertionError(f"unknown capacity artifact family: {family}")
+
+
+@pytest.mark.parametrize(
+    ("family", "artifact_parts"),
+    [
+        pytest.param(
+            "clean_sealed_spool",
+            (spool.SEALED_DIR_NAME, "00000000000000000001.spool"),
+            id="clean_sealed_spool",
+        ),
+        pytest.param(
+            "prefix_sealed_spool",
+            (spool.SEALED_DIR_NAME, "00000000000000000001.prefix.spool"),
+            id="prefix_sealed_spool",
+        ),
+        pytest.param(
+            "ack_json",
+            (
+                spool.SEALED_DIR_NAME,
+                spool.ACKS_DIR_NAME,
+                "00000000000000000001.spool.ap00000000000000000005.json",
+            ),
+            id="ack_json",
+        ),
+        pytest.param(
+            "blocker_json",
+            (
+                spool.SEALED_DIR_NAME,
+                spool.BLOCKERS_DIR_NAME,
+                "00000000000000000001.blocker.json",
+            ),
+            id="blocker_json",
+        ),
+        pytest.param(
+            "highwater_json",
+            (spool.HIGHWATER_FILE_NAME,),
+            id="highwater_json",
+        ),
+        pytest.param(
+            "replay_quarantine_spool",
+            (spool.QUARANTINE_DIR_NAME, "seq-00000000000000000001-clean-vp0.spool"),
+            id="replay_quarantine_spool",
+        ),
+        pytest.param(
+            "replay_quarantine_json",
+            (spool.QUARANTINE_DIR_NAME, "seq-00000000000000000001-clean-vp0.json"),
+            id="replay_quarantine_json",
+        ),
+        pytest.param(
+            "legacy_quarantine_spool",
+            (spool.QUARANTINE_DIR_NAME, "000001-clean-vp0.spool"),
+            id="legacy_quarantine_spool",
+        ),
+        pytest.param(
+            "legacy_quarantine_json",
+            (spool.QUARANTINE_DIR_NAME, "000001-clean-vp0.json"),
+            id="legacy_quarantine_json",
+        ),
+    ],
+)
+def test_capacity_artifact_family_is_counted(
+    spool_home,
+    monkeypatch,
+    family,
+    artifact_parts,
+):
+    root, active_path, _, _ = _paths(spool_home)
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    active_path.write_bytes(b"")
+
+    artifact_path = root.joinpath(*artifact_parts)
+    artifact_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    artifact_bytes = _capacity_artifact_payload(family=family)
+    artifact_path.write_bytes(artifact_bytes)
+    if family in {"replay_quarantine_spool", "legacy_quarantine_spool"}:
+        artifact_path.with_suffix(".json").write_bytes(b"")
+
+    if os.name == "posix":
+        os.chmod(root, 0o700)
+        os.chmod(active_path, 0o600)
+        current = artifact_path.parent
+        while current != root:
+            os.chmod(current, 0o700)
+            current = current.parent
+        os.chmod(artifact_path, 0o600)
+        if family in {"replay_quarantine_spool", "legacy_quarantine_spool"}:
+            os.chmod(artifact_path.with_suffix(".json"), 0o600)
+
+    requested_frame = spool._frame_bytes_for_record(_record(f"unit-{family}"))
+    monkeypatch.setattr(
+        spool,
+        "TOTAL_CAP_BYTES",
+        len(artifact_bytes) + len(requested_frame) - 1,
+    )
+    before = active_path.read_bytes()
+
+    with pytest.raises(spool.SpoolCapacityError):
+        spool.append_records((_record(f"unit-{family}"),))
+
+    assert before == b""
+    assert active_path.read_bytes() == b""
+
+
+def test_capacity_inventory_excludes_lock_and_protocol_temp(spool_home, monkeypatch):
+    root, active_path, lock_path, _ = _paths(spool_home)
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    active_path.write_bytes(b"")
+    lock_path.write_bytes(b"L" * 4096)
+    owner_lock_path = root / spool.REPLAY_OWNER_LOCK_NAME
+    owner_lock_path.write_bytes(b"O" * 4096)
+    protocol_temp = root / ".segment-sequence.highwater.json.123.456.tmp"
+    highwater_payload = json.dumps(
+        {
+            "last_reserved_sequence": "00000000000000000001",
+            "schema_version": 1,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    protocol_temp.write_bytes(highwater_payload + (b" " * 5000))
+
+    if os.name == "posix":
+        os.chmod(root, 0o700)
+        os.chmod(active_path, 0o600)
+        os.chmod(lock_path, 0o600)
+        os.chmod(owner_lock_path, 0o600)
+        os.chmod(protocol_temp, 0o600)
+
+    requested_frame = spool._frame_bytes_for_record(_record("unit-capacity-exclude"))
+    monkeypatch.setattr(spool, "TOTAL_CAP_BYTES", len(requested_frame))
+
+    result = spool.append_records((_record("unit-capacity-exclude"),))
+
+    assert len(result.unit_results) == 1
+    assert result.unit_results[0].receipt.offset == 0
+    assert result.unit_results[0].receipt.frame_length == len(requested_frame)
+    assert active_path.read_bytes() == requested_frame
+
+
+@pytest.mark.parametrize(
+    ("anomaly", "expected_exc", "match"),
+    [
+        pytest.param(
+            "sealed_symlink",
+            spool.SpoolPathSecurityError,
+            "symlinked fallback spool path refused",
+            id="sealed_symlink",
+        ),
+        pytest.param(
+            "sealed_fifo",
+            spool.SpoolPathSecurityError,
+            "not a regular file",
+            id="sealed_fifo",
+            marks=pytest.mark.skipif(os.name != "posix", reason="FIFO anomaly is POSIX-only"),
+        ),
+        pytest.param(
+            "sealed_unexpected_dir",
+            spool.SpoolPathSecurityError,
+            "unexpected fallback spool directory encountered during sequence inventory",
+            id="sealed_unexpected_dir",
+        ),
+        pytest.param(
+            "sealed_unrecognized_file",
+            spool.SpoolDurabilityError,
+            "unrecognized sealed segment artifact",
+            id="sealed_unrecognized_file",
+        ),
+        pytest.param(
+            "root_unrecognized_file",
+            spool.SpoolDurabilityError,
+            "unrecognized sequence-bearing artifact",
+            id="root_unrecognized_file",
+        ),
+    ],
+)
+def test_capacity_inventory_fails_closed(spool_home, anomaly, expected_exc, match):
+    root, active_path, _, _ = _paths(spool_home)
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    active_path.write_bytes(b"")
+
+    sealed_dir = root / spool.SEALED_DIR_NAME
+    sealed_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    anomaly_path = (
+        root / "unexpected.bin"
+        if anomaly == "root_unrecognized_file"
+        else sealed_dir
+        / (
+            "unexpected"
+            if anomaly == "sealed_unexpected_dir"
+            else "unexpected.bin"
+            if anomaly == "sealed_unrecognized_file"
+            else "00000000000000000001.spool"
+        )
+    )
+
+    if anomaly == "sealed_symlink":
+        outside = spool_home / "outside-target.spool"
+        outside.write_bytes(b"outside")
+        anomaly_path.symlink_to(outside)
+    elif anomaly == "sealed_fifo":
+        os.mkfifo(anomaly_path)
+    elif anomaly == "sealed_unexpected_dir":
+        anomaly_path.mkdir(mode=0o700)
+    else:
+        anomaly_path.write_bytes(b"unexpected")
+
+    if os.name == "posix":
+        os.chmod(root, 0o700)
+        os.chmod(active_path, 0o600)
+        os.chmod(sealed_dir, 0o700)
+        if anomaly in {"sealed_unexpected_dir"}:
+            os.chmod(anomaly_path, 0o700)
+        elif anomaly not in {"sealed_symlink", "sealed_fifo"}:
+            os.chmod(anomaly_path, 0o600)
+
+    before = active_path.read_bytes()
+
+    with pytest.raises(expected_exc, match=match):
+        spool.append_records((_record(f"unit-{anomaly}"),))
+
+    assert before == b""
+    assert active_path.read_bytes() == b""
+
+
 _CORRUPT_TAIL_CASES = (
     (
         spool.SpoolTailStatus.INCOMPLETE_EOF,
@@ -726,3 +1013,584 @@ def test_multi_unit_partial_append_returns_durable_prefix_only(spool_home, monke
     scan = spool.scan_spool(active_path)
     assert scan.valid_prefix_bytes == err.durable_results[0].receipt.frame_length
     assert scan.tail_status is spool.SpoolTailStatus.INCOMPLETE_EOF
+
+
+def _close_runtime(runtime) -> None:
+    spool._close_fd_quietly(runtime.lock_fd)
+    spool._close_fd_quietly(runtime.root_fd)
+    spool._close_fd_quietly(runtime.home_fd)
+
+
+def test_replay_owner_lock_is_exclusive_and_supports_takeover_after_release(spool_home):
+    first_runtime = spool._open_locked_runtime()
+    second_runtime = spool._open_locked_runtime()
+    try:
+        owner = spool._try_acquire_replay_owner(first_runtime)
+        assert owner is not None
+        assert spool._try_acquire_replay_owner(second_runtime) is None
+
+        spool._close_fd_quietly(owner.fd)
+        takeover = spool._try_acquire_replay_owner(second_runtime)
+        assert takeover is not None
+        spool._close_fd_quietly(takeover.fd)
+    finally:
+        _close_runtime(second_runtime)
+        _close_runtime(first_runtime)
+
+
+def test_segment_sequence_highwater_never_reuses_reserved_values(spool_home):
+    runtime = spool._open_locked_runtime()
+    sealed_fd = -1
+    try:
+        with spool._append_lock(runtime.lock_fd, str(spool._lock_path())):
+            sealed_fd, _ = spool._open_dir_at(
+                runtime.root_fd,
+                spool.SEALED_DIR_NAME,
+                full_path=spool._sealed_dir(),
+                mode=spool.ROOT_MODE,
+                create=True,
+                parent_label=runtime.root_path,
+                fsync_parent_on_open_existing=True,
+            )
+            first = spool._allocate_next_segment_sequence(
+                runtime=runtime,
+                root_fd=runtime.root_fd,
+            )
+            assert first == 1
+            (spool._sealed_dir() / f"{first:020d}.spool").write_bytes(b"reserved-gap")
+
+            second = spool._allocate_next_segment_sequence(
+                runtime=runtime,
+                root_fd=runtime.root_fd,
+            )
+            assert second == 2
+
+        highwater = json.loads(
+            spool._segment_sequence_highwater_path().read_text(encoding="utf-8")
+        )
+        assert highwater == {
+            "last_reserved_sequence": "00000000000000000002",
+            "schema_version": 1,
+        }
+    finally:
+        if sealed_fd >= 0:
+            spool._close_fd_quietly(sealed_fd)
+        _close_runtime(runtime)
+
+
+def test_decode_spool_segment_returns_full_record_and_frame_metadata(spool_home):
+    record = _record("unit-decode", contents=("hello", "world"))
+    frame = spool._frame_bytes_for_record(record)
+    segment_path = spool_home / "segment.spool"
+    segment_path.write_bytes(frame)
+
+    decoded = spool.decode_spool_segment(segment_path)
+
+    assert decoded.valid_prefix_bytes == len(frame)
+    assert decoded.tail_status is spool.SpoolTailStatus.CLEAN
+    assert decoded.tail_offset is None
+    assert len(decoded.prefix_frames) == 1
+
+    decoded_frame = decoded.prefix_frames[0]
+    assert decoded_frame.record == record
+    assert decoded_frame.frame_offset == 0
+    assert decoded_frame.frame_length == len(frame)
+    assert decoded_frame.payload_length == len(frame) - spool.HEADER_SIZE
+    assert decoded_frame.checksum_hex == frame[16:32].hex()
+
+
+def test_allocate_next_segment_sequence_reconstructs_from_all_artifact_families(spool_home):
+    runtime = spool._open_locked_runtime()
+    try:
+        root = spool._spool_root()
+        sealed_dir = spool._sealed_dir()
+        acks_dir = spool._acks_dir()
+        blockers_dir = spool._blockers_dir()
+        quarantine_dir = spool._quarantine_dir()
+        sealed_dir.mkdir(parents=True, exist_ok=True)
+        acks_dir.mkdir(parents=True, exist_ok=True)
+        blockers_dir.mkdir(parents=True, exist_ok=True)
+        quarantine_dir.mkdir(parents=True, exist_ok=True)
+
+        (sealed_dir / "00000000000000000003.spool").write_bytes(b"clean")
+        (sealed_dir / "00000000000000000004.prefix.spool").write_bytes(b"prefix")
+        (acks_dir / "00000000000000000007.spool.ap00000000000000000099.json").write_text(
+            "{}",
+            encoding="utf-8",
+        )
+        (blockers_dir / "00000000000000000008.blocker.json").write_text("{}", encoding="utf-8")
+        (quarantine_dir / "seq-00000000000000000009-checksum_mismatch-vp10.spool").write_bytes(
+            b"evidence"
+        )
+        (quarantine_dir / "seq-00000000000000000010-invalid_json-vp0.json").write_text(
+            "{}",
+            encoding="utf-8",
+        )
+        (root / ".segment-sequence.highwater.json.123.456.tmp").write_text(
+            json.dumps(
+                {
+                    "last_reserved_sequence": "00000000000000000011",
+                    "schema_version": 1,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            encoding="utf-8",
+        )
+        spool._segment_sequence_highwater_path().write_text(
+            json.dumps(
+                {
+                    "last_reserved_sequence": "00000000000000000002",
+                    "schema_version": 1,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            encoding="utf-8",
+        )
+
+        with spool._append_lock(runtime.lock_fd, str(spool._lock_path())):
+            next_sequence = spool._allocate_next_segment_sequence(
+                runtime=runtime,
+                root_fd=runtime.root_fd,
+            )
+
+        assert next_sequence == 12
+    finally:
+        _close_runtime(runtime)
+
+
+def test_malformed_sequence_bearing_name_blocks_replay(spool_home):
+    runtime = spool._open_locked_runtime()
+    try:
+        sealed_dir = spool._sealed_dir()
+        sealed_dir.mkdir(parents=True, exist_ok=True)
+        (sealed_dir / "not-a-sequence.spool").write_bytes(b"bad")
+
+        with spool._append_lock(runtime.lock_fd, str(spool._lock_path())):
+            with pytest.raises(spool.SpoolDurabilityError, match="unrecognized sealed segment artifact"):
+                spool._allocate_next_segment_sequence(
+                    runtime=runtime,
+                    root_fd=runtime.root_fd,
+                )
+    finally:
+        _close_runtime(runtime)
+
+
+def test_malformed_sequence_bearing_protocol_temp_blocks_replay(spool_home):
+    runtime = spool._open_locked_runtime()
+    try:
+        root = spool._spool_root()
+        root.mkdir(parents=True, exist_ok=True)
+        (root / ".mystery-sequence-00000000000000000012.123.456.tmp").write_text(
+            "bad-temp",
+            encoding="utf-8",
+        )
+
+        with spool._append_lock(runtime.lock_fd, str(spool._lock_path())):
+            with pytest.raises(spool.SpoolDurabilityError, match="unrecognized protocol temp artifact"):
+                spool._allocate_next_segment_sequence(
+                    runtime=runtime,
+                    root_fd=runtime.root_fd,
+                )
+    finally:
+        _close_runtime(runtime)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="directory-swap security checks are POSIX-only")
+@pytest.mark.parametrize(
+    ("target", "target_parts"),
+    [
+        ("root_swap", ()),
+        ("sealed_swap", (spool.SEALED_DIR_NAME,)),
+        ("acks_swap", (spool.SEALED_DIR_NAME, spool.ACKS_DIR_NAME)),
+        ("blockers_swap", (spool.SEALED_DIR_NAME, spool.BLOCKERS_DIR_NAME)),
+        ("quarantine_swap", (spool.QUARANTINE_DIR_NAME,)),
+    ],
+)
+def test_replay_security_checks_reject_root_swap_for_sealed_acks_blockers_and_quarantine(
+    spool_home,
+    target,
+    target_parts,
+):
+    runtime = spool._open_locked_runtime()
+    try:
+        root = spool._spool_root()
+        sealed = spool._sealed_dir()
+        acks = spool._acks_dir()
+        blockers = spool._blockers_dir()
+        quarantine = spool._quarantine_dir()
+        sealed.mkdir(parents=True, exist_ok=True)
+        acks.mkdir(parents=True, exist_ok=True)
+        blockers.mkdir(parents=True, exist_ok=True)
+        quarantine.mkdir(parents=True, exist_ok=True)
+
+        external = spool_home / f"{target}-external"
+        external.mkdir()
+        target_path = root.joinpath(*target_parts) if target_parts else root
+        parked = target_path.with_name(target_path.name + ".real")
+        os.replace(target_path, parked)
+        os.symlink(external, target_path, target_is_directory=True)
+
+        with spool._append_lock(runtime.lock_fd, str(spool._lock_path())):
+            with pytest.raises(spool.SpoolPathSecurityError):
+                spool._allocate_next_segment_sequence(
+                    runtime=runtime,
+                    root_fd=runtime.root_fd,
+                )
+
+        assert not (external / spool.HIGHWATER_FILE_NAME).exists()
+    finally:
+        _close_runtime(runtime)
+
+
+def test_inventory_fd_repeated_exceptions_return_to_baseline(spool_home):
+    baseline = _fd_count()
+    root = spool._spool_root()
+    root.mkdir(parents=True, exist_ok=True)
+    for attempt in range(10):
+        runtime = spool._open_locked_runtime()
+        temp_path = root / f".mystery-sequence-0000000000000000{attempt:04d}.123.456.tmp"
+        temp_path.write_text("bad-temp", encoding="utf-8")
+        try:
+            with spool._append_lock(runtime.lock_fd, str(spool._lock_path())):
+                with pytest.raises(spool.SpoolDurabilityError, match="unrecognized protocol temp artifact"):
+                    spool._allocate_next_segment_sequence(
+                        runtime=runtime,
+                        root_fd=runtime.root_fd,
+                    )
+        finally:
+            _close_runtime(runtime)
+            temp_path.unlink(missing_ok=True)
+    assert _fd_count() == baseline
+
+
+def _ack_payload(*, segment_sequence: int, segment_name: str, acked_prefix_bytes: int, valid_prefix_bytes: int, tail_status: str = "clean", segment_kind: str = "clean"):
+    return {
+        "schema_version": 1,
+        "segment_sequence": f"{segment_sequence:020d}",
+        "segment_name": segment_name,
+        "segment_kind": segment_kind,
+        "segment_size_bytes": valid_prefix_bytes,
+        "acked_prefix_bytes": acked_prefix_bytes,
+        "valid_prefix_bytes": valid_prefix_bytes,
+        "tail_status": tail_status,
+        "last_frame_offset": 0,
+        "last_frame_length": acked_prefix_bytes,
+        "last_frame_checksum_hex": "1" * 32,
+    }
+
+
+def test_publish_ack_same_prefix_same_content_is_idempotent_success(spool_home):
+    runtime = spool._open_locked_runtime()
+    try:
+        sealed_dir = spool._sealed_dir()
+        acks_dir = spool._acks_dir()
+        sealed_dir.mkdir(parents=True, exist_ok=True)
+        acks_dir.mkdir(parents=True, exist_ok=True)
+        segment_path = sealed_dir / "00000000000000000001.spool"
+        segment_path.write_bytes(b"alpha")
+        payload = _ack_payload(
+            segment_sequence=1,
+            segment_name=segment_path.name,
+            acked_prefix_bytes=5,
+            valid_prefix_bytes=5,
+        )
+
+        spool._publish_ack_sidecar_strict(
+            runtime,
+            segment_sequence=1,
+            segment_path=segment_path,
+            ack_payload=payload,
+        )
+        spool._publish_ack_sidecar_strict(
+            runtime,
+            segment_sequence=1,
+            segment_path=segment_path,
+            ack_payload=payload,
+        )
+
+        assert sorted(acks_dir.glob("*.json")) == [acks_dir / "00000000000000000001.spool.ap00000000000000000005.json"]
+    finally:
+        _close_runtime(runtime)
+
+
+def test_publish_ack_same_prefix_different_content_blocks_integrity(spool_home):
+    runtime = spool._open_locked_runtime()
+    try:
+        sealed_dir = spool._sealed_dir()
+        acks_dir = spool._acks_dir()
+        sealed_dir.mkdir(parents=True, exist_ok=True)
+        acks_dir.mkdir(parents=True, exist_ok=True)
+        segment_path = sealed_dir / "00000000000000000001.spool"
+        segment_path.write_bytes(b"alpha")
+        spool._write_sidecar_json(
+            acks_dir / "00000000000000000001.spool.ap00000000000000000005.json",
+            _ack_payload(
+                segment_sequence=1,
+                segment_name=segment_path.name,
+                acked_prefix_bytes=5,
+                valid_prefix_bytes=5,
+            ),
+        )
+
+        with pytest.raises(spool.SpoolDurabilityError, match="conflicting ack sidecar"):
+            spool._publish_ack_sidecar_strict(
+                runtime,
+                segment_sequence=1,
+                segment_path=segment_path,
+                ack_payload=_ack_payload(
+                    segment_sequence=1,
+                    segment_name=segment_path.name,
+                    acked_prefix_bytes=5,
+                    valid_prefix_bytes=5,
+                    tail_status="checksum_mismatch",
+                ),
+            )
+    finally:
+        _close_runtime(runtime)
+
+
+def test_malformed_or_oversized_ack_sidecar_blocks_integrity(spool_home):
+    runtime = spool._open_locked_runtime()
+    try:
+        sealed_dir = spool._sealed_dir()
+        acks_dir = spool._acks_dir()
+        sealed_dir.mkdir(parents=True, exist_ok=True)
+        acks_dir.mkdir(parents=True, exist_ok=True)
+        segment_path = sealed_dir / "00000000000000000001.spool"
+        segment_path.write_bytes(b"alpha")
+        malformed = acks_dir / "00000000000000000001.spool.ap00000000000000000005.json"
+        malformed.write_text("{}", encoding="utf-8")
+
+        with pytest.raises(spool.SpoolDurabilityError, match="invalid ack sidecar"):
+            spool._load_ack_sidecar_winner(runtime=runtime, segment_path=segment_path)
+
+        malformed.unlink()
+        oversized = acks_dir / "00000000000000000001.spool.ap00000000000000000005.json"
+        oversized.write_text("x" * 3000, encoding="utf-8")
+        with pytest.raises(spool.SpoolDurabilityError, match="invalid ack sidecar"):
+            spool._load_ack_sidecar_winner(runtime=runtime, segment_path=segment_path)
+    finally:
+        _close_runtime(runtime)
+
+
+def test_highest_valid_ack_winner_ignores_lower_or_mismatched_sidecars(spool_home):
+    runtime = spool._open_locked_runtime()
+    try:
+        sealed_dir = spool._sealed_dir()
+        acks_dir = spool._acks_dir()
+        sealed_dir.mkdir(parents=True, exist_ok=True)
+        acks_dir.mkdir(parents=True, exist_ok=True)
+        segment_path = sealed_dir / "00000000000000000001.spool"
+        segment_path.write_bytes(b"alpha")
+        spool._write_sidecar_json(
+            acks_dir / "00000000000000000001.spool.ap00000000000000000003.json",
+            _ack_payload(
+                segment_sequence=1,
+                segment_name=segment_path.name,
+                acked_prefix_bytes=3,
+                valid_prefix_bytes=5,
+            ),
+        )
+        spool._write_sidecar_json(
+            acks_dir / "00000000000000000001.spool.ap00000000000000000005.json",
+            _ack_payload(
+                segment_sequence=1,
+                segment_name=segment_path.name,
+                acked_prefix_bytes=5,
+                valid_prefix_bytes=5,
+            ),
+        )
+        spool._write_sidecar_json(
+            acks_dir / "00000000000000000009.spool.ap00000000000000000099.json",
+            _ack_payload(
+                segment_sequence=9,
+                segment_name="00000000000000000009.spool",
+                acked_prefix_bytes=99,
+                valid_prefix_bytes=99,
+            ),
+        )
+
+        winner = spool._load_ack_sidecar_winner(runtime=runtime, segment_path=segment_path)
+
+        assert winner is not None
+        assert winner["acked_prefix_bytes"] == 5
+    finally:
+        _close_runtime(runtime)
+
+
+def test_ack_sidecar_count_above_64_blocks_integrity(spool_home):
+    runtime = spool._open_locked_runtime()
+    try:
+        sealed_dir = spool._sealed_dir()
+        acks_dir = spool._acks_dir()
+        sealed_dir.mkdir(parents=True, exist_ok=True)
+        acks_dir.mkdir(parents=True, exist_ok=True)
+        segment_path = sealed_dir / "00000000000000000001.spool"
+        segment_path.write_bytes(b"a" * 65)
+        for idx in range(1, 66):
+            spool._write_sidecar_json(
+                acks_dir / f"00000000000000000001.spool.ap{idx:020d}.json",
+                _ack_payload(
+                    segment_sequence=1,
+                    segment_name=segment_path.name,
+                    acked_prefix_bytes=idx,
+                    valid_prefix_bytes=65,
+                ),
+            )
+
+        with pytest.raises(spool.SpoolDurabilityError, match="too many ack sidecars"):
+            spool._load_ack_sidecar_winner(runtime=runtime, segment_path=segment_path)
+    finally:
+        _close_runtime(runtime)
+
+
+def test_replay_to_session_db_uses_strict_ack_publication(spool_home, monkeypatch):
+    calls = []
+
+    def _strict(runtime, *, segment_sequence, segment_path, ack_payload):
+        calls.append(
+            {
+                "runtime": runtime,
+                "segment_sequence": segment_sequence,
+                "segment_path": segment_path,
+                "ack_payload": ack_payload,
+            }
+        )
+
+    monkeypatch.setattr(spool, "_publish_ack_sidecar_strict", _strict)
+    monkeypatch.setattr(spool, "_delete_fully_acked_segment", lambda *_args, **_kwargs: None)
+
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=spool_home / "state.db")
+    try:
+        monkeypatch.setenv("HERMES_HOME", str(spool_home / ".hermes"))
+        hermes_home = spool_home / ".hermes"
+        hermes_home.mkdir(parents=True, exist_ok=True)
+        sealed_dir = hermes_home / spool.SPOOL_ROOT_NAME / spool.SEALED_DIR_NAME
+        sealed_dir.mkdir(parents=True, exist_ok=True)
+        segment_path = sealed_dir / "00000000000000000001.spool"
+        segment_path.write_bytes(spool._frame_bytes_for_record(_record()))
+
+        result = spool.replay_to_session_db(db, trigger="startup")
+
+        assert result.state is spool.ReplayRunState.REPLAYED
+        assert len(calls) == 1
+        assert calls[0]["segment_sequence"] == 1
+        assert calls[0]["segment_path"].name == "00000000000000000001.spool"
+    finally:
+        db.close()
+
+
+def test_stale_lower_ack_sidecars_cleanup_only_after_durable_higher_winner(spool_home):
+    runtime = spool._open_locked_runtime()
+    try:
+        sealed_dir = spool._sealed_dir()
+        acks_dir = spool._acks_dir()
+        sealed_dir.mkdir(parents=True, exist_ok=True)
+        acks_dir.mkdir(parents=True, exist_ok=True)
+        segment_path = sealed_dir / "00000000000000000001.spool"
+        segment_path.write_bytes(b"alpha")
+        spool._write_sidecar_json(
+            acks_dir / "00000000000000000001.spool.ap00000000000000000003.json",
+            _ack_payload(
+                segment_sequence=1,
+                segment_name=segment_path.name,
+                acked_prefix_bytes=3,
+                valid_prefix_bytes=5,
+            ),
+        )
+
+        spool._publish_ack_sidecar_strict(
+            runtime,
+            segment_sequence=1,
+            segment_path=segment_path,
+            ack_payload=_ack_payload(
+                segment_sequence=1,
+                segment_name=segment_path.name,
+                acked_prefix_bytes=5,
+                valid_prefix_bytes=5,
+            ),
+        )
+
+        assert sorted(path.name for path in acks_dir.glob("*.json")) == [
+            "00000000000000000001.spool.ap00000000000000000005.json"
+        ]
+    finally:
+        _close_runtime(runtime)
+
+
+def test_corrupt_active_with_valid_prefix_publishes_prefix_evidence_and_blocker(spool_home):
+    runtime = spool._open_locked_runtime()
+    try:
+        root = spool._spool_root()
+        sealed_dir = spool._sealed_dir()
+        blockers_dir = spool._blockers_dir()
+        quarantine_dir = spool._quarantine_dir()
+        root.mkdir(parents=True, exist_ok=True)
+        sealed_dir.mkdir(parents=True, exist_ok=True)
+        blockers_dir.mkdir(parents=True, exist_ok=True)
+        quarantine_dir.mkdir(parents=True, exist_ok=True)
+
+        clean_frame = spool._frame_bytes_for_record(_record("unit-clean"))
+        corrupt_frame = bytearray(spool._frame_bytes_for_record(_record("unit-bad", attempt_index=1)))
+        corrupt_frame[-1] ^= 0x01
+        active_path = root / spool.ACTIVE_SPOOL_NAME
+        active_path.write_bytes(clean_frame + bytes(corrupt_frame))
+
+        runtime = spool._open_locked_runtime()
+        with spool._append_lock(runtime.lock_fd, str(spool._lock_path())):
+            result = spool._reconcile_active_spool_for_replay(runtime)
+
+        assert result["tail_status"] is spool.SpoolTailStatus.CHECKSUM_MISMATCH
+        assert result["valid_prefix_bytes"] == len(clean_frame)
+        assert result["segment_sequence"] == 1
+        assert result["prefix_segment_name"] == "00000000000000000001.prefix.spool"
+        assert (sealed_dir / "00000000000000000001.prefix.spool").read_bytes() == clean_frame
+        evidence_spools = sorted(quarantine_dir.glob("seq-00000000000000000001-*.spool"))
+        assert len(evidence_spools) == 1
+        assert evidence_spools[0].read_bytes() == clean_frame + bytes(corrupt_frame)
+        blocker = json.loads((blockers_dir / "00000000000000000001.blocker.json").read_text(encoding="utf-8"))
+        assert blocker["prefix_segment_name"] == "00000000000000000001.prefix.spool"
+        assert blocker["blocking_offset"] == len(clean_frame)
+        assert active_path.exists()
+        assert active_path.read_bytes() == b""
+    finally:
+        _close_runtime(runtime)
+
+
+def test_corrupt_active_with_zero_prefix_publishes_evidence_and_blocker(spool_home):
+    runtime = spool._open_locked_runtime()
+    try:
+        root = spool._spool_root()
+        blockers_dir = spool._blockers_dir()
+        quarantine_dir = spool._quarantine_dir()
+        root.mkdir(parents=True, exist_ok=True)
+        blockers_dir.mkdir(parents=True, exist_ok=True)
+        quarantine_dir.mkdir(parents=True, exist_ok=True)
+
+        corrupt_frame = bytearray(spool._frame_bytes_for_record(_record("unit-bad")))
+        corrupt_frame[0] = 0x00
+        active_path = root / spool.ACTIVE_SPOOL_NAME
+        active_path.write_bytes(bytes(corrupt_frame))
+
+        runtime = spool._open_locked_runtime()
+        with spool._append_lock(runtime.lock_fd, str(spool._lock_path())):
+            result = spool._reconcile_active_spool_for_replay(runtime)
+
+        assert result["tail_status"] is spool.SpoolTailStatus.BAD_MAGIC
+        assert result["valid_prefix_bytes"] == 0
+        assert result["segment_sequence"] == 1
+        assert result["prefix_segment_name"] is None
+        evidence_spools = sorted(quarantine_dir.glob("seq-00000000000000000001-*.spool"))
+        assert len(evidence_spools) == 1
+        assert evidence_spools[0].read_bytes() == bytes(corrupt_frame)
+        blocker = json.loads((blockers_dir / "00000000000000000001.blocker.json").read_text(encoding="utf-8"))
+        assert blocker["prefix_segment_name"] is None
+        assert blocker["blocking_offset"] == 0
+        assert active_path.exists()
+        assert active_path.read_bytes() == b""
+    finally:
+        _close_runtime(runtime)

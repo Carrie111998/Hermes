@@ -504,6 +504,95 @@ def test_save_session_log_strips_private_spool_marker(agent, tmp_path):
     assert run_agent._DB_PERSISTENCE_UNIT_ID not in saved["messages"][0]
 
 
+def test_persist_session_replays_spool_before_canonical_append_under_persist_lock(agent, monkeypatch):
+    order = []
+
+    class _OrderingDB(_RecordingBatchDB):
+        def append_messages_batch(self, session_id, messages, *, compression_lock_holder=None):
+            order.append("append")
+            return super().append_messages_batch(
+                session_id,
+                messages,
+                compression_lock_holder=compression_lock_holder,
+            )
+
+    db = _OrderingDB()
+    _prime_batch_flush_agent(agent, db)
+
+    def _replay(session_db, *, trigger):
+        assert session_db is db
+        assert agent._session_persist_lock._is_owned()
+        order.append(("replay", trigger))
+        return SimpleNamespace(state="empty")
+
+    monkeypatch.setattr(run_agent.session_spool, "replay_to_session_db", _replay)
+
+    result = agent._persist_session([{"role": "user", "content": "hello replay hook"}], [])
+
+    assert result.state is run_agent.SessionPersistState.CANONICAL
+    assert order[0] == ("replay", "pre_persist")
+    assert order[1] == "append"
+
+
+def test_flush_messages_to_session_db_stops_when_replay_returns_blocked(agent, monkeypatch):
+    db = _RecordingBatchDB()
+    _prime_batch_flush_agent(agent, db)
+
+    monkeypatch.setattr(
+        run_agent.session_spool,
+        "replay_to_session_db",
+        lambda *_args, **_kwargs: SimpleNamespace(state="blocked_integrity"),
+    )
+
+    result = agent._flush_messages_to_session_db([{"role": "user", "content": "hello"}], [])
+
+    assert result is False
+    assert db.calls == []
+
+
+def test_persist_session_stops_when_replay_returns_retry_pending(agent, monkeypatch):
+    db = _RecordingBatchDB()
+    _prime_batch_flush_agent(agent, db)
+
+    monkeypatch.setattr(
+        run_agent.session_spool,
+        "replay_to_session_db",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            state=spool.ReplayRunState.RETRY_PENDING,
+            retry_class="ack_cleanup_busy",
+            ack_pending=True,
+            cooldown_seconds=1.0,
+        ),
+    )
+
+    result = agent._persist_session([{"role": "user", "content": "hello"}], [])
+
+    assert result.state is run_agent.SessionPersistState.NOT_DURABLE
+    assert result.error_class == "retry_pending"
+    assert db.calls == []
+
+
+def test_flush_messages_to_session_db_stops_when_replay_returns_retry_pending(agent, monkeypatch):
+    db = _RecordingBatchDB()
+    _prime_batch_flush_agent(agent, db)
+
+    monkeypatch.setattr(
+        run_agent.session_spool,
+        "replay_to_session_db",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            state=spool.ReplayRunState.RETRY_PENDING,
+            retry_class="ack_cleanup_busy",
+            ack_pending=True,
+            cooldown_seconds=1.0,
+        ),
+    )
+
+    result = agent._flush_messages_to_session_db([{"role": "user", "content": "hello"}], [])
+
+    assert result is False
+    assert db.calls == []
+
+
 @pytest.fixture()
 def agent_with_memory_tool():
     """Agent whose valid_tool_names includes 'memory'."""
