@@ -80,6 +80,12 @@ const PROFILE_SCOPED_PREFIXES = [
   "/api/model/auxiliary",
   "/api/model/moa",
   "/api/model/options",
+  // Memory-provider config is per-profile state: the credential values land
+  // in that profile's config/.env and a successful save flips
+  // `memory.provider` in its config.yaml. Unscoped, the Memory card reads the
+  // launch profile's values and writes them straight back there, silently
+  // reconfiguring a profile the user is not editing.
+  "/api/memory/providers",
   // A named profile keeps its own pairing whitelist, and its gateway only
   // consults that one — approving into the global store would grant access
   // the running gateway never sees.

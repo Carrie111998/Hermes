@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { api } from "./api";
+import { api, setManagementProfile } from "./api";
 
 const SESSION_HEADER = "X-Hermes-Session-Token";
 
@@ -102,5 +102,67 @@ describe("api OAuth helpers", () => {
       expect(init.credentials).toBe("include");
       expect((init.headers as Headers).has(SESSION_HEADER)).toBe(false);
     }
+  });
+});
+
+describe("memory-provider config is management-profile scoped", () => {
+  // Regression: /api/memory/providers was missing from PROFILE_SCOPED_PREFIXES,
+  // so with the dashboard switched to a named profile the Memory card read the
+  // LAUNCH profile's provider values and its save wrote them back there —
+  // flipping `memory.provider` in a profile the user was not editing.
+  afterEach(() => {
+    setManagementProfile("");
+  });
+
+  it("scopes the config read to the managed profile", async () => {
+    vi.stubGlobal("window", {});
+    const fetchMock = jsonFetchMock({ name: "honcho", fields: [] });
+    vi.stubGlobal("fetch", fetchMock);
+    setManagementProfile("coder");
+
+    await api.getMemoryProviderConfig("honcho");
+
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "/api/memory/providers/honcho/config?profile=coder",
+    );
+  });
+
+  it("scopes the config write to the managed profile", async () => {
+    vi.stubGlobal("window", {});
+    const fetchMock = jsonFetchMock({ ok: true, active: "honcho" });
+    vi.stubGlobal("fetch", fetchMock);
+    setManagementProfile("coder");
+
+    await api.updateMemoryProviderConfig("honcho", { HONCHO_API_KEY: "k" });
+
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "/api/memory/providers/honcho/config?profile=coder",
+    );
+    expect((fetchMock.mock.calls[0][1] as RequestInit).method).toBe("PUT");
+  });
+
+  it("scopes provider setup to the managed profile", async () => {
+    vi.stubGlobal("window", {});
+    const fetchMock = jsonFetchMock({ ok: true });
+    vi.stubGlobal("fetch", fetchMock);
+    setManagementProfile("coder");
+
+    await api.setupMemoryProvider("honcho", { HONCHO_API_KEY: "k" });
+
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "/api/memory/providers/honcho/setup?profile=coder",
+    );
+  });
+
+  it("leaves URLs alone when no management profile is selected", async () => {
+    vi.stubGlobal("window", {});
+    const fetchMock = jsonFetchMock({ name: "honcho", fields: [] });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await api.getMemoryProviderConfig("honcho");
+
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "/api/memory/providers/honcho/config",
+    );
   });
 });

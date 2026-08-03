@@ -6025,25 +6025,32 @@ async def get_memory_provider_config(name: str, surface: Optional[str] = None, p
     return await asyncio.to_thread(_run)
 
 @app.post("/api/memory/providers/{name}/setup")
-async def setup_memory_provider(name: str, body: MemoryProviderSetupRequest):
+async def setup_memory_provider(
+    name: str, body: MemoryProviderSetupRequest, profile: Optional[str] = None
+):
+    # Same scope as its GET/PUT ``/config`` siblings: this route persists
+    # provider values and runs the provider's install steps, both of which
+    # write per-profile state. Without the scope the whole body ran against
+    # the launch profile no matter which profile the dashboard was managing.
     _require_valid_memory_provider_name(name)
-    provider = _load_memory_provider(name)
-    if provider is None and not _memory_provider_manifest(name):
-        # No discoverable plugin directory → nothing whose manifest could
-        # legitimately declare setup commands. Refuse before the
-        # command-running path. (provider may be None with a manifest present
-        # when its pip deps aren't installed yet — that's the setup use case.)
-        raise HTTPException(status_code=404, detail=f"Unknown memory provider: {name}")
-    if provider is not None and body.values:
-        try:
-            _write_memory_provider_config_values(name, provider, body.values)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        except Exception:
-            _log.exception("Failed to persist memory provider setup values for %s", name)
-            raise HTTPException(status_code=500, detail="Internal server error")
-    _invalidate_plugins_hub_cache()
-    return _install_memory_provider_setup(name)
+    with _profile_scope(profile):
+        provider = _load_memory_provider(name)
+        if provider is None and not _memory_provider_manifest(name):
+            # No discoverable plugin directory → nothing whose manifest could
+            # legitimately declare setup commands. Refuse before the
+            # command-running path. (provider may be None with a manifest present
+            # when its pip deps aren't installed yet — that's the setup use case.)
+            raise HTTPException(status_code=404, detail=f"Unknown memory provider: {name}")
+        if provider is not None and body.values:
+            try:
+                _write_memory_provider_config_values(name, provider, body.values)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            except Exception:
+                _log.exception("Failed to persist memory provider setup values for %s", name)
+                raise HTTPException(status_code=500, detail="Internal server error")
+        _invalidate_plugins_hub_cache()
+        return _install_memory_provider_setup(name)
 
 
 @app.put("/api/memory/providers/{name}/config")
