@@ -3643,28 +3643,89 @@ def extract_api_error_context(error: Exception) -> Dict[str, Any]:
 
 
 
-def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: int) -> None:
-    """Append any pending /steer text to the last tool result in this turn.
+def drain_pending_steer_batch(agent) -> list[tuple[Optional[str], str]]:
+    """Drain pending steer items while keeping client ids when available."""
+    drain = getattr(agent, "_drain_pending_steer_batch", None)
+    if callable(drain):
+        return list(drain() or [])
+    text = agent._drain_pending_steer()
+    return [(None, text)] if text else []
 
-    Called at the end of a tool-call batch, before the next API call.
-    The steer is appended to the last ``role:"tool"`` message's content
-    with a clear marker so the model understands it came from the user
-    and NOT from the tool itself. Role alternation is preserved —
-    nothing new is inserted, we only modify existing content.
 
-    Args:
-        messages: The running messages list.
-        num_tool_msgs: Number of tool results appended in this batch;
-            used to locate the tail slice safely.
+def restore_pending_steer_batch(
+    agent, items: list[tuple[Optional[str], str]]
+) -> None:
+    """Put an undeliverable steer batch back ahead of newer pending items."""
+    if not items:
+        return
+    restore = getattr(agent, "_restore_pending_steer_batch", None)
+    if callable(restore):
+        restore(items)
+        return
+    existing = getattr(agent, "_pending_steer", None)
+    texts = [text for _steer_id, text in items]
+    if existing:
+        texts.append(existing)
+    agent._pending_steer = "\n".join(texts) or None
+
+
+def notify_steer_event(
+    agent, event_type: str, items: list[tuple[Optional[str], str]]
+) -> None:
+    """Notify a surface only about steers it can identify and settle."""
+    steer_ids = [steer_id for steer_id, _text in items if steer_id]
+    callback = getattr(agent, "event_callback", None)
+    if not steer_ids or not callable(callback):
+        return
+    try:
+        callback(event_type, {"steer_ids": steer_ids})
+    except Exception:
+        logging.debug("steer event callback failed", exc_info=True)
+
+
+def inject_pending_steer_before_api(agent, messages: list) -> int:
+    """Inject pending steer into the latest existing tool message before API."""
+    steer_items = drain_pending_steer_batch(agent)
+    if not steer_items:
+        return 0
+    steer_text = "\n".join(text for _steer_id, text in steer_items)
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        if not isinstance(message, dict) or message.get("role") != "tool":
+            continue
+        marker = format_steer_marker(steer_text)
+        existing = message.get("content", "")
+        if isinstance(existing, str):
+            message["content"] = existing + marker
+        else:
+            try:
+                blocks = list(existing) if existing else []
+                blocks.append({"type": "text", "text": marker})
+                message["content"] = blocks
+            except Exception:
+                message["content"] = f"{existing}{marker}"
+        notify_steer_event(agent, "steer.injected", steer_items)
+        return len(steer_items)
+    restore_pending_steer_batch(agent, steer_items)
+    return 0
+
+
+def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: int) -> int:
+    """Append pending /steer text to the last tool result in this turn.
+
+    Called at the end of a tool-call batch, before the next API call. The
+    returned count is the number of steer items actually injected; surfaces
+    receive the id-bearing confirmation only after the marker is in history.
     """
     if num_tool_msgs <= 0 or not messages:
-        return
-    steer_text = agent._drain_pending_steer()
-    if not steer_text:
-        return
-    # Find the last tool-role message in the recent tail. Skipping
-    # non-tool messages defends against future code appending
-    # something else at the boundary.
+        return 0
+    steer_items = drain_pending_steer_batch(agent)
+    if not steer_items:
+        return 0
+    steer_text = "\n".join(text for _steer_id, text in steer_items)
+    # Find the last tool-role message in the recent tail. Skipping non-tool
+    # messages defends against future code appending something else at the
+    # boundary.
     target_idx = None
     for j in range(len(messages) - 1, max(len(messages) - num_tool_msgs - 1, -1), -1):
         msg = messages[j]
@@ -3672,25 +3733,16 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
             target_idx = j
             break
     if target_idx is None:
-        # No tool result in this batch (e.g. all skipped by interrupt);
-        # put the steer back so the caller's fallback path can deliver
-        # it as a normal next-turn user message.
-        _lock = getattr(agent, "_pending_steer_lock", None)
-        if _lock is not None:
-            with _lock:
-                if agent._pending_steer:
-                    agent._pending_steer = agent._pending_steer + "\n" + steer_text
-                else:
-                    agent._pending_steer = steer_text
-        else:
-            existing = getattr(agent, "_pending_steer", None)
-            agent._pending_steer = (existing + "\n" + steer_text) if existing else steer_text
-        return
+        # No tool result in this batch (e.g. all skipped by interrupt); put the
+        # steer back so the caller's fallback path can deliver it as a normal
+        # next-turn user message.
+        restore_pending_steer_batch(agent, steer_items)
+        return 0
     marker = format_steer_marker(steer_text)
     existing_content = messages[target_idx].get("content", "")
     if not isinstance(existing_content, str):
-        # Anthropic multimodal content blocks — preserve them and append
-        # a text block at the end.
+        # Anthropic multimodal content blocks — preserve them and append a text
+        # block at the end.
         try:
             blocks = list(existing_content) if existing_content else []
             blocks.append({"type": "text", "text": marker.lstrip()})
@@ -3705,6 +3757,8 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
         len(steer_text),
         steer_text[:120] + ("..." if len(steer_text) > 120 else ""),
     )
+    notify_steer_event(agent, "steer.injected", steer_items)
+    return len(steer_items)
 
 
 
@@ -3783,6 +3837,10 @@ __all__ = [
     "copy_reasoning_content_for_api",
     "cleanup_dead_connections",
     "extract_api_error_context",
+    "drain_pending_steer_batch",
+    "restore_pending_steer_batch",
+    "notify_steer_event",
+    "inject_pending_steer_before_api",
     "apply_pending_steer_to_tool_results",
     "_iter_pool_sockets",
     "force_close_tcp_sockets",

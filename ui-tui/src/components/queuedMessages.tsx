@@ -1,5 +1,6 @@
 import { Box, Text } from '@hermes/ink'
 
+import type { PendingSteer } from '../app/interfaces.js'
 import { compactPreview } from '../lib/text.js'
 import type { Theme } from '../theme.js'
 
@@ -23,9 +24,9 @@ export function QueuedMessages({ cols, pendingSteer, queueEditIdx, queued, t }: 
 
   return (
     <Box flexDirection="column" marginTop={1}>
-      {pendingSteer.map((text, index) => (
-        <Text color={t.color.accent} key={`${index}-${text.slice(0, 16)}`}>
-          {`⏩ steer: ${compactPreview(text, Math.max(16, cols - 10))} · arrives after next tool call`}
+      {pendingSteer.map(item => (
+        <Text color={t.color.accent} key={item.id}>
+          {`⏩ steer: ${compactPreview(item.text, Math.max(16, cols - 10))} · arrives after next tool call`}
         </Text>
       ))}
       {queued.length > 0 && (
@@ -65,7 +66,7 @@ export function QueuedMessages({ cols, pendingSteer, queueEditIdx, queued, t }: 
 
 interface QueuedMessagesProps {
   cols: number
-  pendingSteer: string[]
+  pendingSteer: PendingSteer[]
   queueEditIdx: number | null
   queued: string[]
   t: Theme

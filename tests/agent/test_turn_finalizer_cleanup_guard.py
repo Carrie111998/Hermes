@@ -57,6 +57,8 @@ class _StubAgent:
             setattr(self, attr, 0)
         self.session_cost_status = "ok"
         self.session_cost_source = "stub"
+        self._pending_steer_items = []
+        self.event_callback = None
 
     # --- fallible cleanup surfaces -------------------------------------
     def _save_trajectory(self, *a, **k):
@@ -89,6 +91,11 @@ class _StubAgent:
 
     def _turn_completion_explainer_enabled(self):
         return False
+
+    def _drain_pending_steer_batch(self):
+        items = list(self._pending_steer_items)
+        self._pending_steer_items.clear()
+        return items
 
     def _drain_pending_steer(self):
         return None
@@ -164,3 +171,16 @@ def test_clean_turn_has_no_cleanup_errors_key():
     assert "cleanup_errors" not in result
 
 
+
+def test_leftover_steer_is_requeued_and_emits_id_confirmation():
+    agent = _StubAgent(raise_in=())
+    events = []
+    agent.event_callback = lambda event_type, payload: events.append((event_type, payload))
+    agent._pending_steer_items = [("tui-steer-leftover", "late steer")]
+
+    result = _run(agent)
+
+    assert result["pending_steer"] == "late steer"
+    assert events == [
+        ("steer.requeued", {"steer_ids": ["tui-steer-leftover"]})
+    ]

@@ -180,18 +180,17 @@ export function useSubmission(opts: UseSubmissionOptions) {
       }
 
       if (mode === 'steer' && live.sid) {
+        const steerId = composerActions.pushPendingSteer(full)
         submitSteer(live.sid, full, {
           gw,
-          onQueued: () => {
-            // Accepted into the live turn: surface the steered text in the
-            // composer-adjacent pending strip (always visible at the bottom,
-            // unlike the transcript tail, which the live turn scrolls past).
-            // Multiple steers accumulate; the strip clears when the next
-            // Multiple steers accumulate; the strip clears when the backend
-            // injects them (next tool batch drain) or the turn ends.
-            composerActions.pushPendingSteer(full)
-          },
-          onRejected: fallback
+          steerId,
+          // The strip is optimistic so an accepted RPC cannot race a later
+          // injection confirmation and recreate a ghost pending row.
+          onQueued: () => {},
+          onRejected: note => {
+            composerActions.settlePendingSteer([steerId])
+            fallback(note)
+          }
         })
         return
       }

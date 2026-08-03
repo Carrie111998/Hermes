@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { isSessionBusyError, markSubmitting, submitPrompt, submitSteer, type SubmitPromptDeps } from '../app/submissionCore.js'
+import { isSessionBusyError, markSubmitting, submitPrompt, type SubmitPromptDeps, submitSteer } from '../app/submissionCore.js'
 import { getUiState, patchUiState, resetUiState } from '../app/uiStore.js'
 import type { GatewayClient } from '../gatewayClient.js'
 
@@ -160,6 +160,21 @@ describe('submissionCore.submitSteer — busy-input steer feedback paths', () =>
     expect(gw.request).toHaveBeenCalledWith('session.steer', { session_id: 'sess-1', text: 'keep going' })
     expect(deps.onQueued).toHaveBeenCalledTimes(1)
     expect(deps.onRejected).not.toHaveBeenCalled()
+  })
+
+  it('includes the client steer id in the RPC so late confirmations settle the same item', async () => {
+    const gw = makeSteerGateway(() => Promise.resolve({ status: 'queued', steer_id: 'tui-steer-7' }))
+    const deps = makeSteerDeps(gw, { steerId: 'tui-steer-7' })
+
+    submitSteer('sess-1', 'late confirmation', deps)
+    await Promise.resolve()
+
+    expect(gw.request).toHaveBeenCalledWith('session.steer', {
+      session_id: 'sess-1',
+      steer_id: 'tui-steer-7',
+      text: 'late confirmation'
+    })
+    expect(deps.onQueued).toHaveBeenCalledTimes(1)
   })
 
   it('rejected steer fires onRejected and never onQueued (fallback path, no optimistic bubble)', async () => {

@@ -3083,14 +3083,39 @@ class AIAgent:
         # A hard interrupt supersedes any pending /steer — the steer was
         # meant for the agent's next tool-call iteration, which will no
         # longer happen. Drop it instead of surprising the user with a
-        # late injection on the post-interrupt turn.
-        _steer_lock = getattr(self, "_pending_steer_lock", None)
-        if _steer_lock is not None:
-            with _steer_lock:
+        # late injection on the post-interrupt turn. A redirect preserves the
+        # pending steer because it rebuilds the same logical turn.
+        _cancelled_steer_ids: list[str] = []
+        if not preserve_redirect:
+            _steer_lock = getattr(self, "_pending_steer_lock", None)
+            if _steer_lock is not None:
+                with _steer_lock:
+                    pending = list(getattr(self, "_pending_steers", None) or [])
+                    _cancelled_steer_ids = [
+                        steer_id for steer_id, _text in pending if steer_id
+                    ]
+                    self._pending_steer = None
+                    self._pending_steers = []
+            else:
+                pending = list(getattr(self, "_pending_steers", None) or [])
+                _cancelled_steer_ids = [
+                    steer_id for steer_id, _text in pending if steer_id
+                ]
                 self._pending_steer = None
+                self._pending_steers = []
+        if _cancelled_steer_ids:
+            callback = getattr(self, "event_callback", None)
+            if callable(callback):
+                try:
+                    callback(
+                        "steer.cancelled",
+                        {"steer_ids": _cancelled_steer_ids},
+                    )
+                except Exception:
+                    pass
         return True
 
-    def steer(self, text: str) -> bool:
+    def steer(self, text: str, steer_id: str | None = None) -> bool:
         """
         Inject a user message into the next tool result without interrupting.
 
@@ -3100,10 +3125,14 @@ class AIAgent:
         sees the steer as part of the tool output on its next iteration.
 
         Thread-safe: callable from gateway/CLI/TUI threads. Multiple calls
-        before the drain point concatenate with newlines.
+        before the drain point retain their individual ids and concatenate
+        with newlines for the model.
 
         Args:
-            text: The user text to inject. Empty strings are ignored.
+            text: The user text. Empty strings are ignored.
+            steer_id: Optional client id used to acknowledge the exact steer
+                that was later injected or requeued. Existing callers may omit
+                it and retain the legacy text-only behavior.
 
         Returns:
             True if the steer was accepted, False if the text was empty.
@@ -3111,20 +3140,81 @@ class AIAgent:
         if not text or not text.strip():
             return False
         cleaned = text.strip()
+        cleaned_id = str(steer_id).strip() if steer_id else None
         _lock = getattr(self, "_pending_steer_lock", None)
+
+        def append_pending() -> None:
+            pending = getattr(self, "_pending_steers", None)
+            if pending is None:
+                pending = []
+                self._pending_steers = pending
+            pending.append((cleaned_id, cleaned))
+            self._sync_pending_steer_text()
+
         if _lock is None:
             # Test stubs that built AIAgent via object.__new__ skip __init__.
-            # Fall back to direct attribute set; no concurrent callers expected
-            # in those stubs.
-            existing = getattr(self, "_pending_steer", None)
-            self._pending_steer = (existing + "\n" + cleaned) if existing else cleaned
+            # Fall back to direct attribute set; no concurrent callers are
+            # expected in those stubs.
+            append_pending()
             return True
         with _lock:
-            if self._pending_steer:
-                self._pending_steer = self._pending_steer + "\n" + cleaned
-            else:
-                self._pending_steer = cleaned
+            append_pending()
         return True
+
+    def _sync_pending_steer_text(self) -> None:
+        pending = getattr(self, "_pending_steers", None) or []
+        self._pending_steer = "\n".join(text for _steer_id, text in pending) or None
+
+    def _restore_pending_steer_batch(
+        self, items: list[tuple[str | None, str]]
+    ) -> None:
+        if not items:
+            return
+        _lock = getattr(self, "_pending_steer_lock", None)
+
+        def restore() -> None:
+            existing = list(getattr(self, "_pending_steers", None) or [])
+            if not existing:
+                existing_text = getattr(self, "_pending_steer", None)
+                if existing_text:
+                    existing = [(None, existing_text)]
+            self._pending_steers = list(items) + existing
+            self._sync_pending_steer_text()
+
+        if _lock is None:
+            restore()
+        else:
+            with _lock:
+                restore()
+
+    def _drain_pending_steer_batch(self) -> list[tuple[str | None, str]]:
+        _lock = getattr(self, "_pending_steer_lock", None)
+
+        def drain() -> list[tuple[str | None, str]]:
+            pending = list(getattr(self, "_pending_steers", None) or [])
+            if not pending:
+                text = getattr(self, "_pending_steer", None)
+                if text:
+                    pending = [(None, text)]
+            self._pending_steers = []
+            self._pending_steer = None
+            return pending
+
+        if _lock is None:
+            return drain()
+        with _lock:
+            return drain()
+
+    def _drain_pending_steer(self) -> Optional[str]:
+        """Return the pending steer text (if any) and clear the slot.
+
+        Safe to call from the agent execution thread after appending tool
+        results. Returns None when no steer is pending. The batch-aware
+        companion preserves client ids for gateway acknowledgement.
+        """
+        items = self._drain_pending_steer_batch()
+        text = "\n".join(item_text for _steer_id, item_text in items)
+        return text or None
 
     def redirect(self, text: str) -> bool:
         """Redirect the active turn without converting it into a new task.
@@ -3238,21 +3328,6 @@ class AIAgent:
             self._pending_redirect = None
         return text
 
-    def _drain_pending_steer(self) -> Optional[str]:
-        """Return the pending steer text (if any) and clear the slot.
-
-        Safe to call from the agent execution thread after appending tool
-        results. Returns None when no steer is pending.
-        """
-        _lock = getattr(self, "_pending_steer_lock", None)
-        if _lock is None:
-            text = getattr(self, "_pending_steer", None)
-            self._pending_steer = None
-            return text
-        with _lock:
-            text = self._pending_steer
-            self._pending_steer = None
-        return text
 
     def _record_file_mutation_result(
         self,
@@ -3522,7 +3597,7 @@ class AIAgent:
         # which already surfaces its own message) — don't second-guess.
         return ""
 
-    def _apply_pending_steer_to_tool_results(self, messages: list, num_tool_msgs: int) -> None:
+    def _apply_pending_steer_to_tool_results(self, messages: list, num_tool_msgs: int) -> int:
         """Forwarder — see ``agent.agent_runtime_helpers.apply_pending_steer_to_tool_results``."""
         from agent.agent_runtime_helpers import apply_pending_steer_to_tool_results
         return apply_pending_steer_to_tool_results(self, messages, num_tool_msgs)

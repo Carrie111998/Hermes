@@ -130,14 +130,20 @@ export interface SubmitSteerDeps {
   gw: GatewayClient
   onQueued: () => void
   onRejected: (note: string) => void
+  steerId?: string
 }
 
 // Fire the mid-run steer RPC and dispatch the outcome by callback. Kept as a
 // pure function (mirroring submitPrompt) so the accepted/rejected/error paths
 // are unit-testable without a React harness; useSubmission wires the UI side.
 export function submitSteer(sid: string, text: string, deps: SubmitSteerDeps): void {
+  const params = {
+    session_id: sid,
+    text,
+    ...(deps.steerId ? { steer_id: deps.steerId } : {})
+  }
   deps.gw
-    .request<SessionSteerResponse>('session.steer', { session_id: sid, text })
+    .request<SessionSteerResponse>('session.steer', params)
     .then(raw => {
       const r = asRpcResult<SessionSteerResponse>(raw)
       if (r?.status !== 'queued') {

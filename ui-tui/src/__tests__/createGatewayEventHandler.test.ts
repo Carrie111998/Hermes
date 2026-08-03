@@ -21,6 +21,7 @@ const buildCtx = (appended: Msg[]) =>
   ({
     composer: {
       clearPendingSteer: vi.fn(),
+      settlePendingSteer: vi.fn(),
       dequeue: () => undefined,
       queueEditRef: ref<null | number>(null),
       sendQueued: vi.fn(),
@@ -65,6 +66,32 @@ describe('createGatewayEventHandler', () => {
     resetTurnState()
     turnController.fullReset()
     patchUiState({ showReasoning: true })
+  })
+
+  it('settles pending steer only on an id-bearing terminal event', () => {
+    const ctx = buildCtx([])
+    const onEvent = createGatewayEventHandler(ctx)
+
+    onEvent({ payload: {}, type: 'message.start' } as any)
+    onEvent({ payload: { name: 'read_file', tool_id: 'tool-1' }, type: 'tool.complete' } as any)
+    expect(ctx.composer.clearPendingSteer).not.toHaveBeenCalled()
+
+    onEvent({ payload: { steer_ids: ['tui-steer-1'] }, type: 'steer.injected' } as any)
+    expect(ctx.composer.settlePendingSteer).toHaveBeenCalledWith(['tui-steer-1'])
+  })
+
+  it('settles requeued and cancelled steer ids without clearing unrelated pending items', () => {
+    const ctx = buildCtx([])
+    const onEvent = createGatewayEventHandler(ctx)
+
+    onEvent({ payload: { steer_ids: ['tui-steer-1', 'tui-steer-2'] }, type: 'steer.injected' } as any)
+    onEvent({ payload: { steer_ids: ['tui-steer-3'] }, type: 'steer.requeued' } as any)
+    onEvent({ payload: { steer_ids: ['tui-steer-4'] }, type: 'steer.cancelled' } as any)
+
+    expect(ctx.composer.settlePendingSteer).toHaveBeenNthCalledWith(1, ['tui-steer-1', 'tui-steer-2'])
+    expect(ctx.composer.settlePendingSteer).toHaveBeenNthCalledWith(2, ['tui-steer-3'])
+    expect(ctx.composer.settlePendingSteer).toHaveBeenNthCalledWith(3, ['tui-steer-4'])
+    expect(ctx.composer.clearPendingSteer).not.toHaveBeenCalled()
   })
 
   it('archives incomplete todos into transcript flow at end of turn so they scroll up', () => {

@@ -316,6 +316,7 @@ export interface SessionInterruptResponse {
 
 export interface SessionSteerResponse {
   status?: 'queued' | 'rejected'
+  steer_id?: string
   text?: string
 }
 
@@ -607,6 +608,11 @@ export type GatewayEvent =
   | { payload?: { text?: string }; session_id?: string; type: 'thinking.delta' }
   | { payload?: { kind?: string }; session_id?: string; type: 'reaction' }
   | { payload?: undefined; session_id?: string; type: 'message.start' }
+  | {
+      payload?: { steer_ids?: string[] }
+      session_id?: string
+      type: 'steer.cancelled' | 'steer.injected' | 'steer.requeued'
+    }
   | { payload?: { kind?: string; text?: string }; session_id?: string; type: 'status.update' }
   | {
       payload?: {

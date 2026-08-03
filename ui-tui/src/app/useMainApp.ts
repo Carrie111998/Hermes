@@ -780,7 +780,11 @@ export function useMainApp(gw: GatewayClient) {
   const onEvent = useMemo(
     () =>
       createGatewayEventHandler({
-        composer: { clearPendingSteer: () => composerActions.clearPendingSteer(), setInput: composerActions.setInput },
+        composer: {
+          clearPendingSteer: () => composerActions.clearPendingSteer(),
+          settlePendingSteer: steerIds => composerActions.settlePendingSteer(steerIds),
+          setInput: composerActions.setInput
+        },
         gateway,
         session: {
           STARTUP_RESUME_ID,

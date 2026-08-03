@@ -615,9 +615,18 @@ def finalize_turn(
     # If a /steer landed after the final assistant turn (no more tool
     # batches to drain into), hand it back to the caller so it can be
     # delivered as the next user turn instead of being silently lost.
-    _leftover_steer = agent._drain_pending_steer()
-    if _leftover_steer:
+    from agent.agent_runtime_helpers import (
+        drain_pending_steer_batch,
+        notify_steer_event,
+    )
+
+    _leftover_steer_items = drain_pending_steer_batch(agent)
+    if _leftover_steer_items:
+        _leftover_steer = "\n".join(
+            text for _steer_id, text in _leftover_steer_items
+        )
         result["pending_steer"] = _leftover_steer
+        notify_steer_event(agent, "steer.requeued", _leftover_steer_items)
     agent._response_was_previewed = False
 
     # Include interrupt message if one triggered the interrupt

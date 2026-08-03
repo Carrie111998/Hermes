@@ -5330,6 +5330,17 @@ def _mirror_subagent_to_child(event_type: str, payload: dict) -> None:
             _child_mirrors.pop(child_key, None)
 
 
+def _on_agent_event(sid: str, event_type: str, payload: dict | None = None) -> None:
+    if event_type not in {"steer.injected", "steer.requeued", "steer.cancelled"}:
+        return
+    raw_ids = (payload or {}).get("steer_ids")
+    if not isinstance(raw_ids, list):
+        return
+    steer_ids = [str(steer_id) for steer_id in raw_ids if str(steer_id)]
+    if steer_ids:
+        _emit(event_type, sid, {"steer_ids": steer_ids})
+
+
 def _agent_cbs(sid: str) -> dict:
     callbacks = {
         "tool_start_callback": lambda tc_id, name, args: _on_tool_start(
@@ -5354,6 +5365,9 @@ def _agent_cbs(sid: str) -> dict:
         ),
         "status_callback": lambda kind, text=None: _status_update(
             sid, str(kind), None if text is None else str(text)
+        ),
+        "event_callback": lambda event_type, payload=None: _on_agent_event(
+            sid, str(event_type), payload if isinstance(payload, dict) else None
         ),
         # Credits/notice spine (L1): an AgentNotice fired by the agent becomes a
         # notification.show WS event; a recovery clear becomes notification.clear.

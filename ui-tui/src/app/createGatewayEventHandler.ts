@@ -769,14 +769,17 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
 
       case 'message.start':
         resetAgentsNudgeTurnState()
-        // A new assistant message can only start after the previous batch of
-        // tool results was drained — which is exactly where a pending steer
-        // gets injected. Clearing here makes the composer hint disappear as
-        // soon as the steered text actually rides into the run.
-        ctx.composer.clearPendingSteer()
         turnController.startMessage()
-
         return
+      case 'steer.injected':
+      case 'steer.requeued':
+      case 'steer.cancelled': {
+        const steerIds = ev.payload?.steer_ids
+        if (Array.isArray(steerIds)) {
+          ctx.composer.settlePendingSteer(steerIds.map(String))
+        }
+        return
+      }
       case 'status.update': {
         const p = ev.payload
 
@@ -1127,11 +1130,6 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
 
         return
       case 'tool.complete': {
-        // A pending steer is injected onto the just-finished tool batch on the
-        // backend (drained after the tool results return). Clearing here makes
-        // the composer hint disappear at the injection point — message.start
-        // cannot be used: it fires per prompt.submit, not per tool cycle.
-        ctx.composer.clearPendingSteer()
         // The clarify tool finishing with its overlay still live means it was
         // abandoned (backend _block timed out, empty answer). A real answer
         // clears the overlay in answerClarify() before this fires, so this

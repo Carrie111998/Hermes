@@ -12,6 +12,7 @@ import threading
 import pytest
 
 from agent.prompt_builder import STEER_MARKER_OPEN, format_steer_marker
+from agent.agent_runtime_helpers import inject_pending_steer_before_api
 from run_agent import AIAgent
 
 
@@ -379,6 +380,20 @@ class TestSteerInjection:
         assert new_content[1]["type"] == "text"
         assert "extra note" in new_content[1]["text"]
 
+    def test_multiple_duplicate_steers_settle_by_id_and_batch(self):
+        agent = _bare_agent()
+        events = []
+        agent.event_callback = lambda event_type, payload: events.append((event_type, payload))
+        agent.steer("same text", steer_id="tui-steer-1")
+        agent.steer("same text", steer_id="tui-steer-2")
+
+        messages = [{"role": "tool", "content": "output", "tool_call_id": "1"}]
+        assert agent._apply_pending_steer_to_tool_results(messages, num_tool_msgs=1) == 2
+        assert events == [("steer.injected", {"steer_ids": ["tui-steer-1", "tui-steer-2"]})]
+
+        agent.steer("same text", steer_id="tui-steer-3")
+        assert agent._apply_pending_steer_to_tool_results(messages, num_tool_msgs=1) == 1
+        assert events[-1] == ("steer.injected", {"steer_ids": ["tui-steer-3"]})
 
 
 class TestSteerThreadSafety:
@@ -417,13 +432,18 @@ class TestSteerClearedOnInterrupt:
         agent._tool_worker_threads = None
         agent._tool_worker_threads_lock = None
 
-        agent.steer("will be dropped")
+        events = []
+        agent.event_callback = lambda event_type, payload: events.append((event_type, payload))
+        agent.steer("will be dropped", steer_id="tui-steer-cancelled")
         agent._pending_redirect = "also drop this"
         assert agent._pending_steer == "will be dropped"
 
         agent.clear_interrupt()
         assert agent._pending_steer is None
         assert agent._pending_redirect is None
+        assert events == [
+            ("steer.cancelled", {"steer_ids": ["tui-steer-cancelled"]})
+        ]
 
 
 class TestPreApiCallSteerDrain:
@@ -446,17 +466,16 @@ class TestPreApiCallSteerDrain:
             {"role": "tool", "content": "output here", "tool_call_id": "tc1"},
         ]
         # Steer arrives during API call (set after tool execution)
-        agent.steer("focus on error handling")
-        # Simulate what the pre-API-call drain does:
-        _pre_api_steer = agent._drain_pending_steer()
-        assert _pre_api_steer == "focus on error handling"
-        # Inject into last tool msg (mirrors the new code in run_conversation)
-        for _si in range(len(messages) - 1, -1, -1):
-            if messages[_si].get("role") == "tool":
-                messages[_si]["content"] += format_steer_marker(_pre_api_steer)
-                break
+        events = []
+        agent.event_callback = lambda event_type, payload: events.append((event_type, payload))
+        agent.steer("focus on error handling", steer_id="tui-steer-pre-api")
+
+        assert inject_pending_steer_before_api(agent, messages) == 1
         assert STEER_MARKER_OPEN in messages[-1]["content"]
         assert "focus on error handling" in messages[-1]["content"]
+        assert events == [
+            ("steer.injected", {"steer_ids": ["tui-steer-pre-api"]})
+        ]
         assert agent._pending_steer is None
 
     def test_pre_api_drain_restashes_when_no_tool_message(self):
@@ -466,19 +485,11 @@ class TestPreApiCallSteerDrain:
         messages = [
             {"role": "user", "content": "hello"},
         ]
-        agent.steer("early steer")
-        _pre_api_steer = agent._drain_pending_steer()
-        assert _pre_api_steer == "early steer"
-        # No tool message found — put it back
-        found = False
-        for _si in range(len(messages) - 1, -1, -1):
-            if messages[_si].get("role") == "tool":
-                found = True
-                break
-        assert not found
-        # Restash
-        agent._pending_steer = _pre_api_steer
+        agent.steer("early steer", steer_id="tui-steer-restash")
+
+        assert inject_pending_steer_before_api(agent, messages) == 0
         assert agent._pending_steer == "early steer"
+        assert agent._pending_steers == [("tui-steer-restash", "early steer")]
 
 
 

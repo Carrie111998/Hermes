@@ -2939,6 +2939,7 @@ def _(rid, params: dict) -> dict:
     text = (params.get("text") or "").strip()
     if not text:
         return _err(rid, 4002, "text is required")
+    steer_id = str(params.get("steer_id") or "").strip() or None
     session, err = _sess_nowait(params, rid)
     if err:
         return err
@@ -2946,7 +2947,11 @@ def _(rid, params: dict) -> dict:
     if agent is None or not hasattr(agent, "steer"):
         return _err(rid, 4010, "agent does not support steer")
     try:
-        accepted = agent.steer(text)
+        accepted = (
+            agent.steer(text, steer_id=steer_id)
+            if steer_id
+            else agent.steer(text)
+        )
     except Exception as exc:
         return _err(rid, 5000, f"steer failed: {exc}")
     if accepted:
@@ -2957,7 +2962,10 @@ def _(rid, params: dict) -> dict:
         with session["history_lock"]:
             _record_inflight_correction(session, text)
             session["last_active"] = time.time()
-    return _ok(rid, {"status": "queued" if accepted else "rejected", "text": text})
+    payload = {"status": "queued" if accepted else "rejected", "text": text}
+    if steer_id:
+        payload["steer_id"] = steer_id
+    return _ok(rid, payload)
 
 
 @method("session.redirect")

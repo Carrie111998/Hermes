@@ -23,6 +23,7 @@ import type {
   ComposerPasteResult,
   ComposerToken,
   MaybePromise,
+  PendingSteer,
   StateSetter,
   UseComposerStateOptions,
   UseComposerStateResult
@@ -114,7 +115,8 @@ export function useComposerState({ gw, submitRef, sys }: UseComposerStateOptions
   // of truth for "what is in the composer right now".
   const inputRef = useRef('')
   const tokensRef = useRef<ComposerToken[]>([])
-  const [pendingSteer, setPendingSteer] = useState<string[]>([])
+  const [pendingSteer, setPendingSteer] = useState<PendingSteer[]>([])
+  const pendingSteerSeq = useRef(0)
 
   const setInput = useCallback<StateSetter<string>>(next => {
     inputRef.current = typeof next === 'function' ? next(inputRef.current) : next
@@ -232,7 +234,21 @@ export function useComposerState({ gw, submitRef, sys }: UseComposerStateOptions
   )
 
   const pushPendingSteer = useCallback(
-    (text: string) => setPendingSteer(prev => [...prev, text]),
+    (text: string): string => {
+      const id = `tui-steer-${++pendingSteerSeq.current}`
+      setPendingSteer(prev => [...prev, { id, text }])
+      return id
+    },
+    []
+  )
+  const settlePendingSteer = useCallback(
+    (steerIds: string[]) => {
+      if (!steerIds.length) {
+        return
+      }
+      const ids = new Set(steerIds)
+      setPendingSteer(prev => prev.filter(item => !ids.has(item.id)))
+    },
     []
   )
   const clearPendingSteer = useCallback(() => setPendingSteer([]), [])
@@ -450,6 +466,7 @@ export function useComposerState({ gw, submitRef, sys }: UseComposerStateOptions
       setInput,
       setInputBuf,
       pushPendingSteer,
+      settlePendingSteer,
       clearPendingSteer,
       setQueueEdit,
       syncQueue,
@@ -472,6 +489,7 @@ export function useComposerState({ gw, submitRef, sys }: UseComposerStateOptions
       setInput,
       setInputBuf,
       pushPendingSteer,
+      settlePendingSteer,
       clearPendingSteer,
       setQueueEdit,
       syncQueue,

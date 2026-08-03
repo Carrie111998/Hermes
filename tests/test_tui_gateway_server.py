@@ -8264,6 +8264,35 @@ def test_session_steer_calls_agent_steer_when_agent_supports_it():
     assert "interrupt_called" not in calls  # must NOT interrupt
 
 
+def test_session_steer_forwards_client_id():
+    calls = {}
+
+    class _Agent:
+        def steer(self, text, steer_id=None):
+            calls["value"] = (text, steer_id)
+            return True
+
+    server._sessions["sid"] = _session(agent=_Agent())
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "session.steer",
+                "params": {
+                    "session_id": "sid",
+                    "steer_id": "tui-steer-1",
+                    "text": "follow the error",
+                },
+            }
+        )
+    finally:
+        server._sessions.pop("sid", None)
+
+    assert resp["result"]["status"] == "queued"
+    assert resp["result"]["steer_id"] == "tui-steer-1"
+    assert calls["value"] == ("follow the error", "tui-steer-1")
+
+
 def test_session_steer_rejects_empty_text():
     server._sessions["sid"] = _session(
         agent=types.SimpleNamespace(steer=lambda t: True)
