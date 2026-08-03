@@ -341,6 +341,95 @@ class TestSearXNGSearchProviderSearch:
         assert captured_params.get("empty") == ""
         assert captured_params.get("p_token") == "abc"
 
+    def test_search_suffix_url_does_not_double_append(self, monkeypatch):
+        """SEARXNG_URL pointed directly at /search must not produce /search/search."""
+        monkeypatch.setenv("SEARXNG_URL", "http://localhost:8080/search")
+        from plugins.web.searxng.provider import SearXNGWebSearchProvider
+        mock_resp = self._make_mock_response({"results": []})
+        calls = []
+        def capture_get(url, **kwargs):
+            calls.append(url)
+            return mock_resp
+        with patch("httpx.get", side_effect=capture_get):
+            SearXNGWebSearchProvider().search("query", limit=5)
+        assert calls[0] == "http://localhost:8080/search", f"Got: {calls[0]}"
+
+    def test_search_suffix_with_trailing_slash(self, monkeypatch):
+        """SEARXNG_URL ending in /search/ must not produce /search/search."""
+        monkeypatch.setenv("SEARXNG_URL", "http://localhost:8080/search/")
+        from plugins.web.searxng.provider import SearXNGWebSearchProvider
+        mock_resp = self._make_mock_response({"results": []})
+        calls = []
+        def capture_get(url, **kwargs):
+            calls.append(url)
+            return mock_resp
+        with patch("httpx.get", side_effect=capture_get):
+            SearXNGWebSearchProvider().search("query", limit=5)
+        assert calls[0] == "http://localhost:8080/search", f"Got: {calls[0]}"
+
+    def test_search_suffix_with_query_params(self, monkeypatch):
+        """SEARXNG_URL with /search path and query params must strip the path
+        suffix AND merge the query params."""
+        monkeypatch.setenv("SEARXNG_URL", "http://localhost:8080/search?p_token=abc")
+        from plugins.web.searxng.provider import SearXNGWebSearchProvider
+        mock_resp = self._make_mock_response({"results": []})
+        calls = []
+        captured_params = {}
+        def capture_get(url, **kwargs):
+            calls.append(url)
+            captured_params.update(kwargs.get("params", {}))
+            return mock_resp
+        with patch("httpx.get", side_effect=capture_get):
+            SearXNGWebSearchProvider().search("query", limit=5)
+        assert calls[0] == "http://localhost:8080/search", f"Got: {calls[0]}"
+        assert captured_params.get("p_token") == "abc"
+
+    def test_reserved_keys_case_insensitive(self, monkeypatch):
+        """Reserved keys must be matched case-insensitively."""
+        monkeypatch.setenv("SEARXNG_URL", "http://localhost:8080/?Q=evil&FORMAT=html&PageNo=99")
+        from plugins.web.searxng.provider import SearXNGWebSearchProvider
+        mock_resp = self._make_mock_response({"results": []})
+        captured_params = {}
+        def capture_get(url, **kwargs):
+            captured_params.update(kwargs.get("params", {}))
+            return mock_resp
+        with patch("httpx.get", side_effect=capture_get):
+            SearXNGWebSearchProvider().search("real query", limit=5)
+        assert "Q" not in captured_params
+        assert "FORMAT" not in captured_params
+        assert "PageNo" not in captured_params
+        assert captured_params["q"] == "real query"
+        assert captured_params["format"] == "json"
+        assert captured_params["pageno"] == 1
+
+    def test_http_error_log_does_not_leak_token(self, monkeypatch, caplog):
+        """When SearXNG returns HTTP error, the log line must not contain
+        the p_token value (httpx stringifies the full URL in the exception)."""
+        import logging, httpx
+        monkeypatch.setenv("SEARXNG_URL", "https://search.example.com/?p_token=secret123")
+        from plugins.web.searxng.provider import SearXNGWebSearchProvider
+        real_resp = httpx.Response(
+            403,
+            request=httpx.Request("GET", "https://search.example.com/search?q=x&p_token=secret123"),
+        )
+        with patch("httpx.get", return_value=real_resp):
+            with caplog.at_level(logging.WARNING):
+                SearXNGWebSearchProvider().search("query", limit=5)
+        assert "secret123" not in caplog.text
+
+    def test_request_error_log_does_not_leak_token(self, monkeypatch, caplog):
+        """When httpx.RequestError fires, the log line must not contain the
+        p_token value (httpx includes the full URL in the exception message)."""
+        import logging, httpx
+        monkeypatch.setenv("SEARXNG_URL", "https://search.example.com/?p_token=secret123")
+        from plugins.web.searxng.provider import SearXNGWebSearchProvider
+        def raise_conn_error(url, **kwargs):
+            raise httpx.ConnectError("connection refused")
+        with patch("httpx.get", side_effect=raise_conn_error):
+            with caplog.at_level(logging.WARNING):
+                SearXNGWebSearchProvider().search("query", limit=5)
+        assert "secret123" not in caplog.text
+
 
 # ---------------------------------------------------------------------------
 # Integration: _is_backend_available recognizes "searxng"

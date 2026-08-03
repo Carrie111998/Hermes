@@ -4082,11 +4082,11 @@ OPTIONAL_ENV_VARS = {
         "category": "tool",
     },
     "SEARXNG_URL": {
-        "description": "URL of your SearXNG instance for free self-hosted web search",
+        "description": "URL of your SearXNG instance (may include auth tokens, e.g. ?p_token=...)",
         "prompt": "SearXNG URL (e.g. http://localhost:8080)",
         "url": "https://searxng.github.io/searxng/",
         "tools": ["web_search"],
-        "password": False,
+        "password": True,
         "category": "tool",
     },
     "BRAVE_SEARCH_API_KEY": {

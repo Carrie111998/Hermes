@@ -84,7 +84,13 @@ class SearXNGWebSearchProvider(WebSearchProvider):
         # like Pangolin's p_token).  Parse and merge them into every request.
         from urllib.parse import urlparse, parse_qsl
         parsed = urlparse(raw_url)
-        base_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}".rstrip("/")
+        # Strip a trailing /search or /search/ from the path — users often
+        # point SEARXNG_URL directly at the endpoint and we always append
+        # /search ourselves.  Without this the final URL becomes /search/search.
+        path = parsed.path.rstrip("/")
+        if path.endswith("/search"):
+            path = path[: -len("/search")]
+        base_url = f"{parsed.scheme}://{parsed.netloc}{path}".rstrip("/")
         # parse_qsl preserves order, blank values, and repeated keys (as
         # separate tuples).  Group repeated keys into lists so httpx emits
         # them as repeated query params (e.g. ?a=1&a=2).
@@ -105,10 +111,12 @@ class SearXNGWebSearchProvider(WebSearchProvider):
             "pageno": 1,
         }
         # Merge extra params from the URL, but never let them override
-        # Hermes-owned request fields (q, format, pageno).
+        # Hermes-owned request fields (q, format, pageno).  Case-insensitive
+        # comparison — HTTP query param names are case-sensitive on the wire,
+        # but a malicious or sloppy ?Q=evil should not hijack the search query.
         _reserved = {"q", "format", "pageno"}
         for key, value in extra_params.items():
-            if key not in _reserved:
+            if key.lower() not in _reserved:
                 params[key] = value
 
         try:
@@ -120,16 +128,27 @@ class SearXNGWebSearchProvider(WebSearchProvider):
             )
             resp.raise_for_status()
         except httpx.HTTPStatusError as exc:
-            logger.warning("SearXNG HTTP error: %s", exc)
+            # Don't log the exception directly — httpx stringifies the full
+            # URL including any auth query params (p_token).
+            logger.warning(
+                "SearXNG HTTP error: %s %s",
+                exc.response.status_code,
+                exc.request.url.path if exc.request else "<no path>",
+            )
             return {
                 "success": False,
                 "error": f"SearXNG returned HTTP {exc.response.status_code}",
             }
         except httpx.RequestError as exc:
-            logger.warning("SearXNG request error: %s", exc)
+            # Scrub query params from the log line; they may contain tokens.
+            logger.warning(
+                "SearXNG request error reaching %s: %s",
+                base_url,
+                type(exc).__name__,
+            )
             return {
                 "success": False,
-                "error": f"Could not reach SearXNG at {base_url}: {exc}",
+                "error": f"Could not reach SearXNG at {base_url}: {type(exc).__name__}",
             }
 
         try:
