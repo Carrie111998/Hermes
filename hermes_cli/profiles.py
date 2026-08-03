@@ -374,8 +374,7 @@ def get_profile_dir(name: str) -> Path:
         raise ValueError(f"Invalid profile name {name!r}: path components are not allowed")
     validate_profile_name(safe_name)
     # safe_name is both basename-contained and restricted to _PROFILE_ID_RE.
-    # codeql[py/path-injection]
-    return _get_profiles_root() / safe_name
+    return _get_profiles_root() / safe_name  # lgtm[py/path-injection]
 
 
 def profile_exists(name: str) -> bool:
