@@ -512,10 +512,12 @@ class TestGetDueJobs:
 
         At a 10:57 gateway restart, daily/weekday jobs scheduled for 08:00 and
         09:00 should catch up once, while 17:00 and 19:30 jobs should remain
-        scheduled for later the same day.  All four records deliberately carry
-        yesterday's persisted ``next_run_at`` to reproduce a day-long gateway
-        outage; the due scan must distinguish today's missed occurrences from
-        jobs whose first occurrence today is still in the future.
+        scheduled for later the same day.  The matrix also pins an exact-time
+        boundary and a twice-daily schedule with an elapsed 08:00 occurrence.
+        All records deliberately carry an older persisted ``next_run_at`` to
+        reproduce a day-long gateway outage; the due scan must distinguish
+        today's missed occurrences from jobs whose first occurrence today is
+        still in the future.
         """
         now = datetime(2026, 8, 3, 10, 57, tzinfo=timezone.utc)  # Monday
         monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
