@@ -25,12 +25,10 @@ def test_gateway_import_defers_user_plugin_discovery_until_explicit_startup(tmp_
         encoding="utf-8",
     )
     (hermes_home / "config.yaml").write_text(
-        yaml.safe_dump(
-            {
-                "plugins": {"enabled": ["gateway_importer"]},
-                "auxiliary": {"title_generation": {"provider": "auto"}},
-            }
-        ),
+        yaml.safe_dump({
+            "plugins": {"enabled": ["gateway_importer"]},
+            "auxiliary": {"title_generation": {"provider": "auto"}},
+        }),
         encoding="utf-8",
     )
 

@@ -2018,7 +2018,11 @@ if _config_path.exists():
             _aux_bridged_keys = {"vision", "web_extract", "approval"}
             try:
                 from hermes_cli.plugins import get_plugin_auxiliary_tasks
-                for _entry in get_plugin_auxiliary_tasks():
+                # ``gateway.run`` is still importing here. Starting global
+                # discovery can load a user plugin whose register() imports
+                # GatewayRunner, permanently caching that circular-import
+                # failure before the explicit startup discovery below.
+                for _entry in get_plugin_auxiliary_tasks(discover=False):
                     _aux_bridged_keys.add(_entry["key"])
             except Exception:
                 # Plugin discovery failure must not break gateway startup;
