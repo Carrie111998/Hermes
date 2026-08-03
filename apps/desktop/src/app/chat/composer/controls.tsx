@@ -12,6 +12,7 @@ import {
   iconSize,
   Layers3,
   Loader2,
+  Smartphone,
   Square,
   SteeringWheel,
   Volume2,
@@ -62,6 +63,7 @@ export function ComposerControls({
   state,
   voiceStatus,
   onDictate,
+  onContinueOnPhone,
   onQueue,
   onToggleAutoSpeak
 }: {
@@ -76,6 +78,7 @@ export function ComposerControls({
   state: ChatBarState
   voiceStatus: VoiceStatus
   onDictate: () => void
+  onContinueOnPhone?: () => void
   onQueue: () => void
   onToggleAutoSpeak: () => void
 }) {
@@ -92,6 +95,24 @@ export function ComposerControls({
   return (
     <div className="ml-auto flex shrink-0 items-center gap-(--composer-control-gap)">
       <ModelPill compact={compactModelPill} disabled={disabled} model={state.model} />
+      {onContinueOnPhone && (
+        <Tip label={t.sidebar.row.continueOnPhone}>
+          <Button
+            aria-label={t.sidebar.row.continueOnPhone}
+            className={GHOST_ICON_BTN}
+            disabled={disabled}
+            onClick={() => {
+              triggerHaptic('selection')
+              onContinueOnPhone()
+            }}
+            size="icon"
+            type="button"
+            variant="ghost"
+          >
+            <Smartphone className={iconSize.sm} />
+          </Button>
+        </Tip>
+      )}
       <DictationButton disabled={disabled} onToggle={onDictate} state={state.voice} status={voiceStatus} />
       <AutoSpeakButton active={autoSpeak} disabled={disabled} onToggle={onToggleAutoSpeak} />
       <WakeWordButton disabled={disabled} />

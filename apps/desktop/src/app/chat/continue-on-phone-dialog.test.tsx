@@ -5,12 +5,14 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { I18nProvider } from '@/i18n'
 import type { ContinueOnPhoneResult } from '@/lib/continue-on-phone'
 
-import { ContinueOnPhoneDialog } from './continue-on-phone-dialog'
+import { ContinueOnPhoneDialog, ContinueOnPhoneDialogHost } from './continue-on-phone-dialog'
+import { closeContinueOnPhone } from './continue-on-phone-state'
 import { SessionActionsMenu } from './sidebar/session-actions-menu'
 
 const openExternal = vi.fn().mockResolvedValue(undefined)
 
 beforeEach(() => {
+  closeContinueOnPhone()
   openExternal.mockClear()
   window.hermesDesktop = {
     ...(window.hermesDesktop ?? {}),
@@ -45,6 +47,7 @@ describe('ContinueOnPhoneDialog', () => {
         <SessionActionsMenu sessionId="session-42" title="Research session">
           <button type="button">Session menu</button>
         </SessionActionsMenu>
+        <ContinueOnPhoneDialogHost />
       </I18nProvider>
     )
 

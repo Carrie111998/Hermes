@@ -79,6 +79,17 @@ describe('ComposerControls shortcut tooltips', () => {
   })
 })
 
+describe('continue on phone control', () => {
+  it('opens remote control from the composer chrome', () => {
+    const onContinueOnPhone = vi.fn()
+    renderControls({ onContinueOnPhone })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Link phone' }))
+
+    expect(onContinueOnPhone).toHaveBeenCalledTimes(1)
+  })
+})
+
 describe('wake-word ear visibility', () => {
   afterEach(() => {
     resetWakeWordState()

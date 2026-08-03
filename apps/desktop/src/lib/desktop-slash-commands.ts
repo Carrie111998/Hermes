@@ -54,6 +54,7 @@ export type DesktopActionId =
   | 'new'
   | 'pet'
   | 'profile'
+  | 'remoteControl'
   | 'skin'
   | 'title'
   | 'wake'
@@ -182,6 +183,12 @@ const DESKTOP_COMMAND_SPECS: readonly DesktopCommandSpec[] = [
     argumentMode: 'options'
   },
   { name: '/profile', description: 'Switch the active Hermes profile', surface: action('profile') },
+  {
+    name: '/remote-control',
+    description: 'Continue this chat on your phone',
+    aliases: ['/rc'],
+    surface: action('remoteControl')
+  },
   {
     name: '/skin',
     description: 'Switch desktop theme or cycle to the next one',

@@ -3,6 +3,7 @@ import type { MutableRefObject } from 'react'
 import { useEffect, useRef } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { $continueOnPhoneTarget, closeContinueOnPhone } from '@/app/chat/continue-on-phone-state'
 import { getSession } from '@/hermes'
 import { textPart } from '@/lib/chat-messages'
 import { createClientSessionState } from '@/lib/chat-runtime'
@@ -1536,6 +1537,7 @@ describe('usePromptActions desktop slash pickers', () => {
   })
 
   afterEach(() => {
+    closeContinueOnPhone()
     cleanup()
     vi.useRealTimers()
     vi.restoreAllMocks()
@@ -1580,6 +1582,24 @@ describe('usePromptActions desktop slash pickers', () => {
     await handle!.submitText('/learning')
 
     expect(openMemoryGraph).toHaveBeenCalledTimes(3)
+    expect(requestGateway).not.toHaveBeenCalledWith('slash.exec', expect.anything())
+    expect(requestGateway).not.toHaveBeenCalledWith('command.dispatch', expect.anything())
+  })
+
+  it('opens phone linking for /remote-control and /rc without hitting the backend', async () => {
+    const requestGateway = vi.fn(async () => ({}) as never)
+
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness onReady={h => (handle = h)} refreshSessions={async () => undefined} requestGateway={requestGateway} />
+    )
+
+    await handle!.submitText('/remote-control')
+    expect($continueOnPhoneTarget.get()?.sessionId).toBe(RUNTIME_SESSION_ID)
+
+    closeContinueOnPhone()
+    await handle!.submitText('/rc')
+    expect($continueOnPhoneTarget.get()?.sessionId).toBe(RUNTIME_SESSION_ID)
     expect(requestGateway).not.toHaveBeenCalledWith('slash.exec', expect.anything())
     expect(requestGateway).not.toHaveBeenCalledWith('command.dispatch', expect.anything())
   })

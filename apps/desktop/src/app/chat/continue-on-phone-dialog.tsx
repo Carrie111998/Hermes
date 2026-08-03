@@ -1,3 +1,4 @@
+import { useStore } from '@nanostores/react'
 import * as QRCode from 'qrcode'
 import { useEffect, useState } from 'react'
 
@@ -20,6 +21,8 @@ import {
   resolveContinueOnPhoneUrl
 } from '@/lib/continue-on-phone'
 import { notifyError } from '@/store/notifications'
+
+import { $continueOnPhoneTarget, closeContinueOnPhone } from './continue-on-phone-state'
 
 type ResolveUrl = (sessionId: string, profile?: string) => Promise<ContinueOnPhoneResult>
 type GenerateQr = (url: string) => Promise<string>
@@ -252,5 +255,22 @@ export function ContinueOnPhoneDialog({
         )}
       </DialogContent>
     </Dialog>
+  )
+}
+
+export function ContinueOnPhoneDialogHost() {
+  const target = useStore($continueOnPhoneTarget)
+
+  return (
+    <ContinueOnPhoneDialog
+      onOpenChange={open => {
+        if (!open) {
+          closeContinueOnPhone()
+        }
+      }}
+      open={target !== null}
+      profile={target?.profile}
+      sessionId={target?.sessionId ?? ''}
+    />
   )
 }

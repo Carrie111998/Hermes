@@ -88,6 +88,7 @@ export function ChatBar({
   sessionId,
   state,
   onCancel,
+  onContinueOnPhone,
   onAddUrl,
   onAttachDroppedItems,
   onAttachImageBlob,
@@ -931,6 +932,7 @@ export function ChatBar({
       }}
       disabled={disabled}
       hasComposerPayload={hasComposerPayload}
+      onContinueOnPhone={onContinueOnPhone}
       onDictate={dictate}
       onQueue={queueDraft}
       onToggleAutoSpeak={handleToggleAutoSpeak}

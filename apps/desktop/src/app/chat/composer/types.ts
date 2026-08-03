@@ -42,6 +42,7 @@ export interface ChatBarProps {
   sessionId?: string | null
   cwd?: string | null
   onCancel: () => Promise<void> | void
+  onContinueOnPhone?: () => void
   onAddContextRef?: (refText: string, label?: string, detail?: string) => void
   onAddUrl?: (url: string) => void
   onAttachImageBlob?: (blob: Blob) => Promise<boolean | void> | boolean | void
