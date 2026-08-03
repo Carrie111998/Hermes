@@ -1245,8 +1245,10 @@ def _normalized_inference_axes(job: Dict[str, Any]) -> Tuple[Optional[str], Opti
 
 def _normalize_output_retention(value: Any) -> Optional[int]:
     """Normalize an optional per-job output retention cap."""
-    if value is None or value == "" or value is False:
+    if value is None or value == "":
         return None
+    if isinstance(value, bool):
+        raise ValueError(f"Cron output_retention must be an integer or null (got {value!r})")
     try:
         ivalue = int(value)
     except (TypeError, ValueError) as exc:

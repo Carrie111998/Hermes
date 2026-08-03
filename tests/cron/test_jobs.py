@@ -981,6 +981,15 @@ class TestCronOutputRetention:
         )
         assert jobs._cron_output_keep({"output_retention": "bogus"}, silent=True) == jobs._CRON_SILENT_OUTPUT_DEFAULT_KEEP
 
+    def test_cron_output_keep_bool_override_is_invalid_not_numeric(self, monkeypatch):
+        import cron.jobs as jobs
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"cron": {"output_retention_silent": 99, "output_retention": 12}},
+        )
+        assert jobs._cron_output_keep({"output_retention": True}, silent=True) == jobs._CRON_SILENT_OUTPUT_DEFAULT_KEEP
+        assert jobs._cron_output_keep({"output_retention": False}, silent=True) == jobs._CRON_SILENT_OUTPUT_DEFAULT_KEEP
+
     def test_cron_output_keep_defaults_on_bad_config(self, monkeypatch):
         import cron.jobs as jobs
         monkeypatch.setattr(
