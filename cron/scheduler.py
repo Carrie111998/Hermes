@@ -1402,7 +1402,52 @@ def _extract_agent_iteration(final_response: str):
     return parsed, None, raw_block
 
 
-def _emit_agent_iteration_event(emitter, job: dict, final_response: str) -> None:
+def _install_scout_firecrawl_run(job: dict):
+    """Install one Firecrawl run state for a canonical Scout agent activation."""
+    if job.get("no_agent"):
+        return None, None
+    from events.producers.agent_source_mapping import canonical_agent_source
+
+    if canonical_agent_source(job.get("name")) != "scout":
+        return None, None
+    from agent.firecrawl_run_state import install_firecrawl_run
+
+    return install_firecrawl_run()
+
+
+def _reset_scout_firecrawl_run(token) -> None:
+    if token is None:
+        return
+    from agent.firecrawl_run_state import reset_firecrawl_run
+
+    reset_firecrawl_run(token)
+
+
+def _credits_iteration_fields() -> dict:
+    return {
+        "action_required": True,
+        "action_kind": "credits",
+        "provider_error": "provider_credits_exhausted",
+        "provider_scope": "account",
+    }
+
+
+def _claim_credits_iteration(firecrawl_state) -> bool:
+    return bool(
+        firecrawl_state
+        and firecrawl_state.first_failure
+        and firecrawl_state.claim_credits_action()
+    )
+
+
+def _emit_agent_iteration_event(
+    emitter,
+    job: dict,
+    final_response: str,
+    *,
+    firecrawl_state=None,
+    credits_only: bool = False,
+) -> None:
     """Hook called from _process_job for ALL successful cron runs.
 
     Unlike _emit_tailor_iteration_event which is gated by job_name, this
@@ -1452,6 +1497,11 @@ def _emit_agent_iteration_event(emitter, job: dict, final_response: str) -> None
             canonical_name = canonical_agent_source(job_name)
             if not is_canonical_agent(canonical_name):
                 return
+            credits_owed = bool(
+                firecrawl_state and firecrawl_state.first_failure
+            )
+            if credits_only and not credits_owed:
+                return
             synth_payload = {
                 "agent": canonical_name,
                 "summary": (
@@ -1462,6 +1512,13 @@ def _emit_agent_iteration_event(emitter, job: dict, final_response: str) -> None
                 "job_id": job_id,
                 "job_name": job_name,
             }
+            if credits_owed:
+                synth_payload.update(_credits_iteration_fields())
+                if not _claim_credits_iteration(firecrawl_state):
+                    if credits_only:
+                        return
+                    for key in _credits_iteration_fields():
+                        synth_payload.pop(key, None)
             bus.emit(
                 event_type=EventType.AGENT_ITERATION,
                 source=canonical_name,
@@ -1483,6 +1540,10 @@ def _emit_agent_iteration_event(emitter, job: dict, final_response: str) -> None
             parsed = None
 
         if error_reason is None and parsed is not None:
+            if credits_only and not (
+                firecrawl_state and firecrawl_state.first_failure
+            ):
+                return
             payload = dict(parsed)
             payload["job_id"] = job_id
             payload["job_name"] = job_name
@@ -1499,6 +1560,13 @@ def _emit_agent_iteration_event(emitter, job: dict, final_response: str) -> None
                 payload["agent_llm_supplied"] = parsed.get("agent")
                 payload["agent"] = canonical_name
 
+            if firecrawl_state and firecrawl_state.first_failure:
+                payload.update(_credits_iteration_fields())
+                if not _claim_credits_iteration(firecrawl_state):
+                    if credits_only:
+                        return
+                    for key in _credits_iteration_fields():
+                        payload.pop(key, None)
             bus.emit(
                 event_type=EventType.AGENT_ITERATION,
                 source=payload.get("agent") or job_name or "unknown",
@@ -1523,8 +1591,57 @@ def _emit_agent_iteration_event(emitter, job: dict, final_response: str) -> None
             correlation_id=job_id or None,
             job_id=job_id or None,
         )
+        if firecrawl_state and firecrawl_state.first_failure:
+            canonical_name = canonical_agent_source(job_name)
+            if (
+                is_canonical_agent(canonical_name)
+                and _claim_credits_iteration(firecrawl_state)
+            ):
+                synth_payload = {
+                    "agent": canonical_name,
+                    "summary": (
+                        f"{canonical_name} completed with Firecrawl credits exhausted"
+                    ),
+                    "synthesized": True,
+                    "job_id": job_id,
+                    "job_name": job_name,
+                    **_credits_iteration_fields(),
+                }
+                bus.emit(
+                    event_type=EventType.AGENT_ITERATION,
+                    source=canonical_name,
+                    payload=synth_payload,
+                    correlation_id=job_id or None,
+                    job_id=job_id or None,
+                )
     except Exception as e:  # pragma: no cover - defensive
         logger.debug("agent_iteration emit failed: %s", e)
+
+
+def _finalize_agent_iteration_event(
+    emitter,
+    job: dict,
+    final_response: str,
+    *,
+    success: bool,
+    firecrawl_state,
+) -> None:
+    """Emit ordinary iteration evidence or one credits-gated Scout action."""
+    if success:
+        _emit_agent_iteration_event(
+            emitter,
+            job,
+            final_response,
+            firecrawl_state=firecrawl_state,
+        )
+    elif firecrawl_state and firecrawl_state.first_failure:
+        _emit_agent_iteration_event(
+            emitter,
+            job,
+            final_response,
+            firecrawl_state=firecrawl_state,
+            credits_only=True,
+        )
 # ============================================================================
 
 
@@ -4887,6 +5004,10 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
     _job_id = job["id"]
     _cron_job_name = job.get("name", _job_id)
     emitter = _get_event_emitter()
+    firecrawl_state = None
+    firecrawl_token = None
+    success = False
+    final_response = ""
 
     # Same-job concurrency guard (Guard #3, 2026-04-30) — fork seam.
     # The built-in ticker enforces this inside ``tick``'s ``_process_job``;
@@ -4976,6 +5097,7 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         # interpreter-shutdown guard in _deliver_result.
         _deferred_agents: list = []
         try:
+            firecrawl_state, firecrawl_token = _install_scout_firecrawl_run(job)
             success, output, final_response, error = run_job(
                 job, defer_agent_teardown=_deferred_agents
             )
@@ -5088,7 +5210,6 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         # _emit_agent_iteration_event docstrings).
         if success and emitter:
             _emit_tailor_iteration_event(emitter, job, final_response or "")
-            _emit_agent_iteration_event(emitter, job, final_response or "")
 
         return True
 
@@ -5100,6 +5221,16 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         return False
 
     finally:
+        try:
+            _finalize_agent_iteration_event(
+                emitter,
+                job,
+                final_response or "",
+                success=success,
+                firecrawl_state=firecrawl_state,
+            )
+        finally:
+            _reset_scout_firecrawl_run(firecrawl_token)
         # Release the fork's same-job concurrency slot on every exit path
         # (claim-refused, success, agent failure, raised exception).
         _release_in_flight(_job_id)
@@ -5249,6 +5380,10 @@ def tick(
             # dangling "claimed"/"running" row for a completed attempt.
             _execution_id = job.get("execution_id")
             emitter = _get_event_emitter()
+            firecrawl_state = None
+            firecrawl_token = None
+            success = False
+            final_response = ""
 
             # Same-job concurrency guard (Guard #3, 2026-04-30) -----------
             # Reject a second fire while a prior fire for this job_id is
@@ -5398,6 +5533,7 @@ def tick(
                         logger.debug(
                             "mark_execution_running failed for %s", _job_id
                         )
+                firecrawl_state, firecrawl_token = _install_scout_firecrawl_run(job)
                 success, output, final_response, error = run_job(job)
                 _job_duration = _time.monotonic() - _job_start
 
@@ -5518,12 +5654,6 @@ def tick(
                 # event-design.md for failure-mode handling.
                 if success and emitter:
                     _emit_tailor_iteration_event(emitter, job, final_response or "")
-                    # Generic agent-iteration event (2026-04-30) — opt-in
-                    # via <AGENT_ITERATION_JSON> marker in any agent's
-                    # output. Skips jobflow-tailor (its dedicated event
-                    # already covers it). Missing-marker is silent; only
-                    # malformed-marker emits AGENT_ERROR.
-                    _emit_agent_iteration_event(emitter, job, final_response or "")
 
                 # OTel: finalize cron span with execution results + exit ctx.
                 try:
@@ -5579,6 +5709,16 @@ def tick(
                 return False
 
             finally:
+                try:
+                    _finalize_agent_iteration_event(
+                        emitter,
+                        job,
+                        final_response or "",
+                        success=success,
+                        firecrawl_state=firecrawl_state,
+                    )
+                finally:
+                    _reset_scout_firecrawl_run(firecrawl_token)
                 # Release the same-job concurrency slot regardless of how
                 # the run exited (success, agent failure, raised exception).
                 # See `_in_flight` registry block at module top — Guard #3.
