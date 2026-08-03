@@ -2847,3 +2847,217 @@ class TestCreateAgentModelRecovery:
         assert captured[1]["model"] == "minimax/minimax-m3"
 
 
+# ---------------------------------------------------------------------------
+# Regression tests for repaired transcript duplication
+# ---------------------------------------------------------------------------
+
+
+class TestRepairedTranscriptDuplication:
+    """repair_message_sequence (runs before every LLM call) may merge
+    adjacent user/assistant messages, rewriting the transcript prefix.
+    The exact prefix-match in _build_response_conversation_history would
+    then fail and fall through to prepending prior history, doubling the
+    stored transcript every turn.
+
+    _transcript_mode="full" (set by _run_agent) marks the agent's
+    authoritative full transcript so the builder stores it verbatim even
+    when repair has rewritten the prefix."""
+
+    @pytest.mark.asyncio
+    async def test_repaired_consecutive_user_messages_stored_once(self, adapter):
+        """When the agent's result contains a transcript where repair has
+        merged consecutive user messages, the stored history must equal the
+        repaired transcript, not prior + current_user + repaired_transcript."""
+        repaired_transcript = [
+            {"role": "user", "content": "first message\n\nsecond message"},
+            {"role": "assistant", "content": "got both"},
+        ]
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    {
+                        "final_response": "got both",
+                        "messages": list(repaired_transcript),
+                        "_transcript_mode": "full",
+                        "api_calls": 1,
+                    },
+                    {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                )
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={"model": "hermes-agent", "input": "second message"},
+                )
+
+            assert resp.status == 200
+            resp_data = await resp.json()
+            stored = adapter._response_store.get(resp_data["id"])
+            stored_history = stored["conversation_history"]
+            # Must equal the repaired transcript exactly, not duplicated
+            assert stored_history == repaired_transcript
+            assert stored_history.count(repaired_transcript[0]) == 1
+
+    @pytest.mark.asyncio
+    async def test_repaired_transcript_does_not_double_on_chain(self, adapter):
+        """Two consecutive turns where repair merges user messages must
+        not cause exponential history growth."""
+        first_transcript = [
+            {"role": "user", "content": "first\n\nsecond"},
+            {"role": "assistant", "content": "reply 1"},
+        ]
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            # Turn 1
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    {
+                        "final_response": "reply 1",
+                        "messages": list(first_transcript),
+                        "_transcript_mode": "full",
+                        "api_calls": 1,
+                    },
+                    {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                )
+                resp1 = await cli.post(
+                    "/v1/responses",
+                    json={"model": "hermes-agent", "input": "second"},
+                )
+
+            assert resp1.status == 200
+            resp1_data = await resp1.json()
+            stored1 = adapter._response_store.get(resp1_data["id"])
+            assert stored1["conversation_history"] == first_transcript
+            assert len(stored1["conversation_history"]) == 2
+
+            # Turn 2: chains from turn 1
+            second_transcript = first_transcript + [
+                {"role": "user", "content": "third\n\nfourth"},
+                {"role": "assistant", "content": "reply 2"},
+            ]
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    {
+                        "final_response": "reply 2",
+                        "messages": list(second_transcript),
+                        "_transcript_mode": "full",
+                        "api_calls": 1,
+                    },
+                    {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                )
+                resp2 = await cli.post(
+                    "/v1/responses",
+                    json={
+                        "model": "hermes-agent",
+                        "input": "fourth",
+                        "previous_response_id": resp1_data["id"],
+                    },
+                )
+
+            assert resp2.status == 200
+            resp2_data = await resp2.json()
+            stored2 = adapter._response_store.get(resp2_data["id"])
+            # Must be exactly second_transcript (4 msgs), not doubled (8 msgs)
+            assert stored2["conversation_history"] == second_transcript
+            assert len(stored2["conversation_history"]) == 4
+
+    @pytest.mark.asyncio
+    async def test_repaired_adjacent_user_input_output_boundary(self, adapter):
+        """Multiple user items in input[] become adjacent user messages; repair
+        merges them, breaking exact-prefix detection. Output must still contain
+        only the current turn's assistant reply, not historical tool calls."""
+        prior_history = [
+            {"role": "user", "content": "search the web for X"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "function": {
+                            "name": "web_search",
+                            "arguments": '{"query": "X"}',
+                        },
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "results..."},
+            {"role": "assistant", "content": "Here is what I found about X."},
+        ]
+        adapter._response_store.put(
+            "resp_prev",
+            {
+                "response": {"id": "resp_prev", "status": "completed"},
+                "conversation_history": list(prior_history),
+                "session_id": "api-test-session",
+            },
+        )
+
+        # Repair merges the two adjacent user input items into one message.
+        repaired_transcript = prior_history + [
+            {"role": "user", "content": "follow up A\n\nfollow up B"},
+            {"role": "assistant", "content": "reply"},
+        ]
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    {
+                        "final_response": "reply",
+                        "messages": list(repaired_transcript),
+                        "_transcript_mode": "full",
+                        "api_calls": 1,
+                    },
+                    {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                )
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={
+                        "model": "hermes-agent",
+                        "input": [
+                            {"role": "user", "content": "follow up A"},
+                            {"role": "user", "content": "follow up B"},
+                        ],
+                        "previous_response_id": "resp_prev",
+                    },
+                )
+
+            assert resp.status == 200
+            data = await resp.json()
+            # Output must contain only the current turn's assistant message,
+            # not replay the historical function_call / function_call_output.
+            output_types = [item["type"] for item in data["output"]]
+            assert output_types == ["message"]
+            stored = adapter._response_store.get(data["id"])
+            assert stored["conversation_history"] == repaired_transcript
+
+
+class TestRunAgentTranscriptMode:
+    """Unit tests for the _transcript_mode annotation applied by _run_agent."""
+
+    @pytest.mark.asyncio
+    async def test_run_agent_sets_transcript_mode_full_for_message_list(self, adapter):
+        """AIAgent returns a full transcript as result["messages"]; _run_agent
+        must mark it so _build_response_conversation_history trusts it."""
+        mock_agent = MagicMock()
+        mock_agent.run_conversation.return_value = {
+            "final_response": "ok",
+            "messages": [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "ok"},
+            ],
+        }
+        mock_agent.session_prompt_tokens = 1
+        mock_agent.session_completion_tokens = 2
+        mock_agent.session_total_tokens = 3
+
+        with patch.object(adapter, "_create_agent", return_value=mock_agent):
+            result, _ = await adapter._run_agent(
+                user_message="hello",
+                conversation_history=[],
+                session_id="session-123",
+            )
+
+        assert result.get("_transcript_mode") == "full"

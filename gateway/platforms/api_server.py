@@ -5692,6 +5692,15 @@ class APIServerAdapter(BasePlatformAdapter):
     ) -> List[Dict[str, Any]]:
         """Build the stored Responses transcript without duplicating history.
 
+        ``_run_agent`` sets ``result["_transcript_mode"] = "full"`` when the
+        agent returns its authoritative full transcript (the normal AIAgent
+        path).  Message repair may rewrite prior messages in place, so the
+        transcript no longer shares an exact prefix with the input
+        ``conversation_history``; content-equality prefix detection therefore
+        cannot reliably distinguish full transcripts from delta returns.
+        When the mode is explicitly ``"full"``, trust it and store the
+        transcript verbatim — do not concatenate prior history on front.
+
         When context compression occurs during a turn the agent returns a
         compressed full transcript in ``result["messages"]`` (starting with a
         summary) and sets ``result["_compressed"] = True``.  Because the
@@ -5699,6 +5708,9 @@ class APIServerAdapter(BasePlatformAdapter):
         prefix, the normal turn-start detection fails and old code would
         concatenate the uncompressed history on front, bloating the stored
         context and re-triggering compression on every subsequent request.
+        The older ``_compressed`` flag and the exact-prefix heuristic are
+        retained as fallbacks for code paths that do not set the explicit mode
+        (mocks, legacy adapters).
         """
         prior = list(conversation_history)
         current_user = {"role": "user", "content": user_message}
@@ -5711,6 +5723,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 result,
             )
             if turn_start:
+                return list(agent_messages)
+
+            # _run_agent explicitly marks authoritative full transcripts.
+            # Trust the mode regardless of prefix drift caused by message repair
+            # or other in-place transcript rewriting.
+            if result.get("_transcript_mode") == "full":
                 return list(agent_messages)
 
             # turn_start == 0: agent_messages does not start with prior.
@@ -5751,6 +5769,18 @@ class APIServerAdapter(BasePlatformAdapter):
             return len(expected_prefix)
         if prior and agent_messages[:len(prior)] == prior:
             return len(prior)
+
+        # _run_agent explicitly marks authoritative full transcripts.  When
+        # repair or other in-place rewriting has changed the prefix, the
+        # exact-prefix comparison fails; fall back to a reverse anchor on the
+        # last user message in the transcript, which corresponds to this turn's
+        # user input (possibly merged with adjacent prior user messages by
+        # repair_message_sequence).
+        if result.get("_transcript_mode") == "full":
+            for i in range(len(agent_messages) - 1, -1, -1):
+                if agent_messages[i].get("role") == "user":
+                    return i + 1
+
         return 0
 
     @classmethod
@@ -6013,6 +6043,12 @@ class APIServerAdapter(BasePlatformAdapter):
                     _eff_sid = getattr(agent, "session_id", session_id)
                     if isinstance(_eff_sid, str) and _eff_sid:
                         result["session_id"] = _eff_sid
+                    # AIAgent.run_conversation returns the authoritative full
+                    # transcript in result["messages"].  Mark it explicitly so
+                    # _build_response_conversation_history can trust the transcript
+                    # even when message repair rewrites the prefix in place.
+                    if isinstance(result.get("messages"), list):
+                        result["_transcript_mode"] = "full"
                     # Signal whether context compression occurred during this turn
                     # so _build_response_conversation_history can skip the
                     # prior-concatenation path and store the compressed transcript
