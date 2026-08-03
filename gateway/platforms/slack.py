@@ -99,6 +99,22 @@ class _SlackUploadPolicyError(PermissionError):
     """Local path is not an approved generated-artifact upload source."""
 
 
+class _SlackUploadMetadataIncomplete(RuntimeError):
+    """Slack acknowledged an upload but omitted metadata needed to verify it."""
+
+
+def _upload_file_id(result: Any) -> str:
+    """Return the file ID from a successful Slack upload acknowledgement."""
+    response = getattr(result, "data", result)
+    if not isinstance(response, dict) or response.get("ok") is False:
+        raise RuntimeError("Slack did not confirm the file upload")
+    files = response.get("files")
+    file_obj = files[0] if isinstance(files, list) and files else response.get("file")
+    if not isinstance(file_obj, dict) or not file_obj.get("id"):
+        raise RuntimeError("Slack upload response did not include a file ID")
+    return str(file_obj["id"])
+
+
 def _verified_upload_file_id(
     result: Any, expected_filename: str, expected_size: int
 ) -> str:
@@ -112,14 +128,20 @@ def _verified_upload_file_id(
         raise RuntimeError("Slack upload response did not include a file ID")
 
     actual_name = str(file_obj.get("name") or "")
-    if actual_name and actual_name != expected_filename:
+    if not actual_name:
+        raise _SlackUploadMetadataIncomplete(
+            "Slack upload response did not include a filename"
+        )
+    if actual_name != expected_filename:
         raise RuntimeError(
             f"Slack confirmed the wrong filename ({actual_name!r})"
         )
     expected_type = _Path(expected_filename).suffix.lower().lstrip(".")
     actual_type = str(file_obj.get("filetype") or "").lower()
     if not actual_type:
-        raise RuntimeError("Slack upload response did not include a file type")
+        raise _SlackUploadMetadataIncomplete(
+            "Slack upload response did not include a file type"
+        )
     if expected_type in {"htm", "html"} and actual_type != "html":
         raise RuntimeError(
             f"Slack confirmed the wrong file type ({actual_type!r})"
@@ -1966,9 +1988,45 @@ class SlackAdapter(BasePlatformAdapter):
                         initial_comment=caption or "",
                         thread_ts=thread_ts,
                     )
-                    file_id = _verified_upload_file_id(
-                        result, display_name, len(file_bytes)
-                    )
+                    upload_file_id = _upload_file_id(result)
+                    try:
+                        file_id = _verified_upload_file_id(
+                            result, display_name, len(file_bytes)
+                        )
+                    except _SlackUploadMetadataIncomplete:
+                        # files_upload_v2 may return only the new ID even though
+                        # Slack accepted the upload. Resolve that ID through
+                        # files.info instead of falsely reporting failure or
+                        # retrying the upload and creating a duplicate file.
+                        metadata_result = None
+                        metadata_exc: Optional[Exception] = None
+                        for metadata_attempt in range(3):
+                            try:
+                                metadata_result = await self._get_client(
+                                    chat_id
+                                ).files_info(file=upload_file_id)
+                                break
+                            except Exception as exc:
+                                metadata_exc = exc
+                                if (
+                                    not self._is_retryable_upload_error(exc)
+                                    or metadata_attempt >= 2
+                                ):
+                                    break
+                                await asyncio.sleep(1.5 * (metadata_attempt + 1))
+                        if metadata_result is None:
+                            raise RuntimeError(
+                                "Slack accepted the upload but its file metadata "
+                                "could not be verified"
+                            ) from metadata_exc
+                        file_id = _verified_upload_file_id(
+                            metadata_result, display_name, len(file_bytes)
+                        )
+                        if file_id != upload_file_id:
+                            raise RuntimeError(
+                                "Slack returned mismatched file IDs while "
+                                "verifying the upload"
+                            )
                     logger.info(
                         "artifact_delivery correlation_id=%s stage=upload_result "
                         "platform=slack chat_id=%s thread_id=%s filename=%s "
