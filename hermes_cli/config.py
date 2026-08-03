@@ -1823,7 +1823,9 @@ DEFAULT_CONFIG = {
             # NOTE: no reasoning_effort here by design — see moa_reference above.
         },
     },
-    
+
+    "delegate_completion_tasks": [],
+
     "display": {
         "compact": False,
         "personality": "",
