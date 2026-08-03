@@ -4323,6 +4323,15 @@ CREATE TABLE IF NOT EXISTS epic_memberships (
     PRIMARY KEY (epic_id, task_id)
 );
 
+CREATE TABLE IF NOT EXISTS epic_story_integrations (
+    epic_id          TEXT NOT NULL,
+    story_id         TEXT NOT NULL,
+    source_sha       TEXT NOT NULL,
+    candidate_sha    TEXT,
+    integrated_at    INTEGER NOT NULL,
+    PRIMARY KEY (epic_id, story_id, source_sha)
+);
+
 CREATE TABLE IF NOT EXISTS board_governance (
     id                     INTEGER PRIMARY KEY CHECK (id = 1),
     qualification_required INTEGER NOT NULL DEFAULT 0
@@ -13464,6 +13473,19 @@ def integrate_story_to_epic(
     if epic_id is None:
         return None
 
+    epic = get_task(conn, epic_id)
+    if epic is None or epic.status in {"done", "archived"}:
+        return None
+
+    # Durable integration state is checked before resolving the repository or
+    # any Git ref.  Member events are intentionally GC-able; this table is the
+    # cheap, restart-safe memory that makes a settled member silent forever.
+    if conn.execute(
+        "SELECT 1 FROM epic_story_integrations WHERE epic_id=? AND story_id=? LIMIT 1",
+        (epic_id, story_id),
+    ).fetchone() is not None:
+        return "already_integrated"
+
     try:
         board_default = str(meta.get("default_workdir") or "").strip()
         repo_root = _git_toplevel(Path(board_default).expanduser()) if board_default else None
@@ -13640,6 +13662,22 @@ def _record_story_integration(
     )
     with write_txn(conn):
         _append_event(conn, story_id, "story_integrated_to_epic", payload)
+        source_sha = str(payload.get("source_sha") or "").strip()
+        if source_sha:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO epic_story_integrations
+                    (epic_id, story_id, source_sha, candidate_sha, integrated_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    epic_id,
+                    story_id,
+                    source_sha,
+                    candidate_sha or None,
+                    int(time.time()),
+                ),
+            )
         if pin_sha:
             _append_event(
                 conn, epic_id, EPIC_BASE_PINNED_EVENT,
@@ -15479,7 +15517,15 @@ def reconcile(
     # (not counted as this pass's action) so a real integration can still
     # happen this pass even if earlier done cards are already merged.
     done_rows = conn.execute(
-        "SELECT id FROM tasks WHERE status = 'done' ORDER BY completed_at ASC"
+        """
+        SELECT t.id
+          FROM tasks t
+          LEFT JOIN epic_memberships em ON em.task_id = t.id
+          LEFT JOIN tasks e ON e.id = em.epic_id
+         WHERE t.status = 'done'
+           AND (em.epic_id IS NULL OR e.status NOT IN ('done', 'archived'))
+         ORDER BY t.completed_at ASC
+        """
     ).fetchall()
     # Step 5 (merge-back): carry finished work to LOCAL main. OFF unless the
     # board opts into product_workflow.merge_after_green -- when off, behavior

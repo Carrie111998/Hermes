@@ -9686,7 +9686,7 @@ def test_integrate_story_to_epic_idempotent_second_call_is_noop(kanban_home, tmp
     assert not any("merge" in cmd and "--no-ff" in cmd for cmd in calls), (
         "must not re-merge an already-integrated story"
     )
-    _assert_no_push(calls)
+    assert calls == []
 
 
 def test_integrate_story_to_epic_conflict_aborts_blocks_story_and_never_pushes(
@@ -11569,3 +11569,151 @@ def test_d4_non_audit_events_invalidate_escalation_without_mutation(kanban_home,
             )
         assert kb.get_task(conn, tid) == before_task
         assert kb.list_events(conn, tid) == before_events
+
+
+def test_reconcile_ten_times_does_not_reprocess_integrated_story(
+    kanban_home, tmp_path, monkeypatch
+):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    board = "v2-reconcile-stable"
+    _v2_product_board_with_repo(board, repo)
+    epic, story, _epic_branch, _story_sha = _make_epic_and_done_story(board, repo)
+
+    with kb.connect(board=board) as conn:
+        assert kb.integrate_story_to_epic(conn, story, board=board) == "integrated"
+        before = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind=?",
+            (story, "story_integrated_to_epic"),
+        ).fetchone()[0]
+
+    calls = _record_git_calls(monkeypatch)
+    with kb.connect(board=board) as conn:
+        for _ in range(10):
+            kb.reconcile(conn, board=board, spawn_ready=False)
+        after = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind=?",
+            (story, "story_integrated_to_epic"),
+        ).fetchone()[0]
+
+    assert after == before
+    assert calls == []
+
+
+def test_reconcile_keeps_prior_member_state_when_sibling_advances_tip(
+    kanban_home, tmp_path, monkeypatch
+):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    board = "v2-reconcile-sibling"
+    _v2_product_board_with_repo(board, repo)
+    epic, first, epic_branch, _first_sha = _make_epic_and_done_story(board, repo)
+
+    with kb.connect(board=board) as conn:
+        assert kb.integrate_story_to_epic(conn, first, board=board) == "integrated"
+        sibling_branch = f"story/{epic}-s2"
+        subprocess.run(
+            ["git", "-C", str(repo), "switch", "-c", sibling_branch, epic_branch],
+            check=True, capture_output=True, text=True,
+        )
+        sibling_sha = _commit_file(
+            repo, "sibling_work.txt", "sibling work\n", "sibling commit"
+        )
+        subprocess.run(
+            ["git", "-C", str(repo), "switch", "main"],
+            check=True, capture_output=True, text=True,
+        )
+        sibling = kb.create_task(
+            conn, title="Sibling", board=board, workspace_kind="worktree",
+            workspace_path=str(repo), branch_name=sibling_branch,
+        )
+        kb.add_epic_membership(conn, epic_id=epic, task_id=sibling)
+        _set_task_status(conn, sibling, "done")
+
+    calls = _record_git_calls(monkeypatch)
+    with kb.connect(board=board) as conn:
+        result = kb.reconcile(conn, board=board, spawn_ready=False)
+        first_events = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind=?",
+            (first, "story_integrated_to_epic"),
+        ).fetchone()[0]
+        sibling_events = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind=?",
+            (sibling, "story_integrated_to_epic"),
+        ).fetchone()[0]
+
+    assert result.integrated == [sibling]
+    assert first_events == 1
+    assert sibling_events == 1
+    assert any("merge" in cmd and "--no-ff" in cmd for cmd in calls)
+
+
+def test_integration_state_survives_member_event_gc_and_restart(
+    kanban_home, tmp_path, monkeypatch
+):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    board = "v2-reconcile-recovery"
+    _v2_product_board_with_repo(board, repo)
+    _epic, story, _epic_branch, _story_sha = _make_epic_and_done_story(board, repo)
+
+    with kb.connect(board=board) as conn:
+        assert kb.integrate_story_to_epic(conn, story, board=board) == "integrated"
+        with kb.write_txn(conn):
+            conn.execute(
+                "DELETE FROM task_events WHERE task_id=? AND kind=?",
+                (story, "story_integrated_to_epic"),
+            )
+
+    calls = _record_git_calls(monkeypatch)
+    with kb.connect(board=board) as conn:
+        result = kb.reconcile(conn, board=board, spawn_ready=False)
+        count = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind=?",
+            (story, "story_integrated_to_epic"),
+        ).fetchone()[0]
+
+    assert result.integrated == []
+    assert count == 0
+    assert calls == []
+
+
+@pytest.mark.parametrize("terminal_status", ["done", "archived"])
+def test_terminal_epic_members_are_never_reconciled(
+    kanban_home, tmp_path, monkeypatch, terminal_status
+):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    board = f"v2-terminal-epic-{terminal_status}"
+    _v2_product_board_with_repo(board, repo)
+    epic, _story, _epic_branch, _story_sha = _make_epic_and_done_story(board, repo)
+    with kb.connect(board=board) as conn:
+        _set_task_status(conn, epic, terminal_status)
+
+    calls = _record_git_calls(monkeypatch)
+    with kb.connect(board=board) as conn:
+        result = kb.reconcile(conn, board=board, spawn_ready=False)
+
+    assert result.integrated == []
+    assert calls == []
+
+
+def test_new_active_epic_member_integrates_once_via_reconcile(
+    kanban_home, tmp_path
+):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    board = "v2-reconcile-new-member"
+    _v2_product_board_with_repo(board, repo)
+    _epic, story, _epic_branch, _story_sha = _make_epic_and_done_story(board, repo)
+    with kb.connect(board=board) as conn:
+        first = kb.reconcile(conn, board=board, spawn_ready=False)
+        second = kb.reconcile(conn, board=board, spawn_ready=False)
+        count = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind=?",
+            (story, "story_integrated_to_epic"),
+        ).fetchone()[0]
+
+    assert first.integrated == [story]
+    assert second.integrated == []
+    assert count == 1
