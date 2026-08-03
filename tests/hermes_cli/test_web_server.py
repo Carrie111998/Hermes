@@ -318,6 +318,39 @@ class TestWebServerEndpoints:
                 monitor.close()
             writer.close()
 
+    def test_get_status_loads_gateway_config_off_event_loop(self, monkeypatch):
+        """Cold gateway config loading must not block the WebSocket loop.
+
+        On Windows the first ``load_gateway_config()`` call imports and
+        discovers platform adapters and can take longer than Desktop's 15s
+        WebSocket timeout.  Running it inline makes a concurrent /api/ws
+        handshake time out before ``gateway.ready`` can be sent.
+        """
+        import gateway.config as gateway_config
+        import hermes_cli.web_server as web_server
+
+        seen = {}
+
+        class _Config:
+            @staticmethod
+            def get_connected_platforms():
+                return []
+
+        def _load():
+            seen["thread"] = threading.get_ident()
+            return _Config()
+
+        monkeypatch.setattr(gateway_config, "load_gateway_config", _load)
+
+        async def _run():
+            event_loop_thread = threading.get_ident()
+            await web_server.get_status()
+            return event_loop_thread
+
+        event_loop_thread = asyncio.run(_run())
+
+        assert seen["thread"] != event_loop_thread
+
     def test_get_sessions_auto_archive_uses_maintenance_writer(self):
         from hermes_cli import web_server
         from hermes_cli.config import load_config, save_config
@@ -1914,6 +1947,36 @@ class TestNewEndpoints:
         assert {"discord", "discord_admin"} <= set(
             config["platform_toolsets"]["discord"]
         )
+
+    def test_toolsets_resolve_subscription_features_once(self, monkeypatch):
+        import hermes_cli.tools_config as tools_config
+        from hermes_cli.nous_subscription import NousSubscriptionFeatures
+
+        calls = 0
+        features = NousSubscriptionFeatures(
+            subscribed=False,
+            nous_auth_present=False,
+            provider_is_nous=False,
+            features={},
+            account_info=None,
+        )
+
+        def resolve_features(config, *, force_fresh=False):
+            nonlocal calls
+            calls += 1
+            return features
+
+        monkeypatch.setattr(
+            tools_config,
+            "get_nous_subscription_features",
+            resolve_features,
+        )
+
+        resp = self.client.get("/api/tools/toolsets")
+
+        assert resp.status_code == 200
+        assert resp.json()
+        assert calls == 1
 
 
     def test_get_toolset_config_returns_provider_matrix(self):
