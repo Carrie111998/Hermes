@@ -621,7 +621,9 @@ class CredentialPool:
         # Optional manual-selection name from config ``default_auth``
         # (#76937).  When set and a matching entry is available, selection is
         # pinned to that credential instead of passive auto-rotation.
-        self._default_auth = get_default_auth_name(provider)
+        # Per-session override via HERMES_AUTH_NAME env var takes precedence.
+        session_auth = os.getenv("HERMES_AUTH_NAME", "").strip()
+        self._default_auth = session_auth or get_default_auth_name(provider)
         self._lock = threading.Lock()
         self._active_leases: Dict[str, int] = {}
         self._max_concurrent = DEFAULT_MAX_CONCURRENT_PER_CREDENTIAL
@@ -2062,6 +2064,12 @@ class CredentialPool:
                 return credential_id
 
             available = self._available_entries(clear_expired=True, refresh=True)
+            if not available:
+                return None
+
+            # Manual selection (#76937): pin to the configured default_auth
+            # credential while it is available; fall back to auto-rotate.
+            available = self._narrow_to_default_auth_unlocked(available)
             if not available:
                 return None
 

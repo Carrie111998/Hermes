@@ -239,3 +239,38 @@ def test_load_pool_honors_default_auth_end_to_end(tmp_path, monkeypatch):
         e for e in persisted["credential_pool"]["openrouter"] if e["id"] == "cred-b"
     )
     assert named_on_disk["name"] == "daily"
+
+
+def test_session_auth_env_var_overrides_default_auth(tmp_path, monkeypatch):
+    """HERMES_AUTH_NAME env var overrides config default_auth."""
+    from agent import credential_pool as cp
+
+    monkeypatch.setattr(cp, "_seed_from_env", lambda provider, entries: (False, set()))
+    monkeypatch.setattr(cp, "get_default_auth_name", lambda _p: "daily")
+
+    monkeypatch.setenv("HERMES_AUTH_NAME", "monthly")
+    pool = cp.load_pool("openrouter")
+    assert pool._default_auth == "monthly"
+
+
+def test_session_auth_env_var_empty_falls_back_to_config(tmp_path, monkeypatch):
+    """Empty HERMES_AUTH_NAME falls back to config default_auth."""
+    from agent import credential_pool as cp
+
+    monkeypatch.setattr(cp, "_seed_from_env", lambda provider, entries: (False, set()))
+    monkeypatch.setattr(cp, "get_default_auth_name", lambda _p: "daily")
+
+    monkeypatch.setenv("HERMES_AUTH_NAME", "")
+    pool = cp.load_pool("openrouter")
+    assert pool._default_auth == "daily"
+
+
+def test_acquire_lease_narrows_to_default_auth(monkeypatch):
+    """acquire_lease() respects default_auth name like select() does."""
+    entries = [
+        _entry("a", "sk-or-a", priority=0),
+        _entry("b", "sk-or-b", priority=1, name="daily"),
+    ]
+    pool = _make_pool(entries, default_auth="daily", monkeypatch=monkeypatch)
+    leased_id = pool.acquire_lease()
+    assert leased_id == "b"  # entry b has name="daily"
