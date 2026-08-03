@@ -1,10 +1,16 @@
 """Tests for agent.redact -- secret masking in logs and output."""
 
+import json
 import logging
 
 import pytest
 
-from agent.redact import redact_cdp_url, redact_sensitive_text, RedactingFormatter
+from agent.redact import (
+    mask_known_secret_values,
+    redact_cdp_url,
+    redact_sensitive_text,
+    RedactingFormatter,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -829,5 +835,110 @@ class TestKeywordWordBoundary:
         text = "secrets: hunter2hunter2hunter2hh"
         result = redact_sensitive_text(text)
         assert "hunter2hunter2hunter2hh" not in result
+
+
+class TestExactValueMasking:
+    """mask_known_secret_values: exact-value masking of known secret VALUES.
+
+    Shape-based redaction (vendor prefixes, URL creds, auth headers) cannot
+    catch opaque secret values applied from Bitwarden/1Password/command
+    secret sources under arbitrary names (``DATABASE_URL``, ``FOO``), or
+    credential-suffixed env values like ``MY_SERVICE_TOKEN=abc123randomstring``.
+    This pass masks the exact values wherever they appear.
+    """
+
+    def test_masks_credential_suffixed_env_value(self, monkeypatch):
+        monkeypatch.setenv("MY_SERVICE_TOKEN", "opaque-secret-value-xyz")
+        result = mask_known_secret_values("the token is opaque-secret-value-xyz here")
+        assert "opaque-secret-value-xyz" not in result
+        assert "***" in result
+
+    def test_masks_extra_values(self):
+        result = mask_known_secret_values(
+            "connecting to postgres://user:supersecret@db",
+            extra_values={"supersecret"},
+        )
+        assert "supersecret" not in result
+        assert "***" in result
+
+    def test_short_values_not_masked(self, monkeypatch):
+        """Values under 6 chars collide with ordinary prose — never masked."""
+        monkeypatch.setenv("MY_SERVICE_TOKEN", "abc12")
+        text = "the value abc12 is short and must stay"
+        assert mask_known_secret_values(text) == text
+
+    def test_falsy_text_unchanged(self):
+        assert mask_known_secret_values("") == ""
+        assert mask_known_secret_values(None) is None
+
+    def test_never_raises_on_bad_extra_values(self):
+        text = "some plain output text"
+        assert mask_known_secret_values(text, extra_values={42}) == text
+
+
+class TestToolResultEgressExactValueMasking:
+    """make_tool_result_message masks applied secret values before egress."""
+
+    def _patch_secret_sources(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(
+            "hermes_cli.env_loader.get_secret_source_values",
+            lambda home: {"DATABASE_URL": "postgres://user:supersecret@db"},
+        )
+        monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
+
+    def test_plain_string_content_masks_applied_secret(self, monkeypatch, tmp_path):
+        self._patch_secret_sources(monkeypatch, tmp_path)
+        from agent.tool_dispatch_helpers import make_tool_result_message
+
+        result = make_tool_result_message(
+            "terminal",
+            "connecting to postgres://user:supersecret@db",
+            "call_1",
+        )
+        assert "supersecret" not in json.dumps(result["content"])
+        assert "***" in result["content"]
+
+    def test_multimodal_text_masked_image_preserved(self, monkeypatch, tmp_path):
+        self._patch_secret_sources(monkeypatch, tmp_path)
+        from agent.tool_dispatch_helpers import make_tool_result_message
+
+        image_part = {
+            "type": "image_url",
+            "image_url": {"url": "data:image/png;base64,AAAA"},
+        }
+        content = [
+            {"type": "text", "text": "db is postgres://user:supersecret@db"},
+            image_part,
+        ]
+        result = make_tool_result_message("computer_use", content, "call_2")
+        parts = result["content"]
+        assert isinstance(parts, list)
+        text_parts = [p for p in parts if p.get("type") == "text"]
+        assert text_parts, "text part missing from rebuilt list"
+        assert "supersecret" not in text_parts[0]["text"]
+        assert "***" in text_parts[0]["text"]
+        image_parts = [p for p in parts if p.get("type") == "image_url"]
+        assert image_parts == [image_part]
+
+    def test_message_construction_survives_secret_source_failure(self, monkeypatch):
+        """Best-effort: an exception in secret-source resolution must not break
+        message construction."""
+        monkeypatch.setattr(
+            "hermes_cli.env_loader.get_secret_source_values",
+            lambda home: (_ for _ in ()).throw(RuntimeError("boom")),
+        )
+        monkeypatch.setattr(
+            "hermes_constants.get_hermes_home",
+            lambda: (_ for _ in ()).throw(RuntimeError("boom")),
+        )
+        from agent.tool_dispatch_helpers import make_tool_result_message
+
+        result = make_tool_result_message(
+            "terminal",
+            "connecting to postgres://user:supersecret@db",
+            "call_3",
+        )
+        assert result["tool_call_id"] == "call_3"
+        assert result["name"] == "terminal"
 
 

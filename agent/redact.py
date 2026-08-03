@@ -939,6 +939,78 @@ def redact_terminal_output(
     return redact_sensitive_text(output, force=force, code_file=code_file)
 
 
+# Credential-suffixed env var names whose VALUES are treated as exact-match
+# secrets (e.g. MY_SERVICE_TOKEN, OPENAI_API_KEY, DB_PASSWORD). This is the
+# opaque-value pass: shape-based redaction (vendor prefixes, URL creds, auth
+# headers) cannot catch values applied from Bitwarden/1Password/command
+# secret sources under arbitrary names (``DATABASE_URL``, ``FOO``), or
+# credential-suffixed env values like ``MY_SERVICE_TOKEN=abc123randomstring``.
+_CREDENTIAL_VALUE_SUFFIXES = ("_API_KEY", "_TOKEN", "_SECRET", "_KEY", "_PASSWORD")
+
+# Minimum value length before an exact-value mask is applied. Shorter values
+# (e.g. ``PIN=1234``) collide with ordinary prose too easily to mask safely.
+_SECRET_VALUE_MIN_LEN = 6
+
+
+def _known_secret_values() -> set[str]:
+    """Return exact values of credential-suffixed environment variables.
+
+    Snapshot at call time so values set after import are still caught. Only
+    values of length >= ``_SECRET_VALUE_MIN_LEN`` are returned — shorter
+    values collide with ordinary prose too easily to mask safely.
+    """
+    values: set[str] = set()
+    for name, value in os.environ.items():
+        if (
+            value
+            and len(value) >= _SECRET_VALUE_MIN_LEN
+            and name.endswith(_CREDENTIAL_VALUE_SUFFIXES)
+        ):
+            values.add(value)
+    return values
+
+
+def mask_known_secret_values(
+    text: str,
+    extra_values: set[str] | None = None,
+) -> str:
+    """Replace exact matches of known secret values with ``***``.
+
+    "Known" values are: (a) the values of env vars whose name ends with a
+    credential suffix (``_API_KEY`` / ``_TOKEN`` / ``_SECRET`` / ``_KEY`` /
+    ``_PASSWORD``) and whose value is at least 6 chars long, and (b) any
+    ``extra_values`` supplied by the caller — e.g. values applied from
+    Bitwarden/1Password/command secret sources under arbitrary names like
+    ``DATABASE_URL``.
+
+    This is the exact-value complement to the shape-based patterns in
+    :func:`redact_sensitive_text`. It is deliberately unconditional (not
+    gated on ``security.redact_secrets``) because an exact secret value can
+    never be confused with prose: egress of applied values is the
+    highest-severity disclosure channel, so the mask must not be skippable.
+
+    Falsy ``text`` is returned unchanged. Never raises: any failure (e.g. an
+    unhashable ``extra_values`` member) falls back to returning ``text``.
+    """
+    if not text:
+        return text
+    try:
+        known = _known_secret_values()
+        if extra_values:
+            known.update(
+                v
+                for v in extra_values
+                if isinstance(v, str) and len(v) >= _SECRET_VALUE_MIN_LEN
+            )
+        if not known:
+            return text
+        for value in known:
+            text = text.replace(value, "***")
+    except Exception:  # noqa: BLE001 — masking must never raise or corrupt output
+        return text
+    return text
+
+
 # Substrings used to gate ``_PREFIX_RE`` execution. If none of these appear in
 # the input string, the prefix regex cannot match anything, so we skip it.
 # False positives are fine (they just run the regex, which then matches

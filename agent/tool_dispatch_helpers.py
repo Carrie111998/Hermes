@@ -554,8 +554,45 @@ def make_tool_result_message(
     neutralized and framed). Non-text parts (e.g. image_url) are preserved.
     The outer list itself is rebuilt rather than returned by identity, so
     callers should compare by value, not by ``is``.
+
+    After wrapping, exact values of applied/known secrets are masked (``***``)
+    before the message is sent to the provider — shape-based redaction (vendor
+    prefixes, URL creds, auth headers) cannot catch opaque values applied from
+    Bitwarden/1Password/command secret sources under arbitrary names
+    (``DATABASE_URL``, ``FOO``), or credential-suffixed env values. Masking is
+    best-effort: any failure skips it without breaking message construction.
     """
     wrapped = _maybe_wrap_untrusted(name, content)
+    # Exact-value egress masking (see agent/redact.mask_known_secret_values).
+    # Lazy imports keep this hot path free of module-load weight and let
+    # per-profile secret snapshots be resolved at call time.
+    try:
+        from agent.redact import mask_known_secret_values
+        from hermes_cli.env_loader import get_secret_source_values
+        from hermes_constants import get_hermes_home
+
+        extra_values: set[str] | None = None
+        try:
+            home = get_hermes_home()
+            applied = get_secret_source_values(home)
+            if applied:
+                extra_values = set(applied.values())
+        except Exception:
+            extra_values = None
+
+        if isinstance(wrapped, str):
+            wrapped = mask_known_secret_values(wrapped, extra_values)
+        elif isinstance(wrapped, list):
+            wrapped = [
+                {**part, "text": mask_known_secret_values(part["text"], extra_values)}
+                if isinstance(part, dict)
+                and part.get("type") == "text"
+                and isinstance(part.get("text"), str)
+                else part
+                for part in wrapped
+            ]
+    except Exception as exc:  # noqa: BLE001 — masking must never break egress
+        logger.debug("Exact-value egress masking skipped for %s: %s", name, exc)
     message = {
         "role": "tool",
         "name": name,
