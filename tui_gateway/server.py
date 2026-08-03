@@ -183,9 +183,14 @@ def _get_tui_hook_registry(hermes_home: Optional[str] = None) -> HookRegistry:
                 registry = HookRegistry(hooks_dir=hooks_dir)
                 try:
                     registry.discover_and_load()
+                    # Only cache on success — a failed load leaves the registry in a
+                    # broken state.  Not caching allows a retry on the next message
+                    # (e.g. after the user corrects a bad hook file) rather than
+                    # silently serving an empty/half-loaded registry forever.
+                    _tui_hook_registries[resolved] = registry
                 except Exception as e:
-                    logger.error("Failed to discover and load hooks: %s", e)
-                _tui_hook_registries[resolved] = registry
+                    logger.error("Failed to load hooks for %s: %s", resolved, e)
+                    # do not cache — allow retry on next message
     return _tui_hook_registries[resolved]
 _cfg_cache: dict | None = None
 _cfg_mtime: float | None = None
@@ -12345,17 +12350,31 @@ def _run_prompt_submit(
                     "chat_id": session.get("session_key", sid),
                     "thread_id": None,
                     "chat_type": "",
+                    # NOTE: in the TUI path there is no distinct session_id concept
+                    # separate from session_key — the routing key *is* the session
+                    # identifier.  Per the hook contract (gateway/hooks.py) these two
+                    # fields should be distinct, but the TUI deliberately collapses
+                    # them here.  Hooks can detect this surface via the "surface" key
+                    # and bail early if they require a true separate session_id.
                     "session_id": session.get("session_key", sid),
                     "session_key": session.get("session_key", sid),
+                    "surface": "tui",
                     "message": text if isinstance(text, str) else "",
                 }
                 _registry = _get_tui_hook_registry()
-                _pre_route_results = asyncio.run(
-                    asyncio.wait_for(
-                        _registry.emit_collect("message:pre_route", _pre_route_ctx),
-                        timeout=5.0,
+                # asyncio.run() raises RuntimeError when called from a thread that
+                # already has a running event loop (e.g. asyncio.to_thread workers).
+                # Use an explicit new loop to avoid that and to guarantee cleanup.
+                _loop = asyncio.new_event_loop()
+                try:
+                    _pre_route_results = _loop.run_until_complete(
+                        asyncio.wait_for(
+                            _registry.emit_collect("message:pre_route", _pre_route_ctx),
+                            timeout=5.0,
+                        )
                     )
-                )
+                finally:
+                    _loop.close()
                 for _pr in _pre_route_results:
                     if not isinstance(_pr, dict):
                         continue
