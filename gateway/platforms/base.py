@@ -5298,20 +5298,38 @@ class BasePlatformAdapter(ABC):
         # already installed on this adapter, so no extra wiring is required.
         # Photo/album merge semantics are preserved inside
         # _queue_or_replace_pending_event itself.
+        #
+        # ``_queue_or_replace_pending_event`` can DECLINE silently: it returns
+        # without queueing and without raising when the source resolves to no
+        # adapter, or when the per-session pending cap is reached. Treating the
+        # call as success there would DROP the burst, where the historical
+        # merge would still have delivered it (mashed, but delivered) -- and
+        # the cap was effectively unreachable before, since the old merge
+        # collapsed every follow-up into one slot instead of one entry each.
+        # So confirm the queue actually grew, and fall back to the merge when
+        # it did not. Merging is lossy; dropping is worse.
         _busy_handler = getattr(self, "_busy_session_handler", None)
         _runner = getattr(_busy_handler, "__self__", None)
-        #
-        # _queue_or_replace_pending_event returns early WITHOUT queueing
-        # when it cannot resolve an adapter for the event source, so only
-        # delegate once we know it resolves back to THIS adapter. Otherwise
-        # keep the historical merge: merging is lossy, but dropping is worse.
         _enqueue = getattr(_runner, "_queue_or_replace_pending_event", None)
         _resolve = getattr(_runner, "_adapter_for_source", None)
-        if callable(_enqueue) and callable(_resolve):
+        _depth = getattr(_runner, "_queue_depth", None)
+        _target = None
+        if callable(_resolve):
             try:
-                if _resolve(getattr(state.event, "source", None)) is self:
-                    _enqueue(session_key, state.event)
+                _target = _resolve(getattr(state.event, "source", None))
+            except Exception:
+                _target = None
+        if callable(_enqueue) and callable(_depth) and _target is not None:
+            try:
+                _before = _depth(session_key, adapter=_target)
+                _enqueue(session_key, state.event)
+                if _depth(session_key, adapter=_target) > _before:
                     return True
+                logger.warning(
+                    "[%s] FIFO declined the debounced burst for %s "
+                    "(pending cap reached?); falling back to pending-slot merge",
+                    self.name, session_key,
+                )
             except Exception:
                 logger.warning(
                     "[%s] FIFO enqueue of debounced burst failed for %s; "
