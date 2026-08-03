@@ -297,6 +297,12 @@ from gateway.platforms.base import (
     _TEXT_INJECT_EXTENSIONS,
     utf16_len,
 )
+from gateway.root_action_approval import (
+    PendingRootAction,
+    RootActionProtocolError,
+    get_root_action_store,
+    post_signed_decision,
+)
 from plugins.platforms.telegram.telegram_ids import (
     normalize_telegram_chat_id,
 )
@@ -853,6 +859,11 @@ class TelegramAdapter(BasePlatformAdapter):
         self._choice_picker_state: Dict[str, dict] = {}
         # Approval button state: message_id → session_key
         self._approval_state: Dict[int, str] = {}
+        # Shared with the authenticated webhook proposal route. Callback data
+        # contains only an action id; immutable fields stay server-side.
+        self._root_action_store = get_root_action_store()
+        self._root_action_delivery_tasks: set[asyncio.Task] = set()
+        self._root_action_delivery_task_ids: set[str] = set()
         # Slash-confirm button state: confirm_id → session_key (for /reload-mcp
         # and any other slash-confirm prompts; see GatewayRunner._request_slash_confirm).
         self._slash_confirm_state: Dict[str, str] = {}
@@ -936,17 +947,40 @@ class TelegramAdapter(BasePlatformAdapter):
         if not normalized_user_id:
             return False
 
+        normalized_chat_type = str(chat_type or "dm").strip().lower() or "dm"
+        if normalized_chat_type == "private":
+            normalized_chat_type = "dm"
+        elif normalized_chat_type == "supergroup":
+            normalized_chat_type = "forum" if thread_id is not None else "group"
+
+        # GatewayRunner installs a profile-bound check on every connected
+        # adapter. Prefer it over introspecting the message-handler closure:
+        # secondary profile handlers are closures without ``__self__`` and
+        # falling through to process-wide TELEGRAM_ALLOWED_USERS would cross
+        # profile boundaries.
+        bound_check = getattr(self, "_authorization_check", None)
+        if callable(bound_check):
+            try:
+                return bool(
+                    bound_check(
+                        normalized_user_id,
+                        normalized_chat_type,
+                        str(chat_id) if chat_id is not None else None,
+                    )
+                )
+            except Exception:
+                logger.warning(
+                    "[Telegram] Profile-bound callback auth failed for user %s",
+                    normalized_user_id,
+                    exc_info=True,
+                )
+                return False
+
         runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
         auth_fn = getattr(runner, "_is_user_authorized", None)
         if callable(auth_fn):
             try:
                 from gateway.session import SessionSource
-
-                normalized_chat_type = str(chat_type or "dm").strip().lower() or "dm"
-                if normalized_chat_type == "private":
-                    normalized_chat_type = "dm"
-                elif normalized_chat_type == "supergroup":
-                    normalized_chat_type = "forum" if thread_id is not None else "group"
 
                 source = SessionSource(
                     platform=Platform.TELEGRAM,
@@ -3874,6 +3908,7 @@ class TelegramAdapter(BasePlatformAdapter):
             ))
             # Handle inline keyboard button callbacks (update prompts)
             self._app.add_handler(CallbackQueryHandler(self._handle_callback_query))
+            self._resume_root_action_deliveries()
             
             # Start polling — retry initialize() for transient TLS resets.
             # Each attempt is capped by _init_timeout so a single unreachable
@@ -4005,6 +4040,7 @@ class TelegramAdapter(BasePlatformAdapter):
                             self._handle_media_message
                         ))
                         self._app.add_handler(CallbackQueryHandler(self._handle_callback_query))
+                        self._resume_root_action_deliveries()
                         # Best-effort discard the old app's resources
                         try:
                             await _shutdown_abandoned_app(old_app)
@@ -5422,6 +5458,57 @@ class TelegramAdapter(BasePlatformAdapter):
     def _ea_escape(self, text: str) -> str:
         return _html.escape(text)
 
+    async def send_root_action_proposal(
+        self,
+        chat_id: str,
+        preview: str,
+        *,
+        pending: PendingRootAction,
+    ) -> SendResult:
+        """Render an immutable root-action preview with one-shot buttons."""
+        if not self._bot:
+            return SendResult(success=False, error="Not connected")
+        action_id = pending.proposal.action_id
+        if len(action_id) > 45:
+            return SendResult(success=False, error="Action id is too long for Telegram")
+        try:
+            keyboard = InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "✅ Approve",
+                            callback_data=f"ra:approve:{action_id}",
+                        ),
+                        InlineKeyboardButton(
+                            "❌ Deny",
+                            callback_data=f"ra:deny:{action_id}",
+                        ),
+                    ]
+                ]
+            )
+            msg = await self._send_message_with_thread_fallback(
+                chat_id=normalize_telegram_chat_id(chat_id),
+                text=preview,
+                reply_markup=keyboard,
+                **self._link_preview_kwargs(),
+            )
+            resolved_chat_id = getattr(getattr(msg, "chat", None), "id", None)
+            if resolved_chat_id is None:
+                raise RootActionProtocolError(
+                    "Telegram send did not return its numeric chat id"
+                )
+            self._root_action_store.bind_chat_id(action_id, str(resolved_chat_id))
+            return SendResult(success=True, message_id=str(msg.message_id))
+        except Exception as exc:
+            logger.warning(
+                "[%s] root-action proposal delivery failed: %s",
+                self.name,
+                _redact_telegram_error_text(exc),
+            )
+            return SendResult(
+                success=False, error=_redact_telegram_error_text(exc)
+            )
+
     async def send_exec_approval(
         self, chat_id: str, command: str, session_key: str,
         description: str = "dangerous command",
@@ -6234,6 +6321,7 @@ class TelegramAdapter(BasePlatformAdapter):
             )
 
             try:
+
                 provider_label = get_label(state["current_provider"])
             except Exception:
                 provider_label = state["current_provider"]
@@ -6264,6 +6352,149 @@ class TelegramAdapter(BasePlatformAdapter):
         else:
             # Catch-all (e.g. page counter button "mx:noop")
             await query.answer()
+    async def _deliver_root_action_until_ack(self, action_id: str) -> None:
+        """Retry one locked decision until Pythia positively acknowledges it."""
+        delay = 1.0
+        while True:
+            pending = self._root_action_store.get(action_id)
+            if (
+                pending is None
+                or pending.decision is None
+                or pending.principal is None
+                or pending.decided_at is None
+                or pending.terminal_failure
+            ):
+                return
+            try:
+                await asyncio.to_thread(
+                    post_signed_decision,
+                    pending,
+                    decision=pending.decision,
+                    principal=pending.principal,
+                    chat_id=pending.chat_id,
+                    decided_at=pending.decided_at,
+                )
+            except RootActionProtocolError as exc:
+                if exc.terminal:
+                    self._root_action_store.mark_terminal_failure(
+                        action_id, str(exc)
+                    )
+                    await self._surface_root_action_terminal_failure(pending)
+                    return
+                logger.warning(
+                    "[%s] root-action callback delivery failed for %s; retrying",
+                    self.name,
+                    action_id,
+                )
+                await asyncio.sleep(delay)
+                delay = min(delay * 2.0, 60.0)
+                continue
+            except Exception:
+                logger.warning(
+                    "[%s] root-action callback delivery failed for %s; retrying",
+                    self.name,
+                    action_id,
+                )
+                await asyncio.sleep(delay)
+                delay = min(delay * 2.0, 60.0)
+                continue
+            self._root_action_store.acknowledge(action_id)
+            return
+
+    async def _surface_root_action_terminal_failure(
+        self, pending: PendingRootAction
+    ) -> None:
+        if not pending.message_id or not getattr(self, "_bot", None):
+            return
+        try:
+            result = self._bot.edit_message_text(
+                chat_id=pending.chat_id,
+                message_id=pending.message_id,
+                text="Root-action approval failed permanently; please retry.",
+                reply_markup=None,
+            )
+            if inspect.isawaitable(result):
+                await result
+        except Exception:
+            logger.warning(
+                "[%s] failed to surface terminal root-action callback failure",
+                self.name,
+                exc_info=True,
+            )
+
+    def _start_root_action_delivery(self, action_id: str) -> None:
+        if action_id in self._root_action_delivery_task_ids:
+            return
+        self._root_action_delivery_task_ids.add(action_id)
+        task = asyncio.create_task(self._deliver_root_action_until_ack(action_id))
+        self._root_action_delivery_tasks.add(task)
+
+        def _done(completed: asyncio.Task, *, key: str = action_id) -> None:
+            self._root_action_delivery_tasks.discard(completed)
+            self._root_action_delivery_task_ids.discard(key)
+
+        task.add_done_callback(_done)
+
+    def _resume_root_action_deliveries(self) -> None:
+        for pending in self._root_action_store.pending_deliveries():
+            self._start_root_action_delivery(pending.proposal.action_id)
+
+    async def _handle_root_action_callback(
+        self,
+        query: Any,
+        data: str,
+        *,
+        query_chat_id: Any,
+        query_chat_type: Any,
+        query_thread_id: Any,
+        query_user_name: Any,
+    ) -> None:
+        """Consume one server-side root-action button and notify Pythia."""
+        parts = data.split(":", 2)
+        if len(parts) != 3 or parts[1] not in {"approve", "deny"}:
+            await query.answer(text="Invalid root-action data.")
+            return
+        decision, action_id = parts[1], parts[2]
+        caller_id = str(getattr(query.from_user, "id", "") or "").strip()
+        if not self._is_callback_user_authorized(
+            caller_id,
+            chat_id=query_chat_id,
+            chat_type=str(query_chat_type) if query_chat_type is not None else None,
+            thread_id=str(query_thread_id) if query_thread_id is not None else None,
+            user_name=query_user_name,
+        ):
+            await query.answer(text="⛔ You are not authorized for this action.")
+            return
+
+        pending = self._root_action_store.get(action_id)
+        if pending is None:
+            await query.answer(text="This action is expired or already resolved.")
+            return
+        principal = "telegram:" + caller_id
+        try:
+            self._root_action_store.consume(
+                action_id,
+                decision=decision,
+                principal=principal,
+                chat_id=str(query_chat_id or ""),
+            )
+        except RootActionProtocolError as exc:
+            await query.answer(text=str(exc))
+            return
+
+        self._start_root_action_delivery(action_id)
+        label = "✅ Approved" if decision == "approve" else "❌ Denied"
+        await query.answer(text=f"{label}; delivering")
+        try:
+            user_display = _html.escape(
+                str(getattr(query.from_user, "first_name", "User") or "User")
+            )
+            await query.edit_message_text(
+                text=f"{label} by {user_display} (delivery pending)",
+                reply_markup=None,
+            )
+        except Exception:
+            logger.debug("[%s] failed to update root-action message", self.name)
 
     async def _notify_clarify_expired(self, query, user_display: str) -> None:
         """Tell the user a clarify tap arrived too late to be delivered.
@@ -6330,6 +6561,18 @@ class TelegramAdapter(BasePlatformAdapter):
                 query_user_name=query_user_name,
             )
             return
+        # --- Root-action callbacks (ra:approve|deny:action_id) ---
+        if data.startswith("ra:"):
+            await self._handle_root_action_callback(
+                query,
+                data,
+                query_chat_id=query_chat_id,
+                query_chat_type=query_chat_type,
+                query_thread_id=query_thread_id,
+                query_user_name=query_user_name,
+            )
+            return
+
 
         # --- Exec approval callbacks (ea:choice:id) ---
         if data.startswith("ea:"):
