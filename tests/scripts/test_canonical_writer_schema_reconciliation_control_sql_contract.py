@@ -122,6 +122,24 @@ def test_install_has_exact_bootstrap_and_runtime_principal_separation() -> None:
     assert "REVOKE canonical_brain_migration_owner FROM SESSION_USER" in sql
 
 
+def test_install_accepts_only_the_exact_provider_managed_role_closure() -> None:
+    sql = _text(INSTALL)
+
+    assert sql.count("provider_forward_role_closure(roleid) AS") == 1
+    assert sql.count("JOIN provider_forward_role_closure AS reachable") == 1
+    assert (
+        "SELECT roleid FROM forward_role_closure\n"
+        "                   EXCEPT\n"
+        "                   SELECT roleid FROM provider_forward_role_closure"
+    ) in sql
+    assert (
+        "SELECT roleid FROM provider_forward_role_closure\n"
+        "                   EXCEPT\n"
+        "                   SELECT roleid FROM forward_role_closure"
+    ) in sql
+    assert "pg_catalog.count(DISTINCT role.rolname) = 1" not in sql
+
+
 def test_retire_is_exact_drift_intolerant_and_non_cascading() -> None:
     sql = _text(RETIRE)
 
