@@ -33,6 +33,6 @@ Preserve safe continuation context when a dispatcher-owned Kanban worker yields 
 - [x] Ruff and `git diff --check` pass.
 - [x] Local Codex review findings resolved: board pinning, persistence-before-release, delegated-child isolation, content-sensitive worktree/index fingerprints, and interrupt precedence.
 - [x] Codex app-server applicability reviewed: it does not consume Hermes' per-tool iteration budget and owns native turn persistence/watchdog retirement, so this timeout behavior correctly remains scoped to the Hermes-managed loop.
-- [ ] Coherent conventional commit pushed to `fork/resolve/issue-77881-kanban-resume`.
+- [x] Coherent conventional commit `a807631f9` pushed to `fork/resolve/issue-77881-kanban-resume`.
 - [ ] Draft PR updated; GitHub `@codex review` loop reaches current-head all-clear.
 - [ ] Exact Kanban review-required handoff written before blocking.
