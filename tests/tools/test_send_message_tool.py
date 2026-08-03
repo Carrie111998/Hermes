@@ -809,6 +809,74 @@ class TestMatrixBridgeOnForeignLoop:
             # (legacy direct path) when it cannot inspect the adapter.
             assert _matrix_adapter_loop_matches(BrokenAdapter()) is True
 
+    def test_loop_mismatch_bridge_timeout_returns_error(self):
+        """A send that exceeds the bridge timeout must surface a timed-out
+        error dict and cancel the scheduled future instead of blocking the
+        caller's event loop (review: replace blocking future.result with
+        asyncio.wrap_future + async timeout)."""
+        adapter_loop = asyncio.new_event_loop()
+        adapter = self._adapter_with_loop(
+            adapter_loop, SimpleNamespace(success=True, message_id="$never")
+        )
+        import threading
+        t = threading.Thread(target=adapter_loop.run_forever, daemon=True)
+        t.start()
+        try:
+            # Make the adapter's send block far past the patched 50ms cap.
+            orig_send = adapter.send
+
+            async def slow_send(chat_id, message, metadata=None):
+                await asyncio.sleep(5)
+                return await orig_send(chat_id, message, metadata)
+
+            adapter.send = slow_send
+
+            with patch(
+                "gateway.run._gateway_runner_ref", return_value=self._runner_with(adapter)
+            ), patch("tools.send_message_tool._MATRIX_BRIDGE_TIMEOUT", 0.05):
+                result = asyncio.run(
+                    _send_matrix_via_adapter(
+                        SimpleNamespace(enabled=True, token="tok", extra={}),
+                        "!room:example.com",
+                        "cron report",
+                    )
+                )
+            assert result.get("error") == "Matrix send timed out on adapter loop"
+            assert result.get("success") is not True
+        finally:
+            adapter_loop.call_soon_threadsafe(adapter_loop.stop)
+            t.join(timeout=5)
+            adapter_loop.close()
+
+    def test_loop_mismatch_bridge_schedule_failure_returns_error(self):
+        """If the send cannot be scheduled onto the adapter loop at all
+        (loop closed during a shutdown race), the bridge must return an
+        error dict, not raise."""
+        adapter_loop = asyncio.new_event_loop()
+        adapter = self._adapter_with_loop(
+            adapter_loop, SimpleNamespace(success=True, message_id="$x")
+        )
+        try:
+            with patch(
+                "gateway.run._gateway_runner_ref", return_value=self._runner_with(adapter)
+            ), patch(
+                "agent.async_utils.safe_schedule_threadsafe", return_value=None
+            ):
+                result = asyncio.run(
+                    _send_matrix_via_adapter(
+                        SimpleNamespace(enabled=True, token="tok", extra={}),
+                        "!room:example.com",
+                        "report",
+                    )
+                )
+            assert (
+                result.get("error")
+                == "Matrix send failed: could not schedule send on adapter loop"
+            )
+            assert result.get("success") is not True
+        finally:
+            adapter_loop.close()
+
 
 # ---------------------------------------------------------------------------
 # HTML auto-detection in Telegram send

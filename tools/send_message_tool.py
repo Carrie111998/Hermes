@@ -17,6 +17,11 @@ from agent.secret_scope import get_secret
 
 logger = logging.getLogger(__name__)
 
+# Cap for awaiting a send scheduled onto the live Matrix adapter's own event
+# loop (see _matrix_bridge_to_adapter_loop). Mirrors the 90s cap the
+# scheduler's synchronous live-adapter path applies.
+_MATRIX_BRIDGE_TIMEOUT = 90
+
 _TELEGRAM_TOPIC_TARGET_RE = re.compile(r"^\s*(-?\d+)(?::(\d+))?\s*$")
 _FEISHU_TARGET_RE = re.compile(r"^\s*((?:oc|ou|on|chat|open)_[-A-Za-z0-9]+)(?::([-A-Za-z0-9_]+))?\s*$")
 # Slack conversation IDs: C (public channel), G (private/group channel), D (DM).
@@ -1834,9 +1839,10 @@ async def _matrix_bridge_to_adapter_loop(adapter, chat_id, message, media_files,
     ephemeral adapter cannot open the shared crypto store (BAD_ACCOUNT_KEY)
     and would break encrypted-room delivery.
 
-    Blocks the calling thread until the send completes (or times out), the
-    same contract the scheduler's live-adapter path uses. Returns a dict so
-    cron's standalone delivery path can inspect ``.get("error")``.
+    Awaits the send on the adapter's own loop without blocking the caller's
+    event loop, capped by the same 90s timeout the scheduler's sync
+    live-adapter path uses. Returns a dict so cron's standalone delivery
+    path can inspect ``.get("error")``.
     """
     from agent.async_utils import safe_schedule_threadsafe
 
@@ -1855,7 +1861,14 @@ async def _matrix_bridge_to_adapter_loop(adapter, chat_id, message, media_files,
     if future is None:
         return _error("Matrix send failed: could not schedule send on adapter loop")
     try:
-        result = future.result(timeout=90)
+        # Await the concurrent future without blocking the caller's event
+        # loop. This helper is async and may run on the gateway loop itself,
+        # where future.result(timeout=90) would stall every other task for
+        # up to 90s. wrap_future bridges the concurrent future into this
+        # loop; wait_for applies the same cap the scheduler's sync path uses.
+        result = await asyncio.wait_for(
+            asyncio.wrap_future(future), timeout=_MATRIX_BRIDGE_TIMEOUT
+        )
     except TimeoutError:
         future.cancel()
         return _error("Matrix send timed out on adapter loop")
