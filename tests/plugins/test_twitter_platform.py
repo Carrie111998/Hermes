@@ -52,6 +52,7 @@ def test_registration_disables_generic_message_splitting():
     assert kwargs["cron_deliver_env_var"] == "TWITTER_HOME_CHANNEL"
     assert callable(kwargs["target_parser_fn"])
     assert kwargs["max_message_length"] == 0
+    assert kwargs["supports_media_delivery"] is True
     assert kwargs["check_fn"]()
     assert kwargs["install_hint"] == (
         "Run `hermes gateway setup` and choose Twitter / X to install its plugin dependency."
@@ -1324,6 +1325,24 @@ async def test_write_timeout_is_not_retried():
         await client.create_post("hello", reply_to="123")
     assert "/2/tweets" in str(error.value)
     assert calls == 1
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_client_omits_empty_text_from_media_only_dm():
+    from plugins.platforms.twitter.client import XClient
+
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(201, json={"data": {"dm_event_id": "7"}})
+
+    client = XClient(token="token", transport=httpx.MockTransport(handler))
+    assert await client.send_dm("42-7", "", media_id="800") == "7"
+    assert json.loads(requests[0].content) == {
+        "attachments": [{"media_id": "800"}]
+    }
     await client.close()
 
 
@@ -3263,6 +3282,35 @@ async def test_send_uploads_images_before_creating_post(monkeypatch, tmp_path):
     adapter._client.create_post.assert_awaited_once_with(
         "with image", media_ids=["800"]
     )
+
+
+@pytest.mark.asyncio
+async def test_send_media_only_omits_empty_text_from_post(monkeypatch, tmp_path):
+    from PIL import Image
+
+    from plugins.platforms.twitter.adapter import TwitterAdapter
+    from plugins.platforms.twitter.client import XClient
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    image = tmp_path / "one.png"
+    Image.new("RGB", (1, 1)).save(image)
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(201, json={"data": {"id": "801"}})
+
+    adapter = TwitterAdapter(PlatformConfig(extra={"client_id": "client"}))
+    adapter._client = XClient(token="token", transport=httpx.MockTransport(handler))
+    adapter._client.upload_image = AsyncMock(return_value="800")
+
+    result = await adapter.send(
+        "timeline", "", metadata={"media_files": [(str(image), False)]}
+    )
+
+    assert result.success
+    assert json.loads(requests[0].content) == {"media": {"media_ids": ["800"]}}
+    await adapter._client.close()
 
 
 @pytest.mark.asyncio

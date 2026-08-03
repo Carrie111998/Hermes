@@ -223,7 +223,9 @@ class XClient:
         reply_to: str | None = None,
         media_ids: list[str] | None = None,
     ) -> str:
-        body: dict[str, Any] = {"text": text}
+        body: dict[str, Any] = {}
+        if text:
+            body["text"] = text
         if reply_to:
             body["reply"] = {"in_reply_to_tweet_id": str(reply_to)}
         if media_ids:
@@ -240,7 +242,9 @@ class XClient:
     async def send_dm(
         self, conversation_id: str, text: str, *, media_id: str | None = None
     ) -> str:
-        body: dict[str, Any] = {"text": text}
+        body: dict[str, Any] = {}
+        if text:
+            body["text"] = text
         if media_id:
             body["attachments"] = [{"media_id": str(media_id)}]
         path = f"/2/dm_conversations/{quote(str(conversation_id), safe='')}/messages"

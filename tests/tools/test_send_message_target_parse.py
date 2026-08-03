@@ -6,13 +6,14 @@ skips wholesale when optional Telegram dependencies are not installed.
 
 import asyncio
 import json
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from gateway.config import Platform
-from tools.send_message_tool import _parse_target_ref, send_message_tool
+from tools.send_message_tool import _parse_target_ref, _send_to_platform, send_message_tool
 
 
 def _register_twitter_platform():
@@ -144,6 +145,112 @@ def test_send_message_routes_twitter_reply_with_separate_interaction_id() -> Non
         media_files=[],
         force_document=False,
     )
+
+
+@pytest.mark.asyncio
+async def test_twitter_live_adapter_receives_media_without_omission_warning(
+    monkeypatch,
+) -> None:
+    previous = _register_twitter_platform()
+    twitter = Platform("twitter")
+    media_files = [("/tmp/image.png", False)]
+    recorded = {}
+
+    class Adapter:
+        async def send(self, *, chat_id, content, metadata=None):
+            recorded["metadata"] = metadata
+            return SimpleNamespace(success=True, message_id="tweet-1")
+
+    runner = SimpleNamespace(adapters={twitter: Adapter()})
+    fake_gateway_run = ModuleType("gateway.run")
+    fake_gateway_run._gateway_runner_ref = lambda: runner
+    monkeypatch.setitem(sys.modules, "gateway.run", fake_gateway_run)
+
+    try:
+        result = await _send_to_platform(
+            twitter,
+            SimpleNamespace(enabled=True, token=None, extra={}),
+            "timeline",
+            "hello with image",
+            media_files=media_files,
+        )
+    finally:
+        _restore_twitter_platform(previous)
+
+    assert result == {"success": True, "message_id": "tweet-1"}
+    assert recorded["metadata"] == {"media_files": media_files}
+
+
+@pytest.mark.asyncio
+async def test_twitter_standalone_sender_accepts_media_only(monkeypatch) -> None:
+    previous = _register_twitter_platform()
+    twitter = Platform("twitter")
+    media_files = [("/tmp/image.png", False)]
+
+    from gateway.platform_registry import platform_registry
+
+    entry = platform_registry.get("twitter")
+    original_sender = entry.standalone_sender_fn
+    standalone_send = AsyncMock(
+        return_value={"success": True, "message_id": "tweet-1"}
+    )
+    entry.standalone_sender_fn = standalone_send
+    fake_gateway_run = ModuleType("gateway.run")
+    fake_gateway_run._gateway_runner_ref = lambda: None
+    monkeypatch.setitem(sys.modules, "gateway.run", fake_gateway_run)
+
+    try:
+        result = await _send_to_platform(
+            twitter,
+            SimpleNamespace(enabled=True, token=None, extra={}),
+            "timeline",
+            "",
+            media_files=media_files,
+        )
+    finally:
+        entry.standalone_sender_fn = original_sender
+        _restore_twitter_platform(previous)
+
+    assert result == {"success": True, "message_id": "tweet-1"}
+    standalone_send.assert_awaited_once_with(
+        SimpleNamespace(enabled=True, token=None, extra={}),
+        "timeline",
+        "",
+        thread_id=None,
+        media_files=media_files,
+        force_document=False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_plugin_without_media_capability_still_rejects_media_only() -> None:
+    from gateway.platform_registry import PlatformEntry, platform_registry
+
+    standalone_send = AsyncMock(return_value={"success": True})
+    platform_registry.register(
+        PlatformEntry(
+            name="textonly_test",
+            label="Text only test",
+            adapter_factory=lambda _config: None,
+            check_fn=lambda: True,
+            standalone_sender_fn=standalone_send,
+        )
+    )
+    platform = Platform("textonly_test")
+
+    try:
+        result = await _send_to_platform(
+            platform,
+            SimpleNamespace(enabled=True, token=None, extra={}),
+            "channel",
+            "",
+            media_files=[("/tmp/image.png", False)],
+        )
+    finally:
+        platform_registry.unregister("textonly_test")
+
+    assert "only media attachments" in result["error"]
+    standalone_send.assert_not_awaited()
 
 
 def test_send_message_routes_whatsapp_group_jid_without_home_fallback() -> None:

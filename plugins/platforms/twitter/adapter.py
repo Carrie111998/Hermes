@@ -673,12 +673,18 @@ class TwitterAdapter(BasePlatformAdapter):
             destination_kind = (
                 "timeline" if chat_id == "timeline" else "reply" if valid_public else "dm"
             )
-            content = format_public_message(content)
-            over_weighted_limit = (
+            media_requested = bool((metadata or {}).get("media_files"))
+            if content.strip() or not media_requested:
+                content = format_public_message(content)
+            else:
+                content = ""
+            over_weighted_limit = bool(content) and (
                 x_weighted_length(content) > X_BOT_WEIGHTED_LIMIT
             )
             fallback_parts = (
-                [] if over_weighted_limit else format_thread_messages(content)
+                []
+                if over_weighted_limit or not content
+                else format_thread_messages(content)
             )
             over_part_limit = len(fallback_parts) > X_MAX_FALLBACK_PARTS
             if over_weighted_limit or over_part_limit:
@@ -752,6 +758,8 @@ class TwitterAdapter(BasePlatformAdapter):
                     reserved_reply_id = str(reply_to)
                     reserved_reply_kind = "dm"
             media_ids = await self._upload_images(metadata, for_dm=is_dm)
+            if not content and not media_ids:
+                raise ValueError("Twitter content is empty or contains unsupported characters")
             if chat_id == "timeline":
                 parent_id = ""
                 index = 0
@@ -1709,6 +1717,7 @@ def register(ctx) -> None:
         target_parser_fn=parse_delivery_target,
         standalone_sender_fn=standalone_send,
         max_message_length=0,
+        supports_media_delivery=True,
         install_hint=TWITTER_TEXT_INSTALL_HINT,
         emoji="𝕏",
         pii_safe=True,

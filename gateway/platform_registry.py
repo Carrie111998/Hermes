@@ -97,6 +97,9 @@ class PlatformEntry:
     # Max message length for smart-chunking.  0 = no limit.
     max_message_length: int = 0
 
+    # Whether send_message may pass outbound MEDIA attachments to this plugin.
+    supports_media_delivery: bool = False
+
     # ── Privacy ──
     # If True, session descriptions redact PII (phone numbers, etc.)
     pii_safe: bool = False

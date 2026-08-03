@@ -115,11 +115,13 @@ Hermes sends only to a DM conversation first established by an authorized inboun
 
 ## Text and images
 
-X receives one plain-text post. Hermes converts Markdown links to `label (URL)`, strips remaining Markdown markers, normalizes Unicode, and validates the result with X-compatible weighted counting for URLs, emoji, CJK, combining sequences, and reply mentions.
+X receives plain text. Hermes converts Markdown links to `label (URL)`, strips remaining Markdown markers, normalizes Unicode, and validates the result with X-compatible weighted counting for URLs, emoji, CJK, combining sequences, and reply mentions. A delivery may contain up to 2,800 weighted characters and at most ten 280-weight fallback parts.
 
-Over-limit text fails before an X write. Hermes does not split, truncate, or post a partial response.
+Text over 280 weighted characters is first attempted once as a single timeline post, reply, or DM. Only if X definitively rejects that attempt with HTTP 400, 403, 413, or 422 does Hermes retry it as a public thread or sequential DMs. Hermes does not split or replay after an ambiguous write, transport failure, HTTP 408, 429, 5xx, or another non-content failure.
 
-Inbound images are downloaded only after authorization and are checked for HTTPS/SSRF safety, MIME, decoded format, dimensions, count, timeout, and byte limits. Outbound delivery accepts local JPG, PNG, or WEBP files: up to four images on a public post and one image in a DM. A validation or upload failure aborts the whole send; there is no silent text-only fallback. Video and animated GIF upload are not supported.
+Timeline text over 2,800 weighted characters, or requiring more than ten fallback parts, fails before an X write. In a reply or DM, Hermes sends a short request for a narrower answer instead. If one or more fallback parts are confirmed before a later failure, Hermes reports those IDs as a successful partial delivery and does not replay the whole response.
+
+Inbound images are downloaded only after authorization and are checked for HTTPS/SSRF safety, MIME, decoded format, dimensions, count, timeout, and byte limits. Outbound delivery accepts local JPG, PNG, or WEBP files: up to four images on a public post and one image in a DM, attached only to the first fallback part. A validation or upload failure aborts the whole send; there is no silent text-only fallback. Video and animated GIF upload are not supported.
 
 ## Delivery safety, tools, and cron
 
