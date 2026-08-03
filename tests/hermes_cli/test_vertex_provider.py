@@ -29,6 +29,26 @@ def test_google_vertex_not_confused_with_gemini():
     assert _PROVIDER_ALIASES["google-gemini"] == "gemini"
 
 
+def test_vertex_explicit_config_gate_recognizes_express_key(monkeypatch):
+    """The picker's explicit-only filter must not hide Vertex when GOOGLE_VERTEX_API_KEY is set.
+
+    Regression: the PROVIDER_REGISTRY vertex entry declared no api_key_env_vars,
+    so is_provider_explicitly_configured("vertex") always returned False and the
+    desktop chat model picker (explicit_only=True) silently dropped Vertex even
+    with a valid Express Mode key configured.
+    """
+    from hermes_cli.auth import is_provider_explicitly_configured
+    from hermes_cli.auth import PROVIDER_REGISTRY
+
+    assert "GOOGLE_VERTEX_API_KEY" in PROVIDER_REGISTRY["vertex"].api_key_env_vars
+
+    monkeypatch.delenv("GOOGLE_VERTEX_API_KEY", raising=False)
+    assert is_provider_explicitly_configured("vertex") is False
+
+    monkeypatch.setenv("GOOGLE_VERTEX_API_KEY", "AQ.FAKEKEY123")
+    assert is_provider_explicitly_configured("vertex") is True
+
+
 def test_resolve_runtime_provider_mints_token(monkeypatch):
     import agent.vertex_adapter as va
     from hermes_cli import runtime_provider as rp
