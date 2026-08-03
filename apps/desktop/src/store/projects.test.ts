@@ -144,10 +144,12 @@ describe('resolveNewSessionCwd', () => {
     expect(resolveNewSessionCwd()).toBe('/home/user/configured')
   })
 
-  it('inherits the focused session workspace when not drilled into a project', () => {
-    // Simulate a primary session whose stored row carries a project cwd —
-    // the common case: you're in a chat that has a pwd, hit ⌘N/⌘T, and
-    // expect the new draft to stay in that project without sidebar drill-in.
+  it('does not inherit the focused session workspace — a new chat outside a project stays detached', () => {
+    // #77496: "New session" must land in the Home bucket, not under the
+    // project of the conversation you happen to be looking at. The focused
+    // chat's workspace is never a new-session target unless the user
+    // explicitly drilled into that project in the sidebar.
+    applyConfiguredDefaultProjectDir(null)
     $selectedStoredSessionId.set('sess-a')
     $sessions.set([
       {
@@ -166,18 +168,21 @@ describe('resolveNewSessionCwd', () => {
       } as never
     ])
 
-    expect(resolveNewSessionCwd()).toBe('/Users/me/www/hermes-agent')
+    // No configured default and no project scope → detached, so the backend
+    // places the new session in the Home bucket.
+    expect(resolveNewSessionCwd()).toBe('')
   })
 
-  it('does not re-attach a remembered cwd when the focused session is detached', () => {
-    $currentCwd.set('/Users/me/stale-remembered')
-    $selectedStoredSessionId.set('sess-detached')
+  it('ignores the focused session workspace even when a default dir is configured', () => {
+    // Same as above but with the configured default set: the new session falls
+    // back to the default dir — never to the focused chat's project cwd.
+    $selectedStoredSessionId.set('sess-a')
     $sessions.set([
       {
         archived: false,
-        cwd: null,
+        cwd: '/Users/me/www/hermes-agent',
         ended_at: null,
-        id: 'sess-detached',
+        id: 'sess-a',
         input_tokens: 0,
         is_active: true,
         last_active: 0,
@@ -185,12 +190,10 @@ describe('resolveNewSessionCwd', () => {
         model: null,
         output_tokens: 0,
         started_at: 0,
-        title: 'loose'
+        title: 'work'
       } as never
     ])
 
-    // Focused session has no workspace → fall through to configured default,
-    // not the stale $currentCwd from an earlier chat.
     expect(resolveNewSessionCwd()).toBe('/home/user/configured')
   })
 })
