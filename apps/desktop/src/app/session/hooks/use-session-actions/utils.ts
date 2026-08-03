@@ -524,6 +524,11 @@ export function appendLiveSessionProjection(
     })
   }
 
+  // `queued` is a separately accepted next turn. Text equality cannot prove it
+  // is the inflight or latest persisted turn because repeating a prompt is
+  // valid. The gateway clears the queue before dispatch and then represents
+  // that turn as inflight, so a live payload cannot expose one turn in both
+  // fields without a future durable turn identity saying so.
   if (queuedUser) {
     projected.push({
       id: `user-queued-${sessionId}`,

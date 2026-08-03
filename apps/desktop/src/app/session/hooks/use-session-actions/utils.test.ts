@@ -26,6 +26,9 @@ const msg = (id: string, role: ChatMessage['role'], text: string, extra: Partial
 
 const session = (over: Partial<SessionInfo>): SessionInfo => over as SessionInfo
 
+const chatText = (message: ChatMessage): string =>
+  message.parts.map(part => ('text' in part ? part.text : '')).join('')
+
 describe('applyRuntimeInfo approval mode', () => {
   beforeEach(() => {
     $approvalModes.set({})
@@ -729,5 +732,58 @@ describe('appendLiveSessionProjection', () => {
     const stored = [msg('stored-user', 'user', 'earlier')]
 
     expect(appendLiveSessionProjection(stored, { session_id: 'runtime-1' })).toBe(stored)
+  })
+
+  it('preserves a queued turn whose text matches the inflight turn', () => {
+    const stored = [msg('stored-user-1', 'user', 'earlier')]
+
+    const restored = appendLiveSessionProjection(stored, {
+      session_id: 'runtime-1',
+      inflight: { user: 'same prompt', assistant: '', streaming: true },
+      queued: { user: 'same prompt' }
+    })
+
+    const users = restored.filter(message => message.role === 'user').map(message => chatText(message))
+
+    expect(users).toEqual(['earlier', 'same prompt', 'same prompt'])
+    expect(restored.map(message => message.id)).toEqual([
+      'stored-user-1',
+      'user-inflight-runtime-1',
+      'assistant-stream-runtime-1',
+      'user-queued-runtime-1'
+    ])
+  })
+
+  // SAFETY: the guard must never swallow a genuinely new queued turn. Joel
+  // legitimately re-sends the same short text ("what's next?"), so suppressing
+  // on any historical match would lose a real prompt — far worse than a
+  // cosmetic duplicate.
+  it('still projects a queued prompt that repeats an OLDER (non-latest) turn', () => {
+    const stored = [
+      msg('stored-user-1', 'user', "what's next?"),
+      msg('stored-assistant-1', 'assistant', 'here is what is next'),
+      msg('stored-user-2', 'user', 'different prompt'),
+      msg('stored-assistant-2', 'assistant', 'another answer')
+    ]
+
+    const restored = appendLiveSessionProjection(stored, {
+      session_id: 'runtime-1',
+      queued: { user: "what's next?" }
+    })
+
+    expect(restored).toHaveLength(5)
+    expect(chatText(restored[4]!)).toBe("what's next?")
+    expect(restored[4]).toMatchObject({ id: 'user-queued-runtime-1' })
+  })
+
+  it('still projects a queued prompt when nothing matches it', () => {
+    const stored = [msg('stored-user-1', 'user', 'earlier')]
+
+    const restored = appendLiveSessionProjection(stored, {
+      session_id: 'runtime-1',
+      queued: { user: 'brand new prompt' }
+    })
+
+    expect(restored.map(message => chatText(message))).toEqual(['earlier', 'brand new prompt'])
   })
 })

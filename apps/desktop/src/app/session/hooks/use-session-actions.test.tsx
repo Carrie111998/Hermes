@@ -741,10 +741,11 @@ describe('resumeSession failure recovery', () => {
     expect($messages.get().map(message => message.id)).toContain('user-optimistic')
   })
 
-  it('restores the in-flight turn and queued user prompt after a full renderer restart', async () => {
+  it('preserves an identically worded queued turn when resume already persisted the inflight user', async () => {
     const storedMessages = [
       { content: 'earlier question', role: 'user', timestamp: 1 },
-      { content: 'earlier answer', role: 'assistant', timestamp: 2 }
+      { content: 'earlier answer', role: 'assistant', timestamp: 2 },
+      { content: 'same prompt', role: 'user', timestamp: 3 }
     ]
 
     vi.mocked(getSessionMessages).mockResolvedValue({ messages: storedMessages, session_id: 'stored-1' } as never)
@@ -759,11 +760,11 @@ describe('resumeSession failure recovery', () => {
           messages: storedMessages,
           running: true,
           inflight: {
-            user: 'current prompt',
+            user: 'same prompt',
             assistant: 'partial answer',
             streaming: true
           },
-          queued: { user: 'newest prompt' },
+          queued: { user: 'same prompt' },
           info: {}
         } as never
       }
@@ -783,10 +784,15 @@ describe('resumeSession failure recovery', () => {
     await waitFor(() => expect(resume).not.toBeNull())
     await resume!('stored-1', true)
 
-    const renderedMessages = JSON.stringify(resumedState?.messages)
-    expect(renderedMessages).toContain('current prompt')
-    expect(renderedMessages).toContain('partial answer')
-    expect(renderedMessages).toContain('newest prompt')
+    const renderedMessages = resumedState?.messages ?? []
+
+    const repeatedUsers = renderedMessages.filter(
+      message => message.role === 'user' && JSON.stringify(message.parts).includes('same prompt')
+    )
+
+    expect(repeatedUsers).toHaveLength(2)
+
+    expect(JSON.stringify(renderedMessages)).toContain('partial answer')
   })
 
   it('uses the continuation projection when resume rotates an equal-length stored transcript', async () => {
