@@ -1,8 +1,8 @@
 import { JsonRpcGatewayClient, resolveGatewayWsUrl } from '@hermes/shared'
 
-import { reconnectBackoffDelayMs } from '@/lib/reconnect-backoff'
-import { assertManagedGatewayMethodAllowed } from '@/lib/managed-ui-policy'
 import { isManagedEvaosAgent } from '@/i18n/managed-brand'
+import { assertManagedGatewayMethodAllowed } from '@/lib/managed-ui-policy'
+import { reconnectBackoffDelayMs } from '@/lib/reconnect-backoff'
 import type {
   ActionResponse,
   ActionStatusResponse,
