@@ -2219,6 +2219,16 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                             judge_exc,
                             exc_info=True,
                         )
+                        # A transport/API failure (e.g. GeminiAPIError) is an
+                        # INFRASTRUCTURE fault, not a work-quality signal. Do NOT
+                        # let it burn the block-recurrence budget or wedge the
+                        # worker: classify it as an unreachable judge and report
+                        # accurately instead of crashing on an unbound `verdict`.
+                        verdict = "rejected"
+                        reason = (
+                            f"goal judge unreachable (transport/API error): "
+                            f"{type(judge_exc).__name__}; operator evidence required"
+                        )
                     if verdict != "done":
                         print(
                             f"kanban: goal completion of {tid} rejected by judge: {reason}. "
@@ -2236,7 +2246,19 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 expected_run_id=_worker_run_id_for(tid),
             ):
                 failed.append(tid)
-                print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
+                # Surface the ACTUAL status instead of the factually false
+                # "unknown id or terminal state" string. A card in `triage`
+                # (parked by the block-loop breaker) is neither unknown nor
+                # terminal; report its real status so the operator can decide.
+                cur_row = conn.execute(
+                    "SELECT status FROM tasks WHERE id = ?", (tid,)
+                ).fetchone()
+                real_status = cur_row["status"] if cur_row else "gone"
+                print(
+                    f"cannot complete {tid}: current status is '{real_status}'; "
+                    f"complete accepts running|ready|blocked|triage",
+                    file=sys.stderr,
+                )
             else:
                 print(f"Completed {tid}")
     return 0 if not failed else 1
@@ -2345,7 +2367,18 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
                 kb.add_comment(conn, tid, author, f"UNBLOCK: {reason}")
             if not kb.unblock_task(conn, tid):
                 failed.append(tid)
-                print(f"cannot unblock {tid} (not blocked/scheduled?)", file=sys.stderr)
+                # Report the ACTUAL status instead of guessing — a card in
+                # `triage` (loop-breaker parking) is not `blocked`/`scheduled`
+                # and the operator needs to know why the verb refused.
+                cur_row = conn.execute(
+                    "SELECT status FROM tasks WHERE id = ?", (tid,)
+                ).fetchone()
+                real_status = cur_row["status"] if cur_row else "gone"
+                print(
+                    f"cannot unblock {tid}: current status is '{real_status}'; "
+                    f"unblock accepts blocked|scheduled",
+                    file=sys.stderr,
+                )
             else:
                 print(f"Unblocked {tid}" + (f": {reason}" if reason else ""))
     return 0 if not failed else 1
@@ -2375,9 +2408,18 @@ def _cmd_promote(args: argparse.Namespace) -> int:
                 force=bool(args.force),
                 dry_run=bool(args.dry_run),
             )
+            # Surface the ACTUAL target status: a triage-parked card is
+            # routed back to `todo` (the intake lane), not `ready`.
+            target = "todo"
+            if ok:
+                cur_row = conn.execute(
+                    "SELECT status FROM tasks WHERE id = ?", (tid,)
+                ).fetchone()
+                target = cur_row["status"] if cur_row else "ready"
             results.append({
                 "task_id": tid,
                 "promoted": ok,
+                "target": target,
                 "dry_run": bool(args.dry_run),
                 "forced": bool(args.force),
                 "reason": reason,
@@ -2396,7 +2438,7 @@ def _cmd_promote(args: argparse.Namespace) -> int:
     for r in results:
         if r["promoted"]:
             suffix = f": {reason}" if reason else ""
-            print(f"{label} {r['task_id']} -> ready{tag}{suffix}")
+            print(f"{label} {r['task_id']} -> {r['target']}{tag}{suffix}")
         else:
             print(f"cannot promote {r['task_id']}: {r['error']}", file=sys.stderr)
     return 0 if not failed else 1
