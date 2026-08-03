@@ -7,7 +7,7 @@ import { deleteSession, getSessionMessages, setSessionArchived } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { type ChatMessage, preserveLocalAssistantErrors, toChatMessages } from '@/lib/chat-messages'
 import { isMissingRpcMethod } from '@/lib/gateway-rpc'
-import { recoverInFlightTurnJournal } from '@/lib/inflight-turn-journal'
+import { purgeInFlightTurnJournals, recoverInFlightTurnJournal } from '@/lib/inflight-turn-journal'
 import { setSessionYolo } from '@/lib/yolo-session'
 import { migrateSessionDraft } from '@/store/composer'
 import { clearQueuedPrompts, migrateQueuedPrompts } from '@/store/composer-queue'
@@ -1341,6 +1341,13 @@ export function useSessionActions({
 
         await deleteSession(storedSessionId, removed?.profile)
         clearQueuedPrompts(storedSessionId)
+        // The journaled in-flight tail holds this session's prompt and tool
+        // calls in localStorage; a deleted session must not leave that behind
+        // to age out on its own. Pass the runtime id too: it is not a journal
+        // key, but entries record it, so it reaches a tail stranded under an
+        // intermediate stored id that compression rotated past — an id that is
+        // in neither `$sessions` nor `removedIds`, so nothing else can name it.
+        purgeInFlightTurnJournals([...removedIds, closingRuntimeId])
 
         if (closingRuntimeId) {
           clearQueuedPrompts(closingRuntimeId)
