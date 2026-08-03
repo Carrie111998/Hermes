@@ -1,13 +1,15 @@
 import { Codecs, persistentAtom } from '@/lib/persisted'
 
 const STATUSBAR_HIDDEN_STORAGE_KEY = 'hermes.desktop.statusbarHidden'
-const STATUSBAR_VISIBLE_STORAGE_KEY = 'hermes.desktop.statusbarVisible'
+// The legacy key cannot distinguish a user choice from the false fallback that
+// v0.19.1 persisted during module initialization. A fresh key resets that
+// ambiguous value once; subsequent explicit hide choices remain persistent.
+const STATUSBAR_VISIBLE_STORAGE_KEY = 'hermes.desktop.statusbarVisible.v2'
 
-// Whole-bar visibility, VS Code's `workbench.statusBar.visible`. Off by default
-// — the bar is opt-in. Hiding it unmounts the bar (its 15s status poll goes with
-// it), so the way back is the `view.toggleStatusbar` keybind or the ⌘K row,
-// never the bar itself.
-export const $statusbarVisible = persistentAtom(STATUSBAR_VISIBLE_STORAGE_KEY, false, Codecs.bool)
+// Whole-bar visibility, VS Code's `workbench.statusBar.visible`. Hiding it
+// unmounts the bar (its 15s status poll goes with it), so the way back is the
+// `view.toggleStatusbar` keybind or the ⌘K row — never the bar itself.
+export const $statusbarVisible = persistentAtom(STATUSBAR_VISIBLE_STORAGE_KEY, true, Codecs.bool)
 
 export function toggleStatusbarVisible() {
   $statusbarVisible.set(!$statusbarVisible.get())
