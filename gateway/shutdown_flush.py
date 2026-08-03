@@ -36,14 +36,90 @@ from typing import Any, Dict, Optional
 logger = logging.getLogger(__name__)
 
 
+def _managed_install() -> bool:
+    """True when a package manager (NixOS) owns this install's directory modes.
+
+    Read at each creation so the *creation* mode honours the same carve-out
+    ``hermes_cli.config._secure_dir`` already applies to reconciliation. The
+    import is local and a failure means "not managed": an unimportable config
+    module is the single-user source-install case, where owner-only is right.
+    """
+    try:
+        from hermes_cli.config import is_managed
+
+        return bool(is_managed())
+    except Exception:  # pragma: no cover - defensive
+        return False
+
+
+def _reconcile_flush_dir_mode(flush_dir: Path) -> None:
+    """Apply the shared HERMES_HOME directory policy to an existing flush dir.
+
+    Delegates to ``hermes_cli.config._secure_dir`` — the single place that
+    implements this policy for HERMES_HOME *and every subdirectory*
+    ``ensure_hermes_home`` creates (``cron``, ``sessions``, ``logs``,
+    ``memories``, ...). The hand-rolled ``os.chmod(flush_dir, 0o700)`` this
+    replaces diverged from that shared policy on three axes:
+
+    * it ran in managed mode, where the policy is to stand down;
+    * it ignored ``HERMES_HOME_MODE``, which every sibling dir honours;
+    * it was unguarded, and ``chmod`` by a non-owner raises ``EPERM`` — so on
+      a shared-state install it raised straight out of ``_get_flush_dir()``,
+      and because every caller wraps this module in ``except Exception:
+      pass`` the shutdown flush degraded to a silent no-op, losing the very
+      messages it exists to save.
+
+    Best-effort by design: this runs on the shutdown path, so a failure to
+    reconcile permissions must never cost us the flush itself.
+    """
+    if os.name != "posix":
+        # POSIX mode bits are advisory on Windows, where at-rest protection is
+        # ACL-based; preserves this function's original non-POSIX behaviour.
+        return
+    try:
+        from hermes_cli.config import _secure_dir
+
+        _secure_dir(flush_dir)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("Could not reconcile pending-message dir mode: %s", exc)
+
+
 def _get_flush_dir():
-    """Return the pending-messages flush directory under the active HERMES_HOME."""
+    """Return the pending-messages flush directory under the active HERMES_HOME.
+
+    Created owner-only (0700) so the verbatim user messages parked here for
+    crash recovery are not world-readable, with the mode passed to ``mkdir``
+    rather than chmod'd afterwards so the directory never exists at umask
+    permissions.
+
+    **Managed installs are carved out at creation, not just at
+    reconciliation.** ``pending_messages`` is not among the directories
+    ``nix/nixosModules.nix`` pre-creates via ``systemd.tmpfiles`` (only
+    stateDir, .hermes, cron, sessions, logs, memories, plugins), so on a
+    managed host it is always made lazily at runtime and these lines are the
+    only thing setting its mode. That module pins those dirs to ``2770``
+    (setgid, group-rwx), runs the gateway with ``UMask = "0007"`` precisely so
+    "files created by the gateway should be group-writable so interactive
+    users in the hermes group can read/write them", and deliberately avoids
+    ``chown -R`` to keep the setgid bit alive "for group access by hostUsers".
+    ``container.hostUsers`` get a ``~/.hermes`` symlink to that same stateDir,
+    so the gateway service and an interactive CLI share one ``$HERMES_HOME``
+    at two different uids. Forcing 0700 there locks whichever side ran second
+    out of the recovery directory — including the operator who has to salvage
+    an agent-history snapshot by hand. Omitting the explicit mode lets the
+    inherited setgid + umask land 2770, matching ``ensure_hermes_home``'s
+    managed branch and its ``logs/curator`` lazy-mkdir precedent.
+    """
     from hermes_constants import get_hermes_home
 
     flush_dir = get_hermes_home() / "pending_messages"
+    if _managed_install():
+        # Let the NixOS-configured setgid + umask decide, and skip the
+        # reconciler (which stands down under is_managed() anyway).
+        flush_dir.mkdir(parents=True, exist_ok=True)
+        return flush_dir
     flush_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    if os.name == "posix":
-        os.chmod(flush_dir, 0o700)
+    _reconcile_flush_dir_mode(flush_dir)
     return flush_dir
 
 
