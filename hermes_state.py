@@ -50,6 +50,7 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     _FTS_TRIGGERS,
     _LISTABLE_CHILD_SQL,
     _PREVIEW_RAW_SELECT,
+    _enrich_delegation_fields,
     _ephemeral_child_sql,
     _shape_preview,
     DEFERRED_INDEX_SQL,
@@ -4697,7 +4698,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 "SELECT * FROM sessions WHERE id = ?", (session_id,)
             )
             row = cursor.fetchone()
-        return dict(row) if row else None
+        return _enrich_delegation_fields(dict(row)) if row else None
 
     def resolve_session_id(self, session_id_or_prefix: str) -> Optional[str]:
         """Resolve an exact or uniquely prefixed session ID to the full ID.
@@ -5422,6 +5423,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             s["preview"] = _shape_preview(s.pop("_preview_raw", ""))
             # Drop the internal ordering column so callers see a clean dict.
             s.pop("_effective_last_active", None)
+            _enrich_delegation_fields(s)
             sessions.append(s)
 
         # Back-fill pinned conversations the page missed. A pin outlives
@@ -5460,6 +5462,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 if s["id"] in seen_ids:
                     continue
                 s["preview"] = _shape_preview(s.pop("_preview_raw", ""))
+                _enrich_delegation_fields(s)
                 seen_ids.add(s["id"])
                 sessions.append(s)
 
@@ -5490,10 +5493,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     "id", "ended_at", "end_reason", "message_count",
                     "tool_call_count", "title", "last_active", "preview",
                     "model", "system_prompt", "cwd", "git_branch", "git_repo_root",
+                    "delegate_from", "is_delegate_child",
                 ):
                     if key in tip_row:
                         merged[key] = tip_row[key]
                 merged["_lineage_root_id"] = s["id"]
+                _enrich_delegation_fields(merged)
                 projected.append(merged)
             sessions = projected
 

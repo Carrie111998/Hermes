@@ -17,6 +17,7 @@ from agent.skill_commands import SKILL_SCAFFOLD_SQL_LIKE
 from hermes_state_common import (
     SCHEMA_SQL,
     _PREVIEW_RAW_SELECT,
+    _enrich_delegation_fields,
     _shape_preview,
 )
 
@@ -125,6 +126,7 @@ class SessionPortabilityMixin:
         for row in rows:
             s = dict(row)
             s["preview"] = _shape_preview(s.pop("_preview_raw", ""))
+            _enrich_delegation_fields(s)
             runs.append(s)
         return runs
 
@@ -162,7 +164,7 @@ class SessionPortabilityMixin:
             return None
         s = dict(row)
         s["preview"] = _shape_preview(s.pop("_preview_raw", ""))
-        return s
+        return _enrich_delegation_fields(s)
 
     def get_session_rich_row(self, session_id: str, compact_rows: bool = False) -> Optional[Dict[str, Any]]:
         """Public wrapper for :meth:`_get_session_rich_row`.
