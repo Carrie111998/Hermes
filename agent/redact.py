@@ -445,18 +445,15 @@ _PREFIX_RE = re.compile(
 
 # C0 control chars (except \n and \t, which carry real line structure), C1
 # controls (0x80-0x9F), DEL (0x7F), plus zero-width / format chars. \r is
-# dropped too: it is redundant with \n in CRLF and never carries meaning alone
-# in modern output, so removing it can't corrupt structure — and it fixes
-# CR-split secrets (issue #77484). Dropping \n/\t would merge lines and break
-# the line-anchored _CFG_*_RE passes, so a token split by a raw newline stays
-# split (pathological — real secrets are single-line).
-# Gate + full pattern (see redact_sensitive_text).
+# covered by the C0 range (0x0d) but handled separately at the call site
+# (normalized to \n as redundant with \n in CRLF). Dropping \n/\t would merge
+# lines and break the line-anchored _CFG_*_RE passes, so a token split by a
+# raw newline stays split (pathological — real secrets are single-line).
 _HAS_CONTROL_RE = re.compile(
     r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\x80-\x9f\u200b-\u200f\u202a-\u202e\u2060-\u2064]"
 )
 _CONTROL_RE = _HAS_CONTROL_RE
-# \r additionally dropped (redundant with \n in CRLF).
-_HAS_CR_RE = re.compile(r"\r")
+# \r normalized to \n at the call site (redundant with \n in CRLF).
 _CRLF_RE = re.compile(r"\r\n?")
 # Display-mask strip: EVERY control incl. \n/\t — a masked secret must never
 # emit multiline or tabbed output into config/status/dump display (#55319).
