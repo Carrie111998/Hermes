@@ -82,3 +82,28 @@ export function matchesAllowedUser(senderId, allowedUsers, sessionDir) {
 
   return false;
 }
+
+// Group JIDs look like "120363427286014824@g.us" — strip the suffix so the
+// allowlist only has to store bare group IDs (matches WHATSAPP_ALLOWED_GROUPS docs).
+export function parseAllowedGroups(rawValue) {
+  return new Set(
+    String(rawValue || '')
+      .split(',')
+      .map((value) => String(value || '').trim().replace(/@.*/, ''))
+      .filter(Boolean)
+  );
+}
+
+export function matchesAllowedGroup(groupJid, allowedGroups) {
+  if (!allowedGroups || allowedGroups.size === 0) {
+    return false;
+  }
+
+  // "*" means allow all groups (consistent with matchesAllowedUser's '*' convention)
+  if (allowedGroups.has('*')) {
+    return true;
+  }
+
+  const id = String(groupJid || '').replace(/@.*/, '');
+  return allowedGroups.has(id);
+}
