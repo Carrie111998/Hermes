@@ -8,7 +8,9 @@ import { openExternalLink } from '@/lib/external-link'
 import {
   $billingBlock,
   $billingSettingsRequest,
+  billingBlockPresentation,
   billingCtaLabel,
+  billingRecoveryAvailable,
   clearBillingBlock,
   requestBillingSettings,
   runBillingRecovery,
@@ -76,6 +78,55 @@ test('managed recovery never navigates to the hidden in-app Billing surface', ()
 
   expect($billingSettingsRequest.get()).toBe(0)
   expect(openExternalLink).not.toHaveBeenCalled()
+})
+
+test('managed recovery exposes no action, including provider-owned billing URLs', () => {
+  Object.defineProperty(window, 'hermesDesktop', {
+    configurable: true,
+    value: { eva: {} },
+    writable: true
+  })
+
+  expect(billingRecoveryAvailable(makeBlock())).toBe(false)
+  expect(billingRecoveryAvailable(makeBlock({ is_nous: true, provider: 'nous' }))).toBe(false)
+})
+
+test('managed credit-wall presentation ignores backend entitlement and provider copy', () => {
+  const presentation = billingBlockPresentation(
+    makeBlock({
+      message: 'Your Nous subscription has no credits. Open https://portal.nousresearch.com/billing.',
+      provider: 'nous',
+      provider_label: 'Nous Portal'
+    }),
+    true,
+    {
+      fallbackMessage: 'Add credits to keep going.',
+      titleNous: 'Out of Nous credits',
+      titleProvider: provider => `Out of credits — ${provider}`
+    }
+  )
+
+  expect(presentation).toEqual({
+    message: 'Contact Electric Sheep support to restore access.',
+    title: 'evaOS Agent access unavailable'
+  })
+})
+
+test('unmanaged credit-wall presentation preserves upstream provider and backend copy', () => {
+  const presentation = billingBlockPresentation(
+    makeBlock({ message: 'Raw backend entitlement.\nMore detail.' }),
+    false,
+    {
+      fallbackMessage: 'Fallback.',
+      titleNous: 'Out of Nous credits',
+      titleProvider: provider => `Out of credits — ${provider}`
+    }
+  )
+
+  expect(presentation).toEqual({
+    message: 'Raw backend entitlement.',
+    title: 'Out of credits — OpenAI'
+  })
 })
 
 test('runBillingRecovery deep-links a third-party provider to its billing page', () => {

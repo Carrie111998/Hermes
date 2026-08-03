@@ -8,6 +8,7 @@ import { readActiveTerminal } from '@/app/right-sidebar/terminal/buffer'
 import { closeAgentTerminalByProc } from '@/app/right-sidebar/terminal/terminals'
 import { burstVibeHearts } from '@/components/chat/vibe-hearts'
 import { translateNow } from '@/i18n'
+import { isManagedEvaosAgent } from '@/i18n/managed-brand'
 import { type GatewayEventPayload, textPart } from '@/lib/chat-messages'
 import { coerceGatewayText, coerceThinkingText, normalizePersonalityValue } from '@/lib/chat-runtime'
 import { playCompletionSound } from '@/lib/completion-sound'
@@ -18,7 +19,13 @@ import { isProviderSetupErrorMessage } from '@/lib/provider-setup-errors'
 import { invalidateSlashCompletions } from '@/lib/slash-completion-cache'
 import { type AgentNoticePayload, clearAgentNotice, nativeNoticeInput, showAgentNotice } from '@/store/agent-notices'
 import { reconcileApprovalModeForProfile } from '@/store/approval-mode'
-import { billingCtaLabel, clearBillingBlock, runBillingRecovery, setBillingBlock } from '@/store/billing-block'
+import {
+  billingBlockPresentation,
+  billingCtaLabel,
+  clearBillingBlock,
+  runBillingRecovery,
+  setBillingBlock
+} from '@/store/billing-block'
 import { clearClarifyRequest, normalizeChoices, setClarifyRequest, warnDroppedChoices } from '@/store/clarify'
 import { setSessionCompacting } from '@/store/compaction'
 import { refreshBackgroundProcesses } from '@/store/composer-status'
@@ -76,10 +83,6 @@ import { finalizeInterruptedMessages } from '../use-prompt-actions/rewind'
 
 import { hasSessionInfoStatePatch, sessionInfoStatePatch, SUBAGENT_EVENT_TYPES, toTodoPayload } from './utils'
 
-function firstBillingLine(text: string): string {
-  return (text || '').split('\n')[0]?.trim() ?? ''
-}
-
 /**
  * A turn failed on a billing wall (out of credits / payment required). The
  * gateway forwards the structured descriptor built by `agent/billing_links.py`;
@@ -100,23 +103,31 @@ function surfaceBillingBlock(sessionId: string, raw: unknown): void {
 
   setBillingBlock(sessionId, block)
 
+  const managedEva = isManagedEvaosAgent()
+
   const ctaCopy = {
     addCredits: translateNow('billingBlock.addCredits'),
     openBilling: translateNow('billingBlock.openBilling')
   }
+
+  const presentation = billingBlockPresentation(block, managedEva, {
+    fallbackMessage: translateNow('billingBlock.fallbackMessage'),
+    titleNous: translateNow('billingBlock.titleNous'),
+    titleProvider: provider => translateNow('billingBlock.titleProvider', provider)
+  })
 
   notify({
     // Collapse repeat walls from the same provider into one toast.
     id: `billing-block:${block.provider}`,
     kind: 'warning',
     icon: 'credit-card',
-    title: block.is_nous
-      ? translateNow('billingBlock.titleNous')
-      : translateNow('billingBlock.titleProvider', block.provider_label),
-    message: firstBillingLine(block.message) || translateNow('billingBlock.fallbackMessage'),
+    title: presentation.title,
+    message: presentation.message,
     // Sticky: a credit wall blocks every turn until resolved.
     durationMs: 0,
-    action: { label: billingCtaLabel(block, ctaCopy), onClick: () => runBillingRecovery(block) }
+    action: managedEva
+      ? undefined
+      : { label: billingCtaLabel(block, ctaCopy), onClick: () => runBillingRecovery(block) }
   })
 }
 

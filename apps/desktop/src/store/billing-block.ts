@@ -26,6 +26,35 @@ export const $billingBlock = atom<ActiveBillingBlock | null>(null)
  */
 export const $billingSettingsRequest = atom(0)
 
+export interface BillingBlockPresentationCopy {
+  fallbackMessage: string
+  titleNous: string
+  titleProvider: (provider: string) => string
+}
+
+export interface BillingBlockPresentation {
+  message: string
+  title: string
+}
+
+export function billingBlockPresentation(
+  block: BillingBlock,
+  managed: boolean,
+  copy: BillingBlockPresentationCopy
+): BillingBlockPresentation {
+  if (managed) {
+    return {
+      title: 'evaOS Agent access unavailable',
+      message: 'Contact Electric Sheep support to restore access.'
+    }
+  }
+
+  return {
+    title: block.is_nous ? copy.titleNous : copy.titleProvider(block.provider_label),
+    message: block.message.split('\n')[0]?.trim() || copy.fallbackMessage
+  }
+}
+
 export function setBillingBlock(sessionId: string, block: BillingBlock): void {
   $billingBlock.set({ at: Date.now(), block, sessionId })
 }
@@ -50,8 +79,8 @@ export function requestBillingSettings(): void {
   $billingSettingsRequest.set($billingSettingsRequest.get() + 1)
 }
 
-export function billingRecoveryAvailable(block: BillingBlock): boolean {
-  return !isManagedEvaosAgent() || (!block.is_nous && Boolean(block.billing_url))
+export function billingRecoveryAvailable(_block: BillingBlock): boolean {
+  return !isManagedEvaosAgent()
 }
 
 /**
@@ -59,8 +88,8 @@ export function billingRecoveryAvailable(block: BillingBlock): boolean {
  * in-chat banner so both behave identically: Nous routes to the upstream
  * Settings → Billing surface; a third-party provider deep-links to its own
  * billing page (falling back to the in-app surface only if we have no URL).
- * Managed evaOS Agent exposes no in-app Billing route, so only a provider-owned
- * external URL remains actionable.
+ * Managed evaOS Agent exposes no billing action; Electric Sheep owns account
+ * recovery outside the upstream provider surfaces.
  */
 export function runBillingRecovery(block: BillingBlock): void {
   if (!billingRecoveryAvailable(block)) {
