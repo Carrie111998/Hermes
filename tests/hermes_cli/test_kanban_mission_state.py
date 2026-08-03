@@ -1441,3 +1441,112 @@ class TestR1OutcomeVocabulary:
             operation_id="op-t", next_state=next_state,
         )
         assert r.outcome == "replayed"
+
+
+# ---------------------------------------------------------------------------
+# kanban_db.connect() integration — mission-state tables auto-created
+# ---------------------------------------------------------------------------
+
+class TestConnectIntegration:
+    """Verify that kanban_db.connect() automatically creates mission-state
+    tables and indexes, so callers never need manual ensure_mission_state_schema().
+    """
+
+    def test_connect_creates_mission_tables_on_fresh_db(self, tmp_path):
+        """A fresh DB opened via connect() has mission tables immediately."""
+        from hermes_cli import kanban_db as kb
+        db_path = tmp_path / "fresh_kanban.db"
+        conn = kb.connect(db_path)
+        try:
+            tables = {row[0] for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()}
+            assert "mission_missions" in tables, f"Missing mission_missions in {tables}"
+            assert "mission_journal" in tables, f"Missing mission_journal in {tables}"
+            # K9 tables also present
+            assert "tasks" in tables, f"Missing tasks in {tables}"
+        finally:
+            conn.close()
+
+    def test_connect_creates_mission_index(self, tmp_path):
+        """The request_fingerprint index is created by connect()."""
+        from hermes_cli import kanban_db as kb
+        db_path = tmp_path / "fresh_kanban2.db"
+        conn = kb.connect(db_path)
+        try:
+            indexes = {row[0] for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index'"
+            ).fetchall()}
+            assert "idx_mission_journal_request_fingerprint" in indexes
+        finally:
+            conn.close()
+
+    def test_connect_preserves_k9_data(self, tmp_path):
+        """Opening a DB with existing K9 data adds mission tables without loss."""
+        from hermes_cli import kanban_db as kb
+        db_path = tmp_path / "k9_existing.db"
+        # Create a K9 DB first
+        conn1 = kb.connect(db_path)
+        conn1.execute(
+            "INSERT INTO tasks (id, title, status, created_at) "
+            "VALUES ('t1', 'my task', 'running', 0)"
+        )
+        conn1.commit()
+        conn1.close()
+
+        # Reopen — mission tables should appear, K9 data preserved
+        conn2 = kb.connect(db_path)
+        try:
+            tables = {row[0] for row in conn2.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()}
+            assert "mission_missions" in tables
+            assert "tasks" in tables
+            row = conn2.execute("SELECT title FROM tasks WHERE id='t1'").fetchone()
+            assert row is not None
+            assert row[0] == "my task"
+        finally:
+            conn2.close()
+
+    def test_connect_idempotent(self, tmp_path):
+        """Opening the same DB multiple times via connect() is safe."""
+        from hermes_cli import kanban_db as kb
+        db_path = tmp_path / "idempotent.db"
+        for _ in range(3):
+            conn = kb.connect(db_path)
+            tables = {row[0] for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()}
+            assert "mission_missions" in tables
+            assert "mission_journal" in tables
+            conn.close()
+
+    def test_create_mission_works_after_connect(self, tmp_path):
+        """create_mission() works immediately after connect() — no manual migration."""
+        from hermes_cli import kanban_db as kb
+        db_path = tmp_path / "api_ready.db"
+        conn = kb.connect(db_path)
+        try:
+            state = _make_state()
+            result = ms.create_mission(conn, state=state, operation_id="op-integ")
+            assert result.outcome == "created"
+            record = ms.get_mission(conn, "mission-1")
+            assert record is not None
+            assert record.status == "planned"
+        finally:
+            conn.close()
+
+    def test_init_db_creates_mission_tables(self, tmp_path):
+        """init_db() also creates mission-state tables."""
+        from hermes_cli import kanban_db as kb
+        db_path = tmp_path / "init_db_test.db"
+        kb.init_db(db_path)
+        conn = kb.connect(db_path)
+        try:
+            tables = {row[0] for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()}
+            assert "mission_missions" in tables
+            assert "mission_journal" in tables
+        finally:
+            conn.close()

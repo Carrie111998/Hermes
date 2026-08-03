@@ -2251,6 +2251,11 @@ def connect(
                     # stale PRAGMA snapshots during gateway startup.
                     conn.executescript(SCHEMA_SQL)
                     _migrate_add_optional_columns(conn)
+                    # R2 durable mission-state tables.  Lazy import avoids circular
+                    # dependency (kanban_mission_state imports kanban_db).  Direct
+                    # import — a missing module is an init failure that must surface.
+                    from hermes_cli.kanban_mission_state import migrate_mission_state
+                    migrate_mission_state(conn)
                     _INITIALIZED_PATHS.add(resolved)
         except Exception:
             conn.close()
