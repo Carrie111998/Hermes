@@ -16717,6 +16717,7 @@ class IapStoppedReleaseTransport(IapCoordinatorTransport):
         remote_argv: Sequence[str],
         *,
         account: str,
+        failure_code: str = "stopped_release_remote_failed",
         allowed_returncodes: frozenset[int] = frozenset({0}),
         timeout_seconds: float = 300.0,
         maximum_output_bytes: int = _HTTP_RESPONSE_MAX_BYTES,
@@ -16731,6 +16732,9 @@ class IapStoppedReleaseTransport(IapCoordinatorTransport):
             or not 0 < maximum_output_bytes <= (
                 _STOPPED_RELEASE_REMOTE_OUTPUT_MAX_BYTES
             )
+            or not isinstance(failure_code, str)
+            or re.fullmatch(r"stopped_release_[a-z0-9_]{3,47}", failure_code)
+            is None
         ):
             raise OwnerLauncherError("stopped_release_remote_contract_invalid")
         authorization_before = self._authorization_snapshot(account)
@@ -16766,7 +16770,7 @@ class IapStoppedReleaseTransport(IapCoordinatorTransport):
             or not isinstance(completed.stdout, bytes)
             or len(completed.stdout) > maximum_output_bytes
         ):
-            raise OwnerLauncherError("stopped_release_remote_failed")
+            raise OwnerLauncherError(failure_code)
         return completed
 
     def _run_remote_input(
@@ -16846,6 +16850,7 @@ class IapStoppedReleaseTransport(IapCoordinatorTransport):
                 "%f",
             ),
             account=account,
+            failure_code="stopped_release_source_probe_failed",
             maximum_output_bytes=40,
         )
         if completed.stdout == b"":
@@ -16874,11 +16879,12 @@ class IapStoppedReleaseTransport(IapCoordinatorTransport):
                         source_root,
                     ),
                     account=account,
+                    failure_code="stopped_release_source_clone_failed",
                     timeout_seconds=900.0,
                 )
             except OwnerLauncherError as exc:
                 if (
-                    exc.code != "stopped_release_remote_failed"
+                    exc.code != "stopped_release_source_clone_failed"
                     or not self._revision_source_exists(
                         release_sha,
                         account=account,
@@ -16897,6 +16903,7 @@ class IapStoppedReleaseTransport(IapCoordinatorTransport):
                 "origin",
             ),
             account=account,
+            failure_code="stopped_release_repository_probe_failed",
             maximum_output_bytes=512,
         )
         inside_work_tree = self._run_remote(
@@ -16909,6 +16916,7 @@ class IapStoppedReleaseTransport(IapCoordinatorTransport):
                 "--is-inside-work-tree",
             ),
             account=account,
+            failure_code="stopped_release_worktree_probe_failed",
             maximum_output_bytes=16,
         )
         if (
@@ -16929,6 +16937,7 @@ class IapStoppedReleaseTransport(IapCoordinatorTransport):
                 release_sha,
             ),
             account=account,
+            failure_code="stopped_release_source_checkout_failed",
         )
         head = self._run_remote(
             (
@@ -16941,6 +16950,7 @@ class IapStoppedReleaseTransport(IapCoordinatorTransport):
                 "HEAD",
             ),
             account=account,
+            failure_code="stopped_release_head_probe_failed",
             maximum_output_bytes=64,
         )
         detached = self._run_remote(
@@ -16954,6 +16964,7 @@ class IapStoppedReleaseTransport(IapCoordinatorTransport):
                 "HEAD",
             ),
             account=account,
+            failure_code="stopped_release_detached_probe_failed",
             allowed_returncodes=frozenset({1}),
             maximum_output_bytes=512,
         )
@@ -16968,6 +16979,7 @@ class IapStoppedReleaseTransport(IapCoordinatorTransport):
                 "--untracked-files=all",
             ),
             account=account,
+            failure_code="stopped_release_status_probe_failed",
             maximum_output_bytes=8_192,
         )
         if (
@@ -17014,6 +17026,11 @@ class IapStoppedReleaseTransport(IapCoordinatorTransport):
         completed = self._run_remote(
             remote,
             account=account,
+            failure_code=(
+                "stopped_release_apply_remote_failed"
+                if command == "apply"
+                else "stopped_release_plan_remote_failed"
+            ),
             timeout_seconds=2_400.0 if command == "apply" else 300.0,
         )
         if (
