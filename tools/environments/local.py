@@ -1970,7 +1970,9 @@ class LocalEnvironment(BaseEnvironment):
     is_local = True
 
     def _additional_profile_scoped_passthrough_names(self) -> tuple[str, ...]:
-        """Return first-party terminal env names (``BUZZ_*``) present in the
+        """Keep local identity and first-party terminal vars out of snapshots.
+
+        Return first-party terminal env names (``BUZZ_*``) present in the
         current env, so they are excluded from the shared session snapshot.
 
         The login-shell snapshot (``init_session`` ``export -p`` dump and the
@@ -1991,17 +1993,17 @@ class LocalEnvironment(BaseEnvironment):
         so a later profile that lacks the var still gets the unset-guard.
         """
         merged = dict(os.environ | self.env)
-        return tuple(
-            sorted(
-                name
-                for name in merged
-                # Prefix-only on purpose: the snapshot exclusion stays
-                # conservative even when the context-gated carve-out is
-                # inactive (the var then never reaches the child env anyway,
-                # but a monotonic exclusion is a cheap extra guard).
-                if isinstance(name, str) and _matches_terminal_first_party_prefix(name)
-            )
+        names = {"HOME", "HERMES_HOME", "HERMES_REAL_HOME"}
+        names.update(
+            name
+            for name in merged
+            # Prefix-only on purpose: the snapshot exclusion stays
+            # conservative even when the context-gated carve-out is
+            # inactive (the var then never reaches the child env anyway,
+            # but a monotonic exclusion is a cheap extra guard).
+            if isinstance(name, str) and _matches_terminal_first_party_prefix(name)
         )
+        return tuple(sorted(names))
 
     def __init__(self, cwd: str = "", timeout: int = 60, env: dict = None):
         cwd = _resolve_local_initial_cwd(cwd)
