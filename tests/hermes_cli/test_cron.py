@@ -20,6 +20,16 @@ def tmp_cron_dir(tmp_path, monkeypatch):
 
 class TestCronCommandLifecycle:
 
+    def test_show_prints_full_prompt(self, tmp_cron_dir, capsys):
+        prompt = "A complete instruction that is longer than the list preview. " * 3
+        job = create_job(prompt=prompt, schedule="every 1h", name="inspect me")
+
+        assert cron_command(Namespace(cron_command="show", job_id=job["id"])) == 0
+
+        output = capsys.readouterr().out
+        assert prompt in output
+        assert "inspect me" in output
+
     def test_edit_can_replace_and_clear_skills(self, tmp_cron_dir, capsys):
         job = create_job(
             prompt="Combine skill outputs",

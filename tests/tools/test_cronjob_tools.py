@@ -10,6 +10,39 @@ from tools.cronjob_tools import (
 )
 
 
+def test_get_returns_full_prompt_while_list_stays_compact(tmp_path, monkeypatch):
+    monkeypatch.setattr("cron.jobs.CRON_DIR", tmp_path / "cron")
+    monkeypatch.setattr("cron.jobs.JOBS_FILE", tmp_path / "cron" / "jobs.json")
+    monkeypatch.setattr("cron.jobs.OUTPUT_DIR", tmp_path / "cron" / "output")
+    prompt = "Inspect the complete scheduled instruction. " * 4
+
+    created = json.loads(cronjob(action="create", prompt=prompt, schedule="every 1h", name="full prompt"))
+    listed = json.loads(cronjob(action="list"))
+    fetched = json.loads(cronjob(action="get", job_id="full prompt"))
+
+    assert listed["jobs"][0]["prompt_preview"].endswith("...")
+    assert "prompt" not in listed["jobs"][0]
+    assert fetched["success"] is True
+    assert fetched["job"]["job_id"] == created["job_id"]
+    assert fetched["job"]["prompt"] == prompt
+
+
+def test_get_keeps_existing_not_found_and_ambiguous_name_errors(tmp_path, monkeypatch):
+    monkeypatch.setattr("cron.jobs.CRON_DIR", tmp_path / "cron")
+    monkeypatch.setattr("cron.jobs.JOBS_FILE", tmp_path / "cron" / "jobs.json")
+    monkeypatch.setattr("cron.jobs.OUTPUT_DIR", tmp_path / "cron" / "output")
+    cronjob(action="create", prompt="first", schedule="every 1h", name="duplicate")
+    cronjob(action="create", prompt="second", schedule="every 2h", name="duplicate")
+
+    missing = json.loads(cronjob(action="get", job_id="missing"))
+    ambiguous = json.loads(cronjob(action="get", job_id="duplicate"))
+
+    assert missing["success"] is False
+    assert "not found" in missing["error"]
+    assert ambiguous["success"] is False
+    assert len(ambiguous["matches"]) == 2
+
+
 # =========================================================================
 # Cron prompt scanning
 # =========================================================================

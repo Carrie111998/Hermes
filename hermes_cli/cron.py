@@ -439,6 +439,20 @@ def cron_edit(args):
     return 0
 
 
+def cron_show(args):
+    """Print one cron job's full prompt and inspectable configuration."""
+    result = _cron_api(action="get", job_id=args.job_id)
+    if not result.get("success"):
+        print(color(f"Failed to show job: {result.get('error', 'unknown error')}", Colors.RED))
+        return 1
+
+    job = result["job"]
+    print(color(f"Cron job: {job['name']} ({job['job_id']})", Colors.CYAN))
+    print(f"  Schedule: {job['schedule']}")
+    print(f"  Prompt: {job['prompt']}")
+    return 0
+
+
 def _job_action(action: str, job_id: str, success_verb: str) -> int:
     result = _cron_api(action=action, job_id=job_id)
     if not result.get("success"):
@@ -487,6 +501,9 @@ def cron_command(args):
     if subcmd == "edit":
         return cron_edit(args)
 
+    if subcmd == "show":
+        return cron_show(args)
+
     if subcmd == "pause":
         return _job_action("pause", args.job_id, "Paused")
 
@@ -500,5 +517,5 @@ def cron_command(args):
         return _job_action("remove", args.job_id, "Removed")
 
     print(f"Unknown cron command: {subcmd}")
-    print("Usage: hermes cron [list|create|edit|pause|resume|run|remove|status|runs|tick]")
+    print("Usage: hermes cron [list|show|create|edit|pause|resume|run|remove|status|runs|tick]")
     sys.exit(1)

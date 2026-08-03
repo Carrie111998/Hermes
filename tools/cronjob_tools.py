@@ -589,6 +589,13 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
     return result
 
 
+def _format_job_detail(job: Dict[str, Any]) -> Dict[str, Any]:
+    """Return an inspectable job record without weakening list's compact view."""
+    result = _format_job(job)
+    result["prompt"] = str(job.get("prompt") or "")
+    return result
+
+
 def _execute_job_now(job: Dict[str, Any]) -> Dict[str, Any]:
     """Execute a cron job immediately, outside the scheduler tick.
 
@@ -858,6 +865,9 @@ def cronjob(
         # Resolve to canonical ID (supports name-based lookup)
         job_id = job["id"]
 
+        if normalized in {"get", "show"}:
+            return json.dumps({"success": True, "job": _format_job_detail(job)}, indent=2)
+
         if normalized == "remove":
             removed = remove_job(job_id)
             if not removed:
@@ -1029,7 +1039,7 @@ CRONJOB_SCHEMA = {
     "description": """Manage scheduled cron jobs with a single compressed tool.
 
 Use action='create' to schedule a new job from a prompt or one or more skills.
-Use action='list' to inspect jobs.
+Use action='list' to inspect jobs and action='get' to read one job's complete prompt.
 Use action='update', 'pause', 'resume', 'remove', or 'run' to manage an existing job.
 
 To stop a job the user no longer wants: first action='list' to find the job_id, then action='remove' with that job_id. Never guess job IDs — always list first.
@@ -1048,11 +1058,11 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
         "properties": {
             "action": {
                 "type": "string",
-                "description": "One of: create, list, update, pause, resume, remove, run. When action=create, the 'schedule' and 'prompt' fields are REQUIRED."
+                "description": "One of: create, list, get, update, pause, resume, remove, run. When action=create, the 'schedule' and 'prompt' fields are REQUIRED."
             },
             "job_id": {
                 "type": "string",
-                "description": "Required for update/pause/resume/remove/run"
+                "description": "Required for get/update/pause/resume/remove/run"
             },
             "prompt": {
                 "type": "string",
