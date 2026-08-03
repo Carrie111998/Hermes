@@ -6955,20 +6955,24 @@ def _terminate_reclaimed_worker(
     # signal the entire group so descendant processes are also terminated.
     _use_group = False
     if signal_fn is None and hasattr(os, "killpg") and hasattr(os, "getpgid"):
-        try:
-            _use_group = os.getpgid(int(pid)) == int(pid)
-        except (ProcessLookupError, OSError):
-            _use_group = False
+        _getpgid = getattr(os, "getpgid", None)
+        if _getpgid is not None:
+            try:
+                _use_group = _getpgid(int(pid)) == int(pid)
+            except (ProcessLookupError, OSError):
+                _use_group = False
 
     def _signal_target(_pid: int, _sig: int) -> None:
         if _use_group:
-            try:
-                os.killpg(_pid, _sig)
-                return
-            except ProcessLookupError:
-                raise
-            except OSError:
-                pass
+            _kp = getattr(os, "killpg", None)
+            if _kp:
+                try:
+                    _kp(_pid, _sig)
+                    return
+                except ProcessLookupError:
+                    raise
+                except OSError:
+                    pass
         kill(_pid, _sig)
 
     try:
