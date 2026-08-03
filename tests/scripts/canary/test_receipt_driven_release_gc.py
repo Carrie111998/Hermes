@@ -2,11 +2,28 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+from contextlib import nullcontext
 from pathlib import Path
 
 import pytest
 
 from scripts.canary import receipt_driven_release_gc as gc
+
+
+@pytest.fixture(autouse=True)
+def _local_lifecycle(monkeypatch):
+    monkeypatch.setattr(gc, "host_release_lifecycle_lock", lambda: nullcontext())
+    monkeypatch.setattr(
+        gc,
+        "_rename_noreplace",
+        lambda old_fd, old, new_fd, new: os.rename(
+            old,
+            new,
+            src_dir_fd=old_fd,
+            dst_dir_fd=new_fd,
+        ),
+    )
 
 
 def _sha(index: int) -> str:
@@ -51,6 +68,34 @@ def _terminal_receipt(
 ) -> Path:
     path = layout.evidence_base / revision / gc.RECEIPT_NAME
     path.parent.mkdir(parents=True)
+    manifest_unsigned = {
+        "schema": gc.RELEASE_MANIFEST_SCHEMA,
+        "revision": revision,
+        "artifact_root": str(layout.release_base / revision),
+        "python_version": "3.11.15",
+        "interpreter": str(layout.release_base / revision / "bin/python"),
+        "writer_module": "gateway.canonical_writer",
+        "writer_module_origin": str(layout.release_base / revision / "writer.py"),
+        "gateway_module": "gateway.run",
+        "gateway_module_origin": str(layout.release_base / revision / "gateway.py"),
+        "entries": [],
+    }
+    manifest = {
+        **manifest_unsigned,
+        "artifact_sha256": hashlib.sha256(
+            json.dumps(
+                manifest_unsigned,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode("utf-8")
+        ).hexdigest(),
+    }
+    manifest_path = layout.release_base / revision / gc.MANIFEST_NAME
+    manifest_raw = _canonical(manifest)
+    if manifest_path.parent.is_dir():
+        manifest_path.write_bytes(manifest_raw)
+        manifest_path.chmod(0o400)
     unsigned = {
         "schema": gc.STOPPED_RECEIPT_SCHEMA,
         "ok": ok,
@@ -58,6 +103,9 @@ def _terminal_receipt(
         "services_stopped_and_disabled": services_stopped_and_disabled,
         "release_revision": revision,
         "release_root": str(layout.release_base / revision),
+        "release_manifest_path": str(manifest_path),
+        "release_manifest_file_sha256": hashlib.sha256(manifest_raw).hexdigest(),
+        "release_artifact_sha256": manifest["artifact_sha256"],
         "receipt_path": str(path),
         "source": {
             "repository": gc.FORK_REPOSITORY,
@@ -65,6 +113,11 @@ def _terminal_receipt(
             "head_sha": revision,
             "tree_sha": _sha(900),
         },
+        "service_state_before": [{"unit": "canary", "state": "absent"}],
+        "service_state_after": [{"unit": "canary", "state": "absent"}],
+        "host_identity_receipt_path": "/var/lib/muncho-canary/host.json",
+        "host_identity_receipt_file_sha256": "d" * 64,
+        "host_identity_receipt_sha256": "e" * 64,
         "created_at_unix": created_at_unix,
     }
     receipt = {**unsigned, "receipt_sha256": gc._sha256_json(unsigned)}
@@ -95,6 +148,18 @@ def _pair(
 
 def _unit(plan: dict, revision: str) -> dict:
     return next(unit for unit in plan["units"] if unit["revision"] == revision)
+
+
+def _protection_inventory(path: Path, *, current, previous, protected) -> Path:
+    unsigned = {
+        "schema": gc.PROTECTION_INVENTORY_SCHEMA,
+        "current_links": [str(item) for item in current],
+        "previous_links": [str(item) for item in previous],
+        "protected_refs": [str(item) for item in protected],
+    }
+    value = {**unsigned, "inventory_sha256": gc._sha256_json(unsigned)}
+    path.write_bytes(_canonical(value))
+    return path
 
 
 def test_plan_is_dry_run_and_retains_latest_three_terminal_releases(tmp_path):
@@ -192,6 +257,77 @@ def test_missing_nonterminal_invalid_and_incomplete_units_are_preserved(tmp_path
         assert "release_source_pair_incomplete" in _unit(plan, revision)["reasons"]
 
 
+def test_incomplete_or_invalid_newer_units_do_not_consume_retention_slots(tmp_path):
+    layout = _layout(tmp_path)
+    complete = [_sha(index) for index in range(1, 6)]
+    for created, revision in enumerate(complete, start=1):
+        _pair(layout, revision, created)
+    release_only = _sha(20)
+    (layout.release_base / release_only).mkdir()
+    _terminal_receipt(layout, release_only, 100)
+    invalid_newest = _sha(21)
+    invalid_path = _pair(layout, invalid_newest, 101)
+    invalid_value = json.loads(invalid_path.read_text(encoding="utf-8"))
+    invalid_value["receipt_sha256"] = "f" * 64
+    invalid_path.chmod(0o600)
+    invalid_path.write_bytes(_canonical(invalid_value))
+    invalid_path.chmod(0o400)
+
+    plan = gc.build_plan(layout, production_sha=_sha(99))
+
+    assert plan["protected"]["newest_complete_terminal_pairs"] == sorted(complete[-3:])
+    assert [_unit(plan, revision)["action"] for revision in complete[:2]] == [
+        "delete_pair",
+        "delete_pair",
+    ]
+    assert _unit(plan, release_only)["action"] == "preserve"
+    assert _unit(plan, invalid_newest)["action"] == "preserve"
+
+
+def test_release_manifest_anchor_must_match_trusted_producer_receipt(tmp_path):
+    layout = _layout(tmp_path)
+    revisions = [_sha(index) for index in range(1, 5)]
+    for created, revision in enumerate(revisions, start=1):
+        _pair(layout, revision, created)
+    tampered = revisions[-1]
+    manifest_path = layout.release_base / tampered / gc.MANIFEST_NAME
+    manifest_path.chmod(0o600)
+    manifest_path.write_bytes(_canonical({"schema": "tampered"}))
+    manifest_path.chmod(0o400)
+
+    plan = gc.build_plan(layout, production_sha=_sha(99))
+
+    unit = _unit(plan, tampered)
+    assert unit["action"] == "preserve"
+    assert "receipt_absent_or_nonterminal" in unit["reasons"]
+
+
+def test_nested_mount_boundary_marks_unit_invalid_and_preserves_it(
+    tmp_path, monkeypatch
+):
+    layout = _layout(tmp_path)
+    revisions = [_sha(index) for index in range(1, 5)]
+    for created, revision in enumerate(revisions, start=1):
+        _pair(layout, revision, created)
+    nested = layout.release_base / revisions[0] / "nested-mount"
+    nested.mkdir()
+    nested_inode = os.lstat(nested).st_ino
+    original_mount_id = gc._mount_id
+
+    def mount_id(fd):
+        if os.fstat(fd).st_ino == nested_inode:
+            return "test:nested-mount"
+        return original_mount_id(fd)
+
+    monkeypatch.setattr(gc, "_mount_id", mount_id)
+
+    plan = gc.build_plan(layout, production_sha=_sha(99))
+
+    unit = _unit(plan, revisions[0])
+    assert unit["action"] == "preserve"
+    assert "invalid_release_or_source_entry" in unit["reasons"]
+
+
 def test_apply_requires_current_exact_plan_digest_before_mutation(tmp_path):
     layout = _layout(tmp_path)
     revisions = [_sha(index) for index in range(1, 5)]
@@ -272,6 +408,95 @@ def test_integration_apply_deletes_only_release_source_unit_and_keeps_evidence(
         assert receipts[revision].is_file()
 
 
+def test_apply_resumes_idempotent_physical_purge_after_crash(tmp_path, monkeypatch):
+    layout = _layout(tmp_path)
+    revisions = [_sha(index) for index in range(1, 5)]
+    for created, revision in enumerate(revisions, start=1):
+        _pair(layout, revision, created)
+    candidate = revisions[0]
+    plan = gc.build_plan(layout, production_sha=_sha(99))
+    assert _unit(plan, candidate)["action"] == "delete_pair"
+    original_purge = gc._purge_tree_at
+    calls = 0
+
+    def crash_after_first_purge(root, name):
+        nonlocal calls
+        original_purge(root, name)
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("simulated crash after first physical purge")
+
+    monkeypatch.setattr(gc, "_purge_tree_at", crash_after_first_purge)
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        gc.apply_plan(
+            layout,
+            production_sha=_sha(99),
+            approved_plan_sha256=plan["plan_sha256"],
+            require_root_linux=False,
+        )
+
+    evidence = layout.evidence_base / candidate
+    assert (evidence / gc.INTENT_NAME).is_file()
+    assert (evidence / gc.LOGICAL_DELETE_NAME).is_file()
+    assert not (evidence / gc.PURGE_NAME).exists()
+    monkeypatch.setattr(gc, "_purge_tree_at", original_purge)
+
+    result = gc.apply_plan(
+        layout,
+        production_sha=_sha(99),
+        approved_plan_sha256=plan["plan_sha256"],
+        require_root_linux=False,
+    )
+
+    assert result["removed_release_source_pairs"] == [candidate]
+    assert not (layout.release_base / candidate).exists()
+    assert not (layout.source_base / candidate).exists()
+    assert (evidence / gc.PURGE_NAME).is_file()
+
+
+def test_apply_resumes_after_crash_between_no_replace_tombstones(tmp_path, monkeypatch):
+    layout = _layout(tmp_path)
+    revisions = [_sha(index) for index in range(1, 5)]
+    for created, revision in enumerate(revisions, start=1):
+        _pair(layout, revision, created)
+    candidate = revisions[0]
+    plan = gc.build_plan(layout, production_sha=_sha(99))
+    original_rename = gc._rename_noreplace
+    calls = 0
+
+    def crash_on_second_rename(old_fd, old, new_fd, new):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("simulated crash between tombstones")
+        original_rename(old_fd, old, new_fd, new)
+
+    monkeypatch.setattr(gc, "_rename_noreplace", crash_on_second_rename)
+    with pytest.raises(RuntimeError, match="between tombstones"):
+        gc.apply_plan(
+            layout,
+            production_sha=_sha(99),
+            approved_plan_sha256=plan["plan_sha256"],
+            require_root_linux=False,
+        )
+
+    evidence = layout.evidence_base / candidate
+    assert (evidence / gc.INTENT_NAME).is_file()
+    assert not (evidence / gc.LOGICAL_DELETE_NAME).exists()
+    monkeypatch.setattr(gc, "_rename_noreplace", original_rename)
+
+    result = gc.apply_plan(
+        layout,
+        production_sha=_sha(99),
+        approved_plan_sha256=plan["plan_sha256"],
+        require_root_linux=False,
+    )
+
+    assert result["removed_release_source_pairs"] == [candidate]
+    assert (evidence / gc.LOGICAL_DELETE_NAME).is_file()
+    assert (evidence / gc.PURGE_NAME).is_file()
+
+
 def test_unknown_entries_are_reported_and_never_removed(tmp_path):
     layout = _layout(tmp_path)
     unknown_release = layout.release_base / "operator-note"
@@ -307,6 +532,13 @@ def test_non_symlink_current_path_fails_closed(tmp_path):
         gc.build_plan(layout, production_sha=_sha(99))
 
 
+def test_missing_listed_current_path_fails_closed(tmp_path):
+    layout = _layout(tmp_path, current_links=(tmp_path / "missing-current",))
+
+    with pytest.raises(FileNotFoundError):
+        gc.build_plan(layout, production_sha=_sha(99))
+
+
 def test_main_defaults_to_dry_run(monkeypatch, capsys):
     observed = {}
 
@@ -315,6 +547,12 @@ def test_main_defaults_to_dry_run(monkeypatch, capsys):
         observed["production_sha"] = production_sha
         return {"schema": gc.PLAN_SCHEMA, "plan_sha256": "a" * 64}
 
+    inventory_layout = gc.GCLayout(
+        current_links=(Path("/current"),),
+        previous_links=(Path("/previous"),),
+        protected_refs=(Path("/protected.json"),),
+    )
+    monkeypatch.setattr(gc, "load_protection_inventory", lambda _path: inventory_layout)
     monkeypatch.setattr(gc, "build_plan", fake_plan)
     monkeypatch.setattr(
         gc,
@@ -322,6 +560,38 @@ def test_main_defaults_to_dry_run(monkeypatch, capsys):
         lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError()),
     )
 
-    assert gc.main(["--production-sha", _sha(1)]) == 0
+    assert (
+        gc.main([
+            "--production-sha",
+            _sha(1),
+            "--protection-inventory",
+            "/inventory.json",
+        ])
+        == 0
+    )
     assert json.loads(capsys.readouterr().out)["schema"] == gc.PLAN_SCHEMA
     assert observed["production_sha"] == _sha(1)
+
+
+def test_cli_fails_closed_when_protection_inventory_is_omitted():
+    with pytest.raises(SystemExit):
+        gc.main(["--production-sha", _sha(1)])
+
+
+def test_protection_inventory_must_contain_every_nonempty_class(tmp_path):
+    path = tmp_path / "inventory.json"
+    unsigned = {
+        "schema": gc.PROTECTION_INVENTORY_SCHEMA,
+        "current_links": ["/current"],
+        "previous_links": [],
+        "protected_refs": ["/protected.json"],
+    }
+    path.write_bytes(
+        _canonical({
+            **unsigned,
+            "inventory_sha256": gc._sha256_json(unsigned),
+        })
+    )
+
+    with pytest.raises(RuntimeError, match="incomplete or invalid"):
+        gc.load_protection_inventory(path)
