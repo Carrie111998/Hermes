@@ -884,9 +884,19 @@ class ShellFileOperations(FileOperations):
         
         # Content analysis: >30% non-printable chars = binary
         if content_sample:
-            non_printable = sum(1 for c in content_sample[:1000]
-                               if ord(c) < 32 and c not in '\n\r\t')
-            return non_printable / min(len(content_sample), 1000) > 0.30
+            sample = content_sample[:1000]
+            sample_len = len(sample)
+            non_printable = sum(1 for c in sample if ord(c) < 32 and c not in '\n\r\t')
+            if non_printable / max(sample_len, 1) > 0.30:
+                return True
+            # High ratio of replacement characters (U+FFFD) indicates a file
+            # opened with the wrong encoding (e.g. GBK text read as UTF-8).
+            # A single split multi-byte char from byte-truncated sampling is
+            # harmless (1-2 chars out of 1000) but GBK-as-UTF-8 produces
+            # many replacement chars (~77% of sample).
+            replacements = sum(1 for c in sample if ord(c) == 0xFFFD)
+            if replacements / max(sample_len, 1) > 0.20:
+                return True
         
         return False
     
@@ -1144,7 +1154,7 @@ class ShellFileOperations(FileOperations):
             )
         
         # Read a sample to check for binary content
-        sample_cmd = f"head -c 1000 {self._escape_shell_arg(path)} 2>/dev/null"
+        sample_cmd = f"head -c 2000 {self._escape_shell_arg(path)} 2>/dev/null"
         sample_result = self._exec(sample_cmd)
         sample_output = _strip_terminal_fence_leaks(sample_result.stdout)
         
