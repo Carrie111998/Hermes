@@ -2515,8 +2515,7 @@ def _cmd_release(args: argparse.Namespace) -> int:
         board_meta = kb.product_board_metadata(board)
         workflow = kb._product_workflow_dict(board_meta)
         policy_name = str(workflow.get("deployment_policy") or "manual").strip()
-        # Keep these names in sync with release_product_task and
-        # _validate_release_completion_evidence.
+        # Keep this name in sync with release_product_task.
         if policy_name not in {"manual", "not_required", "required"}:
             print(
                 f"kanban: cannot release {task_id}: unsupported deployment policy "

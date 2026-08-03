@@ -12600,7 +12600,7 @@ def _resolve_worktree_workspace(
     base = base_branch or "HEAD"
 
     def ensure_epic_base(repo_root: Path) -> None:
-        if base_branch is not None:
+        if base_branch is not None and not _git_branch_exists(repo_root, base_branch):
             _ensure_epic_branch(
                 repo_root,
                 base_branch,
@@ -12708,7 +12708,7 @@ def _resolve_worktree_workspace(
             f"task {task.id} worktree path {task.workspace_path!r} is not inside a git repo "
             "and does not point at a git repo root"
         )
-    if base_branch is not None:
+    if base_branch is not None and not _git_branch_exists(repo_root, base_branch):
         _ensure_epic_branch(
             repo_root,
             base_branch,

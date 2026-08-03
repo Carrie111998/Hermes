@@ -173,7 +173,7 @@ def test_resolve_workspace_derives_the_epic_base_without_an_explicit_argument(
     assert _git(repo, "rev-parse", epic_branch) == base_sha
 
 
-def test_reusing_an_existing_story_worktree_restores_a_missing_epic_base(
+def test_reusing_a_story_worktree_refuses_to_recreate_a_missing_epic_base(
     epic_home, tmp_path
 ):
     """A missing historical epic base must not follow a moved current HEAD."""
