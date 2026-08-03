@@ -1082,6 +1082,28 @@ _docker_orphan_reaper_ran = False
 _docker_orphan_reaper_lock = threading.Lock()
 
 
+def _sanitize_terminal_output(text: str, command: str = "") -> str:
+    """Apply strip_ansi and redact_terminal_output to a single string.
+
+    Mirrors the normal-output sanitization pipeline but callable on
+    individual strings (error messages, tracebacks) rather than full
+    command output.  Used by the exception-return paths in the
+    foreground execution loop so raw exception text is never surfaced
+    to the model without the same scrubbing normal output receives.
+    """
+    try:
+        from tools.ansi_strip import strip_ansi
+        text = strip_ansi(text)
+    except Exception:
+        pass
+    try:
+        from agent.redact import redact_terminal_output
+        text = redact_terminal_output(text.strip(), command) if text else ""
+    except Exception:
+        pass
+    return text
+
+
 def _maybe_reap_docker_orphans(container_config: Dict[str, Any]) -> None:
     """Run the docker orphan reaper once per process, if enabled.
 
@@ -2941,10 +2963,12 @@ def terminal_tool(
                     
                     logger.error("Execution failed after %d retries - Command: %s - Error: %s: %s - Task: %s, Backend: %s",
                                  max_retries, _safe_command_preview(command), type(e).__name__, e, effective_task_id, env_type)
+                    error_msg = f"Command execution failed: {type(e).__name__}: {str(e)}"
+                    error_msg = _sanitize_terminal_output(error_msg, command)
                     return json.dumps({
                         "output": "",
                         "exit_code": -1,
-                        "error": f"Command execution failed: {type(e).__name__}: {str(e)}"
+                        "error": error_msg
                     }, ensure_ascii=False)
                 
                 # Got a result
@@ -3153,8 +3177,10 @@ def terminal_tool(
         return json.dumps({
             "output": "",
             "exit_code": -1,
-            "error": f"Failed to execute command: {str(e)}",
-            "traceback": tb_str,
+            "error": _sanitize_terminal_output(
+                f"Failed to execute command: {str(e)}", command
+            ),
+            "traceback": _sanitize_terminal_output(tb_str, command),
             "status": "error"
         }, ensure_ascii=False)
 
