@@ -151,7 +151,12 @@ The "silent when empty" behavior is the key to the classic watchdog pattern: the
 
 ## Script Rules
 
-Scripts must live in `~/.hermes/scripts/`. This is enforced at both job-creation time and run time — absolute paths, `~/` expansion, and path-traversal patterns (`../`) are rejected. The same directory is shared with the pre-check script gate used by LLM jobs.
+Scripts must resolve inside `~/.hermes/scripts/`. At run time, relative paths,
+absolute paths, and `~`-prefixed paths are accepted only when their resolved
+target stays in that directory; path traversal and symlink escapes are rejected.
+The `cronjob` tool accepts only relative paths at its agent-facing creation
+boundary, so use a filename such as `memory-watchdog.sh` in chat-created jobs.
+The same directory is shared with the pre-check script gate used by LLM jobs.
 
 Interpreter choice is by file extension:
 
