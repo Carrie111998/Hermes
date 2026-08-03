@@ -120,6 +120,9 @@ def test_install_has_exact_bootstrap_and_runtime_principal_separation() -> None:
     assert "membership.admin_option IS TRUE" in sql
     assert "membership.inherit_option IS FALSE" in sql
     assert "membership.set_option IS FALSE" in sql
+    assert sql.count("SELECT pg_catalog.count(*) = 0\n                  OR (") == 1
+    assert sql.count("SELECT pg_catalog.count(*) = 0\n                       OR (") == 1
+    assert "only those two provider-safe shapes" in sql
     assert "SET LOCAL ROLE cloudsqlsuperuser;" in sql
     assert "SET LOCAL ROLE canonical_brain_migration_owner;" not in sql
     assert "GRANT canonical_brain_migration_owner TO SESSION_USER" not in sql
