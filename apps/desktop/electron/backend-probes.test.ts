@@ -17,6 +17,8 @@ import {
   DEFAULT_PROBE_TIMEOUT_MS,
   findAcceptablePython,
   hermesRuntimeImportProbe,
+  MACOS_WELL_KNOWN_PYTHON_DIRS,
+  macOSWellKnownPythonCandidates,
   posixPythonCommandCandidates,
   PROBE_TIMEOUT_MS,
   pythonResolutionFailureMessage,
@@ -376,6 +378,196 @@ test('with no accept validator the first resolvable candidate wins', () => {
   // Callers that only need "any interpreter" (the uninstall path) must keep
   // the original zero-subprocess behaviour.
   assert.equal(findAcceptablePython({ findOnPath: pathTable({ python3: '/usr/bin/python3' }) }), '/usr/bin/python3')
+})
+
+// ── macOS Homebrew-before-PATH ordering ──────────────────────────────────────
+//
+// A Finder/Dock launch inherits launchd's environment, not a login shell's:
+// `launchctl getenv PATH` is unset on a stock machine, leaving
+// /usr/bin:/bin:/usr/sbin:/sbin. Homebrew is not on it, so a PATH-only search
+// cannot see an installed /opt/homebrew/bin/python3.12 and settles for
+// /usr/bin/python3 (3.9.6) -- measured on this machine: the minimal-PATH walk
+// resolves null, because 3.9 is the only interpreter it can reach.
+//
+// Injected fake filesystems throughout: the scan must be provably correct on
+// machines whose real /opt/homebrew holds nothing in range (this one has only
+// 3.14.4 and 3.9.24).
+
+/** Build a fileExists stub from a set of paths that exist. */
+function fsTable(paths: string[]) {
+  const existing = new Set(paths)
+
+  return (candidate: string) => existing.has(candidate)
+}
+
+test('a versioned Homebrew interpreter is preferred over a PATH hit on macOS', () => {
+  const brewed = '/opt/homebrew/bin/python3.12'
+  const probed: string[] = []
+
+  const resolved = findAcceptablePython({
+    platform: 'darwin',
+    fileExists: fsTable([brewed]),
+    findOnPath: pathTable({ python3: '/usr/bin/python3', python: '/usr/bin/python3' }),
+    accept: candidate => {
+      probed.push(candidate)
+
+      return true
+    }
+  })
+
+  assert.equal(resolved, brewed)
+  // PATH is never consulted once the well-known pass answers, so the 3.9
+  // interpreter costs zero subprocesses.
+  assert.deepEqual(probed, [brewed])
+})
+
+test('a Homebrew interpreter that fails the probe is demoted, not returned', () => {
+  // The load-bearing guarantee: Homebrew ordering is a preference layered on
+  // top of the probe, exactly like the versioned-name ordering. It must never
+  // be able to promote an interpreter that cannot run Hermes.
+  const brewed = '/opt/homebrew/bin/python3.12'
+  const pathHit = '/opt/py313/bin/python3.13'
+  const probed: string[] = []
+
+  const resolved = findAcceptablePython({
+    platform: 'darwin',
+    fileExists: fsTable([brewed]),
+    findOnPath: pathTable({ 'python3.13': pathHit }),
+    accept: candidate => {
+      probed.push(candidate)
+
+      return candidate !== brewed
+    }
+  })
+
+  assert.equal(resolved, pathHit)
+  assert.deepEqual(probed, [brewed, pathHit], 'the walk must continue into PATH after demoting the Homebrew hit')
+})
+
+test('the well-known scan is macOS-only', () => {
+  // Linux desktop launchers inherit a session PATH built from the user's
+  // profile, so PATH already sees a versioned interpreter there; scanning
+  // /usr/local/bin on Linux would prefer a path nobody asked for.
+  const brewed = '/usr/local/bin/python3.12'
+
+  assert.equal(
+    findAcceptablePython({
+      platform: 'linux',
+      fileExists: fsTable([brewed]),
+      findOnPath: pathTable({ python3: '/usr/bin/python3' }),
+      accept: () => true
+    }),
+    '/usr/bin/python3'
+  )
+})
+
+test('the well-known scan is opt-in: no fileExists means PATH-only', () => {
+  // Keeps callers that must not touch the filesystem (and every pre-existing
+  // test in this file) on the exact previous behaviour.
+  assert.equal(
+    findAcceptablePython({
+      platform: 'darwin',
+      findOnPath: pathTable({ python3: '/usr/bin/python3' }),
+      accept: () => true
+    }),
+    '/usr/bin/python3'
+  )
+})
+
+test('the well-known scan stays bounded and costs one lstat per candidate', () => {
+  const checked: string[] = []
+
+  assert.equal(
+    findAcceptablePython({
+      platform: 'darwin',
+      fileExists: candidate => {
+        checked.push(candidate)
+
+        return false
+      },
+      findOnPath: () => null,
+      accept: () => true
+    }),
+    null
+  )
+
+  // One stat per (directory x supported version). No directory listing, no
+  // globbing -- the cost cannot grow with what happens to be installed.
+  assert.equal(checked.length, MACOS_WELL_KNOWN_PYTHON_DIRS.length * SUPPORTED_PYTHON_VERSIONS.length)
+  assert.deepEqual(checked, macOSWellKnownPythonCandidates(true))
+})
+
+test('the well-known scan never prefers a bare python3 symlink', () => {
+  // Bare `python3` in /opt/homebrew/bin points at whichever formula is linked
+  // -- 3.14.4 on this machine, above the `<3.14` ceiling. Preferring it over
+  // PATH would demote a good PATH interpreter in favour of a guess, so only
+  // self-describing versioned names are scanned.
+  for (const candidate of macOSWellKnownPythonCandidates(true)) {
+    assert.doesNotMatch(candidate, /[\\/]python3?$/, `${candidate} must name its own version`)
+  }
+
+  assert.equal(macOSWellKnownPythonCandidates(false).length, 0)
+})
+
+test('both Homebrew prefixes are covered (Apple Silicon and Intel)', () => {
+  // /opt/homebrew is Apple Silicon; /usr/local is Intel Homebrew, and also
+  // where the python.org installer symlinks. Same two directories main.ts
+  // already hard-codes for its `gh` lookup.
+  assert.ok(MACOS_WELL_KNOWN_PYTHON_DIRS.includes('/opt/homebrew/bin'))
+  assert.ok(MACOS_WELL_KNOWN_PYTHON_DIRS.includes('/usr/local/bin'))
+  assert.ok(
+    MACOS_WELL_KNOWN_PYTHON_DIRS.indexOf('/opt/homebrew/bin') < MACOS_WELL_KNOWN_PYTHON_DIRS.indexOf('/usr/local/bin'),
+    'Apple Silicon Homebrew is the common case and should be scanned first'
+  )
+})
+
+test('a well-known hit already on PATH is probed once, not twice', () => {
+  // When Homebrew IS on PATH (a terminal launch), the same binary resolves in
+  // both passes. Dedup by resolved path keeps that at one subprocess.
+  const brewed = '/opt/homebrew/bin/python3.12'
+  const probed: string[] = []
+
+  assert.equal(
+    findAcceptablePython({
+      platform: 'darwin',
+      fileExists: fsTable([brewed]),
+      findOnPath: pathTable({ python3: brewed, python: brewed }),
+      accept: candidate => {
+        probed.push(candidate)
+
+        return false
+      }
+    }),
+    null
+  )
+  assert.deepEqual(probed, [brewed])
+})
+
+test('a checkout venv still short-circuits before any well-known scan', () => {
+  // The scan must add zero cost to the case every install path produces.
+  const root = path.join(os.tmpdir(), 'hermes-resolve-root')
+  const dotVenv = venvPythonCandidates(root, false)[0]
+  const statted: string[] = []
+
+  const resolved = resolvePythonForRoot({
+    root,
+    isWindows: false,
+    fileExists: candidate => {
+      statted.push(candidate)
+
+      return candidate === dotVenv
+    },
+    canImport: () => true,
+    findSystemPython: accept =>
+      findAcceptablePython({ platform: 'darwin', fileExists: () => true, findOnPath: () => null, accept })
+  })
+
+  assert.equal(resolved, dotVenv)
+  assert.deepEqual(
+    statted.filter(candidate => MACOS_WELL_KNOWN_PYTHON_DIRS.some(directory => candidate.startsWith(directory))),
+    [],
+    'no well-known directory may be consulted when a venv resolves'
+  )
 })
 
 test('nothing usable yields the actionable message, not a doomed spawn', () => {

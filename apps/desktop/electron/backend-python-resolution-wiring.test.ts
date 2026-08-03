@@ -126,7 +126,7 @@ test('every findSystemPython call site states its accept policy', () => {
 test('the POSIX walk and the Windows passes share one version floor', () => {
   const body = functionBody(MAIN_TS, 'findSystemPython')
 
-  assert.match(body, /findAcceptablePython\(\{\s*findOnPath,\s*accept\s*\}\)/, 'POSIX must use the shared walk')
+  assert.match(body, /findAcceptablePython\(\{\s*findOnPath,\s*accept[,\s}]/, 'POSIX must use the shared walk')
   assert.match(body, /const SUPPORTED_VERSIONS = SUPPORTED_PYTHON_VERSIONS/, 'Windows must reuse the shared list')
 
   for (const version of SUPPORTED_PYTHON_VERSIONS) {
@@ -135,6 +135,21 @@ test('the POSIX walk and the Windows passes share one version floor', () => {
       'the version floor must not be re-literalised inside main.ts'
     )
   }
+})
+
+test('the POSIX walk is handed what the macOS well-known pass needs', () => {
+  // The Homebrew-before-PATH pass in backend-probes is opt-in: it only runs
+  // when the caller supplies `fileExists` AND a darwin `platform`. main.ts is
+  // the only production caller that can supply them, and main.ts is not loaded
+  // by any vitest project -- so without this assertion, dropping either
+  // argument silently reverts the whole pass with the suite still green. That
+  // is the same coverage hole that let the fallback rung run unprobed.
+  const body = functionBody(MAIN_TS, 'findSystemPython')
+  const call = body.match(/findAcceptablePython\(\{[^}]*\}\)/)
+
+  assert.ok(call, 'main.ts must still call the shared POSIX walk')
+  assert.match(call[0], /fileExists/, 'without fileExists the well-known-directory pass never runs')
+  assert.match(call[0], /platform:\s*process\.platform/, 'the pass is gated on a darwin platform')
 })
 
 test('Windows candidate hits are validated before being returned', () => {

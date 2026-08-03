@@ -2075,7 +2075,14 @@ function findSystemPython(options: { accept: ((candidate: string) => boolean) | 
     // below applies here too -- `python3` is 3.9 on macOS CommandLineTools
     // and on Debian 11 / Ubuntu 20.04, which cannot import hermes_cli at all.
     // The version ordering is a preference; `accept` is the actual proof.
-    return findAcceptablePython({ findOnPath, accept })
+    //
+    // `fileExists` + `platform` additionally enable the macOS
+    // Homebrew-before-PATH pass: a Finder/Dock launch inherits launchd's
+    // environment, where PATH is /usr/bin:/bin:/usr/sbin:/sbin and Homebrew is
+    // absent -- so a PATH-only search on a GUI launch cannot see an installed
+    // /opt/homebrew/bin/python3.12 and settles for /usr/bin/python3 (3.9.6).
+    // Same shape as the version ordering: a preference, still gated by accept.
+    return findAcceptablePython({ findOnPath, accept, fileExists, platform: process.platform })
   }
 
   // Windows: PATH-based detection has TWO landmines we have to dodge.

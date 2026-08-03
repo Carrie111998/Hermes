@@ -67,6 +67,53 @@ function posixPythonCommandCandidates() {
 }
 
 /**
+ * Directories searched for a versioned interpreter BEFORE PATH, on macOS only.
+ *
+ * A Finder/Dock launch does not run a login shell, so the app inherits
+ * launchd's environment -- `launchctl getenv PATH` is unset on a stock machine,
+ * which leaves `/usr/bin:/bin:/usr/sbin:/sbin`. Homebrew is not on it. That is
+ * the same inheritance problem `backend-env.POSIX_SANE_PATH_ENTRIES` exists to
+ * repair for the spawned backend's PATH, and the same one main.ts's `gh` lookup
+ * dodges by hard-coding these two directories -- but interpreter resolution
+ * still ran PATH-only, so on a GUI launch it could not see a perfectly good
+ * Homebrew 3.12 and fell through to `/usr/bin/python3` (3.9.6), the interpreter
+ * that cannot import hermes_cli at all.
+ *
+ * Both Homebrew prefixes are listed: `/opt/homebrew` on Apple Silicon,
+ * `/usr/local` on Intel (and where the python.org installer symlinks). Linux is
+ * excluded on purpose -- its desktop launchers inherit a session PATH built
+ * from the user's profile, so PATH already sees a versioned interpreter.
+ */
+const MACOS_WELL_KNOWN_PYTHON_DIRS = Object.freeze(['/opt/homebrew/bin', '/usr/local/bin'])
+
+/**
+ * Versioned interpreter paths in the well-known macOS directories.
+ *
+ * Versioned names ONLY. Bare `python3` in these directories is a Homebrew
+ * symlink to whichever formula is currently linked -- 3.14 on this machine,
+ * which is above the `<3.14` ceiling -- so preferring it over PATH would demote
+ * a good PATH interpreter in favour of a guess. `python3.12` names its own
+ * version, and bare `python3` remains reachable through the PATH walk below.
+ *
+ * Bounded by construction: `SUPPORTED_PYTHON_VERSIONS.length` x
+ * `MACOS_WELL_KNOWN_PYTHON_DIRS.length` paths, each an lstat, and only ones
+ * that exist ever become probe candidates.
+ *
+ * @param {boolean} isMacOS - Non-darwin platforms get an empty list.
+ * @returns {string[]} Absolute candidate paths, highest version last-resort
+ *   ordering matching SUPPORTED_PYTHON_VERSIONS (oldest first, as elsewhere).
+ */
+function macOSWellKnownPythonCandidates(isMacOS: boolean) {
+  if (!isMacOS) {
+    return []
+  }
+
+  return MACOS_WELL_KNOWN_PYTHON_DIRS.flatMap(directory =>
+    SUPPORTED_PYTHON_VERSIONS.map(version => path.posix.join(directory, `python${version}`))
+  )
+}
+
+/**
  * Walk interpreter candidates and return the first one `accept` approves.
  *
  * Pure and dependency-injected (no electron, no direct PATH access) so the
@@ -75,32 +122,67 @@ function posixPythonCommandCandidates() {
  * point at the same binary (`python3` and `python` symlinked together) costs
  * one probe, not two.
  *
+ * Two phases, in order:
+ *   1. versioned interpreters in the well-known macOS directories (only when
+ *      `fileExists` and a darwin `platform` are both supplied)
+ *   2. the PATH walk, versioned names before bare ones
+ *
+ * Phase 1 is a PREFERENCE, structurally identical to the versioned-before-bare
+ * ordering in phase 2: `accept` still decides. A Homebrew interpreter that
+ * fails the probe is demoted and the walk continues into PATH, so the scan can
+ * only ever change WHICH acceptable interpreter wins -- never whether an
+ * unacceptable one gets returned.
+ *
  * @param {object} deps
  * @param {(command: string) => string | null} deps.findOnPath - PATH resolver.
  * @param {(candidate: string) => boolean} [deps.accept] - Validator; when
  *   omitted the first resolvable candidate wins (legacy behaviour).
+ * @param {(filePath: string) => boolean} [deps.fileExists] - Enables phase 1.
+ *   Omitted (the default) means PATH-only, which keeps callers that don't want
+ *   to touch the filesystem -- and tests that inject no fake fs -- hermetic.
+ * @param {string} [deps.platform] - Must be 'darwin' for phase 1 to run.
  * @param {string[]} [deps.candidates] - Override the command list (tests).
  * @returns {string | null} An accepted interpreter path, or null.
  */
 function findAcceptablePython(deps: {
   findOnPath: (command: string) => string | null | undefined
   accept?: ((candidate: string) => boolean) | null
+  fileExists?: ((filePath: string) => boolean) | null
+  platform?: string | null
   candidates?: string[]
 }) {
   const candidates = deps.candidates || posixPythonCommandCandidates()
   const seen = new Set<string>()
 
-  for (const command of candidates) {
-    const resolved = deps.findOnPath(command)
-
+  const consider = (resolved: string | null | undefined) => {
     if (!resolved || seen.has(resolved)) {
-      continue
+      return null
     }
 
     seen.add(resolved)
 
-    if (!deps.accept || deps.accept(resolved)) {
-      return resolved
+    return !deps.accept || deps.accept(resolved) ? resolved : null
+  }
+
+  if (deps.fileExists && deps.platform === 'darwin') {
+    for (const candidate of macOSWellKnownPythonCandidates(true)) {
+      if (!deps.fileExists(candidate)) {
+        continue
+      }
+
+      const accepted = consider(candidate)
+
+      if (accepted) {
+        return accepted
+      }
+    }
+  }
+
+  for (const command of candidates) {
+    const accepted = consider(deps.findOnPath(command))
+
+    if (accepted) {
+      return accepted
     }
   }
 
@@ -382,6 +464,8 @@ export {
   execProbeSync,
   findAcceptablePython,
   hermesRuntimeImportProbe,
+  MACOS_WELL_KNOWN_PYTHON_DIRS,
+  macOSWellKnownPythonCandidates,
   posixPythonCommandCandidates,
   PROBE_TIMEOUT_MS,
   pythonResolutionFailureMessage,
