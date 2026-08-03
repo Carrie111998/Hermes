@@ -31,6 +31,7 @@ _UPDATE_OUTPUT_FILE = ".update_output.txt"
 _REQUEST_VERSION = 2
 _RESULT_VERSION = 1
 _NONCE_RE = re.compile(r"[0-9a-f]{32}")
+_RESTART_NO_EXIT_REASON = "owner exited and Restart=no disables automatic restart"
 
 
 def _marker(home: Path, name: str) -> Path:
@@ -39,10 +40,46 @@ def _marker(home: Path, name: str) -> Path:
 
 def _scope_command(scope: str) -> list[str]:
     if scope == "user":
-        return ["systemctl", "--user"]
+        return ["systemctl", "--user", "--no-ask-password"]
     if scope == "system":
-        return ["systemctl"]
+        return ["systemctl", "--no-ask-password"]
     raise ValueError(f"unsupported systemd scope: {scope!r}")
+
+
+_SYSTEMD_STATE_ARGS = [
+    "--property=ActiveState",
+    "--property=SubState",
+    "--property=MainPID",
+    "--property=ExecMainStartTimestampMonotonic",
+    "--property=ActiveEnterTimestampMonotonic",
+    "--property=Restart",
+]
+
+
+def _run_systemd_state_query(scope: str, service: str) -> subprocess.CompletedProcess[str]:
+    command = _scope_command(scope) + ["show", service, *_SYSTEMD_STATE_ARGS]
+    run_kwargs = {
+        "capture_output": True,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+        "timeout": 5,
+    }
+    if scope == "user" or (hasattr(os, "geteuid") and os.geteuid() == 0):
+        return subprocess.run(command, **run_kwargs)
+    if not hasattr(os, "geteuid"):
+        raise OSError("system systemd scope requires a prompt-free privilege path")
+
+    # Match the updater's existing noninteractive policy: prefer a blanket
+    # passwordless capability, but still try the exact read-only command for a
+    # targeted sudoers rule.  ``-n`` and ``--no-ask-password`` prohibit both
+    # sudo and polkit prompts.
+    subprocess.run(
+        ["sudo", "-n", "true"],
+        capture_output=True,
+        timeout=5,
+    )
+    return subprocess.run(["sudo", "-n", *command], **run_kwargs)
 
 
 def _coerce_int(value: Any) -> int:
@@ -174,24 +211,7 @@ def prepare_owner_restart_request(
 
 def read_systemd_service_state(scope: str, service: str) -> dict[str, Any]:
     """Read one systemd unit's lifecycle identity in a single bounded query."""
-    shown = subprocess.run(
-        _scope_command(scope)
-        + [
-            "show",
-            service,
-            "--property=ActiveState",
-            "--property=SubState",
-            "--property=MainPID",
-            "--property=ExecMainStartTimestampMonotonic",
-            "--property=ActiveEnterTimestampMonotonic",
-            "--property=Restart",
-        ],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=5,
-    )
+    shown = _run_systemd_state_query(scope, service)
     if shown.returncode != 0:
         raise OSError((shown.stderr or "systemctl show failed").strip())
     props: dict[str, str] = {}
@@ -309,31 +329,6 @@ def _transition_verified(
     )
 
 
-def start_inactive_service(scope: str, service: str) -> bool:
-    """Start a Restart=no owner once the old process has fully exited."""
-    command = _scope_command(scope)
-    try:
-        subprocess.run(
-            command + ["reset-failed", service],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=5,
-        )
-        started = subprocess.run(
-            command + ["start", service],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=15,
-        )
-    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
-        return False
-    return started.returncode == 0
-
-
 def _append_update_output(home: Path, message: str) -> None:
     path = _marker(home, _UPDATE_OUTPUT_FILE)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -354,6 +349,16 @@ def _append_update_output(home: Path, message: str) -> None:
 def _result_message(
     request: dict[str, Any], *, verified: bool, exit_code: int, reason: str
 ) -> str:
+    if not verified and reason == _RESTART_NO_EXIT_REASON:
+        command = "systemctl --user" if request["scope"] == "user" else "sudo systemctl"
+        return (
+            "✗ Update finalization incomplete: updater-owning service "
+            f"{request['service']} exited and has Restart=no; Hermes did not auto-start it.\n"
+            "  Restart it manually to load the updated code:\n"
+            f"    {command} start {request['service']}\n"
+            "  Then verify:\n"
+            f"    {command} status {request['service']}"
+        )
     scope_flag = "--user " if request["scope"] == "user" else ""
     if verified and exit_code == 0:
         return (
@@ -521,6 +526,19 @@ def verify_owner_restart(
             )
 
         old_pid = _coerce_int(request["old_state"].get("main_pid"))
+        restart_no = request["old_state"].get("restart") == "no"
+        initial_old_gone = bool(
+            _coerce_int(state.get("main_pid")) != old_pid
+            and state.get("active_state") not in {"activating", "deactivating"}
+        )
+        if restart_no and initial_old_gone:
+            return _persist_verifier_result(
+                home,
+                request,
+                verified=False,
+                reason=_RESTART_NO_EXIT_REASON,
+                observed_state=state,
+            )
         if _transition_verified(home, request, state):
             return _persist_verifier_result(
                 home,
@@ -559,8 +577,6 @@ def verify_owner_restart(
             0.0, (request["deadline_ns"] - time.time_ns()) / 1_000_000_000
         )
         deadline = time.monotonic() + remaining
-        restart_no_start_attempted = False
-        restart_no_start_failed = False
         saw_transition_without_ack = False
         saw_failed_state = False
         while time.monotonic() < deadline:
@@ -571,15 +587,6 @@ def verify_owner_restart(
             except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
                 time.sleep(max(0.001, poll_interval))
                 continue
-
-            if _transition_verified(home, request, state):
-                return _persist_verifier_result(
-                    home,
-                    request,
-                    verified=True,
-                    reason="owner transition and readiness acknowledged",
-                    observed_state=state,
-                )
 
             key, old_generation = _request_generation(request)
             changed_identity = bool(
@@ -599,16 +606,24 @@ def verify_owner_restart(
 
             old_gone = bool(
                 _coerce_int(state.get("main_pid")) != old_pid
-                or state.get("active_state") != "active"
+                and state.get("active_state") not in {"activating", "deactivating"}
             )
-            if (
-                request["old_state"].get("restart") == "no"
-                and old_gone
-                and not restart_no_start_attempted
-            ):
-                restart_no_start_attempted = True
-                restart_no_start_failed = not start_inactive_service(
-                    request["scope"], request["service"]
+            if restart_no and old_gone:
+                return _persist_verifier_result(
+                    home,
+                    request,
+                    verified=False,
+                    reason=_RESTART_NO_EXIT_REASON,
+                    observed_state=state,
+                )
+
+            if _transition_verified(home, request, state):
+                return _persist_verifier_result(
+                    home,
+                    request,
+                    verified=True,
+                    reason="owner transition and readiness acknowledged",
+                    observed_state=state,
                 )
 
             time.sleep(max(0.001, poll_interval))
@@ -617,8 +632,6 @@ def verify_owner_restart(
             reason = "new owner never wrote a matching readiness acknowledgement"
         elif saw_failed_state:
             reason = "owner entered failed state before restart verification"
-        elif restart_no_start_failed:
-            reason = "could not start the inactive Restart=no owner service"
         else:
             reason = "owner restart verification timed out without a transition"
         return _persist_verifier_result(

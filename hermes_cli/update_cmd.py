@@ -3379,14 +3379,32 @@ def _owner_restart_verification_timeout(
     owner: tuple[str, list[str], str],
 ) -> float:
     """Bound owner drain, restart backoff, and new-gateway startup verification."""
-    _scope, scope_cmd, svc_name = owner
+    scope, scope_cmd, svc_name = owner
     try:
         from hermes_cli.gateway import _get_restart_exit_wait_budget
 
         exit_wait_budget = max(0.0, float(_get_restart_exit_wait_budget()))
     except Exception:
         exit_wait_budget = 105.0
-    restart_timeout = _service_restart_sec(scope_cmd, svc_name, default=0.0)
+    prompt_free_scope_cmd = list(scope_cmd)
+    if "--no-ask-password" not in prompt_free_scope_cmd:
+        prompt_free_scope_cmd.append("--no-ask-password")
+    restart_probe = prompt_free_scope_cmd + [
+        "show",
+        svc_name,
+        "--property=RestartUSec",
+        "--value",
+    ]
+    prompt_free_scope_cmd = _resolve_noninteractive_systemd_command(
+        scope,
+        prompt_free_scope_cmd,
+        targeted_probe=restart_probe,
+    )
+    if prompt_free_scope_cmd is None:
+        raise PermissionError("no prompt-free systemctl capability for owner verifier")
+    restart_timeout = _service_restart_sec(
+        prompt_free_scope_cmd, svc_name, default=0.0
+    )
     # SIGUSR1 may first wait for the active turn and only then enter stop/drain.
     # Cover the same full wait budget used by gateway restart callers, plus
     # service backoff and two minutes for replacement startup/readiness.  Keep
@@ -3406,6 +3424,46 @@ def _clear_owner_restart_request_files() -> None:
             (home / name).unlink(missing_ok=True)
         except OSError:
             pass
+
+
+def _resolve_noninteractive_systemd_command(
+    scope: str,
+    command: list[str],
+    *,
+    targeted_probe: list[str] | None = None,
+) -> list[str] | None:
+    """Resolve a prompt-free user/system systemd command prefix.
+
+    User-scope commands run directly. System-scope commands run directly as
+    root; otherwise they use ``sudo -n`` only after the same blanket/targeted
+    capability probes used by gateway manage-unit operations.
+    """
+    if scope == "user":
+        return command
+    if scope != "system" or not hasattr(os, "geteuid"):
+        return None
+    if os.geteuid() == 0:
+        return command
+
+    sudo_command = ["sudo", "-n"] + command
+    try:
+        probe = subprocess.run(
+            ["sudo", "-n", "true"],
+            capture_output=True,
+            timeout=5,
+        )
+        if probe.returncode == 0:
+            return sudo_command
+        if targeted_probe is None:
+            return None
+        probe = subprocess.run(
+            ["sudo", "-n"] + targeted_probe,
+            capture_output=True,
+            timeout=5,
+        )
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+        return None
+    return sudo_command if probe.returncode == 0 else None
 
 
 def _launch_updater_owner_restart_verifier(
@@ -3428,9 +3486,22 @@ def _launch_updater_owner_restart_verifier(
     if not systemd_run:
         return False
 
+    scope, _scope_cmd, svc_name = owner
+    command = [systemd_run]
+    if scope == "user":
+        command.extend(["--user", "--no-ask-password"])
+    else:
+        command.append("--no-ask-password")
+    command = _resolve_noninteractive_systemd_command(
+        scope,
+        command,
+        targeted_probe=command + ["--version"],
+    )
+    if command is None:
+        return False
+
     from hermes_cli import update_owner_restart
 
-    scope, _scope_cmd, svc_name = owner
     try:
         old_state = update_owner_restart.read_systemd_service_state(scope, svc_name)
         timeout_seconds = _owner_restart_verification_timeout(owner)
@@ -3452,9 +3523,6 @@ def _launch_updater_owner_restart_verifier(
         f"hermes-update-owner-verify-{os.getpid()}-{nonce[:8]}".replace(".", "-")
     )
     project_root = Path(__file__).resolve().parent.parent
-    command = [systemd_run]
-    if scope == "user":
-        command.append("--user")
     command.extend(
         [
             "--collect",
@@ -5112,33 +5180,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 if scope_ in _manage_cmd_cache:
                     return _manage_cmd_cache[scope_]
                 cmd = scope_cmd_ + ["--no-ask-password"]
-                if (
-                    scope_ == "system"
-                    and hasattr(os, "geteuid")
-                    and os.geteuid() != 0  # windows-footgun: ok — systemd path, Linux-only
-                ):
-                    sudo_cmd = ["sudo", "-n"] + scope_cmd_ + ["--no-ask-password"]
-                    sudo_ok = False
-                    try:
-                        _probe = subprocess.run(
-                            ["sudo", "-n", "true"],
-                            capture_output=True,
-                            timeout=5,
-                        )
-                        sudo_ok = _probe.returncode == 0
-                        if not sudo_ok:
-                            # Blanket sudo refused — a targeted sudoers entry
-                            # (NOPASSWD for systemctl ... hermes-gateway*)
-                            # may still allow the exact commands we need.
-                            _probe = subprocess.run(
-                                sudo_cmd + ["reset-failed", svc_name_],
-                                capture_output=True,
-                                timeout=5,
-                            )
-                            sudo_ok = _probe.returncode == 0
-                    except (FileNotFoundError, subprocess.TimeoutExpired):
-                        sudo_ok = False
-                    cmd = sudo_cmd if sudo_ok else None
+                cmd = _resolve_noninteractive_systemd_command(
+                    scope_,
+                    cmd,
+                    targeted_probe=cmd + ["reset-failed", svc_name_],
+                )
                 _manage_cmd_cache[scope_] = cmd
                 return cmd
 

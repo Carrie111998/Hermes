@@ -58,6 +58,97 @@ def test_request_accepts_bounded_full_gateway_exit_wait(tmp_path):
         _prepare(tmp_path, timeout_seconds=1800.1)
 
 
+def _systemd_state_result(*, returncode: int = 0):
+    return type(
+        "Result",
+        (),
+        {
+            "returncode": returncode,
+            "stdout": (
+                "ActiveState=active\n"
+                "SubState=running\n"
+                "MainPID=4321\n"
+                "ExecMainStartTimestampMonotonic=101\n"
+                "ActiveEnterTimestampMonotonic=102\n"
+                "Restart=on-failure\n"
+            )
+            if returncode == 0
+            else "",
+            "stderr": "" if returncode == 0 else "permission denied",
+        },
+    )()
+
+
+def test_root_system_scope_state_read_disables_password_prompts(monkeypatch):
+    commands: list[list[str]] = []
+    monkeypatch.setattr(update_owner_restart.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(
+        update_owner_restart.subprocess,
+        "run",
+        lambda args, **_kwargs: commands.append(args) or _systemd_state_result(),
+    )
+
+    assert update_owner_restart.read_systemd_service_state("system", SERVICE) == OLD_STATE
+    assert commands[0][0:3] == [
+        "systemctl",
+        "--no-ask-password",
+        "show",
+    ]
+
+
+def test_nonroot_system_scope_state_read_uses_sudo_n(monkeypatch):
+    commands: list[list[str]] = []
+    monkeypatch.setattr(update_owner_restart.os, "geteuid", lambda: 1000)
+
+    def fake_run(args, **_kwargs):
+        commands.append(args)
+        if args == ["sudo", "-n", "true"]:
+            return _systemd_state_result()
+        assert args[0:5] == [
+            "sudo",
+            "-n",
+            "systemctl",
+            "--no-ask-password",
+            "show",
+        ]
+        return _systemd_state_result()
+
+    monkeypatch.setattr(update_owner_restart.subprocess, "run", fake_run)
+
+    assert update_owner_restart.read_systemd_service_state("system", SERVICE) == OLD_STATE
+    assert commands[0] == ["sudo", "-n", "true"]
+    assert commands[1][0:5] == [
+        "sudo",
+        "-n",
+        "systemctl",
+        "--no-ask-password",
+        "show",
+    ]
+
+
+def test_targeted_system_scope_state_probe_is_reused(monkeypatch):
+    commands: list[list[str]] = []
+    monkeypatch.setattr(update_owner_restart.os, "geteuid", lambda: 1000)
+
+    def fake_run(args, **_kwargs):
+        commands.append(args)
+        if args == ["sudo", "-n", "true"]:
+            return _systemd_state_result(returncode=1)
+        assert args[0:5] == [
+            "sudo",
+            "-n",
+            "systemctl",
+            "--no-ask-password",
+            "show",
+        ]
+        return _systemd_state_result()
+
+    monkeypatch.setattr(update_owner_restart.subprocess, "run", fake_run)
+
+    assert update_owner_restart.read_systemd_service_state("system", SERVICE) == OLD_STATE
+    assert len(commands) == 2
+
+
 def _result(home: Path) -> dict:
     return json.loads(
         (home / update_owner_restart.OWNER_RESTART_RESULT_FILE).read_text()
@@ -127,9 +218,18 @@ def test_changed_pid_and_generation_require_matching_health_ack(tmp_path, monkey
     assert "✓ Update complete!" in (tmp_path / ".update_output.txt").read_text()
 
 
-def test_restart_no_is_started_once_outside_owner_cgroup(tmp_path, monkeypatch):
+def test_restart_no_exit_is_actionable_without_automatic_start(tmp_path, monkeypatch):
     request = _prepare(tmp_path, restart="no")
     old_no_restart = {**OLD_STATE, "restart": "no"}
+    deactivating = {
+        "active_state": "deactivating",
+        "sub_state": "stop-sigterm",
+        "main_pid": 4321,
+        "exec_start": 101,
+        "active_enter": 102,
+        "restart": "no",
+    }
+    deactivating_without_pid = {**deactivating, "main_pid": 0}
     inactive = {
         "active_state": "inactive",
         "sub_state": "dead",
@@ -138,51 +238,10 @@ def test_restart_no_is_started_once_outside_owner_cgroup(tmp_path, monkeypatch):
         "active_enter": 102,
         "restart": "no",
     }
-    new_no_restart = {**NEW_STATE, "restart": "no"}
-    states = iter([old_no_restart, inactive, new_no_restart])
-    starts: list[tuple[str, str]] = []
-
-    monkeypatch.setattr(
-        update_owner_restart,
-        "read_systemd_service_state",
-        lambda _scope, _service: next(states, new_no_restart),
+    states = iter(
+        [old_no_restart, deactivating, deactivating_without_pid, inactive]
     )
-    monkeypatch.setattr(update_owner_restart.os, "kill", lambda _pid, _sig: None)
 
-    def fake_start(scope, service):
-        starts.append((scope, service))
-        assert update_owner_restart.acknowledge_owner_restart_ready(
-            tmp_path,
-            current_service=SERVICE,
-            current_pid=9876,
-            now_ns=request["requested_at_ns"] + 1,
-        )
-        return True
-
-    monkeypatch.setattr(update_owner_restart, "start_inactive_service", fake_start)
-
-    assert (
-        update_owner_restart.verify_owner_restart(
-            tmp_path, request["nonce"], poll_interval=0.001
-        )
-        == 0
-    )
-    assert starts == [("user", SERVICE)]
-
-
-def test_restart_no_start_failure_is_actionable(tmp_path, monkeypatch):
-    request = _prepare(tmp_path, restart="no")
-    old_no_restart = {**OLD_STATE, "restart": "no"}
-    inactive = {
-        "active_state": "inactive",
-        "sub_state": "dead",
-        "main_pid": 0,
-        "exec_start": 101,
-        "active_enter": 102,
-        "restart": "no",
-    }
-    states = iter([old_no_restart, inactive])
-    starts: list[tuple[str, str]] = []
     monkeypatch.setattr(
         update_owner_restart,
         "read_systemd_service_state",
@@ -190,9 +249,11 @@ def test_restart_no_start_failure_is_actionable(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(update_owner_restart.os, "kill", lambda _pid, _sig: None)
     monkeypatch.setattr(
-        update_owner_restart,
-        "start_inactive_service",
-        lambda scope, service: starts.append((scope, service)) or False,
+        update_owner_restart.subprocess,
+        "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("Restart=no must never be auto-started")
+        ),
     )
 
     assert (
@@ -201,8 +262,52 @@ def test_restart_no_start_failure_is_actionable(tmp_path, monkeypatch):
         )
         == 1
     )
-    assert starts == [("user", SERVICE)]
-    assert "could not start" in _result(tmp_path)["reason"]
+
+    result = _result(tmp_path)
+    assert result["verified"] is False
+    assert result["exit_code"] == 1
+    assert result["reason"] == "owner exited and Restart=no disables automatic restart"
+    assert result["observed_state"]["active_state"] == "inactive"
+    assert result["observed_state"]["main_pid"] == 0
+    assert result["message"] == (
+        "✗ Update finalization incomplete: updater-owning service "
+        f"{SERVICE} exited and has Restart=no; Hermes did not auto-start it.\n"
+        "  Restart it manually to load the updated code:\n"
+        f"    systemctl --user start {SERVICE}\n"
+        "  Then verify:\n"
+        f"    systemctl --user status {SERVICE}"
+    )
+    assert (tmp_path / ".update_exit_code").read_text() == "1"
+
+
+def test_restart_no_prearmed_transition_cannot_publish_success(tmp_path, monkeypatch):
+    request = _prepare(tmp_path, restart="no")
+    new_no_restart = {**NEW_STATE, "restart": "no"}
+    assert update_owner_restart.acknowledge_owner_restart_ready(
+        tmp_path,
+        current_service=SERVICE,
+        current_pid=9876,
+        now_ns=request["requested_at_ns"] + 1,
+    )
+    monkeypatch.setattr(
+        update_owner_restart,
+        "read_systemd_service_state",
+        lambda _scope, _service: dict(new_no_restart),
+    )
+    monkeypatch.setattr(
+        update_owner_restart.os,
+        "kill",
+        lambda *_args: (_ for _ in ()).throw(
+            AssertionError("prearmed transition must not signal again")
+        ),
+    )
+
+    assert update_owner_restart.verify_owner_restart(tmp_path, request["nonce"]) == 1
+    result = _result(tmp_path)
+    assert result["verified"] is False
+    assert result["exit_code"] == 1
+    assert result["reason"] == "owner exited and Restart=no disables automatic restart"
+    assert "systemctl --user start" in result["message"]
 
 
 def test_changed_owner_without_health_ack_times_out_as_failure(tmp_path, monkeypatch):
