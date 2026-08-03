@@ -445,8 +445,29 @@ def _capture_user_packages(venv_dir: Path) -> list[str]:
         }
         user_packages = []
         for line in lines:
-            # Extract package name from specifier (before ==, >=, @, etc.)
-            pkg_name = line.split("==")[0].split(">=")[0].split("<=")[0].split("~=")[0].split("@")[0].strip().lower().replace("_", "-")
+            # Skip editable installs (-e ...) entirely — these are typically
+            # hermes-agent itself or local dev installs that uv sync will
+            # re-establish from the lock file.  Also skip lines that don't
+            # look like a normal pin (e.g. "-e git+...#egg=hermes_agent").
+            if line.startswith("-e ") or line.startswith("-e\t"):
+                continue
+            # Extract package name from specifier.  Handle normal pins
+            # (foo==1.0), version ranges (foo>=1.0), URL installs
+            # (foo @ https://...), and editable VCS lines we didn't skip
+            # above.  Also strip any fragment (e.g. "#egg=...").
+            name_part = line.split("#")[0]
+            pkg_name = (
+                name_part
+                .split("==")[0]
+                .split(">=")[0]
+                .split("<=")[0]
+                .split("~=")[0]
+                .split(" @ ")[0]
+                .split("@")[0]
+                .strip()
+                .lower()
+                .replace("_", "-")
+            )
             if pkg_name and pkg_name not in hermes_own:
                 user_packages.append(line)
 
