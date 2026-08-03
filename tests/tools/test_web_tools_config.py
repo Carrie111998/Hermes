@@ -472,7 +472,7 @@ class TestWebSearchSchema:
             result = json.loads(tools.web_tools.web_search_tool("docs", limit=500))
 
         assert result == {"success": True, "data": {"web": []}, "_metadata": {"backend": "parallel"}}
-        fake_search.assert_called_once_with("docs", 100, categories=None)
+        fake_search.assert_called_once_with("docs", 100)
 
 
     # ── Categories parameter tests ────────────────────────────────────

@@ -253,7 +253,6 @@ class TavilyWebSearchProvider(WebSearchProvider):
                 api_key="" if force_keyless else api_key,
             )
             return _normalize_tavily_search_results(raw)
-            return _normalize_tavily_search_results(raw)
         except ValueError as exc:
             return {"success": False, "error": str(exc)}
         except Exception as exc:  # noqa: BLE001 — including httpx errors

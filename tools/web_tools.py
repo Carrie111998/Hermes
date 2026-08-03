@@ -857,7 +857,10 @@ def web_search_tool(
 
             - firecrawl: ``web``, ``news``, ``images`` (sources); ``research``,
               ``github``, ``pdf`` (categories)
-            - searxng: Many categories depending on installed engines —\n              ``general``, ``news``, ``science``, ``it``, ``images``,\n              ``files``, ``social media``, ``map``, ``music``, ``videos``,\n              and others. Check ``GET /config`` on your instance.
+            - searxng: Many categories depending on installed engines —
+              ``general``, ``news``, ``science``, ``it``, ``images``,
+              ``files``, ``social media``, ``map``, ``music``, ``videos``,
+              and others. Check ``GET /config`` on your instance.
             - exa: ``company``, ``people``, ``news``, ``code``
             - brave-free: ``web``, ``news``, ``images``, ``video``
             - tavily: ``general``, ``news``, ``finance`` (via ``topic`` param)
@@ -992,7 +995,9 @@ def web_search_tool(
             if categories:
                 # Category filters change the provider request, so bypass the
                 # category-unaware search memo rather than serving an
-                # unfiltered cached response.
+                # unfiltered cached response. Only pass the new keyword when
+                # requested so third-party providers with the old signature
+                # remain compatible on ordinary searches.
                 response_data = provider.search(query, limit, categories=categories)
             else:
                 # ── TTL memo + single-flight (tools/web_result_cache.py) ──
