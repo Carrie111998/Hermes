@@ -294,7 +294,11 @@ class TestTencentTokenhubAgentInit:
 
 
 class TestTencentTokenhubModelCatalogJSON:
-    """Verify tencent/hy3:free and tencent/hy3 are present in the website model-catalog.json."""
+    """Verify paid tencent/hy3 remains in the website model-catalog.json.
+
+    The OpenRouter free tier id ``tencent/hy3:free`` was withdrawn and dropped
+    from curation (see fix/openrouter-catalog-drift); the paid id stays.
+    """
 
     def test_in_model_catalog_json(self):
         catalog_path = os.path.join(
@@ -318,8 +322,8 @@ class TestTencentTokenhubModelCatalogJSON:
             for provider_entry in providers:
                 for model in provider_entry.get("models", []):
                     all_ids.add(model.get("id", ""))
-        assert "tencent/hy3:free" in all_ids
         assert "tencent/hy3" in all_ids
+        assert "tencent/hy3:free" not in all_ids
 
 
 # =============================================================================
