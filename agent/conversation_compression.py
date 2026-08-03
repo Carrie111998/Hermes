@@ -2990,9 +2990,68 @@ def compress_context(
                 )
 
         messages_before_compression = copy.deepcopy(messages)
+        # A rejected speculative install must leave the session row
+        # byte-identical: the durable activity stamp the heartbeat writes
+        # must not advertise "context compression completed" for a candidate
+        # that never crossed the commit boundary. Capture the pre-attempt
+        # activity projection so the rejection/rollback paths below can
+        # restore it verbatim.
+        _activity_row_before = None
+        if speculative_candidate is not None and agent._session_db is not None:
+            try:
+                _sb = agent._session_db.get_session(agent.session_id)
+                if isinstance(_sb, dict):
+                    _activity_row_before = {
+                        "last_activity_at": _sb.get("last_activity_at"),
+                        "last_activity_provenance": _sb.get(
+                            "last_activity_provenance"
+                        ),
+                        "last_activity_description": _sb.get(
+                            "last_activity_description"
+                        ),
+                    }
+            except Exception:
+                _activity_row_before = None
         _activity_heartbeat = _CompressionActivityHeartbeat(
             agent, commit_fence=commit_fence
         ).start()
+
+        def _restore_speculative_activity_row() -> None:
+            if (
+                speculative_candidate is None
+                or _activity_row_before is None
+                or agent._session_db is None
+            ):
+                return
+            _sid = agent.session_id
+            _at = _activity_row_before.get("last_activity_at")
+            _desc = _activity_row_before.get("last_activity_description")
+            _prov = _activity_row_before.get("last_activity_provenance")
+            try:
+                def _do(conn):
+                    # Verbatim restore: touch_session_activity refuses to move
+                    # last_activity_at backwards and normalizes NULLs away, so
+                    # a rejected install would still differ from its pre-attempt
+                    # row. Write the captured projection directly instead.
+                    conn.execute(
+                        "UPDATE sessions SET "
+                        "last_activity_at = ?, "
+                        "last_activity_description = ?, "
+                        "last_activity_provenance = ? "
+                        "WHERE id = ?",
+                        (_at, _desc, _prov, _sid),
+                    )
+
+                agent._session_db._execute_write(
+                    _do,
+                    patience_s=getattr(
+                        agent._session_db, "_ACTIVITY_WRITE_PATIENCE_S", 1.0
+                    ),
+                )
+            except Exception:
+                logger.debug(
+                    "failed to restore speculative activity row", exc_info=True
+                )
         # Publish forward progress to the commit fence while the summary LLM
         # call streams. Async hosts (gateway session hygiene) poll
         # ``commit_fence.seconds_since_progress()`` to extend their deadline
@@ -3059,6 +3118,9 @@ def compress_context(
                         )
                     ):
                         agent._speculative_install_status = "rejected"
+                        # The heartbeat already stamped terminal activity;
+                        # undo it so a rejected install leaves no durable trace.
+                        _restore_speculative_activity_row()
                         _release_lock()
                         existing_prompt = getattr(agent, "_cached_system_prompt", None)
                         if not existing_prompt:
@@ -3145,6 +3207,16 @@ def compress_context(
         raise
     finally:
         if _activity_heartbeat is not None:
+            if (
+                speculative_candidate is not None
+                and agent._speculative_install_status == "rejected"
+            ):
+                # A rejected speculative install must not advertise a durable
+                # "context compression completed" — the attempt never crossed
+                # the commit boundary. Stop the heartbeat suppressed so the
+                # daemon thread terminates without persisting a terminal stamp
+                # (the pre-return restore already rewrote the row verbatim).
+                _activity_heartbeat._suppressed = True
             _activity_heartbeat.stop("context compression completed")
 
     _commit_fence_entered = False
@@ -3582,6 +3654,11 @@ def compress_context(
                         if locals().get("old_session_id") is None and not in_place
                         else "failed_not_indexed"
                     )
+                # A failed durable commit for a speculative candidate must not
+                # advertise "context compression completed" on the session row —
+                # the install was rejected, so leave activity byte-identical.
+                if speculative_candidate is not None and not _session_commit_succeeded:
+                    _restore_speculative_activity_row()
                 # If the rotation rolled back to the parent (orphan-avoidance
                 # above), agent.session_id is the still-indexed parent and
                 # old_session_id was cleared — so this is recovery, not an
