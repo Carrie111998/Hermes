@@ -3526,7 +3526,7 @@ def _task_minimum_context_length(task: Optional[str]) -> Optional[int]:
     """Return the minimum context length required for an auxiliary task.
 
     Only ``compression`` carries an explicit minimum today (the same
-    ``MINIMUM_CONTEXT_LENGTH`` (64K) floor that
+    ``MINIMUM_CONTEXT_LENGTH`` (64K by default) floor that
     ``check_compression_model_feasibility`` already enforces at startup).
     Other tasks (``vision``, ``title_generation``, ``web_extract``,
     ``skills_hub``, ``mcp``, ``session_search``) return ``None`` — they
