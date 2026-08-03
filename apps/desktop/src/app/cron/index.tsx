@@ -73,7 +73,7 @@ import {
 import type { SetStatusbarItemGroup } from '../shell/statusbar-controls'
 
 import { BlueprintSlotControl, blueprintSlotHelp, cleanBlueprintFieldError, initialBlueprintValues } from './blueprints'
-import { cronEditorUpdates, jobIsScriptOnly, validateCronEditor } from './cron-job-model'
+import { cronEditorUpdates, jobDescription, jobIsScriptOnly, validateCronEditor } from './cron-job-model'
 import { jobState, jobTitle, STATE_DOT } from './job-state'
 
 const DEFAULT_DELIVER = 'local'
@@ -613,6 +613,8 @@ function CronJobDetail({
   const isPaused = state === 'paused'
   const deliver = jobDeliver(job)
   const prompt = jobPrompt(job)
+  const scriptOnly = jobIsScriptOnly(job)
+  const description = jobDescription(job)
   const modelOverride = jobModel(job)
 
   return (
@@ -621,6 +623,7 @@ function CronJobDetail({
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div className="flex min-w-0 flex-wrap items-center gap-2">
             <h3 className="text-[0.95rem] font-semibold tracking-tight text-foreground">{jobTitle(job)}</h3>
+            {scriptOnly && <PanelPill tone="muted">{c.scriptBadge}</PanelPill>}
             <PanelPill tone={STATE_TONE[state] ?? 'muted'}>{c.states[state] ?? state}</PanelPill>
           </div>
           <div className="flex shrink-0 items-center gap-0.5">
@@ -651,10 +654,10 @@ function CronJobDetail({
         ) : null}
       </header>
 
-      {prompt ? (
+      {description ? (
         <section className="space-y-1.5">
-          <PanelSectionLabel>{c.promptLabel}</PanelSectionLabel>
-          <PanelBlock>{prompt}</PanelBlock>
+          <PanelSectionLabel>{scriptOnly && !prompt ? c.scriptLabel : c.promptLabel}</PanelSectionLabel>
+          <PanelBlock>{description}</PanelBlock>
         </section>
       ) : null}
 

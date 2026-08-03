@@ -1729,6 +1729,8 @@ export const en: Translations = {
     namePlaceholder: 'Morning briefing',
     promptLabel: 'Prompt',
     promptPlaceholder: 'Summarize my unread Slack threads and email me the top 5...',
+    scriptLabel: 'Script',
+    scriptBadge: 'script',
     frequencyLabel: 'Frequency',
     deliverLabel: 'Deliver to',
     deliverNeedsHomeChannel: 'set a home channel first',

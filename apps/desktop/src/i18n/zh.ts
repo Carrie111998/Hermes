@@ -1923,6 +1923,8 @@ export const zh: Translations = {
     namePlaceholder: '晨间简报',
     promptLabel: '提示词',
     promptPlaceholder: '总结我未读的 Slack 话题，并把前 5 条邮件发给我…',
+    scriptLabel: '脚本',
+    scriptBadge: '脚本',
     frequencyLabel: '频率',
     deliverLabel: '投递至',
     deliverNeedsHomeChannel: '请先设置主频道',

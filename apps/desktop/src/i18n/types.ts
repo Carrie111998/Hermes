@@ -1435,6 +1435,8 @@ export interface Translations {
     namePlaceholder: string
     promptLabel: string
     promptPlaceholder: string
+    scriptLabel: string
+    scriptBadge: string
     frequencyLabel: string
     deliverLabel: string
     deliverNeedsHomeChannel: string

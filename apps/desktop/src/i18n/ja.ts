@@ -1570,6 +1570,8 @@ export const ja = defineLocale({
     namePlaceholder: '例: 日次サマリー',
     promptLabel: 'プロンプト',
     promptPlaceholder: '実行ごとにエージェントが行う内容は？',
+    scriptLabel: 'スクリプト',
+    scriptBadge: 'スクリプト',
     frequencyLabel: '頻度',
     deliverLabel: '配信先',
     deliverNeedsHomeChannel: '先にホームチャンネルを設定してください',

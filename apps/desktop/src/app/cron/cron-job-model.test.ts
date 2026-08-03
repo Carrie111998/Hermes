@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { cronEditorUpdates, jobIsScriptOnly, validateCronEditor } from './cron-job-model'
+import { cronEditorUpdates, jobDescription, jobIsScriptOnly, validateCronEditor } from './cron-job-model'
 
 describe('jobIsScriptOnly', () => {
   it('is true when no_agent is set and a script is present', () => {
@@ -11,6 +11,21 @@ describe('jobIsScriptOnly', () => {
     expect(jobIsScriptOnly({ no_agent: false, script: 'echo hi' })).toBe(false)
     expect(jobIsScriptOnly({ no_agent: true, script: '' })).toBe(false)
     expect(jobIsScriptOnly({ no_agent: true, script: null })).toBe(false)
+  })
+})
+
+describe('jobDescription', () => {
+  it('returns the prompt when present', () => {
+    expect(jobDescription({ prompt: 'Summarize mail', script: 'sync.sh' })).toBe('Summarize mail')
+  })
+
+  it('falls back to the script when the prompt is empty (script-only jobs)', () => {
+    expect(jobDescription({ prompt: '', script: 'sync_quillreach_cron.sh' })).toBe('sync_quillreach_cron.sh')
+  })
+
+  it('returns an empty string when neither prompt nor script is set', () => {
+    expect(jobDescription({ prompt: '', script: '' })).toBe('')
+    expect(jobDescription({ prompt: null, script: null })).toBe('')
   })
 })
 

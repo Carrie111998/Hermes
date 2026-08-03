@@ -1459,6 +1459,8 @@ export const ar = defineLocale({
     namePlaceholder: 'مثال: الملخص الصباحي',
     promptLabel: 'الرسالة',
     promptPlaceholder: 'ماذا تريد من Hermes أن يفعل؟',
+    scriptLabel: 'البرنامج النصي',
+    scriptBadge: 'برنامج نصي',
     frequencyLabel: 'التكرار',
     deliverLabel: 'التسليم',
     customScheduleLabel: 'جدول مخصص',
