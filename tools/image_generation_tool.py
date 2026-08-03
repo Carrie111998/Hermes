@@ -20,6 +20,8 @@ Pricing shown in UI strings is as-of the initial commit; we accept drift and
 update when it's noticed.
 """
 
+import hashlib
+import hmac
 import json
 import logging
 import os
@@ -835,6 +837,160 @@ def _postprocess_image_generate_result(raw: str, task_id: str | None = None) -> 
     return json.dumps(payload, ensure_ascii=False)
 
 
+_LITERAL_TRUNCATION_SUFFIX = "...[truncated]"
+_PROMPT_INTEGRITY_FIELD_ABSENT = object()
+
+
+def _is_lower_sha256(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(char in "0123456789abcdef" for char in value)
+    )
+
+
+def _prompt_integrity_details(
+    prompt: Any, frozen_length: Any, frozen_sha256: Any
+) -> dict:
+    actual_length = len(prompt) if isinstance(prompt, str) else None
+    actual_sha256 = None
+    utf8_encoding_valid = None
+    if isinstance(prompt, str):
+        try:
+            actual_sha256 = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+            utf8_encoding_valid = True
+        except UnicodeEncodeError:
+            utf8_encoding_valid = False
+    return {
+        "verified": False,
+        "output_admitted": False,
+        "frozen_prompt_length_chars": frozen_length,
+        "actual_prompt_length_chars": actual_length,
+        "frozen_prompt_sha256": frozen_sha256,
+        "actual_prompt_sha256": actual_sha256,
+        "utf8_encoding_valid": utf8_encoding_valid,
+        "literal_truncation_marker_present": bool(
+            isinstance(prompt, str)
+            and prompt.rstrip().endswith(_LITERAL_TRUNCATION_SUFFIX)
+        ),
+        "length_matches": (
+            actual_length == frozen_length
+            if actual_length is not None and type(frozen_length) is int
+            else None
+        ),
+        "sha256_matches": (
+            hmac.compare_digest(actual_sha256, frozen_sha256)
+            if isinstance(actual_sha256, str) and _is_lower_sha256(frozen_sha256)
+            else None
+        ),
+    }
+
+
+def _prompt_integrity_failure(reason_code: str, error: str, details: dict) -> str:
+    return tool_error(
+        error,
+        success=False,
+        image=None,
+        error_type="prompt_integrity",
+        reason_code=reason_code,
+        prompt_integrity=details,
+    )
+
+
+def _verify_frozen_prompt_integrity(
+    prompt: Any, frozen_length: Any, frozen_sha256: Any
+) -> tuple[Optional[dict], Optional[str]]:
+    """Verify the exact persisted prompt before any provider can run.
+
+    Hashing uses the UTF-8 encoding of the string exactly as received, without
+    stripping or normalization. The literal truncation suffix is always denied.
+    A frozen length or digest activates the paired, fail-closed contract.
+    """
+    literal_truncation = bool(
+        isinstance(prompt, str)
+        and prompt.rstrip().endswith(_LITERAL_TRUNCATION_SUFFIX)
+    )
+    length_present = frozen_length is not _PROMPT_INTEGRITY_FIELD_ABSENT
+    sha256_present = frozen_sha256 is not _PROMPT_INTEGRITY_FIELD_ABSENT
+    contract_requested = length_present or sha256_present
+    if not literal_truncation and not contract_requested:
+        return None, None
+
+    details = _prompt_integrity_details(
+        prompt,
+        frozen_length if length_present else None,
+        frozen_sha256 if sha256_present else None,
+    )
+    if details["literal_truncation_marker_present"]:
+        return None, _prompt_integrity_failure(
+            "PROMPT_ARGUMENT_LITERAL_TRUNCATION",
+            "Prompt ends with the literal truncation marker; provider dispatch refused.",
+            details,
+        )
+
+    valid_contract = (
+        length_present
+        and sha256_present
+        and type(frozen_length) is int
+        and frozen_length > 0
+        and _is_lower_sha256(frozen_sha256)
+    )
+    if not valid_contract:
+        return None, _prompt_integrity_failure(
+            "PROMPT_INTEGRITY_CONTRACT_INVALID",
+            "Frozen prompt integrity requires both a positive character length "
+            "and a lowercase 64-character SHA-256 digest.",
+            details,
+        )
+    if not isinstance(prompt, str):
+        return None, _prompt_integrity_failure(
+            "PROMPT_ARGUMENT_TYPE_INVALID",
+            "Prompt must be a string when frozen prompt integrity is requested.",
+            details,
+        )
+    if details["utf8_encoding_valid"] is not True:
+        return None, _prompt_integrity_failure(
+            "PROMPT_ARGUMENT_UTF8_ENCODING_INVALID",
+            "Prompt cannot be encoded as UTF-8 for frozen SHA-256 verification.",
+            details,
+        )
+    if details["length_matches"] is not True:
+        return None, _prompt_integrity_failure(
+            "PROMPT_ARGUMENT_LENGTH_MISMATCH",
+            "Prompt character length does not match the frozen prompt contract.",
+            details,
+        )
+    if details["sha256_matches"] is not True:
+        return None, _prompt_integrity_failure(
+            "PROMPT_ARGUMENT_SHA256_MISMATCH",
+            "Prompt SHA-256 does not match the frozen prompt contract.",
+            details,
+        )
+
+    details["verified"] = True
+    return details, None
+
+
+def _attach_prompt_integrity_proof(raw: str, proof: Optional[dict]) -> str:
+    if proof is None:
+        return raw
+    try:
+        payload = json.loads(raw) if isinstance(raw, str) else raw
+    except Exception:
+        return raw
+    if not isinstance(payload, dict):
+        return raw
+
+    bound_proof = dict(proof)
+    bound_proof["output_admitted"] = bool(
+        payload.get("success") is True
+        and isinstance(payload.get("image"), str)
+        and payload["image"].strip()
+    )
+    payload["prompt_integrity"] = bound_proof
+    return json.dumps(payload, ensure_ascii=False)
+
+
 def image_generate_tool(
     prompt: str,
     aspect_ratio: str = DEFAULT_ASPECT_RATIO,
@@ -1183,7 +1339,27 @@ IMAGE_GENERATE_SCHEMA = {
                 "description": (
                     "The text prompt describing the desired image (text-to-"
                     "image) or the edit to apply (image-to-image). Be detailed "
-                    "and descriptive."
+                    "and descriptive. A literal suffix of `...[truncated]` is "
+                    "rejected before provider dispatch."
+                ),
+            },
+            "frozen_prompt_length_chars": {
+                "type": "integer",
+                "minimum": 1,
+                "description": (
+                    "Optional fail-closed prompt-integrity contract. Exact "
+                    "character length of the frozen prompt. Supply together "
+                    "with `frozen_prompt_sha256`; both must match the exact "
+                    "persisted `prompt` argument before any provider call."
+                ),
+            },
+            "frozen_prompt_sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$",
+                "description": (
+                    "Optional fail-closed prompt-integrity contract. Lowercase "
+                    "SHA-256 of the exact frozen prompt encoded as UTF-8. Supply "
+                    "together with `frozen_prompt_length_chars`."
                 ),
             },
             "aspect_ratio": {
@@ -1500,6 +1676,17 @@ def _maybe_route_managed_krea(
 
 def _handle_image_generate(args, **kw):
     prompt = args.get("prompt", "")
+    frozen_length = args.get(
+        "frozen_prompt_length_chars", _PROMPT_INTEGRITY_FIELD_ABSENT
+    )
+    frozen_sha256 = args.get(
+        "frozen_prompt_sha256", _PROMPT_INTEGRITY_FIELD_ABSENT
+    )
+    prompt_integrity, integrity_error = _verify_frozen_prompt_integrity(
+        prompt, frozen_length, frozen_sha256
+    )
+    if integrity_error is not None:
+        return integrity_error
     if not prompt:
         return tool_error("prompt is required for image generation")
     aspect_ratio = args.get("aspect_ratio", DEFAULT_ASPECT_RATIO)
@@ -1516,7 +1703,8 @@ def _handle_image_generate(args, **kw):
         reference_image_urls=reference_image_urls,
     )
     if dispatched is not None:
-        return _postprocess_image_generate_result(dispatched, task_id=task_id)
+        bound = _attach_prompt_integrity_proof(dispatched, prompt_integrity)
+        return _postprocess_image_generate_result(bound, task_id=task_id)
 
     # Managed-mode Krea routing: when no explicit plugin provider is configured
     # but the selected model is a native ``krea-2-*`` id, a portal user routes to
@@ -1529,7 +1717,8 @@ def _handle_image_generate(args, **kw):
         reference_image_urls=reference_image_urls,
     )
     if krea_routed is not None:
-        return _postprocess_image_generate_result(krea_routed, task_id=task_id)
+        bound = _attach_prompt_integrity_proof(krea_routed, prompt_integrity)
+        return _postprocess_image_generate_result(bound, task_id=task_id)
 
     raw = image_generate_tool(
         prompt=prompt,
@@ -1537,7 +1726,8 @@ def _handle_image_generate(args, **kw):
         image_url=image_url,
         reference_image_urls=reference_image_urls,
     )
-    return _postprocess_image_generate_result(raw, task_id=task_id)
+    bound = _attach_prompt_integrity_proof(raw, prompt_integrity)
+    return _postprocess_image_generate_result(bound, task_id=task_id)
 
 
 # ---------------------------------------------------------------------------
