@@ -150,6 +150,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup()
+  Reflect.deleteProperty(window, 'hermesDesktop')
   vi.clearAllMocks()
 })
 
@@ -846,6 +847,39 @@ describe('ToolsetConfigPanel', () => {
       )
       // No success toast — the row is not active yet.
       expect(notify).not.toHaveBeenCalledWith(expect.objectContaining({ kind: 'success' }))
+    })
+
+    it('does not offer a Nous Portal escape from a managed toolset response', async () => {
+      const { notify } = await import('@/store/notifications')
+      Object.defineProperty(window, 'hermesDesktop', {
+        configurable: true,
+        value: { eva: {} },
+        writable: true
+      })
+      getToolsetConfig.mockResolvedValue(nousBrowserConfig())
+      selectToolsetProvider.mockResolvedValue({
+        ok: true,
+        name: 'browser',
+        provider: 'Nous Subscription (Browser Use cloud)',
+        needs_nous_auth: true,
+        feature: 'browser'
+      })
+
+      const { ToolsetConfigPanel } = await import('./toolset-config-panel')
+      render(<ToolsetConfigPanel onConfiguredChange={vi.fn()} toolset="browser" />)
+
+      await screen.findByRole('button', { name: /Nous Subscription/ })
+      fireEvent.click(await screen.findByRole('button', { name: /Use this backend/ }))
+
+      await waitFor(() =>
+        expect(notify).toHaveBeenCalledWith({
+          kind: 'warning',
+          title: 'Provider unavailable',
+          message: 'This backend is not available for your managed agent.'
+        })
+      )
+      expect(startOAuthLogin).not.toHaveBeenCalled()
+      expect(pollOAuthSession).not.toHaveBeenCalled()
     })
 
     it('drives the existing Nous OAuth device-code flow from the sign-in action and refetches', async () => {

@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
 import {
+  assertManagedGatewayMethodAllowed,
   isManagedBillingSlashCommand,
   isManagedConfigFieldVisible,
   isManagedSettingsViewVisible
@@ -40,5 +41,25 @@ describe('managed renderer policy', () => {
 
     expect(isManagedBillingSlashCommand('/my-billing-skill', true)).toBe(false)
     expect(isManagedBillingSlashCommand('/tools', true)).toBe(false)
+  })
+
+  it('rejects Nous billing and subscription RPCs below the managed UI', () => {
+    for (const method of [
+      'billing.state',
+      'billing.charge',
+      'billing.auto_reload',
+      'billing.step_up',
+      'subscription.state',
+      'subscription.change',
+      'subscription.resume',
+      'subscription.upgrade',
+      'usage.bars'
+    ]) {
+      expect(() => assertManagedGatewayMethodAllowed(method, true)).toThrow(/unavailable in managed evaOS Agent/)
+      expect(() => assertManagedGatewayMethodAllowed(method, false)).not.toThrow()
+    }
+
+    expect(() => assertManagedGatewayMethodAllowed('session.status', true)).not.toThrow()
+    expect(() => assertManagedGatewayMethodAllowed('usage.snapshot', true)).not.toThrow()
   })
 })

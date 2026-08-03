@@ -92,12 +92,13 @@ describe('ProvidersSettings', () => {
       writable: true
     })
     listOAuthProviders.mockResolvedValue({
-      providers: [provider('nous', false), provider('openai-codex', true), provider('minimax-oauth', false)]
+      providers: [provider('nous', true), provider('openai-codex', true), provider('minimax-oauth', false)]
     })
 
     await renderProvidersSettings()
 
     expect(screen.queryByText('Electric Sheep account')).toBeNull()
+    expect(screen.queryByText('Nous Portal')).toBeNull()
     expect(screen.queryByText('Fireworks AI')).toBeNull()
     expect(await screen.findByText('OpenAI OAuth (ChatGPT)')).toBeTruthy()
     expect(screen.getByRole('button', { name: 'Reauthenticate' })).toBeTruthy()

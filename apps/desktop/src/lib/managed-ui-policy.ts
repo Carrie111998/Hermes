@@ -1,4 +1,6 @@
 const MANAGED_BILLING_SLASH_COMMANDS = new Set(['/subscription', '/topup', '/upgrade'])
+const MANAGED_NOUS_GATEWAY_METHODS = new Set(['usage.bars'])
+const MANAGED_NOUS_GATEWAY_PREFIXES = ['billing.', 'subscription.']
 
 const MANAGED_HIDDEN_ADVANCED_FIELDS = new Set([
   'toolsets',
@@ -27,4 +29,14 @@ export function isManagedBillingSlashCommand(command: string, managed: boolean):
   const withSlash = normalized.startsWith('/') ? normalized : `/${normalized}`
 
   return MANAGED_BILLING_SLASH_COMMANDS.has(withSlash)
+}
+
+export function assertManagedGatewayMethodAllowed(method: string, managed: boolean): void {
+  if (
+    managed &&
+    (MANAGED_NOUS_GATEWAY_METHODS.has(method) ||
+      MANAGED_NOUS_GATEWAY_PREFIXES.some(prefix => method.startsWith(prefix)))
+  ) {
+    throw new Error('Billing and subscription actions are unavailable in managed evaOS Agent.')
+  }
 }

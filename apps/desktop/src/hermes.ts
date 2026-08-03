@@ -1,6 +1,8 @@
 import { JsonRpcGatewayClient, resolveGatewayWsUrl } from '@hermes/shared'
 
 import { reconnectBackoffDelayMs } from '@/lib/reconnect-backoff'
+import { assertManagedGatewayMethodAllowed } from '@/lib/managed-ui-policy'
+import { isManagedEvaosAgent } from '@/i18n/managed-brand'
 import type {
   ActionResponse,
   ActionStatusResponse,
@@ -233,6 +235,17 @@ export class HermesGateway extends JsonRpcGatewayClient {
       notConnectedErrorMessage: 'evaOS Agent gateway is not connected',
       requestTimeoutMs: DEFAULT_GATEWAY_REQUEST_TIMEOUT_MS
     })
+  }
+
+  override request<T>(
+    method: string,
+    params: Record<string, unknown> = {},
+    timeoutMs?: number,
+    signal?: AbortSignal
+  ): Promise<T> {
+    assertManagedGatewayMethodAllowed(method, isManagedEvaosAgent())
+
+    return super.request<T>(method, params, timeoutMs, signal)
   }
 }
 

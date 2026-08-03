@@ -46,6 +46,7 @@ const EVA_MANAGED_ESCAPE_QUERY_KEYS = new Set([
   'token'
 ])
 const EVA_MANAGED_BLOCKED_BACKEND_PATHS = new Set(['/api/hermes/update', '/api/hermes/update/check'])
+const EVA_MANAGED_BLOCKED_BACKEND_PREFIXES = ['/api/providers/oauth/nous']
 const EVA_MANAGED_PROFILE_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
 
 class EvaBrokerError extends Error {
@@ -124,8 +125,13 @@ function assertEvaManagedApiRequestAllowed(request) {
 
   const { parsed, pathname } = normalizeEvaManagedApiPath(request?.path)
   const policyPath = pathname.length > '/api/'.length ? pathname.replace(/\/+$/, '') : pathname
-  if (EVA_MANAGED_BLOCKED_BACKEND_PATHS.has(policyPath)) {
-    throw new EvaBrokerError('Updates are managed by Electric Sheep.', 403, 'managed-escape')
+  if (
+    EVA_MANAGED_BLOCKED_BACKEND_PATHS.has(policyPath) ||
+    EVA_MANAGED_BLOCKED_BACKEND_PREFIXES.some(
+      prefix => policyPath === prefix || policyPath.startsWith(`${prefix}/`)
+    )
+  ) {
+    throw new EvaBrokerError('This action is unavailable for managed evaOS Agent accounts.', 403, 'managed-escape')
   }
 
   for (const [key, value] of parsed.searchParams.entries()) {

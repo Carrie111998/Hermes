@@ -152,7 +152,7 @@ function OAuthPicker({
   const featured = managedEva ? null : (ordered.find(p => p.id === FEATURED_ID && !p.status?.logged_in) ?? null)
 
   const rest = managedEva
-    ? ordered.filter(p => p.id !== FEATURED_ID || p.status?.logged_in)
+    ? ordered.filter(p => p.id !== FEATURED_ID)
     : featured
       ? ordered.filter(p => p.id !== FEATURED_ID)
       : ordered

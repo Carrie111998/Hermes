@@ -18,6 +18,7 @@ import {
   startOAuthLogin
 } from '@/hermes'
 import { useI18n } from '@/i18n'
+import { isManagedEvaosAgent } from '@/i18n/managed-brand'
 import { Check, Loader2, Save, Terminal } from '@/lib/icons'
 import { cn } from '@/lib/utils'
 import { upsertDesktopActionTask } from '@/store/activity'
@@ -588,6 +589,16 @@ export function ToolsetConfigPanel({ toolset, onConfiguredChange }: ToolsetConfi
       )
 
       if (result.needs_nous_auth) {
+        if (isManagedEvaosAgent()) {
+          notify({
+            kind: 'warning',
+            title: 'Provider unavailable',
+            message: 'This backend is not available for your managed agent.'
+          })
+
+          return
+        }
+
         // Managed Nous row selected without Portal entitlement: the config
         // keys are written but the backend won't activate until the user
         // signs in (the CLI runs this gate inline; the GUI surfaces it as a

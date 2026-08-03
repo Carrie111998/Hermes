@@ -188,7 +188,7 @@ test('managed backend leaves file authorization to the assigned OS-isolated Herm
   )
 })
 
-test('managed backend blocks only connection, assignment, and updater escape hatches', () => {
+test('managed backend blocks connection, assignment, updater, and Nous OAuth escape hatches', () => {
   const denied = [
     { path: '/api/future-feature', method: 'POST', agentId: 'another-agent' },
     { path: '/api/future-feature', method: 'POST', customer_id: 'another-customer' },
@@ -200,7 +200,11 @@ test('managed backend blocks only connection, assignment, and updater escape hat
     { path: '/api/hermes/update', method: 'POST' },
     { path: '/api/hermes/update/', method: 'POST' },
     { path: '/api/hermes/update/check?force=true', method: 'GET' },
-    { path: '/api/hermes/update/check/', method: 'GET' }
+    { path: '/api/hermes/update/check/', method: 'GET' },
+    { path: '/api/providers/oauth/nous', method: 'DELETE' },
+    { path: '/api/providers/oauth/nous/start', method: 'POST' },
+    { path: '/api/providers/oauth/nous/submit', method: 'POST' },
+    { path: '/api/providers/oauth/nous/poll/session-1', method: 'GET' }
   ]
   for (const request of denied) {
     assert.throws(
