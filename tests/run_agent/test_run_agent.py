@@ -1043,6 +1043,37 @@ class TestInit:
             )
             assert a.valid_tool_names == {"web_search", "terminal"}
 
+    def test_deferred_tools_remain_session_available(self):
+        """Tool Search hides schemas without erasing session capabilities."""
+        visible = _make_tool_defs(
+            "terminal", "tool_search", "tool_describe", "tool_call"
+        )
+        full = _make_tool_defs("terminal", "session_search")
+
+        def _defs(**kwargs):
+            return full if kwargs.get("skip_tool_search_assembly") else visible
+
+        with (
+            patch("run_agent.get_tool_definitions", side_effect=_defs),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+        ):
+            a = AIAgent(
+                api_key="test-key-1234567890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+
+        assert a.valid_tool_names == {
+            "terminal", "tool_search", "tool_describe", "tool_call"
+        }
+        assert a.available_tool_names == {
+            "terminal", "session_search", "tool_search", "tool_describe", "tool_call"
+        }
+        assert a.deferred_tool_names == {"session_search"}
+
     def test_session_id_auto_generated(self):
         """Session ID should be auto-generated in YYYYMMDD_HHMMSS_<hex6> format."""
         with (
@@ -2246,6 +2277,22 @@ class TestExecuteToolCalls:
         assert len(messages) == 1
         assert messages[0]["role"] == "tool"
         assert "search result" in messages[0]["content"]
+
+    def test_deferred_direct_call_uses_session_availability_allowlist(self, agent):
+        agent.available_tool_names = {"web_search", "deferred_plugin_tool"}
+        tc = _mock_tool_call(
+            name="deferred_plugin_tool", arguments='{"query":"prior decision"}', call_id="c1"
+        )
+        messages = []
+
+        with patch("run_agent.handle_function_call", return_value="match") as mock_hfc:
+            agent._execute_tool_calls(
+                _mock_assistant_msg(content="", tool_calls=[tc]), messages, "task-1"
+            )
+
+        assert set(mock_hfc.call_args.kwargs["enabled_tools"]) == {
+            "web_search", "deferred_plugin_tool"
+        }
 
     def test_sequential_memory_remove_notifies_provider_with_tool_result(self, agent):
         old_text = "stale preference entry"

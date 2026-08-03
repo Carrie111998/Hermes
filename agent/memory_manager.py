@@ -139,6 +139,9 @@ def inject_memory_provider_tools(agent: Any) -> int:
             continue
         tools.append({"type": "function", "function": schema})
         valid_tool_names.add(tool_name)
+        available_tool_names = getattr(agent, "available_tool_names", None)
+        if available_tool_names is not None:
+            available_tool_names.add(tool_name)
         existing_tool_names.add(tool_name)
         added += 1
 

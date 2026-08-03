@@ -5007,6 +5007,30 @@ def refresh_agent_mcp_tools(
     )
     new_names = {t["function"]["name"] for t in new_defs}
 
+    # When Tool Search assembled a bridge surface, retain the pre-assembly
+    # session scope separately. A refresh must replace this snapshot together
+    # with ``tools``/``valid_tool_names``; otherwise a tool removed by a live
+    # toolset reload could remain callable through stale availability state.
+    new_available_names = set(new_names)
+    new_deferred_names: set[str] = set()
+    try:
+        from tools.tool_search import BRIDGE_TOOL_NAMES
+
+        if BRIDGE_TOOL_NAMES <= new_names:
+            preassembly_defs = get_tool_definitions(
+                enabled_toolsets=enabled,
+                disabled_toolsets=disabled,
+                quiet_mode=True,
+                skip_tool_search_assembly=True,
+            ) or []
+            preassembly_names = {
+                t["function"]["name"] for t in preassembly_defs
+            }
+            new_available_names.update(preassembly_names)
+            new_deferred_names = preassembly_names - new_names
+    except Exception:
+        pass
+
     # Re-append the post-build injected families that get_tool_definitions does
     # NOT reproduce, so a refresh never strips them (memory-provider + context-
     # engine tools). Staged entirely on LOCALS — the live ``agent.tools`` /
@@ -5016,6 +5040,7 @@ def refresh_agent_mcp_tools(
     # half-swap. ``staged_engine_names`` are the context-engine routing names
     # this rebuild actually appended (matching agent_init's dedup-aware add).
     staged_engine_names = _reinject_post_build_tools(agent, new_defs, new_names)
+    new_available_names.update(new_names)
 
     # Single atomic read-diff-publish so the returned ``added`` is consistent
     # with what was actually published, even under concurrent callers, and a
@@ -5034,13 +5059,18 @@ def refresh_agent_mcp_tools(
             t["function"]["name"]
             for t in (getattr(agent, "tools", None) or [])
         }
-        if new_names == current:
+        current_available = set(
+            getattr(agent, "available_tool_names", current)
+        )
+        if new_names == current and new_available_names == current_available:
             # No change → leave the live snapshot untouched (no churn), but
             # record the generation so an in-flight older caller can't clobber.
             agent._tool_snapshot_generation = max(published_gen, snapshot_generation)
             return set()
         agent.tools = new_defs
         agent.valid_tool_names = new_names
+        agent.available_tool_names = new_available_names
+        agent.deferred_tool_names = new_deferred_names
         # Publish context-engine routing names atomically with the snapshot.
         engine_names = getattr(agent, "_context_engine_tool_names", None)
         if isinstance(engine_names, set):

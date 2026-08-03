@@ -4425,24 +4425,32 @@ def run_conversation(
                     for tc in assistant_message.tool_calls:
                         logging.debug(f"Tool call: {tc.function.name} with args: {tc.function.arguments[:200]}...")
                 
+                # Deferred schemas remain callable by name. This is an
+                # intentional direct-call route for runtime-owned core tools
+                # whose stable prompt guidance can name them even while Tool
+                # Search keeps their schemas out of the model-visible prefix.
+                callable_tool_names = set(agent.valid_tool_names) | set(
+                    getattr(agent, "available_tool_names", ())
+                )
+
                 # Validate tool call names - detect model hallucinations
                 # Repair mismatched tool names before validating
                 for tc in assistant_message.tool_calls:
-                    if tc.function.name not in agent.valid_tool_names:
+                    if tc.function.name not in callable_tool_names:
                         repaired = agent._repair_tool_call(tc.function.name)
                         if repaired:
                             print(f"{agent.log_prefix}🔧 Auto-repaired tool name: '{tc.function.name}' -> '{repaired}'")
                             tc.function.name = repaired
                 invalid_tool_calls = [
                     tc.function.name for tc in assistant_message.tool_calls
-                    if tc.function.name not in agent.valid_tool_names
+                    if tc.function.name not in callable_tool_names
                 ]
                 if invalid_tool_calls:
                     # Track retries for invalid tool calls
                     agent._invalid_tool_retries += 1
 
                     # Return helpful error to model — model can agent-correct next turn
-                    available = ", ".join(sorted(agent.valid_tool_names))
+                    available = ", ".join(sorted(callable_tool_names))
                     invalid_name = invalid_tool_calls[0]
                     invalid_preview = invalid_name[:80] + "..." if len(invalid_name) > 80 else invalid_name
                     agent._buffer_vprint(f"⚠️  Unknown tool '{invalid_preview}' — sending error to model for agent-correction ({agent._invalid_tool_retries}/3)")
@@ -4466,7 +4474,7 @@ def run_conversation(
                     messages.append(assistant_msg)
                     for tc in assistant_message.tool_calls:
                         _tc_name = tc.function.name
-                        if _tc_name not in agent.valid_tool_names:
+                        if _tc_name not in callable_tool_names:
                             # A blank/whitespace-only name is not a typo the
                             # model can fuzzy-correct toward a real tool — it is
                             # almost always a weak open model echoing tool-call

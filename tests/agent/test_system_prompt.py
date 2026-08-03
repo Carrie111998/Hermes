@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from agent.system_prompt import build_system_prompt_parts
+from agent.prompt_builder import SESSION_SEARCH_GUIDANCE
 
 
 def _make_agent(**overrides):
@@ -99,3 +100,12 @@ class TestCodingContextBlock:
         monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
         agent = _make_agent(valid_tool_names=[], platform="cli")
         assert "coding agent" not in _stable_prompt(agent)
+
+
+def test_deferred_runtime_tool_keeps_capability_guidance():
+    agent = _make_agent(
+        valid_tool_names=["tool_search", "tool_describe", "tool_call"],
+        available_tool_names={"session_search"},
+    )
+
+    assert SESSION_SEARCH_GUIDANCE in _stable_prompt(agent)

@@ -132,6 +132,13 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # patch ``run_agent.get_toolset_for_tool`` and similar helpers, so
     # we resolve through ``_ra()`` to honor those patches.
     _r = _ra()
+    # Tool Search may defer schemas without removing the underlying tools from
+    # the session. Capability guidance must follow availability, not only the
+    # smaller model-visible schema set. Agents built by older/test call paths
+    # retain the historical behavior through this fallback.
+    available_tool_names = set(agent.valid_tool_names) | set(
+        getattr(agent, "available_tool_names", ())
+    )
 
     # Resolve the model's context window once so context-file caps can scale
     # to it (dynamic cap — see prompt_builder._dynamic_context_file_max_chars).
@@ -186,11 +193,11 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
 
     # Tool-aware behavioral guidance: only inject when the tools are loaded
     tool_guidance = []
-    if "memory" in agent.valid_tool_names:
+    if "memory" in available_tool_names:
         tool_guidance.append(MEMORY_GUIDANCE)
-    if "session_search" in agent.valid_tool_names:
+    if "session_search" in available_tool_names:
         tool_guidance.append(SESSION_SEARCH_GUIDANCE)
-    if "skill_manage" in agent.valid_tool_names:
+    if "skill_manage" in available_tool_names:
         tool_guidance.append(SKILLS_GUIDANCE)
     # Kanban worker/orchestrator lifecycle — only present when the
     # dispatcher spawned this process (kanban_show check_fn gates on
@@ -199,7 +206,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     _kanban_guidance = getattr(agent, "_kanban_worker_guidance", None)
     if _kanban_guidance:
         tool_guidance.append(_kanban_guidance)
-    elif _kanban_guidance is None and "kanban_show" in agent.valid_tool_names:
+    elif _kanban_guidance is None and "kanban_show" in available_tool_names:
         # Fallback for code paths that bypass agent_init (rare).
         tool_guidance.append(KANBAN_GUIDANCE)
     if tool_guidance:
@@ -214,11 +221,11 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # tool_guidance because the content is multi-paragraph. The guidance is
     # rendered for the host platform so Windows/Linux hosts don't see
     # macOS-only wording (Mac, Space, cmd+s).
-    if "computer_use" in agent.valid_tool_names:
+    if "computer_use" in available_tool_names:
         from agent.prompt_builder import computer_use_guidance
         stable_parts.append(computer_use_guidance())
 
-    nous_subscription_prompt = _r.build_nous_subscription_prompt(agent.valid_tool_names)
+    nous_subscription_prompt = _r.build_nous_subscription_prompt(available_tool_names)
     if nous_subscription_prompt:
         stable_parts.append(nous_subscription_prompt)
     # Tool-use enforcement: tells the model to actually call tools instead
@@ -257,12 +264,12 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             if "gpt" in _model_lower or "codex" in _model_lower or "grok" in _model_lower:
                 stable_parts.append(OPENAI_MODEL_EXECUTION_GUIDANCE)
 
-    has_skills_tools = any(name in agent.valid_tool_names for name in ['skills_list', 'skill_view', 'skill_manage'])
+    has_skills_tools = any(name in available_tool_names for name in ['skills_list', 'skill_view', 'skill_manage'])
     if has_skills_tools:
         avail_toolsets = {
             toolset
             for toolset in (
-                _r.get_toolset_for_tool(tool_name) for tool_name in agent.valid_tool_names
+                _r.get_toolset_for_tool(tool_name) for tool_name in available_tool_names
             )
             if toolset
         }
@@ -280,7 +287,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         except Exception:
             _compact_cats = frozenset()
         skills_prompt = _r.build_skills_system_prompt(
-            available_tools=agent.valid_tool_names,
+            available_tools=available_tool_names,
             available_toolsets=avail_toolsets,
             compact_categories=_compact_cats or None,
         )

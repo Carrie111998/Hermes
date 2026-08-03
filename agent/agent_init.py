@@ -1177,6 +1177,38 @@ def init_agent(
     elif not agent.quiet_mode:
         print("🛠️  No tools loaded (all tools filtered out or unavailable)")
 
+    # ``valid_tool_names`` deliberately mirrors the model-visible schemas in
+    # ``agent.tools``.  Tool Search can hide explicitly opted-in core tools
+    # behind its bridge, but those tools are still available to this session:
+    # prompt guidance and direct-call routing must not mistake schema deferral
+    # for toolset filtering.  Only pay for a second (memoized) catalog read
+    # when the bridge proves assembly activated.
+    agent.available_tool_names = set(agent.valid_tool_names)
+    agent.deferred_tool_names = set()
+    try:
+        from tools.tool_search import BRIDGE_TOOL_NAMES
+
+        if BRIDGE_TOOL_NAMES <= agent.valid_tool_names:
+            _available_defs = _ra().get_tool_definitions(
+                enabled_toolsets=enabled_toolsets,
+                disabled_toolsets=disabled_toolsets,
+                quiet_mode=True,
+                skip_tool_search_assembly=True,
+            ) or []
+            _preassembly_tool_names = {
+                tool["function"]["name"] for tool in _available_defs
+            }
+            agent.available_tool_names = (
+                _preassembly_tool_names | agent.valid_tool_names
+            )
+            agent.deferred_tool_names = (
+                _preassembly_tool_names - agent.valid_tool_names
+            )
+    except Exception:
+        # Tool discovery is fail-soft throughout initialization.  Falling back
+        # to the visible set preserves the pre-Tool-Search behavior.
+        pass
+
     # Kanban worker/orchestrator lifecycle guidance is session-static:
     # the dispatcher decides at spawn time whether this process is a kanban
     # worker (kanban_show tool is present iff HERMES_KANBAN_TASK is set).
@@ -1185,7 +1217,7 @@ def init_agent(
     # (init + each context compression).
     from agent.prompt_builder import KANBAN_GUIDANCE
     agent._kanban_worker_guidance = (
-        KANBAN_GUIDANCE if "kanban_show" in agent.valid_tool_names else ""
+        KANBAN_GUIDANCE if "kanban_show" in agent.available_tool_names else ""
     )
 
     # Check tool requirements
@@ -1925,6 +1957,7 @@ def init_agent(
             _wrapped = {"type": "function", "function": _schema}
             agent.tools.append(_wrapped)
             agent.valid_tool_names.add(_tname)
+            agent.available_tool_names.add(_tname)
             agent._context_engine_tool_names.add(_tname)
             _existing_tool_names.add(_tname)
 

@@ -44,6 +44,29 @@ def test_refresh_adds_late_landing_tools(monkeypatch):
     assert len(agent.tools) == 3
 
 
+def test_refresh_atomically_replaces_deferred_availability(monkeypatch):
+    """A reload cannot leave a removed deferred tool callable from stale state."""
+    agent = _agent(["terminal", "tool_search", "tool_describe", "tool_call"])
+    agent.available_tool_names = set(agent.valid_tool_names) | {"old_deferred"}
+    agent.deferred_tool_names = {"old_deferred"}
+
+    visible = [_tool(n) for n in agent.valid_tool_names]
+    preassembly = [_tool("terminal"), _tool("new_deferred")]
+
+    import model_tools
+
+    def _defs(**kwargs):
+        return preassembly if kwargs.get("skip_tool_search_assembly") else visible
+
+    monkeypatch.setattr(model_tools, "get_tool_definitions", _defs)
+
+    mcp_tool.refresh_agent_mcp_tools(agent)
+
+    assert "old_deferred" not in agent.available_tool_names
+    assert "new_deferred" in agent.available_tool_names
+    assert agent.deferred_tool_names == {"new_deferred"}
+
+
 def test_refresh_no_change_returns_empty_and_leaves_agent_untouched(monkeypatch):
     """No new tools → empty set, and the snapshot object is not swapped."""
     agent = _agent(["read_file", "terminal"])
