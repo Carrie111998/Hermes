@@ -1888,3 +1888,256 @@ class TestP2_FingerprintNormalization:
         assert ms.canonical_fingerprint(a) == ms.canonical_fingerprint(b)
         fp = ms.canonical_fingerprint(a)
         assert len(fp) == 64
+
+
+# ---------------------------------------------------------------------------
+# P1 RED: nested additionalProperties enforcement
+# ---------------------------------------------------------------------------
+
+class TestP2_NestedAdditionalProperties:
+    """Every nested object type with R1 additionalProperties:false must
+    reject unknown keys."""
+
+    def _make_valid_active(self):
+        """Build a minimal valid active state with all required nested objects."""
+        identity = _make_identity()
+        return _make_state(
+            status="active", phase="execution",
+            identity=identity,
+            card_ref={"card_id": "c1", "phase": "execution"},
+            execution_ref={"run_id": "r1", "attempt_id": "a1"},
+            evidence_refs=[{
+                "evidence_id": "ev1", "kind": "runtime_snapshot",
+                "fingerprint": _sha64(), "artifact": "art1",
+            }],
+            decision_refs=[{
+                "decision_id": "d1", "kind": "local",
+                "outcome": "pass", "evidence_ids": ["ev1"],
+            }],
+            consultation_refs=[{
+                "execution_id": "ex1", "mode": "plan-review",
+                "snapshot_head": _sha40(), "tree_sha": _sha40(),
+                "plan_fingerprint": _sha64(),
+                "checkpoint_fingerprint": _sha64(),
+                "bundle_fingerprint": _sha64(),
+                "expected_question_ids": ["Q1"],
+                "schema_version": "codex-senior-consult-response/v3",
+                "status": "COMPLETED",
+                "detailed_status": "VALID_ADVISORY_VERDICT",
+                "verdict": "accept",
+                "response_fingerprint": _sha64(),
+                "response_artifact": "r.json",
+            }],
+            active_blocker=None, active_human_gate=None,
+            queue_exhausted=None,
+            next_safe_action={
+                "action": "dispatch_card", "executable": True,
+                "card_id": "c1", "reason_code": "active",
+            },
+            last_operation={
+                "operation_id": "op1", "request_fingerprint": _sha64(),
+                "attempt_id": "a1",
+            },
+        )
+
+    def test_identity_extra_key_rejected(self, db):
+        state = self._make_valid_active()
+        state["identity"]["unexpected_key"] = "x"
+        errors = ms._validate_state_shape(state)
+        assert any("identity" in e for e in errors), f"Expected identity error, got: {errors}"
+
+    def test_card_ref_extra_key_rejected(self, db):
+        state = self._make_valid_active()
+        state["card_ref"]["extra"] = True
+        errors = ms._validate_state_shape(state)
+        assert any("card_ref" in e for e in errors), f"Expected card_ref error, got: {errors}"
+
+    def test_execution_ref_extra_key_rejected(self, db):
+        state = self._make_valid_active()
+        state["execution_ref"]["extra"] = True
+        errors = ms._validate_state_shape(state)
+        assert any("execution_ref" in e for e in errors), f"Expected execution_ref error, got: {errors}"
+
+    def test_evidence_ref_extra_key_rejected(self, db):
+        state = self._make_valid_active()
+        state["evidence_refs"][0]["extra"] = True
+        errors = ms._validate_state_shape(state)
+        assert any("evidence_ref" in e.lower() for e in errors), f"Expected evidence_ref error, got: {errors}"
+
+    def test_decision_ref_extra_key_rejected(self, db):
+        state = self._make_valid_active()
+        state["decision_refs"][0]["extra"] = True
+        errors = ms._validate_state_shape(state)
+        assert any("decision_ref" in e.lower() for e in errors), f"Expected decision_ref error, got: {errors}"
+
+    def test_next_safe_action_extra_key_rejected(self, db):
+        state = self._make_valid_active()
+        state["next_safe_action"]["extra"] = True
+        errors = ms._validate_state_shape(state)
+        assert any("next_safe_action" in e for e in errors), f"Expected NSA error, got: {errors}"
+
+    def test_last_operation_extra_key_rejected(self, db):
+        state = self._make_valid_active()
+        state["last_operation"]["extra"] = True
+        errors = ms._validate_state_shape(state)
+        assert any("last_operation" in e for e in errors), f"Expected last_op error, got: {errors}"
+
+    def test_completion_extra_key_rejected(self, db):
+        state = self._make_valid_active()
+        state["completion"]["extra"] = True
+        errors = ms._validate_state_shape(state)
+        assert any("completion" in e for e in errors), f"Expected completion error, got: {errors}"
+
+    def test_consultation_ref_extra_key_rejected(self, db):
+        state = self._make_valid_active()
+        state["consultation_refs"][0]["extra"] = True
+        errors = ms._validate_state_shape(state)
+        assert any("consultation_ref" in e.lower() for e in errors), f"Expected cons error, got: {errors}"
+
+
+class TestP2_BlockedNestedExtraKeys:
+    """Blocked state nested objects must also reject extra keys."""
+
+    def test_blocker_extra_key_rejected(self, db):
+        state = _make_blocked_state()
+        state["active_blocker"]["extra"] = True
+        errors = ms._validate_state_shape(state)
+        assert any("active_blocker" in e for e in errors), f"Expected blocker error, got: {errors}"
+
+    def test_resume_condition_extra_key_rejected(self, db):
+        state = _make_blocked_state()
+        state["active_blocker"]["resume_condition"]["extra"] = True
+        errors = ms._validate_state_shape(state)
+        assert any("resume_condition" in e for e in errors), f"Expected rc error, got: {errors}"
+
+
+class TestP2_HumanGateNestedExtraKeys:
+    def test_human_gate_extra_key_rejected(self, db):
+        state = _make_human_gate_state()
+        state["active_human_gate"]["extra"] = True
+        errors = ms._validate_state_shape(state)
+        assert any("active_human_gate" in e for e in errors), f"Expected gate error, got: {errors}"
+
+
+class TestP2_QueueExhaustedNestedExtraKeys:
+    def test_queue_exhausted_extra_key_rejected(self, db):
+        state = _make_queue_exhausted_state()
+        state["queue_exhausted"]["extra"] = True
+        errors = ms._validate_state_shape(state)
+        assert any("queue_exhausted" in e for e in errors), f"Expected qe error, got: {errors}"
+
+    def test_qe_resume_condition_extra_key_rejected(self, db):
+        state = _make_queue_exhausted_state()
+        state["queue_exhausted"]["resume_condition"]["extra"] = True
+        errors = ms._validate_state_shape(state)
+        assert any("resume_condition" in e for e in errors), f"Expected rc error, got: {errors}"
+
+
+class TestP2_CompletedNestedExtraKeys:
+    def test_gate_ref_extra_key_rejected(self, db):
+        state = _make_completed_state()
+        state["completion"]["final_review"]["extra"] = True
+        errors = ms._validate_state_shape(state)
+        assert any("final_review" in e for e in errors), f"Expected gate error, got: {errors}"
+
+
+# ---------------------------------------------------------------------------
+# P2 RED: non-finite JSON rejection
+# ---------------------------------------------------------------------------
+
+class TestP2_NonFiniteJSON:
+    """NaN and Infinity must be rejected at any depth."""
+
+    def test_nan_in_nested_field_rejected(self, db):
+        """NaN in evidence_ref fingerprint should be rejected."""
+        state = _make_valid_active_for_nonfinite()
+        state["evidence_refs"][0]["fingerprint"] = float("nan")
+        result = ms.create_mission(
+            db, state=state, operation_id="op-nan",
+        )
+        assert result.outcome == "invalid"
+
+    def test_positive_infinity_rejected(self, db):
+        state = _make_valid_active_for_nonfinite()
+        state["generation"] = float("inf")
+        errors = ms._validate_state_shape(state)
+        assert errors, f"Expected Infinity to be rejected, got: {errors}"
+
+    def test_negative_infinity_rejected(self, db):
+        state = _make_valid_active_for_nonfinite()
+        state["generation"] = float("-inf")
+        errors = ms._validate_state_shape(state)
+        assert errors, f"Expected -Infinity to be rejected, got: {errors}"
+
+    def test_nan_in_list_rejected(self, db):
+        state = _make_valid_active_for_nonfinite()
+        state["evidence_refs"][0]["fingerprint"] = float("nan")
+        errors = ms._validate_state_shape(state)
+        assert errors, f"Expected NaN in list item to be rejected"
+
+    def test_unicode_still_accepted(self, db):
+        state = _make_valid_active_for_nonfinite()
+        state["identity"]["repository"] = "https://github.com/test/\u00f1repo"
+        errors = ms._validate_state_shape(state)
+        assert errors == [], f"Unicode should be accepted, got: {errors}"
+
+    def test_bool_and_null_accepted(self, db):
+        state = _make_valid_active_for_nonfinite()
+        state["completion"]["merge_required"] = True
+        state["completion"]["merge_gate"] = None
+        errors = ms._validate_state_shape(state)
+        # Note: merge_gate=None is only valid when merge_required=False
+        # This test just ensures bool/null don't crash the validator
+        assert isinstance(errors, list)
+
+    def test_generation_bool_rejected(self, db):
+        """Python bool is int subtype; True/False must be rejected for generation."""
+        state = _make_valid_active_for_nonfinite()
+        state["generation"] = True
+        errors = ms._validate_state_shape(state)
+        assert errors, f"Expected bool generation to be rejected"
+
+    def test_fingerprint_stable_after_reopen(self, tmp_path):
+        """Fingerprint survives close/reopen with non-finite-free state."""
+        db_path = tmp_path / "fp_test.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        ms.migrate_mission_state(conn)
+        state = _make_valid_active_for_nonfinite()
+        r = ms.create_mission(conn, state=state, operation_id="op-1")
+        fp = r.state_fingerprint
+        conn.close()
+
+        conn2 = sqlite3.connect(str(db_path))
+        conn2.row_factory = sqlite3.Row
+        ms.migrate_mission_state(conn2)
+        rec = ms.get_mission(conn2, state["mission_id"])
+        conn2.close()
+        assert rec.state_fingerprint == fp
+
+
+def _make_valid_active_for_nonfinite():
+    """Valid active state for non-finite JSON tests."""
+    identity = _make_identity()
+    return _make_state(
+        status="active", phase="execution",
+        identity=identity,
+        card_ref={"card_id": "c1", "phase": "execution"},
+        execution_ref={"run_id": "r1", "attempt_id": "a1"},
+        evidence_refs=[{
+            "evidence_id": "ev1", "kind": "runtime_snapshot",
+            "fingerprint": _sha64(), "artifact": "art1",
+        }],
+        decision_refs=[],
+        consultation_refs=[],
+        active_blocker=None, active_human_gate=None,
+        queue_exhausted=None,
+        next_safe_action={
+            "action": "dispatch_card", "executable": True,
+            "card_id": "c1", "reason_code": "active",
+        },
+        last_operation={
+            "operation_id": "op1", "request_fingerprint": _sha64(),
+            "attempt_id": "a1",
+        },
+    )

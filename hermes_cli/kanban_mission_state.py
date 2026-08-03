@@ -74,6 +74,68 @@ _CONSULTATION_REQUIRED_KEYS = frozenset({
     "response_artifact",
 })
 
+# R1 nested object allowlists (additionalProperties: false)
+# Each maps a dotted path prefix to its allowed key set.
+_NESTED_ALLOWLISTS = {
+    "identity": frozenset({
+        "board", "tenant", "repository", "branch",
+        "base_sha", "head_sha", "tree_sha",
+        "plan_fingerprint", "checkpoint_fingerprint",
+    }),
+    "planner_import": frozenset({
+        "board", "import_id", "envelope_fingerprint",
+    }),
+    "card_ref": frozenset({"card_id", "phase"}),
+    "execution_ref": frozenset({"run_id", "attempt_id"}),
+    "last_operation": frozenset({
+        "operation_id", "request_fingerprint", "attempt_id",
+    }),
+    "next_safe_action": frozenset({
+        "action", "executable", "card_id", "reason_code",
+    }),
+    "completion": frozenset({
+        "final_review", "merge_required", "merge_gate",
+    }),
+    "active_blocker": frozenset({
+        "blocker_id", "reason_code", "summary",
+        "evidence_ids", "resume_condition",
+    }),
+    "active_blocker.resume_condition": frozenset({
+        "type", "description", "reference",
+    }),
+    "active_human_gate": frozenset({
+        "gate_id", "gate_type", "version", "status",
+        "prompt_fingerprint", "resolution_ref",
+    }),
+    "queue_exhausted": frozenset({
+        "decision_id", "reason_code", "summary",
+        "exhausted_at_generation", "evidence_ids",
+        "resume_condition",
+    }),
+    "queue_exhausted.resume_condition": frozenset({
+        "type", "description", "reference",
+    }),
+    "evidence_ref": frozenset({
+        "evidence_id", "kind", "fingerprint", "artifact",
+    }),
+    "decision_ref": frozenset({
+        "decision_id", "kind", "outcome", "evidence_ids",
+    }),
+    "consultation_ref": frozenset({
+        "execution_id", "mode", "snapshot_head", "tree_sha",
+        "plan_fingerprint", "checkpoint_fingerprint",
+        "bundle_fingerprint", "expected_question_ids",
+        "schema_version", "status", "detailed_status",
+        "verdict", "response_fingerprint", "response_artifact",
+    }),
+    "gate_ref": frozenset({
+        "gate_id", "gate_type", "repository", "branch",
+        "commit_sha", "tree_sha", "diff_fingerprint",
+        "bundle_fingerprint", "response_fingerprint",
+        "response_artifact", "result",
+    }),
+}
+
 # R1-aligned outcome vocabulary for TransitionResult.
 # The R1 schema defines: applied, replayed, stale_generation, conflict, invalid.
 # "not-found" and "failed" map to "invalid" with appropriate error codes.
@@ -102,7 +164,7 @@ def canonical_fingerprint(value: Any) -> str:
     faithfully.  ``separators=(',',':')`` removes whitespace for a
     compact, unambiguous representation.
     """
-    payload = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    payload = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
@@ -320,6 +382,122 @@ def _row_to_journal_record(row: sqlite3.Row) -> JournalRecord:
     )
 
 
+def _reject_non_finite(obj, path: str = "$") -> list[str]:
+    """Reject NaN/Infinity at any depth. Returns error list."""
+    errors: list[str] = []
+    if isinstance(obj, float):
+        if obj != obj:  # NaN
+            errors.append(f"{path}: NaN is not allowed")
+        elif obj == float("inf"):
+            errors.append(f"{path}: Infinity is not allowed")
+        elif obj == float("-inf"):
+            errors.append(f"{path}: -Infinity is not allowed")
+    elif isinstance(obj, dict):
+        for k, v in obj.items():
+            errors.extend(_reject_non_finite(v, f"{path}.{k}"))
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            errors.extend(_reject_non_finite(v, f"{path}[{i}]"))
+    return errors
+
+
+def _check_nested_allowlists(state: dict) -> list[str]:
+    """Check additionalProperties:false for all nested R1 object types."""
+    errors: list[str] = []
+
+    def _check_obj(obj: dict, allowed: frozenset, path: str) -> None:
+        if not isinstance(obj, dict):
+            return
+        extra = set(obj.keys()) - allowed
+        if extra:
+            errors.append(f"{path}: unknown properties {sorted(extra)}")
+
+    # Top-level
+    _check_obj(state, _VALID_STATE_KEYS, "$")
+
+    # identity
+    ident = state.get("identity")
+    if isinstance(ident, dict):
+        _check_obj(ident, _NESTED_ALLOWLISTS["identity"], "$.identity")
+
+    # planner_import
+    pi = state.get("planner_import")
+    if isinstance(pi, dict):
+        _check_obj(pi, _NESTED_ALLOWLISTS["planner_import"], "$.planner_import")
+
+    # card_ref
+    cr = state.get("card_ref")
+    if isinstance(cr, dict):
+        _check_obj(cr, _NESTED_ALLOWLISTS["card_ref"], "$.card_ref")
+
+    # execution_ref
+    er = state.get("execution_ref")
+    if isinstance(er, dict):
+        _check_obj(er, _NESTED_ALLOWLISTS["execution_ref"], "$.execution_ref")
+
+    # last_operation
+    lo = state.get("last_operation")
+    if isinstance(lo, dict):
+        _check_obj(lo, _NESTED_ALLOWLISTS["last_operation"], "$.last_operation")
+
+    # next_safe_action
+    nsa = state.get("next_safe_action")
+    if isinstance(nsa, dict):
+        _check_obj(nsa, _NESTED_ALLOWLISTS["next_safe_action"], "$.next_safe_action")
+
+    # completion
+    comp = state.get("completion")
+    if isinstance(comp, dict):
+        _check_obj(comp, _NESTED_ALLOWLISTS["completion"], "$.completion")
+
+    # active_blocker
+    ab = state.get("active_blocker")
+    if isinstance(ab, dict):
+        _check_obj(ab, _NESTED_ALLOWLISTS["active_blocker"], "$.active_blocker")
+        rc = ab.get("resume_condition")
+        if isinstance(rc, dict):
+            _check_obj(rc, _NESTED_ALLOWLISTS["active_blocker.resume_condition"], "$.active_blocker.resume_condition")
+
+    # active_human_gate
+    ahg = state.get("active_human_gate")
+    if isinstance(ahg, dict):
+        _check_obj(ahg, _NESTED_ALLOWLISTS["active_human_gate"], "$.active_human_gate")
+
+    # queue_exhausted
+    qe = state.get("queue_exhausted")
+    if isinstance(qe, dict):
+        _check_obj(qe, _NESTED_ALLOWLISTS["queue_exhausted"], "$.queue_exhausted")
+        rc = qe.get("resume_condition")
+        if isinstance(rc, dict):
+            _check_obj(rc, _NESTED_ALLOWLISTS["queue_exhausted.resume_condition"], "$.queue_exhausted.resume_condition")
+
+    # evidence_refs
+    for i, ev in enumerate(state.get("evidence_refs", [])):
+        if isinstance(ev, dict):
+            _check_obj(ev, _NESTED_ALLOWLISTS["evidence_ref"], f"$.evidence_refs[{i}]")
+
+    # decision_refs
+    for i, dr in enumerate(state.get("decision_refs", [])):
+        if isinstance(dr, dict):
+            _check_obj(dr, _NESTED_ALLOWLISTS["decision_ref"], f"$.decision_refs[{i}]")
+
+    # consultation_refs
+    for i, cr in enumerate(state.get("consultation_refs", [])):
+        if isinstance(cr, dict):
+            _check_obj(cr, _NESTED_ALLOWLISTS["consultation_ref"], f"$.consultation_refs[{i}]")
+
+    # completion.final_review (gateRef)
+    if isinstance(comp, dict):
+        fr = comp.get("final_review")
+        if isinstance(fr, dict):
+            _check_obj(fr, _NESTED_ALLOWLISTS["gate_ref"], "$.completion.final_review")
+        mg = comp.get("merge_gate")
+        if isinstance(mg, dict):
+            _check_obj(mg, _NESTED_ALLOWLISTS["gate_ref"], "$.completion.merge_gate")
+
+    return errors
+
+
 def _validate_state_shape(state: dict) -> list[str]:
     """Validate that *state* matches the R1 mission_state document shape.
 
@@ -333,6 +511,13 @@ def _validate_state_shape(state: dict) -> list[str]:
       R1 schema/tests remain the normative development reference.
     """
     errors: list[str] = []
+
+    # Non-finite check (NaN/Infinity at any depth)
+    errors.extend(_reject_non_finite(state))
+
+    # Nested allowlists (additionalProperties:false)
+    errors.extend(_check_nested_allowlists(state))
+
     if state.get("document_type") != DOCUMENT_TYPE_STATE:
         errors.append("document_type must be 'mission_state'")
     if state.get("schema_version") != SCHEMA_VERSION:
@@ -347,7 +532,7 @@ def _validate_state_shape(state: dict) -> list[str]:
     if phase not in VALID_PHASES:
         errors.append(f"phase must be one of {sorted(VALID_PHASES)}")
     generation = state.get("generation")
-    if not isinstance(generation, int) or generation < 0:
+    if not isinstance(generation, int) or generation < 0 or isinstance(generation, bool):
         errors.append("generation must be a non-negative integer")
 
     # Reject unknown top-level keys (R1 additionalProperties: false)
