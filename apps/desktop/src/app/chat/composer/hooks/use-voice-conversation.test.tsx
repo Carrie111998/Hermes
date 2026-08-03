@@ -157,6 +157,22 @@ describe('useVoiceConversation full-duplex barge-in', () => {
     await waitFor(() => expect(monitorCalls.length).toBeGreaterThan(0))
   })
 
+  it('uses a quiet-microphone threshold and responsive end-of-speech timing', async () => {
+    const { hook } = renderConversation()
+
+    await act(async () => {
+      await hook.result.current.start()
+    })
+
+    expect(micHandle.start).toHaveBeenCalledWith(
+      expect.objectContaining({
+        idleSilenceMs: 8_000,
+        silenceLevel: 0.02,
+        silenceMs: 900
+      })
+    )
+  })
+
   it('interrupts the in-flight turn when speech trips mid-generation', async () => {
     const { hook, onInterrupt } = renderConversation()
 

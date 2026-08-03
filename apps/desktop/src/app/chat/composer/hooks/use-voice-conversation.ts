@@ -45,6 +45,15 @@ interface VoiceConversationOptions {
  *  the captured utterance anyway. */
 const INTERRUPT_SETTLE_TIMEOUT_MS = 5_000
 
+// Browser analyser levels are normalized from byte-domain RMS (`rms / 42`).
+// 0.02 is approximately the desktop equivalent of the CLI's documented
+// int16 RMS threshold of 200. The previous 0.075 threshold was roughly four
+// times stricter: a quiet-but-clear microphone could trigger openWakeWord yet
+// never count as speech once the desktop conversation opened.
+const CONVERSATION_SPEECH_LEVEL = 0.02
+const CONVERSATION_END_SILENCE_MS = 900
+const CONVERSATION_IDLE_SILENCE_MS = 8_000
+
 export function useVoiceConversation({
   busy,
   enabled,
@@ -235,9 +244,9 @@ export function useVoiceConversation({
     try {
       // VAD tuning mirrors `tools.voice_mode` defaults so the browser loop matches the CLI.
       await handle.start({
-        silenceLevel: 0.075,
-        silenceMs: 1_250,
-        idleSilenceMs: 12_000,
+        silenceLevel: CONVERSATION_SPEECH_LEVEL,
+        silenceMs: CONVERSATION_END_SILENCE_MS,
+        idleSilenceMs: CONVERSATION_IDLE_SILENCE_MS,
         onError: error => {
           notifyError(error, voiceCopy.microphoneFailed)
           pendingStartRef.current = false

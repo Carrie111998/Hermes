@@ -25,6 +25,19 @@ describe('subagent store', () => {
     const item = listFor('s1')[0]
     expect(item?.status).toBe('completed')
     expect(item?.summary).toBe('done')
+
+    // focused test: ensure role and agent (for active task summaries) are extracted
+    upsertSubagent('s1', {
+      goal: 'scan files',
+      status: 'running',
+      subagent_id: 'a2',
+      task_index: 1,
+      role: 'leaf',
+      agent: 'primary'
+    })
+    const item2 = listFor('s1').find((i: any) => i.id?.includes('a2')) || listFor('s1')[1]
+    expect(item2?.role).toBe('leaf')
+    expect(item2?.agent).toBe('primary')
   })
 
   it('builds parent/child trees', () => {

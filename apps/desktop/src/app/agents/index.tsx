@@ -313,6 +313,8 @@ function SubagentRow({ node, depth = 0, nowMs }: { node: SubagentNode; depth?: n
 
   const subtitle = [
     node.model,
+    node.role,
+    node.agent,
     fmtDuration(durationSeconds, t.agents),
     node.toolCount ? t.agents.toolsCount(node.toolCount) : '',
     fmtTokens((node.inputTokens ?? 0) + (node.outputTokens ?? 0), t.agents),
