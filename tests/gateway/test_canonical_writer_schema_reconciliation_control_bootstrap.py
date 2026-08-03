@@ -290,6 +290,7 @@ def _intermediate(
     *,
     initial_state: str = "absent",
     provider_forward_role_count: int = 1,
+    materialized_creator_edge: bool = True,
 ) -> dict[str, Any]:
     session_hash = gate["temporary_control_admin_username_sha256"]
     before = _observation(
@@ -306,7 +307,11 @@ def _intermediate(
         state="exact_installed",
         session_user_sha256=session_hash,
         control_admin_count=1,
-        membership_count=1 if initial_state == "absent" else 0,
+        membership_count=(
+            1
+            if initial_state == "absent" and materialized_creator_edge
+            else 0
+        ),
         observed_at_unix=970,
         provider_forward_role_count=provider_forward_role_count,
     )
@@ -661,7 +666,7 @@ def test_observation_validator_rejects_rehashed_session_boundary_tamper(
     (
         (("before_observation", "session_user_sha256"), _digest("wrong-user")),
         (("after_observation", "control_admin_count"), 0),
-        (("after_observation", "executor_membership_count"), 0),
+        (("after_observation", "executor_membership_count"), 2),
     ),
 )
 def test_intermediate_binds_admin_session_and_creator_edge(
@@ -702,6 +707,24 @@ def test_intermediate_binds_admin_session_and_creator_edge(
             install_claim=install,
             now_unix=NOW,
         )
+
+
+def test_intermediate_accepts_cloud_sql_unmaterialized_creator_authority() -> None:
+    key = Ed25519PrivateKey.generate()
+    gate = _gate(key)
+    install = _signed_install(key, gate)
+    intermediate = _intermediate(
+        gate,
+        install,
+        materialized_creator_edge=False,
+    )
+
+    assert bootstrap.validate_intermediate_for_owner(
+        intermediate,
+        gate=gate,
+        install_claim=install,
+        now_unix=NOW,
+    ) == intermediate
 
 
 def test_terminal_binds_fresh_writer_observation_after_cleanup() -> None:

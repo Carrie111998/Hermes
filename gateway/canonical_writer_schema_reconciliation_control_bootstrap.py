@@ -1077,8 +1077,19 @@ def validate_intermediate_for_owner(
         or before["cluster_prepared_xact_count"] != 0
         or after["cluster_prepared_xact_count"] != 0
         or before["executor_membership_count"] != 0
-        or after["executor_membership_count"]
-        != (1 if before["state"] == "absent" else 0)
+        # PostgreSQL 18 may materialize the creator's implicit ADMIN edge,
+        # while Cloud SQL exposes the same creator authority without a
+        # pg_auth_members row.  The observation's exact membership and
+        # forward-closure contracts prove that a present edge is the single
+        # provider-granted shape; only its provider-safe absence is optional.
+        or (
+            before["state"] == "absent"
+            and after["executor_membership_count"] not in {0, 1}
+        )
+        or (
+            before["state"] == "exact_installed"
+            and after["executor_membership_count"] != 0
+        )
         or raw.get("before_observation") != before
         or raw.get("before_observation_sha256")
         != before["observation_sha256"]
