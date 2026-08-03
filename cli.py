@@ -4708,6 +4708,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         from hermes_cli.prompt_stash import PromptStash as _PromptStash
         self._prompt_stash = _PromptStash()
         self.preloaded_skills: list[str] = []
+        self._auto_load_skills_result: tuple[str, list[str], list[str]] | None = None
         self._startup_skills_line_shown = False
         self._active_session_lease = None
 
@@ -18021,6 +18022,7 @@ def main(
             toolsets_list = sorted(_get_platform_tools(CLI_CONFIG, "cli"))
     
     parsed_skills = _parse_skills_argument(skills)
+    loaded_skills: list[str] = []
 
     # Create CLI instance
     cli = HermesCLI(
@@ -18039,10 +18041,37 @@ def main(
         ignore_rules=ignore_rules,
     )
 
+    # Resolve auto-load templates only after the session exists so
+    # ${HERMES_SESSION_ID} substitutions receive the real CLI session ID. The
+    # exact rendered bytes are handed to lazily created replacement agents and
+    # remain stable across model switches for this CLI session.
+    from agent.skill_commands import build_auto_load_prompt
+
+    effective_ignore_rules = (
+        ignore_rules or os.environ.get("HERMES_IGNORE_RULES") == "1"
+    )
+    auto_load_result = (
+        ("", [], [])
+        if effective_ignore_rules
+        else build_auto_load_prompt(
+            task_id=cli.session_id,
+            user_config=CLI_CONFIG,
+        )
+    )
+    _auto_prompt, auto_load_skills, auto_load_missing = auto_load_result
+    auto_load_set = set(auto_load_skills)
+    cli._auto_load_skills_result = auto_load_result
+    if auto_load_missing:
+        logger.warning(
+            "Auto-load skill(s) not found or disabled: %s",
+            ", ".join(auto_load_missing),
+        )
+
     if parsed_skills:
         skills_prompt, loaded_skills, missing_skills = build_preloaded_skills_prompt(
             parsed_skills,
             task_id=cli.session_id,
+            excluded_loaded_names=auto_load_set,
         )
         if missing_skills:
             missing_display = ", ".join(missing_skills)
@@ -18065,7 +18094,14 @@ def main(
             cli.system_prompt = "\n\n".join(
                 part for part in (cli.system_prompt, skills_prompt) if part
             ).strip()
-            cli.preloaded_skills = loaded_skills
+
+    # Display only canonical names that loaded successfully, auto_load first.
+    if auto_load_skills or loaded_skills:
+        display = list(auto_load_skills)
+        for s in loaded_skills:
+            if s not in auto_load_set:
+                display.append(s)
+        cli.preloaded_skills = display
 
     # Inject worktree context into agent's system prompt
     if wt_info:
