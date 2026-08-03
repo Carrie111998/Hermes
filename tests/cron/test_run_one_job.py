@@ -112,12 +112,37 @@ def test_tick_process_job_sequence(monkeypatch):
     assert calls[-1] == ("mark", "j1", True)
 
 
+def test_run_one_job_canonicalizes_persisted_nominal_time(monkeypatch):
+    _patch_pipeline(monkeypatch)
+    captured = {}
+
+    def create(job_id, *, source, scheduled_for=None):
+        captured.update(job_id=job_id, source=source, scheduled_for=scheduled_for)
+        return {
+            "id": "p" * 32,
+            "job_id": job_id,
+            "source": source,
+            "scheduled_for": scheduled_for,
+        }
+
+    monkeypatch.setattr(s, "create_execution", create)
+    assert s.run_one_job({
+        "id": "direct-local",
+        "next_run_at": "2026-08-02T19:53:03.565157-05:00",
+    }) is True
+    assert captured == {
+        "job_id": "direct-local",
+        "source": "builtin",
+        "scheduled_for": "2026-08-03T00:53:03+00:00",
+    }
+
+
 def test_run_one_job_success_sequence(monkeypatch):
     """The extracted helper runs the same execute→save→deliver→mark sequence
     for a successful job."""
     calls = _patch_pipeline(monkeypatch)
 
-    ok = s.run_one_job({"id": "j2", "name": "t"})
+    ok = s.run_one_job({"id": "j2", "name": "t", "scheduled_for": FIRE_AT})
 
     assert ok is True
     assert [c[0] for c in calls] == ["run_job", "save", "deliver", "mark"]
@@ -129,7 +154,7 @@ def test_run_one_job_silent_skips_delivery(monkeypatch):
     deliver."""
     calls = _patch_pipeline(monkeypatch, silent_marker_in="[SILENT]")
 
-    s.run_one_job({"id": "j3", "name": "t"})
+    s.run_one_job({"id": "j3", "name": "t", "scheduled_for": FIRE_AT})
 
     kinds = [c[0] for c in calls]
     assert "run_job" in kinds and "save" in kinds and "mark" in kinds
@@ -140,7 +165,7 @@ def test_run_one_job_empty_response_is_soft_failure(monkeypatch):
     """An empty final response marks the run as NOT ok (issue #8585)."""
     calls = _patch_pipeline(monkeypatch, final="   ")
 
-    s.run_one_job({"id": "j4", "name": "t"})
+    s.run_one_job({"id": "j4", "name": "t", "scheduled_for": FIRE_AT})
 
     mark = [c for c in calls if c[0] == "mark"][0]
     assert mark == ("mark", "j4", False)
@@ -150,7 +175,7 @@ def test_run_one_job_failed_job_delivers_error(monkeypatch):
     """A failed job still delivers (the error notice) and marks not-ok."""
     calls = _patch_pipeline(monkeypatch, success=False, final="", error="boom")
 
-    s.run_one_job({"id": "j5", "name": "t"})
+    s.run_one_job({"id": "j5", "name": "t", "scheduled_for": FIRE_AT})
 
     kinds = [c[0] for c in calls]
     assert "deliver" in kinds  # failures always deliver
@@ -180,7 +205,7 @@ def test_run_one_job_records_timeout_after_dispatch_as_ambiguous(monkeypatch):
             ambiguous.append((execution_id, error)) or {"id": execution_id},
     )
 
-    assert s.run_one_job({"id": "j-ambiguous", "name": "t"}) is True
+    assert s.run_one_job({"id": "j-ambiguous", "name": "t", "scheduled_for": FIRE_AT}) is True
     assert ambiguous == [("d" * 32, "confirmation timeout")]
 
 
@@ -205,7 +230,7 @@ def test_run_one_job_exception_after_confirmed_dispatch_is_ambiguous(monkeypatch
             ambiguous.append((execution_id, error, delivery_receipts)) or {"id": execution_id},
     )
 
-    assert s.run_one_job({"id": "j-after-dispatch", "name": "t"}) is True
+    assert s.run_one_job({"id": "j-after-dispatch", "name": "t", "scheduled_for": FIRE_AT}) is True
     assert ambiguous[0][0] == "d" * 32
     assert "post-dispatch bookkeeping failed" in ambiguous[0][1]
     assert ambiguous[0][2][0]["status"] == "ambiguous"
@@ -319,7 +344,7 @@ def test_run_one_job_delivers_before_agent_teardown(monkeypatch):
     monkeypatch.setattr(aux, "cleanup_stale_async_clients",
                         lambda: order.append("cleanup_stale"))
 
-    ok = s.run_one_job({"id": "j8", "name": "t"})
+    ok = s.run_one_job({"id": "j8", "name": "t", "scheduled_for": FIRE_AT})
 
     assert ok is True
     # Delivery must strictly precede agent teardown + stale-client reap.
@@ -360,7 +385,7 @@ def test_run_one_job_tears_down_deferred_agent_when_delivery_raises(monkeypatch)
     monkeypatch.setattr(aux, "cleanup_stale_async_clients",
                         lambda: order.append("cleanup_stale"))
 
-    ok = s.run_one_job({"id": "j9", "name": "t"})
+    ok = s.run_one_job({"id": "j9", "name": "t", "scheduled_for": FIRE_AT})
 
     assert ok is True  # delivery error is recorded, not propagated
     assert order == ["deliver-raise", "agent.close", "cleanup_stale"], order
@@ -398,7 +423,7 @@ def test_run_one_job_tears_down_deferred_agent_when_save_raises(monkeypatch):
     monkeypatch.setattr(aux, "cleanup_stale_async_clients",
                         lambda: order.append("cleanup_stale"))
 
-    ok = s.run_one_job({"id": "j10", "name": "t"})
+    ok = s.run_one_job({"id": "j10", "name": "t", "scheduled_for": FIRE_AT})
 
     # save raised → outer handler marks failure and returns False, but the
     # deferred agent was still torn down (no delivery, no leak).

@@ -4876,10 +4876,16 @@ def run_one_job(
     execution_id = job.get("execution_id")
     if not execution_id:
         execution_source = "builtin"
+        supplied_scheduled_for = job.get("scheduled_for")
+        nominal_scheduled_for = (
+            require_canonical_scheduled_for(supplied_scheduled_for)
+            if supplied_scheduled_for is not None
+            else canonicalize_stored_fire_at(job.get("next_run_at"))
+        )
         execution = create_execution(
             job["id"],
             source=execution_source,
-            scheduled_for=job.get("scheduled_for") or job.get("next_run_at"),
+            scheduled_for=nominal_scheduled_for,
         )
         execution_id = execution["id"]
     else:
@@ -4963,10 +4969,16 @@ def run_one_job(
         try:
             _install_cron_execution_context(job)
             try:
-                success, output, final_response, error = run_job(
-                    job, defer_agent_teardown=_deferred_agents,
-                    extra_prompt=extra_prompt,
-                )
+                if extra_prompt is None:
+                    success, output, final_response, error = run_job(
+                        job, defer_agent_teardown=_deferred_agents,
+                    )
+                else:
+                    success, output, final_response, error = run_job(
+                        job,
+                        defer_agent_teardown=_deferred_agents,
+                        extra_prompt=extra_prompt,
+                    )
             finally:
                 _clear_cron_execution_context()
         except BaseException:
