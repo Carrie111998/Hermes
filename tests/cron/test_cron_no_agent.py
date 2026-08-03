@@ -12,6 +12,7 @@ Covers:
 from __future__ import annotations
 
 import json
+import sys
 from unittest.mock import patch
 
 import pytest
@@ -118,3 +119,40 @@ def test_run_job_script_path_traversal_still_blocked(hermes_env):
     ok, output = _run_job_script("/etc/passwd")
     assert ok is False
     assert "Blocked" in output or "outside" in output
+
+
+def test_run_job_script_passes_bash_safe_path_on_windows(hermes_env, monkeypatch):
+    """Windows regression (#65317/#43073): the .sh script path handed to bash
+    must be Git-Bash-safe (/c/Users/...), not the raw 'C:\\Users\\...' form that
+    bash mangles into exit 127 'No such file or directory'."""
+    import subprocess
+    from cron.scheduler import _run_job_script
+
+    script_path = hermes_env / "scripts" / "cron-watchdog.sh"
+    script_path.write_text("#!/bin/bash\necho watchdog ok\n")
+
+    captured = {}
+
+    class _FakeResult:
+        returncode = 0
+        stdout = "watchdog ok\n"
+        stderr = ""
+
+    def fake_run(argv, **kwargs):
+        captured["argv"] = argv
+        return _FakeResult()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    ok, output = _run_job_script(str(script_path))
+    assert ok is True
+    # The argv must contain the script path in a bash-safe form.
+    script_arg = captured["argv"][1]
+    assert "\\" not in script_arg, (
+        f"bash received a backslash path {script_arg!r}; Windows Git Bash "
+        f"mangles backslashes (exit 127). Expected /c/Users/... form."
+    )
+    if sys.platform == "win32":
+        assert script_arg.startswith("/"), (
+            f"on Windows the bash script path should be MSYS form, got {script_arg!r}"
+        )

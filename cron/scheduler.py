@@ -2288,7 +2288,15 @@ def _run_job_script(
                 "On Windows, install Git for Windows (which ships Git Bash) "
                 "or rewrite the script as Python (.py)."
         )
-        argv = [_bash, str(path)]
+        # Pass the script path in Git-Bash-safe form. On Windows, str(path)
+        # yields 'C:\\Users\\...\\script.sh' and bash eats the backslashes
+        # (\\U, \\A, \\L, \\s become escapes) -> exit 127 'No such file or
+        # directory'. _bash_safe_path rewrites to /c/Users/... (no-op off
+        # Windows), matching the existing MSYS-handling convention in
+        # tools/environments/local.py.
+        from tools.environments.local import _bash_safe_path
+
+        argv = [_bash, _bash_safe_path(str(path))]
         env_overlay: dict[str, str] = {}
     else:
         python_exe, env_overlay = _windows_cron_python_invocation(sys.executable)
