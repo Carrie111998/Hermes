@@ -291,6 +291,7 @@ def _intermediate(
     initial_state: str = "absent",
     provider_forward_role_count: int = 1,
     materialized_creator_edge: bool = True,
+    replay_creator_edge: bool = False,
 ) -> dict[str, Any]:
     session_hash = gate["temporary_control_admin_username_sha256"]
     before = _observation(
@@ -298,7 +299,9 @@ def _intermediate(
         state=initial_state,
         session_user_sha256=session_hash,
         control_admin_count=1,
-        membership_count=0,
+        membership_count=(
+            1 if initial_state == "exact_installed" and replay_creator_edge else 0
+        ),
         observed_at_unix=960,
         provider_forward_role_count=provider_forward_role_count,
     )
@@ -309,7 +312,11 @@ def _intermediate(
         control_admin_count=1,
         membership_count=(
             1
-            if initial_state == "absent" and materialized_creator_edge
+            if (
+                initial_state == "absent" and materialized_creator_edge
+            ) or (
+                initial_state == "exact_installed" and replay_creator_edge
+            )
             else 0
         ),
         observed_at_unix=970,
@@ -725,6 +732,73 @@ def test_intermediate_accepts_cloud_sql_unmaterialized_creator_authority() -> No
         install_claim=install,
         now_unix=NOW,
     ) == intermediate
+
+
+def test_intermediate_accepts_exact_replay_creator_edge_until_cleanup() -> None:
+    key = Ed25519PrivateKey.generate()
+    gate = _gate(key)
+    install = _signed_install(key, gate)
+    intermediate = _intermediate(
+        gate,
+        install,
+        initial_state="exact_installed",
+        replay_creator_edge=True,
+    )
+
+    assert intermediate["mutation_applied"] is False
+    assert intermediate["before_observation"]["executor_membership_count"] == 1
+    assert intermediate["after_observation"]["executor_membership_count"] == 1
+    assert bootstrap.validate_intermediate_for_owner(
+        intermediate,
+        gate=gate,
+        install_claim=install,
+        now_unix=NOW,
+    ) == intermediate
+
+
+def test_intermediate_rejects_exact_replay_creator_edge_drift() -> None:
+    key = Ed25519PrivateKey.generate()
+    gate = _gate(key)
+    install = _signed_install(key, gate)
+    intermediate = _intermediate(
+        gate,
+        install,
+        initial_state="exact_installed",
+        replay_creator_edge=True,
+    )
+    after = intermediate["after_observation"]
+    after["executor_membership_count"] = 0
+    after["control_admin_forward_role_count"] -= 1
+    after.update(
+        _hashed(
+            {
+                name: value
+                for name, value in after.items()
+                if name != "observation_sha256"
+            },
+            "observation_sha256",
+        )
+    )
+    intermediate["after_observation_sha256"] = after["observation_sha256"]
+    intermediate = _hashed(
+        {
+            name: value
+            for name, value in intermediate.items()
+            if name != "intermediate_sha256"
+        },
+        "intermediate_sha256",
+    )
+
+    with pytest.raises(
+        bootstrap.ControlBootstrapError,
+        match="schema_reconciliation_control_intermediate_invalid",
+    ):
+        bootstrap.validate_intermediate_for_owner(
+            intermediate,
+            gate=gate,
+            install_claim=install,
+            now_unix=NOW,
+        )
 
 
 def test_terminal_binds_fresh_writer_observation_after_cleanup() -> None:

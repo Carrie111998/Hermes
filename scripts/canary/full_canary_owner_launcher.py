@@ -9882,12 +9882,17 @@ class CloudSqlSchemaReconciliationExecutor(CloudSqlTemporaryAdmin):
             raise OwnerLauncherError(
                 "cloud_sql_schema_reconciliation_executor_resource_invalid"
             )
+        # Cloud SQL v1 accepts role replacement only through the
+        # ``databaseRoles`` and ``revokeExistingRoles`` query parameters.
+        # ``revokeExistingRoles`` is not a User resource field, and sending it
+        # in the JSON body makes a real recovery update fail with HTTP 400.
+        # Keep the body to actual User fields; the exact role set remains
+        # pinned by ``_update_user_query_values`` and is re-observed twice
+        # before authority is accepted.
         return {
-            "databaseRoles": list(self._DATABASE_ROLES),
             "etag": self._fixed_update_etag,
             "name": username,
             "password": password,
-            "revokeExistingRoles": True,
             "type": "BUILT_IN",
         }
 
