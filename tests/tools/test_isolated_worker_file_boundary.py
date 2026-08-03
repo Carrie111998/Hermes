@@ -45,7 +45,9 @@ def test_isolated_file_reads_and_writes_never_use_host_paths(
     monkeypatch.setattr(file_tools.file_state, "note_write", _unexpected_host_io)
 
     read_result = json.loads(
-        file_tools.read_file_tool("notes.txt", task_id="conversation-42")
+        file_tools.read_file_tool(
+            "notes.txt", limit=500, task_id="conversation-42"
+        )
     )
     assert read_result["content"] == "1|lease-only content"
 
