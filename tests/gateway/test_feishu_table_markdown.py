@@ -87,3 +87,37 @@ def test_markdown_table_uses_post_not_text():
     )
 
 
+def test_indented_code_block_does_not_swallow_trailing_content():
+    """Regression test: Feishu's ``md`` renderer swallows prose that follows a
+    4-space-indented code block when it lives inside one large markdown element.
+
+    This only bites on the ``post`` path — i.e. when the message also carries a
+    markdown hint like ``**bold**`` that forces post rendering.  In that case
+    ``_build_markdown_post_rows`` must isolate indented code blocks into their
+    own post row (like fenced blocks already were), so content after the block
+    — commonly a ``xxx:`` line followed by an indented list — stays visible.
+    """
+    content = (
+        "**加粗触发 post 渲染**\n"
+        "前文冒号：\n"
+        "\n"
+        "    配置项一  值一\n"
+        "    配置项二  值二\n"
+        "\n"
+        "冒号后的关键结论必须保留"
+    )
+    msg_type, payload_str = _call_build_outbound_payload(content)
+    assert msg_type == "post", f"expected 'post' for markdown content, got {msg_type!r}"
+    md_texts = _md_texts_from_post_payload(payload_str)
+    assert len(md_texts) >= 3, (
+        f"indented code block must be isolated into its own row (>=3 md rows), "
+        f"got {len(md_texts)}: {md_texts!r}"
+    )
+    joined = "\n".join(md_texts)
+    assert "冒号后的关键结论必须保留" in joined, (
+        "content after the indented code block was swallowed by the Feishu md "
+        "renderer; the isolation fix in _build_markdown_post_rows is missing"
+    )
+    assert "配置项一" in joined, "indented block content itself was lost"
+
+
