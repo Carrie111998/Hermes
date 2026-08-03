@@ -6817,7 +6817,10 @@ def _make_task(**overrides) -> "kb.Task":
 
 def _set_task_status(conn: sqlite3.Connection, task_id: str, status: str) -> None:
     """Test helper: set a task's status directly."""
-    conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, task_id))
+    conn.execute(
+        "UPDATE tasks SET status = ? WHERE id = ?",
+        (status, task_id),
+    )
 
 
 
@@ -9638,6 +9641,35 @@ def _make_epic_and_done_story(board: str, repo: Path) -> tuple[str, str, str, st
     return epic, story, epic_branch, story_sha
 
 
+def _add_approved_review_candidate(
+    conn: sqlite3.Connection,
+    task_id: str,
+    branch: str,
+    source_sha: str,
+) -> None:
+    metadata = {
+        "workflow_outcome": {"verdict": "approved"},
+        "ai_provenance": {
+            "writer": {"agent": "developer"},
+            "reviewer": {
+                "agent": "reviewer",
+                "verdict": "approved",
+                "reviewed_branch": branch,
+                "reviewed_commit": source_sha,
+            },
+        },
+    }
+    now = int(time.time())
+    conn.execute(
+        """
+        INSERT INTO task_runs
+            (task_id, step_key, status, started_at, ended_at, outcome, metadata)
+        VALUES (?, 'review', 'done', ?, ?, 'completed', ?)
+        """,
+        (task_id, now, now, json.dumps(metadata)),
+    )
+
+
 def test_integrate_story_to_epic_merges_and_never_pushes(kanban_home, tmp_path, monkeypatch):
     repo = tmp_path / "repo"
     _init_git_repo(repo)
@@ -9675,6 +9707,10 @@ def test_integrate_story_to_epic_idempotent_second_call_is_noop(kanban_home, tmp
     epic, story, epic_branch, story_sha = _make_epic_and_done_story(board, repo)
 
     with kb.connect(board=board) as conn:
+        conn.execute(
+            "UPDATE tasks SET completed_at=? WHERE id=?",
+            (int(time.time()), story),
+        )
         first = kb.integrate_story_to_epic(conn, story, board=board)
     assert first == "integrated"
 
@@ -9686,7 +9722,7 @@ def test_integrate_story_to_epic_idempotent_second_call_is_noop(kanban_home, tmp
     assert not any("merge" in cmd and "--no-ff" in cmd for cmd in calls), (
         "must not re-merge an already-integrated story"
     )
-    _assert_no_push(calls)
+    assert calls == []
 
 
 def test_integrate_story_to_epic_conflict_aborts_blocks_story_and_never_pushes(
@@ -11569,3 +11605,413 @@ def test_d4_non_audit_events_invalidate_escalation_without_mutation(kanban_home,
             )
         assert kb.get_task(conn, tid) == before_task
         assert kb.list_events(conn, tid) == before_events
+
+
+def test_reconcile_ten_times_does_not_reprocess_integrated_story(
+    kanban_home, tmp_path, monkeypatch
+):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    board = "v2-reconcile-stable"
+    _v2_product_board_with_repo(board, repo)
+    epic, story, _epic_branch, _story_sha = _make_epic_and_done_story(board, repo)
+
+    with kb.connect(board=board) as conn:
+        conn.execute(
+            "UPDATE tasks SET completed_at=? WHERE id=?",
+            (int(time.time()), story),
+        )
+        assert kb.integrate_story_to_epic(conn, story, board=board) == "integrated"
+        before = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind=?",
+            (story, "story_integrated_to_epic"),
+        ).fetchone()[0]
+
+    calls = _record_git_calls(monkeypatch)
+    with kb.connect(board=board) as conn:
+        for _ in range(10):
+            kb.reconcile(conn, board=board, spawn_ready=False)
+        after = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind=?",
+            (story, "story_integrated_to_epic"),
+        ).fetchone()[0]
+
+    assert after == before
+    assert calls == []
+
+
+def test_reconcile_reintegrates_story_after_later_completion(
+    kanban_home, tmp_path, monkeypatch
+):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    board = "v2-reconcile-reworked-story"
+    _v2_product_board_with_repo(board, repo)
+    epic, story, epic_branch, story_sha = _make_epic_and_done_story(board, repo)
+
+    with kb.connect(board=board) as conn:
+        story_branch = f"story/{epic}-s1"
+        _add_approved_review_candidate(conn, story, story_branch, story_sha)
+        assert kb.integrate_story_to_epic(conn, story, board=board) == "integrated"
+        first_events = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind=?",
+            (story, "story_integrated_to_epic"),
+        ).fetchone()[0]
+
+        story_branch = f"story/{epic}-s1"
+        subprocess.run(
+            ["git", "-C", str(repo), "switch", story_branch],
+            check=True, capture_output=True, text=True,
+        )
+        _commit_file(repo, "rework.txt", "reworked\n", "rework commit")
+        subprocess.run(
+            ["git", "-C", str(repo), "switch", "main"],
+            check=True, capture_output=True, text=True,
+        )
+        reworked_sha = _git_output(repo, "rev-parse", story_branch)
+        _add_approved_review_candidate(conn, story, story_branch, reworked_sha)
+        conn.commit()
+
+    calls = _record_git_calls(monkeypatch)
+    with kb.connect(board=board) as conn:
+        result = kb.reconcile(conn, board=board, spawn_ready=False)
+        reworked_events = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind=?",
+            (story, "story_integrated_to_epic"),
+        ).fetchone()[0]
+        rework_content = _git_output(repo, "show", f"{epic_branch}:rework.txt")
+        calls.clear()
+        unchanged = kb.reconcile(conn, board=board, spawn_ready=False)
+        unchanged_events = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind=?",
+            (story, "story_integrated_to_epic"),
+        ).fetchone()[0]
+
+    assert result.integrated == [story]
+    assert reworked_events == first_events + 1
+    assert rework_content == "reworked"
+    assert unchanged.integrated == []
+    assert unchanged_events == reworked_events
+    assert calls == []
+
+
+def test_reconcile_reintegrates_unreviewed_story_without_completion_timestamp(
+    kanban_home, tmp_path
+):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    board = "v2-reconcile-unreviewed-rework"
+    _v2_product_board_with_repo(board, repo)
+    epic, story, epic_branch, _story_sha = _make_epic_and_done_story(board, repo)
+    story_branch = f"story/{epic}-s1"
+
+    with kb.connect(board=board) as conn:
+        assert kb.integrate_story_to_epic(conn, story, board=board) == "integrated"
+        subprocess.run(
+            ["git", "-C", str(repo), "switch", story_branch],
+            check=True, capture_output=True, text=True,
+        )
+        _commit_file(repo, "rework.txt", "reworked\n", "rework commit")
+        subprocess.run(
+            ["git", "-C", str(repo), "switch", "main"],
+            check=True, capture_output=True, text=True,
+        )
+        conn.commit()
+
+        result = kb.reconcile(conn, board=board, spawn_ready=False)
+
+    assert result.integrated == [story]
+    assert _git_output(repo, "show", f"{epic_branch}:rework.txt") == "reworked"
+
+
+def test_reconcile_cache_miss_integrates_approved_sha_not_advanced_story_tip(
+    kanban_home, tmp_path
+):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    board = "v2-reconcile-reviewed-cache-miss"
+    _v2_product_board_with_repo(board, repo)
+    epic, story, epic_branch, approved_sha = _make_epic_and_done_story(board, repo)
+    story_branch = f"story/{epic}-s1"
+
+    with kb.connect(board=board) as conn:
+        _add_approved_review_candidate(conn, story, story_branch, approved_sha)
+        subprocess.run(
+            ["git", "-C", str(repo), "switch", story_branch],
+            check=True, capture_output=True, text=True,
+        )
+        _commit_file(repo, "unreviewed.txt", "unreviewed\n", "unreviewed tip")
+        subprocess.run(
+            ["git", "-C", str(repo), "switch", "main"],
+            check=True, capture_output=True, text=True,
+        )
+        advanced_sha = _git_output(repo, "rev-parse", story_branch)
+        conn.commit()
+
+        result = kb.reconcile(conn, board=board, spawn_ready=False)
+
+    assert result.integrated == [story]
+    assert subprocess.run(
+        ["git", "-C", str(repo), "merge-base", "--is-ancestor", approved_sha, epic_branch],
+        capture_output=True, text=True,
+    ).returncode == 0
+    assert subprocess.run(
+        ["git", "-C", str(repo), "merge-base", "--is-ancestor", advanced_sha, epic_branch],
+        capture_output=True, text=True,
+    ).returncode != 0
+    assert _git_output(repo, "show", f"{epic_branch}:story_work.txt") == "story work"
+    assert subprocess.run(
+        ["git", "-C", str(repo), "show", f"{epic_branch}:unreviewed.txt"],
+        capture_output=True, text=True,
+    ).returncode != 0
+    assert _git_output(repo, "for-each-ref", "--format=%(refname)", "refs/heads/hermes/reviewed-") == ""
+
+
+def test_integrate_story_to_epic_reports_reviewed_ref_creation_failure(
+    kanban_home, tmp_path, monkeypatch
+):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    board = "v2-reviewed-ref-create-failure"
+    _v2_product_board_with_repo(board, repo)
+    _epic, story, _epic_branch, approved_sha = _make_epic_and_done_story(board, repo)
+
+    with kb.connect(board=board) as conn:
+        _add_approved_review_candidate(conn, story, f"story/{_epic}-s1", approved_sha)
+
+    real_integration_git = kb._integration_git
+
+    def fail_reviewed_ref_creation(cwd, args, *, timeout=120):
+        if (
+            args[:1] == ["update-ref"]
+            and len(args) > 1
+            and args[1].startswith("refs/heads/hermes/reviewed-")
+        ):
+            return subprocess.CompletedProcess(["git"], 1, "", "forced failure")
+        return real_integration_git(cwd, args, timeout=timeout)
+
+    monkeypatch.setattr(kb, "_integration_git", fail_reviewed_ref_creation)
+    with kb.connect(board=board) as conn:
+        assert kb.integrate_story_to_epic(conn, story, board=board) == "verify_failed"
+
+
+def test_integrate_story_to_epic_reports_reviewed_ref_deletion_failure(
+    kanban_home, tmp_path, monkeypatch
+):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    board = "v2-reviewed-ref-delete-failure"
+    _v2_product_board_with_repo(board, repo)
+    _epic, story, _epic_branch, approved_sha = _make_epic_and_done_story(board, repo)
+
+    with kb.connect(board=board) as conn:
+        _add_approved_review_candidate(conn, story, f"story/{_epic}-s1", approved_sha)
+
+    real_integration_git = kb._integration_git
+
+    def fail_reviewed_ref_deletion(cwd, args, *, timeout=120):
+        if (
+            args[:2] == ["update-ref", "-d"]
+            and len(args) > 2
+            and args[2].startswith("refs/heads/hermes/reviewed-")
+        ):
+            return subprocess.CompletedProcess(["git"], 1, "", "forced failure")
+        return real_integration_git(cwd, args, timeout=timeout)
+
+    monkeypatch.setattr(kb, "_integration_git", fail_reviewed_ref_deletion)
+    with kb.connect(board=board) as conn:
+        assert kb.integrate_story_to_epic(conn, story, board=board) == "verify_failed"
+
+
+def test_reconcile_keeps_prior_member_state_when_sibling_advances_tip(
+    kanban_home, tmp_path, monkeypatch
+):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    board = "v2-reconcile-sibling"
+    _v2_product_board_with_repo(board, repo)
+    epic, first, epic_branch, _first_sha = _make_epic_and_done_story(board, repo)
+
+    with kb.connect(board=board) as conn:
+        completed_at = int(time.time())
+        conn.execute(
+            "UPDATE tasks SET completed_at=? WHERE id=?",
+            (completed_at, first),
+        )
+        assert kb.integrate_story_to_epic(conn, first, board=board) == "integrated"
+        sibling_branch = f"story/{epic}-s2"
+        subprocess.run(
+            ["git", "-C", str(repo), "switch", "-c", sibling_branch, epic_branch],
+            check=True, capture_output=True, text=True,
+        )
+        sibling_sha = _commit_file(
+            repo, "sibling_work.txt", "sibling work\n", "sibling commit"
+        )
+        subprocess.run(
+            ["git", "-C", str(repo), "switch", "main"],
+            check=True, capture_output=True, text=True,
+        )
+        sibling = kb.create_task(
+            conn, title="Sibling", board=board, workspace_kind="worktree",
+            workspace_path=str(repo), branch_name=sibling_branch,
+        )
+        kb.add_epic_membership(conn, epic_id=epic, task_id=sibling)
+        _set_task_status(conn, sibling, "done")
+        conn.execute(
+            "UPDATE tasks SET completed_at=? WHERE id=?",
+            (completed_at, sibling),
+        )
+
+    calls = _record_git_calls(monkeypatch)
+    with kb.connect(board=board) as conn:
+        result = kb.reconcile(conn, board=board, spawn_ready=False)
+        first_events = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind=?",
+            (first, "story_integrated_to_epic"),
+        ).fetchone()[0]
+        sibling_events = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind=?",
+            (sibling, "story_integrated_to_epic"),
+        ).fetchone()[0]
+        had_merge = any("merge" in cmd and "--no-ff" in cmd for cmd in calls)
+        calls.clear()
+        second = kb.reconcile(conn, board=board, spawn_ready=False)
+        first_events_after = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind=?",
+            (first, "story_integrated_to_epic"),
+        ).fetchone()[0]
+        sibling_events_after = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind=?",
+            (sibling, "story_integrated_to_epic"),
+        ).fetchone()[0]
+
+    assert result.integrated == [sibling]
+    assert first_events == 1
+    assert sibling_events == 1
+    assert had_merge
+    assert second.integrated == []
+    assert first_events_after == first_events
+    assert sibling_events_after == sibling_events
+    assert calls == []
+
+
+def test_explicit_integration_verification_is_not_skipped_by_durable_state(
+    kanban_home, tmp_path
+):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    board = "v2-explicit-integration-verification"
+    _v2_product_board_with_repo(board, repo)
+    epic, story, _epic_branch, story_sha = _make_epic_and_done_story(board, repo)
+
+    with kb.connect(board=board) as conn:
+        assert kb.integrate_story_to_epic(conn, story, board=board) == "integrated"
+        verify_calls = []
+        ownership_calls = []
+
+        def verify(candidate):
+            verify_calls.append(candidate)
+            return True
+
+        def before_apply():
+            ownership_calls.append(True)
+            return True
+
+        assert (
+            kb.integrate_story_to_epic(
+                conn,
+                story,
+                board=board,
+                expected_source_sha="different-source-sha",
+            )
+            == "verify_failed"
+        )
+        assert (
+            kb.integrate_story_to_epic(
+                conn,
+                story,
+                board=board,
+                candidate_verify_fn=verify,
+                expected_source_sha=story_sha,
+                before_apply_fn=before_apply,
+            )
+            == "already_integrated"
+        )
+
+    assert len(verify_calls) == 1
+    assert ownership_calls == [True]
+
+
+def test_integration_state_survives_member_event_gc_and_restart(
+    kanban_home, tmp_path, monkeypatch
+):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    board = "v2-reconcile-recovery"
+    _v2_product_board_with_repo(board, repo)
+    _epic, story, _epic_branch, _story_sha = _make_epic_and_done_story(board, repo)
+
+    with kb.connect(board=board) as conn:
+        conn.execute(
+            "UPDATE tasks SET completed_at=? WHERE id=?",
+            (int(time.time()), story),
+        )
+        assert kb.integrate_story_to_epic(conn, story, board=board) == "integrated"
+        with kb.write_txn(conn):
+            conn.execute(
+                "DELETE FROM task_events WHERE task_id=? AND kind=?",
+                (story, "story_integrated_to_epic"),
+            )
+
+    calls = _record_git_calls(monkeypatch)
+    with kb.connect(board=board) as conn:
+        result = kb.reconcile(conn, board=board, spawn_ready=False)
+        count = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind=?",
+            (story, "story_integrated_to_epic"),
+        ).fetchone()[0]
+
+    assert result.integrated == []
+    assert count == 0
+    assert calls == []
+
+
+@pytest.mark.parametrize("terminal_status", ["done", "archived"])
+def test_terminal_epic_members_are_never_reconciled(
+    kanban_home, tmp_path, monkeypatch, terminal_status
+):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    board = f"v2-terminal-epic-{terminal_status}"
+    _v2_product_board_with_repo(board, repo)
+    epic, _story, _epic_branch, _story_sha = _make_epic_and_done_story(board, repo)
+    with kb.connect(board=board) as conn:
+        _set_task_status(conn, epic, terminal_status)
+
+    calls = _record_git_calls(monkeypatch)
+    with kb.connect(board=board) as conn:
+        result = kb.reconcile(conn, board=board, spawn_ready=False)
+
+    assert result.integrated == []
+    assert calls == []
+
+
+def test_new_active_epic_member_integrates_once_via_reconcile(
+    kanban_home, tmp_path
+):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    board = "v2-reconcile-new-member"
+    _v2_product_board_with_repo(board, repo)
+    _epic, story, _epic_branch, _story_sha = _make_epic_and_done_story(board, repo)
+    with kb.connect(board=board) as conn:
+        first = kb.reconcile(conn, board=board, spawn_ready=False)
+        second = kb.reconcile(conn, board=board, spawn_ready=False)
+        count = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind=?",
+            (story, "story_integrated_to_epic"),
+        ).fetchone()[0]
+
+    assert first.integrated == [story]
+    assert second.integrated == []
+    assert count == 1

@@ -4323,6 +4323,15 @@ CREATE TABLE IF NOT EXISTS epic_memberships (
     PRIMARY KEY (epic_id, task_id)
 );
 
+CREATE TABLE IF NOT EXISTS epic_story_integrations (
+    epic_id          TEXT NOT NULL,
+    story_id         TEXT NOT NULL,
+    source_sha       TEXT NOT NULL,
+    candidate_sha    TEXT,
+    integrated_at    INTEGER NOT NULL,
+    PRIMARY KEY (epic_id, story_id, source_sha)
+);
+
 CREATE TABLE IF NOT EXISTS board_governance (
     id                     INTEGER PRIMARY KEY CHECK (id = 1),
     qualification_required INTEGER NOT NULL DEFAULT 0
@@ -13464,6 +13473,52 @@ def integrate_story_to_epic(
     if epic_id is None:
         return None
 
+    epic = get_task(conn, epic_id)
+    if epic is None or epic.status in {"done", "archived"}:
+        return None
+
+    # Durable integration state is checked before resolving the repository or
+    # any Git ref only for the ordinary reconcile fast path. Explicit source,
+    # candidate, or ownership controls must retain their verification semantics
+    # and must never be hidden by an older integration row.
+    reviewed_candidate: Optional[tuple[str, str]] = None
+    ordinary_reconcile = (
+        candidate_verify_fn is _RECONCILE_INTEGRATION_VERIFY_UNSET
+        and expected_source_sha is None
+        and before_apply_fn is None
+    )
+    if ordinary_reconcile:
+        reviewed_candidate = _latest_approved_review_candidate(conn, story_id)
+        if reviewed_candidate is not None:
+            already_integrated = conn.execute(
+                """
+                SELECT 1
+                  FROM epic_story_integrations
+                 WHERE epic_id=?
+                   AND story_id=?
+                   AND source_sha=?
+                 LIMIT 1
+                """,
+                (epic_id, story_id, reviewed_candidate[1]),
+            ).fetchone()
+        else:
+            already_integrated = conn.execute(
+                """
+                SELECT 1
+                  FROM epic_story_integrations AS integration
+                  JOIN tasks AS story ON story.id = integration.story_id
+                 WHERE integration.epic_id=?
+                   AND integration.story_id=?
+                   AND story.status='done'
+                   AND story.completed_at IS NOT NULL
+                   AND integration.integrated_at >= story.completed_at
+                 LIMIT 1
+                """,
+                (epic_id, story_id),
+            ).fetchone()
+        if already_integrated is not None:
+            return "already_integrated"
+
     try:
         board_default = str(meta.get("default_workdir") or "").strip()
         repo_root = _git_toplevel(Path(board_default).expanduser()) if board_default else None
@@ -13478,6 +13533,17 @@ def integrate_story_to_epic(
             or not _git_branch_exists(repo_root, story_branch)
         ):
             return None
+        if ordinary_reconcile and reviewed_candidate is None:
+            current_source_sha = _git_ref_sha(repo_root, story_branch)
+            if current_source_sha and conn.execute(
+                """
+                SELECT 1 FROM epic_story_integrations
+                 WHERE epic_id=? AND story_id=? AND source_sha=?
+                 LIMIT 1
+                """,
+                (epic_id, story_id, current_source_sha),
+            ).fetchone() is not None:
+                return "already_integrated"
     except Exception:
         return None
 
@@ -13518,21 +13584,61 @@ def integrate_story_to_epic(
         if (
             candidate_verify_fn is not _RECONCILE_INTEGRATION_VERIFY_UNSET
             or expected_source_sha is not None
+            or reviewed_candidate is not None
         ):
+            candidate_source_branch = story_branch
+            candidate_expected_source_sha = expected_source_sha
+            reviewed_source_ref: Optional[str] = None
             try:
+                if reviewed_candidate is not None:
+                    reviewed_source_ref = f"hermes/reviewed-{secrets.token_hex(6)}"
+                    retained = _integration_git(
+                        repo_root,
+                        [
+                            "update-ref",
+                            f"refs/heads/{reviewed_source_ref}",
+                            reviewed_candidate[1],
+                        ],
+                    )
+                    if retained.returncode != 0:
+                        raise IntegrationCandidateError(
+                            "could not retain reviewed source candidate"
+                        )
+                    candidate_source_branch = reviewed_source_ref
+                    candidate_expected_source_sha = reviewed_candidate[1]
                 effective_verify_fn = (
-                    None
-                    if candidate_verify_fn is _RECONCILE_INTEGRATION_VERIFY_UNSET
-                    else candidate_verify_fn
+                    (lambda _path: True)
+                    if reviewed_candidate is not None
+                    and candidate_verify_fn is _RECONCILE_INTEGRATION_VERIFY_UNSET
+                    else (
+                        None
+                        if candidate_verify_fn is _RECONCILE_INTEGRATION_VERIFY_UNSET
+                        else candidate_verify_fn
+                    )
                 )
-                candidate = _build_verified_merge_candidate(
-                    repo_root,
-                    epic_branch,
-                    story_branch,
-                    f"integrate story {story_id}",
-                    effective_verify_fn,
-                    expected_source_sha=expected_source_sha,
-                )
+                try:
+                    candidate = _build_verified_merge_candidate(
+                        repo_root,
+                        epic_branch,
+                        candidate_source_branch,
+                        f"integrate story {story_id}",
+                        effective_verify_fn,
+                        expected_source_sha=candidate_expected_source_sha,
+                    )
+                finally:
+                    if reviewed_source_ref is not None:
+                        released = _integration_git(
+                            repo_root,
+                            [
+                                "update-ref",
+                                "-d",
+                                f"refs/heads/{reviewed_source_ref}",
+                            ],
+                        )
+                        if released.returncode != 0:
+                            raise IntegrationCandidateError(
+                                "could not remove reviewed source candidate"
+                            )
                 if before_apply_fn is not None and not before_apply_fn():
                     return "ownership_conflict"
                 if not _fast_forward_target(candidate):
@@ -13640,6 +13746,22 @@ def _record_story_integration(
     )
     with write_txn(conn):
         _append_event(conn, story_id, "story_integrated_to_epic", payload)
+        source_sha = str(payload.get("source_sha") or "").strip()
+        if source_sha:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO epic_story_integrations
+                    (epic_id, story_id, source_sha, candidate_sha, integrated_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    epic_id,
+                    story_id,
+                    source_sha,
+                    candidate_sha or None,
+                    int(time.time()),
+                ),
+            )
         if pin_sha:
             _append_event(
                 conn, epic_id, EPIC_BASE_PINNED_EVENT,
@@ -15479,7 +15601,15 @@ def reconcile(
     # (not counted as this pass's action) so a real integration can still
     # happen this pass even if earlier done cards are already merged.
     done_rows = conn.execute(
-        "SELECT id FROM tasks WHERE status = 'done' ORDER BY completed_at ASC"
+        """
+        SELECT t.id
+          FROM tasks t
+          LEFT JOIN epic_memberships em ON em.task_id = t.id
+          LEFT JOIN tasks e ON e.id = em.epic_id
+         WHERE t.status = 'done'
+           AND (em.epic_id IS NULL OR e.status NOT IN ('done', 'archived'))
+         ORDER BY t.completed_at ASC
+        """
     ).fetchall()
     # Step 5 (merge-back): carry finished work to LOCAL main. OFF unless the
     # board opts into product_workflow.merge_after_green -- when off, behavior
