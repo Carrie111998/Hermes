@@ -9929,25 +9929,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # resolves every waiter as retryable (False).  Awaited with
             # shield + deadline so the cancellation + waiter resolution
             # completes before adapters disappear.
+            # Only completion flushes belong to this pre-teardown drain.
+            # Selecting from _background_tasks also cancelled startup-resume
+            # and supervised watcher tasks, globally reordering shutdown
+            # cancellation for subsystems this PR does not touch.
             _flush_tasks = [
-                _t for _t in list(self._background_tasks)
-                if _t is not self._stop_task
-                and _t is not self._restart_task
+                _t for _t in list(
+                    self._completion_notification_batch_tasks.values()
+                )
+                if not _t.done()
             ]
             if _flush_tasks:
                 for _t in _flush_tasks:
-                    if not _t.done():
-                        _t.cancel()
-                _drain_deadline = time.monotonic() + 3.0
-                for _t in _flush_tasks:
-                    try:
-                        _remaining = max(0.0, _drain_deadline - time.monotonic())
-                        await asyncio.wait_for(
-                            asyncio.shield(_t),
-                            timeout=_remaining,
-                        )
-                    except (asyncio.CancelledError, TimeoutError):
-                        pass
+                    _t.cancel()
+                try:
+                    # gather(return_exceptions=True) absorbs the children's
+                    # CancelledError; the previous
+                    # `except asyncio.CancelledError: pass` also swallowed a
+                    # cancellation aimed at _stop_impl_body itself.
+                    await asyncio.wait_for(
+                        asyncio.gather(*_flush_tasks, return_exceptions=True),
+                        timeout=3.0,
+                    )
+                except TimeoutError:
+                    logger.warning(
+                        "Completion flush drain timed out after 3s (%d tasks)",
+                        len(_flush_tasks),
+                    )
 
             for platform, adapter in list(self.adapters.items()):
                 await self._bounded_adapter_teardown(adapter, platform)
@@ -18662,6 +18670,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     self._record_coalesced_completion_siblings(
                         [evt for _text, evt, _future in entries]
                     )
+            except asyncio.CancelledError:
+                # CancelledError is a BaseException, so `except Exception`
+                # below never sees it — but the `finally` still ran with
+                # delivered=None, which _bool_to_disposition maps to
+                # DROP_UNROUTABLE.  _run_process_watcher retries only RETRY,
+                # so cancellation silently dropped the completion.  Resolving
+                # the waiters here makes the `finally` a no-op for them via
+                # its `not future.done()` guard.
+                for _text, _evt, future in entries:
+                    if not future.done():
+                        future.set_result(self.CompletionDisposition.RETRY)
+                raise
             except Exception:
                 logger.exception(
                     "Coalesced process completion delivery failed"

@@ -761,7 +761,10 @@ def test_completion_batches_do_not_cross_conversation_routes():
             runner._enqueue_process_completion_notification("second", second),
         )
 
-    assert asyncio.run(_exercise()) == [True, True]
+    assert asyncio.run(_exercise()) == [
+        runner.CompletionDisposition.DELIVERED,
+        runner.CompletionDisposition.DELIVERED,
+    ]
     assert adapter.handle_message.await_count == 2
 
 
@@ -796,8 +799,10 @@ def test_completion_arriving_during_batch_delivery_schedules_next_flush():
             )
         )
         release_first_delivery.set()
-        assert await first is True
-        assert await asyncio.wait_for(second, timeout=2.0) is True
+        assert await first is runner.CompletionDisposition.DELIVERED
+        assert await asyncio.wait_for(second, timeout=2.0) is (
+            runner.CompletionDisposition.DELIVERED
+        )
 
     asyncio.run(_exercise())
 
@@ -831,10 +836,16 @@ def test_failed_coalesced_delivery_retries_all_entries():
         ))
 
     async def _exercise():
-        # First batch fails → all waiters get False
-        assert await _enqueue_all() == [False, False]
-        # Second batch succeeds → all waiters get True
-        assert await _enqueue_all() == [True, True]
+        # First batch fails → every waiter is resolved as retryable
+        assert await _enqueue_all() == [
+            runner.CompletionDisposition.RETRY,
+            runner.CompletionDisposition.RETRY,
+        ]
+        # Second batch succeeds
+        assert await _enqueue_all() == [
+            runner.CompletionDisposition.DELIVERED,
+            runner.CompletionDisposition.DELIVERED,
+        ]
 
     asyncio.run(_exercise())
     assert adapter.handle_message.await_count == 2
@@ -858,7 +869,11 @@ def test_coalesced_success_records_every_completion_identity():
             for i, evt in enumerate(events)
         ))
 
-    assert asyncio.run(_exercise()) == [True, True, True]
+    assert asyncio.run(_exercise()) == [
+        runner.CompletionDisposition.DELIVERED,
+        runner.CompletionDisposition.DELIVERED,
+        runner.CompletionDisposition.DELIVERED,
+    ]
     for evt in events:
         identity = runner._completion_delivery_identity(evt)
         assert identity in runner._completion_deliveries_delivered
@@ -880,7 +895,10 @@ def test_duplicate_primary_does_not_discard_fresh_batch_sibling():
             runner._enqueue_process_completion_notification("fresh", fresh),
         )
 
-    assert asyncio.run(_exercise()) == [True, True]
+    assert asyncio.run(_exercise()) == [
+        runner.CompletionDisposition.DELIVERED,
+        runner.CompletionDisposition.DELIVERED,
+    ]
     adapter.handle_message.assert_awaited_once()
     fresh_identity = runner._completion_delivery_identity(fresh)
     assert fresh_identity in runner._completion_deliveries_delivered
@@ -910,7 +928,11 @@ def test_batch_format_failure_resolves_waiters_for_retry(monkeypatch):
         ))
         return await asyncio.wait_for(pending, timeout=2.0)
 
-    assert asyncio.run(_exercise()) == [False, False]
+    # Formatter failure resolves every waiter as retryable, not as a drop.
+    assert asyncio.run(_exercise()) == [
+        runner.CompletionDisposition.RETRY,
+        runner.CompletionDisposition.RETRY,
+    ]
     adapter.handle_message.assert_not_awaited()
 
 
@@ -1043,7 +1065,7 @@ def test_single_completion_bounded_latency():
     )
     elapsed = _time.monotonic() - t0
 
-    assert result is True
+    assert result is runner.CompletionDisposition.DELIVERED
     adapter.handle_message.assert_awaited_once()
     # Bounded batching delay — well under 1 s even on slow CI.
     assert elapsed < 1.0, f"Single completion took {elapsed:.3f}s, expected < 1.0s"
@@ -1085,7 +1107,7 @@ def test_cancellation_during_batch_window_resolves_waiters_retryable():
 
     result = asyncio.run(_cancel_during_window())
     # Cancelled completion is retryable
-    assert result is False
+    assert result is runner.CompletionDisposition.RETRY
 
 
 def test_cancellation_during_delivery_resolves_waiters_retryable():
@@ -1151,8 +1173,8 @@ def test_cancellation_during_delivery_resolves_waiters_retryable():
         key = runner._completion_notification_batch_key(evt)
         assert key not in runner._completion_notification_batches
         assert key not in runner._completion_notification_batch_tasks
-        assert result is False, (
-            f"Expected False (retryable) after cancellation during delivery, "
+        assert result is runner.CompletionDisposition.RETRY, (
+            f"Expected RETRY after cancellation during delivery, "
             f"got {result!r}"
         )
 
