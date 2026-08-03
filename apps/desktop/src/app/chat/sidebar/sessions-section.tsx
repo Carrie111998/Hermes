@@ -1,7 +1,9 @@
 import type { useSensors } from '@dnd-kit/core'
+import { useStore } from '@nanostores/react'
 import type * as React from 'react'
-import { useMemo } from 'react'
+import { useId, useMemo } from 'react'
 
+import type { SessionDragPayload } from '@/app/chat/composer/inline-refs'
 import { SidebarPanelLabel } from '@/app/shell/sidebar-label'
 import { DisclosureCaret } from '@/components/ui/disclosure-caret'
 import { SidebarGroup, SidebarGroupContent } from '@/components/ui/sidebar'
@@ -25,6 +27,7 @@ import {
 } from './projects'
 import { ReorderableList, useSortableBindings } from './reorderable-list'
 import { SidebarSessionSkeletons } from './section-states'
+import { $sessionListDrop, type SessionListKind, useSessionDropList } from './session-drop'
 import { SidebarSessionRow } from './session-row'
 import { VirtualSessionList } from './virtual-session-list'
 
@@ -149,6 +152,11 @@ interface SidebarSessionsSectionProps {
   // lists, pinned, messaging groups, and the project overview, where the order
   // isn't strictly by recency so a date bucket would be misleading.
   dateGrouped?: boolean
+  // Drag-to-pin: which flat list this section renders, and where a dropped row
+  // should land in it (`before` = live session id, `null` = the end). Both are
+  // required for the section to accept session drags at all.
+  dropList?: SessionListKind
+  onDropSession?: (payload: SessionDragPayload, before: null | string) => void
 }
 
 export function SidebarSessionsSection({
@@ -190,7 +198,9 @@ export function SidebarSessionsSection({
   projectBackRow,
   dndSensors,
   showProfileTags = false,
-  dateGrouped = false
+  dateGrouped = false,
+  dropList,
+  onDropSession
 }: SidebarSessionsSectionProps) {
   const { t } = useI18n()
   const dividerLabels = t.sidebar.dateDivider
@@ -278,6 +288,23 @@ export function SidebarSessionsSection({
     !projectOverview?.length &&
     !projectContent &&
     sessions.length >= VIRTUALIZE_THRESHOLD
+
+  // Drag-to-pin accepts a drop only where this section is actually rendering
+  // its flat list: project / grouped / overview bodies derive their own order,
+  // so a positional drop there would have nowhere to land. An EMPTY Pinned
+  // section still accepts — that's the whole point of dragging a row onto it.
+  const flatListRendered = !groups?.length && !projectOverview?.length && !projectContent
+  const listId = useId()
+
+  const dropListSpec = useMemo(
+    () =>
+      dropList && onDropSession && flatListRendered
+        ? { id: listId, ids: sessions.map(session => session.id), kind: dropList, onDrop: onDropSession }
+        : null,
+    [dropList, flatListRendered, listId, onDropSession, sessions]
+  )
+
+  const dropListRef = useSessionDropList(dropListSpec)
 
   // First paint into the grouped view (e.g. the app restoring the Projects tab)
   // has flat recents in `sessions` but no tree yet. Show skeletons rather than
@@ -404,7 +431,8 @@ export function SidebarSessionsSection({
   const resolvedContentClassName = cn(contentClassName, flatVirtualized && 'overflow-y-visible')
 
   return (
-    <SidebarGroup className={rootClassName}>
+    <SidebarGroup className={rootClassName} data-session-list={dropListSpec ? '' : undefined} ref={dropListRef}>
+      {dropListSpec && <SessionListDropAffordance listId={listId} />}
       <SidebarSectionHeader
         action={headerAction}
         collapsible={collapsible}
@@ -421,6 +449,35 @@ export function SidebarSessionsSection({
         </SidebarGroupContent>
       )}
     </SidebarGroup>
+  )
+}
+
+/**
+ * The drop affordance while a session drag hovers THIS list: a ring around the
+ * section (the "it lands here" frame) and a hairline at the insertion slot.
+ * Its own component so the per-pointermove hint churn re-renders only this
+ * node, never the section's whole row list — and placement-on-release stays
+ * intact: the rows themselves never move until the drop commits.
+ */
+function SessionListDropAffordance({ listId }: { listId: string }) {
+  const drop = useStore($sessionListDrop)
+
+  if (drop?.listId !== listId) {
+    return null
+  }
+
+  return (
+    <>
+      <span
+        aria-hidden="true"
+        className="pointer-events-none absolute inset-0 z-10 rounded-lg ring-1 ring-inset ring-(--ui-stroke-secondary)"
+      />
+      <span
+        aria-hidden="true"
+        className="pointer-events-none absolute inset-x-2 z-10 h-0.5 -translate-y-px rounded-full bg-(--ui-text-tertiary)"
+        style={{ top: drop.offsetY }}
+      />
+    </>
   )
 }
 

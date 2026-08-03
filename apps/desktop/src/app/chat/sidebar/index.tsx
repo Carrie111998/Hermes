@@ -5,6 +5,7 @@ import type * as React from 'react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useLocation } from 'react-router'
 
+import type { SessionDragPayload } from '@/app/chat/composer/inline-refs'
 import { PlatformAvatar } from '@/app/messaging/platform-icon'
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
@@ -1102,6 +1103,44 @@ export function ChatSidebar({
 
   // Sortable rows carry live session ids; the pinned store is keyed by durable
   // (lineage-root) ids, so translate before persisting the new order.
+  // Drag-to-pin: a row dropped on PINNED pins (or re-slots) at the hovered
+  // position. Rendered rows can be a SUBSET of the stored pin ids (a pin whose
+  // session isn't loaded renders nothing), so translate the anchor row into an
+  // index in the raw store rather than trusting the rendered position.
+  const dropOnPinned = (payload: SessionDragPayload, before: null | string) => {
+    const pinId = payload.pinId ?? payload.id
+    const ids = pinnedSessionIds.filter(id => id !== pinId)
+    const anchor = before ? sessionByAnyId.get(before) : undefined
+    const at = before ? ids.indexOf(anchor ? sessionPinId(anchor) : before) : -1
+
+    // pinSession both pins a new row and — insertUniqueId drops the id before
+    // re-inserting — re-slots an already pinned one, so one call covers the
+    // cross-section pin AND the same-section reorder.
+    pinSession(pinId, at >= 0 ? at : ids.length)
+    setSidebarPinsOpen(true)
+  }
+
+  // ...and a row dropped on SESSIONS unpins (if it was pinned) and lands at the
+  // hovered slot of the flat list. The list is hand-ordered from here on, so
+  // manual mode must be flagged for it to win over the default recency sort.
+  const dropOnSessions = (payload: SessionDragPayload, before: null | string) => {
+    const current = displayAgentSessions.map(session => session.id)
+    unpinSession(payload.pinId ?? payload.id)
+
+    const ids = current.filter(id => id !== payload.id)
+    const at = before ? ids.indexOf(before) : -1
+    ids.splice(at >= 0 ? at : ids.length, 0, payload.id)
+
+    // A release that changes nothing stays a no-op — a stray drag must never
+    // flip a recency-sorted list into manual ordering behind the user's back.
+    if (payload.pinned || !sameIds(ids, current)) {
+      setSidebarSessionOrderManual(true)
+      setSidebarSessionOrderIds(ids)
+    }
+
+    setSidebarRecentsOpen(true)
+  }
+
   const reorderPinned = (ids: string[]) =>
     setPinnedSessionOrder(
       ids.map(id => {
@@ -1269,11 +1308,13 @@ export function ChatSidebar({
                 activeSessionId={activeSidebarSessionId}
                 contentClassName={cn('flex max-h-[50vh] flex-col gap-px rounded-lg pb-2 pt-1', GROUP_BODY)}
                 dndSensors={dndSensors}
+                dropList="pinned"
                 emptyState={<SidebarPinnedEmptyState />}
                 label={s.pinned}
                 onArchiveSession={onArchiveSession}
                 onBranchSession={onBranchSession}
                 onDeleteSession={onDeleteSession}
+                onDropSession={dropOnPinned}
                 onReorderSessions={reorderPinned}
                 onResumeSession={onResumeSession}
                 onToggle={() => setSidebarPinsOpen(!pinsOpen)}
@@ -1305,6 +1346,7 @@ export function ChatSidebar({
                 )}
                 dateGrouped={inProject || !agentOrderManual}
                 dndSensors={dndSensors}
+                dropList="sessions"
                 emptyState={
                   showSessionSkeletons ? (
                     <SidebarSessionSkeletons />
@@ -1423,6 +1465,7 @@ export function ChatSidebar({
                 onArchiveSession={onArchiveSession}
                 onBranchSession={onBranchSession}
                 onDeleteSession={onDeleteSession}
+                onDropSession={showAllProfiles ? undefined : dropOnSessions}
                 onEnterProject={onEnterProject}
                 onNewSessionInWorkspace={showAllProfiles ? undefined : onNewSessionInWorkspace}
                 onReorderProjects={showAllProfiles ? undefined : reorderProjects}

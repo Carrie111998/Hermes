@@ -21,6 +21,11 @@ export interface SessionDragPayload {
   id: string
   profile: string
   title: string
+  /** Durable (lineage-root) id the pin store is keyed by — set by sidebar
+   *  rows so a drop on Pinned pins the same id the menu would. */
+  pinId?: string
+  /** True when the drag started from a row in the Pinned section. */
+  pinned?: boolean
 }
 
 /** A session's friendly display label — its title, or a localized fallback. */
