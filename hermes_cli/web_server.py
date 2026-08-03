@@ -1376,6 +1376,8 @@ from hermes_cli.web_models import (  # noqa: F401
     ProfileReasoningUpdate,
     ProfileSettingsUpdate,
     ProfileDescribeAuto,
+    ProfileFallbackEntry,
+    ProfileFallbackUpdate,
     SkillToggle,
     SkillCreate,
     SkillContentUpdate,
@@ -6083,6 +6085,19 @@ def get_model_info(profile: Optional[str] = None):
                     "max_output_tokens": mc.max_output_tokens,
                     "model_family": mc.model_family,
                 }
+        except Exception:
+            pass
+
+        # Provider profile may know the exact reasoning-effort dial values the
+        # model accepts (None → full list; [] → no reasoning dial). Surfaced so
+        # the dashboard picker shows only valid choices per model.
+        try:
+            from providers import get_provider_profile
+            profile = get_provider_profile(provider)
+            if profile is not None:
+                levels = profile.reasoning_effort_levels(model_name)
+                if levels is not None:
+                    caps["reasoning_levels"] = levels
         except Exception:
             pass
 
@@ -13118,6 +13133,159 @@ def _read_profile_reasoning_effort(profile_dir: Path) -> str:
         return value if value in _REASONING_EFFORT_OPTIONS else ""
     except Exception:
         return ""
+    finally:
+        reset_hermes_home_override(token)
+
+
+def _profile_fallback_public_entry(entry: Dict[str, Any], source_index: int) -> Dict[str, Any]:
+    from hermes_cli.fallback_config import normalize_fallback_reasoning_effort
+
+    try:
+        effort = normalize_fallback_reasoning_effort(entry.get("reasoning_effort"))
+    except ValueError:
+        # Existing hand-edited configs should remain viewable; an invalid value
+        # is shown as inherit and is rejected if the user tries to save it.
+        effort = ""
+    base_url = entry.get("base_url")
+    base_url = base_url.strip().rstrip("/") if isinstance(base_url, str) and base_url.strip() else None
+    api_mode = entry.get("api_mode")
+    api_mode = api_mode.strip() if isinstance(api_mode, str) and api_mode.strip() else None
+    provider = str(entry.get("provider") or "").strip()
+    model = str(entry.get("model") or "").strip()
+    return {
+        "source_index": source_index,
+        "source_provider": provider or None,
+        "source_model": model or None,
+        "source_base_url": base_url,
+        "source_api_mode": api_mode,
+        "provider": provider,
+        "model": model,
+        "reasoning_effort": effort,
+        "base_url": base_url,
+        "api_mode": api_mode,
+    }
+
+
+def _read_profile_fallbacks(profile_dir: Path) -> List[Dict[str, Any]]:
+    """Read a profile's effective fallback chain without returning secrets."""
+    from hermes_cli.fallback_config import get_fallback_chain
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    token = set_hermes_home_override(str(profile_dir))
+    try:
+        config = load_config()
+        chain = get_fallback_chain(config)
+        return [_profile_fallback_public_entry(entry, index) for index, entry in enumerate(chain)]
+    finally:
+        reset_hermes_home_override(token)
+
+
+def _write_profile_fallbacks(
+    profile_dir: Path,
+    requested: List[ProfileFallbackEntry],
+) -> List[Dict[str, Any]]:
+    """Persist an ordered fallback chain while preserving route credentials.
+
+    ``source_index`` is only a UI hint. Public route identity fields are
+    matched first so a concurrent reorder or edit cannot copy credentials from
+    another row. Changing provider never copies the old route's credentials;
+    changing only the model on the same provider keeps the route credentials.
+    """
+    from hermes_cli.fallback_config import (
+        get_fallback_chain,
+        normalize_fallback_reasoning_effort,
+    )
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    token = set_hermes_home_override(str(profile_dir))
+    try:
+        config = load_config()
+        existing = get_fallback_chain(config)
+        new_chain: List[Dict[str, Any]] = []
+        seen_routes: set[tuple[str, str, str]] = set()
+
+        def _identity_part(value: Any) -> str:
+            return str(value or "").strip().rstrip("/").lower()
+
+        def _route_identity(entry: Dict[str, Any]) -> tuple[str, str, str, str]:
+            return (
+                _identity_part(entry.get("provider")),
+                _identity_part(entry.get("model")),
+                _identity_part(entry.get("base_url")),
+                _identity_part(entry.get("api_mode")),
+            )
+
+        for item in requested:
+            provider = (item.provider or "").strip()
+            model = (item.model or "").strip()
+            if not provider or not model:
+                raise ValueError("fallback provider and model are required")
+            effort = normalize_fallback_reasoning_effort(item.reasoning_effort)
+
+            old: Dict[str, Any] = {}
+            source_provider = (item.source_provider or "").strip()
+            source_model = (item.source_model or "").strip()
+            source_identity: Optional[tuple[str, str, str, str]] = None
+            if source_provider and source_model:
+                source_identity = (
+                    _identity_part(source_provider),
+                    _identity_part(source_model),
+                    _identity_part(item.source_base_url),
+                    _identity_part(item.source_api_mode),
+                )
+            elif isinstance(item.source_index, int) and not isinstance(item.source_index, bool):
+                # Legacy clients did not send source identity. Preserve only
+                # when the current route metadata also matches exactly; this
+                # is intentionally conservative for stale clients.
+                source_identity = (
+                    _identity_part(provider),
+                    _identity_part(model),
+                    _identity_part(item.base_url),
+                    _identity_part(item.api_mode),
+                )
+
+            candidates: List[Dict[str, Any]] = []
+            if isinstance(item.source_index, int) and not isinstance(item.source_index, bool):
+                if 0 <= item.source_index < len(existing):
+                    candidates.append(existing[item.source_index])
+            if source_identity is not None:
+                candidates.extend(
+                    candidate
+                    for candidate in existing
+                    if candidate not in candidates
+                    and _route_identity(candidate) == source_identity
+                )
+
+            for candidate in candidates:
+                if source_identity is None or _route_identity(candidate) != source_identity:
+                    continue
+                # A model edit is safe on the same provider/endpoint, but a
+                # provider edit must not inherit the old secret/custom route.
+                if _identity_part(candidate.get("provider")) == _identity_part(provider):
+                    old = dict(candidate)
+                    break
+
+            base_url = _identity_part(old.get("base_url"))
+            route_key = (provider.lower(), model.lower(), base_url)
+            if route_key in seen_routes:
+                raise ValueError("fallback provider/model routes must be unique")
+            seen_routes.add(route_key)
+
+            entry = dict(old)
+            entry["provider"] = provider
+            entry["model"] = model
+            if effort:
+                entry["reasoning_effort"] = effort
+            else:
+                entry.pop("reasoning_effort", None)
+            new_chain.append(entry)
+
+        config["fallback_providers"] = new_chain
+        # Saving through the new list format makes the effective order explicit
+        # and prevents an old single fallback from being appended twice.
+        config.pop("fallback_model", None)
+        save_config(config)
+        return [_profile_fallback_public_entry(entry, index) for index, entry in enumerate(new_chain)]
     finally:
         reset_hermes_home_override(token)
 

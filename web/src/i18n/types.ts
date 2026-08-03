@@ -426,6 +426,15 @@ export interface Translations {
     reasoningInherit?: string;
     reasoningSaved?: string;
     reasoningUnset?: string;
+    fallbacks?: string;
+    fallbackAdd?: string;
+    fallbackRemove?: string;
+    fallbackMoveUp?: string;
+    fallbackMoveDown?: string;
+    fallbackSelect?: string;
+    fallbackNone?: string;
+    fallbackSaved?: string;
+    fallbackCustomEndpoint?: string;
     actions?: string;
     manageSkills?: string;
     activeSetHint?: string;

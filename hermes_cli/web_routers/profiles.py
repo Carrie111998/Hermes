@@ -33,6 +33,7 @@ from hermes_cli.web_models import (
     ProfileReasoningUpdate,
     ProfileSettingsUpdate,
     ProfileDescribeAuto,
+    ProfileFallbackUpdate,
 )
 
 # Same logger the handlers used before extraction (identical logger object).
@@ -56,6 +57,8 @@ _write_profile_mcp_servers = late("_write_profile_mcp_servers")
 _write_profile_model = late("_write_profile_model")
 _write_profile_reasoning_effort = late("_write_profile_reasoning_effort")
 _write_profile_settings = late("_write_profile_settings")
+_read_profile_fallbacks = late("_read_profile_fallbacks")
+_write_profile_fallbacks = late("_write_profile_fallbacks")
 
 
 @sessions_router.get("/api/profiles/sessions")
@@ -709,6 +712,31 @@ async def update_profile_settings_endpoint(name: str, body: ProfileSettingsUpdat
         _log.exception("PUT /api/profiles/%s/settings failed", name)
         raise HTTPException(status_code=500, detail=str(e))
     return {"ok": True, **saved}
+
+
+@router.get("/api/profiles/{name}/fallbacks")
+async def get_profile_fallbacks_endpoint(name: str):
+    """Return the ordered fallback chain without credential-bearing fields."""
+    profile_dir = _resolve_profile_dir(name)
+    try:
+        return {"fallbacks": _read_profile_fallbacks(profile_dir)}
+    except Exception as e:
+        _log.exception("GET /api/profiles/%s/fallbacks failed", name)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.put("/api/profiles/{name}/fallbacks")
+async def update_profile_fallbacks_endpoint(name: str, body: ProfileFallbackUpdate):
+    """Persist an ordered fallback chain with per-entry reasoning policy."""
+    profile_dir = _resolve_profile_dir(name)
+    try:
+        saved = _write_profile_fallbacks(profile_dir, body.fallbacks)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        _log.exception("PUT /api/profiles/%s/fallbacks failed", name)
+        raise HTTPException(status_code=500, detail=str(e))
+    return {"ok": True, "fallbacks": saved}
 
 
 @router.post("/api/profiles/{name}/describe-auto")

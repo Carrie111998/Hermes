@@ -23,6 +23,8 @@ vi.mock("@/lib/api", () => ({
     getModelOptions: vi.fn(),
     setProfileModel: vi.fn(),
     setProfileSettings: vi.fn(),
+    getProfileFallbacks: vi.fn(),
+    updateProfileFallbacks: vi.fn(),
     getProfileSoul: vi.fn(),
     updateProfileSoul: vi.fn(),
     updateProfileDescription: vi.fn(),
@@ -421,6 +423,8 @@ describe("ProfilesPage reasoning effort selector", () => {
       reasoning_effort: "high",
     });
     mockedApi.setProfileModel.mockResolvedValue({ ok: true, provider: "provider-a", model: "model-a" });
+    mockedApi.getProfileFallbacks.mockResolvedValue({ fallbacks: [] });
+    mockedApi.updateProfileFallbacks.mockResolvedValue({ ok: true, fallbacks: [] });
   });
 
   it("renders the profile selector with inherit plus all allowed values", async () => {
