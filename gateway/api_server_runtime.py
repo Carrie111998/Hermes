@@ -1358,9 +1358,25 @@ class APIServerRuntimeMixin:
                         history,
                         attachment_parts,
                     )
-                    tool_exposure.activate_names(
-                        _runtime_history_tool_names(history),
-                    )
+                    activated_tool_names = _runtime_history_tool_names(history)
+                    if runtime_checkpoint is not None:
+                        activated_tool_names.update(
+                            _runtime_checkpoint_activated_tool_names(
+                                runtime_checkpoint,
+                            ),
+                        )
+                        checkpoint_message = runtime_checkpoint.get("message")
+                        checkpoint_calls = (
+                            checkpoint_message.get("tool_calls")
+                            if isinstance(checkpoint_message, dict)
+                            else []
+                        )
+                        activated_tool_names.update({
+                            str((call.get("function") or {}).get("name") or "")
+                            for call in checkpoint_calls or []
+                            if isinstance(call, dict)
+                        })
+                    tool_exposure.activate_names(activated_tool_names)
                     user_message = ""
                 else:
                     last = normalized_messages[-1]

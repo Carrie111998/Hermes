@@ -2208,7 +2208,10 @@ def test_session_db_resume_survives_database_reopen(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_runtime_session_db_resume_loads_private_history_without_checkpoint():
+@pytest.mark.parametrize("restore_checkpoint_tools", [False, True])
+async def test_runtime_session_db_resume_loads_private_history_and_checkpoint_tools(
+    restore_checkpoint_tools,
+):
     class RecordingDB:
         def __init__(self):
             self.messages = [
@@ -2266,6 +2269,7 @@ async def test_runtime_session_db_resume_loads_private_history_without_checkpoin
             kwargs["agent_configurator"](agent)
             assert agent._resume_from_tool_results is True
             assert agent._require_incremental_session_persistence is True
+            assert ("media.generate_video" in agent.valid_tool_names) is restore_checkpoint_tools
             assert kwargs["session_id"] == "thread_session"
             assert kwargs["user_message"] == ""
             assert [message["role"] for message in kwargs["conversation_history"]] == [
@@ -2280,6 +2284,25 @@ async def test_runtime_session_db_resume_loads_private_history_without_checkpoin
     client = TestClient(TestServer(app))
     await client.start_server()
     try:
+        resume_fields = {}
+        if restore_checkpoint_tools:
+            resume_fields["runtime_checkpoint"] = {
+                "activated_tool_names": [
+                    "media.generate_image",
+                    "media.generate_video",
+                ],
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{
+                        "id": "call_media",
+                        "function": {
+                            "name": "media.generate_image",
+                            "arguments": "{}",
+                        },
+                    }],
+                },
+            }
         response = await client.post("/v1/runtime/runs", json=_run_body(
             "run_session_resume",
             context={"session_id": "thread_session", "history_mode": "session_db"},
@@ -2297,7 +2320,14 @@ async def test_runtime_session_db_resume_loads_private_history_without_checkpoin
                 "name": "media.generate_image",
                 "description": "generate an image",
                 "input_schema": {"type": "object"},
+                "exposure": "deferred",
+            }, {
+                "name": "media.generate_video",
+                "description": "generate a video",
+                "input_schema": {"type": "object"},
+                "exposure": "deferred",
             }],
+            **resume_fields,
         ))
         assert response.status == 200
         events = [json.loads(line) async for line in response.content]
