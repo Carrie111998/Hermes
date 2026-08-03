@@ -191,6 +191,12 @@ wake = [
   "openwakeword==0.6.0",
   "onnxruntime==1.27.0",
   "sherpa-onnx==1.13.4",
+  # sherpa-onnx 1.13.4 declares sherpa-onnx-core==1.13.4 as a hard
+  # dependency but the committed lock omitted it, so macOS arm64 installs
+  # reported the Sherpa wake backend as available while the native import
+  # failed (dlopen libonnxruntime missing). Declare it explicitly so the
+  # lock resolves the full native closure (see #77936).
+  "sherpa-onnx-core==1.13.4",
   "sentencepiece==0.2.2",
   "pvporcupine==4.0.3",
   "sounddevice==0.5.5",
