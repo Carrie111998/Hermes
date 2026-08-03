@@ -176,6 +176,31 @@ def test_start_server_loopback_public_url_enables_gate(monkeypatch):
         clear_providers()
 
 
+def test_desktop_loopback_uses_separate_gated_public_sidecar(monkeypatch, tmp_path):
+    """Desktop may render a public QR without exposing its local backend."""
+    monkeypatch.setenv("HERMES_DESKTOP", "1")
+    monkeypatch.setenv(
+        "HERMES_HANDOFF_STORE",
+        str(tmp_path / "runtime" / "handoff.sqlite3"),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.dashboard_auth.prefix.resolve_public_url",
+        lambda: "https://hermes.example.com",
+    )
+    captured = _stub_uvicorn_run(monkeypatch)
+
+    web_server.start_server(
+        host="127.0.0.1",
+        port=9119,
+        open_browser=False,
+        allow_public=False,
+    )
+
+    assert web_server.app.state.auth_required is False
+    assert web_server.app.state.public_host == ""
+    assert captured["kwargs"].get("proxy_headers") is False
+
+
 def test_start_server_insecure_public_no_longer_bypasses_gate(monkeypatch):
     """``--insecure`` (allow_public=True) on a public host: gate now ENGAGES.
 

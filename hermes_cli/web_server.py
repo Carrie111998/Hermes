@@ -17412,11 +17412,22 @@ def start_server(
 
     public_url = resolve_public_url()
     public_host = urllib.parse.urlparse(public_url).hostname if public_url else ""
-    app.state.auth_required = should_require_auth(
-        host,
-        public_url=public_url,
+    # Hermes Desktop's loopback backend only mints handoff tickets. The public
+    # URL terminates at a separate gated dashboard process which shares the
+    # hash-only handoff store. Keep the Desktop backend on legacy loopback auth
+    # and do not accept the public Host header there, even though it needs the
+    # configured URL to render the QR code.
+    desktop_sidecar_client = (
+        host in _LOOPBACK_HOST_VALUES
+        and os.environ.get("HERMES_DESKTOP") == "1"
+        and bool((os.environ.get("HERMES_HANDOFF_STORE") or "").strip())
     )
-    app.state.public_host = public_host or ""
+    app.state.auth_required = (
+        False
+        if desktop_sidecar_client
+        else should_require_auth(host, public_url=public_url)
+    )
+    app.state.public_host = "" if desktop_sidecar_client else (public_host or "")
 
     # ``--insecure`` no longer disables the auth gate (June 2026 hardening:
     # the hermes-0day MCP-persistence campaign abused unauthenticated public
