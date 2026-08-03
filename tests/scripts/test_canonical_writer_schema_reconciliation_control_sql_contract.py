@@ -119,11 +119,43 @@ def test_install_has_exact_bootstrap_and_runtime_principal_separation() -> None:
     assert "membership.admin_option IS TRUE" in sql
     assert "membership.inherit_option IS FALSE" in sql
     assert "membership.set_option IS FALSE" in sql
-    assert "REVOKE canonical_brain_migration_owner FROM SESSION_USER" in sql
+    assert "SET LOCAL ROLE cloudsqlsuperuser;" in sql
+    assert "SET LOCAL ROLE canonical_brain_migration_owner;" not in sql
+    assert "GRANT canonical_brain_migration_owner TO SESSION_USER" not in sql
+    assert "REVOKE canonical_brain_migration_owner FROM SESSION_USER" not in sql
+    assert sql.count("OWNER TO canonical_brain_migration_owner;") == 2
+    assert sql.index("SET LOCAL ROLE cloudsqlsuperuser;") < sql.index(
+        "CREATE SCHEMA canonical_brain_reconciliation"
+    )
+    assert sql.index(
+        "CREATE FUNCTION canonical_brain_reconciliation.\n"
+        "apply_missing_discord_routeback_helper_v1()"
+    ) < sql.index(
+        "ALTER FUNCTION canonical_brain_reconciliation.\n"
+        "observe_missing_discord_routeback_helper_v1()"
+    )
 
 
 def test_install_accepts_only_the_exact_provider_managed_role_closure() -> None:
     sql = _text(INSTALL)
+
+    assert sql.count("provider_forward_role_closure(roleid) AS") == 1
+    assert sql.count("JOIN provider_forward_role_closure AS reachable") == 1
+    assert (
+        "SELECT roleid FROM forward_role_closure\n"
+        "                   EXCEPT\n"
+        "                   SELECT roleid FROM provider_forward_role_closure"
+    ) in sql
+    assert (
+        "SELECT roleid FROM provider_forward_role_closure\n"
+        "                   EXCEPT\n"
+        "                   SELECT roleid FROM forward_role_closure"
+    ) in sql
+    assert "pg_catalog.count(DISTINCT role.rolname) = 1" not in sql
+
+
+def test_retire_accepts_only_the_exact_provider_managed_role_closure() -> None:
+    sql = _text(RETIRE)
 
     assert sql.count("provider_forward_role_closure(roleid) AS") == 1
     assert sql.count("JOIN provider_forward_role_closure AS reachable") == 1
@@ -168,6 +200,11 @@ def test_retire_is_exact_drift_intolerant_and_non_cascading() -> None:
     assert "EXECUTE '" not in sql
     assert HELPER_SIGNATURE in sql
     assert "DROP FUNCTION canonical_brain._discord" not in sql
+    assert "SET LOCAL ROLE cloudsqlsuperuser;" in sql
+    assert "CURRENT_USER <> 'cloudsqlsuperuser'" in sql
+    assert "SET LOCAL ROLE canonical_brain_migration_owner;" not in sql
+    assert "GRANT canonical_brain_migration_owner TO SESSION_USER" not in sql
+    assert "REVOKE canonical_brain_migration_owner FROM SESSION_USER" not in sql
 
 
 def test_retire_pins_the_pg18_function_configuration() -> None:

@@ -60,6 +60,15 @@ BEGIN
                  FROM pg_catalog.pg_auth_members AS membership
                  JOIN forward_role_closure AS reachable
                    ON reachable.roleid = membership.member
+           ), provider_forward_role_closure(roleid) AS (
+               SELECT role.oid
+                 FROM pg_catalog.pg_roles AS role
+                WHERE role.rolname = 'cloudsqlsuperuser'
+               UNION
+               SELECT membership.roleid
+                 FROM pg_catalog.pg_auth_members AS membership
+                 JOIN provider_forward_role_closure AS reachable
+                   ON reachable.roleid = membership.member
            )
            SELECT (SELECT pg_catalog.count(*) = 1 FROM bootstrap)
               AND (SELECT pg_catalog.bool_and(
@@ -78,13 +87,15 @@ BEGIN
                               AND inherit_option IS TRUE
                               AND set_option IS TRUE
                           ) FROM relevant_edges)
-              AND (SELECT pg_catalog.count(DISTINCT role.rolname) = 1
-                          AND pg_catalog.bool_and(
-                              role.rolname = 'cloudsqlsuperuser'
-                          )
-                     FROM forward_role_closure AS closure
-                     JOIN pg_catalog.pg_roles AS role
-                       ON role.oid = closure.roleid)
+              AND NOT EXISTS (
+                  (SELECT roleid FROM forward_role_closure
+                   EXCEPT
+                   SELECT roleid FROM provider_forward_role_closure)
+                  UNION ALL
+                  (SELECT roleid FROM provider_forward_role_closure
+                   EXCEPT
+                   SELECT roleid FROM forward_role_closure)
+              )
        )
        OR pg_catalog.current_setting(
               'max_prepared_transactions'
@@ -118,10 +129,6 @@ END
 $control_retire_authority_preflight$;
 
 SET LOCAL ROLE cloudsqlsuperuser;
-GRANT canonical_brain_migration_owner TO SESSION_USER
-    WITH ADMIN FALSE, INHERIT FALSE, SET TRUE;
-RESET ROLE;
-SET LOCAL ROLE canonical_brain_migration_owner;
 
 LOCK TABLE public.canonical_event_log,
     canonical_brain.writer_capability_consumptions,
@@ -199,7 +206,7 @@ BEGIN
        )
       INTO STRICT managed_cloudsqladmin_database_exact;
 
-    IF CURRENT_USER <> 'canonical_brain_migration_owner'
+    IF CURRENT_USER <> 'cloudsqlsuperuser'
        OR executor_oid IS NULL
        OR control_namespace_oid IS NULL
        OR observer_oid IS NULL
@@ -518,9 +525,6 @@ DROP FUNCTION canonical_brain_reconciliation.
 observe_missing_discord_routeback_helper_v1();
 DROP SCHEMA canonical_brain_reconciliation;
 
-RESET ROLE;
-SET LOCAL ROLE cloudsqlsuperuser;
-REVOKE canonical_brain_migration_owner FROM SESSION_USER;
 REVOKE CONNECT ON DATABASE muncho_canary_brain
     FROM canonical_brain_schema_reconciler;
 DROP ROLE canonical_brain_schema_reconciler;

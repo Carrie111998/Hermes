@@ -180,17 +180,16 @@ CREATE ROLE canonical_brain_schema_reconciler
 
 SET LOCAL ROLE cloudsqlsuperuser;
 
--- The broad bootstrap identity starts without migration-owner membership.
--- The edge exists only inside this transaction and is revoked before COMMIT.
-GRANT canonical_brain_migration_owner TO SESSION_USER
-    WITH ADMIN FALSE, INHERIT FALSE, SET TRUE;
+-- Cloud SQL's provider-admin role may create and re-owner customer objects,
+-- but the service intentionally does not promise that a freshly granted
+-- customer-role edge is immediately usable by SET ROLE.  Keep the provider
+-- boundary active only for this stopped, serializable bootstrap transaction;
+-- install the fixed objects, transfer their ownership exactly, and persist no
+-- membership edge from the one-time login to the migration owner.
 GRANT CONNECT ON DATABASE muncho_canary_brain
     TO canonical_brain_schema_reconciler;
 CREATE SCHEMA canonical_brain_reconciliation
     AUTHORIZATION canonical_brain_migration_owner;
-
-RESET ROLE;
-SET LOCAL ROLE canonical_brain_migration_owner;
 
 LOCK TABLE public.canonical_event_log,
     canonical_brain.writer_capability_consumptions,
@@ -927,6 +926,13 @@ $fixed_helper_definition$;
 END
 $control_apply$;
 
+ALTER FUNCTION canonical_brain_reconciliation.
+observe_missing_discord_routeback_helper_v1()
+    OWNER TO canonical_brain_migration_owner;
+ALTER FUNCTION canonical_brain_reconciliation.
+apply_missing_discord_routeback_helper_v1()
+    OWNER TO canonical_brain_migration_owner;
+
 REVOKE ALL PRIVILEGES ON FUNCTION canonical_brain_reconciliation.
 observe_missing_discord_routeback_helper_v1() FROM PUBLIC;
 REVOKE ALL PRIVILEGES ON FUNCTION canonical_brain_reconciliation.
@@ -938,9 +944,6 @@ GRANT EXECUTE ON FUNCTION canonical_brain_reconciliation.
 apply_missing_discord_routeback_helper_v1()
     TO canonical_brain_schema_reconciler;
 
-RESET ROLE;
-SET LOCAL ROLE cloudsqlsuperuser;
-REVOKE canonical_brain_migration_owner FROM SESSION_USER;
 RESET ROLE;
 
 DO $control_bootstrap_terminal$
