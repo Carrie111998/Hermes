@@ -171,7 +171,19 @@ def contains_launchctl_submit_command(command: str) -> bool:
 
 
 def _resolve_terminal_script_path(candidate: str, cwd: Optional[str]) -> Path:
-    path = Path(candidate).expanduser()
+    try:
+        # Reject NUL bytes before pathlib touches them: expanduser() raises
+        # either ValueError ("embedded null byte") or RuntimeError ("Could
+        # not determine home directory", #77906) depending on what the
+        # tokenized garbage looks like. Guard must never crash on either.
+        if "\x00" in candidate:
+            return Path("/nonexistent-guard-skip") if cwd else Path.cwd()
+        path = Path(candidate).expanduser()
+    except (OSError, ValueError, RuntimeError):
+        # OSError: unreadable/long paths. ValueError/RuntimeError: NUL byte
+        # or unresolvable ~ in a path tokenized from a binary's decoded
+        # contents. Never let a guarded path crash the guard (#77906).
+        return Path("/nonexistent-guard-skip") if cwd else Path.cwd()
     if not path.is_absolute():
         path = Path(cwd or Path.cwd()) / path
     return path
@@ -258,7 +270,12 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
     try:
         descriptor = os.open(path, flags)
-    except OSError:
+    except (OSError, ValueError, RuntimeError):
+        # OSError: unreadable/long paths. ValueError: embedded NUL byte in
+        # the path (from a binary's decoded contents tokenized as a script
+        # path). Either way the file is not a readable shell script — treat
+        # as "nothing to scan" (#77906). A guarded path must never crash
+        # the guard.
         return None, False
     try:
         metadata = os.fstat(descriptor)
@@ -268,7 +285,9 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
         # chunk tells us if this is a binary (NUL bytes) that should be
         # skipped as "nothing to scan" rather than failing closed (#76762).
         data = os.read(descriptor, _MAX_REFERENCED_SCRIPT_BYTES + 1)
-    except OSError:
+    except (OSError, ValueError, RuntimeError):
+        # ValueError: embedded NUL byte in path — same class as os.open
+        # above (#77906); never let a guarded path crash the guard.
         return None, False
     finally:
         os.close(descriptor)
@@ -374,7 +393,12 @@ def _resolve_script_path(script_path: str) -> Path:
     """
     from hermes_constants import get_hermes_home
 
-    raw = Path(script_path).expanduser()
+    try:
+        raw = Path(script_path).expanduser()
+    except (OSError, ValueError):
+        # ValueError: embedded NUL byte in the path (#77906). Never let a
+        # guarded path crash the guard — treat as unreadable (empty).
+        return get_hermes_home() / "scripts" / "_guard_skip_unreadable"
     if raw.is_absolute():
         return raw
     return get_hermes_home() / "scripts" / raw

@@ -2545,6 +2545,15 @@ def terminal_tool(
                         if stat.S_ISREG(metadata.st_mode) and metadata.st_size <= 1024 * 1024:
                             data = local_path.read_bytes()
                             if len(data) <= 1024 * 1024:
+                                # Binary (ELF/Mach-O/PE) contains NUL bytes —
+                                # decoding it as text feeds machine-code junk
+                                # into the lifecycle scan, producing false
+                                # positives like "gateway restart" found in
+                                # the binary's string table (#77906). Treat
+                                # binaries as "nothing to scan", matching
+                                # _read_referenced_script's NUL check.
+                                if b"\x00" in data:
+                                    return None
                                 return data.decode("utf-8", errors="replace")
                 except Exception:
                     pass
@@ -2552,7 +2561,12 @@ def terminal_tool(
                 try:
                     result = env.execute(f"cat {shlex.quote(script_path)}")
                     if result.get("returncode", -1) == 0:
-                        return result.get("output", "")
+                        output = result.get("output", "")
+                        # Same binary guard as the local branch: NUL bytes
+                        # mean the file is a binary, not a script (#77906).
+                        if "\x00" in output:
+                            return None
+                        return output
                 except Exception:
                     pass
                 return None
