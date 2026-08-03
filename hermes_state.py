@@ -5428,6 +5428,58 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             current = child_id
         return current
 
+    @staticmethod
+    def _compression_projection_ctes(seed_where_sql: str) -> str:
+        """Return CTEs that resolve each listable row's compression tip in SQL.
+
+        ``seed_where_sql`` must filter only properties of the surfaced root
+        (source, archive state, child visibility, etc.), never its raw message
+        count.  Consumers can then filter/count against ``projection_tips``'
+        effective count before applying their own LIMIT/OFFSET.
+        """
+        return f"""
+            projection_chain(root_id, cur_id, depth) AS (
+                SELECT s.id, s.id, 0 FROM sessions s {seed_where_sql}
+                UNION ALL
+                SELECT chain.root_id, child.id, chain.depth + 1
+                FROM projection_chain chain
+                JOIN sessions parent ON parent.id = chain.cur_id
+                JOIN sessions child ON child.id = (
+                    SELECT candidate.id
+                    FROM sessions candidate
+                    WHERE candidate.parent_session_id = parent.id
+                      AND json_extract(COALESCE(candidate.model_config, '{{}}'), '$._branched_from') IS NULL
+                      AND json_extract(COALESCE(candidate.model_config, '{{}}'), '$._delegate_from') IS NULL
+                      AND COALESCE(candidate.source, '') != 'tool'
+                    ORDER BY
+                      CASE
+                        WHEN candidate.end_reason = 'compression' THEN 0
+                        WHEN candidate.ended_at IS NULL THEN 1
+                        ELSE 2
+                      END,
+                      COALESCE(
+                        (SELECT MAX(m.timestamp) FROM messages m WHERE m.session_id = candidate.id),
+                        candidate.started_at
+                      ) DESC,
+                      candidate.started_at DESC,
+                      candidate.id DESC
+                    LIMIT 1
+                )
+                WHERE parent.end_reason = 'compression'
+                  AND chain.depth < 100
+            ),
+            projection_tips AS (
+                SELECT chain.root_id, tip.message_count AS effective_message_count
+                FROM projection_chain chain
+                JOIN (
+                    SELECT root_id, MAX(depth) AS depth
+                    FROM projection_chain
+                    GROUP BY root_id
+                ) latest ON latest.root_id = chain.root_id AND latest.depth = chain.depth
+                JOIN sessions tip ON tip.id = chain.cur_id
+            )
+        """
+
     # Columns excluded from compact_rows projections: only the payload-heavy
     # blob no list consumer renders. Everything else — including gateway
     # routing fields and desktop sidebar fields like git_branch — stays, and
@@ -5549,7 +5601,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             clause, clause_params = _cwd_prefix_clause(cwd_prefix)
             where_clauses.append(clause)
             params.extend(clause_params)
-        if min_message_count > 0:
+        filter_by_projected_message_count = (
+            min_message_count > 0 and project_compression_tips and not include_children
+        )
+        if min_message_count > 0 and not filter_by_projected_message_count:
             where_clauses.append("s.message_count >= ?")
             params.append(min_message_count)
         if archived_only:
@@ -5558,6 +5613,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             where_clauses.append("s.archived = 0")
 
         where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+        effective_message_count_sql = (
+            "COALESCE(projection_tips.effective_message_count, s.message_count) >= ?"
+            if filter_by_projected_message_count
+            else ""
+        )
         # Snapshot the filter params before the query builders below extend
         # them with LIMIT/OFFSET — the pinned back-fill reuses the same WHERE.
         base_where_params = list(params)
@@ -5636,6 +5696,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 outer_where = (
                     f"{where_sql} AND {combined}" if where_sql else f"WHERE {combined}"
                 )
+            if effective_message_count_sql:
+                outer_where = (
+                    f"{outer_where} AND {effective_message_count_sql}"
+                    if outer_where
+                    else f"WHERE {effective_message_count_sql}"
+                )
             _sel = self._compact_session_cols() if compact_rows else "s.*"
             query = f"""
                 WITH RECURSIVE chain(root_id, cur_id) AS (
@@ -5656,7 +5722,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         MAX({_sql_session_last_active_by_id("cur_id")}) AS effective_last_active
                     FROM chain
                     GROUP BY root_id
-                )
+                ),
+                {self._compression_projection_ctes(where_sql)}
                 SELECT {_sel},
                     COALESCE(
                         (SELECT {_PREVIEW_RAW_SELECT}
@@ -5669,16 +5736,29 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     COALESCE(cm.effective_last_active, s.started_at) AS _effective_last_active
                 FROM sessions s
                 LEFT JOIN chain_max cm ON cm.root_id = s.id
+                LEFT JOIN projection_tips ON projection_tips.root_id = s.id
                 {outer_where}
                 ORDER BY _effective_last_active DESC, s.started_at DESC, s.id DESC
                 LIMIT ? OFFSET ?
             """
-            # WHERE params apply twice (CTE seed + outer select); the id filter
-            # only applies to the outer select.
-            params = params + params + id_params + [limit, offset]
+            # WHERE params apply to both chain CTE seeds and the outer select;
+            # id/effective-count filters only apply to the outer select.
+            params = (
+                params + params + params + id_params
+                + ([min_message_count] if effective_message_count_sql else [])
+                + [limit, offset]
+            )
         else:
             _sel = self._compact_session_cols() if compact_rows else "s.*"
+            effective_where = where_sql
+            if effective_message_count_sql:
+                effective_where = (
+                    f"{effective_where} AND {effective_message_count_sql}"
+                    if effective_where
+                    else f"WHERE {effective_message_count_sql}"
+                )
             query = f"""
+                WITH RECURSIVE {self._compression_projection_ctes(where_sql)}
                 SELECT {_sel},
                     COALESCE(
                         (SELECT {_PREVIEW_RAW_SELECT}
@@ -5689,11 +5769,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     ) AS _preview_raw,
                     {_sql_session_last_active("s")} AS last_active
                 FROM sessions s
-                {where_sql}
+                LEFT JOIN projection_tips ON projection_tips.root_id = s.id
+                {effective_where}
                 ORDER BY s.started_at DESC
                 LIMIT ? OFFSET ?
             """
-            params.extend([limit, offset])
+            params = (
+                params + params
+                + ([min_message_count] if effective_message_count_sql else [])
+                + [limit, offset]
+            )
         with self._read_ctx() as conn:
             cursor = conn.execute(query, params)
             rows = cursor.fetchall()
@@ -5716,7 +5801,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 f"{where_sql} AND s.pinned = 1" if where_sql else "WHERE s.pinned = 1"
             )
             _sel = self._compact_session_cols() if compact_rows else "s.*"
+            pinned_effective_where = pinned_where
+            if effective_message_count_sql:
+                pinned_effective_where += f" AND {effective_message_count_sql}"
             pinned_query = f"""
+                WITH RECURSIVE {self._compression_projection_ctes(where_sql)}
                 SELECT {_sel},
                     COALESCE(
                         (SELECT {_PREVIEW_RAW_SELECT}
@@ -5730,11 +5819,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         s.started_at
                     ) AS last_active
                 FROM sessions s
-                {pinned_where}
+                LEFT JOIN projection_tips ON projection_tips.root_id = s.id
+                {pinned_effective_where}
                 ORDER BY s.started_at DESC
             """
             with self._read_ctx() as conn:
-                pinned_cursor = conn.execute(pinned_query, base_where_params)
+                pinned_params = (
+                    base_where_params + base_where_params
+                    + ([min_message_count] if effective_message_count_sql else [])
+                )
+                pinned_cursor = conn.execute(pinned_query, pinned_params)
                 pinned_rows = pinned_cursor.fetchall()
             for row in pinned_rows:
                 s = dict(row)
@@ -7319,7 +7413,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             clause, clause_params = _cwd_prefix_clause(cwd_prefix)
             where_clauses.append(clause)
             params.extend(clause_params)
-        if min_message_count > 0:
+        filter_by_projected_message_count = min_message_count > 0 and exclude_children
+        if min_message_count > 0 and not filter_by_projected_message_count:
             where_clauses.append("s.message_count >= ?")
             params.append(min_message_count)
         if archived_only:
@@ -7328,9 +7423,21 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             where_clauses.append("s.archived = 0")
 
         where_sql = f" WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+        if filter_by_projected_message_count:
+            query = f"""
+                WITH RECURSIVE {self._compression_projection_ctes(where_sql)}
+                SELECT COUNT(*)
+                FROM sessions s
+                LEFT JOIN projection_tips ON projection_tips.root_id = s.id
+                {where_sql} AND COALESCE(projection_tips.effective_message_count, s.message_count) >= ?
+            """
+            query_params = params + params + [min_message_count]
+        else:
+            query = f"SELECT COUNT(*) FROM sessions s{where_sql}"
+            query_params = params
 
         with self._lock:
-            cursor = self._conn.execute(f"SELECT COUNT(*) FROM sessions s{where_sql}", params)
+            cursor = self._conn.execute(query, query_params)
             return cursor.fetchone()[0]
 
     def session_count_by_source(

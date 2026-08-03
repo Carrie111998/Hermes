@@ -1835,6 +1835,71 @@ class TestCompressionChainProjection:
         assert tip_row["ended_at"] is None  # tip is still live
         assert tip_row["end_reason"] is None
 
+    def _build_empty_root_filter_fixture(self, db):
+        """Create a projected tip plus listable and hidden child controls."""
+        db.create_session("filtered-root", "cli")
+        db._conn.execute(
+            "UPDATE sessions SET started_at = ?, ended_at = ?, end_reason = ? WHERE id = ?",
+            (100.0, 110.0, "compression", "filtered-root"),
+        )
+        # A normal child created while the parent was live remains hidden.
+        db.create_session("ordinary-child", "cli", parent_session_id="filtered-root")
+        db._conn.execute(
+            "UPDATE sessions SET started_at = ? WHERE id = ?", (105.0, "ordinary-child")
+        )
+        db.append_message("ordinary-child", "user", "hidden delegate-like child")
+
+        db.create_session("filtered-tip", "cli", parent_session_id="filtered-root")
+        db._conn.execute(
+            "UPDATE sessions SET started_at = ? WHERE id = ?", (120.0, "filtered-tip")
+        )
+        db.append_message("filtered-tip", "user", "live continuation")
+
+        # Explicit branches stay independently listable.
+        db.create_session("branch-parent", "cli")
+        db._conn.execute(
+            "UPDATE sessions SET started_at = ?, ended_at = ?, end_reason = ? WHERE id = ?",
+            (200.0, 210.0, "branched", "branch-parent"),
+        )
+        db.create_session(
+            "branch-child",
+            "cli",
+            parent_session_id="branch-parent",
+            model_config={"_branched_from": "branch-parent"},
+        )
+        db._conn.execute(
+            "UPDATE sessions SET started_at = ? WHERE id = ?", (220.0, "branch-child")
+        )
+        db.append_message("branch-child", "user", "listable branch")
+        db._conn.commit()
+
+    def test_list_filters_compression_roots_by_projected_tip_message_count(self, db):
+        self._build_empty_root_filter_fixture(db)
+
+        rows = db.list_sessions_rich(min_message_count=1, order_by_last_active=True)
+
+        assert [row["id"] for row in rows] == ["branch-child", "filtered-tip"]
+        assert rows[1]["message_count"] == 1
+        assert rows[1]["_lineage_root_id"] == "filtered-root"
+        assert "ordinary-child" not in [row["id"] for row in rows]
+
+    def test_session_count_filters_compression_roots_by_projected_tip_message_count(self, db):
+        self._build_empty_root_filter_fixture(db)
+
+        assert db.session_count(min_message_count=1, exclude_children=True) == 2
+
+    def test_pagination_applies_after_projected_tip_message_count_filter(self, db):
+        self._build_empty_root_filter_fixture(db)
+
+        rows = db.list_sessions_rich(
+            min_message_count=1,
+            order_by_last_active=False,
+            limit=1,
+            offset=1,
+        )
+
+        assert [row["id"] for row in rows] == ["filtered-tip"]
+
 
 
 
