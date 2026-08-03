@@ -1516,7 +1516,31 @@ def fetch_openrouter_models(
     except Exception:
         remote = None
     fallback = list(remote) if remote else list(OPENROUTER_MODELS)
+
+    # Allow users to append custom/extra OpenRouter models via config.yaml
+    # (e.g. openrouter.extra_models or model.extra_models)
+    extra_ids: list[str] = []
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+        openrouter_cfg = cfg.get("openrouter") or {}
+        model_cfg = cfg.get("model") or {}
+        raw_extra = openrouter_cfg.get("extra_models") or model_cfg.get("extra_models") or []
+        if isinstance(raw_extra, str) and raw_extra.strip():
+            raw_extra = [raw_extra.strip()]
+        if isinstance(raw_extra, list):
+            for item in raw_extra:
+                if isinstance(item, str) and item.strip():
+                    extra_ids.append(item.strip())
+    except Exception:
+        pass
+
     preferred_ids = [mid for mid, _ in fallback]
+    extra_set = set(extra_ids)
+    for extra_id in extra_ids:
+        if extra_id not in preferred_ids:
+            preferred_ids.append(extra_id)
+            fallback.append((extra_id, "custom"))
 
     try:
         req = urllib.request.Request(
@@ -1556,8 +1580,12 @@ def fetch_openrouter_models(
             # Keep the silent-default badge through the live refresh so the
             # picker shows which model Hermes lands on when none is selected.
             desc = "default"
+        elif _openrouter_model_is_free(live_item.get("pricing")):
+            desc = "free"
+        elif preferred_id in extra_set:
+            desc = "custom"
         else:
-            desc = "free" if _openrouter_model_is_free(live_item.get("pricing")) else ""
+            desc = ""
         curated.append((preferred_id, desc))
 
     if not curated:
