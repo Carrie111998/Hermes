@@ -1,7 +1,8 @@
-"""Invariant tests for the bundled bitwarden-secrets skill.
+"""Invariant tests for the bundled secrets-protocol skill.
 
-Covers skills/security/bitwarden-secrets — the authoritative Bitwarden
-Secrets Manager (bws) secrets-handling protocol. Tests assert the
+Covers skills/security/secrets-protocol — the authoritative Hermes
+secrets-handling protocol for every secret source (Bitwarden Secrets
+Manager / bws, 1Password / op, and the command helper). Tests assert the
 contracts the maintainers hold for every bundled skill: valid
 frontmatter, description within the 60-character hardline, required
 sections present, and honest references to the hardening series rather
@@ -17,7 +18,7 @@ import pytest
 import yaml
 
 REPO = Path(__file__).resolve().parent.parent.parent
-SKILL_DIR = REPO / "skills" / "security" / "bitwarden-secrets"
+SKILL_DIR = REPO / "skills" / "security" / "secrets-protocol"
 SKILL_MD = SKILL_DIR / "SKILL.md"
 
 # The secrets-exfiltration hardening series — the docs may reference
@@ -36,7 +37,7 @@ def _frontmatter(skill_md: Path) -> dict:
 def test_skill_exists_with_frontmatter():
     assert SKILL_MD.exists(), f"missing {SKILL_MD}"
     fm = _frontmatter(SKILL_MD)
-    assert fm["name"] == "bitwarden-secrets"
+    assert fm["name"] == "secrets-protocol"
     assert fm["description"].strip()
     assert len(fm["description"]) <= 60, (
         f"description is {len(fm['description'])} chars (max 60)"
@@ -114,7 +115,7 @@ def test_skill_metadata_consistent_with_docs_page():
         / "skills"
         / "bundled"
         / "security"
-        / "security-bitwarden-secrets.md"
+        / "security-secrets-protocol.md"
     )
     assert docs_page.exists(), "missing mirrored docs page"
     page_fm = _frontmatter(docs_page)

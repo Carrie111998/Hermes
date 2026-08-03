@@ -2,9 +2,23 @@
 
 Pull API keys from [Bitwarden Secrets Manager](https://bitwarden.com/products/secrets-manager/) at process startup instead of storing them in plaintext inside `~/.hermes/.env`. One bootstrap secret (a machine-account access token) replaces N per-provider keys, and rotating a credential becomes a single change in the Bitwarden web app.
 
-## Immediate action: rotate your access token
+## The security posture is the feature
 
-If you have used this integration on **any Hermes version before the secrets-exfiltration hardening series**, your secret values were persisted in a plaintext cache file on disk, and your machine-account access token was inherited by every child process Hermes spawned. The vulnerability is now closed by design, but **rotate the token now** — anyone who read that cache file or any spawned child's environment could have taken it.
+Hermes does not merely *support* Bitwarden Secrets Manager — it implements the integration so that **the plaintext-secrets vulnerability class does not exist**. Every disclosure path is closed by design, and a hermetic end-to-end test pins the whole surface shut:
+
+1. **No plaintext at rest — encrypted-only by default.** Every fetched secret is persisted only as AES-GCM ciphertext in `~/.hermes/cache/bws_cache.enc.json`, keyed off the bootstrap token. There is no plaintext write branch in the codebase. Setting `encrypted_cache.enabled: false` means **memory-only**: disk persistence is disabled entirely, and plaintext is never consulted or written as an alternative.
+2. **Legacy plaintext caches are re-encrypted and removed on first read.** A legacy plaintext `bws_cache.json` is re-encrypted and removed on first read — including in memory-only mode. After any run, a plaintext cache file cannot survive.
+3. **Secret values never reach status lines, logs, or terminal output.** Secret-source error, remediation-hint, warning, and conflict lines are masked before they hit stderr. `RedactingFormatter` masks opaque credential values in all log output — both shape-based tokens (`sk-`, `ghp_`, auth headers) and exact credential values with no recognizable prefix (`MY_SERVICE_TOKEN=…`, `*_PASSWORD=…`).
+4. **The vault token and passwords never reach child processes.** `BWS_ACCESS_TOKEN` (under its exact configured name) and every `*_PASSWORD` are stripped from spawned children on every surface — terminal commands, the browser worker, the ACP executor, the computer-use driver, and the TUI/Node host. The only process that receives the token is the `bws` CLI itself, explicitly, never by inheritance.
+5. **Applied secrets are stripped from children by provenance, not just by name.** Beyond the named strip, every value present in the per-home applied-secrets snapshot is removed from spawned children regardless of the variable name — `DATABASE_URL`, `FOO`, or any arbitrary item key resolve to nothing in a child's environment. Only variables registered through `env_passthrough` pass through, deliberately and by explicit configuration.
+6. **Secret values are redacted before anything reaches the model provider.** Applied secret values are masked in tool-result content, in the pre-send sanitization pass over context, and in terminal output before the request is sent to the provider. A secret can appear in an agent's context as `***`, never as its value.
+7. **The 1Password integration ships the same posture.** The 1Password cache is encrypted-only (`~/.hermes/cache/op_cache.enc.json`), and `OP_SERVICE_ACCOUNT_TOKEN`, `OP_CONNECT_TOKEN`, and `OP_SESSION_*` are stripped from spawned children the same way as the BWS token.
+
+The guarantee is tested, not promised: the end-to-end no-exfiltration gate (`tests/test_secrets_exfiltration.py`) pins the posture on the wire — a secret applied from any external source and echoed by a tool arrives at the provider-bound message carrying the mask, never the value, and the key name survives for debugging. The emission-side channels are pinned by the same suite: secret names and values never surface in stdout, stderr, or formatted output. Any regression that re-opens a channel fails CI.
+
+## Token rotation
+
+Rotation is how you maintain the posture. The machine-account access token is the single credential that unlocks every applied secret, so rotating it on a schedule — and immediately if it may have leaked — keeps the guarantee airtight. The rotation path is fully masked and validates before it writes, so routine maintenance never weakens the posture.
 
 1. In the Bitwarden web app → **Secrets Manager** → **Machine accounts** → your machine account → **Access tokens**.
 2. **Revoke** the existing token(s).
@@ -19,18 +33,25 @@ If you have used this integration on **any Hermes version before the secrets-exf
 
 Clipboard discipline: the new token should go **straight from creation to the terminal** — create it in the web app, copy to clipboard, paste into the `hermes secrets bitwarden token` prompt, and **do not save it anywhere else in between** (no notes app, no file, no chat, no screenshot). If the paste fails, re-copy from the web app rather than retyping the token.
 
-The command probes Bitwarden with the new token **before** writing anything — a rejected token leaves your current `.env` untouched — and on success clears the fetch caches. After rotating, also rotate any high-value secrets (provider API keys, database passwords) that were exposed to processes spawned while the old token was live, since those values could have been read by any child process during that window.
+The command probes Bitwarden with the new token **before** writing anything — a rejected token leaves your current `.env` untouched — and on success clears the fetch caches. After rotating, also rotate any high-value secrets (provider API keys, database passwords) that were applied while the old token was live: whoever holds the old token can still read them directly from the vault until those secrets are themselves rotated.
 
-## The security posture is the feature
+### Rotating an expired or revoked token
 
-Hermes does not merely *support* Bitwarden Secrets Manager — it implements the integration so that **the plaintext-secrets vulnerability class does not exist in the default configuration**. Four disclosure channels are closed by design, and a hermetic end-to-end test pins them shut:
+When the machine-account token expires, gets revoked, or the account is deleted, startup shows:
 
-1. **No plaintext at rest — encrypted-only by default.** Every fetched secret is persisted only as AES-GCM ciphertext in `~/.hermes/cache/bws_cache.enc.json`, keyed off the bootstrap token. There is no plaintext write branch in the codebase. Setting `encrypted_cache.enabled: false` means **memory-only**: disk persistence is disabled entirely, and plaintext is never consulted or written as an alternative.
-2. **Legacy plaintext is destroyed, not tolerated.** A pre-hardening `bws_cache.json` (written by older Hermes versions) is re-encrypted and removed on first read — including in memory-only mode. After any run, a plaintext cache file cannot survive.
-3. **Secret values never reach status lines or logs.** Secret-source error, remediation-hint, warning, and conflict lines are masked before they hit stderr. `RedactingFormatter` masks opaque credential values in all log output — both shape-based tokens (`sk-`, `ghp_`, auth headers) and exact credential values with no recognizable prefix (`MY_SERVICE_TOKEN=…`, `*_PASSWORD=…`).
-4. **The vault token and passwords never reach child processes.** `BWS_ACCESS_TOKEN` (under its exact configured name) and every `*_PASSWORD` are stripped from spawned children on every surface — terminal commands, the browser worker, the ACP executor, the computer-use driver, and the TUI/Node host. The only process that receives the token is the `bws` CLI itself, explicitly, never by inheritance.
+```
+Bitwarden Secrets Manager: Bitwarden rejected the machine-account access token (BWS_ACCESS_TOKEN) — it was likely revoked, expired, or belongs to another region.  (...)
+Bitwarden Secrets Manager: → Run `hermes secrets bitwarden token` to paste a fresh access token ...
+```
 
-The guarantee is tested, not promised: the end-to-end no-exfiltration gate loads a secret from Bitwarden and asserts its name and value never surface in stdout, stderr, or formatted output. Any regression that re-opens a channel fails CI.
+Fix it without re-running the whole wizard:
+
+```bash
+hermes secrets bitwarden token                     # masked prompt
+hermes secrets bitwarden token --access-token 0.…  # non-interactive
+```
+
+On success the command stores the token, clears the fetch caches, and warns if the configured project is not visible to the new machine account.
 
 ## How it works
 
@@ -105,24 +126,6 @@ From now on, every `hermes` invocation pulls fresh secrets at startup. You'll se
 | `hermes secrets bitwarden install` | Just download the pinned `bws` binary (no auth required) |
 | `hermes secrets bitwarden disable` | Flip `enabled: false`; leaves token + project id in place |
 
-## Rotating an expired or revoked token
-
-When the machine-account token expires, gets revoked, or the account is deleted, startup shows:
-
-```
-Bitwarden Secrets Manager: Bitwarden rejected the machine-account access token (BWS_ACCESS_TOKEN) — it was likely revoked, expired, or belongs to another region.  (...)
-Bitwarden Secrets Manager: → Run `hermes secrets bitwarden token` to paste a fresh access token ...
-```
-
-Fix it without re-running the whole wizard:
-
-```bash
-hermes secrets bitwarden token                     # masked prompt
-hermes secrets bitwarden token --access-token 0.…  # non-interactive
-```
-
-The command probes Bitwarden with the new token **before** writing anything — a rejected token leaves your current `.env` untouched. On success it stores the token, clears the fetch caches, and warns if the configured project is not visible to the new machine account.
-
 ## Configuration
 
 Defaults in `~/.hermes/config.yaml`:
@@ -173,8 +176,10 @@ Startup warnings include a `→` remediation line telling you exactly which comm
 
 - The bootstrap token (`BWS_ACCESS_TOKEN`) is itself sensitive — anyone with it can read every secret the machine account has access to. Treat it the same as any other API key.
 - Hermes will refuse to let Bitwarden overwrite the bootstrap token itself, even with `override_existing: true`. If you store `BWS_ACCESS_TOKEN` as a secret inside the project, it's silently skipped during apply.
-- The disk cache is **never** plaintext — AES-GCM encrypted by default, keyed off the bootstrap token, with the legacy plaintext cache re-encrypted and removed on first read. There is no plaintext write path.
-- Secret values are masked in startup status lines and log output; the vault token and `*_PASSWORD` values are stripped from every spawned child process.
+- The disk cache is **never** plaintext — AES-GCM encrypted by default, keyed off the bootstrap token, with legacy plaintext caches re-encrypted and removed on first read. There is no plaintext write path.
+- Secret values are masked in status lines, log output, and terminal output; the vault token, every `*_PASSWORD`, and every applied secret value are stripped from spawned child processes.
+- Applied secret values are redacted before anything reaches the model provider — tool results, pre-send context, and terminal output all carry the mask, never the value.
+- The 1Password integration follows the same posture: encrypted-only `op_cache.enc.json`, with `OP_SERVICE_ACCOUNT_TOKEN`, `OP_CONNECT_TOKEN`, and `OP_SESSION_*` stripped from children.
 - The `bws` binary download is verified against the published SHA-256 checksum from the same GitHub release. Mismatch aborts the install.
 - The pinned version (`bws v2.0.0` at time of writing) is updated through PRs to this repo — Hermes does not auto-upgrade `bws` to "latest" because upstream release shapes can change.
 

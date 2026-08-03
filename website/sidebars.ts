@@ -288,7 +288,7 @@ const sidebars: SidebarsConfig = {
                   key: 'skills-bundled-security',
                   collapsed: true,
                   items: [
-                    'user-guide/skills/bundled/security/security-bitwarden-secrets',
+                    'user-guide/skills/bundled/security/security-secrets-protocol',
                   ],
                 },
                 {

@@ -124,7 +124,7 @@ If a skill is missing from this list but present in the repo, the catalog is reg
 
 | Skill | Description | Path |
 |-------|-------------|------|
-| [`bitwarden-secrets`](/docs/user-guide/skills/bundled/security/security-bitwarden-secrets) | Authoritative Bitwarden Secrets Manager (bws) protocol for Hermes — encrypted-only cache, no plaintext at rest, masked output, child-process env hygiene. | `security/bitwarden-secrets` |
+| [`secrets-protocol`](/docs/user-guide/skills/bundled/security/security-secrets-protocol) | Authoritative secrets-handling protocol for every Hermes secret source (Bitwarden, 1Password, command helper) — encrypted-only cache, no plaintext at rest, masked output, child-process env hygiene. | `security/secrets-protocol` |
 
 ## smart-home
 
