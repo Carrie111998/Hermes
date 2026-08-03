@@ -118,7 +118,9 @@ def _verified_upload_file_id(
         )
     expected_type = _Path(expected_filename).suffix.lower().lstrip(".")
     actual_type = str(file_obj.get("filetype") or "").lower()
-    if actual_type and expected_type and actual_type != expected_type:
+    if not actual_type:
+        raise RuntimeError("Slack upload response did not include a file type")
+    if expected_type in {"htm", "html"} and actual_type != "html":
         raise RuntimeError(
             f"Slack confirmed the wrong file type ({actual_type!r})"
         )

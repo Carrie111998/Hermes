@@ -708,6 +708,21 @@ class TestSendDocument:
         assert "did not include a file ID" in result.error
 
     @pytest.mark.asyncio
+    async def test_send_document_rejects_wrong_html_file_type(
+        self, adapter, tmp_path
+    ):
+        test_file = tmp_path / "report.html"
+        test_file.write_text("<p>safe</p>", encoding="utf-8")
+        response = _upload_response("report.html")
+        response["files"][0]["filetype"] = "text"
+        adapter._app.client.files_upload_v2 = AsyncMock(return_value=response)
+
+        result = await adapter.send_document("C123", str(test_file))
+
+        assert not result.success
+        assert "wrong file type" in result.error
+
+    @pytest.mark.asyncio
     async def test_send_document_with_thread(self, adapter, tmp_path):
         test_file = tmp_path / "notes.txt"
         test_file.write_bytes(b"some notes")
