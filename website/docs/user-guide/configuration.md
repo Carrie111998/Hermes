@@ -881,6 +881,19 @@ Points at a custom OpenAI-compatible endpoint. Uses `OPENAI_API_KEY` for auth.
 The summary model **must** have a context window at least as large as your main agent model's. The compressor sends the full middle section of the conversation to the summary model — if that model's context window is smaller than the main model's, the summarization call will fail with a context length error. When this happens, the middle turns are **dropped without a summary**, losing conversation context silently. If you override the model, verify its context length meets or exceeds your main model's.
 :::
 
+## Principle Distiller
+
+Optional Phase 3 self-distillation of strategic principles from successful conversation turns (experience-driven agent evolution). When enabled, each clean turn that hit an injected principle retrieves matching principles from `~/.hermes/data/principles/principles.jsonl`, distills a new principle record, persists it, and appends the learned line to the turn's final response. Corrections are handled by the reward hook at the start of the next turn (strong correction −0.2, weak −0.1, clean run +0.05).
+
+**Off by default.** The conversation loop never imports or calls the distiller while disabled.
+
+```yaml
+principle_distiller:
+  enabled: false          # true = enable self-distillation
+```
+
+Environment override: `HERMES_PRINCIPLE_DISTILLER` — set to `1`, `true`, `yes`, or `on` to enable; any other set value disables; unset falls through to the config key. The switch is read once per turn at loop startup; mid-conversation edits do not flip behavior mid-turn. The injected principle block is carried by the `api_content` sidecar, so the persisted transcript and the wire payload stay byte-identical.
+
 ## Session Stall Watchdog
 
 The gateway runs a notify-only stall watchdog (`agent.session_stall_timeout`, default `300` seconds, `0` = disabled). When a busy session has a **pending inbound follow-up** and the agent's shared activity clock has been idle for at least this long, the gateway logs a WARNING and sends the user a one-shot notification:

@@ -556,6 +556,21 @@ compression:
   # auxiliary section below (auxiliary.compression.provider / model).
 
 # =============================================================================
+# Principle self-distillation (Phase 3, OFF by default)
+# =============================================================================
+# Experience-driven principle evolution: when enabled, each CLEAN turn that
+# hit an injected principle distills a new principle record into
+# ~/.hermes/data/principles/principles.jsonl and appends the learned line to
+# the turn's final response. Disabled by default — the conversation loop
+# never imports or calls the distiller unless this is enabled.
+#
+# Env override: HERMES_PRINCIPLE_DISTILLER=1/true/yes/on enables; any other
+# set value disables; unset falls through to this key.
+#
+# principle_distiller:
+#   enabled: false
+
+# =============================================================================
 # Anthropic prompt caching TTL
 # =============================================================================
 # When prompt caching is active (Claude via OpenRouter or native Anthropic),

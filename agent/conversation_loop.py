@@ -22,6 +22,7 @@ import os
 import random
 import re
 import ssl
+import sys
 import time
 from typing import Any, Dict, List, Optional
 
@@ -88,6 +89,22 @@ from tools.skill_provenance import set_current_write_origin
 from utils import base_url_host_matches, env_var_enabled
 
 logger = logging.getLogger(__name__)
+
+# ── Phase 3 principle distiller (optional, config-gated) ─────────────
+# Defensive import: `auto` lives in ~/.hermes (outside the vendored repo),
+# so put both ~/.hermes/auto (bare `from principle_repo import ...` inside
+# the distiller) and ~/.hermes (the `from auto import ...` package path) on
+# sys.path before importing. ANY failure (module missing, path error) must
+# degrade to None — the loop then skips the whole distiller code path.
+try:
+    _pd_auto_dir = os.path.join(os.path.expanduser("~"), ".hermes", "auto")
+    _pd_auto_home = os.path.dirname(_pd_auto_dir)
+    for _pd_path in (_pd_auto_dir, _pd_auto_home):
+        if _pd_path not in sys.path:
+            sys.path.insert(0, _pd_path)
+    from auto import principle_distiller as _principle_distiller
+except Exception:
+    _principle_distiller = None
 
 # Stable prefix of the local interrupt status string emitted when a turn is
 # cancelled while waiting on the provider. Surfaces (ACP, TUI) match on this
@@ -1225,6 +1242,40 @@ def _notify_context_engine_turn_complete(
         )
 
 
+# ── Phase 3 tool-error markers ─────────────────────────────────────
+# Distinctive prefixes of the tool-result error strings the loop and
+# agent.tool_executor append when a tool call failed (invalid name,
+# invalid JSON, execution exception, timeout). Scanned over THIS turn's
+# message slice to compute the distiller's `has_tool_error` signal
+# without instrumenting every append site in the vendored executor
+# (concurrent/sequential/segmented paths all funnel through these).
+_TOOL_ERROR_CONTENT_MARKERS = (
+    "Error executing tool '",
+    "Error: Invalid JSON arguments.",
+    "Skipped: another tool call in this turn used an invalid name",
+    "Skipped: other tool call in this response had invalid JSON.",
+    "Tool call rejected: the tool name was empty",
+    "Tool '",
+)
+
+
+def _turn_slice_has_tool_error(messages: List[Dict[str, Any]], start_idx: int) -> bool:
+    """True when any tool-result message appended after ``start_idx`` carries
+    a tool-error marker. ``start_idx`` is this turn's user-message index
+    (``current_turn_user_idx``), so prior turns' error results can't dirty
+    this turn's distillation."""
+    for msg in messages[start_idx + 1:]:
+        if not isinstance(msg, dict) or msg.get("role") != "tool":
+            continue
+        content = msg.get("content")
+        if not isinstance(content, str):
+            continue
+        for marker in _TOOL_ERROR_CONTENT_MARKERS:
+            if content.startswith(marker):
+                return True
+    return False
+
+
 def run_conversation(
     agent,
     user_message: Any,
@@ -1285,6 +1336,29 @@ def run_conversation(
     agent._last_compaction_in_place = False
     agent._last_compression_attempt_recorded = False
     agent._last_compression_attempt_in_place = None
+
+    # ── Phase 3 principle distiller gate + reward (config-gated) ──
+    # H0b: read the switch ONCE per turn and stash it on the agent — a
+    # mid-conversation config/env edit must not flip behavior mid-turn.
+    # Degrades to False on any config failure; never blocks the loop.
+    try:
+        from hermes_cli.config import principle_distiller_enabled
+
+        agent._principle_distiller_enabled = principle_distiller_enabled()
+    except Exception:
+        agent._principle_distiller_enabled = False
+
+    # W3: start-of-turn reward slot. Consumes the PREVIOUS turn's stashed
+    # ids (apply_principle_rewards deletes them in its finally). Runs before
+    # build_turn_context so W1's fresh stash can't be mistaken for the
+    # previous turn's. Any exception is logged and the loop continues.
+    if agent._principle_distiller_enabled and isinstance(user_message, str):
+        try:
+            from auto.principle_reward_hook import apply_principle_rewards
+
+            apply_principle_rewards(agent, user_message)
+        except Exception:
+            logger.exception("Principle reward failed; continuing without it")
 
     # ── Per-turn setup (the prologue) ──
     # All once-per-turn setup — stdio guarding, retry-counter resets, user
@@ -5976,6 +6050,7 @@ def run_conversation(
                         if _tc_name not in agent.valid_tool_names:
                             # See _invalid_tool_name_error_content for the
                             # blank-name anti-priming rationale (#47967).
+                            agent._turn_had_tool_error = True
                             content = _invalid_tool_name_error_content(
                                 _tc_name, agent.valid_tool_names
                             )
@@ -6026,6 +6101,7 @@ def run_conversation(
                     # hiding the truncation from the length handler above.
                     # Detect truncation: args that don't end with } or ]
                     # (after stripping whitespace) are cut off mid-stream.
+                    agent._turn_had_tool_error = True
                     _truncated = any(
                         not (tc.function.arguments or "").rstrip().endswith(("}", "]"))
                         for tc in assistant_message.tool_calls
@@ -6217,6 +6293,7 @@ def run_conversation(
                 # provider-side tool_call/result pairing stays intact.
                 if _invalid_batch_calls:
                     for tc in _invalid_batch_calls:
+                        agent._turn_had_tool_error = True
                         messages.append({
                             "role": "tool",
                             "name": tc.function.name,
@@ -7223,6 +7300,47 @@ def run_conversation(
                 messages.append({"role": "assistant", "content": final_response})
                 break
     
+    # ── Phase 3 principle distillation (end of turn N, config-gated) ──
+    # Same-turn slot per PRINCIPLE_DISTILLER_INTEGRATION_PLAN.md (D1): the
+    # correction signal for turn N only arrives with turn N+1's message, so
+    # has_user_correction stays False here and the reward hook (W3, start of
+    # turn N+1) is the correction channel. Inputs: this turn's original user
+    # message, the hit dicts W1 stashed at turn start, and the tool-error
+    # tally (loop-flag OR slice-scan of this turn's tool results OR the
+    # loop's `failed` flag). Any exception or malformed return is logged at
+    # ERROR and never crashes the loop; a non-empty `text` is appended to the
+    # final response so the distilled principle is visible to the user.
+    if getattr(agent, "_principle_distiller_enabled", False) and _principle_distiller is not None:
+        try:
+            _pd_record = _principle_distiller.distill_from_turn(
+                user_message=original_user_message or user_message,
+                hit_principles=list(getattr(agent, "_prev_turn_principle_hits", None) or []),
+                has_tool_error=bool(failed)
+                or bool(getattr(agent, "_turn_had_tool_error", False))
+                or _turn_slice_has_tool_error(messages, current_turn_user_idx),
+                has_user_correction=False,
+                dry_run=False,
+            )
+            # Validate the returned record before touching final_response —
+            # malformed output (str/list/{}/missing/non-str text) must never
+            # raise or inject garbage.
+            if (
+                isinstance(_pd_record, dict)
+                and isinstance(_pd_record.get("text"), str)
+                and _pd_record["text"].strip()
+            ):
+                if isinstance(final_response, str):
+                    final_response = final_response + "\n\n" + _pd_record["text"].strip()
+                elif final_response is None:
+                    final_response = _pd_record["text"].strip()
+                logger.info(
+                    "Distilled principle (turn %s): %s",
+                    turn_id,
+                    _pd_record["text"].strip()[:80],
+                )
+        except Exception:
+            logger.exception("Principle distillation failed; continuing without it")
+
     # Post-loop turn finalization extracted to agent/turn_finalizer.finalize_turn
     # (god-file decomposition Phase 1 step 4). Behavior-neutral: the assembled
     # result dict is returned exactly as before.

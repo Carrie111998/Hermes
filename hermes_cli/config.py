@@ -2049,6 +2049,22 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
                 f"Move '{key}' under the appropriate section",
             ))
 
+    # ── principle_distiller section: must be a mapping with a bool `enabled` ──
+    pd_cfg = config.get("principle_distiller")
+    if pd_cfg is not None:
+        if not isinstance(pd_cfg, dict):
+            issues.append(ConfigIssue(
+                "warning",
+                "principle_distiller must be a mapping (e.g. 'principle_distiller:\\n  enabled: true')",
+                "Change to a YAML mapping with an 'enabled' boolean",
+            ))
+        elif not isinstance(pd_cfg.get("enabled", False), bool):
+            issues.append(ConfigIssue(
+                "warning",
+                "principle_distiller.enabled must be a boolean (true/false)",
+                f"Got {type(pd_cfg.get('enabled')).__name__}; use 'enabled: true' or 'enabled: false'",
+            ))
+
     return issues
 
 
@@ -3110,6 +3126,31 @@ def atomic_config_write(config_path: Path, data: Any, **kwargs: Any) -> None:
 
     require_readable_config_before_write(config_path)
     atomic_yaml_write(config_path, data, **kwargs)
+
+
+def principle_distiller_enabled(config: Optional[Dict[str, Any]] = None) -> bool:
+    """Whether the Phase 3 principle self-distillation is enabled.
+
+    Resolution order (see PRINCIPLE_INTEGRATION_DESIGN.md §5):
+      1. ``HERMES_PRINCIPLE_DISTILLER`` env var — 1/true/yes/on (case-insensitive)
+         enables; any other set value disables; unset falls through.
+      2. ``principle_distiller.enabled`` config key (default False).
+
+    A missing/malformed config section degrades to False and never raises,
+    so the caller can stash the result once and never re-read the config.
+    """
+    env_val = os.environ.get("HERMES_PRINCIPLE_DISTILLER")
+    if env_val is not None:
+        return env_val.strip().lower() in ("1", "true", "yes", "on")
+    if config is None:
+        config = load_config_readonly()
+    section = config.get("principle_distiller") if isinstance(config, dict) else None
+    if isinstance(section, dict):
+        enabled = section.get("enabled", False)
+        # Strict bool only: a truthy string ("yes") is a config error, not an
+        # enable signal (validate_config_structure warns about it).
+        return enabled if isinstance(enabled, bool) else False
+    return False
 
 
 def load_config() -> Dict[str, Any]:
