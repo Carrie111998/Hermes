@@ -21,6 +21,17 @@
     "focus": "distinguish received date from purchase or entitlement date; verify historical campaign terms, separate validity, use state, and current usability; no expiry claim without evidence and no transfer or exception guidance first"
   },
   {
+    "id": "voucher_topup_no_new_campaign_bonus",
+    "message": "Това доплащане прави ли ми нов бонусен безплатен полет от кампанията?",
+    "history": [
+      {
+        "role": "user",
+        "content": "Имам вече купен подаръчен ваучер на стойност. Избрах услуга, дата и час, и платих с карта само разликата в цената."
+      }
+    ],
+    "focus": "existing voucher redemption with card top-up: reject categorical yes; no new free-flight campaign entitlement from top-up alone; qualifying new voucher/direct BookNow only under verified rules; date/time does not prove BookNow; original buyer/order email may own any pre-existing bonus; clarify unknown purchase origin"
+  },
+  {
     "id": "massage_sofia_budget",
     "message": "Търся масаж за двама в София до 100 евро. Какво ще ми предложиш?",
     "focus": "catalog relevance, cards, EUR pricing, budget taste"

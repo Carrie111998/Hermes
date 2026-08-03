@@ -69,6 +69,21 @@
     ]
   },
   {
+    "id": "voucher_topup_no_new_campaign_bonus",
+    "source_threads": [
+      "1533713798198984805"
+    ],
+    "principle": "Redeeming or exchanging an already-existing voucher, reserving a service with it, or paying a top-up for the price difference does not by itself create a new campaign bonus/free-flight entitlement. A new campaign bonus comes only from a qualifying new voucher purchase or direct BookNow purchase under verified campaign rules. Choosing a date/time does not prove BookNow because existing-voucher reservations also have slots. A bonus may already have been created by the original voucher purchase and belong to the original buyer/order email; the recipient or top-up payer is not automatically the entitlement owner. If purchase origin or entitlement evidence is unknown, ask one minimal clarification or state the branches without promising entitlement, account visibility, or same-day slots.",
+    "scoring": [
+      "campaign_fact_accuracy",
+      "voucher_state_reasoning",
+      "booknow_boundary",
+      "ownership_clarity",
+      "evidence_uncertainty",
+      "no_overpromise"
+    ]
+  },
+  {
     "id": "campaign_gift_time_validity",
     "source_threads": [
       "generalized_campaign_validity_regression"

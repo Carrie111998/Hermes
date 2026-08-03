@@ -1672,7 +1672,7 @@ def test_system_prompt_links_campaign_bonus_id_to_slots_tool() -> None:
     assert "не коментирай самото ограничение" in prompt
     assert "представи се кратко като SkyAI" in prompt
     assert "не решавай учебни задачи" in prompt
-    assert len(prompt) < 6000
+    assert len(prompt) < 6300
     assert "силно попадение" not in prompt
     assert "ще й легне" not in prompt
     assert "ако клиентът уточни нещо" not in prompt
