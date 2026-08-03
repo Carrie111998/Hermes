@@ -17,6 +17,7 @@ import { RowButton } from '@/components/ui/row-button'
 import { SearchField } from '@/components/ui/search-field'
 import { disconnectOAuthProvider, listOAuthProviders } from '@/hermes'
 import { useI18n } from '@/i18n'
+import { isManagedEvaosAgent } from '@/i18n/managed-brand'
 import { Check, ChevronDown, ChevronRight, KeyRound, Loader2, Terminal, Trash2 } from '@/lib/icons'
 import { normalize } from '@/lib/text'
 import { cn } from '@/lib/utils'
@@ -140,6 +141,7 @@ function OAuthPicker({
   const p = t.settings.providers
   const [showAll, setShowAll] = useState(false)
   const ordered = useMemo(() => sortProviders(providers), [providers])
+  const managedEva = isManagedEvaosAgent()
 
   if (ordered.length === 0) {
     return null
@@ -147,8 +149,14 @@ function OAuthPicker({
 
   const select = (p: OAuthProvider) => startManualProviderOAuth(p.id)
 
-  const featured = ordered.find(p => p.id === FEATURED_ID && !p.status?.logged_in) ?? null
-  const rest = featured ? ordered.filter(p => p.id !== FEATURED_ID) : ordered
+  const featured = managedEva ? null : (ordered.find(p => p.id === FEATURED_ID && !p.status?.logged_in) ?? null)
+
+  const rest = managedEva
+    ? ordered.filter(p => p.id !== FEATURED_ID || p.status?.logged_in)
+    : featured
+      ? ordered.filter(p => p.id !== FEATURED_ID)
+      : ordered
+
   // Keep connected accounts grouped and always visible; only the unconnected
   // providers hide behind the disclosure, so the page leads with what's set up.
   // Both lists preserve `sortProviders` order (curated priority, then name).
@@ -176,7 +184,7 @@ function OAuthPicker({
       </p>
       {featured && <FeaturedProviderRow onSelect={select} provider={featured} />}
       {/* Slot #2 — always visible, matching onboarding / CANONICAL_PROVIDERS. */}
-      <FireworksProviderRow onClick={onWantApiKey} />
+      {!managedEva && <FireworksProviderRow onClick={onWantApiKey} />}
       {connected.length > 0 && (
         <>
           <GroupLabel>{p.connected}</GroupLabel>
@@ -261,6 +269,9 @@ function ConnectedProviderRow({
       </RowButton>
       <div className="flex items-center gap-1 pr-2">
         <Trail className="size-4 text-muted-foreground transition group-hover:text-foreground" />
+        <Button onClick={() => onSelect(provider)} size="inline" type="button" variant="textStrong">
+          {copy.reauthenticate}
+        </Button>
         {canDisconnect && (
           <Button
             aria-label={`${t.common.remove} ${title}`}

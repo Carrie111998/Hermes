@@ -25,6 +25,7 @@ import { FloatingPet } from '@/components/pet/floating-pet'
 import { RemoteDisplayBanner } from '@/components/remote-display-banner'
 import { emitGatewayEvent } from '@/contrib/events'
 import { getSessionMessages, triggerCronJob } from '@/hermes'
+import { isManagedEvaosAgent } from '@/i18n/managed-brand'
 import { type ChatMessage, chatMessageText, preserveLocalAssistantErrors, toChatMessages } from '@/lib/chat-messages'
 import { sessionMessagesSignature } from '@/lib/session-signatures'
 import { isMessagingSource } from '@/lib/session-source'
@@ -159,6 +160,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   const gatewayState = useStore($gatewayState)
   const activeSessionId = useStore($activeSessionId)
   const billingSettingsRequest = useStore($billingSettingsRequest)
+  const managedEva = isManagedEvaosAgent()
   const currentCwd = useStore($currentCwd)
 
   // eslint-disable-next-line no-restricted-syntax -- one-shot request-seen sentinel, not an atom mirror
@@ -169,10 +171,10 @@ export function ContribWiring({ children }: { children: ReactNode }) {
 
     billingSettingsSeenRef.current = billingSettingsRequest
 
-    if (billingSettingsRequest > 0) {
+    if (billingSettingsRequest > 0 && !managedEva) {
       navigate(`${SETTINGS_ROUTE}?tab=billing`)
     }
-  }, [billingSettingsRequest, navigate])
+  }, [billingSettingsRequest, managedEva, navigate])
   const freshDraftReady = useStore($freshDraftReady)
   const resumeFailedSessionId = useStore($resumeFailedSessionId)
   const resumeExhaustedSessionId = useStore($resumeExhaustedSessionId)

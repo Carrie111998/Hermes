@@ -891,6 +891,7 @@ export const ja = defineLocale({
       collapse: '折りたたむ',
       connectAnother: '別のプロバイダーを接続',
       otherProviders: 'その他のプロバイダー',
+      reauthenticate: '再認証',
       removeConfirm: provider => `${provider} を削除しますか？`,
       removeKeyManaged: provider => `${provider} は API キーで設定されています。API Keys から削除してください。`,
       removedTitle: 'アカウントを削除しました',

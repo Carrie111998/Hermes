@@ -1,3 +1,7 @@
+import { isManagedEvaosAgent } from '@/i18n/managed-brand'
+
+import { isManagedBillingSlashCommand } from './managed-ui-policy'
+
 export interface CommandsCatalogSection {
   name: string
   pairs: [string, string][]
@@ -434,6 +438,10 @@ export function isDesktopSlashExtensionCommand(command: string): boolean {
 
 /** Gates execution: true unless the command is a known no-desktop-surface command. */
 export function isDesktopSlashCommand(command: string): boolean {
+  if (isManagedBillingSlashCommand(command, isManagedEvaosAgent())) {
+    return false
+  }
+
   const spec = resolveDesktopCommand(command)
 
   if (spec) {
@@ -445,6 +453,10 @@ export function isDesktopSlashCommand(command: string): boolean {
 
 /** Gates discovery in the popover/completions. */
 export function isDesktopSlashSuggestion(command: string): boolean {
+  if (isManagedBillingSlashCommand(command, isManagedEvaosAgent())) {
+    return false
+  }
+
   const normalized = normalizeCommand(command)
 
   // Aliases stay hidden so the popover isn't cluttered with duplicates.
@@ -482,6 +494,10 @@ export function isModelPickerCommand(command: string): boolean {
 }
 
 export function desktopSlashUnavailableMessage(command: string): string | null {
+  if (isManagedBillingSlashCommand(command, isManagedEvaosAgent())) {
+    return `${normalizeCommand(command)} is not available in managed evaOS Agent.`
+  }
+
   const canonical = canonicalDesktopSlashCommand(command)
   const surface = SPEC_BY_NAME.get(canonical)?.surface
 
@@ -526,11 +542,15 @@ export function desktopSkinSlashCompletions(
       display: '/skin next',
       meta: 'Cycle to the next desktop theme'
     },
-    ...themes.map(theme => ({
-      text: `/skin ${theme.name}`,
-      display: `/skin ${theme.name}`,
-      meta: `${theme.label}${theme.name === activeThemeName ? ' (current)' : ''} - ${theme.description}`
-    }))
+    ...themes.map(theme => {
+      const commandName = theme.name === 'nous' || theme.name === 'ember' ? theme.label : theme.name
+
+      return {
+        text: `/skin ${commandName}`,
+        display: `/skin ${commandName}`,
+        meta: `${theme.label}${theme.name === activeThemeName ? ' (current)' : ''} - ${theme.description}`
+      }
+    })
   ]
 
   if (!prefix) {

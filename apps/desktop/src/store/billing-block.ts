@@ -1,6 +1,7 @@
 import type { BillingBlock } from '@hermes/shared'
 import { atom } from 'nanostores'
 
+import { isManagedEvaosAgent } from '@/i18n/managed-brand'
 import { openExternalLink } from '@/lib/external-link'
 
 /**
@@ -49,13 +50,23 @@ export function requestBillingSettings(): void {
   $billingSettingsRequest.set($billingSettingsRequest.get() + 1)
 }
 
+export function billingRecoveryAvailable(block: BillingBlock): boolean {
+  return !isManagedEvaosAgent() || (!block.is_nous && Boolean(block.billing_url))
+}
+
 /**
  * The single recovery action for a billing wall, shared by the toast and the
- * in-chat banner so both behave identically: Nous routes to the in-app
+ * in-chat banner so both behave identically: Nous routes to the upstream
  * Settings → Billing surface; a third-party provider deep-links to its own
  * billing page (falling back to the in-app surface only if we have no URL).
+ * Managed evaOS Agent exposes no in-app Billing route, so only a provider-owned
+ * external URL remains actionable.
  */
 export function runBillingRecovery(block: BillingBlock): void {
+  if (!billingRecoveryAvailable(block)) {
+    return
+  }
+
   if (block.is_nous) {
     requestBillingSettings()
 

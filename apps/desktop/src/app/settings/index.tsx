@@ -5,6 +5,7 @@ import { codiconIcon } from '@/components/ui/codicon'
 import { Tip } from '@/components/ui/tooltip'
 import { getHermesConfigDefaults, getHermesConfigRecord, saveHermesConfig } from '@/hermes'
 import { useI18n } from '@/i18n'
+import { isManagedEvaosAgent } from '@/i18n/managed-brand'
 import { triggerHaptic } from '@/lib/haptics'
 import {
   Archive,
@@ -22,6 +23,7 @@ import {
   Wrench,
   Zap
 } from '@/lib/icons'
+import { isManagedSettingsViewVisible } from '@/lib/managed-ui-policy'
 import { notifyError } from '@/store/notifications'
 
 import { useRouteEnumParam } from '../hooks/use-route-enum-param'
@@ -57,8 +59,11 @@ const SETTINGS_VIEWS: readonly SettingsViewId[] = [
   'about'
 ]
 
+const MANAGED_SETTINGS_VIEWS = SETTINGS_VIEWS.filter(view => isManagedSettingsViewVisible(view, true))
+
 export function SettingsView({ onClose, onConfigSaved, onMainModelChanged }: SettingsPageProps) {
   const { t } = useI18n()
+  const managedEva = isManagedEvaosAgent()
   const navigate = useNavigate()
   const { hash, pathname, search } = useLocation()
 
@@ -76,7 +81,8 @@ export function SettingsView({ onClose, onConfigSaved, onMainModelChanged }: Set
     }
   }, [navigate, search])
 
-  const [activeView, setActiveView] = useRouteEnumParam('tab', SETTINGS_VIEWS, 'config:model' as SettingsViewId)
+  const availableViews = managedEva ? MANAGED_SETTINGS_VIEWS : SETTINGS_VIEWS
+  const [activeView, setActiveView] = useRouteEnumParam('tab', availableViews, 'config:model' as SettingsViewId)
   const effectiveView = activeView
   // Providers subnav (Accounts vs API keys) lives in its own param so each
   // sub-view is deep-linkable and survives a refresh.
@@ -144,8 +150,8 @@ export function SettingsView({ onClose, onConfigSaved, onMainModelChanged }: Set
 
   const allNavGroups: OverlayNavGroup[] = useMemo(
     () => [
-    ...SECTIONS.map(s => {
-      const view = `config:${s.id}` as SettingsViewId
+      ...SECTIONS.map(s => {
+        const view = `config:${s.id}` as SettingsViewId
 
         return {
           active: activeView === view,
@@ -259,11 +265,13 @@ export function SettingsView({ onClose, onConfigSaved, onMainModelChanged }: Set
         label: t.settings.nav.about,
         onSelect: () => setActiveView('about')
       }
-      ],
-      [activeView, keysView, providerView, t, setActiveView, openProviderView, openKeysView]
-    )
+    ],
+    [activeView, keysView, providerView, t, setActiveView, openProviderView, openKeysView]
+  )
 
-  const navGroups = allNavGroups
+  const navGroups = managedEva
+    ? allNavGroups.filter(group => isManagedSettingsViewVisible(group.id, true))
+    : allNavGroups
 
   const navFooter = (
     <>

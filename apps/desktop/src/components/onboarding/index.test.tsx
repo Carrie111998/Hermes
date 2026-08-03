@@ -76,6 +76,32 @@ describe('onboarding Picker', () => {
     expect(screen.queryByText('Starting Eva…')).toBeNull()
   })
 
+  it('allows a manually requested provider flow in managed mode', () => {
+    Object.defineProperty(window, 'hermesDesktop', {
+      configurable: true,
+      value: { eva: {} },
+      writable: true
+    })
+    $desktopOnboarding.set({
+      configured: true,
+      flow: { status: 'idle' },
+      mode: 'oauth',
+      providers: [provider('openai-codex', 'OpenAI Codex / ChatGPT')],
+      reason: null,
+      requested: true,
+      firstRunSkipped: false,
+      manual: true,
+      localEndpoint: false
+    })
+
+    render(
+      <DesktopOnboardingOverlay enabled={false} profile="default" requestGateway={async () => undefined as never} />
+    )
+
+    expect(screen.getByText('Connect evaOS Agent to your assigned agent')).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Close' })).toBeTruthy()
+  })
+
   it('features the Electric Sheep account and hides other providers behind a disclosure', () => {
     setProviders([provider('anthropic', 'Anthropic Claude'), provider('nous', 'Nous Portal')])
     render(<Picker ctx={ctx} />)

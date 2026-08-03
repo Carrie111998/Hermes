@@ -862,6 +862,7 @@ export const zhHant = defineLocale({
       collapse: '收合',
       connectAnother: '連結其他提供方',
       otherProviders: '其他提供方',
+      reauthenticate: '重新驗證',
       removeConfirm: provider => `移除 ${provider}？`,
       removeKeyManaged: provider => `${provider} 由 API 金鑰設定。請從 API Keys 中移除。`,
       removedTitle: '帳號已移除',

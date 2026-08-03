@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it } from 'vitest'
 
 import {
   desktopSkinSlashCompletions,
@@ -13,6 +13,10 @@ import {
   rankSkillCommands,
   resolveDesktopCommand
 } from './desktop-slash-commands'
+
+afterEach(() => {
+  Reflect.deleteProperty(window, 'hermesDesktop')
+})
 
 describe('desktop slash command curation', () => {
   it('keeps core desktop chat commands in suggestions', () => {
@@ -32,6 +36,23 @@ describe('desktop slash command curation', () => {
     expect(isDesktopSlashSuggestion('/my-skill')).toBe(true)
     expect(isDesktopSlashSuggestion('/gif-search')).toBe(true)
     expect(isDesktopSlashCommand('/my-skill')).toBe(true)
+  })
+
+  it('denies managed billing commands without hiding user extension commands', () => {
+    Object.defineProperty(window, 'hermesDesktop', {
+      configurable: true,
+      value: { eva: {} },
+      writable: true
+    })
+
+    for (const command of ['/topup', '/subscription', '/upgrade']) {
+      expect(isDesktopSlashSuggestion(command)).toBe(false)
+      expect(isDesktopSlashCommand(command)).toBe(false)
+      expect(desktopSlashUnavailableMessage(command)).toContain('managed evaOS Agent')
+    }
+
+    expect(isDesktopSlashSuggestion('/my-billing-skill')).toBe(true)
+    expect(isDesktopSlashCommand('/my-billing-skill')).toBe(true)
   })
 
   it('hides terminal, messaging, and dedicated-UI commands from suggestions', () => {
@@ -263,6 +284,22 @@ describe('desktop slash command curation', () => {
         display: '/skin midnight',
         meta: 'Midnight - Deep blue'
       }
+    ])
+  })
+
+  it('shows managed theme labels in /skin suggestions while legacy ids remain resolvable', () => {
+    const completions = desktopSkinSlashCompletions(
+      [
+        { name: 'nous', label: 'Blue', description: 'Blue glass' },
+        { name: 'ember', label: 'evaOS', description: 'evaOS warm' }
+      ],
+      'nous',
+      ''
+    )
+
+    expect(completions.slice(2)).toEqual([
+      { text: '/skin Blue', display: '/skin Blue', meta: 'Blue (current) - Blue glass' },
+      { text: '/skin evaOS', display: '/skin evaOS', meta: 'evaOS - evaOS warm' }
     ])
   })
 

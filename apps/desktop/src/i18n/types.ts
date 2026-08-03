@@ -727,6 +727,7 @@ export interface Translations {
       collapse: string
       connectAnother: string
       otherProviders: string
+      reauthenticate: string
       disconnect: string
       disconnectInTerminal: string
       removeConfirm: (provider: string) => string

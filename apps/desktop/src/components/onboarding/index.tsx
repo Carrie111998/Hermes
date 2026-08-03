@@ -7,6 +7,7 @@ import { Input } from '@/components/ui/input'
 import { Progress } from '@/components/ui/progress'
 import { getGlobalModelOptions } from '@/hermes'
 import { useI18n } from '@/i18n'
+import { isManagedEvaosAgent } from '@/i18n/managed-brand'
 import { Check, ChevronDown, ChevronLeft, KeyRound, Loader2 } from '@/lib/icons'
 import { isProviderSetupErrorMessage } from '@/lib/provider-setup-errors'
 import { cn } from '@/lib/utils'
@@ -180,18 +181,26 @@ function useApiKeyCatalog(): ApiKeyOption[] {
 const ONBOARDING_EXIT_MS = 1180
 
 export function DesktopOnboardingOverlay(props: DesktopOnboardingOverlayProps) {
+  const onboarding = useStore($desktopOnboarding)
+
   // Managed evaOS Agent authenticates through Electric Sheep and connects to the
-  // administrator-bound remote agent. The upstream provider picker is a local
-  // runtime flow, so mounting it here would cover the managed Gateway sign-in
-  // surface before a remote session exists.
-  if (window.hermesDesktop?.eva) {
+  // administrator-bound remote agent, so unmanaged first-run setup must not
+  // cover enrollment. A manual provider flow is different: Settings already
+  // selected the broker-assigned runtime/profile and intentionally opens this
+  // shared overlay to connect or reauthenticate that runtime's provider.
+  if (isManagedEvaosAgent() && !onboarding.manual) {
     return null
   }
 
-  return <UnmanagedDesktopOnboardingOverlay {...props} />
+  return <DesktopProviderOnboardingOverlay {...props} />
 }
 
-function UnmanagedDesktopOnboardingOverlay({ enabled, onCompleted, profile, requestGateway }: DesktopOnboardingOverlayProps) {
+function DesktopProviderOnboardingOverlay({
+  enabled,
+  onCompleted,
+  profile,
+  requestGateway
+}: DesktopOnboardingOverlayProps) {
   const { t } = useI18n()
   const onboarding = useStore($desktopOnboarding)
   const boot = useStore($desktopBoot)

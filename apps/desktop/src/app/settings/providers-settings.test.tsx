@@ -69,6 +69,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup()
+  Reflect.deleteProperty(window, 'hermesDesktop')
   vi.restoreAllMocks()
   vi.clearAllMocks()
 })
@@ -84,6 +85,32 @@ async function renderProvidersSettings() {
 }
 
 describe('ProvidersSettings', () => {
+  it('keeps managed Accounts allow-by-default while hiding only promotional rows', async () => {
+    Object.defineProperty(window, 'hermesDesktop', {
+      configurable: true,
+      value: { eva: {} },
+      writable: true
+    })
+    listOAuthProviders.mockResolvedValue({
+      providers: [provider('nous', false), provider('openai-codex', true), provider('minimax-oauth', false)]
+    })
+
+    await renderProvidersSettings()
+
+    expect(screen.queryByText('Electric Sheep account')).toBeNull()
+    expect(screen.queryByText('Fireworks AI')).toBeNull()
+    expect(await screen.findByText('OpenAI OAuth (ChatGPT)')).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Reauthenticate' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Remove OpenAI OAuth (ChatGPT)' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Have an API key instead?' })).toBeTruthy()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Reauthenticate' }))
+    expect(startManualProviderOAuth).toHaveBeenCalledWith('openai-codex')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Connect another provider' }))
+    expect(await screen.findByText('MiniMax')).toBeTruthy()
+  })
+
   it('disconnects a connected provider account and refreshes the accounts list', async () => {
     await renderProvidersSettings()
 

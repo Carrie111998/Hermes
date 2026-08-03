@@ -1,5 +1,5 @@
 import type { BillingBlock } from '@hermes/shared'
-import { beforeEach, expect, test, vi } from 'vitest'
+import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 
 vi.mock('@/lib/external-link', () => ({ openExternalLink: vi.fn() }))
 
@@ -33,6 +33,10 @@ beforeEach(() => {
   vi.clearAllMocks()
 })
 
+afterEach(() => {
+  Reflect.deleteProperty(window, 'hermesDesktop')
+})
+
 test('setBillingBlock stores the block against its session', () => {
   setBillingBlock('s1', makeBlock())
   expect($billingBlock.get()?.sessionId).toBe('s1')
@@ -57,6 +61,20 @@ test('clearBillingBlock with no arg clears any active block', () => {
 test('runBillingRecovery routes Nous to in-app Settings, never an external link', () => {
   runBillingRecovery(makeBlock({ is_nous: true, provider: 'nous', provider_label: 'Nous Portal' }))
   expect($billingSettingsRequest.get()).toBe(1)
+  expect(openExternalLink).not.toHaveBeenCalled()
+})
+
+test('managed recovery never navigates to the hidden in-app Billing surface', () => {
+  Object.defineProperty(window, 'hermesDesktop', {
+    configurable: true,
+    value: { eva: {} },
+    writable: true
+  })
+
+  runBillingRecovery(makeBlock({ is_nous: true, provider: 'nous', provider_label: 'Nous Portal' }))
+  runBillingRecovery(makeBlock({ billing_url: null, is_nous: false, provider: 'custom' }))
+
+  expect($billingSettingsRequest.get()).toBe(0)
   expect(openExternalLink).not.toHaveBeenCalled()
 })
 

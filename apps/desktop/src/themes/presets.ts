@@ -33,8 +33,8 @@ const nousTintTransparent = (pct: number) => `color-mix(in srgb, ${NOUS_BLUE} ${
  */
 export const nousTheme: DesktopTheme = {
   name: 'nous',
-  label: 'Electric Sheep',
-  description: 'Glass neutrals with Electric Sheep blue accents',
+  label: 'Blue',
+  description: 'Glass neutrals with blue accents',
   colors: {
     background: '#F8FAFF',
     foreground: '#17171A',
@@ -136,8 +136,8 @@ export const midnightTheme: DesktopTheme = {
 /** Warm crimson and bronze — forge vibes. Matches the CLI ares skin. */
 export const emberTheme: DesktopTheme = {
   name: 'ember',
-  label: 'Ember',
-  description: 'Warm crimson and bronze — forge vibes',
+  label: 'evaOS',
+  description: 'Warm crimson and bronze — evaOS',
   colors: {
     background: '#160800',
     foreground: '#ffd8b0',

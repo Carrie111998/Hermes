@@ -55,6 +55,7 @@ import {
   Wrench,
   Zap
 } from '@/lib/icons'
+import { isManagedConfigFieldVisible } from '@/lib/managed-ui-policy'
 import { normalize } from '@/lib/text'
 import { cn } from '@/lib/utils'
 import { resolveVersionStatus } from '@/lib/version-status'
@@ -1097,13 +1098,15 @@ function CommandPaletteBody({ onExited }: { onExited: () => void }) {
     }
 
     const fieldItems = SECTIONS.flatMap(section =>
-      section.keys.map(key => ({
-        icon: section.icon,
-        id: `field-${key}`,
-        keywords: ['settings', key, section.label, settingsSectionLabel(section)],
-        label: `${settingsSectionLabel(section)}: ${configFieldLabel(key)}`,
-        run: go(`${SETTINGS_ROUTE}?tab=config:${section.id}&field=${encodeURIComponent(key)}`)
-      }))
+      section.keys
+        .filter(key => isManagedConfigFieldVisible(key, managedEva))
+        .map(key => ({
+          icon: section.icon,
+          id: `field-${key}`,
+          keywords: ['settings', key, section.label, settingsSectionLabel(section)],
+          label: `${settingsSectionLabel(section)}: ${configFieldLabel(key)}`,
+          run: go(`${SETTINGS_ROUTE}?tab=config:${section.id}&field=${encodeURIComponent(key)}`)
+        }))
     )
 
     result.push({ heading: t.commandCenter.settingsFields, items: fieldItems })
@@ -1147,6 +1150,7 @@ function CommandPaletteBody({ onExited }: { onExited: () => void }) {
     configFieldLabel,
     go,
     goSession,
+    managedEva,
     mcpServers,
     mode,
     resolvedMode,
