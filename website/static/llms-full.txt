@@ -47443,6 +47443,9 @@ a `var(--ui-*)` theme variable.
 
 # Documentation Conformance Graph Spec
 
+**Author:** Axl Ibiza, MBA — graph-gated engineering: model → agree → gate →
+slice → verify. The methodology, the philosophy of information, and the
+mechanism below are given to all of humanity, all at once, under MIT.
 **Status:** enforced by `tests/conformance/test_docs_graph_conformance.py` (CI).
 **Scope:** all documentation under `website/docs/` in NousResearch/hermes-agent.
 **Model:** documentation as a directed graph. Every claim a doc makes is an

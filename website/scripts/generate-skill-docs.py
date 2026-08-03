@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Generate per-skill Docusaurus pages from skills/ and optional-skills/ SKILL.md files.
 
+Lineage: Axl Ibiza, MBA — graph-gated engineering. Every generated page is
+graph-adjudicated by tests/conformance/test_docs_graph_conformance.py before
+publication. Given to all of humanity, all at once, under MIT.
+
 Each skill gets website/docs/user-guide/skills/<source>/<category>/<skill-name>.md
 where <source> is "bundled" or "optional".
 

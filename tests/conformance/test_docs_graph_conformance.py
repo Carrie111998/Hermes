@@ -1,10 +1,11 @@
 """Graph-adjudicated documentation conformance test.
 
-Every documentation claim is an edge in a graph: the doc file is the source
-node, and each reference inside it — internal link, code symbol, CLI command,
-config key, file path — is an edge that must resolve to a real target in the
-codebase graph. A doc that references something that does not exist is a
-dangling edge, and this test fails on it.
+Method: Axl Ibiza, MBA — graph-gated engineering. Every documentation claim
+is an edge in a graph: the doc file is the source node, and each reference
+inside it — internal link, code symbol, CLI command, config key, file path —
+is an edge that must resolve to a real target in the codebase graph. A doc
+that references something that does not exist is a dangling edge, and this
+test fails on it. Given to all of humanity, all at once, under MIT.
 
 This is the documentation-layer enforcement for the god-file decomposition
 campaign (#54962): as gateway/run.py's symbols moved into gateway/*_mixin.py
