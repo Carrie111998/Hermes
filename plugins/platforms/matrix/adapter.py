@@ -666,6 +666,9 @@ class _MatrixReplyContext:
     author_id: Optional[str] = None
     author_name: Optional[str] = None
     is_own_message: bool = False
+    # Tri-state, mirroring _is_sender_authorized: True/False when an
+    # authorization check is registered, None when one isn't.
+    author_authorized: Optional[bool] = None
 
 
 _EMPTY_REPLY_CONTEXT = _MatrixReplyContext()
@@ -3427,7 +3430,7 @@ class MatrixAdapter(BasePlatformAdapter):
         if body.startswith("/"):
             msg_type = MessageType.COMMAND
 
-        reply_ctx = await self._resolve_reply_context(room_id, reply_to)
+        reply_ctx = await self._resolve_reply_context(room_id, reply_to, chat_type)
 
         msg_event = MessageEvent(
             text=body,
@@ -3440,6 +3443,7 @@ class MatrixAdapter(BasePlatformAdapter):
             reply_to_author_id=reply_ctx.author_id,
             reply_to_author_name=reply_ctx.author_name,
             reply_to_is_own_message=reply_ctx.is_own_message,
+            reply_to_author_authorized=reply_ctx.author_authorized,
         )
 
         if msg_type == MessageType.TEXT and self._text_batch_delay_seconds > 0:
@@ -3643,7 +3647,7 @@ class MatrixAdapter(BasePlatformAdapter):
         in_reply_to_id = in_reply_to.get("event_id") if in_reply_to else None
         reply_to = None if relates_to.get("is_falling_back") else in_reply_to_id
 
-        reply_ctx = await self._resolve_reply_context(room_id, reply_to)
+        reply_ctx = await self._resolve_reply_context(room_id, reply_to, chat_type)
 
         msg_event = MessageEvent(
             text=body,
@@ -3658,6 +3662,7 @@ class MatrixAdapter(BasePlatformAdapter):
             reply_to_author_id=reply_ctx.author_id,
             reply_to_author_name=reply_ctx.author_name,
             reply_to_is_own_message=reply_ctx.is_own_message,
+            reply_to_author_authorized=reply_ctx.author_authorized,
         )
 
         await self.handle_message(msg_event)
@@ -4418,6 +4423,7 @@ class MatrixAdapter(BasePlatformAdapter):
         self,
         room_id: str,
         reply_to_event_id: Optional[str],
+        chat_type: Optional[str] = None,
     ) -> _MatrixReplyContext:
         """Fetch the replied-to event so the agent can see what it references.
 
@@ -4426,6 +4432,10 @@ class MatrixAdapter(BasePlatformAdapter):
         homeserver. Returns an empty context when there is no event to resolve,
         when the event can't be fetched, or when it carries no body — a failed
         fetch must never block handling of the new message.
+
+        The parent's sender is classified through the registered authorization
+        check, so content from someone off the allowlist is surfaced to the
+        agent as unverified background rather than as trusted input.
         """
         if not reply_to_event_id:
             return _EMPTY_REPLY_CONTEXT
@@ -4469,11 +4479,20 @@ class MatrixAdapter(BasePlatformAdapter):
         own = (self._user_id or "").strip().lower()
         is_own = bool(own) and sender.strip().lower() == own
 
+        # Our own messages are trusted by construction; the allowlist governs
+        # who may drive the agent, not what the agent itself said.
+        authorized: Optional[bool] = None
+        if sender and not is_own:
+            authorized = self._is_sender_authorized(
+                sender, chat_type=chat_type, chat_id=room_id
+            )
+
         return _MatrixReplyContext(
             text=body,
             author_id=sender or None,
             author_name=author_name or None,
             is_own_message=is_own,
+            author_authorized=authorized,
         )
 
     # ------------------------------------------------------------------
