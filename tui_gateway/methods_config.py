@@ -16,6 +16,115 @@ method = _registry.method
 _profile_scoped = _registry.profile_scoped
 
 
+@method("usage.summary")
+def _(rid, params: dict) -> dict:
+    """Return a cheap aggregate of the local session usage ledger."""
+    empty = {
+        "total_sessions": 0,
+        "token_sessions": 0,
+        "cost_sessions": 0,
+        "total_estimated_cost_usd": 0.0,
+        "total_input_tokens": 0,
+        "total_output_tokens": 0,
+        "total_cache_read_tokens": 0,
+        "most_expensive_session_usd": 0.0,
+        "cheapest_session_usd": 0.0,
+    }
+
+    try:
+        db = _get_db()
+        if db is None:
+            return _ok(rid, empty)
+
+        session = db._conn.execute(
+            """
+            SELECT COUNT(*) AS total_sessions,
+                   SUM(CASE WHEN COALESCE(input_tokens, 0) > 0
+                              OR COALESCE(output_tokens, 0) > 0
+                              OR COALESCE(cache_read_tokens, 0) > 0
+                              OR COALESCE(cache_write_tokens, 0) > 0
+                            THEN 1 ELSE 0 END) AS token_sessions,
+                   SUM(CASE WHEN COALESCE(estimated_cost_usd, 0) > 0
+                            THEN 1 ELSE 0 END) AS cost_sessions,
+                   MIN(CASE WHEN COALESCE(estimated_cost_usd, 0) > 0
+                            THEN estimated_cost_usd END) AS cheapest_session_usd
+            FROM sessions
+            """
+        ).fetchone()
+        if session is None:
+            return _ok(rid, empty)
+
+        payload = {
+            "total_sessions": int(session["total_sessions"] or 0),
+            "token_sessions": int(session["token_sessions"] or 0),
+            "cost_sessions": int(session["cost_sessions"] or 0),
+            "total_estimated_cost_usd": 0.0,
+            "total_input_tokens": 0,
+            "total_output_tokens": 0,
+            "total_cache_read_tokens": 0,
+            "most_expensive_session_usd": 0.0,
+            "cheapest_session_usd": float(session["cheapest_session_usd"] or 0.0),
+        }
+
+        # session_model_usage includes auxiliary calls (for example vision or
+        # compression) as well as the main model calls. It is the complete
+        # metering ledger, while the sessions columns remain the session-level
+        # compatibility counters. Fall back to those counters for older DBs.
+        try:
+            usage = db._conn.execute(
+                """
+                SELECT COALESCE(SUM(input_tokens), 0) AS input_tokens,
+                       COALESCE(SUM(output_tokens), 0) AS output_tokens,
+                       COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
+                       COALESCE(SUM(estimated_cost_usd), 0) AS estimated_cost_usd
+                FROM session_model_usage
+                """
+            ).fetchone()
+            by_session = db._conn.execute(
+                """
+                SELECT COALESCE(SUM(estimated_cost_usd), 0) AS estimated_cost_usd
+                FROM session_model_usage
+                GROUP BY session_id
+                """
+            ).fetchall()
+            payload.update(
+                total_estimated_cost_usd=float(usage["estimated_cost_usd"] or 0.0),
+                total_input_tokens=int(usage["input_tokens"] or 0),
+                total_output_tokens=int(usage["output_tokens"] or 0),
+                total_cache_read_tokens=int(usage["cache_read_tokens"] or 0),
+                most_expensive_session_usd=max(
+                    (float(row["estimated_cost_usd"] or 0.0) for row in by_session),
+                    default=0.0,
+                ),
+            )
+        except Exception:
+            fallback = db._conn.execute(
+                """
+                SELECT COALESCE(SUM(estimated_cost_usd), 0) AS estimated_cost_usd,
+                       COALESCE(SUM(input_tokens), 0) AS input_tokens,
+                       COALESCE(SUM(output_tokens), 0) AS output_tokens,
+                       COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
+                       COALESCE(MAX(estimated_cost_usd), 0) AS most_expensive_session_usd
+                FROM sessions
+                """
+            ).fetchone()
+            payload.update(
+                total_estimated_cost_usd=float(fallback["estimated_cost_usd"] or 0.0),
+                total_input_tokens=int(fallback["input_tokens"] or 0),
+                total_output_tokens=int(fallback["output_tokens"] or 0),
+                total_cache_read_tokens=int(fallback["cache_read_tokens"] or 0),
+                most_expensive_session_usd=float(
+                    fallback["most_expensive_session_usd"] or 0.0
+                ),
+            )
+
+        return _ok(rid, payload)
+    except Exception:
+        # Usage is an informational surface; an unavailable/partially migrated
+        # state.db should not make the Desktop gateway request fail.
+        return _ok(rid, empty)
+
+
 @method("projects.discover_repos")
 def _(rid, params: dict) -> dict:
     """Repos for the desktop overview: scanned-from-disk (cached) ∪ session-derived."""
