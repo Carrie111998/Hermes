@@ -136,6 +136,37 @@ class TestResolveProviderClientNamedCustom:
         assert model == "my-model"
         assert "beans.local" in str(client.base_url)
 
+    def test_named_custom_provider_extra_headers_reach_auxiliary_client(self, tmp_path):
+        """Named-provider headers must be installed on auxiliary OpenAI clients."""
+        _write_config(tmp_path, {
+            "providers": {
+                "llama": {
+                    "name": "llama",
+                    "base_url": "https://llama.example/v1",
+                    "api_key": "no-key-required",
+                    "extra_headers": {
+                        "CF-Access-Client-Id": "client.access",
+                        "CF-Access-Client-Secret": "secret-value",
+                    },
+                },
+            },
+        })
+        from agent import auxiliary_client
+
+        with patch.object(auxiliary_client, "OpenAI") as mock_openai:
+            mock_openai.return_value = MagicMock()
+            client, model = auxiliary_client.resolve_provider_client(
+                "llama", "gemma-test"
+            )
+
+        assert client is not None
+        assert model == "gemma-test"
+        kwargs = mock_openai.call_args.kwargs
+        assert kwargs["default_headers"] == {
+            "CF-Access-Client-Id": "client.access",
+            "CF-Access-Client-Secret": "secret-value",
+        }
+
     def test_named_custom_provider_default_model(self, tmp_path):
         _write_config(tmp_path, {
             "model": {"default": "main-model"},

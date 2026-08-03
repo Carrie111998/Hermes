@@ -4765,6 +4765,18 @@ def resolve_provider_client(
                     raw_base_for_wrap = custom_base
                 _clean_base2, _dq2 = _extract_url_query_params(openai_base)
                 _extra2 = {"default_query": _dq2} if _dq2 else {}
+                # Named custom providers may carry credentials in
+                # ``extra_headers`` (for example Cloudflare Access service
+                # headers).  Preserve them on auxiliary clients just as the
+                # main client path does.  Values are intentionally never
+                # logged.
+                _provider_headers2 = custom_entry.get("extra_headers")
+                if isinstance(_provider_headers2, dict) and _provider_headers2:
+                    _extra2["default_headers"] = {
+                        str(key): str(value)
+                        for key, value in _provider_headers2.items()
+                        if value is not None
+                    }
                 _headers2 = _apply_user_default_headers(_extra2.get("default_headers"))
                 if _headers2:
                     _extra2["default_headers"] = _headers2
