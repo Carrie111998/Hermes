@@ -13481,6 +13481,7 @@ def integrate_story_to_epic(
     # any Git ref only for the ordinary reconcile fast path. Explicit source,
     # candidate, or ownership controls must retain their verification semantics
     # and must never be hidden by an older integration row.
+    reviewed_candidate: Optional[tuple[str, str]] = None
     if (
         candidate_verify_fn is _RECONCILE_INTEGRATION_VERIFY_UNSET
         and expected_source_sha is None
@@ -13569,21 +13570,53 @@ def integrate_story_to_epic(
         if (
             candidate_verify_fn is not _RECONCILE_INTEGRATION_VERIFY_UNSET
             or expected_source_sha is not None
+            or reviewed_candidate is not None
         ):
+            candidate_source_branch = story_branch
+            candidate_expected_source_sha = expected_source_sha
+            reviewed_source_ref: Optional[str] = None
+            if reviewed_candidate is not None:
+                reviewed_source_ref = f"hermes/reviewed-{secrets.token_hex(6)}"
+                retained = _integration_git(
+                    repo_root,
+                    ["update-ref", f"refs/heads/{reviewed_source_ref}", reviewed_candidate[1]],
+                )
+                if retained.returncode != 0:
+                    raise IntegrationCandidateError(
+                        "could not retain reviewed source candidate"
+                    )
+                candidate_source_branch = reviewed_source_ref
+                candidate_expected_source_sha = reviewed_candidate[1]
             try:
                 effective_verify_fn = (
-                    None
-                    if candidate_verify_fn is _RECONCILE_INTEGRATION_VERIFY_UNSET
-                    else candidate_verify_fn
+                    (lambda _path: True)
+                    if reviewed_candidate is not None
+                    and candidate_verify_fn is _RECONCILE_INTEGRATION_VERIFY_UNSET
+                    else (
+                        None
+                        if candidate_verify_fn is _RECONCILE_INTEGRATION_VERIFY_UNSET
+                        else candidate_verify_fn
+                    )
                 )
-                candidate = _build_verified_merge_candidate(
-                    repo_root,
-                    epic_branch,
-                    story_branch,
-                    f"integrate story {story_id}",
-                    effective_verify_fn,
-                    expected_source_sha=expected_source_sha,
-                )
+                try:
+                    candidate = _build_verified_merge_candidate(
+                        repo_root,
+                        epic_branch,
+                        candidate_source_branch,
+                        f"integrate story {story_id}",
+                        effective_verify_fn,
+                        expected_source_sha=candidate_expected_source_sha,
+                    )
+                finally:
+                    if reviewed_source_ref is not None:
+                        _integration_git(
+                            repo_root,
+                            [
+                                "update-ref",
+                                "-d",
+                                f"refs/heads/{reviewed_source_ref}",
+                            ],
+                        )
                 if before_apply_fn is not None and not before_apply_fn():
                     return "ownership_conflict"
                 if not _fast_forward_target(candidate):

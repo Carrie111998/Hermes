@@ -11687,6 +11687,48 @@ def test_reconcile_reintegrates_story_after_later_completion(
     assert calls == []
 
 
+def test_reconcile_cache_miss_integrates_approved_sha_not_advanced_story_tip(
+    kanban_home, tmp_path
+):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    board = "v2-reconcile-reviewed-cache-miss"
+    _v2_product_board_with_repo(board, repo)
+    epic, story, epic_branch, approved_sha = _make_epic_and_done_story(board, repo)
+    story_branch = f"story/{epic}-s1"
+
+    with kb.connect(board=board) as conn:
+        _add_approved_review_candidate(conn, story, story_branch, approved_sha)
+        subprocess.run(
+            ["git", "-C", str(repo), "switch", story_branch],
+            check=True, capture_output=True, text=True,
+        )
+        _commit_file(repo, "unreviewed.txt", "unreviewed\n", "unreviewed tip")
+        subprocess.run(
+            ["git", "-C", str(repo), "switch", "main"],
+            check=True, capture_output=True, text=True,
+        )
+        advanced_sha = _git_output(repo, "rev-parse", story_branch)
+        conn.commit()
+
+        result = kb.reconcile(conn, board=board, spawn_ready=False)
+
+    assert result.integrated == [story]
+    assert subprocess.run(
+        ["git", "-C", str(repo), "merge-base", "--is-ancestor", approved_sha, epic_branch],
+        capture_output=True, text=True,
+    ).returncode == 0
+    assert subprocess.run(
+        ["git", "-C", str(repo), "merge-base", "--is-ancestor", advanced_sha, epic_branch],
+        capture_output=True, text=True,
+    ).returncode != 0
+    assert _git_output(repo, "show", f"{epic_branch}:story_work.txt") == "story work"
+    assert subprocess.run(
+        ["git", "-C", str(repo), "show", f"{epic_branch}:unreviewed.txt"],
+        capture_output=True, text=True,
+    ).returncode != 0
+
+
 def test_reconcile_keeps_prior_member_state_when_sibling_advances_tip(
     kanban_home, tmp_path, monkeypatch
 ):
