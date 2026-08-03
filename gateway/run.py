@@ -18722,11 +18722,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Returns a ``CompletionDisposition`` so callers can decide whether
         to retry or drop without relying on overloaded ``Optional[bool]``.
         """
+        # Guard each attribute independently.  A single guard on
+        # _completion_notification_batches meant a partially pre-initialised
+        # runner — a test using object.__new__ that sets the batch dict but
+        # not the rest — skipped the whole block and then raised
+        # AttributeError on _completion_notification_batch_max below.
         if not hasattr(self, "_completion_notification_batches"):
             self._completion_notification_batches = {}
+        if not hasattr(self, "_completion_notification_batch_tasks"):
             self._completion_notification_batch_tasks = {}
+        if not hasattr(self, "_completion_notification_batch_lock"):
             self._completion_notification_batch_lock = __import__("threading").Lock()
+        if not hasattr(self, "_completion_notification_batch_window"):
             self._completion_notification_batch_window = 0.1
+        if not hasattr(self, "_completion_notification_batch_max"):
             self._completion_notification_batch_max = 50
 
         key = self._completion_notification_batch_key(evt)

@@ -1111,72 +1111,57 @@ def test_cancellation_during_batch_window_resolves_waiters_retryable():
 
 
 def test_cancellation_during_delivery_resolves_waiters_retryable():
-    """Cancel while delivery is in-flight (adapter unreachable)
-    resolves all pending waiters as False (retryable)."""
-    adapter = SimpleNamespace(
-        handle_message=AsyncMock(
-            side_effect=asyncio.CancelledError("adapter down")
-        )
-    )
+    """Cancelling the real flush mid-delivery resolves the waiter as RETRY.
+
+    Exercises GatewayRunner._flush_process_completion_batch itself.  The
+    previous version replaced that method with a local reimplementation via
+    types.MethodType and asserted on the reimplementation, so it passed while
+    the production path mapped CancelledError onto DROP_UNROUTABLE — the
+    defect the sweeper review on #72675 reported as finding 1.  After the
+    assertion was migrated to CompletionDisposition.RETRY the stand-in still
+    resolved its futures with False, so the test failed for a reason
+    unrelated to the code under test.
+
+    The adapter blocks inside delivery so the flush task can be cancelled
+    while it is awaiting the send, which is the case the finding describes.
+    """
+    delivery_entered = asyncio.Event()
+    hold_delivery = asyncio.Event()
+
+    async def _deliver(_event):
+        delivery_entered.set()
+        await hold_delivery.wait()
+
+    adapter = SimpleNamespace(handle_message=AsyncMock(side_effect=_deliver))
+    runner = _runner(adapter)
+    runner._background_tasks = set()
+
+    evt = _completion_event(started_at=1.0, session_id="proc_cancel_delivery")
 
     async def _exercise():
-        runner = _runner(adapter)
-        # Plant a background_tasks set so the flush is lifecycle-registered
-        runner._background_tasks = set()
-
-        evt = _completion_event(started_at=1.0, session_id="proc_cancel_delivery")
-
-        # The flush task will attempt delivery, get CancelledError from
-        # the adapter, and propagate it. Our cleanup path must catch it.
-        async def _short_window_flush(self, key):
-            """Override to use a zero window so we don't block."""
-            current_task = asyncio.current_task()
-            try:
-                # Skip sleep — immediate pop
-                entries = self._completion_notification_batches.pop(key, [])
-                if self._completion_notification_batch_tasks.get(key) is current_task:
-                    self._completion_notification_batch_tasks.pop(key, None)
-                if not entries:
-                    return
-                try:
-                    for _text, candidate_evt, _future in entries:
-                        await self._deliver_completion_notification(
-                            "text", candidate_evt,
-                        )
-                except Exception:
-                    pass
-                finally:
-                    for _text, _evt, future in entries:
-                        if not future.done():
-                            future.set_result(False)
-            except asyncio.CancelledError:
-                stale = self._completion_notification_batches.pop(key, [])
-                if self._completion_notification_batch_tasks.get(key) is current_task:
-                    self._completion_notification_batch_tasks.pop(key, None)
-                for _text, _evt, future in stale:
-                    if not future.done():
-                        future.set_result(False)
-                raise
-            finally:
-                if self._completion_notification_batch_tasks.get(key) is current_task:
-                    self._completion_notification_batch_tasks.pop(key, None)
-
-        # Monkeypatch to use a fast no-sleep flush for testing
-        import types
-        runner._flush_process_completion_batch = types.MethodType(
-            _short_window_flush, runner
+        enq_task = asyncio.create_task(
+            runner._enqueue_process_completion_notification("text", evt)
         )
+        await asyncio.wait_for(delivery_entered.wait(), timeout=2.0)
 
-        result = await runner._enqueue_process_completion_notification(
-            "text", evt,
+        # The real flush pops the batch and its task key before delivery
+        # begins, so the task has to be located directly.
+        flush_task = None
+        for task in asyncio.all_tasks():
+            coro = getattr(task, "get_coro", lambda: None)()
+            if getattr(coro, "__name__", "") == "_flush_process_completion_batch":
+                flush_task = task
+                break
+        assert flush_task is not None, "real flush task should be running"
+        flush_task.cancel()
+
+        result = await asyncio.wait_for(enq_task, timeout=2.0)
+        assert result is runner.CompletionDisposition.RETRY, (
+            f"Expected RETRY after cancellation during delivery, got {result!r}"
         )
         key = runner._completion_notification_batch_key(evt)
         assert key not in runner._completion_notification_batches
         assert key not in runner._completion_notification_batch_tasks
-        assert result is runner.CompletionDisposition.RETRY, (
-            f"Expected RETRY after cancellation during delivery, "
-            f"got {result!r}"
-        )
 
     asyncio.run(_exercise())
 
