@@ -147,6 +147,7 @@ async def test_dispatch_attachment_preserves_secure_handle_without_plaintext_cac
 ) -> None:
     """The opaque handle stays in raw_message and never becomes a disk path."""
     adapter = _make_adapter(monkeypatch)
+    _accept_secure_handles(adapter)
     captured = _capture(adapter, monkeypatch)
 
     handle = "a" * 48
@@ -464,6 +465,7 @@ async def test_dispatch_group_preserves_text_and_attachment(
 ) -> None:
     """Spectrum group content from a mixed text+image iMessage must not drop text."""
     adapter = _make_adapter(monkeypatch)
+    _accept_secure_handles(adapter)
     captured = _capture(adapter, monkeypatch)
 
     event = _attachment_event(
@@ -507,6 +509,7 @@ async def test_dispatch_voice_preserves_handle_without_plaintext_cache(
 ) -> None:
     """Inbound voice bytes remain behind the one-shot sidecar handle."""
     adapter = _make_adapter(monkeypatch)
+    _accept_secure_handles(adapter)
     captured = _capture(adapter, monkeypatch)
 
     event = _voice_event({
@@ -559,6 +562,7 @@ async def test_dispatch_attachment_document_stays_behind_handle(
 ) -> None:
     """Non-image attachments retain type without writing a document cache."""
     adapter = _make_adapter(monkeypatch)
+    _accept_secure_handles(adapter)
     captured = _capture(adapter, monkeypatch)
 
     event = _attachment_event({
@@ -644,6 +648,7 @@ async def test_caf_attachment_named_promoted_to_voice(
 ) -> None:
     """A named .caf attachment is promoted to VOICE for STT routing."""
     adapter = _make_adapter(monkeypatch)
+    _accept_secure_handles(adapter)
     captured = _capture(adapter, monkeypatch)
 
     event = _caf_attachment_event(

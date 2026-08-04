@@ -26,6 +26,7 @@ Outbound:
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -283,6 +284,29 @@ _DEFAULT_MENTION_PATTERNS = [
     r"(?<![\w@])@?hermes\s+agent\b[,:\-]?",
     r"(?<![\w@])@?hermes\b[,:\-]?",
 ]
+
+
+class PhotonAttachmentConsumerUnavailable(RuntimeError):
+    """A secure consumer did not accept an opaque attachment handle."""
+
+
+def _event_has_attachment_handle(event: Dict[str, Any]) -> bool:
+    def content_has_handle(content: Any) -> bool:
+        if not isinstance(content, dict):
+            return False
+        if content.get("type") in {"attachment", "voice"}:
+            return bool(
+                re.fullmatch(r"[a-f0-9]{48}", str(content.get("handle") or ""))
+            )
+        if content.get("type") == "group":
+            return any(
+                content_has_handle(item.get("content"))
+                for item in content.get("items") or []
+                if isinstance(item, dict)
+            )
+        return False
+
+    return content_has_handle(event.get("content"))
 
 
 # ---------------------------------------------------------------------------
