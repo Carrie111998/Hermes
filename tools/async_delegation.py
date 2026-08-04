@@ -1074,6 +1074,23 @@ def _finalize_batch(
     _finish_finalization(delegation_id, status)
 
 
+def _runtime_result_models(results: Any) -> List[str]:
+    """Return ordered, unique model identities reported by child results."""
+    models: List[str] = []
+    if not isinstance(results, list):
+        return models
+    for result in results:
+        if not isinstance(result, dict):
+            continue
+        model = result.get("model")
+        if not isinstance(model, str):
+            continue
+        model = model.strip()
+        if model and model not in models:
+            models.append(model)
+    return models
+
+
 def _push_batch_completion_event(
     event_record: Dict[str, Any], combined: Dict[str, Any], status: str
 ) -> None:
@@ -1090,6 +1107,22 @@ def _push_batch_completion_event(
 
     dispatched_at = event_record.get("dispatched_at") or time.time()
     completed_at = event_record.get("completed_at") or time.time()
+    results = combined.get("results") or []
+    runtime_models = _runtime_result_models(results)
+    dispatch_model = event_record.get("model")
+    if isinstance(dispatch_model, str):
+        dispatch_model = dispatch_model.strip() or None
+    else:
+        dispatch_model = None
+    if len(runtime_models) == 1:
+        effective_model = runtime_models[0]
+        model_source = "runtime_result"
+    elif runtime_models:
+        effective_model = None
+        model_source = "runtime_results"
+    else:
+        effective_model = dispatch_model
+        model_source = "dispatch" if dispatch_model else None
     evt = {
         "type": "async_delegation",
         "delegation_id": event_record.get("delegation_id"),
@@ -1102,12 +1135,19 @@ def _push_batch_completion_event(
         "context": event_record.get("context"),
         "toolsets": event_record.get("toolsets"),
         "role": event_record.get("role"),
-        "model": event_record.get("model"),
+        # Prefer identities reported by the completed child agents over the
+        # dispatch request. With inherited delegation settings the latter is
+        # intentionally empty, while every child result records its resolved
+        # runtime model. Preserve heterogeneous batches instead of assigning a
+        # misleading single identity to the whole fan-out.
+        "model": effective_model,
+        "models": runtime_models,
+        "model_source": model_source,
         "status": status,
         "is_batch": True,
         # The full per-task results list — the formatter renders a
         # consolidated multi-task block from this.
-        "results": combined.get("results") or [],
+        "results": results,
         # Per-task live transcript log paths (cache/delegation/live/...).
         # They persist after completion and double as the full-fidelity
         # operational record of each child's run.

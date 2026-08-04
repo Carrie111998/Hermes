@@ -65,6 +65,26 @@ def _drain_for(delegation_id, timeout=5.0):
     return None
 
 
+def _complete_batch(results, model=None):
+    dispatched = ad.dispatch_async_delegation_batch(
+        goals=[f"task {index + 1}" for index in range(len(results))],
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model=model,
+        session_key="",
+        max_async_children=1,
+        runner=lambda: {
+            "results": results,
+            "total_duration_seconds": 0.1,
+        },
+    )
+    assert dispatched["status"] == "dispatched"
+    event = _drain_for(dispatched["delegation_id"])
+    assert event is not None
+    return event
+
+
 def test_active_for_session_counts_every_live_delegation_state():
     with ad._records_lock:
         ad._records.update(
@@ -621,6 +641,83 @@ def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch):
     text = format_process_notification(evt)
     assert text is not None
     assert "the real task" in text
+
+
+def test_batch_completion_promotes_inherited_runtime_model():
+    runtime_model = "runtime-model"
+    event = _complete_batch([
+        {
+            "task_index": 0,
+            "status": "completed",
+            "summary": "identified",
+            "model": runtime_model,
+        }
+    ])
+
+    assert event["model"] == runtime_model
+    assert event["models"] == [runtime_model]
+    assert event["model_source"] == "runtime_result"
+    text = format_process_notification(event)
+    assert text is not None
+    assert f"Model: {runtime_model}" in text
+    assert "Model: ?" not in text
+
+    # Durable events written before runtime model promotion still carry the
+    # child model in each result; the formatter should recover it on replay.
+    legacy_event = dict(event)
+    legacy_event.pop("models")
+    legacy_event["model"] = None
+    legacy_text = format_process_notification(legacy_event)
+    assert legacy_text is not None
+    assert f"Model: {runtime_model}" in legacy_text
+
+
+def test_batch_completion_preserves_mixed_runtime_models():
+    event = _complete_batch([
+        {
+            "task_index": 0,
+            "status": "completed",
+            "summary": "first",
+            "model": "runtime-a",
+        },
+        {
+            "task_index": 1,
+            "status": "completed",
+            "summary": "second",
+            "model": "runtime-b",
+        },
+    ])
+
+    assert event["model"] is None
+    assert event["models"] == ["runtime-a", "runtime-b"]
+    assert event["model_source"] == "runtime_results"
+    text = format_process_notification(event)
+    assert text is not None
+    assert "Models: runtime-a, runtime-b" in text
+    assert "model=runtime-a" in text
+    assert "model=runtime-b" in text
+    assert "Model: ?" not in text
+
+
+def test_batch_completion_uses_dispatch_model_without_runtime_identity():
+    dispatch_model = "configured-model"
+    event = _complete_batch(
+        [
+            {
+                "task_index": 0,
+                "status": "error",
+                "error": "pre-run failure",
+            }
+        ],
+        model=dispatch_model,
+    )
+
+    assert event["model"] == dispatch_model
+    assert event["models"] == []
+    assert event["model_source"] == "dispatch"
+    text = format_process_notification(event)
+    assert text is not None
+    assert f"Model: {dispatch_model}" in text
 
 
 def test_delegate_task_background_uses_live_tui_agent_session_id(monkeypatch):

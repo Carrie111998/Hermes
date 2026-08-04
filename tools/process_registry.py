@@ -2240,6 +2240,32 @@ def _format_async_delegation(evt: dict) -> str:
     batch_results = evt.get("results")
     if evt.get("is_batch") or isinstance(batch_results, list):
         results = batch_results or []
+        batch_models = []
+        event_models = evt.get("models")
+        if not isinstance(event_models, list):
+            event_models = []
+        for candidate in event_models:
+            if isinstance(candidate, str):
+                candidate = candidate.strip()
+                if candidate and candidate not in batch_models:
+                    batch_models.append(candidate)
+        if not batch_models:
+            # Backward compatibility for durable events persisted before the
+            # batch event promoted result-level runtime model metadata.
+            for result in results:
+                if not isinstance(result, dict):
+                    continue
+                candidate = result.get("model")
+                if isinstance(candidate, str):
+                    candidate = candidate.strip()
+                    if candidate and candidate not in batch_models:
+                        batch_models.append(candidate)
+        if len(batch_models) == 1:
+            model_label = f"Model: {batch_models[0]}"
+        elif batch_models:
+            model_label = f"Models: {', '.join(batch_models)}"
+        else:
+            model_label = f"Model: {model}"
         goals = evt.get("goals") or []
         n = len(results) if results else len(goals)
         total_dur = evt.get("total_duration_seconds", duration)
@@ -2259,7 +2285,7 @@ def _format_async_delegation(evt: dict) -> str:
             lines.append(f"Context you provided: {context}")
         if toolsets:
             lines.append(f"Toolsets: {', '.join(toolsets)}")
-        lines.append(f"Role: {role}   Model: {model}   Total duration: {total_dur}s")
+        lines.append(f"Role: {role}   {model_label}   Total duration: {total_dur}s")
         if error and not results:
             lines.append("--- ERROR ---")
             lines.append(f"The batch did not complete successfully: {error}")
@@ -2278,6 +2304,8 @@ def _format_async_delegation(evt: dict) -> str:
             header += f"  (status={r_status}"
             if r.get("api_calls"):
                 header += f", api_calls={r['api_calls']}"
+            if len(batch_models) > 1 and r.get("model"):
+                header += f", model={r['model']}"
             if r.get("duration_seconds") is not None:
                 header += f", {r['duration_seconds']}s"
             header += ") ---"
