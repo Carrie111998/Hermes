@@ -260,6 +260,14 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
         descriptor = os.open(path, flags)
     except OSError:
         return None, False
+    except ValueError:
+        # A path the OS cannot even represent — an embedded NUL byte from a
+        # token parsed out of scanned content (#78256). #76762 covered the
+        # NUL-in-*contents* case below and Path.resolve, but ``os.open``
+        # itself raises ValueError (not OSError) for NUL-in-*path*, which
+        # crashed the whole guard instead of failing open. Same semantics as
+        # an unreadable file: nothing to scan.
+        return None, False
     try:
         metadata = os.fstat(descriptor)
         if not stat.S_ISREG(metadata.st_mode):
@@ -268,7 +276,7 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
         # chunk tells us if this is a binary (NUL bytes) that should be
         # skipped as "nothing to scan" rather than failing closed (#76762).
         data = os.read(descriptor, _MAX_REFERENCED_SCRIPT_BYTES + 1)
-    except OSError:
+    except (OSError, ValueError):
         return None, False
     finally:
         os.close(descriptor)

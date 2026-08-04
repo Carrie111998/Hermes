@@ -857,3 +857,43 @@ class TestCronCreateLifecycleBlockExtra:
         assert rc == 1
         out = capsys.readouterr().out
         assert "Blocked" in out
+
+
+class TestNulByteReferencedPathFailsOpen:
+    """#78256: a referenced-script path carrying an embedded NUL byte must be
+    skipped ("nothing to scan"), not crash the guard. #76762 established the
+    fail-open contract for NUL bytes in scanned *contents* and Path.resolve,
+    but ``os.open()`` raises ValueError (not OSError) for NUL in the *path*
+    itself — which escaped the OSError-only handler and took down the whole
+    terminal tool for commands like ``python -m pip --version`` whose
+    recursive scan produced such a token."""
+
+    def test_read_referenced_script_nul_path_fails_open(self):
+        from pathlib import Path
+        from cron.lifecycle_guard import _read_referenced_script
+
+        text, unsafe = _read_referenced_script(Path("x\x00y"))
+        assert text is None
+        assert unsafe is False
+
+    def test_guard_survives_nul_byte_in_referenced_script_path(self):
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        # A sourced path with an embedded NUL: previously ValueError from
+        # os.open crashed the guard (and the terminal tool call around it).
+        assert contains_gateway_lifecycle_command_or_referenced_script(
+            "source /tmp/e\x00vil.sh"
+        ) is False
+
+    def test_guard_still_blocks_real_lifecycle_script(self, tmp_path):
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        script = tmp_path / "restart.sh"
+        script.write_text("#!/bin/sh\nhermes gateway restart\n")
+        assert contains_gateway_lifecycle_command_or_referenced_script(
+            f"bash {script}"
+        ) is True
