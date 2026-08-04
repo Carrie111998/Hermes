@@ -504,3 +504,226 @@ def test_container_deployments_still_get_a_usable_profile(
     _ensure_chrome_debug_data_dir(chrome_debug_data_dir())
 
     assert (hermes_home / "chrome-debug").is_dir()
+
+
+# ---------------------------------------------------------------------------
+# launch-stderr.log: the mode of an *already existing* log.
+#
+# Creation-time hardening covers a fresh install. It does nothing for the case
+# that actually matters here: an older Hermes wrote this file with a plain
+# open() and left it 0644 on disk. ``O_CREAT`` applies its mode argument only
+# to a file it creates, so an upgrading user kept the exact exposure this
+# change claims to close — and this is the one artifact in it with a fixed,
+# guessable name, so it is the one another local account can open by guess
+# under the ``HERMES_HOME_MODE=0701`` hatch without a listable directory.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def non_container_host(monkeypatch):
+    """Pin ``_is_container()`` to False so the reconcile is not skipped.
+
+    ``_secure_file`` (unlike ``_secure_dir``) returns early inside a
+    container, and it sniffs for one via ``/.dockerenv`` and
+    ``/proc/1/cgroup`` — not just the env vars the ``hermes_home`` fixture
+    clears. On a developer laptop neither exists, but CI running the suite
+    *inside* a container would silently skip the tighten and fail the healing
+    assertion for an ambient reason that has nothing to do with this code.
+    Pinning it makes the test assert the policy instead of the host it runs
+    on; the container carve-out gets its own test below.
+    """
+    import hermes_cli.config as hermes_config
+
+    monkeypatch.setattr(hermes_config, "_is_container", lambda: False)
+
+
+def test_preexisting_group_readable_stderr_log_is_healed(
+    hermes_home, permissive_umask, non_container_host
+):
+    """A log an older Hermes left readable must end up owner-only.
+
+    This is the contract, not an octal: after the call, no group or other bit
+    survives, and the owner can still read and write. Asserting the bits
+    rather than ``== 0o600`` keeps ``HERMES_HOME_MODE``-style policy changes
+    from making this a change-detector.
+    """
+    from hermes_cli.browser_connect import _open_launch_stderr_log
+
+    profile = hermes_home / "chrome-debug"
+    profile.mkdir(mode=0o700)
+    log = profile / "launch-stderr.log"
+    # Exactly what the pre-fix code produced under a default umask.
+    with open(log, "wb") as fh:
+        fh.write(b"chromium stderr from an older hermes")
+    os.chmod(log, 0o644)
+    assert _mode(log) & GROUP_OTHER_BITS, "fixture precondition: starts exposed"
+
+    with _open_launch_stderr_log(str(log)) as fh:
+        fh.write(b"stderr from this launch")
+
+    mode = _mode(log)
+    assert not (mode & GROUP_OTHER_BITS), (
+        f"pre-existing launch log left exposed: {oct(mode)} — an upgrading "
+        "install keeps the exposure this change is supposed to close"
+    )
+    # The fix must not cost the owner access to their own diagnostic.
+    assert mode & stat.S_IRUSR and mode & stat.S_IWUSR
+    assert log.read_bytes() == b"stderr from this launch"
+
+
+def test_stderr_log_is_not_left_exposed_while_it_holds_bytes(
+    hermes_home, permissive_umask, non_container_host
+):
+    """No window where *this launch's* stderr sits in a readable file.
+
+    Reconciling after the write would leave real Chromium stderr readable for
+    the lifetime of the launch. The tighten therefore has to happen while the
+    file is still empty — ``O_TRUNC`` has already emptied it by then, so this
+    asserts the ordering, which is the part that makes the fix a fix rather
+    than a narrowing of the window.
+    """
+    from hermes_cli.browser_connect import _open_launch_stderr_log
+
+    profile = hermes_home / "chrome-debug"
+    profile.mkdir(mode=0o700)
+    log = profile / "launch-stderr.log"
+    with open(log, "wb") as fh:
+        fh.write(b"previous-launch stderr")
+    os.chmod(log, 0o644)
+
+    handle = _open_launch_stderr_log(str(log))
+    try:
+        # State the caller sees before it writes a single byte.
+        assert not (_mode(log) & GROUP_OTHER_BITS), (
+            f"log still group/other-readable at the moment it is handed to "
+            f"the caller: {oct(_mode(log))}"
+        )
+        assert log.stat().st_size == 0, "O_TRUNC should have emptied it"
+        handle.write(b"fresh stderr")
+    finally:
+        handle.close()
+
+    assert not (_mode(log) & GROUP_OTHER_BITS)
+
+
+def test_reconciling_the_log_keeps_a_running_browsers_handle_working(
+    hermes_home, permissive_umask, non_container_host
+):
+    """Tightening a live log must not break a Chromium already writing to it.
+
+    Same argument the profile directory makes: only group/other bits drop, the
+    owner keeps ``rw``, and POSIX checks the mode at ``open()`` rather than on
+    an already-open descriptor. Stands in for a browser from a previous
+    candidate still holding the log open.
+    """
+    from hermes_cli.browser_connect import _open_launch_stderr_log
+
+    profile = hermes_home / "chrome-debug"
+    profile.mkdir(mode=0o700)
+    log = profile / "launch-stderr.log"
+    with open(log, "wb") as fh:
+        fh.write(b"")
+    os.chmod(log, 0o644)
+
+    held = os.open(str(log), os.O_WRONLY | os.O_APPEND)
+    try:
+        os.write(held, b"before-tighten")
+
+        with _open_launch_stderr_log(str(log)) as fh:
+            fh.write(b"")
+
+        # The pre-existing descriptor must still be writable.
+        os.write(held, b"|after-tighten")
+    finally:
+        os.close(held)
+
+    assert not (_mode(log) & GROUP_OTHER_BITS)
+    assert log.read_bytes().endswith(b"|after-tighten")
+
+
+def test_managed_mode_leaves_an_existing_stderr_log_alone(
+    hermes_home, permissive_umask, monkeypatch
+):
+    """Managed/NixOS installs own their modes for the log as well as the dir.
+
+    Delegating to ``_secure_file`` inherits the carve-out rather than
+    re-deciding it here, so a group-readable log an administrator's
+    configuration produced stays that way.
+    """
+    monkeypatch.setenv("HERMES_MANAGED", "nixos")
+
+    from hermes_cli.browser_connect import _open_launch_stderr_log
+
+    profile = hermes_home / "chrome-debug"
+    profile.mkdir(mode=0o770)
+    log = profile / "launch-stderr.log"
+    with open(log, "wb") as fh:
+        fh.write(b"gateway-written stderr")
+    os.chmod(log, 0o660)
+
+    with _open_launch_stderr_log(str(log)) as fh:
+        fh.write(b"next launch")
+
+    assert _mode(log) == 0o660, (
+        f"managed-mode log permissions overridden: {oct(_mode(log))}; the "
+        "NixOS module shares state through the hermes group on purpose"
+    )
+
+
+def test_managed_mode_fresh_stderr_log_keeps_group_sharing(managed_nixos_home):
+    """A *fresh* log on a managed host must not lock the other uid out.
+
+    The carve-out has to cover creation, not only reconciliation — the same
+    defect the profile directory had before it was fixed. ``launch-stderr.log``
+    is created lazily at runtime and is not in the module's
+    ``systemd.tmpfiles`` rules, so a hardcoded 0600 would be the only thing
+    setting its mode. On such a host the gateway and an interactive
+    ``hostUsers`` CLI share one ``$HERMES_HOME`` at two uids through the hermes
+    group, and *every candidate binary reuses this one path* — so a 0600 log
+    created by whichever ran first makes the other's truncating open fail with
+    EACCES and takes down the whole launch, not just the diagnostic.
+    """
+    from hermes_cli.browser_connect import _open_launch_stderr_log
+
+    profile = managed_nixos_home / "chrome-debug"
+    profile.mkdir(mode=0o770)
+    log = profile / "launch-stderr.log"
+
+    with _open_launch_stderr_log(str(log)) as fh:
+        fh.write(b"stderr")
+
+    mode = _mode(log)
+    assert mode & stat.S_IRGRP and mode & stat.S_IWGRP, (
+        f"fresh managed-mode launch log dropped group access ({oct(mode)}); "
+        "the NixOS module's UMask=0007 exists so an interactive hostUsers CLI "
+        "and the gateway can both write it — losing that fails the launch, "
+        "not just the diagnostic"
+    )
+
+
+def test_container_deployments_keep_an_existing_log_usable(
+    hermes_home, permissive_umask, monkeypatch
+):
+    """Containers keep their broader modes, by the house helper's own rule.
+
+    ``_secure_file`` skips containers because volume-mounted state is often
+    read by a second UID. Asserting the skip here documents that this is the
+    shared policy being inherited, not an accident of this call site — and
+    that nothing raises when the tighten is declined.
+    """
+    monkeypatch.setenv("HERMES_CONTAINER", "1")
+
+    from hermes_cli.browser_connect import _open_launch_stderr_log
+
+    profile = hermes_home / "chrome-debug"
+    profile.mkdir(mode=0o700)
+    log = profile / "launch-stderr.log"
+    with open(log, "wb") as fh:
+        fh.write(b"volume-mounted stderr")
+    os.chmod(log, 0o644)
+
+    with _open_launch_stderr_log(str(log)) as fh:
+        fh.write(b"next launch")
+
+    assert _mode(log) == 0o644, "container carve-out not inherited"
+    assert log.read_bytes() == b"next launch", "log must still be writable"

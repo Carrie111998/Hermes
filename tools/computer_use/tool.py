@@ -1203,7 +1203,8 @@ def _vision_cache_dir():
     if _managed_install():
         cache_dir.mkdir(parents=True, exist_ok=True)
         return cache_dir
-    # mode= is honored only for the leaf and is not masked by umask.
+    # mode= is honored only for the leaf and is not further masked by umask
+    # for the bits we care about; _secure_dir reconciles anything unusual.
     cache_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     try:
         from hermes_cli.config import _secure_dir

@@ -218,20 +218,66 @@ def _open_launch_stderr_log(path: str):
     unlistable, so a predictable filename is exactly the case that stays
     reachable; the uuid-named files elsewhere in the profile do not.
 
-    The mode is passed to ``os.open`` so it applies at creation. ``O_TRUNC``
-    keeps the existing per-candidate overwrite semantics, and on an
-    already-existing log the inode's mode is left alone — matching
-    ``tools.computer_use.tool._write_private_bytes``, the house pattern for
-    bytes Hermes itself writes. Falls back to a plain open rather than
-    failing the launch, since losing the diagnostic log is better than
-    losing the browser.
+    Two halves, covering different installs:
+
+    * **At creation** the mode is passed to ``os.open``, so the file is never
+      briefly group/other-readable. ``O_TRUNC`` keeps the existing
+      per-candidate overwrite semantics.
+    * **On an already-existing log** ``O_CREAT`` applies ``mode`` only to a
+      file it actually creates, so the inode keeps whatever it had. An older
+      Hermes left this file at 0644 on disk, so creation-time hardening alone
+      would leave every *upgrading* install exposed at the one path in this
+      change with a guessable name — the exposure this is meant to close is
+      already on disk. ``hermes_cli.config._secure_file`` reconciles it, for
+      the same reason ``_ensure_chrome_debug_data_dir`` delegates to
+      ``_secure_dir``: that helper is the single owner of the owner-only file
+      policy. It skips managed/NixOS installs and containers, where broader
+      modes are deliberate, and it is where Windows ACL enforcement lands
+      (#77527) — so delegating inherits that instead of needing a second
+      implementation here. A hand-rolled ``os.chmod(path, 0o600)`` would
+      fight all three.
+
+    Ordering matters: the reconcile runs *after* the truncating open and
+    *before* any bytes are written, so the tighten lands while the file is
+    empty and no fresh Chromium stderr ever sits in a widely-readable file.
+    It is safe against a *running* browser for the same reason the directory
+    tighten is — only group/other bits drop, the owner keeps ``rw``, and POSIX
+    checks the mode at ``open()`` rather than on already-open descriptors.
+
+    **The managed/NixOS carve-out applies at creation here too**, not only at
+    reconciliation — the same defect the profile directory had. This log is
+    created lazily at runtime and is not covered by the module's
+    ``systemd.tmpfiles`` rules, so on a managed host a hardcoded 0600 would be
+    the only thing setting its mode. There the gateway and an interactive
+    ``hostUsers`` CLI share one ``$HERMES_HOME`` at two uids through the hermes
+    group; a 0600 log created by whichever ran first makes the other's
+    truncating open fail with ``EACCES`` — and because every candidate binary
+    reuses this one path, that fails *the whole launch*, not merely the
+    diagnostic. Omitting the explicit mode lets the service's
+    ``UMask = "0007"`` land 0660, which is what the merge base produced.
     """
+    managed = _managed_install()
+    # 0o666 rather than 0o600 on managed installs so the configured umask
+    # decides, matching the merge base's plain open() and the carve-out
+    # _ensure_chrome_debug_data_dir applies to the directory.
+    create_mode = 0o666 if managed else 0o600
     flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
     try:
-        fd = os.open(path, flags, 0o600)
+        fd = os.open(path, flags, create_mode)
     except OSError:
-        return open(path, "wb")
-    return os.fdopen(fd, "wb")
+        # Same fallback the pre-fix code had: let a genuinely unopenable path
+        # surface to launch_chrome_debug's per-candidate handler.
+        handle = open(path, "wb")
+    else:
+        handle = os.fdopen(fd, "wb")
+    if not managed:
+        try:
+            from hermes_cli.config import _secure_file
+
+            _secure_file(path)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("browser debug launch: stderr log chmod skipped: %s", exc)
+    return handle
 
 
 def _chrome_debug_args(port: int) -> list[str]:
