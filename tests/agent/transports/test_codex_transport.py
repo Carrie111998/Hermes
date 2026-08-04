@@ -74,6 +74,21 @@ class TestCodexBuildKwargs:
         )
         assert kw1["prompt_cache_key"] == kw2["prompt_cache_key"]
 
+    def test_cache_key_differs_across_unrelated_sessions(self, transport):
+        """#78941: two unrelated sessions (different users/conversations)
+        sharing the same static prefix must NOT collapse onto the same
+        prompt_cache_key — session_id scopes the hash unless it is a cron
+        per-fire id, which is normalized to its stable job prefix instead."""
+        messages = [{"role": "user", "content": "Hi"}]
+        kw1 = transport.build_kwargs(
+            model="gpt-5.4", messages=messages, tools=[],
+            session_id="session_alice_1",
+        )
+        kw2 = transport.build_kwargs(
+            model="gpt-5.4", messages=messages, tools=[],
+            session_id="session_bob_1",
+        )
+        assert kw1["prompt_cache_key"] != kw2["prompt_cache_key"]
 
     def test_github_responses_drops_message_item_id_end_to_end(self, transport):
         # #32716: Copilot binds codex_message_items ids to a backend
