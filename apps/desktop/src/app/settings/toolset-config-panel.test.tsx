@@ -869,10 +869,8 @@ describe('ToolsetConfigPanel', () => {
 
       const managedRow = await screen.findByRole('button', { name: /Electric Sheep managed service/ })
 
-      if (managedRow.getAttribute('aria-expanded') !== 'true') {
-        fireEvent.click(managedRow)
-      }
-
+      // The panel auto-expands its sole provider in an effect. Clicking while
+      // that effect is pending races its state update and can collapse the row.
       await waitFor(() => expect(managedRow.getAttribute('aria-expanded')).toBe('true'))
       expect(screen.getByText('managed')).toBeTruthy()
       expect(screen.getByText('Managed Browser Use included with your managed agent')).toBeTruthy()
@@ -969,10 +967,7 @@ describe('ToolsetConfigPanel', () => {
 
       const managedRow = await screen.findByRole('button', { name: /Electric Sheep managed service/ })
 
-      if (managedRow.getAttribute('aria-expanded') !== 'true') {
-        fireEvent.click(managedRow)
-      }
-
+      // Await the default-provider effect instead of racing it with a click.
       await waitFor(() => expect(managedRow.getAttribute('aria-expanded')).toBe('true'))
       fireEvent.click(await screen.findByRole('button', { name: /Use this backend/ }))
 
