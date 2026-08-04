@@ -363,6 +363,7 @@ def test_environments_package_reexports_cua_fleet_sdk() -> None:
 class _FakeResponse:
     def __init__(self, status_code: int = 200, content: bytes | None = None):
         self.status_code = status_code
+        self.headers: dict[str, str] = {}
         self.content = (
             content or b'{"result":{"stdout":"ok\\n","stderr":"","returncode":0}}'
         )
@@ -372,8 +373,8 @@ class _FakeServices:
     def __init__(self):
         self.calls: list[tuple[str, str, str, object]] = []
 
-    async def request(self, name, *, method, path, json=None):
-        self.calls.append((name, method, path, json))
+    async def request(self, name, *, method, path, json=None, headers=None):
+        self.calls.append((name, method, path, json, headers))
         return _FakeResponse()
 
 
@@ -880,7 +881,7 @@ def test_cua_fleet_terminal_parses_sse_command_response() -> None:
 def test_cua_fleet_sandbox_package_is_lazy_installable() -> None:
     from tools.lazy_deps import LAZY_DEPS
 
-    assert LAZY_DEPS["terminal.cua_fleet"] == ("cua-sandbox==0.1.25",)
+    assert LAZY_DEPS["terminal.cua_fleet"] == ("cua-sandbox==0.1.26",)
 
 
 def test_cua_fleet_nix_extra_matches_lazy_dependency_pin() -> None:
@@ -924,7 +925,7 @@ def test_desktop_terminal_reuses_existing_task_lease_without_incrementing(monkey
 def test_cua_fleet_provider_uses_public_sandbox_facade() -> None:
     from tools.lazy_deps import LAZY_DEPS
 
-    assert LAZY_DEPS["terminal.cua_fleet"] == ("cua-sandbox==0.1.25",)
+    assert LAZY_DEPS["terminal.cua_fleet"] == ("cua-sandbox==0.1.26",)
 
 
 def test_cua_fleet_nix_build_declares_evdev_build_system() -> None:
@@ -948,3 +949,47 @@ def test_cua_fleet_nix_build_sets_evdev_header_search_path() -> None:
 
     python_nix = Path(__file__).parents[2] / "nix" / "python.nix"
     assert "export CPATH=${linuxHeaders}/include" in python_nix.read_text()
+
+
+def test_fleet_mcp_transport_negotiates_a_streamable_http_session() -> None:
+    from tools.environments.cua_fleet import _FleetMcpTransport
+
+    calls: list[dict] = []
+
+    class _Response:
+        def __init__(self, headers=None):
+            self.status_code = 200
+            self.headers = headers or {}
+            self.content = b'{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}'
+
+    class _Services:
+        async def request(self, name, *, method, path, json, headers=None):
+            calls.append({"name": name, "path": path, "json": json, "headers": headers})
+            if json.get("method") == "initialize":
+                return _Response({"mcp-session-id": "session-9"})
+            return _Response()
+
+    class _Sandbox:
+        services = _Services()
+
+    class _State:
+        sandbox = _Sandbox()
+
+    class _Worker:
+        def run(self, coro, timeout):
+            import asyncio
+
+            return asyncio.new_event_loop().run_until_complete(coro)
+
+    transport = _FleetMcpTransport(_State(), _Worker(), timeout=5)
+    transport.start()
+    transport.list_tools()
+
+    initialize, initialized, tools_list = calls
+    assert initialize["json"]["method"] == "initialize"
+    assert initialize["headers"]["accept"] == "application/json, text/event-stream"
+    assert "mcp-session-id" not in initialize["headers"]
+    assert initialized["json"] == {"jsonrpc": "2.0", "method": "notifications/initialized"}
+    assert initialized["headers"]["mcp-session-id"] == "session-9"
+    assert tools_list["json"]["method"] == "tools/list"
+    assert tools_list["headers"]["mcp-session-id"] == "session-9"

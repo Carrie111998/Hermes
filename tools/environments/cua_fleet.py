@@ -159,6 +159,7 @@ class _FleetMcpTransport(CuaToolTransport):
         self._timeout = timeout
         self._started = False
         self._request_id = 0
+        self._session_id: str | None = None
 
     def start(self) -> None:
         if self._started:
@@ -172,9 +173,13 @@ class _FleetMcpTransport(CuaToolTransport):
                 "clientInfo": {"name": "hermes-agent", "version": "0.1"},
             },
         )
+        # Streamable-HTTP MCP servers reject requests until the client has
+        # acknowledged initialization on the negotiated session.
+        self._notify("notifications/initialized")
 
     def stop(self) -> None:
         self._started = False
+        self._session_id = None
 
     def is_alive(self) -> bool:
         if not self._started:
@@ -193,6 +198,34 @@ class _FleetMcpTransport(CuaToolTransport):
     def call_tool(self, name: str, arguments: Mapping[str, Any]) -> Mapping[str, Any]:
         return self._request("tools/call", {"name": name, "arguments": dict(arguments)})
 
+    def _headers(self) -> dict[str, str]:
+        # Spec-compliant streamable-HTTP MCP servers answer 406 unless the
+        # client accepts both JSON and SSE, and 400 without the session id
+        # negotiated by initialize.
+        headers = {"accept": "application/json, text/event-stream"}
+        if self._session_id:
+            headers["mcp-session-id"] = self._session_id
+        return headers
+
+    def _post(self, payload: Mapping[str, Any]) -> Any:
+        response = self._worker.run(
+            self._state.sandbox.services.request(
+                "mcp", method="POST", path="/mcp", json=payload, headers=self._headers()
+            ),
+            self._timeout,
+        )
+        session_id = response.headers.get("mcp-session-id")
+        if session_id:
+            self._session_id = session_id
+        return response
+
+    def _notify(self, method: str) -> None:
+        response = self._post({"jsonrpc": "2.0", "method": method})
+        if not 200 <= response.status_code < 300:
+            raise RuntimeError(
+                f"Fleet MCP notification failed with HTTP {response.status_code}"
+            )
+
     def _request(self, method: str, params: Mapping[str, Any]) -> Mapping[str, Any]:
         self._request_id += 1
         payload = {
@@ -201,12 +234,7 @@ class _FleetMcpTransport(CuaToolTransport):
             "method": method,
             "params": params,
         }
-        response = self._worker.run(
-            self._state.sandbox.services.request(
-                "mcp", method="POST", path="/mcp", json=payload
-            ),
-            self._timeout,
-        )
+        response = self._post(payload)
         if not 200 <= response.status_code < 300:
             raise RuntimeError(
                 f"Fleet MCP request failed with HTTP {response.status_code}"

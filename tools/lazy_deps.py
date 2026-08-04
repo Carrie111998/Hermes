@@ -254,7 +254,7 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
 
     # ─── Terminal backends ─────────────────────────────────────────────────
     "terminal.modal": ("modal==1.3.4",),
-    "terminal.cua_fleet": ("cua-sandbox==0.1.25",),
+    "terminal.cua_fleet": ("cua-sandbox==0.1.26",),
     "terminal.daytona": ("daytona==0.155.0",),
     "terminal.vercel": ("vercel==0.7.2",),
 
