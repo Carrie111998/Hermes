@@ -962,6 +962,45 @@ def test_build_api_kwargs_xai_oauth_sends_cache_key_via_extra_body(monkeypatch):
 
 
 
+def test_try_refresh_codex_client_credentials_preserves_configured_proxy(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    agent.provider = "openai-codex"
+    agent.base_url = "http://127.0.0.1:3001/codex"
+    agent._client_kwargs["base_url"] = agent.base_url
+    rebuilt = {"kwargs": None}
+
+    class _ExistingClient:
+        def close(self):
+            pass
+
+    class _RebuiltClient:
+        pass
+
+    def _fake_openai(**kwargs):
+        rebuilt["kwargs"] = kwargs
+        return _RebuiltClient()
+
+    def _fake_resolve(force_refresh=False, refresh_if_expiring=True, **_):
+        return {
+            "api_key": "fresh-codex-token" if force_refresh else agent.api_key,
+            "base_url": "https://chatgpt.com/backend-api/codex",
+        }
+
+    monkeypatch.setattr(
+        "hermes_cli.auth.resolve_codex_runtime_credentials",
+        _fake_resolve,
+    )
+    monkeypatch.setattr(run_agent, "OpenAI", _fake_openai)
+
+    agent.client = _ExistingClient()
+    ok = agent._try_refresh_codex_client_credentials(force=True)
+
+    assert ok is True
+    assert rebuilt["kwargs"]["api_key"] == "fresh-codex-token"
+    assert rebuilt["kwargs"]["base_url"] == "http://127.0.0.1:3001/codex"
+    assert agent.base_url == "http://127.0.0.1:3001/codex"
+
+
 def test_try_refresh_codex_client_credentials_handles_xai_oauth(monkeypatch):
     """``_try_refresh_codex_client_credentials`` must rebuild the OpenAI
     client with freshly resolved xAI OAuth credentials when the active

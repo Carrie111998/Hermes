@@ -459,7 +459,12 @@ def _resolve_runtime_from_pool_entry(
     api_mode = "chat_completions"
     if provider == "openai-codex":
         api_mode = "codex_responses"
-        base_url = base_url or DEFAULT_CODEX_BASE_URL
+        configured_provider = str(model_cfg.get("provider") or "").strip().lower()
+        configured_base_url = str(model_cfg.get("base_url") or "").strip().rstrip("/")
+        if configured_provider == "openai-codex" and configured_base_url:
+            base_url = configured_base_url
+        else:
+            base_url = base_url or DEFAULT_CODEX_BASE_URL
     elif provider == "xai-oauth":
         api_mode = "codex_responses"
         base_url = base_url or DEFAULT_XAI_OAUTH_BASE_URL
@@ -1943,10 +1948,13 @@ def resolve_runtime_provider(
     if provider == "openai-codex":
         try:
             creds = resolve_codex_runtime_credentials()
+            configured_base_url = ""
+            if str(model_cfg.get("provider") or "").strip().lower() == "openai-codex":
+                configured_base_url = str(model_cfg.get("base_url") or "").strip().rstrip("/")
             return {
                 "provider": "openai-codex",
                 "api_mode": "codex_responses",
-                "base_url": creds.get("base_url", "").rstrip("/"),
+                "base_url": configured_base_url or creds.get("base_url", "").rstrip("/"),
                 "api_key": creds.get("api_key", ""),
                 "source": creds.get("source", "hermes-auth-store"),
                 "last_refresh": creds.get("last_refresh"),

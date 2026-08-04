@@ -5312,6 +5312,11 @@ class AIAgent:
 
         api_key = creds.get("api_key")
         base_url = creds.get("base_url")
+        if self.provider == "openai-codex":
+            active_base_url = str(self.base_url or "").strip().rstrip("/")
+            singleton_base_url = str(singleton_now.get("base_url") or "").strip().rstrip("/")
+            if active_base_url and singleton_base_url and active_base_url != singleton_base_url:
+                base_url = active_base_url
         if not isinstance(api_key, str) or not api_key.strip():
             return False
         if not isinstance(base_url, str) or not base_url.strip():
