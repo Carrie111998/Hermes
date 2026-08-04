@@ -695,6 +695,57 @@ class TestLifecycleGuardModule:
         )
         assert result is False
 
+    def test_remote_binary_reference_does_not_crash_guard(self):
+        """Sibling of #76762 for fallback readers: with an SSH-style
+        read_remote_script that returns a binary's decoded bytes, a command
+        referencing a binary crashed the guard with
+        ValueError: embedded null byte.
+
+        The local read skips the ELF as "nothing to scan", but the fallback
+        re-reads it as text; re-tokenizing machine code yields NUL-byte paths
+        that reached os.open(), where only OSError was caught. Fallback text
+        containing NUL bytes must be treated like a local binary read.
+        """
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+        elf_bytes = (
+            b"\x7fELF\x00\x00\x01\x00/usr/bin/evil\x00"
+            b"\x00hermes gateway restart\x00"
+        )
+        result = contains_gateway_lifecycle_command_or_referenced_script(
+            "/usr/bin/python3 -c 'print(1)'",
+            read_remote_script=lambda path: elf_bytes.decode(
+                "utf-8", errors="replace"
+            ),
+        )
+        assert result is False
+
+    def test_remote_fallback_still_blocks_real_scripts(self):
+        """The fallback reader must still catch lifecycle commands in genuine
+        shell scripts, not just skip NUL-containing binary junk."""
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+        result = contains_gateway_lifecycle_command_or_referenced_script(
+            "bash /nonexistent/deploy.sh",
+            read_remote_script=lambda path: (
+                "#!/bin/bash\nhermes gateway restart\n"
+                if "deploy.sh" in path
+                else None
+            ),
+        )
+        assert result is True
+
+    def test_read_referenced_script_nul_path_never_crashes(self):
+        """os.open() on a NUL-containing path raises ValueError, not OSError;
+        the guard must tolerate both (whole bug class of #76762)."""
+        from pathlib import Path
+        from cron.lifecycle_guard import _read_referenced_script
+        text, unsafe = _read_referenced_script(Path("/tmp/bad\x00path"))
+        assert text is None
+        assert unsafe is False
+
     def test_shell_script_reference_walk_still_works(self, tmp_path):
         """The referenced-script walk still applies to real shell scripts:
         a .sh script that itself invokes a lifecycle command is caught."""
