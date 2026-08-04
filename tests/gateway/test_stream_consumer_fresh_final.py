@@ -11,6 +11,7 @@ time instead of first-token time.
 from __future__ import annotations
 
 import asyncio
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -39,6 +40,20 @@ def _make_adapter(*, supports_delete: bool = True) -> MagicMock:
     return adapter
 
 
+# ``stream_consumer`` measures preview age with ``time.monotonic()``, whose
+# epoch is arbitrary (on Linux, boot). Assigning ``_message_created_ts = 0.0``
+# therefore does NOT mean "long ago" -- it means "monotonic() seconds ago",
+# which on a freshly-booted CI runner can be only a few seconds. That made
+# these tests pass on a long-uptime dev box and fail intermittently in CI.
+# Anchor to the same clock the production code reads instead.
+_LONG_AGO_SECONDS = 3600.0
+
+
+def _stale_ts() -> float:
+    """A ``_message_created_ts`` that is unambiguously old on any host."""
+    return time.monotonic() - _LONG_AGO_SECONDS
+
+
 class TestFreshFinalForLongLivedPreviews:
     """openclaw#72038 port — send fresh final when preview is old."""
 
@@ -53,7 +68,7 @@ class TestFreshFinalForLongLivedPreviews:
         )
         await consumer._send_or_edit("hello")
         # Pretend the preview has been visible for a long time.
-        consumer._message_created_ts = 0.0  # far in the past
+        consumer._message_created_ts = _stale_ts()  # far in the past
         await consumer._send_or_edit("hello world", finalize=True)
         # Should edit, not send a fresh message.
         assert adapter.send.call_count == 1  # only the initial send
@@ -74,7 +89,7 @@ class TestFreshFinalForLongLivedPreviews:
             config=StreamConsumerConfig(fresh_final_after_seconds=60.0),
         )
         await consumer._send_or_edit("hello")
-        consumer._message_created_ts = 0.0
+        consumer._message_created_ts = _stale_ts()
         await consumer._send_or_edit("hello world", finalize=True)
         assert adapter.send.call_count == 2
         adapter.edit_message.assert_not_called()
@@ -206,7 +221,7 @@ class TestCancelledBestEffortDeliveryFinalizes:
         consumer.on_delta("Reply with **bold** and `code` markers.")
         task = asyncio.create_task(consumer.run())
         await asyncio.sleep(0.05)
-        consumer._message_created_ts = 0.0  # force the preview stale
+        consumer._message_created_ts = _stale_ts()  # force the preview stale
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
 
