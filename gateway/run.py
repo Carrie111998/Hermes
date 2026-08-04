@@ -2452,6 +2452,8 @@ from gateway.turn_lease import (
     SessionTurnLeaseRegistry,
     TurnLeaseTimeoutError,
 )
+from gateway.voice_realtime_bridge import DiscordVoiceTurnRunner
+from agent.voice_supervisor import VoiceSupervisorController
 from gateway.session_state import (
     SERVICE_TIER_UNSET as _SERVICE_TIER_UNSET,
     SessionState,
@@ -4429,9 +4431,20 @@ class TurnRunner:
     def voice_ack_callback(self, call_id, tool_name, args):
         """tool_start_callback: speak a one-time ack in the voice channel."""
         ctx = self._ctx
-        if ctx._voice_ack_fired[0] or ctx._voice_ack_guild[0] is None:
+        if ctx._voice_ack_guild[0] is None:
             return
         if not ctx._run_still_current():
+            return
+        # Realtime supervisor consult: narrate progress through the voice
+        # model's own speech (rate-limited inside narrate_tool) instead of
+        # the one-shot TTS ack.
+        _rt_ctrl = getattr(self._runner, "_voice_realtime_controllers", {}).get(
+            ctx._voice_ack_guild[0]
+        )
+        if _rt_ctrl is not None and _rt_ctrl.consult_active:
+            _rt_ctrl.narrate_tool(tool_name)
+            return
+        if ctx._voice_ack_fired[0]:
             return
         ctx._voice_ack_fired[0] = True
         _adapter = self._runner.adapters.get(Platform.DISCORD)
@@ -6363,6 +6376,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Protects against the same utterance being emitted twice by the voice
         # capture / STT pipeline, which otherwise produces a second delayed reply.
         self._recent_voice_transcripts: Dict[tuple[int, int], List[tuple[float, str]]] = {}
+        # Realtime (xAI S2S) supervisor controllers per Discord guild — built
+        # lazily on the first consult/steer function call from a voice session.
+        self._voice_realtime_controllers: Dict[int, Any] = {}
 
         # Track background tasks to prevent garbage collection mid-execution
         self._background_tasks: set = set()
@@ -11549,6 +11565,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # transcription is forwarded without requiring /voice join.
                     if hasattr(adapter, "_voice_input_callback"):
                         adapter._voice_input_callback = self._handle_voice_channel_input
+                    if hasattr(adapter, "_voice_function_call_callback"):
+                        adapter._voice_function_call_callback = self._handle_voice_channel_function_call
                     connected_count += 1
                     self._update_platform_runtime_status(
                         platform.value,
@@ -12933,6 +12951,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         # Wire voice input callback on reconnect as well (#60623).
                         if hasattr(adapter, "_voice_input_callback"):
                             adapter._voice_input_callback = self._handle_voice_channel_input
+                        if hasattr(adapter, "_voice_function_call_callback"):
+                            adapter._voice_function_call_callback = self._handle_voice_channel_function_call
                         self.delivery_router.adapters = self.adapters
                         del self._failed_platforms[platform]
                         self._update_platform_runtime_status(
@@ -18891,6 +18911,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 response = ""
 
+            # Realtime supervisor consult: hand the result back to the voice
+            # model (it speaks its own summary) instead of TTS-ing the reply.
+            _rt_consumed = False
+            _rt_controller = self._voice_realtime_controller_for_event(event)
+            if _rt_controller is not None:
+                try:
+                    _rt_consumed = _rt_controller.on_turn_complete(event.text, response)
+                except Exception:
+                    logger.warning("realtime consult completion failed", exc_info=True)
+
             # Auto voice reply: send TTS audio before the text response
             _already_sent = bool(agent_result.get("already_sent"))
             # Skip when streaming TTS already delivered audio for this turn (#60671).
@@ -18900,7 +18930,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 and bool(getattr(_stts_adapter, "_streaming_tts_turn_completed", lambda *_a, **_k: False)(session_key, run_generation))
             )
             if (
-                not _streaming_tts_done
+                not _rt_consumed
+                and not _streaming_tts_done
                 and self._should_send_voice_reply(event, response, agent_messages, already_sent=_already_sent)
             ):
                 await self._send_voice_reply(event, response)
@@ -19776,6 +19807,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # after connection is not lost.
         if hasattr(adapter, "_voice_input_callback"):
             adapter._voice_input_callback = self._handle_voice_channel_input
+        if hasattr(adapter, "_voice_function_call_callback"):
+            adapter._voice_function_call_callback = self._handle_voice_channel_function_call
         if hasattr(adapter, "_on_voice_disconnect"):
             adapter._on_voice_disconnect = self._handle_voice_timeout_cleanup
         # Let the adapter's inactivity timer see the live voice-reply mode so it
@@ -19829,6 +19862,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception as e:
             logger.warning("Error leaving voice channel: %s", e)
         # Always clean up state even if leave raised an exception
+        # (getattr: test fixtures build runners via object.__new__).
+        getattr(self, "_voice_realtime_controllers", {}).pop(guild_id, None)
         self._voice_mode[self._voice_key(event.source.platform, event.source.chat_id)] = "off"
         self._save_voice_modes()
         self._set_adapter_auto_tts_disabled(adapter, event.source.chat_id, disabled=True)
@@ -19845,6 +19880,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._save_voice_modes()
         adapter = self.adapters.get(Platform.DISCORD)
         self._set_adapter_auto_tts_disabled(adapter, chat_id, disabled=True)
+        # Sweep supervisor controllers whose realtime session went away with
+        # the voice connection (the timeout only reports the text chat id).
+        controllers = getattr(self, "_voice_realtime_controllers", {})
+        if controllers and adapter is not None:
+            session_for = getattr(adapter, "voice_realtime_session", None)
+            for gid in list(controllers):
+                if session_for is None or session_for(gid) is None:
+                    controllers.pop(gid, None)
 
     def _is_duplicate_voice_transcript(self, guild_id: int, user_id: int, transcript: str) -> bool:
         """Suppress repeated STT outputs for the same recent utterance.
@@ -19887,6 +19930,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         recent_store[key] = recent[-5:]
         return False
 
+    def _voice_channel_source(
+        self, adapter, guild_id: int, user_id: int
+    ) -> Optional[SessionSource]:
+        """Build the SessionSource a voice-channel utterance runs under.
+
+        Reuses the linked text channel's metadata when available so voice
+        input shares the same session as the bound text conversation. Shared
+        by the transcript path and the realtime supervisor's TurnRunner (so
+        both resolve identical session keys).
+        """
+        text_ch_id = adapter._voice_text_channels.get(guild_id)
+        if not text_ch_id:
+            return None
+        source_data = getattr(adapter, "_voice_sources", {}).get(guild_id)
+        if source_data:
+            source = SessionSource.from_dict(source_data)
+            source.user_id = str(user_id)
+            source.user_name = str(user_id)
+        else:
+            source = SessionSource(
+                platform=Platform.DISCORD,
+                chat_id=str(text_ch_id),
+                user_id=str(user_id),
+                user_name=str(user_id),
+                chat_type="channel",
+            )
+        return source
+
     async def _handle_voice_channel_input(
         self, guild_id: int, user_id: int, transcript: str
     ):
@@ -19903,21 +19974,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not text_ch_id:
             return
 
-        # Build source — reuse the linked text channel's metadata when available
-        # so voice input shares the same session as the bound text conversation.
-        source_data = getattr(adapter, "_voice_sources", {}).get(guild_id)
-        if source_data:
-            source = SessionSource.from_dict(source_data)
-            source.user_id = str(user_id)
-            source.user_name = str(user_id)
-        else:
-            source = SessionSource(
-                platform=Platform.DISCORD,
-                chat_id=str(text_ch_id),
-                user_id=str(user_id),
-                user_name=str(user_id),
-                chat_type="channel",
-            )
+        source = self._voice_channel_source(adapter, guild_id, user_id)
+        if source is None:
+            return
 
         # Check authorization before processing voice input
         if not self._is_user_authorized(source):
@@ -19965,6 +20024,74 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
 
         await adapter.handle_message(event)
+
+    # -- Realtime (xAI S2S) supervisor voice ---------------------------------
+
+    def _handle_voice_channel_function_call(
+        self, guild_id: int, name: str, call_id: str, args_json: str
+    ) -> None:
+        """Dispatch a consult/steer tool call from a realtime voice session.
+
+        Registered as the Discord adapter's ``_voice_function_call_callback``
+        and invoked from realtime-session threads — everything loop-bound is
+        bridged inside the controller's TurnRunner.
+        """
+        try:
+            controller = self._ensure_voice_realtime_controller(guild_id)
+        except Exception:
+            logger.warning("voice realtime controller build failed", exc_info=True)
+            return
+        if controller is None:
+            logger.warning(
+                "voice function call %s dropped: no realtime session for guild %d",
+                name, guild_id,
+            )
+            return
+        controller.on_function_call(name, call_id, args_json)
+
+    def _ensure_voice_realtime_controller(self, guild_id: int):
+        """Return the supervisor controller for a guild, (re)building it when
+        the adapter's session changed (VC reconnects create fresh sessions)."""
+        adapter = self.adapters.get(Platform.DISCORD)
+        if adapter is None or not hasattr(adapter, "voice_realtime_session"):
+            return None
+        if not hasattr(self, "_voice_realtime_controllers"):
+            self._voice_realtime_controllers = {}
+        session = adapter.voice_realtime_session(guild_id)
+        if session is None:
+            self._voice_realtime_controllers.pop(guild_id, None)
+            return None
+        controller = self._voice_realtime_controllers.get(guild_id)
+        if controller is not None and controller.session is session:
+            return controller
+        narrate = True
+        try:
+            from hermes_cli.config import read_raw_config
+            _voice_cfg = (read_raw_config() or {}).get("voice") or {}
+            narrate = bool((_voice_cfg.get("realtime") or {}).get("narrate_progress", True))
+        except Exception:
+            pass
+        loop = getattr(self, "_gateway_loop", None)
+        if loop is None:
+            return None
+        runner = DiscordVoiceTurnRunner(self, adapter, guild_id, loop)
+        controller = VoiceSupervisorController(session, runner, narrate=narrate)
+        self._voice_realtime_controllers[guild_id] = controller
+        return controller
+
+    def _voice_realtime_controller_for_event(self, event: MessageEvent):
+        """The live controller whose consult could own this turn, or None."""
+        controllers = getattr(self, "_voice_realtime_controllers", None)
+        if (
+            not controllers
+            or event.message_type != MessageType.VOICE
+            or event.source.platform != Platform.DISCORD
+        ):
+            return None
+        guild_id = self._get_guild_id(event)
+        if not guild_id:
+            return None
+        return controllers.get(guild_id)
 
     def _should_send_voice_reply(
         self,

@@ -1,0 +1,242 @@
+"""Surface-agnostic supervisor brain for realtime voice.
+
+One brain, many surfaces: the CLI (local mic/speakers), Discord voice
+channels, and browser clients each provide a :class:`TurnRunner` + an event
+callback; the consult/steer lifecycle, instant acknowledgments, progress
+narration, and stale-consult self-healing live here exactly once.
+
+The controller is transport-dumb: it talks to a
+:class:`tools.voice_realtime.RealtimeVoiceSession`-shaped object (function
+calls in, ``send_function_output`` / ``speak_acknowledgment`` /
+``speak_verbatim`` out) and to a surface-supplied turn runner (submit /
+interrupt / busy / queue-empty). TypeScript surfaces (desktop, dashboard)
+mirror this state machine in apps/shared rather than importing it.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import time
+from typing import Any, Callable, Dict, Optional, Protocol
+
+logger = logging.getLogger(__name__)
+
+# A consult whose turn is provably dead (runner idle, queue empty) must be
+# older than this before it is failed out — rules out the enqueue→run window.
+STALE_CONSULT_MIN_AGE_S = 30.0
+
+# Minimum gap between spoken tool-progress lines.
+NARRATE_INTERVAL_S = 12.0
+
+# Function-output payload cap (the full text lives on the surface anyway).
+MAX_CONSULT_OUTPUT_CHARS = 6000
+
+
+class TurnRunner(Protocol):
+    """The surface's agent-turn seam."""
+
+    def submit(self, task: str) -> None:
+        """Queue *task* as a normal agent turn."""
+
+    def interrupt(self) -> None:
+        """Interrupt the currently running turn (steering)."""
+
+    def is_busy(self) -> bool:
+        """True while an agent turn is executing."""
+
+    def is_queue_empty(self) -> bool:
+        """True when no turn is queued waiting to run."""
+
+
+class VoiceSupervisorController:
+    """Consult/steer lifecycle between a realtime voice session and a surface.
+
+    Events (``on_event(kind, text)``) let each surface render its own UI:
+    ``consult`` / ``steer`` — a task/instruction was accepted from voice.
+    """
+
+    def __init__(
+        self,
+        session: Any,
+        runner: TurnRunner,
+        *,
+        narrate: bool = True,
+        on_event: Optional[Callable[[str, str], None]] = None,
+    ):
+        self._session = session
+        self._runner = runner
+        self._narrate = narrate
+        self._on_event = on_event
+        self._consult: Optional[Dict[str, Any]] = None
+        self._last_narrate = 0.0
+
+    # -- state ---------------------------------------------------------------
+
+    @property
+    def session(self) -> Any:
+        """The realtime session this controller is bound to (identity checks
+        let surfaces detect a stale controller after a session restart)."""
+        return self._session
+
+    @property
+    def consult_active(self) -> bool:
+        return self._consult is not None
+
+    def reset(self) -> None:
+        """Drop tracked state (session teardown)."""
+        self._consult = None
+
+    def _emit(self, kind: str, text: str) -> None:
+        if self._on_event is not None:
+            try:
+                self._on_event(kind, text)
+            except Exception:
+                logger.debug("voice supervisor event callback failed", exc_info=True)
+
+    # -- voice session → agent ------------------------------------------------
+
+    def on_function_call(self, name: str, call_id: str, args_json: str) -> None:
+        """Dispatch a tool call from the voice model."""
+        from tools.voice_realtime import CONSULT_TOOL_NAME, STEER_TOOL_NAME
+
+        try:
+            args = json.loads(args_json) or {}
+        except (ValueError, TypeError):
+            args = {}
+        if name == STEER_TOOL_NAME:
+            self._on_steer(call_id, args)
+            return
+        if name != CONSULT_TOOL_NAME:
+            self._session.send_function_output(call_id, f"Unknown tool: {name}")
+            return
+        task = str(args.get("task") or "").strip()
+        if not task:
+            self._session.send_function_output(call_id, "No task provided.")
+            return
+        stale = self._take_stale_consult()
+        if stale is not None:
+            # Self-heal: the tracked turn died without reaching the
+            # completion hook — fail it out instead of rejecting forever.
+            self._session.send_function_output(
+                stale["call_id"], "That task failed without producing a result."
+            )
+        if self._consult is not None:
+            self._session.send_function_output(
+                call_id,
+                "Hermes is still working on the previous task; its result "
+                "will arrive shortly. Tell the user to hang on.",
+            )
+            return
+        self._consult = {"call_id": call_id, "task": task, "at": time.monotonic()}
+        self._emit("consult", task)
+        self._runner.submit(task)
+        if not getattr(self._session, "last_response_had_audio", True):
+            # Model called the tool silently — speak an instant "on it"
+            # (force_message, zero model latency) instead of dead air.
+            self._session.speak_acknowledgment()
+
+    def _on_steer(self, call_id: str, args: Dict[str, Any]) -> None:
+        """Interrupt Hermes and continue with the user's instruction; the
+        consult is retargeted so the voice model gets the FINAL result."""
+        instruction = str(args.get("instruction") or "").strip()
+        if not instruction:
+            self._session.send_function_output(call_id, "No steering instruction provided.")
+            return
+        if self._consult is None:
+            self._session.send_function_output(
+                call_id,
+                "No Hermes task is running — use consult_hermes to start one.",
+            )
+            return
+        self._emit("steer", instruction)
+        self._consult["task"] = instruction
+        self._consult["at"] = time.monotonic()
+        self._runner.submit(instruction)
+        try:
+            if self._runner.is_busy():
+                self._runner.interrupt()
+        except Exception as e:
+            logger.debug("voice steer interrupt failed: %s", e)
+        self._session.send_function_output(
+            call_id, "Steering applied — Hermes is adjusting course."
+        )
+
+    def _take_stale_consult(self) -> Optional[Dict[str, Any]]:
+        consult = self._consult
+        if (
+            consult is None
+            or self._runner.is_busy()
+            or not self._runner.is_queue_empty()
+            or time.monotonic() - consult.get("at", 0.0) < STALE_CONSULT_MIN_AGE_S
+        ):
+            return None
+        self._consult = None
+        return consult
+
+    # -- agent → voice session ------------------------------------------------
+
+    def on_turn_complete(self, message: Any, response: str) -> bool:
+        """Report a finished consult turn back to the voice session.
+        True → this turn was consumed (the surface must not TTS it).
+
+        Containment (not just equality) matches turns whose queued text was
+        merged with a steering instruction by the surface's pending-message
+        coalescing before it ran."""
+        consult = self._consult
+        if not consult or not isinstance(message, str):
+            return False
+        task = consult["task"]
+        if message != task and task not in message:
+            return False
+        self._consult = None
+        session = self._session
+        if session is None or not getattr(session, "alive", False):
+            return False
+        output = (response or "").strip() or "Hermes finished with no text output."
+        if len(output) > MAX_CONSULT_OUTPUT_CHARS:
+            output = (
+                output[:MAX_CONSULT_OUTPUT_CHARS]
+                + "\n[truncated — full text is on the user's screen]"
+            )
+        session.send_function_output(consult["call_id"], output)
+        return True
+
+    def narrate_tool(self, function_name: str) -> None:
+        """Speak a short verbatim progress line while a consult runs.
+        Called from tool-display paths — must never raise."""
+        if (
+            not function_name
+            or self._consult is None
+            or not self._narrate
+            or not getattr(self._session, "alive", False)
+        ):
+            return
+        now = time.monotonic()
+        if now - self._last_narrate < NARRATE_INTERVAL_S:
+            return
+        self._last_narrate = now
+        try:
+            self._session.speak_verbatim(
+                f"Running {function_name.replace('_', ' ')}.", interruptible=True
+            )
+        except Exception:
+            pass
+
+    def notify(self, text: str) -> None:
+        """Best-effort spoken notice (e.g. 'Hermes needs your approval')."""
+        if self._consult is None:
+            return
+        try:
+            self._session.speak_verbatim(text, interruptible=True)
+        except Exception:
+            pass
+
+
+__all__ = [
+    "MAX_CONSULT_OUTPUT_CHARS",
+    "NARRATE_INTERVAL_S",
+    "STALE_CONSULT_MIN_AGE_S",
+    "TurnRunner",
+    "VoiceSupervisorController",
+]

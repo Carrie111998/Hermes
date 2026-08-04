@@ -44,6 +44,19 @@ export {
   JsonRpcGatewayClient,
   type WebSocketLike
 } from './json-rpc-gateway'
+export {
+  ACK_PHRASES,
+  CONSULT_TOOL_NAME,
+  REALTIME_INPUT_SAMPLE_RATE,
+  REALTIME_OUTPUT_SAMPLE_RATE,
+  type RealtimeFunctionCall,
+  type RealtimeTokenGrant,
+  type RealtimeVoiceCallbacks,
+  RealtimeVoiceClient,
+  type RealtimeVoiceClientOptions,
+  type RealtimeVoiceStatus,
+  STEER_TOOL_NAME
+} from './realtime-voice'
 export { skillInvocationText } from './skill-scaffold'
 export {
   type HermesSkin,
