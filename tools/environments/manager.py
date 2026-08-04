@@ -15,6 +15,7 @@ from tools.environments.definitions import (
     BackendFactoryRequest,
     EffectiveBackendCapabilities,
     EnvironmentRuntimeState,
+    ExecutionLocation,
 )
 from tools.environments.registry import (
     BackendUnavailableError,
@@ -57,11 +58,30 @@ class EnvironmentManager:
         from tools.environments.base import BaseEnvironment
 
         definition = self.resolve_backend(request.backend_name)
+        resolved_config: dict[str, Any] = {}
+        if definition.config_resolver is not None:
+            plugin_config = definition.config_resolver()
+            if not isinstance(plugin_config, Mapping):
+                raise TypeError(
+                    f"Terminal backend {definition.name!r} config_resolver must return a mapping"
+                )
+            resolved_config.update(plugin_config)
+        resolved_config.update(request.backend_config)
+        request.backend_config = resolved_config
+
         environment = definition.factory(request)
         if not isinstance(environment, BaseEnvironment):
             raise TypeError(
                 f"Terminal backend {definition.name!r} factory must return BaseEnvironment"
             )
+        if definition.capabilities.execution_location is ExecutionLocation.REMOTE:
+            from tools.environments.local import LocalEnvironment
+
+            if isinstance(environment, LocalEnvironment):
+                raise TypeError(
+                    f"Terminal backend {definition.name!r} declares remote execution "
+                    "but returned LocalEnvironment"
+                )
         return environment
 
     def get_or_create_environment(

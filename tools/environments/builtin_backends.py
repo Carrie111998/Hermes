@@ -17,6 +17,23 @@ if TYPE_CHECKING:
     from tools.environments.registry import TerminalBackendRegistry
 
 
+# Reserve every legacy built-in name before its definition is migrated. This
+# keeps the name-based legacy behavior stable without allowing third-party
+# plugins to claim a built-in identity during the incremental cutover.
+RESERVED_BUILTIN_BACKEND_NAMES = frozenset(
+    {
+        "local",
+        "docker",
+        "singularity",
+        "modal",
+        "managed_modal",
+        "daytona",
+        "ssh",
+        "vercel_sandbox",
+    }
+)
+
+
 def _create_local_environment(request: BackendFactoryRequest) -> "BaseEnvironment":
     from tools.environments.local import LocalEnvironment
 
