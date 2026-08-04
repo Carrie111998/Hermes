@@ -280,6 +280,110 @@ def _strip_html(html: str) -> str:
     return text.strip()
 
 
+def _strip_outbound_html(html: str) -> str:
+    """Strip non-content blocks before building an outbound plain fallback."""
+    text = re.sub(
+        r"<(style|script)\b[^>]*>.*?</\1\s*>",
+        "",
+        html,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    # Be conservative with a model-emitted block missing its close tag: stop
+    # only at the structural boundary that ends metadata and starts content.
+    text = re.sub(
+        r"<(style|script)\b[^>]*>.*?(?=</head\s*>|<body\b)",
+        "",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    return _strip_html(text)
+
+
+# These literals intentionally mirror cron.scheduler._deliver_result. The
+# scheduler-path integration test owns the drift check without coupling the
+# platform plugin back to scheduler internals at import time.
+_CRON_DIVIDER = "\n-------------\n\n"
+_CRON_FOOTER_PREFIX = (
+    '\n\nTo stop or manage this job, send me a new message (e.g. "stop reminder '
+)
+_DECLARED_SUBJECT_RE = re.compile(
+    r"\ASubject:[ \t]*(\S[^\r\n]*)\r?\n\r?\n",
+    re.IGNORECASE,
+)
+
+
+def _unwrap_cron_response(content: str) -> str:
+    """Return the scheduler payload when its complete default wrapper matches."""
+    if not content.startswith("Cronjob Response: "):
+        return content
+
+    divider_pos = content.find(_CRON_DIVIDER)
+    footer_pos = content.rfind(_CRON_FOOTER_PREFIX)
+    if divider_pos < 0 or footer_pos < 0 or footer_pos <= divider_pos:
+        return content
+
+    header = content[:divider_pos]
+    if "\n(job_id: " not in header:
+        return content
+
+    body = content[divider_pos + len(_CRON_DIVIDER):footer_pos].strip()
+    return body or content
+
+
+def _sanitize_declared_subject(subject: str) -> Optional[str]:
+    """Make a model-declared Subject safe for assignment to an RFC header."""
+    cleaned = re.sub(r"[\r\n\x00]+", " ", subject)
+    cleaned = " ".join(cleaned.split()).strip()[:255].strip()
+    return cleaned or None
+
+
+def _extract_declared_html_email(content: str) -> Optional[Tuple[Optional[str], str]]:
+    """Extract an optional Subject plus a complete HTML document.
+
+    Recognition is deliberately all-or-nothing. A Subject line over ordinary
+    text, an HTML fragment, or a malformed cron wrapper remains plain text.
+    """
+    candidate = _unwrap_cron_response(content)
+    subject: Optional[str] = None
+    html = candidate
+
+    match = _DECLARED_SUBJECT_RE.match(candidate)
+    if match:
+        subject = _sanitize_declared_subject(match.group(1))
+        html = candidate[match.end():]
+
+    probe = html.lstrip().lower()
+    if not (
+        probe.startswith("<!doctype html")
+        or probe.startswith("<html")
+    ):
+        return None
+    if "</html>" not in probe:
+        return None
+    return subject, html
+
+
+def _compose_outbound_email_body(
+    content: str,
+    *,
+    multipart_plain: bool,
+) -> Tuple[email_lib.message.Message, Optional[str], bool]:
+    """Compose body MIME while preserving both legacy plain-text shapes."""
+    declared = _extract_declared_html_email(content)
+    if declared is not None:
+        subject, html = declared
+        message = MIMEMultipart("alternative")
+        message.attach(MIMEText(_strip_outbound_html(html), "plain", "utf-8"))
+        message.attach(MIMEText(html, "html", "utf-8"))
+        return message, subject, True
+
+    if multipart_plain:
+        message = MIMEMultipart()
+        message.attach(MIMEText(content, "plain", "utf-8"))
+        return message, None, False
+    return MIMEText(content, "plain", "utf-8"), None, False
+
+
 def _extract_email_address(raw: str) -> str:
     """Extract bare email address from 'Name <addr>' format."""
     match = re.search(r"<([^>]+)>", raw)
@@ -466,6 +570,10 @@ def _extract_attachments(
 
 class EmailAdapter(BasePlatformAdapter):
     """Email gateway adapter using IMAP (receive) and SMTP (send)."""
+
+    # Email sends one atomic MIME message and handles long payloads itself.
+    # This prevents DeliveryRouter from truncating complete HTML documents.
+    splits_long_messages = True
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.EMAIL)
@@ -970,28 +1078,35 @@ class EmailAdapter(BasePlatformAdapter):
         reply_to_msg_id: Optional[str] = None,
     ) -> str:
         """Send an email via SMTP. Runs in executor thread."""
-        msg = MIMEMultipart()
+        msg, declared_subject, is_html_origination = _compose_outbound_email_body(
+            body,
+            multipart_plain=True,
+        )
         msg["From"] = self._address
         msg["To"] = to_addr
 
-        # Thread context for reply
-        ctx = self._thread_context.get(to_addr, {})
-        subject = ctx.get("subject", "Hermes Agent")
-        if not subject.startswith("Re:"):
-            subject = f"Re: {subject}"
+        if is_html_origination:
+            subject = declared_subject or "Hermes Agent"
+        else:
+            # Thread context for ordinary replies.
+            ctx = self._thread_context.get(to_addr, {})
+            subject = ctx.get("subject", "Hermes Agent")
+            if not subject.startswith("Re:"):
+                subject = f"Re: {subject}"
         msg["Subject"] = subject
 
-        # Threading headers
-        original_msg_id = reply_to_msg_id or ctx.get("message_id")
-        if original_msg_id:
-            msg["In-Reply-To"] = original_msg_id
-            msg["References"] = original_msg_id
+        # A declared HTML document is a fresh origination, never a reply to
+        # whichever inbound message most recently populated this address key.
+        if not is_html_origination:
+            ctx = self._thread_context.get(to_addr, {})
+            original_msg_id = reply_to_msg_id or ctx.get("message_id")
+            if original_msg_id:
+                msg["In-Reply-To"] = original_msg_id
+                msg["References"] = original_msg_id
 
         msg["Date"] = formatdate(localtime=True)
         msg_id = f"<hermes-{uuid.uuid4().hex[:12]}@{self._message_id_domain()}>"
         msg["Message-ID"] = msg_id
-
-        msg.attach(MIMEText(body, "plain", "utf-8"))
 
         smtp = self._connect_smtp()
         try:
@@ -1245,7 +1360,6 @@ async def _standalone_send(
     standalone_sender_fn contract; replaces the legacy _send_email helper."""
     import smtplib
     import ssl as _ssl
-    from email.mime.text import MIMEText
     from email.utils import formatdate
 
     extra = getattr(pconfig, "extra", {}) or {}
@@ -1261,10 +1375,13 @@ async def _standalone_send(
         return {"error": "Email not configured (EMAIL_ADDRESS, EMAIL_PASSWORD, EMAIL_SMTP_HOST required)"}
 
     try:
-        msg = MIMEText(message, "plain", "utf-8")
+        msg, declared_subject, _is_html = _compose_outbound_email_body(
+            message,
+            multipart_plain=False,
+        )
         msg["From"] = address
         msg["To"] = chat_id
-        msg["Subject"] = "Hermes Agent"
+        msg["Subject"] = declared_subject or "Hermes Agent"
         msg["Date"] = formatdate(localtime=True)
 
         server = smtplib.SMTP(smtp_host, smtp_port)
