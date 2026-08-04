@@ -39,10 +39,17 @@ if ! command -v python3 &>/dev/null; then
 fi
 echo "✓ python3: $(python3 --version)"
 
-# ── Create hermes-vip user ──
+# ── Create hermes-vip user + group ──
+if ! getent group hermes-vip &>/dev/null; then
+    echo "Creating hermes-vip group..."
+    groupadd -r hermes-vip
+    echo "✓ hermes-vip group created"
+else
+    echo "✓ hermes-vip group exists"
+fi
 if ! id hermes-vip &>/dev/null; then
     echo "Creating hermes-vip user..."
-    useradd -r -s /sbin/nologin -d /nonexistent hermes-vip
+    useradd -r -s /sbin/nologin -d /nonexistent -g hermes-vip hermes-vip
     echo "✓ hermes-vip user created"
 else
     echo "✓ hermes-vip user exists"
@@ -60,6 +67,7 @@ echo "✓ daemon files installed"
 # ── Create runtime directory ──
 mkdir -p /var/run/hermes-vip
 chown hermes-vip:hermes-vip /var/run/hermes-vip
+# 0750: hermes-vip group can traverse; sockets are 0660 (daemon chmods)
 chmod 750 /var/run/hermes-vip
 echo "✓ /var/run/hermes-vip created"
 
@@ -94,6 +102,20 @@ SERVICE
 systemctl daemon-reload
 echo "✓ systemd service installed"
 
+# ── Generate daemon config ──
+# trusted_user must be set: vipd.py reads config["trusted_user"] (top-level)
+# or SUDO_USER env. Under systemd neither is auto-populated, and without it
+# TRUSTED_UIDS={0} would reject the Hermes plugin's request.sock connection.
+CONFIG_PATH="/etc/hermes-vip/config.yaml"
+TRUSTED_USER="${SUDO_USER:-root}"
+mkdir -p /etc/hermes-vip /var/log/hermes-vip
+sed -e "s/__TRUSTED_USER__/${TRUSTED_USER}/" \
+    "$DIR/../../config.yaml.tmpl" > "$CONFIG_PATH"
+chown root:hermes-vip "$CONFIG_PATH"
+chmod 640 "$CONFIG_PATH"
+chown hermes-vip:hermes-vip /var/log/hermes-vip
+echo "✓ daemon config generated (trusted_user=${TRUSTED_USER})"
+
 # ── Add caller to hermes-vip group ──
 if [ -n "${SUDO_USER:-}" ]; then
     if ! groups "$SUDO_USER" 2>/dev/null | grep -q hermes-vip; then
@@ -112,15 +134,36 @@ systemctl enable hermes-vipd
 systemctl start hermes-vipd
 echo "✓ hermes-vipd started"
 
+# ── Auto-install plugin (system-wide hermes home, else user home) ──
+PLUGIN_DIR="${HERMES_PLUGIN_DIR:-}"
+if [ -z "$PLUGIN_DIR" ]; then
+    if [ -n "${SUDO_USER:-}" ]; then
+        SUDO_HOME=$(getent passwd "$SUDO_USER" | cut -d: -f6)
+        for cand in "/root/.hermes/plugins" "$SUDO_HOME/.hermes/plugins"; do
+            if [ -d "$cand" ]; then
+                PLUGIN_DIR="$cand"
+                break
+            fi
+        done
+    fi
+    [ -z "$PLUGIN_DIR" ] && PLUGIN_DIR="/root/.hermes/plugins"
+fi
+mkdir -p "$PLUGIN_DIR/hermes-vip"
+cp -R "$DIR/../../plugins/hermes-privilege-harness/." "$PLUGIN_DIR/hermes-vip/"
+chmod -R a+rX "$PLUGIN_DIR/hermes-vip"
+echo "✓ plugin installed to $PLUGIN_DIR/hermes-vip"
+
 echo ""
 echo "========================================"
 echo "Installation complete."
 echo ""
-echo "Plugin install (as the hermes user):"
-echo "  mkdir -p ~/.hermes/plugins/hermes-vip"
-echo "  cp plugins/hermes-privilege-harness/* ~/.hermes/plugins/hermes-vip/"
-echo ""
 echo "Check status:"
-echo "  sudo systemctl status hermes-vipd"
+echo "  systemctl status hermes-vipd"
 echo "  ls -la /var/run/hermes-vip/"
+echo ""
+echo "IMPORTANT (security model):"
+echo "  request.sock is 0660, group hermes-vip. The Hermes process must run"
+echo "  as a user in the hermes-vip group (see usermod -a -G hermes-vip)."
+echo "  The daemon rejects connections whose SO_PEERCRED uid is not trusted."
 echo "========================================"
+

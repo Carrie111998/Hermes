@@ -23,56 +23,83 @@ logger = logging.getLogger("hermes-vip.guard")
 
 REQUEST_SOCK = os.environ.get("VIP_REQUEST_SOCK", "/var/run/hermes-vip/request.sock")
 
+import threading
+_lock = threading.Lock()
+
 # ── Defense-in-depth daemon-level stamp verification ──
-# Plugin generates a random secret, registers it with daemon via stamp_init.
-# Every sudo_execute includes HMAC-SHA256(command, secret) as stamp.
-# Daemon verifies the HMAC before executing.
-_stamp_secret: bytes = os.urandom(32)
-_stamps: dict[str, str] = {}
-_nonce: str = ""  # command[:120] → HMAC hex digest
-_secret_registered: bool = False
+# The capability is ISSUED BY THE DAEMON (stamp_init) and bound to the
+# plugin's peer uid. The plugin never self-mints secrets. Every
+# sudo_execute includes HMAC-SHA256(command, cap) as stamp; the daemon
+# verifies cap ownership + HMAC before executing.
+_stamp_cap: bytes = b""          # daemon-issued capability
+_stamps: dict[str, tuple[str, float]] = {}   # sha256(command) -> (hmac, ts)
+_cap_registered: bool = False
 
 
-def _register_stamp_secret():
-    """Register stamp secret with daemon. Called once at plugin init."""
-    global _secret_registered
-    if _secret_registered:
+def _register_stamp_cap():
+    """Ask the daemon to issue a capability. Called once at plugin init.
+
+    The daemon mints the random cap and binds it to our peer uid — a local
+    process cannot self-mint a credential, so the old self-authentication
+    bypass is closed.
+    """
+    global _cap_registered, _stamp_cap
+    if _cap_registered:
         return
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     s.settimeout(5)
     try:
         s.connect(REQUEST_SOCK)
-        req = json.dumps({
-            "type": "stamp_init",
-            "secret": base64.b64encode(_stamp_secret).decode(),
-        }).encode()
+        req = json.dumps({"type": "stamp_init"}).encode()
         s.sendall(struct.pack("!I", len(req)) + req)
-        raw = s.recv(4)
+        raw = _recv_all(s, 4)
         if raw and len(raw) == 4:
             mlen = struct.unpack("!I", raw)[0]
-            data = s.recv(mlen)
+            data = _recv_all(s, mlen)
             resp = json.loads(data.decode())
-            if resp.get("status") == "ok":
-                global _nonce
-                _nonce = resp.get("nonce", "")
-                _secret_registered = True
-                logger.info("stamp secret registered nonce=%s", _nonce[:8])
+            if resp.get("status") == "ok" and resp.get("cap"):
+                _stamp_cap = base64.b64decode(resp["cap"])
+                _cap_registered = True
+                logger.info("stamp capability issued (%d bytes)",
+                            len(_stamp_cap))
     except Exception as exc:
-        logger.warning("failed to register stamp secret: %s", exc)
+        logger.warning("failed to register stamp capability: %s", exc)
     finally:
         s.close()
 
 
+_STAMP_TTL = 15.0
+
+
 def _stamp(command: str):
-    """Compute HMAC stamp for the command."""
-    key = command[:120]
-    _stamps[key] = hmac.new(_stamp_secret, command.encode(), hashlib.sha256).hexdigest()
+    """Record that this exact command passed check() (full-sha256 key)."""
+    key = hashlib.sha256(command.encode()).hexdigest()
+    digest = hmac.new(_stamp_cap, command.encode(), hashlib.sha256).hexdigest()
+    now = time.time()
+    with _lock:
+        _stamps[key] = (digest, now)
+        for k in [k for k, (_, ts) in _stamps.items()
+                  if now - ts > _STAMP_TTL * 2]:
+            del _stamps[k]
 
 
 def _verify(command: str) -> bool:
-    """Verify the command was stamped by check(). Returns True and clears stamp."""
-    key = command[:120]
-    return key in _stamps
+    """Verify the command was stamped by check() and matches exactly.
+
+    Full-sha256 key (not a 120-char prefix), HMAC value comparison, and a
+    TTL check — a same-prefix command cannot pass.
+    """
+    key = hashlib.sha256(command.encode()).hexdigest()
+    with _lock:
+        entry = _stamps.pop(key, None)
+    if entry is None:
+        return False
+    digest, ts = entry
+    if time.time() - ts > _STAMP_TTL:
+        return False
+    expected = hmac.new(_stamp_cap, command.encode(),
+                        hashlib.sha256).hexdigest()
+    return hmac.compare_digest(digest, expected)
 
 
 # ── pre_tool_call ──
@@ -114,13 +141,20 @@ def vip_sudo(command: str, reason: str = "") -> str:
         logger.error("daemon unreachable: %s", exc)
         return json.dumps({"error": "VIP daemon not running", "exit_code": -1})
 
+    if not _cap_registered or not _stamp_cap:
+        return json.dumps({
+            "error": "REJECTED: no stamp capability (daemon unreachable at init?)",
+            "exit_code": -1,
+        })
+
     req = {
         "type": "sudo_execute",
         "command": command,
         "reason": reason or "privilege request",
         "origin": {"channel": "vip_sudo", "timestamp": time.time()},
-        "stamp": _stamps.pop(command[:120], ""),
-        "nonce": _nonce,
+        "cap": base64.b64encode(_stamp_cap).decode(),
+        "stamp": hmac.new(_stamp_cap, command.encode(),
+                          hashlib.sha256).hexdigest(),
     }
     payload = json.dumps(req).encode()
 

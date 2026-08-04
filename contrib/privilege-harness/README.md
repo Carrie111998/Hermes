@@ -3,6 +3,16 @@
 > 🔐 **LLM 只有一个提权通道，永远经过你批准。**
 > 🔐 **One path to root. Always user-approved.**
 
+> ⚠️ **EXPERIMENTAL — not a root-security boundary.**
+> This is a defense-in-depth design, not a hard security boundary for
+> production root access. The socket layer rejects untrusted peers
+> (SO_PEERCRED) and every execution requires a daemon-issued capability +
+> HMAC, but an attacker who can already execute arbitrary code as the
+> Hermes user is out of scope. Treat `vip_sudo` as a UX gate + approval
+> audit trail, not as an isolation boundary against a compromised Hermes
+> process. Do not rely on it to protect root in multi-tenant deployments.
+
+
 [English](#english) | [中文](#chinese)
 
 ---
@@ -13,7 +23,7 @@ This is my first exploration into **constraining LLM agents at the infrastructur
 
 Hermes' built-in sudo works by storing your password in plaintext (`SUDO_PASSWORD` in `.env`). That password is visible in files, environment variables, and process memory — reachable by any injected code.
 
-**Privilege Harness eliminates passwords entirely.** Instead, a dedicated system user (`_hermesvip`) holds NOPASSWD sudo, but the LLM can never touch it directly. A daemon speaks for it. Every privileged command flows through a single gate: `vip_sudo`. Every execution requires your explicit approval via Hermes' native interactive card.
+**Privilege Harness eliminates passwords entirely.** Instead, a dedicated system user (`hermes-vip`) holds NOPASSWD sudo, but the LLM can never touch it directly. A daemon speaks for it. Every privileged command flows through a single gate: `vip_sudo`. Every execution requires your explicit approval via Hermes' native interactive card.
 
 ### Two Branches, Two Philosophies
 
@@ -39,6 +49,19 @@ sudo bash install.sh
 ```
 
 Requires Hermes Agent >= v0.18.0. macOS & Linux.
+### Security model (passive-vip)
+
+- `request.sock` is `0660` (group `hermes-vip`); the daemon additionally
+  rejects any connection whose `SO_PEERCRED` uid is not trusted
+  (`TRUSTED_UIDS` — root + the configured `trusted_user`).
+- The stamp capability is **issued by the daemon** and bound to the peer
+  uid; the plugin never self-mints secrets, so a local process cannot
+  mint its own credentials to reach `sudo_execute`.
+- Every `sudo_execute` requires: cap owned by the connecting uid +
+  `HMAC-SHA256(command, cap)` matching + peer uid verified at accept time.
+- The Hermes process must run as a user in the `hermes-vip` group
+  (see `install.sh` output), otherwise the plugin cannot connect.
+
 
 ### License
 
@@ -52,7 +75,7 @@ MIT
 
 Hermes 原生的 sudo 方案是把密码明文存在 `.env` 里，LLM 调 `sudo` 时自动注入。密码在文件、环境变量、进程内存中到处飘——任何注入代码都能读到。
 
-**Privilege Harness 完全不需要密码。** 创建一个专用系统用户（`_hermesvip`），它有 NOPASSWD sudo 但 LLM 永远不能直接访问。一个 daemon 替它发声。所有提权命令走唯一入口 `vip_sudo`，每次执行都要你在 Hermes 原生交互卡片上批准。
+**Privilege Harness 完全不需要密码。** 创建一个专用系统用户（`hermes-vip`），它有 NOPASSWD sudo 但 LLM 永远不能直接访问。一个 daemon 替它发声。所有提权命令走唯一入口 `vip_sudo`，每次执行都要你在 Hermes 原生交互卡片上批准。
 
 ### 两个分支，两种哲学
 
