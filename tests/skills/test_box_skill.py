@@ -200,26 +200,34 @@ def test_box_skill_selects_auth_by_runtime_topology_and_avoids_default_home_assu
     assert "uses POSIX shell syntax" in rest
 
 
-def test_ccg_uses_a_dedicated_app_user_for_normal_hermes_work():
-    """Keep CCG's elevated provisioning identity out of the normal runtime path."""
+def test_ccg_selects_runtime_identity_by_shared_or_isolated_deployment():
+    """Choose a CCG actor from the Hermes deployment's permission boundary."""
     skill = SKILL_MD.read_text(encoding="utf-8")
     ccg = (SKILL_DIR / "references" / "ccg-setup.md").read_text(encoding="utf-8")
 
-    assert "dedicated App User" in skill
-    assert "Service Account — control plane" in ccg
-    assert "App User — Hermes runtime identity" in ccg
-    assert "Do not configure normal Hermes work to run as the Service Account" in ccg
+    assert "shared Service Account or dedicated App User" in skill
+    assert "One centrally managed Hermes agent serves a shared Slack channel" in ccg
+    assert "one shared Box permission set" in ccg
+    assert "One person uses a Hermes profile" in ccg
+    assert "one App User per profile or isolation boundary" in ccg
+    assert "does not apply each Slack caller's personal Box permissions" in ccg
     assert "**App Details** sidebar" in ccg
     assert "**App Access Only**" in ccg
-    assert "**Manage users**" in ccg
+    assert "For an App User runtime, enable **Manage users**" in ccg
     assert "Manage users is required to create the App User" in ccg
     assert "**Generate User Access Tokens**" in ccg
     assert 'box users:create "Hermes Production Agent" --app-user' in ccg
-    assert "confirmation email" in ccg
-    assert "Do not configure Hermes as the App User or make its first API call" in ccg
+    assert "Do not assume an App User confirmation email is delivered or required" in ccg
+    assert "continue when the returned actor ID is the new App User ID" in ccg
+    assert "user_email_confirmation_required" in ccg
+    assert "password_reset_required" in ccg
+    assert "Do not tell the user to look for an email unless Box reports that requirement" in ccg
     assert "--ccg-user <APP_USER_ID> --name hermes-agent --set-as-current" in ccg
     assert "returned `id` is exactly `<APP_USER_ID>`" in ccg
-    assert "<APP_USER_EMAIL>" in ccg
+    assert "<SERVICE_ENVIRONMENT_NAME>" in ccg
+    assert "Shared agent: use the Service Account directly" in ccg
+    assert "Isolated profile: provision an App User" in ccg
+    assert "<RUNTIME_IDENTITY_EMAIL>" in ccg
 
 
 def test_shared_resource_access_uses_type_specific_discovery_not_root_listing():

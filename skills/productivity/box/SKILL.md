@@ -30,7 +30,7 @@ Use Box as the cloud file system for file operations, collaboration, metadata, a
 When someone is exploring a cloud file system for Hermes, first give a short fit assessment: Box is useful when a team needs cloud file storage, sharing, search, metadata, and document work. Then ask how they want Hermes to connect:
 
 1. **Personal Box access (OAuth):** Hermes acts with the user's existing Box permissions.
-2. **Shared or background agent (CCG):** Hermes runs as a dedicated App User, provisioned by a Service Account, and sees only explicitly shared content.
+2. **Shared or background agent (CCG):** choose a Service Account for one shared agent identity, or dedicated App Users for isolated Hermes profiles. Both see only content explicitly shared with that identity.
 3. **Box-backed application or integration (SDK):** build with an official Box SDK and the appropriate app authentication.
 
 After the connection is selected and working, offer Box AI for document Q&A, extraction, summaries, or grounded writing when it fits the requested work; it is not a separate connection path.
@@ -43,7 +43,7 @@ When a user selects an authentication path or asks Hermes to connect Box, perfor
 
 - If `box` is missing, ask for any terminal approval required to install `@box/cli` under the current Hermes home at `tools/box-cli`; then verify it with the shell-appropriate command in [CLI guide](references/cli-guide.md). Do not attempt a global npm install, use `sudo`, change npm's global prefix, or change `PATH`.
 - Before personal OAuth, determine whether the CLI process and the browser the user will authorize in run on the same host. Use the local callback only when they do; otherwise ask the user to confirm remote/headless authentication and read [OAuth setup](references/oauth-setup.md). Do not infer runtime topology from the operating system alone.
-- For CCG, open the Developer Console when browser access is available and perform every non-secret step. Pause only for the user's Box administrator action or for credentials to be stored locally outside the chat. Never request a client secret in chat. Configure the CLI to act as the dedicated App User, verify that actor, and open the selected folders' sharing flow to add that App User after approval. Read [CCG setup](references/ccg-setup.md).
+- For CCG, open the Developer Console when browser access is available and perform every non-secret step. Pause only for the user's Box administrator action or for credentials to be stored locally outside the chat. Choose the Service Account or a dedicated App User according to [CCG setup](references/ccg-setup.md), configure and verify that runtime actor, then open the selected folders' sharing flow to add it after approval.
 - If an install, browser authorization, environment switch, or permission change needs approval, request that approval and resume the setup after it is granted. Do not replace the action with a command list.
 
 ## Start each task
@@ -56,7 +56,7 @@ When a user selects an authentication path or asks Hermes to connect Box, perfor
    If this succeeds, record the actor and continue. Do not ask about authentication again. Treat `folders:items 0` only as a listing of the actor's root; it is not proof that a shared file, folder, or Hub is inaccessible. For a known file or folder, verify its ID directly; for a Hub, use the Hubs discovery path in [Box Hubs](references/hubs.md).
 2. If authentication is absent, ask which identity the user wants:
    - **Act as me (OAuth):** fastest setup for one person using Hermes as an extension of themselves. Read [OAuth setup](references/oauth-setup.md).
-   - **Act as its own agent (CCG):** use a dedicated App User for shared/background Hermes or an identity that only sees explicitly shared content. Read [CCG setup](references/ccg-setup.md).
+   - **Act as its own agent (CCG):** choose a shared Service Account or dedicated App User according to the deployment and permission boundary. Read [CCG setup](references/ccg-setup.md).
 3. Read the relevant reference before operating. Use documented commands first; only run subcommand help when the request needs an option not covered by the reference or the installed CLI rejects the documented form.
 
 ## Extend the CLI without pausing
