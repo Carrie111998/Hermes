@@ -440,8 +440,9 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "openai/gpt-5.4",
     ],
     "sambanova": [
-        "Meta-Llama-3.3-70B-Instruct",
-        "Qwen2.5-72B-Instruct",
+        "MiniMax-M2.7",
+        "gemma-4-31B-it",
+        "gpt-oss-120b",
     ],
     "opencode-zen": [
         "kimi-k2.5",

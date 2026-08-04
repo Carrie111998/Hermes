@@ -9,25 +9,22 @@ from __future__ import annotations
 from providers import register_provider
 from providers.base import ProviderProfile
 
-# SambaNova API endpoints
-SAMBA_NOVA_BASE_URL = "https://api.sambanova.ai/v1"
-SAMBA_NOVA_MODELS_URL = "https://api.sambanova.ai/v1/models"
-
-
 sambanova = ProviderProfile(
     name="sambanova",
     aliases=("sambanova-ai", "sambanovaai"),
-    env_vars=("SAMBANOVA_API_KEY",),
+    env_vars=("SAMBANOVA_API_KEY", "SAMBANOVA_BASE_URL"),
     display_name="SambaNova",
     description="SambaNova — AI acceleration platform with OpenAI-compatible API",
     signup_url="https://cloud.sambanova.ai/",
-    base_url=SAMBA_NOVA_BASE_URL,
-    models_url=SAMBA_NOVA_MODELS_URL,
+    base_url="https://api.sambanova.ai/v1",
+    models_url="https://api.sambanova.ai/v1/models",
+    auth_type="api_key",
+    default_aux_model="gemma-4-31B-it",
     fallback_models=(
-        "Meta-Llama-3.3-70B-Instruct",
-        "Qwen2.5-72B-Instruct",
+        "MiniMax-M2.7",
+        "gemma-4-31B-it",
+        "gpt-oss-120b",
     ),
-    supports_vision=False,
 )
 
 register_provider(sambanova)
