@@ -158,12 +158,167 @@ _MARKDOWN_HINT_RE = re.compile(
 # Detect markdown tables: a line starting with | followed by a separator line.
 # Feishu post-type 'md' elements do not render tables, so we force text mode.
 _MARKDOWN_TABLE_RE = re.compile(r"^\|.*\|\n\|[-|: ]+\|", re.MULTILINE)
+_MARKDOWN_TABLE_SEP_RE = re.compile(r"^\|[-|: ]+\|$")
 _MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 _MARKDOWN_FENCE_OPEN_RE = re.compile(r"^```([^\n`]*)\s*$")
 _MARKDOWN_FENCE_CLOSE_RE = re.compile(r"^```\s*$")
 _MENTION_RE = re.compile(r"@_user_\d+")
 _MULTISPACE_RE = re.compile(r"[ \t]{2,}")
 _POST_CONTENT_INVALID_RE = re.compile(r"content format of the post type is incorrect", re.IGNORECASE)
+
+
+def _wrap_markdown_tables_in_code(content: str) -> str:
+    """Wrap markdown table segments in fenced code blocks.
+
+    Feishu card/post 'md' elements do not render markdown tables (table content
+    can appear blank). Tables render fine inside a fenced code block, so we
+    isolate contiguous table blocks (header row + separator + body rows) and
+    wrap each one with ``` fences, leaving surrounding prose untouched.
+    """
+    if "```" not in content and not _MARKDOWN_TABLE_RE.search(content):
+        return content
+    lines = content.splitlines()
+    out: list[str] = []
+    i = 0
+    n = len(lines)
+    in_fence = False
+    while i < n:
+        line = lines[i]
+        stripped = line.strip()
+        # Track existing fences so we never wrap inside one.
+        if _MARKDOWN_FENCE_OPEN_RE.match(stripped):
+            in_fence = True
+            out.append(line)
+            i += 1
+            continue
+        if in_fence:
+            out.append(line)
+            if _MARKDOWN_FENCE_CLOSE_RE.match(stripped):
+                in_fence = False
+            i += 1
+            continue
+        # A table block: separator row at i, preceded by header at i-1
+        # (already appended), followed by zero or more body rows.
+        if _MARKDOWN_TABLE_SEP_RE.match(stripped):
+            # header is out[-1]; re-emit header + separator + body inside fences
+            header = out.pop() if out else ""
+            block = [header, line]
+            j = i + 1
+            while j < n and lines[j].strip().startswith("|"):
+                block.append(lines[j])
+                j += 1
+            out.append("```")
+            out.extend(block)
+            out.append("```")
+            i = j
+            continue
+        out.append(line)
+        i += 1
+    return "\n".join(out)
+
+
+def _parse_markdown_tables(content: str) -> tuple[list[dict], list[str]]:
+    """Split markdown content into (tables, prose_segments).
+
+    Returns a list of parsed table dicts ({header, rows, start, end}) and a
+    list of prose segments (non-table contiguous text blocks).
+    """
+    lines = content.splitlines()
+    tables: list[dict] = []
+    prose: list[str] = []
+    i, n = 0, len(lines)
+    current_prose: list[str] = []
+
+    def _flush_prose() -> None:
+        nonlocal current_prose
+        block = "\n".join(current_prose).strip()
+        if block:
+            prose.append(block)
+        current_prose = []
+
+    while i < n:
+        stripped = lines[i].strip()
+        is_header = (
+            "|" in stripped
+            and i + 1 < n
+            and bool(_MARKDOWN_TABLE_SEP_RE.match(lines[i + 1].strip()))
+        )
+        if is_header:
+            _flush_prose()
+            header = [c.strip() for c in stripped.strip("|").split("|") if c.strip()]
+            j = i + 2
+            rows: list[list[str]] = []
+            while j < n and "|" in lines[j].strip():
+                cells = [c.strip() for c in lines[j].strip().strip("|").split("|")]
+                cells = [c for c in cells if c]
+                while len(cells) < len(header):
+                    cells.append("")
+                rows.append(cells[: len(header)])
+                j += 1
+            tables.append({"header": header, "rows": rows, "start": i, "end": j})
+            i = j
+        else:
+            current_prose.append(lines[i])
+            i += 1
+    _flush_prose()
+    return tables, prose
+
+
+def _build_card2_with_tables(content: str) -> dict:
+    """Build a Card 2.0 payload: native `table` components for markdown tables,
+    markdown elements for remaining prose."""
+    tables, prose = _parse_markdown_tables(content)
+    elements: list[dict] = []
+    # Interleave prose and tables by original order is complex; simpler and
+    # acceptable: prose first (as markdown), then all tables.
+    for block in prose:
+        if block:
+            elements.append({"tag": "markdown", "content": block[:4000]})
+    for table in tables:
+        header = table["header"]
+        columns = []
+        rows = []
+        for idx, h in enumerate(header):
+            # 列宽自适应：取本列最长文本（表头+所有行），按字符估算 px，
+            # 中文/全角按 2 单位计，落在 [80, 320]px 区间，避免过宽或过窄。
+            max_len = len(h)
+            for cells in table["rows"]:
+                val = cells[idx] if idx < len(cells) else ""
+                max_len = max(max_len, len(val))
+            est_px = max(80, min(320, max_len * 14 + 24))
+            columns.append(
+                {
+                    "name": f"col{idx}",
+                    "display_name": h,
+                    "data_type": "text",
+                    "width": f"{est_px}px",
+                }
+            )
+        rows = [
+            {f"col{idx}": (cells[idx] if idx < len(cells) else "") for idx in range(len(header))}
+            for cells in table["rows"]
+        ]
+        elements.append(
+            {
+                "tag": "table",
+                "columns": columns,
+                "rows": rows,
+                "page_size": 10,
+                "freeze_first_column": False,
+                "header_style": {"text_align": "center", "bold": True, "background_style": "grey"},
+            }
+        )
+    if not elements:
+        elements = [{"tag": "markdown", "content": content[:4000]}]
+    return {
+        "schema": "2.0",
+        "config": {"update_multi": True, "width_mode": "fill"},
+        "body": {
+            "direction": "vertical",
+            "padding": "12px 12px 20px 12px",
+            "elements": elements,
+        },
+    }
 # ---------------------------------------------------------------------------
 # Media type sets and upload constants
 # ---------------------------------------------------------------------------
@@ -1911,9 +2066,12 @@ class FeishuAdapter(BasePlatformAdapter):
                         metadata=metadata,
                     )
                 except Exception as exc:
-                    if msg_type != "post" or not _POST_CONTENT_INVALID_RE.search(str(exc)):
+                    if msg_type not in ("post", "interactive") or not (
+                        _POST_CONTENT_INVALID_RE.search(str(exc))
+                        or "interactive" == msg_type and "card" in str(exc).lower()
+                    ):
                         raise
-                    logger.warning("[Feishu] Invalid post payload rejected by API; falling back to plain text")
+                    logger.warning("[Feishu] Invalid %s payload rejected by API; falling back to plain text", msg_type)
                     response = await self._feishu_send_with_retry(
                         chat_id=chat_id,
                         msg_type="text",
@@ -1922,11 +2080,14 @@ class FeishuAdapter(BasePlatformAdapter):
                         metadata=metadata,
                     )
                 if (
-                    msg_type == "post"
+                    msg_type in ("post", "interactive")
                     and not self._response_succeeded(response)
-                    and _POST_CONTENT_INVALID_RE.search(str(getattr(response, "msg", "") or ""))
+                    and (
+                        _POST_CONTENT_INVALID_RE.search(str(getattr(response, "msg", "") or ""))
+                        or "interactive" == msg_type and "card" in str(getattr(response, "msg", "") or "").lower()
+                    )
                 ):
-                    logger.warning("[Feishu] Post payload rejected by API response; falling back to plain text")
+                    logger.warning("[Feishu] %s payload rejected by API response; falling back to plain text", msg_type)
                     response = await self._feishu_send_with_retry(
                         chat_id=chat_id,
                         msg_type="text",
@@ -4524,11 +4685,28 @@ class FeishuAdapter(BasePlatformAdapter):
     def _build_outbound_payload(self, content: str) -> tuple[str, str]:
         # Feishu post-type 'md' elements do not render markdown tables; sending
         # table content as post causes the message to appear blank on the client.
-        # Force plain text for anything that looks like a markdown table.
+        # When FEISHU_MARKDOWN_AS_CARD is enabled we send a Card 2.0 with native
+        # `table` components (real data tables, horizontally scrollable) parsed
+        # from the markdown tables, and the remaining prose as markdown elements.
         if _MARKDOWN_TABLE_RE.search(content):
+            if os.environ.get("FEISHU_MARKDOWN_AS_CARD", "1") == "1":
+                card = _build_card2_with_tables(content)
+                return "interactive", json.dumps(card, ensure_ascii=False)
             text_payload = {"text": content}
             return "text", json.dumps(text_payload, ensure_ascii=False)
         if _MARKDOWN_HINT_RE.search(content):
+            # When FEISHU_MARKDOWN_AS_CARD is enabled, wrap markdown content in
+            # an interactive card (markdown element) instead of a post message.
+            # Cards render markdown more completely than post 'md' elements
+            # (headings, bold, lists, links, code fences).
+            if os.environ.get("FEISHU_MARKDOWN_AS_CARD", "1") == "1":
+                card = {
+                    "config": {"wide_screen_mode": True},
+                    "elements": [
+                        {"tag": "markdown", "content": content[:4000]},
+                    ],
+                }
+                return "interactive", json.dumps(card, ensure_ascii=False)
             return "post", _build_markdown_post_payload(content)
         text_payload = {"text": content}
         return "text", json.dumps(text_payload, ensure_ascii=False)
