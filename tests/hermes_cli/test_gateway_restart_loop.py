@@ -579,6 +579,13 @@ class TestLifecycleGuardModule:
         check_gateway_lifecycle("research the gateway architecture", None)
         check_gateway_lifecycle("check server health and restart watchers", None)
 
+    def test_embedded_nul_in_referenced_path_does_not_crash(self):
+        """Malformed shell input must not crash the terminal guard in os.open."""
+        from cron.lifecycle_guard import contains_gateway_lifecycle_command_or_referenced_script
+
+        command = "/bin/bash /tmp/safe\x00broken.sh"
+        assert not contains_gateway_lifecycle_command_or_referenced_script(command)
+
     def test_script_with_command_raises(self, tmp_path, monkeypatch):
         from cron.lifecycle_guard import GatewayLifecycleBlocked, check_gateway_lifecycle
         script = tmp_path / "restart.sh"
