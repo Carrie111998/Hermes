@@ -96,6 +96,22 @@ test('managed recovery suppresses Nous but preserves provider-owned billing URLs
   expect($billingSettingsRequest.get()).toBe(0)
 })
 
+test('managed recovery suppresses third-party blocks without a provider-owned billing URL', () => {
+  Object.defineProperty(window, 'hermesDesktop', {
+    configurable: true,
+    value: { eva: {} },
+    writable: true
+  })
+
+  const providerBlock = makeBlock({ billing_url: null, provider: 'custom' })
+
+  expect(billingRecoveryAvailable(providerBlock)).toBe(false)
+
+  runBillingRecovery(providerBlock)
+  expect(openExternalLink).not.toHaveBeenCalled()
+  expect($billingSettingsRequest.get()).toBe(0)
+})
+
 test('managed credit-wall presentation ignores backend entitlement and provider copy', () => {
   const presentation = billingBlockPresentation(
     makeBlock({

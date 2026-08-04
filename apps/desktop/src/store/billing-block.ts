@@ -80,7 +80,11 @@ export function requestBillingSettings(): void {
 }
 
 export function billingRecoveryAvailable(block: BillingBlock): boolean {
-  return !isManagedEvaosAgent() || !block.is_nous
+  if (!isManagedEvaosAgent()) {
+    return true
+  }
+
+  return !block.is_nous && Boolean(block.billing_url)
 }
 
 /**
@@ -88,8 +92,8 @@ export function billingRecoveryAvailable(block: BillingBlock): boolean {
  * in-chat banner so both behave identically: Nous routes to the upstream
  * Settings → Billing surface; a third-party provider deep-links to its own
  * billing page (falling back to the in-app surface only if we have no URL).
- * Managed evaOS Agent suppresses only Nous-owned recovery; third-party
- * provider recovery remains provider-owned and actionable.
+ * Managed evaOS Agent exposes only provider-owned URLs: its upstream Billing
+ * surface is hidden and therefore cannot serve as a recovery fallback.
  */
 export function runBillingRecovery(block: BillingBlock): void {
   if (!billingRecoveryAvailable(block)) {
