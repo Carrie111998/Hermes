@@ -5284,7 +5284,10 @@ def _try_main_fallback_chain(
     """
     try:
         from hermes_cli.config import load_config_readonly
-        from hermes_cli.fallback_config import get_fallback_chain
+        from hermes_cli.fallback_config import (
+            fallback_entry_allows_continuation,
+            get_fallback_chain,
+        )
 
         chain = get_fallback_chain(load_config_readonly())
     except Exception as exc:
@@ -5302,6 +5305,13 @@ def _try_main_fallback_chain(
 
     for i, entry in enumerate(chain):
         if not isinstance(entry, dict):
+            continue
+        if not fallback_entry_allows_continuation(entry):
+            # ``triage_and_notify`` is not an auxiliary task provider.  The
+            # bounded local notifier is owned solely by the cron conversation
+            # lane; auxiliary work must fail closed rather than continue on it.
+            label = f"fallback_providers[{i}]({entry.get('provider') or 'unknown'})"
+            tried.append(f"{label} (triage-only)")
             continue
         fb_provider = str(entry.get("provider") or "").strip()
         fb_model = str(entry.get("model") or "").strip()

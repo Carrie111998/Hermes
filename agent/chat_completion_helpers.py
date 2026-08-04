@@ -1794,6 +1794,27 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         )
         return agent._try_activate_fallback(reason)
 
+    # A triage-and-notify entry is an explicit non-continuation policy.  Do
+    # not construct/swap a client, regenerate the prompt, or replay the turn.
+    # The conversation loop observes this state at the retry boundary and
+    # finalizes the existing session as a durable held checkpoint.
+    from hermes_cli.fallback_config import (
+        FALLBACK_FAILURE_POLICY_TRIAGE_AND_NOTIFY,
+        fallback_failure_policy,
+    )
+
+    if fallback_failure_policy(fb) == FALLBACK_FAILURE_POLICY_TRIAGE_AND_NOTIFY:
+        from agent.fallback_triage import arm_triage_and_notify_hold
+
+        arm_triage_and_notify_hold(agent, fb, reason)
+        logger.warning(
+            "Fallback triage-and-notify armed instead of continuation: provider=%s model=%s platform=%s",
+            fb_provider,
+            fb_model,
+            getattr(agent, "platform", ""),
+        )
+        return True
+
     # Use centralized router for client construction.
     # raw_codex=True because the main agent needs direct responses.stream()
     # access for Codex providers.

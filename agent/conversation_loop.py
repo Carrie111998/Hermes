@@ -976,6 +976,10 @@ def _sync_failover_system_message(agent, api_messages, active_system_prompt):
     Mutates ``api_messages[0]`` in place and returns the prompt to use as
     ``active_system_prompt`` for subsequent call-block rebuilds.
     """
+    # ``triage_and_notify`` must leave the primary request/cache layout alone:
+    # it never retries the full conversation on the local model.
+    if getattr(agent, "_fallback_triage_state", None) is not None:
+        return active_system_prompt
     sp = getattr(agent, "_cached_system_prompt", None)
     if not isinstance(sp, str) or not sp:
         return active_system_prompt
@@ -1285,6 +1289,10 @@ def run_conversation(
     agent._last_compaction_in_place = False
     agent._last_compression_attempt_recorded = False
     agent._last_compression_attempt_in_place = None
+    # Fallback triage state is deliberately per turn. Gateway agents are
+    # cached, so retaining a prior held state would incorrectly suppress a
+    # later primary-backed request.
+    agent._fallback_triage_state = None
 
     # ── Per-turn setup (the prologue) ──
     # All once-per-turn setup — stdio guarding, retry-counter resets, user
@@ -2126,6 +2134,10 @@ def run_conversation(
         agent._current_api_request_id = api_request_id
 
         while retry_count < max_retries:
+            # A triage-only fallback was selected during the prior failed
+            # attempt. Do not build/redecorate/replay another API request.
+            if getattr(agent, "_fallback_triage_state", None) is not None:
+                break
             # ── Nous Portal rate limit guard ──────────────────────
             # If another session already recorded that Nous is rate-
             # limited, skip the API call entirely.  Each attempt
@@ -2148,6 +2160,8 @@ def run_conversation(
                         )
                         agent._buffer_status(f"⏳ {_nous_msg}")
                         if agent._try_activate_fallback():
+                            if getattr(agent, "_fallback_triage_state", None) is not None:
+                                break
                             active_system_prompt = _sync_failover_system_message(
                                 agent, api_messages, active_system_prompt)
                             retry_count = 0
@@ -2590,6 +2604,8 @@ def run_conversation(
                     if agent._fallback_index < len(agent._fallback_chain):
                         agent._buffer_status("⚠️ Empty/malformed response — switching to fallback...")
                     if agent._try_activate_fallback():
+                        if getattr(agent, "_fallback_triage_state", None) is not None:
+                            break
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
@@ -2663,6 +2679,8 @@ def run_conversation(
                         if agent._has_pending_fallback():
                             agent._buffer_status(f"⚠️ Max retries ({max_retries}) for invalid responses — trying fallback...")
                         if agent._try_activate_fallback():
+                            if getattr(agent, "_fallback_triage_state", None) is not None:
+                                break
                             active_system_prompt = _sync_failover_system_message(
                                 agent, api_messages, active_system_prompt)
                             retry_count = 0
@@ -2840,6 +2858,8 @@ def run_conversation(
                             "⚠️ Model declined to respond (safety refusal) — trying fallback..."
                         )
                     if agent._try_activate_fallback():
+                        if getattr(agent, "_fallback_triage_state", None) is not None:
+                            break
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
@@ -3009,6 +3029,8 @@ def run_conversation(
                                 "Content filter terminated stream; switching to fallback..."
                             )
                             if agent._try_activate_fallback():
+                                if getattr(agent, "_fallback_triage_state", None) is not None:
+                                    break
                                 # Roll the partial content (if any was already
                                 # appended in a prior continuation pass) back to
                                 # the last clean turn so the fallback provider
@@ -4449,6 +4471,8 @@ def run_conversation(
                         else:
                             agent._buffer_status("⚠️ Rate limited — switching to fallback provider...")
                         if agent._try_activate_fallback(reason=classified.reason):
+                            if getattr(agent, "_fallback_triage_state", None) is not None:
+                                break
                             active_system_prompt = _sync_failover_system_message(
                                 agent, api_messages, active_system_prompt)
                             retry_count = 0
@@ -4482,6 +4506,8 @@ def run_conversation(
                         "switching to fallback provider..."
                     )
                     if agent._try_activate_fallback(reason=classified.reason):
+                        if getattr(agent, "_fallback_triage_state", None) is not None:
+                            break
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
@@ -5054,6 +5080,8 @@ def run_conversation(
                         else:
                             agent._buffer_status(f"⚠️ Non-retryable error (HTTP {status_code}) — trying fallback...")
                     if agent._try_activate_fallback():
+                        if getattr(agent, "_fallback_triage_state", None) is not None:
+                            break
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
@@ -5277,6 +5305,8 @@ def run_conversation(
                     if agent._has_pending_fallback():
                         agent._buffer_status(f"⚠️ Max retries ({max_retries}) exhausted — trying fallback...")
                     if agent._try_activate_fallback():
+                        if getattr(agent, "_fallback_triage_state", None) is not None:
+                            break
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
@@ -5548,6 +5578,17 @@ def run_conversation(
                     # iteration from the correction instead of re-firing the
                     # stale request.
                     break
+
+        _fallback_triage_state = getattr(agent, "_fallback_triage_state", None)
+        if _fallback_triage_state is not None:
+            # Finalization writes this deterministic response into the existing
+            # durable session transcript, providing the checkpoint/hold record
+            # without injecting an invalid role sequence or touching the
+            # primary prompt-cache layout.
+            from agent.fallback_triage import triage_turn_outcome
+
+            final_response, failed, _turn_exit_reason = triage_turn_outcome(_fallback_triage_state)
+            break
         
         if _retry.restart_with_redirected_messages:
             # The cancelled request produced no valid assistant item. Reuse the
@@ -6736,6 +6777,8 @@ def run_conversation(
                             "switching to fallback provider..."
                         )
                         if agent._try_activate_fallback():
+                            if getattr(agent, "_fallback_triage_state", None) is not None:
+                                break
                             active_system_prompt = _sync_failover_system_message(
                                 agent, api_messages, active_system_prompt)
                             agent._empty_content_retries = 0
@@ -7223,11 +7266,23 @@ def run_conversation(
                 messages.append({"role": "assistant", "content": final_response})
                 break
     
+    # A triage-only fallback can also be selected after the retry loop while
+    # processing a response (for example an exhausted empty-response path).
+    # Normalize that outer-loop exit into the same durable held outcome.
+    if getattr(agent, "_fallback_triage_state", None) is not None:
+        # A triage-only fallback can be selected after a primary response was
+        # parsed (notably an exhausted empty response), leaving ``final_response``
+        # as ``""``. The policy hold is authoritative in every late-selection
+        # path and must replace that stale terminal value before finalization.
+        from agent.fallback_triage import triage_turn_outcome
+
+        final_response, failed, _turn_exit_reason = triage_turn_outcome(agent._fallback_triage_state)
+
     # Post-loop turn finalization extracted to agent/turn_finalizer.finalize_turn
     # (god-file decomposition Phase 1 step 4). Behavior-neutral: the assembled
     # result dict is returned exactly as before.
     from agent.turn_finalizer import finalize_turn
-    return finalize_turn(
+    result = finalize_turn(
         agent,
         final_response=final_response,
         api_call_count=api_call_count,
@@ -7244,6 +7299,11 @@ def run_conversation(
         _pending_verification_response=_pending_verification_response,
         _pending_verification_response_previewed=_pending_verification_response_previewed,
     )
+    if getattr(agent, "_fallback_triage_state", None) is not None:
+        # Retain a machine-readable result marker for gateways/schedulers while
+        # the durable assistant response remains the resume/checkpoint record.
+        result["held"] = True
+    return result
 
 
 

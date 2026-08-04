@@ -2512,7 +2512,21 @@ def _try_resolve_fallback_provider() -> dict | None:
             return None
         for entry in fb_list:
             try:
-                from hermes_cli.fallback_config import resolve_entry_api_key
+                from hermes_cli.fallback_config import (
+                    fallback_entry_allows_continuation,
+                    resolve_entry_api_key,
+                )
+
+                if not fallback_entry_allows_continuation(entry):
+                    # No AIAgent/session exists at this credential-resolution
+                    # boundary. Fail closed rather than turning a triage-only
+                    # local endpoint into a full gateway runtime.
+                    logger.info(
+                        "Skipping triage-only fallback during gateway runtime resolution: provider=%s model=%s",
+                        entry.get("provider"),
+                        entry.get("model"),
+                    )
+                    continue
 
                 runtime = resolve_runtime_provider(
                     requested=entry.get("provider"),

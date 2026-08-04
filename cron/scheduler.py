@@ -3346,7 +3346,22 @@ def run_job(
                 if not fb_provider or not fb_model:
                     continue
                 try:
-                    from hermes_cli.fallback_config import resolve_entry_api_key
+                    from hermes_cli.fallback_config import (
+                        fallback_entry_allows_continuation,
+                        resolve_entry_api_key,
+                    )
+
+                    if not fallback_entry_allows_continuation(entry):
+                        # Runtime resolution occurs before an AIAgent/session
+                        # exists. Do not silently run the complete cron prompt
+                        # on a triage-only local fallback.
+                        logger.info(
+                            "Job '%s': skipping triage-only fallback before agent construction (%s/%s)",
+                            job_id,
+                            fb_provider,
+                            fb_model,
+                        )
+                        continue
 
                     fb_kwargs = {
                         "requested": fb_provider,

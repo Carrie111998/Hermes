@@ -39,6 +39,37 @@ fallback_providers:
 
 Each entry requires both `provider` and `model`. Entries missing either field are ignored.
 
+### Failure behavior per fallback entry
+
+`failure_policy` is an optional, supported `config.yaml` field on each fallback entry:
+
+| Value | Behavior |
+|---|---|
+| `continue` (default) | Existing behavior: Hermes switches the live client/model and continues the turn with its conversation and tools. |
+| `triage_and_notify` | Emergency non-continuation behavior: Hermes alerts through the active status channel, preserves a durable held-turn response in the session, and does **not** send the original task, tools, cached prompt, or reasoning loop to that fallback. |
+
+Use `triage_and_notify` for a smaller local emergency model that must never take over a high-capability task:
+
+```yaml
+fallback_providers:
+  - provider: custom
+    model: local-emergency-model
+    base_url: http://127.0.0.1:11434/v1
+    failure_policy: triage_and_notify
+```
+
+The policy is generic: it applies to the selected entry, not to a particular profile, provider, or model name. Omitting it preserves the historic continuation behavior.
+
+For a normal interactive/gateway turn, a `triage_and_notify` activation produces a deterministic operator alert and a final durable held response. Hermes does not construct a fallback client for that turn, does not replay the transcript, does not alter prompt-cache/message alternation, and does not run fallback tools.
+
+For a scheduled operational turn, Hermes identifies the existing lane from `platform: cron`. In that lane only, it may make exactly one isolated local notification/liveness completion (`max_tokens: 256`, request timeout 20 seconds) using two fixed messages and no tools. The original scheduled task remains held. A successful bounded check keeps the scheduler tick operational; local resolution, empty response, timeout, or local-model failure becomes an explicit held failure. No original task, transcript, system prompt, or tool result is marshaled to the local model. All triage finalization skips output-transform/post-LLM/session-end hooks, context observation, external-memory sync, background review, and micro-compaction so the notifier cannot trigger derived external work.
+
+:::warning Pre-agent credential failures fail closed
+Gateway/cron runtime credential resolution can fail before an `AIAgent` and durable session exist. At that boundary a `triage_and_notify` entry is deliberately skipped rather than promoted into a full runtime. The caller receives its explicit primary-resolution failure; there is no session checkpoint or in-flight alert to attach yet. A durable pre-agent hold/notification record is deferred until a future lifecycle architecture provides a session before provider resolution.
+:::
+
+`triage_and_notify` top-level entries are also excluded from automatic auxiliary-task fallback: compression, vision, and other auxiliary work cannot use the local emergency endpoint as a continuation runtime.
+
 :::note `fallback_model` vs `fallback_providers`
 `fallback_providers` (plural, list) is the current config shape and supports multiple fallbacks tried in order. `fallback_model` (singular) is the legacy single-fallback key — Hermes still honors it for back-compat, but `hermes fallback` writes the current `fallback_providers` key and migrates legacy config on write. When both are set, `fallback_providers` takes priority.
 :::

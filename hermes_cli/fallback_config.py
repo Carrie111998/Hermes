@@ -5,6 +5,34 @@ from __future__ import annotations
 from typing import Any
 
 
+# Per-entry schema values for ``fallback_providers`` / legacy ``fallback_model``.
+# Missing or unrecognized values intentionally retain historic continuation.
+FALLBACK_FAILURE_POLICY_CONTINUE = "continue"
+FALLBACK_FAILURE_POLICY_TRIAGE_AND_NOTIFY = "triage_and_notify"
+_SUPPORTED_FAILURE_POLICIES = frozenset({
+    FALLBACK_FAILURE_POLICY_CONTINUE,
+    FALLBACK_FAILURE_POLICY_TRIAGE_AND_NOTIFY,
+})
+
+
+def fallback_failure_policy(entry: dict[str, Any]) -> str:
+    """Return the supported failure behavior for one fallback entry.
+
+    ``failure_policy`` is per-entry so a chain can mix ordinary continuity
+    fallbacks with an emergency local endpoint. Missing/unknown values fail
+    open to ``continue`` for backwards-compatible config.yaml upgrades.
+    """
+    value = str(entry.get("failure_policy") or "").strip().lower().replace("-", "_")
+    if value in _SUPPORTED_FAILURE_POLICIES:
+        return value
+    return FALLBACK_FAILURE_POLICY_CONTINUE
+
+
+def fallback_entry_allows_continuation(entry: dict[str, Any]) -> bool:
+    """Whether this fallback entry may receive normal agent work."""
+    return fallback_failure_policy(entry) == FALLBACK_FAILURE_POLICY_CONTINUE
+
+
 def _normalized_base_url(value: Any) -> str:
     if not isinstance(value, str):
         return ""
