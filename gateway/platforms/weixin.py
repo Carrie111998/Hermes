@@ -1742,13 +1742,32 @@ class WeixinAdapter(BasePlatformAdapter):
             time.monotonic() + self._rate_limit_circuit_open_seconds,
         )
 
-    def _record_rate_limit_event(self) -> bool:
-        """Record a genuine iLink rate limit and return True if breaker opened."""
+    def _note_rate_limit_event(self) -> None:
+        """Record a genuine iLink rate limit within the sliding window.
+
+        Recording is deliberately separate from tripping the breaker: a single
+        transient 429-style reply should still be retried with backoff inside
+        the current send (see ``_send_text_chunk_locked``). The breaker is only
+        tripped once that retry budget is exhausted, so it protects *subsequent*
+        calls instead of aborting the current one.
+        """
         now = time.monotonic()
         window_start = now - self._rate_limit_circuit_window_seconds
         self._rate_limit_events = [ts for ts in self._rate_limit_events if ts >= window_start]
         self._rate_limit_events.append(now)
-        if len(self._rate_limit_events) >= self._rate_limit_circuit_threshold:
+
+    def _should_trip_rate_limit_circuit(self) -> bool:
+        return len(self._rate_limit_events) >= self._rate_limit_circuit_threshold
+
+    def _record_rate_limit_event(self) -> bool:
+        """Backwards-compatible helper: record an event and trip immediately.
+
+        Retained so external callers/subclasses keep working; the send path now
+        uses ``_note_rate_limit_event`` plus an explicit trip after the retry
+        budget is spent.
+        """
+        self._note_rate_limit_event()
+        if self._should_trip_rate_limit_circuit():
             self._open_rate_limit_circuit()
             return self._rate_limit_cooldown_remaining() > 0
         return False
@@ -1839,10 +1858,17 @@ class WeixinAdapter(BasePlatformAdapter):
                             last_error = RuntimeError(
                                 f"iLink sendmessage rate limited: ret={ret} errcode={errcode} errmsg={errmsg}"
                             )
-                            if self._record_rate_limit_event():
-                                last_error = self._rate_limit_error()
-                                break
+                            # Track the event for the cross-call breaker, but do not
+                            # abandon this send yet: a transient rate limit should
+                            # still consume the configured retry budget with backoff.
+                            self._note_rate_limit_event()
                             if attempt >= self._send_chunk_retries:
+                                # Retry budget exhausted and iLink is still limiting us:
+                                # trip the breaker so subsequent sends back off too.
+                                if self._should_trip_rate_limit_circuit():
+                                    self._open_rate_limit_circuit()
+                                    if self._rate_limit_cooldown_remaining() > 0:
+                                        last_error = self._rate_limit_error()
                                 break
                             wait = self._send_chunk_retry_delay_seconds * 3  # 3x backoff for rate limit
                             logger.warning(
