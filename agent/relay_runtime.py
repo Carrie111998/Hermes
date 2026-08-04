@@ -395,6 +395,18 @@ class RelayRuntime:
                     break
             if not progressed:
                 return
+        # Loop exhausted with progress every pass: more parked handles than
+        # _MAX_DRAIN_SCOPES restarts could clear. Loud, not silent — a leak
+        # past the cap means scopes survive session teardown.
+        with session.lock:
+            leftover = len(session.pending_handles)
+        logger.warning(
+            "Hermes Relay parked-handle drain exhausted %s restarts for "
+            "session %s — %d handle(s) remain parked (possible leak)",
+            _MAX_DRAIN_SCOPES,
+            session.session_id,
+            leftover,
+        )
 
     def _drain_registry(self, session: RelaySession) -> None:
         """Pop every registered non-session scope, newest-first.
@@ -420,6 +432,19 @@ class RelayRuntime:
                     break
             if not progressed:
                 return
+        # Loop exhausted with progress every pass: registry larger than
+        # _MAX_DRAIN_SCOPES restarts could clear. Loud, not silent.
+        with session.scope_registry_lock:
+            leftover = len(
+                [h for _k, h in session.scope_registry if h is not session.handle]
+            )
+        logger.warning(
+            "Hermes Relay registry drain exhausted %s restarts for session %s "
+            "— %d registered scope(s) remain (possible leak)",
+            _MAX_DRAIN_SCOPES,
+            session.session_id,
+            leftover,
+        )
 
     def pop_scope(
         self,

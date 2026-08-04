@@ -2301,8 +2301,13 @@ def run_conversation(
                             middleware_trace=list(_llm_middleware_trace),
                             request=_request_payload,
                         )
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning(
+                        "pre_api_request hook dispatch failed (%s: %s)",
+                        type(e).__name__,
+                        e,
+                        exc_info=True,
+                    )
 
                 if env_var_enabled("HERMES_DUMP_REQUESTS"):
                     agent._dump_api_request_debug(api_kwargs, reason="preflight")
@@ -5689,8 +5694,13 @@ def run_conversation(
                         assistant_content_chars=len(_assistant_text),
                         assistant_tool_call_count=len(_assistant_tool_calls),
                     )
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(
+                    "post_api_request hook dispatch failed (%s: %s)",
+                    type(e).__name__,
+                    e,
+                    exc_info=True,
+                )
 
             # Handle assistant response
             if assistant_message.content and not agent.quiet_mode:
