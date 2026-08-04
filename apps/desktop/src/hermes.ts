@@ -438,6 +438,10 @@ export async function listAllProfileSessions(
     path:
       `/api/profiles/sessions?limit=${limit}&offset=0&min_messages=${Math.max(0, minMessages)}` +
       `&archived=${archived}&order=${order}&profile=${encodeURIComponent(profile)}${sourceParam}${excludeParam}`,
+    // This aggregate endpoint is served by the primary backend. Keep its
+    // endpoint-level selector independent from Electron's backend-routing
+    // profile so managed policy can reject ambiguous query-only selectors.
+    profile: 'default',
     timeoutMs: SESSION_LIST_REQUEST_TIMEOUT_MS
   })
 
