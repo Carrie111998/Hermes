@@ -53,20 +53,55 @@ const VARIANT_TAGS: ReadonlyArray<readonly [RegExp, string]> = [
 
 const titleCase = (text: string): string => text.replace(/\b\w/g, char => char.toUpperCase()).trim()
 
+// Brand names whose canonical casing is not word-initial, so titleCasing alone
+// would render "Deepseek" or "Glm". Applied to the finished fallback label;
+// whole-word matches only, so version tokens are never touched.
+const BRAND_CASING: Readonly<Record<string, string>> = {
+  deepseek: 'DeepSeek',
+  opencode: 'OpenCode',
+  openrouter: 'OpenRouter',
+  glm: 'GLM'
+}
+
+const applyBrandCasing = (text: string): string =>
+  Object.entries(BRAND_CASING).reduce(
+    (acc, [raw, canonical]) => acc.replace(new RegExp(`\\b${raw}\\b`, 'gi'), canonical),
+    text
+  )
+
+// Split on dashes and capitalize lowercase letter-leading tokens (`sol` → `Sol`)
+// while digit-leading tokens stay untouched (`4o`, `70b`). Joining with spaces
+// matches the normalization the titleCase paths apply.
+const smartTitle = (text: string): string =>
+  text
+    .split('-')
+    .map(token =>
+      /^[a-z]/.test(token) && token === token.toLowerCase()
+        ? token[0].toUpperCase() + token.slice(1)
+        : token
+    )
+    .join(' ')
+
 function prettifyBase(base: string): string {
   if (/^claude-/i.test(base)) {
     return titleCase(base.replace(/^claude-/i, '').replace(/-/g, ' '))
   }
 
   if (/^gpt-/i.test(base)) {
-    return base.replace(/^gpt-/i, 'GPT-')
+    const tail = base.replace(/^gpt-/i, '')
+
+    // Dotted ids already carry the canonical version separator, so the
+    // remaining dash tokens are variant words (`gpt-5.6-sol` → `GPT-5.6 Sol`).
+    // Dash-form tails (`gpt-5-5`) stay untouched — restoring the dot is a
+    // separate normalization for dash-separated ids.
+    return tail.includes('.') ? `GPT-${smartTitle(tail)}` : `GPT-${tail}`
   }
 
   if (/^gemini-/i.test(base)) {
     return base.replace(/^gemini-/i, 'Gemini ').replace(/-/g, ' ')
   }
 
-  return titleCase(base.replace(/-/g, ' '))
+  return applyBrandCasing(smartTitle(base))
 }
 
 /** Split a model id into a clean display name plus an optional grayed variant
