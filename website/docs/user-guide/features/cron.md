@@ -559,12 +559,13 @@ Outputs are concatenated in the order listed.
 
 ## Provider recovery
 
-Cron jobs inherit your configured fallback providers and credential pool rotation. If the primary API key is rate-limited or the provider returns an error, the cron agent can:
+Cron jobs inherit your configured fallback providers and credential pool rotation. Recovery fires at two distinct points, and which one you are relying on matters when you are tuning an unattended fleet.
 
-- **Fall back to an alternate provider** if you have `fallback_providers` (or the legacy `fallback_model`) configured in `config.yaml`
-- **Rotate to the next credential** in your [credential pool](/user-guide/configuration#credential-pool-strategies) for the same provider
+**At agent construction (scheduler-time auth resolution).** If the primary provider fails authentication while the job's agent is being built, the scheduler walks `fallback_providers` (or the legacy `fallback_model`) from `config.yaml` and constructs the agent with the first provider/model pair that resolves. Provider and model move together, so a fallback entry never silently routes your primary model through a different provider.
 
-This means cron jobs that run at high frequency or during peak hours are more resilient — a single rate-limited key won't fail the entire run.
+**During the run (agent-level failover).** The constructed agent carries that same fallback chain plus your [credential pool](/user-guide/configuration#credential-pool-strategies). Rate limits, upstream-aggregator throttling, and billing or credit exhaustion first attempt credential-pool rotation on the same provider; when rotation cannot recover, the agent activates the next entry in the fallback chain and retries within the same turn. Authentication failures that survive a credential refresh escalate the same way.
+
+So a single rate-limited key will not fail the run, provided a rotation target or a fallback entry can actually take over. Two things follow for unattended jobs: a second key on the same capped plan is not a recovery path, because the cap applies to both, and once the chain is exhausted the run fails and is reported through the job's normal failure delivery. Pin `provider` / `model` per job, put at least one fallback entry on a different account or provider, and monitor the primary provider's quota directly rather than treating failover as a quota strategy.
 
 ## Schedule formats
 
@@ -778,6 +779,10 @@ The referenced jobs' most recent completed outputs are injected above the prompt
 ## Job storage
 
 Jobs are stored in `~/.hermes/cron/jobs.json`. Output from job runs is saved to `~/.hermes/cron/output/{job_id}/{timestamp}.md`.
+
+The cron store is per profile. Each profile owns its own `jobs.json` under its own `HERMES_HOME`, so the paths above belong to the default profile, while a job authored in profile `coder` lives in `~/.hermes/profiles/coder/cron/jobs.json` and runs with that profile's `.env`, `config.yaml`, and skills. A job you cannot find is usually a job in another profile.
+
+Because the store sits under `HERMES_HOME` rather than inside the install, `hermes update` replaces the code without touching registered jobs, their schedules, or their pinned providers and models.
 
 :::tip
 Ask the agent to manage jobs through the `cronjob` tool, `hermes cron edit`, or `/cron` — not by patching `jobs.json` directly. Direct edits can fail silently when [file write safety](../security.md#file-write-safety) blocks the path (for example when `HERMES_WRITE_SAFE_ROOT` is set), and the [file-mutation verifier](../configuration.md#file-mutation-verifier) footer is the authoritative signal that nothing was saved.
