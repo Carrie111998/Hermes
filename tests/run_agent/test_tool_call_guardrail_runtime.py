@@ -5,6 +5,8 @@ import uuid
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from run_agent import AIAgent
 
 
@@ -218,6 +220,95 @@ def test_config_enabled_hard_stop_concurrent_path_does_not_submit_blocked_calls_
     assert started_events == [("tool.started", "web_search", allowed_args, {})]
     assert len(completed_events) == 1
     assert completed_events[0][1] == "web_search"
+
+
+@pytest.mark.parametrize(
+    ("executor_name", "direct_name", "args"),
+    [
+        (
+            "_execute_tool_calls_sequential",
+            "terminal",
+            {"command": "echo recovered"},
+        ),
+        (
+            "_execute_tool_calls_concurrent",
+            "terminal",
+            {"command": "echo recovered"},
+        ),
+        (
+            "_execute_tool_calls_sequential",
+            "mcp__notes__command_execute",
+            {"command": "open_daily_note"},
+        ),
+        (
+            "_execute_tool_calls_concurrent",
+            "mcp__notes__command_execute",
+            {"command": "open_daily_note"},
+        ),
+    ],
+)
+def test_executor_unwraps_visible_eager_tool_call(
+    executor_name, direct_name, args
+):
+    agent = _make_agent("tool_call", direct_name)
+    tc = _mock_tool_call(
+        "tool_call",
+        json.dumps({"name": direct_name, "arguments": args}),
+        f"c-{executor_name}",
+    )
+    msg = SimpleNamespace(content="", tool_calls=[tc])
+    messages = []
+
+    with (
+        patch(
+            "model_tools.get_tool_definitions",
+            return_value=_make_tool_defs(direct_name),
+        ),
+        patch(
+            "run_agent.handle_function_call",
+            return_value=json.dumps({"ok": True}),
+        ) as dispatch,
+    ):
+        getattr(agent, executor_name)(msg, messages, "task-1")
+
+    dispatch.assert_called_once()
+    assert dispatch.call_args.args[:2] == (direct_name, args)
+    assert json.loads(messages[0]["content"]) == {"ok": True}
+
+
+@pytest.mark.parametrize(
+    "executor_name",
+    ["_execute_tool_calls_sequential", "_execute_tool_calls_concurrent"],
+)
+def test_executor_rejects_out_of_scope_eager_tool_call(executor_name):
+    agent = _make_agent("tool_call", "web_search")
+    tc = _mock_tool_call(
+        "tool_call",
+        json.dumps(
+            {
+                "name": "mcp__notes__command_execute",
+                "arguments": {"command": "should_not_run"},
+            }
+        ),
+        f"c-{executor_name}",
+    )
+    msg = SimpleNamespace(content="", tool_calls=[tc])
+    messages = []
+
+    with (
+        patch(
+            "model_tools.get_tool_definitions",
+            return_value=_make_tool_defs("web_search"),
+        ),
+        patch(
+            "run_agent.handle_function_call",
+            return_value="SHOULD_NOT_RUN",
+        ) as dispatch,
+    ):
+        getattr(agent, executor_name)(msg, messages, "task-1")
+
+    dispatch.assert_not_called()
+    assert "not available in this session" in messages[0]["content"]
 
 
 def test_relay_rewrite_precedes_sequential_policy_approval_checkpoint_and_dispatch():

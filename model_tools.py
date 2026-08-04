@@ -1180,7 +1180,10 @@ def handle_function_call(
             return _ts_mod.dispatch_tool_describe(function_args or {},
                                                   current_tool_defs=current_defs)
         if function_name == _ts_mod.TOOL_CALL_NAME:
-            underlying_name, underlying_args, err = _ts_mod.resolve_underlying_call(function_args or {})
+            underlying_name, underlying_args, err = _ts_mod.resolve_underlying_call(
+                function_args or {},
+                allow_eager=True,
+            )
             if err or not underlying_name:
                 return tool_error(err or "tool_call could not be resolved")
             # Defense in depth: the underlying tool MUST be in the session's
@@ -1190,7 +1193,15 @@ def handle_function_call(
             # restricted session can never invoke an out-of-scope tool through
             # the bridge even if the catalog scoping above regressed.
             _scoped_deferrable = _ts_mod.scoped_deferrable_names(current_defs)
-            if underlying_name not in _scoped_deferrable:
+            _scoped_direct = {
+                (td.get("function") or {}).get("name", "")
+                for td in current_defs
+                if (td.get("function") or {}).get("name", "") not in _ts_mod.BRIDGE_TOOL_NAMES
+                and not _ts_mod.is_deferrable_tool_name(
+                    (td.get("function") or {}).get("name", "")
+                )
+            }
+            if underlying_name not in _scoped_deferrable and underlying_name not in _scoped_direct:
                 return tool_error(
                     f"'{underlying_name}' is not available in this session. "
                     "Use tool_search to find tools you can call."
@@ -1198,9 +1209,10 @@ def handle_function_call(
             # Probe-validate against the deferred tool's schema (ironclaw#5149):
             # a blind call missing required arguments returns the parameter
             # schema instead of dispatching into an opaque downstream failure.
-            _probe_err = _ts_mod.validate_deferred_call_args(underlying_name, underlying_args)
-            if _probe_err is not None:
-                return _probe_err
+            if underlying_name in _scoped_deferrable:
+                _probe_err = _ts_mod.validate_deferred_call_args(underlying_name, underlying_args)
+                if _probe_err is not None:
+                    return _probe_err
             # Recurse with the underlying tool. All hooks fire against the
             # real tool name. The bridge is invisible to hooks by design.
             return handle_function_call(

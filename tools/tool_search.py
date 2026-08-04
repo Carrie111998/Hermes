@@ -925,6 +925,19 @@ def dispatch_tool_describe(args: Dict[str, Any],
     if not name:
         return tool_error("name is required")
     if not is_deferrable_tool_name(name):
+        for td in current_tool_defs:
+            fn = td.get("function") or {}
+            if fn.get("name") == name and name not in BRIDGE_TOOL_NAMES:
+                return json.dumps(
+                    {
+                        "name": name,
+                        "description": fn.get("description", ""),
+                        "parameters": fn.get("parameters", {}),
+                        "invocation": "direct",
+                        "hint": f"Call '{name}' directly; do not use tool_call.",
+                    },
+                    ensure_ascii=False,
+                )
         return tool_error(
             f"'{name}' is not a deferrable tool. If you see it in the tools list "
             "already, call it directly; otherwise check the spelling against tool_search."
@@ -1016,7 +1029,11 @@ def validate_deferred_call_args(name: str, args: Dict[str, Any]) -> Optional[str
         return None
 
 
-def resolve_underlying_call(args: Dict[str, Any]) -> Tuple[Optional[str], Dict[str, Any], Optional[str]]:
+def resolve_underlying_call(
+    args: Dict[str, Any],
+    *,
+    allow_eager: bool = False,
+) -> Tuple[Optional[str], Dict[str, Any], Optional[str]]:
     """Parse a ``tool_call`` invocation into (underlying_name, args, error_msg).
 
     Used by:
@@ -1041,7 +1058,7 @@ def resolve_underlying_call(args: Dict[str, Any]) -> Tuple[Optional[str], Dict[s
             return None, {}, f"tool_call 'arguments' is not valid JSON: {e}"
     if not isinstance(raw_args, dict):
         return None, {}, "tool_call 'arguments' must be an object"
-    if not is_deferrable_tool_name(name):
+    if not allow_eager and not is_deferrable_tool_name(name):
         return None, {}, (
             f"'{name}' is not a deferrable tool. If it appears in the model-facing tools "
             "list already, call it directly instead of via tool_call."
