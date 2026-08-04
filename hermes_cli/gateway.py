@@ -3697,6 +3697,17 @@ def get_launchd_label() -> str:
     return f"ai.hermes.gateway-{suffix}" if suffix else "ai.hermes.gateway"
 
 
+def _launchd_stdio_log_dir() -> Path:
+    """Return a boot-volume log directory for launchd's pre-exec redirects."""
+    return _launchd_user_home() / "Library" / "Logs" / get_launchd_label()
+
+
+def _ensure_launchd_stdio_log_dir() -> Path:
+    log_dir = _launchd_stdio_log_dir()
+    log_dir.mkdir(parents=True, exist_ok=True)
+    return log_dir
+
+
 # Cached launchd domain result — probing is cheap but should only run once per
 # process invocation (each ``hermes gateway start/stop/status`` call).
 _resolved_launchd_domain: str | None = None
@@ -3774,6 +3785,7 @@ def _launchd_domain() -> str:
 # 3/113 ("Could not find service") all mean the job isn't currently loaded in
 # the target domain, so start/restart should re-bootstrap the plist and retry.
 _LAUNCHD_JOB_UNLOADED_EXIT_CODES = frozenset({3, 113, 125})
+_LAUNCHD_READY_TIMEOUT_SECONDS = 60.0
 
 # launchctl returns 5 ("Input/output error") or a persistent 125 in two very
 # different situations, so exit 5 is NOT on its own proof the domain is broken:
@@ -3852,6 +3864,64 @@ def _launchctl_bootstrap(
             check=True,
             timeout=timeout,
         )
+
+
+def _wait_for_launchd_gateway_ready(
+    *, timeout: float | None = None
+) -> tuple[int | None, str | None]:
+    """Wait for launchd and Hermes runtime state to agree on a ready PID."""
+    wait_seconds = max(
+        0.0,
+        _LAUNCHD_READY_TIMEOUT_SECONDS if timeout is None else float(timeout),
+    )
+    deadline = time.monotonic() + wait_seconds
+    label = get_launchd_label()
+
+    while True:
+        try:
+            result = subprocess.run(
+                ["launchctl", "list", label],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=10,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            result = None
+
+        pid = None
+        if result is not None and result.returncode == 0:
+            pid = _parse_launchd_pid_from_list_output(result.stdout or "")
+        if pid is not None:
+            runtime_state = _gateway_runtime_status_for_pid(pid)
+            gateway_state = (runtime_state or {}).get("gateway_state")
+            if gateway_state == "running":
+                return pid, None
+            if gateway_state == "startup_failed":
+                reason = (runtime_state or {}).get("exit_reason") or "startup failed"
+                return None, str(reason)
+
+        if time.monotonic() >= deadline:
+            return None, None
+        time.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
+
+
+def _require_launchd_gateway_ready() -> int:
+    pid, failure_reason = _wait_for_launchd_gateway_ready()
+    if pid is not None:
+        return pid
+
+    if failure_reason:
+        print_error(f"Gateway startup failed: {failure_reason}")
+    else:
+        print_error(
+            "Gateway did not become ready within "
+            f"{_LAUNCHD_READY_TIMEOUT_SECONDS:g}s."
+        )
+    print(f"  Inspect: launchctl print {_launchd_domain()}/{get_launchd_label()}")
+    print(f"  launchd stderr: {_launchd_stdio_log_dir() / 'gateway.stderr.log'}")
+    sys.exit(1)
 
 
 def _launchd_reload_log_path() -> Path:
@@ -4058,8 +4128,7 @@ def generate_launchd_plist() -> str:
     working_dir = _stable_service_working_dir()
     hermes_home = str(get_hermes_home().resolve())
     label = get_launchd_label()
-    log_dir = Path.home() / "Library" / "Logs" / label
-    log_dir.mkdir(parents=True, exist_ok=True)
+    log_dir = _launchd_stdio_log_dir()
     profile_arg = _profile_arg(hermes_home)
     # Build a sane PATH for the launchd plist.  launchd provides only a
     # minimal default (/usr/bin:/bin:/usr/sbin:/sbin) which misses Homebrew,
@@ -4181,6 +4250,7 @@ def refresh_launchd_plist_if_needed() -> bool:
     if _refuse_temp_home_service_write(new_plist, "launchd plist"):
         return False
 
+    _ensure_launchd_stdio_log_dir()
     plist_path.write_text(new_plist, encoding="utf-8")
     label = get_launchd_label()
     domain = _launchd_domain()
@@ -4349,6 +4419,7 @@ def launchd_install(force: bool = False):
     new_plist = generate_launchd_plist()
     if _refuse_temp_home_service_write(new_plist, "launchd plist"):
         return
+    _ensure_launchd_stdio_log_dir()
     print(f"Installing launchd service to: {plist_path}")
     plist_path.write_text(new_plist, encoding="utf-8")
 
@@ -4363,7 +4434,8 @@ def launchd_install(force: bool = False):
         return
 
     print()
-    print("✓ Service installed and loaded!")
+    pid = _require_launchd_gateway_ready()
+    print(f"✓ Service installed and loaded (PID {pid})!")
     _clear_launchd_unsupported_marker()
     print()
     print("Next steps:")
@@ -4392,6 +4464,7 @@ def launchd_uninstall():
 def launchd_start():
     plist_path = get_launchd_plist_path()
     label = get_launchd_label()
+    _ensure_launchd_stdio_log_dir()
 
     # Self-heal if the plist is missing entirely (e.g., manual cleanup, failed upgrade)
     if not plist_path.exists():
@@ -4413,7 +4486,8 @@ def launchd_start():
                 raise
             _launchd_fallback_to_detached(f"launchctl exit {e.returncode}")
             return
-        print("✓ Service started")
+        pid = _require_launchd_gateway_ready()
+        print(f"✓ Service started (PID {pid})")
         _clear_launchd_unsupported_marker()
         return
 
@@ -4443,7 +4517,8 @@ def launchd_start():
                 raise
             _launchd_fallback_to_detached(f"launchctl exit {e2.returncode}")
             return
-    print("✓ Service started")
+    pid = _require_launchd_gateway_ready()
+    print(f"✓ Service started (PID {pid})")
     _clear_launchd_unsupported_marker()
 
 

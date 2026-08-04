@@ -1,6 +1,7 @@
 """Tests for gateway service management helpers."""
 
 import os
+import plistlib
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -232,25 +233,23 @@ class TestGeneratedSystemdUnits:
         assert str(local_bin) in plist
         assert str(profile_node_bin) not in plist
 
-    def test_launchd_stdio_uses_user_library_logs_not_hermes_home(
-        self,
-        tmp_path,
-        monkeypatch,
+    def test_launchd_stdio_logs_stay_on_the_user_boot_volume(
+        self, tmp_path, monkeypatch
     ):
-        user_home = tmp_path / "user"
-        hermes_home = tmp_path / "external-volume" / "hermes"
-        user_home.mkdir()
+        user_home = tmp_path / "Users" / "alice"
+        hermes_home = tmp_path / "Volumes" / "Vault" / "hermes"
+        user_home.mkdir(parents=True)
         hermes_home.mkdir(parents=True)
-        monkeypatch.setenv("HOME", str(user_home))
+        monkeypatch.setattr(gateway_cli, "_launchd_user_home", lambda: user_home)
         monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: hermes_home)
 
-        plist = gateway_cli.generate_launchd_plist()
+        plist = plistlib.loads(gateway_cli.generate_launchd_plist().encode())
+        expected_dir = user_home / "Library" / "Logs" / gateway_cli.get_launchd_label()
 
-        log_dir = user_home / "Library" / "Logs" / gateway_cli.get_launchd_label()
-        assert f"<string>{log_dir}/gateway.stdout.log</string>" in plist
-        assert f"<string>{log_dir}/gateway.stderr.log</string>" in plist
-        assert str(hermes_home / "logs") not in plist
-        assert log_dir.is_dir()
+        assert Path(plist["StandardOutPath"]).parent == expected_dir
+        assert Path(plist["StandardErrorPath"]).parent == expected_dir
+        assert not Path(plist["StandardOutPath"]).is_relative_to(hermes_home)
+        assert not Path(plist["StandardErrorPath"]).is_relative_to(hermes_home)
 
 
 
@@ -285,6 +284,117 @@ class TestGatewayStopCleanup:
 
 class TestLaunchdServiceRecovery:
 
+    def test_launchd_start_waits_for_matching_runtime_ready_pid(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        plist_path = tmp_path / "ai.hermes.gateway.plist"
+        plist_path.write_text("<plist/>", encoding="utf-8")
+        runtime_probes = []
+
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+        monkeypatch.setattr(gateway_cli, "get_launchd_label", lambda: "ai.hermes.gateway")
+        monkeypatch.setattr(gateway_cli, "_launchd_user_home", lambda: tmp_path)
+        monkeypatch.setattr(gateway_cli, "_launchd_domain", lambda: "gui/501")
+        monkeypatch.setattr(
+            gateway_cli, "refresh_launchd_plist_if_needed", lambda: False
+        )
+
+        def fake_run(cmd, **kwargs):
+            if cmd[:2] == ["launchctl", "list"]:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout='{\n\t"PID" = 4321;\n}',
+                    stderr="",
+                )
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+        monkeypatch.setattr(
+            gateway_cli,
+            "_gateway_runtime_status_for_pid",
+            lambda pid: runtime_probes.append(pid)
+            or {"pid": pid, "gateway_state": "running"},
+        )
+
+        gateway_cli.launchd_start()
+
+        assert runtime_probes == [4321]
+        assert "Service started (PID 4321)" in capsys.readouterr().out
+
+    def test_launchd_start_fails_when_launchd_never_spawns_a_pid(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        plist_path = tmp_path / "ai.hermes.gateway.plist"
+        plist_path.write_text("<plist/>", encoding="utf-8")
+
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+        monkeypatch.setattr(gateway_cli, "get_launchd_label", lambda: "ai.hermes.gateway")
+        monkeypatch.setattr(gateway_cli, "_launchd_user_home", lambda: tmp_path)
+        monkeypatch.setattr(gateway_cli, "_launchd_domain", lambda: "gui/501")
+        monkeypatch.setattr(
+            gateway_cli, "refresh_launchd_plist_if_needed", lambda: False
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_LAUNCHD_READY_TIMEOUT_SECONDS",
+            0.0,
+            raising=False,
+        )
+
+        def fake_run(cmd, **kwargs):
+            if cmd[:2] == ["launchctl", "list"]:
+                return SimpleNamespace(returncode=0, stdout="{}", stderr="")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        with pytest.raises(SystemExit) as exc_info:
+            gateway_cli.launchd_start()
+
+        assert exc_info.value.code == 1
+        output = capsys.readouterr().out
+        assert "Service started" not in output
+        assert "did not become ready" in output
+        assert "gateway.stderr.log" in output
+
+    def test_launchd_install_creates_stdio_log_dir_and_waits_for_ready_pid(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        plist_path = tmp_path / "LaunchAgents" / "ai.hermes.gateway.plist"
+        user_home = tmp_path / "Users" / "alice"
+        runtime_probes = []
+
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+        monkeypatch.setattr(gateway_cli, "get_launchd_label", lambda: "ai.hermes.gateway")
+        monkeypatch.setattr(gateway_cli, "_launchd_user_home", lambda: user_home)
+        monkeypatch.setattr(gateway_cli, "_launchd_domain", lambda: "gui/501")
+        monkeypatch.setattr(gateway_cli, "generate_launchd_plist", lambda: "<plist/>")
+        monkeypatch.setattr(gateway_cli, "_launchctl_bootstrap", lambda *a, **k: None)
+
+        def fake_run(cmd, **kwargs):
+            if cmd[:2] == ["launchctl", "list"]:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout='{\n\t"PID" = 9876;\n}',
+                    stderr="",
+                )
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+        monkeypatch.setattr(
+            gateway_cli,
+            "_gateway_runtime_status_for_pid",
+            lambda pid: runtime_probes.append(pid)
+            or {"pid": pid, "gateway_state": "running"},
+        )
+
+        gateway_cli.launchd_install()
+
+        expected_log_dir = user_home / "Library" / "Logs" / "ai.hermes.gateway"
+        assert expected_log_dir.is_dir()
+        assert runtime_probes == [9876]
+        assert "Service installed and loaded (PID 9876)" in capsys.readouterr().out
+
 
     def test_refresh_defers_reload_when_running_inside_gateway_tree(self, tmp_path, monkeypatch):
         """#43842: when the refresh runs inside the gateway's own process tree,
@@ -294,6 +404,7 @@ class TestLaunchdServiceRecovery:
         plist_path.write_text("<plist>old content</plist>", encoding="utf-8")
 
         monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+        monkeypatch.setattr(gateway_cli, "_launchd_user_home", lambda: tmp_path)
         monkeypatch.setattr(gateway_cli, "launchd_plist_is_current", lambda: False)
         monkeypatch.setattr(
             gateway_cli,
