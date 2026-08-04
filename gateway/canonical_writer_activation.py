@@ -19,6 +19,7 @@ import os
 import grp
 import pwd
 import ipaddress
+import math
 import re
 import stat
 import subprocess
@@ -107,6 +108,8 @@ CANARY_PROJECTOR_GID = 991
 CANARY_PROJECTOR_UID = 992
 PROJECTOR_USER = "muncho-projector"
 ACTIVATION_LOCK_PATH = HOST_LIFECYCLE_LOCK_PATH
+HOST_IDENTITY_CONVERGENCE_ATTEMPTS = 10
+HOST_IDENTITY_CONVERGENCE_DELAY_SECONDS = 0.1
 
 DEFAULT_PLAN_PATH = Path("/etc/muncho/writer-activation/activation-plan.json")
 DEFAULT_STAGED_PLAN_PATH = Path(
@@ -1897,11 +1900,40 @@ def _host_identities_are_exact(snapshot: Mapping[str, Any]) -> bool:
         and effective
         == {
             str(CANARY_SOCKET_CLIENT_GID): [GATEWAY_USER],
-            str(CANARY_PROJECTOR_GID): [PROJECTOR_USER, WRITER_USER],
+            str(CANARY_PROJECTOR_GID): sorted((PROJECTOR_USER, WRITER_USER)),
             str(CANARY_GATEWAY_GID): [GATEWAY_USER],
             str(CANARY_WRITER_GID): [WRITER_USER],
         }
     )
+
+
+def _wait_for_exact_host_identities(
+    *,
+    snapshotter: Callable[[], dict[str, Any]] | None = None,
+    sleeper: Callable[[float], None] = time.sleep,
+    attempts: int = HOST_IDENTITY_CONVERGENCE_ATTEMPTS,
+    delay_seconds: float = HOST_IDENTITY_CONVERGENCE_DELAY_SECONDS,
+) -> dict[str, Any]:
+    """Bound NSS convergence while preserving the exact identity predicate."""
+
+    if type(attempts) is not int or attempts < 1:
+        raise ValueError("host identity convergence attempts are invalid")
+    if (
+        type(delay_seconds) not in {int, float}
+        or not math.isfinite(float(delay_seconds))
+        or delay_seconds < 0
+    ):
+        raise ValueError("host identity convergence delay is invalid")
+    if snapshotter is None:
+        snapshotter = _host_identity_snapshot
+    latest: dict[str, Any] = {}
+    for attempt in range(attempts):
+        latest = snapshotter()
+        if _host_identities_are_exact(latest):
+            return latest
+        if attempt + 1 < attempts:
+            sleeper(float(delay_seconds))
+    raise RuntimeError("canary host identity reconciliation did not converge")
 
 
 def prepare_canary_host_identities(
@@ -2053,9 +2085,7 @@ def prepare_canary_host_identities(
         runner=runner,
         label="reconcile exact writer identity",
     )
-    after = _host_identity_snapshot()
-    if not _host_identities_are_exact(after):
-        raise RuntimeError("canary host identity reconciliation did not converge")
+    after = _wait_for_exact_host_identities()
     return {"changed": True, "before": before, "after": after}
 
 

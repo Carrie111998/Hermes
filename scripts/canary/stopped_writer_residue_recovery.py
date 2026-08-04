@@ -24,6 +24,8 @@ from pathlib import Path
 from typing import Any, Callable, ContextManager, Mapping, NoReturn, Sequence
 
 from gateway.canonical_writer_host_authority import (
+    DEFAULT_EXTERNAL_IAM_LIVE_PATH,
+    DEFAULT_NATIVE_OBSERVATION_EVIDENCE_ROOT,
     ExternalIAMReceipt,
     NativeObservationPlan,
     OwnerApprovalReceipt,
@@ -188,6 +190,25 @@ _NATIVE_FAILURE_KEYS = frozenset({
     "stage_preserved",
 })
 _FAILURE_FILE_RE = re.compile(r"^failure-[1-9][0-9]*-[1-9][0-9]*\.json$")
+_HOST_PREPARATION_FAILURE_SCHEMA = "muncho-writer-host-preparation-failure.v1"
+_HOST_PREPARATION_FAILURE_KEYS = frozenset({
+    "schema",
+    "revision",
+    "native_observation_plan_sha256",
+    "owner_approval_receipt_sha256",
+    "changed",
+    "before",
+    "after",
+    "error_type",
+    "error_sha256",
+    "failed_at_unix",
+    "receipt_path",
+    "receipt_sha256",
+})
+_HOST_IDENTITY_CONVERGENCE_ERROR_TYPE = "RuntimeError"
+_HOST_IDENTITY_CONVERGENCE_ERROR_SHA256 = hashlib.sha256(
+    b"RuntimeError:canary host identity reconciliation did not converge"
+).hexdigest()
 
 
 def _collector_pair_names() -> frozenset[str]:
@@ -498,19 +519,117 @@ def _validate_failed_native_authority_bundle(
     return owner, iam
 
 
-def _native_failure_binding(
+def _host_identities_are_exact(value: Mapping[str, Any]) -> bool:
+    from gateway.canonical_writer_activation import _host_identities_are_exact
+
+    return _host_identities_are_exact(value)
+
+
+def _require_current_exact_host_identities() -> Mapping[str, Any]:
+    from gateway.canonical_writer_activation import _host_identity_snapshot
+
+    value = _host_identity_snapshot()
+    if not _host_identities_are_exact(value):
+        raise RuntimeError("current canary host identities are not exact")
+    return value
+
+
+def _validate_host_identity_convergence_failure(
+    value: Mapping[str, Any],
     *,
-    target_revision: str,
     source_revision: str,
-    collector_receipt_sha256: str,
     native: NativeObservationPlan,
     owner: OwnerApprovalReceipt,
-) -> dict[str, str]:
-    raw = _trusted_publication(
-        DEFAULT_QUARANTINE_PATH,
+    iam: ExternalIAMReceipt,
+    require_current_host_state: bool,
+) -> None:
+    external = value.get("external_iam_evidence")
+    expected_evidence_root = (
+        DEFAULT_NATIVE_OBSERVATION_EVIDENCE_ROOT
+        / source_revision
+        / native.sha256
+    )
+    expected_iam_path = (
+        expected_evidence_root / "external-iam" / f"{iam.sha256}.json"
+    )
+    if (
+        not isinstance(external, Mapping)
+        or set(external)
+        != {
+            "path",
+            "sha256",
+            "policy_sha256",
+            "mode",
+            "owner_uid",
+            "group_gid",
+            "live_path",
+        }
+        or external
+        != {
+            "path": str(expected_iam_path),
+            "sha256": iam.sha256,
+            "policy_sha256": iam.policy_sha256,
+            "mode": "0400",
+            "owner_uid": 0,
+            "group_gid": 0,
+            "live_path": str(DEFAULT_EXTERNAL_IAM_LIVE_PATH),
+        }
+    ):
+        raise ValueError("native failure external IAM evidence is invalid")
+    archived_iam_raw = _trusted_publication(
+        expected_iam_path,
         maximum=_MAX_RECEIPT_BYTES,
     )
-    value = _decode_canonical_mapping(raw, label="native failure quarantine")
+    if archived_iam_raw != _canonical_bytes(iam.to_mapping()):
+        raise ValueError("native failure archived IAM receipt drifted")
+
+    host = value.get("host_preparation_evidence")
+    if not isinstance(host, Mapping) or set(host) != _HOST_PREPARATION_FAILURE_KEYS:
+        raise ValueError("native host preparation failure fields are not exact")
+    host_path = Path(str(host.get("receipt_path")))
+    expected_host_root = expected_evidence_root / "host-preparation-failures"
+    host_unsigned = {
+        name: item for name, item in host.items() if name != "receipt_sha256"
+    }
+    if (
+        host.get("schema") != _HOST_PREPARATION_FAILURE_SCHEMA
+        or host.get("revision") != source_revision
+        or host.get("native_observation_plan_sha256") != native.sha256
+        or host.get("owner_approval_receipt_sha256") != owner.sha256
+        or host.get("changed") is not True
+        or not isinstance(host.get("before"), Mapping)
+        or not isinstance(host.get("after"), Mapping)
+        or host["before"] == host["after"]
+        or not _host_identities_are_exact(host["after"])
+        or host.get("error_type") != _HOST_IDENTITY_CONVERGENCE_ERROR_TYPE
+        or host.get("error_sha256") != _HOST_IDENTITY_CONVERGENCE_ERROR_SHA256
+        or type(host.get("failed_at_unix")) is not int
+        or host["failed_at_unix"] < 0
+        or host_path.parent != expected_host_root
+        or _FAILURE_FILE_RE.fullmatch(host_path.name) is None
+        or host.get("receipt_sha256") != _sha256_json(host_unsigned)
+        or value.get("host_preparation_sha256") != _sha256_json(host)
+        or value.get("error_type") != host["error_type"]
+        or value.get("error_sha256") != host["error_sha256"]
+        or value.get("failed_at_unix") < host["failed_at_unix"]
+    ):
+        raise ValueError("native host identity convergence failure is invalid")
+    host_raw = _trusted_publication(host_path, maximum=_MAX_RECEIPT_BYTES)
+    if host_raw != _canonical_bytes(host):
+        raise ValueError("native host preparation failure receipt drifted")
+    if require_current_host_state:
+        _require_current_exact_host_identities()
+
+
+def _validate_native_failure_value(
+    value: Mapping[str, Any],
+    *,
+    source_revision: str,
+    native: NativeObservationPlan,
+    owner: OwnerApprovalReceipt,
+    iam: ExternalIAMReceipt,
+    require_current_host_state: bool,
+) -> Path:
     if set(value) != _NATIVE_FAILURE_KEYS:
         raise ValueError("native failure quarantine fields are not exact")
     failure_path = Path(str(value.get("failure_receipt_path")))
@@ -523,14 +642,11 @@ def _native_failure_binding(
         or value.get("native_observation_plan_sha256") != native.sha256
         or value.get("owner_approval_receipt_sha256") != owner.sha256
         or value.get("owner_approval_receipt") != owner.to_mapping()
-        or value.get("external_iam_evidence") != {}
-        or value.get("host_preparation_evidence") != {}
-        or value.get("host_preparation_sha256") != _sha256_json({})
-        or value.get("stage") != "read_only_preflight"
         or value.get("stage_preserved") is not False
         or value.get("quarantined") is not True
         or not isinstance(value.get("error_type"), str)
-        or re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,63}", value["error_type"]) is None
+        or re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,63}", value["error_type"])
+        is None
         or _SHA256_RE.fullmatch(str(value.get("error_sha256"))) is None
         or type(value.get("failed_at_unix")) is not int
         or value["failed_at_unix"] < 0
@@ -538,6 +654,49 @@ def _native_failure_binding(
         or _FAILURE_FILE_RE.fullmatch(failure_path.name) is None
     ):
         raise ValueError("native failure quarantine binding is invalid")
+    if value.get("stage") == "read_only_preflight":
+        if (
+            value.get("external_iam_evidence") != {}
+            or value.get("host_preparation_evidence") != {}
+            or value.get("host_preparation_sha256") != _sha256_json({})
+        ):
+            raise ValueError("native failure quarantine binding is invalid")
+    elif value.get("stage") == "prepare_host_identities":
+        _validate_host_identity_convergence_failure(
+            value,
+            source_revision=source_revision,
+            native=native,
+            owner=owner,
+            iam=iam,
+            require_current_host_state=require_current_host_state,
+        )
+    else:
+        raise ValueError("native failure quarantine binding is invalid")
+    return failure_path
+
+
+def _native_failure_binding(
+    *,
+    target_revision: str,
+    source_revision: str,
+    collector_receipt_sha256: str,
+    native: NativeObservationPlan,
+    owner: OwnerApprovalReceipt,
+    iam: ExternalIAMReceipt,
+) -> dict[str, str]:
+    raw = _trusted_publication(
+        DEFAULT_QUARANTINE_PATH,
+        maximum=_MAX_RECEIPT_BYTES,
+    )
+    value = _decode_canonical_mapping(raw, label="native failure quarantine")
+    failure_path = _validate_native_failure_value(
+        value,
+        source_revision=source_revision,
+        native=native,
+        owner=owner,
+        iam=iam,
+        require_current_host_state=True,
+    )
     failure_raw = _trusted_publication(
         failure_path,
         maximum=_MAX_RECEIPT_BYTES,
@@ -942,7 +1101,7 @@ def _plan_from_live(target_revision: str) -> dict[str, Any]:
                 DEFAULT_STAGED_NATIVE_PLAN_PATH.name,
             )
         )
-        owner, _iam = _validate_failed_native_authority_bundle(
+        owner, iam = _validate_failed_native_authority_bundle(
             root=STAGING_ROOT,
             native=native,
         )
@@ -952,6 +1111,7 @@ def _plan_from_live(target_revision: str) -> dict[str, Any]:
             collector_receipt_sha256=collector.sha256,
             native=native,
             owner=owner,
+            iam=iam,
         )
         if os.path.lexists(failed_native["archive_path"]):
             raise RuntimeError("native failure quarantine archive collides")
@@ -1326,6 +1486,27 @@ def _validate_current_state(plan: Mapping[str, Any]) -> str:
             or _sha256_bytes(durable_failure_raw) != failed["failure_receipt_sha256"]
         ):
             raise RuntimeError("native failure quarantine digest drifted")
+        native = _decode_native_plan(
+            _trusted_staged_artifact(
+                current_root,
+                DEFAULT_STAGED_NATIVE_PLAN_PATH.name,
+            )
+        )
+        owner, iam = _validate_failed_native_authority_bundle(
+            root=current_root,
+            native=native,
+        )
+        _validate_native_failure_value(
+            _decode_canonical_mapping(
+                failure_raw,
+                label="native failure quarantine",
+            ),
+            source_revision=str(plan["source_release_revision"]),
+            native=native,
+            owner=owner,
+            iam=iam,
+            require_current_host_state=True,
+        )
         if failure_archive_exists:
             if state != "archive":
                 raise RuntimeError("native failure quarantine moved before residue")

@@ -24,6 +24,53 @@ def _sha256(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
+def _exact_host_identity_snapshot() -> dict[str, Any]:
+    return {
+        "gateway": {
+            "name": "muncho-gateway",
+            "uid": 993,
+            "gid": 992,
+            "home": "/var/lib/hermes-gateway",
+            "shell": "/usr/sbin/nologin",
+            "groups": [990, 992],
+        },
+        "writer": {
+            "name": "muncho-canonical-writer",
+            "uid": 999,
+            "gid": 994,
+            "home": "/nonexistent",
+            "shell": "/usr/sbin/nologin",
+            "groups": [991, 994],
+        },
+        "projector": {
+            "name": "muncho-projector",
+            "uid": 992,
+            "gid": 991,
+            "home": "/nonexistent",
+            "shell": "/usr/sbin/nologin",
+            "groups": [991],
+        },
+        "groups": {
+            "muncho-gateway": {"gid": 992, "members": []},
+            "muncho-canonical-writer": {"gid": 994, "members": []},
+            "muncho-writer-client": {
+                "gid": 990,
+                "members": ["muncho-gateway"],
+            },
+            "muncho-projector": {
+                "gid": 991,
+                "members": ["muncho-canonical-writer"],
+            },
+        },
+        "effective_gid_members": {
+            "990": ["muncho-gateway"],
+            "991": ["muncho-canonical-writer", "muncho-projector"],
+            "992": ["muncho-gateway"],
+            "994": ["muncho-canonical-writer"],
+        },
+    }
+
+
 def _collector_receipt() -> dict[str, Any]:
     digest = "d" * 64
     unsigned: dict[str, Any] = {
@@ -278,6 +325,7 @@ def recovery_tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, 
     external_iam_path = staging_root / "external-iam-receipt.json"
     quarantine_path = tmp_path / "writer-failure" / "quarantine.json"
     native_failure_root = tmp_path / "native-failures"
+    native_evidence_root = tmp_path / "native-evidence"
     writer_raw = b'{"writer":"stopped"}'
     gateway_raw = b"gateway: stopped\n"
     writer_path.write_bytes(writer_raw)
@@ -358,6 +406,11 @@ def recovery_tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, 
         "DEFAULT_NATIVE_FAILURE_ROOT",
         native_failure_root,
     )
+    monkeypatch.setattr(
+        recovery,
+        "DEFAULT_NATIVE_OBSERVATION_EVIDENCE_ROOT",
+        native_evidence_root,
+    )
     monkeypatch.setattr(recovery, "CONFIG_COLLECTOR_EVIDENCE_ROOT", evidence_root)
     monkeypatch.setattr(
         recovery,
@@ -428,6 +481,11 @@ def recovery_tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, 
         lambda path, **_kwargs: path.read_bytes(),
     )
     monkeypatch.setattr(recovery, "_fsync_directory", lambda _path: None)
+    monkeypatch.setattr(
+        recovery,
+        "_require_current_exact_host_identities",
+        _exact_host_identity_snapshot,
+    )
     return {
         "staging_root": staging_root,
         "writer_path": writer_path,
@@ -443,6 +501,7 @@ def recovery_tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, 
         "external_iam_path": external_iam_path,
         "quarantine_path": quarantine_path,
         "native_failure_root": native_failure_root,
+        "native_evidence_root": native_evidence_root,
         "recovery_root": recovery_root,
         "foreign_path": foreign_path,
         "service_states": service_states,
@@ -690,6 +749,8 @@ def _external_iam_mapping(*, source_approval_sha256: str) -> dict[str, Any]:
 
 def _write_failed_native_bundle(
     recovery_tree: dict[str, Any],
+    *,
+    host_identity_convergence_failure: bool = False,
 ) -> tuple[dict[Path, bytes], bytes, bytes]:
     writer_unit = b"[Service]\nExecStart=/writer\n"
     gateway_unit = b"[Service]\nExecStart=/gateway\n"
@@ -746,7 +807,7 @@ def _write_failed_native_bundle(
         / "failure-123-456.json"
     )
     failure_path.parent.mkdir(parents=True)
-    failure = {
+    failure: dict[str, Any] = {
         "schema": "muncho-writer-only-activation-failure.v1",
         "revision": SOURCE_REVISION,
         "native_observation_plan_sha256": native.sha256,
@@ -763,6 +824,55 @@ def _write_failed_native_bundle(
         "host_preparation_evidence": {},
         "stage_preserved": False,
     }
+    if host_identity_convergence_failure:
+        evidence_root = (
+            recovery_tree["native_evidence_root"] / SOURCE_REVISION / native.sha256
+        )
+        archived_iam_path = evidence_root / "external-iam" / f"{iam.sha256}.json"
+        archived_iam_path.parent.mkdir(parents=True)
+        archived_iam_path.write_bytes(iam_raw)
+        exact_after = _exact_host_identity_snapshot()
+        host_path = (
+            evidence_root
+            / "host-preparation-failures"
+            / "failure-124-457.json"
+        )
+        host_path.parent.mkdir(parents=True)
+        host_unsigned = {
+            "schema": "muncho-writer-host-preparation-failure.v1",
+            "revision": SOURCE_REVISION,
+            "native_observation_plan_sha256": native.sha256,
+            "owner_approval_receipt_sha256": owner.sha256,
+            "changed": True,
+            "before": {"state": "pre-reconciliation"},
+            "after": exact_after,
+            "error_type": recovery._HOST_IDENTITY_CONVERGENCE_ERROR_TYPE,
+            "error_sha256": recovery._HOST_IDENTITY_CONVERGENCE_ERROR_SHA256,
+            "failed_at_unix": 200,
+            "receipt_path": str(host_path),
+        }
+        host = {
+            **host_unsigned,
+            "receipt_sha256": recovery._sha256_json(host_unsigned),
+        }
+        host_path.write_bytes(recovery._canonical_bytes(host))
+        failure.update({
+            "external_iam_evidence": {
+                "path": str(archived_iam_path),
+                "sha256": iam.sha256,
+                "policy_sha256": iam.policy_sha256,
+                "mode": "0400",
+                "owner_uid": 0,
+                "group_gid": 0,
+                "live_path": str(recovery.DEFAULT_EXTERNAL_IAM_LIVE_PATH),
+            },
+            "stage": "prepare_host_identities",
+            "error_type": recovery._HOST_IDENTITY_CONVERGENCE_ERROR_TYPE,
+            "error_sha256": recovery._HOST_IDENTITY_CONVERGENCE_ERROR_SHA256,
+            "failed_at_unix": 201,
+            "host_preparation_sha256": recovery._sha256_json(host),
+            "host_preparation_evidence": host,
+        })
     failure_raw = recovery._canonical_bytes(failure)
     failure_path.write_bytes(failure_raw)
     recovery_tree["quarantine_path"].parent.mkdir(parents=True)
@@ -872,6 +982,99 @@ def test_apply_archives_exact_read_only_preflight_failure_chain_last(
         lifecycle_lock=contextlib.nullcontext,
     )
     assert repeated == receipt
+
+
+def test_apply_archives_exact_host_identity_convergence_failure_chain(
+    recovery_tree: dict[str, Any],
+) -> None:
+    _extras, _native_raw, failure_raw = _write_failed_native_bundle(
+        recovery_tree,
+        host_identity_convergence_failure=True,
+    )
+
+    plan = recovery.plan_stopped_writer_residue_recovery(TARGET_REVISION)
+    receipt = recovery.apply_stopped_writer_residue_recovery(
+        TARGET_REVISION,
+        plan["plan_sha256"],
+        clock=lambda: 893,
+        lifecycle_lock=contextlib.nullcontext,
+    )
+
+    assert plan["schema"] == recovery.FAILED_NATIVE_PLAN_SCHEMA
+    assert plan["failed_native_observation"]["sha256"] == _sha256(failure_raw)
+    assert receipt["schema"] == recovery.FAILED_NATIVE_RECEIPT_SCHEMA
+    assert receipt["failure_receipt_preserved"] is True
+
+
+def test_host_identity_failure_recovery_rejects_nonexact_current_state(
+    recovery_tree: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_failed_native_bundle(
+        recovery_tree,
+        host_identity_convergence_failure=True,
+    )
+    monkeypatch.setattr(
+        recovery,
+        "_require_current_exact_host_identities",
+        lambda: (_ for _ in ()).throw(
+            RuntimeError("current canary host identities are not exact")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="current canary host identities"):
+        recovery.plan_stopped_writer_residue_recovery(TARGET_REVISION)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("error_sha256", "f" * 64),
+        ("error_type", "ValueError"),
+    ),
+)
+def test_host_identity_failure_recovery_rejects_outer_error_drift(
+    recovery_tree: dict[str, Any],
+    field: str,
+    value: str,
+) -> None:
+    _write_failed_native_bundle(
+        recovery_tree,
+        host_identity_convergence_failure=True,
+    )
+    failure = json.loads(recovery_tree["quarantine_path"].read_text())
+    failure[field] = value
+    drifted = recovery._canonical_bytes(failure)
+    Path(failure["failure_receipt_path"]).write_bytes(drifted)
+    recovery_tree["quarantine_path"].write_bytes(drifted)
+
+    with pytest.raises(ValueError, match="convergence failure is invalid"):
+        recovery.plan_stopped_writer_residue_recovery(TARGET_REVISION)
+
+
+def test_host_identity_failure_recovery_rejects_embedded_after_drift(
+    recovery_tree: dict[str, Any],
+) -> None:
+    _write_failed_native_bundle(
+        recovery_tree,
+        host_identity_convergence_failure=True,
+    )
+    failure = json.loads(recovery_tree["quarantine_path"].read_text())
+    host = failure["host_preparation_evidence"]
+    host["after"]["effective_gid_members"]["991"] = ["muncho-projector"]
+    host_unsigned = {
+        name: item for name, item in host.items() if name != "receipt_sha256"
+    }
+    host["receipt_sha256"] = recovery._sha256_json(host_unsigned)
+    failure["host_preparation_sha256"] = recovery._sha256_json(host)
+    host_raw = recovery._canonical_bytes(host)
+    Path(host["receipt_path"]).write_bytes(host_raw)
+    failure_raw = recovery._canonical_bytes(failure)
+    Path(failure["failure_receipt_path"]).write_bytes(failure_raw)
+    recovery_tree["quarantine_path"].write_bytes(failure_raw)
+
+    with pytest.raises(ValueError, match="convergence failure is invalid"):
+        recovery.plan_stopped_writer_residue_recovery(TARGET_REVISION)
 
 
 def test_failed_native_plan_cannot_be_downcast_to_installed_native_schema(

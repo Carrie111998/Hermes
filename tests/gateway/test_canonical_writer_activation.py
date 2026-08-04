@@ -1295,6 +1295,57 @@ def test_native_expired_approval_after_host_mutation_is_forensic(
     ]
 
 
+def test_host_identity_convergence_retries_only_until_exact(monkeypatch):
+    snapshots = iter((
+        {"state": "stale"},
+        {"state": "still-stale"},
+        {"state": "exact"},
+    ))
+    sleeps = []
+    monkeypatch.setattr(
+        activation,
+        "_host_identities_are_exact",
+        lambda value: value == {"state": "exact"},
+    )
+
+    observed = activation._wait_for_exact_host_identities(
+        snapshotter=lambda: next(snapshots),
+        sleeper=sleeps.append,
+        attempts=3,
+        delay_seconds=0.25,
+    )
+
+    assert observed == {"state": "exact"}
+    assert sleeps == [0.25, 0.25]
+
+
+def test_host_identity_convergence_remains_bounded(monkeypatch):
+    calls = 0
+    sleeps = []
+
+    def snapshot():
+        nonlocal calls
+        calls += 1
+        return {"state": "stale"}
+
+    monkeypatch.setattr(
+        activation,
+        "_host_identities_are_exact",
+        lambda _value: False,
+    )
+
+    with pytest.raises(RuntimeError, match="did not converge"):
+        activation._wait_for_exact_host_identities(
+            snapshotter=snapshot,
+            sleeper=sleeps.append,
+            attempts=4,
+            delay_seconds=0.1,
+        )
+
+    assert calls == 4
+    assert sleeps == [0.1, 0.1, 0.1]
+
+
 def test_systemd_bundle_rejects_installable_temporary_exporter():
     value = {
         "schema": activation.SYSTEMD_BUNDLE_SCHEMA,
@@ -1351,7 +1402,7 @@ def test_host_identity_exactness_excludes_writer_and_discord_memberships():
         },
         "effective_gid_members": {
             "990": [activation.GATEWAY_USER],
-            "991": [activation.PROJECTOR_USER, activation.WRITER_USER],
+            "991": sorted((activation.PROJECTOR_USER, activation.WRITER_USER)),
             "992": [activation.GATEWAY_USER],
             "994": [activation.WRITER_USER],
         },
