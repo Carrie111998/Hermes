@@ -15,6 +15,7 @@ Return: {"decision": "switch_session", "session_id": "<id>"} or None/{}
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -40,13 +41,6 @@ _META_LOCK = threading.Lock()
 # How many recent exchanges to pass as continuation context
 HISTORY_WINDOW = 3
 
-# Signals that a message is almost certainly a continuation of the current
-# session rather than a topic switch.  Skip the classifier when we see these.
-CONTINUATION_PATTERNS: List[str] = [
-    r"^(ok|okay|thanks|thank you|got it|great|sure|sounds good|perfect|cool|nice|alright|yep|yup|yeah|nope|no|yes)\W*$",
-    r"^(and|also|but|so|then|what about|how about)\b",
-    r"^(can you|could you|please|can we)\b.{0,40}(also|too|as well)\b",
-]
 CONTINUATION_RE = re.compile(
     r"^(?:"
     r"ok(?:\s+(?:thanks?|got\s+it|sounds?\s+good|cool|fine|great|perfect|sure|works?))?"
@@ -281,7 +275,8 @@ async def _call_auxiliary_llm(prompt: str, aux_cfg: Dict[str, Any], config: Dict
     # Prefer the gateway-internal auxiliary_client (fast, handles all providers)
     try:
         from agent.auxiliary_client import call_llm
-        resp = call_llm(
+        resp = await asyncio.to_thread(
+            call_llm,
             task="compression",  # use compression slot — cheap text, no vision
             messages=[{"role": "user", "content": prompt}],
             temperature=0.0,
@@ -466,6 +461,9 @@ async def handle(event_type: str, context: Dict[str, Any]) -> Optional[Dict[str,
     # _META_LOCK serialises threads within this process; if hook instances
     # run in separate processes, a filesystem lock would be needed instead.
     # ------------------------------------------------------------------
+    decision: Optional[Dict[str, Any]] = None
+    target_session_id: str = ""
+
     with _META_LOCK:
         # Reload meta inside the lock so we act on the freshest state
         # (another thread may have saved between our initial load and here).
@@ -479,49 +477,57 @@ async def handle(event_type: str, context: Dict[str, Any]) -> Optional[Dict[str,
         if target_role == current_role:
             # No switch needed — save current session mapping and pass through
             _save_meta(meta)
-            return None
+        else:
+            target_session_id = sessions.get(target_role, "")
 
-        target_session_id = sessions.get(target_role, "")
+            if not target_session_id:
+                # KNOWN LIMITATION — first-turn isolation gap:
+                # When the classifier picks a new role that has no saved session_id
+                # yet, we cannot redirect this turn because there is no destination
+                # session to switch to.  We write the target_role to meta.yaml so
+                # the gateway's normal session-creation path runs under the new
+                # role label, and the NEXT turn will find a session_id here and
+                # route correctly.  The current (first) turn therefore stays in
+                # the existing inbound session — isolation only begins from the
+                # second message onward.  This is a deliberate trade-off: creating
+                # a new session preemptively and then redirecting would require an
+                # extra round-trip and risks orphaned sessions if the user does not
+                # follow up.  Hooks that need true first-turn isolation should
+                # pre-register a session_id for each role in meta.yaml during
+                # installation (see README.md § "Pre-seeding sessions").
+                meta["current_role"] = target_role
+                _save_meta(meta)
+                logger.info(
+                    "[multi-role-router] Role switch to '%s' detected but no prior session exists "
+                    "(first-turn isolation gap): current turn stays in session '%s'. "
+                    "Target role written to meta.yaml — isolation begins on the next turn.",
+                    target_role,
+                    current_session_id,
+                )
+            elif target_session_id == current_session_id:
+                _save_meta(meta)
+            else:
+                # Switch!
+                meta["current_role"] = target_role
+                _save_meta(meta)
+                decision = {"decision": "switch_session", "session_id": target_session_id}
 
-        if not target_session_id:
-            # KNOWN LIMITATION — first-turn isolation gap:
-            # When the classifier picks a new role that has no saved session_id
-            # yet, we cannot redirect this turn because there is no destination
-            # session to switch to.  We write the target_role to meta.yaml so
-            # the gateway's normal session-creation path runs under the new
-            # role label, and the NEXT turn will find a session_id here and
-            # route correctly.  The current (first) turn therefore stays in
-            # the existing inbound session — isolation only begins from the
-            # second message onward.  This is a deliberate trade-off: creating
-            # a new session preemptively and then redirecting would require an
-            # extra round-trip and risks orphaned sessions if the user does not
-            # follow up.  Hooks that need true first-turn isolation should
-            # pre-register a session_id for each role in meta.yaml during
-            # installation (see README.md § "Pre-seeding sessions").
-            meta["current_role"] = target_role
-            _save_meta(meta)
-            logger.info(
-                "[multi-role-router] Role switch to '%s' detected but no prior session exists "
-                "(first-turn isolation gap): current turn stays in session '%s'. "
-                "Target role written to meta.yaml — isolation begins on the next turn.",
-                target_role,
-                current_session_id,
-            )
-            return None
-
-        if target_session_id == current_session_id:
-            _save_meta(meta)
-            return None
-
-        # Switch!
-        meta["current_role"] = target_role
-        _save_meta(meta)
-
-    logger.info(
-        "[multi-role-router] Switching %s → %s (session %s → %s)",
-        current_role,
-        target_role,
-        current_session_id,
-        target_session_id,
+    # Record the exchange in history so future classifier calls have context.
+    # The assistant response is not available at pre_route time.
+    _update_meta_session(
+        role=target_role,
+        session_id=current_session_id,
+        current_role=current_role,
+        message=message,
+        response="",  # not available at pre_route time
     )
-    return {"decision": "switch_session", "session_id": target_session_id}
+
+    if decision:
+        logger.info(
+            "[multi-role-router] Switching %s → %s (session %s → %s)",
+            current_role,
+            target_role,
+            current_session_id,
+            target_session_id,
+        )
+    return decision
