@@ -78,10 +78,38 @@ M Referrers.getReferrerType  # répartition sources (organique, direct, sites, s
 
 ## 5. Rapport & journal
 
-- **Rapport Discord compact** (c'est la sortie du cron) : 8-12 lignes max —
-  clics/impressions/position vs S-1, requêtes non-brand nouvelles, compteur
-  indexation, visites fiables + conversions Matomo vs S-1, statut sync YW,
-  et la ligne fixe : « GBP : à consulter manuellement (hors périmètre serveur). »
+Deux sorties : le résumé texte (cron → Discord) **et un rapport HTML client**
+que Gilles transfère à Xavier.
+
+### 5a. Rapport HTML client (pièce jointe Discord)
+
+- Fichier : `/opt/data/workspace/tan-seo-reports/rapport-seo-tanorient-YYYY-MM-DD.html`
+  (crée le dossier au besoin ; garde les anciens, ils font l'historique).
+- **Auto-contenu** (CSS inline, aucune ressource externe), **en français**,
+  lisible sur mobile. Charte WMH sobre : noir/blanc/gris uniquement (pas de
+  bleu), police `Aptos, 'Segoe UI', Helvetica, sans-serif`, titres capitales
+  légères, tableaux à filets fins gris.
+- Structure : en-tête (« Suivi SEO & visibilité IA — tanorient.com », période,
+  « WMH Project pour Tan Services ») · synthèse 3-4 phrases · tableau GSC
+  (clics, impressions, CTR, position — S vs S-1 avec Δ) · requêtes marquantes
+  (brand vs non-brand) · tableau Matomo segment fiable (visites, actions/visite,
+  conversions par objectif) · état annonces brokerage (N annonces, dernière
+  sync) · « Actions en cours / à venir » · note de bas de page : méthodologie
+  (segment anti-bots) + « Données Google Business Profile relevées manuellement ».
+- **Ton client** : factuel, pédagogique, zéro jargon interne (pas de « MCP »,
+  « cron », IDs de posts, ni pièges techniques). Uniquement des chiffres
+  vérifiés dans la session — ne jamais estimer une valeur manquante ; écrire
+  « non disponible cette semaine » à la place.
+- **Envoi** : via l'outil d'envoi de message vers `discord:1467614563489812673`,
+  en incluant `MEDIA:/opt/data/workspace/tan-seo-reports/rapport-seo-tanorient-YYYY-MM-DD.html`
+  dans le message (syntaxe native d'attachement) + le résumé texte en légende.
+
+### 5b. Résumé Discord (sortie du cron)
+
+- 8-12 lignes max — clics/impressions/position vs S-1, requêtes non-brand
+  nouvelles, compteur indexation, visites fiables + conversions Matomo vs S-1,
+  statut sync YW, la ligne fixe « GBP : à consulter manuellement » et la
+  mention du rapport HTML joint.
 - Toute anomalie (chute brutale, page désindexée, sync en échec) : détaille-la
   et propose l'action — mais **n'applique aucun correctif de contenu** sans
   validation.
