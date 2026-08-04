@@ -1,5 +1,6 @@
 """Tests for agent.redact -- secret masking in logs and output."""
 
+import json
 import logging
 
 import pytest
@@ -831,3 +832,273 @@ class TestKeywordWordBoundary:
         assert "hunter2hunter2hunter2hh" not in result
 
 
+class TestSerializedJsonStaysParseable:
+    """Redacting a serialized JSON payload must not corrupt the JSON.
+
+    Same defect class as #43083 (``_AUTH_HEADER_RE``'s greedy ``\\S+`` eating a
+    closing quote), at the sibling patterns that fix did not touch: the
+    KEY=VALUE passes and ``_SECRET_HEADER_RE``. Each captures an unquoted value
+    bounded by "not whitespace", which also admits the quote that closes the
+    enclosing JSON string. Masking a value under the 18-char floor to a bare
+    ``***`` then deleted that quote, and every in-tree consumer that reparses
+    the redacted text degrades differently:
+
+    * ``agent_runtime_helpers.dump_api_request_debug`` — swallows the
+      ``JSONDecodeError``, so no request dump lands for exactly the API
+      failures the dump exists to explain.
+    * ``agent.trace_upload._tool_calls_to_blocks`` — raises
+      ``TraceRedactionError`` and refuses the whole upload.
+    * ``tools.kanban_tools`` — ``except json.JSONDecodeError: pass`` leaves the
+      *original unredacted* dict bound, so the secret is persisted verbatim.
+      That one is a redaction bypass, covered by
+      ``TestRedactThenReparseConsumers`` below.
+
+    Asserted as an invariant — redact(serialize(x)) parses — rather than as
+    fixed output, so any future pattern that eats a delimiter fails here.
+    """
+
+    # (content, the secret that must not survive). Short values (< the 18-char
+    # mask floor) mask to a bare "***" and so have no tail that could
+    # accidentally carry the delimiter — that is what made the corruption
+    # visible; long values pin the other branch.
+    #
+    # ``api_key: ab`` is deliberately absent: _YAML_ASSIGN_RE is line-anchored
+    # and a serialized-JSON line starts with its own key, so that pass does not
+    # fire inside JSON by design. Listing it would assert a behaviour the
+    # redactor never promised.
+    SECRET_BEARING_CONTENT = [
+        ("export MY_TOKEN=xyz", "xyz"),
+        ("export MY_TOKEN=abcdefghijklmnopqrstuvwxyz", "abcdefghijklmnopqrstuvwxyz"),
+        ("DB_PASSWORD=pw1", "pw1"),
+        ("spring.datasource.password=ab", "ab"),
+        ("spring.datasource.password=averylongpassword123", "averylongpassword123"),
+        ("value at end of string MY_TOKEN=ab", "ab"),
+        ("A_TOKEN=q1 B_PASSWORD=q2", "q2"),
+        ('MY_TOKEN="quotedshortvalue"', "quotedshortvalue"),
+        ("MY_TOKEN='sq'", "sq"),
+        # _SECRET_HEADER_RE — the sibling pattern with the same bare (\S+)
+        # value class. Short values mask to "***" and so exposed the same
+        # delimiter deletion; a curl command carrying one is an ordinary thing
+        # to find inside a request dump or a tool-call argument.
+        ("x-api-key: abc123", "abc123"),
+        ("x-auth-token: sh0rt", "sh0rt"),
+        ("api-key: pw1", "pw1"),
+        ("x-api-key: averylongheadervalue123456", "averylongheadervalue123456"),
+    ]
+
+    @pytest.mark.parametrize("content,secret", SECRET_BEARING_CONTENT)
+    def test_redacted_json_still_parses(self, content, secret):
+        payload = {"messages": [{"role": "user", "content": content}]}
+        serialized = json.dumps(payload, ensure_ascii=False, indent=2)
+
+        redacted = redact_sensitive_text(serialized, force=True)
+
+        # The assertion under test: the payload survives the round trip.
+        reparsed = json.loads(redacted)
+        assert list(reparsed) == ["messages"]
+        assert reparsed["messages"][0]["role"] == "user"
+
+    @pytest.mark.parametrize("content,secret", SECRET_BEARING_CONTENT)
+    def test_secret_still_masked_inside_json(self, content, secret):
+        """Preserving the delimiter must not preserve the secret with it."""
+        payload = {"messages": [{"role": "user", "content": content}]}
+        serialized = json.dumps(payload, ensure_ascii=False, indent=2)
+
+        redacted = redact_sensitive_text(serialized, force=True)
+
+        # Assert on the *parsed* value, not the raw text, so a pass can never
+        # come from the JSON having been mangled into something unparseable.
+        content_out = json.loads(redacted)["messages"][0]["content"]
+        assert f"={secret}" not in content_out
+        assert f"='{secret}'" not in content_out
+        assert f'="{secret}"' not in content_out
+
+    def test_mask_tail_is_the_value_not_the_delimiter(self):
+        """A long value's preserved tail comes from the secret, not the quote.
+
+        Before the fix the captured value included the closing quote, so
+        ``mask_secret``'s 4-char tail was ``lue"`` — the JSON happened to stay
+        parseable, but the displayed tail was wrong and one real character of
+        the value was hidden behind the delimiter.
+        """
+        serialized = json.dumps(
+            {"c": "MY_TOKEN=averylongsecretvalue"}, ensure_ascii=False, indent=2
+        )
+
+        value = json.loads(redact_sensitive_text(serialized, force=True))["c"]
+
+        assert value.endswith("alue")
+        assert not value.endswith('lue"')
+
+    def test_compact_json_closing_brace_is_preserved(self):
+        """Un-indented JSON: the value absorbs the closing brace too.
+
+        ``json.dumps`` without ``indent=`` leaves no whitespace after the value,
+        so the "not whitespace" value class captures ``xyz"}`` — the delimiter
+        run, not just one quote. ``plugins/platforms/google_chat/adapter.py``
+        redacts an un-indented dump, so this shape is a real call path.
+        """
+        serialized = json.dumps({"c": "MY_TOKEN=xyz"}, ensure_ascii=False)
+
+        redacted = redact_sensitive_text(serialized, force=True)
+
+        assert json.loads(redacted)["c"] == "MY_TOKEN=***"
+
+    def test_plain_shell_text_unquoted_value_unchanged(self):
+        """Outside a container there is no delimiter to split — mask as before."""
+        result = redact_sensitive_text("PGPASSWORD=hunter2 psql -h db", force=True)
+        assert result == "PGPASSWORD=*** psql -h db"
+
+    def test_apostrophe_in_value_is_not_treated_as_delimiter(self):
+        """Only a *trailing* quote is split, and the secret is still masked."""
+        result = redact_sensitive_text("MY_TOKEN=ab'cd", force=True)
+        assert "ab'cd" not in result
+        assert "MY_TOKEN=" in result
+
+    def test_interior_quote_value_is_fully_masked(self):
+        """A value containing a quote must not survive past the quote.
+
+        This is the property that rules out the other candidate fix — copying
+        #43083's value-class exclusion (``[^\\s\"']+``) onto these patterns.
+        That would stop the capture *at* the interior quote and re-emit the
+        rest verbatim: ``PGPASSWORD=p'ass`` -> ``PGPASSWORD=***'ass``. Bearer
+        tokens never contain quotes (#43083's stated rationale), but a
+        password may, so the exclusion is safe there and lossy here.
+        """
+        for text, leaked_tail in [
+            ("PGPASSWORD=p'ass psql", "ass"),
+            ("MY_SECRET=he\"llo", "llo"),
+            ("DB_PASSWORD=x'y'z", "y'z"),
+            ("x-api-key: ab'cd", "cd"),
+        ]:
+            result = redact_sensitive_text(text, force=True)
+            assert leaked_tail not in result, (text, result)
+
+    def test_quoted_header_value_keeps_both_quotes(self):
+        """A header value wrapped in its own quotes stays balanced.
+
+        ``x-api-key: "abc"`` must mask to ``x-api-key: "***"``. Splitting only
+        the trailing quote would emit ``***"`` — parseable, but visibly
+        unbalanced, and the same shape #43083 asserts for Authorization
+        (``result.count('"') == 2``).
+        """
+        for text in ['x-api-key: "quoted"', "x-api-key: 'quoted'"]:
+            result = redact_sensitive_text(text, force=True)
+            assert "quoted" not in result
+            assert result.count(text[11]) == 2, result
+
+    def test_shell_command_quote_survives(self):
+        """The non-JSON half of the same defect: a quoted curl header.
+
+        Direct parallel to #43083's ``test_token_flush_against_double_quote``,
+        which pins this contract for ``Authorization:``. Without it the closing
+        quote vanishes and the command no longer parses (shell EOF).
+        """
+        for quote in ('"', "'"):
+            text = f"curl -H {quote}x-api-key: abc123{quote} https://api.example.com"
+            result = redact_sensitive_text(text, force=True)
+            assert "abc123" not in result
+            assert result.count(quote) == 2, result
+            assert "https://api.example.com" in result
+
+    @pytest.mark.parametrize(
+        "template,secret",
+        [
+            ("sh -c {q}export MY_TOKEN={s}{q}", "xyz"),
+            ("docker run -e {q}DB_PASSWORD={s}{q}", "pw1"),
+            ("ssh host {q}PGPASSWORD={s} psql{q}", "pw1"),
+            ("curl -H {q}x-api-key: {s}{q}", "abc123"),
+        ],
+    )
+    @pytest.mark.parametrize("quote", ['"', "'"])
+    def test_quoted_shell_command_stays_balanced(self, template, secret, quote):
+        """A quote opened *before* the key must still be closed after masking.
+
+        The most common real shape of this defect, and it needs no JSON at all:
+        the shell quote wrapping the whole command is what the greedy value
+        class eats. ``sh -c 'export MY_TOKEN=xyz'`` masked to
+        ``sh -c 'export MY_TOKEN=***`` — an unterminated quote, i.e. shell EOF.
+        Asserted as balanced quote counts, the same contract #43083 pinned for
+        ``Authorization:``.
+        """
+        text = template.format(q=quote, s=secret)
+
+        result = redact_sensitive_text(text, force=True)
+
+        assert secret not in result, result
+        assert result.count(quote) % 2 == 0, result
+        assert result.endswith(quote), result
+
+
+class TestRedactThenReparseConsumers:
+    """The three in-tree callers that reparse redacted JSON, end to end.
+
+    These replicate each consumer's real handling — including its exception
+    handler — because the handler is what turns a corrupted document into the
+    user-visible failure. Behaviour contracts, not output snapshots.
+    """
+
+    # Both serializers used by the real callers. Neither is
+    # ``separators=(",", ":")``: dump_api_request_debug passes ``indent=2``,
+    # trace_upload and kanban_tools use json.dumps' default ``", "`` item
+    # separator. Both therefore leave whitespace after a string value.
+    SERIALIZERS = [
+        ("indent", {"indent": 2}),
+        ("default", {}),
+    ]
+
+    SECRETS = [
+        "export MY_TOKEN=xyz",
+        "DB_PASSWORD=pw1",
+        "spring.datasource.password=ab",
+        "x-api-key: abc123",
+        "psql; export MY_TOKEN=xyz",
+    ]
+
+    @pytest.mark.parametrize("secret_text", SECRETS)
+    @pytest.mark.parametrize("label,kwargs", SERIALIZERS)
+    def test_request_dump_payload_survives(self, secret_text, label, kwargs):
+        """dump_api_request_debug: json.loads must not raise.
+
+        The real function wraps everything in ``except Exception: return None``,
+        so a raise here means no dump file at all.
+        """
+        payload = {"request": {"body": {"messages": [{"content": secret_text}]}}}
+        serialized = json.dumps(payload, ensure_ascii=False, **kwargs)
+
+        reparsed = json.loads(redact_sensitive_text(serialized, force=True))
+
+        assert list(reparsed) == ["request"]
+
+    @pytest.mark.parametrize("secret_text", SECRETS)
+    def test_trace_upload_tool_args_survive(self, secret_text):
+        """trace_upload: a corrupted reparse raises TraceRedactionError.
+
+        ``_tool_calls_to_blocks`` re-serializes with json.dumps' defaults and
+        refuses the entire upload when the result won't parse.
+        """
+        args = {"command": secret_text, "cwd": "/tmp"}
+
+        reparsed = json.loads(redact_sensitive_text(json.dumps(args), force=True))
+
+        assert sorted(reparsed) == ["command", "cwd"]
+        assert reparsed["cwd"] == "/tmp"
+
+    @pytest.mark.parametrize("secret_text", SECRETS)
+    def test_kanban_metadata_is_not_left_unredacted(self, secret_text):
+        """kanban_tools: ``except JSONDecodeError: pass`` keeps the raw dict.
+
+        The most severe of the three — the handler leaves ``metadata`` bound to
+        the original object, so a corrupted reparse means the unredacted secret
+        is what gets persisted. Replicates tools/kanban_tools.py's five lines.
+        """
+        metadata = {"cmd": secret_text}
+        original = dict(metadata)
+
+        meta_json = redact_sensitive_text(json.dumps(metadata), force=True)
+        try:
+            metadata = json.loads(meta_json)
+        except json.JSONDecodeError:
+            pass  # the real handler
+
+        assert metadata != original, "redaction silently bypassed"

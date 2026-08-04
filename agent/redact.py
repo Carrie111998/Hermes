@@ -494,6 +494,65 @@ def _mask_token(token: str) -> str:
     return mask_secret(token, head=6, tail=4, floor=18)
 
 
+# A quote that closes a *containing* document, plus any structural characters
+# that follow it, rather than part of the secret value. Anchored at the end of
+# the captured value; ``[}\],]*`` covers compact (un-indented) JSON, where the
+# value class also swallows the object/array/element punctuation after the
+# closing quote (``"MY_TOKEN=ab"}`` captures ``ab"}``).
+_TRAILING_DELIMITER_RE = re.compile(r"[\"'][}\],]*$")
+# Quote characters a capture may have wrapped whole — see
+# ``_mask_preserving_delimiter``.
+_QUOTE_CHARS = "\"'"
+
+
+def _split_trailing_delimiter(value: str, *, quote: str = "") -> tuple[str, str]:
+    """Split a trailing container delimiter off an unquoted captured value.
+
+    Several patterns here bound the secret with a "not whitespace" value class
+    (``(\\S+)``) or an optionally-quoted equivalent. That class also admits the
+    quote which closes an *enclosing* document, and redacting a serialized JSON
+    payload is the case that matters: ``"content": "MY_TOKEN=ab"`` hands ``ab"``
+    to the masker, and because a value under the 18-char floor masks to a bare
+    ``***`` the closing quote is deleted outright. The document no longer
+    parses, so a caller that reparses the redacted text loses the whole payload.
+
+    Returns ``(value, suffix)``; ``suffix`` is re-emitted verbatim after the
+    mask. Splitting is skipped when an opening ``quote`` was captured — such a
+    value already ends at its own backreference — and when nothing but the
+    delimiter was captured, which is left for the masker to handle as before.
+
+    Known limit: a value with no whitespace before the next JSON token (truly
+    compact ``{"a":"MY_TOKEN=x","b":1}`` captures ``x","b":1}``) has no
+    delimiter-only suffix and is not split. Fully general handling would mean
+    not running a text redactor across JSON boundaries at all, which is the
+    caller's choice, not this helper's.
+    """
+    if quote:
+        return value, ""
+    match = _TRAILING_DELIMITER_RE.search(value)
+    if match is None or match.start() == 0:
+        return value, ""
+    return value[: match.start()], match.group(0)
+
+
+def _mask_preserving_delimiter(value: str) -> str:
+    """``_mask_token`` for a bare ``(\\S+)`` capture, keeping any delimiter.
+
+    For the patterns whose value class is bare ``(\\S+)`` and which have no
+    quote group of their own to defer to (``_SECRET_HEADER_RE``). Handles the
+    two ways such a capture can pick up quotes it does not own:
+
+    * wrapped in a matching pair (``x-api-key: "abc"``) — mask the inside and
+      re-emit both quotes, keeping the pair balanced;
+    * a single trailing quote closing an enclosing document or shell string —
+      delegate to ``_split_trailing_delimiter``.
+    """
+    if len(value) >= 2 and value[0] in _QUOTE_CHARS and value[-1] == value[0]:
+        return f"{value[0]}{_mask_token(value[1:-1])}{value[0]}"
+    secret, delimiter = _split_trailing_delimiter(value)
+    return f"{_mask_token(secret)}{delimiter}"
+
+
 def _redact_query_string(query: str) -> str:
     """Redact sensitive parameter values in a URL query string.
 
@@ -737,7 +796,13 @@ def redact_sensitive_text(
                 # embedded matching inside the helper.
                 if not _key_has_secret_keyword(name):
                     return m.group(0)
-                return f"{name}={quote}{_mask_token(value)}{quote}"
+                # An unquoted value stops at whitespace, so it can absorb the
+                # quote that closes a *containing* document (serialized JSON).
+                # Hand the masker only the secret and re-emit the delimiter, or
+                # a short value's bare ``***`` would swallow it and leave the
+                # document unparseable.
+                value, delimiter = _split_trailing_delimiter(value, quote=quote)
+                return f"{name}={quote}{_mask_token(value)}{quote}{delimiter}"
             text = _ENV_ASSIGN_RE.sub(_redact_env, text)
             # Lowercase/dotted config keys (issue #16413). Skip URLs entirely —
             # web-URL query params are intentionally passed through (see note
@@ -799,7 +864,11 @@ def redact_sensitive_text(
     # colon-separated, so gate on ":" — the regex itself is the precise filter.
     if ":" in text:
         text = _SECRET_HEADER_RE.sub(
-            lambda m: m.group(1) + _mask_token(m.group(2)),
+            # Same unquoted-capture hazard as the KEY=VALUE passes above: the
+            # ``(\S+)`` value class absorbs the quote closing an enclosing
+            # JSON document, and a short header value masks to a bare ``***``
+            # that would delete it.
+            lambda m: m.group(1) + _mask_preserving_delimiter(m.group(2)),
             text,
         )
 
