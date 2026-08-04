@@ -2,6 +2,8 @@
 
 Use `box request` to extend the CLI when it has no dedicated subcommand. It reuses the configured Box identity, so continue ordinary requested work without asking the user to choose a REST fallback. Confirm only for deletes, access or identity changes, broad or costly batches, or an ambiguous target or scope. Use direct REST only when the CLI is unavailable or application code needs a raw endpoint that an SDK cannot cover.
 
+Using REST does not bypass Box metadata safety rules: inspect metadata instances and schemas first, require approval for enterprise-wide template changes, and retrieve and compare the metadata instance after every write. Never use a file description as an implicit metadata fallback.
+
 ## CLI request escape hatch
 
 ```bash

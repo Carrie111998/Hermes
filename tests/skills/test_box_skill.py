@@ -100,3 +100,20 @@ def test_ccg_template_is_valid_and_matches_registered_credentials():
     assert settings.get("clientID") == "YOUR_BOX_CLIENT_ID"
     assert settings.get("clientSecret") == "YOUR_BOX_CLIENT_SECRET"
     assert data.get("enterpriseID") == "YOUR_BOX_ENTERPRISE_ID"
+
+
+def test_metadata_extraction_requires_complete_schema_and_readback():
+    """Protect structured metadata from falling back to a truncated description."""
+    search_and_ai = (SKILL_DIR / "references" / "search-and-ai.md").read_text(
+        encoding="utf-8"
+    )
+    content_workflows = (SKILL_DIR / "references" / "content-workflows.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert "every requested field" in search_and_ai
+    assert "require explicit user approval" in search_and_ai
+    assert "metadata instance ID" in search_and_ai
+    assert "missing, normalized, or rejected" in search_and_ai
+    assert "Never use a file description as an automatic substitute" in search_and_ai
+    assert "limited to 256 characters" in content_workflows

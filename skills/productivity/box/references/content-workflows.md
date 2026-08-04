@@ -40,6 +40,10 @@ box folders:move <FOLDER_ID> <NEW_PARENT_ID> --json --fields id,name,parent
 
 Read back the item or its parent after every write. Moving a folder moves its contents; confirm broad moves before executing them.
 
+## File descriptions
+
+Box file descriptions are limited to 256 characters. Never use a description as a fallback for extracted structured metadata. Set one only when the user explicitly asks for a description, verify that the complete intended text fits the limit before writing, then fetch the file and compare the returned description with the intended value. Use [Search and AI](search-and-ai.md) to persist extracted fields through a compatible metadata template instead.
+
 ## Collaborate and share
 
 ```bash
@@ -67,4 +71,4 @@ box files:metadata:create <FILE_ID> --scope enterprise --template-key properties
   --data invoice_id=INV-001 --json
 ```
 
-Read the template definition and existing metadata before writing. Use [Search and AI](search-and-ai.md) when metadata must be extracted from document content.
+Read the template definition and all existing metadata instances before writing. Use [Search and AI](search-and-ai.md) when metadata must be extracted from document content; do not use a partial, unrelated, or incomplete template.

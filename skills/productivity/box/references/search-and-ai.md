@@ -40,34 +40,50 @@ box ai:text-gen --items=id=<FILE_ID>,type=file \
 
 ## Extract and persist file metadata
 
-Treat a request to extract metadata as a write workflow, not a request to merely show an AI response. Unless the user asks to preview the result only, use a compatible existing Box metadata template, then write the returned values onto each source file.
+Treat a request to extract metadata as a structured Box metadata workflow, not a request to merely show an AI response. Unless the user asks to preview only, persist values only when one template can represent every requested field with the correct types.
 
-1. Resolve the template named by the user, or list templates and select the compatible existing one. Read its fields and inspect any metadata already attached to the file.
+1. Inspect the file's metadata instances, list the enterprise templates, and retrieve every candidate schema before extracting or writing.
    ```bash
+   box files:metadata <FILE_ID> --json
    box metadata-templates --json --fields templateKey,displayName,scope
    box metadata-templates:get <TEMPLATE_KEY> --scope enterprise --json
-   box files:metadata:get <FILE_ID> --scope enterprise --template-key <TEMPLATE_KEY> --json
    ```
-2. Extract against that template. Request only the target file IDs and keep the extraction output in the terminal result rather than downloading the source file.
+2. Compare every requested field to each candidate's field key and type. Select an existing template only when it supports **all** requested fields. Do not attach a semantically unrelated template or one that supports only some fields just to persist a subset.
+3. Extract against the selected template. Request only the target file IDs and keep the extraction output in the terminal result rather than downloading the source file.
    ```bash
    box ai:extract-structured --items=id=<FILE_ID>,type=file \
      --metadata-template="type=metadata_template,scope=enterprise,template_key=<TEMPLATE_KEY>" \
      --json
    ```
-3. Convert the returned structured values to the template's field keys and types. Add a metadata instance when the file has none; otherwise replace the extracted fields. Do not write fields that are absent, null, or incompatible with the template.
+4. Convert returned values to the selected template's field keys and types. Add a metadata instance when the selected template has none on the file; otherwise replace its extracted fields. Do not write absent, null, incompatible, or truncated values.
    ```bash
-   box files:metadata:add <FILE_ID> --scope enterprise --template-key <TEMPLATE_KEY> \
+   box files:metadata:create <FILE_ID> --scope enterprise --template-key <TEMPLATE_KEY> \
      --data "invoice_number=INV-001" --data "total=#1250.00" --json
 
    box files:metadata:update <FILE_ID> --scope enterprise --template-key <TEMPLATE_KEY> \
      --replace "invoice_number=INV-001" --replace "total=#1250.00" --json
    ```
-4. Read the attached metadata back and report the file link, template, and fields written.
+   Use the required `#` prefix for float values with `files:metadata:create` or `files:metadata:add`.
+5. Retrieve the specific instance and compare every returned field with the intended value. A successful response to the write is not verification. Report the template key, metadata instance ID, file link, and any missing, normalized, or rejected values.
    ```bash
    box files:metadata:get <FILE_ID> --scope enterprise --template-key <TEMPLATE_KEY> --json
    ```
 
-The extraction request authorizes the matching per-file metadata writes, so do not ask again before attaching or updating those values. Do ask before creating or changing an enterprise metadata template, cascading it across a folder, or applying extraction to a material batch. If no compatible template exists, explain that Box metadata requires a schema and ask whether the user wants to select or create one; do not store arbitrary extraction JSON in an unrelated field.
+The extraction request authorizes matching per-file metadata writes, so do not ask again after finding a fully compatible existing template. Creating or changing a metadata template is an enterprise-wide schema change: require explicit user approval before doing it. If approved, create a dedicated, semantically appropriate template with stable field keys and correct field types, attach it to the target file, and verify every field. Use full ISO timestamps for date values, such as `2025-03-29T00:00:00Z`.
+
+```bash
+box metadata-templates:create --display-name "Invoice extraction" \
+  --template-key invoice_extraction \
+  --string "Client name" --field-key client_name \
+  --number "Invoice amount" --field-key invoice_amount \
+  --date "Invoice date" --field-key invoice_date --json
+```
+
+If no existing template supports every field and the user does not approve a new one, leave structured metadata unchanged. Explain that the schema is incomplete and ask whether they want a separate sidecar document, an explicitly requested description that fits, or another existing template. Never silently truncate or discard fields.
+
+### File descriptions are not metadata fallback
+
+**Hard rule:** Never use a file description as an automatic substitute for structured metadata. Box file descriptions are limited to 256 characters. Use `box files:update --description` only when the user explicitly requests a description, first verify the complete intended text fits within 256 characters, then read it back and compare it with the intended value. Do not use a description for complete extracted metadata or as a fallback for fields that do not fit a template.
 
 ## Confidentiality and AI units
 
