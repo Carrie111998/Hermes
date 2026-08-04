@@ -304,11 +304,14 @@ def _session_token_source() -> str:
 
     * ``injected`` — ``HERMES_DASHBOARD_SESSION_TOKEN`` is present AND the
       desktop-shell marker ``HERMES_DESKTOP=1`` is set (Electron spawns
-      ``hermes serve`` with both; this is the trusted desktop path).
-    * ``env`` — a token is present but the desktop marker is not.  Includes
-      the stale-token case where a leftover ``HERMES_DASHBOARD_SESSION_TOKEN``
-      in ``<hermes-home>/.env`` is loaded into the environment and clobbers
-      (or replaces) the token the desktop shell injected.
+      ``hermes serve`` with both; this is the trusted desktop path).  NOTE:
+      the stale-``.env`` clobber state ALSO lands here — the loader replaces
+      the injected token with the stale value while the marker survives — so
+      ``injected`` alone does not prove the token the desktop minted is the
+      one the server adopted (see ``_log_token_mismatch_hint``).
+    * ``env`` — a token is present but the desktop marker is not.  A manual
+      shell launch (or a non-desktop CLI process) with a leftover exported
+      ``HERMES_DASHBOARD_SESSION_TOKEN``.
     * ``generated`` — no token in the environment; a fresh random token was
       minted for this server process.
 
@@ -14615,22 +14618,29 @@ def _log_token_mismatch_hint(mode: str) -> None:
     if mode != "loopback":
         return
     source = _SESSION_TOKEN_SOURCE
-    if source == "injected":
-        return
-    if source == "env":
-        _log.warning(
-            "stale HERMES_DASHBOARD_SESSION_TOKEN in %s suspected — remove "
-            "the line (or run `hermes setup`) and restart the server; "
-            "server token source=env",
-            get_hermes_home() / ".env",
-        )
-    else:  # generated
+    if source == "generated":
         _log.warning(
             "server generated a fresh session token (no "
             "HERMES_DASHBOARD_SESSION_TOKEN in the environment) — the client "
             "is presenting a stale token; restart the desktop app so it "
             "re-injects its token; server token source=generated"
         )
+        return
+    # source is ``injected`` OR ``env`` — both mean the server resolved its
+    # token from the environment. A loopback mismatch here IS the lockout
+    # signature: the desktop injected a fresh token, but a stale
+    # HERMES_DASHBOARD_SESSION_TOKEN in .env (loaded with override=True)
+    # replaced it before _SESSION_TOKEN resolved — the marker survives the
+    # clobber, so ``injected`` cannot be distinguished from the stale state
+    # by source alone. A genuinely-adopted injection would have matched and
+    # never reached this point, so the mismatch itself is the trigger.
+    _log.warning(
+        "stale HERMES_DASHBOARD_SESSION_TOKEN in %s suspected — remove "
+        "the line (or run `hermes setup`) and restart the server; "
+        "server token source=%s",
+        get_hermes_home() / ".env",
+        source,
+    )
 
 
 def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
