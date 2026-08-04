@@ -321,6 +321,31 @@ def test_run_job_script_python_still_runs_via_python(hermes_env):
     assert output.startswith("python ")
 
 
+def test_run_job_script_isolated_python_ignores_startup_environment(
+    hermes_env, tmp_path, monkeypatch
+):
+    """*.isolated.py starts before inherited Python hooks can execute."""
+    from cron.scheduler import _run_job_script
+
+    poison = tmp_path / "poison"
+    poison.mkdir()
+    (poison / "sitecustomize.py").write_text(
+        "print('UNREVIEWED_PYTHON_STARTUP')\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("PYTHONPATH", str(poison))
+    script_path = hermes_env / "scripts" / "report.isolated.py"
+    script_path.write_text(
+        "import os\n"
+        "assert 'PYTHONPATH' not in os.environ\n"
+        "print('ISOLATED_PYTHON_OK')\n",
+        encoding="utf-8",
+    )
+
+    ok, output = _run_job_script("report.isolated.py")
+    assert ok is True
+    assert output == "ISOLATED_PYTHON_OK"
+
+
 def test_run_job_script_path_traversal_still_blocked(hermes_env):
     """Security regression: shell-script support must NOT loosen containment."""
     from cron.scheduler import _run_job_script

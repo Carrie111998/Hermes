@@ -2021,6 +2021,8 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
     Supported interpreters (chosen by file extension):
 
     * ``.sh`` / ``.bash`` — run with ``/bin/bash``
+    * ``*.isolated.py`` — run with the current Python interpreter under
+      ``-I -B`` after removing interpreter/loader startup variables
     * anything else — run with the current Python interpreter
       (``sys.executable``), preserving the original behaviour for
       Python-based pre-check and data-collection scripts.
@@ -2069,10 +2071,13 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
     script_timeout = _get_script_timeout()
 
     # Pick an interpreter by extension.  Bash for .sh/.bash, Python for
-    # everything else.  We deliberately do NOT honour the file's own
+    # everything else.  A *.isolated.py filename opts into isolated Python
+    # startup without changing the existing behavior of ordinary .py jobs.
+    # We deliberately do NOT honour the file's own
     # shebang: the scripts dir is trusted, but keeping the interpreter
     # choice explicit here keeps the allowed surface small and auditable.
     suffix = path.suffix.lower()
+    isolated_python = path.name.lower().endswith(".isolated.py")
     if suffix in {".sh", ".bash"}:
         # Resolve bash dynamically so Windows (Git Bash) and Linux/macOS
         # all work.  On native Windows without Git for Windows installed
@@ -2090,19 +2095,33 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
             )
         argv = [_bash, str(path)]
     else:
-        argv = [sys.executable, str(path)]
+        argv = [sys.executable]
+        if isolated_python:
+            argv.extend(["-I", "-B"])
+        argv.append(str(path))
 
     try:
         from tools.environments.local import _sanitize_subprocess_env
 
         popen_kwargs = {"creationflags": windows_hide_flags()} if sys.platform == "win32" else {}
+        run_env = _sanitize_subprocess_env(os.environ.copy())
+        if isolated_python:
+            for key in tuple(run_env):
+                if (
+                    key.startswith("PYTHON")
+                    or key.startswith("BASH_FUNC_")
+                    or key.startswith("LD_")
+                    or key.startswith("DYLD_")
+                    or key in {"BASH_ENV", "ENV"}
+                ):
+                    run_env.pop(key, None)
         result = subprocess.run(
             argv,
             capture_output=True,
             text=True,
             timeout=script_timeout,
             cwd=str(path.parent),
-            env=_sanitize_subprocess_env(os.environ.copy()),
+            env=run_env,
             **popen_kwargs,
         )
         stdout = (result.stdout or "").strip()
