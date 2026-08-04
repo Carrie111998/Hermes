@@ -132,6 +132,9 @@ def test_hubs_route_large_reusable_qa_with_governance_and_safe_mutations():
     assert "preserves Box permissions" in skill
     assert "governed AI integration" in skill
     assert "consumes AI units" in skill
+    assert "do not wait for acknowledgement" in skill
+    assert "scope or expected AI-unit use is ambiguous" in skill
+    assert "not explicitly requested that scale" in skill
     assert "Do not use a Hub for metadata extraction or text generation" in search_and_ai
     assert "single_item_qa" in hubs
     assert '"type":"hubs"' in hubs

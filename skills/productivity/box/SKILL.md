@@ -94,7 +94,7 @@ For Q&A over more than 25 files, first narrow a one-off request with search or m
 
 When the user asks to extract metadata from a Box file, treat it as a request to persist the result. First prove that one existing metadata template represents every requested field; then use structured extraction, attach the returned values to that same file, and read the metadata back. Do this without a separate confirmation only when the schema is fully compatible and the user did not ask for a preview. Never silently substitute a file description, attach a partial or unrelated template, truncate fields, or discard fields. Read [Search and AI](references/search-and-ai.md) for the required template-selection and writeback workflow.
 
-Before the first Box AI request, explain that Box AI must be enabled, consumes AI units, and remains limited to the current actor's permissions. An AI response returned to Hermes can still contain sensitive information. For a material batch, confirm the scope. See [Search and AI](references/search-and-ai.md).
+Before the first Box AI request, state that Box AI must be enabled, consumes AI units, and remains limited to the current actor's permissions; do not wait for acknowledgement. An AI response returned to Hermes can still contain sensitive information. Confirm only when a material batch's file scope or expected AI-unit use is ambiguous, or when the user has not explicitly requested that scale. See [Search and AI](references/search-and-ai.md).
 
 ## Operate safely
 
