@@ -234,13 +234,31 @@ class HolographicMemoryProvider(MemoryProvider):
                 "# Holographic Memory\n"
                 "Active. Empty fact store — proactively add facts the user would expect you to remember.\n"
                 "Use fact_store(action='add') to store durable structured facts about people, projects, preferences, decisions.\n"
-                "Use fact_feedback to rate facts after using them (trains trust scores)."
+                "Use fact_feedback to rate facts after using them (trains trust scores).\n"
+                "\n"
+                "## MANDATORY memory routing gate (never skip)\n"
+                "Before ANY memory write (memory or fact_store), ask:\n"
+                "> \"Will I need this in EVERY future session, regardless of topic?\"\n"
+                "- YES (always-on: skills, priority chains, hygiene, global prefs) → memory tool only.\n"
+                "- NO / Maybe (situational: configs, workflows, project state, quirks) → fact_store only.\n"
+                "- NEVER store the same fact in both.\n"
+                "- BEFORE any memory add: probe fact_store first (action='search' or 'probe'). If the fact exists there, do NOT duplicate — reference it instead.\n"
+                "- memory.md mutations ONLY via the memory tool — never hand-edit the file (drift guard).\n"
             )
         return (
             f"# Holographic Memory\n"
             f"Active. {total} facts stored with entity resolution and trust scoring.\n"
             f"Use fact_store to search, probe entities, reason across entities, or add facts.\n"
-            f"Use fact_feedback to rate facts after using them (trains trust scores)."
+            f"Use fact_feedback to rate facts after using them (trains trust scores).\n"
+            f"\n"
+            f"## MANDATORY memory routing gate (never skip)\n"
+            f"Before ANY memory write (memory or fact_store), ask:\n"
+            f"> \"Will I need this in EVERY future session, regardless of topic?\"\n"
+            f"- YES (always-on: skills, priority chains, hygiene, global prefs) → memory tool only.\n"
+            f"- NO / Maybe (situational: configs, workflows, project state, quirks) → fact_store only.\n"
+            f"- NEVER store the same fact in both.\n"
+            f"- BEFORE any memory add: probe fact_store first (action='search' or 'probe'). If the fact exists there, do NOT duplicate — reference it instead.\n"
+            f"- memory.md mutations ONLY via the memory tool — never hand-edit the file (drift guard).\n"
         )
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
