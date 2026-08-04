@@ -7,6 +7,7 @@ import {
   appendUniquePathEntries,
   buildDesktopBackendEnv,
   buildDesktopBackendPath,
+  buildDesktopParentWatchdogEnv,
   hermesManagedNodePathEntries,
   normalizeHermesHomeRoot,
   pathEnvKey,
@@ -145,6 +146,21 @@ test('buildDesktopBackendEnv forces PYTHONUTF8 unless the user set it explicitly
   })
 
   assert.equal(optedOut.PYTHONUTF8, '0')
+})
+
+test('buildDesktopParentWatchdogEnv includes pid and approximate main-process start epoch', () => {
+  assert.deepEqual(
+    buildDesktopParentWatchdogEnv({
+      pid: 4242,
+      nowMs: 1_780_000_010_500,
+      uptimeSeconds: 10.25
+    }),
+    {
+      HERMES_DESKTOP: '1',
+      HERMES_DESKTOP_PARENT_PID: '4242',
+      HERMES_DESKTOP_PARENT_START_EPOCH: '1780000000.250'
+    }
+  )
 })
 
 test('normalizeHermesHomeRoot maps profile homes back to the global Hermes root', () => {

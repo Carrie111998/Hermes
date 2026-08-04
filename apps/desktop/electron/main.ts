@@ -35,7 +35,7 @@ import { classifyActiveRuntime } from './active-runtime-state'
 import { stopBackendChild as stopBackendChildImpl } from './backend-child'
 import { dashboardFallbackArgs, sourceDeclaresServe } from './backend-command'
 import { createBackendConnectionState } from './backend-connection-state'
-import { buildDesktopBackendEnv, hermesManagedNodePathEntries, normalizeHermesHomeRoot } from './backend-env'
+import { buildDesktopBackendEnv, buildDesktopParentWatchdogEnv, hermesManagedNodePathEntries, normalizeHermesHomeRoot } from './backend-env'
 import { isReauthRequiredError, waitForHermesReady } from './backend-health'
 import {
   canImportHermesCli,
@@ -8204,9 +8204,10 @@ async function spawnPoolBackend(profile, entry) {
         TERMINAL_CWD: hermesCwd,
         HERMES_DASHBOARD_SESSION_TOKEN: token,
         // Marks this dashboard backend as desktop-spawned so it runs the cron
-        // scheduler tick loop (the gateway isn't running under the app).
-        HERMES_DESKTOP: '1',
-        HERMES_DESKTOP_PARENT_PID: String(process.pid),
+        // scheduler tick loop (the gateway isn't running under the app), and
+        // passes the Electron PID + start epoch so Windows watchdog checks can
+        // reject PID reuse instead of trusting PID liveness alone.
+        ...buildDesktopParentWatchdogEnv(),
         HERMES_WEB_DIST: webDist,
         ...(readyFile ? { HERMES_DESKTOP_READY_FILE: readyFile } : {})
       },
@@ -8498,9 +8499,10 @@ async function startHermes() {
           TERMINAL_CWD: hermesCwd,
           HERMES_DASHBOARD_SESSION_TOKEN: token,
           // Marks this dashboard backend as desktop-spawned so it runs the cron
-          // scheduler tick loop (the gateway isn't running under the app).
-          HERMES_DESKTOP: '1',
-          HERMES_DESKTOP_PARENT_PID: String(process.pid),
+          // scheduler tick loop (the gateway isn't running under the app), and
+          // passes the Electron PID + start epoch so Windows watchdog checks can
+          // reject PID reuse instead of trusting PID liveness alone.
+          ...buildDesktopParentWatchdogEnv(),
           HERMES_WEB_DIST: webDist,
           ...(readyFile ? { HERMES_DESKTOP_READY_FILE: readyFile } : {})
         },
