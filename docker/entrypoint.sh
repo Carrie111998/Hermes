@@ -413,6 +413,31 @@ echo "[entrypoint] .env contents:"
 cat "$HERMES_HOME/.env"
 echo "[entrypoint] --- end .env ---"
 
+# Cron ticker for secondary profiles (Railway runs a single foreground gateway
+# on the default profile; without gateway.multiplex_profiles the built-in
+# ticker only owns the default store — upstream #69377 — so named-profile cron
+# jobs would show "scheduled" forever without this). Cheap side-loop: tick each
+# listed profile's due jobs once a minute via `hermes -p <p> cron tick`.
+# Delivery works without live adapters (standalone bot-token HTTP path in
+# cron/scheduler.py:_deliver_result, incl. MEDIA: attachments). Railway-only:
+# under s6/docker the per-profile gateway services own their own tickers.
+if [ -n "$RAILWAY_ENVIRONMENT" ]; then
+    (
+        while true; do
+            sleep 60
+            for _cp in seo-geo; do
+                _cplog="$HERMES_HOME/profiles/$_cp/logs/cron-tick.log"
+                # crude rotation: keep the log under ~1 MB
+                if [ -f "$_cplog" ] && [ "$(wc -c < "$_cplog")" -gt 1048576 ]; then
+                    tail -c 262144 "$_cplog" > "$_cplog.tmp" && mv "$_cplog.tmp" "$_cplog"
+                fi
+                hermes -p "$_cp" cron tick >> "$_cplog" 2>&1 || true
+            done
+        done
+    ) &
+    echo "[entrypoint] cron side-ticker started for profiles: seo-geo"
+fi
+
 # Optionally start `hermes dashboard` as a side-process.
 #
 # This is what the Hermes Desktop app connects to as a "Remote gateway"

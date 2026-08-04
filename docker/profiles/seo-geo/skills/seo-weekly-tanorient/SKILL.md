@@ -100,9 +100,25 @@ que Gilles transfère à Xavier.
   « cron », IDs de posts, ni pièges techniques). Uniquement des chiffres
   vérifiés dans la session — ne jamais estimer une valeur manquante ; écrire
   « non disponible cette semaine » à la place.
-- **Envoi** : via l'outil d'envoi de message vers `discord:1467614563489812673`,
-  en incluant `MEDIA:/opt/data/workspace/tan-seo-reports/rapport-seo-tanorient-YYYY-MM-DD.html`
-  dans le message (syntaxe native d'attachement) + le résumé texte en légende.
+- **Envoi — en run cron (cas normal)** : termine ta sortie finale par la ligne
+  `MEDIA:/opt/data/workspace/tan-seo-reports/rapport-seo-tanorient-YYYY-MM-DD.html`
+  — le scheduler livre le résumé + la pièce jointe nativement sur le canal
+  `deliver` du job (`_send_media_via_adapter`). Rien d'autre à faire.
+- **Envoi — en session manuelle** (pas d'outil `send_message` en CLI) : méthode
+  éprouvée 04/08, API REST Discord directe (canal DM `1467614563489812673`) :
+  ```bash
+  PAYLOAD=$(cat /opt/data/workspace/.tmp_payload.json)   # {"content": "<résumé>"}
+  curl -s -X POST "https://discord.com/api/v10/channels/1467614563489812673/messages" \
+    -H "Authorization: Bot $TOK" \
+    -F "payload_json=$PAYLOAD" \
+    -F "file1=@/opt/data/workspace/tan-seo-reports/rapport-seo-tanorient-YYYY-MM-DD.html;type=text/html"
+  ```
+  🔴 `-F "payload_json=@fichier"` NE MARCHE PAS (Discord joint le fichier au
+  lieu de le parser) — passer la chaîne JSON **inline**. Vérifier la réponse
+  (`id` + `attachments`). Le fichier payload doit vivre sous `/opt/data`
+  (`/tmp` interdit à l'écriture). Le token bot n'est pas dans ton shell par
+  design ; en manuel, lis-le via `tr '\0' '\n' < /proc/1/environ | grep
+  '^DISCORD_BOT_TOKEN='` — réservé à CE canal DM, jamais pour un autre usage.
 
 ### 5b. Résumé Discord (sortie du cron)
 
