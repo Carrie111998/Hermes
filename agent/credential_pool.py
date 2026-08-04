@@ -1458,17 +1458,42 @@ class CredentialPool:
                         logger.debug(
                             "Failed to clear terminal xAI OAuth state: %s", clear_exc
                         )
-                    removed_ids = [
-                        item.id for item in self._entries
-                        if item.source == "device_code"
-                    ]
-                    self._entries = [
-                        item for item in self._entries
-                        if item.source != "device_code"
-                    ]
-                    if self._current_id == entry.id:
-                        self._current_id = None
-                    self._persist(removed_ids=removed_ids)
+                    # Singleton-seeded device_code entries are removed so the
+                    # next load does not re-seed the same revoked grant from
+                    # the (now-cleared) provider singleton.
+                    #
+                    # Independent manual:device_code entries (hermes auth add)
+                    # must instead be marked DEAD and persisted. Removing only
+                    # device_code left manual entries with last_status=null so
+                    # every new process re-selected the revoked refresh token
+                    # and hammered invalid_grant again.
+                    if entry.source == "device_code":
+                        removed_ids = [
+                            item.id for item in self._entries
+                            if item.source == "device_code"
+                        ]
+                        self._entries = [
+                            item for item in self._entries
+                            if item.source != "device_code"
+                        ]
+                        if self._current_id == entry.id:
+                            self._current_id = None
+                        self._persist(removed_ids=removed_ids)
+                    else:
+                        code = getattr(exc, "code", None) or "invalid_grant"
+                        updated = replace(
+                            entry,
+                            last_status=STATUS_DEAD,
+                            last_status_at=time.time(),
+                            last_error_code=getattr(exc, "status_code", None) or 400,
+                            last_error_reason=str(code),
+                            last_error_message=str(exc),
+                            last_error_reset_at=None,
+                        )
+                        self._replace_entry(entry, updated)
+                        if self._current_id == entry.id:
+                            self._current_id = None
+                        self._persist()
                     return None
             # For openai-codex: same race as xAI/nous — another Hermes process
             # may have consumed the refresh token between our proactive sync

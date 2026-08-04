@@ -5444,12 +5444,23 @@ def _is_terminal_xai_oauth_refresh_error(exc: Exception) -> bool:
     (invalid_grant, token revoked, refresh_token_reused).
     ``xai_auth_missing_refresh_token`` means the pool entry has no refresh
     token at all — retrying will never work.
-    Both carry ``relogin_required=True``; transient failures (429, 5xx) do not.
+    Raw OAuth codes (``invalid_grant`` / ``invalid_token`` /
+    ``refresh_token_reused``) are also terminal when raised with
+    ``relogin_required=True`` — callers and tests may surface the upstream
+    code directly instead of wrapping it as ``xai_refresh_failed``.
+    Transient failures (429, 5xx, tier denial) do not set
+    ``relogin_required`` and are therefore excluded.
     """
     return (
         isinstance(exc, AuthError)
         and exc.provider == "xai-oauth"
-        and exc.code in {"xai_refresh_failed", "xai_auth_missing_refresh_token"}
+        and exc.code in {
+            "xai_refresh_failed",
+            "xai_auth_missing_refresh_token",
+            "invalid_grant",
+            "invalid_token",
+            "refresh_token_reused",
+        }
         and bool(exc.relogin_required)
     )
 

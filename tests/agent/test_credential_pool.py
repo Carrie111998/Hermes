@@ -2024,3 +2024,99 @@ class TestCredentialPoolQueryLocking:
             inner.release()
 
         assert done.wait(timeout=2.0), f"{method}() did not complete after lock release"
+
+
+def test_xai_manual_device_code_invalid_grant_persists_dead_across_reload(tmp_path, monkeypatch):
+    """A terminal xAI invalid_grant on manual:device_code must stick on disk.
+
+    hermes auth add xai-oauth creates independent ``manual:device_code`` pool
+    entries. The previous quarantine path only removed singleton-seeded
+    ``device_code`` rows, so a revoked manual refresh token kept
+    ``last_status=null``, was re-selected after every process restart, and
+    re-hit invalid_grant indefinitely.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setattr("hermes_cli.auth._import_codex_cli_tokens", lambda: None)
+
+    expired_access = _jwt_with_claims({"exp": int(time.time()) - 3600})
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "xai-oauth": [
+                    {
+                        "id": "xai-revoked",
+                        "label": "revoked",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "manual:device_code",
+                        "access_token": expired_access,
+                        "refresh_token": "refresh-revoked",
+                    },
+                    {
+                        "id": "xai-healthy",
+                        "label": "healthy",
+                        "auth_type": "oauth",
+                        "priority": 1,
+                        "source": "manual:device_code",
+                        "access_token": _jwt_with_claims({"exp": int(time.time()) + 3600}),
+                        "refresh_token": "refresh-healthy",
+                    },
+                ]
+            },
+        },
+    )
+
+    from hermes_cli.auth import AuthError
+    from agent.credential_pool import STATUS_DEAD, load_pool
+
+    refresh_calls = {"n": 0}
+
+    def fake_refresh(access_token, refresh_token, **kwargs):
+        refresh_calls["n"] += 1
+        refresh_calls.setdefault("tokens", []).append(refresh_token)
+        if refresh_token == "refresh-revoked":
+            # Production refresh_xai_oauth_pure raises code=xai_refresh_failed on
+            # HTTP 400 with the upstream invalid_grant body in the message.
+            raise AuthError(
+                "xAI token refresh failed. Response: "
+                '{"error":"invalid_grant","error_description":"Refresh token has been revoked"}',
+                provider="xai-oauth",
+                code="xai_refresh_failed",
+                relogin_required=True,
+            )
+        # Healthy entry: return rotated tokens without network.
+        return {
+            "access_token": _jwt_with_claims({"exp": int(time.time()) + 7200}),
+            "refresh_token": "refresh-healthy-rotated",
+            "last_refresh": datetime.now(timezone.utc).isoformat(),
+        }
+
+    monkeypatch.setattr("hermes_cli.auth.refresh_xai_oauth_pure", fake_refresh)
+
+    pool = load_pool("xai-oauth")
+    # Force refresh of the priority-0 revoked entry.
+    revoked = next(e for e in pool._entries if e.id == "xai-revoked")
+    assert pool._refresh_entry(revoked, force=True) is None
+
+    auth_payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    entries = auth_payload["credential_pool"]["xai-oauth"]
+    dead = next(e for e in entries if e["id"] == "xai-revoked")
+    healthy = next(e for e in entries if e["id"] == "xai-healthy")
+    assert dead["last_status"] == STATUS_DEAD
+    assert dead["last_error_reason"] == "xai_refresh_failed"
+    assert healthy.get("last_status") in (None, "ok")
+    first_calls = refresh_calls["n"]
+    assert first_calls == 1
+
+    # New process: reloaded pool must skip the dead entry and never re-refresh it.
+    pool2 = load_pool("xai-oauth")
+    selected = pool2.select()
+    assert selected is not None
+    assert selected.id == "xai-healthy"
+
+    dead_in_memory = next(e for e in pool2._entries if e.id == "xai-revoked")
+    assert dead_in_memory.last_status == STATUS_DEAD
+    # Selecting/loading must not retry the revoked refresh token.
+    assert refresh_calls["tokens"].count("refresh-revoked") == 1
