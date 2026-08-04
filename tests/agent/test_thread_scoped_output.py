@@ -165,3 +165,31 @@ def test_sequential_silence_calls_both_silence_correctly():
     assert "first-silenced" not in captured
     assert "second-silenced" not in captured
     assert "loud" in captured
+
+
+def test_sequential_silence_keeps_proxy_sink_open_and_writable():
+    """Regression discriminator: the old design closed its per-call /dev/null
+    handle on exit, but _ensure_installed only captured the sink on the FIRST
+    call — leaving the proxy's retained sink closed for every subsequent call.
+    Because _ThreadRoutingStream.write() swallows write failures, output-level
+    asserts cannot distinguish old vs new behavior; asserting on the sink
+    itself can.  The module-level sink must stay open and writable across
+    sequential silence calls (issue #55769 / #55925)."""
+    from agent.thread_scoped_output import _installed
+
+    def body():
+        with thread_scoped_silence():
+            print("first-silenced")
+        with thread_scoped_silence():
+            print("second-silenced")
+
+    _run_with_real_stream(body)
+
+    for attr in ("stdout", "stderr"):
+        proxy = _installed[attr]
+        # Old code: first context exit closed the captured sink → this fails.
+        assert not proxy._sink.closed, f"{attr} proxy sink was closed after sequential calls"
+        # A write to the retained sink must land (old code raised ValueError on
+        # the closed handle, which write() swallowed).
+        written = proxy._sink.write("probe\n")
+        assert written == len("probe\n"), f"{attr} proxy sink rejected a write"
