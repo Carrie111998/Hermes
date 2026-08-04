@@ -24,6 +24,18 @@ Design notes
   match on name as a fallback, but the user has an obvious incentive
   to describe them.
 
+* Capability routing (fleet/agentcard-routing, routing-rules.md): when
+  the AgentCard registry is available (``kanban.cards_dir``, default
+  ``<hermes-root>/workspace/fleet/cards``), the LLM no longer picks
+  assignees — it classifies each task as ``primary_domain`` +
+  ``requires_capabilities`` from the catalog, and
+  ``hermes_cli.agentcard_router`` deterministically routes by matching
+  capabilities against the profile cards (domain guard first, then
+  scoring, then tie-breaks). Every machine-routed child produces one
+  JSON audit line in ``fleet/routing-audit.log`` and a comment on the
+  root task. A missing/unusable registry falls back to the legacy
+  description-based routing below (log tag ``AGENTCARD_REGISTRY_EMPTY``).
+
 * ``fanout=false`` collapses to the same effect as ``kanban specify``:
   we tighten the body and flip ``triage -> todo`` as a single task,
   no children created. This makes ``decompose`` a strict superset of
@@ -41,8 +53,10 @@ import logging
 import os
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
+from hermes_cli import agentcard_router
 from hermes_cli import kanban_db as kb
 from hermes_cli import profiles as profiles_mod
 
@@ -69,7 +83,8 @@ Output a single JSON object with this exact shape:
       {
         "title": "<concrete task title, imperative voice, <= 80 chars>",
         "body":  "<detailed spec for the worker on this child task>",
-        "assignee": "<profile name from the roster, or null for default>",
+        "primary_domain": "<domain id from the domain catalog, or null>",
+        "requires_capabilities": ["<capability ids from the capability catalog>"],
         "parents": [<int>, ...]
       },
       ...
@@ -84,9 +99,15 @@ Rules:
     them no parents so the dispatcher fans them out at once.
   - Use 2-6 tasks for normal work. Don't create 20 tiny tasks. Don't
     cram everything into 1 task.
-  - Pick assignees from the roster by matching the task to the profile's
-    DESCRIPTION (not just the name). When nothing matches well, use null
-    and the system will route to the default_assignee.
+  - CLASSIFY, do not assign: for each task emit "primary_domain" (one
+    domain id from the domain catalog, or null when nothing fits) and
+    "requires_capabilities" (an array of capability ids from the
+    capability catalog; empty when nothing applies). The system routes
+    deterministically by matching these against the profiles' AgentCards.
+    NEVER invent ids — emit only ids present in the catalogs.
+  - "assignee" is a legacy override only: emit a profile name from the
+    roster ONLY when the task must be pinned to a specific profile. When
+    omitted, the machine routes by capability.
   - Each child task body is what a fresh worker will read with no other
     context — be specific about goal, approach, and acceptance criteria.
 
@@ -98,12 +119,13 @@ return:
     "rationale": "<one sentence>",
     "title": "<tightened title>",
     "body":  "<concrete spec for a single worker>",
-    "assignee": "<profile name from the roster, or null for default>"
+    "primary_domain": "<domain id from the domain catalog, or null>",
+    "requires_capabilities": ["<capability ids from the capability catalog>"]
   }
 
-In that case the task stays as one work item, just with a tightened spec and
-a concrete assignee. If no profile fits, use null and the system will route to
-the default_assignee.
+In that case the task stays as one work item, just with a tightened spec.
+The machine routes it by capability; "assignee" is a legacy override
+(profile name from the roster) used only when the task must be pinned.
 
 No preamble, no closing remarks, no code fences. Output only the JSON object.
 """
@@ -114,10 +136,13 @@ Title: {title}
 Body:
 {body}
 
-Available profiles (assignees you may pick from):
+Available profiles (roster — only used for legacy "assignee" overrides):
 {roster}
 
-Default assignee (used when no profile fits a task): {default_assignee}
+Capability catalog (emit ONLY these ids in "requires_capabilities"):
+{catalog}
+
+Default assignee (used when routing finds no match): {default_assignee}
 """
 
 
@@ -268,6 +293,242 @@ def _normalize_assignee_choice(
     return chosen
 
 
+def _resolve_cards_dir(cfg: dict) -> Optional[Path]:
+    """Resolve the AgentCard registry directory (``kanban.cards_dir``).
+
+    Falls back to ``<hermes-root>/workspace/fleet/cards`` when unset. A
+    missing/unusable directory is handled at load time with the
+    ``AGENTCARD_REGISTRY_EMPTY`` log tag, so this never raises.
+    """
+    kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+    explicit = (kanban_cfg.get("cards_dir") or "").strip()
+    if explicit:
+        try:
+            return Path(explicit).expanduser()
+        except Exception:
+            return None
+    try:
+        return agentcard_router.default_cards_dir()
+    except Exception:
+        return None
+
+
+def _load_agentcard_registry(
+    cards_dir: Optional[Path],
+    valid_names: set[str],
+) -> agentcard_router.RegistryResult:
+    """Stage 0 for the decomposer: load + validate the card registry.
+
+    Cards whose profile is not an installed Hermes profile are excluded by
+    the router (a routed winner must be spawnable); warnings are logged with
+    their normative log tag (``CARD_INVALID`` / ``AGENTCARD_REGISTRY_EMPTY``).
+    Never raises — an unusable registry just means description-based fallback.
+    """
+    if cards_dir is None:
+        return agentcard_router.RegistryResult()
+    try:
+        result = agentcard_router.load_registry(
+            cards_dir,
+            known_profiles=valid_names or None,
+        )
+    except Exception as exc:
+        logger.warning("decompose: agentcard registry load failed: %s", exc)
+        return agentcard_router.RegistryResult()
+    for warning in result.warnings:
+        logger.warning("decompose: %s", warning)
+    return result
+
+
+def _format_catalog(cards: dict) -> str:
+    """Render the capability/domain catalog the LLM classifies against."""
+    if not cards:
+        return "  (no agent cards loaded — description-based fallback routing)"
+    domains = sorted(
+        {
+            dom
+            for card in cards.values()
+            for dom in (card.get("domain_boundaries") or {}).get("owns", [])
+            if isinstance(dom, str)
+        }
+    )
+    caps = [
+        (cap.get("id"), cap.get("domain"), profile)
+        for profile in sorted(cards)
+        for cap in (cards[profile].get("capabilities") or [])
+        if isinstance(cap, dict) and isinstance(cap.get("id"), str)
+    ]
+    lines = [f"  Domains: {', '.join(domains)}"]
+    lines.append("  Capability ids (id — domain — owning profile):")
+    for cid, dom, profile in sorted(caps):
+        lines.append(f"    - {cid} ({dom}, {profile})")
+    return "\n".join(lines)
+
+
+def _llm_tie_breaker(
+    winners: list[str],
+    cards: dict,
+    task: dict,
+) -> Optional[str]:
+    """routing-rules.md stage 3.3 — one bounded LLM call to break a tie.
+
+    Passes each tied candidate's description + capabilities as context and
+    asks for exactly one profile name from the tie set. Returns ``None``
+    (→ deterministic tie-break) when the auxiliary LLM is unavailable or
+    answers with something outside the tie set.
+    """
+    try:
+        from agent.auxiliary_client import call_llm  # type: ignore
+    except Exception:
+        return None
+    roster = "\n".join(
+        f"- {p}: {str(cards[p].get('description') or '')[:200]}"
+        for p in winners
+    )
+    prompt = (
+        "A routing tie must be broken between these profiles:\n"
+        f"{roster}\n\nTask: {str(task.get('title') or '')[:300]}\n\n"
+        'Answer with exactly one profile name from the list, as JSON: '
+        '{"profile": "<name>"}.'
+    )
+    try:
+        resp = call_llm(
+            task="kanban_decomposer",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You break routing ties. Answer with JSON only.",
+                },
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.0,
+            max_tokens=60,
+            timeout=30,
+        )
+        raw = resp.choices[0].message.content or ""
+    except Exception:
+        return None
+    name: Optional[str] = None
+    parsed = _extract_json_blob(raw)
+    if isinstance(parsed, dict):
+        candidate = parsed.get("profile")
+        if isinstance(candidate, str):
+            name = candidate.strip()
+    if name is None:
+        name = raw.strip().strip('"').strip()
+    return name if name in winners else None
+
+
+def _choose_child_assignee(
+    entry: dict,
+    *,
+    task_id: str,
+    idx: int,
+    default_assignee: str,
+    valid_names: set[str],
+    cards: dict,
+    audits: list[dict],
+) -> str:
+    """Pick a child's assignee: legacy override, capability routing, or default.
+
+    * Explicit ``assignee`` from the LLM (a valid profile name) is honored as
+      a legacy override — backward compatible with pre-AgentCard responses.
+    * Otherwise, when the registry is loaded and the LLM classified the task
+      (``primary_domain`` / ``requires_capabilities``), the machine routes
+      deterministically; the decision is appended to ``audits``.
+    * Otherwise the configured ``default_assignee`` catches the child.
+    """
+    assignee = entry.get("assignee")
+    if isinstance(assignee, str) and assignee.strip():
+        return _normalize_assignee_choice(
+            assignee,
+            default_assignee=default_assignee,
+            valid_names=valid_names,
+        )
+
+    primary_domain = entry.get("primary_domain")
+    capabilities = entry.get("requires_capabilities") or []
+    if not isinstance(capabilities, list):
+        capabilities = []
+    capabilities = [c for c in capabilities if isinstance(c, str) and c.strip()]
+
+    if cards and (primary_domain or capabilities):
+        routed = False
+        try:
+            result = agentcard_router.route_task(
+                {
+                    "task_id": f"{task_id}#{idx}",
+                    "title": str(entry.get("title") or ""),
+                    "body": str(entry.get("body") or ""),
+                    "primary_domain": primary_domain,
+                    "requires_capabilities": capabilities,
+                },
+                cards,
+                default_assignee=default_assignee,
+                tie_breaker=_llm_tie_breaker,
+            )
+        except Exception as exc:
+            logger.warning(
+                "decompose: capability routing failed for child %d: %s", idx, exc,
+            )
+        else:
+            routed = True
+            audits.append(result.audit)
+            return _normalize_assignee_choice(
+                result.winner,
+                default_assignee=default_assignee,
+                valid_names=valid_names,
+            )
+        if not routed:
+            logger.info(
+                "decompose: child %d classified but routing failed — "
+                "routing to default_assignee %r",
+                idx, default_assignee,
+            )
+    return default_assignee
+
+
+def _write_routing_audit(audits: list[dict], *, task_id: str, author: str) -> None:
+    """Section 6: append audit lines to ``fleet/routing-audit.log`` and comment.
+
+    Both writes are best-effort — a broken audit trail must not fail the
+    decomposition itself. The board comment carries the one-line decision
+    (winner, matched_capability_ids, primary_domain) per routed child.
+    """
+    if not audits:
+        return
+    audit_log = None
+    try:
+        cfg = _load_config()
+        cards_dir = _resolve_cards_dir(cfg)
+        if cards_dir is not None:
+            audit_log = agentcard_router.audit_log_path(cards_dir)
+    except Exception:
+        audit_log = None
+    if audit_log is not None:
+        try:
+            for audit in audits:
+                agentcard_router.append_audit_line(audit, audit_log)
+        except Exception as exc:
+            logger.warning("decompose: routing audit log write failed: %s", exc)
+    try:
+        lines = [
+            "capability routing (winner, primary_domain, "
+            "matched_capability_ids, fallback):"
+        ]
+        for audit in audits:
+            matched = ",".join(audit["matched_capability_ids"]) or "-"
+            fallback = audit.get("fallback_used") or "-"
+            lines.append(
+                f"- {audit['title'][:60] or '(untitled)'} -> {audit['winner']} "
+                f"(domain={audit['primary_domain']}, matched={matched}, "
+                f"fallback={fallback})"
+            )
+        with kb.connect_closing() as conn:
+            kb.add_comment(conn, task_id, author, "\n".join(lines))
+    except Exception as exc:
+        logger.warning("decompose: routing audit comment write failed: %s", exc)
+
+
 def decompose_task(
     task_id: str,
     *,
@@ -297,6 +558,14 @@ def decompose_task(
     auto_promote = bool(kanban_cfg.get("auto_promote_children", True))
     roster, valid_names = _build_roster()
 
+    # AgentCard capability routing (T5): load + validate the registry once per
+    # dispatch. An unusable registry (missing dir, invalid cards, no schema)
+    # falls back to description-based routing with AGENTCARD_REGISTRY_EMPTY.
+    cards_dir = _resolve_cards_dir(cfg)
+    registry = _load_agentcard_registry(cards_dir, valid_names)
+    cards = registry.cards
+    catalog = _format_catalog(cards)
+
     try:
         from agent.auxiliary_client import call_llm  # type: ignore
     except Exception as exc:
@@ -308,6 +577,7 @@ def decompose_task(
         title=_truncate(task.title or "", 400),
         body=_truncate(task.body or "(no body)", 4000),
         roster=_format_roster(roster),
+        catalog=catalog,
         default_assignee=default_assignee,
     )
 
@@ -351,11 +621,16 @@ def decompose_task(
         title_val = new_title.strip() if isinstance(new_title, str) and new_title.strip() else None
         body_val = new_body if isinstance(new_body, str) and new_body.strip() else None
         assignee_val = None
+        single_audits: list[dict] = []
         if not task.assignee:
-            assignee_val = _normalize_assignee_choice(
-                parsed.get("assignee"),
+            assignee_val = _choose_child_assignee(
+                parsed,
+                task_id=task_id,
+                idx=0,
                 default_assignee=default_assignee,
                 valid_names=valid_names,
+                cards=cards,
+                audits=single_audits,
             )
         if title_val is None and body_val is None:
             return DecomposeOutcome(
@@ -374,6 +649,7 @@ def decompose_task(
             return DecomposeOutcome(
                 task_id, False, "task moved out of triage before promotion",
             )
+        _write_routing_audit(single_audits, task_id=task_id, author=audit_author)
         return DecomposeOutcome(
             task_id, True, "single task (no fanout)",
             fanout=False, new_title=title_val,
@@ -388,6 +664,7 @@ def decompose_task(
     # Rewrite invalid assignees to the default fallback. Never leave a
     # task with assignee=None — the user explicitly does not want that.
     children: list[dict] = []
+    audits: list[dict] = []
     for idx, entry in enumerate(raw_tasks):
         if not isinstance(entry, dict):
             return DecomposeOutcome(
@@ -402,11 +679,6 @@ def decompose_task(
         if not isinstance(body, str):
             body = ""
         assignee = entry.get("assignee")
-        chosen = _normalize_assignee_choice(
-            assignee,
-            default_assignee=default_assignee,
-            valid_names=valid_names,
-        )
         if (
             isinstance(assignee, str)
             and assignee.strip()
@@ -417,6 +689,15 @@ def decompose_task(
                 "routing to default_assignee %r",
                 task_id, idx, assignee, default_assignee,
             )
+        chosen = _choose_child_assignee(
+            entry,
+            task_id=task_id,
+            idx=idx,
+            default_assignee=default_assignee,
+            valid_names=valid_names,
+            cards=cards,
+            audits=audits,
+        )
         parents = entry.get("parents") or []
         if not isinstance(parents, list):
             parents = []
@@ -449,6 +730,9 @@ def decompose_task(
         return DecomposeOutcome(
             task_id, False, "task moved out of triage before decomposition",
         )
+
+    # Section 6 audit trail: one JSON line per routed child + board comment.
+    _write_routing_audit(audits, task_id=task_id, author=audit_author)
 
     return DecomposeOutcome(
         task_id, True, f"decomposed into {len(child_ids)} children",
