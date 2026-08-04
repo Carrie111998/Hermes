@@ -540,7 +540,7 @@ class TestNonBuiltinProviderAvailability:
 
 
     def test_capability_backend_honors_custom_extract_provider(self):
-        """Per-capability selection (_get_extract_backend) must resolve the
+        """Per-capability selection (_get_extract_backends) must resolve the
         custom provider when configured, instead of dead-ending — issue #32698."""
         with patch("tools.web_tools._ddgs_package_importable", return_value=False), \
              patch("tools.web_tools._peek_nous_access_token", return_value=None), \

@@ -18,6 +18,15 @@ Covers the automated-review findings on the fallback-chain dispatch loop in
   4. All-error / empty-response / exception outcomes from a backend fall
      through to the next chain entry, and the last attempt's outcome is
      surfaced when nothing in the chain succeeds.
+  5. A ``blocked_by_policy`` result is a terminal decision, NOT a retryable
+     all-error outcome — the next backend must not be asked for the same
+     blocked URL, and the marker must survive into the tool output.
+  6. Users who never configured ``web.extract_backends`` keep the pre-chain
+     active-provider rescue; explicit chains never take it.
+  7. An empty provider response must not swallow the reconstructed
+     invalid-URL / private-network diagnostics.
+  8. Chain entries are normalized: blanks/None dropped, duplicates collapsed,
+     configured order preserved.
 """
 
 from __future__ import annotations
@@ -80,6 +89,26 @@ def _error_results(name):
         return [
             {"url": u, "title": "", "content": "", "raw_content": "",
              "error": f"{name} failed"}
+            for u in urls
+        ]
+    return _respond
+
+
+def _policy_blocked_results(name):
+    """Build a ``respond`` callable shaped like a website-policy block.
+
+    Matches what the firecrawl provider emits when the website policy denies a
+    host: a per-URL ``error`` PLUS a ``blocked_by_policy`` marker.
+    """
+    def _respond(urls):
+        return [
+            {"url": u, "title": "", "content": "", "raw_content": "",
+             "error": f"Blocked by website policy ({name})",
+             "blocked_by_policy": {
+                 "host": "blocked.test",
+                 "rule": "blocked.test",
+                 "source": "config",
+             }}
             for u in urls
         ]
     return _respond
@@ -351,3 +380,176 @@ class TestAllErrorEmptyExceptionOutcomes:
         assert chain_b.calls == 1
         assert result.get("success") is False
         assert "second boom" in result["error"]
+
+
+# ─── A website-policy block is terminal, not a retryable backend failure ────
+
+
+class TestPolicyBlockIsTerminal:
+    @pytest.mark.asyncio
+    async def test_blocked_by_policy_does_not_fall_through_to_next_backend(
+        self, clean_registry, safe_urls, monkeypatch
+    ):
+        """A policy-blocked result carries an ``error``, so the all-error
+        fallthrough would otherwise shop the forbidden URL around the chain
+        until some provider isn't policy-aware. The block must stop the chain
+        and its marker must survive into the tool output."""
+        blocking = _FakeExtractProvider(
+            "chain-a", respond=_policy_blocked_results("chain-a"),
+        )
+        must_not_run = _FakeExtractProvider("chain-b")
+        web_search_registry.register_provider(blocking)
+        web_search_registry.register_provider(must_not_run)
+
+        monkeypatch.setattr(web_tools, "_ensure_web_plugins_loaded", lambda: None)
+        monkeypatch.setattr(
+            web_tools, "_load_web_config",
+            lambda: {"extract_backends": ["chain-a", "chain-b"]},
+        )
+
+        result = json.loads(await web_tools.web_extract_tool(["https://blocked.test/x"]))
+
+        assert blocking.calls == 1
+        assert must_not_run.calls == 0, (
+            "a policy block must be terminal — the next backend must never be "
+            "asked for the same blocked URL"
+        )
+        entry = result["results"][0]
+        assert entry["blocked_by_policy"]["rule"] == "blocked.test"
+        assert entry["error"]
+
+    @pytest.mark.asyncio
+    async def test_partial_policy_block_still_stops_the_chain(
+        self, clean_registry, safe_urls, monkeypatch
+    ):
+        """One blocked URL among otherwise-failed ones is still a policy
+        decision — the whole batch must not be retried elsewhere."""
+        def _mixed(urls):
+            return [
+                {"url": urls[0], "title": "", "content": "", "raw_content": "",
+                 "error": "Blocked by website policy",
+                 "blocked_by_policy": {"host": "blocked.test",
+                                       "rule": "blocked.test",
+                                       "source": "config"}},
+                {"url": urls[1], "title": "", "content": "", "raw_content": "",
+                 "error": "chain-a failed"},
+            ]
+
+        blocking = _FakeExtractProvider("chain-a", respond=_mixed)
+        must_not_run = _FakeExtractProvider("chain-b")
+        web_search_registry.register_provider(blocking)
+        web_search_registry.register_provider(must_not_run)
+
+        monkeypatch.setattr(web_tools, "_ensure_web_plugins_loaded", lambda: None)
+        monkeypatch.setattr(
+            web_tools, "_load_web_config",
+            lambda: {"extract_backends": ["chain-a", "chain-b"]},
+        )
+
+        result = json.loads(await web_tools.web_extract_tool(
+            ["https://blocked.test/x", "https://example.com"]
+        ))
+
+        assert blocking.calls == 1
+        assert must_not_run.calls == 0
+        assert result["results"][0]["blocked_by_policy"]["rule"] == "blocked.test"
+
+
+# ─── Legacy (non-chain) resolution keeps the active-provider rescue ─────────
+
+
+class TestLegacyScalarResolutionKeepsActiveProviderRescue:
+    @pytest.mark.asyncio
+    async def test_unregistered_scalar_backend_still_walks_to_active_provider(
+        self, clean_registry, safe_urls, monkeypatch
+    ):
+        """Users who never set ``web.extract_backends`` must keep the
+        pre-chain behavior: a configured/auto-detected name that isn't a
+        registered provider falls through to ``get_active_extract_provider()``
+        instead of erroring out."""
+        rescued = _FakeExtractProvider("rescued-active-provider")
+        mock_active = MagicMock(return_value=rescued)
+        monkeypatch.setattr(
+            web_search_registry, "get_active_extract_provider", mock_active,
+        )
+
+        monkeypatch.setattr(web_tools, "_ensure_web_plugins_loaded", lambda: None)
+        monkeypatch.setattr(
+            web_tools, "_load_web_config",
+            lambda: {"extract_backend": "not-registered-anywhere"},
+        )
+
+        result = json.loads(await web_tools.web_extract_tool(["https://example.com"]))
+
+        assert mock_active.called
+        assert rescued.calls == 1
+        assert result["results"][0]["content"] == "ok-from-rescued-active-provider"
+
+
+# ─── Empty provider response must not eat the per-URL diagnostics ───────────
+
+
+class TestEmptyResponsePreservesUrlDiagnostics:
+    @pytest.mark.asyncio
+    async def test_invalid_and_private_url_entries_survive_an_empty_response(
+        self, clean_registry, monkeypatch
+    ):
+        """When URLs were rejected up front (malformed / private-network), the
+        reconstructed per-URL diagnostics are the answer — a backend that then
+        returns nothing must not replace them with a bare provider error."""
+        empty_provider = _FakeExtractProvider("chain-a", empty=True)
+        web_search_registry.register_provider(empty_provider)
+
+        async def _safe(url):
+            return "169.254.169.254" not in url
+
+        monkeypatch.setattr(web_tools, "async_is_safe_url", _safe)
+        monkeypatch.setattr(web_tools, "_ensure_web_plugins_loaded", lambda: None)
+        monkeypatch.setattr(
+            web_tools, "_load_web_config",
+            lambda: {"extract_backends": ["chain-a"]},
+        )
+
+        result = json.loads(await web_tools.web_extract_tool(
+            ["https://example.com", "http://169.254.169.254/latest/meta-data", 12345]
+        ))
+
+        assert empty_provider.calls == 1
+        results = result["results"]
+        assert len(results) == 3
+        assert results[0]["error"] == "Extract backend returned no result for this URL"
+        assert "private or internal" in results[1]["error"]
+        assert "Invalid URL item at index 2" in results[2]["error"]
+
+
+# ─── Chain normalization: blanks dropped, duplicates collapsed, order kept ──
+
+
+class TestChainNormalization:
+    def test_blank_none_and_duplicate_entries_are_normalized(self, monkeypatch):
+        monkeypatch.setattr(
+            web_tools, "_load_web_config",
+            lambda: {"extract_backends":
+                     ["Chain-A", "", None, "  chain-b  ", "chain-a"]},
+        )
+        monkeypatch.setattr(web_tools, "_is_backend_available", lambda _b: True)
+
+        assert web_tools._get_extract_backends() == ["chain-a", "chain-b"]
+
+    def test_scalar_view_reports_the_first_chain_entry(self, monkeypatch):
+        monkeypatch.setattr(
+            web_tools, "_load_web_config",
+            lambda: {"extract_backends": ["chain-a", "chain-b"]},
+        )
+        monkeypatch.setattr(web_tools, "_is_backend_available", lambda _b: True)
+
+        assert web_tools._get_extract_backend() == "chain-a"
+
+    def test_empty_chain_falls_through_to_scalar_resolution(self, monkeypatch):
+        monkeypatch.setattr(
+            web_tools, "_load_web_config",
+            lambda: {"extract_backends": [], "extract_backend": "tavily"},
+        )
+        monkeypatch.setenv("TAVILY_API_KEY", "test-key")
+
+        assert web_tools._get_extract_backends() == ["tavily"]

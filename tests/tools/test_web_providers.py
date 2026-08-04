@@ -2,7 +2,7 @@
 
 Covers:
 - WebSearchProvider / WebExtractProvider ABC enforcement
-- Per-capability backend selection (_get_search_backend, _get_extract_backend)
+- Per-capability backend selection (_get_search_backend, _get_extract_backends)
 - Backward compatibility (web.backend still works as shared fallback)
 - Config keys merge correctly via DEFAULT_CONFIG
 """
@@ -115,10 +115,13 @@ class TestDefaultConfig:
         assert "backend" in web
         assert "search_backend" in web
         assert "extract_backend" in web
-        # All empty string by default (no override)
+        assert "extract_backends" in web
+        # All empty by default (no override) — the empty chain must leave
+        # scalar/auto-detect resolution in charge.
         assert web["backend"] == ""
         assert web["search_backend"] == ""
         assert web["extract_backend"] == ""
+        assert web["extract_backends"] == []
 
 
 # ---------------------------------------------------------------------------

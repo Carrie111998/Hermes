@@ -204,6 +204,7 @@ async def get_toolset_config(name: str, profile: Optional[str] = None):
         active_provider = None
         active_search_backend = None
         active_extract_backend = None
+        active_extract_backends = None
         if cat:
             # Fetch portal/entitlement state once for the whole matrix — the
             # per-provider readiness computation below reuses it instead of
@@ -262,14 +263,21 @@ async def get_toolset_config(name: str, profile: Optional[str] = None):
             # web_search / web_extract dispatchers do (per-capability key →
             # shared web.backend → credential auto-detect), so the GUI badges
             # reflect what a tool call would actually hit right now.
+            # ``active_extract_backend`` stays the scalar the GUI badge binds
+            # to (the backend a call hits first); ``active_extract_backends``
+            # is the additive full fallback chain from web.extract_backends.
             try:
-                from tools.web_tools import _get_extract_backend, _get_search_backend
+                from tools.web_tools import _get_extract_backends, _get_search_backend
 
                 active_search_backend = _get_search_backend()
-                active_extract_backend = _get_extract_backend()
+                active_extract_backends = _get_extract_backends()
+                active_extract_backend = (
+                    active_extract_backends[0] if active_extract_backends else None
+                )
             except Exception:
                 active_search_backend = None
                 active_extract_backend = None
+                active_extract_backends = None
     payload = {
         "name": name,
         "has_category": cat is not None,
@@ -279,6 +287,7 @@ async def get_toolset_config(name: str, profile: Optional[str] = None):
     if name == "web":
         payload["active_search_backend"] = active_search_backend
         payload["active_extract_backend"] = active_extract_backend
+        payload["active_extract_backends"] = active_extract_backends
     return payload
 
 
@@ -405,7 +414,7 @@ async def select_toolset_provider(
     'extract') scopes the selection to ``web.search_backend`` /
     ``web.extract_backend`` — the same per-capability overrides the runtime
     dispatchers (``tools.web_tools._get_search_backend`` /
-    ``_get_extract_backend``) resolve first. The provider must actually
+    ``_get_extract_backends``) resolve first. The provider must actually
     support the requested capability (a search-only backend can't be the
     extract backend). Omitting ``capability`` keeps the legacy whole-provider
     behavior (writes ``web.backend``).

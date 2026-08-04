@@ -284,29 +284,64 @@ def _get_search_backend() -> str:
     return _get_capability_backend("search")
 
 
+def _explicit_extract_chain() -> List[str]:
+    """Normalized ``web.extract_backends`` list, or ``[]`` when unconfigured.
+
+    Blank/``None`` entries are dropped and duplicates collapse to their first
+    occurrence, so a hand-edited ``[firecrawl, "", tavily, firecrawl]``
+    resolves to ``["firecrawl", "tavily"]`` rather than re-attempting a
+    backend that already failed.
+
+    A non-empty return is also the signal that the user *explicitly* asked for
+    a chain: the dispatcher then resolves every entry exactly and never
+    substitutes the scalar active provider (which resolves from
+    ``web.extract_backend`` / ``web.backend`` — a different key entirely) for
+    an entry that fails to resolve.
+    """
+    backends = _load_web_config().get("extract_backends")
+    if not isinstance(backends, list):
+        return []
+    chain: List[str] = []
+    for entry in backends:
+        if entry is None:
+            continue
+        name = str(entry).lower().strip()
+        if name and name not in chain:
+            chain.append(name)
+    return chain
+
+
 def _get_extract_backends() -> List[str]:
     """Determine which backends to use for web_extract, returning a fallback chain.
-    
+
     Selection priority:
     1. ``web.extract_backends`` (list of backends for fallback)
     2. ``web.extract_backend`` (single per-capability override)
     3. ``web.backend`` (shared fallback)
     4. Auto-detect from env vars
     """
-    cfg = _load_web_config()
-    backends = cfg.get("extract_backends")
-    if isinstance(backends, list) and backends:
-        chain = []
-        for b in backends:
-            b_clean = str(b).lower().strip()
-            if b_clean and _is_backend_available(b_clean):
-                chain.append(b_clean)
-        if chain:
-            return chain
-        return [str(b).lower().strip() for b in backends if str(b).strip()]
+    chain = _explicit_extract_chain()
+    if chain:
+        available = [b for b in chain if _is_backend_available(b)]
+        # If nothing in the chain probes as available (missing creds, cold
+        # registry), keep the configured order so the dispatcher can report a
+        # real per-backend error instead of "nothing configured".
+        return available or chain
 
     single = _get_capability_backend("extract")
     return [single] if single else []
+
+
+def _get_extract_backend() -> str:
+    """Scalar view of the chain — the backend a ``web_extract`` call hits first.
+
+    Kept for callers that show or persist a single active extract backend (the
+    dashboard's ``/api/tools/toolsets/web/config`` badge, ``hermes tools``).
+    The dispatcher itself walks the full chain via
+    :func:`_get_extract_backends`.
+    """
+    backends = _get_extract_backends()
+    return backends[0] if backends else ""
 
 
 def _get_capability_backend(capability: str) -> str:
@@ -877,17 +912,32 @@ async def web_extract_tool(
             # drop an otherwise-available custom fallback entry.
             _ensure_web_plugins_loaded()
             backends = _get_extract_backends()
+            # Only an explicitly configured ``web.extract_backends`` list is a
+            # chain. Scalar / auto-detected resolution is the legacy path and
+            # keeps its pre-chain rescue through the registry's active
+            # provider (see below).
+            explicit_chain = bool(_explicit_extract_chain())
 
             from agent.web_search_registry import (
+                get_active_extract_provider,
                 get_provider as _wsp_get_provider,
                 _disabled_web_plugin_for,
             )
 
             last_error_json = None
             extracted_results = []
+            provider_returned_empty = False
 
             for idx, backend in enumerate(backends):
                 provider = _wsp_get_provider(backend) if backend else None
+
+                if provider is None and not explicit_chain:
+                    # Legacy single-backend behavior: when the configured name
+                    # isn't registered at all (typo / uninstalled plugin /
+                    # auto-detected name), fall through to the active-provider
+                    # walk exactly as this dispatcher did before the chain
+                    # existed. Explicit chains never take this rescue.
+                    provider = get_active_extract_provider()
 
                 if provider is not None and not provider.supports_extract():
                     last_error_json = json.dumps(
@@ -968,10 +1018,30 @@ async def web_extract_tool(
                         )
                     
                     if not extracted_results:
+                        provider_returned_empty = True
                         last_error_json = json.dumps({"success": False, "error": f"Empty response from {provider.name}"})
                         logger.warning("Empty response from %s. Trying next backend if available.", provider.name)
                         continue
-                        
+
+                    if any(
+                        isinstance(r, dict) and r.get("blocked_by_policy")
+                        for r in extracted_results
+                    ):
+                        # A website-policy block is a terminal decision, not a
+                        # transient backend failure. Blocked entries also carry
+                        # an ``error``, so the all-error fallthrough below would
+                        # otherwise re-dispatch the same forbidden URL to the
+                        # next provider until one of them isn't policy-aware.
+                        # Keep these results — the blocked_by_policy marker
+                        # rides through to the trimmed output — and stop here.
+                        logger.info(
+                            "Extract via %s was blocked by website policy; not "
+                            "falling through to the next backend.",
+                            provider.name,
+                        )
+                        last_error_json = None
+                        break
+
                     all_failed = all(r.get("error") for r in extracted_results)
                     if all_failed and len(backends) > 1 and idx != len(backends) - 1:
                         first_err = extracted_results[0].get("error", "Unknown error")
@@ -994,9 +1064,18 @@ async def web_extract_tool(
                     )
                     continue
 
-            if last_error_json and not extracted_results:
-                return last_error_json
-            
+            if not extracted_results:
+                # An empty provider response is not, on its own, the whole
+                # answer: when some of the caller's URLs were rejected up front
+                # (malformed, or private/internal per the SSRF filter), those
+                # per-URL diagnostics are what the caller needs, and returning
+                # a bare backend error would drop them. Fall through to the
+                # reconstruction below in that case — pre-chain behavior.
+                if provider_returned_empty and (invalid_urls or ssrf_blocked):
+                    last_error_json = None
+                if last_error_json:
+                    return last_error_json
+
             results = extracted_results
 
         # Reconstruct the original input order across invalid, blocked, and
