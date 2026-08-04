@@ -1,15 +1,15 @@
-import { expect, test } from './test'
-
 import {
+  DESKTOP_PRODUCT_NAME,
   PACKAGED_BINARY_PATH,
   type PackagedAppFixture,
   packagedBinaryExists,
   setupPackagedApp,
 } from './fixtures'
+import { expect, test } from './test'
 import { expectVisualSnapshot } from './visual-snapshot'
 
 /**
- * E2E smoke tests for the packaged Hermes desktop app.
+ * E2E smoke tests for the packaged desktop app.
  *
  * Launches the real packaged Electron binary (produced by `npm run pack` →
  * `electron-builder --dir`) with BOOT_FAKE=1 and full sandbox isolation
@@ -34,9 +34,9 @@ test.afterAll(async () => {
   fixture = null
 })
 
-test('window opens with the Hermes title', async () => {
+test('window opens with the packaged product title', async () => {
   const title = await fixture!.page.title()
-  expect(title).toContain('Hermes')
+  expect(title).toContain(DESKTOP_PRODUCT_NAME)
 })
 
 test('renderer loads and shows DOM content', async () => {

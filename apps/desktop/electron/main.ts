@@ -90,7 +90,7 @@ import {
 } from './desktop-uninstall'
 import { describeDevCdpDecision, resolveDevCdpPort } from './dev-cdp'
 import { installEmbedReferer } from './embed-referer'
-const { createEvaAppUpdater } = require('./eva-app-updater.cjs')
+const { createEvaAppUpdater, safeApplyFailure, safeCheckFailure } = require('./eva-app-updater.cjs')
 const {
   assertEvaManagedLocalMutationAllowed,
   assertEvaManagedLocalTerminalAllowed,
@@ -2455,7 +2455,19 @@ function getEvaAppUpdater() {
       autoUpdater,
       emitProgress: emitUpdateProgress,
       isPackaged: IS_PACKAGED,
-      platform: process.platform
+      onError: (stage, error) => {
+        const message = error instanceof Error ? error.message : String(error || 'Unknown updater error')
+        rememberLog(`[updates] managed ${stage} failed: ${message}`)
+      },
+      platform: process.platform,
+      prepareInstallHandoff: () => {
+        const previous = isQuittingForHandoff
+        isQuittingForHandoff = true
+
+        return () => {
+          isQuittingForHandoff = previous
+        }
+      }
     })
   }
 
@@ -11627,27 +11639,45 @@ ipcMain.handle('hermes:terminal:dispose', (_event, id) => {
   return disposeTerminalSession(String(id || ''))
 })
 
-ipcMain.handle('hermes:updates:check', async () =>
-  EVA_MANAGED_BUILD
-    ? getEvaAppUpdater().check()
-    : checkUpdates().catch(error => ({
-        supported: true,
-        branch: readDesktopUpdateConfig().branch,
-        error: 'check-failed',
-        message: error?.message || String(error),
-        fetchedAt: Date.now()
-      }))
-)
+ipcMain.handle('hermes:updates:check', async () => {
+  if (EVA_MANAGED_BUILD) {
+    try {
+      return await getEvaAppUpdater().check()
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error || 'Unknown updater error')
+      rememberLog(`[updates] managed check setup failed: ${message}`)
 
-ipcMain.handle('hermes:updates:apply', async (_event, payload) =>
-  EVA_MANAGED_BUILD
-    ? getEvaAppUpdater().apply()
-    : applyUpdates(payload || {}).catch(error => ({
-        ok: false,
-        error: 'apply-failed',
-        message: error?.message || String(error)
-      }))
-)
+      return safeCheckFailure()
+    }
+  }
+
+  return checkUpdates().catch(error => ({
+    supported: true,
+    branch: readDesktopUpdateConfig().branch,
+    error: 'check-failed',
+    message: error?.message || String(error),
+    fetchedAt: Date.now()
+  }))
+})
+
+ipcMain.handle('hermes:updates:apply', async (_event, payload) => {
+  if (EVA_MANAGED_BUILD) {
+    try {
+      return await getEvaAppUpdater().apply()
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error || 'Unknown updater error')
+      rememberLog(`[updates] managed apply setup failed: ${message}`)
+
+      return safeApplyFailure()
+    }
+  }
+
+  return applyUpdates(payload || {}).catch(error => ({
+    ok: false,
+    error: 'apply-failed',
+    message: error?.message || String(error)
+  }))
+})
 
 ipcMain.handle('hermes:updates:branch:get', async () =>
   EVA_MANAGED_BUILD ? { branch: EVA_MANAGED_POLICY.updateChannel } : readDesktopUpdateConfig()

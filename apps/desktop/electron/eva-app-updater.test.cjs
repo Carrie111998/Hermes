@@ -6,7 +6,11 @@ const {
   EVA_APP_UPDATE_FEED,
   createEvaAppUpdater,
   releaseNoteCommits,
-  sanitizeReleaseNote
+  safeApplyFailure,
+  safeCheckFailure,
+  sanitizeReleaseNote,
+  statusFor,
+  unsupportedStatus
 } = require('./eva-app-updater.cjs')
 
 class FakeUpdater extends EventEmitter {
@@ -57,20 +61,28 @@ function fixture(overrides = {}) {
   const updater = new FakeUpdater()
   const progress = []
   const scheduled = []
+  const handoffCalls = []
+  const errors = []
   const service = createEvaAppUpdater({
     app: { getVersion: () => '2026.7.20-es.8', isPackaged: true },
     autoUpdater: updater,
     emitProgress: value => progress.push(value),
     isPackaged: true,
     now: () => 1234,
+    onError: (stage, error) => errors.push({ error, stage }),
     platform: 'darwin',
+    prepareInstallHandoff: () => {
+      handoffCalls.push('prepare')
+
+      return () => handoffCalls.push('rollback')
+    },
     schedule: callback => {
       scheduled.push(callback)
       return scheduled.length
     },
     ...overrides
   })
-  return { progress, scheduled, service, updater }
+  return { errors, handoffCalls, progress, scheduled, service, updater }
 }
 
 test('managed app updater always restores the fixed Electric Sheep feed and forward-only policy', async () => {
@@ -118,6 +130,18 @@ test('release notes become normal update-overlay entries without executable cont
   ])
 })
 
+test('exported updater helpers use a live clock by default', () => {
+  const commits = releaseNoteCommits({ version: '2026.7.20-es.9', releaseNotes: '- Fixed.' })
+  const status = statusFor({ getVersion: () => '2026.7.20-es.8' }, { version: '2026.7.20-es.9' }, true)
+  const unsupported = unsupportedStatus('Unavailable.')
+
+  assert.equal(Number.isFinite(commits[0].at), true)
+  assert.equal(Number.isFinite(status.fetchedAt), true)
+  assert.equal(Number.isFinite(unsupported.fetchedAt), true)
+  assert.equal(safeCheckFailure().message, 'evaOS Agent could not check for updates. Try again.')
+  assert.equal(safeApplyFailure().message, 'evaOS Agent could not install the update. Try again.')
+})
+
 test('release notes cannot restore upstream product branding', () => {
   assert.equal(
     sanitizeReleaseNote('Hermes Desktop by Nous Research connects through Nous Portal for Eva'),
@@ -138,8 +162,8 @@ test('release notes cannot restore upstream product branding', () => {
   )
 })
 
-test('apply downloads, reports progress, and schedules a signed restart handoff', async () => {
-  const { progress, scheduled, service, updater } = fixture()
+test('apply downloads, reports progress, and prepares handoff before the signed restart', async () => {
+  const { handoffCalls, progress, scheduled, service, updater } = fixture()
 
   const result = await service.apply()
   assert.deepEqual(result, {
@@ -161,7 +185,25 @@ test('apply downloads, reports progress, and schedules a signed restart handoff'
   )
 
   scheduled[0]()
+  assert.deepEqual(handoffCalls, ['prepare'])
   assert.deepEqual(updater.installCalls, [[false, true]])
+})
+
+test('a failed install handoff restores the active-work quit guard and reports a safe error', async () => {
+  const { errors, handoffCalls, progress, scheduled, service, updater } = fixture()
+  updater.quitAndInstall = () => {
+    throw new Error('helper failed at /private/tmp/secret')
+  }
+
+  const result = await service.apply()
+  assert.equal(result.ok, true)
+  scheduled[0]()
+
+  assert.deepEqual(handoffCalls, ['prepare', 'rollback'])
+  assert.equal(errors.at(-1).stage, 'install-handoff')
+  assert.equal(errors.at(-1).error.message, 'helper failed at /private/tmp/secret')
+  assert.equal(progress.at(-1).message, 'evaOS Agent could not install the update. Try again.')
+  assert.equal(progress.at(-1).message.includes('/private/tmp'), false)
 })
 
 test('unpacked or non-mac builds never check, download, or install', async () => {
@@ -177,18 +219,87 @@ test('unpacked or non-mac builds never check, download, or install', async () =>
   assert.deepEqual(updater.installCalls, [])
 })
 
-test('check failures remain recoverable and do not attempt installation', async () => {
+test('a no-update apply clears state so a later update installs in the same process', async () => {
   const updater = new FakeUpdater()
-  updater.checkForUpdates = async () => {
-    throw new Error('feed unavailable')
+  updater.checkForUpdates = async function () {
+    this.checkCalls += 1
+    const info = this.checkCalls === 1 ? { version: '2026.7.20-es.8' } : { version: '2026.7.20-es.9' }
+    this.emit(this.checkCalls === 1 ? 'update-not-available' : 'update-available', info)
+
+    return { updateInfo: info }
+  }
+  const { scheduled, service } = fixture({ autoUpdater: updater })
+
+  const first = await service.apply()
+  const second = await service.apply()
+
+  assert.deepEqual(first, {
+    ok: false,
+    error: 'no-update',
+    message: 'evaOS Agent is already up to date.'
+  })
+  assert.equal(second.ok, true)
+  assert.equal(updater.checkCalls, 2)
+  assert.equal(updater.downloadCalls, 1)
+  assert.equal(scheduled.length, 1)
+})
+
+test('check failures remain renderer-safe and a later apply retries in the same process', async () => {
+  const updater = new FakeUpdater()
+  updater.checkForUpdates = async function () {
+    this.checkCalls += 1
+    if (this.checkCalls === 1) {
+      throw new Error('feed unavailable at https://private.example.invalid/latest-mac.yml')
+    }
+    const info = { version: '2026.7.20-es.9' }
+    this.emit('update-available', info)
+
+    return { updateInfo: info }
+  }
+  const { errors, scheduled, service } = fixture({ autoUpdater: updater })
+
+  const first = await service.apply()
+  const second = await service.apply()
+
+  assert.deepEqual(first, {
+    ok: false,
+    error: 'check-failed',
+    message: 'evaOS Agent could not check for updates. Try again.'
+  })
+  assert.equal(first.message.includes('private.example.invalid'), false)
+  assert.equal(errors[0].error.message.includes('private.example.invalid'), true)
+  assert.equal(second.ok, true)
+  assert.equal(updater.downloadCalls, 1)
+  assert.equal(scheduled.length, 1)
+})
+
+test('a check without update info does not invent an available target', async () => {
+  const updater = new FakeUpdater()
+  updater.checkForUpdates = async function () {
+    this.checkCalls += 1
+
+    return {}
   }
   const { service } = fixture({ autoUpdater: updater })
 
   const status = await service.check()
+  assert.equal(status.updateAvailable, false)
+  assert.equal(status.targetSha, undefined)
+  assert.equal(status.behind, 0)
+})
+
+test('download failures keep infrastructure details out of renderer results and progress', async () => {
+  const updater = new FakeUpdater()
+  updater.downloadUpdate = async function () {
+    this.downloadCalls += 1
+    throw new Error('signature failed for /private/tmp/evaOS-Agent.zip')
+  }
+  const { errors, progress, service } = fixture({ autoUpdater: updater })
+
   const result = await service.apply()
-  assert.equal(status.error, 'check-failed')
-  assert.equal(result.ok, false)
-  assert.equal(result.error, 'check-failed')
-  assert.equal(updater.downloadCalls, 0)
-  assert.deepEqual(updater.installCalls, [])
+
+  assert.deepEqual(result, safeApplyFailure())
+  assert.equal(result.message.includes('/private/tmp'), false)
+  assert.equal(progress.at(-1).message, result.message)
+  assert.equal(errors.at(-1).error.message.includes('/private/tmp'), true)
 })

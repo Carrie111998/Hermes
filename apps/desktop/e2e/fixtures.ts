@@ -27,20 +27,24 @@ import * as path from 'node:path'
 
 import { _electron, type ElectronApplication, type Page } from '@playwright/test'
 
-import { startMockServer, type MockServerOptions } from './mock-server'
+import { type MockServerOptions, startMockServer } from './mock-server'
 import { installErrorBannerGuard } from './test'
 
 const DESKTOP_ROOT = path.resolve(import.meta.dirname, '..')
 const REPO_ROOT = path.resolve(DESKTOP_ROOT, '..', '..')
 const RELEASE_ROOT = path.join(DESKTOP_ROOT, 'release')
+
 const DESKTOP_PACKAGE = JSON.parse(
   fs.readFileSync(path.join(DESKTOP_ROOT, 'package.json'), 'utf8'),
 ) as {
-  build?: { appId?: string; productName?: string }
+  build?: { appId?: string; executableName?: string; productName?: string }
+  productName?: string
 }
 
 export const IS_MANAGED_EVAOS_AGENT =
   DESKTOP_PACKAGE.build?.appId === 'com.electricsheephq.evaos.agent'
+export const DESKTOP_PRODUCT_NAME = DESKTOP_PACKAGE.build?.productName ?? DESKTOP_PACKAGE.productName ?? 'Hermes'
+export const DESKTOP_EXECUTABLE_NAME = DESKTOP_PACKAGE.build?.executableName ?? DESKTOP_PRODUCT_NAME
 
 // ─── Credential stripping (matches launch.spec.ts) ──────────────────────
 
@@ -546,16 +550,23 @@ providers:
  */
 function resolvePackagedBinaryPath(): string {
   if (process.platform === 'win32') {
-    return path.join(RELEASE_ROOT, 'win-unpacked', 'Hermes.exe')
+    return path.join(RELEASE_ROOT, 'win-unpacked', `${DESKTOP_EXECUTABLE_NAME}.exe`)
   }
 
   if (process.platform === 'darwin') {
     const arch = process.arch === 'arm64' ? 'arm64' : 'x64'
 
-    return path.join(RELEASE_ROOT, `mac-${arch}`, 'Hermes.app', 'Contents', 'MacOS', 'Hermes')
+    return path.join(
+      RELEASE_ROOT,
+      `mac-${arch}`,
+      `${DESKTOP_PRODUCT_NAME}.app`,
+      'Contents',
+      'MacOS',
+      DESKTOP_EXECUTABLE_NAME
+    )
   }
 
-  return path.join(RELEASE_ROOT, 'linux-unpacked', 'hermes')
+  return path.join(RELEASE_ROOT, 'linux-unpacked', DESKTOP_EXECUTABLE_NAME)
 }
 
 export const PACKAGED_BINARY_PATH = resolvePackagedBinaryPath()

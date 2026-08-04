@@ -4,6 +4,8 @@ const EVA_APP_UPDATE_FEED =
   'https://github.com/electricsheephq/evaOS-hermes-desktop-app-adapter/releases/latest/download/'
 const EVA_APP_UPDATE_CHANNEL = 'latest'
 const EVA_APP_UPDATE_BRANCH = 'managed-beta'
+const SAFE_CHECK_FAILURE_MESSAGE = 'evaOS Agent could not check for updates. Try again.'
+const SAFE_APPLY_FAILURE_MESSAGE = 'evaOS Agent could not install the update. Try again.'
 const MANAGED_RELEASE_NOTE_REPLACEMENTS = [
   [/Eva by Electric Sheep/g, 'evaOS Agent'],
   [/Hermes Desktop/g, 'evaOS Agent'],
@@ -14,10 +16,6 @@ const MANAGED_RELEASE_NOTE_REPLACEMENTS = [
   [/\bEva\b/g, 'evaOS Agent'],
   [/\bNous\b/g, 'Electric Sheep']
 ]
-
-function messageOf(error) {
-  return error instanceof Error ? error.message : String(error || 'Unknown updater error')
-}
 
 function normalizeVersion(info) {
   const value = String(info?.version || '').trim()
@@ -31,7 +29,7 @@ function sanitizeReleaseNote(summary) {
   )
 }
 
-function releaseNoteCommits(info, now = Date.now()) {
+function releaseNoteCommits(info, now = Date.now) {
   const raw = Array.isArray(info?.releaseNotes)
     ? info.releaseNotes
         .map(item => item?.note)
@@ -52,7 +50,7 @@ function releaseNoteCommits(info, now = Date.now()) {
     }))
 }
 
-function statusFor(app, info, updateAvailable, now = Date.now()) {
+function statusFor(app, info, updateAvailable, now = Date.now) {
   const targetVersion = normalizeVersion(info)
   const commits = updateAvailable ? releaseNoteCommits(info, now) : []
 
@@ -69,12 +67,30 @@ function statusFor(app, info, updateAvailable, now = Date.now()) {
   }
 }
 
-function unsupportedStatus(message, now = Date.now()) {
+function unsupportedStatus(message, now = Date.now) {
   return {
     supported: false,
     branch: EVA_APP_UPDATE_BRANCH,
     message,
     fetchedAt: now()
+  }
+}
+
+function safeCheckFailure(now = Date.now) {
+  return {
+    supported: true,
+    branch: EVA_APP_UPDATE_BRANCH,
+    error: 'check-failed',
+    message: SAFE_CHECK_FAILURE_MESSAGE,
+    fetchedAt: now()
+  }
+}
+
+function safeApplyFailure() {
+  return {
+    ok: false,
+    error: 'apply-failed',
+    message: SAFE_APPLY_FAILURE_MESSAGE
   }
 }
 
@@ -85,7 +101,9 @@ function createEvaAppUpdater(options) {
     emitProgress = () => undefined,
     isPackaged = app?.isPackaged,
     now = Date.now,
+    onError = () => undefined,
     platform = process.platform,
+    prepareInstallHandoff = () => undefined,
     schedule = setTimeout
   } = options || {}
 
@@ -120,6 +138,14 @@ function createEvaAppUpdater(options) {
       url: EVA_APP_UPDATE_FEED,
       channel: EVA_APP_UPDATE_CHANNEL
     })
+  }
+
+  function reportError(stage, error) {
+    try {
+      onError(stage, error)
+    } catch {
+      // Diagnostics must never replace the stable updater result.
+    }
   }
 
   autoUpdater.on('update-available', info => {
@@ -162,8 +188,13 @@ function createEvaAppUpdater(options) {
       return
     }
 
-    const message = messageOf(error)
-    emitProgress({ stage: 'error', message, error: 'app-update-failed', percent: null })
+    reportError('event', error)
+    emitProgress({
+      stage: 'error',
+      message: SAFE_APPLY_FAILURE_MESSAGE,
+      error: 'app-update-failed',
+      percent: null
+    })
   })
 
   async function check() {
@@ -176,24 +207,19 @@ function createEvaAppUpdater(options) {
     }
 
     checkPromise = (async () => {
-      configure()
-      lastStatus = null
-
       try {
+        configure()
+        lastStatus = null
         const result = await autoUpdater.checkForUpdates()
         if (!lastStatus) {
           const info = result?.updateInfo
-          lastStatus = statusFor(app, info, normalizeVersion(info) !== app.getVersion(), now)
+          const version = normalizeVersion(info)
+          lastStatus = statusFor(app, info, Boolean(version && version !== app.getVersion()), now)
         }
         return lastStatus
       } catch (error) {
-        return {
-          supported: true,
-          branch: EVA_APP_UPDATE_BRANCH,
-          error: 'check-failed',
-          message: messageOf(error),
-          fetchedAt: now()
-        }
+        reportError('check', error)
+        return safeCheckFailure(now)
       } finally {
         checkPromise = null
       }
@@ -217,18 +243,17 @@ function createEvaAppUpdater(options) {
 
     applyPromise = (async () => {
       applying = true
-      configure()
-
-      const status = lastStatus?.updateAvailable ? lastStatus : await check()
-      if (!status?.updateAvailable) {
-        return {
-          ok: false,
-          error: status?.error || 'no-update',
-          message: status?.message || 'evaOS Agent is already up to date.'
-        }
-      }
-
       try {
+        configure()
+        const status = lastStatus?.updateAvailable ? lastStatus : await check()
+        if (!status?.updateAvailable) {
+          return {
+            ok: false,
+            error: status?.error || 'no-update',
+            message: status?.message || 'evaOS Agent is already up to date.'
+          }
+        }
+
         downloadedVersion = null
         emitProgress({ stage: 'fetch', message: 'Downloading the signed update…', percent: 0 })
         await autoUpdater.downloadUpdate()
@@ -237,12 +262,34 @@ function createEvaAppUpdater(options) {
           throw new Error('The update downloaded without a verified release identity.')
         }
 
-        schedule(() => autoUpdater.quitAndInstall(false, true), 500)
+        schedule(() => {
+          let rollbackHandoff
+          try {
+            rollbackHandoff = prepareInstallHandoff()
+            autoUpdater.quitAndInstall(false, true)
+          } catch (error) {
+            if (typeof rollbackHandoff === 'function') {
+              rollbackHandoff()
+            }
+            reportError('install-handoff', error)
+            emitProgress({
+              stage: 'error',
+              message: SAFE_APPLY_FAILURE_MESSAGE,
+              error: 'app-update-failed',
+              percent: null
+            })
+          }
+        }, 500)
         return { ok: true, handedOff: true, message: `Installing evaOS Agent ${downloadedVersion}.` }
       } catch (error) {
-        const message = messageOf(error)
-        emitProgress({ stage: 'error', message, error: 'app-update-failed', percent: null })
-        return { ok: false, error: 'apply-failed', message }
+        reportError('apply', error)
+        emitProgress({
+          stage: 'error',
+          message: SAFE_APPLY_FAILURE_MESSAGE,
+          error: 'app-update-failed',
+          percent: null
+        })
+        return safeApplyFailure()
       } finally {
         applying = false
         applyPromise = null
@@ -265,6 +312,8 @@ module.exports = {
   EVA_APP_UPDATE_FEED,
   createEvaAppUpdater,
   releaseNoteCommits,
+  safeApplyFailure,
+  safeCheckFailure,
   sanitizeReleaseNote,
   statusFor,
   unsupportedStatus

@@ -14,7 +14,26 @@ const RELEASE_ROOT = path.join(DESKTOP_ROOT, 'release')
 const PLATFORM = process.platform
 const PRODUCT_NAME = PACKAGE_JSON.build?.productName || PACKAGE_JSON.productName
 const EXECUTABLE_NAME = PACKAGE_JSON.build?.executableName || PRODUCT_NAME
-const ARTIFACT_PREFIX = `evaOS-Agent-${PACKAGE_JSON.version}-${ARCH}`
+const ARTIFACT_TEMPLATE = PACKAGE_JSON.build?.artifactName
+
+function artifactNameFor(ext) {
+  if (typeof ARTIFACT_TEMPLATE !== 'string' || !ARTIFACT_TEMPLATE.trim()) {
+    throw new Error('package.json build.artifactName is required for packaged artifact validation')
+  }
+
+  const rendered = ARTIFACT_TEMPLATE.replaceAll('${version}', PACKAGE_JSON.version)
+    .replaceAll('${arch}', ARCH)
+    .replaceAll('${ext}', ext)
+
+  if (rendered.includes('${')) {
+    throw new Error(`Unsupported electron-builder artifact template: ${ARTIFACT_TEMPLATE}`)
+  }
+
+  return rendered
+}
+
+const DMG_NAME = artifactNameFor('dmg')
+const ARTIFACT_PREFIX = DMG_NAME.slice(0, -'.dmg'.length)
 
 // Platform-specific packaged-app layout for the remote-first managed Eva beta.
 const APP = (() => {
@@ -124,7 +143,7 @@ function ensurePackagedApp() {
 
 function resolveDmgPath() {
   if (!exists(RELEASE_ROOT)) {
-    return path.join(RELEASE_ROOT, `${ARTIFACT_PREFIX}.dmg`)
+    return path.join(RELEASE_ROOT, DMG_NAME)
   }
 
   const candidates = fs
@@ -140,7 +159,7 @@ function resolveDmgPath() {
 
   return candidates.length > 0
     ? path.join(RELEASE_ROOT, candidates[0])
-    : path.join(RELEASE_ROOT, `${ARTIFACT_PREFIX}.dmg`)
+    : path.join(RELEASE_ROOT, DMG_NAME)
 }
 
 function resolveNsisPath() {
