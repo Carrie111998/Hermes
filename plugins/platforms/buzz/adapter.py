@@ -446,6 +446,7 @@ class BuzzAdapter(BasePlatformAdapter):
         # Gated by _TURN_ANCHOR_TTL so unrelated proactive/cron sends (which
         # arrive long after the last inbound) still post at root.
         self._turn_reply_anchor: Dict[str, tuple[str, float]] = {}
+        self._load_turn_anchors()
         # channel_id -> raw ``channels list`` entry; drives DM-vs-channel
         # classification (see _may_reclassify_as_dm).
         self._channel_meta: Dict[str, dict] = {}
@@ -614,6 +615,56 @@ class BuzzAdapter(BasePlatformAdapter):
 
     # ── Sending ───────────────────────────────────────────────────────────
 
+    def _turn_anchor_path(self) -> Optional[str]:
+        """Where turn anchors persist. None disables persistence entirely."""
+        home = os.environ.get("HERMES_HOME")
+        return os.path.join(home, "buzz_turn_anchors.json") if home else None
+
+    def _save_turn_anchors(self) -> None:
+        """Persist anchors so a gateway restart mid-turn does not lose threading.
+
+        The anchor is otherwise pure process state, so a restart between the
+        triggering message and the final send drops the reply target and the
+        rest of the answer lands at the channel root -- seen as "the reply
+        starts threaded, then jumps to root". Restarts mid-turn are routine
+        (deploys, config reloads), so the anchor has to outlive the process.
+
+        Best-effort: threading is cosmetic and must never break sending.
+        """
+        path = self._turn_anchor_path()
+        if not path:
+            return
+        try:
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump({k: [v[0], v[1]] for k, v in self._turn_reply_anchor.items()}, fh)
+            os.replace(tmp, path)
+        except Exception:
+            logger.debug("Buzz: could not persist turn anchors", exc_info=True)
+
+    def _load_turn_anchors(self) -> None:
+        """Restore anchors written before a restart, dropping any past TTL."""
+        path = self._turn_anchor_path()
+        if not path or not os.path.exists(path):
+            return
+        try:
+            with open(path, encoding="utf-8") as fh:
+                raw = json.load(fh)
+            now = time.time()
+            restored = {
+                str(k): (str(v[0]), float(v[1]))
+                for k, v in (raw or {}).items()
+                if isinstance(v, (list, tuple)) and len(v) == 2
+                and (now - float(v[1])) <= _TURN_ANCHOR_TTL
+            }
+            self._turn_reply_anchor.update(restored)
+            if restored:
+                logger.info(
+                    "Buzz: restored %d turn reply anchor(s) across restart", len(restored)
+                )
+        except Exception:
+            logger.debug("Buzz: could not load turn anchors", exc_info=True)
+
     def _fresh_turn_anchor(self, chat_id: str) -> Optional[str]:
         """Reply-to fallback: the current turn's triggering event, if recent.
 
@@ -627,7 +678,7 @@ class BuzzAdapter(BasePlatformAdapter):
         if not entry:
             return None
         event_id, ts = entry
-        if (time.monotonic() - ts) > _TURN_ANCHOR_TTL:
+        if (time.time() - ts) > _TURN_ANCHOR_TTL:
             self._turn_reply_anchor.pop(chat_id, None)
             return None
         return event_id
@@ -1102,7 +1153,8 @@ class BuzzAdapter(BasePlatformAdapter):
         # every send the agent makes while responding — final reply, interim
         # narration, overflow-split chunks, status bubbles — threads under it
         # rather than scattering to the channel root (see _turn_reply_anchor).
-        self._turn_reply_anchor[channel_id] = (event_id, time.monotonic())
+        self._turn_reply_anchor[channel_id] = (event_id, time.time())
+        self._save_turn_anchors()
 
         # Strip a leading @mention so slash commands (@Chip /whoami ->
         # /whoami) and clean prompts are recognized. DM messages often still
