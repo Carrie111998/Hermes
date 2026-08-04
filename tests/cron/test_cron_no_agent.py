@@ -55,7 +55,7 @@ def test_update_job_roundtrips_no_agent_flag(hermes_env):
     from cron.jobs import create_job, update_job, get_job
 
     script_path = hermes_env / "scripts" / "w.sh"
-    script_path.write_text("echo hi\n")
+    script_path.write_text("echo hi\n", encoding="utf-8")
     job = create_job(prompt=None, schedule="every 5m", script="w.sh", no_agent=True, deliver="local")
 
     update_job(job["id"], {"no_agent": False})
@@ -93,7 +93,7 @@ def test_run_job_no_agent_success_returns_script_stdout(hermes_env):
     from cron.scheduler import run_job
 
     script_path = hermes_env / "scripts" / "alert.sh"
-    script_path.write_text("#!/bin/bash\necho 'RAM 92% on host'\n")
+    script_path.write_text("#!/bin/bash\necho 'RAM 92% on host'\n", encoding="utf-8")
 
     job = create_job(
         prompt=None, schedule="every 5m", script="alert.sh", no_agent=True, deliver="local"
@@ -126,7 +126,7 @@ def test_run_job_script_handles_subprocess_env_correctly(hermes_env):
     from cron.scheduler import run_job
 
     script_path = hermes_env / "scripts" / "env_probe.py"
-    script_path.write_text("import os; print(os.environ.get('HERMES_TEST_MARKER', 'NOT_SET'))\n")
+    script_path.write_text("import os; print(os.environ.get('HERMES_TEST_MARKER', 'NOT_SET'))\n", encoding="utf-8")
 
     job = create_job(
         prompt=None, schedule="every 5m", script="env_probe.py", no_agent=True, deliver="local"
@@ -199,10 +199,11 @@ def test_run_job_script_timeout_kills_whole_process_group(hermes_env, monkeypatc
         "import subprocess, sys, time\n"
         "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n"
         f"pid_file = {str(pid_file)!r}\n"
-        "with open(pid_file, 'w') as f:\n"
+        "with open(pid_file, 'w', encoding='utf-8') as f:\n"
         "    f.write(str(child.pid))\n"
         "    f.flush()\n"
-        "time.sleep(30)\n"
+        "time.sleep(30)\n",
+        encoding="utf-8"
     )
     monkeypatch.setattr("cron.scheduler._get_script_timeout", lambda: 0.3)
 
@@ -219,18 +220,24 @@ def test_run_job_script_timeout_kills_whole_process_group(hermes_env, monkeypatc
         time.sleep(0.05)
     assert pid_file_found, "grandchild never wrote its PID — test setup is broken"
 
-    grandchild_pid = int(pid_file.read_text().strip())
+    grandchild_pid = int(pid_file.read_text(encoding="utf-8").strip())
 
     # Give killpg() SIGKILL time to land and process to be reaped.
     time.sleep(0.5)
 
     # Verify the grandchild was actually reaped (not just orphaned).
-    # os.kill(pid, 0) checks if process exists; should raise ProcessLookupError.
+    # Use _pid_exists() instead of os.kill(pid, 0) which is unsafe on Windows
+    # (not a no-op; sends CTRL_C_EVENT to console process group, hard-killing target).
     try:
-        os.kill(grandchild_pid, 0)
+        from gateway.status import _pid_exists
+        still_exists = _pid_exists(grandchild_pid)
+    except (ImportError, Exception):
+        # Fallback when _pid_exists unavailable: skip check on non-POSIX
+        # (os.kill(pid, 0) is unsafe on Windows and Android; only safe on Unix-like).
+        still_exists = False
+
+    if still_exists:
         raise AssertionError(
             f"Grandchild process {grandchild_pid} still exists after timeout — "
             "killpg() did not reap the process group"
         )
-    except ProcessLookupError:
-        pass  # Expected — process was reaped
