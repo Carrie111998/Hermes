@@ -1134,8 +1134,8 @@ export function ChatSidebar({
                   (item.id === 'skills' && currentView === 'skills') ||
                   (item.id === 'messaging' && currentView === 'messaging') ||
                   (item.id === 'artifacts' && currentView === 'artifacts') ||
-                  // Contributed rows light up at their own route.
-                  (Boolean(item.route) && pathname === item.route)
+                  // Contributed rows light up at their route and its nested pages.
+                  (Boolean(item.route) && (pathname === item.route || pathname.startsWith(`${item.route}/`)))
 
                 const isNewSession = item.id === 'new-session'
 

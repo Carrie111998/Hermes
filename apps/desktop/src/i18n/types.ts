@@ -1505,6 +1505,54 @@ export interface Translations {
     copyPath: string
   }
 
+  groups: {
+    title: string
+    createRoom: string
+    roomName: string
+    profiles: string
+    profilesHint: string
+    searchProfiles: string
+    create: string
+    cancel: string
+    empty: string
+    message: string
+    send: string
+    stop: string
+    delete: string
+    back: string
+    approval: string
+    run: string
+    reject: string
+    loadFailed: string
+    you: string
+    agent: string
+    working: string
+    workspace: string
+    noWorkspace: string
+    browseWorkspace: string
+    loadEarlier: string
+    loadingEarlier: string
+    compressed: string
+    compressionCount: (count: number) => string
+    summary: string
+    copyQuestion: string
+    restoreCheckpoint: string
+    restoreTitle: string
+    restoreBody: string
+    restoreConfirm: string
+    contextPolicy: string
+    contextPolicyHint: string
+    triggerTokens: string
+    maxHistoryTokens: string
+    tailMessageCount: string
+    agentCount: (count: number) => string
+    contextTriggerValue: (tokens: string) => string
+    contextRecentValue: (tokens: string) => string
+    contextMessagesValue: (count: number) => string
+    composerHint: string
+    mentionAgents: string
+  }
+
   artifactCard: {
     kind: Record<'code' | 'html' | 'svg', string>
     generating: (lines: number) => string

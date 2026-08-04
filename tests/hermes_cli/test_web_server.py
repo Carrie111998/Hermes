@@ -1889,6 +1889,305 @@ class TestNewEndpoints:
     # --- Profiles ---
 
 
+    def test_profiles_list_includes_default(self):
+        from hermes_constants import get_hermes_home
+        get_hermes_home().mkdir(parents=True, exist_ok=True)
+
+        resp = self.client.get("/api/profiles")
+        assert resp.status_code == 200
+        names = [p["name"] for p in resp.json()["profiles"]]
+        assert "default" in names
+
+    def test_profiles_list_falls_back_when_profile_listing_fails(self, monkeypatch):
+        from hermes_constants import get_hermes_home
+        import hermes_cli.profiles as profiles_mod
+
+        hermes_home = get_hermes_home()
+        hermes_home.mkdir(parents=True, exist_ok=True)
+        (hermes_home / "config.yaml").write_text(
+            "model:\n  provider: openrouter\n  name: anthropic/claude-sonnet-4.6\n",
+            encoding="utf-8",
+        )
+        named = hermes_home / "profiles" / "multi-agent"
+        named.mkdir(parents=True)
+        (named / ".env").write_text("EXAMPLE=1\n", encoding="utf-8")
+        (named / "skills" / "demo").mkdir(parents=True)
+        (named / "skills" / "demo" / "SKILL.md").write_text("---\nname: demo\n---\n", encoding="utf-8")
+
+        monkeypatch.setattr(
+            profiles_mod,
+            "list_profiles",
+            lambda: (_ for _ in ()).throw(RuntimeError("boom")),
+        )
+
+        resp = self.client.get("/api/profiles")
+
+        assert resp.status_code == 200
+        profiles = {p["name"]: p for p in resp.json()["profiles"]}
+        assert profiles["default"]["is_default"] is True
+        assert profiles["default"]["provider"] == "openrouter"
+        assert profiles["multi-agent"]["has_env"] is True
+        assert profiles["multi-agent"]["skill_count"] == 1
+
+    def test_profiles_list_includes_display_name(self):
+        from hermes_constants import get_hermes_home
+
+        profile_dir = get_hermes_home() / "profiles" / "architect"
+        profile_dir.mkdir(parents=True)
+        (profile_dir / "profile.yaml").write_text("display_name: 技术架构师\n", encoding="utf-8")
+
+        resp = self.client.get("/api/profiles")
+
+        assert resp.status_code == 200
+        profiles = {p["name"]: p for p in resp.json()["profiles"]}
+        assert profiles["architect"]["display_name"] == "技术架构师"
+
+    def test_profiles_create_rename_delete_round_trip(self, monkeypatch):
+        # Stub gateway service teardown so the test doesn't shell out to
+        # launchctl/systemctl on the host.
+        import hermes_cli.profiles as profiles_mod
+        monkeypatch.setattr(profiles_mod, "_cleanup_gateway_service", lambda *a, **kw: None)
+
+        created = self.client.post("/api/profiles", json={"name": "test-prof"})
+        assert created.status_code == 200
+
+        renamed = self.client.patch(
+            "/api/profiles/test-prof",
+            json={"new_name": "test-prof-2"},
+        )
+        assert renamed.status_code == 200
+
+        names = [p["name"] for p in self.client.get("/api/profiles").json()["profiles"]]
+        assert "test-prof" not in names
+        assert "test-prof-2" in names
+
+        deleted = self.client.delete("/api/profiles/test-prof-2")
+        assert deleted.status_code == 200
+        names = [p["name"] for p in self.client.get("/api/profiles").json()["profiles"]]
+        assert "test-prof-2" not in names
+
+    def test_profile_setup_command_uses_named_profile_wrapper(self):
+        from hermes_constants import get_hermes_home
+
+        (get_hermes_home() / "profiles" / "coder").mkdir(parents=True)
+
+        resp = self.client.get("/api/profiles/coder/setup-command")
+
+        assert resp.status_code == 200
+        assert resp.json()["command"] == "coder setup"
+
+    def test_profile_setup_command_uses_hermes_for_default_profile(self):
+        from hermes_constants import get_hermes_home
+
+        get_hermes_home().mkdir(parents=True, exist_ok=True)
+
+        resp = self.client.get("/api/profiles/default/setup-command")
+
+        assert resp.status_code == 200
+        assert resp.json()["command"] == "hermes setup"
+
+    def test_profiles_create_creates_wrapper_alias_when_safe(self, monkeypatch, tmp_path):
+        import hermes_cli.profiles as profiles_mod
+
+        wrapper_dir = tmp_path / "bin"
+        wrapper_dir.mkdir()
+        monkeypatch.setattr(profiles_mod, "_get_wrapper_dir", lambda: wrapper_dir)
+        monkeypatch.setattr(profiles_mod.shutil, "which", lambda name: "/opt/hermes/bin/hermes")
+
+        resp = self.client.post(
+            "/api/profiles",
+            json={"name": "writer", "clone_from": None},
+        )
+
+        assert resp.status_code == 200
+        is_windows = sys.platform == "win32"
+        wrapper_path = wrapper_dir / ("writer.bat" if is_windows else "writer")
+        assert wrapper_path.exists()
+        lines = [line.strip() for line in wrapper_path.read_text().splitlines() if line.strip()]
+        if is_windows:
+            assert lines == ["@echo off", "hermes -p writer %*"]
+        else:
+            assert lines == ["#!/bin/sh", 'exec /opt/hermes/bin/hermes -p writer "$@"']
+
+    def test_profiles_create_with_clone_from_copies_source_skills(self, monkeypatch):
+        from hermes_constants import get_hermes_home
+        import hermes_cli.profiles as profiles_mod
+
+        monkeypatch.setattr(profiles_mod, "create_wrapper_script", lambda name: None)
+        (get_hermes_home() / "config.yaml").write_text(
+            "model:\n  provider: openrouter\n",
+            encoding="utf-8",
+        )
+        default_skill = get_hermes_home() / "skills" / "custom" / "new-skill"
+        default_skill.mkdir(parents=True)
+        (default_skill / "SKILL.md").write_text("---\nname: new-skill\n---\n", encoding="utf-8")
+
+        resp = self.client.post(
+            "/api/profiles",
+            json={"name": "cloned", "clone_from": "default"},
+        )
+
+        assert resp.status_code == 200
+        cloned_root = get_hermes_home() / "profiles" / "cloned"
+        cloned_skill = cloned_root / "skills" / "custom" / "new-skill" / "SKILL.md"
+        assert cloned_skill.exists()
+        cloned_config = yaml.safe_load((cloned_root / "config.yaml").read_text(encoding="utf-8"))
+        assert cloned_config["_config_version"] == DEFAULT_CONFIG["_config_version"]
+        profiles = {p["name"]: p for p in self.client.get("/api/profiles").json()["profiles"]}
+        assert profiles["cloned"]["skill_count"] == 1
+
+    def test_profiles_create_with_clone_from_duplicates_source(self, monkeypatch):
+        from hermes_constants import get_hermes_home
+        import hermes_cli.profiles as profiles_mod
+
+        monkeypatch.setattr(profiles_mod, "create_wrapper_script", lambda name: None)
+
+        # Create a source profile and give it a distinctive skill.
+        assert self.client.post("/api/profiles", json={"name": "source-prof"}).status_code == 200
+        source_skill = get_hermes_home() / "profiles" / "source-prof" / "skills" / "custom" / "src-skill"
+        source_skill.mkdir(parents=True)
+        (source_skill / "SKILL.md").write_text("---\nname: src-skill\n---\n", encoding="utf-8")
+
+        # Duplicate it via an explicit clone_from source (not "default").
+        resp = self.client.post(
+            "/api/profiles",
+            json={"name": "source-prof-copy", "clone_from": "source-prof"},
+        )
+
+        assert resp.status_code == 200
+        cloned_skill = (
+            get_hermes_home() / "profiles" / "source-prof-copy" / "skills" / "custom" / "src-skill" / "SKILL.md"
+        )
+        assert cloned_skill.exists()
+
+    def test_profiles_create_clone_all_from_named_source(self, monkeypatch):
+        from hermes_constants import get_hermes_home
+        import hermes_cli.profiles as profiles_mod
+
+        monkeypatch.setattr(profiles_mod, "create_wrapper_script", lambda name: None)
+
+        assert self.client.post("/api/profiles", json={"name": "full-src"}).status_code == 200
+        source_dir = get_hermes_home() / "profiles" / "full-src"
+        (source_dir / "config.yaml").write_text("model:\n  provider: source-only\n", encoding="utf-8")
+        (source_dir / "workspace" / "artifact.txt").parent.mkdir(parents=True, exist_ok=True)
+        (source_dir / "workspace" / "artifact.txt").write_text("copied", encoding="utf-8")
+
+        resp = self.client.post(
+            "/api/profiles",
+            json={"name": "full-copy", "clone_from": "full-src", "clone_all": True},
+        )
+
+        assert resp.status_code == 200
+        target_dir = get_hermes_home() / "profiles" / "full-copy"
+        assert (target_dir / "config.yaml").read_text(encoding="utf-8") == "model:\n  provider: source-only\n"
+        assert (target_dir / "workspace" / "artifact.txt").read_text(encoding="utf-8") == "copied"
+
+    def test_profiles_create_without_clone_seeds_bundled_skills(self, monkeypatch):
+        from hermes_constants import get_hermes_home
+        import hermes_cli.profiles as profiles_mod
+
+        monkeypatch.setattr(profiles_mod, "create_wrapper_script", lambda name: None)
+
+        def fake_seed(profile_dir, quiet=False):
+            skill_dir = profile_dir / "skills" / "software-development" / "plan"
+            skill_dir.mkdir(parents=True)
+            (skill_dir / "SKILL.md").write_text("---\nname: plan\n---\n", encoding="utf-8")
+            return {"copied": ["plan"]}
+
+        monkeypatch.setattr(profiles_mod, "seed_profile_skills", fake_seed)
+
+        resp = self.client.post(
+            "/api/profiles",
+            json={"name": "fresh", "clone_from": None},
+        )
+
+        assert resp.status_code == 200
+        seeded_skill = get_hermes_home() / "profiles" / "fresh" / "skills" / "software-development" / "plan" / "SKILL.md"
+        assert seeded_skill.exists()
+        profiles = {p["name"]: p for p in self.client.get("/api/profiles").json()["profiles"]}
+        assert profiles["fresh"]["skill_count"] == 1
+
+    def test_profiles_create_builder_fields_model_mcp_and_keep_skills(self, monkeypatch):
+        """Profile-builder create: model + MCP servers + keep-skills selection
+        all land in the NEW profile's config, and hub installs are spawned
+        scoped to that profile via ``-p <name>``."""
+        from hermes_constants import (
+            get_hermes_home,
+            set_hermes_home_override,
+            reset_hermes_home_override,
+        )
+        from hermes_cli.config import load_config
+        from hermes_cli.skills_config import get_disabled_skills
+        import hermes_cli.profiles as profiles_mod
+        import hermes_cli.web_server as web_server
+
+        monkeypatch.setattr(profiles_mod, "create_wrapper_script", lambda name: None)
+
+        # Seed two known skills so keep-skills "replace" has something to act on.
+        def fake_seed(profile_dir, quiet=False):
+            for skill in ("keep-me", "drop-me"):
+                d = profile_dir / "skills" / "custom" / skill
+                d.mkdir(parents=True)
+                (d / "SKILL.md").write_text(f"---\nname: {skill}\n---\n", encoding="utf-8")
+            return {"copied": ["keep-me", "drop-me"]}
+
+        monkeypatch.setattr(profiles_mod, "seed_profile_skills", fake_seed)
+
+        # Capture hub-install spawns instead of launching real subprocesses.
+        spawned = []
+
+        class _FakeProc:
+            pid = 4321
+
+        def fake_spawn(subcommand, name):
+            spawned.append((list(subcommand), name))
+            return _FakeProc()
+
+        monkeypatch.setattr(web_server, "_spawn_hermes_action", fake_spawn)
+
+        resp = self.client.post(
+            "/api/profiles",
+            json={
+                "name": "builder",
+                "provider": "openrouter",
+                "model": "anthropic/claude-sonnet-4.6",
+                "mcp_servers": [
+                    {"name": "ctx7", "url": "https://mcp.context7.com/mcp"},
+                    {"name": "bogus"},  # no url/command -> must be skipped, no 500
+                ],
+                "keep_skills": ["keep-me"],
+                "hub_skills": ["someuser/some-skill"],
+            },
+        )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["model_set"] is True
+        assert data["mcp_written"] == 1  # bogus skipped
+        assert data["skills_disabled"] == 1  # drop-me disabled, keep-me kept
+        assert data["hub_installs"] == [{"identifier": "someuser/some-skill", "pid": 4321}]
+
+        # Hub install was scoped to the new profile.
+        assert spawned == [
+            (
+                ["-p", "builder", "skills", "install", "someuser/some-skill", "--yes"],
+                web_server._hub_action_name("install", "someuser/some-skill"),
+            )
+        ]
+
+        # Verify the writes landed in the NEW profile's config, not the root.
+        prof_dir = get_hermes_home() / "profiles" / "builder"
+        token = set_hermes_home_override(str(prof_dir))
+        try:
+            cfg = load_config()
+            assert cfg["model"]["default"] == "anthropic/claude-sonnet-4.6"
+            assert cfg["model"]["provider"] == "openrouter"
+            assert sorted((cfg.get("mcp_servers") or {}).keys()) == ["ctx7"]
+            disabled = get_disabled_skills(cfg)
+            assert "drop-me" in disabled
+            assert "keep-me" not in disabled
+        finally:
+            reset_hermes_home_override(token)
 
     def test_profiles_create_builder_mcp_auth_is_profile_scoped(
         self, monkeypatch
@@ -2920,6 +3219,7 @@ class TestThemeBootstrapCSS:
         from starlette.testclient import TestClient
         import hermes_cli.web_server as ws
 
+        monkeypatch.delenv("HERMES_SERVE_HEADLESS", raising=False)
         dist = tmp_path / "web_dist"
         (dist / "assets").mkdir(parents=True)
         (dist / "index.html").write_text(

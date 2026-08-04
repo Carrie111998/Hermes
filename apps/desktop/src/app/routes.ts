@@ -1,5 +1,6 @@
 import { atom } from 'nanostores'
 import type { ReactNode } from 'react'
+import { matchPath } from 'react-router-dom'
 
 import { noteActiveTreeGroup, revealTreePane } from '@/components/pane-shell/tree/store'
 import { registry } from '@/contrib/registry'
@@ -14,6 +15,7 @@ export const SKILLS_ROUTE = '/skills'
 export const MESSAGING_ROUTE = '/messaging'
 export const WEBHOOKS_ROUTE = '/webhooks'
 export const ARTIFACTS_ROUTE = '/artifacts'
+export const GROUPS_ROUTE = '/groups'
 export const CRON_ROUTE = '/cron'
 export const PROFILES_ROUTE = '/profiles'
 export const AGENTS_ROUTE = '/agents'
@@ -25,6 +27,7 @@ export type AppView =
   | 'chat'
   | 'command-center'
   | 'cron'
+  | 'groups'
   // A contributed (plugin) full page at its own route — NOT chat. Without this
   // distinction contributed paths fell through appViewForPath's 'chat' default,
   // so the sidebar kept a session highlighted and the titlebar kept the
@@ -83,7 +86,7 @@ export const ROUTES_AREA = 'routes'
 
 /** Payload of a `routes` contribution's `data`. */
 export interface RouteContribution {
-  /** Absolute path, e.g. `/kanban`. One segment; no params. */
+  /** Absolute path, e.g. `/kanban`; may end in one React Router segment param such as `/groups/:roomId`. */
   path: string
 }
 
@@ -100,7 +103,7 @@ export function contributedRoutes(): Array<{ key: string; path: string; title?: 
 }
 
 function isContributedPath(pathname: string): boolean {
-  return contributedRoutes().some(route => route.path === pathname)
+  return contributedRoutes().some(route => Boolean(matchPath({ path: route.path, end: true }, pathname)))
 }
 
 // ── Contributed sidebar nav — the `sidebar.nav` registry area ────────────────
@@ -185,8 +188,28 @@ export function sessionRoute(sessionId: string): string {
   return `${SESSION_ROUTE_PREFIX}${encodeURIComponent(sessionId)}`
 }
 
+export function groupRoomId(pathname: string): string | null {
+  const path = routePathname(pathname)
+
+  if (!path.startsWith(`${GROUPS_ROUTE}/`)) {
+    return null
+  }
+
+  const id = path.slice(GROUPS_ROUTE.length + 1)
+
+  return id && !id.includes('/') ? decodeURIComponent(id) : null
+}
+
+export function groupRoomRoute(roomId: string): string {
+  return `${GROUPS_ROUTE}/${encodeURIComponent(roomId)}`
+}
+
 export function appViewForPath(pathname: string): AppView {
   const path = routePathname(pathname)
+
+  if (path === GROUPS_ROUTE || groupRoomId(path)) {
+    return 'groups'
+  }
 
   if (isNewChatRoute(path) || routeSessionId(path)) {
     return 'chat'

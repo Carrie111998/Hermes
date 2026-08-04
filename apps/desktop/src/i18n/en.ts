@@ -1799,6 +1799,25 @@ export const en: Translations = {
     copyPath: 'Copy path'
   },
 
+  groups: {
+    title: 'Group chats', createRoom: 'Create room', roomName: 'Room name', profiles: 'Profiles',
+    profilesHint: 'Comma-separated profile names', searchProfiles: 'Search profiles', create: 'Create', cancel: 'Cancel', empty: 'No group rooms yet.',
+    message: 'Message the room', send: 'Send', stop: 'Stop', delete: 'Delete room', back: 'All rooms',
+    approval: 'Approval needed', run: 'Run', reject: 'Reject', loadFailed: 'Could not load group chats.',
+    you: 'You', agent: 'Agent', working: 'Working…', workspace: 'Workspace', noWorkspace: 'No workspace',
+    browseWorkspace: 'Browse…', loadEarlier: 'Load earlier messages', loadingEarlier: 'Loading earlier messages…',
+    compressed: 'Earlier context was compressed.', compressionCount: count => `Compressed ${count} ${count === 1 ? 'time' : 'times'}`, summary: 'Context summary', copyQuestion: 'Copy question',
+    restoreCheckpoint: 'Restore checkpoint', restoreTitle: 'Restore to this checkpoint?',
+    restoreBody: 'All messages after this prompt will be removed from the conversation, and the prompt will rerun from here.',
+    restoreConfirm: 'Restore & rerun', contextPolicy: 'Context policy',
+    contextPolicyHint: 'Compression trigger · recent history budget · minimum recent messages retained.',
+    triggerTokens: 'Compression trigger tokens', maxHistoryTokens: 'Recent history token budget',
+    tailMessageCount: 'Recent messages to keep', agentCount: count => `${count} Agents`,
+    contextTriggerValue: tokens => `${tokens} trigger`, contextRecentValue: tokens => `${tokens} recent`,
+    contextMessagesValue: count => `${count} messages`, composerHint: 'Enter to send · Shift+Enter for newline · @ mention an Agent',
+    mentionAgents: 'Mention agents'
+  },
+
   artifactCard: {
     kind: { code: 'Code', html: 'Interactive page', svg: 'Graphic' },
     generating: lines => `Generating… ${lines} lines`,
@@ -1824,6 +1843,7 @@ export const en: Translations = {
       'new-session': 'New session',
       skills: 'Capabilities',
       messaging: 'Messaging',
+      groups: 'Group chats',
       artifacts: 'Artifacts'
     },
     searchAria: 'Search sessions',

@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import queue
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -38,6 +39,7 @@ from agent.replay_cleanup import sanitize_replay_history
 from agent.skill_commands import describe_skill_invocation
 from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from tui_gateway import git_probe
+from tui_gateway.group_chat import GroupChatCoordinator, GroupChatStore
 from tui_gateway.turn_marker import (
     clear_turn_marker,
     read_turn_marker,
@@ -291,6 +293,46 @@ _pool = concurrent.futures.ThreadPoolExecutor(
     thread_name_prefix="tui-rpc",
 )
 atexit.register(lambda: _pool.shutdown(wait=False, cancel_futures=True))
+_group_lock = threading.RLock()
+_group_store: GroupChatStore | None = None
+_group_coordinator: GroupChatCoordinator | None = None
+_group_session_targets: dict[str, tuple[str, str]] = {}
+_group_stream_ids: dict[str, str] = {}
+_group_projectors: dict[str, Callable[[str, dict], dict]] = {}
+_group_turn_done: dict[str, threading.Event] = {}
+_group_subscribers: dict[str, set[Transport]] = {}
+
+
+def _remove_group_transport(transport: Transport) -> None:
+    with _group_lock:
+        for room_id in list(_group_subscribers):
+            subscribers = _group_subscribers[room_id]
+            subscribers.discard(transport)
+            if not subscribers:
+                _group_subscribers.pop(room_id, None)
+
+
+def _broadcast_group_event(room_id: str, event: dict) -> None:
+    frame = {"jsonrpc": "2.0", "method": "event", "params": {
+        "type": "group.event", "payload": event,
+    }}
+    with _group_lock:
+        subscribers = list(_group_subscribers.get(room_id, ()))
+    for transport in subscribers:
+        try:
+            if transport.write(frame) is False:
+                _remove_group_transport(transport)
+        except Exception:
+            _remove_group_transport(transport)
+
+
+def _groups() -> GroupChatStore:
+    global _group_store
+    with _group_lock:
+        if _group_store is None:
+            _group_store = GroupChatStore(get_hermes_home() / "group_chat.sqlite3")
+        return _group_store
+
 
 # Reserve real stdout for JSON-RPC only; redirect Python's stdout to stderr
 # so stray print() from libraries/tools becomes harmless gateway.stderr instead
@@ -1078,6 +1120,7 @@ def _close_sessions_for_transport(
     independent reap loop in ``handle_ws``.
 
     Returns ``(reaped, detached)`` counts for disconnect-path observability."""
+    _remove_group_transport(transport)
     with _sessions_lock:
         owned = [(sid, s) for sid, s in _sessions.items() if s.get("transport") is transport]
     reaped = 0
@@ -1536,6 +1579,38 @@ def _event_frame(event: str, sid: str, payload: dict | None = None) -> dict:
 def _emit(event: str, sid: str, payload: dict | None = None):
     write_json(_event_frame(event, sid, payload))
 
+
+    target = _group_session_targets.get(sid)
+    if target:
+        room_id, profile = target
+        group_payload = dict(payload or {})
+        group_payload.setdefault("session_id", sid)
+        if event == "message.start":
+            _group_stream_ids[sid] = uuid.uuid4().hex
+        if stream_id := _group_stream_ids.get(sid):
+            group_payload.setdefault("message_id", stream_id)
+        group_event_type = "agent.error" if event == "error" else event
+        projector = _group_projectors.get(sid)
+        try:
+            group_event = (
+                projector(group_event_type, group_payload)
+                if projector else _groups().append_event(room_id, group_event_type, group_payload, profile)
+            )
+        except KeyError:
+            # A member can emit after its room was deleted. Drop stale routing
+            # state and always release the waiting FIFO worker.
+            with _group_lock:
+                _group_session_targets.pop(sid, None)
+                _group_stream_ids.pop(sid, None)
+                _group_projectors.pop(sid, None)
+                if done := _group_turn_done.pop(sid, None):
+                    done.set()
+            return
+        _broadcast_group_event(room_id, group_event)
+        if event in {"message.complete", "error"}:
+            _group_stream_ids.pop(sid, None)
+            if done := _group_turn_done.get(sid):
+                done.set()
 
 # Live client transports, one per connected WS peer (maintained by tui_gateway.ws).
 # A session-less event from a background thread has neither a session transport
@@ -7612,6 +7687,384 @@ def _emit_terminal_turn_error(sid: str, session: dict, error: Any) -> None:
     _emit("message.complete", sid, payload)
 
 
+# ── Methods: group chat ──────────────────────────────────────────────
+
+
+def _group_runtime() -> GroupChatCoordinator:
+    global _group_coordinator
+    with _group_lock:
+        if _group_coordinator is None:
+            def recover_session(room_id: str, profile: str, runtime_id: str | None,
+                                stored_id: str | None) -> str | None:
+                if runtime_id and runtime_id in _sessions:
+                    _group_session_targets[runtime_id] = (room_id, profile)
+                    return runtime_id
+                if not stored_id:
+                    return None
+                response = _methods["session.resume"]("group-recover", {
+                    "session_id": stored_id,
+                    "profile": profile,
+                    "source": "desktop",
+                })
+                if "error" in response:
+                    if runtime_id:
+                        _group_session_targets.pop(runtime_id, None)
+                    _groups().clear_member_runtime_session(room_id, profile)
+                    raise RuntimeError(response["error"]["message"])
+                result = response["result"]
+                resumed_runtime_id = result["session_id"]
+                resumed_stored_id = str(
+                    result.get("resumed") or result.get("stored_session_id")
+                    or result.get("session_key") or stored_id
+                )
+                if runtime_id:
+                    _group_session_targets.pop(runtime_id, None)
+                _group_session_targets[resumed_runtime_id] = (room_id, profile)
+                _groups().set_member_session(
+                    room_id, profile, resumed_runtime_id, resumed_stored_id
+                )
+                return resumed_runtime_id
+
+            def create_session(params: dict) -> dict[str, str]:
+                response = _methods["session.create"]("group-create", {
+                    "profile": params["profile"], "source": "desktop", "title": "Group chat",
+                    "cwd": params.get("workspace") or "",
+                })
+                if "error" in response:
+                    raise RuntimeError(response["error"]["message"])
+                result = response["result"]
+                runtime_id = result["session_id"]
+                stored_id = str(result.get("stored_session_id") or result.get("session_key") or "")
+                if not stored_id:
+                    raise RuntimeError("session.create did not return a durable session id")
+                _group_session_targets[runtime_id] = (params["room_id"], params["profile"])
+                return {
+                    "runtime_session_id": runtime_id,
+                    "stored_session_id": stored_id,
+                }
+
+            def submit(sid: str, text: str, project) -> dict:
+                session = _sessions.get(sid)
+                if session is None:
+                    target = _group_session_targets.get(sid)
+                    if target is None:
+                        raise RuntimeError("group session is unavailable")
+                    room_id, profile = target
+                    room = _groups().get_room(room_id)
+                    member = next(
+                        (candidate for candidate in (room or {}).get("members", [])
+                         if candidate["profile"] == profile),
+                        None,
+                    )
+                    stored_id = member.get("stored_session_id") if member else None
+                    if stored_id:
+                        response = _methods["session.resume"]("group-recover", {
+                            "session_id": stored_id,
+                            "profile": profile,
+                            "source": "desktop",
+                        })
+                    else:
+                        response = _methods["session.create"]("group-recreate", {
+                            "profile": profile,
+                            "source": "desktop",
+                            "title": "Group chat",
+                        })
+                    if "error" in response:
+                        raise RuntimeError(response["error"]["message"])
+                    result = response["result"]
+                    new_sid = result["session_id"]
+                    durable_id = str(
+                        result.get("resumed")
+                        or result.get("stored_session_id")
+                        or result.get("session_key")
+                        or stored_id
+                        or ""
+                    )
+                    if not durable_id:
+                        raise RuntimeError("group session recovery did not return a durable session id")
+                    _group_session_targets.pop(sid, None)
+                    _group_session_targets[new_sid] = (room_id, profile)
+                    _groups().set_member_session(room_id, profile, new_sid, durable_id)
+                    sid = new_sid
+                done = threading.Event()
+                _group_projectors[sid] = project
+                _group_turn_done[sid] = done
+                response = _methods["prompt.submit"]("group-send", {"session_id": sid, "text": text})
+                if "error" in response:
+                    _group_projectors.pop(sid, None)
+                    _group_turn_done.pop(sid, None)
+                    raise RuntimeError(response["error"]["message"])
+                # prompt.submit acknowledges stream start; FIFO requires the
+                # turn's terminal event before the next queued turn begins.
+                done.wait()
+                _group_projectors.pop(sid, None)
+                _group_turn_done.pop(sid, None)
+                return response
+
+            def interrupt(sid: str) -> dict:
+                return _methods["session.interrupt"]("group-stop", {"session_id": sid})
+
+            def approve(sid: str, choice: str, all_: bool) -> dict:
+                return _methods["approval.respond"]("group-approval", {
+                    "session_id": sid, "choice": choice, "all": all_,
+                })
+
+            _group_coordinator = GroupChatCoordinator(
+                _groups(), create_session, submit, interrupt, approve, recover_session
+            )
+        return _group_coordinator
+
+
+@method("group.room.create")
+def _(rid, params: dict) -> dict:
+    raw_name = params.get("name")
+    name = raw_name.strip() if isinstance(raw_name, str) else ""
+    members = params.get("members")
+    if not isinstance(members, list) and isinstance(params.get("profiles"), list):
+        members = [
+            {"profile": profile, "name": profile}
+            for profile in params["profiles"]
+        ]
+    if not name or len(name) > 128 or not isinstance(members, list) or not members:
+        return _err(rid, 4000, "valid name and non-empty members required")
+    try:
+        from hermes_cli import profiles as profiles_mod
+
+        validated = []
+        seen: set[str] = set()
+        for member in members:
+            if not isinstance(member, dict):
+                raise ValueError("each member must be an object")
+            raw_profile = member.get("profile")
+            if not isinstance(raw_profile, str):
+                raise ValueError("member profile must be a string")
+            profile = raw_profile.strip()
+            profiles_mod.validate_profile_name(profile)
+            if not profile:
+                raise ValueError("member profile cannot be empty")
+            if profile in seen:
+                raise ValueError(f"duplicate member profile: {profile}")
+            if not profiles_mod.profile_exists(profile):
+                raise ValueError(f"unknown profile: {profile}")
+            raw_member_name = member.get("name", profile)
+            if not isinstance(raw_member_name, str):
+                raise ValueError("member name must be a string")
+            member_name = raw_member_name.strip()
+            if not member_name or len(member_name) > 128:
+                raise ValueError("member name must be 1-128 characters")
+            seen.add(profile)
+            validated.append({"profile": profile, "name": member_name})
+        workspace = params.get("workspace")
+        if workspace is not None:
+            if not isinstance(workspace, str):
+                raise ValueError("workspace must be a string")
+            workspace = os.path.abspath(os.path.expanduser(workspace.strip())) if workspace.strip() else None
+            if workspace and not os.path.isdir(workspace):
+                raise ValueError("workspace must be an existing directory")
+        context = dict(params.get("context") or {}) if isinstance(params.get("context"), dict) else {}
+        for key in ("trigger_tokens", "max_history_tokens", "tail_message_count"):
+            if key in params:
+                context[key] = int(params[key])
+        if context.get("trigger_tokens", 1) <= 0 or context.get("max_history_tokens", 1) <= 0:
+            raise ValueError("token limits must be positive")
+        if context.get("tail_message_count", 0) < 0:
+            raise ValueError("tail_message_count must be non-negative")
+        return _ok(rid, {"room": _groups().create_room(
+            name,
+            validated,
+            context=context,
+            workspace=workspace,
+            max_mention_depth=params.get(
+                "max_mention_depth", GroupChatStore.DEFAULT_MAX_MENTION_DEPTH
+            ),
+        )})
+    except (KeyError, ValueError, sqlite3.Error) as exc:
+        return _err(rid, 4000, str(exc))
+
+
+@method("group.room.list")
+def _(rid, params: dict) -> dict:
+    return _ok(rid, {"rooms": _groups().list_rooms()})
+
+
+@method("group.room.get")
+def _(rid, params: dict) -> dict:
+    room_id = str(params.get("room_id") or "")
+    room = _groups().get_room(room_id)
+    if room is None:
+        return _err(rid, 4040, "group room not found")
+    try:
+        raw_before = params.get("before_seq")
+        if raw_before is None and params.get("cursor") not in (None, ""):
+            raw_before = params.get("cursor")
+        page = _groups().message_page(
+            room_id,
+            int(raw_before) if raw_before is not None else None,
+            int(params.get("limit") or 50),
+        )
+    except (TypeError, ValueError):
+        return _err(rid, 4000, "cursor, before_seq and limit must be integers")
+    room["messages"] = page["messages"]
+    room["context_status"] = "compressed" if room.get("summary") else "ready"
+    return _ok(rid, {
+        "room": room,
+        "cursor": str(page["before_seq"]) if page["has_more"] and page["before_seq"] is not None else None,
+        "has_more": page["has_more"],
+    })
+
+
+@method("group.room.delete")
+def _(rid, params: dict) -> dict:
+    room_id = str(params.get("room_id") or "")
+    room = _groups().get_room(room_id)
+    if room is None:
+        return _err(rid, 4040, "group room not found")
+    coordinator = _group_runtime()
+    for member in room["members"]:
+        coordinator.stop(room_id, member["profile"])
+    with _group_lock:
+        stale_sids = [
+            sid for sid, target in _group_session_targets.items()
+            if target[0] == room_id
+        ]
+        for sid in stale_sids:
+            if done := _group_turn_done.pop(sid, None):
+                done.set()
+            _group_projectors.pop(sid, None)
+            _group_session_targets.pop(sid, None)
+            _group_stream_ids.pop(sid, None)
+        _group_subscribers.pop(room_id, None)
+        deleted = _groups().delete_room(room_id)
+    if not deleted:
+        return _err(rid, 4040, "group room not found")
+    return _ok(rid, {"deleted": True, "room_id": room_id})
+
+
+@method("group.timeline")
+def _(rid, params: dict) -> dict:
+    room_id = str(params.get("room_id") or "")
+    if "before_seq" in params or "limit" in params:
+        try:
+            before_seq = params.get("before_seq")
+            page = _groups().message_page(
+                room_id,
+                int(before_seq) if before_seq is not None else None,
+                int(params.get("limit") or 50),
+            )
+            return _ok(rid, page)
+        except (TypeError, ValueError):
+            return _err(rid, 4000, "before_seq and limit must be integers")
+    return _ok(rid, {"events": _groups().timeline(
+        room_id, int(params.get("after") or 0)
+    )})
+
+
+@method("group.send")
+def _(rid, params: dict) -> dict:
+    try:
+        return _ok(rid, _group_runtime().send(
+            str(params.get("room_id") or ""), str(params.get("text") or "")
+        ))
+    except KeyError:
+        return _err(rid, 4040, "group room not found")
+
+
+@method("group.message.send")
+def _(rid, params: dict) -> dict:
+    return _methods["group.send"](rid, {
+        "room_id": params.get("room_id"),
+        "text": params.get("content"),
+    })
+
+
+@method("group.message.rewind")
+def _(rid, params: dict) -> dict:
+    room_id = str(params.get("room_id") or "")
+    text = str(params.get("content") or "")
+    room = _groups().get_room(room_id)
+    if room is None:
+        return _err(rid, 4040, "group room not found")
+    old_session_ids = [
+        str(member["runtime_session_id"])
+        for member in room["members"]
+        if member.get("runtime_session_id")
+    ]
+    try:
+        raw_seq = params.get("seq")
+        if raw_seq is None:
+            raise ValueError("seq is required")
+        seq = int(raw_seq)
+        # Detach the abandoned runtimes before truncating. A late terminal event
+        # from an interrupted turn must not be projected back into the rewound
+        # room after its canonical tail has been deleted.
+        with _group_lock:
+            for sid in old_session_ids:
+                if done := _group_turn_done.pop(sid, None):
+                    done.set()
+                _group_projectors.pop(sid, None)
+                _group_session_targets.pop(sid, None)
+                _group_stream_ids.pop(sid, None)
+        result = _group_runtime().rewind_and_rerun(room_id, seq, text)
+        return _ok(rid, {**result, "room": _groups().get_room(room_id)})
+    except KeyError:
+        return _err(rid, 4040, "group room not found")
+    except (TypeError, ValueError, sqlite3.Error) as exc:
+        return _err(rid, 4000, str(exc))
+
+
+@method("group.stop")
+def _(rid, params: dict) -> dict:
+    room_id = str(params.get("room_id") or "")
+    profile = str(params.get("profile") or "")
+    room = _groups().get_room(room_id)
+    if room is None:
+        return _err(rid, 4040, "group room not found")
+    profiles = [profile] if profile else [member["profile"] for member in room["members"]]
+    stopped = [candidate for candidate in profiles if _group_runtime().stop(room_id, candidate)]
+    return _ok(rid, {"stopped": stopped})
+
+
+@method("group.run.interrupt")
+def _(rid, params: dict) -> dict:
+    return _methods["group.stop"](rid, params)
+
+
+@method("group.subscribe")
+def _(rid, params: dict) -> dict:
+    room_id = str(params.get("room_id") or "")
+    if _groups().get_room(room_id) is None:
+        return _err(rid, 4040, "group room not found")
+    transport = current_transport()
+    if transport is None:
+        return _err(rid, 4000, "group subscription requires a transport")
+    with _group_lock:
+        _group_subscribers.setdefault(room_id, set()).add(transport)
+    return _ok(rid, {"subscribed": True, "room_id": room_id})
+
+
+@method("group.unsubscribe")
+def _(rid, params: dict) -> dict:
+    room_id = str(params.get("room_id") or "")
+    transport = current_transport()
+    if transport is not None:
+        with _group_lock:
+            subscribers = _group_subscribers.get(room_id)
+            if subscribers is not None:
+                subscribers.discard(transport)
+                if not subscribers:
+                    _group_subscribers.pop(room_id, None)
+    return _ok(rid, {"subscribed": False, "room_id": room_id})
+
+
+@method("group.approval.respond")
+def _(rid, params: dict) -> dict:
+    result = _group_runtime().respond_approval(
+        str(params.get("room_id") or ""), str(params.get("profile") or ""),
+        str(params.get("choice") or "deny"), bool(params.get("all", False)),
+    )
+    return _ok(rid, {"resolved": result})
+
+
 def _queued_prompt_snapshot(session: dict) -> dict | None:
     """Return the accepted next-turn prompt without its transport handle.
 
@@ -7625,6 +8078,7 @@ def _queued_prompt_snapshot(session: dict) -> dict | None:
         return None
     user = _inflight_text(queued.get("text"))
     return {"user": user} if user else None
+
 
 
 # ── Methods: session ─────────────────────────────────────────────────

@@ -75,6 +75,7 @@ import { useComposerActions } from '../chat/hooks/use-composer-actions'
 import { CommandPalette } from '../command-palette'
 import { useGatewayBoot } from '../gateway/hooks/use-gateway-boot'
 import { useGatewayRequest } from '../gateway/hooks/use-gateway-request'
+import { handleGroupEvent } from '../groups/group-store'
 import { useKeybinds } from '../hooks/use-keybinds'
 import { ModelPickerOverlay } from '../model-picker-overlay'
 import { ModelVisibilityOverlay } from '../model-visibility-overlay'
@@ -682,6 +683,8 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   const handleGatewayEventWithPlugins = useCallback(
     (event: Parameters<typeof handleDesktopGatewayEvent>[0]) => {
       emitGatewayEvent(event)
+      handleGroupEvent(event)
+
 
       if (event.type === 'wake.detected') {
         const payload = event.payload as { profile?: null | string; start_new_session?: boolean } | undefined

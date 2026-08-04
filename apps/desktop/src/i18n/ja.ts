@@ -1640,6 +1640,23 @@ export const ja = defineLocale({
     copyPath: 'パスをコピー'
   },
 
+  groups: {
+    title: 'グループチャット', createRoom: 'ルームを作成', roomName: 'ルーム名', profiles: 'プロファイル',
+    profilesHint: 'プロファイル名をカンマ区切りで入力', searchProfiles: 'プロファイルを検索', create: '作成', cancel: 'キャンセル', empty: 'グループルームはまだありません。',
+    message: 'ルームにメッセージ', send: '送信', stop: '停止', delete: 'ルームを削除', back: 'すべてのルーム',
+    approval: '承認が必要です', run: '実行', reject: '拒否', loadFailed: 'グループチャットを読み込めませんでした。',
+    you: 'あなた', agent: 'エージェント', working: '作業中…', workspace: 'ワークスペース', noWorkspace: 'ワークスペースなし',
+    browseWorkspace: '参照…', loadEarlier: '以前のメッセージを読み込む', loadingEarlier: '以前のメッセージを読み込み中…',
+    compressed: '以前のコンテキストは圧縮されています。', compressionCount: count => `${count} 回圧縮`, summary: 'コンテキスト要約', copyQuestion: '質問をコピー',
+    restoreCheckpoint: 'チェックポイントを復元', restoreTitle: 'このチェックポイントに復元しますか？',
+    restoreBody: 'このプロンプト以降のすべてのメッセージを削除し、ここからプロンプトを再実行します。', restoreConfirm: '復元して再実行',
+    contextPolicy: 'コンテキストポリシー', contextPolicyHint: '圧縮トリガー · 最近の履歴トークン予算 · 保持する最小メッセージ数。',
+    triggerTokens: '圧縮トリガートークン', maxHistoryTokens: '最近の履歴トークン予算', tailMessageCount: '保持する最近のメッセージ数',
+    agentCount: count => `${count} エージェント`, contextTriggerValue: tokens => `${tokens} で圧縮`,
+    contextRecentValue: tokens => `${tokens} 最近の履歴`, contextMessagesValue: count => `${count} 件を保持`,
+    composerHint: 'Enter で送信 · Shift+Enter で改行 · @ でエージェントを指定', mentionAgents: 'エージェントを指定'
+  },
+
   artifactCard: {
     kind: { code: 'コード', html: 'インタラクティブページ', svg: 'グラフィック' },
     generating: lines => `生成中… ${lines} 行`,
@@ -1665,6 +1682,7 @@ export const ja = defineLocale({
       'new-session': '新しいセッション',
       skills: 'スキルとツール',
       messaging: 'メッセージング',
+      groups: 'グループチャット',
       artifacts: 'アーティファクト'
     },
     searchAria: 'セッションを検索',
