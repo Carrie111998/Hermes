@@ -2663,9 +2663,12 @@ def _verify_native_preflight_inputs(
     runner: Runner,
     require_installed: bool,
     require_original_boot: bool,
+    require_collector_fresh: bool,
 ) -> ConfigCollectorReceipt:
     """Perform all bounded host reads before the native lifecycle mutates state."""
 
+    if type(require_collector_fresh) is not bool:
+        raise TypeError("native collector freshness requirement must be boolean")
     if (
         require_original_boot
         and _current_boot_id_sha256() != plan.value["boot_id_sha256"]
@@ -2673,11 +2676,17 @@ def _verify_native_preflight_inputs(
         raise RuntimeError("native observation boot identity drifted")
     if current_host_identity_sha256() != plan.value["host_identity_sha256"]:
         raise RuntimeError("native observation host identity drifted")
+    # Publication proves the collector snapshot was fresh when the immutable
+    # plan was sealed.  Activation may happen after the snapshot's five-minute
+    # window because owner/auth checks are deliberately performed out of band.
+    # In that path the collector is only a static binding: the database check
+    # below performs a new managed-HBA probe and privilege attestation before
+    # any host or service mutation.
     collector_receipt = None
     if not require_installed:
         collector_receipt = _load_bound_config_collector_receipt(
             plan,
-            require_fresh=True,
+            require_fresh=require_collector_fresh,
         )
     _verify_native_release(plan)
     artifacts = _native_artifact_contract(plan)
@@ -2746,7 +2755,7 @@ def _verify_native_preflight_inputs(
         raise RuntimeError("native legacy helper authority must remain absent")
     final_collector_receipt = _load_bound_config_collector_receipt(
         plan,
-        require_fresh=not require_installed,
+        require_fresh=require_collector_fresh,
     )
     if (
         collector_receipt is None
@@ -2779,6 +2788,7 @@ def native_observation_read_only_preflight(
         runner=runner,
         require_installed=False,
         require_original_boot=True,
+        require_collector_fresh=True,
     )
     observed_at_unix = int(_clock())
     if observed_at_unix < 0:
@@ -3037,6 +3047,7 @@ def _load_existing_native_receipt(
         runner=runner,
         require_installed=True,
         require_original_boot=False,
+        require_collector_fresh=False,
     )
     if not _host_identities_are_exact(_host_identity_snapshot()):
         raise RuntimeError("native receipt host identities drifted")
@@ -3983,6 +3994,7 @@ class NativeObservationExecutor:
                     runner=self.runner,
                     require_installed=False,
                     require_original_boot=True,
+                    require_collector_fresh=False,
                 )
                 if os.path.lexists(_native_stage_path(self.plan)):
                     raise RuntimeError(

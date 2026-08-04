@@ -1089,6 +1089,7 @@ def test_native_expired_approval_before_host_mutation_is_retryable_not_forensic(
     real_require = activation.OwnerApprovalReceipt.require
     require_calls = 0
     calls = []
+    preflight_calls = []
 
     def expiring_require(self, *, scope, plan_sha256, now_unix):
         nonlocal require_calls
@@ -1133,7 +1134,7 @@ def test_native_expired_approval_before_host_mutation_is_retryable_not_forensic(
     monkeypatch.setattr(
         activation,
         "_verify_native_preflight_inputs",
-        lambda *_args, **_kwargs: None,
+        lambda *_args, **kwargs: preflight_calls.append(kwargs),
     )
     monkeypatch.setattr(
         activation,
@@ -1166,6 +1167,14 @@ def test_native_expired_approval_before_host_mutation_is_retryable_not_forensic(
 
     assert not [
         argv for argv in calls if argv[:2] == (activation.SYSTEMCTL, "start")
+    ]
+    assert preflight_calls == [
+        {
+            "runner": executor.runner,
+            "require_installed": False,
+            "require_original_boot": True,
+            "require_collector_fresh": False,
+        }
     ]
 
 
@@ -1576,21 +1585,33 @@ def test_public_durable_native_receipt_loader_is_fail_closed(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("require_installed", "expected_events"),
+    (
+        "require_installed",
+        "require_collector_fresh",
+        "expected_events",
+    ),
     (
         (
             False,
+            True,
             ("collector:True", "release", "database", "collector:True"),
         ),
         (
+            False,
+            False,
+            ("collector:False", "release", "database", "collector:False"),
+        ),
+        (
             True,
+            False,
             ("release", "database", "collector:False", "collector:False"),
         ),
     ),
 )
-def test_packaged_preflight_requires_fresh_initial_collector_but_attests_db_before_expired_replay(
+def test_packaged_preflight_separates_static_collector_from_live_database_attestation(
     monkeypatch,
     require_installed,
+    require_collector_fresh,
     expected_events,
 ):
     plan = _collector_bound_native_plan()
@@ -1648,6 +1669,7 @@ def test_packaged_preflight_requires_fresh_initial_collector_but_attests_db_befo
         runner=lambda _command: None,
         require_installed=require_installed,
         require_original_boot=False,
+        require_collector_fresh=require_collector_fresh,
     )
 
     assert tuple(events) == expected_events
@@ -1674,6 +1696,7 @@ def test_packaged_preflight_requires_fresh_initial_collector_but_attests_db_befo
             runner=lambda _command: None,
             require_installed=require_installed,
             require_original_boot=False,
+            require_collector_fresh=require_collector_fresh,
         )
     assert trusted_reads == []
 
@@ -1748,6 +1771,7 @@ def test_packaged_preflight_allows_absent_future_install_parent(monkeypatch):
         runner=lambda _command: None,
         require_installed=False,
         require_original_boot=False,
+        require_collector_fresh=False,
     )
 
     assert checked == [target.parent]
