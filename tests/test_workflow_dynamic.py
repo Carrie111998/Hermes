@@ -1141,6 +1141,119 @@ class TestRecoverWorkflow:
 # ── pending extensions accumulation ────────────────────────────────────────
 
 
+class TestAutoExtensionEnrichedContext:
+    """Auto-extension passes accumulated results + template catalog to the analyst."""
+
+    def test_record_passes_accumulated_results_and_catalog(self):
+        agent = _make_agent()
+        # Create workflow: n1 -> n2
+        r1 = _parse(
+            handle_workflow_dynamic(
+                {
+                    "action": "create",
+                    "objective": "Enriched context test",
+                    "workflow_id": "wf-enriched-1",
+                    "nodes": [
+                        {"node_id": "n1", "goal": "first step", "depends_on": []},
+                        {"node_id": "n2", "goal": "second step", "depends_on": ["n1"]},
+                    ],
+                },
+                agent,
+            )
+        )
+        assert r1["ok"], r1
+
+        # Complete n1 — the extension analyst should see n1's result in context
+        with patch("tools.delegate_tool.delegate_task", return_value=json.dumps({"error": "no-op"})):
+            with patch("plugins.workflow.get_config", return_value={
+                "max_nodes_per_workflow": 256,
+                "max_extensions_per_workflow": 10,
+                "max_nodes_per_extension": 3,
+                "auto_approve_extensions": False,
+                "template_catalog": [
+                    {"shape": "review-loop", "when": "quality gate"},
+                    {"shape": "sequential", "when": "one more step"},
+                ],
+            }):
+                with patch("plugins.workflow.analyst.analyze_extension") as mock_ext:
+                    mock_ext.return_value = [
+                        {"node_id": "ext1", "goal": "Review the work",
+                         "depends_on": ["n1"], "pattern": "review-loop"}
+                    ]
+                    r2 = _parse(
+                        handle_workflow_dynamic(
+                            {
+                                "action": "record",
+                                "workflow_id": "wf-enriched-1",
+                                "node_id": "n1",
+                                "status": "completed",
+                                "summary": "first step result here",
+                            },
+                            agent,
+                        )
+                    )
+        assert r2["ok"], r2
+        mock_ext.assert_called_once()
+        kwargs = mock_ext.call_args.kwargs
+        # Accumulated results include n1's summary
+        assert kwargs["accumulated_results"] == [
+            {"node_id": "n1", "goal": "first step",
+             "summary": "first step result here", "status": "completed"}
+        ]
+        # Template catalog is threaded through from config
+        assert kwargs["template_catalog"] == [
+            {"shape": "review-loop", "when": "quality gate"},
+            {"shape": "sequential", "when": "one more step"},
+        ]
+        # Existing nodes cover the whole graph
+        assert set(kwargs["existing_nodes"]) == {"n1", "n2"}
+
+
+    def test_record_without_catalog_config_defaults_to_none(self):
+        agent = _make_agent()
+        r1 = _parse(
+            handle_workflow_dynamic(
+                {
+                    "action": "create",
+                    "objective": "No catalog test",
+                    "workflow_id": "wf-nocatalog-1",
+                    "nodes": [{"node_id": "a", "goal": "do thing", "depends_on": []}],
+                },
+                agent,
+            )
+        )
+        assert r1["ok"], r1
+
+        with patch("tools.delegate_tool.delegate_task", return_value=json.dumps({"error": "no-op"})):
+            with patch("plugins.workflow.get_config", return_value={
+                "max_nodes_per_workflow": 256,
+                "max_extensions_per_workflow": 10,
+                "max_nodes_per_extension": 3,
+                "auto_approve_extensions": False,
+            }):
+                with patch("plugins.workflow.analyst.analyze_extension") as mock_ext:
+                    mock_ext.return_value = []
+                    r2 = _parse(
+                        handle_workflow_dynamic(
+                            {
+                                "action": "record",
+                                "workflow_id": "wf-nocatalog-1",
+                                "node_id": "a",
+                                "status": "completed",
+                                "summary": "did thing",
+                            },
+                            agent,
+                        )
+                    )
+        assert r2["ok"], r2
+        mock_ext.assert_called_once()
+        kwargs = mock_ext.call_args.kwargs
+        # No template_catalog key in config -> analyst falls back to its default
+        assert kwargs["template_catalog"] is None
+        # Accumulated results still flow
+        assert kwargs["accumulated_results"][0]["node_id"] == "a"
+
+
 class TestPendingExtensionsAccumulate:
     """Tests that pending_extensions accumulate across multiple record calls."""
 

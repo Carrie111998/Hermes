@@ -17,6 +17,10 @@ from plugins.workflow.analyst import (
     analyze_escalation,
     analyze_status,
     analyze_failure,
+    analyze_extension,
+    _format_accumulated_results,
+    _format_template_catalog,
+    _DEFAULT_TEMPLATE_CATALOG,
 )
 from plugins.workflow.engine import (
     WorkflowEngine, Workflow, WorkflowNode, NodeState,
@@ -328,3 +332,88 @@ def test_node_state_loop_history_default():
 def test_node_state_loop_history_persists():
     """LOOP convention removed."""
     pass
+
+
+
+# ════════════════════════════════════════════════════════════════
+# Enriched extension analysis (shape-aware, done-check)
+# ════════════════════════════════════════════════════════════════
+
+def test_extension_builds_prompt_with_accumulated_results():
+    """The extension prompt includes accumulated results + template catalog."""
+    with patch("plugins.workflow.analyst._invoke") as mock_invoke:
+        mock_invoke.return_value = AnalystOutcome(mode="extension", success=True)
+        analyze_extension(
+            summary="wrote the spec",
+            objective="ship a feature",
+            existing_nodes=["spec", "impl"],
+            accumulated_results=[
+                {"node_id": "spec", "goal": "write spec", "summary": "wrote the spec"},
+            ],
+            template_catalog=[{"shape": "review-loop", "when": "quality gate"}],
+        )
+        mock_invoke.assert_called_once()
+        call_kwargs = mock_invoke.call_args.kwargs
+        assert call_kwargs["mode"] == "extension"
+        um = call_kwargs["user_message"]
+        # Accumulated results section present with node content
+        assert "Accumulated results" in um
+        assert "[spec] wrote the spec" in um
+        # Template catalog section present
+        assert "review-loop: quality gate" in um
+        # Existing nodes present
+        assert "spec, impl" in um
+
+
+def test_extension_defaults_when_not_supplied():
+    """Defaults: empty accumulated results, default catalog — no crash."""
+    with patch("plugins.workflow.analyst._invoke") as mock_invoke:
+        mock_invoke.return_value = AnalystOutcome(mode="extension", success=True)
+        analyze_extension(summary="done", objective="obj")
+        mock_invoke.assert_called_once()
+        um = mock_invoke.call_args.kwargs["user_message"]
+        assert "(no completed nodes yet)" in um
+        assert "sequential:" in um  # default catalog present
+
+
+def test_extension_done_check_returns_empty():
+    """Analyst returning [] (objective met) yields no suggestions."""
+    with patch("plugins.workflow.analyst._invoke") as mock_invoke:
+        mock_invoke.return_value = AnalystOutcome(mode="extension", success=True, raw_response="[]")
+        result = analyze_extension(summary="fully delivered", objective="ship it")
+        assert result == []
+
+
+def test_extension_keeps_pattern_field():
+    """Suggestions carrying a pattern field survive validation."""
+    with patch("plugins.workflow.analyst._invoke") as mock_invoke:
+        mock_invoke.return_value = AnalystOutcome(mode="extension", success=True, raw_response=(
+            '[{"node_id": "qa-review", "goal": "Review the artifact", '
+            '"depends_on": ["impl"], "pattern": "review-loop"}]'
+        ))
+        result = analyze_extension(summary="impl done", objective="ship it")
+        assert result == [
+            {"node_id": "qa-review", "goal": "Review the artifact",
+             "depends_on": ["impl"], "pattern": "review-loop"}
+        ]
+
+
+def test_format_accumulated_results_truncates_long_summaries():
+    long_summary = "x" * 700
+    out = _format_accumulated_results(
+        [{"node_id": "n1", "summary": long_summary}]
+    )
+    assert len(out) < 600
+    assert "[n1]" in out
+    assert out.endswith("...")
+
+
+def test_format_template_catalog_handles_empty():
+    assert _format_template_catalog(None) == "(none configured)"
+    assert _format_template_catalog([]) == "(none configured)"
+
+
+def test_default_catalog_covers_known_shapes():
+    shapes = {e["shape"] for e in _DEFAULT_TEMPLATE_CATALOG}
+    assert {"sequential", "parallel-fanout", "synthesize", "review-loop",
+            "tournament", "research"} <= shapes

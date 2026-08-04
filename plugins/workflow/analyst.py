@@ -185,13 +185,79 @@ Rules:
 
 _EXTENSION_USER = """Workflow objective: {objective}
 
-Worker completion summary: {summary}
+Worker completion summary (node that just completed): {summary}
 
-Existing nodes: {existing_nodes}
+Accumulated results of ALL completed nodes so far:
+{accumulated_results}
 
-Based on the summary, suggest 0-3 follow-up nodes to continue working toward the objective.
-If the objective appears to be met, return an empty array.
-Only suggest nodes that are NOT already in the existing_nodes list."""
+Existing node ids: {existing_nodes}
+
+Workflow-shape template catalog (shape → when to use):
+{template_catalog}
+
+Decide what the graph should do next per the system prompt: DONE-CHECK
+first (return [] if the objective is met), then gap analysis choosing a
+shape from the catalog, then instantiate 0-3 nodes with a pattern field.
+Only suggest nodes NOT already in the existing_nodes list."""
+
+
+_DEFAULT_TEMPLATE_CATALOG: list[dict] = [
+    {
+        "shape": "sequential",
+        "when": "a single further processing step (format, polish, commit, report) advances the objective",
+    },
+    {
+        "shape": "parallel-fanout",
+        "when": "several independent sub-questions or sub-deliverables remain; breadth is the gap",
+    },
+    {
+        "shape": "synthesize",
+        "when": "the remaining gap is consolidation or ranking of existing outputs, not new discovery",
+    },
+    {
+        "shape": "review-loop",
+        "when": "the next step is expensive or final (compute, publish, money); a cheap review before it prevents waste",
+    },
+    {
+        "shape": "tournament",
+        "when": "the objective is pick-the-best-approach and candidates differ materially",
+    },
+    {
+        "shape": "research",
+        "when": "the next step requires unknown information before work can continue",
+    },
+]
+
+
+def _format_template_catalog(catalog: list[dict] | None) -> str:
+    """Render the shape catalog as a compact table for the prompt."""
+    if not catalog:
+        return "(none configured)"
+    rows = []
+    for entry in catalog:
+        shape = str(entry.get("shape") or "custom")
+        when = str(entry.get("when") or "").strip()
+        rows.append(f"- {shape}: {when}" if when else f"- {shape}")
+    return "\n".join(rows)
+
+
+def _format_accumulated_results(results: list[dict] | None) -> str:
+    """Render completed node results as a bounded digest for the prompt."""
+    if not results:
+        return "(no completed nodes yet)"
+    parts = []
+    for r in results:
+        nid = str(r.get("node_id") or "?")
+        summary = str(r.get("summary") or "").strip()
+        goal = str(r.get("goal") or "").strip()
+        if summary:
+            snippet = summary if len(summary) <= 500 else summary[:500] + "..."
+            parts.append(f"[{nid}] {snippet}")
+        elif goal:
+            parts.append(f"[{nid}] (no summary; goal: {goal[:200]})")
+        else:
+            parts.append(f"[{nid}] (no summary)")
+    return "\n---\n".join(parts)
 
 
 # ── Mode: loop decision ─────────────────────────────────────
@@ -410,20 +476,33 @@ def analyze_extension(
     summary: str = "",
     objective: str = "",
     existing_nodes: list[str] | None = None,
+    accumulated_results: list[dict] | None = None,
+    template_catalog: list[dict] | None = None,
     timeout: Optional[int] = None,
 ) -> list[dict]:
     """Suggest follow-up nodes after a worker completes.
 
-    Calls the workflow_analyst auxiliary with the extension prompt.
-    Returns a list of suggestion dicts (node_id, goal, depends_on)
+    The analyst decides the next shape of the graph given the objective,
+    the node that just completed, the accumulated results of all completed
+    nodes, and the known workflow-shape template catalog. A done-check is
+    the first step: returning [] means the objective is met and the graph
+    should terminate.
+
+    Returns a list of suggestion dicts (node_id, goal, depends_on, pattern)
     or an empty list if the analyst is unavailable / returns nothing useful.
     """
     if existing_nodes is None:
         existing_nodes = []
+    if accumulated_results is None:
+        accumulated_results = []
+    if template_catalog is None:
+        template_catalog = _DEFAULT_TEMPLATE_CATALOG
     user_msg = _EXTENSION_USER.format(
         summary=summary,
         objective=objective,
         existing_nodes=", ".join(existing_nodes) if existing_nodes else "(none)",
+        accumulated_results=_format_accumulated_results(accumulated_results),
+        template_catalog=_format_template_catalog(template_catalog),
     )
     outcome = _invoke(
         mode="extension",
@@ -549,9 +628,13 @@ def _validate_suggestions(items: list) -> list[dict]:
         depends_on = item.get("depends_on")
         if not isinstance(depends_on, list):
             depends_on = []
-        validated.append({
+        entry: dict = {
             "node_id": nid,
             "goal": goal,
             "depends_on": [str(d).strip() for d in depends_on if str(d).strip()],
-        })
+        }
+        pattern = str(item.get("pattern") or "").strip()
+        if pattern:
+            entry["pattern"] = pattern
+        validated.append(entry)
     return validated

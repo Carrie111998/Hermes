@@ -974,10 +974,24 @@ def _action_record(
                 )
             else:
                 existing_ids = set(workflow.nodes.keys())
+                # Accumulated results: everything completed so far, in
+                # node_order, including the node that just completed.
+                accumulated_results = [
+                    {
+                        "node_id": nid,
+                        "goal": n.goal,
+                        "summary": n.summary,
+                        "status": n.status,
+                    }
+                    for nid, n in workflow.nodes.items()
+                    if n.status == COMPLETED and n.summary
+                ]
                 suggestions = analyze_extension(
-                    summary=node.summary,
+                    summary=node.summary or "",
                     objective=workflow.objective,
                     existing_nodes=list(existing_ids),
+                    accumulated_results=accumulated_results,
+                    template_catalog=cfg.get("template_catalog"),
                 )
                 if suggestions:
                     # Dedup: filter out suggestions whose node_id already exists
