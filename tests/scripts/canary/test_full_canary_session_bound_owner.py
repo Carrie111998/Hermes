@@ -18,6 +18,7 @@ from gateway import canonical_writer_foundation_phase_b as foundation_phase_b
 import gateway.canonical_writer_preflight_publisher as preflight_publisher
 from gateway import canonical_writer_schema_reconciliation_bootstrap as reconciliation_bootstrap
 from scripts.canary import full_canary_owner_launcher as launcher
+from scripts.canary import stopped_writer_residue_recovery as residue_recovery
 from scripts.canary import writer_release
 from scripts.canary.runtime_units import CANARY_RUNTIME_UNITS
 
@@ -249,6 +250,57 @@ def test_stopped_release_source_prepare_rejects_wrong_repository(monkeypatch):
         match="stopped_release_source_repository_invalid",
     ):
         transport._prepare_source(RELEASE_SHA, account="owner@example.com")
+
+
+@pytest.mark.parametrize("command", ("plan", "apply"))
+def test_stopped_writer_residue_command_uses_exact_source_module(
+    monkeypatch,
+    command,
+):
+    transport = object.__new__(launcher.IapStoppedWriterResidueRecoveryTransport)
+    captured: dict[str, object] = {}
+
+    def run_remote(remote, **kwargs):
+        captured["remote"] = tuple(remote)
+        captured.update(kwargs)
+        return subprocess.CompletedProcess(remote, 0, stdout=b'{}\n')
+
+    monkeypatch.setattr(transport, "_run_remote", run_remote)
+    value = transport._run_recovery_command(
+        RELEASE_SHA,
+        command,
+        account="owner@example.com",
+        approved_plan_sha256=("d" * 64 if command == "apply" else None),
+    )
+
+    remote = captured["remote"]
+    module_index = remote.index("-m") + 1
+    assert value == {}
+    assert remote[module_index : module_index + 4] == (
+        residue_recovery.__name__,
+        command,
+        "--revision",
+        RELEASE_SHA,
+    )
+    assert captured["allowed_returncodes"] == frozenset({0, 2})
+    assert captured["failure_code"] == "stopped_release_residue_remote_failed"
+    if command == "apply":
+        assert remote[-2:] == ("--approved-plan-sha256", "d" * 64)
+    else:
+        assert remote[-2:] == ("--revision", RELEASE_SHA)
+
+
+def test_stopped_writer_residue_cli_action_is_mutually_exclusive():
+    arguments = launcher._cli_parser().parse_args(
+        [
+            "--release-sha",
+            RELEASE_SHA,
+            "--recover-stopped-writer-residue",
+        ]
+    )
+
+    assert arguments.recover_stopped_writer_residue is True
+    assert arguments.publish_stopped_release is False
 
 
 def _canonical(value: Mapping[str, object]) -> bytes:

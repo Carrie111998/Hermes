@@ -145,6 +145,9 @@ WRITER_PREFLIGHT_FAILURE_SCHEMA = (
     "muncho-writer-preflight-publication-failure.v2"
 )
 WRITER_PREFLIGHT_MODULE = "gateway.canonical_writer_preflight_publisher"
+STOPPED_WRITER_RESIDUE_RECOVERY_MODULE = (
+    "scripts.canary.stopped_writer_residue_recovery"
+)
 WRITER_PREFLIGHT_EVIDENCE_BASE = (
     "/var/lib/muncho-writer-canary-evidence/staged-publication"
 )
@@ -17072,6 +17075,122 @@ class IapStoppedReleaseTransport(IapCoordinatorTransport):
         )
 
 
+class IapStoppedWriterResidueRecoveryTransport(IapStoppedReleaseTransport):
+    """Quarantine one exact receipt-bound stopped writer staging pair."""
+
+    _MODULE = STOPPED_WRITER_RESIDUE_RECOVERY_MODULE
+
+    def _run_recovery_command(
+        self,
+        release_sha: str,
+        command: str,
+        *,
+        account: str,
+        approved_plan_sha256: str | None = None,
+    ) -> Mapping[str, Any]:
+        if command not in {"plan", "apply"}:
+            raise OwnerLauncherError("stopped_writer_residue_command_invalid")
+        if command == "apply":
+            approved = _require_sha256(
+                approved_plan_sha256,
+                "stopped_writer_residue_plan_invalid",
+            )
+        elif approved_plan_sha256 is not None:
+            raise OwnerLauncherError("stopped_writer_residue_plan_invalid")
+        else:
+            approved = None
+        source_root = self._source_root(release_sha)
+        remote = (
+            *self._fixed_remote_environment(chdir=source_root),
+            self._REMOTE_PYTHON,
+            "-B",
+            "-E",
+            "-s",
+            "-m",
+            self._MODULE,
+            command,
+            "--revision",
+            release_sha,
+            *(
+                ()
+                if approved is None
+                else ("--approved-plan-sha256", approved)
+            ),
+        )
+        completed = self._run_remote(
+            remote,
+            account=account,
+            failure_code="stopped_release_residue_remote_failed",
+            allowed_returncodes=frozenset({0, 2}),
+            timeout_seconds=300.0,
+        )
+        if (
+            not completed.stdout
+            or not completed.stdout.endswith(b"\n")
+            or b"\n" in completed.stdout[:-1]
+        ):
+            raise OwnerLauncherError("stopped_writer_residue_output_invalid")
+        try:
+            value = _decode_json_object(
+                completed.stdout,
+                maximum=_HTTP_RESPONSE_MAX_BYTES,
+            )
+        except OwnerLauncherError:
+            raise OwnerLauncherError(
+                "stopped_writer_residue_output_invalid"
+            ) from None
+        if completed.returncode == 2:
+            from scripts.canary import stopped_writer_residue_recovery as recovery
+
+            if (
+                set(value) != {"schema", "ok", "error_code", "error_type"}
+                or value.get("schema") != recovery.FAILURE_SCHEMA
+                or value.get("ok") is not False
+                or value.get("error_code")
+                != "stopped_writer_residue_recovery_failed"
+                or not isinstance(value.get("error_type"), str)
+                or re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,63}", value["error_type"])
+                is None
+            ):
+                raise OwnerLauncherError(
+                    "stopped_writer_residue_output_invalid"
+                )
+            raise OwnerLauncherError(
+                f"stopped_writer_residue_{command}_remote_failed"
+            )
+        return value
+
+    def recover(self, release_sha: str) -> Mapping[str, Any]:
+        if _RELEASE_SHA.fullmatch(release_sha) is None:
+            raise OwnerLauncherError("invalid_release_sha")
+        from scripts.canary import stopped_writer_residue_recovery as recovery
+
+        account = self._owner_identity.account_for_read_only_preflight()
+        self._prepare_source(release_sha, account=account)
+        try:
+            plan = recovery.validate_plan_mapping(
+                self._run_recovery_command(
+                    release_sha,
+                    "plan",
+                    account=account,
+                ),
+                expected_target_revision=release_sha,
+            )
+            return recovery.validate_receipt_mapping(
+                self._run_recovery_command(
+                    release_sha,
+                    "apply",
+                    account=account,
+                    approved_plan_sha256=str(plan["plan_sha256"]),
+                ),
+                plan=plan,
+            )
+        except (TypeError, ValueError) as exc:
+            raise OwnerLauncherError(
+                "stopped_writer_residue_output_invalid"
+            ) from exc
+
+
 class IapHostReceiptRotationTransport(IapStoppedReleaseTransport):
     """Drive one exact stale-boot receipt transition before stopped release."""
 
@@ -22312,6 +22431,14 @@ def _cli_parser() -> argparse.ArgumentParser:
         help="publish the exact fork revision while every canary service is stopped",
     )
     actions.add_argument(
+        "--recover-stopped-writer-residue",
+        action="store_true",
+        help=(
+            "atomically quarantine only one receipt-bound stopped writer "
+            "staging pair before successor release publication"
+        ),
+    )
+    actions.add_argument(
         "--preflight-owner-gate-inert-inputs",
         action="store_true",
         help=(
@@ -22865,6 +22992,20 @@ def main(argv: Sequence[str] | None = None) -> int:
                 expected_prior_boot_id_sha256=prior_boot_sha256,
                 expected_current_boot_id_sha256=current_boot_sha256,
             )
+            runtime_and_provenance_guard(release_sha)
+            _emit_canonical_line(receipt)
+            return 0
+        if arguments.recover_stopped_writer_residue:
+            if arguments.external_iam_policy_sha256 is not None:
+                raise OwnerLauncherError(
+                    "stopped_writer_residue_owner_cli_invalid"
+                )
+            recovery_transport = IapStoppedWriterResidueRecoveryTransport(
+                owner_identity,
+                gcloud_executable=gcloud_executable,
+                gcloud_configuration=gcloud_configuration,
+            )
+            receipt = recovery_transport.recover(release_sha)
             runtime_and_provenance_guard(release_sha)
             _emit_canonical_line(receipt)
             return 0
