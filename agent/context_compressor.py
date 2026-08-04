@@ -42,6 +42,7 @@ from agent.model_metadata import (
 from agent.redact import redact_sensitive_text
 from agent.turn_context import drop_stale_api_content
 from tools.todo_tool import TODO_INJECTION_HEADER
+from agent.chat_completion_helpers import MAX_ITERATION_SUMMARY_REQUEST
 
 logger = logging.getLogger(__name__)
 
@@ -4178,6 +4179,7 @@ This compaction should PRIORITISE preserving all information related to the focu
         return text in {
             COMPRESSION_CONTINUATION_USER_CONTENT,
             _LEGACY_COMPRESSION_CONTINUATION_USER_CONTENT,
+            MAX_ITERATION_SUMMARY_REQUEST,
         } or text.startswith(
             TODO_INJECTION_HEADER + "\n"
         )

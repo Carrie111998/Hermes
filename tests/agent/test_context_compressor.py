@@ -13,6 +13,7 @@ from agent.context_compressor import (
     _summarize_tool_result,
     _is_summary_access_or_quota_error,
 )
+from agent.chat_completion_helpers import MAX_ITERATION_SUMMARY_REQUEST
 from hermes_state import SessionDB
 
 
@@ -498,6 +499,33 @@ class TestNonStringContent:
             {"role": "user", "content": "[System: Your previous response was truncated ...]"},
         ]
         assert c._latest_user_task_snapshot(only_synthetic) is None
+
+    def test_max_iteration_nudge_not_treated_as_human_intent(self):
+        """Regression #78580: the max-iteration runtime nudge is appended with
+        role="user" so the LLM can respond after tool-calling budget is
+        exhausted. SessionDB round-trips drop underscore-prefixed provenance
+        flags, so detection must key off the nudge's exact text, not a flag.
+        The grounding snapshot must still anchor on the real human ask, and
+        the nudge itself must be classified as synthetic scaffolding.
+        """
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(model="test", quiet_mode=True)
+
+        assert c._is_synthetic_compression_user_turn(
+            {"role": "user", "content": MAX_ITERATION_SUMMARY_REQUEST}
+        )
+
+        messages = [
+            {"role": "user", "content": "migrate the billing service to the new API"},
+            {"role": "assistant", "content": "starting migration"},
+            # Simulates a reloaded SessionDB row: no "_max_iteration_synthetic"
+            # flag survives persistence, only the literal nudge text does.
+            {"role": "user", "content": MAX_ITERATION_SUMMARY_REQUEST},
+        ]
+        snapshot = c._latest_user_task_snapshot(messages)
+        assert snapshot is not None
+        assert "migrate the billing service to the new API" in snapshot
+        assert "maximum number of tool-calling iterations" not in snapshot
 
     def test_grounding_preserves_following_sections_across_regrounding(self):
         """The snapshot rewrite must keep later headings intact — twice.

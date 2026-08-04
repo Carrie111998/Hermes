@@ -2081,6 +2081,17 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
 
 
 
+# Exact runtime nudge text appended by handle_max_iterations(). Exported so
+# compaction's synthetic-user-turn detection (agent/context_compressor.py)
+# can recognize this row by content after it survives SessionDB persistence,
+# which does not preserve underscore-prefixed in-memory provenance flags (#78580).
+MAX_ITERATION_SUMMARY_REQUEST = (
+    "You've reached the maximum number of tool-calling iterations allowed. "
+    "Please provide a final response summarizing what you've found and accomplished so far, "
+    "without calling any more tools."
+)
+
+
 def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
     """Request a summary when max iterations are reached. Returns the final response text."""
     print(f"⚠️  Reached maximum iterations ({agent.max_iterations}). Requesting summary...")
@@ -2107,12 +2118,13 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
             defer_logical_completion=True,
         )
 
-    summary_request = (
-        "You've reached the maximum number of tool-calling iterations allowed. "
-        "Please provide a final response summarizing what you've found and accomplished so far, "
-        "without calling any more tools."
+    messages.append(
+        {
+            "role": "user",
+            "content": MAX_ITERATION_SUMMARY_REQUEST,
+            "_max_iteration_synthetic": True,
+        }
     )
-    messages.append({"role": "user", "content": summary_request})
 
     try:
         # Build API messages, stripping internal-only fields
