@@ -327,11 +327,44 @@ app.include_router(_memory_oauth_router)
 # ---------------------------------------------------------------------------
 
 
+def _session_token_source() -> str:
+    """Classify where the dashboard session token came from.
+
+    Returns one of:
+
+    * ``injected`` — ``HERMES_DASHBOARD_SESSION_TOKEN`` is present AND the
+      desktop-shell marker ``HERMES_DESKTOP=1`` is set (Electron spawns
+      ``hermes serve`` with both; this is the trusted desktop path).
+    * ``env`` — a token is present but the desktop marker is not.  Includes
+      the stale-token case where a leftover ``HERMES_DASHBOARD_SESSION_TOKEN``
+      in ``<hermes-home>/.env`` is loaded into the environment and clobbers
+      (or replaces) the token the desktop shell injected.
+    * ``generated`` — no token in the environment; a fresh random token was
+      minted for this server process.
+
+    The token value itself is never returned or logged — only this label.
+    """
+    token = os.environ.get("HERMES_DASHBOARD_SESSION_TOKEN")
+    if not token:
+        return "generated"
+    if os.environ.get("HERMES_DESKTOP") == "1":
+        return "injected"
+    return "env"
+
+
 def _resolve_session_token() -> str:
     return os.environ.get("HERMES_DASHBOARD_SESSION_TOKEN") or secrets.token_urlsafe(32)
 
 
 _SESSION_TOKEN = _resolve_session_token()
+_SESSION_TOKEN_SOURCE = _session_token_source()
+# One provenance line at startup so a stale-token lockout is diagnosable from
+# the log alone.  Never log the token value — it is a credential.
+_log.info(
+    "dashboard session token: source=%s length=%d",
+    _SESSION_TOKEN_SOURCE,
+    len(_SESSION_TOKEN),
+)
 _SESSION_HEADER_NAME = "X-Hermes-Session-Token"
 _SSH_OWNER_NONCE: Optional[str] = None
 
@@ -14641,6 +14674,37 @@ def _ws_auth_mode() -> str:
     return "loopback"
 
 
+def _log_token_mismatch_hint(mode: str) -> None:
+    """Warn with an actionable fix when a loopback token mismatch is likely
+    caused by a stale ``HERMES_DASHBOARD_SESSION_TOKEN``.
+
+    A leftover value in ``<hermes-home>/.env`` loads into the environment at
+    import time and clobbers the token the desktop shell injects via
+    ``HERMES_DASHBOARD_SESSION_TOKEN`` + ``HERMES_DESKTOP=1``, so the desktop's
+    credential never matches ``_SESSION_TOKEN``.  Diagnostics only — the
+    caller still rejects the connection; auth semantics are untouched.
+    """
+    if mode != "loopback":
+        return
+    source = _SESSION_TOKEN_SOURCE
+    if source == "injected":
+        return
+    if source == "env":
+        _log.warning(
+            "stale HERMES_DASHBOARD_SESSION_TOKEN in %s suspected — remove "
+            "the line (or run `hermes setup`) and restart the server; "
+            "server token source=env",
+            get_hermes_home() / ".env",
+        )
+    else:  # generated
+        _log.warning(
+            "server generated a fresh session token (no "
+            "HERMES_DASHBOARD_SESSION_TOKEN in the environment) — the client "
+            "is presenting a stale token; restart the desktop app so it "
+            "re-injects its token; server token source=generated"
+        )
+
+
 def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
     """Validate WS-upgrade auth; return ``(reason, credential)``.
 
@@ -14722,6 +14786,7 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
         return "no_credential", "none"
     if hmac.compare_digest(token.encode(), _SESSION_TOKEN.encode()):
         return None, "token"
+    _log_token_mismatch_hint(_ws_auth_mode())
     return "token_mismatch", "token"
 
 
