@@ -71,10 +71,12 @@ const applyBrandCasing = (text: string): string =>
 
 // Split on dashes and capitalize lowercase letter-leading tokens (`sol` → `Sol`)
 // while digit-leading tokens stay untouched (`4o`, `70b`). Joining with spaces
-// matches the normalization the titleCase paths apply.
+// matches the normalization the titleCase paths apply; empty tokens (leading,
+// trailing, or doubled dashes) are dropped so malformed ids never leak spaces.
 const smartTitle = (text: string): string =>
   text
     .split('-')
+    .filter(Boolean)
     .map(token =>
       /^[a-z]/.test(token) && token === token.toLowerCase()
         ? token[0].toUpperCase() + token.slice(1)

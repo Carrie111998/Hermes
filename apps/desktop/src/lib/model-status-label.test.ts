@@ -25,6 +25,9 @@ describe('model-status-label', () => {
     expect(displayModelName('deepseek/deepseek-v4-pro')).toBe('DeepSeek V4 Pro')
     expect(displayModelName('glm-5-2')).toBe('GLM 5 2')
     expect(displayModelName('opencode-go/deepseek-v4-flash')).toBe('DeepSeek V4 Flash')
+    // Malformed trailing dash must not leak a space into the label.
+    expect(displayModelName('gpt-5.6-sol-')).toBe('GPT-5.6 Sol')
+    expect(displayModelName('-leading-dash')).toBe('Leading Dash')
   })
 
   it('maps reasoning effort to compact labels', () => {
