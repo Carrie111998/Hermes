@@ -27,6 +27,8 @@ Usage:
 
 import os
 import re
+import base64
+import codecs
 import difflib
 import hashlib
 from abc import ABC, abstractmethod
@@ -725,6 +727,13 @@ _FAIL_CLOSED_INPROC_EXTS = frozenset({'.json', '.yaml', '.yml', '.toml'})
 MAX_LINES = 2000
 MAX_LINE_LENGTH = 2000
 MAX_FILE_SIZE = 50 * 1024  # 50KB
+# Bytes of a file that decide binary-vs-text.
+BINARY_SNIFF_BYTES = 1000
+# Fetched past that window so a character starting on its last byte can still
+# be completed (UTF-8 tops out at 4 bytes), which is what separates "the cut
+# split a character" from "these bytes are undecodable". One more byte on top
+# tells "the file ends inside the window" from "there is more after it".
+BINARY_SNIFF_LOOKAHEAD = 3
 DEFAULT_READ_OFFSET = 1
 DEFAULT_READ_LIMIT = 2000
 DEFAULT_SEARCH_OFFSET = 0
@@ -887,11 +896,86 @@ class ShellFileOperations(FileOperations):
             self._command_cache[cmd] = result.stdout.strip() == 'yes'
         return self._command_cache[cmd]
     
-    def _is_likely_binary(self, path: str, content_sample: str = None) -> bool:
+    def _read_sniff_sample(self, path: str) -> Optional[bytes]:
+        """Fetch the binary-sniff window as raw bytes, or None if unavailable.
+
+        Raw bytes, not the env's decoded stdout: environments decode with
+        ``errors="replace"`` and flush at command end, so a character split by
+        the byte cut arrives as U+FFFD — indistinguishable from a genuinely
+        undecodable byte. base64 carries the sample across that transport
+        intact. ``-w0`` is GNU-only, hence the ``tr``; the input redirect keeps
+        a leading-dash path out of argv.
+        """
+        if not self._has_command('base64'):
+            return None
+        want = BINARY_SNIFF_BYTES + BINARY_SNIFF_LOOKAHEAD + 1
+        quoted = self._escape_shell_arg(path)
+        result = self._exec(
+            f"head -c {want} < {quoted} 2>/dev/null | base64 | tr -d '\\n'")
+        if result.exit_code != 0:
+            return None
+        encoded = "".join(_strip_terminal_fence_leaks(result.stdout).split())
+        try:
+            return base64.b64decode(encoded, validate=True)
+        except Exception:
+            return None
+
+    def _sample_is_binary(self, path: str, sample: bytes) -> bool:
+        """Binary-vs-text verdict for a raw sniff window."""
+        if os.path.splitext(path)[1].lower() in BINARY_EXTENSIONS:
+            return True
+        if not sample:
+            return False
+
+        # Incremental decode with no final flush: a character the window cut in
+        # half stays buffered rather than becoming U+FFFD, so only bytes that
+        # are actually undecodable produce one. The lookahead is what makes
+        # that exact — a lone 0xE9 at the end of a latin-1 file is a valid
+        # UTF-8 lead byte, and only the bytes after it reveal that nothing
+        # completes it. When the sample reached EOF there is nothing more
+        # coming, so flush and let a dangling sequence count against the file.
+        at_eof = len(sample) <= BINARY_SNIFF_BYTES + BINARY_SNIFF_LOOKAHEAD
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        text = decoder.decode(sample, final=at_eof)
+
+        # Undecodable bytes mean a read→edit→write round-trip would write the
+        # lossy text back over the original bytes, so such a file is read-only
+        # as far as the agent is concerned. U+FFFD is "printable", so the
+        # ratio below never catches it; legitimate UTF-8 effectively never
+        # contains one.
+        if "�" in text:
+            return True
+        if not text:
+            return False
+        non_printable = sum(1 for c in text if ord(c) < 32 and c not in '\n\r\t')
+        return non_printable / len(text) > 0.30
+
+    def _detect_binary(self, path: str, file_size: int) -> bool:
+        """Decide binary-vs-text, preferring the byte-exact sample."""
+        if os.path.splitext(path)[1].lower() in BINARY_EXTENSIONS:
+            return True
+        sample = self._read_sniff_sample(path)
+        if sample is not None:
+            return self._sample_is_binary(path, sample)
+        # No base64 in the environment: fall back to the env's decoded sample,
+        # which cannot tell a split character from an undecodable byte except
+        # by whether the file outran the window.
+        result = self._exec(
+            f"head -c {BINARY_SNIFF_BYTES} {self._escape_shell_arg(path)} 2>/dev/null")
+        return self._is_likely_binary(
+            path, _strip_terminal_fence_leaks(result.stdout),
+            sample_truncated=file_size > BINARY_SNIFF_BYTES)
+
+    def _is_likely_binary(self, path: str, content_sample: str = None,
+                          sample_truncated: bool = False) -> bool:
         """
         Check if a file is likely binary.
         
         Uses extension check (fast) + content analysis (fallback).
+
+        ``sample_truncated`` says the caller cut ``content_sample`` at a byte
+        offset (file longer than BINARY_SNIFF_BYTES), which makes a single
+        trailing U+FFFD ambiguous — see below.
         """
         ext = os.path.splitext(path)[1].lower()
         if ext in BINARY_EXTENSIONS:
@@ -899,6 +983,18 @@ class ShellFileOperations(FileOperations):
         
         # Content analysis: >30% non-printable chars = binary
         if content_sample:
+            sample = content_sample[:BINARY_SNIFF_BYTES]
+            # A byte-sliced sample can cut a multi-byte character in half, and
+            # the env's decoder flushes that dangling prefix as U+FFFD. The
+            # artifact is always exactly one U+FFFD and always the final char
+            # (a truncated sequence decodes as a single maximal subpart), so
+            # dropping one trailing replacement char is what separates "sample
+            # ended mid-character" from "file holds undecodable bytes" — every
+            # other U+FFFD still trips the check below. Without this, any text
+            # file whose byte BINARY_SNIFF_BYTES lands inside a multi-byte
+            # character — routine for CJK — reads back as unreadable binary.
+            if sample_truncated and sample.endswith("�"):
+                sample = sample[:-1]
             # Undecodable bytes: the terminal env decodes stdout with
             # errors="replace", so any non-UTF-8 byte arrives here already
             # turned into U+FFFD. That char is "printable" (ord 65533), so the
@@ -908,11 +1004,11 @@ class ShellFileOperations(FileOperations):
             # sample carries the replacement char as binary (read-only) so the
             # agent can't corrupt it. Legitimate UTF-8 text effectively never
             # contains U+FFFD.
-            if "\ufffd" in content_sample[:1000]:
+            if "\ufffd" in sample:
                 return True
-            non_printable = sum(1 for c in content_sample[:1000]
+            non_printable = sum(1 for c in content_sample[:BINARY_SNIFF_BYTES]
                                if ord(c) < 32 and c not in '\n\r\t')
-            return non_printable / min(len(content_sample), 1000) > 0.30
+            return non_printable / min(len(content_sample), BINARY_SNIFF_BYTES) > 0.30
         
         return False
     
@@ -1179,12 +1275,8 @@ class ShellFileOperations(FileOperations):
                 ),
             )
         
-        # Read a sample to check for binary content
-        sample_cmd = f"head -c 1000 {self._escape_shell_arg(path)} 2>/dev/null"
-        sample_result = self._exec(sample_cmd)
-        sample_output = _strip_terminal_fence_leaks(sample_result.stdout)
-        
-        if self._is_likely_binary(path, sample_output):
+        # Sample the head of the file to check for binary content
+        if self._detect_binary(path, file_size):
             return ReadResult(
                 is_binary=True,
                 file_size=file_size,
@@ -1298,9 +1390,7 @@ class ShellFileOperations(FileOperations):
             file_size = 0
         if self._is_image(path):
             return ReadResult(is_image=True, is_binary=True, file_size=file_size)
-        sample_result = self._exec(f"head -c 1000 {self._escape_shell_arg(path)} 2>/dev/null")
-        sample_output = _strip_terminal_fence_leaks(sample_result.stdout)
-        if self._is_likely_binary(path, sample_output):
+        if self._detect_binary(path, file_size):
             return ReadResult(
                 is_binary=True, file_size=file_size,
                 error="Binary file — cannot display as text."

@@ -16,6 +16,8 @@ from tools.file_operations import (
     SearchMatch,
     LintResult,
     ShellFileOperations,
+    BINARY_SNIFF_BYTES,
+    BINARY_SNIFF_LOOKAHEAD,
     MAX_LINE_LENGTH,
     normalize_read_pagination,
     normalize_search_pagination,
@@ -250,6 +252,11 @@ def make_real_subprocess_env(cwd: str, include_stderr: bool = False) -> MagicMoc
     intercepted by a bare MagicMock.  ``include_stderr`` folds stderr
     into ``output`` for tests that surface shell error text; leave it
     off for tests that parse structured stdout (e.g. find results).
+
+    Decodes with ``errors="replace"`` to match the real environments
+    (``tools/environments/base.py``), which hand file ops a lossy string
+    rather than raising on undecodable bytes.  Anything that inspects
+    U+FFFD — the binary sniff — only behaves like production under this.
     """
     env = MagicMock()
     env.cwd = cwd
@@ -259,6 +266,8 @@ def make_real_subprocess_env(cwd: str, include_stderr: bool = False) -> MagicMoc
             command,
             shell=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             capture_output=True,
             input=kwargs.get("stdin_data"),
         )
@@ -302,10 +311,12 @@ class TestShellFileOpsHelpers:
 
         def side_effect(command, **kwargs):
             commands.append(command)
+            if command.startswith("command -v base64"):
+                return {"output": "yes\n", "returncode": 0}
             if command.startswith("wc -c"):
                 return {"output": "5\n", "returncode": 0}
             if command.startswith("head -c"):
-                return {"output": "hello", "returncode": 0}
+                return {"output": "aGVsbG8=", "returncode": 0}  # b64 of "hello"
             if command.startswith("sed -n"):
                 return {"output": "hello\n", "returncode": 0}
             if command.startswith("wc -l"):
@@ -317,10 +328,16 @@ class TestShellFileOpsHelpers:
         result = ops.read_file(r"C:\Users\alice\notes.txt")
 
         assert result.error is None
-        assert commands[0] == "wc -c < '/c/Users/alice/notes.txt' 2>/dev/null"
-        assert commands[1] == "head -c 1000 '/c/Users/alice/notes.txt' 2>/dev/null"
-        assert commands[2] == "sed -n '1,2000p' '/c/Users/alice/notes.txt'"
-        assert commands[3] == "wc -l < '/c/Users/alice/notes.txt'"
+        safe = "'/c/Users/alice/notes.txt'"
+        want = BINARY_SNIFF_BYTES + BINARY_SNIFF_LOOKAHEAD + 1
+        # The base64 probe carries no path; everything that names the file has
+        # to use the bash-safe form.
+        assert [c for c in commands if "notes.txt" in c] == [
+            f"wc -c < {safe} 2>/dev/null",
+            f"head -c {want} < {safe} 2>/dev/null | base64 | tr -d '\\n'",
+            f"sed -n '1,2000p' {safe}",
+            f"wc -l < {safe}",
+        ]
 
     def test_is_likely_binary_by_extension(self, file_ops):
         assert file_ops._is_likely_binary("photo.png") is True
@@ -673,3 +690,186 @@ class TestReadNonUtf8IsBinary:
         ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
         # Proper UTF-8 (including non-ASCII) must still read as text.
         assert ops._is_likely_binary("notes.txt", "café résumé\nsecond\n") is False
+
+
+def _write_split_boundary_file(path: Path, tail: str = "다" * 200) -> str:
+    """Write a valid UTF-8 file whose BINARY_SNIFF_BYTES boundary splits a char.
+
+    Pads with ASCII so the multi-byte character straddles the window cut.
+    Returns the text written.
+    """
+    pad = "a" * (BINARY_SNIFF_BYTES - 2)          # bytes 1..998
+    text = pad + "가" + tail + "\n"               # "가" spans bytes 999..1001
+    path.write_text(text, encoding="utf-8")
+    assert path.stat().st_size > BINARY_SNIFF_BYTES, "file must exceed the window"
+    head = path.read_bytes()[:BINARY_SNIFF_BYTES]
+    assert head.decode("utf-8", errors="replace").endswith("�"), (
+        "fixture must actually split a character at the window boundary"
+    )
+    return text
+
+
+class TestBinarySniffTruncationBoundary:
+    """A character split by the sniff window is not evidence of binary.
+
+    Regression: the sniff judges BINARY_SNIFF_BYTES *bytes*, so on CJK text the
+    cut routinely lands inside a multi-byte character. Environments decode with
+    errors="replace" and flush at command end, so that dangling prefix reached
+    the guard as U+FFFD and read as undecodable bytes — making ordinary Korean
+    notes unreadable ("Binary file - cannot display as text") once they grew
+    past the window.
+
+    The sample is therefore taken as raw bytes and decoded here, incrementally
+    and without a final flush, so a split character stays buffered instead of
+    becoming U+FFFD. BINARY_SNIFF_LOOKAHEAD extra bytes keep that exact: a lone
+    0xE9 ending the window is a valid UTF-8 lead byte, and only the bytes after
+    it show whether anything completes it.
+    """
+
+    def test_split_boundary_file_reads_as_text(self, tmp_path):
+        ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
+        target = tmp_path / "korean.md"
+        _write_split_boundary_file(target)
+
+        result = ops.read_file(str(target))
+
+        assert result.is_binary is False, result.error
+        assert result.error is None
+        assert "가" in result.content
+        assert "�" not in result.content
+
+    def test_split_boundary_file_reads_raw_as_text(self, tmp_path):
+        ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
+        target = tmp_path / "korean.md"
+        text = _write_split_boundary_file(target)
+
+        result = ops.read_file_raw(str(target))
+
+        assert result.is_binary is False, result.error
+        assert result.content == text
+
+    def test_undecodable_bytes_midsample_still_binary(self, tmp_path):
+        """The guard's real target — invalid bytes away from the cut — stands."""
+        ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
+        target = tmp_path / "latin1.md"
+        target.write_bytes(b"caf\xe9 r\xe9sum\xe9\n" + b"a" * 2000)
+
+        assert ops.read_file(str(target)).is_binary is True
+        assert ops.read_file_raw(str(target)).is_binary is True
+
+    def test_undecodable_byte_exactly_at_the_boundary_still_binary(self, tmp_path):
+        """The ambiguous case the lookahead exists to settle.
+
+        0xE9 on the window's last byte is a valid UTF-8 lead byte, so on the
+        window alone it is indistinguishable from a character the cut split.
+        The following bytes are what prove nothing completes it.
+        """
+        ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
+        target = tmp_path / "boundary-latin1.md"
+        target.write_bytes(b"a" * (BINARY_SNIFF_BYTES - 1) + b"\xe9" + b"r" * 2000)
+
+        assert ops.read_file(str(target)).is_binary is True
+        assert ops.read_file_raw(str(target)).is_binary is True
+
+    def test_trailing_undecodable_byte_at_eof_still_binary(self, tmp_path):
+        """At EOF nothing can complete a dangling sequence, so it counts."""
+        ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
+        short = tmp_path / "short.md"
+        short.write_bytes(b"plain text\n" + b"\xe9")
+        assert short.stat().st_size <= BINARY_SNIFF_BYTES
+        assert ops.read_file(str(short)).is_binary is True
+
+        # Same thing just past the window, where the lookahead hits EOF.
+        past = tmp_path / "past-window.md"
+        past.write_bytes(b"a" * (BINARY_SNIFF_BYTES + 2) + b"\xe9")
+        assert ops.read_file(str(past)).is_binary is True
+
+    def test_four_byte_char_split_by_window_reads_as_text(self, tmp_path):
+        """The lookahead has to cover the longest UTF-8 sequence, not just 3."""
+        ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
+        target = tmp_path / "emoji.md"
+        target.write_bytes(b"a" * (BINARY_SNIFF_BYTES - 2) + "🙂".encode() + b"tail\n")
+
+        result = ops.read_file(str(target))
+
+        assert result.is_binary is False, result.error
+        assert "🙂" in result.content
+
+    @pytest.mark.parametrize("offset_from_window", [-3, -2, -1, 0])
+    def test_every_split_offset_reads_as_text(self, tmp_path, offset_from_window):
+        """Where the character starts must not change the verdict."""
+        ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
+        target = tmp_path / f"split{offset_from_window}.md"
+        pad = b"a" * (BINARY_SNIFF_BYTES + offset_from_window)
+        target.write_bytes(pad + "각".encode() + "나".encode() * 400)
+
+        assert ops.read_file(str(target)).is_binary is False
+
+    def test_short_korean_file_unaffected(self, tmp_path):
+        ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
+        target = tmp_path / "short-korean.md"
+        target.write_text("회의 용어집\n두 번째 줄\n", encoding="utf-8")
+
+        result = ops.read_file(str(target))
+
+        assert result.is_binary is False, result.error
+        assert "회의 용어집" in result.content
+
+    def test_ascii_file_unaffected(self, tmp_path):
+        ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
+        target = tmp_path / "notes.md"
+        target.write_text("hello\n" * 500, encoding="utf-8")
+
+        result = ops.read_file(str(target))
+
+        assert result.is_binary is False, result.error
+        assert "hello" in result.content
+
+
+class TestBinarySniffWithoutBase64:
+    """Fallback for environments with no base64 to carry raw bytes back.
+
+    Without it the sample can only arrive as the env's lossy string, where a
+    split character and an undecodable byte both look like a trailing U+FFFD.
+    The fallback resolves that the only way it can — by whether the file
+    outran the window — so it is deliberately less precise than the byte path.
+    """
+
+    @staticmethod
+    def _ops_without_base64(cwd):
+        ops = ShellFileOperations(make_real_subprocess_env(cwd))
+        ops._command_cache['base64'] = False
+        return ops
+
+    def test_split_boundary_file_still_reads_as_text(self, tmp_path):
+        ops = self._ops_without_base64(str(tmp_path))
+        target = tmp_path / "korean.md"
+        _write_split_boundary_file(target)
+
+        result = ops.read_file(str(target))
+
+        assert result.is_binary is False, result.error
+        assert "가" in result.content
+
+    def test_mojibake_still_binary(self, tmp_path):
+        ops = self._ops_without_base64(str(tmp_path))
+        target = tmp_path / "latin1.md"
+        target.write_bytes(b"caf\xe9 r\xe9sum\xe9\n" + b"a" * 2000)
+
+        assert ops.read_file(str(target)).is_binary is True
+
+    def test_truncation_allowance_is_exactly_one_trailing_char(self):
+        """Only a single trailing U+FFFD is excused, and only when truncated."""
+        ops = ShellFileOperations(MagicMock())
+
+        assert ops._is_likely_binary(
+            "notes.md", "ok�", sample_truncated=True) is False
+        # Same sample, untruncated caller: still binary.
+        assert ops._is_likely_binary(
+            "notes.md", "ok�", sample_truncated=False) is True
+        # Two at the tail can't come from one split character.
+        assert ops._is_likely_binary(
+            "notes.md", "ok��", sample_truncated=True) is True
+        # Interior replacement chars are never excused.
+        assert ops._is_likely_binary(
+            "notes.md", "o�k�", sample_truncated=True) is True
