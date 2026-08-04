@@ -191,6 +191,55 @@ class TestHelpers:
                        for k in child_env)
         assert "NO_COLOR" in child_env
 
+    def test_run_secret_cli_uses_apply_environment_not_process_globals(
+        self, tmp_path, monkeypatch
+    ):
+        """Plugin helpers inherit only the profile-local source environment."""
+        monkeypatch.setenv("PROFILE_SOURCE_TOKEN", "primary-token")
+
+        def _fetch(cfg, home):
+            proc = run_secret_cli(
+                [
+                    sys.executable,
+                    "-c",
+                    "import os; print(os.getenv('PROFILE_SOURCE_TOKEN', ''))",
+                ],
+                allow_env=("PROFILE_SOURCE_TOKEN",),
+            )
+            return FetchResult(secrets={"SEEN_TOKEN": proc.stdout.strip()})
+
+        reg.register_source(_make_source(fetch_fn=_fetch))
+        env = {"PROFILE_SOURCE_TOKEN": "secondary-token"}
+        reg.apply_all(
+            {"dummy": {"enabled": True}},
+            tmp_path,
+            environ=env,
+        )
+
+        assert env["SEEN_TOKEN"] == "secondary-token"
+
+    def test_run_secret_cli_fails_closed_without_fetch_context_in_multiplex(
+        self, monkeypatch
+    ):
+        from agent import secret_scope as ss
+        from agent.secret_sources.base import run_secret_cli
+
+        monkeypatch.setenv("PROFILE_TOKEN", "primary-token")
+        ss.set_multiplex_active(True)
+        try:
+            proc = run_secret_cli(
+                [
+                    sys.executable,
+                    "-c",
+                    "import os; print(os.getenv('PROFILE_TOKEN', ''))",
+                ],
+                allow_env=("PROFILE_TOKEN",),
+            )
+        finally:
+            ss.set_multiplex_active(False)
+
+        assert proc.stdout.strip() == ""
+
 
 
 

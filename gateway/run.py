@@ -1843,13 +1843,17 @@ def _profile_runtime_scope(profile_home: "Path"):
     from hermes_cli.env_loader import hydrate_profile_secret_sources
 
     home_token = set_hermes_home_override(str(profile_home))
-    hydrate_profile_secret_sources(Path(profile_home))
-    secret_token = set_secret_scope(build_profile_secret_scope(Path(profile_home)))
+    secret_token = None
     try:
+        hydrate_profile_secret_sources(Path(profile_home))
+        secret_token = set_secret_scope(build_profile_secret_scope(Path(profile_home)))
         yield
     finally:
-        reset_secret_scope(secret_token)
-        reset_hermes_home_override(home_token)
+        try:
+            if secret_token is not None:
+                reset_secret_scope(secret_token)
+        finally:
+            reset_hermes_home_override(home_token)
 
 
 def load_gateway_config_for_runner() -> "GatewayConfig":
@@ -2254,7 +2258,7 @@ from gateway.session_state import (
     legacy_dict_property,
     legacy_lease_token_property,
 )
-from gateway.authz_mixin import GatewayAuthorizationMixin
+from gateway.authz_mixin import GatewayAuthorizationMixin, _auth_env
 from gateway.kanban_watchers import GatewayKanbanWatchersMixin
 from gateway.slash_commands import GatewaySlashCommandsMixin
 from gateway.turn_context import TurnContext
@@ -2318,20 +2322,22 @@ def _own_policy_open_startup_violation(config) -> Optional[str]:
         extra = getattr(platform_config, "extra", None) or {}
         dm_policy = str(
             extra.get("dm_policy")
-            or (_getenv(dm_env, "pairing") if dm_env else "pairing")
+            or (_auth_env(dm_env, "pairing") if dm_env else "pairing")
         ).strip().lower()
         group_policy = str(
             extra.get("group_policy")
-            or (_getenv(group_env, "pairing") if group_env else "pairing")
+            or (_auth_env(group_env, "pairing") if group_env else "pairing")
         ).strip().lower()
         if dm_policy != "open" and group_policy != "open":
             continue
-        gateway_allow_all = os.getenv(
-            "GATEWAY_ALLOW_ALL_USERS", ""
-        ).lower() in {"true", "1", "yes"}
+        gateway_allow_all = _auth_env("GATEWAY_ALLOW_ALL_USERS").lower() in {
+            "true",
+            "1",
+            "yes",
+        }
         platform_opted_in = gateway_allow_all or (
             allow_all_env
-            and _getenv(allow_all_env, "").lower() in {"true", "1", "yes"}
+            and _auth_env(allow_all_env).lower() in {"true", "1", "yes"}
         )
         if platform_opted_in:
             continue
@@ -10778,7 +10784,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "dm_policy/group_policy: open on the platform."
             )
 
-        reason = _own_policy_open_startup_violation(self.config)
+        reason = self._primary_open_policy_violation()
         if reason:
             platform_value = reason.split(":", 1)[0]
             allow_all_env = None
@@ -10973,7 +10979,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 else:
                     logger.warning("No adapter available for %s", _pval)
                 continue
-            
             # Set up message + fatal error handlers. Under multiplexing the
             # default profile needs the same whole-handler runtime scope as a
             # secondary profile: authorization and prompt rendering both run
@@ -12247,6 +12252,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             return "default"
 
+    def _primary_open_policy_violation(self) -> Optional[str]:
+        """Evaluate the active profile's open-policy guard in its own scope."""
+        if not bool(getattr(self.config, "multiplex_profiles", False)):
+            return _own_policy_open_startup_violation(self.config)
+
+        from hermes_cli.profiles import get_profile_dir
+
+        profile_home = get_profile_dir(self._active_profile_name())
+        with _profile_runtime_scope(profile_home):
+            return _own_policy_open_startup_violation(self.config)
+
     # ── Kanban board watchers ───────────────────────────────────────────
     # The kanban notifier/dispatcher watcher loops + their helpers live in
     # GatewayKanbanWatchersMixin (gateway/kanban_watchers.py). They use only
@@ -13085,10 +13101,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         try:
             from hermes_cli.profiles import profiles_to_serve, get_active_profile_name
+            from gateway.pairing import PairingStore
         except Exception:
             return 0
 
         active = get_active_profile_name() or "default"
+        if not isinstance(getattr(self, "pairing_stores", None), dict):
+            self.pairing_stores = {}
+        primary_pairing_store = getattr(self, "pairing_store", None)
+        if primary_pairing_store is not None:
+            self.pairing_stores.setdefault(active, primary_pairing_store)
         connected = 0
         # Resource claim -> profile that owns it. Credential claims prevent two
         # profiles polling the same account; listener claims prevent sidecars
@@ -13114,6 +13136,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if profile_name == active:
                 continue  # handled by the primary startup loop
             try:
+                if profile_name not in self.pairing_stores:
+                    self.pairing_stores[profile_name] = PairingStore(
+                        profile=profile_name
+                    )
                 connected += await self._start_one_profile_adapters(
                     profile_name, profile_home, claimed
                 )
@@ -13134,7 +13160,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Record served profiles in runtime status for `hermes status`.
         try:
             from gateway.status import write_runtime_status
-            from gateway.pairing import PairingStore
             served = [active] + sorted(self._profile_adapters.keys())
             # Per-profile PairingStores so authz_mixin can route pairing
             # checks to the right whitelist. The active profile gets a store
@@ -13472,49 +13497,60 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Reconnect is scoped to the profile's own config and secret mapping;
         # never rebuild a secondary adapter with the default profile's credentials.
 
-    def _make_profile_message_handler(self, profile_name: str):
-        """Return a message handler that stamps source.profile then delegates.
+    def _primary_message_handler(self):
+        """Scope primary intake without overwriting a routed runtime profile."""
+        if bool(
+            getattr(getattr(self, "config", None), "multiplex_profiles", False)
+        ):
+            return self._make_profile_message_handler(
+                self._active_profile_name(),
+                preserve_route=True,
+            )
+        return self._handle_message
 
-        Auth runs inside ``_handle_message`` *before* the agent-turn scope is
-        installed. For secondary profiles under multiplex, wrap the whole
-        handler in ``_profile_runtime_scope`` so allowlists/tokens from that
-        profile's ``.env`` are visible to ``get_secret`` / authz.
+    def _make_profile_message_handler(
+        self,
+        profile_name: str,
+        *,
+        preserve_route: bool = False,
+    ):
+        """Return a profile-scoped message handler for one adapter owner.
+
+        Secondary adapters enforce their fixed owner.  The primary adapter may
+        carry a ``profile_routes`` target, so ``preserve_route`` keeps that
+        runtime/session profile while separately stamping transport ownership.
         """
         from hermes_cli.profiles import get_profile_dir
 
         try:
-            profile_home = get_profile_dir(profile_name)
+            # The primary/default adapter belongs to the gateway process's
+            # active runtime home, including an installed ContextVar override.
+            # Named profiles continue through the canonical profile resolver.
+            if profile_name == "default":
+                profile_home = Path(get_hermes_home())
+            else:
+                profile_home = get_profile_dir(profile_name)
         except Exception:
-            profile_home = None
+            profile_home = Path(get_hermes_home())
 
         async def _handler(event):
             try:
-                if getattr(event, "source", None) is not None and not event.source.profile:
-                    event.source.profile = profile_name
+                source = getattr(event, "source", None)
+                if source is not None:
+                    setattr(source, "_transport_profile", profile_name)
+                    if preserve_route:
+                        source.profile = (
+                            self._profile_name_for_source(source) or profile_name
+                        )
+                    else:
+                        source.profile = profile_name
             except Exception:
                 pass
-            if profile_home is not None:
-                with _profile_runtime_scope(profile_home):
-                    return await self._handle_message(event)
-            return await self._handle_message(event)
-
-        return _handler
-
-    def _make_default_profile_message_handler(self):
-        """Scope a multiplexed default-profile message from ingress onward."""
-        profile_home = Path(get_hermes_home())
-
-        async def _handler(event):
             with _profile_runtime_scope(profile_home):
                 return await self._handle_message(event)
 
         return _handler
 
-    def _primary_message_handler(self):
-        """Return the correctly scoped handler for a primary adapter."""
-        if getattr(self.config, "multiplex_profiles", False):
-            return self._make_default_profile_message_handler()
-        return self._handle_message
 
     @staticmethod
     def _adapter_credential_claim(
@@ -13745,10 +13781,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         full auth chain — platform allowlists, group allowlists, pairing
         store, allow-all flags — stays the single source of truth.
 
-        ``profile_name`` binds the callback to the secondary adapter's own
-        multiplex profile, so its ``SessionSource`` resolves that profile's
-        secret scope instead of falling back to the active profile.
+        ``profile_name`` binds the callback to the adapter's own multiplex
+        profile, so its ``SessionSource`` resolves that profile's secret scope
+        instead of falling back to process-global credentials.
         """
+        if profile_name is None and bool(
+            getattr(getattr(self, "config", None), "multiplex_profiles", False)
+        ):
+            profile_name = self._active_profile_name()
+
         def check(
             user_id: str,
             chat_type: Optional[str] = None,
@@ -13763,6 +13804,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 user_id=user_id,
                 profile=profile_name,
             )
+            if profile_name:
+                from hermes_cli.profiles import get_profile_dir
+
+                with _profile_runtime_scope(get_profile_dir(profile_name)):
+                    return self._is_user_authorized(source)
             return self._is_user_authorized(source)
         return check
 
@@ -14344,7 +14390,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 source.chat_type == "dm"
                 and self._get_unauthorized_dm_behavior(
                     source.platform,
-                    profile=source.profile,
+                    profile=self._adapter_profile_for_source(source),
                 )
                 == "pair"
             ):

@@ -32,14 +32,18 @@ def _auth_env(name: str, default: str = "") -> str:
     """Read allowlist/auth env; prefer profile secret_scope under multiplex."""
     if not name:
         return default
+    multiplex_active = False
     try:
-        from agent.secret_scope import get_secret
+        from agent.secret_scope import get_secret, is_multiplex_active
 
-        val = get_secret(name)
-        if val is not None and str(val).strip():
-            return str(val).strip()
+        multiplex_active = is_multiplex_active()
+        value = get_secret(name)
+        if value is not None:
+            return str(value).strip()
     except Exception:
         pass
+    if multiplex_active:
+        return default
     return (os.getenv(name) or default).strip()
 
 
@@ -189,6 +193,9 @@ class GatewayAuthorizationMixin:
             ).items():
                 if adapter is profile_adapters.get(platform):
                     return profile
+        stamped_transport_profile = getattr(source, "_transport_profile", None)
+        if stamped_transport_profile:
+            return str(stamped_transport_profile)
         return getattr(source, "profile", None)
 
     def _adapter_authorization_is_upstream(
@@ -369,18 +376,27 @@ class GatewayAuthorizationMixin:
         return False
 
     def _pairing_store_for(self, source: "SessionSource"):
-        """Pick the per-profile PairingStore for a source, falling back to global.
+        """Pick the PairingStore for a source without crossing profile boundaries.
 
-        In a multiplexing gateway, each profile owns its own pairing whitelist
-        so isolation is preserved. When the source has no profile (single-
-        profile gateway, or a path that hasn't stamped profile yet) or the
-        profile isn't registered, fall back to ``self.pairing_store`` (the
-        global default) so existing behavior is preserved.
+        Unstamped and active-profile sources retain the primary store for
+        single-profile compatibility. In multiplex mode, a stamped non-active
+        profile with no registered store fails closed instead of inheriting the
+        primary profile's approved-user whitelist.
         """
         per_profile = getattr(self, "pairing_stores", None) or {}
-        profile = getattr(source, "profile", None)
+        profile = self._adapter_profile_for_source(source)
         if profile and profile in per_profile:
             return per_profile[profile]
+        if profile and getattr(
+            getattr(self, "config", None), "multiplex_profiles", False
+        ):
+            try:
+                active_name_fn = getattr(self, "_active_profile_name", None)
+                active = active_name_fn() if callable(active_name_fn) else None
+            except Exception:
+                active = None
+            if not active or profile != active:
+                return None
         return getattr(self, "pairing_store", None)
 
     def _is_user_authorized(self, source: SessionSource) -> bool:

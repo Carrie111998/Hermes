@@ -290,11 +290,56 @@ def test_apply_never_overrides_token_var(monkeypatch, tmp_path):
     result = op.apply_onepassword_secrets(
         enabled=True,
         env={"OP_SERVICE_ACCOUNT_TOKEN": "op://V/I/F"},
-        override_existing=True, cache_ttl_seconds=0,
+        override_existing=True,
+        cache_ttl_seconds=0,
     )
     assert "OP_SERVICE_ACCOUNT_TOKEN" in result.skipped
     assert os.environ["OP_SERVICE_ACCOUNT_TOKEN"] == "original"
     assert calls["n"] == 0
+
+
+def test_registry_fetch_uses_profile_auth_environment(monkeypatch, tmp_path):
+    """Multiplex fetches must not pass process-global OP auth to the child."""
+    from agent.secret_sources import registry as reg
+
+    monkeypatch.setenv("OP_SERVICE_ACCOUNT_TOKEN", "primary-service-token")
+    monkeypatch.setenv("OP_SESSION_primary", "primary-session")
+    monkeypatch.setenv("OP_CONNECT_TOKEN", "primary-connect-token")
+    monkeypatch.setattr(op, "find_op", lambda binary_path="": tmp_path / "op")
+    captured = {}
+
+    def fake_run(*args, **kwargs):
+        captured.update(kwargs.get("env") or {})
+        return _ok("resolved-value")
+
+    monkeypatch.setattr(op.subprocess, "run", fake_run)
+    reg._reset_registry_for_tests()
+    monkeypatch.setattr(reg, "_ensure_builtin_sources", lambda: None)
+    reg.register_source(op.OnePasswordSource())
+    env = {
+        "OP_SERVICE_ACCOUNT_TOKEN": "personal-service-token",
+        "OP_SESSION_personal": "personal-session",
+    }
+    try:
+        reg.apply_all(
+            {
+                "onepassword": {
+                    "enabled": True,
+                    "cache_ttl_seconds": 0,
+                    "env": {"TARGET_SECRET": "op://Vault/Item/Field"},
+                }
+            },
+            tmp_path,
+            environ=env,
+        )
+    finally:
+        reg._reset_registry_for_tests()
+
+    assert env["TARGET_SECRET"] == "resolved-value"
+    assert captured["OP_SERVICE_ACCOUNT_TOKEN"] == "personal-service-token"
+    assert captured["OP_SESSION_personal"] == "personal-session"
+    assert "OP_SESSION_primary" not in captured
+    assert "OP_CONNECT_TOKEN" not in captured
 
 
 

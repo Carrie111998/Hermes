@@ -44,7 +44,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Dict, FrozenSet, List, MutableMapping, Optional, Sequence
+from typing import Dict, FrozenSet, List, Mapping, MutableMapping, Optional, Sequence
 
 # Bump ONLY for breaking changes to the required contract surface
 # (abstract-method signatures, FetchResult required fields).  Additive
@@ -275,6 +275,36 @@ def scrub_ansi(text: str) -> str:
     return _ANSI_RE.sub("", text or "")
 
 
+def secret_source_environ() -> Mapping[str, str]:
+    """Return the current source's isolated env, failing closed in multiplex."""
+    try:
+        from agent.secret_sources.registry import current_secret_source_fetch_env
+    except ImportError:
+        scoped = None
+    else:
+        scoped = current_secret_source_fetch_env()
+    if scoped is not None:
+        return scoped
+
+    # Keep the original source-environment context hook working for legacy
+    # callers/plugins.  The registry hook above is authoritative for the
+    # profile-scoped fetch path, while this fallback preserves the
+    # non-multiplex API introduced by the upstream side of this merge.
+    legacy = _SOURCE_ENVIRONMENT.get()
+    if legacy is not None:
+        return legacy
+
+    try:
+        from agent.secret_scope import is_multiplex_active
+    except ImportError:
+        multiplex_active = False
+    else:
+        multiplex_active = is_multiplex_active()
+    if multiplex_active:
+        return {}
+    return os.environ
+
+
 def run_secret_cli(
     argv: Sequence[str],
     *,
@@ -302,11 +332,25 @@ def run_secret_cli(
     surface); returns the completed process otherwise — callers own
     returncode interpretation.
     """
-    base_keep = ("PATH", "HOME", "USERPROFILE", "SYSTEMROOT", "TMPDIR", "TEMP",
-                 "LANG", "LC_ALL", "XDG_CONFIG_HOME", "XDG_DATA_HOME")
+    # These are operational process settings, not profile credentials.  In
+    # an isolated fetch they must come from the process environment even if a
+    # profile .env contains an override; in particular a profile must not
+    # redirect helper subprocesses to another HERMES_HOME.
+    base_keep = (
+        "PATH", "HOME", "USERPROFILE", "SYSTEMROOT", "TMPDIR", "TEMP",
+        "LANG", "LC_ALL", "XDG_CONFIG_HOME", "XDG_DATA_HOME",
+        "HERMES_HOME", "HERMES_PROFILE", "HERMES_PROFILE_NAME",
+    )
+    scoped_env = secret_source_environ()
+
     env: Dict[str, str] = {}
-    for key in (*base_keep, *allow_env):
+    for key in base_keep:
         val = os.environ.get(key)
+        if val is not None:
+            env[key] = val
+    allowed_source = scoped_env
+    for key in allow_env:
+        val = allowed_source.get(key)
         if val is not None:
             env[key] = val
     if extra_env:

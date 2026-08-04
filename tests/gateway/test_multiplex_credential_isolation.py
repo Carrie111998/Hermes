@@ -5,9 +5,12 @@ interpolation) rather than mocking it, proving the property that matters: two
 profiles with different keys never see each other's, and an unscoped read in
 multiplex mode fails closed instead of leaking.
 """
-import pytest
 
+import os
+import shlex
 from pathlib import Path
+
+import pytest
 
 from agent import secret_scope as ss
 
@@ -164,5 +167,77 @@ def test_cold_profile_hydrates_external_source_without_global_env(
     assert calls["count"] == 1
     assert "TEST_PROVIDER_API_KEY" not in os.environ
     assert "EXPLICIT_API_KEY" not in os.environ
+
+
+class TestProfileExternalSecretSourceScope:
+    """A secondary gateway profile resolves its own helper-backed token."""
+
+    @pytest.mark.skipif(os.name == "nt", reason="command secret source is POSIX-only")
+    def test_gateway_config_uses_profile_helper_without_mutating_process_env(
+        self, tmp_path, monkeypatch
+    ):
+        from gateway.config import Platform, load_gateway_config
+        from gateway.run import _profile_runtime_scope
+
+        default_home = tmp_path / "default"
+        profile_home = tmp_path / "personal"
+        default_home.mkdir()
+        profile_home.mkdir()
+        helper = profile_home / "secret-helper.sh"
+        helper.write_text(
+            "#!/bin/sh\nprintf 'TELEGRAM_BOT_TOKEN=secondary-token\\n'\n",
+            encoding="utf-8",
+        )
+        helper.chmod(0o700)
+        (profile_home / "config.yaml").write_text(
+            "platforms:\n"
+            "  telegram:\n"
+            "    enabled: true\n"
+            "secrets:\n"
+            "  command:\n"
+            "    enabled: true\n"
+            f"    command: {shlex.quote(str(helper))}\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(default_home))
+        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "primary-token")
+        ss.set_multiplex_active(True)
+
+        with _profile_runtime_scope(profile_home):
+            profile_config = load_gateway_config()
+
+        assert profile_config.platforms[Platform.TELEGRAM].token == "secondary-token"
+        assert os.environ["TELEGRAM_BOT_TOKEN"] == "primary-token"
+
+
+def test_profile_runtime_scope_resets_home_when_hydration_fails(monkeypatch, tmp_path):
+    """Scope setup failures must not leak the home override."""
+    import hermes_constants
+    from gateway import run as gateway_run
+    from hermes_cli import env_loader
+
+    home_token = object()
+    reset_tokens = []
+    monkeypatch.setattr(
+        hermes_constants,
+        "set_hermes_home_override",
+        lambda _home: home_token,
+    )
+    monkeypatch.setattr(
+        hermes_constants,
+        "reset_hermes_home_override",
+        lambda token: reset_tokens.append(token),
+    )
+
+    def _fail_hydration(_home):
+        raise RuntimeError("hydration failed")
+
+    monkeypatch.setattr(env_loader, "hydrate_profile_secret_sources", _fail_hydration)
+
+    with pytest.raises(RuntimeError, match="hydration failed"):
+        with gateway_run._profile_runtime_scope(tmp_path):
+            raise AssertionError("scope body should not run")
+
+    assert reset_tokens == [home_token]
 
 

@@ -114,6 +114,310 @@ def test_adapter_auth_check_stamps_secondary_profile(monkeypatch):
     assert captured["profile"] == "coder"
 
 
+def test_primary_adapter_auth_check_uses_active_profile_scope(tmp_path, monkeypatch):
+    """The active adapter must remain authorized after multiplex fail-closed mode."""
+    from agent import secret_scope as ss
+    from gateway.run import GatewayRunner
+
+    default_home = tmp_path / "default"
+    default_home.mkdir()
+    (default_home / ".env").write_text(
+        "TELEGRAM_ALLOWED_USERS=primary-user\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "foreign-process-user")
+    monkeypatch.setattr(
+        "hermes_cli.profiles.get_active_profile_name",
+        lambda: "default",
+    )
+    monkeypatch.setattr(
+        "hermes_cli.profiles.get_profile_dir",
+        lambda name: default_home,
+    )
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(multiplex_profiles=True)
+    runner.adapters = {}
+    runner._profile_adapters = {}
+    runner.pairing_store = MagicMock()
+    runner.pairing_store.is_approved.return_value = False
+    runner.pairing_stores = {"default": runner.pairing_store}
+    check = runner._make_adapter_auth_check(Platform.TELEGRAM)
+
+    ss.set_multiplex_active(True)
+    try:
+        assert check("primary-user", "dm", "primary-user") is True
+        assert check("foreign-process-user", "dm", "foreign-process-user") is False
+    finally:
+        ss.set_multiplex_active(False)
+
+
+def test_adapter_auth_check_reads_secondary_profile_allowlist(tmp_path, monkeypatch):
+    """A profile-bound callback must not fall back to the primary allowlist."""
+    from agent import secret_scope as ss
+    from gateway.run import GatewayRunner
+
+    default_home = tmp_path / "default"
+    personal_home = tmp_path / "personal"
+    default_home.mkdir()
+    personal_home.mkdir()
+    (personal_home / ".env").write_text(
+        "TELEGRAM_ALLOWED_USERS=personal-user\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(default_home))
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "primary-user")
+    monkeypatch.setattr(
+        "hermes_cli.profiles.get_profile_dir",
+        lambda name: personal_home,
+    )
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(multiplex_profiles=True)
+    runner.adapters = {}
+    runner._profile_adapters = {}
+    runner.pairing_store = MagicMock()
+    runner.pairing_store.is_approved.return_value = False
+    runner.pairing_stores = {}
+    check = runner._make_adapter_auth_check(
+        Platform.TELEGRAM,
+        profile_name="personal",
+    )
+
+    ss.set_multiplex_active(True)
+    try:
+        assert check("personal-user", "dm", "personal-user") is True
+        assert check("primary-user", "dm", "primary-user") is False
+    finally:
+        ss.set_multiplex_active(False)
+
+
+def test_auth_env_never_falls_back_to_process_env_in_multiplex(monkeypatch):
+    from agent import secret_scope as ss
+    from gateway.authz_mixin import _auth_env
+
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "primary-user")
+    ss.set_multiplex_active(True)
+    try:
+        assert _auth_env("TELEGRAM_ALLOWED_USERS") == ""
+
+        token = ss.set_secret_scope({})
+        try:
+            assert _auth_env("TELEGRAM_ALLOWED_USERS") == ""
+        finally:
+            ss.reset_secret_scope(token)
+
+        token = ss.set_secret_scope({"TELEGRAM_ALLOWED_USERS": "profile-user"})
+        try:
+            assert _auth_env("TELEGRAM_ALLOWED_USERS") == "profile-user"
+        finally:
+            ss.reset_secret_scope(token)
+    finally:
+        ss.set_multiplex_active(False)
+
+
+def test_group_chat_allowlist_never_falls_back_to_process_env_in_multiplex(
+    monkeypatch,
+):
+    """A secondary profile must not inherit the primary profile's chat grant."""
+    from agent import secret_scope as ss
+    from gateway.run import GatewayRunner
+
+    monkeypatch.setenv("TELEGRAM_GROUP_ALLOWED_CHATS", "-100-primary")
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(multiplex_profiles=True)
+    runner.adapters = {}
+    runner._profile_adapters = {}
+    runner.pairing_store = MagicMock()
+    runner.pairing_store.is_approved.return_value = False
+    runner.pairing_stores = {}
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        user_id=None,
+        chat_id="-100-primary",
+        chat_type="group",
+        profile="personal",
+    )
+
+    ss.set_multiplex_active(True)
+    token = ss.set_secret_scope({})
+    try:
+        assert runner._is_user_authorized(source) is False
+    finally:
+        ss.reset_secret_scope(token)
+        ss.set_multiplex_active(False)
+
+
+def test_bot_allowance_never_falls_back_to_process_env_in_multiplex(monkeypatch):
+    """A secondary profile must not inherit the primary profile's bot policy."""
+    from agent import secret_scope as ss
+    from gateway.run import GatewayRunner
+
+    monkeypatch.setenv("TELEGRAM_ALLOW_BOTS", "all")
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(multiplex_profiles=True)
+    runner.adapters = {}
+    runner._profile_adapters = {}
+    runner.pairing_store = MagicMock()
+    runner.pairing_store.is_approved.return_value = False
+    runner.pairing_stores = {}
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        user_id=None,
+        chat_id="-100-personal",
+        chat_type="group",
+        profile="personal",
+        is_bot=True,
+    )
+
+    ss.set_multiplex_active(True)
+    token = ss.set_secret_scope({})
+    try:
+        assert runner._is_user_authorized(source) is False
+    finally:
+        ss.reset_secret_scope(token)
+        ss.set_multiplex_active(False)
+
+
+def test_unauthorized_dm_behavior_never_inherits_process_allowlist(monkeypatch):
+    """A primary allowlist must not force secondary unknown DMs into ignore mode."""
+    from agent import secret_scope as ss
+    from gateway.run import GatewayRunner
+
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "primary-user")
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(multiplex_profiles=True)
+    runner.adapters = {}
+    runner._profile_adapters = {}
+
+    ss.set_multiplex_active(True)
+    token = ss.set_secret_scope({})
+    try:
+        assert runner._get_unauthorized_dm_behavior(
+            Platform.TELEGRAM,
+            profile="personal",
+        ) == "pair"
+    finally:
+        ss.reset_secret_scope(token)
+        ss.set_multiplex_active(False)
+
+
+def test_routed_source_uses_transport_pairing_store():
+    """A topic route changes runtime profile, not the receiving bot's whitelist."""
+    import weakref
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(multiplex_profiles=True)
+    primary_adapter = MagicMock()
+    runner.adapters = {Platform.TELEGRAM: primary_adapter}
+    runner._profile_adapters = {"x100": {}}
+    runner._active_profile_name = lambda: "default"
+    runner.pairing_store = MagicMock(name="primary-pairing")
+    routed_pairing = MagicMock(name="routed-profile-pairing")
+    runner.pairing_stores = {
+        "default": runner.pairing_store,
+        "x100": routed_pairing,
+    }
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_type="group",
+        user_id="owner",
+        profile="x100",
+    )
+    setattr(source, "_transport_adapter_ref", weakref.ref(primary_adapter))
+
+    assert runner._pairing_store_for(source) is runner.pairing_store
+
+
+def test_secondary_pairing_never_falls_back_to_primary_store(monkeypatch):
+    """Missing secondary pairing state must deny, not reuse the primary store."""
+    from agent import secret_scope as ss
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(multiplex_profiles=True)
+    runner.adapters = {}
+    runner._profile_adapters = {}
+    runner._active_profile_name = lambda: "default"
+    runner.pairing_store = MagicMock()
+    runner.pairing_store.is_approved.return_value = True
+    runner.pairing_stores = {}
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        user_id="primary-paired-user",
+        chat_id="primary-paired-user",
+        chat_type="dm",
+        profile="personal",
+    )
+
+    ss.set_multiplex_active(True)
+    token = ss.set_secret_scope({})
+    try:
+        assert runner._is_user_authorized(source) is False
+    finally:
+        ss.reset_secret_scope(token)
+        ss.set_multiplex_active(False)
+
+
+def test_primary_open_policy_guard_uses_active_profile_scope(tmp_path, monkeypatch):
+    from gateway.run import GatewayRunner
+
+    default_home = tmp_path / "default"
+    default_home.mkdir()
+    (default_home / ".env").write_text(
+        "GATEWAY_ALLOW_ALL_USERS=true\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("GATEWAY_ALLOW_ALL_USERS", raising=False)
+    monkeypatch.setattr(
+        "hermes_cli.profiles.get_profile_dir",
+        lambda name: default_home,
+    )
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(multiplex_profiles=True)
+    runner.config.platforms = {
+        Platform.WECOM: PlatformConfig(
+            enabled=True,
+            extra={"dm_policy": "open"},
+        ),
+    }
+    runner._active_profile_name = lambda: "default"
+
+    assert runner._primary_open_policy_violation() is None
+
+
+def test_secondary_open_policy_ignores_primary_allow_all(monkeypatch):
+    """Primary allow-all must not satisfy a secondary profile's startup guard."""
+    from agent import secret_scope as ss
+    from gateway.run import _own_policy_open_startup_violation
+
+    monkeypatch.setenv("GATEWAY_ALLOW_ALL_USERS", "true")
+    secondary_cfg = GatewayConfig(multiplex_profiles=True)
+    secondary_cfg.platforms = {
+        Platform.WECOM: PlatformConfig(
+            enabled=True,
+            extra={"dm_policy": "open"},
+        ),
+    }
+
+    ss.set_multiplex_active(True)
+    token = ss.set_secret_scope({})
+    try:
+        assert _own_policy_open_startup_violation(secondary_cfg) is not None
+    finally:
+        ss.reset_secret_scope(token)
+
+    token = ss.set_secret_scope({"GATEWAY_ALLOW_ALL_USERS": "true"})
+    try:
+        assert _own_policy_open_startup_violation(secondary_cfg) is None
+    finally:
+        ss.reset_secret_scope(token)
+        ss.set_multiplex_active(False)
+
+
 def test_secondary_open_policy_fails_startup_guard(monkeypatch):
     """Secondary profiles must pass the same open-policy startup guard."""
     from gateway.run import _own_policy_open_startup_violation

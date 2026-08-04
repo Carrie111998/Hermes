@@ -489,6 +489,66 @@ def test_apply_external_secret_sources_survives_non_dict_section(tmp_path, monke
     assert env_loader.get_secret_source("ANYTHING") is None
 
 
+def test_secondary_profile_dotenv_does_not_mutate_multiplex_process_env(
+    tmp_path, monkeypatch
+):
+    """Late imports in a profile turn must not overwrite primary credentials."""
+    from agent import secret_scope as ss
+
+    default_home = tmp_path / "default"
+    personal_home = tmp_path / "personal"
+    default_home.mkdir()
+    personal_home.mkdir()
+    (personal_home / ".env").write_text(
+        "TELEGRAM_ALLOWED_USERS=personal-user\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(default_home))
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "primary-user")
+    ss.set_multiplex_active(True)
+    try:
+        loaded = env_loader.load_hermes_dotenv(hermes_home=personal_home)
+    finally:
+        ss.set_multiplex_active(False)
+
+    assert loaded == []
+    assert os.environ["TELEGRAM_ALLOWED_USERS"] == "primary-user"
+
+
+def test_profile_secret_snapshot_refreshes_when_bootstrap_changes(
+    tmp_path, monkeypatch
+):
+    """A rotated profile bootstrap must not reuse the old resolved value."""
+    from types import SimpleNamespace
+    from agent.secret_sources import registry as reg
+
+    (tmp_path / "config.yaml").write_text(
+        "secrets:\n  synthetic:\n    enabled: true\n",
+        encoding="utf-8",
+    )
+
+    def fake_apply_all(cfg, home_path, *, environ):
+        environ["TARGET_SECRET"] = environ["BOOTSTRAP_TOKEN"]
+        return SimpleNamespace(
+            sources=[SimpleNamespace(name="synthetic")],
+            provenance={"TARGET_SECRET": SimpleNamespace(source="synthetic")},
+        )
+
+    monkeypatch.setattr(reg, "apply_all", fake_apply_all)
+
+    first = env_loader.resolve_profile_secret_source_values(
+        tmp_path,
+        {"BOOTSTRAP_TOKEN": "token-a"},
+    )
+    second = env_loader.resolve_profile_secret_source_values(
+        tmp_path,
+        {"BOOTSTRAP_TOKEN": "token-b"},
+    )
+
+    assert first == {"TARGET_SECRET": "token-a"}
+    assert second == {"TARGET_SECRET": "token-b"}
+
+
 def test_apply_external_secret_sources_bad_ttl_does_not_crash(tmp_path, monkeypatch):
     """A non-numeric cache_ttl_seconds must be coerced, not crash startup."""
 

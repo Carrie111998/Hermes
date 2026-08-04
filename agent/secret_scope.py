@@ -270,18 +270,24 @@ def load_env_file(env_path: Path) -> Dict[str, str]:
 
 
 def build_profile_secret_scope(hermes_home: Path) -> Dict[str, str]:
-    """Build a profile's secret mapping from its ``<home>/.env``.
+    """Build a profile's private secret mapping without touching process env.
 
-    Returns a fresh dict (safe to install via ``set_secret_scope``). Genuinely
-    global vars are intentionally NOT copied in — ``get_secret`` reads those
-    from ``os.environ`` directly, so the scope holds only profile secrets.
+    ``.env`` has precedence.  ``.op.env`` fills missing bootstrap/session
+    values exactly as the single-profile loader does before external sources
+    resolve their references.
     """
     home = Path(hermes_home)
     secrets = load_env_file(home / ".env")
+    for key, value in load_env_file(home / ".op.env").items():
+        secrets.setdefault(key, value)
 
     try:
-        from hermes_cli.env_loader import get_secret_source_values
-        external_secrets = get_secret_source_values(home)
+        from hermes_cli.env_loader import hydrate_profile_secret_sources
+
+        # Use the same profile bootstrap/fingerprint path as the gateway's
+        # eager hydration. Calling the lower-level resolver with a different
+        # base mapping would invalidate the cache and refetch on every scope.
+        external_secrets = hydrate_profile_secret_sources(home)
     except Exception:
         external_secrets = {}
 

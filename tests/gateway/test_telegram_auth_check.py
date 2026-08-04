@@ -267,6 +267,92 @@ async def test_unauthorized_dm_with_pair_behavior_builds_event(monkeypatch):
     )
     await adapter._handle_text_message(update, SimpleNamespace())
     assert build_called is True
+def test_registered_authorization_check_precedes_process_env_for_messages(monkeypatch):
+    """A secondary adapter must use its profile-bound check at early intake."""
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "6940705170")
+    adapter = _make_adapter()
+
+    async def profile_handler(event):
+        return None
+
+    adapter._message_handler = profile_handler
+    adapter.set_authorization_check(
+        lambda user_id, chat_type, chat_id: user_id == "429731663"
+    )
+
+    personal_message = _make_message(
+        from_user_id=429731663,
+        chat_id=429731663,
+        chat_type="dm",
+    )
+    work_message = _make_message(
+        from_user_id=6940705170,
+        chat_id=6940705170,
+        chat_type="dm",
+    )
+
+    assert adapter._is_user_authorized_from_message(personal_message) is True
+    assert adapter._is_user_authorized_from_message(work_message) is False
+
+
+def test_message_env_fallback_is_profile_scoped_in_multiplex(monkeypatch):
+    """Env-only early intake must honor the current profile scope."""
+    from agent import secret_scope as ss
+
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "6940705170")
+    adapter = _make_adapter()
+    adapter._authorization_check = None
+    adapter._message_handler = None
+
+    ss.set_multiplex_active(True)
+    token = ss.set_secret_scope({"TELEGRAM_ALLOWED_USERS": "429731663"})
+    try:
+        personal_message = _make_message(
+            from_user_id=429731663,
+            chat_id=429731663,
+            chat_type="dm",
+        )
+        work_message = _make_message(
+            from_user_id=6940705170,
+            chat_id=6940705170,
+            chat_type="dm",
+        )
+        assert adapter._is_user_authorized_from_message(personal_message) is True
+        assert adapter._is_user_authorized_from_message(work_message) is False
+    finally:
+        ss.reset_secret_scope(token)
+        ss.set_multiplex_active(False)
+
+
+def test_group_allowed_chats_env_fallback_is_profile_scoped(monkeypatch):
+    """Observed group scope must not inherit another profile's chat grant."""
+    from agent import secret_scope as ss
+
+    monkeypatch.setenv("TELEGRAM_GROUP_ALLOWED_CHATS", "-100-primary")
+    adapter = _make_adapter()
+
+    ss.set_multiplex_active(True)
+    token = ss.set_secret_scope({})
+    try:
+        assert adapter._telegram_group_allowed_chats() == set()
+    finally:
+        ss.reset_secret_scope(token)
+        ss.set_multiplex_active(False)
+
+
+def test_auth_env_configured_uses_profile_scope(monkeypatch):
+    from agent import secret_scope as ss
+
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "6940705170")
+    adapter = _make_adapter()
+
+    ss.set_multiplex_active(True)
+    token = ss.set_secret_scope({})
+    try:
+        assert adapter._telegram_auth_env_configured() is False
+    finally:
+        ss.reset_secret_scope(token)
+        ss.set_multiplex_active(False)
 
 
 def test_runner_auth_gets_group_user_allowlist_context(monkeypatch):

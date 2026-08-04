@@ -3,13 +3,15 @@ import logging
 import asyncio
 from contextlib import contextmanager
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 import gateway.run as gateway_run
 from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.platforms.base import MessageEvent
 from gateway.run import GatewayRunner
+from gateway.session import SessionSource
 
 
 class _FakeAdapter:
@@ -74,6 +76,90 @@ class TestCredentialFingerprint:
 
 class TestProfileMessageHandler:
     @pytest.mark.asyncio
+    async def test_primary_handler_scopes_auth_without_clobbering_route(
+        self, tmp_path, monkeypatch
+    ):
+        from agent.secret_scope import get_secret
+
+        default_home = tmp_path / "default"
+        default_home.mkdir()
+        x100_home = tmp_path / "x100"
+        x100_home.mkdir()
+        (default_home / ".env").write_text(
+            "PRIMARY_SCOPE_MARKER=default-scope\n"
+            "TELEGRAM_ALLOWED_USERS=owner\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_profile_dir",
+            lambda name: x100_home if name == "x100" else default_home,
+        )
+        monkeypatch.setattr(
+            "gateway.run.get_hermes_home",
+            lambda: default_home,
+        )
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_active_profile_name",
+            lambda: "default",
+        )
+        monkeypatch.setattr(
+            "hermes_cli.profiles.profile_exists",
+            lambda name: True,
+        )
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = GatewayConfig(multiplex_profiles=True)
+        from gateway.profile_routing import parse_profile_routes
+
+        runner.config.profile_routes = parse_profile_routes([
+            {
+                "name": "x100-topic",
+                "platform": "telegram",
+                "chat_id": "-1001",
+                "thread_id": "1787",
+                "profile": "x100",
+            }
+        ])
+        runner._active_profile_name = MagicMock(return_value="default")
+        runner.adapters = {}
+        runner._profile_adapters = {}
+        runner.pairing_store = MagicMock()
+        runner.pairing_store.is_approved.return_value = False
+        runner.pairing_stores = {"default": runner.pairing_store}
+        seen = {}
+
+        async def fake_handle(event):
+            seen["profile"] = event.source.profile
+            seen["secret"] = get_secret("PRIMARY_SCOPE_MARKER")
+            seen["authorized"] = runner._is_user_authorized(event.source)
+            seen["target_home"] = runner._resolve_profile_home_for_source(
+                event.source
+            )
+            return "ok"
+
+        runner._handle_message = fake_handle
+        handler = runner._primary_message_handler()
+        event = MessageEvent(
+            text="hello",
+            source=SessionSource(
+                platform=Platform.TELEGRAM,
+                chat_id="-1001",
+                chat_type="group",
+                user_id="owner",
+                thread_id="1787",
+                profile="stale-profile",
+            ),
+        )
+
+        assert await handler(event) == "ok"
+        assert seen == {
+            "profile": "x100",
+            "secret": "default-scope",
+            "authorized": True,
+            "target_home": x100_home,
+        }
+
+    @pytest.mark.asyncio
     async def test_stamps_profile_on_unstamped_source(self):
         runner = GatewayRunner.__new__(GatewayRunner)
         seen = {}
@@ -93,6 +179,29 @@ class TestProfileMessageHandler:
 
         result = await handler(_Evt())
         assert result == "ok"
+        assert seen["profile"] == "coder"
+
+
+    @pytest.mark.asyncio
+    async def test_overwrites_stale_profile_on_owned_adapter(self):
+        """An adapter owned by one profile cannot route a stale foreign stamp."""
+        runner = GatewayRunner.__new__(GatewayRunner)
+        seen = {}
+
+        async def _fake_handle(event):
+            seen["profile"] = event.source.profile
+            return "ok"
+
+        runner._handle_message = _fake_handle
+        handler = runner._make_profile_message_handler("coder")
+
+        class _Src:
+            profile = "default"
+
+        class _Evt:
+            source = _Src()
+
+        assert await handler(_Evt()) == "ok"
         assert seen["profile"] == "coder"
 
 
@@ -273,6 +382,47 @@ class TestSecondaryProfileConfigHandling:
         assert "webhook" in message
         assert "telegram" not in message
         assert "reviewer" not in runner._profile_adapters
+
+    @pytest.mark.asyncio
+    async def test_pairing_store_exists_before_secondary_connect(self, monkeypatch):
+        """Polling must never start before the profile's own whitelist exists."""
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = GatewayConfig(multiplex_profiles=True)
+        runner.adapters = {}
+        runner._failed_platforms = {}
+        runner._profile_adapters = {}
+        runner.pairing_store = MagicMock()
+        runner.pairing_stores = {}
+        personal_store = MagicMock()
+
+        async def fake_start_one(profile_name, profile_home, claimed):
+            assert runner.pairing_stores["default"] is runner.pairing_store
+            assert runner.pairing_stores[profile_name] is personal_store
+            runner._profile_adapters[profile_name] = {}
+            return 1
+
+        monkeypatch.setattr(
+            "hermes_cli.profiles.profiles_to_serve",
+            lambda multiplex: [
+                ("default", Path("/tmp/default")),
+                ("personal", Path("/tmp/personal")),
+            ],
+        )
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_active_profile_name",
+            lambda: "default",
+        )
+        monkeypatch.setattr(
+            "gateway.pairing.PairingStore",
+            lambda profile=None: personal_store,
+        )
+        monkeypatch.setattr(runner, "_start_one_profile_adapters", fake_start_one)
+        monkeypatch.setattr(
+            "gateway.status.write_runtime_status",
+            lambda **kwargs: None,
+        )
+
+        assert await runner._start_secondary_profile_adapters() == 1
 
     @pytest.mark.asyncio
     async def test_multiplexer_skips_bad_profile_and_continues(self, monkeypatch, caplog):
@@ -493,5 +643,4 @@ class TestFeishuPortBindingConditional:
 
         connected = await runner._start_one_profile_adapters("reviewer", "/tmp/x", {})
         assert connected == 0  # no error, just nothing connected
-
 

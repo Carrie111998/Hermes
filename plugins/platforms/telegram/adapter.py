@@ -27,6 +27,13 @@ from typing import Dict, List, Optional, Set, Any, Tuple
 logger = logging.getLogger(__name__)
 
 
+def _telegram_auth_env(name: str, default: str = "") -> str:
+    """Read auth policy from the active profile's fail-closed scope."""
+    from gateway.authz_mixin import _auth_env
+
+    return _auth_env(name, default)
+
+
 def _redact_telegram_error_text(error: object) -> str:
     """Redact secrets from Telegram transport errors before logging or returning them."""
     text = "" if error is None else str(error)
@@ -992,17 +999,26 @@ class TelegramAdapter(BasePlatformAdapter):
         if not normalized_user_id:
             return False
 
+        normalized_chat_type = str(chat_type or "dm").strip().lower() or "dm"
+        if normalized_chat_type == "private":
+            normalized_chat_type = "dm"
+        elif normalized_chat_type == "supergroup":
+            normalized_chat_type = "forum" if thread_id is not None else "group"
+
+        if getattr(self, "_authorization_check", None) is not None:
+            registered_auth = self._is_sender_authorized(
+                normalized_user_id,
+                normalized_chat_type,
+                str(chat_id or normalized_user_id),
+            )
+            if registered_auth is not None:
+                return registered_auth
+
         runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
         auth_fn = getattr(runner, "_is_user_authorized", None)
         if callable(auth_fn):
             try:
                 from gateway.session import SessionSource
-
-                normalized_chat_type = str(chat_type or "dm").strip().lower() or "dm"
-                if normalized_chat_type == "private":
-                    normalized_chat_type = "dm"
-                elif normalized_chat_type == "supergroup":
-                    normalized_chat_type = "forum" if thread_id is not None else "group"
 
                 source = SessionSource(
                     platform=Platform.TELEGRAM,
@@ -1020,13 +1036,17 @@ class TelegramAdapter(BasePlatformAdapter):
                     exc_info=True,
                 )
 
-        allowed_csv = _scoped_gate_env("TELEGRAM_ALLOWED_USERS").strip()
+        allowed_csv = _telegram_auth_env("TELEGRAM_ALLOWED_USERS")
         if not allowed_csv:
             # Fail-closed: no allowlist means deny by default.
             # The runner auth path in _is_user_authorized() handles
             # GATEWAY_ALLOW_ALL_USERS; this fallback must not silently
             # allow everyone (fixes #24457).
-            return _scoped_gate_env("GATEWAY_ALLOW_ALL_USERS").lower() in {"true", "1", "yes"}
+            return _telegram_auth_env("GATEWAY_ALLOW_ALL_USERS").lower() in {
+                "true",
+                "1",
+                "yes",
+            }
         allowed_ids = {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}
         return "*" in allowed_ids or normalized_user_id in allowed_ids
 
@@ -1100,7 +1120,7 @@ class TelegramAdapter(BasePlatformAdapter):
             "GATEWAY_ALLOWED_USERS",
             "GATEWAY_ALLOW_ALL_USERS",
         )
-        return any(_scoped_gate_env(key).strip() for key in keys)
+        return any(_telegram_auth_env(key) for key in keys)
 
     def _should_pass_unauthorized_dm_for_pairing(self, source) -> bool:
         """Return True when an unauthorized DM must still reach gateway pairing.
@@ -1192,6 +1212,17 @@ class TelegramAdapter(BasePlatformAdapter):
                     pass
 
         if authorized is None:
+            registered_auth = None
+            if getattr(self, "_authorization_check", None) is not None:
+                registered_auth = self._is_sender_authorized(
+                    user_id,
+                    source.chat_type,
+                    source.chat_id,
+                )
+            if registered_auth is not None:
+                return registered_auth
+
+        if authorized is None:
             runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
             auth_fn = getattr(runner, "_is_user_authorized", None)
             if callable(auth_fn):
@@ -1210,7 +1241,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     )
 
         if authorized is None:
-            allowed_csv = _scoped_gate_env("TELEGRAM_ALLOWED_USERS").strip()
+            allowed_csv = _telegram_auth_env("TELEGRAM_ALLOWED_USERS")
             if not allowed_csv:
                 return True
             allowed_ids = {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}

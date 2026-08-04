@@ -39,12 +39,15 @@ import signal as _signal
 import subprocess
 import sys
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, MutableMapping, Optional, cast
 
 # Reuse the exact result shape the bitwarden source returns so
 # hermes_cli.env_loader can consume both providers identically.
-from agent.secret_sources.base import ErrorKind, SecretSource
-from agent.secret_sources.base import get_source_environment
+from agent.secret_sources.base import (
+    ErrorKind,
+    SecretSource,
+    secret_source_environ,
+)
 from agent.secret_sources.bitwarden import FetchResult
 
 __all__ = [
@@ -181,18 +184,47 @@ def _run_helper(
         return None
 
     # User-configured secret-helper command: runs with the user's full shell
-    # env by design (it may need any credential to resolve the secret).
-    source_env = get_source_environment()
-    if source_env is os.environ:
-        # Legacy single-profile startup intentionally preserves the existing
-        # helper contract, which may rely on the user's full environment.
-        from tools.environments.local import build_subprocess_env
+    # env by design (it may need any credential to resolve the secret).  An
+    # isolated multiplex-profile fetch is the exception: start from the normal
+    # scrubbed child environment, then add only that profile's own values so a
+    # secondary helper cannot inherit the primary profile's credentials.
+    from tools.environments.local import build_subprocess_env
+    fetch_env = secret_source_environ()
+    if fetch_env is os.environ:
         env = build_subprocess_env(scrub_secrets=False, inherit_profile_home=False)
     else:
-        # A multiplex profile must never inherit sibling secrets from the
-        # process-global environment.  hydrate_profile_secret_sources seeds
-        # only global-safe values plus this profile's own .env.
-        env = dict(source_env)
+        # Operational/process-home keys are always taken from the parent
+        # process.  A profile .env may contain arbitrary helper inputs, but it
+        # must not redirect the helper to a profile-specific HOME/HERMES_HOME.
+        base_keep = (
+            "PATH",
+            "HOME",
+            "USERPROFILE",
+            "SYSTEMROOT",
+            "TMPDIR",
+            "TEMP",
+            "LANG",
+            "LC_ALL",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "HERMES_HOME",
+            "HERMES_PROFILE",
+            "HERMES_PROFILE_NAME",
+        )
+        env = {}
+        for key in base_keep:
+            value = os.environ.get(key)
+            if isinstance(value, str):
+                env[key] = value
+        env.update({
+            key: value
+            for key, value in fetch_env.items()
+            if (
+                isinstance(key, str)
+                and key not in base_keep
+                and isinstance(value, str)
+            )
+        })
     env["HERMES_SECRET_KEY"] = secret_key
 
     try:
@@ -350,6 +382,7 @@ def apply_command_secrets(
         )
         return result
 
+    target_env = cast(MutableMapping[str, str], secret_source_environ())
     if _is_windows():
         result.warnings.append(
             "the 'command' secret source is POSIX-only (needs /bin/sh); "
@@ -383,11 +416,11 @@ def apply_command_secrets(
             # them would flow into an Authorization header → guaranteed 401.
             result.skipped.append(key)
             continue
-        if not override_existing and os.environ.get(key):
+        if not override_existing and target_env.get(key):
             # Process env / .env win — same precedence as bitwarden.
             result.skipped.append(key)
             continue
-        os.environ[key] = value
+        target_env[key] = value
         result.applied.append(key)
 
     return result

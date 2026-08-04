@@ -210,6 +210,52 @@ def test_fetch_server_url_sets_env(monkeypatch, tmp_path):
     assert captured_env.get("BWS_SERVER_URL") == "https://vault.bitwarden.eu"
 
 
+def test_registry_fetch_uses_profile_auth_environment(monkeypatch, tmp_path):
+    """Multiplex BWS fetches must neither use nor forward primary credentials."""
+    from agent.secret_sources import registry as reg
+
+    fake_binary = tmp_path / "bws"
+    fake_binary.write_text("")
+    monkeypatch.setenv("BWS_ACCESS_TOKEN", "primary-bws-token")
+    monkeypatch.setenv("OPENAI_API_KEY", "primary-openai-key")
+    monkeypatch.setattr(bw, "find_bws", lambda **kwargs: fake_binary)
+    captured_env = {}
+
+    def fake_run(cmd, **kwargs):
+        captured_env.update(kwargs["env"])
+        return mock.Mock(
+            returncode=0,
+            stdout=_fake_bws_payload(
+                [{"key": "TARGET_SECRET", "value": "resolved-value"}]
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(bw.subprocess, "run", fake_run)
+    reg._reset_registry_for_tests()
+    monkeypatch.setattr(reg, "_ensure_builtin_sources", lambda: None)
+    reg.register_source(bw.BitwardenSource())
+    env = {"BWS_ACCESS_TOKEN": "personal-bws-token"}
+    try:
+        reg.apply_all(
+            {
+                "bitwarden": {
+                    "enabled": True,
+                    "project_id": "personal-project",
+                    "cache_ttl_seconds": 0,
+                }
+            },
+            tmp_path,
+            environ=env,
+        )
+    finally:
+        reg._reset_registry_for_tests()
+
+    assert env["TARGET_SECRET"] == "resolved-value"
+    assert captured_env["BWS_ACCESS_TOKEN"] == "personal-bws-token"
+    assert "OPENAI_API_KEY" not in captured_env
+
+
 
 
 

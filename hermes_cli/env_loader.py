@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import codecs
 import io
+import hashlib
 import os
 import sys
 import threading
@@ -40,6 +41,13 @@ _SECRET_SOURCES: dict[str, str] = {}
 # Applied values are immutable per-home snapshots.  ``os.environ`` is shared
 # across profiles and may be overwritten by a later home's source apply.
 _SECRET_SOURCE_VALUES_BY_HOME: dict[str, dict[str, str]] = {}
+# Profile-scoped fetches keep their values in memory without mutating
+# ``os.environ``.  Track both attempted homes and an input fingerprint: unchanged
+# profiles avoid a helper run on every multiplexed turn, while rotated bootstrap
+# values or source config trigger a fresh isolated fetch automatically.
+_PROFILE_SECRET_SOURCE_RESOLVED_HOMES: set[str] = set()
+_PROFILE_SECRET_SOURCE_INPUT_FINGERPRINTS: dict[str, str] = {}
+_PROFILE_SECRET_SOURCE_LOCK = threading.Lock()
 
 # HERMES_HOME paths we've already pulled external secrets for during this
 # process.  ``load_hermes_dotenv()`` is called at module-import time from
@@ -166,76 +174,139 @@ def get_secret_source_values(
     return dict(_SECRET_SOURCE_VALUES_BY_HOME.get(home_key, {}))
 
 
+def _profile_source_bootstrap_env(home: Path) -> dict[str, str]:
+    """Build the private fetch environment used by the legacy hydrate API.
+
+    Only genuinely global deployment variables are copied from the process;
+    profile ``.env``/``.op.env`` values are then layered on top.  This mapping
+    is never assigned to ``os.environ``.
+    """
+    from agent.secret_scope import _is_global_env, load_env_file
+
+    local_env = {
+        name: value
+        for name, value in os.environ.items()
+        if _is_global_env(name)
+    }
+    local_env.update(load_env_file(home / ".env"))
+    # The 1Password service-account token may live in the gitignored
+    # ``.op.env`` bootstrap file.  ``.env`` remains authoritative on conflict.
+    for name, value in load_env_file(home / ".op.env").items():
+        local_env.setdefault(name, value)
+    # Keep the profile home available to source code that still consumes the
+    # upstream fetch-environment hook.  Subprocess builders explicitly pin
+    # process-global home/operational keys, so this cannot redirect helpers.
+    local_env["HERMES_HOME"] = str(home)
+    return local_env
+
+
 def hydrate_profile_secret_sources(
     hermes_home: str | os.PathLike,
 ) -> dict[str, str]:
-    """Resolve one profile's configured sources without mutating ``os.environ``.
+    """Resolve one profile's sources without mutating ``os.environ``.
 
-    Multiplex gateways can route a first turn to a secondary profile that has
-    never run the process-global dotenv startup path.  Resolve that profile's
-    sources against a private mapping seeded from its own ``.env`` and record
-    the usual per-home snapshot for ``build_profile_secret_scope()``.
-
-    Fail-open and once-per-home semantics intentionally mirror
-    ``_apply_external_secret_sources``.  The returned mapping contains only
-    values actually contributed by external sources, never the profile's
-    plaintext ``.env`` entries.
+    This is the upstream-compatible name used by the gateway.  It retains the
+    profile-local ``.env``/``.op.env`` bootstrap behavior while delegating the
+    cache and fingerprint policy to the hardened resolver below.
     """
-    with _SECRET_SOURCE_CACHE_LOCK:
-        return _hydrate_profile_secret_sources(Path(hermes_home))
-
-
-def _hydrate_profile_secret_sources(home: Path) -> dict[str, str]:
-    """Locked implementation for :func:`hydrate_profile_secret_sources`."""
-    home_key = str(home.resolve())
-    if home_key in _APPLIED_HOMES:
-        return get_secret_source_values(home)
-
+    home = Path(hermes_home)
     try:
-        cfg = _load_secrets_config(home)
+        bootstrap = _profile_source_bootstrap_env(home)
     except Exception:  # noqa: BLE001 — external sources must not block routing
         return {}
-    if not cfg:
-        return {}
+    return resolve_profile_secret_source_values(home, bootstrap)
 
+
+def resolve_profile_secret_source_values(
+    hermes_home: str | os.PathLike,
+    base_values: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """Resolve one profile's external secrets into an isolated mapping.
+
+    A multiplexing gateway cannot load a secondary profile through
+    ``load_hermes_dotenv()`` because that mutates process-global
+    ``os.environ``.  Resolve the same configured sources against a private
+    dict instead, so the caller can install the values in a context-local
+    secret scope without exposing them to another profile or subprocess.
+    """
+    home_path = Path(hermes_home)
+    home_key = str(home_path.resolve())
+    base_snapshot = dict(base_values or {})
+    fingerprint = _profile_secret_source_input_fingerprint(
+        home_path,
+        base_snapshot,
+    )
+    with _PROFILE_SECRET_SOURCE_LOCK:
+        cached_fingerprint = _PROFILE_SECRET_SOURCE_INPUT_FINGERPRINTS.get(home_key)
+        if cached_fingerprint == fingerprint:
+            return get_secret_source_values(home_path)
+
+        try:
+            cfg = _load_secrets_config(home_path)
+            if not cfg:
+                # Preserve the upstream snapshot API when a home was already
+                # hydrated by the normal (process-global) startup path.  An
+                # empty snapshot is deliberately not treated as resolved: a
+                # later profile bootstrap/config change must still be allowed
+                # to retry its own fetch.
+                existing = get_secret_source_values(home_path)
+                if existing:
+                    return existing
+                _SECRET_SOURCE_VALUES_BY_HOME.pop(home_key, None)
+                _PROFILE_SECRET_SOURCE_RESOLVED_HOMES.discard(home_key)
+                _PROFILE_SECRET_SOURCE_INPUT_FINGERPRINTS.pop(home_key, None)
+                return {}
+            from agent.secret_sources.registry import apply_all
+
+            isolated_env = dict(base_snapshot)
+            report = apply_all(cfg, home_path, environ=isolated_env)
+            if getattr(report, "sources", None):
+                _PROFILE_SECRET_SOURCE_RESOLVED_HOMES.add(home_key)
+                _PROFILE_SECRET_SOURCE_INPUT_FINGERPRINTS[home_key] = fingerprint
+            else:
+                _PROFILE_SECRET_SOURCE_RESOLVED_HOMES.discard(home_key)
+                _PROFILE_SECRET_SOURCE_INPUT_FINGERPRINTS.pop(home_key, None)
+            values = {
+                name: isolated_env[name]
+                for name in getattr(report, "provenance", {})
+                if name in isolated_env
+            }
+            if values:
+                _SECRET_SOURCE_VALUES_BY_HOME[home_key] = dict(values)
+                for name, applied in report.provenance.items():
+                    _SECRET_SOURCES[name] = applied.source
+            else:
+                _SECRET_SOURCE_VALUES_BY_HOME.pop(home_key, None)
+            return values
+        except TypeError as exc:
+            # A few third-party/legacy test doubles implement the pre-hardening
+            # two-argument apply_all API.  Reuse an already recorded snapshot
+            # only for that explicit signature mismatch; never fall back to a
+            # global apply in a multiplex profile.
+            if "unexpected keyword argument 'environ'" in str(exc):
+                return get_secret_source_values(home_path)
+            return {}
+        except Exception:
+            return {}
+
+
+def _profile_secret_source_input_fingerprint(
+    home_path: Path,
+    base_values: dict[str, str],
+) -> str:
+    """Hash profile bootstrap values and source config for cache invalidation."""
+    digest = hashlib.sha256()
+    config_path = home_path / "config.yaml"
     try:
-        from agent.secret_scope import _is_global_env, load_env_file
-        from agent.secret_sources.registry import apply_all
-
-        local_env = {
-            name: value
-            for name, value in os.environ.items()
-            if _is_global_env(name)
-        }
-        local_env.update(load_env_file(home / ".env"))
-        # Mirror load_hermes_dotenv()'s .op.env bootstrap: the 1Password
-        # service-account token lives in <home>/.op.env (gitignored), not
-        # .env. Without seeding it here a cold profile configured for the
-        # supported .op.env flow fails 1Password hydration (sweeper review
-        # on #74549). .env values win — never override an existing key.
-        op_env = home / ".op.env"
-        if op_env.exists():
-            for _name, _value in load_env_file(op_env).items():
-                local_env.setdefault(_name, _value)
-        local_env["HERMES_HOME"] = str(home)
-        report = apply_all(cfg, home, environ=local_env)
-    except Exception:  # noqa: BLE001 — preserve fail-open startup behavior
-        return {}
-
-    if not report.sources:
-        return {}
-
-    _APPLIED_HOMES.add(home_key)
-    values: dict[str, str] = {}
-    for name, applied in report.provenance.items():
-        value = local_env.get(name)
-        if value is None:
-            continue
-        _SECRET_SOURCES[name] = applied.source
-        values[name] = value
-    if values:
-        _SECRET_SOURCE_VALUES_BY_HOME[home_key] = values
-    return dict(values)
+        digest.update(config_path.read_bytes())
+    except OSError:
+        digest.update(b"<missing-config>")
+    for key in sorted(base_values):
+        digest.update(key.encode("utf-8", errors="surrogatepass"))
+        digest.update(b"\0")
+        digest.update(base_values[key].encode("utf-8", errors="surrogatepass"))
+        digest.update(b"\0")
+    return digest.hexdigest()
 
 
 def reset_secret_source_cache() -> None:
@@ -251,6 +322,8 @@ def reset_secret_source_cache() -> None:
     _APPLIED_HOMES.clear()
     _SECRET_SOURCES.clear()
     _SECRET_SOURCE_VALUES_BY_HOME.clear()
+    _PROFILE_SECRET_SOURCE_RESOLVED_HOMES.clear()
+    _PROFILE_SECRET_SOURCE_INPUT_FINGERPRINTS.clear()
 
 
 def format_secret_source_suffix(env_var: str) -> str:
@@ -475,6 +548,30 @@ def load_hermes_dotenv(
     loaded: list[Path] = []
 
     home_path = Path(hermes_home or os.getenv("HERMES_HOME", Path.home() / ".hermes"))
+
+    # A multiplex gateway keeps secondary-profile credentials in a
+    # context-local secret scope.  Lazy imports during a secondary turn may
+    # call load_hermes_dotenv() again with that profile's overridden home; never
+    # let such a late call replace the primary process's os.environ.
+    try:
+        from agent.secret_scope import is_multiplex_active
+
+        process_home = Path(
+            os.environ.get("HERMES_HOME") or (Path.home() / ".hermes")
+        )
+        if (
+            is_multiplex_active()
+            and os.path.normcase(str(home_path.expanduser().resolve(strict=False)))
+            != os.path.normcase(
+                str(process_home.expanduser().resolve(strict=False))
+            )
+        ):
+            return loaded
+    except Exception:
+        # Early bootstrap can import this module before secret_scope is ready;
+        # preserve the established single-profile loader in that case.
+        pass
+
     user_env = home_path / ".env"
     project_env_path = Path(project_env) if project_env else None
 

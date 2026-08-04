@@ -30,9 +30,10 @@ from __future__ import annotations
 import concurrent.futures
 import logging
 import os
+from contextvars import ContextVar, copy_context
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, MutableMapping, Optional
+from typing import Dict, List, Mapping, MutableMapping, Optional
 
 from agent.secret_sources.base import (
     SECRET_SOURCE_API_VERSION,
@@ -50,6 +51,19 @@ logger = logging.getLogger(__name__)
 # insertion order, which doubles as the default apply order.
 _SOURCES: Dict[str, SecretSource] = {}
 _BUILTINS_LOADED = False
+
+# An explicit ``apply_all(..., environ=...)`` call is an isolated resolution
+# pass (used by multiplexed profile secret scopes).  Propagate that private
+# environment into each fetch worker so sources that spawn helpers can avoid
+# inheriting another profile's process-global credentials.
+_FETCH_ENV: ContextVar[Optional[Mapping[str, str]]] = ContextVar(
+    "_SECRET_SOURCE_FETCH_ENV", default=None
+)
+
+
+def current_secret_source_fetch_env() -> Optional[Mapping[str, str]]:
+    """Return the isolated environment for the active source fetch, if any."""
+    return _FETCH_ENV.get()
 
 
 @dataclass
@@ -198,8 +212,10 @@ def _reset_registry_for_tests() -> None:
 
 
 def _fetch_with_timeout(
-    source: SecretSource, cfg: dict, home_path: Path,
-    environ: MutableMapping[str, str],
+    source: SecretSource,
+    cfg: dict,
+    home_path: Path,
+    fetch_env: Optional[Mapping[str, str]] = None,
 ) -> FetchResult:
     """Run source.fetch() under a wall-clock budget; never raises.
 
@@ -213,15 +229,32 @@ def _fetch_with_timeout(
     executor = concurrent.futures.ThreadPoolExecutor(
         max_workers=1, thread_name_prefix=f"secret-src-{source.name}"
     )
-    try:
-        def _fetch() -> FetchResult:
-            token = set_source_environment(environ)
-            try:
-                return source.fetch(cfg, home_path)
-            finally:
-                reset_source_environment(token)
+    def _fetch_in_scope() -> FetchResult:
+        fetch_token = _FETCH_ENV.set(fetch_env)
+        legacy_token = None
+        if fetch_env is not None:
+            # Preserve the upstream source-environment hook for plugins that
+            # still call get_source_environment(), while the hardening hook
+            # remains authoritative for bundled sources.
+            legacy_env = (
+                fetch_env
+                if isinstance(fetch_env, MutableMapping)
+                else dict(fetch_env)
+            )
+            legacy_token = set_source_environment(legacy_env)
+        try:
+            return source.fetch(cfg, home_path)
+        finally:
+            if legacy_token is not None:
+                reset_source_environment(legacy_token)
+            _FETCH_ENV.reset(fetch_token)
 
-        future = executor.submit(_fetch)
+    try:
+        # ThreadPoolExecutor workers do not inherit ContextVars.  Snapshot
+        # the caller's context explicitly so profile/home/secret context is
+        # present while the source fetch (and any helper it calls) runs.
+        fetch_context = copy_context()
+        future = executor.submit(fetch_context.run, _fetch_in_scope)
         try:
             result = future.result(timeout=timeout)
         except concurrent.futures.TimeoutError:
@@ -359,6 +392,7 @@ def apply_all(secrets_cfg: dict, home_path: Path,
     """
     import os as _os
 
+    isolated_fetch_env = dict(environ) if environ is not None else None
     env = environ if environ is not None else _os.environ
     report = ApplyReport()
 
@@ -386,7 +420,9 @@ def apply_all(secrets_cfg: dict, home_path: Path,
     for source in ordered:
         cfg = secrets_cfg.get(source.name)
         cfg = cfg if isinstance(cfg, dict) else {}
-        result = _fetch_with_timeout(source, cfg, home_path, env)
+        result = _fetch_with_timeout(
+            source, cfg, home_path, fetch_env=isolated_fetch_env
+        )
         fetches.append((source, cfg, result))
         try:
             for var in source.protected_env_vars(cfg):

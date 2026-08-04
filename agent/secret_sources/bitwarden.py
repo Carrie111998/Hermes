@@ -45,7 +45,7 @@ import urllib.error
 import urllib.request
 import zipfile
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, MutableMapping, Optional, Tuple, cast
 
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -57,8 +57,7 @@ from agent.secret_sources._cache import (
     FetchResult,
     is_valid_env_name as _is_valid_env_name,
 )
-from agent.secret_sources.base import ErrorKind, SecretSource
-from agent.secret_sources.base import get_source_environment
+from agent.secret_sources.base import ErrorKind, SecretSource, secret_source_environ
 
 logger = logging.getLogger(__name__)
 
@@ -668,41 +667,22 @@ def _run_bws_list(
     bws: Path, access_token: str, project_id: str, server_url: str = ""
 ) -> Tuple[Dict[str, str], List[str]]:
     cmd = [str(bws), "secret", "list", project_id, "--output", "json"]
-    # bws child intentionally receives the access token.  Under a profile-local
-    # fetch it must not inherit sibling credentials from process-global env.
-    source_env = get_source_environment()
-    if source_env is os.environ:
-        from tools.environments.local import build_subprocess_env
+    # The child gets only its own bootstrap token plus an optional endpoint;
+    # never the process-wide post-dotenv credential set from another profile.
+    from agent.secret_sources.base import run_secret_cli
 
-        env = build_subprocess_env(scrub_secrets=False, inherit_profile_home=False)
-    else:
-        env = dict(source_env)
-    env["BWS_ACCESS_TOKEN"] = access_token
-    # Make sure we're not echoing telemetry / colour codes into json.
-    env.setdefault("NO_COLOR", "1")
-    # Region / self-hosted support.  bws defaults to https://vault.bitwarden.com
-    # (US Cloud); EU Cloud users need https://vault.bitwarden.eu, and
-    # self-hosted users need their own URL.  When unset, fall back to whatever
-    # BWS_SERVER_URL the caller already had in their shell env (preserved by
-    # the copy above) so manual overrides keep working too.
-    if server_url:
-        env["BWS_SERVER_URL"] = server_url
+    extra_env = {"BWS_ACCESS_TOKEN": access_token}
+    effective_server_url = server_url.strip()
+    if not effective_server_url:
+        effective_server_url = secret_source_environ().get("BWS_SERVER_URL", "").strip()
+    if effective_server_url:
+        extra_env["BWS_SERVER_URL"] = effective_server_url
 
-    try:
-        proc = subprocess.run(  # noqa: S603 — bws path is trusted
-            cmd,
-            env=env,
-            capture_output=True,
-            text=True, encoding='utf-8', errors='replace',
-            timeout=_BWS_RUN_TIMEOUT,
-            stdin=subprocess.DEVNULL,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(
-            f"bws timed out after {_BWS_RUN_TIMEOUT}s fetching secrets"
-        ) from exc
-    except OSError as exc:
-        raise RuntimeError(f"failed to invoke bws: {exc}") from exc
+    proc = run_secret_cli(
+        cmd,
+        extra_env=extra_env,
+        timeout=_BWS_RUN_TIMEOUT,
+    )
 
     if proc.returncode != 0:
         # bws writes auth/network errors to stderr as a Rust error-report
@@ -782,7 +762,8 @@ def apply_bitwarden_secrets(
     if not enabled:
         return result
 
-    access_token = os.environ.get(access_token_env, "").strip()
+    target_env = cast(MutableMapping[str, str], secret_source_environ())
+    access_token = target_env.get(access_token_env, "").strip()
     if not access_token:
         result.error = (
             f"secrets.bitwarden.enabled is true but {access_token_env} is "
@@ -831,10 +812,10 @@ def apply_bitwarden_secrets(
             # token as a BSM secret too.
             result.skipped.append(key)
             continue
-        if not override_existing and os.environ.get(key):
+        if not override_existing and target_env.get(key):
             result.skipped.append(key)
             continue
-        os.environ[key] = value
+        target_env[key] = value
         result.applied.append(key)
 
     return result
@@ -913,8 +894,9 @@ class BitwardenSource(SecretSource):
         cfg = cfg if isinstance(cfg, dict) else {}
         result = FetchResult()
 
+        source_env = secret_source_environ()
         access_token_env = str(cfg.get("access_token_env") or "BWS_ACCESS_TOKEN")
-        access_token = get_source_environment().get(access_token_env, "").strip()
+        access_token = source_env.get(access_token_env, "").strip()
         if not access_token:
             result.error = (
                 f"secrets.bitwarden.enabled is true but {access_token_env} is "
@@ -962,7 +944,11 @@ class BitwardenSource(SecretSource):
                 project_id=project_id,
                 binary=binary,
                 cache_ttl_seconds=ttl,
-                server_url=str(cfg.get("server_url", "") or "").strip(),
+                server_url=str(
+                    cfg.get("server_url", "")
+                    or source_env.get("BWS_SERVER_URL", "")
+                    or ""
+                ).strip(),
                 home_path=home_path,
                 encrypted_cache_enabled=encrypted_enabled,
                 encrypted_cache_max_stale_seconds=encrypted_max_stale,

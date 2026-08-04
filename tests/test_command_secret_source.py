@@ -139,6 +139,25 @@ def test_bare_value_helper_resolves_single_value(tmp_path):
 
 
 
+def test_command_helper_fails_closed_without_fetch_context_in_multiplex(
+    tmp_path, monkeypatch
+):
+    from agent import secret_scope as ss
+
+    helper = _write_helper(
+        tmp_path,
+        "printf '%s' \"${CMDTEST_PARENT_SECRET:-}\"",
+    )
+    monkeypatch.setenv("CMDTEST_PARENT_SECRET", "primary-secret")
+    ss.set_multiplex_active(True)
+    try:
+        value = get_command_secret(command=str(helper), key="CMDTEST_API_KEY")
+    finally:
+        ss.set_multiplex_active(False)
+
+    assert value is None
+
+
 def test_timeout_kills_hung_helper_and_degrades_to_empty(tmp_path):
     helper = _write_helper(tmp_path, "sleep 30")
     start = time.monotonic()

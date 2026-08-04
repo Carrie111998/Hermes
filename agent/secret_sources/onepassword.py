@@ -46,7 +46,7 @@ import shutil
 import subprocess
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, MutableMapping, Optional, Tuple, cast
 
 from agent.secret_sources._cache import (
     CachedFetch,
@@ -54,8 +54,7 @@ from agent.secret_sources._cache import (
     FetchResult,
     is_valid_env_name,
 )
-from agent.secret_sources.base import ErrorKind, SecretSource
-from agent.secret_sources.base import get_source_environment
+from agent.secret_sources.base import ErrorKind, SecretSource, secret_source_environ
 
 logger = logging.getLogger(__name__)
 
@@ -183,7 +182,7 @@ def _auth_fingerprint(token_env: str) -> str:
     previous identity is never served under a new one.  Never logged or
     displayed; the raw token never leaves this hash.
     """
-    source_env = get_source_environment()
+    source_env = secret_source_environ()
     parts: List[str] = [
         f"token={source_env.get(token_env, '')}",
         f"account={source_env.get('OP_ACCOUNT', '')}",
@@ -240,10 +239,16 @@ def _scrub(text: str) -> str:
 
 def _op_child_env(token_value: str) -> Dict[str, str]:
     """Build a minimal allowlisted environment for the ``op`` child process."""
-    source_env = get_source_environment()
+    source_env = secret_source_environ()
     env: Dict[str, str] = {}
     for key in _OP_ENV_ALLOWLIST:
-        val = source_env.get(key)
+        if key.startswith("OP_"):
+            val = source_env.get(key)
+        else:
+            # PATH/home/config-directory settings are process operational
+            # state, not profile auth.  Keep them anchored to the parent
+            # process so a profile override cannot redirect ``op``.
+            val = os.environ.get(key)
         if val is not None:
             env[key] = val
     # Desktop / interactive session credentials.
@@ -343,7 +348,7 @@ def fetch_onepassword_secrets(
     if not valid:
         return {}, warnings
 
-    token_value = get_source_environment().get(token_env, "").strip()
+    token_value = secret_source_environ().get(token_env, "").strip()
     cache_key: _CacheKey = (
         _auth_fingerprint(token_env),
         account or "",
@@ -421,6 +426,7 @@ def apply_onepassword_secrets(
     if not enabled:
         return result
 
+    target_env = cast(MutableMapping[str, str], secret_source_environ())
     valid, warnings = _validate_references(env)
     result.warnings.extend(warnings)
 
@@ -431,7 +437,7 @@ def apply_onepassword_secrets(
             # Never let a resolved secret clobber the very token used to auth.
             result.skipped.append(name)
             continue
-        if not override_existing and os.environ.get(name):
+        if not override_existing and target_env.get(name):
             result.skipped.append(name)
             continue
         refs_to_fetch[name] = ref
@@ -479,11 +485,11 @@ def apply_onepassword_secrets(
             if name not in result.skipped:
                 result.skipped.append(name)
             continue
-        if not override_existing and os.environ.get(name):
+        if not override_existing and target_env.get(name):
             if name not in result.skipped:
                 result.skipped.append(name)
             continue
-        os.environ[name] = value
+        target_env[name] = value
         result.applied.append(name)
 
     return result

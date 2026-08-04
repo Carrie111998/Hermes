@@ -86,4 +86,45 @@ class TestCallbackAuthFailClosed:
         adapter._message_handler = None
         assert adapter._is_callback_user_authorized("12345") is True
 
+    def test_registered_profile_check_precedes_process_env(self, monkeypatch):
+        """Secondary-profile buttons must not use the primary allowlist."""
+        monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "6940705170")
+        adapter = _make_adapter()
+        adapter._message_handler = None
+        adapter.set_authorization_check(
+            lambda user_id, chat_type, chat_id: user_id == "429731663"
+        )
+
+        assert adapter._is_callback_user_authorized(
+            "429731663",
+            chat_id="429731663",
+            chat_type="dm",
+        ) is True
+        assert adapter._is_callback_user_authorized(
+            "6940705170",
+            chat_id="6940705170",
+            chat_type="dm",
+        ) is False
+
+    def test_env_fallback_is_profile_scoped_in_multiplex(self, monkeypatch):
+        """Fallback auth must not reuse another profile's allowlist."""
+        from agent import secret_scope as ss
+
+        monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "primary-user")
+        monkeypatch.delenv("GATEWAY_ALLOW_ALL_USERS", raising=False)
+        adapter = _make_adapter()
+        adapter._message_handler = None
+        adapter._authorization_check = None
+
+        ss.set_multiplex_active(True)
+        token = ss.set_secret_scope(
+            {"TELEGRAM_ALLOWED_USERS": "personal-user"}
+        )
+        try:
+            assert adapter._is_callback_user_authorized("personal-user") is True
+            assert adapter._is_callback_user_authorized("primary-user") is False
+        finally:
+            ss.reset_secret_scope(token)
+            ss.set_multiplex_active(False)
+
 

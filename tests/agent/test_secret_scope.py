@@ -1,4 +1,8 @@
 """Tests for the profile-scoped credential primitive (Workstream A / Phase 2)."""
+
+import os
+import shlex
+
 import pytest
 
 from agent import secret_scope as ss
@@ -217,6 +221,24 @@ class TestEnvFileParsing:
             "ANTHROPIC_API_KEY": "sk-profile"
         }
 
+    def test_build_profile_secret_scope_loads_op_bootstrap_without_overriding_env(
+        self, tmp_path
+    ):
+        (tmp_path / ".env").write_text(
+            "OP_SERVICE_ACCOUNT_TOKEN=env-token\n",
+            encoding="utf-8",
+        )
+        (tmp_path / ".op.env").write_text(
+            "OP_SERVICE_ACCOUNT_TOKEN=bootstrap-token\n"
+            "OP_SESSION_personal=session-value\n",
+            encoding="utf-8",
+        )
+
+        scope = ss.build_profile_secret_scope(tmp_path)
+
+        assert scope["OP_SERVICE_ACCOUNT_TOKEN"] == "env-token"
+        assert scope["OP_SESSION_personal"] == "session-value"
+
     def test_build_profile_secret_scope_includes_home_external_secrets(
         self, tmp_path, monkeypatch
     ):
@@ -250,7 +272,6 @@ class TestEnvFileParsing:
         )
 
         assert ss.build_profile_secret_scope(profile) == {}
-
 
 class TestApiServerListenerGlobals:
     """API_SERVER listener settings are deployment config (#69379), not
@@ -287,3 +308,79 @@ class TestApiServerListenerGlobals:
         finally:
             ss.reset_secret_scope(token)
         assert not ss._is_global_env("API_SERVER_KEY")
+    @pytest.mark.skipif(os.name == "nt", reason="command secret source is POSIX-only")
+    def test_build_profile_secret_scope_resolves_profile_command_source_in_memory(
+        self, tmp_path, monkeypatch
+    ):
+        key = "PROFILE_SCOPED_TEST_TOKEN"
+        monkeypatch.delenv(key, raising=False)
+        helper = tmp_path / "secret-helper.sh"
+        helper.write_text(
+            "#!/bin/sh\nprintf 'PROFILE_SCOPED_TEST_TOKEN=from-helper\\n'\n",
+            encoding="utf-8",
+        )
+        helper.chmod(0o700)
+        (tmp_path / "config.yaml").write_text(
+            f"secrets:\n  command:\n    enabled: true\n    command: \"'{helper}'\"\n",
+            encoding="utf-8",
+        )
+
+        scope = ss.build_profile_secret_scope(tmp_path)
+
+        assert scope[key] == "from-helper"
+        assert key not in os.environ
+
+    @pytest.mark.skipif(os.name == "nt", reason="command secret source is POSIX-only")
+    def test_profile_command_source_does_not_inherit_another_profile_secret(
+        self, tmp_path, monkeypatch
+    ):
+        key = "PROFILE_SCOPED_NO_LEAK_TOKEN"
+        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "foreign-token")
+        helper = tmp_path / "secret-helper.sh"
+        helper.write_text(
+            "#!/bin/sh\n"
+            "if [ \"${TELEGRAM_BOT_TOKEN:-}\" = foreign-token ]; then\n"
+            "  result=leaked\n"
+            "else\n"
+            "  result=safe\n"
+            "fi\n"
+            "printf 'PROFILE_SCOPED_NO_LEAK_TOKEN=%s\\n' \"$result\"\n",
+            encoding="utf-8",
+        )
+        helper.chmod(0o700)
+        (tmp_path / "config.yaml").write_text(
+            f"secrets:\n  command:\n    enabled: true\n    command: \"'{helper}'\"\n",
+            encoding="utf-8",
+        )
+
+        scope = ss.build_profile_secret_scope(tmp_path)
+
+        assert scope[key] == "safe"
+        assert os.environ["TELEGRAM_BOT_TOKEN"] == "foreign-token"
+
+    @pytest.mark.skipif(os.name == "nt", reason="command secret source is POSIX-only")
+    def test_build_profile_secret_scope_caches_profile_command_source(
+        self, tmp_path, monkeypatch
+    ):
+        key = "PROFILE_SCOPED_CACHE_TOKEN"
+        monkeypatch.delenv(key, raising=False)
+        counter = tmp_path / "helper-calls"
+        helper = tmp_path / "secret-helper.sh"
+        helper.write_text(
+            "#!/bin/sh\n"
+            f"printf x >> {shlex.quote(str(counter))}\n"
+            "printf 'PROFILE_SCOPED_CACHE_TOKEN=from-helper\\n'\n",
+            encoding="utf-8",
+        )
+        helper.chmod(0o700)
+        (tmp_path / "config.yaml").write_text(
+            f"secrets:\n  command:\n    enabled: true\n    command: \"'{helper}'\"\n",
+            encoding="utf-8",
+        )
+
+        first = ss.build_profile_secret_scope(tmp_path)
+        second = ss.build_profile_secret_scope(tmp_path)
+
+        assert first[key] == "from-helper"
+        assert second[key] == "from-helper"
+        assert counter.read_text(encoding="utf-8") == "x"
