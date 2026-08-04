@@ -1499,10 +1499,12 @@ def _collect_auto_append_media_tags(
         if msg.get("role") not in ("tool", "function"):
             continue
         call_id = str(msg.get("tool_call_id") or msg.get("call_id") or "")
-        if tool_name_by_call_id.get(call_id) not in _AUTO_APPEND_MEDIA_TOOL_NAMES:
+        tool_name = tool_name_by_call_id.get(call_id) or str(
+            msg.get("tool_name") or msg.get("name") or ""
+        )
+        if tool_name not in _AUTO_APPEND_MEDIA_TOOL_NAMES:
             continue
         content = str(msg.get("content") or "")
-        tool_name = tool_name_by_call_id.get(call_id)
         # JSON-payload tools (image_generate) return a local-file path in a
         # known field rather than a MEDIA: tag. Extract it so delivery is
         # deterministic even when the model omits the path from its reply.
@@ -19075,7 +19077,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "reply_to": reply_anchor,
                     "metadata": thread_meta,
                 }
-                await adapter.send_voice(**send_kwargs)
+                send_result = await adapter.send_voice(**send_kwargs)
+                if send_result is not None and not getattr(send_result, "success", True):
+                    logger.warning(
+                        "Auto voice reply delivery failed: %s",
+                        getattr(send_result, "error", "send returned success=False"),
+                    )
         except Exception as e:
             logger.warning("Auto voice reply failed: %s", e, exc_info=True)
         finally:
@@ -21406,6 +21413,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "words. Do not guess at the content; ask the user "
                             "to resend or type it out.]"
                         )
+
                         continue
                     successful_transcripts.append(transcript)
                     # Pass the transcript through as a plain quoted line. The
