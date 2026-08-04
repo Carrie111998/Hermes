@@ -271,9 +271,12 @@ hermes config unset agent.disabled_toolsets
 |------|-------------|
 | *(none)* | Hermes Agent + Rust acceleration (llm-pipeline, context-governor, poly-kv) |
 | `--with-semantic-memory` | + semantic-memory MCP server (prebuilt binary) + auto-register + disable built-in memory |
-| `--with-agent-graph` | + agent-graph MCP server (prebuilt binary) + auto-register |
-| `--with-all-mcp` | + both MCP servers |
-| `--with-josh-setup` | + everything: MCP servers + 70+ skills + 12 agent hooks + full auto-config |
+| `--with-agent-graph` | + agent-graph MCP server (prebuilt binary) + auto-register + systemd unit |
+| `--with-claim-ledger` | + claim-ledger MCP server (prebuilt binary) + auto-register |
+| `--with-cea-graph` | + cea-graph MCP server (binary + Python relay) + auto-register |
+| `--with-pilot-bridge` | + pilot-bridge MCP server (binary + Python relay) + auto-register |
+| `--with-all-mcp` | + all five MCP servers above |
+| `--with-josh-setup` | + everything: all 5 MCP servers + 70+ skills + 12 hooks + full auto-config |
 | `--skip-rust` | Skip PyO3 wheels (Python-only fallback) |
 | `--no-venv` | Use system Python instead of uv-managed venv |
 | `--skip-setup` | Skip post-install setup wizard |
@@ -307,16 +310,16 @@ hermes
 
 | Daemon | Unit | Port/socket |
 |--------|------|------------|
-| semantic-memory | `semantic-memory.service` | stdio MCP (Hermes spawns) or `--http-port 1738` if you add the flag |
+| semantic-memory | `semantic-memory.service` | stdio MCP or `--http-port 1738` |
 | agent-graph | `agent-graph-mcpd.service` | `~/.local/share/agent-graph/run/mcp.sock` |
 
-**Daemons not in the installer** (source-only, build with `cargo install`):
+**Additional MCP servers** (stdio, spawned by Hermes — no daemon needed):
 
-| Daemon | What it does |
-|--------|-------------|
-| `claim-ledger-mcp` | Evidence/claim verification ledger — stdio MCP, needs `--ledger-dir` arg |
-| `cea-graph` | Causal edit attribution — Python relay to cea-bridge |
-| `pilot-bridge` | Forge-pilot bridge — Python relay for OODA loops |
+| Server | Flag | What it does |
+|--------|------|-------------|
+| claim-ledger | `--with-claim-ledger` | Hash-chained proof debt tracking, claim verification, cryptographic receipts |
+| cea-graph | `--with-cea-graph` | Causal Edit Attribution — predicts code edit risk from real causal graph |
+| pilot-bridge | `--with-pilot-bridge` | Forge-pilot OODA loops — observe, bootstrap, evaluate Rust workspaces |
 
 ### Rust acceleration — active paths
 
