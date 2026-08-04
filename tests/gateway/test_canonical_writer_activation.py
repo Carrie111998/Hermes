@@ -166,6 +166,88 @@ def test_absent_install_parent_accepts_only_root_controlled_existing_ancestor(
         )
 
 
+def test_native_install_creates_exact_root_parents_before_artifacts(monkeypatch):
+    payload = b"sealed-artifact"
+    digest = activation.hashlib.sha256(payload).hexdigest()
+    artifacts = {
+        "writer_config": activation.InstallArtifact(
+            source_path=Path("/stage/writer.json"),
+            target_path=Path("/etc/muncho-canonical-writer/writer.json"),
+            sha256=digest,
+            mode=0o440,
+            uid=0,
+            gid=994,
+            maximum_bytes=1024,
+        ),
+        "gateway_config": activation.InstallArtifact(
+            source_path=Path("/stage/gateway.yaml"),
+            target_path=Path("/etc/hermes/config.yaml"),
+            sha256=digest,
+            mode=0o444,
+            uid=0,
+            gid=0,
+            maximum_bytes=1024,
+        ),
+        "writer_unit": activation.InstallArtifact(
+            source_path=Path("/stage/writer.service"),
+            target_path=Path("/etc/systemd/system/writer.service"),
+            sha256=digest,
+            mode=0o644,
+            uid=0,
+            gid=0,
+            maximum_bytes=1024,
+        ),
+        "gateway_unit": activation.InstallArtifact(
+            source_path=Path("/stage/gateway.service"),
+            target_path=Path("/etc/systemd/system/gateway.service"),
+            sha256=digest,
+            mode=0o644,
+            uid=0,
+            gid=0,
+            maximum_bytes=1024,
+        ),
+    }
+    events = []
+    monkeypatch.setattr(
+        activation,
+        "_native_artifact_contract",
+        lambda _plan: artifacts,
+    )
+    monkeypatch.setattr(
+        activation,
+        "_ensure_root_directory",
+        lambda path, *, mode=0o700: events.append(("parent", path, mode)),
+    )
+    monkeypatch.setattr(
+        activation,
+        "_read_trusted_file",
+        lambda *_args, **_kwargs: payload,
+    )
+    monkeypatch.setattr(
+        activation,
+        "_install_exact_bytes",
+        lambda path, _payload, **_kwargs: events.append(("install", path)) or True,
+    )
+
+    created = activation._install_native_observation_artifacts(
+        activation.NativeObservationPlan(value={})
+    )
+
+    assert events[:3] == [
+        ("parent", Path("/etc/hermes"), 0o755),
+        ("parent", Path("/etc/muncho-canonical-writer"), 0o755),
+        ("parent", Path("/etc/systemd/system"), 0o755),
+    ]
+    assert events[3:] == [
+        ("install", artifacts[name].target_path)
+        for name in ("writer_config", "gateway_config", "writer_unit", "gateway_unit")
+    ]
+    assert created == tuple(
+        artifacts[name].target_path
+        for name in ("writer_config", "gateway_config", "writer_unit", "gateway_unit")
+    )
+
+
 @pytest.mark.parametrize(
     ("mode", "uid", "gid", "xattrs"),
     (
