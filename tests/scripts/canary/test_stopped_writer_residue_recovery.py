@@ -167,13 +167,15 @@ def _native_plan_mapping(
     gateway_sha256: str,
     writer_unit_sha256: str,
     gateway_unit_sha256: str,
+    phase_b_readiness_unit_sha256: str | None = None,
+    schema: str = recovery.LEGACY_NATIVE_OBSERVATION_PLAN_SCHEMA,
     collector_sha256: str = COLLECTOR_SHA256,
     external_iam_policy_sha256: str = "e" * 64,
 ) -> dict[str, Any]:
     root = f"/opt/muncho-canary-releases/{SOURCE_REVISION}"
     interpreter = f"{root}/venv/bin/python"
-    return {
-        "schema": "muncho-writer-native-observation-plan.v2",
+    mapping = {
+        "schema": schema,
         "boot_id_sha256": "b" * 64,
         "host_identity_sha256": "c" * 64,
         "observation_id": "11111111-1111-4111-8111-111111111111",
@@ -267,6 +269,20 @@ def _native_plan_mapping(
         ),
         "external_iam_policy_sha256": external_iam_policy_sha256,
     }
+    if schema == recovery.NATIVE_OBSERVATION_PLAN_SCHEMA:
+        if phase_b_readiness_unit_sha256 is None:
+            raise ValueError("current native plan requires readiness unit binding")
+        mapping["phase_b_readiness_unit"] = {
+            "name": recovery.PHASE_B_READINESS_UNIT_NAME,
+            "path": (
+                "/etc/systemd/system/"
+                f"{recovery.PHASE_B_READINESS_UNIT_NAME}"
+            ),
+            "sha256": phase_b_readiness_unit_sha256,
+        }
+    elif phase_b_readiness_unit_sha256 is not None:
+        raise ValueError("legacy native plan forbids readiness unit binding")
+    return mapping
 
 
 def _legacy_plan(current: dict[str, Any]) -> dict[str, Any]:
@@ -304,6 +320,82 @@ def test_cli_imports_under_remote_minimal_python() -> None:
 
     assert completed.returncode == 0, completed.stderr.decode("utf-8", errors="replace")
     assert b"Quarantine one exact stopped writer staging residue" in completed.stdout
+
+
+def test_recovery_service_parser_accepts_only_static_stopped_readiness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    unit = recovery.PHASE_B_READINESS_UNIT_NAME
+    monkeypatch.setattr(recovery, "_STOPPED_SERVICE_UNITS", (unit,))
+    raw = "\n".join((
+        "LoadState=loaded",
+        "ActiveState=inactive",
+        "SubState=dead",
+        "UnitFileState=static",
+        "MainPID=0",
+        f"FragmentPath=/etc/systemd/system/{unit}",
+        "DropInPaths=",
+        "",
+    ))
+
+    state = recovery._parse_recovery_service_observation(unit, raw)
+
+    assert state["state"] == "disabled_inactive"
+    assert state["properties"]["UnitFileState"] == "static"
+    recovery._validate_service_states([state])
+    with pytest.raises(RuntimeError, match="not safely stopped"):
+        recovery._parse_recovery_service_observation(
+            unit,
+            raw.replace("UnitFileState=static", "UnitFileState=disabled"),
+        )
+
+
+@pytest.mark.parametrize(
+    "unit",
+    (
+        "muncho-canonical-writer-export.timer",
+        "muncho-isolated-worker.socket",
+    ),
+)
+def test_recovery_service_parser_normalizes_only_pidless_main_pid(
+    unit: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(recovery, "_STOPPED_SERVICE_UNITS", (unit,))
+    raw = "\n".join((
+        "LoadState=loaded",
+        "ActiveState=inactive",
+        "SubState=dead",
+        "UnitFileState=disabled",
+        f"FragmentPath=/etc/systemd/system/{unit}",
+        "DropInPaths=",
+        "",
+    ))
+
+    state = recovery._parse_recovery_service_observation(unit, raw)
+
+    assert state["state"] == "disabled_inactive"
+    assert state["properties"]["MainPID"] == "0"
+    recovery._validate_service_states([state])
+
+
+def test_recovery_service_parser_rejects_missing_main_pid_for_service(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    unit = recovery.WRITER_UNIT_NAME
+    monkeypatch.setattr(recovery, "_STOPPED_SERVICE_UNITS", (unit,))
+    raw = "\n".join((
+        "LoadState=loaded",
+        "ActiveState=inactive",
+        "SubState=dead",
+        "UnitFileState=disabled",
+        f"FragmentPath=/etc/systemd/system/{unit}",
+        "DropInPaths=",
+        "",
+    ))
+
+    with pytest.raises(RuntimeError, match="output is incomplete"):
+        recovery._parse_recovery_service_observation(unit, raw)
 
 
 def test_lightweight_collector_receipt_loader_preserves_exact_boundary(
@@ -359,6 +451,14 @@ def recovery_tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, 
         staging_root / "muncho-canonical-writer-phase-b-readiness.service"
     )
     gateway_unit_path = staging_root / "hermes-cloud-gateway.service"
+    live_root = tmp_path / "live"
+    live_writer_unit_path = live_root / "muncho-canonical-writer.service"
+    live_phase_b_unit_path = (
+        live_root / "muncho-canonical-writer-phase-b-readiness.service"
+    )
+    live_gateway_unit_path = live_root / "hermes-cloud-gateway.service"
+    live_writer_config_path = live_root / "writer.json"
+    live_gateway_config_path = live_root / "gateway.yaml"
     owner_approval_path = staging_root / "owner-approval.json"
     external_iam_path = staging_root / "external-iam-receipt.json"
     quarantine_path = tmp_path / "writer-failure" / "quarantine.json"
@@ -430,6 +530,31 @@ def recovery_tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, 
     )
     monkeypatch.setattr(
         recovery,
+        "DEFAULT_LIVE_WRITER_UNIT_PATH",
+        live_writer_unit_path,
+    )
+    monkeypatch.setattr(
+        recovery,
+        "DEFAULT_LIVE_PHASE_B_READINESS_UNIT_PATH",
+        live_phase_b_unit_path,
+    )
+    monkeypatch.setattr(
+        recovery,
+        "DEFAULT_LIVE_GATEWAY_UNIT_PATH",
+        live_gateway_unit_path,
+    )
+    monkeypatch.setattr(
+        recovery,
+        "DEFAULT_LIVE_WRITER_CONFIG_PATH",
+        live_writer_config_path,
+    )
+    monkeypatch.setattr(
+        recovery,
+        "DEFAULT_LIVE_GATEWAY_CONFIG_PATH",
+        live_gateway_config_path,
+    )
+    monkeypatch.setattr(
+        recovery,
         "DEFAULT_STAGED_OWNER_APPROVAL_PATH",
         owner_approval_path,
     )
@@ -464,6 +589,11 @@ def recovery_tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, 
             writer_unit_path,
             phase_b_unit_path,
             gateway_unit_path,
+            live_writer_unit_path,
+            live_phase_b_unit_path,
+            live_gateway_unit_path,
+            live_writer_config_path,
+            live_gateway_config_path,
         ),
     )
     monkeypatch.setattr(recovery, "_STOPPED_SERVICE_UNITS", (unit,))
@@ -535,6 +665,11 @@ def recovery_tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, 
         "writer_unit_path": writer_unit_path,
         "phase_b_unit_path": phase_b_unit_path,
         "gateway_unit_path": gateway_unit_path,
+        "live_writer_unit_path": live_writer_unit_path,
+        "live_phase_b_unit_path": live_phase_b_unit_path,
+        "live_gateway_unit_path": live_gateway_unit_path,
+        "live_writer_config_path": live_writer_config_path,
+        "live_gateway_config_path": live_gateway_config_path,
         "owner_approval_path": owner_approval_path,
         "external_iam_path": external_iam_path,
         "quarantine_path": quarantine_path,
@@ -790,11 +925,18 @@ def _write_failed_native_bundle(
     *,
     host_identity_convergence_failure: bool = False,
     install_failure: bool = False,
+    installed_live_artifacts: bool = False,
+    current_native_schema: bool = False,
 ) -> tuple[dict[Path, bytes], bytes, bytes]:
     if host_identity_convergence_failure and install_failure:
         raise ValueError("test failure shape must be exact")
     writer_unit = b"[Service]\nExecStart=/writer\n"
     gateway_unit = b"[Service]\nExecStart=/gateway\n"
+    phase_b_unit = recovery.render_phase_b_readiness_service(
+        revision=SOURCE_REVISION,
+        artifact_root=f"/opt/muncho-canary-releases/{SOURCE_REVISION}",
+        artifact_sha256="d" * 64,
+    ).encode()
     policy_receipt = recovery.ExternalIAMReceipt.from_mapping(
         _external_iam_mapping(source_approval_sha256="0" * 64)
     )
@@ -803,6 +945,14 @@ def _write_failed_native_bundle(
         gateway_sha256=_sha256(recovery_tree["gateway_raw"]),
         writer_unit_sha256=_sha256(writer_unit),
         gateway_unit_sha256=_sha256(gateway_unit),
+        phase_b_readiness_unit_sha256=(
+            _sha256(phase_b_unit) if current_native_schema else None
+        ),
+        schema=(
+            recovery.NATIVE_OBSERVATION_PLAN_SCHEMA
+            if current_native_schema
+            else recovery.LEGACY_NATIVE_OBSERVATION_PLAN_SCHEMA
+        ),
         external_iam_policy_sha256=policy_receipt.policy_sha256,
     )
     native = recovery.NativeObservationPlan.from_mapping(native_mapping)
@@ -824,11 +974,6 @@ def _write_failed_native_bundle(
     )
     owner_raw = recovery._canonical_bytes(owner.to_mapping())
     iam_raw = recovery._canonical_bytes(iam.to_mapping())
-    phase_b_unit = recovery.render_phase_b_readiness_service(
-        revision=SOURCE_REVISION,
-        artifact_root=f"/opt/muncho-canary-releases/{SOURCE_REVISION}",
-        artifact_sha256="d" * 64,
-    ).encode()
     extras = {
         recovery_tree["native_plan_path"]: native_raw,
         recovery_tree["writer_unit_path"]: writer_unit,
@@ -839,6 +984,18 @@ def _write_failed_native_bundle(
     }
     for path, raw in extras.items():
         path.write_bytes(raw)
+    if installed_live_artifacts:
+        live = {
+            recovery_tree["live_writer_unit_path"]: writer_unit,
+            recovery_tree["live_gateway_unit_path"]: gateway_unit,
+            recovery_tree["live_writer_config_path"]: recovery_tree["writer_raw"],
+            recovery_tree["live_gateway_config_path"]: recovery_tree["gateway_raw"],
+        }
+        if current_native_schema:
+            live[recovery_tree["live_phase_b_unit_path"]] = phase_b_unit
+        for path, raw in live.items():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(raw)
     recovery_tree["installed_native_plan_path"].write_bytes(native_raw)
     failure_path = (
         recovery_tree["native_failure_root"]
@@ -1128,6 +1285,333 @@ def test_apply_archives_exact_native_install_failure_chain(
     assert receipt["failure_receipt_preserved"] is True
 
 
+def test_install_failure_recovery_archives_exact_live_artifacts_and_reloads(
+    recovery_tree: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_failed_native_bundle(
+        recovery_tree,
+        install_failure=True,
+        installed_live_artifacts=True,
+    )
+    before = [{
+        "unit": "muncho-canonical-writer.service",
+        "state": "disabled_inactive",
+        "properties": {
+            "LoadState": "loaded",
+            "ActiveState": "inactive",
+            "SubState": "dead",
+            "UnitFileState": "disabled",
+            "MainPID": "0",
+            "FragmentPath": (
+                "/etc/systemd/system/muncho-canonical-writer.service"
+            ),
+            "DropInPaths": "",
+        },
+    }]
+    after = recovery._service_states_after_native_artifact_archive(before)
+    current = {"value": before}
+    reloads = []
+    monkeypatch.setattr(
+        recovery,
+        "_collect_service_states",
+        lambda: current["value"],
+    )
+
+    def read_exact(item, path):
+        raw = path.read_bytes()
+        if _sha256(raw) != item["sha256"]:
+            raise RuntimeError("installed native artifact digest drifted")
+        return raw
+
+    def reload_units():
+        reloads.append(True)
+        current["value"] = after
+
+    def live_contract(native, *, base_archive):
+        specs = (
+            (
+                "writer_unit",
+                recovery_tree["live_writer_unit_path"],
+                native.value["writer_unit"]["sha256"],
+                0,
+                0,
+                0o644,
+                recovery._MAX_UNIT_BYTES,
+            ),
+            (
+                "gateway_unit",
+                recovery_tree["live_gateway_unit_path"],
+                native.value["gateway_unit"]["sha256"],
+                0,
+                0,
+                0o644,
+                recovery._MAX_UNIT_BYTES,
+            ),
+            (
+                "writer_config",
+                recovery_tree["live_writer_config_path"],
+                native.value["writer_config"]["sha256"],
+                0,
+                recovery.CANARY_WRITER_GID,
+                0o440,
+                recovery._MAX_CONFIG_BYTES,
+            ),
+            (
+                "gateway_config",
+                recovery_tree["live_gateway_config_path"],
+                native.value["gateway_config"]["sha256"],
+                0,
+                0,
+                0o444,
+                recovery._MAX_CONFIG_BYTES,
+            ),
+        )
+        return [
+            {
+                "name": name,
+                "source_path": str(path),
+                "archive_path": str(
+                    recovery._live_artifact_archive_path(base_archive, path)
+                ),
+                "sha256": sha256,
+                "uid": uid,
+                "gid": gid,
+                "mode": mode,
+                "maximum_bytes": maximum,
+            }
+            for name, path, sha256, uid, gid, mode, maximum in specs
+        ]
+
+    monkeypatch.setattr(recovery, "_read_exact_live_artifact", read_exact)
+    monkeypatch.setattr(recovery, "_native_live_artifact_contract", live_contract)
+    monkeypatch.setattr(
+        recovery,
+        "_observed_native_live_artifacts",
+        lambda native, *, base_archive: live_contract(
+            native,
+            base_archive=base_archive,
+        ),
+    )
+    monkeypatch.setattr(recovery, "_daemon_reload", reload_units)
+
+    plan = recovery.plan_stopped_writer_residue_recovery(TARGET_REVISION)
+    assert len(plan["installed_native_artifacts"]) == 4
+    assert plan["invariants"]["units_installed"] is True
+
+    receipt = recovery.apply_stopped_writer_residue_recovery(
+        TARGET_REVISION,
+        plan["plan_sha256"],
+        clock=lambda: 895,
+        lifecycle_lock=contextlib.nullcontext,
+    )
+
+    assert reloads == [True]
+    for item in plan["installed_native_artifacts"]:
+        assert not Path(item["source_path"]).exists()
+        assert Path(item["archive_path"]).exists()
+    assert receipt["installed_native_artifacts_archived"] is True
+    assert receipt["installed_native_artifacts_deleted"] is False
+    assert receipt["daemon_reloaded_after_installed_artifact_archive"] is True
+    assert receipt["service_states_after"] == after
+
+
+def test_v3_install_crash_recovery_archives_static_readiness_and_resumes(
+    recovery_tree: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_failed_native_bundle(
+        recovery_tree,
+        install_failure=True,
+        installed_live_artifacts=True,
+        current_native_schema=True,
+    )
+    writer_unit = recovery.WRITER_UNIT_NAME
+    readiness_unit = recovery.PHASE_B_READINESS_UNIT_NAME
+    before = [
+        {
+            "unit": writer_unit,
+            "state": "disabled_inactive",
+            "properties": {
+                "LoadState": "loaded",
+                "ActiveState": "inactive",
+                "SubState": "dead",
+                "UnitFileState": "disabled",
+                "MainPID": "0",
+                "FragmentPath": f"/etc/systemd/system/{writer_unit}",
+                "DropInPaths": "",
+            },
+        },
+        {
+            "unit": readiness_unit,
+            "state": "disabled_inactive",
+            "properties": {
+                "LoadState": "loaded",
+                "ActiveState": "inactive",
+                "SubState": "dead",
+                "UnitFileState": "static",
+                "MainPID": "0",
+                "FragmentPath": f"/etc/systemd/system/{readiness_unit}",
+                "DropInPaths": "",
+            },
+        },
+    ]
+    monkeypatch.setattr(
+        recovery,
+        "_STOPPED_SERVICE_UNITS",
+        (writer_unit, readiness_unit),
+    )
+    recovery._validate_service_states(before)
+    after = recovery._service_states_after_native_artifact_archive(before)
+    current = {"value": before}
+    reloads: list[bool] = []
+    monkeypatch.setattr(
+        recovery,
+        "_collect_service_states",
+        lambda: current["value"],
+    )
+
+    def read_exact(item, path):
+        raw = path.read_bytes()
+        if _sha256(raw) != item["sha256"]:
+            raise RuntimeError("installed native artifact digest drifted")
+        return raw
+
+    def live_contract(native, *, base_archive):
+        specs = (
+            (
+                "writer_unit",
+                recovery_tree["live_writer_unit_path"],
+                native.value["writer_unit"]["sha256"],
+                0,
+                0,
+                0o644,
+                recovery._MAX_UNIT_BYTES,
+            ),
+            (
+                "phase_b_readiness_unit",
+                recovery_tree["live_phase_b_unit_path"],
+                native.value["phase_b_readiness_unit"]["sha256"],
+                0,
+                0,
+                0o644,
+                recovery._MAX_UNIT_BYTES,
+            ),
+            (
+                "gateway_unit",
+                recovery_tree["live_gateway_unit_path"],
+                native.value["gateway_unit"]["sha256"],
+                0,
+                0,
+                0o644,
+                recovery._MAX_UNIT_BYTES,
+            ),
+            (
+                "writer_config",
+                recovery_tree["live_writer_config_path"],
+                native.value["writer_config"]["sha256"],
+                0,
+                recovery.CANARY_WRITER_GID,
+                0o440,
+                recovery._MAX_CONFIG_BYTES,
+            ),
+            (
+                "gateway_config",
+                recovery_tree["live_gateway_config_path"],
+                native.value["gateway_config"]["sha256"],
+                0,
+                0,
+                0o444,
+                recovery._MAX_CONFIG_BYTES,
+            ),
+        )
+        return [
+            {
+                "name": name,
+                "source_path": str(path),
+                "archive_path": str(
+                    recovery._live_artifact_archive_path(base_archive, path)
+                ),
+                "sha256": sha256,
+                "uid": uid,
+                "gid": gid,
+                "mode": mode,
+                "maximum_bytes": maximum,
+            }
+            for name, path, sha256, uid, gid, mode, maximum in specs
+        ]
+
+    def reload_units():
+        reloads.append(True)
+        current["value"] = after
+
+    monkeypatch.setattr(recovery, "_read_exact_live_artifact", read_exact)
+    monkeypatch.setattr(recovery, "_native_live_artifact_contract", live_contract)
+    monkeypatch.setattr(
+        recovery,
+        "_observed_native_live_artifacts",
+        lambda native, *, base_archive: live_contract(
+            native,
+            base_archive=base_archive,
+        ),
+    )
+    monkeypatch.setattr(recovery, "_daemon_reload", reload_units)
+
+    plan = recovery.plan_stopped_writer_residue_recovery(TARGET_REVISION)
+    assert len(plan["installed_native_artifacts"]) == 5
+    assert {
+        item["name"] for item in plan["installed_native_artifacts"]
+    } == {
+        "writer_unit",
+        "phase_b_readiness_unit",
+        "gateway_unit",
+        "writer_config",
+        "gateway_config",
+    }
+
+    original_rename = recovery.os.rename
+    live_sources = {
+        Path(item["source_path"]) for item in plan["installed_native_artifacts"]
+    }
+    live_renames = {"count": 0}
+
+    def crash_during_second_live_rename(source, destination):
+        if Path(source) in live_sources:
+            live_renames["count"] += 1
+            if live_renames["count"] == 2:
+                raise RuntimeError("simulated process crash during live archive")
+        return original_rename(source, destination)
+
+    monkeypatch.setattr(recovery.os, "rename", crash_during_second_live_rename)
+    with pytest.raises(RuntimeError, match="simulated process crash"):
+        recovery.apply_stopped_writer_residue_recovery(
+            TARGET_REVISION,
+            plan["plan_sha256"],
+            clock=lambda: 895,
+            lifecycle_lock=contextlib.nullcontext,
+        )
+    assert sum(
+        Path(item["archive_path"]).exists()
+        for item in plan["installed_native_artifacts"]
+    ) == 1
+    monkeypatch.setattr(recovery.os, "rename", original_rename)
+
+    receipt = recovery.apply_stopped_writer_residue_recovery(
+        TARGET_REVISION,
+        plan["plan_sha256"],
+        clock=lambda: 896,
+        lifecycle_lock=contextlib.nullcontext,
+    )
+
+    assert reloads == [True]
+    assert receipt["installed_native_artifacts_archived"] is True
+    assert receipt["daemon_reloaded_after_installed_artifact_archive"] is True
+    assert receipt["service_states_after"] == after
+    for item in plan["installed_native_artifacts"]:
+        assert not Path(item["source_path"]).exists()
+        assert Path(item["archive_path"]).exists()
+
+
 def test_install_failure_recovery_rejects_host_state_digest_drift(
     recovery_tree: dict[str, Any],
 ) -> None:
@@ -1221,6 +1705,7 @@ def test_failed_native_plan_cannot_be_downcast_to_installed_native_schema(
     downcast = dict(plan)
     downcast["schema"] = recovery.INSTALLED_NATIVE_PLAN_SCHEMA
     del downcast["failed_native_observation"]
+    del downcast["installed_native_artifacts"]
     downcast["invariants"] = {
         name: value
         for name, value in downcast["invariants"].items()
@@ -1228,8 +1713,11 @@ def test_failed_native_plan_cannot_be_downcast_to_installed_native_schema(
         not in {
             "failure_quarantine_archived",
             "failure_quarantine_deleted",
-            "failure_receipt_preserved",
-        }
+                "failure_receipt_preserved",
+                "installed_native_artifacts_archived",
+                "installed_native_artifacts_deleted",
+                "daemon_reloaded_after_installed_artifact_archive",
+            }
     }
     unsigned = {
         name: value for name, value in downcast.items() if name != "plan_sha256"

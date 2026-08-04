@@ -17,6 +17,8 @@ import hashlib
 import json
 import os
 import re
+import stat
+import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -27,27 +29,36 @@ from gateway.canonical_writer_host_authority import (
     DEFAULT_EXTERNAL_IAM_LIVE_PATH,
     DEFAULT_NATIVE_OBSERVATION_EVIDENCE_ROOT,
     ExternalIAMReceipt,
+    LEGACY_NATIVE_OBSERVATION_PLAN_SCHEMA,
+    NATIVE_OBSERVATION_PLAN_SCHEMA,
     NativeObservationPlan,
     OwnerApprovalReceipt,
 )
 from gateway.canonical_writer_host_identity import (
+    CANARY_WRITER_GID,
     _host_identities_are_exact as _pure_host_identities_are_exact,
     _host_identity_snapshot as _pure_host_identity_snapshot,
 )
 from gateway.canonical_writer_release_contract import (
     GATEWAY_UNIT_NAME,
+    PHASE_B_READINESS_UNIT_NAME,
     WRITER_UNIT_NAME,
+    _CONTROL_RE,
     render_phase_b_readiness_service,
 )
 from scripts.canary.writer_release import (
     _ACTIVATION_PATHS,
+    _PIDLESS_SERVICE_UNITS,
     _SERVICE_PROPERTIES,
     _STOPPED_SERVICE_UNITS,
-    _collect_service_states,
+    _bounded_command_stdout,
     _fsync_directory,
     _publish_bytes_no_replace,
     _read_stable_root_file,
+    _runner,
+    _service_observation_command,
     _validate_root_directory,
+    _validate_root_executable,
     _validate_root_parent_chain,
     host_release_lifecycle_lock as _host_activation_lock,
 )
@@ -59,9 +70,12 @@ PLAN_SCHEMA = "muncho-stopped-writer-residue-recovery-plan.v2"
 RECEIPT_SCHEMA = "muncho-stopped-writer-residue-recovery.v2"
 INSTALLED_NATIVE_PLAN_SCHEMA = "muncho-stopped-writer-residue-recovery-plan.v3"
 INSTALLED_NATIVE_RECEIPT_SCHEMA = "muncho-stopped-writer-residue-recovery.v3"
-FAILED_NATIVE_PLAN_SCHEMA = "muncho-stopped-writer-residue-recovery-plan.v4"
-FAILED_NATIVE_RECEIPT_SCHEMA = "muncho-stopped-writer-residue-recovery.v4"
+LEGACY_FAILED_NATIVE_PLAN_SCHEMA = "muncho-stopped-writer-residue-recovery-plan.v4"
+LEGACY_FAILED_NATIVE_RECEIPT_SCHEMA = "muncho-stopped-writer-residue-recovery.v4"
+FAILED_NATIVE_PLAN_SCHEMA = "muncho-stopped-writer-residue-recovery-plan.v5"
+FAILED_NATIVE_RECEIPT_SCHEMA = "muncho-stopped-writer-residue-recovery.v5"
 FAILURE_SCHEMA = "muncho-stopped-writer-residue-recovery-failure.v1"
+_MAX_SERVICE_OUTPUT_BYTES = 64 * 1024
 
 DEFAULT_WRITER_CONFIG_SOURCE_PATH = Path(
     "/etc/muncho/writer-activation/staged/writer.json"
@@ -85,6 +99,19 @@ DEFAULT_STAGED_PHASE_B_READINESS_UNIT_PATH = Path(
 DEFAULT_STAGED_GATEWAY_UNIT_PATH = Path(
     "/etc/muncho/writer-activation/staged/hermes-cloud-gateway.service"
 )
+DEFAULT_LIVE_WRITER_UNIT_PATH = Path(
+    "/etc/systemd/system/muncho-canonical-writer.service"
+)
+DEFAULT_LIVE_PHASE_B_READINESS_UNIT_PATH = Path(
+    "/etc/systemd/system/muncho-canonical-writer-phase-b-readiness.service"
+)
+DEFAULT_LIVE_GATEWAY_UNIT_PATH = Path(
+    "/etc/systemd/system/hermes-cloud-gateway.service"
+)
+DEFAULT_LIVE_WRITER_CONFIG_PATH = Path(
+    "/etc/muncho-canonical-writer/writer.json"
+)
+DEFAULT_LIVE_GATEWAY_CONFIG_PATH = Path("/etc/hermes/config.yaml")
 DEFAULT_STAGED_OWNER_APPROVAL_PATH = Path(
     "/etc/muncho/writer-activation/staged/owner-approval.json"
 )
@@ -93,6 +120,8 @@ DEFAULT_STAGED_EXTERNAL_IAM_PATH = Path(
 )
 DEFAULT_QUARANTINE_PATH = Path("/var/lib/muncho-writer-activation/quarantine.json")
 DEFAULT_NATIVE_FAILURE_ROOT = Path("/var/lib/muncho-writer-activation/native-plans")
+SYSTEMCTL = "/usr/bin/systemctl"
+_FIXED_ENV = {"LC_ALL": "C", "LANG": "C", "PATH": "/usr/bin:/bin"}
 CONFIG_COLLECTOR_EVIDENCE_ROOT = Path(
     "/var/lib/muncho-writer-canary-evidence/config-collector"
 )
@@ -504,6 +533,195 @@ def _decode_native_plan(raw: bytes) -> NativeObservationPlan:
     return plan
 
 
+def _live_artifact_archive_path(base: Path, source: Path) -> Path:
+    return base.with_name(f"{base.name}.installed-{source.name}")
+
+
+def _native_live_artifact_contract(
+    native: NativeObservationPlan,
+    *,
+    base_archive: Path,
+) -> list[dict[str, Any]]:
+    value = native.value
+    schemas = {
+        LEGACY_NATIVE_OBSERVATION_PLAN_SCHEMA,
+        NATIVE_OBSERVATION_PLAN_SCHEMA,
+    }
+    if value.get("schema") not in schemas:
+        raise ValueError("native observation plan schema is not recoverable")
+    specs: list[tuple[str, Path, int, int, int, int]] = [
+        ("writer_unit", DEFAULT_LIVE_WRITER_UNIT_PATH, 0, 0, 0o644, _MAX_UNIT_BYTES),
+        ("gateway_unit", DEFAULT_LIVE_GATEWAY_UNIT_PATH, 0, 0, 0o644, _MAX_UNIT_BYTES),
+        (
+            "writer_config",
+            DEFAULT_LIVE_WRITER_CONFIG_PATH,
+            0,
+            CANARY_WRITER_GID,
+            0o440,
+            _MAX_CONFIG_BYTES,
+        ),
+        (
+            "gateway_config",
+            DEFAULT_LIVE_GATEWAY_CONFIG_PATH,
+            0,
+            0,
+            0o444,
+            _MAX_CONFIG_BYTES,
+        ),
+    ]
+    if value.get("schema") == NATIVE_OBSERVATION_PLAN_SCHEMA:
+        specs.insert(
+            1,
+            (
+                "phase_b_readiness_unit",
+                DEFAULT_LIVE_PHASE_B_READINESS_UNIT_PATH,
+                0,
+                0,
+                0o644,
+                _MAX_UNIT_BYTES,
+            ),
+        )
+    result: list[dict[str, Any]] = []
+    for name, source, uid, gid, mode, maximum in specs:
+        binding = value[name]
+        if binding.get("path") != str(source):
+            raise ValueError("native installed artifact path is not exact")
+        result.append({
+            "name": name,
+            "source_path": str(source),
+            "archive_path": str(_live_artifact_archive_path(base_archive, source)),
+            "sha256": _digest(binding.get("sha256"), f"native installed {name}"),
+            "uid": uid,
+            "gid": gid,
+            "mode": mode,
+            "maximum_bytes": maximum,
+        })
+    return result
+
+
+def _read_exact_live_artifact(binding: Mapping[str, Any], path: Path) -> bytes:
+    _validate_root_parent_chain(path.parent)
+    before = os.lstat(path)
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or stat.S_ISLNK(before.st_mode)
+        or before.st_uid != binding["uid"]
+        or before.st_gid != binding["gid"]
+        or before.st_nlink != 1
+        or stat.S_IMODE(before.st_mode) != binding["mode"]
+        or not 0 <= before.st_size <= binding["maximum_bytes"]
+        or os.listxattr(path, follow_symlinks=False)
+    ):
+        raise RuntimeError("installed native artifact is not exact")
+    descriptor = os.open(
+        path,
+        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            opened.st_dev,
+            opened.st_ino,
+            opened.st_mode,
+            opened.st_uid,
+            opened.st_gid,
+            opened.st_nlink,
+            opened.st_size,
+        ) != (
+            before.st_dev,
+            before.st_ino,
+            before.st_mode,
+            before.st_uid,
+            before.st_gid,
+            before.st_nlink,
+            before.st_size,
+        ):
+            raise RuntimeError("installed native artifact changed during open")
+        chunks: list[bytes] = []
+        size = 0
+        while chunk := os.read(
+            descriptor,
+            min(64 * 1024, binding["maximum_bytes"] + 1 - size),
+        ):
+            chunks.append(chunk)
+            size += len(chunk)
+            if size > binding["maximum_bytes"]:
+                raise RuntimeError("installed native artifact exceeds its bound")
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    reachable = os.lstat(path)
+    identities = (
+        "st_dev",
+        "st_ino",
+        "st_mode",
+        "st_uid",
+        "st_gid",
+        "st_nlink",
+        "st_size",
+        "st_mtime_ns",
+        "st_ctime_ns",
+    )
+    if any(
+        getattr(item, name) != getattr(before, name)
+        for item in (after, reachable)
+        for name in identities
+    ):
+        raise RuntimeError("installed native artifact changed during read")
+    raw = b"".join(chunks)
+    if _sha256_bytes(raw) != binding["sha256"]:
+        raise RuntimeError("installed native artifact digest drifted")
+    return raw
+
+
+def _observed_native_live_artifacts(
+    native: NativeObservationPlan,
+    *,
+    base_archive: Path,
+) -> list[dict[str, Any]]:
+    names = ["writer_unit", "gateway_unit", "writer_config", "gateway_config"]
+    if native.value.get("schema") == NATIVE_OBSERVATION_PLAN_SCHEMA:
+        names.insert(1, "phase_b_readiness_unit")
+    candidate_presence = [
+        os.path.lexists(str(native.value[name]["path"])) for name in names
+    ]
+    if not any(candidate_presence):
+        return []
+    if not all(candidate_presence):
+        raise RuntimeError("installed native artifact residue is partial")
+    contract = _native_live_artifact_contract(native, base_archive=base_archive)
+    present = [os.path.lexists(item["source_path"]) for item in contract]
+    if not any(present):
+        return []
+    if not all(present):
+        raise RuntimeError("installed native artifact residue is partial")
+    for item in contract:
+        archive = Path(item["archive_path"])
+        if os.path.lexists(archive):
+            raise RuntimeError("installed native artifact archive collides")
+        _read_exact_live_artifact(item, Path(item["source_path"]))
+    return contract
+
+
+def _daemon_reload() -> None:
+    _validate_root_executable(Path(SYSTEMCTL))
+    result = subprocess.run(
+        (SYSTEMCTL, "daemon-reload"),
+        env=_FIXED_ENV,
+        check=False,
+        shell=False,
+        capture_output=True,
+        timeout=60,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            "residue recovery daemon reload failed: "
+            f"rc={result.returncode} "
+            f"stdout_sha256={_sha256_bytes(result.stdout)} "
+            f"stderr_sha256={_sha256_bytes(result.stderr)}"
+        )
+
+
 def _validate_failed_native_authority_bundle(
     *,
     root: Path,
@@ -878,6 +1096,14 @@ def _validate_planner_bundle_bindings(
             "ca_sha256": collector.value["database"]["ca_sha256"],
         },
     }
+    if value.get("schema") == NATIVE_OBSERVATION_PLAN_SCHEMA:
+        expected["phase_b_readiness_unit"] = {
+            "name": PHASE_B_READINESS_UNIT_NAME,
+            "path": f"/etc/systemd/system/{PHASE_B_READINESS_UNIT_NAME}",
+            "sha256": staged_artifacts[
+                DEFAULT_STAGED_PHASE_B_READINESS_UNIT_PATH.name
+            ],
+        }
     for name, binding in expected.items():
         if value.get(name) != binding:
             raise ValueError(f"staged native observation {name} binding drifted")
@@ -1098,10 +1324,14 @@ def _activation_inventory(
     staged_names: Sequence[str],
     *,
     installed_native_plan: bool = False,
+    installed_native_artifacts: Sequence[Mapping[str, Any]] = (),
 ) -> list[dict[str, str]]:
-    recoverable = _recoverable_activation_paths(
+    recoverable = set(_recoverable_activation_paths(
         staged_names,
         installed_native_plan=installed_native_plan,
+    ))
+    recoverable.update(
+        Path(str(item["source_path"])) for item in installed_native_artifacts
     )
     inventory: list[dict[str, str]] = []
     for path in _ACTIVATION_PATHS:
@@ -1147,7 +1377,11 @@ def _validate_service_states(value: Any) -> list[dict[str, Any]]:
         if item["state"] == "disabled_inactive":
             expected.update({
                 "LoadState": "loaded",
-                "UnitFileState": "disabled",
+                "UnitFileState": (
+                    "static"
+                    if unit == PHASE_B_READINESS_UNIT_NAME
+                    else "disabled"
+                ),
                 "FragmentPath": f"/etc/systemd/system/{unit}",
             })
         if dict(properties) != expected:
@@ -1158,6 +1392,114 @@ def _validate_service_states(value: Any) -> list[dict[str, Any]]:
             "properties": dict(properties),
         })
     return validated
+
+
+def _parse_recovery_service_observation(unit: str, raw: str) -> dict[str, Any]:
+    """Parse one stopped service using this recovery schema's exact unit state."""
+
+    if unit not in _STOPPED_SERVICE_UNITS:
+        raise ValueError("residue recovery service is not in the fixed inventory")
+    if not isinstance(raw, str) or any(
+        character in raw for character in ("\x00", "\r")
+    ):
+        raise RuntimeError("residue recovery service output is invalid")
+    values: dict[str, str] = {}
+    for line in raw.splitlines():
+        if not line or "=" not in line:
+            raise RuntimeError("residue recovery service output is malformed")
+        name, item = line.split("=", 1)
+        if name not in _SERVICE_PROPERTIES or name in values:
+            raise RuntimeError(
+                "residue recovery service output has unexpected fields"
+            )
+        if _CONTROL_RE.search(item) is not None:
+            raise RuntimeError("residue recovery service value is invalid")
+        values[name] = item
+    missing = set(_SERVICE_PROPERTIES) - set(values)
+    if missing == {"MainPID"} and unit in _PIDLESS_SERVICE_UNITS:
+        values["MainPID"] = "0"
+    elif missing:
+        raise RuntimeError("residue recovery service output is incomplete")
+    if re.fullmatch(r"0|[1-9][0-9]*", values["MainPID"]) is None:
+        raise RuntimeError("residue recovery service PID is invalid")
+
+    absent = {
+        "LoadState": "not-found",
+        "ActiveState": "inactive",
+        "SubState": "dead",
+        "UnitFileState": "",
+        "MainPID": "0",
+        "FragmentPath": "",
+        "DropInPaths": "",
+    }
+    installed = {
+        "LoadState": "loaded",
+        "ActiveState": "inactive",
+        "SubState": "dead",
+        "UnitFileState": (
+            "static" if unit == PHASE_B_READINESS_UNIT_NAME else "disabled"
+        ),
+        "MainPID": "0",
+        "FragmentPath": f"/etc/systemd/system/{unit}",
+        "DropInPaths": "",
+    }
+    if values == absent:
+        state = "absent"
+    elif values == installed:
+        state = "disabled_inactive"
+    else:
+        raise RuntimeError("residue recovery service is not safely stopped")
+    return {
+        "unit": unit,
+        "state": state,
+        "properties": {name: values[name] for name in _SERVICE_PROPERTIES},
+    }
+
+
+def _collect_service_states(*, runner: Callable[..., Any] = _runner) -> list[dict[str, Any]]:
+    states: list[dict[str, Any]] = []
+    for unit in _STOPPED_SERVICE_UNITS:
+        raw = _bounded_command_stdout(
+            _service_observation_command(unit),
+            runner=runner,
+            label="stopped writer residue service observation",
+            maximum_bytes=_MAX_SERVICE_OUTPUT_BYTES,
+        )
+        states.append(_parse_recovery_service_observation(unit, raw))
+    return states
+
+
+def _service_states_after_native_artifact_archive(
+    before: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    affected = {
+        WRITER_UNIT_NAME,
+        PHASE_B_READINESS_UNIT_NAME,
+        GATEWAY_UNIT_NAME,
+    }
+    result: list[dict[str, Any]] = []
+    for item in before:
+        if item["unit"] not in affected:
+            result.append({
+                "unit": item["unit"],
+                "state": item["state"],
+                "properties": dict(item["properties"]),
+            })
+            continue
+        result.append({
+            "unit": item["unit"],
+            "state": "absent",
+            "properties": {
+                "LoadState": "not-found",
+                "ActiveState": "inactive",
+                "SubState": "dead",
+                "UnitFileState": "",
+                "MainPID": "0",
+                "FragmentPath": "",
+                "DropInPaths": "",
+            },
+        })
+    return result
 
 
 def _plan_from_live(target_revision: str) -> dict[str, Any]:
@@ -1191,6 +1533,7 @@ def _plan_from_live(target_revision: str) -> dict[str, Any]:
     ):
         raise RuntimeError("installed native plan archive collides")
     failed_native: Mapping[str, str] | None = None
+    installed_native_artifacts: list[dict[str, Any]] = []
     if frozenset(staged_artifacts) == _failed_native_bundle_names():
         if installed_native is None:
             raise RuntimeError("failed native residue lacks installed native plan")
@@ -1214,9 +1557,14 @@ def _plan_from_live(target_revision: str) -> dict[str, Any]:
         )
         if os.path.lexists(failed_native["archive_path"]):
             raise RuntimeError("native failure quarantine archive collides")
+        installed_native_artifacts = _observed_native_live_artifacts(
+            native,
+            base_archive=archive,
+        )
     inventory = _activation_inventory(
         tuple(staged_artifacts),
         installed_native_plan=installed_native is not None,
+        installed_native_artifacts=installed_native_artifacts,
     )
     unsigned: dict[str, Any] = {
         "schema": (
@@ -1245,7 +1593,7 @@ def _plan_from_live(target_revision: str) -> dict[str, Any]:
         "service_states": _collect_service_states(),
         "invariants": {
             "services_started": False,
-            "units_installed": False,
+            "units_installed": bool(installed_native_artifacts),
             "daemon_reloaded": False,
             "credential_content_or_digest_recorded": False,
             "staging_directory_renamed_atomically": True,
@@ -1262,11 +1610,19 @@ def _plan_from_live(target_revision: str) -> dict[str, Any]:
         }
     if failed_native is not None:
         unsigned["failed_native_observation"] = dict(failed_native)
+        unsigned["installed_native_artifacts"] = installed_native_artifacts
         unsigned["invariants"] = {
             **unsigned["invariants"],
             "failure_quarantine_archived": True,
             "failure_quarantine_deleted": False,
             "failure_receipt_preserved": True,
+            "installed_native_artifacts_archived": bool(
+                installed_native_artifacts
+            ),
+            "installed_native_artifacts_deleted": False,
+            "daemon_reloaded_after_installed_artifact_archive": bool(
+                installed_native_artifacts
+            ),
         }
     return {**unsigned, "plan_sha256": _sha256_json(unsigned)}
 
@@ -1283,6 +1639,7 @@ def validate_plan_mapping(
         LEGACY_PLAN_SCHEMA,
         PLAN_SCHEMA,
         INSTALLED_NATIVE_PLAN_SCHEMA,
+        LEGACY_FAILED_NATIVE_PLAN_SCHEMA,
         FAILED_NATIVE_PLAN_SCHEMA,
     }:
         raise ValueError("residue recovery plan fields are not exact")
@@ -1308,13 +1665,20 @@ def validate_plan_mapping(
     if schema in {
         PLAN_SCHEMA,
         INSTALLED_NATIVE_PLAN_SCHEMA,
+        LEGACY_FAILED_NATIVE_PLAN_SCHEMA,
         FAILED_NATIVE_PLAN_SCHEMA,
     }:
         expected_fields.add("staged_artifacts")
-    if schema in {INSTALLED_NATIVE_PLAN_SCHEMA, FAILED_NATIVE_PLAN_SCHEMA}:
+    if schema in {
+        INSTALLED_NATIVE_PLAN_SCHEMA,
+        LEGACY_FAILED_NATIVE_PLAN_SCHEMA,
+        FAILED_NATIVE_PLAN_SCHEMA,
+    }:
         expected_fields.add("installed_native_observation_plan")
-    if schema == FAILED_NATIVE_PLAN_SCHEMA:
+    if schema in {LEGACY_FAILED_NATIVE_PLAN_SCHEMA, FAILED_NATIVE_PLAN_SCHEMA}:
         expected_fields.add("failed_native_observation")
+    if schema == FAILED_NATIVE_PLAN_SCHEMA:
+        expected_fields.add("installed_native_artifacts")
     if set(value) != expected_fields:
         raise ValueError("residue recovery plan fields are not exact")
     target = _revision(value["target_release_revision"])
@@ -1333,6 +1697,7 @@ def validate_plan_mapping(
     expected_artifact_sets = {
         PLAN_SCHEMA: {_collector_pair_names(), _planner_bundle_names()},
         INSTALLED_NATIVE_PLAN_SCHEMA: {_planner_bundle_names()},
+        LEGACY_FAILED_NATIVE_PLAN_SCHEMA: {_failed_native_bundle_names()},
         FAILED_NATIVE_PLAN_SCHEMA: {_failed_native_bundle_names()},
     }
     if (
@@ -1341,7 +1706,11 @@ def validate_plan_mapping(
     ):
         raise ValueError("residue recovery plan schema artifact set is invalid")
     installed_native: Mapping[str, Any] | None = None
-    if schema in {INSTALLED_NATIVE_PLAN_SCHEMA, FAILED_NATIVE_PLAN_SCHEMA}:
+    if schema in {
+        INSTALLED_NATIVE_PLAN_SCHEMA,
+        LEGACY_FAILED_NATIVE_PLAN_SCHEMA,
+        FAILED_NATIVE_PLAN_SCHEMA,
+    }:
         raw_installed = value["installed_native_observation_plan"]
         if not isinstance(raw_installed, Mapping) or set(raw_installed) != {
             "source_path",
@@ -1382,7 +1751,7 @@ def validate_plan_mapping(
         ):
             raise ValueError("installed native observation plan binding drifted")
     failed_native: Mapping[str, Any] | None = None
-    if schema == FAILED_NATIVE_PLAN_SCHEMA:
+    if schema in {LEGACY_FAILED_NATIVE_PLAN_SCHEMA, FAILED_NATIVE_PLAN_SCHEMA}:
         failed_native = value["failed_native_observation"]
         expected_failure_archive = _quarantine_archive_path(
             target,
@@ -1424,6 +1793,87 @@ def validate_plan_mapping(
             or _FAILURE_FILE_RE.fullmatch(failure_receipt_path.name) is None
         ):
             raise ValueError("failed native observation binding drifted")
+    installed_native_artifacts: list[Mapping[str, Any]] = []
+    if schema == FAILED_NATIVE_PLAN_SCHEMA:
+        raw_live = value["installed_native_artifacts"]
+        if not isinstance(raw_live, list):
+            raise ValueError("installed native artifact bindings are invalid")
+        fixed = {
+            "writer_unit": (DEFAULT_LIVE_WRITER_UNIT_PATH, 0, 0, 0o644, _MAX_UNIT_BYTES),
+            "phase_b_readiness_unit": (
+                DEFAULT_LIVE_PHASE_B_READINESS_UNIT_PATH,
+                0,
+                0,
+                0o644,
+                _MAX_UNIT_BYTES,
+            ),
+            "gateway_unit": (DEFAULT_LIVE_GATEWAY_UNIT_PATH, 0, 0, 0o644, _MAX_UNIT_BYTES),
+            "writer_config": (
+                DEFAULT_LIVE_WRITER_CONFIG_PATH,
+                0,
+                CANARY_WRITER_GID,
+                0o440,
+                _MAX_CONFIG_BYTES,
+            ),
+            "gateway_config": (
+                DEFAULT_LIVE_GATEWAY_CONFIG_PATH,
+                0,
+                0,
+                0o444,
+                _MAX_CONFIG_BYTES,
+            ),
+        }
+        names = [item.get("name") for item in raw_live if isinstance(item, Mapping)]
+        if raw_live and names not in (
+            ["writer_unit", "gateway_unit", "writer_config", "gateway_config"],
+            [
+                "writer_unit",
+                "phase_b_readiness_unit",
+                "gateway_unit",
+                "writer_config",
+                "gateway_config",
+            ],
+        ):
+            raise ValueError("installed native artifact bindings drifted")
+        for item in raw_live:
+            if not isinstance(item, Mapping) or set(item) != {
+                "name",
+                "source_path",
+                "archive_path",
+                "sha256",
+                "uid",
+                "gid",
+                "mode",
+                "maximum_bytes",
+            }:
+                raise ValueError("installed native artifact bindings are invalid")
+            if (
+                not isinstance(item["name"], str)
+                or type(item["uid"]) is not int
+                or type(item["gid"]) is not int
+                or type(item["mode"]) is not int
+                or type(item["maximum_bytes"]) is not int
+            ):
+                raise ValueError("installed native artifact bindings are invalid")
+            source_path, uid, gid, mode, maximum = fixed[str(item["name"])]
+            if item != {
+                "name": item["name"],
+                "source_path": str(source_path),
+                "archive_path": str(
+                    _live_artifact_archive_path(
+                        Path(str(value["archive_path"])), source_path
+                    )
+                ),
+                "sha256": _digest(
+                    item["sha256"], "installed native artifact digest"
+                ),
+                "uid": uid,
+                "gid": gid,
+                "mode": mode,
+                "maximum_bytes": maximum,
+            }:
+                raise ValueError("installed native artifact bindings drifted")
+        installed_native_artifacts = raw_live
     if (
         value["writer_config_path"] != str(DEFAULT_WRITER_CONFIG_SOURCE_PATH)
         or value["gateway_config_path"] != str(DEFAULT_GATEWAY_CONFIG_SOURCE_PATH)
@@ -1438,9 +1888,12 @@ def validate_plan_mapping(
     inventory = value["activation_inventory"]
     if not isinstance(inventory, list) or len(inventory) != len(_ACTIVATION_PATHS):
         raise ValueError("residue recovery inventory is invalid")
-    recoverable = _recoverable_activation_paths(
+    recoverable = set(_recoverable_activation_paths(
         tuple(artifact_names),
         installed_native_plan=installed_native is not None,
+    ))
+    recoverable.update(
+        Path(str(item["source_path"])) for item in installed_native_artifacts
     )
     for path, item in zip(_ACTIVATION_PATHS, inventory, strict=True):
         expected_state = (
@@ -1450,7 +1903,7 @@ def validate_plan_mapping(
             raise ValueError("residue recovery inventory drifted")
     expected_invariants = {
         "services_started": False,
-        "units_installed": False,
+        "units_installed": bool(installed_native_artifacts),
         "daemon_reloaded": False,
         "credential_content_or_digest_recorded": False,
         "staging_directory_renamed_atomically": True,
@@ -1459,19 +1912,34 @@ def validate_plan_mapping(
     if schema in {
         PLAN_SCHEMA,
         INSTALLED_NATIVE_PLAN_SCHEMA,
+        LEGACY_FAILED_NATIVE_PLAN_SCHEMA,
         FAILED_NATIVE_PLAN_SCHEMA,
     }:
         expected_invariants["staged_artifacts_deleted"] = False
-    if schema in {INSTALLED_NATIVE_PLAN_SCHEMA, FAILED_NATIVE_PLAN_SCHEMA}:
+    if schema in {
+        INSTALLED_NATIVE_PLAN_SCHEMA,
+        LEGACY_FAILED_NATIVE_PLAN_SCHEMA,
+        FAILED_NATIVE_PLAN_SCHEMA,
+    }:
         expected_invariants.update({
             "installed_native_observation_plan_archived": True,
             "installed_native_observation_plan_deleted": False,
         })
-    if schema == FAILED_NATIVE_PLAN_SCHEMA:
+    if schema in {LEGACY_FAILED_NATIVE_PLAN_SCHEMA, FAILED_NATIVE_PLAN_SCHEMA}:
         expected_invariants.update({
             "failure_quarantine_archived": True,
             "failure_quarantine_deleted": False,
             "failure_receipt_preserved": True,
+        })
+    if schema == FAILED_NATIVE_PLAN_SCHEMA:
+        expected_invariants.update({
+            "installed_native_artifacts_archived": bool(
+                installed_native_artifacts
+            ),
+            "installed_native_artifacts_deleted": False,
+            "daemon_reloaded_after_installed_artifact_archive": bool(
+                installed_native_artifacts
+            ),
         })
     if value["invariants"] != expected_invariants:
         raise ValueError("residue recovery invariants drifted")
@@ -1515,6 +1983,7 @@ def _validate_current_state(plan: Mapping[str, Any]) -> str:
     installed = plan.get("installed_native_observation_plan")
     has_installed = plan.get("schema") in {
         INSTALLED_NATIVE_PLAN_SCHEMA,
+        LEGACY_FAILED_NATIVE_PLAN_SCHEMA,
         FAILED_NATIVE_PLAN_SCHEMA,
     }
     if has_installed != isinstance(installed, Mapping):
@@ -1537,30 +2006,75 @@ def _validate_current_state(plan: Mapping[str, Any]) -> str:
         )
         if _sha256_bytes(installed_raw) != installed["sha256"]:
             raise RuntimeError("installed native observation plan digest drifted")
-        _decode_native_plan(installed_raw)
-    recoverable = _recoverable_activation_paths(
+        native = _decode_native_plan(installed_raw)
+    else:
+        native = None
+    live_bindings = plan.get("installed_native_artifacts", [])
+    if not isinstance(live_bindings, list):
+        raise RuntimeError("installed native artifact state is invalid")
+    if live_bindings:
+        if native is None:
+            raise RuntimeError("installed native artifacts lack a native plan")
+        expected_live = _native_live_artifact_contract(
+            native,
+            base_archive=archive,
+        )
+        if live_bindings != expected_live:
+            raise RuntimeError("installed native artifact binding drifted")
+    live_source_presence: dict[Path, bool] = {}
+    for item in live_bindings:
+        live_source = Path(str(item["source_path"]))
+        live_archive = Path(str(item["archive_path"]))
+        source_present = os.path.lexists(live_source)
+        archive_present = os.path.lexists(live_archive)
+        if source_present == archive_present:
+            raise RuntimeError("installed native artifact state is ambiguous")
+        current_live = live_source if source_present else live_archive
+        _read_exact_live_artifact(item, current_live)
+        live_source_presence[live_source] = source_present
+    recoverable = set(_recoverable_activation_paths(
         tuple(current_artifacts),
         installed_native_plan=has_installed,
-    )
+    ))
+    recoverable.update(live_source_presence)
     for path in _ACTIVATION_PATHS:
         if path in recoverable:
             expected_present = (
                 installed_source_exists
                 if path == DEFAULT_INSTALLED_NATIVE_PLAN_PATH
-                else source_exists
+                else (
+                    live_source_presence[path]
+                    if path in live_source_presence
+                    else source_exists
+                )
             )
             if expected_present != os.path.lexists(path):
                 raise RuntimeError("residue recovery source presence drifted")
         elif os.path.lexists(path):
             raise RuntimeError("non-recoverable stopped activation path is present")
-    if _collect_service_states() != plan["service_states"]:
+    observed_service_states = _collect_service_states()
+    before_service_states = plan["service_states"]
+    after_service_states = _service_states_after_native_artifact_archive(
+        before_service_states
+    )
+    any_live_source = any(live_source_presence.values())
+    if any_live_source:
+        if observed_service_states != before_service_states:
+            raise RuntimeError("residue recovery service state drifted")
+    elif live_bindings:
+        if observed_service_states not in (before_service_states, after_service_states):
+            raise RuntimeError("residue recovery service state drifted")
+    elif observed_service_states != before_service_states:
         raise RuntimeError("residue recovery service state drifted")
     if source_exists:
         state = "source" if installed_source_exists else "installed_native_archived"
     else:
         state = "staging_archived" if installed_source_exists else "archive"
     failed = plan.get("failed_native_observation")
-    has_failed = plan.get("schema") == FAILED_NATIVE_PLAN_SCHEMA
+    has_failed = plan.get("schema") in {
+        LEGACY_FAILED_NATIVE_PLAN_SCHEMA,
+        FAILED_NATIVE_PLAN_SCHEMA,
+    }
     if has_failed != isinstance(failed, Mapping):
         raise RuntimeError("native failure quarantine state is invalid")
     if has_failed:
@@ -1611,6 +2125,11 @@ def _validate_current_state(plan: Mapping[str, Any]) -> str:
                 raise RuntimeError("native failure quarantine moved before residue")
         elif state == "archive":
             state = "quarantine_pending"
+    if live_bindings and state == "archive":
+        if any_live_source:
+            state = "live_artifacts_pending"
+        elif observed_service_states == before_service_states:
+            state = "daemon_reload_pending"
     return state
 
 
@@ -1659,9 +2178,13 @@ def _receipt_unsigned(
                 FAILED_NATIVE_RECEIPT_SCHEMA
                 if schema == FAILED_NATIVE_PLAN_SCHEMA
                 else (
-                    INSTALLED_NATIVE_RECEIPT_SCHEMA
-                    if schema == INSTALLED_NATIVE_PLAN_SCHEMA
-                    else RECEIPT_SCHEMA
+                    LEGACY_FAILED_NATIVE_RECEIPT_SCHEMA
+                    if schema == LEGACY_FAILED_NATIVE_PLAN_SCHEMA
+                    else (
+                        INSTALLED_NATIVE_RECEIPT_SCHEMA
+                        if schema == INSTALLED_NATIVE_PLAN_SCHEMA
+                        else RECEIPT_SCHEMA
+                    )
                 )
             )
         ),
@@ -1687,17 +2210,32 @@ def _receipt_unsigned(
     if not legacy:
         unsigned["staged_artifacts"] = _plan_staged_artifacts(plan)
         unsigned["staged_artifacts_deleted"] = False
-    if schema in {INSTALLED_NATIVE_PLAN_SCHEMA, FAILED_NATIVE_PLAN_SCHEMA}:
+    if schema in {
+        INSTALLED_NATIVE_PLAN_SCHEMA,
+        LEGACY_FAILED_NATIVE_PLAN_SCHEMA,
+        FAILED_NATIVE_PLAN_SCHEMA,
+    }:
         unsigned["installed_native_observation_plan"] = plan[
             "installed_native_observation_plan"
         ]
         unsigned["installed_native_observation_plan_archived"] = True
         unsigned["installed_native_observation_plan_deleted"] = False
-    if schema == FAILED_NATIVE_PLAN_SCHEMA:
+    if schema in {LEGACY_FAILED_NATIVE_PLAN_SCHEMA, FAILED_NATIVE_PLAN_SCHEMA}:
         unsigned["failed_native_observation"] = plan["failed_native_observation"]
         unsigned["failure_quarantine_archived"] = True
         unsigned["failure_quarantine_deleted"] = False
         unsigned["failure_receipt_preserved"] = True
+    if schema == FAILED_NATIVE_PLAN_SCHEMA:
+        unsigned["installed_native_artifacts"] = plan[
+            "installed_native_artifacts"
+        ]
+        unsigned["installed_native_artifacts_archived"] = bool(
+            plan["installed_native_artifacts"]
+        )
+        unsigned["installed_native_artifacts_deleted"] = False
+        unsigned["daemon_reloaded_after_installed_artifact_archive"] = bool(
+            plan["installed_native_artifacts"]
+        )
     return unsigned
 
 
@@ -1711,10 +2249,17 @@ def validate_receipt_mapping(
         raise ValueError("residue recovery receipt is not an object")
     created_at = value.get("created_at_unix")
     service_states_after = value.get("service_states_after")
+    expected_after = (
+        _service_states_after_native_artifact_archive(
+            validated_plan["service_states"]
+        )
+        if validated_plan.get("installed_native_artifacts")
+        else validated_plan["service_states"]
+    )
     if (
         type(created_at) is not int
         or created_at < 0
-        or service_states_after != validated_plan["service_states"]
+        or service_states_after != expected_after
     ):
         raise ValueError("residue recovery receipt binding drifted")
     unsigned = _receipt_unsigned(
@@ -1772,6 +2317,7 @@ def apply_stopped_writer_residue_recovery(
         state = _validate_current_state(plan)
         if plan.get("schema") in {
             INSTALLED_NATIVE_PLAN_SCHEMA,
+            LEGACY_FAILED_NATIVE_PLAN_SCHEMA,
             FAILED_NATIVE_PLAN_SCHEMA,
         } and state in {
             "source",
@@ -1804,7 +2350,10 @@ def apply_stopped_writer_residue_recovery(
             _fsync_directory(RECOVERY_ROOT)
         state = _validate_current_state(plan)
         if (
-            plan.get("schema") == FAILED_NATIVE_PLAN_SCHEMA
+            plan.get("schema") in {
+                LEGACY_FAILED_NATIVE_PLAN_SCHEMA,
+                FAILED_NATIVE_PLAN_SCHEMA,
+            }
             and state == "quarantine_pending"
         ):
             failed = plan["failed_native_observation"]
@@ -1819,13 +2368,42 @@ def apply_stopped_writer_residue_recovery(
             os.rename(failure_source, failure_archive)
             _fsync_directory(failure_source.parent)
             _fsync_directory(RECOVERY_ROOT)
+        state = _validate_current_state(plan)
+        if state == "live_artifacts_pending":
+            for item in plan["installed_native_artifacts"]:
+                live_source = Path(str(item["source_path"]))
+                live_archive = Path(str(item["archive_path"]))
+                source_exists = os.path.lexists(live_source)
+                archive_exists = os.path.lexists(live_archive)
+                if source_exists == archive_exists:
+                    raise RuntimeError("installed native artifact state is ambiguous")
+                if archive_exists:
+                    continue
+                _read_exact_live_artifact(item, live_source)
+                source_item = os.lstat(live_source)
+                recovery_item = os.lstat(RECOVERY_ROOT)
+                if source_item.st_dev != recovery_item.st_dev:
+                    raise RuntimeError(
+                        "installed native artifact rename is not atomic"
+                    )
+                os.rename(live_source, live_archive)
+                _fsync_directory(live_source.parent)
+                _fsync_directory(RECOVERY_ROOT)
+            state = _validate_current_state(plan)
+        if state == "daemon_reload_pending":
+            _daemon_reload()
         if _validate_current_state(plan) != "archive":
             raise RuntimeError("residue recovery archive was not established")
         existing = _load_terminal_receipt(plan)
         if existing is not None:
             return existing
         after = _collect_service_states()
-        if after != plan["service_states"]:
+        expected_after = (
+            _service_states_after_native_artifact_archive(plan["service_states"])
+            if plan.get("installed_native_artifacts")
+            else plan["service_states"]
+        )
+        if after != expected_after:
             raise RuntimeError("residue recovery terminal service state drifted")
         unsigned = _receipt_unsigned(
             plan,

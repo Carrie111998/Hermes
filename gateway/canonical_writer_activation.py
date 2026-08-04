@@ -50,6 +50,7 @@ from gateway.canonical_writer_host_authority import (
     NativeObservationPlan,
     NativeObservationReceipt,
     NATIVE_OBSERVATION_STAGE_SCHEMA,
+    NATIVE_OBSERVATION_PLAN_SCHEMA,
     OWNER_APPROVAL_RECEIPT_SCHEMA,
     OwnerApprovalReceipt,
     current_host_identity_sha256,
@@ -2292,13 +2293,18 @@ def _native_artifact_contract(
     plan: NativeObservationPlan,
 ) -> Mapping[str, InstallArtifact]:
     value = plan.value
+    if value.get("schema") != NATIVE_OBSERVATION_PLAN_SCHEMA:
+        raise ValueError("legacy native observation plan is recovery-only")
     writer_unit = value["writer_unit"]
+    readiness_unit = value["phase_b_readiness_unit"]
     gateway_unit = value["gateway_unit"]
     writer_config = value["writer_config"]
     gateway_config = value["gateway_config"]
     exact = (
         writer_unit["name"] == WRITER_UNIT
         and writer_unit["path"] == str(DEFAULT_WRITER_UNIT_PATH)
+        and readiness_unit["name"] == PHASE_B_READINESS_UNIT
+        and readiness_unit["path"] == str(DEFAULT_PHASE_B_READINESS_UNIT_PATH)
         and gateway_unit["name"] == GATEWAY_UNIT
         and gateway_unit["path"] == str(DEFAULT_GATEWAY_UNIT_PATH)
         and writer_config["path"] == str(DEFAULT_WRITER_CONFIG_PATH)
@@ -2320,6 +2326,15 @@ def _native_artifact_contract(
             source_path=DEFAULT_STAGED_GATEWAY_UNIT_PATH,
             target_path=DEFAULT_GATEWAY_UNIT_PATH,
             sha256=gateway_unit["sha256"],
+            mode=0o644,
+            uid=0,
+            gid=0,
+            maximum_bytes=256 * 1024,
+        ),
+        "phase_b_readiness_unit": InstallArtifact(
+            source_path=DEFAULT_STAGED_PHASE_B_READINESS_UNIT_PATH,
+            target_path=DEFAULT_PHASE_B_READINESS_UNIT_PATH,
+            sha256=readiness_unit["sha256"],
             mode=0o644,
             uid=0,
             gid=0,
@@ -2361,6 +2376,7 @@ def _install_native_observation_artifacts(
             "writer_config",
             "gateway_config",
             "writer_unit",
+            "phase_b_readiness_unit",
             "gateway_unit",
         ):
             artifact = artifacts[name]
@@ -2405,6 +2421,39 @@ def _install_native_observation_artifacts(
                 [install_error, *rollback],
             ) from None
         raise
+
+
+def _rollback_native_observation_artifacts(
+    plan: NativeObservationPlan,
+    created: Sequence[Path],
+    *,
+    runner: Runner,
+) -> None:
+    artifacts = _native_artifact_contract(plan)
+    by_path = {item.target_path: item for item in artifacts.values()}
+    rollback: list[BaseException] = []
+    for path in reversed(created):
+        artifact = by_path[path]
+        try:
+            _unlink_exact(
+                path,
+                uid=artifact.uid,
+                gid=artifact.gid,
+                mode=artifact.mode,
+                sha256=artifact.sha256,
+            )
+        except BaseException as exc:
+            rollback.append(exc)
+    try:
+        _run(
+            Command((SYSTEMCTL, "daemon-reload"), timeout_seconds=60),
+            runner=runner,
+            label="native rollback daemon reload",
+        )
+    except BaseException as exc:
+        rollback.append(exc)
+    if rollback:
+        raise ExceptionGroup("native observation artifact rollback failed", rollback)
 
 
 def _ensure_runtime_directory(
@@ -3839,6 +3888,7 @@ class NativeObservationExecutor:
             raise PermissionError("native observation is blocked by quarantine")
 
         permanent_units_installed = False
+        installed_artifacts: tuple[Path, ...] = ()
         daemon_reloaded = False
         lifecycle_start_attempted = False
         host_mutation_attempted = False
@@ -3946,7 +3996,7 @@ class NativeObservationExecutor:
                     scope="native_observation",
                     plan_sha256=self.plan.sha256,
                 )
-                _install_native_observation_artifacts(self.plan)
+                installed_artifacts = _install_native_observation_artifacts(self.plan)
                 permanent_units_installed = True
                 _prepare_native_runtime_directories()
                 self._command(
@@ -3954,6 +4004,7 @@ class NativeObservationExecutor:
                         SYSTEMD_ANALYZE,
                         "verify",
                         str(DEFAULT_WRITER_UNIT_PATH),
+                        str(DEFAULT_PHASE_B_READINESS_UNIT_PATH),
                         str(DEFAULT_GATEWAY_UNIT_PATH),
                     ),
                     "native systemd unit verification",
@@ -4023,13 +4074,13 @@ class NativeObservationExecutor:
             self.stage = "stop_services"
             cleanup: list[BaseException] = []
             if lifecycle_start_attempted:
-                for unit in (GATEWAY_UNIT, WRITER_UNIT):
+                for unit in (GATEWAY_UNIT, WRITER_UNIT, PHASE_B_READINESS_UNIT):
                     try:
                         self._stop(unit)
                     except BaseException as exc:
                         cleanup.append(exc)
             try:
-                for unit in (GATEWAY_UNIT, WRITER_UNIT):
+                for unit in (GATEWAY_UNIT, WRITER_UNIT, PHASE_B_READINESS_UNIT):
                     if permanent_units_installed and daemon_reloaded:
                         _require_off_disabled(unit, runner=self.runner)
                     else:
@@ -4045,6 +4096,22 @@ class NativeObservationExecutor:
                     "native observation cleanup failed",
                     ([primary] if primary is not None else []) + cleanup,
                 )
+            if (
+                primary is not None
+                and installed_artifacts
+                and not lifecycle_start_attempted
+            ):
+                try:
+                    _rollback_native_observation_artifacts(
+                        self.plan,
+                        installed_artifacts,
+                        runner=self.runner,
+                    )
+                except BaseException as rollback_error:
+                    primary = ExceptionGroup(
+                        "native observation rollback failed",
+                        [primary, rollback_error],
+                    )
         if primary is None and stage_written:
             try:
                 self.stage = "finalize_native"

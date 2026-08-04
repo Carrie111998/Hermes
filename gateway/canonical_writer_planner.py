@@ -73,6 +73,7 @@ from gateway.canonical_writer_activation import (
     CANARY_WRITER_UID,
     DEFAULT_DATABASE_CA_PATH,
     DEFAULT_GATEWAY_CONFIG_SOURCE_PATH,
+    DEFAULT_PHASE_B_READINESS_UNIT_PATH,
     DEFAULT_NATIVE_PLAN_PATH,
     DEFAULT_STAGED_PLAN_PATH,
     DEFAULT_STAGED_GATEWAY_UNIT_PATH,
@@ -80,6 +81,7 @@ from gateway.canonical_writer_activation import (
     DEFAULT_STAGED_PHASE_B_READINESS_UNIT_PATH,
     DEFAULT_STAGED_WRITER_UNIT_PATH,
     DEFAULT_WRITER_CONFIG_SOURCE_PATH,
+    PHASE_B_READINESS_UNIT,
     InstallArtifact,
     NumericIdentities,
     SystemdBundle as PackagedSystemdBundle,
@@ -1017,6 +1019,11 @@ def build_native_observation_plan(
             "path": str(DEFAULT_WRITER_UNIT_PATH),
             "sha256": digests.writer_unit_sha256,
         },
+        "phase_b_readiness_unit": {
+            "name": PHASE_B_READINESS_UNIT,
+            "path": str(DEFAULT_PHASE_B_READINESS_UNIT_PATH),
+            "sha256": digests.phase_b_readiness_unit_sha256,
+        },
         "gateway_argv": gateway_argv,
         "writer_argv": writer_argv,
         "gateway_config": {
@@ -1132,6 +1139,11 @@ def build_activation_plan(
             "name": DEFAULT_WRITER_UNIT,
             "path": str(DEFAULT_WRITER_UNIT_PATH),
             "sha256": _sha256_text(unit_bundle.writer_service),
+        },
+        "phase_b_readiness_unit": {
+            "name": PHASE_B_READINESS_UNIT,
+            "path": str(DEFAULT_PHASE_B_READINESS_UNIT_PATH),
+            "sha256": _sha256_text(unit_bundle.phase_b_readiness_service),
         },
         "gateway_config": {
             "path": str(unit_spec.gateway_config),
@@ -1896,6 +1908,11 @@ def build_and_stage_final_activation_plan(
             "name": DEFAULT_WRITER_UNIT,
             "path": str(DEFAULT_WRITER_UNIT_PATH),
             "sha256": _sha256_text(bundle.writer_service),
+        },
+        "phase_b_readiness_unit": {
+            "name": PHASE_B_READINESS_UNIT,
+            "path": str(DEFAULT_PHASE_B_READINESS_UNIT_PATH),
+            "sha256": _sha256_text(bundle.phase_b_readiness_service),
         },
         "gateway_config": {
             "path": str(unit_spec.gateway_config),

@@ -18496,7 +18496,7 @@ class IapWriterActivationBridgeTransport(IapStoppedReleaseTransport):
                 "installed_path",
             }
             digest_key = "native_observation_plan_sha256"
-            schema = "muncho-writer-native-observation-plan.v2"
+            schema = "muncho-writer-native-observation-plan.v3"
             path = WRITER_NATIVE_PLAN_PATH
         if (
             not isinstance(value, Mapping)

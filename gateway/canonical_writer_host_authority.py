@@ -30,7 +30,8 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 
-NATIVE_OBSERVATION_PLAN_SCHEMA = "muncho-writer-native-observation-plan.v2"
+LEGACY_NATIVE_OBSERVATION_PLAN_SCHEMA = "muncho-writer-native-observation-plan.v2"
+NATIVE_OBSERVATION_PLAN_SCHEMA = "muncho-writer-native-observation-plan.v3"
 NATIVE_OBSERVATION_RECEIPT_SCHEMA = "muncho-writer-native-observation.v1"
 NATIVE_OBSERVATION_STAGE_SCHEMA = "muncho-writer-native-observation-stage.v1"
 OWNER_APPROVAL_RECEIPT_SCHEMA = "muncho-writer-owner-approval.v1"
@@ -366,7 +367,7 @@ _NATIVE_DISCOVERY_POLICY_KEYS = frozenset(
         "digest_algorithm",
     }
 )
-_NATIVE_PLAN_KEYS = frozenset(
+_LEGACY_NATIVE_PLAN_KEYS = frozenset(
     {
         "schema",
         "boot_id_sha256",
@@ -391,6 +392,9 @@ _NATIVE_PLAN_KEYS = frozenset(
         "external_iam_policy_sha256",
     }
 )
+_NATIVE_PLAN_KEYS = _LEGACY_NATIVE_PLAN_KEYS | frozenset(
+    {"phase_b_readiness_unit"}
+)
 
 
 @dataclass(frozen=True)
@@ -401,9 +405,16 @@ class NativeObservationPlan:
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any]) -> "NativeObservationPlan":
-        value = _exact_keys(raw, _NATIVE_PLAN_KEYS, "native observation plan")
-        if value.get("schema") != NATIVE_OBSERVATION_PLAN_SCHEMA:
+        if not isinstance(raw, Mapping):
+            raise ValueError("native observation plan is not an object")
+        schema = raw.get("schema")
+        keys = {
+            LEGACY_NATIVE_OBSERVATION_PLAN_SCHEMA: _LEGACY_NATIVE_PLAN_KEYS,
+            NATIVE_OBSERVATION_PLAN_SCHEMA: _NATIVE_PLAN_KEYS,
+        }.get(schema)
+        if keys is None:
             raise ValueError("native observation plan schema is invalid")
+        value = _exact_keys(raw, keys, "native observation plan")
         _digest(value.get("boot_id_sha256"), "native plan boot identity")
         _digest(value.get("host_identity_sha256"), "native plan host identity")
         try:
@@ -428,7 +439,10 @@ class NativeObservationPlan:
             "external_iam_policy_sha256",
         ):
             _digest(value.get(name), f"native plan {name}")
-        for name in ("gateway_unit", "writer_unit"):
+        unit_names = ["gateway_unit", "writer_unit"]
+        if schema == NATIVE_OBSERVATION_PLAN_SCHEMA:
+            unit_names.append("phase_b_readiness_unit")
+        for name in unit_names:
             binding = _exact_keys(value.get(name), _UNIT_BINDING_KEYS, name)
             unit_name = binding.get("name")
             if not isinstance(unit_name, str) or _UNIT_RE.fullmatch(unit_name) is None:
@@ -1142,9 +1156,10 @@ class NativeObservationReceipt:
         value = _exact_keys(raw, _NATIVE_RECEIPT_KEYS, "native observation receipt")
         if value.get("schema") != NATIVE_OBSERVATION_RECEIPT_SCHEMA:
             raise ValueError("native observation receipt schema is invalid")
-        plan = NativeObservationPlan.from_mapping(
-            _exact_keys(value.get("plan"), _NATIVE_PLAN_KEYS, "native receipt plan")
-        )
+        raw_plan = value.get("plan")
+        if not isinstance(raw_plan, Mapping):
+            raise ValueError("native receipt plan is not an object")
+        plan = NativeObservationPlan.from_mapping(raw_plan)
         plan_digest = _digest(
             value.get("native_observation_plan_sha256"),
             "native observation plan digest",
@@ -3188,7 +3203,15 @@ def collect_native_observation(
     host = _host_identity_sha256()
     if boot != plan.value["boot_id_sha256"] or host != plan.value["host_identity_sha256"]:
         raise RuntimeError("native observation host or boot identity drifted")
-    for name in ("gateway_unit", "writer_unit", "gateway_config", "writer_config"):
+    if plan.value.get("schema") != NATIVE_OBSERVATION_PLAN_SCHEMA:
+        raise ValueError("legacy native observation plan is recovery-only")
+    for name in (
+        "gateway_unit",
+        "writer_unit",
+        "phase_b_readiness_unit",
+        "gateway_config",
+        "writer_config",
+    ):
         binding = plan.value[name]
         if _trusted_file_sha256(Path(binding["path"])) != binding["sha256"]:
             raise RuntimeError(f"native observation {name} digest drifted")
@@ -3233,6 +3256,17 @@ def collect_native_observation(
             "kernel_executable_mappings": kernel_mappings,
             "process_authority": process.evaluator_mapping(),
         }
+    readiness = plan.value["phase_b_readiness_unit"]
+    readiness_state = _native_systemd_state(readiness["name"])
+    if (
+        readiness_state["LoadState"] != "loaded"
+        or readiness_state["ActiveState"] != "active"
+        or readiness_state["SubState"] != "exited"
+        or readiness_state["UnitFileState"] not in {"disabled", "static"}
+        or readiness_state["FragmentPath"] != readiness["path"]
+        or readiness_state["MainPID"] != 0
+    ):
+        raise RuntimeError("native Phase B readiness service is not exactly active")
     observed_boot = _boottime_ns()
     observation = {
         "boot_id_sha256": boot,
@@ -3599,6 +3633,19 @@ def finalize_native_observation_stage(
             "main_pid": state["MainPID"],
         }
         _validate_stopped_service(services[label], unit=unit)
+    readiness = plan.value["phase_b_readiness_unit"]
+    readiness_state = _native_systemd_state(readiness["name"])
+    if (
+        readiness_state["LoadState"] != "loaded"
+        or readiness_state["ActiveState"] != "inactive"
+        or readiness_state["SubState"] != "dead"
+        or readiness_state["UnitFileState"] != "static"
+        or readiness_state["FragmentPath"] != readiness["path"]
+        or readiness_state["MainPID"] != 0
+    ):
+        raise RuntimeError(
+            "native Phase B readiness service was not finalized stopped/off"
+        )
     owner_digest = validate_native_observation_approval(
         owner_approval_receipt,
         expected_plan_sha256=approved_plan_sha256,
@@ -3649,7 +3696,10 @@ def load_native_observation_plan(
     path: str | os.PathLike[str] = DEFAULT_NATIVE_OBSERVATION_PLAN_PATH,
 ) -> NativeObservationPlan:
     _require_root_linux()
-    return NativeObservationPlan.from_mapping(_read_root_mapping(Path(path)))
+    plan = NativeObservationPlan.from_mapping(_read_root_mapping(Path(path)))
+    if plan.value.get("schema") != NATIVE_OBSERVATION_PLAN_SCHEMA:
+        raise ValueError("legacy native observation plan is recovery-only")
+    return plan
 
 
 def main(argv: Sequence[str] | None = None) -> int:
