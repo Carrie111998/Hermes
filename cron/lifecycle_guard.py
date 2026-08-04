@@ -266,7 +266,17 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
         return None, False
     try:
         metadata = os.fstat(descriptor)
+        if stat.S_ISDIR(metadata.st_mode):
+            # A directory is not a script and cannot carry a command. Without
+            # this branch it falls into the conservative "not regular" case
+            # below and the whole command is reported unsafe. Counterpart to
+            # the binary handling further down (#76762): "not a script" is not
+            # a suspicion.
+            return None, False
         if not stat.S_ISREG(metadata.st_mode):
+            # Named Pipes, Sockets, Geraete: hier bleibt es beim vorsichtigen
+            # Urteil. Was daraus gelesen wird, kann sich zwischen Pruefung und
+            # Ausfuehrung aendern — anders als bei einer Datei auf der Platte.
             return None, True
         # Read a bounded chunk first — even for oversized files, the first
         # chunk tells us if this is a binary (NUL bytes) that should be
