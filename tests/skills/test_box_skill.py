@@ -228,6 +228,13 @@ def test_ccg_selects_runtime_identity_by_shared_or_isolated_deployment():
     assert "Shared agent: use the Service Account directly" in ccg
     assert "Isolated profile: provision an App User" in ccg
     assert "<RUNTIME_IDENTITY_EMAIL>" in ccg
+    assert "Ask which specific file, folder, or Hub" in ccg
+    assert "Do not choose a top-level folder" in ccg
+    assert "If the user prefers a manual invite" in ccg
+    assert "only when the current actor is authorized to manage collaborators" in ccg
+    assert "do not retry with a broader identity" in ccg
+    assert "box collaborations:create <FILE_ID> file" in ccg
+    assert "box hubs:collaborations:create <HUB_ID>" in ccg
 
 
 def test_shared_resource_access_uses_type_specific_discovery_not_root_listing():

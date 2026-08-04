@@ -61,12 +61,16 @@ Confirm that the returned `id` is exactly `<APP_USER_ID>` before any ordinary He
 
 The selected Service Account or App User begins with an empty root. A shared file or folder can be verified directly by ID even if it is absent from folder `0`; a Box Hub is a separate resource and never appears in folder `0`.
 
-Open the selected top-level folder in [Box](https://app.box.com), then open its sharing flow and add the selected runtime identity's email. Request approval before changing collaboration. Choose the narrowest role: Viewer for read/search, Editor for upload/move/version, and Co-owner only when required. Share the parent folder when Hermes needs the subtree.
+Ask which specific file, folder, or Hub the runtime identity should access. Accept a Box URL or ID. Do not choose a top-level folder, infer a parent folder, or grant subtree access by default.
 
-When the current actor is already an editor, create the collaboration through the CLI after approval:
+If the user prefers a manual invite, report the runtime identity's email and ID and ask the resource owner to invite it to that exact file, folder, or Hub in Box. If the user provides an ID, request approval for the exact resource and role, then create the collaboration only when the current actor is authorized to manage collaborators on that resource. If the current actor lacks that authority, do not retry with a broader identity or ask the user to change app scopes; provide the runtime identity email and ID for a manual invite instead.
+
+Use ordinary collaboration for an exact file or folder, and Hub collaboration for an exact Hub:
 
 ```bash
+box collaborations:create <FILE_ID> file --role viewer --login <RUNTIME_IDENTITY_EMAIL> --json
 box collaborations:create <FOLDER_ID> folder --role editor --login <RUNTIME_IDENTITY_EMAIL> --json
+box hubs:collaborations:create <HUB_ID> --role viewer --user-id <RUNTIME_ID> --json
 ```
 
 After the invite, use the selected runtime environment to verify the exact resource, not its root listing:
@@ -78,7 +82,7 @@ box hubs --scope all --max-items 1000 --json
 box hubs:get <HUB_ID> --json
 ```
 
-Use ordinary file/folder collaboration for a file or folder, and Hub collaboration for a Hub; neither proves access to the other. If a CCG operation yields 404 or an empty search, verify the selected CCG environment, its actor ID, and that runtime identity's resource-specific collaboration before assuming the object is missing. Read [Box Hubs](hubs.md) before sharing or verifying a Hub.
+File/folder collaboration and Hub collaboration are distinct; neither proves access to the other. If a CCG operation yields 404 or an empty search, verify the selected CCG environment, its actor ID, and that runtime identity's resource-specific collaboration before assuming the object is missing. Read [Box Hubs](hubs.md) before sharing or verifying a Hub.
 
 ## Advanced impersonation
 
