@@ -10,6 +10,7 @@ export function formatQuickEntryShortcut(shortcut: string, commandOrControlLabel
     .split('+')
     .map(part => {
       const token = part.trim()
+
       return token === 'CommandOrControl' ? commandOrControlLabel : token
     })
     .join(' + ')
@@ -21,6 +22,7 @@ export function parseQuickEntryShortcut(shortcut: string, commandOrControlLabel:
     .split('+')
     .map(part => {
       const token = part.trim()
+
       return token === commandOrControlLabel ? 'CommandOrControl' : token
     })
     .filter(Boolean)
