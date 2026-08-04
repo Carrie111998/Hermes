@@ -4,7 +4,7 @@ const os = require('node:os')
 const path = require('node:path')
 const test = require('node:test')
 
-const { EvaBrokerError, brokerPost } = require('./eva-managed.cjs')
+const { EvaBrokerError, brokerPost, evaDesktopCodeChallenge } = require('./eva-managed.cjs')
 const { createEvaManagedRuntime } = require('./eva-runtime.cjs')
 
 const FUTURE = '2099-07-23T12:00:00.000Z'
@@ -310,6 +310,162 @@ test('production reauthentication errors trigger one runtime re-enrollment', asy
   assert.equal(launches, 1)
   const persisted = JSON.parse(fs.readFileSync(statePath, 'utf8'))
   assert.equal(persisted.runtime.token, 'refreshed-runtime-token')
+})
+
+test('PKCE sign-in keeps one verifier per attempt, rejects wrong callbacks, and clears attempt secrets', async t => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'eva-runtime-pkce-lifecycle-'))
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
+  const statePath = path.join(directory, 'eva-enrollment.json')
+
+  const issuedVerifiers = ['A'.repeat(43), 'B'.repeat(43)]
+  const opened = []
+  const polls = []
+  let releaseFirstPoll
+  const firstPollGate = new Promise(resolve => {
+    releaseFirstPoll = resolve
+  })
+  const desktop = {
+    token: 'desktop-session-token',
+    expiresAt: FUTURE,
+    email: 'employee@example.invalid'
+  }
+  const enrollment = {
+    schemaVersion: 'evaos.hermes_desktop_enrollment.v1',
+    customerId: 'customer-one',
+    runtime: 'hermes',
+    agentId: 'main',
+    baseUrl: 'https://hermes-customer-one.ecs.electricsheephq.com',
+    token: 'runtime-session-token',
+    expiresAt: FUTURE
+  }
+  const runtime = makeManagedRuntime(statePath, {
+    makeCodeVerifier: () => issuedVerifiers.shift(),
+    codeChallengeFor: evaDesktopCodeChallenge,
+    openExternal: async url => {
+      opened.push(new URL(url))
+    },
+    pollDeviceCode: async (deviceCode, verifier, options) => {
+      polls.push({ deviceCode, verifier, signal: options.signal })
+      if (polls.length === 1) await firstPollGate
+      return desktop
+    },
+    launchRuntime: async () => enrollment,
+    revokeDesktopSession: async () => true
+  })
+
+  const firstSignIn = runtime.signIn()
+  await new Promise(resolve => setImmediate(resolve))
+  const firstUrl = opened[0]
+  const firstState = firstUrl.searchParams.get('desktop_auth_state')
+  const firstVerifier = 'A'.repeat(43)
+  assert.equal(firstUrl.searchParams.get('desktop_code_challenge'), evaDesktopCodeChallenge(firstVerifier))
+  assert.equal(firstUrl.searchParams.get('desktop_code_challenge_method'), 'S256')
+  assert.equal(firstUrl.toString().includes(firstVerifier), false)
+
+  await assert.rejects(
+    runtime.completeCallback(
+      `evaos-agent://auth/callback?device_code=ABCDEFGH&desktop_auth_state=${firstState}-wrong`
+    ),
+    error => error instanceof EvaBrokerError && error.code === 'state-mismatch'
+  )
+  await assert.rejects(
+    runtime.completeCallback(
+      `evaos-agent://auth/callback?device_code=ABCDEFGH&desktop_auth_state=${firstState}&desktop_session=leaked`
+    ),
+    error => error instanceof EvaBrokerError && error.code === 'invalid-callback'
+  )
+  assert.equal(
+    await runtime.completeCallback(
+      `evaos-agent://auth/callback?device_code=ABCDEFGH&desktop_auth_state=${firstState}`
+    ),
+    true
+  )
+  await new Promise(resolve => setImmediate(resolve))
+  assert.deepEqual(
+    polls.map(({ deviceCode, verifier }) => ({ deviceCode, verifier })),
+    [{ deviceCode: 'ABCDEFGH', verifier: firstVerifier }]
+  )
+  await assert.rejects(
+    runtime.completeCallback(
+      `evaos-agent://auth/callback?device_code=IJKLMNOP&desktop_auth_state=${firstState}`
+    ),
+    error => error instanceof EvaBrokerError && error.code === 'device-code-mismatch'
+  )
+
+  releaseFirstPoll()
+  await firstSignIn
+  assert.equal(await runtime.completeCallback(
+    `evaos-agent://auth/callback?device_code=ABCDEFGH&desktop_auth_state=${firstState}`
+  ), false)
+  const persistedAfterSuccess = fs.readFileSync(statePath, 'utf8')
+  for (const secret of [firstVerifier, firstState, 'ABCDEFGH']) {
+    assert.equal(persistedAfterSuccess.includes(secret), false)
+  }
+
+  const secondSignIn = runtime.signIn()
+  await new Promise(resolve => setImmediate(resolve))
+  const secondUrl = opened[1]
+  const secondState = secondUrl.searchParams.get('desktop_auth_state')
+  const secondVerifier = 'B'.repeat(43)
+  assert.equal(secondUrl.searchParams.get('desktop_code_challenge'), evaDesktopCodeChallenge(secondVerifier))
+  assert.notEqual(
+    secondUrl.searchParams.get('desktop_code_challenge'),
+    firstUrl.searchParams.get('desktop_code_challenge')
+  )
+  assert.notEqual(secondState, firstState)
+  assert.equal(secondUrl.toString().includes(secondVerifier), false)
+
+  await runtime.signOut()
+  await assert.rejects(
+    secondSignIn,
+    error => error instanceof EvaBrokerError && error.code === 'stale-auth'
+  )
+  assert.equal(
+    await runtime.completeCallback(
+      `evaos-agent://auth/callback?device_code=QRSTUVWX&desktop_auth_state=${secondState}`
+    ),
+    false
+  )
+  const persistedAfterSignOut = fs.readFileSync(statePath, 'utf8')
+  for (const secret of [secondVerifier, secondState, 'QRSTUVWX']) {
+    assert.equal(persistedAfterSignOut.includes(secret), false)
+  }
+  assert.equal(issuedVerifiers.length, 0)
+})
+
+test('an expired PKCE claim clears its callback state and verifier', async t => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'eva-runtime-pkce-expiry-'))
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
+  const statePath = path.join(directory, 'eva-enrollment.json')
+  const verifier = 'C'.repeat(43)
+  let opened
+  const timeout = new EvaBrokerError('evaOS Agent sign-in timed out.', 408, 'timeout')
+  const runtime = makeManagedRuntime(statePath, {
+    makeCodeVerifier: () => verifier,
+    codeChallengeFor: evaDesktopCodeChallenge,
+    openExternal: async url => {
+      opened = new URL(url)
+    },
+    pollDeviceCode: async () => {
+      throw timeout
+    }
+  })
+
+  const signIn = runtime.signIn()
+  await new Promise(resolve => setImmediate(resolve))
+  const state = opened.searchParams.get('desktop_auth_state')
+  await runtime.completeCallback(
+    `evaos-agent://auth/callback?device_code=ABCDEFGH&desktop_auth_state=${state}`
+  )
+  await assert.rejects(signIn, error => error === timeout)
+  assert.equal(
+    await runtime.completeCallback(
+      `evaos-agent://auth/callback?device_code=ABCDEFGH&desktop_auth_state=${state}`
+    ),
+    false
+  )
+  assert.equal(fs.existsSync(statePath), false)
+  assert.equal(opened.toString().includes(verifier), false)
 })
 
 test('a stale in-flight launch cannot restore backoff after auth invalidation', async t => {

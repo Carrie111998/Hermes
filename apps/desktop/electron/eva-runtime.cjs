@@ -6,11 +6,11 @@ const {
   EvaBrokerError,
   assertEvaManagedApiRequestAllowed,
   buildEvaDesktopAuthUrl,
-  claimEvaDeviceCode,
+  evaDesktopCodeChallenge,
   expiresSoon,
   launchEvaHermesRuntime,
   makeAuthState,
-  makeDeviceCode,
+  makeEvaDesktopCodeVerifier,
   normalizeDesktopSession,
   normalizeHermesEnrollment,
   parseEvaDesktopAuthCallback,
@@ -37,6 +37,10 @@ function createEvaManagedRuntime(options) {
   const resetConnection = options.resetConnection ?? (() => undefined)
   const resetRenderer = options.resetRenderer ?? (async () => undefined)
   const launchRuntime = options.launchRuntime ?? launchEvaHermesRuntime
+  const makeCodeVerifier = options.makeCodeVerifier ?? makeEvaDesktopCodeVerifier
+  const codeChallengeFor = options.codeChallengeFor ?? evaDesktopCodeChallenge
+  const pollDeviceCode = options.pollDeviceCode ?? pollEvaDeviceCode
+  const revokeDesktopSession = options.revokeDesktopSession ?? revokeEvaDesktopSession
   const createWsRelay = options.createWsRelay ?? createEvaWsRelay
   const statePath = options.statePath
   const now = options.now ?? Date.now
@@ -190,12 +194,19 @@ function createEvaManagedRuntime(options) {
     authGeneration += 1
     runtimeGeneration += 1
     runtimeSessionGeneration += 1
-    try {
-      pendingAuth?.controller?.abort()
-    } catch {
-      // The pending request already completed.
+    const pending = pendingAuth
+    if (pending) {
+      pendingAuth = null
+      try {
+        pending.controller?.abort()
+      } catch {
+        // The pending request already completed.
+      }
+      pending.authState = null
+      pending.deviceCode = null
+      pending.verifier = null
+      pending.resolveDeviceCode = null
     }
-    pendingAuth = null
     signInPromise = null
     runtimeEnrollmentPromise = null
     runtimeEnrollmentPromiseForced = false
@@ -215,21 +226,36 @@ function createEvaManagedRuntime(options) {
 
     const generation = authGeneration
     const task = (async () => {
-      const deviceCode = makeDeviceCode()
-      const authState = makeAuthState()
+      let authState = makeAuthState()
+      let verifier = makeCodeVerifier()
+      let deviceCode = null
+      const codeChallenge = codeChallengeFor(verifier)
       const controller = new AbortController()
-      let resolveCallback
-      const callbackPromise = new Promise(resolve => {
-        resolveCallback = resolve
+      let resolveDeviceCode
+      let rejectDeviceCode
+      const deviceCodePromise = new Promise((resolve, reject) => {
+        resolveDeviceCode = resolve
+        rejectDeviceCode = reject
       })
-      pendingAuth = { authState, controller, deviceCode, generation, resolve: resolveCallback }
+      const attempt = {
+        authState,
+        controller,
+        deviceCode: null,
+        generation,
+        resolveDeviceCode,
+        verifier
+      }
+      controller.signal.addEventListener(
+        'abort',
+        () => rejectDeviceCode(new EvaBrokerError('evaOS Agent sign-in was cancelled.', 409, 'stale-auth')),
+        { once: true }
+      )
+      pendingAuth = attempt
       try {
         await advanceBootProgress('eva.sign-in', 'Complete evaOS Agent sign-in in your browser', 14)
-        await options.openExternal(buildEvaDesktopAuthUrl(deviceCode, authState))
-        const desktop = await Promise.race([
-          pollEvaDeviceCode(deviceCode, { signal: controller.signal }),
-          callbackPromise
-        ])
+        await options.openExternal(buildEvaDesktopAuthUrl(codeChallenge, authState))
+        deviceCode = await deviceCodePromise
+        const desktop = await pollDeviceCode(deviceCode, verifier, { signal: controller.signal })
         controller.abort()
         assertGeneration(generation)
         writeState({ desktop, runtime: null })
@@ -237,7 +263,14 @@ function createEvaManagedRuntime(options) {
         return desktop
       } finally {
         controller.abort()
-        if (pendingAuth?.authState === authState && pendingAuth?.generation === generation) pendingAuth = null
+        if (pendingAuth === attempt) pendingAuth = null
+        attempt.authState = null
+        attempt.deviceCode = null
+        attempt.verifier = null
+        attempt.resolveDeviceCode = null
+        authState = null
+        deviceCode = null
+        verifier = null
       }
     })()
 
@@ -370,15 +403,14 @@ function createEvaManagedRuntime(options) {
     const pending = pendingAuth
     if (!pending) return false
     const callback = parseEvaDesktopAuthCallback(rawUrl, pending.authState)
-    if (callback.deviceCode !== pending.deviceCode) {
-      throw new EvaBrokerError('evaOS Agent sign-in device code did not match.', 400, 'device-code-mismatch')
-    }
-    const desktop = await claimEvaDeviceCode(callback.deviceCode)
     if (pendingAuth !== pending)
       throw new EvaBrokerError('evaOS Agent ignored a stale sign-in callback.', 409, 'stale-auth')
     assertGeneration(pending.generation)
-    writeState({ desktop, runtime: null })
-    pending.resolve(desktop)
+    if (pending.deviceCode && callback.deviceCode !== pending.deviceCode) {
+      throw new EvaBrokerError('evaOS Agent sign-in device code did not match.', 400, 'device-code-mismatch')
+    }
+    pending.deviceCode = callback.deviceCode
+    pending.resolveDeviceCode?.(callback.deviceCode)
     options.focusWindow?.()
     return true
   }
@@ -396,7 +428,7 @@ function createEvaManagedRuntime(options) {
     const state = readState()
     invalidateAuthWork()
     writeState(emptyState(true))
-    if (state.desktop) await revokeEvaDesktopSession(state.desktop.token).catch(() => false)
+    if (state.desktop) await revokeDesktopSession(state.desktop.token).catch(() => false)
     await resetRenderer()
     return { ok: true }
   }

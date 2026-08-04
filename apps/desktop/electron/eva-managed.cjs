@@ -1,4 +1,5 @@
 const crypto = require('node:crypto')
+const { version: EVA_DESKTOP_PACKAGE_VERSION } = require('../package.json')
 
 const EVA_MANAGED_POLICY = Object.freeze({
   schemaVersion: 'evaos.eva_desktop_managed.v1',
@@ -259,26 +260,34 @@ function isEvaManagedGatewayMethodBlocked(value) {
   )
 }
 
-function makeDeviceCode(cryptoApi = crypto) {
-  const value = String(cryptoApi.randomUUID())
-    .toUpperCase()
-    .replace(/[^A-Z0-9]/g, '')
-  if (value.length < 24 || value.length > 40) {
-    throw new Error('Could not create a valid evaOS Agent device code.')
+function normalizeDeviceCodeVerifier(value) {
+  const verifier = String(value || '')
+  if (!/^[A-Za-z0-9._~-]{43,128}$/.test(verifier)) {
+    throw new EvaBrokerError('evaOS Agent device code verifier is invalid.', 400, 'invalid-verifier')
   }
-  return value
+  return verifier
+}
+
+function makeEvaDesktopCodeVerifier(cryptoApi = crypto) {
+  const bytes = Buffer.from(cryptoApi.randomBytes(32))
+  if (bytes.length !== 32) {
+    throw new Error('Could not create a valid evaOS Agent device code verifier.')
+  }
+  return normalizeDeviceCodeVerifier(bytes.toString('base64url'))
+}
+
+function evaDesktopCodeChallenge(verifier, cryptoApi = crypto) {
+  return cryptoApi.createHash('sha256').update(normalizeDeviceCodeVerifier(verifier), 'ascii').digest('base64url')
 }
 
 function makeAuthState(cryptoApi = crypto) {
   return String(cryptoApi.randomUUID())
 }
 
-function buildEvaDesktopAuthUrl(deviceCode, authState, policy = EVA_MANAGED_POLICY) {
-  const normalizedCode = String(deviceCode || '')
-    .toUpperCase()
-    .replace(/[^A-Z0-9]/g, '')
-  if (normalizedCode.length < 24 || normalizedCode.length > 40) {
-    throw new Error('evaOS Agent device code must contain 24 to 40 letters or digits.')
+function buildEvaDesktopAuthUrl(codeChallenge, authState, policy = EVA_MANAGED_POLICY) {
+  const challenge = String(codeChallenge || '')
+  if (!/^[A-Za-z0-9_-]{43}$/.test(challenge)) {
+    throw new Error('evaOS Agent desktop code challenge is invalid.')
   }
   if (!/^[A-Za-z0-9._:-]{8,128}$/.test(String(authState || ''))) {
     throw new Error('evaOS Agent desktop auth state is invalid.')
@@ -286,9 +295,10 @@ function buildEvaDesktopAuthUrl(deviceCode, authState, policy = EVA_MANAGED_POLI
 
   const url = new URL(policy.dashboardAuthUrl)
   url.searchParams.set('desktop_app', '1')
-  url.searchParams.set('fresh', normalizedCode)
   url.searchParams.set('callback_scheme', policy.callbackScheme)
   url.searchParams.set('desktop_auth_state', String(authState))
+  url.searchParams.set('desktop_code_challenge', challenge)
+  url.searchParams.set('desktop_code_challenge_method', 'S256')
   url.searchParams.set('switch_account', '1')
   url.searchParams.set('prompt', 'select_account')
   return url.toString()
@@ -361,7 +371,7 @@ function parseEvaDesktopAuthCallback(rawUrl, expectedState) {
   const deviceCode = String(url.searchParams.get('device_code') || '')
     .toUpperCase()
     .replace(/[^A-Z0-9]/g, '')
-  if (deviceCode.length < 24 || deviceCode.length > 40) {
+  if (deviceCode.length < 8 || deviceCode.length > 40) {
     throw new EvaBrokerError(
       'evaOS Agent sign-in callback did not contain a valid device code.',
       400,
@@ -476,7 +486,7 @@ async function brokerPost(body, options = {}) {
       signal: requestController.signal,
       headers: {
         'Content-Type': 'application/json',
-        'X-Client-Info': 'evaos-agent/2026.7.20-es.6',
+        'X-Client-Info': `evaos-agent/${EVA_DESKTOP_PACKAGE_VERSION}`,
         ...(options.desktopSession ? { Authorization: `Bearer ${options.desktopSession}` } : {})
       },
       body: JSON.stringify(body)
@@ -502,14 +512,19 @@ async function brokerPost(body, options = {}) {
   return payload
 }
 
-async function claimEvaDeviceCode(deviceCode, options = {}) {
+async function claimEvaDeviceCode(deviceCode, deviceCodeVerifier, options = {}) {
+  const normalizedCode = String(deviceCode || '')
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, '')
+  if (normalizedCode.length < 8 || normalizedCode.length > 40) {
+    throw new EvaBrokerError('evaOS Agent device code is invalid.', 400, 'invalid-device-code')
+  }
   return normalizeDesktopSession(
     await brokerPost(
       {
         action: 'claim_desktop_device_code',
-        device_code: String(deviceCode || '')
-          .toUpperCase()
-          .replace(/[^A-Z0-9]/g, '')
+        device_code: normalizedCode,
+        device_code_verifier: normalizeDeviceCodeVerifier(deviceCodeVerifier)
       },
       options
     ),
@@ -517,7 +532,7 @@ async function claimEvaDeviceCode(deviceCode, options = {}) {
   )
 }
 
-async function pollEvaDeviceCode(deviceCode, options = {}) {
+async function pollEvaDeviceCode(deviceCode, deviceCodeVerifier, options = {}) {
   const now = options.now ?? (() => Date.now())
   const sleep =
     options.sleep ??
@@ -530,7 +545,7 @@ async function pollEvaDeviceCode(deviceCode, options = {}) {
 
   while (now() < deadline) {
     try {
-      return await claimEvaDeviceCode(deviceCode, { ...options, now: now() })
+      return await claimEvaDeviceCode(deviceCode, deviceCodeVerifier, { ...options, now: now() })
     } catch (error) {
       if (!(error instanceof EvaBrokerError) || error.statusCode !== 401 || error.code !== 'broker-rejected') {
         throw error
@@ -601,11 +616,12 @@ module.exports = {
   buildEvaDesktopAuthUrl,
   buildEvaManagedWsUrl,
   claimEvaDeviceCode,
+  evaDesktopCodeChallenge,
   expiresSoon,
   isEvaManagedGatewayMethodBlocked,
   launchEvaHermesRuntime,
   makeAuthState,
-  makeDeviceCode,
+  makeEvaDesktopCodeVerifier,
   normalizeDesktopSession,
   normalizeHermesEnrollment,
   parseEvaDesktopAuthCallback,

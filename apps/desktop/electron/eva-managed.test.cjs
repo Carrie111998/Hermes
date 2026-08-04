@@ -1,6 +1,7 @@
 const assert = require('node:assert/strict')
 const test = require('node:test')
 const vm = require('node:vm')
+const { version: desktopPackageVersion } = require('../package.json')
 
 const {
   EVA_MANAGED_POLICY,
@@ -8,12 +9,14 @@ const {
   assertEvaManagedApiRequestAllowed,
   assertEvaManagedLocalMutationAllowed,
   assertEvaManagedLocalTerminalAllowed,
+  brokerPost,
   buildEvaAccountRendererResetScript,
   buildEvaDesktopAuthUrl,
   buildEvaManagedWsUrl,
+  evaDesktopCodeChallenge,
   isEvaManagedGatewayMethodBlocked,
   launchEvaHermesRuntime,
-  makeDeviceCode,
+  makeEvaDesktopCodeVerifier,
   normalizeHermesEnrollment,
   parseEvaDesktopAuthCallback,
   pollEvaDeviceCode,
@@ -99,22 +102,51 @@ test('managed gateway policy blocks hidden Nous billing methods and their future
   assert.equal(isEvaManagedGatewayMethodBlocked('plugin.billing-helper.run'), false)
 })
 
-test('evaOS Agent auth URL carries a high-entropy fallback code and state but no agent selector', () => {
-  const deviceCode = makeDeviceCode({ randomUUID: () => '12345678-1234-4abc-9def-1234567890ab' })
-  const url = new URL(buildEvaDesktopAuthUrl(deviceCode, 'state-12345678'))
-  assert.equal(deviceCode, '1234567812344ABC9DEF1234567890AB')
+test('evaOS Agent auth URL carries an S256 challenge and never leaks its verifier', () => {
+  const verifier = makeEvaDesktopCodeVerifier({ randomBytes: () => Buffer.alloc(32, 7) })
+  const challenge = evaDesktopCodeChallenge(verifier)
+  const url = new URL(buildEvaDesktopAuthUrl(challenge, 'state-12345678'))
+  assert.match(verifier, /^[A-Za-z0-9_-]{43}$/)
+  assert.match(challenge, /^[A-Za-z0-9_-]{43}$/)
+  assert.notEqual(challenge, verifier)
   assert.equal(url.origin + url.pathname, EVA_MANAGED_POLICY.dashboardAuthUrl)
   assert.equal(url.searchParams.get('callback_scheme'), 'evaos-agent')
-  assert.equal(url.searchParams.get('fresh'), deviceCode)
   assert.equal(url.searchParams.get('desktop_auth_state'), 'state-12345678')
+  assert.equal(url.searchParams.get('desktop_code_challenge'), challenge)
+  assert.equal(url.searchParams.get('desktop_code_challenge_method'), 'S256')
   assert.equal(url.searchParams.get('switch_account'), '1')
+  assert.equal(url.searchParams.has('fresh'), false)
   assert.equal(url.searchParams.has('agent_id'), false)
+  assert.equal(url.toString().includes(verifier), false)
+})
+
+test('broker requests identify the actual Desktop package version', async () => {
+  let clientInfo = null
+  await brokerPost(
+    { action: 'version-probe' },
+    {
+      policy: {
+        brokerUrl: 'https://broker.example.invalid/runtime',
+        brokerRequestTimeoutMs: 1_000
+      },
+      fetchImpl: async (_url, init) => {
+        clientInfo = init.headers['X-Client-Info']
+        return new Response(JSON.stringify({ ok: true }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' }
+        })
+      }
+    }
+  )
+
+  assert.equal(clientInfo, `evaos-agent/${desktopPackageVersion}`)
 })
 
 test('device-code polling treats an unregistered code as pending and then accepts the opaque session', async () => {
   let requests = 0
   let clock = 1000
-  const result = await pollEvaDeviceCode('A'.repeat(32), {
+  const verifier = 'v'.repeat(43)
+  const result = await pollEvaDeviceCode('A'.repeat(12), verifier, {
     now: () => clock,
     pollMs: 5,
     timeoutMs: 30,
@@ -124,7 +156,11 @@ test('device-code polling treats an unregistered code as pending and then accept
     fetchImpl: async (_url, init) => {
       requests += 1
       const body = JSON.parse(init.body)
-      assert.deepEqual(body, { action: 'claim_desktop_device_code', device_code: 'A'.repeat(32) })
+      assert.deepEqual(body, {
+        action: 'claim_desktop_device_code',
+        device_code: 'A'.repeat(12),
+        device_code_verifier: verifier
+      })
       if (requests === 1) {
         return new Response(JSON.stringify({ error: 'Invalid or expired one-time code' }), {
           status: 401,
@@ -150,7 +186,7 @@ test('device-code polling fails immediately on a malformed successful claim', as
   let requests = 0
   let sleeps = 0
   await assert.rejects(
-    pollEvaDeviceCode('A'.repeat(32), {
+    pollEvaDeviceCode('A'.repeat(12), 'v'.repeat(43), {
       now: () => 1000,
       timeoutMs: 30,
       sleep: async () => {
@@ -165,6 +201,38 @@ test('device-code polling fails immediately on a malformed successful claim', as
       }
     }),
     error => error instanceof EvaBrokerError && error.code === 'invalid-session'
+  )
+  assert.equal(requests, 1)
+  assert.equal(sleeps, 0)
+})
+
+test('device-code polling treats malformed or broker-rejected verifiers as terminal', async () => {
+  let requests = 0
+  let sleeps = 0
+  const options = {
+    now: () => 1000,
+    timeoutMs: 30,
+    sleep: async () => {
+      sleeps += 1
+    },
+    fetchImpl: async () => {
+      requests += 1
+      return new Response(JSON.stringify({ error: 'A valid device code verifier is required' }), {
+        status: 400,
+        headers: { 'Content-Type': 'application/json' }
+      })
+    }
+  }
+
+  await assert.rejects(
+    pollEvaDeviceCode('A'.repeat(12), 'too-short', options),
+    error => error instanceof EvaBrokerError && error.statusCode === 400 && error.code === 'invalid-verifier'
+  )
+  assert.equal(requests, 0)
+
+  await assert.rejects(
+    pollEvaDeviceCode('A'.repeat(12), 'v'.repeat(43), options),
+    error => error instanceof EvaBrokerError && error.statusCode === 400 && error.code === 'broker-rejected'
   )
   assert.equal(requests, 1)
   assert.equal(sleeps, 0)
@@ -403,8 +471,8 @@ test('managed enrollment accepts server-selected accounts and rejects mismatched
 })
 
 test('evaOS Agent deep-link callback requires the exact in-flight auth state', () => {
-  const raw = `evaos-agent://auth/callback?device_code=${'A'.repeat(32)}` + '&desktop_auth_state=state-12345678'
-  assert.equal(parseEvaDesktopAuthCallback(raw, 'state-12345678').deviceCode, 'A'.repeat(32))
+  const raw = `evaos-agent://auth/callback?device_code=${'A'.repeat(8)}` + '&desktop_auth_state=state-12345678'
+  assert.equal(parseEvaDesktopAuthCallback(raw, 'state-12345678').deviceCode, 'A'.repeat(8))
   assert.throws(
     () => parseEvaDesktopAuthCallback(raw, 'state-other-123'),
     error => error instanceof EvaBrokerError && error.code === 'state-mismatch'
@@ -421,6 +489,16 @@ test('evaOS Agent deep-link callback requires the exact in-flight auth state', (
     () => parseEvaDesktopAuthCallback(`${raw}&blueprint=unexpected`, 'state-12345678'),
     error => error instanceof EvaBrokerError && error.code === 'invalid-callback'
   )
+  for (const deviceCode of ['A'.repeat(7), 'A'.repeat(41)]) {
+    assert.throws(
+      () =>
+        parseEvaDesktopAuthCallback(
+          `evaos-agent://auth/callback?device_code=${deviceCode}&desktop_auth_state=state-12345678`,
+          'state-12345678'
+        ),
+      error => error instanceof EvaBrokerError && error.code === 'invalid-callback'
+    )
+  }
 })
 
 test('renderer-facing enrollment status never exposes tokens or backend URLs', () => {
