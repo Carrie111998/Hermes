@@ -327,6 +327,9 @@ _parallel_pool: Optional[concurrent.futures.ThreadPoolExecutor] = None
 _parallel_pool_max_workers: Optional[int] = None
 _running_job_ids: set = set()
 _running_lock = threading.Lock()
+_agent_admission_condition = threading.Condition()
+_agent_parallel_limit: Optional[int] = None
+_agent_jobs_running = 0
 
 # Job IDs the gateway shutdown path force-killed the tool subprocess of
 # while still in ``_running_job_ids`` (see ``mark_running_jobs_interrupted``
@@ -499,6 +502,53 @@ def _get_parallel_pool(max_workers: Optional[int]) -> concurrent.futures.ThreadP
         )
         _parallel_pool_max_workers = max_workers
     return _parallel_pool
+
+
+def _set_agent_parallel_limit(limit: Optional[int]) -> None:
+    global _agent_parallel_limit
+    with _agent_admission_condition:
+        _agent_parallel_limit = limit
+        _agent_admission_condition.notify_all()
+
+
+def _acquire_agent_slot() -> None:
+    global _agent_jobs_running
+    with _agent_admission_condition:
+        while (
+            _agent_parallel_limit is not None
+            and _agent_jobs_running >= _agent_parallel_limit
+        ):
+            _agent_admission_condition.wait()
+        _agent_jobs_running += 1
+
+
+def _release_agent_slot() -> None:
+    global _agent_jobs_running
+    with _agent_admission_condition:
+        _agent_jobs_running -= 1
+        _agent_admission_condition.notify_all()
+
+
+def _resolve_agent_parallel_limit(config: Optional[dict] = None) -> Optional[int]:
+    if config is None:
+        try:
+            config = load_config() or {}
+        except Exception:
+            config = {}
+    cron_cfg = config.get("cron", {}) if isinstance(config, dict) else {}
+    if not isinstance(cron_cfg, dict):
+        return None
+    value = cron_cfg.get("max_parallel_agent_jobs")
+    if value is None:
+        return None
+    try:
+        parsed = int(value)
+    except (ValueError, TypeError):
+        logger.warning(
+            "Invalid cron.max_parallel_agent_jobs value; defaulting to unbounded"
+        )
+        return None
+    return parsed if parsed > 0 else None
 
 
 def _get_sequential_pool() -> concurrent.futures.ThreadPoolExecutor:
@@ -3273,7 +3323,14 @@ def run_job(
                     prefill_messages = None
 
         # Max iterations
-        max_iterations = _cfg.get("agent", {}).get("max_turns") or _cfg.get("max_turns") or 500
+        cron_cfg = _cfg.get("cron", {}) if isinstance(_cfg.get("cron", {}), dict) else {}
+        max_iterations = (
+            cron_cfg.get("max_turns")
+            or agent_cfg.get("max_turns")
+            or _cfg.get("max_turns")
+            or 500
+        )
+        cron_api_max_retries = cron_cfg.get("api_max_retries")
 
         # Provider routing
         pr = _cfg.get("provider_routing") or {}
@@ -3519,6 +3576,15 @@ def run_job(
             session_id=_cron_session_id,
             session_db=_session_db,
         )
+        if cron_api_max_retries is not None:
+            try:
+                agent._api_max_retries = max(int(cron_api_max_retries), 1)
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Job '%s': invalid cron.api_max_retries=%r; using agent default",
+                    job_id,
+                    cron_api_max_retries,
+                )
         
         # Run the agent with an *inactivity*-based timeout: the job can run
         # for hours if it's actively calling tools / receiving stream tokens,
@@ -3889,7 +3955,7 @@ def _teardown_cron_agent(agent, job_id: str) -> None:
         logger.debug("Job '%s': failed to reap stale auxiliary clients: %s", job_id, e)
 
 
-def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -> bool:
+def _run_one_job_body(job: dict, *, adapters=None, loop=None, verbose: bool = False) -> bool:
     """Run ONE due job end-to-end: execute → save output → deliver → mark.
 
     This is the shared firing body extracted from ``tick``'s per-job closure so
@@ -4092,6 +4158,18 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         return False
 
 
+def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -> bool:
+    """Run one job with the configured agent-only admission limit."""
+    if job.get("no_agent"):
+        return _run_one_job_body(job, adapters=adapters, loop=loop, verbose=verbose)
+    _set_agent_parallel_limit(_resolve_agent_parallel_limit())
+    _acquire_agent_slot()
+    try:
+        return _run_one_job_body(job, adapters=adapters, loop=loop, verbose=verbose)
+    finally:
+        _release_agent_slot()
+
+
 def _notify_provider_jobs_changed() -> None:
     """Best-effort: tell the active scheduler provider the job set changed.
 
@@ -4188,6 +4266,16 @@ def tick(
         # Resolve max parallel workers: env var > config.yaml > unbounded.
         # Set HERMES_CRON_MAX_PARALLEL=1 to restore old serial behaviour.
         _max_workers: Optional[int] = None
+        _ucfg = {}
+        try:
+            _ucfg = load_config() or {}
+        except Exception:
+            pass
+        _cron_cfg = (
+            _ucfg.get("cron", {}) if isinstance(_ucfg, dict) else {}
+        )
+        if not isinstance(_cron_cfg, dict):
+            _cron_cfg = {}
         try:
             _env_par = os.getenv("HERMES_CRON_MAX_PARALLEL", "").strip()
             if _env_par:
@@ -4196,20 +4284,20 @@ def tick(
             logger.warning("Invalid HERMES_CRON_MAX_PARALLEL value; defaulting to unbounded")
         if _max_workers is None:
             try:
-                _ucfg = load_config() or {}
-                _cfg_par = (
-                    _ucfg.get("cron", {}) if isinstance(_ucfg, dict) else {}
-                ).get("max_parallel_jobs")
+                _cfg_par = _cron_cfg.get("max_parallel_jobs")
                 if _cfg_par is not None:
                     _max_workers = int(_cfg_par) or None
             except Exception:
                 pass
 
+        _max_agent_workers = _resolve_agent_parallel_limit(_ucfg)
+
         if verbose:
             logger.info(
-                "Running %d job(s) in parallel (max_workers=%s)",
+                "Running %d job(s) in parallel (max_workers=%s, max_agent_workers=%s)",
                 len(due_jobs),
                 _max_workers if _max_workers else "unbounded",
+                _max_agent_workers if _max_agent_workers else "unbounded",
             )
 
         def _process_job(job: dict) -> bool:

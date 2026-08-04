@@ -2229,6 +2229,26 @@ DEFAULT_CONFIG = {
         # 1 = serial (pre-v0.9 behaviour).
         # Also overridable via HERMES_CRON_MAX_PARALLEL env var.
         "max_parallel_jobs": None,
+        # Maximum number of LLM-backed cron jobs allowed to execute at once.
+        # Script-only no_agent jobs bypass this admission gate.
+        # null/0 = unbounded; 1 serializes model requests without delaying
+        # deterministic watchdogs and maintenance scripts.
+        "max_parallel_agent_jobs": None,
+        # Maximum tool-calling iterations for LLM-backed cron jobs. When unset,
+        # agent.max_turns remains the fallback for backward compatibility.
+        "max_turns": None,
+        # Total app-level model attempts per cron turn. 1 means a single
+        # attempt; provider routers may still rotate their own credential pool.
+        # null retains agent.api_max_retries for backward compatibility.
+        "api_max_retries": None,
+        # Optional cron-only artifact-spill budgets for tool results. These
+        # preserve full output on disk while limiting what returns to the model.
+        # null values retain the context-scaled interactive defaults.
+        "tool_result_budget": {
+            "max_result_chars": None,
+            "max_turn_chars": None,
+            "preview_chars": None,
+        },
         # Per-job output-file retention: save_job_output keeps the N most
         # recent .md files and prunes older ones. 0 or negative disables
         # pruning (for operators who manage cleanup externally). Default 50.

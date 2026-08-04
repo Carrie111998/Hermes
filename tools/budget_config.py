@@ -4,7 +4,7 @@ Per-tool resolution: pinned > config overrides > registry > default.
 """
 
 from dataclasses import dataclass, field
-from typing import Dict
+from typing import Any, Dict
 
 # Tools whose thresholds must never be overridden.
 # read_file=inf prevents infinite persist->read->persist loops.
@@ -112,3 +112,32 @@ def budget_for_context_window(context_length: int | None) -> BudgetConfig:
         turn_budget=per_turn,
         preview_size=DEFAULT_PREVIEW_SIZE_CHARS,
     )
+
+
+def budget_with_overrides(
+    base: BudgetConfig,
+    overrides: Any,
+) -> BudgetConfig:
+    """Apply positive per-result, per-turn, and preview overrides to a budget."""
+    if not isinstance(overrides, dict):
+        return base
+
+    def _positive_int(key: str, fallback: int) -> int:
+        try:
+            value = int(overrides.get(key))
+        except (TypeError, ValueError):
+            return fallback
+        return value if value > 0 else fallback
+
+    result_size = _positive_int("max_result_chars", base.default_result_size)
+    turn_budget = _positive_int("max_turn_chars", base.turn_budget)
+    preview_size = _positive_int("preview_chars", base.preview_size)
+    preview_size = min(preview_size, result_size, turn_budget)
+
+    resolved = BudgetConfig(
+        default_result_size=result_size,
+        turn_budget=turn_budget,
+        preview_size=preview_size,
+        tool_overrides=base.tool_overrides,
+    )
+    return base if resolved == base else resolved
