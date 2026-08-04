@@ -105,6 +105,29 @@ def _safe_which(cmd: str) -> str | None:
         return None
 
 
+def _npm_min_release_age_days(npm_bin: str, npm_dir: Path) -> int:
+    """Return npm's effective release-age gate for ``npm_dir``."""
+    try:
+        result = subprocess.run(
+            [npm_bin, "config", "get", "min-release-age"],
+            cwd=str(npm_dir),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return 0
+
+    value = result.stdout.strip()
+    if not value.isdigit():
+        return 0
+
+    days = int(value)
+    return days if days > 0 else 0
+
+
 def _termux_browser_setup_steps(node_installed: bool) -> list[str]:
     steps: list[str] = []
     step = 1
@@ -2059,10 +2082,17 @@ def run_doctor(args):
                     check_ok(f"{label} deps", "(no known vulnerabilities)")
                 elif critical > 0 or high > 0:
                     if fix_cmd:
+                        cooldown_days = _npm_min_release_age_days(_npm_bin, npm_dir)
                         vuln_detail = (
                             f"{critical} critical, {high} high, {moderate} moderate — run: {fix_cmd}"
                         )
+                        if cooldown_days:
+                            vuln_detail += (
+                                f"; npm min-release-age={cooldown_days} blocks fixes published "
+                                f"within the last {cooldown_days} days"
+                            )
                     else:
+                        cooldown_days = 0
                         vuln_detail = (
                             f"{critical} critical, {high} high, {moderate} moderate — "
                             "build-tool advisory; clears via lockfile bump"
@@ -2071,6 +2101,11 @@ def run_doctor(args):
                         f"{label} deps",
                         f"({vuln_detail})"
                     )
+                    if cooldown_days:
+                        check_info(
+                            "  ^ retry after the patched release ages out; do not bypass the "
+                            "supply-chain cooldown with `npm audit fix --force`"
+                        )
                     if audit_extra and audit_extra[0] == "--workspace":
                         # The web/ui-tui workspace advisories are in build-time
                         # tooling (esbuild/vite, etc.), not runtime code that ships

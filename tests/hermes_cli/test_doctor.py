@@ -1410,3 +1410,48 @@ class TestDoctorDeprecatedConfigAndEnv:
         assert "Deprecated: delegation.max_async_children" in out
         assert "Deprecated: HERMES_TOOL_PROGRESS_MODE" in out
         assert "⚠" in out or "Deprecated" in out
+
+
+def test_npm_audit_fix_hint_explains_release_age_cooldown(monkeypatch, tmp_path):
+    """Regression for #78893: doctor must explain a blocked root audit fix."""
+    home = tmp_path / ".hermes"
+    home.mkdir(parents=True)
+    project = tmp_path / "project"
+    (project / "node_modules").mkdir(parents=True)
+
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(doctor_mod, "HERMES_HOME", home)
+    monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", project)
+    monkeypatch.setattr(
+        doctor_mod,
+        "_safe_which",
+        lambda cmd: "/usr/bin/npm" if cmd == "npm" else None,
+    )
+
+    def mock_run(cmd, **kwargs):
+        if cmd[1:] == ["config", "get", "min-release-age"]:
+            return SimpleNamespace(returncode=0, stdout="14\n", stderr="")
+        if "audit" in cmd and "--workspaces=false" in cmd:
+            payload = (
+                '{"metadata": {"vulnerabilities": '
+                '{"critical": 0, "high": 2, "moderate": 0}}}'
+            )
+            return SimpleNamespace(returncode=1, stdout=payload, stderr="")
+        if "audit" in cmd:
+            payload = (
+                '{"metadata": {"vulnerabilities": '
+                '{"critical": 0, "high": 0, "moderate": 0}}}'
+            )
+            return SimpleNamespace(returncode=0, stdout=payload, stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(doctor_mod.subprocess, "run", mock_run)
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        doctor_mod.run_doctor(Namespace(fix=False))
+    out = buf.getvalue()
+
+    assert "npm audit fix --workspaces=false" in out
+    assert "npm min-release-age=14 blocks fixes published within the last 14 days" in out
+    assert "do not bypass the supply-chain cooldown with `npm audit fix --force`" in out
