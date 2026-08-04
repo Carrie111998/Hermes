@@ -39,16 +39,16 @@ Do not run setup, show a command cookbook, propose account plans or folder taxon
 
 ## Perform chosen setup interactively
 
-When a user selects an authentication path or asks Hermes to connect Box, perform the setup through `terminal` and browser tools; do not turn the next response into instructions for the user to copy. Take the next safe action yourself, and pause only for an approval, browser sign-in, administrator action, or secret that Hermes cannot safely supply.
+When a user selects an authentication path or asks Hermes to connect Box, perform the setup through `terminal`; do not turn the next response into instructions for the user to copy. Take the next safe action yourself, and pause only for an approval, browser sign-in, administrator action, or secret that Hermes cannot safely supply.
 
-- If `box` is missing, ask for any terminal approval required to install `@box/cli`, then run the install and verify `box --version`.
-- For personal OAuth on a local desktop, run `box login --default-box-app --name hermes-oauth` without `--code`. Wait for the CLI's local browser callback to finish, then continue with `box users:get me --json --fields id,name,login`. Do not inspect browser tabs, request an authorization URL, or ask for a code in this callback flow. Use `--code` only when the user confirms Hermes is remote/headless or the local callback actually fails.
+- If `box` is missing, ask for any terminal approval required to install `@box/cli` under `$HOME/.local/share/hermes-box-cli`; then verify it with `npm exec --prefix "$HOME/.local/share/hermes-box-cli" -- box --version`. Do not attempt a global npm install, use `sudo`, change npm's global prefix, or change `PATH`. Read [CLI guide](references/cli-guide.md) before using the local runner for later operations.
+- For personal OAuth on a local desktop, run one local CLI login operation without `--code` and leave that terminal process running until it exits. Let the Box CLI open the authorization page and receive its own local callback; do not use browser tools, inspect browser tabs, request an authorization URL, navigate to Box, or ask for a code. After the CLI exits, verify the actor. Use `--code` only when the user explicitly confirms Hermes is remote/headless.
 - For CCG, open the Developer Console when browser access is available and perform every non-secret step. Pause only for the user's Box administrator action or for credentials to be stored locally outside the chat. Never request a client secret in chat. Then add the CLI environment, verify the service-account actor, and open the selected folders' sharing flow to add it after approval.
 - If an install, browser authorization, environment switch, or permission change needs approval, request that approval and resume the setup after it is granted. Do not replace the action with a command list.
 
 ## Start each task
 
-1. Confirm the CLI and current actor:
+1. Confirm the CLI and current actor. If `box` is on `PATH`, use it. If Hermes installed the user-local CLI, use `npm exec --prefix "$HOME/.local/share/hermes-box-cli" -- box` in place of every `box` command:
    ```bash
    command -v box
    box users:get me --json --fields id,name,login

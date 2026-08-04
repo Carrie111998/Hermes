@@ -145,3 +145,25 @@ def test_hubs_route_large_reusable_qa_with_governance_and_safe_mutations():
 def test_box_skill_never_mentions_box_drive():
     for markdown_file in SKILL_DIR.rglob("*.md"):
         assert "box drive" not in markdown_file.read_text(encoding="utf-8").lower()
+
+
+def test_local_oauth_keeps_cli_in_control_and_uses_user_local_npm_install():
+    """Keep local OAuth browser handling deterministic on locked-down machines."""
+    skill = SKILL_MD.read_text(encoding="utf-8")
+    oauth = (SKILL_DIR / "references" / "oauth-setup.md").read_text(
+        encoding="utf-8"
+    )
+    cli = (SKILL_DIR / "references" / "cli-guide.md").read_text(encoding="utf-8")
+
+    local_runner = 'npm exec --prefix "$HOME/.local/share/hermes-box-cli" -- box'
+    assert 'npm install --prefix "$HOME/.local/share/hermes-box-cli" @box/cli' in oauth
+    assert local_runner in oauth
+    assert local_runner in cli
+    assert "global npm install" in skill
+    assert "Do not attempt a global npm install" in cli
+    assert "Do not use browser tools" in oauth
+    assert "leave its terminal process running until it exits" in oauth
+    assert "after the local callback path fails" not in oauth
+
+    for markdown_file in SKILL_DIR.rglob("*.md"):
+        assert "npm install -g @box/cli" not in markdown_file.read_text(encoding="utf-8")

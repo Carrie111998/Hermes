@@ -4,19 +4,27 @@ Use OAuth when one person wants Hermes to act with the same Box access they have
 
 ## Local desktop path (default)
 
-Treat a local desktop as the default unless the user says Hermes is running remotely or without a browser callback. Install the CLI through `terminal` if needed, start the official Box CLI login without `--code`, wait for its callback to complete, and verify the actor:
+Treat a local desktop as the default unless the user says Hermes is running remotely or without a browser callback. If `box` is not already on `PATH`, install the CLI in Hermes' user-local directory; do not use a global npm install, `sudo`, an npm-prefix change, or a `PATH` change:
 
 ```bash
-npm install -g @box/cli
-box login --default-box-app --name hermes-oauth
-box users:get me --json --fields id,name,login
+npm install --prefix "$HOME/.local/share/hermes-box-cli" @box/cli
+npm exec --prefix "$HOME/.local/share/hermes-box-cli" -- box --version
 ```
 
-The browser flow creates and selects the named environment. Announce the pending authorization, wait for the CLI process to finish, then continue with the actor check. Do not inspect browser tabs, request the resulting URL, or ask the user to paste a code.
+Use the same runner for every later Box command in this setup. Start one official local login operation without `--code`, leave its terminal process running until it exits, then verify the actor:
+
+```bash
+npm exec --prefix "$HOME/.local/share/hermes-box-cli" -- \
+  box login --default-box-app --name hermes-oauth
+npm exec --prefix "$HOME/.local/share/hermes-box-cli" -- \
+  box users:get me --json --fields id,name,login
+```
+
+If `box` already resolves on `PATH`, run the same `box login` and `box users:get me` commands without the `npm exec` prefix. The browser flow creates and selects the named environment. Announce the pending authorization, wait for the CLI process to finish, then continue with the actor check. Let the CLI open the authorization page and receive the local callback. Do not use browser tools, inspect browser tabs, request the resulting URL, navigate to Box, or ask the user to paste a code.
 
 ## Remote or headless path
 
-Use this path only after the user confirms Hermes is running remotely/headlessly, or after the local callback path fails. Run:
+Use this path only after the user explicitly confirms Hermes is running remotely/headlessly. Run:
 
 ```bash
 box login --default-box-app --code --name hermes-oauth

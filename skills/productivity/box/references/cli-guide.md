@@ -2,6 +2,29 @@
 
 Run Box commands through Hermes' `terminal` tool. Prefer the documented command in this skill over exploratory help calls. Use help only when a required option is absent here or the installed CLI rejects the syntax.
 
+## Use one command runner
+
+If `box` is on `PATH`, run the examples in this guide as written. If it is missing, install the CLI once in Hermes' user-local directory:
+
+```bash
+npm install --prefix "$HOME/.local/share/hermes-box-cli" @box/cli
+```
+
+Then run every example by replacing its leading `box` with:
+
+```bash
+npm exec --prefix "$HOME/.local/share/hermes-box-cli" -- box
+```
+
+For example:
+
+```bash
+npm exec --prefix "$HOME/.local/share/hermes-box-cli" -- \
+  box users:get me --json --fields id,name,login
+```
+
+Do not attempt a global npm install, use `sudo`, change npm's global prefix, or change `PATH`. Keep the same runner for the whole task.
+
 ## Check identity and control output
 
 ```bash
