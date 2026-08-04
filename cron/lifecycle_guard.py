@@ -177,6 +177,31 @@ def _resolve_terminal_script_path(candidate: str, cwd: Optional[str]) -> Path:
     return path
 
 
+def _is_plausible_script(path: Path) -> bool:
+    """True when *path* could really be executed as a script.
+
+    HERMES-LOCAL-PATCH: exec-only: a bare path token discovered inside a scanned file is
+    only worth following when the file could actually run. Data files that a
+    script merely NAMES -- config.yaml, .env, credentials.json -- are not
+    executable, cannot restart a gateway, and scanning them yields false
+    positives (a denylist entry reading "kill hermes/gateway" is prose, not a
+    command) while needlessly reading secrets. Scripts invoked explicitly via a
+    shell (``sh payload.json``) are yielded by the shell branch and bypass this
+    check entirely, so no genuine execution path stops being scanned.
+    """
+    try:
+        metadata = os.stat(path)
+    except OSError:
+        return False
+    if not stat.S_ISREG(metadata.st_mode):
+        # Defer to _read_referenced_script, which skips directories and still
+        # fails closed on fifos/devices.
+        return True
+    if metadata.st_mode & 0o111:
+        return True
+    return path.name.endswith((".sh", ".bash", ".zsh"))
+
+
 def _iter_referenced_shell_scripts(
     command: str,
     *,
@@ -190,7 +215,12 @@ def _iter_referenced_shell_scripts(
         executable = segment[index]
         executable_name = Path(executable).name
 
-        if executable_name in {".", "source"}:
+        # HERMES-LOCAL-PATCH: dot-source: `Path(".").name` is "", not ".", so matching
+        # on the basename alone let the POSIX dot builtin evade this branch
+        # while the spelled-out `source` was caught. Sourcing executes the
+        # file in the current shell, so it must be scanned. The raw token is
+        # tested too; a path-qualified `/usr/bin/source` still matches by name.
+        if executable in {".", "source"} or executable_name in {".", "source"}:
             if len(segment) > index + 1:
                 yield _resolve_terminal_script_path(segment[index + 1], cwd)
             continue
@@ -226,7 +256,10 @@ def _iter_referenced_shell_scripts(
         # (#77131). Skip pure-separator tokens.
         if executable.strip("/"):
             if "/" in executable or executable.endswith((".sh", ".bash", ".zsh")):
-                yield _resolve_terminal_script_path(executable, cwd)
+                # HERMES-LOCAL-PATCH: exec-only
+                _candidate = _resolve_terminal_script_path(executable, cwd)
+                if _is_plausible_script(_candidate):
+                    yield _candidate
 
 
 def _iter_shell_command_payloads(command: str) -> Iterator[str]:
@@ -262,6 +295,18 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
         return None, False
     try:
         metadata = os.fstat(descriptor)
+        # HERMES-LOCAL-PATCH: dir-skip
+        # A directory is never executable as a script -- both `sh somedir`
+        # and `./somedir` fail -- so there is nothing to scan and nothing to
+        # evade through. Directory-valued path tokens are common in the
+        # sources this scanner walks (a Python script with
+        # `ROOT = os.path.expanduser("~/some-dir")` is enough), and failing
+        # closed on them hard-blocks innocent commands with a bogus
+        # "cannot restart or stop the gateway" error. Same bug class as the
+        # bare-"/" token (#77131) and binaries (#76762): skip, don't block.
+        # FIFOs/devices/sockets stay fail-closed -- those CAN feed a shell.
+        if stat.S_ISDIR(metadata.st_mode):
+            return None, False
         if not stat.S_ISREG(metadata.st_mode):
             return None, True
         # Read a bounded chunk first — even for oversized files, the first
