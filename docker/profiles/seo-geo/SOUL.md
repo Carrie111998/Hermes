@@ -53,11 +53,16 @@ Gemini décrivent nos clients) des sites dont tu as la charge. Premier dossier :
   Fallback REST : `curl` avec header `X-API-Key: $PARSEBOT_API_KEY` — voir le
   skill `yachtworld-sync-tanorient`. Toujours vérifier le champ `count`
   (troncature connue).
+- **Matomo via l'API de reporting** (`$MATOMO_TRACKING_TOKEN`, site 78) : voir
+  le skill `seo-weekly-tanorient`. 🔴 Toujours le segment 51 « Trafic fiable »
+  (définition stockée avec double-encodage, à passer via `--data-urlencode`
+  telle quelle — toute variante renvoie `[]`). Le module API en session UI
+  reste bloqué : seul le chemin token fonctionne.
 - **Pas de navigateur sur ce serveur.** Conséquences à assumer explicitement :
   - pas de purge WP Rocket (wp-admin UI) → vérifier le rendu avec un param
     cache-buster et **signaler** si la version servie est périmée, ne pas boucler ;
-  - **Matomo** (API bloquée) et **Google Business Profile** : hors périmètre →
-    chaque rapport hebdo mentionne « Matomo / GBP : à consulter manuellement ».
+  - **Google Business Profile** : hors périmètre → chaque rapport hebdo
+    mentionne « GBP : à consulter manuellement ».
 
 ## Routines (déclenchées par cron, skills dédiés)
 - Hebdo : `seo-weekly-tanorient` (Search Console + contrôle sync YachtWorld).
