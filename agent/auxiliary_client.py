@@ -4761,9 +4761,9 @@ def _call_fallback_candidate_sync(
         # let the caller move on instead of aborting the whole task.
         _mark_provider_unhealthy(fb_provider or fb_label)
         logger.warning(
-            "Auxiliary %s: fallback candidate %s has a stale/unrefreshable "
-            "credential (%s) — skipping to next fallback",
-            task or "call", fb_label, fb_err,
+            "Auxiliary %s: fallback candidate has a stale/unrefreshable "
+            "credential — skipping to next fallback",
+            task or "call",
         )
         return None
 
@@ -4864,9 +4864,9 @@ async def _call_fallback_candidate_async(
                         raise
         _mark_provider_unhealthy(fb_provider or fb_label)
         logger.warning(
-            "Auxiliary %s (async): fallback candidate %s has a stale/unrefreshable "
-            "credential (%s) — skipping to next fallback",
-            task or "call", fb_label, fb_err,
+            "Auxiliary %s (async): fallback candidate has a stale/unrefreshable "
+            "credential — skipping to next fallback",
+            task or "call",
         )
         return None
 
@@ -5090,11 +5090,35 @@ def _candidate_context_window(
     return None
 
 
+class _TaskFallbackLabel(str):
+    """Display-compatible task-chain label carrying typed route metadata."""
+
+    provider: str
+    next_index: int
+
+    def __new__(cls, value: str, *, provider: str, next_index: int):
+        label = super().__new__(cls, value)
+        label.provider = provider
+        label.next_index = next_index
+        return label
+
+
+def _promoted_task_fallback_state(
+    label: str,
+    current_provider: Optional[str],
+) -> Tuple[str, Optional[_TaskFallbackLabel]]:
+    """Keep a promoted candidate's route identity separate from its cursor."""
+    if isinstance(label, _TaskFallbackLabel):
+        return str(label.provider or current_provider or ""), label
+    return str(label or current_provider or ""), None
+
+
 def _try_configured_fallback_chain(
     task: str,
     failed_provider: str,
     reason: str = "error",
     failed_model: Optional[str] = None,
+    start_index: int = 0,
 ) -> Tuple[Optional[Any], Optional[str], str]:
     """Try user-configured fallback_chain for a specific auxiliary task.
 
@@ -5121,6 +5145,11 @@ def _try_configured_fallback_chain(
       on that provider are broken, so a sibling can't help and the
       main-agent-model safety net should be reached instead.
 
+    ``start_index`` is an internal ordered-resume cursor used only after a
+    resolved candidate proves stale. Returned labels remain normal strings for
+    existing three-tuple callers while carrying the next cursor for routing
+    callers that understand :class:`_TaskFallbackLabel`.
+
     Returns:
         (client, model, provider_label) or (None, None, "") if no fallback.
     """
@@ -5131,6 +5160,13 @@ def _try_configured_fallback_chain(
     chain = task_config.get("fallback_chain")
     if not chain or not isinstance(chain, list):
         return None, None, ""
+
+    from hermes_cli.fallback_config import (
+        FALLBACK_FAILURE_POLICY_INVALID,
+        InvalidFallbackPolicyError,
+        fallback_entry_allows_continuation,
+        fallback_failure_policy,
+    )
 
     skip_model = (failed_model or "").strip().lower() or None
     # Identity + scope semantics owned by agent.backend_identity (#59561,
@@ -5152,10 +5188,28 @@ def _try_configured_fallback_chain(
     )
     tried = []
     min_ctx = _task_minimum_context_length(task)
+    if not isinstance(start_index, int) or start_index < 0:
+        start_index = 0
 
-    for i, entry in enumerate(chain):
+    for i, entry in enumerate(chain[start_index:], start=start_index):
         if not isinstance(entry, dict):
             continue
+        if fallback_failure_policy(entry) == FALLBACK_FAILURE_POLICY_INVALID:
+            logger.error(
+                "Auxiliary %s: invalid failure_policy at "
+                "auxiliary.%s.fallback_chain[%d]; stopping before provider resolution",
+                task,
+                task,
+                i,
+            )
+            raise InvalidFallbackPolicyError()
+        if not fallback_entry_allows_continuation(entry):
+            logger.info(
+                "Auxiliary %s: stopping at triage-only fallback_chain[%d]",
+                task,
+                i,
+            )
+            raise AuxiliaryTriageHold() from None
         fb_provider = str(entry.get("provider", "")).strip()
         if not fb_provider:
             continue
@@ -5172,7 +5226,11 @@ def _try_configured_fallback_chain(
             continue
         fb_model = fb_model_raw or None
 
-        label = f"fallback_chain[{i}]({fb_provider})"
+        label = _TaskFallbackLabel(
+            f"fallback_chain[{i}]({fb_provider})",
+            provider=fb_provider,
+            next_index=i + 1,
+        )
 
         try:
             fb_client, resolved_model = _resolve_fallback_entry(entry)
@@ -5274,6 +5332,18 @@ class _TerminalMainFallbackLabel(str):
 
 
 _TERMINAL_MAIN_FALLBACK_LABEL = _TerminalMainFallbackLabel("")
+
+
+_AUXILIARY_TRIAGE_HOLD_MESSAGE = (
+    "Auxiliary request held by triage policy; continuation is disabled."
+)
+
+
+class AuxiliaryTriageHold(RuntimeError):
+    """Sanitized terminal outcome for an auxiliary no-continuation boundary."""
+
+    def __init__(self) -> None:
+        super().__init__(_AUXILIARY_TRIAGE_HOLD_MESSAGE)
 
 
 def _try_main_fallback_chain(
@@ -5385,6 +5455,56 @@ def _try_main_fallback_chain(
     return None, None, ""
 
 
+def _resolve_auxiliary_runtime_fallback(
+    *,
+    task: Optional[str],
+    resolved_provider: Optional[str],
+    reason: str,
+    failed_model: Optional[str],
+    is_auto: bool,
+    task_chain_start_index: int = 0,
+) -> Tuple[Optional[Any], Optional[str], str]:
+    """Resolve the ordered task chain, then the existing continuation lane."""
+    try:
+        fallback = _try_configured_fallback_chain(
+            task or "",
+            resolved_provider or "auto",
+            reason=reason,
+            failed_model=failed_model,
+            start_index=task_chain_start_index,
+        )
+        if fallback[0] is not None:
+            return fallback
+
+        if is_auto:
+            fallback = _try_main_fallback_chain(
+                task,
+                resolved_provider or "auto",
+                reason=reason,
+            )
+            if fallback[2] is _TERMINAL_MAIN_FALLBACK_LABEL:
+                raise AuxiliaryTriageHold()
+            if fallback[0] is None:
+                fallback = _try_payment_fallback(
+                    resolved_provider or "auto",
+                    task or "",
+                    reason=reason,
+                )
+            return fallback
+
+        return _try_main_agent_model_fallback(
+            resolved_provider or "auto",
+            task or "",
+            reason=reason,
+            failed_model=failed_model,
+        )
+    except AuxiliaryTriageHold:
+        # The original provider exception can contain endpoint details or
+        # response text.  Suppress exception chaining so rendered tracebacks
+        # expose only the deterministic hold outcome.
+        raise AuxiliaryTriageHold() from None
+
+
 def _resolve_single_provider(
     provider: str,
     model: Optional[str] = None,
@@ -5409,6 +5529,9 @@ def _resolve_auto(
     task: Optional[str] = None,
 ) -> Tuple[Optional[OpenAI], Optional[str]]:
     """Full auto-detection chain.
+
+    A terminal task-specific or top-level triage policy raises
+    :class:`AuxiliaryTriageHold` before built-in provider discovery.
 
     Priority:
       1. User's main provider + main model, regardless of provider type.
@@ -5560,7 +5683,7 @@ def _resolve_auto(
     fb_client, fb_model, _fb_label = _try_main_fallback_chain(
         task, main_provider or "auto", reason="main provider unavailable")
     if _fb_label is _TERMINAL_MAIN_FALLBACK_LABEL:
-        return None, None
+        raise AuxiliaryTriageHold() from None
     if fb_client is not None:
         return fb_client, fb_model
 
@@ -6505,6 +6628,7 @@ def get_text_auxiliary_client(
         explicit_api_key=api_key,
         api_mode=api_mode,
         main_runtime=main_runtime,
+        task=task or None,
     )
 
 
@@ -6524,6 +6648,7 @@ def get_async_text_auxiliary_client(task: str = "", *, main_runtime: Optional[Di
         explicit_api_key=api_key,
         api_mode=api_mode,
         main_runtime=main_runtime,
+        task=task or None,
     )
 
 
@@ -8680,6 +8805,7 @@ def _call_llm_impl(
         resolved_api_mode = api_mode
     effective_extra_body = _get_task_extra_body(task)
     effective_extra_body.update(extra_body or {})
+    promoted_task_fallback_label: Optional[_TaskFallbackLabel] = None
 
     if task == "vision":
         effective_provider, client, final_model = resolve_vision_provider_client(
@@ -8690,6 +8816,23 @@ def _call_llm_impl(
             async_mode=False,
             main_runtime=main_runtime,
         )
+        if client is None:
+            _explicit = (resolved_provider or "").strip().lower()
+            if _explicit and _explicit != "auto":
+                fb_client, fb_model, fb_label = (
+                    _try_configured_fallback_for_unavailable_client(
+                        task,
+                        _explicit,
+                    )
+                )
+                if fb_client is not None:
+                    client, final_model = fb_client, fb_model
+                    effective_provider, promoted_task_fallback_label = (
+                        _promoted_task_fallback_state(
+                            fb_label,
+                            effective_provider,
+                        )
+                    )
         if client is None and resolved_provider != "auto" and not resolved_base_url:
             logger.warning(
                 "Vision provider %s unavailable, falling back to auto vision backends",
@@ -8715,22 +8858,31 @@ def _call_llm_impl(
             api_key=resolved_api_key,
             api_mode=resolved_api_mode,
             main_runtime=main_runtime,
+            task=task,
         )
         if client is None:
-            # When the user explicitly chose a non-OpenRouter provider but no
-            # credentials were found, honor the task fallback_chain before
-            # raising.  Missing raw env keys are recoverable for auxiliary
+            # When an explicitly selected provider cannot build a client,
+            # honor the task fallback_chain before provider-specific recovery
+            # or raising. Missing raw env keys are recoverable for auxiliary
             # tasks because fallback entries may use OAuth / credential-pool
             # auth (for example openai-codex).
             _explicit = (resolved_provider or "").strip().lower()
-            if _explicit and _explicit not in {"auto", "openrouter", "custom"}:
-                fb_client, fb_model, fb_label = _try_configured_fallback_for_unavailable_client(
-                    task, _explicit,
+            if _explicit and _explicit != "auto":
+                fb_client, fb_model, fb_label = (
+                    _try_configured_fallback_for_unavailable_client(
+                        task,
+                        _explicit,
+                    )
                 )
                 if fb_client is not None:
                     client, final_model = fb_client, fb_model
-                    resolved_provider = fb_label or resolved_provider
-                else:
+                    resolved_provider, promoted_task_fallback_label = (
+                        _promoted_task_fallback_state(
+                            fb_label,
+                            resolved_provider,
+                        )
+                    )
+                elif _explicit not in {"openrouter", "custom"}:
                     raise RuntimeError(
                         f"Provider '{_explicit}' is set in config.yaml but no API key "
                         f"was found. Set the {_explicit.upper()}_API_KEY environment "
@@ -8744,7 +8896,9 @@ def _call_llm_impl(
             if client is None and not resolved_base_url:
                 logger.info("Auxiliary %s: provider %s unavailable, trying auto-detection chain",
                             task or "call", resolved_provider)
-                client, final_model = _get_cached_client("auto", main_runtime=main_runtime, task=task)
+                client, final_model = _get_cached_client(
+                    "auto", main_runtime=main_runtime, task=task
+                )
         if client is None:
             raise RuntimeError(
                 f"No LLM provider configured for task={task} provider={resolved_provider}. "
@@ -9237,8 +9391,12 @@ def _call_llm_impl(
                 reason = "invalid provider response"
             else:
                 reason = "connection error"
-            logger.info("Auxiliary %s: %s on %s (%s), trying fallback",
-                        task or "call", reason, resolved_provider, first_err)
+            logger.info(
+                "Auxiliary %s: %s on %s, trying fallback",
+                task or "call",
+                reason,
+                resolved_provider,
+            )
 
             # Narrow the configured-chain skip to the exact model that
             # failed ONLY for model-specific failures. Auth (401) and
@@ -9254,28 +9412,18 @@ def _call_llm_impl(
             #   2. For auto: top-level main fallback_providers/fallback_model
             #   3. For auto: built-in auxiliary discovery chain
             #   4. For explicit aux providers: main agent model safety net
-            fb_client, fb_model, fb_label = (None, None, "")
-            if is_auto:
-                fb_client, fb_model, fb_label = _try_configured_fallback_chain(
-                    task, resolved_provider or "auto", reason=reason,
-                    failed_model=_chain_failed_model)
-                if fb_client is None:
-                    fb_client, fb_model, fb_label = _try_main_fallback_chain(
-                        task, resolved_provider or "auto", reason=reason)
-                if (
-                    fb_client is None
-                    and fb_label is not _TERMINAL_MAIN_FALLBACK_LABEL
-                ):
-                    fb_client, fb_model, fb_label = _try_payment_fallback(
-                        resolved_provider, task, reason=reason)
-            else:
-                fb_client, fb_model, fb_label = _try_configured_fallback_chain(
-                    task, resolved_provider or "auto", reason=reason,
-                    failed_model=_chain_failed_model)
-                if fb_client is None:
-                    fb_client, fb_model, fb_label = _try_main_agent_model_fallback(
-                        resolved_provider, task, reason=reason,
-                        failed_model=_chain_failed_model)
+            fb_client, fb_model, fb_label = _resolve_auxiliary_runtime_fallback(
+                task=task,
+                resolved_provider=resolved_provider,
+                reason=reason,
+                failed_model=_chain_failed_model,
+                is_auto=is_auto,
+                task_chain_start_index=(
+                    promoted_task_fallback_label.next_index
+                    if promoted_task_fallback_label is not None
+                    else 0
+                ),
+            )
 
             if fb_client is not None:
                 fb_resp = _call_fallback_candidate_sync(
@@ -9287,12 +9435,22 @@ def _call_llm_impl(
                     reasoning_config=reasoning_config)
                 if fb_resp is not None:
                     return fb_resp
-                # The candidate had a stale/unrefreshable credential and was
-                # quarantined — walk the discovery chain once more; unhealthy
-                # entries are skipped so the next viable candidate serves.
-                fb_client, fb_model, fb_label = _try_payment_fallback(
-                    resolved_provider, task, reason="stale fallback credential")
-                if fb_client is not None:
+                # A typed task-chain label carries the only authorized resume
+                # cursor. Continue in configured order before entering any
+                # top-level, payment, built-in, or main-agent lane.
+                while isinstance(fb_label, _TaskFallbackLabel):
+                    fb_client, fb_model, fb_label = (
+                        _resolve_auxiliary_runtime_fallback(
+                            task=task,
+                            resolved_provider=resolved_provider,
+                            reason="stale fallback credential",
+                            failed_model=_chain_failed_model,
+                            is_auto=is_auto,
+                            task_chain_start_index=fb_label.next_index,
+                        )
+                    )
+                    if fb_client is None:
+                        break
                     fb_resp = _call_fallback_candidate_sync(
                         fb_client, fb_model, fb_label,
                         task=task, messages=messages,
@@ -9302,6 +9460,21 @@ def _call_llm_impl(
                         reasoning_config=reasoning_config)
                     if fb_resp is not None:
                         return fb_resp
+                # Preserve the legacy one-more-discovery walk for stale
+                # candidates that did not originate from the task chain.
+                if fb_client is not None:
+                    fb_client, fb_model, fb_label = _try_payment_fallback(
+                        resolved_provider, task, reason="stale fallback credential")
+                    if fb_client is not None:
+                        fb_resp = _call_fallback_candidate_sync(
+                            fb_client, fb_model, fb_label,
+                            task=task, messages=messages,
+                            temperature=temperature, max_tokens=max_tokens,
+                            tools=tools, effective_timeout=effective_timeout,
+                            effective_extra_body=effective_extra_body,
+                            reasoning_config=reasoning_config)
+                        if fb_resp is not None:
+                            return fb_resp
             # All fallback layers exhausted — emit a single user-visible
             # warning so the operator knows aux task is about to fail.
             # (#26882) The error itself is re-raised below.
@@ -9449,6 +9622,7 @@ async def _async_call_llm_impl(
         task, provider, model, base_url, api_key)
     effective_extra_body = _get_task_extra_body(task)
     effective_extra_body.update(extra_body or {})
+    promoted_task_fallback_label: Optional[_TaskFallbackLabel] = None
 
     if task == "vision":
         effective_provider, client, final_model = resolve_vision_provider_client(
@@ -9459,6 +9633,28 @@ async def _async_call_llm_impl(
             async_mode=True,
             main_runtime=main_runtime,
         )
+        if client is None:
+            _explicit = (resolved_provider or "").strip().lower()
+            if _explicit and _explicit != "auto":
+                fb_client, fb_model, fb_label = (
+                    _try_configured_fallback_for_unavailable_client(
+                        task,
+                        _explicit,
+                    )
+                )
+                if fb_client is not None:
+                    client, final_model = _to_async_client(
+                        fb_client,
+                        fb_model or "",
+                        is_vision=True,
+                    )
+                    if client is not None:
+                        effective_provider, promoted_task_fallback_label = (
+                            _promoted_task_fallback_state(
+                                fb_label,
+                                effective_provider,
+                            )
+                        )
         if client is None and resolved_provider != "auto" and not resolved_base_url:
             logger.warning(
                 "Vision provider %s unavailable, falling back to auto vision backends",
@@ -9485,19 +9681,29 @@ async def _async_call_llm_impl(
             api_key=resolved_api_key,
             api_mode=resolved_api_mode,
             main_runtime=main_runtime,
+            task=task,
         )
         if client is None:
             _explicit = (resolved_provider or "").strip().lower()
-            if _explicit and _explicit not in {"auto", "openrouter", "custom"}:
-                fb_client, fb_model, fb_label = _try_configured_fallback_for_unavailable_client(
-                    task, _explicit,
+            if _explicit and _explicit != "auto":
+                fb_client, fb_model, fb_label = (
+                    _try_configured_fallback_for_unavailable_client(
+                        task,
+                        _explicit,
+                    )
                 )
                 if fb_client is not None:
                     client, final_model = _to_async_client(
                         fb_client, fb_model or "", is_vision=(task == "vision")
                     )
-                    resolved_provider = fb_label or resolved_provider
-                else:
+                    if client is not None:
+                        resolved_provider, promoted_task_fallback_label = (
+                            _promoted_task_fallback_state(
+                                fb_label,
+                                resolved_provider,
+                            )
+                        )
+                elif _explicit not in {"openrouter", "custom"}:
                     raise RuntimeError(
                         f"Provider '{_explicit}' is set in config.yaml but no API key "
                         f"was found. Set the {_explicit.upper()}_API_KEY environment "
@@ -9506,7 +9712,12 @@ async def _async_call_llm_impl(
             if client is None and not resolved_base_url:
                 logger.info("Auxiliary %s: provider %s unavailable, trying auto-detection chain",
                             task or "call", resolved_provider)
-                client, final_model = _get_cached_client("auto", async_mode=True, main_runtime=main_runtime, task=task)
+                client, final_model = _get_cached_client(
+                    "auto",
+                    async_mode=True,
+                    main_runtime=main_runtime,
+                    task=task,
+                )
         if client is None:
             raise RuntimeError(
                 f"No LLM provider configured for task={task} provider={resolved_provider}. "
@@ -9877,8 +10088,12 @@ async def _async_call_llm_impl(
                 reason = "invalid provider response"
             else:
                 reason = "connection error"
-            logger.info("Auxiliary %s (async): %s on %s (%s), trying fallback",
-                        task or "call", reason, resolved_provider, first_err)
+            logger.info(
+                "Auxiliary %s (async): %s on %s, trying fallback",
+                task or "call",
+                reason,
+                resolved_provider,
+            )
 
             # Narrow the configured-chain skip to the exact model that
             # failed ONLY for model-specific failures. Auth (401) and
@@ -9894,28 +10109,18 @@ async def _async_call_llm_impl(
             #   2. For auto: top-level main fallback_providers/fallback_model
             #   3. For auto: built-in auxiliary discovery chain
             #   4. For explicit aux providers: main agent model safety net
-            fb_client, fb_model, fb_label = (None, None, "")
-            if is_auto:
-                fb_client, fb_model, fb_label = _try_configured_fallback_chain(
-                    task, resolved_provider or "auto", reason=reason,
-                    failed_model=_chain_failed_model)
-                if fb_client is None:
-                    fb_client, fb_model, fb_label = _try_main_fallback_chain(
-                        task, resolved_provider or "auto", reason=reason)
-                if (
-                    fb_client is None
-                    and fb_label is not _TERMINAL_MAIN_FALLBACK_LABEL
-                ):
-                    fb_client, fb_model, fb_label = _try_payment_fallback(
-                        resolved_provider, task, reason=reason)
-            else:
-                fb_client, fb_model, fb_label = _try_configured_fallback_chain(
-                    task, resolved_provider or "auto", reason=reason,
-                    failed_model=_chain_failed_model)
-                if fb_client is None:
-                    fb_client, fb_model, fb_label = _try_main_agent_model_fallback(
-                        resolved_provider, task, reason=reason,
-                        failed_model=_chain_failed_model)
+            fb_client, fb_model, fb_label = _resolve_auxiliary_runtime_fallback(
+                task=task,
+                resolved_provider=resolved_provider,
+                reason=reason,
+                failed_model=_chain_failed_model,
+                is_auto=is_auto,
+                task_chain_start_index=(
+                    promoted_task_fallback_label.next_index
+                    if promoted_task_fallback_label is not None
+                    else 0
+                ),
+            )
 
             if fb_client is not None:
                 # Convert sync fallback client to async
@@ -9931,11 +10136,21 @@ async def _async_call_llm_impl(
                     reasoning_config=reasoning_config)
                 if fb_resp is not None:
                     return fb_resp
-                # Stale/unrefreshable candidate credential — quarantined; walk
-                # the discovery chain once more (unhealthy entries skipped).
-                fb_client, fb_model, fb_label = _try_payment_fallback(
-                    resolved_provider, task, reason="stale fallback credential")
-                if fb_client is not None:
+                # Resume a stale configured candidate at its typed next cursor;
+                # task policy remains ahead of every broader recovery lane.
+                while isinstance(fb_label, _TaskFallbackLabel):
+                    fb_client, fb_model, fb_label = (
+                        _resolve_auxiliary_runtime_fallback(
+                            task=task,
+                            resolved_provider=resolved_provider,
+                            reason="stale fallback credential",
+                            failed_model=_chain_failed_model,
+                            is_auto=is_auto,
+                            task_chain_start_index=fb_label.next_index,
+                        )
+                    )
+                    if fb_client is None:
+                        break
                     async_fb, async_fb_model = _to_async_client(
                         fb_client, fb_model or "", is_vision=(task == "vision")
                     )
@@ -9948,6 +10163,24 @@ async def _async_call_llm_impl(
                         reasoning_config=reasoning_config)
                     if fb_resp is not None:
                         return fb_resp
+                # Preserve the legacy one-more-discovery walk for stale
+                # candidates that did not originate from the task chain.
+                if fb_client is not None:
+                    fb_client, fb_model, fb_label = _try_payment_fallback(
+                        resolved_provider, task, reason="stale fallback credential")
+                    if fb_client is not None:
+                        async_fb, async_fb_model = _to_async_client(
+                            fb_client, fb_model or "", is_vision=(task == "vision")
+                        )
+                        fb_resp = await _call_fallback_candidate_async(
+                            async_fb, async_fb_model or fb_model, fb_label,
+                            task=task, messages=messages,
+                            temperature=temperature, max_tokens=max_tokens,
+                            tools=tools, effective_timeout=effective_timeout,
+                            effective_extra_body=effective_extra_body,
+                            reasoning_config=reasoning_config)
+                        if fb_resp is not None:
+                            return fb_resp
             # All fallback layers exhausted — warn before re-raising. (#26882)
             logger.warning(
                 "Auxiliary %s (async): %s on %s and all fallbacks exhausted "
