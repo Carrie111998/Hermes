@@ -76,6 +76,8 @@ class TelegramLifecycleMixin:
         """Register the command menu, surface the status indicator, and set up
         DM topics — all off the connect path so a slow Bot API call cannot blow
         the gateway connect timeout (#46298). Every step is non-fatal."""
+        from plugins.platforms.telegram.adapter import _redact_telegram_error_text
+
         try:
             # Register bot commands so Telegram shows a hint menu when users type /
             # List is derived from the central COMMAND_REGISTRY — adding a new
