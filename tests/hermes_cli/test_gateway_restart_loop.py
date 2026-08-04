@@ -857,3 +857,184 @@ class TestCronCreateLifecycleBlockExtra:
         assert rc == 1
         out = capsys.readouterr().out
         assert "Blocked" in out
+
+
+class TestLocalBinaryGuardRegression:
+    """Minimal regression coverage for the on-disk binary → remote revival
+    bypass class that PR #78197 was filed against (#76762 follow-up).
+
+    These tests intentionally exercise only the lifecycle guard module so
+    they fail closed and independent of the unrelated upstream test
+    failures. They do NOT cover cross-backend semantics, two-stage
+    remote reads, envelope formats, deadline budgets, or platform
+    metadata — those are explicitly out of scope for this PR.
+    """
+
+    def test_nul_path_does_not_crash_guard(self, tmp_path):
+        from cron.lifecycle_guard import _read_referenced_script
+        # Simulate a tokenized binary path that contains an embedded NUL.
+        # ``os.open`` raises ``ValueError`` for such paths on POSIX; the
+        # guard must swallow this rather than letting it bubble, and the
+        # local decision must be terminal (found=True) so the remote
+        # fallback is never consulted for an unopenable path.
+        nul_path = tmp_path / "bad\x00name"
+        text, unsafe, found = _read_referenced_script(nul_path)
+        assert text is None
+        assert unsafe is False
+        assert found is True
+
+    def test_embedded_nul_token_never_invokes_remote(self, tmp_path):
+        from cron.lifecycle_guard import contains_gateway_lifecycle_command_or_referenced_script
+        calls = []
+
+        def remote(path):
+            calls.append(path)
+            return "hermes gateway restart"
+
+        result = contains_gateway_lifecycle_command_or_referenced_script(
+            "bash bad\x00name",
+            cwd=str(tmp_path),
+            read_remote_script=remote,
+        )
+        assert result is False
+        assert calls == []
+
+    def test_local_binary_does_not_invoke_remote(self, tmp_path):
+        from cron.lifecycle_guard import contains_gateway_lifecycle_command_or_referenced_script
+        # Incident shape: ``./node.exe`` (a path-bearing direct executable)
+        # must be classified as a local binary and must NOT be revived by
+        # the remote fallback.  On the pre-fix code this test fails: the
+        # binary read returned text=None, the guard treated it as missing,
+        # and the remote callback was invoked.
+        pe = bytearray(4096)
+        pe[:2] = b"MZ"
+        pe[0x3C:0x40] = (0x100).to_bytes(4, "little")
+        pe[0x100:0x104] = b"PE\0\0"
+        binary = tmp_path / "node.exe"
+        binary.write_bytes(pe)
+
+        remote_calls = []
+
+        def remote(path):
+            remote_calls.append(path)
+            # If this were ever called, the guard would be revived by the
+            # remote fallback — that is exactly the bypass we are closing.
+            return "hermes gateway restart"
+
+        cmd = f"ls {tmp_path} && ./{binary.name} --version"
+        result = contains_gateway_lifecycle_command_or_referenced_script(
+            cmd,
+            cwd=str(tmp_path),
+            read_remote_script=remote,
+        )
+        assert result is False
+        assert remote_calls == []
+
+    def test_local_missing_still_allows_remote_fallback(self, tmp_path):
+        from cron.lifecycle_guard import contains_gateway_lifecycle_command_or_referenced_script
+        remote_calls = []
+
+        def remote(path):
+            remote_calls.append(path)
+            return "hermes gateway restart"
+
+        # Local file does NOT exist; only the basename is referenced so
+        # shlex tokenization yields a single argument.  The local read
+        # returns found=False (FileNotFoundError), so the remote fallback
+        # must be consulted.
+        result = contains_gateway_lifecycle_command_or_referenced_script(
+            "bash absent.sh",
+            cwd=str(tmp_path),
+            read_remote_script=remote,
+        )
+        assert result is True
+        assert remote_calls == [str(tmp_path / "absent.sh")]
+
+    def test_explicit_loader_local_binary_does_not_invoke_remote(self, tmp_path):
+        from cron.lifecycle_guard import contains_gateway_lifecycle_command_or_referenced_script
+        binary = tmp_path / "node.exe"
+        pe = bytearray(4096)
+        pe[:2] = b"MZ"
+        pe[0x3C:0x40] = (0x100).to_bytes(4, "little")
+        pe[0x100:0x104] = b"PE\0\0"
+        binary.write_bytes(pe)
+
+        def remote(path):
+            raise AssertionError("remote reader must not be called for a "
+                                 "locally classified binary")
+
+        result = contains_gateway_lifecycle_command_or_referenced_script(
+            f"bash {binary.name}", cwd=str(tmp_path), read_remote_script=remote
+        )
+        assert result is False
+
+    def test_permission_error_fails_closed_without_remote(self, tmp_path, monkeypatch):
+        import cron.lifecycle_guard as lg
+        from cron.lifecycle_guard import contains_gateway_lifecycle_command_or_referenced_script
+
+        def denied_open(path, flags, *args, **kwargs):
+            raise PermissionError(13, "Permission denied")
+
+        monkeypatch.setattr(lg.os, "open", denied_open)
+        calls = []
+
+        def remote(path):
+            calls.append(path)
+            return "hermes gateway restart"
+
+        result = contains_gateway_lifecycle_command_or_referenced_script(
+            "bash denied.sh", cwd=str(tmp_path), read_remote_script=remote
+        )
+        assert result is True  # fail closed
+        assert calls == []  # remote must not be consulted
+
+    def test_generic_open_oserror_fails_closed_without_remote(self, tmp_path, monkeypatch):
+        import cron.lifecycle_guard as lg
+        from cron.lifecycle_guard import contains_gateway_lifecycle_command_or_referenced_script
+
+        def failing_open(path, flags, *args, **kwargs):
+            raise OSError(22, "Invalid argument")
+
+        monkeypatch.setattr(lg.os, "open", failing_open)
+        calls = []
+
+        def remote(path):
+            calls.append(path)
+            return "hermes gateway restart"
+
+        result = contains_gateway_lifecycle_command_or_referenced_script(
+            "bash bad.sh", cwd=str(tmp_path), read_remote_script=remote
+        )
+        assert result is True  # fail closed
+        assert calls == []  # remote must not be consulted
+
+    def test_read_error_after_open_fails_closed_without_remote(self, tmp_path, monkeypatch):
+        import cron.lifecycle_guard as lg
+        from cron.lifecycle_guard import contains_gateway_lifecycle_command_or_referenced_script
+        script = tmp_path / "r.sh"
+        script.write_text("#!/bin/bash\necho hi\n")
+
+        def failing_read(fd, n):
+            raise OSError(5, "Input/output error")
+
+        monkeypatch.setattr(lg.os, "read", failing_read)
+        calls = []
+
+        def remote(path):
+            calls.append(path)
+            return "hermes gateway restart"
+
+        result = contains_gateway_lifecycle_command_or_referenced_script(
+            f"bash {script.name}", cwd=str(tmp_path), read_remote_script=remote
+        )
+        assert result is True  # fail closed
+        assert calls == []  # remote must not be consulted
+
+    def test_safe_text_script_still_scanned(self, tmp_path):
+        from cron.lifecycle_guard import contains_gateway_lifecycle_command_or_referenced_script
+        script = tmp_path / "safe.sh"
+        script.write_text("#!/bin/bash\necho safe\n")
+        result = contains_gateway_lifecycle_command_or_referenced_script(
+            f"bash {script.name}", cwd=str(tmp_path)
+        )
+        assert result is False

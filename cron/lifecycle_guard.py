@@ -253,36 +253,54 @@ def _resolve_script_directory(script_path: str) -> Optional[str]:
     return None
 
 
-def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
-    """Return ``(text, unsafe)`` using bounded, regular-file-only reads."""
+def _read_referenced_script(path: Path) -> tuple[Optional[str], bool, bool]:
+    """Return ``(text, unsafe, found)`` for a referenced script path.
+
+    ``found`` distinguishes a genuinely missing local path (``False`` —
+    the only state allowed to consult ``read_remote_script``) from any
+    locally present file the guard refuses to scan as text (``True``).
+    ``unsafe`` is set (fail closed) whenever the file is present but
+    cannot be safely classified — permission/read errors, non-regular
+    files, and oversized reads must never be revived by the remote
+    fallback (#78197).
+    """
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
     try:
         descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        return None, False, False
+    except NotADirectoryError:
+        return None, False, False
+    except ValueError:
+        # Embedded NUL inside a tokenized binary path: the local decision
+        # is terminal — never consult the remote fallback for a path the
+        # guard cannot even open (#76762).
+        return None, False, True
+    except PermissionError:
+        return None, True, True
     except OSError:
-        return None, False
+        # Any other open failure (EINVAL, ELOOP, ...): the file is
+        # present but unreadable; fail closed rather than falling back.
+        return None, True, True
     try:
         metadata = os.fstat(descriptor)
         if not stat.S_ISREG(metadata.st_mode):
-            return None, True
-        # Read a bounded chunk first — even for oversized files, the first
-        # chunk tells us if this is a binary (NUL bytes) that should be
-        # skipped as "nothing to scan" rather than failing closed (#76762).
+            return None, True, True
         data = os.read(descriptor, _MAX_REFERENCED_SCRIPT_BYTES + 1)
     except OSError:
-        return None, False
+        # Descriptor opened but the read failed: present and unreadable —
+        # fail closed, never fall back.
+        return None, True, True
     finally:
-        os.close(descriptor)
-    # A NUL byte in the first chunk means this is a binary (ELF/Mach-O/
-    # PE), not a shell script — scanning its decoded contents would
-    # tokenize machine code and feed junk paths into the recursion
-    # (including a `ValueError: embedded null byte` from Path.resolve,
-    # #76762). Treat it as "nothing to scan" rather than unsafe: a binary
-    # executed by the user is not a referenced *shell script*.
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
     if b"\x00" in data:
-        return None, False
+        return None, False, True
     if len(data) > _MAX_REFERENCED_SCRIPT_BYTES:
-        return None, True
-    return data.decode("utf-8", errors="replace"), False
+        return None, True, True
+    return data.decode("utf-8", errors="replace"), False, True
 
 
 def _contains_unsafe_gateway_action(
@@ -321,11 +339,13 @@ def _contains_unsafe_gateway_action(
         if resolved in visited:
             continue
         visited.add(resolved)
-        script_text, unsafe = _read_referenced_script(script_path)
+        script_text, unsafe, found = _read_referenced_script(script_path)
         if unsafe:
             return True
-        if script_text is None and read_remote_script is not None:
+        if not found and read_remote_script is not None:
             # Local path missing; try the remote backend if one is available.
+            # A locally classified binary/unsafe file must NEVER be revived
+            # by the remote fallback (#78197).
             script_text = read_remote_script(str(script_path))
         if not script_text:
             continue
@@ -383,11 +403,12 @@ def _resolve_script_path(script_path: str) -> Path:
 def _read_script_for_scanning(script_path: str) -> str:
     """Read a cron script with the bounded terminal-script scanner.
 
-    Non-regular or oversized inputs fail closed by returning a lifecycle-shaped
-    sentinel, while missing/unreadable paths remain empty so ordinary scheduler
-    path validation can report them.
+    Only genuinely missing paths stay empty (so ordinary scheduler path
+    validation can report them). Locally present files that cannot be
+    scanned — non-regular, oversized, permission/read errors — fail
+    closed by returning a lifecycle-shaped sentinel (#78197).
     """
-    script_text, unsafe = _read_referenced_script(_resolve_script_path(script_path))
+    script_text, unsafe, _found = _read_referenced_script(_resolve_script_path(script_path))
     if unsafe:
         return "hermes gateway restart"
     return script_text or ""
