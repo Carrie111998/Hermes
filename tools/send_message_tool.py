@@ -609,6 +609,14 @@ def _parse_target_ref(platform_name: str, target_ref: str):
         # them off the channel directory (mirrors the react handler).
         if _PHOTON_DM_GUID_RE.fullmatch(target_ref.strip()):
             return target_ref.strip(), None, True
+    if platform_name == "a2a":
+        # A2A chat ids are opaque context ids (ctx-...) minted per peer
+        # session; human-readable names like "a2a:macmini" resolve via the
+        # channel directory below. Without this branch every a2a target
+        # parsed to (None, None, False), so resolve_channel_name() results
+        # were re-parsed into None and send fell back to "No home channel".
+        if target_ref.strip().startswith("ctx-"):
+            return target_ref.strip(), None, True
     if target_ref.lstrip("-").isdigit():
         return target_ref, None, True
     # Matrix room IDs (start with !) and user IDs (start with @) are explicit
