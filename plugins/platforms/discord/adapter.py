@@ -1352,6 +1352,9 @@ class DiscordAdapter(BasePlatformAdapter):
                 return False, False
             role_authorized = bool(getattr(self, "_allowed_role_ids", set()))
 
+        if self._discord_parent_channel_requires_thread(message):
+            return False, False
+
         raw_self_mention = self._self_is_explicitly_mentioned(message)
         if not isinstance(message.channel, discord.DMChannel) and (
             message.mentions or raw_self_mention
@@ -5938,6 +5941,28 @@ class DiscordAdapter(BasePlatformAdapter):
         if s:
             return {part.strip() for part in s.split(",") if part.strip()}
         return set()
+
+    def _discord_thread_only_channels(self) -> set[str]:
+        """Return parent channels that accept Discord messages only in threads."""
+        raw = self.config.extra.get("thread_only_channels")
+        if raw is None:
+            raw = os.getenv("DISCORD_THREAD_ONLY_CHANNELS", "")
+        if isinstance(raw, list):
+            return {str(part).strip() for part in raw if str(part).strip()}
+        s = str(raw).strip() if raw is not None else ""
+        return {part.strip() for part in s.split(",") if part.strip()} if s else set()
+
+    def _discord_parent_channel_requires_thread(self, message: Any) -> bool:
+        """True when a configured parent channel received a non-thread message."""
+        thread_only = self._discord_thread_only_channels()
+        if not thread_only or getattr(message, "guild", None) is None:
+            return False
+        channel = getattr(message, "channel", None)
+        parent_id = self._get_parent_channel_id(channel)
+        channel_keys = self._discord_channel_keys(message, parent_id)
+        if "*" not in thread_only and not (channel_keys & thread_only):
+            return False
+        return not bool(parent_id)
 
     def _raw_mentioned_user_ids(self, message: Any) -> set:
         """Extract Discord user-mention IDs directly from raw message content.

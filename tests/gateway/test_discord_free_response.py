@@ -1486,3 +1486,32 @@ async def test_discord_non_reply_free_channel_skips_backfill(adapter, monkeypatc
 
     adapter._fetch_channel_context.assert_not_awaited()
 
+
+def test_discord_thread_only_channel_rejects_parent_messages(adapter):
+    """A thread-only parent must not admit a direct channel message."""
+    parent = FakeTextChannel(channel_id=100, name="intelligence")
+    message = make_message(channel=parent, content="do not handle in parent")
+    message.guild = parent.guild
+    adapter._allowed_user_ids = {"42"}
+    adapter.config.extra["free_response_channels"] = ["100"]
+    adapter.config.extra["thread_only_channels"] = ["100"]
+
+    admitted, _ = adapter._discord_message_admission(message, claim=False)
+
+    assert admitted is False
+
+
+def test_discord_thread_only_channel_admits_a_child_thread(adapter):
+    """A configured parent still admits an approved message inside its thread."""
+    parent = FakeTextChannel(channel_id=100, name="intelligence")
+    thread = FakeThread(channel_id=101, name="task-1", parent=parent)
+    message = make_message(channel=thread, content="handle in task thread")
+    message.guild = parent.guild
+    adapter._allowed_user_ids = {"42"}
+    adapter.config.extra["free_response_channels"] = ["100"]
+    adapter.config.extra["thread_only_channels"] = ["100"]
+
+    admitted, _ = adapter._discord_message_admission(message, claim=False)
+
+    assert admitted is True
+
