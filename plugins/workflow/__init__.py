@@ -149,10 +149,28 @@ def register(ctx):
     # Register kanban lifecycle hooks to update the job log DB
     ctx.register_hook("kanban_task_completed", _on_kanban_task_completed)
     ctx.register_hook("kanban_task_blocked", _on_kanban_task_blocked)
+    # Auto-resume: a completed run's card re-claimed by the dispatcher
+    # (after a manual done -> ready reset) re-opens the exact run.
+    ctx.register_hook("kanban_task_claimed", _on_kanban_task_claimed)
 
     # Register pre_gateway_dispatch hook to capture gateway reference
     # for the workflow completion watcher thread
     ctx.register_hook("pre_gateway_dispatch", _capture_gateway)
+
+
+def _on_kanban_task_claimed(*, task_id: str, **kwargs):
+    """Auto-resume: re-open a completed run when a node card is re-claimed.
+
+    A user manually resetting a done card back to ``ready`` causes the
+    dispatcher to claim it. If the card belongs to a COMPLETED workflow
+    run (state file retained with ``final_status``), re-open the exact
+    run and spawn the resume supervisor. Cards of active runs fall
+    through — the normal hook path handles them.
+    """
+    try:
+        _reopen_completed_run(task_id)
+    except Exception as e:
+        logger.error("kanban_task_claimed auto-resume failed: %s", e)
 
 
 def _on_kanban_task_completed(*, task_id: str, **kwargs):
@@ -218,6 +236,196 @@ def _update_node_card_db(card_id: str, status: str):
 # ---------------------------------------------------------------------------
 # Workflow node event handler — loop logic and layer advancement
 # ---------------------------------------------------------------------------
+
+def _get_board_conn(state: dict):
+    """Open a kanban DB connection for the board in a state dict.
+
+    Returns (kanban_db_module, sqlite3_connection). If the state dict
+    lacks ``kanban_board``, returns (kanban_db, None) so callers can
+    log and bail. Caller is responsible for closing the connection.
+    """
+    import sqlite3
+    from hermes_cli import kanban_db
+    board = state.get("kanban_board")
+    if not board:
+        return kanban_db, None
+    try:
+        conn = kanban_db.connect(board=board)
+        return kanban_db, conn
+    except Exception as e:
+        logger.error("Failed to open kanban DB for board %s: %s", board, e)
+        return kanban_db, None
+
+
+def _mark_execution_running(run_id: str):
+    """Flip a completed ``workflow_executions`` row back to ``running``.
+
+    Called when a completed run is re-opened (auto-resume) so the job
+    log reflects the new active round. Non-fatal on any error.
+    """
+    try:
+        import sqlite3
+        from hermes_cli.kanban_db import kanban_home
+        db_path = kanban_home() / "workflows" / "executions.db"
+        if not db_path.exists():
+            return
+        with sqlite3.connect(str(db_path)) as conn:
+            conn.execute(
+                "UPDATE workflow_executions SET status = 'running', finished_at = NULL "
+                "WHERE run_id = ?",
+                (run_id,),
+            )
+    except Exception:
+        pass  # Non-fatal — state files still drive the run
+
+
+def _spawn_supervisor_for_resume(state: dict):
+    """Spawn the supervisor subprocess to resume a re-opened run.
+
+    Unlike ``_spawn_supervisor_for_next_layer`` (which bails when the
+    workflow is already past the last layer), this always spawns —
+    auto-resume re-opens COMPLETED runs whose layer bookkeeping is at
+    the end. The supervisor's ``execute(..., resume=True)`` path reads
+    node statuses from the state file and re-monitors re-activated
+    nodes regardless of ``current_layer``.
+    """
+    import subprocess
+    import sys
+    workflow_name = state.get("workflow_name", "")
+    run_id = state.get("run_id", "")
+    board = state.get("kanban_board", "")
+    if not workflow_name or not run_id or not board:
+        return
+    # Dedupe: don't stack supervisors for the same run.
+    try:
+        existing = subprocess.run(
+            ["pgrep", "-f", f"workflow_engine.*{workflow_name}.*{run_id}"],
+            capture_output=True, text=True,
+        )
+        if existing.stdout.strip():
+            print(f"   ℹ  Supervisor already running for {workflow_name} (run {run_id}) — skipping spawn")
+            return
+    except Exception:
+        pass
+    cmd = [
+        sys.executable, "-m", "tools.workflow_engine",
+        "start", workflow_name,
+        "--resume",
+        "--board", board,
+        "--run-id", run_id,
+    ]
+    env = os.environ.copy()
+    env["HERMES_WORKFLOW_FILES"] = os.environ.get(
+        "HERMES_WORKFLOW_FILES",
+        str(Path(__file__).resolve().parent.parent.parent / "docs" / "fleet-pipelines"),
+    )
+    try:
+        subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=env,
+            start_new_session=True,
+        )
+        print(f"   👤 supervisor spawned for resumed run {run_id}")
+    except Exception as e:
+        logger.error("Failed to spawn resume supervisor for %s: %s", run_id, e)
+
+
+def _reopen_completed_run(task_id: str) -> bool:
+    """Re-open a completed workflow run when a node card is re-activated.
+
+    Auto-resume trigger: a user manually resets a done card back to
+    ``ready``; the dispatcher claims it (``kanban_task_claimed``) and
+    this hook re-opens the exact run:
+
+      1. Find the retained state file (``_clear_state`` now keeps it
+         with ``final_status`` instead of deleting).
+      2. Reset the node's status to ``ready`` and drop ``final_status``.
+      3. Reset its reviewer nodes too (clear ``kanban_card_id``) so the
+         next ``pending review`` block creates a FRESH reviewer card —
+         the old reviewer card is ``done`` and must not be reused.
+      4. Flip the execution row back to ``running``.
+      5. Spawn the supervisor with ``--resume --run-id <exact>``.
+
+    Returns True when a run was re-opened and a supervisor spawned.
+    """
+    try:
+        result = _find_state_for_card(task_id)
+        if result is None:
+            return False
+        state, state_path = result
+        if not state.get("final_status"):
+            return False  # Run still active — normal hook path handles it
+        workflow_name = state.get("workflow_name", "")
+        run_id = state.get("run_id", "")
+        board = state.get("kanban_board", "")
+        if not workflow_name or not run_id or not board:
+            return False
+
+        # Find which node this card belongs to
+        node_id = None
+        for nid, ns in state.get("states", {}).items():
+            if ns.get("kanban_card_id") == task_id:
+                node_id = nid
+                break
+        if not node_id:
+            return False
+
+        states = state.get("states", {})
+        states[node_id]["status"] = "ready"
+        states[node_id]["completed_at"] = None
+        states[node_id]["result"] = None
+
+        # Reset layer bookkeeping: a completed run sits at the final
+        # layer, so the resume supervisor's layer loop would exit
+        # immediately. Rewind to the re-opened node's layer so its
+        # dispatch/monitor path re-engages. Done nodes in earlier
+        # layers are skipped by the resume path.
+        layers = state.get("layers", [])
+        for li, layer_nids in enumerate(layers):
+            if node_id in layer_nids:
+                state["current_layer"] = li
+                break
+
+        # Reset reviewers for this node so the next "pending review"
+        # block dispatches a FRESH reviewer card instead of reusing the
+        # completed one (the monitor only unblocks BLOCKED reviewer
+        # cards; a done card would stall the loop). Status is "pending"
+        # — the engine's marker for "not yet dispatched reviewer" —
+        # so _has_active_review does not treat it as in-flight.
+        try:
+            import yaml
+            wf_dir = os.environ.get("HERMES_WORKFLOW_FILES", "")
+            if not wf_dir:
+                wf_dir = str(Path(__file__).resolve().parent.parent.parent / "docs" / "fleet-pipelines")
+            wf_path = Path(wf_dir) / f"{workflow_name}.yaml"
+            if wf_path.exists():
+                wf = yaml.safe_load(wf_path.read_text())
+                reviews = wf.get("nodes", {}).get(node_id, {}).get("reviews", [])
+                for rev_entry in reviews:
+                    rev_id = rev_entry if isinstance(rev_entry, str) else rev_entry.get("review", "")
+                    if rev_id and rev_id in states:
+                        states[rev_id]["kanban_card_id"] = None
+                        states[rev_id]["status"] = "pending"
+                        states[rev_id]["completed_at"] = None
+                        states[rev_id]["result"] = None
+        except Exception as e:
+            logger.error("Auto-resume reviewer reset failed for %s: %s", task_id, e)
+
+        state.pop("final_status", None)
+        state["updated_at"] = datetime.now(timezone.utc).isoformat()
+        with open(state_path, "w") as _f:
+            json.dump(state, _f, indent=2)
+
+        _mark_execution_running(run_id)
+        print(f"   ♻  Auto-resume: card {task_id} re-activated — re-opening run {run_id}")
+        _spawn_supervisor_for_resume(state)
+        return True
+    except Exception as e:
+        logger.error("Auto-resume re-open failed for %s: %s", task_id, e)
+        return False
+
 
 def _find_state_for_card(task_id: str):
     """Find the workflow state file that contains this task_id.
