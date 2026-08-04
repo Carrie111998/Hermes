@@ -893,6 +893,12 @@ def _write_failed_native_bundle(
             **host_unsigned,
             "receipt_sha256": recovery._sha256_json(host_unsigned),
         }
+        activation_host_state = {
+            "changed": host["changed"],
+            "before": host["before"],
+            "after": host["after"],
+            "failed": True,
+        }
         host_path.write_bytes(recovery._canonical_bytes(host))
         failure.update({
             "external_iam_evidence": {
@@ -908,7 +914,9 @@ def _write_failed_native_bundle(
             "error_type": recovery._HOST_IDENTITY_CONVERGENCE_ERROR_TYPE,
             "error_sha256": recovery._HOST_IDENTITY_CONVERGENCE_ERROR_SHA256,
             "failed_at_unix": 201,
-            "host_preparation_sha256": recovery._sha256_json(host),
+            "host_preparation_sha256": recovery._sha256_json(
+                activation_host_state
+            ),
             "host_preparation_evidence": host,
         })
     failure_raw = recovery._canonical_bytes(failure)

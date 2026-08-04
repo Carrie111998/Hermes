@@ -591,6 +591,12 @@ def _validate_host_identity_convergence_failure(
     host_unsigned = {
         name: item for name, item in host.items() if name != "receipt_sha256"
     }
+    activation_host_state = {
+        "changed": host.get("changed"),
+        "before": host.get("before"),
+        "after": host.get("after"),
+        "failed": True,
+    }
     if (
         host.get("schema") != _HOST_PREPARATION_FAILURE_SCHEMA
         or host.get("revision") != source_revision
@@ -608,7 +614,8 @@ def _validate_host_identity_convergence_failure(
         or host_path.parent != expected_host_root
         or _FAILURE_FILE_RE.fullmatch(host_path.name) is None
         or host.get("receipt_sha256") != _sha256_json(host_unsigned)
-        or value.get("host_preparation_sha256") != _sha256_json(host)
+        or value.get("host_preparation_sha256")
+        != _sha256_json(activation_host_state)
         or value.get("error_type") != host["error_type"]
         or value.get("error_sha256") != host["error_sha256"]
         or value.get("failed_at_unix") < host["failed_at_unix"]
