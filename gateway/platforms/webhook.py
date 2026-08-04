@@ -40,6 +40,7 @@ import logging
 import re
 import subprocess
 import sys
+import os
 import time
 from collections import deque
 from typing import Any, Deque, Dict, Optional
@@ -183,6 +184,18 @@ class WebhookAdapter(BasePlatformAdapter):
     # interactive acknowledgement that abandons the task (#57056).
     interactive_resume: bool = False
 
+    @staticmethod
+    def _resolve_secret(value: str) -> str:
+        """Expand ``$ENV_VAR`` or ``${ENV_VAR}`` secret references from the
+        environment so that ``webhook_subscriptions.json`` can store env-var
+        names instead of plaintext secrets (making the file safe to commit).
+
+        A value that does not start with ``$`` is returned as-is.
+        """
+        if value.startswith("$"):
+            return os.environ.get(value.lstrip("$").strip("{}"), value)
+        return value
+
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.WEBHOOK)
         # ``host`` may be None (dual-stack default) or a user-pinned string.
@@ -191,7 +204,7 @@ class WebhookAdapter(BasePlatformAdapter):
         _cfg_host = config.extra.get("host", DEFAULT_HOST)
         self._host: Optional[str] = _cfg_host or None
         self._port: int = int(config.extra.get("port", DEFAULT_PORT))
-        self._global_secret: str = config.extra.get("secret", "")
+        self._global_secret: str = self._resolve_secret(config.extra.get("secret", ""))
         self._static_routes: Dict[str, dict] = config.extra.get("routes", {})
         self._dynamic_routes: Dict[str, dict] = {}
         self._dynamic_routes_mtime: float = 0.0
@@ -251,7 +264,7 @@ class WebhookAdapter(BasePlatformAdapter):
 
         # Validate routes at startup — secret is required per route
         for name, route in self._routes.items():
-            secret = route.get("secret", self._global_secret)
+            secret = self._resolve_secret(route.get("secret", self._global_secret))
             if not secret:
                 raise ValueError(
                     f"[webhook] Route '{name}' has no HMAC secret. "
@@ -497,7 +510,7 @@ class WebhookAdapter(BasePlatformAdapter):
             for k, v in data.items():
                 if k in self._static_routes:
                     continue
-                effective_secret = v.get("secret", self._global_secret)
+                effective_secret = self._resolve_secret(v.get("secret", self._global_secret))
                 if not effective_secret:
                     logger.warning(
                         "[webhook] Dynamic route '%s' skipped: 'secret' is "
@@ -654,7 +667,7 @@ class WebhookAdapter(BasePlatformAdapter):
         # INSECURE_NO_AUTH mode). Missing/empty secrets must fail closed here,
         # not only during connect(), so direct handler reuse cannot turn a
         # network webhook route into an unauthenticated agent-dispatch surface.
-        secret = route_config.get("secret", self._global_secret)
+        secret = self._resolve_secret(route_config.get("secret", self._global_secret))
         if not secret:
             logger.error(
                 "[webhook] Route %s has no HMAC secret; refusing request",
