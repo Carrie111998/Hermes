@@ -1665,7 +1665,15 @@ class RelayAdapter(BasePlatformAdapter):
         # in exactly one place — run.py's _resolve_progress_thread_id (flat mode
         # suppresses the synthetic self-anchor there; thread mode stamps the
         # turn's thread). Boundary pinned by test_run_py_suppresses_self_anchor*.
+        # Same escape hatch as send(): scheduled/persisted prompts (cron
+        # clarify, persisted-home deliveries) have no fresh inbound event to
+        # populate _platform_by_chat, so the caller stamps the logical
+        # platform explicitly. Stripped before the metadata goes out.
+        logical_platform = None
         prompt_metadata = metadata
+        if isinstance(prompt_metadata, dict) and "_relay_logical_platform" in prompt_metadata:
+            prompt_metadata = dict(prompt_metadata)
+            logical_platform = str(prompt_metadata.pop("_relay_logical_platform") or "") or None
         action: Dict[str, Any] = {
             "op": "prompt",
             "chat_id": chat_id,
@@ -1683,7 +1691,7 @@ class RelayAdapter(BasePlatformAdapter):
         try:
             result = await self._transport.send_outbound(
                 action,
-                platform=self._platform_by_chat.get(str(chat_id)),
+                platform=logical_platform or self._platform_by_chat.get(str(chat_id)),
             )
         except Exception:  # noqa: BLE001 - transport failure degrades to fallback
             logger.debug("relay prompt transport failure", exc_info=True)

@@ -94,6 +94,68 @@ global defaults. A switch to a paid provider or model can therefore spend money
 on every scheduled run.
 :::
 
+## Human-in-the-loop jobs (clarify)
+
+By default cron agents run fully autonomously: the `clarify` tool is disabled
+because unattended jobs have nobody to answer questions. If a job should be
+able to pause and ask for your input — for example an approval gate before a
+destructive action — opt in via `config.yaml`:
+
+```yaml
+cron:
+  allow_clarify: true
+```
+
+Or use the config command:
+
+```bash
+hermes config set cron.allow_clarify true
+```
+
+When enabled and the job fires from the gateway scheduler, a clarify prompt
+renders through the job's first live delivery target (e.g. as buttons in the
+Discord delivery channel) and the agent waits for your answer, up to
+`agent.clarify_timeout` (default 1 hour; `0` waits indefinitely). If you
+don't respond in time — or the prompt can't be delivered — the agent is told
+so and continues autonomously.
+
+Notes:
+
+- The job's `deliver` must target a gateway-connected messaging platform
+  whose adapter supports interactive clarify prompts (Discord, Telegram, …).
+  Relay-fronted platforms work too — the send carries the job's logical
+  delivery platform explicitly.
+- Typed answers (open-ended questions, or picking "Other" and typing)
+  resolve when the delivery chat's session key is deterministic:
+
+  | Delivery target | Typed answers |
+  |---|---|
+  | DM (any platform) | ✓ resolve (DM detected via the live adapter, the job's origin stamp, or platform id rules) |
+  | Thread / forum topic | ✓ resolve (participant-shared session) |
+  | Group/channel the job was created from | ✓ resolve, bound to the member who scheduled the job |
+  | Group/channel fan-out (`deliver=all`, another chat, CLI-created job) | ✗ typed answers don't resolve — use the buttons |
+
+  Known limitations:
+
+  - A cron clarify and an interactive-session clarify pending in the same
+    chat share FIFO-oldest text resolution — a typed answer resolves the
+    oldest one, so cross-talk is possible while both are open.
+  - For fan-out group deliveries, any group member can click the buttons
+    (component resolution is not user-bound).
+  - Multiplex-profile gateways and `thread_sessions_per_user: true` make
+    typed-reply sessions per-user unpredictable; typed answers may not
+    resolve there (buttons still work).
+  - If the job pins `enabled_toolsets`, it must include `clarify` — the
+    per-job allowlist is applied on top of the global gate.
+- Standalone `hermes cron run` fires have no live messaging adapter, so
+  `clarify` keeps reporting that it is unavailable in that context.
+- The wait heartbeats the scheduler's activity tracker, so the cron
+  inactivity watchdog (`HERMES_CRON_TIMEOUT`, default 600s) does not kill the
+  run while you are deciding.
+- To customize the cron system-prompt wording when clarify is enabled, set an
+  `agent.platform_hints.cron` override — it takes precedence over the
+  built-in human-in-the-loop hint.
+
 ## Skill-backed cron jobs
 
 A cron job can load one or more skills before it runs the prompt.

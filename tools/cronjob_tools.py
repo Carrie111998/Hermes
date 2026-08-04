@@ -323,10 +323,23 @@ def _origin_from_env() -> Optional[Dict[str, str]]:
                 "Cron origin captured thread_id=%s for %s:%s",
                 thread_id, origin_platform, origin_chat_id,
             )
+        # The bound session source carries the chat's type and workspace
+        # scope (Discord DM vs guild channel, Slack team_id) — stamp both so
+        # scheduled-job delivery and cron clarify can resolve the exact
+        # session key a reply in that chat produces, without re-deriving
+        # platform specifics at fire time. Absent for CLI/TUI/API-created
+        # jobs (no bound source) — fire-time fallbacks cover those.
+        _src = get_session_env("HERMES_SESSION_SOURCE") or None
         return {
             "platform": origin_platform,
             "chat_id": origin_chat_id,
             "chat_name": get_session_env("HERMES_SESSION_CHAT_NAME") or None,
+            "chat_type": getattr(_src, "chat_type", None) or None,
+            "scope_id": (
+                getattr(_src, "scope_id", None)
+                or getattr(_src, "guild_id", None)
+                or None
+            ),
             "thread_id": thread_id,
             # Captured so an opt-in delivery mirror (cron.mirror_delivery /
             # attach_to_session) can resolve the exact participant's session in

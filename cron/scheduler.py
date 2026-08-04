@@ -159,19 +159,26 @@ class CronPromptInjectionBlocked(Exception):
 
 
 def _resolve_cron_disabled_toolsets(cfg: dict) -> list[str]:
-    """Toolsets a cron-spawned agent must never receive.
+    """Toolsets a cron-spawned agent must not receive.
 
-    Three protected toolsets are always disabled in cron context:
+    Two protected toolsets are always disabled in cron context:
       - ``cronjob`` — would let a cron-spawned agent schedule more cron jobs
       - ``messaging`` — interactive, needs a live gateway session
-      - ``clarify`` — interactive, blocks waiting for user input
+
+    ``clarify`` is also disabled unless the operator opts in with
+    ``cron.allow_clarify: true``. Unattended jobs have nobody to answer a
+    clarify prompt, so the default stays fully autonomous; the opt-in wires a
+    callback over the job's live delivery adapter (see
+    ``_build_cron_clarify_callback``).
 
     User-level ``agent.disabled_toolsets`` from config.yaml is layered on top
     so per-job ``enabled_toolsets`` cannot bypass policy that applies to
     ordinary agent runs (#25752 — LLM-supplied enabled_toolsets was widening
     past config.yaml's denylist).
     """
-    disabled = ["cronjob", "messaging", "clarify"]
+    disabled = ["cronjob", "messaging"]
+    if not bool(((cfg or {}).get("cron") or {}).get("allow_clarify", False)):
+        disabled.append("clarify")
     agent_cfg = (cfg or {}).get("agent") or {}
     user_disabled = agent_cfg.get("disabled_toolsets") or []
     for name in user_disabled:
@@ -243,6 +250,315 @@ def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str] | None:
             exc,
         )
         return None
+
+
+# Platform hint for cron sessions when cron.allow_clarify is enabled. Replaces
+# the default autonomous-execution hint (PLATFORM_HINTS["cron"], which tells
+# the model it cannot ask questions) so the hint and the available clarify
+# tool don't contradict each other. An explicit agent.platform_hints.cron
+# override in config.yaml always wins over this.
+_CRON_CLARIFY_PLATFORM_HINT = (
+    "You are running as a scheduled cron job with human-in-the-loop support "
+    "enabled. A user is reachable through the job's delivery channel: use the "
+    "clarify tool when a decision genuinely needs their input, but never block "
+    "on it for routine choices — if a clarify prompt times out or cannot be "
+    "delivered, proceed autonomously with a reasonable default. Your final "
+    "response is automatically delivered to the job's configured destination "
+    "— put the primary content directly in your response."
+)
+
+
+def _platform_dm_hint(platform_name: str, chat_id: str) -> Optional[bool]:
+    """Deterministic DM detection for platforms whose chat ids encode it.
+
+    Slack DM channel ids start with "D" (channels with "C"/"G"); Telegram
+    private-chat ids are positive integers (groups/supergroups negative) —
+    same rule as ``gateway.delivery.looks_like_telegram_private_chat_id``.
+    Returns None when the platform's ids don't encode the distinction
+    (Discord snowflakes) so the caller can fall back to the origin stamp or
+    the live adapter's ``get_chat_info``.
+    """
+    if platform_name == "slack":
+        return chat_id.startswith("D")
+    if platform_name == "telegram":
+        from gateway.delivery import looks_like_telegram_private_chat_id
+        return looks_like_telegram_private_chat_id(chat_id)
+    return None
+
+
+# Inbound ``chat_type`` for threaded surfaces, where it differs from the
+# container: Discord stamps thread messages ``"thread"`` (with
+# chat_id == thread_id), Telegram stamps forum topics ``"forum"``. Slack
+# threads key as the container (dm/group) + thread_id.
+_THREAD_CHAT_TYPES = {"discord": "thread", "telegram": "forum"}
+
+
+def _cron_clarify_reply_session_key(
+    job: dict, target: dict, platform, gw_config, *, chat_type_hint: Optional[str] = None
+):
+    """Session key a text reply in the delivery chat will resolve to.
+
+    The gateway intercepts typed clarify answers by the INBOUND chat's
+    session key (``GatewayRunner._maybe_intercept_clarify_text`` →
+    ``build_session_key``), so a cron clarify must register under the key the
+    user's reply produces — the cron job's own session id never matches, and
+    typed answers (open-ended clarifies, text fallback, the native-button
+    "Other" path) would hang until timeout.
+
+    Chat-type resolution, most authoritative first:
+
+      * ``chat_type_hint`` — the live delivery adapter's ``get_chat_info``
+        for the actual target (resolved by the caller at fire time);
+      * the job's origin ``chat_type``/``scope_id`` stamp (written by
+        ``cronjob_tools._origin_from_env`` for chat-created jobs);
+      * deterministic platform id heuristics (``_platform_dm_hint``).
+
+    Key shapes mirror how each platform stamps inbound sources: DM targets
+    key on chat_id alone; thread surfaces are participant-shared (Discord
+    ``thread`` with chat_id remapped to the thread id — inbound thread
+    messages stamp chat_id = thread_id — Telegram ``forum``, Slack
+    container+thread_id); group/channel targets bind to the job's origin
+    user, only when the delivery target IS the origin conversation (a fan-out
+    target cannot predict who will reply). Slack ``scope_id`` is carried from
+    the origin stamp when present.
+
+    Returns None when no deterministic key exists (fan-out group target with
+    per-user sessions, or ``thread_sessions_per_user`` isolation): the caller
+    falls back to the cron session id and typed replies simply don't resolve
+    — buttons and the timeout path are unaffected.
+    """
+    from gateway.session import SessionSource, build_session_key
+
+    origin = _resolve_origin(job) or {}
+    platform_name = platform.value if hasattr(platform, "value") else str(platform)
+    chat_id = str(target.get("chat_id") or "")
+    thread_id = target.get("thread_id")
+    scope_id = origin.get("scope_id") or None
+
+    target_is_origin = _target_matches_origin(
+        origin, platform_name, chat_id, thread_id,
+    )
+    origin_chat_type = (
+        str(origin.get("chat_type") or "").lower() if target_is_origin else ""
+    )
+
+    if thread_id and platform_name == "discord":
+        # Discord thread surfaces key as thread:<thread_id>:<thread_id> —
+        # inbound thread messages stamp chat_id = thread_id, so an explicit
+        # parent:thread target must remap to the thread id.
+        chat_type = "thread"
+        chat_id = str(thread_id)
+        user_id = None
+    elif thread_id:
+        chat_type = _THREAD_CHAT_TYPES.get(platform_name)
+        if chat_type is None:
+            # Slack-style: threads key as the container (dm/group) + thread_id.
+            hint = _platform_dm_hint(platform_name, chat_id)
+            if chat_type_hint in ("dm", "group"):
+                hint = chat_type_hint == "dm"
+            elif origin_chat_type in ("dm", "group"):
+                hint = origin_chat_type == "dm"
+            chat_type = "dm" if hint else "group"
+        user_id = None  # threads are participant-shared by default
+    else:
+        if chat_type_hint in ("dm", "group"):
+            is_dm = chat_type_hint == "dm"
+        elif origin_chat_type in ("dm", "group"):
+            is_dm = origin_chat_type == "dm"
+        else:
+            is_dm = bool(_platform_dm_hint(platform_name, chat_id))
+        chat_type = "dm" if is_dm else "group"
+        user_id = None
+        if not is_dm and target_is_origin and origin.get("user_id"):
+            user_id = str(origin["user_id"])
+
+    group_sessions = getattr(gw_config, "group_sessions_per_user", True)
+    if chat_type == "group" and group_sessions and not user_id and not thread_id:
+        return None
+    if (
+        thread_id
+        and group_sessions
+        and getattr(gw_config, "thread_sessions_per_user", False)
+    ):
+        # Thread replies key per-user in this configuration — the replying
+        # user is unpredictable for a scheduled prompt.
+        return None
+
+    source = SessionSource(
+        platform=platform,
+        chat_id=chat_id,
+        chat_type=chat_type,
+        user_id=user_id,
+        thread_id=str(thread_id) if thread_id else None,
+        scope_id=scope_id,
+    )
+    return build_session_key(
+        source,
+        group_sessions_per_user=group_sessions,
+        thread_sessions_per_user=getattr(gw_config, "thread_sessions_per_user", False),
+    )
+
+
+def _build_cron_clarify_callback(job: dict, adapters, loop):
+    """Build a clarify_callback for a cron-spawned agent.
+
+    Renders the clarify prompt through the live gateway adapter for the job's
+    first delivery target (e.g. Discord buttons in the delivery channel) and
+    blocks until the user answers or ``agent.clarify_timeout`` elapses.
+
+    Mirrors gateway/run.py's ``_clarify_callback_sync`` with two cron-specific
+    differences:
+
+      * the target chat comes from the job's delivery config, not an inbound
+        message event (a cron session has no attached chat);
+      * the pending entry registers under the DELIVERY CHAT's gateway session
+        key (see ``_cron_clarify_reply_session_key``) so typed answers from
+        that chat — open-ended clarifies, text fallback, the native-button
+        "Other" path — resolve through the same inbound text intercept the
+        interactive path uses. Button clicks resolve by clarify_id either
+        way. When the target is a relay-fronted platform the send stamps the
+        logical platform via the ``_relay_logical_platform`` metadata escape
+        hatch (same convention as cron delivery), since a scheduled send has
+        no inbound event to populate the relay's per-chat platform map.
+
+    The wait reuses clarify_gateway.wait_for_response, which polls in
+    1-second slices and heartbeats the activity tracker, so the cron
+    inactivity watchdog (HERMES_CRON_TIMEOUT, default 600s) does not kill the
+    run while the user is deciding.
+
+    Returns None when no live adapter with ``send_clarify`` exists for the
+    job's delivery targets — the caller then leaves clarify_callback unset
+    and the tool reports its standard "not available in this execution
+    context" error.
+    """
+    from gateway.config import load_gateway_config, Platform
+    from gateway.delivery import resolve_delivery_transport
+
+    targets = _resolve_delivery_targets(job)
+    if not targets:
+        return None
+    try:
+        gw_config = load_gateway_config()
+    except Exception:
+        return None
+    if not loop.is_running():
+        return None
+
+    adapter = None
+    platform = None
+    chat_id = None
+    thread_id = None
+    is_relay = False
+    chosen_target = None
+    for target in targets:
+        try:
+            candidate_platform = Platform(str(target.get("platform", "")).lower())
+        except (ValueError, KeyError):
+            continue
+        transport = resolve_delivery_transport(candidate_platform, gw_config, adapters)
+        candidate = transport.adapter if transport is not None else None
+        if candidate is not None and callable(getattr(candidate, "send_clarify", None)):
+            adapter = candidate
+            platform = candidate_platform
+            chat_id = str(target.get("chat_id") or "")
+            thread_id = target.get("thread_id")
+            is_relay = bool(getattr(transport, "is_relay", False))
+            chosen_target = target
+            break
+    if adapter is None or not chat_id:
+        return None
+
+    job_id = job["id"]
+
+    # Resolve the target chat's type from the live adapter when possible —
+    # the delivering adapter knows the chat (Discord DM vs guild channel is
+    # not derivable from a snowflake id). One bounded call per job fire;
+    # every failure degrades to the origin stamp / platform heuristics.
+    chat_type_hint = None
+    if not thread_id:
+        get_info = getattr(adapter, "get_chat_info", None)
+        if callable(get_info):
+            try:
+                import asyncio as _asyncio
+
+                _info_fut = _asyncio.run_coroutine_threadsafe(
+                    get_info(chat_id), loop,
+                )
+                info = _info_fut.result(timeout=5)
+                if isinstance(info, dict) and info.get("type"):
+                    _t = str(info["type"]).strip().lower()
+                    chat_type_hint = "dm" if _t == "dm" else "group"
+            except Exception:
+                chat_type_hint = None
+
+    reply_key = _cron_clarify_reply_session_key(
+        job, chosen_target, platform, gw_config, chat_type_hint=chat_type_hint,
+    )
+    if reply_key is not None:
+        logger.info(
+            "Job '%s': clarify text replies bind to session key %s",
+            job_id, reply_key,
+        )
+
+    send_metadata = {}
+    if thread_id:
+        send_metadata["thread_id"] = thread_id
+    if is_relay:
+        send_metadata["_relay_logical_platform"] = platform.value
+
+    def _cron_clarify_callback(question, choices, multi_select=False):
+        import asyncio
+        import uuid as _uuid
+
+        from tools import clarify_gateway as _clarify_mod
+
+        clarify_id = _uuid.uuid4().hex[:10]
+        sess_key = reply_key or f"cron:{job_id}"
+        _clarify_mod.register(
+            clarify_id=clarify_id,
+            session_key=sess_key,
+            question=question,
+            choices=list(choices) if choices else None,
+            multi_select=bool(multi_select),
+        )
+
+        send_ok = False
+        try:
+            fut = asyncio.run_coroutine_threadsafe(
+                adapter.send_clarify(
+                    chat_id=chat_id,
+                    question=question,
+                    choices=list(choices) if choices else None,
+                    clarify_id=clarify_id,
+                    session_key=sess_key,
+                    metadata=send_metadata or None,
+                ),
+                loop,
+            )
+            result = fut.result(timeout=15)
+            send_ok = bool(getattr(result, "success", False))
+        except Exception as exc:
+            fut.cancel()
+            logger.warning("Job '%s': clarify send failed: %s", job_id, exc)
+        if not send_ok:
+            # Drop ONLY this entry — clear_session would also cancel an
+            # unrelated interactive clarify pending in the same chat.
+            _clarify_mod.discard(clarify_id)
+            return "[clarify prompt could not be delivered]"
+
+        timeout = float(_clarify_mod.get_clarify_timeout())
+        response = _clarify_mod.wait_for_response(clarify_id, timeout=timeout)
+        if response is None or response == "":
+            _wait_desc = (
+                f"{int(timeout)}s"
+                if 0 < timeout < 60
+                else f"{max(1, int(max(timeout, 0) / 60))}m"
+            )
+            return f"[user did not respond within {_wait_desc}]"
+        return response
+
+    return _cron_clarify_callback
+
 
 # Valid delivery platforms — used to validate user-supplied platform names
 # in cron delivery targets, preventing env var enumeration via crafted names.
@@ -2762,7 +3078,8 @@ def _guard_job_credential_exfil(job: dict) -> None:
 
 
 def run_job(
-    job: dict, *, defer_agent_teardown: Optional[list] = None
+    job: dict, *, defer_agent_teardown: Optional[list] = None,
+    adapters=None, loop=None,
 ) -> tuple[bool, str, str, Optional[str]]:
     """
     Execute a single cron job.
@@ -2776,6 +3093,12 @@ def run_job(
     torn-down async client (defense-in-depth alongside the interpreter-shutdown
     guard). When ``None`` (the default) teardown happens inline as before, so
     every existing caller is unchanged.
+
+    ``adapters`` / ``loop``: the gateway's live platform-adapter map and event
+    loop, present when the job is fired by the gateway ticker. They are only
+    used to wire a clarify callback when ``cron.allow_clarify`` is enabled.
+    Standalone ``hermes cron run`` fires pass neither, so clarify stays
+    unavailable there by design.
 
     Returns:
         Tuple of (success, full_output_doc, final_response, error_message)
@@ -3519,7 +3842,41 @@ def run_job(
             session_id=_cron_session_id,
             session_db=_session_db,
         )
-        
+
+        # cron.allow_clarify opt-in: when this run was fired by the gateway
+        # ticker (live adapters + loop present), attach a clarify callback
+        # over the job's delivery adapter and swap the autonomous-only cron
+        # platform hint for its human-in-the-loop variant. Standalone
+        # `hermes cron run` fires have no live adapter, so clarify keeps
+        # reporting "not available in this execution context" there.
+        try:
+            if (
+                bool((_cfg.get("cron") or {}).get("allow_clarify", False))
+                and adapters is not None and loop is not None
+            ):
+                _clarify_cb = _build_cron_clarify_callback(
+                    job, adapters, loop,
+                )
+                if _clarify_cb is not None:
+                    agent.clarify_callback = _clarify_cb
+                    _hint_overrides = getattr(agent, "_platform_hint_overrides", None)
+                    if not isinstance(_hint_overrides, dict):
+                        _hint_overrides = {}
+                    # An explicit operator platform-hint override always wins.
+                    if "cron" not in _hint_overrides:
+                        agent._platform_hint_overrides = {
+                            **_hint_overrides,
+                            "cron": {"replace": _CRON_CLARIFY_PLATFORM_HINT},
+                        }
+                    logger.info(
+                        "Job '%s': clarify enabled (live adapter attached)", job_id,
+                    )
+        except Exception as _clarify_exc:
+            logger.warning(
+                "Job '%s': clarify setup failed (non-fatal): %s",
+                job_id, _clarify_exc,
+            )
+
         # Run the agent with an *inactivity*-based timeout: the job can run
         # for hours if it's actively calling tools / receiving stream tokens,
         # but a hung API call or stuck tool with no activity for the configured
@@ -3957,7 +4314,8 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         _deferred_agents: list = []
         try:
             success, output, final_response, error = run_job(
-                job, defer_agent_teardown=_deferred_agents
+                job, defer_agent_teardown=_deferred_agents,
+                adapters=adapters, loop=loop,
             )
         except BaseException:
             # run_job's finally still hands back the agent when it raises; tear

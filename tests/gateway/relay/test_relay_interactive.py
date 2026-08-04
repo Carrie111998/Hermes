@@ -257,3 +257,23 @@ async def test_processing_lifecycle_reacts_eyes_then_check():
     assert all(r["message_id"] == "m42" and r["chat_id"] == "ch1" for r in reacts)
 
 
+
+
+@pytest.mark.asyncio
+async def test_send_prompt_honors_relay_logical_platform_override():
+    """Scheduled/persisted prompts (e.g. cron clarify) have no inbound event
+    to populate _platform_by_chat; the caller stamps the logical platform via
+    the _relay_logical_platform metadata escape hatch (same as send())."""
+    adapter, stub = _adapter()
+    result = await adapter.send_clarify(
+        "c1",
+        "Which?",
+        ["a", "b"],
+        "cl-relay-1",
+        "s",
+        metadata={"_relay_logical_platform": "discord"},
+    )
+    assert result.success is True
+    assert stub.sent_platforms[-1] == "discord"
+    # The private routing key must not leak into the outbound metadata.
+    assert "_relay_logical_platform" not in (stub.sent[-1].get("metadata") or {})

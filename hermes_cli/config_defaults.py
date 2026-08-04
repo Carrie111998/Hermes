@@ -2163,6 +2163,15 @@ DEFAULT_CONFIG = {
         # jobs from silently inheriting a paid default. Set to false only when
         # jobs should deliberately track changing global inference defaults.
         "model_drift_guard": True,
+        # Allow cron-spawned agents to use the clarify tool (human-in-the-loop
+        # questions/approvals from scheduled jobs). Default false: cron jobs
+        # run unattended, so clarify is hard-disabled and the platform hint
+        # instructs fully autonomous execution. When true AND the job fires
+        # from the gateway ticker with a live delivery adapter, clarify
+        # prompts render through the job's first delivery target (e.g.
+        # Discord buttons) and the agent waits up to agent.clarify_timeout
+        # for an answer before proceeding autonomously.
+        "allow_clarify": False,
         # Default inference model for cron jobs (Axis A — WHAT model an
         # agent job runs on). Resolution at fire time: per-job user pin >
         # cron.model > global model.default. When set, unpinned jobs follow

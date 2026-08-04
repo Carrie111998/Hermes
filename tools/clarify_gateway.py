@@ -354,6 +354,28 @@ def has_pending(session_key: str) -> bool:
         return any(_entries.get(cid) is not None for cid in ids)
 
 
+def discard(clarify_id: str) -> bool:
+    """Drop a single pending entry without resolving it.
+
+    Unlike :func:`clear_session`, this never touches other entries sharing
+    the session key — e.g. an interactive session's clarify pending in the
+    same chat a cron job also delivered to (send-failure cleanup must not
+    cancel the user's interactive prompt).
+
+    Returns True if an entry was removed.
+    """
+    with _lock:
+        entry = _entries.pop(clarify_id, None)
+        if entry is None:
+            return False
+        ids = _session_index.get(entry.session_key)
+        if ids and clarify_id in ids:
+            ids.remove(clarify_id)
+            if not ids:
+                _session_index.pop(entry.session_key, None)
+        return True
+
+
 def clear_session(session_key: str) -> int:
     """Resolve and drop every pending clarify for a session.
 
