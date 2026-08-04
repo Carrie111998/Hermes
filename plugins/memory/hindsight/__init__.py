@@ -592,6 +592,24 @@ def _build_embedded_profile_env(config: dict[str, Any], *, llm_api_key: str | No
     if current_base_url:
         env_values["HINDSIGHT_API_LLM_BASE_URL"] = str(current_base_url)
 
+    reasoning_effort = (
+        config.get("llm_reasoning_effort")
+        if config.get("llm_reasoning_effort") is not None
+        else os.environ.get("HINDSIGHT_API_LLM_REASONING_EFFORT")
+    )
+    if reasoning_effort is not None and reasoning_effort != "":
+        env_values["HINDSIGHT_API_LLM_REASONING_EFFORT"] = str(reasoning_effort)
+
+    per_op_effort = {
+        "retain": "HINDSIGHT_API_RETAIN_LLM_REASONING_EFFORT",
+        "reflect": "HINDSIGHT_API_REFLECT_LLM_REASONING_EFFORT",
+        "consolidation": "HINDSIGHT_API_CONSOLIDATION_LLM_REASONING_EFFORT",
+    }
+    for op, env_key in per_op_effort.items():
+        value = config.get(f"{op}_llm_reasoning_effort")
+        if value is not None and value != "":
+            env_values[env_key] = str(value)
+
     idle_timeout = (
         config.get("idle_timeout")
         if config.get("idle_timeout") is not None
