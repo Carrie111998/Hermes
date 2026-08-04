@@ -99,6 +99,11 @@ _DM_DISCOVERY_EVERY = 5
 _DEFAULT_POLL_INTERVAL = 4.0
 _MIN_POLL_INTERVAL = 1.0
 _CLI_TIMEOUT = 30.0
+# How long a turn's triggering-message anchor stays eligible as a reply-to
+# fallback for un-anchored sends (interim narration, split chunks, status).
+# Long enough to cover a slow multi-tool turn, short enough that a later
+# proactive/cron broadcast doesn't thread under a stale inbound message.
+_TURN_ANCHOR_TTL = 1800.0
 
 # WebSocket transport (NIP-42 authenticated Nostr subscription).
 # kind 44100 is Buzz's channel-membership event — used for live DM discovery.
@@ -431,6 +436,16 @@ class BuzzAdapter(BasePlatformAdapter):
         # channel_id -> {"chat_type", "last_ts", "seen": OrderedDict[event_id, None]}
         self._channel_state: Dict[str, dict] = {}
         self._channel_names: Dict[str, str] = {}
+        # channel_id -> (triggering_event_id, monotonic_ts) for the message that
+        # opened the current turn. Every send this turn (final reply, interim
+        # narration, split chunks, status) falls back to this anchor so the whole
+        # turn threads under the triggering message instead of scattering to the
+        # channel root. Only the final send passes an explicit reply_to; the
+        # gateway's interim/status paths supply metadata=None for buzz (no
+        # persistent thread_id), which is why they previously landed at root.
+        # Gated by _TURN_ANCHOR_TTL so unrelated proactive/cron sends (which
+        # arrive long after the last inbound) still post at root.
+        self._turn_reply_anchor: Dict[str, tuple[str, float]] = {}
         # channel_id -> raw ``channels list`` entry; drives DM-vs-channel
         # classification (see _may_reclassify_as_dm).
         self._channel_meta: Dict[str, dict] = {}
@@ -599,6 +614,24 @@ class BuzzAdapter(BasePlatformAdapter):
 
     # ── Sending ───────────────────────────────────────────────────────────
 
+    def _fresh_turn_anchor(self, chat_id: str) -> Optional[str]:
+        """Reply-to fallback: the current turn's triggering event, if recent.
+
+        Returns the event id recorded by ``_handle_event`` when the inbound
+        message that opened this turn arrived, but only within
+        ``_TURN_ANCHOR_TTL`` — so a turn's un-anchored sends thread under it,
+        while a much-later proactive/cron broadcast (no live turn) posts at the
+        channel root as before.
+        """
+        entry = self._turn_reply_anchor.get(chat_id)
+        if not entry:
+            return None
+        event_id, ts = entry
+        if (time.monotonic() - ts) > _TURN_ANCHOR_TTL:
+            self._turn_reply_anchor.pop(chat_id, None)
+            return None
+        return event_id
+
     async def send(
         self,
         chat_id: str,
@@ -609,7 +642,30 @@ class BuzzAdapter(BasePlatformAdapter):
         if not content:
             return SendResult(success=False, error="Empty message")
         args = ["messages", "send", "--channel", str(chat_id), "--content", "-"]
-        reply_target = reply_to or (metadata or {}).get("thread_id")
+        # buzz-cli runs a MENTION PREFLIGHT on --content: any "@token" that does not
+        # uniquely resolve to a CURRENT MEMBER of this channel hard-fails the whole
+        # send (exit 1, user_error) -- and the plain-text fallback keeps the same
+        # text, so it fails identically and the reply is lost with no user-visible
+        # error. Ordinary prose triggers it ("@mentioning", a teammate who left the
+        # channel), and small channels hit it constantly. Supplying any explicit
+        # --mention downgrades unresolved @text to presentation-only, while
+        # uniquely-resolved member names STILL notify. Our own pubkey is the safe
+        # sentinel: it adds no p-tag (self-mentions are excluded) and the poll loop
+        # already skips our own events.
+        if self._self_pubkey:
+            args += ["--mention", self._self_pubkey]
+        # Resolve the reply anchor. Explicit caller intent wins; otherwise honor
+        # the generic ``reply_to_message_id`` some gateway paths carry (Feishu /
+        # relay-Discord already set it), then fall back to this turn's triggering
+        # message so un-anchored interim/status/chunk sends still thread instead
+        # of landing at the channel root.
+        _meta = metadata or {}
+        reply_target = (
+            reply_to
+            or _meta.get("thread_id")
+            or _meta.get("reply_to_message_id")
+            or self._fresh_turn_anchor(str(chat_id))
+        )
         if reply_target:
             args += ["--reply-to", str(reply_target)]
         code, out, err = await self._run_cli(args, input_text=content)
@@ -1041,6 +1097,12 @@ class BuzzAdapter(BasePlatformAdapter):
         if self._allowed_pubkeys and pubkey not in self._allowed_pubkeys:
             logger.debug("Buzz: ignoring message from unauthorized pubkey %s…", pubkey[:8])
             return
+
+        # Record this triggering event as the current turn's reply anchor so
+        # every send the agent makes while responding — final reply, interim
+        # narration, overflow-split chunks, status bubbles — threads under it
+        # rather than scattering to the channel root (see _turn_reply_anchor).
+        self._turn_reply_anchor[channel_id] = (event_id, time.monotonic())
 
         # Strip a leading @mention so slash commands (@Chip /whoami ->
         # /whoami) and clean prompts are recognized. DM messages often still
