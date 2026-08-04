@@ -1516,7 +1516,11 @@ def _audio_file_duration_seconds(file_path: str) -> Optional[float]:
         if result.returncode != 0:
             return None
         return float(result.stdout.strip())
-    except (ValueError, OSError, subprocess.TimeoutExpired):
+    except Exception:
+        # Best-effort probe: never raise, never affect playback. Mocks that
+        # stand in for subprocess.Popen also intercept run()'s internal Popen,
+        # so the fake proc may lack stdout/stderr entirely (AttributeError,
+        # TypeError on float()) — all of it means "unknown duration".
         return None
 
 
