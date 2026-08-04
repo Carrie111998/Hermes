@@ -25,6 +25,28 @@ Usage:
 
 from typing import List, Dict, Any, Set, Optional
 
+import logging
+
+logger = logging.getLogger(__name__)
+
+# Deduplicate registry-discovery failure warnings: discovery runs on every
+# toolset lookup, so a broken plugin must not flood the log.
+_toolset_discovery_warned: set[str] = set()
+
+
+def _warn_registry_failure(what: str, exc: Exception) -> None:
+    if what in _toolset_discovery_warned:
+        return
+    _toolset_discovery_warned.add(what)
+    logger.warning(
+        "Toolset discovery degraded: %s failed (%s: %s) — falling back to "
+        "static TOOLSETS only. Plugin-provided toolsets are invisible until "
+        "this is fixed.",
+        what,
+        type(exc).__name__,
+        exc,
+    )
+
 
 # Shared tool list for CLI and all messaging platform toolsets.
 # Edit this once to update all platforms simultaneously.
@@ -830,7 +852,8 @@ def _get_plugin_toolset_names() -> Set[str]:
             for toolset_name in registry.get_registered_toolset_names()
             if toolset_name not in TOOLSETS
         }
-    except Exception:
+    except Exception as e:
+        _warn_registry_failure("registry.get_registered_toolset_names", e)
         return set()
 
 
@@ -839,7 +862,8 @@ def _get_registry_toolset_aliases() -> Dict[str, str]:
     try:
         from tools.registry import registry
         return registry.get_registered_toolset_aliases()
-    except Exception:
+    except Exception as e:
+        _warn_registry_failure("registry.get_registered_toolset_aliases", e)
         return {}
 
 

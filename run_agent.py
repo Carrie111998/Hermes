@@ -2953,7 +2953,14 @@ class AIAgent:
         try:
             safe_sid = _safe_session_filename_component(self.session_id)
             log_file = self.logs_dir / f"session_{safe_sid}.json"
-        except Exception:
+        except Exception as e:
+            logger.warning(
+                "Session JSON snapshot skipped: could not derive a safe path "
+                "for session %r (%s: %s)",
+                self.session_id,
+                type(e).__name__,
+                e,
+            )
             return
 
         try:
@@ -2989,8 +2996,14 @@ class AIAgent:
                             existing_count, len(cleaned),
                         )
                         return
-                except Exception:
-                    pass  # corrupted existing file — allow the overwrite
+                except Exception as e:
+                    # Corrupted existing snapshot: allow the overwrite, but
+                    # not silently — a corrupted session log is diagnostic.
+                    logger.warning(
+                        "Existing session log unreadable (%s: %s) — overwriting",
+                        type(e).__name__,
+                        e,
+                    )
 
             entry = {
                 "session_id": self.session_id,
@@ -4035,8 +4048,12 @@ class AIAgent:
                 logger.warning("Memory provider on_session_end failed during shutdown: %s", e, exc_info=True)
             try:
                 self._memory_manager.shutdown_all()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(
+                    "Memory provider shutdown_all failed (state may leak): %s",
+                    e,
+                    exc_info=True,
+                )
         # Notify context engine of session end (flush DAG, close DBs, etc.)
         if hasattr(self, "context_compressor") and self.context_compressor:
             try:
@@ -4044,8 +4061,13 @@ class AIAgent:
                     self.session_id or "",
                     messages or [],
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(
+                    "Context engine on_session_end failed — per-session engine "
+                    "state may leak into the next session: %s",
+                    e,
+                    exc_info=True,
+                )
 
     def commit_memory_session(self, messages: list = None) -> None:
         """Trigger end-of-session extraction without tearing providers down.
@@ -4055,8 +4077,13 @@ class AIAgent:
         if self._memory_manager:
             try:
                 self._memory_manager.on_session_end(messages or [])
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(
+                    "commit_memory_session: memory on_session_end failed — "
+                    "pending extraction for the rotated-out session is lost: %s",
+                    e,
+                    exc_info=True,
+                )
         # Notify context engine of session end too — same lifecycle moment as
         # the memory manager's on_session_end. Without this, engines that
         # accumulate per-session state (DAGs, summaries) leak that state from
@@ -4069,8 +4096,13 @@ class AIAgent:
                     self.session_id or "",
                     messages or [],
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(
+                    "Context engine on_session_end failed — per-session engine "
+                    "state may leak into the next session: %s",
+                    e,
+                    exc_info=True,
+                )
 
     def _sync_external_memory_for_turn(
         self,
@@ -6823,6 +6855,14 @@ class AIAgent:
         if base_url_host_matches(self._base_url_lower, "nousresearch.com"):
             return True
         if base_url_host_matches(self._base_url_lower, "ai-gateway.vercel.sh"):
+            return True
+        # Alibaba DashScope / QwenCloud Token Plan: the compatible-mode endpoint
+        # honors extra_body.reasoning = {"enabled": True, "effort": <level>} for
+        # qwen3 reasoning models (verified live 2026-07-30: nested reasoning
+        # raises reasoning_content ~48% vs baseline). Top-level reasoning_effort
+        # with "ultra" is rejected (HTTP 400); valid = none,minimal,low,medium,
+        # high,xhigh,max.
+        if base_url_host_matches(self._base_url_lower, "aliyuncs.com"):
             return True
         if (
             base_url_host_matches(self._base_url_lower, "models.github.ai")

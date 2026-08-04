@@ -4776,8 +4776,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._active_session_lease = lease
         try:
             atexit.register(self._release_active_session)
-        except Exception:
-            pass
+        except Exception as e:
+            # Lease held but never released on exit: the global active-session
+            # slot stays claimed until another process sweeps it. Loud.
+            logger.warning(
+                "atexit.register failed for active-session release (%s: %s) — "
+                "session slot may remain claimed after exit",
+                type(e).__name__,
+                e,
+            )
         return True
 
     def _release_active_session(self) -> None:
