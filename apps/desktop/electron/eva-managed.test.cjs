@@ -459,10 +459,28 @@ test('managed backend validates routing and endpoint profiles independently', ()
 })
 
 test('account reset clears renderer account state while preserving global preferences', () => {
+  const globalLayoutPresets = JSON.stringify({
+    focus: {
+      name: 'Focus',
+      tree: { type: 'group', id: 'main', panes: ['workspace'], active: 'workspace' }
+    }
+  })
   const values = new Map([
     ['hermes.desktop.lastSessionId.research', 'session-secret'],
     ['hermes.desktop.workspace-cwd.remote.eva-managed%3A%2F%2Fcustomer.default', '/srv/customer'],
     ['hermes:composer-drafts:v3', '{"session-secret":"draft"}'],
+    [
+      'hermes.desktop.layoutTree.v2',
+      JSON.stringify({
+        type: 'group',
+        id: 'main',
+        panes: ['workspace', 'session-tile:account-a', 'route-tile:/skills'],
+        active: 'session-tile:account-a'
+      })
+    ],
+    ['hermes.desktop.userPlacedPanes.v1', '["session-tile:account-a","route-tile:/skills"]'],
+    ['hermes.desktop.layoutPresets.v2', globalLayoutPresets],
+    ['hermes.desktop.layoutPreset.active', 'focus'],
     ['hermes-desktop-theme-v2', 'nord'],
     ['hermes.desktop.keybinds', '{"newChat":"Cmd+N"}']
   ])
@@ -483,6 +501,10 @@ test('account reset clears renderer account state while preserving global prefer
   assert.equal(values.has('hermes.desktop.lastSessionId.research'), false)
   assert.equal(values.has('hermes.desktop.workspace-cwd.remote.eva-managed%3A%2F%2Fcustomer.default'), false)
   assert.equal(values.has('hermes:composer-drafts:v3'), false)
+  assert.equal(values.has('hermes.desktop.layoutTree.v2'), false)
+  assert.equal(values.has('hermes.desktop.userPlacedPanes.v1'), false)
+  assert.equal(values.get('hermes.desktop.layoutPresets.v2'), globalLayoutPresets)
+  assert.equal(values.get('hermes.desktop.layoutPreset.active'), 'focus')
   assert.equal(values.get('hermes-desktop-theme-v2'), 'nord')
   assert.equal(values.get('hermes.desktop.keybinds'), '{"newChat":"Cmd+N"}')
 })
