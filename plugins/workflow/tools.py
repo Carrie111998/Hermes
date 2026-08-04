@@ -296,6 +296,26 @@ def _handle_workflow_start_predefined(
                     hint="wait for the current run to finish, or call workflow_status to inspect",
                 )
 
+    # Capture session info and inject into context (which persists in state file).
+    # Must happen BEFORE the dry-run block — the dry-run path passes
+    # context=_ctx and session_info=_sess to engine.execute().
+    _sess = _capture_session_for_engine()
+    # Override session_info with explicit delivery_target (for cron-triggered workflows)
+    if delivery_target and delivery_target.get("platform") and delivery_target.get("channel"):
+        _sess = {
+            "platform": delivery_target["platform"],
+            "chat_id": delivery_target["channel"],
+            "thread_id": delivery_target.get("thread"),
+            "user_id": None,
+            "profile": delivery_target.get("profile"),
+            "session_key": "",
+        }
+    _ctx = context or None
+    if _sess:
+        if _ctx is None:
+            _ctx = {}
+        _ctx["_session_info"] = _sess
+
     # Dry-run is always synchronous — no cards created, no monitoring needed.
     if dry_run:
         try:
@@ -316,24 +336,6 @@ def _handle_workflow_start_predefined(
             logger.exception("workflow_start dry-run failed for %s", workflow)
             return _err(f"dry-run failed: {exc}")
         return _ok(result)
-
-    # Capture session info and inject into context (which persists in state file)
-    _sess = _capture_session_for_engine()
-    # Override session_info with explicit delivery_target (for cron-triggered workflows)
-    if delivery_target and delivery_target.get("platform") and delivery_target.get("channel"):
-        _sess = {
-            "platform": delivery_target["platform"],
-            "chat_id": delivery_target["channel"],
-            "thread_id": delivery_target.get("thread"),
-            "user_id": None,
-            "profile": delivery_target.get("profile"),
-            "session_key": "",
-        }
-    _ctx = context or None
-    if _sess:
-        if _ctx is None:
-            _ctx = {}
-        _ctx["_session_info"] = _sess
 
     # Fire-and-forget: create all kanban cards and subscribe the final
     # layer for notifications.  The kanban dispatcher picks up ready
