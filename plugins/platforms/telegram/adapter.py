@@ -8074,6 +8074,28 @@ class TelegramAdapter(BasePlatformAdapter):
             return {str(part).strip() for part in raw if str(part).strip()}
         return {part.strip() for part in str(raw).split(",") if part.strip()}
 
+    def _telegram_require_mention_chats(self) -> set[str]:
+        """Return chats that require an explicit trigger even when
+        ``require_mention`` is globally disabled.
+
+        Inverse of ``free_response_chats``. ``require_mention`` is a global
+        boolean whose only per-chat escape hatch is an *exemption* list, so the
+        shape "chatty everywhere EXCEPT room X" was previously unexpressible —
+        the only way to quiet one group was to gag every group. This list
+        supplies that missing inverse for multi-party rooms (exchanges, market
+        makers, partner channels) where the bot should observe by default and
+        speak only when addressed.
+
+        Accepts a list or a comma-separated string, matching the parsing of
+        every other chat-list key in this adapter.
+        """
+        raw = self.config.extra.get("require_mention_chats")
+        if raw is None:
+            raw = os.getenv("TELEGRAM_REQUIRE_MENTION_CHATS", "")
+        if isinstance(raw, list):
+            return {str(part).strip() for part in raw if str(part).strip()}
+        return {part.strip() for part in str(raw).split(",") if part.strip()}
+
     def _telegram_free_response_topics(self) -> set[str]:
         """Return topic-level free-response allowlist entries as ``<chat_id>:<thread_id>``.
 
@@ -8602,7 +8624,12 @@ class TelegramAdapter(BasePlatformAdapter):
             return False
         if self._telegram_is_free_response_topic(message):
             return False
-        if not self._telegram_require_mention():
+        # A per-chat gated room behaves like require_mention=true locally, so
+        # its unmentioned messages are observable context even when the global
+        # flag is off. Without this, the global check below would return False
+        # and the room's untagged chatter would be dropped entirely.
+        _chat_gated = chat_id_str in self._telegram_require_mention_chats()
+        if not _chat_gated and not self._telegram_require_mention():
             return False
         if self._is_reply_to_bot(message):
             return False
@@ -8909,7 +8936,9 @@ class TelegramAdapter(BasePlatformAdapter):
         - the chat passes the ``allowed_chats`` whitelist (when set), or
           ``guest_mode`` is enabled and the bot is explicitly mentioned
         - the chat is explicitly allowlisted in ``free_response_chats``
-        - ``require_mention`` is disabled
+        - ``require_mention`` is disabled and the chat is not listed in
+          ``require_mention_chats`` (the per-chat inverse: listed chats
+          require an explicit trigger even with the global flag off)
         - the message replies to the bot
         - the bot is @mentioned
         - the text/caption matches a configured regex wake-word pattern
@@ -8982,6 +9011,16 @@ class TelegramAdapter(BasePlatformAdapter):
 
         if guest_mention:
             return True
+        # Per-chat mention requirement (inverse of free_response_chats).
+        # Evaluated BEFORE the free-response and global-off short-circuits so a
+        # listed chat stays gated even when require_mention is globally false.
+        # A reply to the bot or an explicit mention still gets through below.
+        if chat_id_str in self._telegram_require_mention_chats():
+            if self._is_reply_to_bot(message):
+                return True
+            if not self._telegram_guest_mode() and self._message_mentions_bot(message):
+                return True
+            return self._message_matches_mention_patterns(message)
         if chat_id_str in self._telegram_free_response_chats():
             return True
         if self._telegram_is_free_response_topic(message):
