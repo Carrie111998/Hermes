@@ -1017,6 +1017,25 @@ class ShellFileOperations(FileOperations):
         q_path = self._escape_shell_arg(path)
         parent = os.path.dirname(path) or "."
         q_parent = self._escape_shell_arg(parent)
+        # Windows: MSYS bash builtins cannot see native NTFS symlinks
+        # ([ -L "$t" ] is always false for them), so the shell-side follow
+        # branch below is a no-op there and mv -f would replace the link
+        # with a plain file (data loss). Resolve in Python first —
+        # os.path.islink/realpath work on native Windows symlinks. Only
+        # consulted for paths that exist on THIS host: remote-backend
+        # (docker/ssh) paths fail islink() and pass through to the shell
+        # branch unchanged.
+        if os.name == "nt":
+            try:
+                if os.path.islink(path):
+                    _link_target = os.path.realpath(path)
+                    if _link_target:
+                        path = _link_target
+                        q_path = self._escape_shell_arg(path)
+                        parent = os.path.dirname(path) or "."
+                        q_parent = self._escape_shell_arg(parent)
+            except OSError:
+                pass
         # template basename: hidden so it doesn't show up in casual `ls`,
         # carries a marker so an orphaned temp (only possible on a hard
         # crash *between* cat and mv) is identifiable.
@@ -2409,7 +2428,17 @@ class ShellFileOperations(FileOperations):
         if not has_hidden_path_ancestor:
             pagination_expr = f" | tail -n +{offset + 1} | head -n {limit}"
 
-        cmd = f"find {self._escape_shell_arg(path)}{hidden_filter_expr} -type f -name {self._escape_shell_arg(search_pattern)} " \
+        # find on Windows (MSYS) fails on the /c/Users MSYS form when the
+        # path chain crosses junctions (e.g. AppData), and _escape_shell_arg
+        # would convert C:/… back to /c/… anyway. Pass the native
+        # forward-slash form, quoted manually, so find receives a path it
+        # can stat. No-op off Windows.
+        if os.name == "nt":
+            find_root = "'" + path.replace("\\", "/").replace("'", "'\"'\"'") + "'"
+        else:
+            find_root = self._escape_shell_arg(path)
+
+        cmd = f"find {find_root}{hidden_filter_expr} -type f -name {self._escape_shell_arg(search_pattern)} " \
               f"-printf '%T@ %p\\n' 2>/dev/null | sort -rn{pagination_expr}"
 
         result = self._exec(cmd, timeout=60)
@@ -2417,7 +2446,7 @@ class ShellFileOperations(FileOperations):
 
         if not stdout.strip() and not limit_reason:
             # Try without -printf (BSD find compatibility -- macOS)
-            cmd_simple = f"find {self._escape_shell_arg(path)}{hidden_filter_expr} -type f -name {self._escape_shell_arg(search_pattern)} " \
+            cmd_simple = f"find {find_root}{hidden_filter_expr} -type f -name {self._escape_shell_arg(search_pattern)} " \
                         f"2>/dev/null | sort -rn{pagination_expr}"
             result = self._exec(cmd_simple, timeout=60)
             stdout, limit_reason = _search_stdout_and_limit(result)
@@ -2428,9 +2457,9 @@ class ShellFileOperations(FileOperations):
                 continue
             parts = line.split(' ', 1)
             if len(parts) == 2 and parts[0].replace('.', '').isdigit():
-                files.append(parts[1])
+                files.append(str(Path(parts[1])))
             else:
-                files.append(line)
+                files.append(str(Path(line)))
 
         # For explicit hidden roots, find's path-based filtering excludes every
         # file under the hidden path. Apply descendant filtering after command

@@ -52,7 +52,14 @@ class TestWriteFileHandler:
         from tools.file_tools import write_file_tool
         result = json.loads(write_file_tool("/tmp/out.txt", "hello world!\n"))
         assert result["status"] == "ok"
-        mock_ops.write_file.assert_called_once_with("/tmp/out.txt", "hello world!\n")
+        mock_ops.write_file.assert_called_once()
+        call_args = mock_ops.write_file.call_args.args
+        # The handler passes the RESOLVED path, not the raw input — on
+        # Windows the resolver normalizes /tmp/out.txt to the native
+        # drive-root form. Assert the contract: content rides through, and
+        # the reported resolved_path is exactly the path that was written.
+        assert call_args[1] == "hello world!\n"
+        assert result.get("resolved_path") == call_args[0]
 
     @patch("tools.file_tools._get_file_ops")
     def test_permission_error_returns_error_json_without_error_log(self, mock_get, caplog):
@@ -143,7 +150,15 @@ class TestPatchHandler:
             old_string="foo", new_string="bar"
         ))
         assert result["status"] == "ok"
-        mock_ops.patch_replace.assert_called_once_with("/tmp/f.py", "foo", "bar", False)
+        mock_ops.patch_replace.assert_called_once()
+        call_args = mock_ops.patch_replace.call_args.args
+        # Handler passes the RESOLVED path (platform-form); assert the
+        # contract on the parts that must survive: the target basename,
+        # both strings, and the append flag.
+        assert os.path.basename(call_args[0]) == "f.py"
+        assert call_args[1] == "foo"
+        assert call_args[2] == "bar"
+        assert call_args[3] is False
 
 
     @patch("tools.file_tools._get_file_ops")

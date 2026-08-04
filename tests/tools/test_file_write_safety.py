@@ -301,7 +301,13 @@ class TestAtomicWrite:
         res = ops.patch_replace(str(target), "b = 2", "b = 22")
         assert res.success, res.error
         assert target.read_text() == "a = 1\nb = 22\nc = 3\n"
-        assert (os.stat(target).st_mode & 0o777) == 0o600
+        if os.name == "nt":
+            # Windows stat() cannot represent POSIX mode bits (writable
+            # files always read 0o666); assert the operational invariant
+            # the mode guards — the patched file stays readable+writable.
+            assert os.access(target, os.R_OK) and os.access(target, os.W_OK)
+        else:
+            assert (os.stat(target).st_mode & 0o777) == 0o600
 
 
 class TestBomHandling:

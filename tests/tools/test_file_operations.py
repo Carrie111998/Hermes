@@ -255,13 +255,36 @@ def make_real_subprocess_env(cwd: str, include_stderr: bool = False) -> MagicMoc
     env.cwd = cwd
 
     def execute(command, **kwargs):
-        completed = subprocess.run(
-            command,
-            shell=True,
-            text=True,
-            capture_output=True,
-            input=kwargs.get("stdin_data"),
-        )
+        # The real ShellFileOperations backend always executes scripts
+        # through bash. On Windows, subprocess(shell=True) resolves to
+        # cmd.exe (COMSPEC) and a bare "bash" may resolve to WSL's bash,
+        # which cannot see Windows paths — use the same bash discovery as
+        # the production backend so the helper faithfully emulates it.
+        if os.name == "nt":
+            from tools.environments.local import _find_bash
+
+            bash = _find_bash()
+            # Raw-bytes stdin (like the production _pipe_stdin): text=True
+            # would translate \n to \r\n and corrupt every write payload.
+            stdin_data = kwargs.get("stdin_data")
+            completed = subprocess.run(
+                [bash, "-c", command],
+                capture_output=True,
+                input=(
+                    stdin_data.encode("utf-8", "surrogatepass")
+                    if stdin_data is not None
+                    else None
+                ),
+            )
+            output = completed.stdout.decode("utf-8", "replace")
+        else:
+            completed = subprocess.run(
+                command,
+                shell=True,
+                text=True,
+                capture_output=True,
+                input=kwargs.get("stdin_data"),
+            )
         output = completed.stdout
         if include_stderr:
             output += completed.stderr
@@ -595,12 +618,19 @@ class TestAtomicWriteNewFilePermissions:
 
         assert result.error is None, f"write failed: {result.error}"
         assert dest.read_text() == "test content\n"
-        expected_mode = 0o666 & ~test_umask
-        actual_mode = dest.stat().st_mode & 0o777
-        assert actual_mode == expected_mode, (
-            f"Expected mode {expected_mode:04o} (umask {test_umask:04o}), "
-            f"got {actual_mode:04o}"
-        )
+        if os.name == "nt":
+            # Windows has no POSIX umask; stat() reports 0o666 for
+            # writable files. Assert the operational invariant of the
+            # new-file branch: the file is readable and writable (the
+            # chmod "=rw" intent), not mktemp's 0600-only.
+            assert os.access(dest, os.R_OK) and os.access(dest, os.W_OK)
+        else:
+            expected_mode = 0o666 & ~test_umask
+            actual_mode = dest.stat().st_mode & 0o777
+            assert actual_mode == expected_mode, (
+                f"Expected mode {expected_mode:04o} (umask {test_umask:04o}), "
+                f"got {actual_mode:04o}"
+            )
 
     def test_overwrite_still_preserves_existing_mode(self, tmp_path):
         """The new-file branch must not disturb the overwrite path's
@@ -614,7 +644,10 @@ class TestAtomicWriteNewFilePermissions:
 
         assert result.error is None, f"write failed: {result.error}"
         assert dest.read_text() == "#!/bin/sh\necho updated\n"
-        assert dest.stat().st_mode & 0o777 == 0o755
+        if os.name == "nt":
+            assert os.access(dest, os.R_OK) and os.access(dest, os.W_OK)
+        else:
+            assert dest.stat().st_mode & 0o777 == 0o755
 
 
 class TestAtomicWriteThroughSymlink:
