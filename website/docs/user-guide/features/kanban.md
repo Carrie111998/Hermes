@@ -226,7 +226,19 @@ up on the next tick (60s by default).
 kanban:
   dispatch_in_gateway: true        # default
   dispatch_interval_seconds: 60    # default
+  default_assignee: ""             # fallback for unassigned Ready cards
+  default_assignee_boards:         # where that profile-local fallback may act
+    - default
 ```
+
+The embedded dispatcher remains a machine-wide singleton and continues to
+sweep every active board for cards that already have an explicit assignee.
+`default_assignee_boards` scopes only the mutating fallback for unassigned
+Ready cards: the default `["default"]` preserves the original single-board
+behavior, `[]` disables dispatcher fallback everywhere, named slugs opt those
+boards in, and `["*"]` deliberately restores the historical all-board
+fallback. Assignment events record both the dispatcher profile and the
+matching routing rule.
 
 Override the config flag at runtime via `HERMES_KANBAN_DISPATCH_IN_GATEWAY=0`
 for debugging. Standard gateway supervision applies: run `hermes gateway
@@ -579,6 +591,7 @@ Config knobs (all under `kanban:` in `~/.hermes/config.yaml`):
 | `auto_decompose_per_tick` | `3` | Cap on decompositions per dispatcher tick. Excess defers to the next tick. |
 | `orchestrator_profile` | `""` | Profile assigned to the root/orchestration task after decomposition. Empty = fall back to active default profile. |
 | `default_assignee` | `""` | Where a child task lands when the LLM picks an unknown profile. Empty = fall back to active default. |
+| `default_assignee_boards` | `["default"]` | Boards where the singleton dispatcher may apply this profile's `default_assignee` to an unassigned Ready card. Use named slugs to opt in, `[]` to disable, or `["*"]` for every board. |
 | `auto_subscribe_on_create` | `true` | When a worker calls `kanban_create` from inside a session with a persistent delivery channel (messaging gateway or TUI), the originating session is auto-subscribed to the new task's completion/block events. The dispatcher still drives the delivery — this only changes whether the caller's chat/key shows up in the notify-sub table. Set to `false` to require explicit `kanban_notify-subscribe` calls per task. |
 
 And the two auxiliary LLM slots:

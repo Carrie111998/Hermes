@@ -19,7 +19,10 @@ processes.
 ## Configuration
 
 On the dispatch-owning gateway (typically the `default` profile), no change is
-needed. On every other profile gateway, add to `~/.hermes/config.yaml`:
+needed for explicitly assigned cards. Its profile-local
+`kanban.default_assignee` is authorized only on the legacy `default` board
+unless `kanban.default_assignee_boards` opts in named boards. On every other
+profile gateway, add to that profile's `config.yaml`:
 
 ```yaml
 kanban:
@@ -27,6 +30,20 @@ kanban:
 ```
 
 Or set the env var: `HERMES_KANBAN_DISPATCH_IN_GATEWAY=false`
+
+If the dispatch owner should apply its fallback to named boards, list them
+explicitly:
+
+```yaml
+kanban:
+  default_assignee: default
+  default_assignee_boards: [project-a, project-b]
+```
+
+Use `default_assignee_boards: ["*"]` only when the dispatcher profile is
+deliberately trusted to assign unowned Ready cards on every board. An empty
+list disables fallback assignment without stopping dispatch of cards that
+already have an assignee.
 
 ## What each gateway does
 

@@ -1095,18 +1095,28 @@ class GatewayKanbanWatchersMixin:
             )
             stale_timeout_seconds = 0
 
-        # Read kanban.default_assignee — fallback profile for tasks
-        # created without an explicit assignee (e.g. via the dashboard).
-        # When set, the dispatcher applies it to unassigned ready tasks
-        # instead of skipping them indefinitely (#27145). Empty string
-        # (the schema default) means "no fallback, keep skipping" —
-        # backward-compatible with existing installs.
+        # Read kanban.default_assignee — fallback profile for tasks created
+        # without an explicit assignee (e.g. via the dashboard). Boards are
+        # shared across profiles, so the profile-local fallback is applied only
+        # on boards authorized by default_assignee_boards.  The default board
+        # remains authorized for compatibility with the original single-board
+        # feature (#27145); named boards require an explicit slug or wildcard.
         default_assignee = (kanban_cfg.get("default_assignee") or "").strip() or None
+        default_assignee_boards = kanban_cfg.get(
+            "default_assignee_boards",
+            [_kb.DEFAULT_BOARD],
+        )
+        try:
+            dispatcher_profile = getattr(self, "_active_profile_name")()
+        except Exception:
+            dispatcher_profile = "unknown"
         if default_assignee:
             logger.info(
-                "kanban dispatcher: default_assignee=%r (unassigned ready tasks "
-                "will route to this profile)",
+                "kanban dispatcher: default_assignee=%r profile=%s "
+                "authorized_boards=%r",
                 default_assignee,
+                dispatcher_profile,
+                default_assignee_boards,
             )
 
         # Read kanban.max_in_progress_per_profile — per-profile concurrency
@@ -1230,6 +1240,8 @@ class GatewayKanbanWatchersMixin:
                     failure_limit=failure_limit,
                     stale_timeout_seconds=stale_timeout_seconds,
                     default_assignee=default_assignee,
+                    default_assignee_dispatcher_profile=dispatcher_profile,
+                    default_assignee_boards=default_assignee_boards,
                     max_in_progress_per_profile=max_in_progress_per_profile,
                 )
             except sqlite3.DatabaseError as exc:

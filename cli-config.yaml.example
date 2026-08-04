@@ -1292,6 +1292,16 @@ delegation:
   #                                           # Supported: openrouter, nous, zai, kimi-coding, minimax
 
 # =============================================================================
+# Kanban Dispatch
+# =============================================================================
+# The singleton dispatcher scans every board for explicitly assigned cards.
+# Scope only the fallback that assigns otherwise-unassigned Ready cards:
+# kanban:
+#   default_assignee: ""                     # Profile used as the fallback
+#   default_assignee_boards:                 # Default: only the legacy default board
+#     - default                              # Use [] to disable or ["*"] for every board
+
+# =============================================================================
 # Honcho Integration (Cross-Session User Modeling)
 # =============================================================================
 # AI-native persistent memory via Honcho (https://honcho.dev/).
