@@ -217,6 +217,7 @@ import {
   MIN_WIDTH as WINDOW_MIN_WIDTH
 } from './window-state'
 import { hiddenWindowsChildOptions } from './windows-child-options'
+import { resolvePetOverlayBounds } from './pet-overlay'
 import {
   buildPathExtCandidates,
   chooseUpdaterArgs,
@@ -9031,6 +9032,49 @@ function closePetOverlay() {
   petOverlayWindow = null
 }
 
+// Re-home the popped-out pet after a display change: if the overlay still sits
+// on a connected display it stays put; otherwise it is re-centered on the main
+// window's display (see resolvePetOverlayBounds). The corrected spot is pushed
+// back to the renderer via the existing 'bounds' control channel, which it
+// persists for the next pop-out/restart.
+function rehomePetOverlay() {
+  if (!petOverlayWindow || petOverlayWindow.isDestroyed()) {
+    return
+  }
+
+  let anchor = null
+
+  try {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      anchor = mainWindow.getContentBounds()
+    }
+  } catch {
+    // Resolve falls back to the primary display when the anchor is unknown.
+  }
+
+  const current = petOverlayWindow.getBounds()
+  const resolved = resolvePetOverlayBounds(current, screen.getAllDisplays(), anchor)
+
+  if (!resolved) {
+    return
+  }
+
+  if (
+    resolved.x === current.x &&
+    resolved.y === current.y &&
+    resolved.width === current.width &&
+    resolved.height === current.height
+  ) {
+    return
+  }
+
+  petOverlayWindow.setBounds(resolved)
+
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('hermes:pet-overlay:control', { type: 'bounds', bounds: resolved })
+  }
+}
+
 // ── Quick Entry ─────────────────────────────────────────────────────────────
 //
 // A global shortcut summons a small frameless always-on-top composer from
@@ -9599,6 +9643,26 @@ ipcMain.handle('hermes:pet-overlay:open', async (_event, request) => {
     }
   } catch {
     // Fall back to raw bounds if the window geometry is unavailable.
+  }
+
+  // A remembered/dragged spot is only trusted while it still lands on a
+  // connected display — otherwise the transparent, non-activating overlay
+  // would open off-screen (e.g. saved on an external monitor that has since
+  // been unplugged) and the pet would be unfindable. Re-center on the main
+  // window's display instead, and echo the corrected bounds so the renderer
+  // persists the on-screen spot (self-healing).
+  if (screenBounds) {
+    let anchor = null
+
+    try {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        anchor = mainWindow.getContentBounds()
+      }
+    } catch {
+      // Resolve falls back to the primary display when the anchor is unknown.
+    }
+
+    screenBounds = resolvePetOverlayBounds(screenBounds, screen.getAllDisplays(), anchor) ?? screenBounds
   }
 
   openPetOverlay(screenBounds)
@@ -11844,6 +11908,18 @@ app.whenReady().then(() => {
 
     screen.on('display-removed', reposition)
   }
+
+  // The popped-out pet must never be stranded on a disconnected display: when
+  // the topology changes, pull an off-screen overlay back onto the display
+  // that holds the main window (and persist the corrected spot). Unlike the
+  // wake indicator this applies on every platform — the pet overlay exists
+  // everywhere, and rehomePetOverlay is a cheap no-op while the pet is in the
+  // window or still on-screen.
+  screen.on('display-added', rehomePetOverlay)
+
+  screen.on('display-metrics-changed', rehomePetOverlay)
+
+  screen.on('display-removed', rehomePetOverlay)
 
   createWindow()
 
