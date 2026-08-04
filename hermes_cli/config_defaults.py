@@ -2140,6 +2140,10 @@ DEFAULT_CONFIG = {
             "domains": [],
             "shared_files": [],
         },
+            # Exact strings and/or ${ENV_VAR} references to redact by exact substring.
+            # These are applied BEFORE the enable gate, so they cover file_read paths
+            # (which skip ENV/JSON passes). Opt-in; empty by default. See issue #72778.
+            "literal_secrets": [],
         # Acknowledged supply-chain security advisories. Each entry is the
         # ID of an advisory the user has read and acted on (uninstalled the
         # compromised package, rotated credentials). Acked advisories no

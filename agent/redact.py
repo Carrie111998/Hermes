@@ -68,6 +68,45 @@ _SENSITIVE_BODY_KEYS = frozenset({
 # downgrade — see `_log_redaction_status()` in gateway/run.py and cli.py.
 _REDACT_ENABLED = os.getenv("HERMES_REDACT_SECRETS", "true").lower() in {"1", "true", "yes", "on"}
 
+
+# Lazy-loaded literal secrets config — imported inside function to avoid
+# circular import at module load time (agent.redact is imported by
+# hermes_cli/config which imports hermes_cli.config_defaults which is
+# the source of DEFAULT_CONFIG). See _get_literal_secrets().
+
+
+def _get_literal_secrets() -> list[str]:
+    """Load literal secrets from config (security.literal_secrets).
+
+    Returns a list of exact strings and/or ${ENV_VAR} references to redact by
+    exact substring. Applied BEFORE the enable gate so it covers file_read
+    paths (which skip ENV/JSON passes). Opt-in; empty by default. See issue #72778.
+
+    Uses lazy import to avoid circular import at module load time.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly, cfg_get
+        cfg = load_config_readonly()
+        secrets = cfg_get(cfg, "security", "literal_secrets", default=[])
+        if not isinstance(secrets, list):
+            return []
+        # Expand ${ENV_VAR} references
+        expanded = []
+        for s in secrets:
+            if isinstance(s, str):
+                if s.startswith("${") and s.endswith("}"):
+                    env_name = s[2:-1]
+                    env_val = os.getenv(env_name)
+                    if env_val:
+                        expanded.append(env_val)
+                else:
+                    expanded.append(s)
+        return expanded
+    except Exception:
+        # If config loading fails for any reason, silently fall back to empty
+        return []
+
+
 # Known API key prefixes -- match the prefix + contiguous token chars
 _PREFIX_PATTERNS = [
     r"sk-[A-Za-z0-9_-]{10,}",           # OpenAI / OpenRouter / Anthropic (sk-ant-*)
@@ -707,6 +746,16 @@ def redact_sensitive_text(
         text = str(text)
     if not text:
         return text
+
+    # Literal secrets from config (security.literal_secrets) — exact substring
+    # redaction applied BEFORE the enable gate so it covers file_read paths
+    # (which skip ENV/JSON passes). Opt-in; empty by default. See issue #72778.
+    literal_secrets = _get_literal_secrets()
+    if literal_secrets:
+        for secret in literal_secrets:
+            if secret and secret in text:
+                text = text.replace(secret, "«redacted-literal-secret»")
+
     if not (force or _REDACT_ENABLED):
         return text
 

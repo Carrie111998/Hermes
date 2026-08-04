@@ -830,4 +830,108 @@ class TestKeywordWordBoundary:
         result = redact_sensitive_text(text)
         assert "hunter2hunter2hunter2hh" not in result
 
+class TestLiteralSecrets:
+    """Tests for security.literal_secrets config (issue #72778)."""
+
+    def test_literal_secret_redacted_in_file_read(self):
+        """Exact strings from security.literal_secrets are redacted in file_read mode."""
+        from agent.redact import _get_literal_secrets
+        original_get = _get_literal_secrets
+        import agent.redact as r
+        try:
+            def mock_get():
+                return ["my-secret-value-12345"]
+            r._get_literal_secrets = mock_get
+
+            text = "The secret is my-secret-value-12345 in this text"
+            result = redact_sensitive_text(text, force=True, file_read=True)
+            assert "my-secret-value-12345" not in result
+            assert "«redacted-literal-secret»" in result
+        finally:
+            r._get_literal_secrets = original_get
+
+    def test_literal_secret_redacted_without_file_read(self):
+        """Literal secrets are redacted regardless of file_read flag."""
+        import agent.redact as r
+        original_get = r._get_literal_secrets
+        try:
+            def mock_get():
+                return ["my-secret-value-12345"]
+            r._get_literal_secrets = mock_get
+
+            text = "The secret is my-secret-value-12345 in this text"
+            result = redact_sensitive_text(text, force=True, file_read=False)
+            assert "my-secret-value-12345" not in result
+            assert "«redacted-literal-secret»" in result
+        finally:
+            r._get_literal_secrets = original_get
+
+    def test_multiple_literal_secrets(self):
+        """Multiple literal secrets are all redacted."""
+        import agent.redact as r
+        original_get = r._get_literal_secrets
+        try:
+            def mock_get():
+                return ["secret-one", "secret-two"]
+            r._get_literal_secrets = mock_get
+
+            text = "first secret-one middle secret-two last"
+            result = redact_sensitive_text(text, force=True, file_read=True)
+            assert result.count("«redacted-literal-secret»") == 2
+            assert "secret-one" not in result
+            assert "secret-two" not in result
+        finally:
+            r._get_literal_secrets = original_get
+
+    def test_env_var_expansion_in_literal_secrets(self):
+        """${ENV_VAR} references in literal_secrets are expanded."""
+        import os
+        from agent.redact import _get_literal_secrets
+        os.environ['TEST_LITERAL_SECRET'] = 'expanded-value'
+        try:
+            from hermes_cli.config import save_config
+            test_cfg = {"security": {"literal_secrets": ["${TEST_LITERAL_SECRET}"]}}
+            save_config(test_cfg, strip_defaults=False)
+            try:
+                secrets = _get_literal_secrets()
+                assert "expanded-value" in secrets
+            finally:
+                save_config({}, strip_defaults=False)
+        finally:
+            del os.environ['TEST_LITERAL_SECRET']
+
+    def test_literal_secret_applies_before_enable_gate(self):
+        """Literal secrets are redacted even when global redaction is disabled."""
+        import agent.redact as r
+        original_get = r._get_literal_secrets
+        original_enabled = r._REDACT_ENABLED
+        try:
+            def mock_get():
+                return ["my-secret"]
+            r._get_literal_secrets = mock_get
+            r._REDACT_ENABLED = False
+
+            text = "secret: my-secret"
+            # force=False, file_read=True - would normally skip all redaction
+            result = redact_sensitive_text(text, force=False, file_read=True)
+            assert "my-secret" not in result
+            assert "«redacted-literal-secret»" in result
+        finally:
+            r._get_literal_secrets = original_get
+            r._REDACT_ENABLED = original_enabled
+
+    def test_empty_literal_secrets_noop(self):
+        """Empty literal_secrets list has no effect."""
+        import agent.redact as r
+        original_get = r._get_literal_secrets
+        try:
+            def mock_get():
+                return []
+            r._get_literal_secrets = mock_get
+
+            text = "some text with nothing to redact"
+            result = redact_sensitive_text(text, force=True, file_read=True)
+            assert result == text
+        finally:
+            r._get_literal_secrets = original_get
 

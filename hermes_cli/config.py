@@ -3436,6 +3436,10 @@ _SECURITY_COMMENT = """
 # tirith pre-exec scanning is enabled by default when the tirith binary
 # is available. Configure via security.tirith_* keys or env vars
 # (TIRITH_ENABLED, TIRITH_BIN, TIRITH_TIMEOUT, TIRITH_FAIL_OPEN).
+# literal_secrets: exact strings and/or ${ENV_VAR} references to redact by
+# exact substring match. Applied BEFORE the enable gate so they cover
+# file_read paths (which skip ENV/JSON passes). Opt-in; empty by default.
+# See issue #72778.
 #
 # security:
 #   redact_secrets: true
@@ -3443,6 +3447,9 @@ _SECURITY_COMMENT = """
 #   tirith_path: "tirith"
 #   tirith_timeout: 5
 #   tirith_fail_open: true
+#   literal_secrets:
+#     - "my-hardcoded-secret"
+#     - "${MY_API_KEY}"
 """
 
 _FALLBACK_COMMENT = """
