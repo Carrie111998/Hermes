@@ -27,17 +27,9 @@
 //   - POST /healthz     -> {"ok": true}
 //   - POST /send        -> {"ok": true, "messageId": "..."}
 //       body: {"spaceId": "...", "text": "...",
-//              "format": "text" | "markdown" (default "text"),
-//              "clientMessageId": "stable-caller-id" (optional)}
-//       receipt: {"clientMessageId": "...", "confirmed": true,
-//                 "providerStatus": "accepted", "messageId": "...",
-//                 "deliveredAt": "..." | null}
-//   - POST /reply       -> structured content-free delivery receipt
-//       exact body: {"spaceId": "...", "text": "...",
-//                    "replyToMessageId": "...", "clientMessageId": "..."}
-//   - POST /edit        -> structured content-free mutation receipt
-//       exact body: {"spaceId": "...", "messageId": "...", "text": "...",
-//                    "clientMessageId": "..."}
+//              "format": "text" | "markdown" (default "text")}
+//   - POST /send-richlink -> {"ok": true, "messageId": "..."}
+//       body: {"spaceId": "...", "url": "https://..."}
 //   - POST /send-attachment -> {"ok": true, "messageId": "..."}
 //       body: {"spaceId": "...", "path": "...", "name": "..." | null,
 //              "mimeType": "..." | null, "caption": "..." | null,
@@ -48,6 +40,12 @@
 //   - POST /unreact     -> {"ok": true} | 400 soft failure
 //       body: {"spaceId": "...", "messageId": "<target msg id>",
 //              "reactionId": "..." | null (restart-recovery fallback)}
+//   - POST /send-poll   -> {"ok": true, "messageId": "..."}
+//       body: {"spaceId": "...", "title": "...", "options": ["...", "..."]}
+//       Sends a native poll (orange iMessage poll bubble). A tap streams
+//       back inbound as a `poll_option` event ({title, selected}).
+//   - POST /send-effect -> {"ok": true, "messageId": "..."}
+//       body: {"spaceId": "...", "text": "...", "effect": "confetti" | ...}
 //   - POST /typing      -> {"ok": true}
 //       body: {"spaceId": "...", "state": "start" | "stop"}
 //   - POST /shutdown    -> {"ok": true}; then process exits
@@ -55,7 +53,7 @@
 // On SIGINT/SIGTERM the sidecar calls `app.stop()` (3s graceful) before
 // exiting. Logs go to stderr; Python supervises restart.
 //
-// Requires spectrum-ts 12.2.0 - pinned exactly in package.json because the SDK
+// Requires spectrum-ts 8.x — pinned exactly in package.json because the SDK
 // ships breaking majors; see README "Upgrading spectrum-ts".
 //
 // Env vars (required):
@@ -75,17 +73,16 @@ import http from "node:http";
 import crypto from "node:crypto";
 import { once } from "node:events";
 import { patchSpectrumTs } from "./patch-spectrum-mixed-attachments.mjs";
+import { chooseSendFormat } from "./send-format.mjs";
 import {
-  SendRequestError,
-  sendTextMessage,
-} from "./send-contract.mjs";
-import {
-  editMessage,
-  replyToMessage,
-} from "./message-actions.mjs";
+  classifyProbeRejection,
+  shouldProbe,
+  isZombieSuspect,
+} from "./stream-staleness.mjs";
 import {
   AttachmentHandleStore,
   mutateAttachmentLease,
+  normalizeInboundBinaryContent,
   serveAttachmentLease,
 } from "./attachment-handles.mjs";
 import {
@@ -94,8 +91,6 @@ import {
   eventHasAttachmentHandle,
   parseDeliveryAck,
 } from "./inbound-deliveries.mjs";
-import { normalizeInboundEvent } from "./inbound-normalization.mjs";
-import { resolveDirectMessageSpace } from "./direct-space-resolution.mjs";
 import fs from "node:fs";
 
 const projectId = process.env.PHOTON_PROJECT_ID;
@@ -106,12 +101,6 @@ const sharedToken = process.env.PHOTON_SIDECAR_TOKEN;
 const telemetry = /^(1|true|yes|on)$/i.test(
   (process.env.PHOTON_TELEMETRY || "").trim()
 );
-
-// spectrum-ts 12.2.0's official Space.send type accepts content only. Keep
-// this false until a pinned SDK version exposes and tests a documented
-// clientMessageId send option; the sidecar still echoes the caller's stable
-// ID as its delivery correlation key.
-const SPECTRUM_SEND_SUPPORTS_CLIENT_MESSAGE_ID = false;
 
 const ATTACHMENT_MAX_ITEM_BYTES = 20 * 1024 * 1024;
 const ATTACHMENT_MAX_TOTAL_BYTES = 64 * 1024 * 1024;
@@ -136,6 +125,22 @@ const STREAM_DEGRADED_RESTART_MS =
   Number(process.env.PHOTON_STREAM_DEGRADED_RESTART_MS) || 90 * 1000;
 const STREAM_INTERRUPTED_DEGRADE_COUNT =
   Number(process.env.PHOTON_STREAM_INTERRUPTED_DEGRADE_COUNT) || 3;
+// Zombie-stream (half-open gRPC) watchdog. The inbound iterator can hang
+// forever without erroring; we track when it last yielded and, once it has
+// been silent past this threshold, drive a cheap authenticated probe. Silence
+// alone NEVER degrades the stream (shared lines can be quiet for hours) and a
+// rejected probe is INCONCLUSIVE, never proof either way — degradation
+// requires silence past the threshold plus a probe-proven live channel.
+// A non-positive threshold disables the watchdog.
+const STREAM_SILENCE_PROBE_MS = (() => {
+  const raw = Number(process.env.PHOTON_STREAM_SILENCE_PROBE_MS);
+  return Number.isFinite(raw) ? raw : 10 * 60 * 1000;
+})();
+const STREAM_PROBE_COOLDOWN_MS =
+  Number(process.env.PHOTON_STREAM_PROBE_COOLDOWN_MS) || 2 * 60 * 1000;
+const STREAM_PROBE_TIMEOUT_MS =
+  Number(process.env.PHOTON_STREAM_PROBE_TIMEOUT_MS) || 10 * 1000;
+const STREAM_WATCHDOG_TICK_MS = 30 * 1000;
 
 const streamHealth = {
   state: "starting",
@@ -146,6 +151,33 @@ const streamHealth = {
   issueCount: 0,
 };
 let streamRestartTimer = null;
+
+// Zombie-watchdog runtime state (see stream-staleness.mjs for the rules).
+const staleness = {
+  lastInboundAt: Date.now(),
+  lastProbeAt: 0,
+  lastProbeOutcome: null, // "alive" | "inconclusive" | null
+  zombieSuspected: false,
+};
+
+function noteInboundYield() {
+  staleness.lastInboundAt = Date.now();
+  staleness.zombieSuspected = false;
+}
+
+function stalenessSnapshot(now) {
+  return {
+    lastInboundAt: new Date(staleness.lastInboundAt).toISOString(),
+    silentForMs: now - staleness.lastInboundAt,
+    silenceThresholdMs: STREAM_SILENCE_PROBE_MS,
+    lastProbeAt:
+      staleness.lastProbeAt > 0
+        ? new Date(staleness.lastProbeAt).toISOString()
+        : null,
+    lastProbeOutcome: staleness.lastProbeOutcome,
+    zombieSuspected: staleness.zombieSuspected,
+  };
+}
 
 function streamHealthSnapshot() {
   const now = Date.now();
@@ -160,6 +192,7 @@ function streamHealthSnapshot() {
     lastIssueAt: streamHealth.lastIssueAt,
     lastIssue: streamHealth.lastIssue,
     issueCount: streamHealth.issueCount,
+    staleness: stalenessSnapshot(now),
   };
 }
 
@@ -255,6 +288,14 @@ console.log = (...args) => {
   originalConsoleLog(...args);
 };
 
+// Upstream liveness probe (see `/probe` handler). A synthetic DM space id +
+// a unique-per-probe bogus message id drive a cheap unary read over the same
+// gRPC channel the inbound stream uses, so we can tell a live channel from a
+// half-open ("zombie") one. `space.get` is purely local in shared/dedicated
+// mode (no chat is created or messaged); only the message read hits the wire.
+const PROBE_SPACE_ID = process.env.PHOTON_PROBE_SPACE_ID || "any;-;+10000000000";
+const PROBE_MSG_PREFIX = "hermes-liveness-probe-";
+
 if (!projectId || !projectSecret || !sharedToken) {
   console.error(
     "photon-sidecar: PHOTON_PROJECT_ID, PHOTON_PROJECT_SECRET and " +
@@ -282,7 +323,6 @@ try {
       "Original error: " +
       (e && e.stack ? e.stack : String(e))
   );
-  process.exit(3);
 }
 let Spectrum,
   imessage,
@@ -290,17 +330,22 @@ let Spectrum,
   voice,
   spectrumText,
   spectrumMarkdown,
-  spectrumTyping;
+  spectrumRichlink,
+  spectrumTyping,
+  spectrumPoll,
+  imessageEffect;
 try {
   ({
     Spectrum,
     attachment,
     voice,
+    poll: spectrumPoll,
     text: spectrumText,
     markdown: spectrumMarkdown,
+    richlink: spectrumRichlink,
     typing: spectrumTyping,
   } = await import("spectrum-ts"));
-  ({ imessage } = await import("spectrum-ts/providers/imessage"));
+  ({ imessage, effect: imessageEffect } = await import("spectrum-ts/providers/imessage"));
 } catch (e) {
   console.error(
     "photon-sidecar: spectrum-ts is not installed. Run `npm install` " +
@@ -314,13 +359,14 @@ const app = await Spectrum({
   projectId,
   projectSecret,
   providers: [imessage.config()],
-  // Keep native groups intact until the sidecar has normalized every child.
-  // Flattening here creates separate delivery/ACK boundaries and can lose the
-  // text sibling or deadlock an attachment-first replay behind the one-entry
-  // durable queue.
-  options: { flattenGroups: false },
+  options: { flattenGroups: true },
   telemetry,
 });
+
+// Effect-name → native effect id map. Optional chaining: an SDK build
+// without the iMessage effect surface (or a test stub) must not crash the
+// sidecar at import — /send-effect then rejects with "unsupported effect".
+const MESSAGE_EFFECTS = imessage?.effect?.message || {};
 
 // ---------------------------------------------------------------------------
 // Inbound: forward `app.messages` (gRPC stream) to the Python consumer.
@@ -422,54 +468,6 @@ function waitForConsumerChange(version) {
   };
 }
 
-// Operational heartbeat: stamp a file whenever the inbound consumer pipe is
-// actively serviced (on connect + every keepalive tick). A watchdog treats a
-// stale file as a dead inbound pipe and restarts the bridge -- this is the one
-// failure mode launchd KeepAlive + the process-liveness reaper miss (the bridge
-// process stays up while the /inbound pipe silently dies). Opt-in: only writes
-// when PHOTON_SIDECAR_HEARTBEAT_PATH is set, so upstream behavior is unchanged.
-const HEARTBEAT_PATH = process.env.PHOTON_SIDECAR_HEARTBEAT_PATH || "";
-function stampInboundHeartbeat() {
-  if (!HEARTBEAT_PATH) return;
-  try {
-    fs.writeFileSync(HEARTBEAT_PATH, String(Date.now()));
-  } catch {
-    /* heartbeat is best-effort; never let it break inbound */
-  }
-}
-
-// The spectrum-ts upstream gRPC channel to Photon can drop ("[upstream]
-// Connection dropped") and NOT self-recover: inbound + outbound both silently
-// stop. spectrum-ts's in-session reconnect is unreliable here, so a clean
-// process restart (fresh channel) is the recovery. We detect the dead-upstream
-// error and exit non-zero; the supervisor (start_photon_keez.sh) and the
-// launchd reaper relaunch the sidecar with a new connection.
-function isUpstreamDown(e) {
-  // High-confidence dead-channel signals only. A false positive here costs a
-  // ~90s bridge restart (sidecar exits -> heartbeat stale -> reaper), so we do
-  // NOT treat transient/ambiguous errors (timeouts, "unavailable") as fatal.
-  const msg = (e && (e.message || String(e))) || "";
-  const name = (e && e.name) || "";
-  return (
-    name === "ConnectionError" ||
-    /connection dropped/i.test(msg) ||
-    /\[upstream\]\s*connection/i.test(msg)
-  );
-}
-
-let _exitingForUpstream = false;
-function exitForUpstream(reason) {
-  if (_exitingForUpstream) return;
-  _exitingForUpstream = true;
-  console.error(
-    "photon-sidecar: upstream connection dead (" +
-      reason +
-      ") -> exiting for a clean restart"
-  );
-  // Brief delay so any in-flight HTTP response flushes, then exit non-zero.
-  setTimeout(() => process.exit(75), 250);
-}
-
 // Write one NDJSON line to the active consumer. Blocks until a consumer is
 // connected; if the write fails (consumer vanished mid-flight) we wait for a
 // new consumer and retry, so a message is never silently dropped here.
@@ -485,6 +483,138 @@ async function deliver(line) {
     } catch {
       clearConsumer(res);
     }
+  }
+}
+
+// Best-effort text preview of a reaction's resolved target Message, so the
+// Python adapter can populate the gateway's `reply_to_text` (context: WHAT was
+// tapped back). The SDK only emits a reaction once it has resolved the full
+// target Message (toReactionMessages bails otherwise), so `target.content` is
+// hydrated here — no extra round trip. Handles plain text and our patched mixed
+// text+attachment groups (first text child); null for attachment/voice-only
+// targets. Capped so one long bubble can't balloon the NDJSON line.
+const REACTION_TARGET_TEXT_CAP = 2000;
+function reactionTargetText(target) {
+  const c = target && typeof target === "object" ? target.content : null;
+  if (!c || typeof c !== "object") return null;
+  let text = null;
+  if (c.type === "text") {
+    text = c.text;
+  } else if (c.type === "richlink") {
+    text = c.url;
+  } else if (c.type === "group") {
+    for (const item of Array.isArray(c.items) ? c.items : []) {
+      const ic = item && typeof item === "object" ? item.content : null;
+      if (ic && ic.type === "text" && ic.text) {
+        text = ic.text;
+        break;
+      }
+      if (ic && ic.type === "richlink" && ic.url) {
+        text = ic.url;
+        break;
+      }
+    }
+  }
+  if (typeof text !== "string" || !text) return null;
+  return text.length > REACTION_TARGET_TEXT_CAP
+    ? text.slice(0, REACTION_TARGET_TEXT_CAP)
+    : text;
+}
+
+async function normalizeContent(content) {
+  if (!content || typeof content !== "object") {
+    return { type: "unknown" };
+  }
+  if (content.type === "text") {
+    return { type: "text", text: content.text || "" };
+  }
+  if (content.type === "richlink") {
+    const out = { type: "richlink", url: content.url || "" };
+    if (typeof content.title === "string") {
+      out.title = content.title;
+    }
+    if (typeof content.summary === "string") {
+      out.summary = content.summary;
+    }
+    return out;
+  }
+  if (content.type === "attachment" || content.type === "voice") {
+    return await normalizeInboundBinaryContent(content, attachmentHandles);
+  }
+  if (content.type === "group") {
+    const items = [];
+    for (const item of Array.isArray(content.items) ? content.items : []) {
+      items.push({
+        id: item && typeof item === "object" ? item.id ?? null : null,
+        content: await normalizeContent(item?.content),
+      });
+    }
+    return { type: "group", items };
+  }
+  if (content.type === "reaction") {
+    const target = content.target;
+    return {
+      type: "reaction",
+      emoji: content.emoji || "",
+      targetMessageId: target?.id ?? null,
+      // Lets Python gate "is this a reaction to one of MY messages" without
+      // tracking every outbound id. May be null if the provider doesn't
+      // hydrate the target — Python falls back to its own sent-id cache.
+      targetDirection: target?.direction ?? null,
+      // Text of the reacted-to message, so Python can correlate the tapback to
+      // the gateway's reply_to_text. Null for attachment/voice-only targets.
+      targetText: reactionTargetText(target),
+    };
+  }
+  // A user tapping a poll choice arrives as `poll_option` carrying the chosen
+  // option title + whether it was selected (true) or deselected (false). This
+  // is how a native iMessage poll's vote streams back — Python turns a
+  // selection into the answer that resolves a pending `clarify`.
+  if (content.type === "poll_option") {
+    return {
+      type: "poll_option",
+      title: content.option?.title ?? content.title ?? "",
+      selected: content.selected !== false,
+      pollTitle: content.poll?.title ?? null,
+    };
+  }
+  // The poll message itself (its creation) — surfaced for completeness so the
+  // agent isn't told "content type not handled" if it sees the echo.
+  if (content.type === "poll") {
+    return {
+      type: "poll",
+      title: content.title ?? "",
+      options: Array.isArray(content.options)
+        ? content.options.map((o) => o?.title ?? "")
+        : [],
+    };
+  }
+  return { type: content.type || "unknown" };
+}
+
+async function normalizeEvent(space, message) {
+  try {
+    const msgSpace = message.space || {};
+    const ts = message.timestamp;
+    return {
+      messageId: message.id ?? null,
+      platform: message.platform || space.__platform || "iMessage",
+      space: {
+        id: space.id ?? msgSpace.id ?? null,
+        // iMessage spaces carry `type` ("dm"|"group") and `phone` directly.
+        type: space.type ?? msgSpace.type ?? "dm",
+        phone: space.phone ?? msgSpace.phone ?? null,
+      },
+      sender: { id: message.sender ? message.sender.id : null },
+      content: await normalizeContent(message.content),
+      timestamp:
+        ts instanceof Date ? ts.toISOString() : ts ? String(ts) : null,
+    };
+  } catch (e) {
+    console.error(
+      "photon-sidecar: failed to normalize inbound message: " + String(e)
+    );
+    return null;
   }
 }
 
@@ -519,26 +649,20 @@ function inboundStreamErrorMessage(e) {
 // always recovers (the adapter dedupes any catch-up replay).
 (async () => {
   let backoff = 1000;
-  let consecutiveFailures = 0;
-  const MAX_CONSECUTIVE_FAILURES = 5; // ~ backoff maxed out => upstream is dead
   for (;;) {
     try {
       for await (const [space, message] of app.messages) {
         backoff = 1000; // healthy traffic — reset
-        consecutiveFailures = 0;
         markStreamHealthy();
-        stampInboundHeartbeat(); // real upstream message => upstream is alive
+        // Every yield — any direction — proves the inbound stream is live.
+        noteInboundYield();
         // Only forward inbound messages (ignore our own outbound echoes).
         if (message && message.direction && message.direction !== "inbound") {
           continue;
         }
         rememberInboundSpace(space, message);
         rememberKnownMessage(message);
-        const event = await normalizeInboundEvent(
-          space,
-          message,
-          attachmentHandles
-        );
+        const event = await normalizeEvent(space, message);
         if (!event) continue;
         if (eventHasAttachmentHandle(event)) {
           const delivery = inboundDeliveries.begin(event, {
@@ -560,19 +684,11 @@ function inboundStreamErrorMessage(e) {
         }
       }
       console.error("photon-sidecar: inbound stream ended — re-subscribing");
-      consecutiveFailures += 1;
       markStreamRecovering("inbound stream ended");
     } catch (e) {
-      consecutiveFailures += 1;
       const reason = e && e.message ? e.message : String(e);
       console.error(inboundStreamErrorMessage(e));
       markStreamRecovering(reason);
-    }
-    // If the stream keeps ending/erroring back-to-back, spectrum-ts's internal
-    // reconnect is not recovering -> exit for a fresh-channel restart.
-    if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
-      exitForUpstream("inbound stream stuck x" + consecutiveFailures);
-      return;
     }
     await new Promise((r) =>
       setTimeout(r, backoff + Math.random() * backoff * 0.2)
@@ -580,6 +696,99 @@ function inboundStreamErrorMessage(e) {
     backoff = Math.min(backoff * 2, 30000);
   }
 })();
+
+// ---------------------------------------------------------------------------
+// Zombie-stream watchdog: detect a half-open gRPC stream the SDK can't see.
+//
+// The inbound iterator above can hang forever on a half-open socket — no
+// error, no end — so the re-subscribe loop never fires and classifyStreamLog
+// never sees a "[spectrum.stream]" line. We track the iterator's last yield
+// (noteInboundYield) and, once it has been silent past
+// STREAM_SILENCE_PROBE_MS, drive a cheap unary read (space.getMessage on a
+// synthetic id) over the same authenticated channel. Decision rules (see
+// stream-staleness.mjs):
+//   probe proves connectivity while the stream is silent -> the stream itself
+//     is the dead part -> markStreamDegraded -> existing exit-75 restart path.
+//   probe inconclusive (rejected/hung) -> do NOTHING: the network may just be
+//     down, and in that case the iterator eventually throws and the
+//     re-subscribe loop recovers on its own. Never restart on silence alone —
+//     shared lines can be legitimately quiet for hours.
+
+async function probeUpstream() {
+  if (typeof app?.stop !== "function") {
+    return { alive: false, hung: false, reason: "spectrum app not constructed" };
+  }
+  const probeId =
+    PROBE_MSG_PREFIX + Date.now() + "-" + Math.random().toString(36).slice(2);
+  let timer = null;
+  const timeout = new Promise((resolve) => {
+    timer = setTimeout(
+      () => resolve({ alive: false, hung: true, reason: "probe timed out" }),
+      STREAM_PROBE_TIMEOUT_MS
+    );
+    timer.unref();
+  });
+  const attempt = (async () => {
+    try {
+      const im = imessage(app);
+      const space = await im.space.get(PROBE_SPACE_ID);
+      await space.getMessage(probeId);
+      // Resolving for a synthetic id is unexpected but is still a completed
+      // round-trip: the channel is alive.
+      return { alive: true, hung: false, reason: "round-trip completed" };
+    } catch (e) {
+      const verdict = classifyProbeRejection(e);
+      return { alive: verdict.alive, hung: false, reason: verdict.reason };
+    }
+  })();
+  const outcome = await Promise.race([attempt, timeout]);
+  if (timer) clearTimeout(timer);
+  staleness.lastProbeAt = Date.now();
+  staleness.lastProbeOutcome = outcome.alive ? "alive" : "inconclusive";
+  return outcome;
+}
+
+let watchdogProbeInFlight = false;
+async function zombieWatchdogTick() {
+  if (watchdogProbeInFlight) return;
+  const now = Date.now();
+  const silentForMs = now - staleness.lastInboundAt;
+  if (
+    !shouldProbe(
+      silentForMs,
+      STREAM_SILENCE_PROBE_MS,
+      now - staleness.lastProbeAt,
+      STREAM_PROBE_COOLDOWN_MS
+    )
+  ) {
+    return;
+  }
+  watchdogProbeInFlight = true;
+  try {
+    const outcome = await probeUpstream();
+    if (isZombieSuspect(silentForMs, STREAM_SILENCE_PROBE_MS, outcome)) {
+      staleness.zombieSuspected = true;
+      const reason =
+        `inbound stream silent for ${silentForMs}ms while an upstream probe ` +
+        "succeeded — half-open (zombie) gRPC stream suspected";
+      console.error("photon-sidecar: " + reason);
+      markStreamDegraded(reason);
+    }
+    // Inconclusive: deliberately no action (see block comment above).
+  } catch (e) {
+    console.error(
+      "photon-sidecar: zombie watchdog tick failed: " +
+        (e && e.message ? e.message : String(e))
+    );
+  } finally {
+    watchdogProbeInFlight = false;
+  }
+}
+
+if (STREAM_SILENCE_PROBE_MS > 0) {
+  const watchdogTimer = setInterval(zombieWatchdogTick, STREAM_WATCHDOG_TICK_MS);
+  watchdogTimer.unref();
+}
 
 // ---------------------------------------------------------------------------
 // HTTP control + inbound server (loopback only).
@@ -620,13 +829,65 @@ function badRequest(res, msg) {
   res.end(JSON.stringify({ ok: false, error: msg }));
 }
 
-function serverError(res) {
+function classifySidecarError(err) {
+  const message = String(err && err.message ? err.message : err || "");
+  const lowered = message.toLowerCase();
+
+  // Spectrum raises AuthenticationError("Target not allowed for this
+  // project") from space.send when a shared/free-tier line tries to
+  // initiate an outbound conversation with a new target. That is a plan
+  // limitation, not a transient fault — surface a dedicated class so the
+  // adapter can explain it instead of retrying (issues #50971/#51897).
+  if (lowered.includes("target not allowed")) {
+    return { errorClass: "target_not_allowed", retryable: false };
+  }
+
+  if (
+    lowered.includes("unauthorized") ||
+    lowered.includes("forbidden") ||
+    lowered.includes("permission") ||
+    lowered.includes("401") ||
+    lowered.includes("403") ||
+    lowered.includes("invalid token") ||
+    lowered.includes("project secret") ||
+    lowered.includes("unable to resolve space id")
+  ) {
+    return { errorClass: "auth_or_config", retryable: false };
+  }
+
+  if (
+    lowered.includes("timeout") ||
+    lowered.includes("timed out") ||
+    lowered.includes("econnreset") ||
+    lowered.includes("econnrefused") ||
+    lowered.includes("socket hang up") ||
+    lowered.includes("fetch failed") ||
+    lowered.includes("unavailable") ||
+    lowered.includes("upstream connect") ||
+    lowered.includes("reset reason") ||
+    lowered.includes("overflow") ||
+    lowered.includes("temporarily") ||
+    lowered.includes("429")
+  ) {
+    return { errorClass: "upstream_transient", retryable: true };
+  }
+
+  return { errorClass: "sidecar_internal", retryable: false };
+}
+
+function serverError(res, err) {
   res.statusCode = 500;
   res.setHeader("Content-Type", "application/json");
+  const classified = classifySidecarError(err);
   // Don't leak stack traces or raw exception text to the caller — even
-  // though we listen on loopback, the supervisor logs the real error
-  // and the client only needs a generic failure signal.
-  res.end(JSON.stringify({ ok: false, error: "internal sidecar error" }));
+  // though we listen on loopback, the supervisor logs the real error. The
+  // Python adapter only needs a safe class plus retryability.
+  res.end(JSON.stringify({
+    ok: false,
+    error: "internal sidecar error",
+    error_class: classified.errorClass,
+    retryable: classified.retryable,
+  }));
 }
 
 function ok(res, data) {
@@ -650,13 +911,11 @@ function handleInbound(req, res) {
     }
   }
   setConsumer(res);
-  stampInboundHeartbeat();
   // Heartbeat keeps the socket warm through idle periods and lets the Python
   // side detect a dead pipe promptly.
   const heartbeat = setInterval(() => {
     try {
       res.write("\n");
-      stampInboundHeartbeat();
     } catch {
       /* ignore */
     }
@@ -671,35 +930,27 @@ function handleInbound(req, res) {
 }
 
 async function resolveSpace(spaceId) {
-  const phoneTarget = phoneTargetFromSpaceId(spaceId);
   const cached = knownSpaces.get(spaceId);
-  if (cached && !phoneTarget) return cached;
+  if (cached) return cached;
 
   const im = imessage(app);
+  const phoneTarget = phoneTargetFromSpaceId(spaceId);
   let space = null;
-  let directResolutionError = null;
 
   // A bare E.164 phone number addresses a DM, so callers can pass just
   // "+1..." (e.g. PHOTON_HOME_CHANNEL for cron delivery) instead of an opaque
   // inbound space id. Photon also represents DM chat ids as `any;-;+1...`;
   // normalize those through the same path. `space.create` accepts the raw
-  // phone string directly. Spectrum 12 only accepts the canonical
-  // `any;-;+1...` chat id for outbound operations, including when an inbound
-  // event had populated this cache with a raw E.164 id.
+  // phone string directly.
   if (phoneTarget) {
     try {
-      space = await resolveDirectMessageSpace(im, phoneTarget, cached);
+      space = await im.space.create(phoneTarget);
     } catch (e) {
-      directResolutionError = e;
       console.error(
-        "photon-sidecar: phone->DM space resolution failed: " +
+        "photon-sidecar: phone->DM space.create failed: " +
           (e && e.stack ? e.stack : String(e))
       );
     }
-  }
-  if (phoneTarget && !space) {
-    throw directResolutionError ??
-      new Error(`unable to resolve direct iMessage space ${spaceId}`);
   }
   // Anything else — typically an opaque group GUID — is rehydrated from the
   // persisted id via `space.get`, so group spaces stay reachable after a
@@ -722,17 +973,22 @@ async function resolveSpace(spaceId) {
   return space;
 }
 
-async function resolveMessageTarget(spaceId, messageId) {
-  const space = await resolveSpace(spaceId);
-  return await space.getMessage(messageId);
-}
-
 // Constant-time token comparison — don't leak the token via `!==` timing.
 const _tokenBuf = Buffer.from(sharedToken);
 function tokenOk(header) {
   if (typeof header !== "string") return false;
   const h = Buffer.from(header);
   return h.length === _tokenBuf.length && crypto.timingSafeEqual(h, _tokenBuf);
+}
+
+function isHttpUrl(value) {
+  if (typeof value !== "string" || !value.trim()) return false;
+  try {
+    const parsed = new URL(value.trim());
+    return parsed.protocol === "http:" || parsed.protocol === "https:";
+  } catch {
+    return false;
+  }
 }
 
 const server = http.createServer(async (req, res) => {
@@ -750,6 +1006,27 @@ const server = http.createServer(async (req, res) => {
   try {
     if (req.url === "/healthz") {
       return ok(res, { stream: streamHealthSnapshot() });
+    }
+    if (req.url === "/probe") {
+      // Upstream liveness probe. Drives a cheap unary read over the SAME gRPC
+      // channel the inbound stream uses. STRICT semantics: only a completed
+      // round-trip (resolution, or a not-found rejection for our synthetic
+      // id) counts as alive; any other rejection or a timeout is
+      // INCONCLUSIVE — never reported as alive.
+      const outcome = await probeUpstream();
+      if (outcome.alive) {
+        return ok(res, { alive: true, outcome: "alive" });
+      }
+      res.statusCode = 503;
+      res.setHeader("Content-Type", "application/json");
+      return res.end(
+        JSON.stringify({
+          ok: false,
+          alive: false,
+          outcome: outcome.hung ? "hung" : "inconclusive",
+          reason: outcome.reason,
+        })
+      );
     }
     if (req.url === "/shutdown") {
       ok(res, {});
@@ -775,52 +1052,37 @@ const server = http.createServer(async (req, res) => {
       return ok(res, { deliveryId, status });
     }
     if (req.url === "/send") {
-      try {
-        const receipt = await sendTextMessage({
-          body,
-          resolveSpace,
-          textBuilder: spectrumText,
-          markdownBuilder: spectrumMarkdown,
-          sdkSupportsClientMessageId:
-            SPECTRUM_SEND_SUPPORTS_CLIENT_MESSAGE_ID,
-        });
-        return ok(res, receipt);
-      } catch (e) {
-        if (e instanceof SendRequestError) {
-          return badRequest(res, e.message);
-        }
-        throw e;
+      const { spaceId, text, format = "text" } = body || {};
+      if (!spaceId || typeof text !== "string") {
+        return badRequest(res, "spaceId and text are required");
       }
+      if (format !== "text" && format !== "markdown") {
+        return badRequest(res, "format must be text or markdown");
+      }
+      const space = await resolveSpace(spaceId);
+      // iMessage renders markdown natively; spectrum-ts degrades it to
+      // readable plain text on platforms that don't.
+      // spectrumMarkdown() enables enableDataDetection in the underlying
+      // iMessage API, which can 500 on messages containing raw URLs.
+      // Plain-text URLs are auto-linked by iMessage, so route markdown
+      // messages that contain URLs through spectrumText while preserving
+      // spectrumMarkdown for URL-free markdown. The decision lives in
+      // send-format.mjs so tests can exercise it directly.
+      const builder =
+        chooseSendFormat(format, text) === "markdown"
+          ? spectrumMarkdown(text)
+          : spectrumText(text);
+      const result = await space.send(builder);
+      return ok(res, { messageId: result?.id || null });
     }
-    if (req.url === "/reply") {
-      try {
-        const receipt = await replyToMessage({
-          body,
-          resolveTarget: resolveMessageTarget,
-          textBuilder: spectrumText,
-        });
-        return ok(res, receipt);
-      } catch (e) {
-        if (e instanceof SendRequestError) {
-          return badRequest(res, e.message);
-        }
-        throw e;
+    if (req.url === "/send-richlink") {
+      const { spaceId, url } = body || {};
+      if (!spaceId || !isHttpUrl(url)) {
+        return badRequest(res, "spaceId and http(s) url are required");
       }
-    }
-    if (req.url === "/edit") {
-      try {
-        const receipt = await editMessage({
-          body,
-          resolveTarget: resolveMessageTarget,
-          textBuilder: spectrumText,
-        });
-        return ok(res, receipt);
-      } catch (e) {
-        if (e instanceof SendRequestError) {
-          return badRequest(res, e.message);
-        }
-        throw e;
-      }
+      const space = await resolveSpace(spaceId);
+      const result = await space.send(spectrumRichlink(url.trim()));
+      return ok(res, { messageId: result?.id || null });
     }
     if (req.url === "/send-attachment") {
       const { spaceId, path, name, mimeType, caption, kind } =
@@ -915,6 +1177,37 @@ const server = http.createServer(async (req, res) => {
       }
       return badRequest(res, "no tracked reaction for message");
     }
+    if (req.url === "/send-poll") {
+      const { spaceId, title, options } = body || {};
+      const choices = Array.isArray(options)
+        ? options.map((option) => String(option || "").trim()).filter(Boolean)
+        : [];
+      if (!spaceId || typeof title !== "string" || !title.trim()) {
+        return badRequest(res, "spaceId and title are required");
+      }
+      if (choices.length < 2) {
+        return badRequest(res, "options must contain at least two choices");
+      }
+      const space = await resolveSpace(spaceId);
+      const result = await space.send(spectrumPoll(title.trim(), choices));
+      return ok(res, { messageId: result?.id || null });
+    }
+    if (req.url === "/send-effect") {
+      const { spaceId, text, effect } = body || {};
+      const effectName = String(effect || "").trim();
+      const effectId = MESSAGE_EFFECTS[effectName];
+      if (!spaceId || typeof text !== "string" || !text.trim()) {
+        return badRequest(res, "spaceId and text are required");
+      }
+      if (!effectId) {
+        return badRequest(res, "unsupported effect");
+      }
+      const space = await resolveSpace(spaceId);
+      const result = await space.send(
+        imessageEffect(spectrumText(text.trim()), effectId)
+      );
+      return ok(res, { messageId: result?.id || null });
+    }
     if (req.url === "/typing") {
       const { spaceId, state = "start" } = body || {};
       if (!spaceId) return badRequest(res, "spaceId is required");
@@ -935,12 +1228,7 @@ const server = http.createServer(async (req, res) => {
     );
     // serverError() intentionally returns a generic message — see its
     // body for the rationale.
-    serverError(res);
-    // A dead upstream surfaces here first (send/typing throw it). Exit so the
-    // supervisor restarts the sidecar with a fresh Photon channel rather than
-    // limping on with inbound + outbound both broken.
-    if (isUpstreamDown(e)) exitForUpstream("handler error");
-    return;
+    return serverError(res, e);
   }
 });
 

@@ -23,7 +23,8 @@ talks to it over loopback.
 │  (iMessage line owner)  │   space.send()    │  (plugins/…/sidecar) │
 └─────────────────────────┘                   └──────────┬───────────┘
                                        GET /inbound (NDJSON) │  ▲ POST /send
-                                       inbound events        ▼  │ /typing
+                                       inbound events        ▼  │ /send-richlink
+                                                            │  │ /typing
                                               ┌──────────────────────┐
                                               │  PhotonAdapter        │
                                               │  (Python, in gateway) │
@@ -36,12 +37,11 @@ talks to it over loopback.
   a `MessageEvent` to the gateway. It reconnects automatically if the stream
   drops; the sidecar owns the gRPC reconnect to Photon.
 - **Outbound**: `send` / `send_typing` / reaction tapbacks are loopback POSTs
-  to the sidecar (`/send`, `/send-attachment`, `/typing`, `/react`,
-  `/unreact`), authenticated with a shared `X-Hermes-Sidecar-Token`.
+  to the sidecar (`/send`, `/send-richlink`, `/send-attachment`, `/typing`,
+  `/react`, `/unreact`), authenticated with a shared
+  `X-Hermes-Sidecar-Token`.
 
 ## First-time setup
-
-Prerequisite: Node.js 20 or newer is required for the pinned Spectrum sidecar.
 
 ```bash
 # One-shot setup: device login (opens browser) + project + user + sidecar deps
@@ -129,25 +129,33 @@ All env vars are documented in `plugin.yaml`. The most important:
 
 ## Attachments & limitations
 
-- **Inbound attachments and voice notes use memory-only opaque handles.** The
-  sidecar never puts bytes in NDJSON or a plaintext media cache. Mixed bubbles
-  preserve text and attachment metadata in a grouped payload. Authorized Keez
-  consumers lease the bytes from loopback, upload them to the secure store,
-  and explicitly consume the handle only after the durable upload receipt.
-  Keez handle consumers bind durable upload and submit receipts to the random
-  `deliveryId`. On replay, the consumer queries that receipt before any
-  `/attachment/<handle>/lease` request. A committed upload finalizes the exact
-  handle and resumes at submit;
-  a committed submit returns its prior approval result and allows ACK. An
-  absent, mismatched, or unknown commit never authorizes ACK.
+- **Inbound attachments and voice notes are downloaded.** The sidecar reads
+  the bytes (`content.read()`) and base64-inlines them on the NDJSON event; the
+  adapter caches them to the shared media cache and populates `media_urls` /
+  `media_types`, so the agent sees the real image/file or can transcribe the
+  voice note — parity with the BlueBubbles iMessage channel. Mixed iMessage
+  bubbles that contain both text and attachments are normalized as a grouped
+  payload so the user's typed text is preserved alongside the cached media.
+  Media larger than `PHOTON_MAX_INLINE_ATTACHMENT_BYTES` (default 20 MB), or
+  any byte read that fails, falls back to a text marker (`[Photon attachment
+  received: …]` or `[Photon voice received: …]`) so the agent still knows
+  something arrived. If Spectrum emits a `richlink` content object, Hermes
+  preserves its URL plus any title/summary metadata Spectrum already exposed;
+  current Spectrum versions may still deliver ordinary inbound links as plain
+  `text`. iMessage may also emit rich-link preview artwork as
+  `.pluginPayloadAttachment` images immediately after the URL; Hermes coalesces
+  those artifacts so the agent receives one link message instead of a follow-up
+  `(attachment)` prompt.
 - **Outbound attachments are supported.** Images, voice notes, video, and
   documents are sent via `space.send(attachment(...))` /
   `space.send(voice(...))` through the sidecar's `/send-attachment`
   endpoint; a caption is delivered as a separate text bubble after the media.
 - **Markdown is rendered.** Replies go out via spectrum-ts' `markdown()`
   builder; iMessage renders bold/italics/lists/code natively and other
-  Spectrum platforms degrade to readable plain text. `PHOTON_MARKDOWN=false`
-  reverts to stripped plain text.
+  Spectrum platforms degrade to readable plain text. URL-only replies go out
+  via spectrum-ts' `richlink()` builder so iMessage can render a native link
+  preview card. `PHOTON_MARKDOWN=false` reverts to stripped plain text and
+  disables rich-link routing.
 - **Reactions (tapbacks) are supported** behind `PHOTON_REACTIONS` (default
   off): the adapter tapbacks 👀 while processing and swaps it for 👍/👎 on
   completion, and a user tapback on a bot-sent message is routed to the agent
@@ -155,8 +163,19 @@ All env vars are documented in `plugin.yaml`. The most important:
   restart is best-effort — the live reaction handle is lost, so a stale
   tapback heals when the next reaction replaces it. Group spaces stay
   reachable across restarts via spectrum-ts' `space.get(id)`.
-- **Message effects, polls** — supported by `spectrum-ts` but not yet
-  exposed; the sidecar is the natural place to add them.
+- **Native polls are supported.** Hermes posts poll content through
+  `spectrum-ts`' `poll(...)` builder via the sidecar's `/send-poll` endpoint.
+- **Message effects are supported.** Text can be sent with native iMessage
+  bubble/screen effects through `spectrum-ts`' iMessage `effect(...)` builder
+  via the sidecar's `/send-effect` endpoint.
+- **Cron/standalone sends require a running gateway.** Processes outside
+  the gateway (cron subprocesses, `hermes send`) cannot spawn the sidecar;
+  they authenticate to the gateway's live sidecar via the runtime record at
+  `<hermes-home>/runtime/photon-sidecar.json` (written after the sidecar's
+  `/healthz` readiness check, `0600`, removed on stop/failed start). Also
+  note that shared/free-tier Photon lines cannot INITIATE conversations
+  with numbers that never texted the line — that's Photon-side policy, not
+  a Hermes limitation.
 
 ## Upgrading spectrum-ts
 
@@ -164,8 +183,8 @@ All env vars are documented in `plugin.yaml`. The most important:
 (no `^` range) and installed with `npm ci`, because the SDK ships breaking
 majors (v2 removed `defineFusorPlatform`; v3 reworked space construction; v5
 split it into `@spectrum-ts/*` packages, with `spectrum-ts` as the umbrella
-that re-exports them; v8 made `richlink` outbound-only, so inbound rich links
-now arrive as plain `text`). A floating range or `npm install spectrum-ts@latest`
+that re-exports them; v8 made `richlink` primarily outbound, so many inbound
+links now arrive as plain `text`). A floating range or `npm install spectrum-ts@latest`
 would let a breaking release take down fresh setups silently. Upgrades are
 deliberate:
 

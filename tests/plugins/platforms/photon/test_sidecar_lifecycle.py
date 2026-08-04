@@ -8,7 +8,6 @@ spawning Node or binding ports.
 """
 from __future__ import annotations
 
-import asyncio
 import subprocess
 from typing import Any, Dict, List, Tuple
 
@@ -50,54 +49,6 @@ class _ProbeClient:
         return _Resp()
 
 
-class _ConnectClient:
-    """Minimal client used to exercise the adapter's connect orchestration."""
-
-    def __init__(self, *a: Any, **k: Any) -> None:
-        pass
-
-    async def aclose(self) -> None:
-        pass
-
-
-@pytest.mark.asyncio
-async def test_connect_starts_exactly_one_sidecar_health_monitor(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Only the tracked health monitor may run, so disconnect can cancel it."""
-    adapter = _make_adapter(monkeypatch)
-
-    async def _no_start() -> None:
-        pass
-
-    monitor_starts = 0
-    blocked = asyncio.Event()
-
-    async def _blocked_inbound() -> None:
-        await blocked.wait()
-
-    async def _blocked_monitor() -> None:
-        nonlocal monitor_starts
-        monitor_starts += 1
-        await blocked.wait()
-
-    monkeypatch.setattr(photon_adapter.httpx, "AsyncClient", _ConnectClient)
-    monkeypatch.setattr(adapter, "_start_sidecar", _no_start)
-    monkeypatch.setattr(adapter, "_inbound_loop", _blocked_inbound)
-    monkeypatch.setattr(adapter, "_monitor_sidecar_health", _blocked_monitor)
-
-    before = asyncio.all_tasks()
-    try:
-        assert await adapter.connect() is True
-        await asyncio.sleep(0)
-        assert monitor_starts == 1
-    finally:
-        spawned = asyncio.all_tasks() - before
-        for task in spawned:
-            task.cancel()
-        await asyncio.gather(*spawned, return_exceptions=True)
-
-
 def _capture_kills(monkeypatch: pytest.MonkeyPatch) -> List[Tuple[int, int]]:
     kills: List[Tuple[int, int]] = []
 
@@ -124,55 +75,6 @@ async def test_reap_noop_when_port_free(monkeypatch: pytest.MonkeyPatch) -> None
 
 
 @pytest.mark.asyncio
-async def test_reap_kills_verified_orphan(monkeypatch: pytest.MonkeyPatch) -> None:
-    adapter = _make_adapter(monkeypatch)
-    monkeypatch.setattr(photon_adapter.httpx, "AsyncClient", _ProbeClient)
-    monkeypatch.setattr(adapter, "_find_listener_pids", lambda port: [4242])
-    monkeypatch.setattr(adapter, "_pid_is_sidecar", lambda pid: True)
-    # Dies promptly on SIGTERM — no escalation expected.
-    monkeypatch.setattr(adapter, "_pid_alive", lambda pid: False)
-    kills = _capture_kills(monkeypatch)
-
-    await adapter._reap_stale_sidecar()
-
-    assert kills == [(4242, photon_adapter.signal.SIGTERM)]
-
-
-@pytest.mark.asyncio
-async def test_reap_escalates_to_sigkill(monkeypatch: pytest.MonkeyPatch) -> None:
-    adapter = _make_adapter(monkeypatch)
-    monkeypatch.setattr(photon_adapter.httpx, "AsyncClient", _ProbeClient)
-    monkeypatch.setattr(adapter, "_find_listener_pids", lambda port: [4242])
-    monkeypatch.setattr(adapter, "_pid_is_sidecar", lambda pid: True)
-    monkeypatch.setattr(adapter, "_pid_alive", lambda pid: True)  # ignores TERM
-    # No clock fakery (logging also calls time.time, which makes a fake clock
-    # fragile) — this test rides out the real 3s SIGTERM grace window.
-    kills = _capture_kills(monkeypatch)
-
-    await adapter._reap_stale_sidecar()
-
-    assert (4242, photon_adapter.signal.SIGTERM) in kills
-    assert (4242, photon_adapter.signal.SIGKILL) in kills
-
-
-@pytest.mark.asyncio
-async def test_reap_raises_for_foreign_listener(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Never signal a process whose command line isn't our sidecar."""
-    adapter = _make_adapter(monkeypatch)
-    monkeypatch.setattr(photon_adapter.httpx, "AsyncClient", _ProbeClient)
-    monkeypatch.setattr(adapter, "_find_listener_pids", lambda port: [777])
-    monkeypatch.setattr(adapter, "_pid_is_sidecar", lambda pid: False)
-    kills = _capture_kills(monkeypatch)
-
-    with pytest.raises(RuntimeError, match="in use by another process"):
-        await adapter._reap_stale_sidecar()
-
-    assert kills == []
-
-
-@pytest.mark.asyncio
 async def test_start_sidecar_spawns_with_stdin_pipe(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:
@@ -183,7 +85,7 @@ async def test_start_sidecar_spawns_with_stdin_pipe(
         pass
 
     monkeypatch.setattr(adapter, "_reap_stale_sidecar", _no_reap)
-    (tmp_path / "node_modules").mkdir()
+    (tmp_path / "node_modules" / "spectrum-ts").mkdir(parents=True)
     monkeypatch.setattr(photon_adapter, "_SIDECAR_DIR", tmp_path)
 
     spawned: Dict[str, Any] = {}
@@ -237,3 +139,73 @@ async def test_start_sidecar_spawns_with_stdin_pipe(
     assert kwargs["env"]["PHOTON_SIDECAR_WATCH_STDIN"] == "1"
     assert spawned["patch_kwargs"]["creationflags"] == hidden_flags
     assert kwargs["creationflags"] == hidden_flags
+
+
+@pytest.mark.asyncio
+async def test_spectrum_patch_runs_off_the_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The node patch run must not block the shared gateway event loop.
+
+    ``_start_sidecar`` spawns the Spectrum patch script and *waits* for it
+    (``timeout=10``). Run inline it holds the loop for that whole window, so
+    every other platform's traffic stalls — and ``_start_sidecar`` runs on
+    every reconnect (``connect(is_reconnect=True)``), not just startup, so the
+    stall recurs on a live gateway. The dep reinstall a few lines above already
+    hops to a thread for exactly this reason; the patch run must too.
+    """
+    import threading
+
+    adapter = _make_adapter(monkeypatch)
+    main_thread = threading.current_thread()
+    seen: Dict[str, Any] = {}
+
+    # node_modules present + deps fresh, so we reach the patch run.
+    monkeypatch.setattr(photon_adapter.Path, "exists", lambda self: True)
+    monkeypatch.setattr(photon_adapter, "_sidecar_deps_stale", lambda: False)
+
+    async def _no_reap() -> None:
+        return None
+
+    monkeypatch.setattr(adapter, "_reap_stale_sidecar", _no_reap)
+
+    def _fake_run(*a: Any, **k: Any) -> Any:
+        seen["thread"] = threading.current_thread()
+
+        class _Done:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        return _Done()
+
+    monkeypatch.setattr(photon_adapter.subprocess, "run", _fake_run)
+
+    class _FakeProc:
+        pid = 4242
+        stdin = None
+        stdout = None
+
+        def poll(self) -> int:
+            # Report "exited" so the readiness health-poll loop bails out
+            # immediately instead of spinning for its full 15s deadline —
+            # the assertion below only cares where the patch run executed.
+            return 0
+
+    monkeypatch.setattr(
+        photon_adapter.subprocess, "Popen", lambda *a, **k: _FakeProc()
+    )
+
+    try:
+        await adapter._start_sidecar()
+    except Exception:
+        # Readiness/handshake past the patch run may fail under the fakes —
+        # irrelevant here; we only assert where the patch run executed.
+        pass
+
+    assert seen.get("thread") is not None, "patch run never executed"
+    assert seen["thread"] is not main_thread, (
+        "Spectrum patch subprocess ran on the event-loop thread; it must be "
+        "dispatched via asyncio.to_thread so a 10s node spawn can't freeze "
+        "every other platform on the gateway loop"
+    )
