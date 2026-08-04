@@ -1173,17 +1173,36 @@ def _set_nested(config, dotted_key: str, value):
         at_leaf = len(remaining) == 1
         if isinstance(current, list):
             part = remaining[0]
-            if at_leaf:
-                current[int(part)] = value
-                return
             try:
                 idx = int(part)
             except (TypeError, ValueError):
+                if at_leaf:
+                    raise TypeError(
+                        f"Cannot set {dotted_key!r}: {part!r} is not a numeric "
+                        f"list index"
+                    )
                 raise TypeError(
                     f"Cannot navigate into list at key {dotted_key!r}: "
                     f"segment {part!r} is not a numeric index"
                 )
-            current = current[idx]
+            if at_leaf:
+                try:
+                    current[idx] = value
+                except IndexError:
+                    raise TypeError(
+                        f"Cannot set {dotted_key!r}: list index {idx} is out of "
+                        f"range (the referenced entry must already exist — "
+                        f"indexes are never created implicitly)"
+                    )
+                return
+            try:
+                current = current[idx]
+            except IndexError:
+                raise TypeError(
+                    f"Cannot set {dotted_key!r}: list index {idx} is out of "
+                    f"range (the referenced entry must already exist — "
+                    f"indexes are never created implicitly)"
+                )
             i += 1
         elif isinstance(current, dict):
             match = _greedy_literal_match(current, remaining)
@@ -1193,8 +1212,21 @@ def _set_nested(config, dotted_key: str, value):
                     current[key] = value
                     return
                 existing = current.get(key)
-                # Preserve dicts and lists; replace scalar with a fresh dict.
+                # Preserve dicts and lists; replace a scalar with a fresh dict
+                # only when the next segment is not a list index. Creating a
+                # dict in front of a numeric segment would silently materialize
+                # a mapping shaped like a list (#78370).
                 if not isinstance(existing, (dict, list)):
+                    next_part = parts[i + consumed]
+                    if next_part.isdigit():
+                        parent = ".".join(parts[: i + consumed])
+                        raise TypeError(
+                            f"Cannot set {dotted_key!r}: {parent!r} is not an "
+                            f"existing list, and numeric index {next_part!r} "
+                            f"would silently create a mapping instead of a list "
+                            f"entry. Create the list in config.yaml first "
+                            f"(indexes are never created implicitly)."
+                        )
                     current[key] = {}
                 current = current[key]
                 i += consumed
@@ -1213,6 +1245,20 @@ def _set_nested(config, dotted_key: str, value):
                     f"the mapping already contains a literal key {shadowed!r} "
                     f"that contains a dot. If you meant that key, escape its "
                     f"dots with a backslash (e.g. {escaped})."
+                )
+            # With dotted-key ambiguity ruled out, a numeric next segment is
+            # an attempted list index. Refuse to invent its missing parent as
+            # a dict. Existing numeric-keyed mappings are still navigated via
+            # the greedy match above.
+            next_part = remaining[1]
+            if next_part.isdigit():
+                parent = ".".join(parts[: i + 1])
+                raise TypeError(
+                    f"Cannot set {dotted_key!r}: {parent!r} is not an existing "
+                    f"list, and numeric index {next_part!r} would silently "
+                    f"create a mapping instead of a list entry. Create the list "
+                    f"in config.yaml first (indexes are never created "
+                    f"implicitly)."
                 )
             current[part] = {}
             current = current[part]
@@ -5930,8 +5976,10 @@ def set_config_value(key: str, value: str, force: bool = False):
                 sys.exit(1)
     try:
         _set_nested(user_config, key, value)
-    except ValueError as e:
-        print(f"✗ {e}", file=sys.stderr)
+    except (TypeError, ValueError) as exc:
+        # Structural list-index refusals and dotted-key ambiguity are both
+        # clean command errors; neither should escape as a raw traceback.
+        print(f"✗ {exc}", file=sys.stderr)
         sys.exit(1)
     # Normalize the api_base → base_url alias at set-time too (issue #8919),
     # so a fresh `hermes config set model.api_base ...` lands on the canonical
