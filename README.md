@@ -214,11 +214,81 @@ See `hermes claw migrate --help` for all options, or use the `openclaw-migration
 
 ---
 
-## RecursiveIntell Rust Acceleration
+## RecursiveIntell Edition
 
-Hermes automatically uses [RecursiveIntell](https://github.com/RecursiveIntell)'s Rust stack when the native extensions are installed. Every path falls back silently to pure Python on any error — no config needed to disable.
+This fork ships with [RecursiveIntell](https://github.com/RecursiveIntell)'s full Rust stack, MCP server infrastructure, 70+ agent skills, and a one-line installer that configures everything automatically.
 
-### Active paths
+### One-line install
+
+```bash
+curl -fsSL https://recursiveintell.com/hermes/install.sh | bash
+```
+
+That gives you Hermes Agent with Rust acceleration active by default (`llm-pipeline`, `context-governor`, `poly-kv`). No config needed — the context-governor plugin is auto-enabled.
+
+### Full Josh's setup
+
+```bash
+curl -fsSL https://recursiveintell.com/hermes/install.sh | bash -s -- --with-josh-setup
+```
+
+This installs everything — the complete Hermes experience:
+
+| Layer | What you get | Where |
+|-------|-------------|-------|
+| **Rust acceleration** | `llm-pipeline` (LLM transport), `context-governor` (prompt compaction), `poly-kv` (vector scoring) | Active by default, silent Python fallback on error |
+| **Skills pack** | 70+ skills — README generation, code review, GPU benchmarking, council deliberation, email automation, device maintenance, research synthesis, and more | `~/.hermes/skills/` |
+| **Agent hooks** | 12 hooks — memory recall/capture, context compaction, CEA edit telemetry, knowledge-router classification, council trimming | `~/.hermes/agent-hooks/` (auto-discovered) |
+| **semantic-memory MCP** | Persistent knowledge base with semantic search, graph edges, factor-graph belief propagation, contradiction detection | `~/.local/bin/semantic-memory-mcp` |
+| **agent-graph MCP** | Multi-agent graph orchestration — run 9+ LLM nodes in parallel fan-out, council deliberation, plan→critique→refine pipelines, HITL approvals | `~/.local/bin/agent-graph-mcp` + daemon |
+
+### What the installer configures automatically
+
+When you use `--with-josh-setup` (or the individual flags), the installer wires everything into your Hermes config:
+
+| Config change | Why |
+|---------------|-----|
+| `context.engine: ri-context-governor` | Rust prompt compaction replaces Python summarizer |
+| `agent.disabled_toolsets: [memory]` | Built-in memory disabled — semantic-memory replaces it |
+| `mcp_servers.semantic_memory` registered | Knowledge base available on next restart |
+| `mcp_servers.agent_graph` registered (with socket args) | Graph orchestration available on next restart |
+| Hooks auto-discovered from `~/.hermes/agent-hooks/` | No config needed — any `.py` file is loaded |
+
+### Installer flags
+
+| Flag | What it does |
+|------|-------------|
+| *(none)* | Hermes Agent + Rust acceleration (llm-pipeline, context-governor, poly-kv) |
+| `--with-semantic-memory` | + semantic-memory MCP server (prebuilt binary) + auto-register + disable built-in memory |
+| `--with-agent-graph` | + agent-graph MCP server (prebuilt binary) + auto-register |
+| `--with-all-mcp` | + both MCP servers |
+| `--with-josh-setup` | + everything: MCP servers + 70+ skills + 12 agent hooks + full auto-config |
+| `--skip-rust` | Skip PyO3 wheels (Python-only fallback) |
+| `--no-venv` | Use system Python instead of uv-managed venv |
+| `--skip-setup` | Skip post-install setup wizard |
+| `--branch NAME` | Install from a specific git branch |
+
+All flags are additive and independent — you can combine them. Downloads are best-effort; a failed MCP binary or skills tarball won't block the install.
+
+### After install — what you need to provide
+
+The installer doesn't ship secrets. After installation:
+
+```bash
+# 1. Set your LLM provider API key
+export OPENAI_API_KEY=sk-...
+
+# 2. Start the agent-graph daemon (if installed)
+agent-graph-mcpd --base-url https://api.deepseek.com/v1 --model deepseek-v4-pro &
+
+# 3. Run setup to configure providers
+hermes setup
+
+# 4. Restart Hermes to pick up MCP servers
+hermes
+```
+
+### Rust acceleration — active paths
 
 | Path | What it accelerates | Rust crate | Status |
 |------|-------------------|------------|--------|
@@ -237,13 +307,13 @@ HERMES_RI_AGENT_GRAPH=0  # fall back to MCP for agent-graph reads
 HERMES_RI_POLY_KV=0      # fall back to pure Python vector scoring
 ```
 
-### Install
+### Install Rust wheels manually
 
 ```bash
 pip install llm-pipeline context-governor poly-kv
 ```
 
-All three are published on crates.io with precompiled PyO3 wheels. The context-governor plugin (`context.engine: ri-context-governor`) uses the Rust first pass automatically; set the summarization fallback model in `agent/transports/ri_context_compressor.py`.
+All three are published on crates.io with precompiled PyO3 wheels.
 
 ---
 
