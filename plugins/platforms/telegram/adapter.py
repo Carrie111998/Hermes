@@ -6405,7 +6405,10 @@ class TelegramAdapter(BasePlatformAdapter):
     ) -> None:
         """Handle inline keyboard button clicks."""
         query = update.callback_query
-        if not query or not query.data:
+        if not query:
+            return
+        if not query.data:
+            await query.answer()
             return
         data = query.data
         query_message = getattr(query, "message", None)
@@ -6744,6 +6747,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
         # --- Update prompt callbacks ---
         if not data.startswith("update_prompt:"):
+            await query.answer()
             return
         answer = data.split(":", 1)[1]  # "y" or "n"
         caller_id = str(getattr(query.from_user, "id", ""))

@@ -234,6 +234,37 @@ class TestTelegramClarifyCallback:
         assert adapter._clarify_state["cidC"] == "sk-auth"
 
 
+class TestTelegramUnknownCallback:
+    """Unknown and data-less callbacks must stop Telegram's spinner."""
+
+    @pytest.mark.asyncio
+    async def test_data_less_callback_is_acknowledged(self):
+        adapter = _make_adapter()
+        query = AsyncMock()
+        query.data = None
+        update = MagicMock()
+        update.callback_query = query
+
+        await adapter._handle_callback_query(update, MagicMock())
+
+        query.answer.assert_awaited_once_with()
+
+    @pytest.mark.asyncio
+    async def test_unknown_callback_is_acknowledged(self):
+        adapter = _make_adapter()
+        query = AsyncMock()
+        query.data = "stale_button"
+        query.message = MagicMock()
+        query.from_user = MagicMock()
+        query.answer = AsyncMock()
+        update = MagicMock()
+        update.callback_query = query
+
+        await adapter._handle_callback_query(update, MagicMock())
+
+        query.answer.assert_awaited_once_with()
+
+
 # ===========================================================================
 # Base adapter fallback render — text numbered list
 # ===========================================================================
