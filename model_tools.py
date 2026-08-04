@@ -1138,6 +1138,17 @@ def handle_function_call(
     function_args = coerce_tool_args(function_name, function_args)
     if not isinstance(function_args, dict):
         function_args = {}
+    from tools.coding_kanban_gate import coding_tool_gate_refusal
+    refusal = coding_tool_gate_refusal(
+        function_name,
+        function_args=function_args,
+        session_id=session_id,
+        task_id=task_id,
+        turn_id=turn_id,
+        user_message=user_task,
+    )
+    if refusal is not None:
+        return refusal
     _tool_middleware_trace = list(tool_request_middleware_trace or [])
 
     # ── Tool Search bridge dispatch ──────────────────────────────────
@@ -1240,6 +1251,19 @@ def handle_function_call(
             logger.debug("tool_request middleware error: %s", _mw_err)
 
     try:
+        if function_name in {"delegate_task", "terminal", "execute_code", "write_file", "patch", "project_create", "project_switch"}:
+            from tools.coding_kanban_gate import coding_tool_gate_refusal
+
+            refusal = coding_tool_gate_refusal(
+                function_name,
+                function_args=function_args,
+                session_id=session_id,
+                task_id=task_id,
+                turn_id=turn_id,
+                user_message=user_task,
+            )
+            if refusal is not None:
+                return refusal
         if function_name in _AGENT_LOOP_TOOLS:
             return tool_error(f"{function_name} must be handled by the agent loop")
 
