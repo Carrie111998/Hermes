@@ -529,6 +529,157 @@ def test_unexpected_behavior_artifacts_fail_get_and_post(
     assert response.status_code == 503
 
 
+@pytest.mark.parametrize(
+    "trigger_sql",
+    (
+        """CREATE TRIGGER cross_insert AFTER INSERT ON trigger_host
+            BEGIN INSERT INTO task_events (task_id, kind, created_at)
+            VALUES ('forged', 'forged', 1); END""",
+        """CREATE TRIGGER cross_inventory_insert AFTER INSERT ON trigger_host
+            BEGIN INSERT INTO task_comments (task_id, author, body, created_at)
+            VALUES ('forged', 'forged', 'forged', 1); END""",
+        """CREATE TRIGGER cross_delete AFTER DELETE ON trigger_host
+            BEGIN DELETE FROM task_runs WHERE 0; END""",
+        """CREATE TRIGGER cross_update_nonfirst
+            AFTER UPDATE OF second_column ON trigger_host
+            BEGIN UPDATE tasks SET status = status WHERE 0; END""",
+        """CREATE TRIGGER "quoted cross trigger"
+            AFTER UPDATE OF "second_column" ON "trigger_host"
+            BEGIN
+              /* UPDATE task_runs SET status = 'decoy'; */
+              SELECT 'DELETE FROM tasks; INSERT INTO task_events DEFAULT VALUES';
+              UPDATE "tasks" SET "status" = "status" WHERE 0;
+            END""",
+    ),
+)
+def test_cross_table_trigger_dml_into_contract_tables_is_rejected_without_mutation(
+    home: Path, trigger_sql: str
+) -> None:
+    conn = sqlite3.connect(home / "kanban.db", isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute(
+            "CREATE TABLE trigger_host (first_column TEXT, second_column TEXT)"
+        )
+        conn.execute(trigger_sql)
+        before = "\n".join(conn.iterdump())
+        with pytest.raises(
+            kb.PortfolioContractSchemaUnavailable, match="cross-table trigger DML"
+        ):
+            kb.validate_portfolio_contract_schema(conn)
+        assert "\n".join(conn.iterdump()) == before
+    finally:
+        conn.close()
+
+
+def test_uncompilable_persistent_trigger_fails_closed(home: Path) -> None:
+    path = home / "kanban.db"
+    conn = sqlite3.connect(path, isolation_level=None)
+    try:
+        conn.execute("CREATE TABLE malformed_trigger_host (value TEXT)")
+        conn.execute(
+            "CREATE TRIGGER malformed_trigger AFTER INSERT ON malformed_trigger_host "
+            "BEGIN SELECT 1; END"
+        )
+        conn.execute("PRAGMA writable_schema=ON")
+        conn.execute(
+            "UPDATE sqlite_master SET sql = 'CREATE TRIGGER malformed_trigger nope' "
+            "WHERE type = 'trigger' AND name = 'malformed_trigger'"
+        )
+        conn.execute("PRAGMA writable_schema=OFF")
+        conn.execute("PRAGMA schema_version = 999")
+    finally:
+        conn.close()
+
+    conn = sqlite3.connect(path, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    try:
+        with pytest.raises(
+            kb.PortfolioContractSchemaUnavailable, match="compiled safely"
+        ):
+            kb.validate_portfolio_contract_schema(conn)
+    finally:
+        conn.close()
+
+
+def test_trigger_view_with_unsupported_probe_fails_closed(home: Path) -> None:
+    conn = sqlite3.connect(home / "kanban.db", isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("CREATE TABLE view_trigger_host (first TEXT, second TEXT)")
+        conn.execute(
+            "CREATE VIEW trigger_view AS SELECT first, second FROM view_trigger_host"
+        )
+        conn.execute(
+            """CREATE TRIGGER view_cross_update
+            INSTEAD OF UPDATE OF second ON trigger_view
+            BEGIN UPDATE tasks SET status = status WHERE 0; END"""
+        )
+        before = "\n".join(conn.iterdump())
+        with pytest.raises(
+            kb.PortfolioContractSchemaUnavailable, match="compiled safely"
+        ):
+            kb.validate_portfolio_contract_schema(conn)
+        assert "\n".join(conn.iterdump()) == before
+    finally:
+        conn.close()
+
+
+def test_trigger_comment_and_string_decoys_do_not_false_positive(home: Path) -> None:
+    conn = sqlite3.connect(home / "kanban.db", isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("CREATE TABLE harmless_trigger_host (value TEXT)")
+        conn.execute(
+            """CREATE TRIGGER harmless_decoys AFTER INSERT ON harmless_trigger_host
+            BEGIN
+              /* DELETE FROM tasks; */
+              SELECT 'INSERT INTO task_events DEFAULT VALUES',
+                     'UPDATE task_runs SET status = status';
+            END"""
+        )
+        kb.validate_portfolio_contract_schema(conn)
+    finally:
+        conn.close()
+
+
+def test_trigger_validation_preserves_caller_authorizer(home: Path) -> None:
+    conn = sqlite3.connect(home / "kanban.db", isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    calls: list[int] = []
+
+    def caller_authorizer(
+        action: int,
+        _first: str | None,
+        _second: str | None,
+        _database: str | None,
+        _source: str | None,
+    ) -> int:
+        calls.append(action)
+        return sqlite3.SQLITE_OK
+
+    try:
+        conn.set_authorizer(caller_authorizer)
+        kb.validate_portfolio_contract_schema(conn)
+        calls.clear()
+        conn.execute("SELECT 1").fetchone()
+        assert sqlite3.SQLITE_SELECT in calls
+    finally:
+        conn.set_authorizer(None)
+        conn.close()
+
+
+def test_reviewed_triggers_compile_without_mutating_database(home: Path) -> None:
+    conn = sqlite3.connect(home / "kanban.db", isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    try:
+        before = "\n".join(conn.iterdump())
+        kb.validate_portfolio_contract_schema(conn)
+        assert "\n".join(conn.iterdump()) == before
+    finally:
+        conn.close()
+
+
 def test_existing_marker_digest_must_be_exact(home: Path) -> None:
     conn = sqlite3.connect(home / "kanban.db", isolation_level=None)
     conn.row_factory = sqlite3.Row
@@ -590,6 +741,57 @@ def _remove_portfolio_schema(conn: sqlite3.Connection) -> None:
     conn.execute("DROP TABLE kanban_schema_revisions")
 
 
+_LIVE_PORTFOLIO_V1_DDL = (
+    """CREATE TABLE kanban_schema_revisions (
+    revision TEXT PRIMARY KEY,
+    applied_at INTEGER NOT NULL
+)""",
+    """CREATE TABLE conditional_archive_operations (
+    operation_key TEXT PRIMARY KEY,
+    binding_hash TEXT NOT NULL,
+    contract TEXT NOT NULL,
+    board TEXT NOT NULL,
+    card_id TEXT NOT NULL,
+    prior_status TEXT NOT NULL,
+    prior_revision INTEGER NOT NULL,
+    prior_event_watermark INTEGER NOT NULL,
+    reason TEXT NOT NULL,
+    status TEXT NOT NULL,
+    post_revision INTEGER NOT NULL,
+    post_event_watermark INTEGER NOT NULL,
+    event_id TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+)""",
+    """CREATE INDEX idx_conditional_archive_card
+    ON conditional_archive_operations(card_id, operation_key)""",
+    """CREATE TRIGGER trg_tasks_revision_after_update
+AFTER UPDATE ON tasks
+WHEN NEW.revision = OLD.revision
+BEGIN
+    UPDATE tasks SET revision = OLD.revision + 1 WHERE id = NEW.id;
+END""",
+)
+
+
+def _install_exact_portfolio_v1(
+    conn: sqlite3.Connection, *, populated: bool = False
+) -> None:
+    _remove_portfolio_schema(conn)
+    for statement in _LIVE_PORTFOLIO_V1_DDL:
+        conn.execute(statement)
+    conn.execute(
+        "INSERT INTO kanban_schema_revisions (revision, applied_at) VALUES (?, 123)",
+        (kb.PORTFOLIO_KANBAN_LEGACY_SCHEMA_REVISION,),
+    )
+    if populated:
+        conn.execute(
+            "INSERT INTO conditional_archive_operations VALUES "
+            "('op:17', 'binding', ?, 'default', 'card-17', 'blocked', 4, 16, "
+            "'reason', 'archived', 5, 17, '17', 123)",
+            (kb.PORTFOLIO_KANBAN_CONDITIONAL_ARCHIVE_CONTRACT,),
+        )
+
+
 def _schema_fingerprint(conn: sqlite3.Connection) -> list[tuple[object, ...]]:
     return [
         tuple(row)
@@ -597,6 +799,170 @@ def _schema_fingerprint(conn: sqlite3.Connection) -> list[tuple[object, ...]]:
             "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name"
         )
     ]
+
+
+def test_exact_live_v1_schema_migrates_before_portfolio_endpoint(
+    client: TestClient, home: Path
+) -> None:
+    path = home / "kanban.db"
+    conn = sqlite3.connect(path, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    try:
+        _install_exact_portfolio_v1(conn)
+    finally:
+        conn.close()
+
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db(db_path=path)
+    response = client.get(
+        "/api/plugins/kanban/portfolio/board",
+        params={"board": "default", "include_archived": "true"},
+    )
+    assert response.status_code == 200, response.text
+    conn = sqlite3.connect(path, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    try:
+        kb.validate_portfolio_contract_schema(conn)
+        marker = conn.execute("SELECT * FROM kanban_schema_revisions").fetchone()
+        assert marker["revision"] == kb.PORTFOLIO_KANBAN_SCHEMA_REVISION
+        assert marker["schema_digest"] == kb.PORTFOLIO_KANBAN_SCHEMA_DIGEST
+    finally:
+        conn.close()
+
+
+def test_cross_table_trigger_is_rejected_before_v1_migration(home: Path) -> None:
+    conn = sqlite3.connect(home / "kanban.db", isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    try:
+        _install_exact_portfolio_v1(conn, populated=True)
+        conn.execute("CREATE TABLE legacy_trigger_host (first TEXT, second TEXT)")
+        conn.execute(
+            """CREATE TRIGGER legacy_cross_update
+            AFTER UPDATE OF second ON legacy_trigger_host
+            BEGIN UPDATE tasks SET revision = revision WHERE 0; END"""
+        )
+        before = "\n".join(conn.iterdump())
+        with pytest.raises(
+            kb.PortfolioContractSchemaUnavailable, match="cross-table trigger DML"
+        ):
+            kb._install_portfolio_contract_schema(conn)
+        assert "\n".join(conn.iterdump()) == before
+        assert not conn.in_transaction
+    finally:
+        conn.close()
+
+
+def test_populated_v1_migration_preserves_operation_and_is_idempotent(
+    home: Path,
+) -> None:
+    path = home / "kanban.db"
+    conn = sqlite3.connect(path, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    try:
+        _install_exact_portfolio_v1(conn, populated=True)
+        kb._install_portfolio_contract_schema(conn)
+        operation = dict(
+            conn.execute(
+                "SELECT * FROM conditional_archive_operations WHERE operation_key = 'op:17'"
+            ).fetchone()
+        )
+        assert operation == {
+            "operation_key": "op:17",
+            "binding_hash": "binding",
+            "contract": kb.PORTFOLIO_KANBAN_CONDITIONAL_ARCHIVE_CONTRACT,
+            "board": "default",
+            "card_id": "card-17",
+            "prior_status": "blocked",
+            "prior_revision": 4,
+            "prior_event_watermark": 16,
+            "reason": "reason",
+            "status": "archived",
+            "post_revision": 5,
+            "post_event_watermark": 17,
+            "event_id": 17,
+            "created_at": 123,
+        }
+        installed = _schema_fingerprint(conn)
+        kb._install_portfolio_contract_schema(conn)
+        assert _schema_fingerprint(conn) == installed
+        assert (
+            dict(
+                conn.execute(
+                    "SELECT * FROM conditional_archive_operations WHERE operation_key = 'op:17'"
+                ).fetchone()
+            )
+            == operation
+        )
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "INSERT INTO kanban_schema_revisions VALUES ('extra', 1)",
+        "UPDATE kanban_schema_revisions SET applied_at = 0",
+        "UPDATE kanban_schema_revisions SET applied_at = 123.5",
+        "UPDATE conditional_archive_operations SET status = 'blocked'",
+        "UPDATE conditional_archive_operations SET event_id = '01'",
+        "UPDATE conditional_archive_operations SET event_id = '0'",
+        "UPDATE conditional_archive_operations SET event_id = '-1'",
+        "UPDATE conditional_archive_operations SET event_id = '17x'",
+        "UPDATE conditional_archive_operations SET event_id = '9223372036854775808'",
+        "ALTER TABLE conditional_archive_operations ADD COLUMN forged TEXT",
+        "CREATE INDEX idx_forged_archive_status ON conditional_archive_operations(status)",
+    ),
+)
+def test_malformed_v1_variants_are_rejected_without_changes(
+    home: Path, mutation: str
+) -> None:
+    path = home / "kanban.db"
+    conn = sqlite3.connect(path, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    try:
+        _install_exact_portfolio_v1(conn, populated=True)
+        conn.execute(mutation)
+        before_schema = _schema_fingerprint(conn)
+        before_rows = "\n".join(conn.iterdump())
+        with pytest.raises(kb.PortfolioContractSchemaUnavailable):
+            kb._install_portfolio_contract_schema(conn)
+        assert _schema_fingerprint(conn) == before_schema
+        assert "\n".join(conn.iterdump()) == before_rows
+        assert not conn.in_transaction
+    finally:
+        conn.close()
+
+
+def test_v1_migration_failpoint_rolls_back_both_rebuilt_tables(home: Path) -> None:
+    path = home / "kanban.db"
+    conn = sqlite3.connect(path, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    try:
+        _install_exact_portfolio_v1(conn, populated=True)
+        before_schema = _schema_fingerprint(conn)
+        before_rows = "\n".join(conn.iterdump())
+
+        def deny(
+            action: int,
+            first: str | None,
+            _second: str | None,
+            _db: str | None,
+            _source: str | None,
+        ) -> int:
+            if action == sqlite3.SQLITE_INSERT and first == "kanban_schema_revisions":
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        conn.set_authorizer(deny)
+        with pytest.raises(sqlite3.DatabaseError):
+            kb._install_portfolio_contract_schema(conn)
+        conn.set_authorizer(None)
+        assert _schema_fingerprint(conn) == before_schema
+        assert "\n".join(conn.iterdump()) == before_rows
+        assert not conn.in_transaction
+    finally:
+        conn.set_authorizer(None)
+        conn.close()
 
 
 @pytest.mark.parametrize(

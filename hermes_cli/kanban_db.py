@@ -162,9 +162,7 @@ def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
     if value == "none" or value in VALID_REASONING_EFFORTS:
         return value
     allowed = ", ".join(("none", *VALID_REASONING_EFFORTS))
-    raise ValueError(
-        f"reasoning_effort must be one of {allowed}, got {effort!r}"
-    )
+    raise ValueError(f"reasoning_effort must be one of {allowed}, got {effort!r}")
 
 
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
@@ -177,7 +175,38 @@ PORTFOLIO_KANBAN_ZERO_WRITE_PAGE_GET_CONTRACT = (
 PORTFOLIO_KANBAN_CONDITIONAL_ARCHIVE_CONTRACT = (
     "hermes-kanban-conditional-archive-cas-v1"
 )
+PORTFOLIO_KANBAN_LEGACY_SCHEMA_REVISION = "portfolio-contracts-v1"
 PORTFOLIO_KANBAN_SCHEMA_REVISION = "portfolio-contracts-v2"
+PORTFOLIO_LEGACY_SCHEMA_DDL = {
+    "kanban_schema_revisions": """CREATE TABLE kanban_schema_revisions (
+    revision TEXT PRIMARY KEY,
+    applied_at INTEGER NOT NULL
+)""",
+    "conditional_archive_operations": """CREATE TABLE conditional_archive_operations (
+    operation_key TEXT PRIMARY KEY,
+    binding_hash TEXT NOT NULL,
+    contract TEXT NOT NULL,
+    board TEXT NOT NULL,
+    card_id TEXT NOT NULL,
+    prior_status TEXT NOT NULL,
+    prior_revision INTEGER NOT NULL,
+    prior_event_watermark INTEGER NOT NULL,
+    reason TEXT NOT NULL,
+    status TEXT NOT NULL,
+    post_revision INTEGER NOT NULL,
+    post_event_watermark INTEGER NOT NULL,
+    event_id TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+)""",
+    "idx_conditional_archive_card": """CREATE INDEX idx_conditional_archive_card
+    ON conditional_archive_operations(card_id, operation_key)""",
+    "trg_tasks_revision_after_update": """CREATE TRIGGER trg_tasks_revision_after_update
+AFTER UPDATE ON tasks
+WHEN NEW.revision = OLD.revision
+BEGIN
+    UPDATE tasks SET revision = OLD.revision + 1 WHERE id = NEW.id;
+END""",
+}
 PORTFOLIO_SCHEMA_DDL = {
     "kanban_schema_revisions": """CREATE TABLE kanban_schema_revisions (
     revision TEXT PRIMARY KEY,
@@ -220,6 +249,15 @@ PORTFOLIO_CONTRACT_TABLES = frozenset({
     "task_runs",
     "conditional_archive_operations",
     "kanban_schema_revisions",
+})
+# Cross-table triggers can also forge inventory evidence even when they do not
+# alter CAS state directly. Keep the narrower set above for exact index/trigger
+# ownership checks, but protect every managed table consumed by the portfolio
+# contract when inspecting trigger-body DML.
+PORTFOLIO_MANAGED_DML_TABLES = PORTFOLIO_CONTRACT_TABLES | frozenset({
+    "task_links",
+    "task_comments",
+    "task_attachments",
 })
 PORTFOLIO_BASE_BEHAVIOR_DDL = {
     "idx_tasks_assignee_status": "CREATE INDEX idx_tasks_assignee_status ON tasks(assignee, status)",
@@ -283,6 +321,143 @@ PORTFOLIO_EXPECTED_AUTO_INDEXES = {
 
 def _canonical_schema_sql(sql: str) -> str:
     return " ".join(sql.replace(";", "").split()).casefold()
+
+
+def _quote_sqlite_identifier(identifier: str) -> str:
+    """Quote an identifier without treating any of its bytes as SQL."""
+    return '"' + identifier.replace('"', '""') + '"'
+
+
+def _validate_trigger_dml_targets(
+    conn: sqlite3.Connection, reviewed_triggers: Mapping[str, str]
+) -> None:
+    """Use SQLite's parser to reject trigger DML into managed tables.
+
+    Trigger ``tbl_name`` only identifies the table that fires a trigger, not
+    the tables its body mutates. Build a schema-only private database and ask
+    SQLite to compile (never execute) each possible DML operation on every
+    trigger-bearing table. The authorizer reports token-aware body DML with
+    the responsible trigger in ``source``. A private connection both keeps
+    validation read-only and avoids clobbering an authorizer already installed
+    by the caller (for example, a migration failpoint).
+    """
+    shadow = sqlite3.connect(":memory:", isolation_level=None)
+    shadow.row_factory = sqlite3.Row
+    try:
+        schema_rows = conn.execute(
+            "SELECT type, name, tbl_name, sql FROM sqlite_master "
+            "WHERE type IN ('table', 'view', 'trigger') ORDER BY rowid"
+        ).fetchall()
+        object_types = {
+            str(row["name"]): str(row["type"])
+            for row in schema_rows
+            if row["type"] in {"table", "view"}
+        }
+        trigger_rows = [row for row in schema_rows if row["type"] == "trigger"]
+
+        # Recreate only schema, never rows. Virtual-table shadow tables may
+        # already have been created by their parent, hence the name check.
+        for object_type in ("table", "view", "trigger"):
+            for row in schema_rows:
+                if row["type"] != object_type or row["sql"] is None:
+                    continue
+                name = str(row["name"])
+                if object_type == "table" and name.startswith("sqlite_"):
+                    continue
+                if (
+                    object_type == "table"
+                    and shadow.execute(
+                        "SELECT 1 FROM sqlite_master WHERE name = ?", (name,)
+                    ).fetchone()
+                ):
+                    continue
+                shadow.execute(str(row["sql"]))
+
+        dml_events: list[tuple[int, str, str]] = []
+
+        def authorizer(
+            action: int,
+            first: str | None,
+            _second: str | None,
+            _database: str | None,
+            source: str | None,
+        ) -> int:
+            if (
+                action
+                in {sqlite3.SQLITE_INSERT, sqlite3.SQLITE_UPDATE, sqlite3.SQLITE_DELETE}
+                and first is not None
+                and source is not None
+            ):
+                dml_events.append((action, first, source))
+            return sqlite3.SQLITE_OK
+
+        shadow.set_authorizer(authorizer)
+        try:
+            for row in trigger_rows:
+                table = str(row["tbl_name"])
+                if object_types.get(table) not in {"table", "view"}:
+                    raise PortfolioContractSchemaUnavailable(
+                        f"Kanban trigger is attached to an unsupported object: {row['name']}"
+                    )
+                quoted_table = _quote_sqlite_identifier(table)
+                columns = [
+                    str(column["name"])
+                    for column in shadow.execute(
+                        f"PRAGMA table_xinfo({_quote_sqlite_identifier(table)})"
+                    )
+                    if int(column["hidden"]) == 0
+                ]
+                statements = [
+                    f"EXPLAIN INSERT INTO {quoted_table} DEFAULT VALUES",
+                    f"EXPLAIN DELETE FROM {quoted_table} WHERE 0",
+                ]
+                if not columns:
+                    raise PortfolioContractSchemaUnavailable(
+                        f"Kanban trigger table has no writable columns: {table}"
+                    )
+                assignments = ", ".join(
+                    f"{_quote_sqlite_identifier(column)} = "
+                    f"{_quote_sqlite_identifier(column)}"
+                    for column in columns
+                )
+                statements.append(
+                    f"EXPLAIN UPDATE {quoted_table} SET {assignments} WHERE 0"
+                )
+                for statement in statements:
+                    shadow.execute(statement).fetchall()
+        finally:
+            # ``sqlite3`` exposes no authorizer getter. This connection is
+            # private, so its deterministic prior state is exactly ``None``.
+            shadow.set_authorizer(None)
+
+        actual_trigger_sql = {
+            str(row["name"]): _canonical_schema_sql(str(row["sql"] or ""))
+            for row in trigger_rows
+        }
+        reviewed = {
+            name: _canonical_schema_sql(sql) for name, sql in reviewed_triggers.items()
+        }
+        violations = sorted({
+            (source, target)
+            for _action, target, source in dml_events
+            if target in PORTFOLIO_MANAGED_DML_TABLES
+            and actual_trigger_sql.get(source) != reviewed.get(source)
+        })
+        if violations:
+            details = ", ".join(f"{source}->{target}" for source, target in violations)
+            raise PortfolioContractSchemaUnavailable(
+                "Kanban portfolio schema has unreviewed cross-table trigger DML: "
+                + details
+            )
+    except PortfolioContractSchemaUnavailable:
+        raise
+    except sqlite3.Error as exc:
+        raise PortfolioContractSchemaUnavailable(
+            "Kanban trigger behavior schema could not be compiled safely"
+        ) from exc
+    finally:
+        shadow.set_authorizer(None)
+        shadow.close()
 
 
 def _portfolio_behavior_digest_input() -> str:
@@ -394,6 +569,10 @@ def validate_portfolio_behavior_schema(
             if name.startswith(("idx_", "trg_"))
         })
         autoindexes = dict(PORTFOLIO_EXPECTED_AUTO_INDEXES)
+    _validate_trigger_dml_targets(
+        conn,
+        {name: sql for name, sql in expected.items() if name.startswith("trg_")},
+    )
     rows = conn.execute(
         "SELECT type, name, tbl_name, sql FROM sqlite_master "
         "WHERE type IN ('index', 'trigger') AND tbl_name IN (?, ?, ?, ?, ?) "
@@ -436,8 +615,88 @@ def validate_portfolio_behavior_schema(
             )
 
 
+def _validate_legacy_portfolio_contract_schema(conn: sqlite3.Connection) -> None:
+    """Accept only the exact released v1 schema and its migratable rows."""
+    validate_portfolio_behavior_schema(conn)
+    artifacts = {
+        str(row["name"]): str(row["sql"] or "")
+        for row in conn.execute(
+            "SELECT name, sql FROM sqlite_master WHERE name IN (?, ?, ?, ?)",
+            tuple(PORTFOLIO_LEGACY_SCHEMA_DDL),
+        )
+    }
+    if set(artifacts) != set(PORTFOLIO_LEGACY_SCHEMA_DDL):
+        raise PortfolioContractSchemaUnavailable(
+            "partial legacy Kanban portfolio schema requires manual repair"
+        )
+    for name, expected in PORTFOLIO_LEGACY_SCHEMA_DDL.items():
+        if _canonical_schema_sql(artifacts[name]) != _canonical_schema_sql(expected):
+            raise PortfolioContractSchemaUnavailable(
+                f"legacy Kanban portfolio schema artifact is malformed: {name}"
+            )
+
+    markers = conn.execute(
+        "SELECT revision, applied_at, typeof(applied_at) AS applied_at_type "
+        "FROM kanban_schema_revisions"
+    ).fetchall()
+    if (
+        len(markers) != 1
+        or markers[0]["revision"] != PORTFOLIO_KANBAN_LEGACY_SCHEMA_REVISION
+        or markers[0]["applied_at_type"] != "integer"
+        or int(markers[0]["applied_at"]) <= 0
+    ):
+        raise PortfolioContractSchemaUnavailable(
+            "legacy Kanban portfolio schema marker is missing or malformed"
+        )
+
+    for row in conn.execute(
+        "SELECT status, event_id, typeof(event_id) AS event_id_type "
+        "FROM conditional_archive_operations"
+    ):
+        event_id = row["event_id"]
+        parsed_event_id: int | None = None
+        if isinstance(event_id, str) and event_id.isascii() and event_id.isdecimal():
+            try:
+                parsed_event_id = int(event_id)
+            except ValueError:
+                parsed_event_id = None
+        canonical_event_id = (
+            parsed_event_id is not None
+            and 0 < parsed_event_id <= 2**63 - 1
+            and event_id == str(parsed_event_id)
+        )
+        if (
+            row["status"] != "archived"
+            or row["event_id_type"] != "text"
+            or not canonical_event_id
+        ):
+            raise PortfolioContractSchemaUnavailable(
+                "legacy Kanban portfolio operation rows are not safely migratable"
+            )
+
+
+def _has_exact_legacy_portfolio_table_ddl(conn: sqlite3.Connection) -> bool:
+    """Recognize v1 by both exact historical table definitions, never shape."""
+    rows = {
+        str(row["name"]): str(row["sql"] or "")
+        for row in conn.execute(
+            "SELECT name, sql FROM sqlite_master "
+            "WHERE type = 'table' AND name IN (?, ?)",
+            ("kanban_schema_revisions", "conditional_archive_operations"),
+        )
+    }
+    return all(
+        _canonical_schema_sql(rows.get(name, "")) == _canonical_schema_sql(expected)
+        for name, expected in PORTFOLIO_LEGACY_SCHEMA_DDL.items()
+        if not name.startswith(("idx_", "trg_"))
+    )
+
+
 def validate_portfolio_contract_schema(conn: sqlite3.Connection) -> None:
     """Validate columns, exact marker/digest, and the complete behavior schema."""
+    # Compile trigger behavior first so malformed persistent triggers fail as a
+    # contract error rather than leaking an arbitrary SQLite schema exception.
+    validate_portfolio_behavior_schema(conn)
     required: dict[str, set[str]] = {
         "tasks": {
             "id",
@@ -520,15 +779,25 @@ def validate_portfolio_contract_schema(conn: sqlite3.Connection) -> None:
         raise PortfolioContractSchemaUnavailable(
             "Kanban portfolio schema has malformed tasks fields"
         )
-    marker = conn.execute(
-        "SELECT schema_digest FROM kanban_schema_revisions WHERE revision = ?",
-        (PORTFOLIO_KANBAN_SCHEMA_REVISION,),
-    ).fetchone()
-    if marker is None or marker["schema_digest"] != PORTFOLIO_KANBAN_SCHEMA_DIGEST:
+    markers = conn.execute(
+        "SELECT revision, schema_digest, applied_at, "
+        "typeof(revision) AS revision_type, "
+        "typeof(schema_digest) AS schema_digest_type, "
+        "typeof(applied_at) AS applied_at_type "
+        "FROM kanban_schema_revisions"
+    ).fetchall()
+    if (
+        len(markers) != 1
+        or markers[0]["revision"] != PORTFOLIO_KANBAN_SCHEMA_REVISION
+        or markers[0]["schema_digest"] != PORTFOLIO_KANBAN_SCHEMA_DIGEST
+        or markers[0]["revision_type"] != "text"
+        or markers[0]["schema_digest_type"] != "text"
+        or markers[0]["applied_at_type"] != "integer"
+        or int(markers[0]["applied_at"]) <= 0
+    ):
         raise PortfolioContractSchemaUnavailable(
             "Kanban portfolio schema migration marker is missing or malformed"
         )
-    validate_portfolio_behavior_schema(conn)
     artifacts = {
         row["name"]: row["sql"]
         for row in conn.execute(
@@ -1467,9 +1736,7 @@ class Task:
                 if "reasoning_effort" in keys and row["reasoning_effort"]
                 else None
             ),
-            max_retries=(
-                row["max_retries"] if "max_retries" in keys else None
-            ),
+            max_retries=(row["max_retries"] if "max_retries" in keys else None),
             goal_mode=(
                 bool(row["goal_mode"])
                 if "goal_mode" in keys and row["goal_mode"]
@@ -3053,6 +3320,48 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     _install_portfolio_contract_schema(conn)
 
 
+def _migrate_exact_legacy_portfolio_schema(conn: sqlite3.Connection) -> None:
+    """Rebuild the two exact v1 tables as v2 on the caller's transaction."""
+    _validate_legacy_portfolio_contract_schema(conn)
+    conn.execute("DROP INDEX idx_conditional_archive_card")
+    conn.execute("DROP TRIGGER trg_tasks_revision_after_update")
+    conn.execute(
+        "ALTER TABLE conditional_archive_operations "
+        "RENAME TO conditional_archive_operations_v1"
+    )
+    conn.execute(
+        "ALTER TABLE kanban_schema_revisions RENAME TO kanban_schema_revisions_v1"
+    )
+    conn.execute(PORTFOLIO_SCHEMA_DDL["kanban_schema_revisions"])
+    conn.execute(PORTFOLIO_SCHEMA_DDL["conditional_archive_operations"])
+    operation_columns = (
+        "operation_key, binding_hash, contract, board, card_id, prior_status, "
+        "prior_revision, prior_event_watermark, reason, status, post_revision, "
+        "post_event_watermark, event_id, created_at"
+    )
+    conn.execute(
+        f"INSERT INTO conditional_archive_operations ({operation_columns}) "
+        f"SELECT operation_key, binding_hash, contract, board, card_id, prior_status, "
+        f"prior_revision, prior_event_watermark, reason, status, post_revision, "
+        f"post_event_watermark, CAST(event_id AS INTEGER), created_at "
+        f"FROM conditional_archive_operations_v1"
+    )
+    conn.execute(
+        "INSERT INTO kanban_schema_revisions "
+        "(revision, schema_digest, applied_at) VALUES (?, ?, ?)",
+        (
+            PORTFOLIO_KANBAN_SCHEMA_REVISION,
+            PORTFOLIO_KANBAN_SCHEMA_DIGEST,
+            max(1, int(time.time())),
+        ),
+    )
+    conn.execute("DROP TABLE conditional_archive_operations_v1")
+    conn.execute("DROP TABLE kanban_schema_revisions_v1")
+    conn.execute(PORTFOLIO_SCHEMA_DDL["idx_conditional_archive_card"])
+    conn.execute(PORTFOLIO_SCHEMA_DDL["trg_tasks_revision_after_update"])
+    validate_portfolio_contract_schema(conn)
+
+
 def _install_portfolio_contract_schema(conn: sqlite3.Connection) -> None:
     """Atomically install and validate the reviewed portfolio schema.
 
@@ -3094,10 +3403,14 @@ def _install_portfolio_contract_schema(conn: sqlite3.Connection) -> None:
             raise PortfolioContractSchemaUnavailable(
                 "partial Kanban portfolio schema artifacts require manual repair"
             )
-        # Complete-looking pre-existing artifacts are not silently blessed.
-        # Their exact marker/digest and the complete behavior schema must already
-        # validate before any mutation is attempted.
-        validate_portfolio_contract_schema(conn)
+        # Classification, any v1 rebuild, marker replacement, and final
+        # validation share one IMMEDIATE transaction. A complete-looking but
+        # forged/partial schema is never stamped or repaired opportunistically.
+        with write_txn(conn):
+            if _has_exact_legacy_portfolio_table_ddl(conn):
+                _migrate_exact_legacy_portfolio_schema(conn)
+            else:
+                validate_portfolio_contract_schema(conn)
         return
 
     # Reject unreviewed base indexes/triggers before the first portfolio DDL.
@@ -10786,19 +11099,13 @@ def _notify_profile_filter(
     if notifier_profiles is None:
         return "", []
 
-    profiles = sorted(
-        {
-            str(profile).strip()
-            for profile in notifier_profiles
-            if str(profile).strip()
-        }
-    )
+    profiles = sorted({
+        str(profile).strip() for profile in notifier_profiles if str(profile).strip()
+    })
     clauses: list[str] = []
     params: list[str] = []
     if profiles:
-        clauses.append(
-            "notifier_profile IN (" + ",".join("?" for _ in profiles) + ")"
-        )
+        clauses.append("notifier_profile IN (" + ",".join("?" for _ in profiles) + ")")
         params.extend(profiles)
     if include_unowned:
         clauses.append("notifier_profile IS NULL OR notifier_profile = ''")
@@ -10822,7 +11129,8 @@ def list_notify_subs(
     used by the dispatch owner for legacy rows created before profile stamping.
     """
     owner_where, owner_params = _notify_profile_filter(
-        notifier_profiles, include_unowned=include_unowned,
+        notifier_profiles,
+        include_unowned=include_unowned,
     )
     where: list[str] = []
     params: list[Any] = []
@@ -10878,7 +11186,8 @@ def count_notify_subs(
     try:
         try:
             owner_where, owner_params = _notify_profile_filter(
-                notifier_profiles, include_unowned=include_unowned,
+                notifier_profiles,
+                include_unowned=include_unowned,
             )
             sql = "SELECT COUNT(*) FROM kanban_notify_subs"
             if owner_where:
