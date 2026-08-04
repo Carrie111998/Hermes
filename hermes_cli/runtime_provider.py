@@ -43,6 +43,7 @@ from hermes_cli.config import (
     normalize_extra_headers,
 )
 from hermes_cli.providers import custom_provider_aliases, custom_provider_slug
+from hermes_cli.provider_selection import resolve_requested_provider_from_model_config
 from hermes_constants import OPENROUTER_BASE_URL
 from hermes_cli.providers import is_official_openai_host
 from utils import base_url_host_matches, base_url_hostname, env_int
@@ -586,21 +587,11 @@ def _resolve_runtime_from_pool_entry(
 
 def resolve_requested_provider(requested: Optional[str] = None) -> str:
     """Resolve provider request from explicit arg, config, then env."""
-    if requested and requested.strip():
-        return requested.strip().lower()
-
-    model_cfg = _get_model_config()
-    cfg_provider = model_cfg.get("provider")
-    if isinstance(cfg_provider, str) and cfg_provider.strip():
-        return cfg_provider.strip().lower()
-
-    # Prefer the persisted config selection over any stale shell/.env
-    # provider override so chat uses the endpoint the user last saved.
-    env_provider = _getenv("HERMES_INFERENCE_PROVIDER", "").strip().lower()
-    if env_provider:
-        return env_provider
-
-    return "auto"
+    return resolve_requested_provider_from_model_config(
+        _get_model_config(),
+        requested,
+        getenv=_getenv,
+    )
 
 
 def _try_resolve_from_custom_pool(

@@ -3152,6 +3152,24 @@ def load_config_readonly() -> Dict[str, Any]:
     return _load_config_impl(want_deepcopy=False)
 
 
+def load_effective_config_readonly(config_path: Path) -> Dict[str, Any]:
+    """Read one explicit config path with normal runtime transforms, read-only.
+
+    Unlike :func:`load_config_readonly`, this accepts a path so audit/test code
+    can inspect multiple profile homes without rebinding ``HERMES_HOME``. It
+    deliberately does not call :func:`ensure_hermes_home`, seed files, or cache
+    a fallback. It applies the same default merge, legacy normalization,
+    environment expansion, and managed-scope overlay as runtime loading, while
+    propagating malformed/unreadable user-config failures so callers can fail
+    closed rather than mistake a runtime fallback for an inactive route.
+    """
+    return _load_config_impl(
+        want_deepcopy=False,
+        config_path=Path(config_path),
+        strict=True,
+    )
+
+
 def write_platform_config_field(
     platform_key: str,
     field_key: str,
@@ -3280,11 +3298,20 @@ def apply_terminal_config_to_env(
     return target
 
 
-def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
+def _load_config_impl(
+    *,
+    want_deepcopy: bool,
+    config_path: Optional[Path] = None,
+    strict: bool = False,
+) -> Dict[str, Any]:
     with _CONFIG_LOCK:
-        ensure_hermes_home()
-        config_path = get_config_path()
+        if config_path is None:
+            ensure_hermes_home()
+            config_path = get_config_path()
+        else:
+            config_path = Path(config_path)
         path_key = str(config_path)
+        use_cache = not strict
 
         try:
             st = config_path.stat()
@@ -3319,7 +3346,7 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
         else:
             cache_sig = None
 
-        cached = _LOAD_CONFIG_CACHE.get(path_key)
+        cached = _LOAD_CONFIG_CACHE.get(path_key) if use_cache else None
         if cached is not None and cache_sig is not None and cached[:4] == cache_sig:
             # File signatures match, but the cached expansion is only valid if
             # every ${VAR} it was expanded against still has the same value.
@@ -3346,6 +3373,8 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
 
                 config = _deep_merge(config, user_config)
             except Exception as e:
+                if strict:
+                    raise
                 # Last-known-good fallback (port of openai/codex#31188's
                 # invariant: a parse failure in a policy/config file must not
                 # silently replace the effective policy with an empty/default
@@ -3397,8 +3426,9 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
         if managed_config:
             managed_expanded = _expand_env_vars(managed_config)
             expanded = _deep_merge(expanded, managed_expanded)
-        _LAST_EXPANDED_CONFIG_BY_PATH[path_key] = copy.deepcopy(expanded)
-        if cache_sig is not None:
+        if use_cache:
+            _LAST_EXPANDED_CONFIG_BY_PATH[path_key] = copy.deepcopy(expanded)
+        if use_cache and cache_sig is not None:
             # Cache stores a separate deepcopy so subsequent ``load_config()``
             # (deepcopy=True) callers can mutate freely without affecting the
             # cached value, and ``load_config_readonly()`` (deepcopy=False)
@@ -3417,7 +3447,7 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
             # object" invariant that callers may rely on for identity checks.
             if not want_deepcopy:
                 return cached_copy
-        else:
+        elif use_cache:
             _LOAD_CONFIG_CACHE.pop(path_key, None)
         # First-load result is a fresh dict (not aliased to the cache); safe
         # to return directly. For the deepcopy=True path this is the
