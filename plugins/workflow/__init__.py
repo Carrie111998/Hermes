@@ -433,15 +433,58 @@ def _find_state_for_card(task_id: str):
     Returns (state_dict, state_file_path) or None.
     """
     # State files live in .engine-state/ under the workflow files directory
+    import json
     wf_dir = os.environ.get("HERMES_WORKFLOW_FILES", "")
     if not wf_dir:
         wf_dir = str(Path(__file__).resolve().parent.parent.parent / "docs" / "fleet-pipelines")
     state_dir = Path(wf_dir) / ".engine-state"
+
+    # Resolve via the durable card→run mapping (executions.db) first so
+    # hooks work even when HERMES_WORKFLOW_FILES points at a DIFFERENT
+    # dir than the supervisor used (e.g. gateway env vs CLI env).
+    try:
+        from hermes_cli.kanban_db import kanban_home
+        db_path = kanban_home() / "workflows" / "executions.db"
+        if db_path.exists():
+            import sqlite3
+            with sqlite3.connect(str(db_path)) as conn:
+                row = conn.execute(
+                    "SELECT run_id, node_id FROM workflow_node_cards WHERE card_id = ?",
+                    (task_id,),
+                ).fetchone()
+            if row:
+                run_id = row[0]
+                # Candidate state dirs: env-configured, repo default,
+                # and the shared workspace pipelines dir (anchored at
+                # the shared kanban/hermes root, NOT the profile home).
+                candidates = set()
+                if state_dir.exists():
+                    candidates.add(state_dir)
+                repo_state = Path(__file__).resolve().parent.parent.parent / "docs" / "fleet-pipelines" / ".engine-state"
+                if repo_state.exists():
+                    candidates.add(repo_state)
+                shared_workspace = kanban_home() / "workspace" / "docs" / "fleet-pipelines" / ".engine-state"
+                if shared_workspace.exists():
+                    candidates.add(shared_workspace)
+                for cand in candidates:
+                    # State files are named <workflow>_<run_id>_state.json
+                    for exact in cand.glob(f"*{run_id}_state.json"):
+                        try:
+                            state = json.loads(exact.read_text())
+                            if any(
+                                ns.get("kanban_card_id") == task_id
+                                for ns in state.get("states", {}).values()
+                            ):
+                                return (state, str(exact))
+                        except Exception:
+                            continue
+    except Exception:
+        pass  # Fall through to the scan below
+
     if not state_dir.exists():
         return None
     for state_file in sorted(state_dir.glob("*_state.json"), reverse=True):
         try:
-            import json
             state = json.loads(state_file.read_text())
             states = state.get("states", {})
             for nid, node_state in states.items():

@@ -6,6 +6,7 @@ Run: python3 -m pytest tests/test_workflow_resume.py -v
 """
 
 import json
+import sqlite3
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
@@ -72,6 +73,73 @@ class TestGetBoardConn:
             kb, conn = _get_board_conn({})
             mock_connect.assert_not_called()
             assert conn is None
+
+
+class TestFindStateForCard:
+    """_find_state_for_card resolves via executions.db mapping when
+    HERMES_WORKFLOW_FILES points at a different dir than the supervisor."""
+
+    def test_resolves_via_durable_mapping(self, tmp_path, monkeypatch):
+        from plugins.workflow import _find_state_for_card
+
+        home = tmp_path / "home"
+        home.mkdir()
+        # Realistic layout: state files live in shared workspace under root
+        state_dir = home / "workspace" / "docs" / "fleet-pipelines" / ".engine-state"
+        state_dir.mkdir(parents=True)
+        run_id = "review-loop-test-20260804-042824-41177"
+        state = {
+            "workflow_name": "review-loop-test",
+            "kanban_board": "fleet-workflow",
+            "run_id": run_id,
+            "current_layer": 2,
+            "layers": [["implement"], ["verify"]],
+            "states": {"implement": {"status": "done", "kanban_card_id": "t_8df96d71"}},
+            "final_status": "completed",
+        }
+        (state_dir / f"review-loop-test_{run_id}_state.json").write_text(json.dumps(state))
+
+        # executions.db with the card → run mapping
+        exec_db = home / "workflows" / "executions.db"
+        exec_db.parent.mkdir(parents=True)
+        conn = sqlite3.connect(str(exec_db))
+        conn.execute(
+            "CREATE TABLE workflow_node_cards (card_id TEXT PRIMARY KEY, "
+            "run_id TEXT NOT NULL, node_id TEXT NOT NULL, status TEXT DEFAULT 'pending')"
+        )
+        conn.execute(
+            "INSERT INTO workflow_node_cards VALUES ('t_8df96d71', ?, 'implement', 'done')",
+            (run_id,),
+        )
+        conn.commit()
+        conn.close()
+
+        # Gateway case: env var unset (or pointing elsewhere)
+        monkeypatch.delenv("HERMES_WORKFLOW_FILES", raising=False)
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
+        monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+        monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+
+        result = _find_state_for_card("t_8df96d71")
+        assert result is not None
+        state_found, path = result
+        assert state_found.get("run_id") == run_id
+        assert state_found.get("final_status") == "completed"
+        assert Path(path).exists()
+
+    def test_unknown_card_not_found(self, tmp_path, monkeypatch):
+        from plugins.workflow import _find_state_for_card
+
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.delenv("HERMES_WORKFLOW_FILES", raising=False)
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
+        monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+        monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+
+        assert _find_state_for_card("t_zzz_none") is None
 
 
 class TestReopenCompletedRun:
