@@ -748,6 +748,13 @@ export default function CronPage() {
         getJobProfile(editJob),
       );
       showToast("Saved changes ✓", "success");
+      // Keep the URL projection accurate after a save: reflect the (possibly
+      // changed) job key, or drop the param once the edit modal closes.
+      if (searchParams.has("job")) {
+        const next = new URLSearchParams(searchParams);
+        next.set("job", getJobKey(editJob));
+        setSearchParams(next, { replace: true });
+      }
       setEditJob(null);
       loadJobs();
     } catch (e) {
