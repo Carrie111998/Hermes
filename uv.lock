@@ -938,7 +938,7 @@ wheels = [
 
 [[package]]
 name = "cua-fleet"
-version = "0.0.8"
+version = "0.0.9"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "attrs" },
@@ -946,15 +946,15 @@ dependencies = [
     { name = "python-dateutil" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/d1/9d/f1f800c746c3f4137d21864293db3d2cded36125dc4fd0547c9def35beff/cua_fleet-0.0.8-py3-none-macosx_10_12_x86_64.whl", hash = "sha256:d62ba6b263e858ff7157e1dfb317b1526a7b6fe2dba76479621490393efb2f8e", size = 2126597, upload-time = "2026-08-02T17:12:56.242Z" },
-    { url = "https://files.pythonhosted.org/packages/0c/ce/dedd4f4847bc1c7da18bd1f58d75c0c03da1fa50f30d0720a74dcf6705e3/cua_fleet-0.0.8-py3-none-macosx_11_0_arm64.whl", hash = "sha256:4a3fd42fe75520ae0070935d13ce22e28b5c121852d6e39d65eed3df35cb3dd0", size = 2040766, upload-time = "2026-08-02T17:12:57.96Z" },
-    { url = "https://files.pythonhosted.org/packages/cb/97/09faebc28ce1b2d7e6882861e6f9f1a3788abe5bc286e23a55e8d9b1caac/cua_fleet-0.0.8-py3-none-manylinux_2_34_aarch64.whl", hash = "sha256:776a1287c474362d76a5240dfd868be3ad29d36a51114519d2b06c8061f51036", size = 2304088, upload-time = "2026-08-02T17:13:00.066Z" },
-    { url = "https://files.pythonhosted.org/packages/fb/36/0cd2f82e1cdd56e7330094ff3aa57ae9ab670b56e4e4500eb91e3e3f8580/cua_fleet-0.0.8-py3-none-manylinux_2_34_x86_64.whl", hash = "sha256:dee669f487ad3dafa176d80d236c5b5a89df0af8d46f86e756c720a1f683af36", size = 2357881, upload-time = "2026-08-02T17:13:01.999Z" },
+    { url = "https://files.pythonhosted.org/packages/dc/b8/fd15a0649a94c576af69d5cda60a78a47cd37a7d5abab6bcfe43456ef0f1/cua_fleet-0.0.9-py3-none-macosx_10_12_x86_64.whl", hash = "sha256:1041153f664fb84fb68e1bf453db611590a28518fe56f511b531dd4e6c931aa4", size = 2109242, upload-time = "2026-08-04T15:35:40.587Z" },
+    { url = "https://files.pythonhosted.org/packages/0f/c0/19c161a492e1e051c7f8c6462a6df18d73d2539c8246bec97ef61c6c1521/cua_fleet-0.0.9-py3-none-macosx_11_0_arm64.whl", hash = "sha256:10177ae5d468461fa38ffccf8c34fccf10ac0a31e025d91a529174d2621718cf", size = 2020725, upload-time = "2026-08-04T15:35:42.226Z" },
+    { url = "https://files.pythonhosted.org/packages/39/ef/fb57cdb3f348b3ce763742b0a2954b7488fd73ddf26e669c74b36d1fa33f/cua_fleet-0.0.9-py3-none-manylinux_2_34_aarch64.whl", hash = "sha256:84f82e365671f6d33daf7dfcabde26434d0ed4c2bcfdebcf11f28c6ec31f0459", size = 2288295, upload-time = "2026-08-04T15:35:43.437Z" },
+    { url = "https://files.pythonhosted.org/packages/c8/d2/3915a34260d65685460334941bf2c4d7803a673243e5ed8c7caab03f01c9/cua_fleet-0.0.9-py3-none-manylinux_2_34_x86_64.whl", hash = "sha256:0f3558227fd9e86870d6f32ab4f2e0ae70d0453246b40ece8795743d7102f717", size = 2337412, upload-time = "2026-08-04T15:35:44.529Z" },
 ]
 
 [[package]]
 name = "cua-sandbox"
-version = "0.1.24"
+version = "0.1.25"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "cua-auto" },
@@ -969,9 +969,9 @@ dependencies = [
     { name = "vncdotool" },
     { name = "websockets" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/df/94/f7cbf8b39e021a9735634a12f8ad37a4ba7cc503c41cd6b02db807fd5b72/cua_sandbox-0.1.24.tar.gz", hash = "sha256:55c42815a1847e2fb3a78e47271acc647688626a6ccbbb4bd2a238814ea09212", size = 152357, upload-time = "2026-08-03T16:00:46.584Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/ec/2a/ab93070d6f3d7a94698732ccdee087b3ef745e217b523491530f12ccc852/cua_sandbox-0.1.25.tar.gz", hash = "sha256:d64d3e7bf189771e4adf2d6a95e95cc3f01962f2d7b0fbcd7d367ebea89905d2", size = 153586, upload-time = "2026-08-04T15:50:28.811Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/d0/e6/e9a4a150a36d29cb7af6e96d4fb14ce1a54c630d7dd8f05c60bd9239a8ec/cua_sandbox-0.1.24-py3-none-any.whl", hash = "sha256:cc657d4e5db850451c5f49f0a4384dd1c6352d6c2acd9bb84a734509551df078", size = 185954, upload-time = "2026-08-03T16:00:45.268Z" },
+    { url = "https://files.pythonhosted.org/packages/06/57/7509da505a0d0aa276d6371ade2024f36c6a7f5b04d5ca52a4af7ef75a43/cua_sandbox-0.1.25-py3-none-any.whl", hash = "sha256:f35711821bfd37cc8d0c55c43a38c9f0c6d4b3b78524d106d0957679fe7fea3f", size = 187036, upload-time = "2026-08-04T15:50:27.587Z" },
 ]
 
 [[package]]
@@ -1983,7 +1983,7 @@ requires-dist = [
     { name = "concurrent-log-handler", marker = "sys_platform == 'win32'", specifier = "==0.9.29" },
     { name = "croniter", specifier = "==6.0.0" },
     { name = "cryptography", specifier = "==48.0.1" },
-    { name = "cua-sandbox", marker = "extra == 'cua-fleet'", specifier = "==0.1.24" },
+    { name = "cua-sandbox", marker = "extra == 'cua-fleet'", specifier = "==0.1.25" },
     { name = "daytona", marker = "extra == 'daytona'", specifier = "==0.155.0" },
     { name = "debugpy", marker = "extra == 'dev'", specifier = "==1.8.20" },
     { name = "defusedxml", marker = "extra == 'wecom'", specifier = "==0.7.1" },
@@ -2896,6 +2896,7 @@ wheels = [
 name = "nemo-relay"
 version = "0.6.0"
 source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/16/db/44d7258ee620c5cce6dc588983fcb11be3ee03ae71089a65686c14d9ee02/nemo_relay-0.6.0.tar.gz", hash = "sha256:f3d3088019609bc953357b5598a47481dc3e7dc8f11ecf27002ede251f37eb7b", size = 1071046, upload-time = "2026-08-03T14:55:49.702Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/25/65/d320016505457cc30971f575e8dadffb923b7cfc780ab8bb25a4ce9d305c/nemo_relay-0.6.0-cp311-abi3-macosx_11_0_arm64.whl", hash = "sha256:ad5dae6febf6532d7b113abc2a404679c8feffc499df3034b93d9a078185d2bb", size = 9917779, upload-time = "2026-07-22T20:07:48.961Z" },
     { url = "https://files.pythonhosted.org/packages/ae/c0/f33250e71c4206da1b339072893f9a1e39295fe1aceb9a2fef4b8620a0f2/nemo_relay-0.6.0-cp311-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:c0cd9570f64c6956fe3bfb82af1cdb3ee70cb50b51098cdb0de831c3f9b4e904", size = 8888375, upload-time = "2026-07-22T20:07:51.049Z" },
