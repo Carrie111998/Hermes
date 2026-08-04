@@ -423,10 +423,13 @@ class SessionManager:
         model_str = str(state.model) if state.model else None
         session_meta = {"cwd": state.cwd}
         provider = getattr(state.agent, "provider", None)
+        requested_provider = getattr(state.agent, "requested_provider", None)
         base_url = getattr(state.agent, "base_url", None)
         api_mode = getattr(state.agent, "api_mode", None)
         if isinstance(provider, str) and provider.strip():
             session_meta["provider"] = provider.strip()
+        if isinstance(requested_provider, str) and requested_provider.strip():
+            session_meta["requested_provider"] = requested_provider.strip()
         if isinstance(base_url, str) and base_url.strip():
             session_meta["base_url"] = base_url.strip()
         if isinstance(api_mode, str) and api_mode.strip():
@@ -526,7 +529,11 @@ class SessionManager:
                 meta = json.loads(mc)
                 if isinstance(meta, dict):
                     cwd = meta.get("cwd", ".")
-                    requested_provider = meta.get("provider") or requested_provider
+                    requested_provider = (
+                        meta.get("requested_provider")
+                        or meta.get("provider")
+                        or requested_provider
+                    )
                     restored_base_url = meta.get("base_url") or restored_base_url
                     restored_api_mode = meta.get("api_mode") or restored_api_mode
             except (json.JSONDecodeError, TypeError):
@@ -637,6 +644,12 @@ class SessionManager:
             kwargs.update(
                 {
                     "provider": runtime.get("provider"),
+                    "requested_provider": (
+                        runtime.get("requested_provider")
+                        or requested_provider
+                        or config_provider
+                        or runtime.get("provider")
+                    ),
                     "api_mode": api_mode or runtime.get("api_mode"),
                     "base_url": base_url or runtime.get("base_url"),
                     "api_key": runtime.get("api_key"),

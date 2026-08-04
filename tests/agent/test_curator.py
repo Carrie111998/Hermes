@@ -80,6 +80,44 @@ def test_curator_defaults(curator_env):
     assert c.get_archive_after_days() == 90
 
 
+def test_llm_review_passes_named_provider_identity(monkeypatch):
+    import agent.curator as curator
+
+    captured = {}
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def run_conversation(self, **kwargs):
+            return {"final_response": "done"}
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {"model": {"provider": "custom:account-b", "default": "review-model"}},
+    )
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda **kwargs: {
+            "provider": "custom",
+            "requested_provider": "custom:account-b",
+            "api_key": "account-b-key",
+            "base_url": "https://shared.example/v1",
+            "api_mode": "chat_completions",
+        },
+    )
+    monkeypatch.setattr("run_agent.AIAgent", FakeAgent)
+
+    result = curator._run_llm_review("review")
+
+    assert result["error"] is None
+    assert captured["provider"] == "custom"
+    assert captured["requested_provider"] == "custom:account-b"
+
+
 
 
 # ---------------------------------------------------------------------------

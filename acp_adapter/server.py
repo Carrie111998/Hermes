@@ -2198,7 +2198,11 @@ class HermesACPAgent(acp.Agent):
             provider = getattr(state.agent, "provider", None) or "auto"
             return f"Current model: {model}\nProvider: {provider}"
 
-        current_provider = getattr(state.agent, "provider", None) or "openrouter"
+        current_provider = (
+            getattr(state.agent, "requested_provider", None)
+            or getattr(state.agent, "provider", None)
+            or "openrouter"
+        )
         target_provider, new_model = self._resolve_model_selection(args, current_provider)
 
         state.model = new_model
@@ -2443,15 +2447,27 @@ class HermesACPAgent(acp.Agent):
         """Switch the model for a session (called by ACP protocol)."""
         state = self.session_manager.get_session(session_id)
         if state:
-            current_provider = getattr(state.agent, "provider", None)
+            current_transport_provider = getattr(state.agent, "provider", None)
+            current_requested_provider = (
+                getattr(state.agent, "requested_provider", None)
+                or current_transport_provider
+                or "openrouter"
+            )
             requested_provider, resolved_model = self._resolve_model_selection(
                 model_id,
-                current_provider or "openrouter",
+                current_requested_provider,
             )
             state.model = resolved_model
-            provider_changed = bool(current_provider and requested_provider != current_provider)
-            current_base_url = None if provider_changed else getattr(state.agent, "base_url", None)
-            current_api_mode = None if provider_changed else getattr(state.agent, "api_mode", None)
+            provider_changed = bool(
+                current_transport_provider
+                and requested_provider != current_requested_provider
+            )
+            current_base_url = (
+                None if provider_changed else getattr(state.agent, "base_url", None)
+            )
+            current_api_mode = (
+                None if provider_changed else getattr(state.agent, "api_mode", None)
+            )
             state.agent = self.session_manager._make_agent(
                 session_id=session_id,
                 cwd=state.cwd,

@@ -14,6 +14,8 @@ fallback calls, contaminating primary state with fallback-provider errors.
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 
 
 # ── Helpers ──────────────────────────────────────────────────────────
@@ -166,6 +168,369 @@ class TestFallbackCredentialIsolation:
         assert agent._credential_pool is fallback_pool
         assert agent._credential_pool.provider == "openai-codex"
         assert agent._transport_cache == {}
+
+    def test_fallback_reuses_identity_matching_runtime_pool(self):
+        """Resolver-selected pools must not be loaded again during fallback."""
+        from agent.chat_completion_helpers import try_activate_fallback
+
+        agent = _make_agent(
+            provider="ollama-cloud",
+            model="glm-5.2",
+            base_url="https://ollama.com/v1",
+            api_mode="chat_completions",
+        )
+        agent._fallback_chain = [{"provider": "openai-codex", "model": "gpt-5.5"}]
+        agent._credential_pool = _make_pool("ollama-cloud")
+        agent._buffer_status = MagicMock()
+        agent._is_azure_openai_url.return_value = False
+        agent._is_direct_openai_url.return_value = False
+        agent._provider_model_requires_responses_api.return_value = False
+        agent._anthropic_prompt_cache_policy.return_value = (False, False)
+        agent._ensure_lmstudio_runtime_loaded = MagicMock()
+        agent.context_compressor = None
+
+        fallback_client = SimpleNamespace(
+            api_key="codex-key",
+            base_url="https://chatgpt.com/backend-api/codex",
+            _custom_headers={},
+        )
+        runtime_pool = _make_pool("openai-codex")
+        reloaded_pool = _make_pool("openai-codex")
+
+        with (
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(fallback_client, "gpt-5.5"),
+            ),
+            patch(
+                "hermes_cli.runtime_provider.resolve_runtime_provider",
+                return_value={
+                    "provider": "openai-codex",
+                    "requested_provider": "openai-codex",
+                    "api_mode": "codex_responses",
+                    "credential_pool": runtime_pool,
+                },
+            ),
+            patch(
+                "agent.credential_pool.load_pool",
+                return_value=reloaded_pool,
+            ) as load_pool,
+        ):
+            assert try_activate_fallback(agent) is True
+
+        load_pool.assert_not_called()
+        assert agent._credential_pool is runtime_pool
+
+    def test_named_custom_fallback_separates_transport_and_pool_identity(self):
+        """A named custom fallback must attach its own pool on a shared URL."""
+        from agent.chat_completion_helpers import try_activate_fallback
+
+        agent = _make_agent(
+            provider="custom",
+            model="fallback-model",
+            base_url="https://gateway.example/v1",
+        )
+        agent.requested_provider = "custom:provider-a"
+        agent._primary_runtime["requested_provider"] = "custom:provider-a"
+        agent._fallback_chain = [{"provider": "provider-b", "model": "fallback-model"}]
+        agent._credential_pool = _make_pool("custom:provider-a")
+        agent._buffer_status = MagicMock()
+        agent._is_azure_openai_url.return_value = False
+        agent._is_direct_openai_url.return_value = False
+        agent._provider_model_requires_responses_api.return_value = False
+        agent._anthropic_prompt_cache_policy.return_value = (False, False)
+        agent._ensure_lmstudio_runtime_loaded = MagicMock()
+        agent.context_compressor = None
+
+        fallback_client = SimpleNamespace(
+            api_key="provider-b-key",
+            base_url="https://gateway.example/v1",
+            _custom_headers={},
+        )
+        fallback_pool = _make_pool("custom:provider-b")
+
+        with (
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(fallback_client, "fallback-model"),
+            ),
+            patch(
+                "hermes_cli.runtime_provider.resolve_runtime_provider",
+                return_value={
+                    "provider": "custom",
+                    "requested_provider": "provider-b",
+                    "api_mode": "chat_completions",
+                },
+            ) as resolve_runtime,
+            patch(
+                "agent.credential_pool.get_custom_provider_pool_key",
+                return_value="custom:provider-b",
+            ) as pool_key,
+            patch(
+                "agent.credential_pool.load_pool",
+                return_value=fallback_pool,
+            ) as load_pool,
+        ):
+            assert try_activate_fallback(agent) is True
+
+        resolve_runtime.assert_called_once_with(
+            requested="provider-b",
+            target_model="fallback-model",
+            explicit_base_url=None,
+            explicit_api_key=None,
+        )
+        pool_key.assert_called_once_with(
+            "https://gateway.example/v1",
+            provider_name="custom:provider-b",
+        )
+        load_pool.assert_called_once_with("custom:provider-b")
+        assert agent.provider == "custom"
+        assert agent.requested_provider == "custom:provider-b"
+        assert agent._credential_pool is fallback_pool
+
+    def test_named_custom_fallback_uses_resolved_api_mode_for_native_client(self):
+        """A named custom fallback must honor resolver protocol metadata."""
+        from agent.chat_completion_helpers import try_activate_fallback
+
+        agent = _make_agent(
+            provider="custom",
+            model="fallback-model",
+            base_url="https://gateway.example/v1",
+        )
+        agent.requested_provider = "custom:provider-a"
+        agent._primary_runtime["requested_provider"] = "custom:provider-a"
+        agent._fallback_chain = [{"provider": "provider-b", "model": "fallback-model"}]
+        agent._credential_pool = _make_pool("custom:provider-a")
+        agent._buffer_status = MagicMock()
+        agent._is_azure_openai_url.return_value = False
+        agent._is_direct_openai_url.return_value = False
+        agent._provider_model_requires_responses_api.return_value = False
+        agent._anthropic_prompt_cache_policy.return_value = (False, False)
+        agent._ensure_lmstudio_runtime_loaded = MagicMock()
+        agent.context_compressor = None
+
+        fallback_client = SimpleNamespace(
+            api_key="provider-b-key",
+            base_url="https://gateway.example/v1",
+            _custom_headers={},
+        )
+        fallback_pool = _make_pool("custom:provider-b")
+        native_client = MagicMock(name="native_anthropic_client")
+
+        with (
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(fallback_client, "fallback-model"),
+            ),
+            patch(
+                "hermes_cli.runtime_provider.resolve_runtime_provider",
+                return_value={
+                    "provider": "custom",
+                    "requested_provider": "provider-b",
+                    "api_mode": "anthropic_messages",
+                },
+            ),
+            patch(
+                "agent.credential_pool.get_custom_provider_pool_key",
+                return_value="custom:provider-b",
+            ),
+            patch(
+                "agent.credential_pool.load_pool",
+                return_value=fallback_pool,
+            ),
+            patch(
+                "agent.anthropic_adapter.build_anthropic_client",
+                return_value=native_client,
+            ) as build_anthropic,
+        ):
+            assert try_activate_fallback(agent) is True
+
+        assert agent.provider == "custom"
+        assert agent.requested_provider == "custom:provider-b"
+        assert agent.api_mode == "anthropic_messages"
+        assert agent._anthropic_client is native_client
+        assert agent.client is None
+        build_anthropic.assert_called_once_with(
+            "provider-b-key", "https://gateway.example/v1", timeout=None,
+        )
+
+    @pytest.mark.parametrize(
+        ("native_provider", "native_api_mode"),
+        [
+            ("bedrock", "bedrock_converse"),
+            ("openai-codex", "codex_app_server"),
+        ],
+    )
+    def test_builtin_native_fallback_skips_unconstructable_runtime(
+        self, native_provider, native_api_mode
+    ):
+        """A built-in native route must not be treated as an endpoint fallback."""
+        from agent.chat_completion_helpers import try_activate_fallback
+
+        agent = _make_agent(
+            provider="custom",
+            model="primary-model",
+            base_url="https://primary.example/v1",
+        )
+        agent.requested_provider = "custom:provider-a"
+        agent._primary_runtime["requested_provider"] = "custom:provider-a"
+        agent._fallback_chain = [
+            {"provider": native_provider, "model": "native-model"},
+            {"provider": "provider-b", "model": "fallback-model"},
+        ]
+        agent._credential_pool = _make_pool("custom:provider-a")
+        agent._buffer_status = MagicMock()
+        agent._is_azure_openai_url.return_value = False
+        agent._is_direct_openai_url.return_value = False
+        agent._provider_model_requires_responses_api.return_value = False
+        agent._anthropic_prompt_cache_policy.return_value = (False, False)
+        agent._ensure_lmstudio_runtime_loaded = MagicMock()
+        agent.context_compressor = None
+        agent._try_activate_fallback.side_effect = (
+            lambda reason=None: try_activate_fallback(agent, reason)
+        )
+
+        supported_client = SimpleNamespace(
+            api_key="provider-b-key",
+            base_url="https://gateway.example/v1",
+            _custom_headers={},
+        )
+        fallback_pool = _make_pool("custom:provider-b")
+
+        def fake_resolve(provider, model=None, raw_codex=False,
+                         explicit_base_url=None, explicit_api_key=None):
+            if provider == "provider-b":
+                return supported_client, "fallback-model"
+            raise AssertionError(
+                f"native fallback must not construct endpoint client for {provider!r}"
+            )
+
+        def fake_runtime(*, requested=None, target_model=None,
+                         explicit_base_url=None, explicit_api_key=None):
+            if requested == native_provider:
+                return {
+                    "provider": native_provider,
+                    "requested_provider": native_provider,
+                    "api_mode": native_api_mode,
+                }
+            if requested == "provider-b":
+                return {
+                    "provider": "custom",
+                    "requested_provider": requested,
+                    "api_mode": "chat_completions",
+                }
+            raise AssertionError(f"unexpected runtime request: {requested!r}")
+
+        with (
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                side_effect=fake_resolve,
+            ) as resolve_client,
+            patch(
+                "hermes_cli.runtime_provider.resolve_runtime_provider",
+                side_effect=fake_runtime,
+            ),
+            patch(
+                "agent.credential_pool.get_custom_provider_pool_key",
+                return_value="custom:provider-b",
+            ),
+            patch(
+                "agent.credential_pool.load_pool",
+                return_value=fallback_pool,
+            ),
+        ):
+            assert try_activate_fallback(agent) is True
+
+        assert [call.args[0] for call in resolve_client.call_args_list] == ["provider-b"]
+        assert agent.provider == "custom"
+        assert agent.requested_provider == "custom:provider-b"
+        assert agent.model == "fallback-model"
+        assert agent.api_mode == "chat_completions"
+
+    @pytest.mark.parametrize("api_mode", ["bedrock_converse", "codex_app_server"])
+    def test_named_custom_fallback_skips_unsupported_native_api_modes(self, api_mode):
+        """Fallback must not publish a native-only mode without its runtime."""
+        from agent.chat_completion_helpers import try_activate_fallback
+
+        agent = _make_agent(
+            provider="custom",
+            model="primary-model",
+            base_url="https://primary.example/v1",
+        )
+        agent.requested_provider = "custom:provider-a"
+        agent._primary_runtime["requested_provider"] = "custom:provider-a"
+        agent._fallback_chain = [
+            {"provider": "unsupported-provider", "model": "unsupported-model"},
+            {"provider": "provider-b", "model": "fallback-model"},
+        ]
+        agent._credential_pool = _make_pool("custom:provider-a")
+        agent._buffer_status = MagicMock()
+        agent._is_azure_openai_url.return_value = False
+        agent._is_direct_openai_url.return_value = False
+        agent._provider_model_requires_responses_api.return_value = False
+        agent._anthropic_prompt_cache_policy.return_value = (False, False)
+        agent._ensure_lmstudio_runtime_loaded = MagicMock()
+        agent.context_compressor = None
+        agent._try_activate_fallback.side_effect = (
+            lambda reason=None: try_activate_fallback(agent, reason)
+        )
+
+        supported_client = SimpleNamespace(
+            api_key="provider-b-key",
+            base_url="https://gateway.example/v1",
+            _custom_headers={},
+        )
+        fallback_pool = _make_pool("custom:provider-b")
+
+        def fake_resolve(provider, model=None, raw_codex=False,
+                         explicit_base_url=None, explicit_api_key=None):
+            if provider == "provider-b":
+                return supported_client, "fallback-model"
+            raise AssertionError(
+                f"unsupported native fallback must not construct {provider!r}"
+            )
+
+        def fake_runtime(*, requested=None, target_model=None,
+                         explicit_base_url=None, explicit_api_key=None):
+            if requested == "unsupported-provider":
+                return {
+                    "provider": "custom",
+                    "requested_provider": requested,
+                    "api_mode": api_mode,
+                }
+            if requested == "provider-b":
+                return {
+                    "provider": "custom",
+                    "requested_provider": requested,
+                    "api_mode": "chat_completions",
+                }
+            raise AssertionError(f"unexpected runtime request: {requested!r}")
+
+        with (
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                side_effect=fake_resolve,
+            ) as resolve_client,
+            patch(
+                "hermes_cli.runtime_provider.resolve_runtime_provider",
+                side_effect=fake_runtime,
+            ),
+            patch(
+                "agent.credential_pool.get_custom_provider_pool_key",
+                return_value="custom:provider-b",
+            ),
+            patch(
+                "agent.credential_pool.load_pool",
+                return_value=fallback_pool,
+            ),
+        ):
+            assert try_activate_fallback(agent) is True
+
+        assert [call.args[0] for call in resolve_client.call_args_list] == ["provider-b"]
+        assert agent.provider == "custom"
+        assert agent.requested_provider == "custom:provider-b"
+        assert agent.model == "fallback-model"
+        assert agent.api_mode == "chat_completions"
 
 
 # ── Test: _recover_with_credential_pool rejects mismatched pool ──────

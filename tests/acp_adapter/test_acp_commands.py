@@ -73,6 +73,60 @@ def make_agent_and_state():
     return acp_agent, state, fake, conn
 
 
+def test_acp_make_agent_preserves_requested_identity_for_named_custom_runtime(monkeypatch):
+    """ACP must give AIAgent both custom transport and named selection identity."""
+    captured = {}
+
+    class CapturingAgent(FakeAgent):
+        def __init__(self, **kwargs):
+            super().__init__()
+            captured.update(kwargs)
+
+    def mod(name, **attrs):
+        module = ModuleType(name)
+        for key, value in attrs.items():
+            setattr(module, key, value)
+        return module
+
+    monkeypatch.setitem(sys.modules, "run_agent", mod("run_agent", AIAgent=CapturingAgent))
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.config",
+        mod(
+            "hermes_cli.config",
+            load_config=lambda: {
+                "model": {"default": "named-model", "provider": "custom:account-b"}
+            },
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.runtime_provider",
+        mod(
+            "hermes_cli.runtime_provider",
+            resolve_runtime_provider=lambda **_kwargs: {
+                "provider": "custom",
+                "requested_provider": "custom:account-b",
+                "api_mode": "chat_completions",
+                "base_url": "https://shared.example/v1",
+                "api_key": "account-b-key",
+                "command": None,
+                "args": [],
+            },
+        ),
+    )
+
+    manager = SessionManager(db=NoopDb())
+    manager._make_agent(
+        session_id="acp-named-custom",
+        cwd=".",
+        requested_provider="custom:account-b",
+    )
+
+    assert captured["provider"] == "custom"
+    assert captured["requested_provider"] == "custom:account-b"
+
+
 def test_acp_real_agent_gets_session_db_for_recall(monkeypatch):
     """ACP sessions persist to SessionDB; recall must receive the same DB handle."""
     captured = {}
@@ -118,6 +172,37 @@ def test_acp_real_agent_gets_session_db_for_recall(monkeypatch):
     assert captured["session_db"] is sentinel_db
     assert captured["platform"] == "acp"
     assert captured["session_id"] == "acp-session"
+
+
+@pytest.mark.asyncio
+async def test_acp_slash_model_reuses_live_named_custom_identity(monkeypatch):
+    """Slash /model must not turn custom:account-a into bare custom."""
+    acp_agent, state, _fake, _conn = make_agent_and_state()
+    state.agent.provider = "custom"
+    state.agent.requested_provider = "custom:account-a"
+    captured = {}
+
+    def resolve_selection(raw_model, current_provider):
+        captured["selection_current_provider"] = current_provider
+        return current_provider, "account-a-next-model"
+
+    def make_agent(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            model=kwargs["model"],
+            provider="custom",
+            requested_provider=kwargs["requested_provider"],
+        )
+
+    monkeypatch.setattr(acp_agent, "_resolve_model_selection", resolve_selection)
+    monkeypatch.setattr(acp_agent.session_manager, "_make_agent", make_agent)
+    monkeypatch.setattr(acp_agent.session_manager, "save_session", lambda _sid: None)
+
+    response = acp_agent._cmd_model("account-a-next-model", state)
+
+    assert "account-a-next-model" in response
+    assert captured["selection_current_provider"] == "custom:account-a"
+    assert captured["requested_provider"] == "custom:account-a"
 
 
 @pytest.mark.asyncio

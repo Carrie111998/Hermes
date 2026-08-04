@@ -972,7 +972,10 @@ def recover_with_credential_pool(
                 from agent.credential_pool import get_custom_provider_pool_key
                 _agent_base = (getattr(agent, "base_url", "") or "").strip()
                 _custom_match = bool(_agent_base) and (
-                    (get_custom_provider_pool_key(_agent_base) or "").strip().lower()
+                    (get_custom_provider_pool_key(
+                        _agent_base,
+                        provider_name=getattr(agent, "requested_provider", None),
+                    ) or "").strip().lower()
                     == pool_provider
                 )
             except Exception:
@@ -1486,20 +1489,41 @@ def restore_primary_runtime(agent) -> bool:
     # pool-rebind block below via ``prefetched_primary_pool`` so the load
     # happens at most once per restore.
     prefetched_primary_pool = None
+    primary_provider = ""
+    primary_requested_provider = ""
+    primary_pool_provider = ""
     try:
         primary_provider = str(
             (agent._primary_runtime or {}).get("provider") or ""
         ).strip().lower()
+        primary_requested_provider = str(
+            (agent._primary_runtime or {}).get("requested_provider") or ""
+        ).strip()
+        primary_pool_provider = primary_provider
+        if primary_provider == "custom":
+            try:
+                from agent.credential_pool import get_custom_provider_pool_key
+
+                primary_pool_provider = (
+                    get_custom_provider_pool_key(
+                        str((agent._primary_runtime or {}).get("base_url") or ""),
+                        provider_name=primary_requested_provider or None,
+                    )
+                    or primary_provider
+                )
+            except Exception:
+                primary_pool_provider = primary_provider
         pool = getattr(agent, "_credential_pool", None)
         if not credential_pool_matches_provider(
             pool,
             primary_provider,
             base_url=str((agent._primary_runtime or {}).get("base_url") or ""),
+            provider_name=primary_requested_provider or None,
         ):
             from agent.credential_pool import load_pool
 
             prefetched_primary_pool = (
-                load_pool(primary_provider) if primary_provider else None
+                load_pool(primary_pool_provider) if primary_pool_provider else None
             )
             pool = prefetched_primary_pool
         next_at = getattr(pool, "next_available_at", lambda: None)()
@@ -1605,8 +1629,14 @@ def restore_primary_runtime(agent) -> bool:
             try:
                 from agent.credential_pool import get_custom_provider_pool_key
 
+                primary_requested_provider = str(
+                    rt.get("requested_provider") or ""
+                ).strip()
                 primary_key = (
-                    get_custom_provider_pool_key(str(rt.get("base_url") or "")) or ""
+                    get_custom_provider_pool_key(
+                        str(rt.get("base_url") or ""),
+                        provider_name=primary_requested_provider or None,
+                    ) or ""
                 ).strip().lower()
                 pool_matches_primary = bool(primary_key) and primary_key == pool_provider
             except Exception:
@@ -1622,7 +1652,9 @@ def restore_primary_runtime(agent) -> bool:
                 else:
                     from agent.credential_pool import load_pool
 
-                    agent._credential_pool = load_pool(primary_provider)
+                    agent._credential_pool = load_pool(
+                        primary_pool_provider or primary_provider
+                    )
             except Exception as exc:
                 logger.warning(
                     "Restore could not reload primary credential pool for %s: %s",
@@ -1662,8 +1694,14 @@ def restore_primary_runtime(agent) -> bool:
                     try:
                         from agent.credential_pool import get_custom_provider_pool_key
                         primary_base_url = str(rt.get("base_url") or "").strip()
+                        primary_requested_provider = str(
+                            rt.get("requested_provider") or ""
+                        ).strip()
                         primary_key = (
-                            get_custom_provider_pool_key(primary_base_url) or ""
+                            get_custom_provider_pool_key(
+                                primary_base_url,
+                                provider_name=primary_requested_provider or None,
+                            ) or ""
                         ).strip().lower()
                         entry_matches_primary = bool(primary_key) and primary_key == entry_provider
                     except Exception:
@@ -2351,7 +2389,15 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     return client
 
 
-def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mode=''):
+def switch_model(
+    agent,
+    new_model,
+    new_provider,
+    api_key='',
+    base_url='',
+    api_mode='',
+    requested_provider=None,
+):
     """Switch the model/provider in-place for a live agent.
 
     Called by the /model command handlers (CLI and gateway) after
@@ -2389,6 +2435,12 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
 
     old_model = agent.model
     old_provider = agent.provider
+    old_requested_provider = getattr(agent, "requested_provider", old_provider)
+    effective_requested_provider = (
+        str(requested_provider).strip()
+        if requested_provider is not None and str(requested_provider).strip()
+        else new_provider
+    )
 
     # ── Snapshot all fields the swap+rebuild can mutate ──
     # If the rebuild raises (bad API key, network error, build_anthropic_client
@@ -2449,7 +2501,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
         # ── Swap core runtime fields ──
         agent.model = new_model
         agent.provider = new_provider
-        agent.requested_provider = new_provider
+        agent.requested_provider = effective_requested_provider
         # Use the new base_url when provided. When it's empty AND the
         # provider is actually changing, do NOT fall back to the current
         # (old provider's) URL — that silently pairs the new provider label
@@ -2489,20 +2541,44 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
         # actually changed (or the pool was missing) — re-selecting the same
         # provider must not churn the pool reference. A reload failure is
         # logged + swallowed: the switch itself must still complete.
-        old_norm = (old_provider or "").strip().lower()
-        new_norm = (new_provider or "").strip().lower()
-        if old_norm != new_norm or getattr(agent, "_credential_pool", None) is None:
-            # A pool bound to the old provider is worse than no pool: the
-            # recovery guard rejects it and every later 401/429 skips rotation.
+        pool_key = new_provider
+        if new_norm_provider == "custom":
+            named_identity = str(effective_requested_provider or "").strip()
+            if named_identity and named_identity.lower() != "custom":
+                try:
+                    from agent.credential_pool import get_custom_provider_pool_key
+                    pool_key = get_custom_provider_pool_key(
+                        base_url or "",
+                        provider_name=named_identity,
+                    )
+                except Exception:
+                    pool_key = None
+            else:
+                pool_key = "custom"
+        existing_pool_provider = str(
+            getattr(getattr(agent, "_credential_pool", None), "provider", "") or ""
+        ).strip().lower()
+        identity_changed = (
+            old_norm_provider == "custom"
+            and new_norm_provider == "custom"
+            and str(old_requested_provider or "").strip().lower()
+            != str(effective_requested_provider or "").strip().lower()
+        )
+        if (
+            old_norm_provider != new_norm_provider
+            or identity_changed
+            or getattr(agent, "_credential_pool", None) is None
+            or (pool_key and existing_pool_provider != str(pool_key).strip().lower())
+        ):
             agent._credential_pool = None
             agent._credential_pool_entry_id = None
             try:
                 from agent.credential_pool import load_pool
-                agent._credential_pool = load_pool(new_provider)
+                if pool_key:
+                    agent._credential_pool = load_pool(pool_key)
             except Exception as _pool_exc:  # noqa: BLE001
                 logger.warning(
-                    "switch_model: credential pool reload failed for %s (%s); "
-                    "continuing without pool rotation this turn",
+                    "switch_model: credential pool reload failed for %s (%s); continuing without pool rotation this turn",
                     new_provider, _pool_exc,
                 )
         # ── Build new client ──

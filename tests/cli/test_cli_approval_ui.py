@@ -42,6 +42,7 @@ def _make_background_cli_stub():
             "api_key": "test-key",
             "base_url": "https://example.test/v1",
             "provider": "test",
+            "requested_provider": "custom:account-b",
             "api_mode": "chat_completions",
         },
         "request_overrides": None,
@@ -230,6 +231,30 @@ class TestCliApprovalUi:
         assert seen["sudo"].__self__ is cli
         assert seen["sudo"].__func__ is HermesCLI._sudo_password_callback
         assert not cli._background_tasks
+
+    def test_background_task_passes_named_provider_identity(self):
+        cli = _make_background_cli_stub()
+        captured = {}
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+                self._print_fn = None
+                self.thinking_callback = None
+
+            def run_conversation(self, **kwargs):
+                return {"final_response": "done", "messages": []}
+
+        with patch.object(cli_module, "AIAgent", FakeAgent), \
+             patch.object(cli_module, "_cprint"), \
+             patch.object(cli_module, "ChatConsole") as chat_console:
+            chat_console.return_value.print = MagicMock()
+            cli._handle_background_command("/btw check weather")
+            for thread in list(cli._background_tasks.values()):
+                thread.join(timeout=10)
+
+        assert captured["provider"] == "test"
+        assert captured["requested_provider"] == "custom:account-b"
 
 
 def _make_real_paint_cli_stub():

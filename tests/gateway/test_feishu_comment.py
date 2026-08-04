@@ -12,6 +12,44 @@ from plugins.platforms.feishu.feishu_comment import (
 )
 
 
+def test_comment_agent_preserves_named_provider_identity(monkeypatch):
+    from plugins.platforms.feishu import feishu_comment as module
+
+    captured = {}
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def run_conversation(self, *args, **kwargs):
+            return {"final_response": "ok", "api_calls": 0, "messages": []}
+
+    monkeypatch.setattr(
+        module,
+        "_resolve_model_and_runtime",
+        lambda: (
+            "review-model",
+            {
+                "provider": "custom",
+                "requested_provider": "custom:account-b",
+                "base_url": "https://gateway.example/v1",
+                "api_key": "account-b-key",
+                "api_mode": "chat_completions",
+                "credential_pool": None,
+            },
+        ),
+    )
+    monkeypatch.setattr(module, "_load_session_history", lambda _key: [])
+    monkeypatch.setattr(module, "_save_session_history", lambda *_args: None)
+    monkeypatch.setattr("run_agent.AIAgent", FakeAgent)
+    monkeypatch.setattr("tools.feishu_doc_tool.set_client", lambda _client: None)
+    monkeypatch.setattr("tools.feishu_drive_tool.set_client", lambda _client: None)
+
+    assert module._run_comment_agent("prompt", object()) == "ok"
+    assert captured["provider"] == "custom"
+    assert captured["requested_provider"] == "custom:account-b"
+
+
 def _make_event(
     comment_id="c1",
     reply_id="r1",

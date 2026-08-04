@@ -1692,6 +1692,42 @@ def _fallback_entry_unavailable_without_network(agent, fb: dict) -> Optional[str
 
 
 
+def _resolve_fallback_runtime_identity(
+    configured_provider: str,
+    model: str,
+    *,
+    explicit_base_url: Optional[str],
+    explicit_api_key: Optional[str],
+) -> tuple[str, str, Dict[str, Any]]:
+    """Resolve fallback transport separately from its durable provider identity."""
+    configured = str(configured_provider or "").strip().lower()
+    runtime: Dict[str, Any] = {}
+    transport = configured
+    requested = configured
+    try:
+        from hermes_cli.model_switch import _canonical_requested_provider_identity
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+
+        resolved = resolve_runtime_provider(
+            requested=configured,
+            target_model=model,
+            explicit_base_url=explicit_base_url,
+            explicit_api_key=explicit_api_key,
+        )
+        if isinstance(resolved, dict):
+            runtime = resolved
+        resolved_transport = str(runtime.get("provider") or configured).strip().lower()
+        if resolved_transport:
+            transport = resolved_transport
+            requested = _canonical_requested_provider_identity(
+                transport,
+                str(runtime.get("requested_provider") or configured or transport),
+            )
+    except Exception as exc:
+        logger.debug("Fallback runtime identity resolution failed for %s: %s", configured, exc)
+    return transport, requested, runtime
+
+
 def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool:
     """Switch to the next fallback model/provider in the chain.
 
@@ -1794,29 +1830,31 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         )
         return agent._try_activate_fallback(reason)
 
-    # Use centralized router for client construction.
-    # raw_codex=True because the main agent needs direct responses.stream()
-    # access for Codex providers.
+    from hermes_cli.fallback_config import resolve_entry_api_key
+    fb_base_url_hint = (fb.get("base_url") or "").strip() or None
+    fb_api_key_hint = resolve_entry_api_key(fb)
+    fb_transport, fb_requested_provider, fb_runtime = _resolve_fallback_runtime_identity(
+        fb_provider,
+        fb_model,
+        explicit_base_url=fb_base_url_hint,
+        explicit_api_key=fb_api_key_hint,
+    )
+    resolved_mode = str(fb_runtime.get("api_mode") or "").strip().lower()
+    if resolved_mode in {"bedrock_converse", "codex_app_server"}:
+        unavailable.add(fb_key)
+        logger.warning("Fallback skip: %s/%s uses unsupported native runtime %s", fb_requested_provider, fb_model, resolved_mode)
+        return agent._try_activate_fallback(reason)
+
+    # Use the configured provider name for client construction: named custom
+    # entries are looked up by durable identity, while the live agent stores
+    # the resolved transport separately.
     try:
         from agent.auxiliary_client import resolve_provider_client
-        # Pass base_url and api_key from fallback config so custom
-        # endpoints (e.g. Ollama Cloud) resolve correctly instead of
-        # falling through to OpenRouter defaults.
-        from hermes_cli.fallback_config import resolve_entry_api_key
-
-        fb_base_url_hint = (fb.get("base_url") or "").strip() or None
-        fb_api_key_hint = resolve_entry_api_key(fb)
-        # For Ollama Cloud endpoints, pull OLLAMA_API_KEY from env
-        # when no explicit key is in the fallback config. Host match
-        # (not substring) — see GHSA-76xc-57q6-vm5m.
-        if fb_base_url_hint and base_url_host_matches(fb_base_url_hint, "ollama.com") and not fb_api_key_hint:
-            from agent.secret_scope import get_secret
-
-            fb_api_key_hint = get_secret("OLLAMA_API_KEY") or None
         fb_client, _resolved_fb_model = resolve_provider_client(
             fb_provider, model=fb_model, raw_codex=True,
             explicit_base_url=fb_base_url_hint,
-            explicit_api_key=fb_api_key_hint)
+            explicit_api_key=fb_api_key_hint,
+        )
         if fb_client is None:
             logger.warning(
                 "Fallback to %s failed: provider not configured",
@@ -1881,57 +1919,64 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
 
         old_model = agent.model
         old_provider = agent.provider
+        if (
+            fb_transport == "custom"
+            and str(fb_runtime.get("api_mode") or "").strip().lower() in {
+                "chat_completions", "codex_responses", "anthropic_messages"
+            }
+        ):
+            fb_api_mode = str(fb_runtime.get("api_mode")).strip().lower()
 
         # Clear the per-config context_length override so the fallback
         # model's actual context window is resolved instead of inheriting
         # the stale value from the previous model.  See #22387.
         agent._config_context_length = None
         agent.model = fb_model
-        agent.provider = fb_provider
-        agent.requested_provider = fb_provider
+        # Preserve runtime transport and durable requested identity separately.
+        agent.provider = fb_transport
+        agent.requested_provider = fb_requested_provider
         agent.base_url = fb_base_url
         agent.api_mode = fb_api_mode
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
         agent._fallback_activated = True
 
-        # Rebind the credential pool to the fallback provider when the provider
-        # changes.  Keeping the primary pool attached would make downstream
-        # recovery (rate_limit / billing / auth) mutate the wrong credential
-        # set and can overwrite the fallback's base_url back to the primary
-        # endpoint.  See #33163.
-        #
-        # When the fallback shares the pool's provider (e.g. both openrouter
-        # entries with different routing) the pool is preserved.  When the
-        # providers differ, load the fallback provider's own pool if one exists
-        # so provider-specific rotation continues to work after the switch.
+        # Rebind the credential pool to the fallback's exact effective route.
+        fallback_pool_key = fb_transport
+        if fb_transport == "custom":
+            named_identity = str(fb_requested_provider or "").strip()
+            if named_identity and named_identity.lower() != "custom":
+                try:
+                    from agent.credential_pool import get_custom_provider_pool_key
+                    fallback_pool_key = get_custom_provider_pool_key(
+                        fb_base_url,
+                        provider_name=named_identity,
+                    )
+                except Exception:
+                    fallback_pool_key = None
         _existing_pool = getattr(agent, "_credential_pool", None)
         if _existing_pool is not None:
             _pool_provider = (getattr(_existing_pool, "provider", "") or "").strip().lower()
-            if _pool_provider and _pool_provider != fb_provider:
-                logger.info(
-                    "Fallback to %s/%s: clearing primary credential pool "
-                    "(pool_provider=%s) to prevent cross-provider contamination",
-                    fb_provider, fb_model, _pool_provider,
-                )
+            if _pool_provider and _pool_provider != str(fallback_pool_key or "").lower():
                 agent._credential_pool = None
                 agent._credential_pool_entry_id = None
-        if getattr(agent, "_credential_pool", None) is None:
+        runtime_pool = fb_runtime.get("credential_pool")
+        runtime_pool_key = str(getattr(runtime_pool, "provider", "") or "").strip().lower()
+        if (
+            getattr(agent, "_credential_pool", None) is None
+            and runtime_pool is not None
+            and runtime_pool_key == str(fallback_pool_key or "").lower()
+            and runtime_pool.has_credentials()
+        ):
+            agent._credential_pool = runtime_pool
+        if getattr(agent, "_credential_pool", None) is None and fallback_pool_key:
             try:
                 from agent.credential_pool import load_pool
-
-                fallback_pool = load_pool(fb_provider)
+                fallback_pool = load_pool(fallback_pool_key)
                 if fallback_pool and fallback_pool.has_credentials():
                     agent._credential_pool = fallback_pool
-                    logger.info(
-                        "Fallback to %s/%s: attached fallback credential pool",
-                        fb_provider, fb_model,
-                    )
             except Exception as exc:
-                logger.debug(
-                    "Fallback to %s/%s: could not attach credential pool: %s",
-                    fb_provider, fb_model, exc,
-                )
+                logger.debug("Fallback pool load failed for %s: %s", fallback_pool_key, exc)
 
         # Honor per-provider / per-model request_timeout_seconds for the
         # fallback target (same knob the primary client uses).  None = use

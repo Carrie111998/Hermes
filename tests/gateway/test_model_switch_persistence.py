@@ -108,6 +108,48 @@ class TestApplySessionModelOverride:
         assert rt["base_url"] == "https://openrouter.ai/api/v1"
         assert rt["api_mode"] == "chat_completions"
 
+    def test_named_custom_override_preserves_transport_and_requested_identity(
+        self, monkeypatch
+    ):
+        """A stored named custom identity must not collapse to bare custom."""
+        import gateway.run as gateway_run
+
+        runner = _make_runner()
+        sk = build_session_key(_make_source())
+        pool = object()
+        seen = []
+        monkeypatch.setattr(
+            gateway_run,
+            "_credential_pool_for_provider",
+            lambda provider: seen.append(provider) or pool,
+        )
+        runner._session_model_overrides[sk] = {
+            "model": "named-model",
+            "provider": "custom",
+            "requested_provider": "custom:account-b",
+            "api_key": "account-b-key",
+            "base_url": "https://shared.example/v1",
+            "api_mode": "chat_completions",
+        }
+
+        model, runtime = runner._apply_session_model_override(
+            sk,
+            "global-model",
+            {
+                "provider": "anthropic",
+                "requested_provider": "anthropic",
+                "api_key": "global-key",
+                "base_url": "https://api.anthropic.com",
+                "api_mode": "anthropic_messages",
+            },
+        )
+
+        assert model == "named-model"
+        assert runtime["provider"] == "custom"
+        assert runtime["requested_provider"] == "custom:account-b"
+        assert runtime["credential_pool"] is pool
+        assert seen == ["custom:account-b"]
+
     def test_no_override_returns_originals(self):
         runner = _make_runner()
         sk = build_session_key(_make_source())

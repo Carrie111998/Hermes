@@ -677,6 +677,7 @@ def init_agent(
                 credential_pool,
                 agent.provider,
                 base_url=agent.base_url,
+                provider_name=getattr(agent, "requested_provider", None),
             ):
                 agent._credential_pool = None
         except Exception:
@@ -1011,6 +1012,8 @@ def init_agent(
     # raw_codex=True because the main agent needs direct responses.stream()
     # access for Codex Responses API streaming.
     agent._anthropic_client = None
+    agent._anthropic_api_key = ""
+    agent._anthropic_base_url = ""
     agent._is_anthropic_oauth = False
 
     # Resolve per-provider / per-model request timeout once up front so
@@ -1259,9 +1262,46 @@ def init_agent(
                     for _fb in _fb_entries:
                         try:
                             from hermes_cli.fallback_config import resolve_entry_api_key
+                            from hermes_cli.runtime_provider import resolve_runtime_provider
                             _fb_explicit_key = resolve_entry_api_key(_fb)
+                            _fb_runtime = {}
+                            _fb_transport = str(_fb.get("provider") or "").strip().lower()
+                            _fb_requested = _fb_transport
+                            _fb_api_mode = "chat_completions"
+                            # Identity resolution is advisory for availability:
+                            # if config/auth lookup is unavailable, still let
+                            # resolve_provider_client decide whether this entry
+                            # can actually be used.
+                            try:
+                                _candidate_runtime = resolve_runtime_provider(
+                                    requested=str(_fb.get("provider") or ""),
+                                    target_model=str(_fb.get("model") or ""),
+                                    explicit_base_url=_fb.get("base_url"),
+                                    explicit_api_key=_fb_explicit_key,
+                                )
+                                if isinstance(_candidate_runtime, dict):
+                                    _fb_runtime = _candidate_runtime
+                                    _fb_transport = str(
+                                        _fb_runtime.get("provider") or _fb_transport
+                                    ).strip().lower()
+                                    _fb_requested = str(
+                                        _fb_runtime.get("requested_provider") or _fb["provider"]
+                                    ).strip().lower()
+                                    _fb_api_mode = str(
+                                        _fb_runtime.get("api_mode") or _fb_api_mode
+                                    ).strip().lower()
+                            except Exception as _identity_exc:
+                                logger.debug(
+                                    "Init fallback identity resolution failed for %s: %s",
+                                    _fb.get("provider"), _identity_exc,
+                                )
+                            _fb_api_mode = str(
+                                _fb_runtime.get("api_mode") or _fb_api_mode
+                            ).strip().lower()
+                            if _fb_api_mode in {"bedrock_converse", "codex_app_server"}:
+                                continue
                             _fb_client, _fb_model = resolve_provider_client(
-                                _fb["provider"], model=_fb["model"], raw_codex=True,
+                                str(_fb.get("provider") or ""), model=str(_fb.get("model") or ""), raw_codex=True,
                                 explicit_base_url=_fb.get("base_url"),
                                 explicit_api_key=_fb_explicit_key,
                             )
@@ -1272,13 +1312,73 @@ def init_agent(
                             )
                             continue
                         if _fb_client is not None:
-                            agent.provider = _fb["provider"]
+                            from hermes_cli.model_switch import _canonical_requested_provider_identity
+                            agent.provider = _fb_transport
+                            agent.requested_provider = _canonical_requested_provider_identity(
+                                _fb_transport, _fb_requested
+                            )
                             agent.model = _fb_model or _fb["model"]
+                            agent.api_mode = _fb_api_mode
                             agent._fallback_activated = True
-                            client_kwargs = {
-                                "api_key": _fb_client.api_key,
-                                "base_url": str(_fb_client.base_url),
-                            }
+                            # Match runtime fallback adoption: only bind a pool
+                            # that belongs to the exact fallback identity and
+                            # still contains credentials.  An empty pool must
+                            # not poison recovery by occupying the slot.
+                            fallback_pool_key = _fb_transport
+                            if _fb_transport == "custom":
+                                named_identity = str(_fb_requested or "").strip()
+                                if named_identity and named_identity.lower() != "custom":
+                                    fallback_pool_key = f"custom:{named_identity.removeprefix('custom:').replace(' ', '-').lower()}"
+                            runtime_pool = _fb_runtime.get("credential_pool")
+                            runtime_pool_provider = str(
+                                getattr(runtime_pool, "provider", "") or ""
+                            ).strip().lower()
+                            runtime_pool_matches = (
+                                runtime_pool is not None
+                                and runtime_pool_provider == str(fallback_pool_key or "").lower()
+                            )
+                            runtime_pool_has_credentials = False
+                            if runtime_pool_matches:
+                                try:
+                                    runtime_pool_has_credentials = bool(
+                                        runtime_pool.has_credentials()
+                                    )
+                                except Exception:
+                                    runtime_pool_has_credentials = False
+                            if runtime_pool_matches and runtime_pool_has_credentials:
+                                agent._credential_pool = runtime_pool
+                            elif fallback_pool_key:
+                                try:
+                                    from agent.credential_pool import load_pool
+                                    loaded_pool = load_pool(fallback_pool_key)
+                                    if loaded_pool and loaded_pool.has_credentials():
+                                        agent._credential_pool = loaded_pool
+                                except Exception as _pool_exc:
+                                    logger.debug(
+                                        "Init fallback pool load failed for %s: %s",
+                                        fallback_pool_key,
+                                        _pool_exc,
+                                    )
+                            # A runtime resolver may have selected a native
+                            # Anthropic wire mode for a named custom endpoint.
+                            # Build that client directly instead of routing the
+                            # endpoint through OpenAI chat completions.
+                            if _fb_api_mode == "anthropic_messages":
+                                from agent.anthropic_adapter import build_anthropic_client
+                                agent._anthropic_api_key = _fb_client.api_key or ""
+                                agent._anthropic_base_url = str(_fb_client.base_url)
+                                agent._anthropic_client = build_anthropic_client(
+                                    agent._anthropic_api_key,
+                                    agent._anthropic_base_url,
+                                    timeout=_provider_timeout,
+                                )
+                                agent.client = None
+                                client_kwargs = {}
+                            else:
+                                client_kwargs = {
+                                    "api_key": _fb_client.api_key,
+                                    "base_url": str(_fb_client.base_url),
+                                }
                             if _provider_timeout is not None:
                                 client_kwargs["timeout"] = _provider_timeout
                             _fb_headers = getattr(_fb_client, "_custom_headers", None)
@@ -1360,32 +1460,38 @@ def init_agent(
         except Exception:
             logger.debug("custom-provider TLS resolution skipped", exc_info=True)
 
-        agent.api_key = client_kwargs.get("api_key", "")
-        agent.base_url = client_kwargs.get("base_url", agent.base_url)
-        try:
-            from agent.ssl_guard import verify_ca_bundle_with_fallback
+        if agent.api_mode == "anthropic_messages" and getattr(agent, "_anthropic_client", None) is not None:
+            # Native Anthropic routes own their client; do not replace it with an
+            # OpenAI-compatible client in the shared post-resolution path.
+            agent.client = None
+            agent._client_kwargs = {}
+        else:
+            agent.api_key = client_kwargs.get("api_key", "")
+            agent.base_url = client_kwargs.get("base_url", agent.base_url)
+            try:
+                from agent.ssl_guard import verify_ca_bundle_with_fallback
 
-            verify_ca_bundle_with_fallback()
-            agent.client = agent._create_openai_client(client_kwargs, reason="agent_init", shared=True)
-            if not agent.quiet_mode:
-                print(f"🤖 AI Agent initialized with model: {agent.model}")
-                if base_url:
-                    print(f"🔗 Using custom base URL: {base_url}")
-                # ``api_key`` may be a callable Entra ID bearer
-                # provider (Azure Foundry). The OpenAI SDK mints a
-                # fresh JWT per request internally — the banner
-                # never invokes or inspects the callable.
-                from agent.azure_identity_adapter import is_token_provider
+                verify_ca_bundle_with_fallback()
+                agent.client = agent._create_openai_client(client_kwargs, reason="agent_init", shared=True)
+                if not agent.quiet_mode:
+                    print(f"🤖 AI Agent initialized with model: {agent.model}")
+                    if base_url:
+                        print(f"🔗 Using custom base URL: {base_url}")
+                    # ``api_key`` may be a callable Entra ID bearer
+                    # provider (Azure Foundry). The OpenAI SDK mints a
+                    # fresh JWT per request internally — the banner
+                    # never invokes or inspects the callable.
+                    from agent.azure_identity_adapter import is_token_provider
 
-                key_used = client_kwargs.get("api_key", "none")
-                if is_token_provider(key_used):
-                    print("🔑 Using credentials: Microsoft Entra ID")
-                elif isinstance(key_used, str) and key_used and key_used != "dummy-key" and len(key_used) > 12:
-                    print(f"🔑 Using API key: {key_used[:8]}...{key_used[-4:]}")
-                else:
-                    print("⚠️  Warning: API key appears invalid or missing")
-        except Exception as e:
-            raise RuntimeError(f"Failed to initialize OpenAI client: {e}")
+                    key_used = client_kwargs.get("api_key", "none")
+                    if is_token_provider(key_used):
+                        print("🔑 Using credentials: Microsoft Entra ID")
+                    elif isinstance(key_used, str) and key_used and key_used != "dummy-key" and len(key_used) > 12:
+                        print(f"🔑 Using API key: {key_used[:8]}...{key_used[-4:]}")
+                    else:
+                        print("⚠️  Warning: API key appears invalid or missing")
+            except Exception as e:
+                raise RuntimeError(f"Failed to initialize OpenAI client: {e}")
 
     # Keep a stable identity for the pool entry that supplied this runtime.
     # OAuth refreshes can replace the runtime token before a failed request is

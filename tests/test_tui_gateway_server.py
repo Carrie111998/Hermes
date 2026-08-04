@@ -3015,12 +3015,21 @@ def test_stored_session_runtime_overrides_skips_bare_billing_provider():
     assert ov["provider_override"] == "anthropic"
     assert ov["model_override"]["provider"] == "anthropic"
 
-    # An explicit routable provider in model_config wins over the bare billing bucket.
+    # A new-format row preserves the runtime transport separately from the
+    # selected identity, so a shared URL cannot choose the wrong account.
     ov = server._stored_session_runtime_overrides(
-        {"model": "m", "billing_provider": "custom", "model_config": {"provider": "custom:myendpoint"}}
+        {
+            "model": "m",
+            "billing_provider": "custom",
+            "model_config": {
+                "provider": "custom",
+                "requested_provider": "custom:myendpoint",
+            },
+        }
     )
     assert ov["provider_override"] == "custom:myendpoint"
-    assert ov["model_override"]["provider"] == "custom:myendpoint"
+    assert ov["model_override"]["provider"] == "custom"
+    assert ov["model_override"]["requested_provider"] == "custom:myendpoint"
 
 
 def test_stored_session_runtime_overrides_restores_explicit_normal_tier():
@@ -3374,6 +3383,10 @@ def test_apply_model_switch_persist_override_false_never_persists(monkeypatch):
 
     assert out["value"] == "new/model"
     assert session["model_override"]["model"] == "new/model"
+    # Old duck-typed switch results have no requested_provider. Their transport
+    # remains the only available durable identity, rather than crashing the
+    # TUI switch path.
+    assert session["model_override"]["requested_provider"] == "nous"
 
 
 def test_startup_runtime_uses_tui_provider_env(monkeypatch):
@@ -3502,6 +3515,23 @@ def test_background_agent_kwargs_preserves_full_fallback_chain(monkeypatch):
     kwargs = server._background_agent_kwargs(agent, "task-id")
 
     assert kwargs["fallback_model"] == chain
+
+
+def test_background_agent_kwargs_preserves_named_provider_identity(monkeypatch):
+    agent = types.SimpleNamespace(
+        model="named-model",
+        provider="custom",
+        requested_provider="custom:account-b",
+        _fallback_chain=[],
+    )
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"max_turns": 25})
+    monkeypatch.setattr(server, "_load_enabled_toolsets", lambda: ["file"])
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+
+    kwargs = server._background_agent_kwargs(agent, "task-id")
+
+    assert kwargs["provider"] == "custom"
+    assert kwargs["requested_provider"] == "custom:account-b"
 
 
 def test_background_agent_kwargs_preserves_empty_fallback_chain(monkeypatch):

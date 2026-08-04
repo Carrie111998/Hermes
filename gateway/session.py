@@ -746,11 +746,18 @@ def build_session_context_prompt(
 
 
 # Keys of a /model session override that are safe to persist to disk.
-# ``api_key`` (and anything else, e.g. ``api_mode`` which is re-derived from
-# provider resolution) is intentionally excluded: credentials must NEVER be
-# written to sessions.json.  On rehydration after a gateway restart the
-# runner re-resolves credentials via the normal runtime provider resolution.
-PERSISTABLE_MODEL_OVERRIDE_KEYS = ("model", "provider", "base_url")
+# ``provider`` is the runtime transport while ``requested_provider`` preserves
+# the configured/named identity (for example ``custom:account-b``).  ``api_key``
+# (and anything else, e.g. ``api_mode`` which is re-derived from provider
+# resolution) is intentionally excluded: credentials must NEVER be written to
+# sessions.json. On rehydration after a gateway restart the runner re-resolves
+# credentials via the normal runtime provider resolution.
+PERSISTABLE_MODEL_OVERRIDE_KEYS = (
+    "model",
+    "provider",
+    "requested_provider",
+    "base_url",
+)
 
 
 def sanitize_model_override(override: Optional[Dict[str, Any]]) -> Optional[Dict[str, str]]:

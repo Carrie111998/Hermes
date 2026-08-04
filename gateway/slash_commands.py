@@ -1767,8 +1767,13 @@ class GatewaySlashCommandsMixin:
         if override:
             current_model = override.get("model", current_model)
             current_provider = override.get("provider", current_provider)
+            current_requested_provider = override.get(
+                "requested_provider", current_provider
+            )
             current_base_url = override.get("base_url", current_base_url)
             current_api_key = override.get("api_key", current_api_key)
+        else:
+            current_requested_provider = current_provider
 
         # No args: show interactive picker (Telegram/Discord) or text list
         if not model_input and not explicit_provider:
@@ -1805,6 +1810,7 @@ class GatewaySlashCommandsMixin:
                     _session_key = session_key
                     _cur_model = current_model
                     _cur_provider = current_provider
+                    _cur_requested_provider = current_requested_provider
                     _cur_base_url = current_base_url
                     _cur_api_key = current_api_key
                     _picker_profile_home = _command_profile_home
@@ -1824,6 +1830,7 @@ class GatewaySlashCommandsMixin:
                             _switch_model,
                             raw_input=model_id,
                             current_provider=_cur_provider,
+                            current_requested_provider=_cur_requested_provider,
                             current_model=_cur_model,
                             current_base_url=_cur_base_url,
                             current_api_key=_cur_api_key,
@@ -1867,6 +1874,10 @@ class GatewaySlashCommandsMixin:
                                 cached_entry[0].switch_model(
                                     new_model=result.new_model,
                                     new_provider=result.target_provider,
+                                    requested_provider=(
+                                        result.requested_provider
+                                        or result.target_provider
+                                    ),
                                     api_key=result.api_key,
                                     base_url=result.base_url,
                                     api_mode=result.api_mode,
@@ -1925,6 +1936,9 @@ class GatewaySlashCommandsMixin:
                         _self._session_model_overrides[_session_key] = {
                             "model": result.new_model,
                             "provider": result.target_provider,
+                            "requested_provider": (
+                                result.requested_provider or result.target_provider
+                            ),
                             "api_key": result.api_key,
                             "base_url": result.base_url,
                             "api_mode": result.api_mode,
@@ -1983,7 +1997,10 @@ class GatewaySlashCommandsMixin:
                                 except Exception:
                                     _persist_model_cfg.pop("context_length", None)
                                 _persist_model_cfg["default"] = result.new_model
-                                _persist_model_cfg["provider"] = result.target_provider
+                                _persist_model_cfg["provider"] = (
+                                    result.requested_provider
+                                    or result.target_provider
+                                )
                                 # Named providers always resolve base_url/api_mode fresh,
                                 # so any leftover is cleared unconditionally below. Custom
                                 # providers have no registry entry to re-derive from, so
@@ -2132,6 +2149,7 @@ class GatewaySlashCommandsMixin:
             _switch_model,
             raw_input=model_input,
             current_provider=current_provider,
+            current_requested_provider=current_requested_provider,
             current_model=current_model,
             current_base_url=current_base_url,
             current_api_key=current_api_key,
@@ -2179,6 +2197,9 @@ class GatewaySlashCommandsMixin:
                     cached_entry[0].switch_model(
                         new_model=result.new_model,
                         new_provider=result.target_provider,
+                        requested_provider=(
+                            result.requested_provider or result.target_provider
+                        ),
                         api_key=result.api_key,
                         base_url=result.base_url,
                         api_mode=result.api_mode,
@@ -2236,6 +2257,9 @@ class GatewaySlashCommandsMixin:
             self._session_model_overrides[session_key] = {
                 "model": result.new_model,
                 "provider": result.target_provider,
+                "requested_provider": (
+                    result.requested_provider or result.target_provider
+                ),
                 "api_key": result.api_key,
                 "base_url": result.base_url,
                 "api_mode": result.api_mode,
@@ -2313,7 +2337,9 @@ class GatewaySlashCommandsMixin:
                     except Exception:
                         model_cfg.pop("context_length", None)
                     model_cfg["default"] = result.new_model
-                    model_cfg["provider"] = result.target_provider
+                    model_cfg["provider"] = (
+                        result.requested_provider or result.target_provider
+                    )
                     # See the picker handler above for why custom providers need an
                     # explicit set-or-clear instead of the old lone truthy check (#25107).
                     _is_custom_target = str(result.target_provider or "").strip().lower() == "custom"

@@ -60,6 +60,44 @@ def test_make_agent_passes_resolved_provider():
         assert call_kwargs.kwargs["api_mode"] == "anthropic_messages"
 
 
+def test_make_agent_passes_resolved_named_provider_identity():
+    """TUI rebuilds must not collapse named custom identity to bare transport."""
+    fake_runtime = {
+        "provider": "custom",
+        "requested_provider": "custom:account-b",
+        "base_url": "https://shared.example/v1",
+        "api_key": "account-b-key",
+        "api_mode": "chat_completions",
+        "command": None,
+        "args": None,
+        "credential_pool": None,
+    }
+    fake_cfg = {
+        "model": {"default": "named-model", "provider": "custom:account-b"},
+        "agent": {"system_prompt": "test"},
+    }
+
+    with (
+        patch("tui_gateway.server._load_cfg", return_value=fake_cfg),
+        patch("tui_gateway.server._get_db", return_value=MagicMock()),
+        patch("tui_gateway.server._load_tool_progress_mode", return_value="compact"),
+        patch("tui_gateway.server._load_reasoning_config", return_value=None),
+        patch("tui_gateway.server._load_service_tier", return_value=None),
+        patch("tui_gateway.server._load_enabled_toolsets", return_value=None),
+        patch(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            return_value=fake_runtime,
+        ),
+        patch("run_agent.AIAgent") as mock_agent,
+    ):
+        from tui_gateway.server import _make_agent
+
+        _make_agent("sid-named", "key-named")
+
+    assert mock_agent.call_args.kwargs["provider"] == "custom"
+    assert mock_agent.call_args.kwargs["requested_provider"] == "custom:account-b"
+
+
 def test_probe_config_health_flags_null_sections():
     """Bare YAML keys (`agent:` with no value) parse as None and silently
     drop nested settings; probe must surface them so users can fix."""

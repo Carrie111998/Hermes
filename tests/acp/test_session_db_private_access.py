@@ -11,6 +11,7 @@ import ast
 import json
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch, call
 
 import pytest
@@ -131,6 +132,69 @@ class TestNoPrviateDBAccess:
 # ---------------------------------------------------------------------------
 # Integration: _persist round-trip via SessionManager
 # ---------------------------------------------------------------------------
+
+class TestNamedCustomProviderIdentityPersistence:
+    def test_restore_uses_requested_provider_not_custom_transport(self, tmp_path, monkeypatch):
+        """ACP restart must retain named custom selection when transports collapse."""
+        resolved_requests = []
+
+        def fake_resolve_runtime_provider(requested=None, **_kwargs):
+            resolved_requests.append(requested)
+            return {
+                "provider": "custom",
+                "requested_provider": "custom:account-b",
+                "api_mode": "chat_completions",
+                "base_url": "https://shared.example/v1",
+                "api_key": "account-b-key",
+                "command": None,
+                "args": [],
+            }
+
+        def fake_agent(**kwargs):
+            return SimpleNamespace(
+                model=kwargs.get("model"),
+                provider=kwargs.get("provider"),
+                requested_provider=kwargs.get("requested_provider"),
+                base_url=kwargs.get("base_url"),
+                api_mode=kwargs.get("api_mode"),
+            )
+
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"model": {"default": "named-model", "provider": "custom:account-a"}},
+        )
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            fake_resolve_runtime_provider,
+        )
+        db = SessionDB(tmp_path / "state.db")
+
+        with patch("run_agent.AIAgent", side_effect=fake_agent):
+            manager = SessionManager(db=db)
+            state = manager.create_session(cwd="/work")
+            state.model = "account-b-model"
+            state.agent = fake_agent(
+                model="account-b-model",
+                provider="custom",
+                requested_provider="custom:account-b",
+                base_url="https://shared.example/v1",
+                api_mode="chat_completions",
+            )
+            manager.save_session(state.session_id)
+            persisted = db.get_session(state.session_id)
+            meta = json.loads(persisted["model_config"])
+            assert meta["provider"] == "custom"
+            assert meta["requested_provider"] == "custom:account-b"
+
+            with manager._lock:
+                del manager._sessions[state.session_id]
+            restored = manager.get_session(state.session_id)
+
+        assert restored is not None
+        assert resolved_requests[-1] == "custom:account-b"
+        assert restored.agent.provider == "custom"
+        assert restored.agent.requested_provider == "custom:account-b"
+
 
 class TestPersistRoundTrip:
     """End-to-end: save a session and verify DB state is correct."""
