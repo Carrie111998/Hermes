@@ -46,10 +46,8 @@ class TestCodexBuildKwargs:
 
 
     def test_cache_key_is_content_addressed_not_session_id(self, transport):
-        """prompt_cache_key is content-addressed from the static prefix
-        (instructions + tools), not the session_id. This keeps recurring cron
-        jobs — whose session_id carries a per-fire timestamp — on a stable warm
-        cache key. The key is a 'pck_' hash and must NOT equal session_id."""
+        """prompt_cache_key is content-addressed from (logical_scope + static_prefix),
+        not raw session_id. The key is a 'pck_' hash and must NOT equal session_id."""
         messages = [{"role": "user", "content": "Hi"}]
         kw = transport.build_kwargs(
             model="gpt-5.4", messages=messages, tools=[],
@@ -59,10 +57,42 @@ class TestCodexBuildKwargs:
         assert pck.startswith("pck_")
         assert pck != "cron_job42_20260624_143000"
 
-    def test_cache_key_stable_across_session_ids(self, transport):
-        """Same static prefix + different session_id (e.g. two cron fires of the
-        same job) must yield the same prompt_cache_key — the whole point of the
-        fix: repeated fires reuse the warm prefix instead of going cold."""
+    def test_cache_key_logical_scope_precedence(self):
+        """Verify _logical_cache_scope precedence:
+        cron job id > child session id > gateway key > lineage root/session id > content-only fallback.
+        """
+        from agent.transports.codex import _logical_cache_scope
+
+        # 1. Cron job id (ignores timestamps)
+        assert _logical_cache_scope(session_id="cron_job42_20260624_143000") == "cron:job42"
+        assert _logical_cache_scope(session_id="cron_job42_1722800000") == "cron:job42"
+        assert _logical_cache_scope(session_id="cron_job42") == "cron:job42"
+
+        # 2. Subagent child session id
+        assert _logical_cache_scope(
+            session_id="subagent_child",
+            parent_session_id="parent_root",
+            is_subagent=True,
+        ) == "session:subagent_child"
+
+        # 3. Gateway conversation key
+        assert _logical_cache_scope(
+            session_id="sess_123",
+            gateway_session_key="telegram:chat_999",
+        ) == "session:telegram:chat_999"
+
+        # 4. Lineage root / session id
+        assert _logical_cache_scope(
+            session_id="sess_segment_2",
+            parent_session_id="sess_root_1",
+        ) == "session:sess_root_1"
+        assert _logical_cache_scope(session_id="sess_plain") == "session:sess_plain"
+
+        # 5. Content-only fallback
+        assert _logical_cache_scope() is None
+
+    def test_cache_key_cron_same_job_same_key(self, transport):
+        """Two fires of the same cron job (timestamped session_ids) must yield the same key."""
         messages = [{"role": "user", "content": "Hi"}]
         kw1 = transport.build_kwargs(
             model="gpt-5.4", messages=messages, tools=[],
@@ -73,6 +103,94 @@ class TestCodexBuildKwargs:
             session_id="cron_job42_20260624_143500",
         )
         assert kw1["prompt_cache_key"] == kw2["prompt_cache_key"]
+
+    def test_cache_key_cron_different_jobs_different_keys(self, transport):
+        """Two different cron jobs with the same static prefix must yield different keys."""
+        messages = [{"role": "user", "content": "Hi"}]
+        kw1 = transport.build_kwargs(
+            model="gpt-5.4", messages=messages, tools=[],
+            session_id="cron_job42_20260624_143000",
+        )
+        kw2 = transport.build_kwargs(
+            model="gpt-5.4", messages=messages, tools=[],
+            session_id="cron_job99_20260624_143000",
+        )
+        assert kw1["prompt_cache_key"] != kw2["prompt_cache_key"]
+
+    def test_cache_key_independent_interactive_sessions_different_keys(self, transport):
+        """Two independent interactive sessions with identical tools/instructions get different keys."""
+        messages = [{"role": "user", "content": "Hi"}]
+        kw1 = transport.build_kwargs(
+            model="gpt-5.4", messages=messages, tools=[],
+            session_id="session_A",
+        )
+        kw2 = transport.build_kwargs(
+            model="gpt-5.4", messages=messages, tools=[],
+            session_id="session_B",
+        )
+        assert kw1["prompt_cache_key"] != kw2["prompt_cache_key"]
+
+    def test_cache_key_gateway_session_key_same_scope(self, transport):
+        """Same gateway conversation key across session rotations yields the same key."""
+        messages = [{"role": "user", "content": "Hi"}]
+        kw1 = transport.build_kwargs(
+            model="gpt-5.4", messages=messages, tools=[],
+            session_id="sess_1",
+            gateway_session_key="telegram:chat_100",
+        )
+        kw2 = transport.build_kwargs(
+            model="gpt-5.4", messages=messages, tools=[],
+            session_id="sess_2",
+            gateway_session_key="telegram:chat_100",
+        )
+        assert kw1["prompt_cache_key"] == kw2["prompt_cache_key"]
+
+    def test_cache_key_parent_child_subagent_different_keys(self, transport):
+        """Parent session and subagent child session yield different cache keys."""
+        messages = [{"role": "user", "content": "Hi"}]
+        kw_parent = transport.build_kwargs(
+            model="gpt-5.4", messages=messages, tools=[],
+            session_id="parent_sess",
+        )
+        kw_child = transport.build_kwargs(
+            model="gpt-5.4", messages=messages, tools=[],
+            session_id="child_subagent",
+            parent_session_id="parent_sess",
+            is_subagent=True,
+        )
+        assert kw_parent["prompt_cache_key"] != kw_child["prompt_cache_key"]
+
+    def test_cache_key_sibling_subagents_different_keys(self, transport):
+        """Two sibling subagent children of the same parent yield different cache keys."""
+        messages = [{"role": "user", "content": "Hi"}]
+        kw_child1 = transport.build_kwargs(
+            model="gpt-5.4", messages=messages, tools=[],
+            session_id="child_subagent_1",
+            parent_session_id="parent_sess",
+            is_subagent=True,
+        )
+        kw_child2 = transport.build_kwargs(
+            model="gpt-5.4", messages=messages, tools=[],
+            session_id="child_subagent_2",
+            parent_session_id="parent_sess",
+            is_subagent=True,
+        )
+        assert kw_child1["prompt_cache_key"] != kw_child2["prompt_cache_key"]
+
+    def test_cache_key_compression_lineage_same_root_key(self, transport):
+        """Context compression lineage (parent_session_id set without is_subagent) uses root scope."""
+        messages = [{"role": "user", "content": "Hi"}]
+        kw_root = transport.build_kwargs(
+            model="gpt-5.4", messages=messages, tools=[],
+            session_id="root_sess",
+        )
+        kw_rotated = transport.build_kwargs(
+            model="gpt-5.4", messages=messages, tools=[],
+            session_id="rotated_sess",
+            parent_session_id="root_sess",
+            is_subagent=False,
+        )
+        assert kw_root["prompt_cache_key"] == kw_rotated["prompt_cache_key"]
 
 
     def test_github_responses_drops_message_item_id_end_to_end(self, transport):

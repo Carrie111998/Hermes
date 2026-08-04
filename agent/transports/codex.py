@@ -117,6 +117,98 @@ def _default_prompt_cache_retention_for_request(
     return None
 
 
+def _logical_cache_scope(
+    session_id: Optional[str] = None,
+    gateway_session_key: Optional[str] = None,
+    parent_session_id: Optional[str] = None,
+    is_subagent: bool = False,
+    conversation_id: Optional[str] = None,
+    session_db: Any = None,
+) -> Optional[str]:
+    """Derive the logical isolation scope for prompt cache routing.
+
+    Scope precedence order:
+    1. Cron job id (e.g. `cron:<job_id>`, parsed from `cron_<job>_<timestamp>`, ignoring per-fire timestamps)
+    2. Child session id (e.g. `session:<child_session_id>`, for subagent turns)
+    3. Gateway conversation id (e.g. `session:<gateway_session_key>` / `conversation_id`)
+    4. Session id / lineage root (e.g. `session:<parent_session_id>` or `session:<session_id>`)
+    5. Content-only fallback (returns None when no session identity is provided)
+    """
+    sid = str(session_id or "").strip()
+    effective_gateway_key = (gateway_session_key or conversation_id or "").strip()
+
+    # 1. Cron job id precedence
+    if sid and (sid.startswith("cron_") or sid.startswith("cron:")):
+        raw = sid[5:]  # strip 'cron_' or 'cron:'
+        # Strip trailing timestamp (ISO-8601, compact YYYYMMDD_HHMMSS, or epoch digits)
+        job_id = re.sub(
+            r'(?:[_\:](?:\d{4}-\d{2}-\d{2}[T_\-]?\d{2}[\:\-]?\d{2}[\:\-]?\d{2}.*|\d{8}[_\-]\d{6}.*|\d{9,13}))$',
+            '',
+            raw,
+        )
+        job_id = job_id or raw
+        return f"cron:{job_id}"
+
+    # 2. Child session id precedence (subagents)
+    if is_subagent:
+        return f"session:{sid}" if sid else None
+
+    # 3. Gateway conversation id precedence
+    if effective_gateway_key:
+        return f"session:{effective_gateway_key}"
+
+    # 4. Session id / lineage root precedence (interactive CLI/TUI, compression lineage)
+    root_id = None
+    if session_db and hasattr(session_db, "get_conversation_root"):
+        try:
+            target = sid or str(parent_session_id or "").strip()
+            if target:
+                root_id = session_db.get_conversation_root(target)
+        except Exception:
+            root_id = None
+    if not root_id:
+        if parent_session_id and str(parent_session_id).strip():
+            root_id = str(parent_session_id).strip()
+        elif sid:
+            root_id = sid
+
+    if root_id:
+        return f"session:{root_id}"
+
+    # 5. Content-only fallback (no session identity available)
+    return None
+
+
+def _scoped_cache_key(
+    scope: Optional[str],
+    instructions: str,
+    tools: Optional[List[Dict[str, Any]]],
+) -> Optional[str]:
+    """Content-address the prompt cache key from (logical_scope + static_prefix).
+
+    Returns ``pck_<sha256[:24]>`` of (scope + "\x00" + instructions + sorted tools),
+    or None when there is no static prefix (instructions and tools both empty/None).
+    If scope is None, falls back to unscoped _content_cache_key.
+    """
+    if not instructions and not tools:
+        return None
+    if not scope:
+        return _content_cache_key(instructions, tools)
+
+    tools_part = ""
+    if tools:
+        sorted_tools = sorted(
+            (t for t in tools if isinstance(t, dict)),
+            key=lambda t: str(t.get("name") or t.get("type") or ""),
+        )
+        tools_part = json.dumps(
+            sorted_tools, sort_keys=True, ensure_ascii=False, separators=(",", ":")
+        )
+    content = f"{scope}\x00{instructions or ''}\x00{tools_part}"
+    digest = hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest()[:24]
+    return f"pck_{digest}"
+
+
 def _content_cache_key(instructions: str, tools: Optional[List[Dict[str, Any]]]) -> Optional[str]:
     """Content-address the prompt cache key from the static request prefix.
 
@@ -340,13 +432,30 @@ class ResponsesApiTransport(ProviderTransport):
             kwargs["parallel_tool_calls"] = True
 
         session_id = params.get("session_id")
-        # prompt_cache_key is content-addressed from the static prefix
-        # (instructions + tools), NOT session_id — recurring cron jobs carry a
-        # per-fire timestamp in session_id (cron_<id>_<ts>) that made every run
-        # cache-cold. session_id is left untouched for transcript isolation and
-        # the cache-scope routing headers below. Falls back to session_id when
-        # there is no static content to hash.
-        cache_key = _content_cache_key(instructions, response_tools) or session_id
+        gateway_session_key = params.get("gateway_session_key") or params.get("conversation_id")
+        parent_session_id = params.get("parent_session_id")
+        is_subagent = bool(params.get("is_subagent"))
+
+        # Explicit prompt_cache_key override (top-level param, request_overrides, or extra_body)
+        explicit_cache_key = params.get("prompt_cache_key")
+        request_overrides = params.get("request_overrides")
+        if not explicit_cache_key and isinstance(request_overrides, dict):
+            explicit_cache_key = request_overrides.get("prompt_cache_key")
+            if not explicit_cache_key and isinstance(request_overrides.get("extra_body"), dict):
+                explicit_cache_key = request_overrides["extra_body"].get("prompt_cache_key")
+
+        if explicit_cache_key:
+            cache_key = explicit_cache_key
+        else:
+            scope = _logical_cache_scope(
+                session_id=session_id,
+                gateway_session_key=gateway_session_key,
+                parent_session_id=parent_session_id,
+                is_subagent=is_subagent,
+                session_db=params.get("session_db"),
+            )
+            cache_key = _scoped_cache_key(scope, instructions, response_tools) or session_id
+
         # xAI Responses takes prompt_cache_key in extra_body (set further
         # down); GitHub Models opts out of cache-key routing entirely.
         if not is_github_responses and not is_xai_responses and cache_key:

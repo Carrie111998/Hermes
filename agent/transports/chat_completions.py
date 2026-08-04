@@ -47,6 +47,11 @@ def _add_prompt_cache_key(
     messages: list[dict[str, Any]],
     tools: list[dict[str, Any]] | None,
     supports_prompt_cache_key: bool,
+    session_id: str | None = None,
+    gateway_session_key: str | None = None,
+    parent_session_id: str | None = None,
+    is_subagent: bool = False,
+    session_db: Any = None,
 ) -> None:
     """Add a content-addressed key only for an explicitly capable endpoint."""
     if not supports_prompt_cache_key:
@@ -62,9 +67,16 @@ def _add_prompt_cache_key(
 
     # Reuse the Responses transport's single authoritative hash algorithm so
     # equivalent static prefixes route to the same cache bucket across modes.
-    from agent.transports.codex import _content_cache_key
+    from agent.transports.codex import _logical_cache_scope, _scoped_cache_key
 
-    cache_key = _content_cache_key(_static_prompt_instructions(messages), tools)
+    scope = _logical_cache_scope(
+        session_id=session_id,
+        gateway_session_key=gateway_session_key,
+        parent_session_id=parent_session_id,
+        is_subagent=is_subagent,
+        session_db=session_db,
+    )
+    cache_key = _scoped_cache_key(scope, _static_prompt_instructions(messages), tools)
     if cache_key:
         api_kwargs["prompt_cache_key"] = cache_key
 
@@ -584,6 +596,11 @@ class ChatCompletionsTransport(ProviderTransport):
             tools=api_kwargs.get("tools"),
             supports_prompt_cache_key=bool(params.get("supports_prompt_cache_key"))
             or _is_openai_api_base_url(params.get("base_url")),
+            session_id=params.get("session_id"),
+            gateway_session_key=params.get("gateway_session_key") or params.get("conversation_id"),
+            parent_session_id=params.get("parent_session_id"),
+            is_subagent=bool(params.get("is_subagent")),
+            session_db=params.get("session_db"),
         )
 
         return api_kwargs
@@ -733,6 +750,11 @@ class ChatCompletionsTransport(ProviderTransport):
             messages=sanitized,
             tools=api_kwargs.get("tools"),
             supports_prompt_cache_key=bool(profile.supports_prompt_cache_key),
+            session_id=params.get("session_id"),
+            gateway_session_key=params.get("gateway_session_key") or params.get("conversation_id"),
+            parent_session_id=params.get("parent_session_id"),
+            is_subagent=bool(params.get("is_subagent")),
+            session_db=params.get("session_db"),
         )
 
         return api_kwargs
