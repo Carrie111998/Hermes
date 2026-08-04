@@ -3384,8 +3384,7 @@ def run_job(
         # global default, which can change after the job was created — a switch
         # to a paid PROVIDER (e.g. nous) OR a paid MODEL on the same provider
         # (e.g. claude-fable-5 on openrouter). Without a guard the job would
-        # silently inherit that change and spend real money on every tick — the
-        # $7.73 incident named BOTH a provider and a model.
+        # silently inherit that change and spend real money on every tick.
         #
         # create_job() snapshots whatever resolution would have picked at
         # creation for each unpinned axis (job["provider_snapshot"] /

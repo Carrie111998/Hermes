@@ -3,7 +3,7 @@
 Background: an UNPINNED cron job follows the global default provider. If that
 global state is changed (e.g. a temporary switch to a paid provider like
 nous/claude-fable-5), the job would silently inherit it on its next tick and
-spend real money — the $7.73 incident.
+spend real money on the next tick.
 
 The fix has two halves:
   - create_job() snapshots the provider resolution WOULD pick at creation into
@@ -261,7 +261,7 @@ def _run_with_current_provider_and_model(
 
 class TestModelDriftGuard:
     """#44585 C1: model drift on the SAME provider must also fail closed —
-    the incident named a model (claude-fable-5), and an unpinned job reads
+    a model change alone can trip the guard, and an unpinned job reads
     config.yaml model.default fresh every tick independently of provider."""
 
     def test_model_drift_same_provider_fails_closed(self, tmp_path):
