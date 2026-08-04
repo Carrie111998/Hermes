@@ -310,16 +310,24 @@ export const coreCommands: SlashCommand[] = [
       }
       // `always` persists to config (shows in every future session); `on` is
       // session-only; `off` disables and clears the persisted preference.
+      // Persistence is only CLAIMED once the gateway confirms the write
+      // (mirrors /theme): a rejected config.set must not be reported as
+      // saved, or the preference silently vanishes on restart. The session
+      // flip stays optimistic — it is local state and cannot fail.
       if (a === 'always') {
         patchUiState({ showTokens: true })
-        ctx.gateway.rpc<ConfigSetResponse>('config.set', { key: 'show_message_tokens', value: 'on' }).catch(() => {})
-        queueMicrotask(() => ctx.transcript.sys('tokens always (saved)'))
+        ctx.gateway
+          .rpc<ConfigSetResponse>('config.set', { key: 'show_message_tokens', value: 'on' })
+          .then(ctx.guarded<ConfigSetResponse>(() => ctx.transcript.sys('tokens always (saved)')))
+          .catch(ctx.guardedErr)
         return
       }
       if (a === 'off') {
         patchUiState({ showTokens: false })
-        ctx.gateway.rpc<ConfigSetResponse>('config.set', { key: 'show_message_tokens', value: 'off' }).catch(() => {})
         queueMicrotask(() => ctx.transcript.sys('tokens off'))
+        ctx.gateway
+          .rpc<ConfigSetResponse>('config.set', { key: 'show_message_tokens', value: 'off' })
+          .catch(ctx.guardedErr)
         return
       }
       if (a === 'on') {
