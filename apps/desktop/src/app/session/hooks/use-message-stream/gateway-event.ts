@@ -1132,6 +1132,10 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         // which session is focused.
         const notice = event.payload as AgentNoticePayload | undefined
 
+        if (isManagedEvaosAgent() && notice?.key?.startsWith('credits.')) {
+          return
+        }
+
         showAgentNotice(notice)
 
         // The urgent pair (access paused / restored) also breaks through as a
