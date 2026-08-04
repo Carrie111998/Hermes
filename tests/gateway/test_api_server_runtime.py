@@ -27,6 +27,7 @@ from gateway.api_server_runtime import (
     _failed_tool_result_projection,
     _normalize_runtime_messages,
     _pin_run_model,
+    _replacement_system_prompt,
     _project_runtime_resume_attachments,
     _resume_session_db_history,
     _runtime_attachment_parts,
@@ -49,6 +50,27 @@ from gateway.runtime_session_history import RuntimeSessionStateError, seed_runti
 aiohttp = pytest.importorskip("aiohttp")
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
+
+
+def test_replacement_system_prompt_logs_only_safe_digest_diagnostics(caplog):
+    caplog.set_level(logging.ERROR, logger="gateway.api_server_runtime")
+
+    with pytest.raises(ValueError, match="system_context digest mismatch"):
+        _replacement_system_prompt({
+            "version": " prompt-v1 ",
+            "mode": " replace ",
+            "digest": "sha256:bad",
+            "stable": " trusted prompt ",
+        })
+
+    record = caplog.records[-1]
+    rendered = record.getMessage()
+    assert "received=sha256:bad" in rendered
+    assert "expected=sha256:" in rendered
+    assert "version_bytes=11/9" in rendered
+    assert "mode_bytes=9/7" in rendered
+    assert "stable_bytes=16/14" in rendered
+    assert "trusted prompt" not in rendered
 
 
 @pytest.mark.asyncio

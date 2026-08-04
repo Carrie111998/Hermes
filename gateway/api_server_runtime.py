@@ -744,15 +744,32 @@ def _replacement_system_prompt(system_context: Any) -> str:
         raise ValueError("trusted system_context is required")
     if set(system_context) != {"version", "mode", "digest", "stable"}:
         raise ValueError("system_context contains unsupported fields")
-    version = str(system_context.get("version") or "").strip()
-    mode = str(system_context.get("mode") or "").strip()
-    digest = str(system_context.get("digest") or "").strip()
-    stable = str(system_context.get("stable") or "").strip()
+    raw_version = str(system_context.get("version") or "")
+    raw_mode = str(system_context.get("mode") or "")
+    raw_digest = str(system_context.get("digest") or "")
+    raw_stable = str(system_context.get("stable") or "")
+    version = raw_version.strip()
+    mode = raw_mode.strip()
+    digest = raw_digest.strip()
+    stable = raw_stable.strip()
     if not version or mode != "replace" or not digest or not stable:
         raise ValueError("trusted replacement system_context is required")
     value = f"{version}\n{mode}\n{stable}"
     expected = "sha256:" + hashlib.sha256(value.encode("utf-8")).hexdigest()
     if digest != expected:
+        logger.error(
+            "runtime system_context digest mismatch "
+            "received=%s expected=%s version_bytes=%d/%d mode_bytes=%d/%d "
+            "stable_bytes=%d/%d",
+            digest,
+            expected,
+            len(raw_version.encode("utf-8")),
+            len(version.encode("utf-8")),
+            len(raw_mode.encode("utf-8")),
+            len(mode.encode("utf-8")),
+            len(raw_stable.encode("utf-8")),
+            len(stable.encode("utf-8")),
+        )
         raise ValueError("system_context digest mismatch")
     return stable
 
