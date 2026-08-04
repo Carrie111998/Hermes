@@ -6593,11 +6593,15 @@ class SlackAdapter(BasePlatformAdapter):
             # 4 (+ Other = 5) so this is normally one block, but chunk anyway
             # so a larger choice list degrades gracefully instead of 400ing.
             elements = []
+            truncated_choices: list[tuple[int, str, str]] = []  # (idx, short, full)
             for idx, choice in enumerate(choices):
                 label = str(choice).strip() or f"Option {idx + 1}"
+                short = label[:75]
+                if len(label) > 75:
+                    truncated_choices.append((idx, short, label))
                 elements.append({
                     "type": "button",
-                    "text": {"type": "plain_text", "text": label[:75], "emoji": True},
+                    "text": {"type": "plain_text", "text": short, "emoji": True},
                     "action_id": f"hermes_clarify_choice_{idx}",
                     "value": f"{clarify_id}|{idx}",
                 })
@@ -6613,6 +6617,17 @@ class SlackAdapter(BasePlatformAdapter):
             ]
             for start in range(0, len(elements), 5):
                 blocks.append({"type": "actions", "elements": elements[start:start + 5]})
+            # Show full text for truncated button labels so users can read
+            # the complete choice before clicking (#78115).
+            if truncated_choices:
+                lines = [f"*{idx + 1}.* {full}" for idx, _short, full in truncated_choices]
+                context_text = "\n".join(lines)
+                # Escape mrkdwn control chars in the full choice text.
+                context_text = context_text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                blocks.append({
+                    "type": "context",
+                    "elements": [{"type": "mrkdwn", "text": context_text}],
+                })
 
             kwargs: Dict[str, Any] = {
                 "channel": chat_id,
