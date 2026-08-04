@@ -2352,6 +2352,11 @@ def _install_native_observation_artifacts(
     artifacts = _native_artifact_contract(plan)
     created: list[Path] = []
     try:
+        for parent in sorted(
+            {artifact.target_path.parent for artifact in artifacts.values()},
+            key=str,
+        ):
+            _ensure_root_directory(parent, mode=0o755)
         for name in (
             "writer_config",
             "gateway_config",
