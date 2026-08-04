@@ -253,17 +253,16 @@ class TestDoctorCommandInstallation:
         assert "Command Installation" in out
         assert "$PREFIX/bin" in out
 
+    @pytest.mark.skipif(sys.platform != "win32", reason="Tests the native Windows console-script layout")
     def test_wheel_virtualenv_windows_console_script_entry_point(
         self, monkeypatch, tmp_path
     ):
         """Windows console-script layout (hermes.exe in the env Scripts dir)
-        must be detected, not reported as a missing entry point (#49529,
-        verified on Win11: venv\\Scripts\\hermes.exe, bare \"hermes\" absent)."""
+        must be detected on a real win32 host — no platform fake. The
+        entry-point detection runs on all platforms; only symlink
+        management is POSIX-guarded (#49529, verified on Win11:
+        venv\\Scripts\\hermes.exe, bare \"hermes\" absent)."""
         _setup_doctor_env(monkeypatch, tmp_path)
-        # Reach the POSIX-guarded section on a win32 host without cascading
-        # POSIX-only stdlib imports (fcntl) through the doctor call chain.
-        _stub_posix_stdlib(monkeypatch)
-        monkeypatch.setattr(sys, "platform", "linux")
         venv = tmp_path / "wheel-venv"
         scripts = venv / "Scripts"
         scripts.mkdir(parents=True)
@@ -289,19 +288,19 @@ class TestDoctorCommandInstallation:
 
         out = _run_doctor(fix=False)
 
+        assert "Command Installation" in out
         assert "Venv entry point exists" in out
         assert "hermes.exe" in out
         assert "Venv entry point not found" not in out
         assert "Active environment entry point needs no global symlink" in out
 
+    @pytest.mark.skipif(sys.platform != "win32", reason="Tests the native Windows console-script layout")
     def test_wheel_virtualenv_windows_console_script_missing_still_warns(
         self, monkeypatch, tmp_path
     ):
         """Windows layout with no console script at all must still warn (no
         false all-clear from the .exe/.cmd/.bat name scan)."""
         _setup_doctor_env(monkeypatch, tmp_path)
-        _stub_posix_stdlib(monkeypatch)
-        monkeypatch.setattr(sys, "platform", "linux")  # reach the POSIX-guarded section
         venv = tmp_path / "wheel-venv"
         scripts = venv / "Scripts"
         scripts.mkdir(parents=True)
