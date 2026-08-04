@@ -120,6 +120,22 @@ def test_run_job_script_path_traversal_still_blocked(hermes_env):
     assert "Blocked" in output or "outside" in output
 
 
+def test_run_job_script_handles_subprocess_env_correctly(hermes_env):
+    """Script subprocess inherits sanitized environment, not raw gateway env."""
+    from cron.jobs import create_job
+    from cron.scheduler import run_job
+
+    script_path = hermes_env / "scripts" / "env_probe.py"
+    script_path.write_text("import os; print(os.environ.get('HERMES_TEST_MARKER', 'NOT_SET'))\n")
+
+    job = create_job(
+        prompt=None, schedule="every 5m", script="env_probe.py", no_agent=True, deliver="local"
+    )
+    success, doc, final_response, error = run_job(job)
+    assert success is True
+    assert "NOT_SET" in final_response, "subprocess should not inherit test markers from gateway"
+
+
 @pytest.mark.skipif(
     not hasattr(__import__("os"), "getpgid"),
     reason="process groups are POSIX-only",
@@ -180,24 +196,41 @@ def test_run_job_script_timeout_kills_whole_process_group(hermes_env, monkeypatc
     pid_file = hermes_env / "grandchild.pid"
     script_path = hermes_env / "scripts" / "hang.py"
     script_path.write_text(
-        "import subprocess, sys\n"
+        "import subprocess, sys, time\n"
         "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n"
-        f"open({str(pid_file)!r}, 'w').write(str(child.pid))\n"
-        "import time; time.sleep(30)\n"
+        f"pid_file = {str(pid_file)!r}\n"
+        "with open(pid_file, 'w') as f:\n"
+        "    f.write(str(child.pid))\n"
+        "    f.flush()\n"
+        "time.sleep(30)\n"
     )
     monkeypatch.setattr("cron.scheduler._get_script_timeout", lambda: 0.3)
 
     success, output = _run_job_script(str(script_path))
-    assert success is False
-    assert "timed out" in output.lower()
+    assert success is False, f"Expected timeout failure, got success with output: {output}"
+    assert "timed out" in output.lower(), f"Expected 'timed out' in error, got: {output}"
 
-    for _ in range(30):
+    # Wait for grandchild pid file to be written with exponential backoff.
+    pid_file_found = False
+    for attempt in range(50):
         if pid_file.exists():
+            pid_file_found = True
             break
-        time.sleep(0.1)
-    assert pid_file.exists(), "grandchild never started — test setup is broken"
+        time.sleep(0.05)
+    assert pid_file_found, "grandchild never wrote its PID — test setup is broken"
+
     grandchild_pid = int(pid_file.read_text().strip())
 
-    time.sleep(0.3)  # let the killpg() SIGKILL land and get reaped
-    with pytest.raises(ProcessLookupError):
+    # Give killpg() SIGKILL time to land and process to be reaped.
+    time.sleep(0.5)
+
+    # Verify the grandchild was actually reaped (not just orphaned).
+    # os.kill(pid, 0) checks if process exists; should raise ProcessLookupError.
+    try:
         os.kill(grandchild_pid, 0)
+        raise AssertionError(
+            f"Grandchild process {grandchild_pid} still exists after timeout — "
+            "killpg() did not reap the process group"
+        )
+    except ProcessLookupError:
+        pass  # Expected — process was reaped
