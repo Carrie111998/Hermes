@@ -145,3 +145,50 @@ def test_tool_turn_narration_is_not_promoted_to_final_by_tool_name():
     assert result["final_response"] == "Memory saved and verified."
     assert result["api_calls"] == 2
     assert result["turn_exit_reason"].startswith("text_response")
+
+
+def test_bare_tool_marker_is_returned_to_model_instead_of_promoted_to_final():
+    """Protocol-like text remains model-authored and cannot become runtime final."""
+    with (
+        patch(
+            "run_agent.get_tool_definitions",
+            return_value=_tool_defs("skill_manage"),
+        ),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1/",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+
+    agent._cached_system_prompt = "You are helpful."
+    agent._use_prompt_caching = False
+    agent.tool_delay = 0
+    agent.compression_enabled = False
+    agent.save_trajectories = False
+    agent.valid_tool_names = {"skill_manage"}
+    agent.client = MagicMock()
+    agent.client.chat.completions.create.side_effect = [
+        _response(
+            content="[memory]",
+            finish_reason="tool_calls",
+            tool_calls=[_tool_call("skill_manage", "skill1")],
+        ),
+        _response(content="", finish_reason="stop"),
+        _response(content="Recovered after nudge.", finish_reason="stop"),
+    ]
+
+    with (
+        patch("run_agent.handle_function_call", return_value="ok"),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("do the full task")
+
+    assert result["final_response"] == "Recovered after nudge."
+    assert result["api_calls"] == 3
