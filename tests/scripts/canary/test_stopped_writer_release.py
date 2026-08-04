@@ -8,6 +8,7 @@ import signal
 import stat
 import subprocess
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 
 import pytest
@@ -20,8 +21,13 @@ TREE_SHA = "b" * 40
 
 
 @pytest.fixture(autouse=True)
-def _tmp_path_uses_process_primary_group(tmp_path):
+def _tmp_path_uses_process_primary_group(tmp_path, monkeypatch):
     os.chown(tmp_path, -1, os.getgid())
+    monkeypatch.setattr(
+        writer_release,
+        "host_release_lifecycle_lock",
+        lambda: nullcontext(),
+    )
 
 
 def _allow_local_owner(monkeypatch) -> None:
@@ -979,6 +985,9 @@ def test_apply_requires_exact_approval_before_any_write(monkeypatch):
             REVISION,
             "f" * 64,
             release_builder=lambda *_args, **_kwargs: built.append(True),
+            lifecycle_lock=lambda: (_ for _ in ()).throw(
+                AssertionError("approval mismatch must not acquire the lifecycle lock")
+            ),
         )
 
     assert built == []
@@ -1203,7 +1212,7 @@ def test_post_build_drift_blocks_final_receipt_after_host_publication(
     second["dedicated_host"]["boot_id_sha256"] = "f" * 64
     unsigned = {name: value for name, value in second.items() if name != "plan_sha256"}
     second["plan_sha256"] = writer_release._sha256_json(unsigned)
-    plans = iter((first, second))
+    plans = iter((first, first, second))
     monkeypatch.setattr(
         writer_release,
         "plan_stopped_release",

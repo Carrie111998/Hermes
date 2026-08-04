@@ -31,7 +31,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping, NoReturn, Sequence
+from typing import Any, Callable, ContextManager, Mapping, NoReturn, Sequence
 
 from scripts.canary.runtime_units import CANARY_RUNTIME_UNITS
 
@@ -63,6 +63,7 @@ from gateway.canonical_writer_release_contract import (
     _REVISION_RE,
     render_systemd_units,
 )
+from gateway.canonical_writer_lifecycle_lock import host_release_lifecycle_lock
 
 BUILD_SCRATCH_NAME = ".release-build-scratch"
 SCRATCH_PROVENANCE_NAME = "provenance.json"
@@ -2295,7 +2296,7 @@ def _materialize_copied_interpreter(
             os.unlink(temp_path)
 
 
-def build_release(
+def _build_release_locked(
     spec: ReleaseBuildSpec,
     *,
     runner: Runner = _runner,
@@ -2445,6 +2446,19 @@ def build_release(
     ):
         raise RuntimeError("release manifest was not sealed")
     return manifest
+
+
+def build_release(
+    spec: ReleaseBuildSpec,
+    *,
+    runner: Runner = _runner,
+    lifecycle_lock: Callable[[], ContextManager[int]] | None = None,
+) -> ReleaseManifest:
+    """Build and seal one exact release under the shared host lifecycle lock."""
+
+    lock = lifecycle_lock or host_release_lifecycle_lock
+    with lock():
+        return _build_release_locked(spec, runner=runner)
 
 
 HostObserver = Callable[[], Mapping[str, str]]
@@ -3773,7 +3787,7 @@ def _read_stopped_receipt_candidate_time(path: Path) -> int | None:
     return created_at_unix
 
 
-def apply_stopped_release(
+def _apply_stopped_release_locked(
     revision: str,
     approved_plan_sha256: str,
     *,
@@ -3931,6 +3945,49 @@ def apply_stopped_release(
         plan=post_build_plan,
         release=release_with_host,
     )
+
+
+def apply_stopped_release(
+    revision: str,
+    approved_plan_sha256: str,
+    *,
+    runner: Runner = _runner,
+    host_observer: HostObserver = _default_host_observer,
+    path_exists: PathExists = os.path.lexists,
+    release_builder: ReleaseBuilder = build_release,
+    host_receipt_collector: HostReceiptCollector = _default_host_receipt_collector,
+    source_retainer: SourceRetainer = _prune_stopped_release_sources,
+    clock: Clock = time.time,
+    lifecycle_lock: Callable[[], ContextManager[int]] | None = None,
+) -> dict[str, Any]:
+    """Publish a stopped release under the shared host lifecycle lock."""
+
+    if (
+        not isinstance(approved_plan_sha256, str)
+        or _SHA256_RE.fullmatch(approved_plan_sha256) is None
+    ):
+        raise ValueError("stopped-release approved plan digest is invalid")
+    prelock_plan = plan_stopped_release(
+        revision,
+        runner=runner,
+        host_observer=host_observer,
+        path_exists=path_exists,
+    )
+    if prelock_plan["plan_sha256"] != approved_plan_sha256:
+        raise PermissionError("stopped-release approved plan digest does not match")
+    lock = lifecycle_lock or host_release_lifecycle_lock
+    with lock():
+        return _apply_stopped_release_locked(
+            revision,
+            approved_plan_sha256,
+            runner=runner,
+            host_observer=host_observer,
+            path_exists=path_exists,
+            release_builder=release_builder,
+            host_receipt_collector=host_receipt_collector,
+            source_retainer=source_retainer,
+            clock=clock,
+        )
 
 
 class _CanonicalArgumentParser(argparse.ArgumentParser):
