@@ -15744,6 +15744,15 @@ async def pty_ws(ws: WebSocket) -> None:
         return
 
     # Keep-alive path: the PTY outlives this socket; reattach by token.
+    # Client may send ?offset=N (total bytes it has already received) so the
+    # server can send an incremental replay instead of the full RingBuffer.
+    raw_offset = ws.query_params.get("offset") or ""
+    client_pty_offset: Optional[int] = None
+    if raw_offset:
+        try:
+            client_pty_offset = int(raw_offset)
+        except ValueError:
+            client_pty_offset = None
     try:
         session, _created = await PTY_REGISTRY.attach_or_spawn(
             attach_token, spawn=_spawn
@@ -15757,7 +15766,7 @@ async def pty_ws(ws: WebSocket) -> None:
         await ws.close(code=1011)
         return
 
-    await session.attach(ws)
+    await session.attach(ws, client_offset=client_pty_offset)
 
     # --- writer loop: WebSocket → PTY master ----------------------------
     # No reader task here: the session's drain task (spawned once per PTY,

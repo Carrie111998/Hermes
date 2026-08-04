@@ -21,6 +21,35 @@ def test_ringbuffer_drops_oldest_over_capacity():
     assert rb.truncated is True
 
 
+def test_ringbuffer_snapshot_from_incremental_window():
+    """snapshot_from returns only the tail after the client's offset, and
+    None once the offset has rolled out of the ring (caller must full-replay).
+    """
+    rb = RingBuffer(10)
+    rb.append(b"abcdef")          # 6 bytes appended
+    assert rb.total_appended == 6
+
+    # Offset at the tail → zero delta, no bytes (client is fully caught up).
+    assert rb.snapshot_from(6) == b""
+    # Offset mid-buffer → only the bytes after it.
+    assert rb.snapshot_from(2) == b"cdef"
+    # Offset 0 (or before the ring's earliest byte) → still in window, full
+    # snapshot; a truly rolled-out offset returns None → caller full-replays.
+    assert rb.snapshot_from(0) == b"abcdef"
+    # Negative offsets never produce a partial slice.
+    assert rb.snapshot_from(-1) is None
+
+    # Overflow evicts oldest; the window shifts accordingly.
+    rb.append(b"ghij")            # 10 bytes total, buffer full
+    assert rb.snapshot_from(6) == b"ghij"
+    assert rb.snapshot_from(4) == b"efghij"        # still in window
+    # Append past capacity evicts the oldest bytes; an offset pointing at an
+    # evicted byte rolls out and requires a full replay.
+    rb.append(b"k")               # 11 bytes → 'a' evicted, earliest=1
+    assert rb.snapshot_from(6) == b"ghijk"         # delta still available
+    assert rb.snapshot_from(0) is None             # offset 0 < earliest → rolled out
+
+
 
 
 class FakeBridge:
@@ -73,6 +102,56 @@ async def test_attach_replays_buffer_then_streams_live():
     await s.attach(ws)
     replay = b"".join(p for kind, p in ws.sent if kind == "bytes")
     assert replay == b"hello world"
+    await s.close()
+
+
+@pytest.mark.asyncio
+async def test_attach_incremental_replay_zero_delta_sends_sentinel():
+    """Reconnecting with an offset already at the tail replays zero bytes but
+    must still emit one frame: the client's resume-hydration gate is
+    edge-triggered on the FIRST payload, so a silent attach would leave the
+    loading overlay up forever (black-screen on tab-return)."""
+    from hermes_cli.pty_session import PtySession
+    bridge = FakeBridge([b"history", None])
+    s = PtySession("k", bridge, buffer_cap=1024, read_timeout=0.01)
+    await s.start()
+    await asyncio.sleep(0.05)                      # drain consumes "history"
+    ws = FakeWS()
+    await s.attach(ws, client_offset=s.buffer.total_appended)
+    sent = [p for kind, p in ws.sent if kind == "bytes"]
+    assert sent == [b"\x1b[0m"], f"expected only SGR-reset sentinel, got {sent}"
+    await s.close()
+
+
+@pytest.mark.asyncio
+async def test_attach_incremental_replay_sends_delta_only():
+    """An offset inside the ring window replays only the bytes after it —
+    never the full buffer (the xterm buffer already has the history)."""
+    from hermes_cli.pty_session import PtySession
+    bridge = FakeBridge([b"hello world", None])
+    s = PtySession("k", bridge, buffer_cap=1024, read_timeout=0.01)
+    await s.start()
+    await asyncio.sleep(0.05)
+    ws = FakeWS()
+    await s.attach(ws, client_offset=6)            # "hello " already painted
+    sent = b"".join(p for kind, p in ws.sent if kind == "bytes")
+    assert sent == b"world", f"expected only delta, got {sent!r}"
+    await s.close()
+
+
+@pytest.mark.asyncio
+async def test_attach_first_attach_empty_buffer_sends_sentinel():
+    """First attach to a PTY that has produced nothing yet must still emit a
+    frame — the loading overlay clears on first payload, not on a timer."""
+    from hermes_cli.pty_session import PtySession
+    bridge = FakeBridge([b"", b"", None])          # idle ticks, no output
+    s = PtySession("k", bridge, buffer_cap=1024, read_timeout=0.01)
+    await s.start()
+    await asyncio.sleep(0.05)
+    ws = FakeWS()
+    await s.attach(ws)                             # no client_offset → full path
+    sent = [p for kind, p in ws.sent if kind == "bytes"]
+    assert sent == [b"\x1b[0m"], f"expected SGR-reset sentinel, got {sent}"
     await s.close()
 
 
