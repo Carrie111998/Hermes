@@ -271,11 +271,14 @@ def _repair_tool_call_arguments(raw_args: str, tool_name: str = "?") -> str:
         pass
 
     # Last resort: replace with empty object so the API request doesn't
-    # crash the entire session.
+    # crash the entire session. Log the full original content (not just
+    # 80 chars) since this is the only remaining copy of whatever the
+    # caller was trying to send — the request payload is discarded right
+    # after this point with no other buffer, retry, or persistence.
     logger.warning(
         "Unrepairable tool_call arguments for %s — "
         "replaced with empty object (was: %s)",
-        tool_name, raw_stripped[:80],
+        tool_name, raw_stripped,
     )
     return "{}"
 
