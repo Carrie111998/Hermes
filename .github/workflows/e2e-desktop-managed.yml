@@ -51,12 +51,12 @@ jobs:
           OPENAI_API_KEY: ''
           NOUS_API_KEY: ''
         run: |
-          mkdir -p playwright-report
+          mkdir -p managed-report
           node --test \
             --test-reporter=spec \
             --test-reporter-destination=stdout \
             --test-reporter=junit \
-            --test-reporter-destination=playwright-report/managed-scenarios.xml \
+            --test-reporter-destination=managed-report/managed-scenarios.xml \
             electron/eva-managed-scenarios.test.cjs
 
       - name: Build and run managed Playwright specs
@@ -73,6 +73,8 @@ jobs:
 
       - name: Verify exact head and fail-closed managed reports
         working-directory: apps/desktop
+        env:
+          MANAGED_SCENARIO_REPORT: managed-report/managed-scenarios.xml
         run: node e2e/verify-managed-reports.mjs
 
       - name: Upload managed Playwright report
@@ -80,7 +82,9 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: managed-playwright-report-${{ github.sha }}
-          path: apps/desktop/playwright-report
+          path: |
+            apps/desktop/playwright-report
+            apps/desktop/managed-report
           retention-days: 14
           overwrite: true
 

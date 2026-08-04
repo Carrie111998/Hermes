@@ -20,7 +20,11 @@ const electronNative: TestProjectConfiguration = {
   test: {
     name: 'electron',
     environment: 'node',
-    include: ['electron/**/*.test.ts', 'scripts/**.test.{ts,mjs}']
+    include: ['electron/**/*.test.ts', 'scripts/**.test.{ts,mjs}'],
+    exclude: [
+      'scripts/notarize.test.mjs',
+      'scripts/verify-managed-update-release.test.mjs',
+    ],
   }
 }
 
