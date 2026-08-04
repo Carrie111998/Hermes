@@ -10696,7 +10696,9 @@ ipcMain.handle('hermes:readFileDataUrlForAttach', async (_event, filePath) => {
 })
 
 ipcMain.handle('hermes:media:stream-url', async (_event, filePath, profile) => {
-  if (!EVA_MANAGED_BUILD) return null
+  if (!EVA_MANAGED_BUILD) {
+    return null
+  }
 
   const candidate = String(filePath || '').trim()
   if (!candidate || !STREAMABLE_MEDIA_EXTS.has(path.extname(candidate).toLowerCase())) {

@@ -375,7 +375,9 @@ export function pluginSocket(pluginId: string, path: string, onMessage: (data: u
           capMs: 30_000
         })
 
-    if (!immediate) attempt += 1
+    if (!immediate) {
+      attempt += 1
+    }
     reconnectTimer = window.setTimeout(() => {
       reconnectTimer = null
       void connect()
@@ -420,7 +422,9 @@ export function pluginSocket(pluginId: string, path: string, onMessage: (data: u
     socket = nextSocket
 
     nextSocket.onopen = () => {
-      if (socket === nextSocket) attempt = 0
+      if (socket === nextSocket) {
+        attempt = 0
+      }
     }
 
     nextSocket.onmessage = event => {
@@ -432,7 +436,9 @@ export function pluginSocket(pluginId: string, path: string, onMessage: (data: u
     }
 
     nextSocket.onclose = () => {
-      if (socket !== nextSocket) return
+      if (socket !== nextSocket) {
+        return
+      }
       socket = null
       scheduleReconnect()
     }

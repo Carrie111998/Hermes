@@ -101,7 +101,9 @@ export async function resolveMediaPlaybackSrc(path: string): Promise<string> {
           connection.profile ?? null
         )
 
-        if (streamUrl) return streamUrl
+        if (streamUrl) {
+          return streamUrl
+        }
       }
 
       return mediaExternalUrl(path)
