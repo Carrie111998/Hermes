@@ -190,14 +190,6 @@ class MemoryStore:
         content: str,
         category: str = "general",
         tags: str = "",
-<<<<<<< Updated upstream
-    ) -> int:
-        """Insert a fact and return its fact_id.
-
-        Deduplicates by content (UNIQUE constraint). On duplicate, returns
-        the existing fact_id without modifying the row. Extracts entities from
-        the content and links them to the fact.
-=======
         initial_trust: float | None = None,
     ) -> dict:
         """Insert a fact. Returns dict with fact_id and status.
@@ -210,7 +202,6 @@ class MemoryStore:
         ``initial_trust`` overrides the store default for this insert (e.g.
         unconfirmed auto-captured facts start discounted so verified facts
         outrank them in search; confirmed via fact_feedback later).
->>>>>>> Stashed changes
         """
         with self._lock:
             content = content.strip()
