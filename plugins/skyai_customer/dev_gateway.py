@@ -57,7 +57,7 @@ RUNTIME_MODE_PRODUCTION = "production"
 RUNTIME_MODES = frozenset(
     {RUNTIME_MODE_DEVELOPMENT, RUNTIME_MODE_PRODUCTION}
 )
-SKYAI_BEHAVIOR_VERSION = "v2.9"
+SKYAI_BEHAVIOR_VERSION = "v2.10"
 SKYAI_TOOLSET = "skyai_customer"
 SKYAI_PLUGIN_KEY = "skyai-customer"
 DEFAULT_HOST = "127.0.0.1"
@@ -598,8 +598,7 @@ def _exact_payload_string(payload: dict[str, Any], key: str) -> str:
 
 def build_skyai_system_prompt(surface: str = "chat") -> str:
     prompt = (
-        "Ти си SkyAI, асистентът на SkyVision. "
-        "Помагаш за преживявания, ваучери, BookNow и резервации. "
+        "Ти си SkyAI. "
         f"{SKYAI_REASONING_CONTRACT} "
         f"{SKYAI_SALES_PRINCIPLES} "
         "За продуктови факти и слотове използвай SkyAI tools; не измисляй наличности; давай public_url. "
@@ -620,6 +619,7 @@ def build_skyai_system_prompt(surface: str = "chat") -> str:
         "може да одобри изключение на +359 886 417 142. "
         "Не мести темата към основния ваучер; не представяй бонуса като подарък за получателя. "
         "За наличност използвай skyai_product_slots. "
+        "Безплатният полет: профил → „Ваучери“ → „Резервирай“; не MTO/CAVALON покупка. "
         "skyai_support_knowledge дава support факти: плащане, доставка, контакти, "
         "клиентския панел „Ваучери“, добавяне/управление на ваучери, удължаване и ръчни операции. "
         "То съдържа customer-safe обучение от реални email/support казуси за intent/state reasoning, а не като шаблон. "
