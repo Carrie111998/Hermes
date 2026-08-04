@@ -539,6 +539,31 @@ test('an expired PKCE claim clears its callback state and verifier', async t => 
   assert.equal(opened.toString().includes(verifier), false)
 })
 
+test('managed sign-in times out while waiting for an ignored browser callback and can retry', async t => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'eva-runtime-callback-timeout-'))
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
+  const statePath = path.join(directory, 'eva-enrollment.json')
+  let opened = 0
+  const runtime = makeManagedRuntime(statePath, {
+    loginTimeoutMs: 5,
+    openExternal: async () => {
+      opened += 1
+    }
+  })
+
+  await assert.rejects(
+    runtime.signIn(),
+    error => error instanceof EvaBrokerError && error.statusCode === 408 && error.code === 'timeout'
+  )
+  await assert.rejects(
+    runtime.signIn(),
+    error => error instanceof EvaBrokerError && error.statusCode === 408 && error.code === 'timeout'
+  )
+
+  assert.equal(opened, 2)
+  assert.equal(fs.existsSync(statePath), false)
+})
+
 test('a stale in-flight launch cannot restore backoff after auth invalidation', async t => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'eva-runtime-stale-backoff-'))
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }))

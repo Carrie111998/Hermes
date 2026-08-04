@@ -970,34 +970,43 @@ export function disconnectOAuthProvider(providerId: string): Promise<{ ok: boole
   })
 }
 
-export function startOAuthLogin(providerId: string): Promise<OAuthStartResponse> {
+export function startOAuthLogin(providerId: string, profile?: null | string): Promise<OAuthStartResponse> {
   return window.hermesDesktop.api<OAuthStartResponse>({
-    ...profileScoped(),
+    ...profileScoped(profile),
     path: `/api/providers/oauth/${encodeURIComponent(providerId)}/start`,
     method: 'POST',
     body: {}
   })
 }
 
-export function submitOAuthCode(providerId: string, sessionId: string, code: string): Promise<OAuthSubmitResponse> {
+export function submitOAuthCode(
+  providerId: string,
+  sessionId: string,
+  code: string,
+  profile?: null | string
+): Promise<OAuthSubmitResponse> {
   return window.hermesDesktop.api<OAuthSubmitResponse>({
-    ...profileScoped(),
+    ...profileScoped(profile),
     path: `/api/providers/oauth/${encodeURIComponent(providerId)}/submit`,
     method: 'POST',
     body: { session_id: sessionId, code }
   })
 }
 
-export function pollOAuthSession(providerId: string, sessionId: string): Promise<OAuthPollResponse> {
+export function pollOAuthSession(
+  providerId: string,
+  sessionId: string,
+  profile?: null | string
+): Promise<OAuthPollResponse> {
   return window.hermesDesktop.api<OAuthPollResponse>({
-    ...profileScoped(),
+    ...profileScoped(profile),
     path: `/api/providers/oauth/${encodeURIComponent(providerId)}/poll/${encodeURIComponent(sessionId)}`
   })
 }
 
-export function cancelOAuthSession(sessionId: string): Promise<{ ok: boolean }> {
+export function cancelOAuthSession(sessionId: string, profile?: null | string): Promise<{ ok: boolean }> {
   return window.hermesDesktop.api<{ ok: boolean }>({
-    ...profileScoped(),
+    ...profileScoped(profile),
     path: `/api/providers/oauth/sessions/${encodeURIComponent(sessionId)}`,
     method: 'DELETE'
   })
@@ -1477,7 +1486,7 @@ export function instantiateAutomationBlueprint(
   profile: string
 ): Promise<CronJob> {
   return window.hermesDesktop.api<CronJob>({
-    ...profileScoped(),
+    ...profileScoped(profile),
     path: `/api/cron/blueprints/instantiate?profile=${encodeURIComponent(profile)}`,
     method: 'POST',
     body

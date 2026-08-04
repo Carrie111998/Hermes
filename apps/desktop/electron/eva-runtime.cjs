@@ -44,6 +44,7 @@ function createEvaManagedRuntime(options) {
   const createWsRelay = options.createWsRelay ?? createEvaWsRelay
   const statePath = options.statePath
   const now = options.now ?? Date.now
+  const loginTimeoutMs = options.loginTimeoutMs ?? EVA_MANAGED_POLICY.loginTimeoutMs
 
   let signInPromise = null
   let runtimeEnrollmentPromise = null
@@ -254,7 +255,16 @@ function createEvaManagedRuntime(options) {
       try {
         await advanceBootProgress('eva.sign-in', 'Complete evaOS Agent sign-in in your browser', 14)
         await options.openExternal(buildEvaDesktopAuthUrl(codeChallenge, authState))
-        deviceCode = await deviceCodePromise
+        let callbackTimer
+        try {
+          callbackTimer = setTimeout(() => {
+            rejectDeviceCode(new EvaBrokerError('evaOS Agent sign-in timed out.', 408, 'timeout'))
+          }, loginTimeoutMs)
+          callbackTimer.unref?.()
+          deviceCode = await deviceCodePromise
+        } finally {
+          clearTimeout(callbackTimer)
+        }
         const desktop = await pollDeviceCode(deviceCode, verifier, { signal: controller.signal })
         controller.abort()
         assertGeneration(generation)

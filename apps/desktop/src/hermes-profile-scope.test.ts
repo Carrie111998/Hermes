@@ -6,10 +6,12 @@ import {
   getElevenLabsVoices,
   getMemoryProviderConfig,
   getStatus,
+  pollOAuthSession,
   restartGateway,
   saveMemoryProviderConfig,
   setApiRequestProfile,
   speakText,
+  startOAuthLogin,
   transcribeAudio,
   updateHermes
 } from './hermes'
@@ -78,6 +80,17 @@ describe('backend action helpers are profile-scoped', () => {
 
     for (const call of api.mock.calls) {
       expect(call[0].profile).toBe('jarvis')
+    }
+  })
+
+  it('lets an OAuth flow stay pinned to the profile that started it', () => {
+    setApiRequestProfile('profile-b')
+
+    void startOAuthLogin('openai-codex', 'profile-a')
+    void pollOAuthSession('openai-codex', 'session-1', 'profile-a')
+
+    for (const call of api.mock.calls) {
+      expect(call[0].profile).toBe('profile-a')
     }
   })
 })

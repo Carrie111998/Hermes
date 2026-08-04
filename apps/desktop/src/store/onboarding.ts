@@ -2,6 +2,7 @@ import { atom } from 'nanostores'
 
 import {
   cancelOAuthSession,
+  getApiRequestProfile,
   getGlobalModelOptions,
   getRecommendedDefaultModel,
   listOAuthProviders,
@@ -159,6 +160,7 @@ const INITIAL: DesktopOnboardingState = {
 export const $desktopOnboarding = atom<DesktopOnboardingState>(INITIAL)
 
 let pollTimer: number | null = null
+let oauthFlowProfile: null | string = null
 let providersRefreshPromise: null | Promise<void> = null
 
 const errMessage = (e: unknown) => (e instanceof Error ? e.message : String(e))
@@ -587,9 +589,10 @@ export async function startProviderOAuth(provider: OAuthProvider, ctx: Onboardin
   }
 
   setFlow({ status: 'starting', provider })
+  oauthFlowProfile = getApiRequestProfile()
 
   try {
-    const start = await startOAuthLogin(provider.id)
+    const start = await startOAuthLogin(provider.id, oauthFlowProfile)
     const browserUrl = start.flow === 'device_code' ? start.verification_url : start.auth_url
     await openSignInUrl(browserUrl)
 
@@ -609,7 +612,7 @@ export async function startProviderOAuth(provider: OAuthProvider, ctx: Onboardin
 // Poll a session-backed device-code flow until it resolves.
 async function pollSession(provider: OAuthProvider, start: DeviceStart, ctx: OnboardingContext) {
   try {
-    const { error_message, status } = await pollOAuthSession(provider.id, start.session_id)
+    const { error_message, status } = await pollOAuthSession(provider.id, start.session_id, oauthFlowProfile)
 
     if (status === 'approved') {
       clearPoll()
@@ -650,7 +653,7 @@ export async function submitOnboardingCode(ctx: OnboardingContext) {
   setFlow({ status: 'submitting', provider, start })
 
   try {
-    const resp = await submitOAuthCode(provider.id, start.session_id, code.trim())
+    const resp = await submitOAuthCode(provider.id, start.session_id, code.trim(), oauthFlowProfile)
 
     if (resp.ok && resp.status === 'approved') {
       setFlow({ status: 'success', provider })
@@ -674,9 +677,10 @@ export function cancelOnboardingFlow() {
   const sessionId = sessionIdFor($desktopOnboarding.get().flow)
 
   if (sessionId) {
-    cancelOAuthSession(sessionId).catch(() => undefined)
+    cancelOAuthSession(sessionId, oauthFlowProfile).catch(() => undefined)
   }
 
+  oauthFlowProfile = null
   setFlow({ status: 'idle' })
 }
 
