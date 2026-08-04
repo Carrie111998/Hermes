@@ -695,6 +695,27 @@ class TestLifecycleGuardModule:
         )
         assert result is False
 
+    def test_embedded_null_referenced_path_does_not_crash_guard(
+        self, monkeypatch
+    ):
+        """A malformed token discovered during recursion is unreadable, not fatal."""
+        from pathlib import Path
+
+        from cron import lifecycle_guard
+
+        monkeypatch.setattr(
+            lifecycle_guard,
+            "_iter_referenced_shell_scripts",
+            lambda command, cwd=None: iter((Path("bad\x00reference.sh"),)),
+        )
+
+        assert (
+            lifecycle_guard.contains_gateway_lifecycle_command_or_referenced_script(
+                "run benign helper"
+            )
+            is False
+        )
+
     def test_shell_script_reference_walk_still_works(self, tmp_path):
         """The referenced-script walk still applies to real shell scripts:
         a .sh script that itself invokes a lifecycle command is caught."""

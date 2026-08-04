@@ -258,7 +258,11 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
     try:
         descriptor = os.open(path, flags)
-    except OSError:
+    except (OSError, ValueError):
+        # Path-like input assembled while recursively tokenizing referenced
+        # source can contain an embedded NUL.  os.open() raises ValueError
+        # for that input (not OSError); it is not a readable script reference
+        # and must not crash the lifecycle guard.
         return None, False
     try:
         metadata = os.fstat(descriptor)
