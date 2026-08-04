@@ -277,11 +277,32 @@ Grant the `application:bot.basic_info:read` scope to display peer bot names; wit
 
 ## Interactive Card Actions
 
-When users click buttons or interact with interactive cards sent by the bot, the adapter routes these as synthetic `/card` command events:
+Feishu has two deliberately separate card-action paths.
+
+In WebSocket mode, cards created by an external plugin through Hermes's
+registered interactive action API carry only an opaque
+`hermes_interactive_action_id`. Their callbacks
+are authenticated by the Feishu connection, checked by normal gateway
+authorization plus the plugin's action policy, and atomically claimed from the
+profile-local ledger. They bypass `/card`, the model, and the conversation
+transcript. The card first shows **Processing** only after authorization and a
+successful claim, then is replaced with Applied, Already processed, Expired,
+Conflict, or Retryable failure. A denied, unknown, or pre-claim failure does
+not replace the shared card, so an unauthorized viewer cannot remove the
+initiator's live buttons. Hermes retries transient final-card edits three
+times; the durable claim remains fail-closed if Feishu still rejects the edit.
+See [Build a Hermes Plugin — Send a gateway
+confirmation card](/developer-guide/plugins#send-a-gateway-confirmation-card).
+
+Webhook-mode Feishu is not a V1 native adapter for external-plugin actions; it
+uses the envelope's exact fallback text and creates no clickable action state.
+
+All other, unregistered card values preserve the legacy generic behavior and
+route as synthetic `/card` command events:
 
 - Button clicks become: `/card button {"key": "value", ...}`
 - The action's `value` payload from the card definition is included as JSON.
-- Card actions are deduplicated with a 15-minute window to prevent double processing.
+- Generic card actions are deduplicated with a 15-minute window to prevent double processing.
 
 Gateway-driven update prompts use a native Feishu `Yes` / `No` card instead of falling back to plain text replies. When `hermes update --gateway` needs confirmation, the adapter records the selected answer in Hermes's `.update_response` file and replaces the card inline with a resolved state.
 
