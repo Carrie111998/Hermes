@@ -2536,22 +2536,27 @@ def terminal_tool(
                 """
                 if env is None:
                     return None
-                try:
-                    local_path = Path(script_path).expanduser()
-                    if not local_path.is_absolute():
-                        local_path = Path(guard_cwd) / local_path
-                    if local_path.is_file():
-                        metadata = local_path.stat()
-                        if stat.S_ISREG(metadata.st_mode):
-                            if metadata.st_size > 1024 * 1024:
-                                return None
-                            data = local_path.read_bytes()
-                            if b"\x00" in data:
-                                return None
-                            if len(data) <= 1024 * 1024:
-                                return data.decode("utf-8", errors="replace")
-                except Exception:
-                    pass
+                if config.get("env_type", "local") == "local":
+                    try:
+                        local_path = Path(script_path).expanduser()
+                        if not local_path.is_absolute():
+                            local_path = Path(guard_cwd) / local_path
+                        if local_path.is_file():
+                            metadata = local_path.stat()
+                            if stat.S_ISREG(metadata.st_mode):
+                                if metadata.st_size > 1024 * 1024:
+                                    return None
+                                data = local_path.read_bytes()
+                                if b"\x00" in data:
+                                    return None
+                                if len(data) <= 1024 * 1024:
+                                    return data.decode("utf-8", errors="replace")
+                    except Exception:
+                        pass
+                    # The local environment sees the same filesystem. A path
+                    # that was missing, unreadable, oversized, or binary will
+                    # not become scannable by executing `cat` against it.
+                    return None
                 # Remote / sandboxed backend: read via the environment's shell.
                 try:
                     result = env.execute(f"cat {shlex.quote(script_path)}")
@@ -2565,6 +2570,7 @@ def terminal_tool(
                 command,
                 cwd=guard_cwd,
                 read_remote_script=_read_script_in_env,
+                prefer_remote_script=config.get("env_type", "local") != "local",
             ):
                 return json.dumps({
                     "output": "",

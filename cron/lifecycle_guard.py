@@ -296,6 +296,7 @@ def _contains_unsafe_gateway_action(
     depth: int,
     visited: set[Path],
     read_remote_script: Optional[_ReadRemoteScriptFn] = None,
+    prefer_remote_script: bool = False,
 ) -> bool:
     if contains_gateway_lifecycle_command(command) or contains_launchctl_submit_command(
         command
@@ -311,24 +312,39 @@ def _contains_unsafe_gateway_action(
             depth=depth + 1,
             visited=visited,
             read_remote_script=read_remote_script,
+            prefer_remote_script=prefer_remote_script,
         ):
             return True
 
     for script_path in _iter_referenced_shell_scripts(command, cwd=cwd):
-        try:
-            resolved = script_path.resolve(strict=False)
-        except (OSError, ValueError):
-            # OSError: unreadable/long paths. ValueError: embedded NUL byte
-            # from a binary's decoded contents tokenized as a path — a
-            # guarded path must never crash the guard (#76762).
+        if prefer_remote_script:
+            # Keep remote path spelling authoritative. Host-side resolve()
+            # can rewrite valid remote paths (for example macOS /tmp to
+            # /private/tmp), which breaks nested relative script scanning.
             resolved = script_path
+        else:
+            try:
+                resolved = script_path.resolve(strict=False)
+            except (OSError, ValueError):
+                # OSError: unreadable/long paths. ValueError: embedded NUL byte
+                # from a binary's decoded contents tokenized as a path — a
+                # guarded path must never crash the guard (#76762).
+                resolved = script_path
         if resolved in visited:
             continue
         visited.add(resolved)
-        script_text, unsafe = _read_referenced_script(script_path)
+        if prefer_remote_script and read_remote_script is not None:
+            script_text = read_remote_script(str(script_path))
+            unsafe = False
+        else:
+            script_text, unsafe = _read_referenced_script(script_path)
         if unsafe:
             return True
-        if script_text is None and read_remote_script is not None:
+        if (
+            script_text is None
+            and read_remote_script is not None
+            and not prefer_remote_script
+        ):
             # Local path missing; try the remote backend if one is available.
             script_text = read_remote_script(str(script_path))
         if not script_text:
@@ -342,6 +358,7 @@ def _contains_unsafe_gateway_action(
             depth=depth + 1,
             visited=visited,
             read_remote_script=read_remote_script,
+            prefer_remote_script=prefer_remote_script,
         ):
             return True
     return False
@@ -352,14 +369,20 @@ def contains_gateway_lifecycle_command_or_referenced_script(
     *,
     cwd: Optional[str] = None,
     read_remote_script: Optional[_ReadRemoteScriptFn] = None,
+    prefer_remote_script: bool = False,
 ) -> bool:
-    """Detect lifecycle/submit commands, including bounded nested scripts."""
+    """Detect lifecycle/submit commands, including bounded nested scripts.
+
+    ``prefer_remote_script`` makes the backend reader authoritative so a
+    same-named host file cannot shadow the script that will actually execute.
+    """
     return _contains_unsafe_gateway_action(
         command,
         cwd=cwd,
         depth=0,
         visited=set(),
         read_remote_script=read_remote_script,
+        prefer_remote_script=prefer_remote_script,
     )
 
 

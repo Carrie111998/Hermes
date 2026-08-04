@@ -578,6 +578,46 @@ class TestTerminalToolGatewayLifecycleGuard:
         assert result["exit_code"] == 0
         assert calls == [str(binary)]
 
+    def test_remote_script_is_scanned_despite_local_path_collision(
+        self, monkeypatch, tmp_path
+    ):
+        """Remote backends must not mistake a colliding local binary for the script."""
+        import tools.terminal_tool as tt
+
+        calls = []
+        script_path = tmp_path / "remote-ops.sh"
+        script_path.write_text("#!/bin/sh\nprintf 'benign host collision\\n'\n")
+
+        class _FakeRemoteEnv:
+            env = {}
+
+            def execute(self, command, **kwargs):
+                calls.append(command)
+                if command.startswith("cat "):
+                    return {
+                        "output": "#!/bin/sh\nhermes gateway restart\n",
+                        "returncode": 0,
+                    }
+                raise AssertionError("unsafe remote script must not execute")
+
+        self._patch_env(monkeypatch, _FakeRemoteEnv(), inside_gateway=True)
+        monkeypatch.setattr(
+            tt,
+            "_get_env_config",
+            lambda: {
+                "env_type": "ssh",
+                "cwd": "/tmp",
+                "timeout": 60,
+                "lifetime_seconds": 3600,
+            },
+        )
+
+        result = json.loads(tt.terminal_tool(command=str(script_path)))
+
+        assert result["exit_code"] == 1
+        assert "referenced script" in result["error"]
+        assert calls == [f"cat {script_path}"]
+
     def test_safe_systemctl_commands_pass_through(self, monkeypatch):
         """Non-hermes systemctl commands must not be blocked by this guard."""
         import tools.terminal_tool as tt
@@ -754,6 +794,33 @@ class TestLifecycleGuardModule:
             is False
         )
 
+    def test_nested_remote_script_keeps_remote_directory_authority(self):
+        """Host path canonicalization must not rewrite nested remote references."""
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        scripts = {
+            "/tmp/hermes-remote/outer.sh": "#!/bin/sh\n./inner.sh\n",
+            "/tmp/hermes-remote/inner.sh": "#!/bin/sh\nhermes gateway restart\n",
+        }
+        reads = []
+
+        def read_remote(path):
+            reads.append(path)
+            return scripts.get(path)
+
+        assert contains_gateway_lifecycle_command_or_referenced_script(
+            "/bin/bash /tmp/hermes-remote/outer.sh",
+            cwd="/tmp/hermes-remote",
+            read_remote_script=read_remote,
+            prefer_remote_script=True,
+        )
+        assert reads == [
+            "/tmp/hermes-remote/outer.sh",
+            "/tmp/hermes-remote/inner.sh",
+        ]
+
     def test_shell_script_reference_walk_still_works(self, tmp_path):
         """The referenced-script walk still applies to real shell scripts:
         a .sh script that itself invokes a lifecycle command is caught."""
@@ -849,7 +916,7 @@ class TestTerminalToolGatewayLifecycleGuardRemote:
         monkeypatch.setattr(tt, "_active_environments", {eid: fake_env})
         monkeypatch.setattr(tt, "_last_activity", {eid: 0.0})
         monkeypatch.setattr(tt, "_task_env_overrides", {})
-        monkeypatch.setattr(tt, "_get_env_config", lambda: {"env_type": "local", "cwd": "/tmp", "timeout": 60, "lifetime_seconds": 3600})
+        monkeypatch.setattr(tt, "_get_env_config", lambda: {"env_type": "ssh", "cwd": "/tmp", "timeout": 60, "lifetime_seconds": 3600})
         if inside_gateway:
             monkeypatch.setenv("_HERMES_GATEWAY", "1")
         else:
