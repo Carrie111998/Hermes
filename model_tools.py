@@ -583,7 +583,43 @@ def _resolve_active_context_length() -> int:
         if not model_id:
             return 0
         from agent.model_metadata import get_model_context_length
-        return int(get_model_context_length(model_id) or 0)
+        # Honor explicit `model.context_length` in config.yaml — short-circuits
+        # the OpenRouter /models probe at get_model_context_length step 0, so
+        # non-OpenRouter providers don't pay the ~2-3s OpenRouter fetch at every
+        # CLI startup.  See issue #46620.
+        raw_ctx = model_cfg.get("context_length")
+        config_ctx = raw_ctx if isinstance(raw_ctx, int) and raw_ctx > 0 else None
+        # Provider-aware resolution: providers like Codex OAuth enforce a
+        # different (lower) window than the direct API for the same slug, and
+        # their resolvers key off provider/base_url/api_key. Without these,
+        # the gate sizes against generic metadata (e.g. 1.05M for gpt-5.5
+        # instead of Codex's enforced 272K). Credential resolution failing
+        # (offline, no keys) degrades to a provider+base_url-only lookup so
+        # the static provider-aware fallbacks still apply.
+        provider = str(model_cfg.get("provider") or "").strip()
+        base_url = str(model_cfg.get("base_url") or "").strip()
+        api_key = ""
+        if provider:
+            try:
+                from hermes_cli.runtime_provider import resolve_runtime_provider
+                rt = resolve_runtime_provider(
+                    requested=provider, target_model=model_id
+                ) or {}
+                base_url = str(rt.get("base_url") or base_url or "").strip()
+                api_key = str(rt.get("api_key") or "").strip()
+            except Exception as rt_exc:
+                logger.debug(
+                    "Runtime credential resolution failed for tool-search "
+                    "context gate (provider=%s): %s — using config values only",
+                    provider, rt_exc,
+                )
+        return int(get_model_context_length(
+            model_id,
+            base_url=base_url,
+            api_key=api_key,
+            config_context_length=config_ctx,
+            provider=provider,
+        ) or 0)
     except Exception as e:
         logger.debug("Could not resolve active context length: %s", e)
         return 0
@@ -1161,21 +1197,22 @@ def handle_function_call(
         if function_name in _AGENT_LOOP_TOOLS:
             return json.dumps({"error": f"{function_name} must be handled by the agent loop"})
 
-        # Check plugin hooks for a block directive (unless caller already
-        # checked — e.g. run_agent._invoke_tool passes skip=True to
+        # Check plugin hooks for a block/approve directive (unless caller
+        # already checked — e.g. run_agent._invoke_tool passes skip=True to
         # avoid double-firing the hook).
         #
         # Single-fire contract: pre_tool_call fires exactly once per tool
-        # execution. get_pre_tool_call_block_message() internally calls
-        # invoke_hook("pre_tool_call", ...) and returns the first block
-        # directive (if any), so observer plugins see the hook on that same
-        # pass. When skip=True, the caller already fired it — do nothing
-        # here.
+        # execution. resolve_pre_tool_block() internally calls
+        # invoke_hook("pre_tool_call", ...) once and returns the block message
+        # for a `block` directive OR for an `approve` directive whose human
+        # gate denied/timed-out/errored (fail-closed). Observer plugins see
+        # the hook on that same pass. When skip=True, the caller already
+        # fired it — do nothing here.
         if not skip_pre_tool_call_hook:
             block_message: Optional[str] = None
             try:
-                from hermes_cli.plugins import get_pre_tool_call_block_message
-                block_message = get_pre_tool_call_block_message(
+                from hermes_cli.plugins import resolve_pre_tool_block
+                block_message = resolve_pre_tool_block(
                     function_name,
                     function_args,
                     task_id=task_id or "",

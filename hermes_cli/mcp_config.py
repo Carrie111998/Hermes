@@ -171,6 +171,31 @@ def _strip_bearer_prefix(token: str) -> str:
     return stripped
 
 
+def _bearer_auth_headers(name: str) -> Dict[str, str]:
+    """Build the persisted Authorization header for a named MCP server.
+
+    The secret itself lives in the active profile's ``.env`` file. Keeping
+    this template construction beside ``_env_key_for_server`` ensures the CLI
+    and Dashboard produce byte-equivalent MCP configuration.
+    """
+    env_key = _env_key_for_server(name)
+    return {"Authorization": f"Bearer ${{{env_key}}}"}
+
+
+def _save_bearer_auth_token(name: str, token: str) -> Dict[str, str]:
+    """Persist a Bearer token in the active profile and return safe headers.
+
+    ``token`` is a one-time provisioning value. It is normalized and written
+    only to ``.env``; callers persist the returned interpolation template in
+    ``config.yaml``.
+    """
+    normalized = _strip_bearer_prefix(token)
+    if not normalized or normalized.lower() == "bearer":
+        raise ValueError("Bearer token is required")
+    save_env_value(_env_key_for_server(name), normalized)
+    return _bearer_auth_headers(name)
+
+
 def _parse_env_assignments(raw_env: Optional[List[str]]) -> Dict[str, str]:
     """Parse ``KEY=VALUE`` strings from CLI args into an env dict."""
     parsed: Dict[str, str] = {}
@@ -239,16 +264,24 @@ def _resolve_mcp_server_config(config: dict) -> dict:
     """
     from tools.mcp_tool import _interpolate_env_vars
 
-    try:
-        from hermes_cli.env_loader import load_hermes_dotenv
-        load_hermes_dotenv()
-    except Exception:  # pragma: no cover — defensive
-        pass
+    from agent.secret_scope import current_secret_scope
+
+    if current_secret_scope() is None:
+        try:
+            from hermes_cli.env_loader import load_hermes_dotenv
+            load_hermes_dotenv()
+        except Exception:  # pragma: no cover — defensive
+            pass
     return _interpolate_env_vars(config)
 
 
 def _probe_single_server(
-    name: str, config: dict, connect_timeout: Optional[float] = None, *, details: Optional[dict] = None
+    name: str,
+    config: dict,
+    connect_timeout: Optional[float] = None,
+    *,
+    details: Optional[dict] = None,
+    truncate_descriptions: bool = True,
 ) -> List[Tuple[str, str]]:
     """Temporarily connect to one MCP server, list its tools, disconnect.
 
@@ -258,6 +291,10 @@ def _probe_single_server(
     ``details``: optional dict the probe fills with extra capability counts
     (``prompts``, ``resources``) — an out-param so the return shape stays
     stable for existing CLI callers.
+
+    ``truncate_descriptions``: mặc định True để giữ nguyên hành vi cũ cho các
+    caller hiện có (in gọn ra CLI). Truyền False khi caller là 1 API/dashboard
+    cần mô tả đầy đủ (vd. route dashboard test) — không cắt còn 80 ký tự.
     """
     issues = validate_mcp_server_entry(name, config)
     if issues:
@@ -289,8 +326,10 @@ def _probe_single_server(
         try:
             for t in server._tools:
                 desc = getattr(t, "description", "") or ""
-                # Truncate long descriptions for display
-                if len(desc) > 80:
+                # Truncate long descriptions for display — chỉ áp dụng khi
+                # caller không yêu cầu mô tả đầy đủ (mặc định True, giữ hành
+                # vi CLI cũ nguyên vẹn).
+                if truncate_descriptions and len(desc) > 80:
                     desc = desc[:77] + "..."
                 tools_found.append((t.name, desc))
             if details is not None:
@@ -492,19 +531,17 @@ def cmd_mcp_add(args):
                 existing_key = get_env_value(env_key)
                 if existing_key:
                     _success(f"{env_key}: already configured")
-                    api_key = existing_key
                 else:
                     api_key = _prompt("API key / Bearer token", password=True)
                     if api_key:
-                        api_key = _strip_bearer_prefix(api_key)
-                        save_env_value(env_key, api_key)
+                        server_config["headers"] = _save_bearer_auth_token(
+                            name, api_key
+                        )
                         _success(f"Saved to {display_hermes_home()}/.env as {env_key}")
 
                 # Set header with env var interpolation
-                if api_key or existing_key:
-                    server_config["headers"] = {
-                        "Authorization": f"Bearer ${{{env_key}}}"
-                    }
+                if existing_key:
+                    server_config["headers"] = _bearer_auth_headers(name)
 
     # ── Discovery: connect and list tools ─────────────────────────────
 
