@@ -53,7 +53,7 @@ Report these links for items already known to the caller; they do not create a s
 - File: `https://app.box.com/file/<FILE_ID>`
 - Folder: `https://app.box.com/folder/<FOLDER_ID>`
 
-Include the item ID with the link. A user may not be able to open a service-account-only item; state that instead of creating a link with broader access.
+Include the item ID with the link. If a human cannot open a service-account-only item, state that rather than creating a link with broader access.
 
 ## Read and write metadata
 

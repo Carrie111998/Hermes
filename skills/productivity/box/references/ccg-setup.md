@@ -4,10 +4,9 @@ Use CCG when Hermes needs its own service-account identity: a background agent, 
 
 ## Create and authorize the app
 
-1. In the [Box Developer Console](https://app.box.com/developers/console), create a **Platform App** using **Client Credentials Grant**.
-2. Choose the scopes and access level needed for the work. Authorization method is fixed when the app is created.
-3. Authorize the app. Enterprise users may need an administrator to approve it.
-4. Copy the Client ID, Client Secret, and Enterprise ID into `~/.hermes/.env`; never paste the secret into chat.
+Open the [Box Developer Console](https://app.box.com/developers/console) with browser tools when available, then create a **Platform App** using **Client Credentials Grant**. Choose only the scopes and access level required for the work; the authorization method is fixed at creation.
+
+Complete every available browser step. Pause only when a Box administrator must approve the app or when the human must sign in. Never ask for a Client Secret in chat. Ask the human to store the Client ID, Client Secret, and Enterprise ID directly in `~/.hermes/.env`, then resume after they confirm it is ready:
 
 ```text
 BOX_CLIENT_ID=your_client_id
@@ -17,7 +16,7 @@ BOX_ENTERPRISE_ID=your_enterprise_id
 
 ## Add a CLI environment
 
-Copy [the CCG configuration template](../templates/ccg-config.json.example), replace its placeholders locally, then run:
+After the credentials exist locally, copy [the CCG configuration template](../templates/ccg-config.json.example), replace its placeholders without printing secrets, add the environment, and verify the actor:
 
 ```bash
 box configure:environments:add /path/to/ccg-config.json --ccg-auth --name hermes-ccg --set-as-current
@@ -30,12 +29,9 @@ The returned `login` is the service-account email. Do not routinely print enviro
 
 A CCG service account begins with its own empty root and cannot see a human's existing Box content until it is invited.
 
-1. In [Box](https://app.box.com), open the top-level folder Hermes should access.
-2. Invite the service-account email from `box users:get me`.
-3. Choose the narrowest role: Viewer for read/search, Editor for upload/move/version, and Co-owner only when required.
-4. Share the parent folder when Hermes needs the subtree.
+Open the selected top-level folder in [Box](https://app.box.com), then open its sharing flow and add the service-account email from `box users:get me`. Request approval before changing collaboration. Choose the narrowest role: Viewer for read/search, Editor for upload/move/version, and Co-owner only when required. Share the parent folder when Hermes needs the subtree.
 
-An existing editor can also collaborate the service account through the CLI:
+When the current actor is already an editor, create the collaboration through the CLI after approval:
 
 ```bash
 box collaborations:create <FOLDER_ID> folder --role editor --login <SERVICE_ACCOUNT_EMAIL> --json

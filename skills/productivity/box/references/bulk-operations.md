@@ -14,7 +14,7 @@ Inventory → classify if needed → plan → confirm → execute → verify →
 box folders:items <FOLDER_ID> --json --max-items 1000 --fields id,name,type,parent
 ```
 
-Paginate until every item is accounted for. Record IDs, names, types, target folder IDs, and a completed-ID log. Before broad moves, access changes, or AI use, show the user the scope and ambiguous cases.
+Paginate until every item is accounted for. Record IDs, names, types, target folder IDs, and a completed-ID log. Before broad moves, access changes, or AI use, present the scope and ambiguous cases for approval.
 
 ## Classify content
 
@@ -25,7 +25,7 @@ box ai:ask --items=id=<FILE_ID>,type=file \
   --prompt "Classify as invoice, receipt, contract, report, or other." --json
 ```
 
-For known fields, use `ai:extract-structured`; for variable fields, use `ai:extract`. Sample a small representative set before processing a large batch. State that Box AI uses units and get confirmation before a material AI batch.
+For known fields, use `ai:extract-structured`; for variable fields, use `ai:extract`. Sample a small representative set before processing a large batch. Disclose Box AI unit use and obtain confirmation before a material AI batch.
 
 ## Execute and recover
 

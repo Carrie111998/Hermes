@@ -36,6 +36,15 @@ When someone is exploring a cloud file system for Hermes, first give a short fit
 
 Do not run setup, show a command cookbook, propose account plans or folder taxonomies, or load every reference for a broad exploratory question. Wait for the user's answer, then load only the relevant path. When a request already names a concrete outcome, skip this discovery step and handle that outcome directly.
 
+## Perform chosen setup interactively
+
+When a user selects an authentication path or asks Hermes to connect Box, perform the setup through `terminal` and browser tools; do not turn the next response into instructions for the user to copy. Take the next safe action yourself, and pause only for an approval, browser sign-in, administrator action, or secret that Hermes cannot safely supply.
+
+- If `box` is missing, ask for any terminal approval required to install `@box/cli`, then run the install and verify `box --version`.
+- For personal OAuth, run `box login --default-box-app --name hermes-oauth`. Announce that browser authorization is waiting, then continue with `box users:get me --json --fields id,name,login` after it completes. Use `--code` only when the terminal cannot receive the browser callback.
+- For CCG, open the Developer Console when browser access is available and perform every non-secret step. Pause only for the user's Box administrator action or for credentials to be stored locally outside the chat. Never request a client secret in chat. Then add the CLI environment, verify the service-account actor, and open the selected folders' sharing flow to add it after approval.
+- If an install, browser authorization, environment switch, or permission change needs approval, request that approval and resume the setup after it is granted. Do not replace the action with a command list.
+
 ## Start each task
 
 1. Confirm the CLI and current actor:
