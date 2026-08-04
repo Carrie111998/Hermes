@@ -520,6 +520,72 @@ export async function fetchProjectSessions(projectId: string): Promise<SidebarPr
   }
 }
 
+interface MoveSessionResult {
+  cwd: string
+  git_branch: null | string
+  git_repo_root: null | string
+  project_id: string
+  session_ids: string[]
+}
+
+const sessionsMovingBetweenProjects = new Set<string>()
+
+/** Move one logical chat (including compression continuations) to a project.
+ * The backend owns membership; update the flat cache from its response, then
+ * reconcile project counts/previews from the authoritative tree. */
+export async function moveSessionToProject(sessionId: string, projectId: string): Promise<boolean> {
+  if (!sessionId || sessionsMovingBetweenProjects.has(sessionId)) {
+    return false
+  }
+
+  try {
+    const context = await activeProjectsContext()
+    const target = $projectTree.get().find(project => project.id === projectId)
+
+    if (!target?.path || target.isNoProject) {
+      return false
+    }
+
+    sessionsMovingBetweenProjects.add(sessionId)
+    const result = await gatewayRequestOn<MoveSessionResult>(context.gateway, 'projects.move_session', {
+      project_id: projectId,
+      session_id: sessionId
+    })
+
+    if (
+      activeGateway() !== context.gateway ||
+      ($activeGatewayProfile.get() || 'default') !== context.profile
+    ) {
+      return true
+    }
+
+    const movedIds = new Set(result.session_ids)
+
+    $sessions.set(
+      $sessions.get().map(session =>
+        movedIds.has(session.id) || (session._lineage_root_id ? movedIds.has(session._lineage_root_id) : false)
+          ? {
+              ...session,
+              cwd: result.cwd,
+              git_branch: result.git_branch,
+              git_repo_root: result.git_repo_root
+            }
+          : session
+      )
+    )
+    await refreshProjectTreeOn(context.gateway)
+
+    return true
+  } catch (err) {
+    markProjectsRpcFailure(err)
+    notify({ kind: 'error', message: translateNow('sidebar.projects.moveSessionFailed') })
+
+    return false
+  } finally {
+    sessionsMovingBetweenProjects.delete(sessionId)
+  }
+}
+
 export interface RepoDiscoveryPolicy {
   enabled: boolean
   roots: string[]

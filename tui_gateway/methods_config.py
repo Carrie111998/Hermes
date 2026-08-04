@@ -158,6 +158,98 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 5061, str(e))
 
 
+@method("projects.move_session")
+def _(rid, params: dict) -> dict:
+    """Move a persisted chat into a project's primary workspace folder."""
+    session_id = str(params.get("session_id") or "").strip()
+    project_id = str(params.get("project_id") or "").strip()
+    if not session_id or not project_id:
+        return _err(rid, 5063, "session_id and project_id required")
+
+    try:
+        db = _get_db()
+        if db is None or db.get_session(session_id) is None:
+            return _err(rid, 4041, "session not found")
+
+        tree, _active = _build_project_tree(
+            db,
+            preview_limit=0,
+            hydrate=False,
+            session_limit=5000,
+            include_discovered=True,
+        )
+        project = next((item for item in tree["projects"] if item["id"] == project_id), None)
+        cwd = str((project or {}).get("path") or "").strip()
+        if not cwd:
+            return _err(rid, 4042, "project has no workspace folder")
+
+        resolved = os.path.abspath(os.path.expanduser(cwd))
+        if not os.path.isdir(resolved):
+            return _err(rid, 4017, f"working directory does not exist: {cwd}")
+
+        lineage = set(db.get_compression_lineage(session_id))
+        acquired_locks = []
+        live_info = []
+        with _sessions_lock:
+            live = [
+                (sid, session)
+                for sid, session in _sessions.items()
+                if sid in lineage or session.get("session_key") in lineage
+            ]
+            try:
+                for _sid, session in live:
+                    lock = session.get("history_lock")
+                    if lock is not None:
+                        lock.acquire()
+                        acquired_locks.append(lock)
+
+                if any(session.get("running") for _sid, session in live):
+                    return _err(rid, 4009, "session busy")
+
+                branch = _git_branch_for_cwd(resolved)
+                repo_root = _git_common_repo_root_for_cwd(resolved)
+                moved_ids = db.move_session_lineage_to_cwd(
+                    session_id,
+                    resolved,
+                    branch,
+                    repo_root,
+                )
+
+                for sid, session in live:
+                    _set_session_cwd(session, resolved)
+                    agent = session.get("agent")
+                    info = (
+                        _session_info(agent, session)
+                        if agent is not None
+                        else {
+                            "cwd": resolved,
+                            "branch": branch,
+                            "project": _project_info_for_cwd(resolved),
+                            "lazy": True,
+                        }
+                    )
+                    live_info.append((sid, info))
+            finally:
+                for lock in reversed(acquired_locks):
+                    lock.release()
+
+        for sid, info in live_info:
+            _emit("session.info", sid, info)
+
+        return _ok(
+            rid,
+            {
+                "cwd": resolved,
+                "git_branch": branch or None,
+                "git_repo_root": repo_root or None,
+                "project_id": project_id,
+                "session_ids": moved_ids,
+            },
+        )
+    except Exception as e:
+        return _err(rid, 5061, str(e))
+
+
 @method("config.get")
 def _(rid, params: dict) -> dict:
     key = params.get("key", "")

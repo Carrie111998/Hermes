@@ -48,6 +48,8 @@ import {
   SESSION_TILE_DRAG
 } from '@/components/pane-shell/tree/store'
 import type { EngineZone, ZoneRect } from '@/components/pane-shell/tree/zones-engine'
+import { moveSessionToProject } from '@/store/projects'
+import { $activeGatewayProfile } from '@/store/profile'
 import { openSessionTile, type TileDock } from '@/store/session-states'
 
 import { requestComposerInsertRefs } from './composer/focus'
@@ -59,6 +61,11 @@ import { type SessionDragPayload, sessionInlineRef, sessionLabel } from './compo
 interface SurfaceSnapshot {
   anchor: string
   composerTarget: string
+  rect: ZoneRect
+}
+
+interface ProjectDropSnapshot {
+  id: string
   rect: ZoneRect
 }
 
@@ -77,6 +84,12 @@ function snapshotSurfaces(): SurfaceSnapshot[] {
     composerTarget: el.dataset.composerTarget || 'main',
     rect: snapRect(el)
   }))
+}
+
+function snapshotProjectTargets(sourceProjectId: string | undefined): ProjectDropSnapshot[] {
+  return queryAllVisible('[data-project-drop-id]')
+    .filter(el => el.dataset.projectDropId !== sourceProjectId)
+    .map(el => ({ id: el.dataset.projectDropId!, rect: snapRect(el) }))
 }
 
 /** A session may land in a zone only if it hosts a chat surface — never the
@@ -99,18 +112,20 @@ function chatZonePane(groupId: string): null | string {
 export function startSessionDrag(
   payload: SessionDragPayload,
   e: ReactPointerEvent<HTMLElement>,
-  opts?: { double?: DoubleTapContext; onTap?: () => void }
+  opts?: { double?: DoubleTapContext; onTap?: () => void; projectMove?: boolean }
 ) {
   let zones: EngineZone[] = []
   let strips: StripSnapshot[] = []
   let surfaces: SurfaceSnapshot[] = []
   let composers: ZoneRect[] = []
   let zoneHost = new Map<string, null | string>()
+  let projectTargets: ProjectDropSnapshot[] = []
 
   // Commit intent, updated per resolved move (the machinery flushes the final
   // move before commit, so these always match the released-at position).
   let split: { anchor: string; before?: null | string; pos: TileDock } | null = null
   let link: null | string = null
+  let projectTargetId: null | string = null
 
   // The drag SOURCE (sidebar row or tile tab). Captured synchronously — React
   // clears `currentTarget` after the pointerdown handler returns, but this runs
@@ -118,6 +133,7 @@ export function startSessionDrag(
   // same in-place feedback pane-tab drags use, replacing the old cursor chip.
   const source = e.currentTarget
   const restoreOpacity = source?.style.opacity ?? ''
+  const sourceProjectId = source?.closest<HTMLElement>('[data-project-drop-id]')?.dataset.projectDropId
 
   startDragSession(e, {
     double: opts?.double,
@@ -130,6 +146,10 @@ export function startSessionDrag(
       surfaces = snapshotSurfaces()
       composers = queryAllVisible('[data-slot="composer-root"]').map(snapRect)
       zoneHost = new Map(zones.map(zone => [zone.id, chatZonePane(zone.id)]))
+      projectTargets =
+        opts?.projectMove && payload.profile === ($activeGatewayProfile.get() || 'default')
+          ? snapshotProjectTargets(sourceProjectId)
+          : []
       source?.style.setProperty('opacity', '0.45')
       // The same sentinel the zone overlay + chat surfaces key off — the
       // whole drop language (sheets, pills, caret, link overlay) lights up.
@@ -143,6 +163,17 @@ export function startSessionDrag(
     },
 
     resolveMove(x, y): DropHint | null {
+      const project = projectTargets.find(target => rectContains(target.rect, x, y))
+
+      if (project) {
+        split = null
+        link = null
+        projectTargetId = project.id
+
+        return { kind: 'project', projectId: project.id }
+      }
+
+      projectTargetId = null
       const zone = zones.find(z => rectContains(z.rect, x, y))
       const host = zone ? zoneHost.get(zone.id) : null
 
@@ -183,7 +214,9 @@ export function startSessionDrag(
     },
 
     onCommit() {
-      if (split) {
+      if (projectTargetId) {
+        void moveSessionToProject(payload.id, projectTargetId)
+      } else if (split) {
         openSessionTile(payload.id, split.pos, split.anchor, split.before)
         // A tile for this session may already exist (openSessionTile is
         // idempotent — e.g. persisted from an earlier run): a drop must never

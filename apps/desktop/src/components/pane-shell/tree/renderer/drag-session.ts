@@ -138,7 +138,9 @@ export const rectContains = (rect: ZoneRect, x: number, y: number, pad = 0) =>
   x >= rect.left - pad && x <= rect.right + pad && y >= rect.top - pad && y <= rect.bottom + pad
 
 const sameHint = (a: DropHint | null, b: DropHint | null) =>
+  a?.kind === b?.kind &&
   a?.groupId === b?.groupId &&
+  a?.projectId === b?.projectId &&
   a?.pos === b?.pos &&
   a?.stack?.before === b?.stack?.before &&
   (a?.stack === undefined) === (b?.stack === undefined) &&

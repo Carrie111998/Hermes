@@ -3686,6 +3686,41 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         self._execute_write(_do)
 
+    def move_session_lineage_to_cwd(
+        self,
+        session_id: str,
+        cwd: str,
+        git_branch: str = None,
+        git_repo_root: str = None,
+    ) -> List[str]:
+        """Move one logical conversation to a workspace as a single unit.
+
+        Desktop projects are derived from persisted cwd/repo metadata. Context
+        compression splits one visible chat across multiple session rows, so a
+        sidebar move must update the whole compression lineage or the old root
+        can reappear in its previous project on refresh.
+        """
+        if not session_id or not cwd or self.get_session(session_id) is None:
+            return []
+
+        session_ids = self.get_compression_lineage(session_id)
+        if not session_ids:
+            return []
+
+        branch = (git_branch or "").strip() or None
+        repo_root = (git_repo_root or "").strip() or None
+
+        def _do(conn):
+            placeholders = ",".join("?" for _ in session_ids)
+            conn.execute(
+                f"UPDATE sessions SET cwd = ?, git_branch = ?, git_repo_root = ? "
+                f"WHERE id IN ({placeholders})",
+                [cwd, branch, repo_root, *session_ids],
+            )
+
+        self._execute_write(_do)
+        return session_ids
+
     def backfill_repo_roots(self, cwd_to_root: Dict[str, str]) -> None:
         """Persist resolved git repo roots for cwds that don't have one yet.
 

@@ -254,6 +254,7 @@ _LONG_HANDLERS = frozenset(
         "projects.for_cwd",
         "projects.tree",
         "projects.project_sessions",
+        "projects.move_session",
         # Setup readiness RPCs are polled by the Desktop frontend on connect
         # and periodically (use-status-snapshot → evaluateRuntimeReadiness).
         # setup.runtime_check calls resolve_runtime_provider() which reads

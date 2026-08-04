@@ -1577,6 +1577,7 @@ export interface Translations {
       copyPath: string
       removeFromSidebar: string
       createFailed: string
+      moveSessionFailed: string
       staleBackend: string
       deleteConfirm: string
       startWork: string

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import threading
 
 import pytest
 
@@ -55,6 +56,7 @@ def test_methods_registered():
         "projects.archive",
         "projects.set_active",
         "projects.for_cwd",
+        "projects.move_session",
     ):
         assert m in server._methods
 
@@ -211,6 +213,75 @@ def test_update_and_archive(tmp_path):
 
     payload = _call("projects.archive", {"id": pid})
     assert all(p["id"] != pid or p["archived"] for p in payload["projects"])
+
+
+def test_move_session_moves_compression_lineage_to_target_project(tmp_path):
+    source = tmp_path / "source"
+    target = tmp_path / "target"
+    source.mkdir()
+    target.mkdir()
+    target_id = _call(
+        "projects.create", {"name": "Target", "folders": [str(target)]}
+    )["project"]["id"]
+
+    db = server._get_db()
+    db.create_session("move-root", "desktop", cwd=str(source))
+    db._conn.execute(
+        "UPDATE sessions SET ended_at=1, end_reason='compression' WHERE id='move-root'"
+    )
+    db.create_session(
+        "move-tip",
+        "desktop",
+        cwd=str(source),
+        parent_session_id="move-root",
+    )
+    db._conn.commit()
+
+    result = _call(
+        "projects.move_session",
+        {"project_id": target_id, "session_id": "move-tip"},
+    )
+
+    assert set(result["session_ids"]) == {"move-root", "move-tip"}
+    assert result["cwd"] == str(target)
+    assert db.get_session("move-root")["cwd"] == str(target)
+    assert db.get_session("move-tip")["cwd"] == str(target)
+
+
+def test_projects_move_session_rejects_a_running_session(tmp_path):
+    target = tmp_path / "target"
+    target.mkdir()
+    project_id = _call("projects.create", {"name": "Busy target", "folders": [str(target)]})["project"]["id"]
+    db = server._get_db()
+    db.create_session("move-busy", "desktop", cwd=str(tmp_path))
+    server._sessions["move-busy"] = {
+        "history_lock": threading.RLock(),
+        "running": True,
+        "session_key": "move-busy",
+    }
+
+    try:
+        response = server._methods["projects.move_session"](
+            1,
+            {"project_id": project_id, "session_id": "move-busy"},
+        )
+    finally:
+        server._sessions.pop("move-busy", None)
+
+    assert response["error"]["code"] == 4009
+    assert db.get_session("move-busy")["cwd"] == str(tmp_path)
+
+
+def test_move_session_rejects_project_without_workspace(tmp_path):
+    db = server._get_db()
+    db.create_session("move-no-target", "desktop", cwd=str(tmp_path))
+    project_id = _call("projects.create", {"name": "Empty"})["project"]["id"]
+
+    response = server._methods["projects.move_session"](
+        1, {"project_id": project_id, "session_id": "move-no-target"}
+    )
+
+    assert response["error"]["code"] == 4042
 
 
 def test_get_unknown_returns_error():

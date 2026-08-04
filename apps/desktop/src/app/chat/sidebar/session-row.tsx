@@ -152,7 +152,9 @@ function SidebarSessionRowImpl({
             return
           }
 
-          startSessionDrag({ id: session.id, profile: session.profile || 'default', title }, event)
+          startSessionDrag({ id: session.id, profile: session.profile || 'default', title }, event, {
+            projectMove: true
+          })
         }}
         // Hovering a row from another profile (the all-profiles view) telegraphs
         // a cross-profile resume — start that backend's spawn now so the click

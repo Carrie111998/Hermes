@@ -20,6 +20,7 @@ import {
   endSessionMutation,
   enterProject,
   exitProjectScope,
+  moveSessionToProject,
   openProjectCreate,
   pickProjectFolder,
   projectNameForCwd,
@@ -542,5 +543,114 @@ describe('tombstone pruning', () => {
     await refreshProjectTree()
 
     expect($removedSessionIds.get().has('sess-1')).toBe(false)
+  })
+})
+
+describe('moveSessionToProject', () => {
+  const moveResult = {
+    cwd: '/work/target',
+    git_branch: 'main',
+    git_repo_root: '/work/target',
+    project_id: 'target',
+    session_ids: ['session-1']
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    $activeGatewayProfile.set('default')
+    $projectTree.set([
+      { id: 'source', label: 'Source', path: '/work/source', repos: [], sessionCount: 1 },
+      { id: 'target', label: 'Target', path: '/work/target', repos: [], sessionCount: 0 }
+    ])
+    $sessions.set([
+      {
+        archived: false,
+        cwd: '/work/source',
+        ended_at: null,
+        id: 'session-1',
+        input_tokens: 0,
+        is_active: false,
+        last_active: 0,
+        message_count: 1,
+        model: null,
+        output_tokens: 0,
+        pinned: false,
+        preview: '',
+        profile: 'default',
+        source: 'desktop',
+        started_at: 0,
+        title: 'Move me',
+        tool_call_count: 0
+      }
+    ])
+  })
+
+  it('updates the flat cache and refreshes the authoritative project tree', async () => {
+    const request = vi.fn(async (method: string) => {
+      if (method === 'projects.move_session') {
+        return moveResult
+      }
+
+      return { active_id: null, projects: [], scoped_session_ids: ['session-1'] }
+    })
+    const gateway = { connectionState: 'open', request }
+    activeGateway.mockReturnValue(gateway as never)
+    gatewayAtom.set(gateway as never)
+
+    await expect(moveSessionToProject('session-1', 'target')).resolves.toBe(true)
+
+    expect(request).toHaveBeenCalledWith('projects.move_session', {
+      project_id: 'target',
+      session_id: 'session-1'
+    })
+    expect($sessions.get()[0]).toMatchObject({
+      cwd: '/work/target',
+      git_branch: 'main',
+      git_repo_root: '/work/target'
+    })
+    expect(request).toHaveBeenCalledWith('projects.tree', { preview_limit: 3 })
+  })
+
+  it('ignores a second drop while the same chat move is in flight', async () => {
+    let finishMove: (value: typeof moveResult) => void = () => undefined
+    const pendingMove = new Promise<typeof moveResult>(resolve => {
+      finishMove = resolve
+    })
+    const request = vi.fn((method: string) =>
+      method === 'projects.move_session'
+        ? pendingMove
+        : Promise.resolve({ active_id: null, projects: [], scoped_session_ids: ['session-1'] })
+    )
+    const gateway = { connectionState: 'open', request }
+    activeGateway.mockReturnValue(gateway as never)
+    gatewayAtom.set(gateway as never)
+
+    const firstMove = moveSessionToProject('session-1', 'target')
+    await vi.waitFor(() => expect(request).toHaveBeenCalledTimes(1))
+    await expect(moveSessionToProject('session-1', 'target')).resolves.toBe(false)
+    finishMove(moveResult)
+    await expect(firstMove).resolves.toBe(true)
+
+    expect(request.mock.calls.filter(([method]) => method === 'projects.move_session')).toHaveLength(1)
+  })
+
+  it('does not write a stale response into a newly selected profile', async () => {
+    let finishMove: (value: typeof moveResult) => void = () => undefined
+    const pendingMove = new Promise<typeof moveResult>(resolve => {
+      finishMove = resolve
+    })
+    const request = vi.fn(() => pendingMove)
+    const gateway = { connectionState: 'open', request }
+    activeGateway.mockReturnValue(gateway as never)
+    gatewayAtom.set(gateway as never)
+
+    const moving = moveSessionToProject('session-1', 'target')
+    await vi.waitFor(() => expect(request).toHaveBeenCalledTimes(1))
+    $activeGatewayProfile.set('other')
+    finishMove(moveResult)
+
+    await expect(moving).resolves.toBe(true)
+    expect($sessions.get()[0]?.cwd).toBe('/work/source')
+    expect(request).not.toHaveBeenCalledWith('projects.tree', expect.anything())
   })
 })

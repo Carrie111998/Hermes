@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { group } from '@/components/pane-shell/tree/model'
 import { $layoutTree } from '@/components/pane-shell/tree/store'
+import { moveSessionToProject } from '@/store/projects'
 import { openSessionTile } from '@/store/session-states'
 
 import { requestComposerInsertRefs } from './composer/focus'
@@ -16,6 +17,7 @@ import { startSessionDrag } from './session-drag'
  */
 
 vi.mock('@/store/session-states', () => ({ openSessionTile: vi.fn() }))
+vi.mock('@/store/projects', () => ({ moveSessionToProject: vi.fn() }))
 vi.mock('./composer/focus', () => ({ requestComposerInsertRefs: vi.fn() }))
 
 const ZONE = { left: 0, top: 0, right: 1000, bottom: 800 }
@@ -61,14 +63,14 @@ function mountStackedTabs() {
 
 /** Press on `source`, drag to (x, y), release. The drag session flushes its
  *  pending move synchronously on release, so no frame wait is needed. */
-function dragTo(source: HTMLElement, x: number, y: number) {
+function dragTo(source: HTMLElement, x: number, y: number, projectMove = false) {
   startSessionDrag({ id: 'dragged', profile: 'default', title: 'Dragged chat' }, {
     button: 0,
     clientX: 0,
     clientY: 0,
     currentTarget: source,
     pointerId: 1
-  } as unknown as ReactPointerEvent<HTMLElement>)
+  } as unknown as ReactPointerEvent<HTMLElement>, { projectMove })
 
   window.dispatchEvent(new MouseEvent('pointermove', { bubbles: true, clientX: x, clientY: y }))
   window.dispatchEvent(new MouseEvent('pointerup', { bubbles: true, clientX: x, clientY: y }))
@@ -109,5 +111,44 @@ describe('session drop targeting across stacked tabs', () => {
 
     expect(requestComposerInsertRefs).not.toHaveBeenCalled()
     expect(openSessionTile).not.toHaveBeenCalled()
+  })
+})
+
+describe('session project transfer targeting', () => {
+  function mountProjectRows() {
+    document.body.innerHTML = `
+      <div data-project-drop-id="source"><div id="row"></div></div>
+      <div data-project-drop-id="target"></div>
+    `
+    stubRect(document.querySelector('[data-project-drop-id="source"]')!, {
+      left: 0,
+      top: 0,
+      right: 200,
+      bottom: 80
+    })
+    stubRect(document.querySelector('[data-project-drop-id="target"]')!, {
+      left: 0,
+      top: 100,
+      right: 200,
+      bottom: 200
+    })
+
+    return document.getElementById('row')!
+  }
+
+  it('moves a sidebar chat when released over another project', () => {
+    const row = mountProjectRows()
+
+    dragTo(row, 100, 150, true)
+
+    expect(moveSessionToProject).toHaveBeenCalledWith('dragged', 'target')
+  })
+
+  it('does not target the project that already contains the chat', () => {
+    const row = mountProjectRows()
+
+    dragTo(row, 100, 40, true)
+
+    expect(moveSessionToProject).not.toHaveBeenCalled()
   })
 })
