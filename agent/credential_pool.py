@@ -389,7 +389,10 @@ def _exhausted_until(entry: PooledCredential) -> Optional[float]:
 
 def _normalize_custom_pool_name(name: str) -> str:
     """Normalize a custom provider name for use as a pool key suffix."""
-    return name.strip().lower().replace(" ", "-")
+    normalized = str(name or "").strip().lower().replace(" ", "-")
+    if normalized.startswith(CUSTOM_POOL_PREFIX):
+        normalized = normalized[len(CUSTOM_POOL_PREFIX):]
+    return normalized
 
 
 def _iter_custom_providers(config: Optional[dict] = None):
@@ -419,28 +422,24 @@ def _iter_custom_providers(config: Optional[dict] = None):
 
 
 def get_custom_provider_pool_key(base_url: Optional[str], provider_name: Optional[str] = None) -> Optional[str]:
-    """Look up the custom_providers list in config.yaml and return 'custom:<name>' for a matching base_url.
+    """Return the configured custom pool key for an endpoint and optional identity.
 
-    When provider_name is given, prefer matching by name first (solving the case where
-    multiple custom providers share the same base_url but have different API keys).
-    Falls back to base_url matching when no name match is found.
-
-    Returns None if no match is found.
+    An explicit provider name is a trust-boundary assertion: it must match both
+    a configured name and that entry's endpoint. URL-only lookup is retained
+    only for callers that have no named identity at all.
     """
     if not base_url:
         return None
     normalized_url = base_url.strip().rstrip("/")
 
-    # When a provider name is given, try to match by name first.
-    # This fixes the P1 bug where two custom providers sharing the same
-    # base_url always resolve to the first one's credentials.
     if provider_name:
         normalized_name = _normalize_custom_pool_name(provider_name)
         for norm_name, entry in _iter_custom_providers():
-            if norm_name == normalized_name:
+            entry_url = str(entry.get("base_url") or "").strip().rstrip("/")
+            if norm_name == normalized_name and entry_url == normalized_url:
                 return f"{CUSTOM_POOL_PREFIX}{norm_name}"
+        return None
 
-    # Fall back to base_url matching (original behavior)
     for norm_name, entry in _iter_custom_providers():
         entry_url = str(entry.get("base_url") or "").strip().rstrip("/")
         if entry_url and entry_url == normalized_url:
@@ -491,14 +490,17 @@ def credential_pool_matches_provider(
     provider: Optional[str],
     *,
     base_url: Optional[str] = None,
+    provider_name: Optional[str] = None,
 ) -> bool:
     """Return whether a pool belongs to the requested runtime provider.
 
     Named custom endpoints intentionally use two identities: the live agent is
     ``custom`` while its pool is keyed ``custom:<name>``. Accept that pair only
-    when the runtime base URL resolves to the exact same custom pool key.
-    Empty string identities fail closed. Legacy pool adapters without a
-    ``provider`` attribute remain compatible; production pools are scoped.
+    when the runtime base URL plus, when available, the original named provider
+    resolve to the exact same custom pool key. This prevents URL-first lookup
+    from accepting a sibling account group that shares the endpoint. Empty
+    string identities fail closed. Legacy pool adapters without a ``provider``
+    attribute remain compatible; production pools are scoped.
     """
     raw_pool_provider = getattr(pool_or_provider, "provider", None)
     if raw_pool_provider is None:
@@ -518,7 +520,10 @@ def credential_pool_matches_provider(
     if provider_norm != "custom" or not pool_provider.startswith(CUSTOM_POOL_PREFIX):
         return False
     try:
-        matched_pool = get_custom_provider_pool_key(base_url or "")
+        matched_pool = get_custom_provider_pool_key(
+            base_url or "",
+            provider_name=provider_name,
+        )
     except Exception:
         return False
     return str(matched_pool or "").strip().lower() == pool_provider
@@ -2728,6 +2733,16 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
     return changed, active_sources
 
 
+def _get_env_prefer_dotenv(key: str, default: str = "") -> str:
+    """Read a profile env key with the pool's established `.env` precedence."""
+    env_file = load_env()
+    raw = env_file.get(key, "").strip()
+    scoped_value = (_get_secret(key, "") or "").strip()
+    if raw.startswith("op://") and scoped_value:
+        return scoped_value
+    return raw or scoped_value or default
+
+
 def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool, Set[str]]:
     changed = False
     active_sources: Set[str] = set()
@@ -2750,23 +2765,6 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
     # authoritative source for Hermes credentials. Stale env vars from parent
     # processes (Codex CLI, test scripts, etc.) should not override deliberate
     # changes to the .env file.
-    def _get_env_prefer_dotenv(key: str) -> str:
-        env_file = load_env()
-        raw = env_file.get(key, "").strip()
-        scoped_value = (_get_secret(key, "") or "").strip()
-        # If .env contains an unresolved op:// reference, prefer the
-        # already-resolved value supplied by the active secret scope (or by
-        # os.environ in legacy single-profile mode), set by
-        # load_hermes_dotenv() -> apply_onepassword_secrets()).  The raw
-        # "op://Vault/Item/field" string would otherwise win and every
-        # provider auth attempt would receive a URL instead of a key.  This
-        # happens during a partial migration, or when the user wrote op://
-        # references straight into .env rather than the secrets.onepassword
-        # config block.  For every non-op:// value the original
-        # .env-takes-precedence behaviour is preserved unchanged.
-        if raw.startswith("op://") and scoped_value:
-            return scoped_value
-        return raw or scoped_value
 
     # Honour user suppression — `hermes auth remove <provider> <N>` for an
     # env-seeded credential marks the env:<VAR> source as suppressed so it
@@ -2919,10 +2917,16 @@ def _seed_custom_pool(pool_key: str, entries: List[PooledCredential]) -> Tuple[b
         def _is_suppressed(_p, _s):  # type: ignore[misc]
             return False
 
-    # Seed from the custom_providers config entry's api_key field
+    # Reuse the runtime resolver so pool-first selection cannot preserve an
+    # inline key that the named-provider runtime would correctly supersede.
     cp_config = _get_custom_provider_config(pool_key)
     if cp_config:
-        api_key = str(cp_config.get("api_key") or "").strip()
+        from hermes_cli.runtime_provider import _resolve_named_custom_api_key
+
+        api_key = _resolve_named_custom_api_key(
+            cp_config,
+            getenv=_get_env_prefer_dotenv,
+        )
         base_url = str(cp_config.get("base_url") or "").strip().rstrip("/")
         name = str(cp_config.get("name") or "").strip()
         if api_key:
@@ -2942,22 +2946,30 @@ def _seed_custom_pool(pool_key: str, entries: List[PooledCredential]) -> Tuple[b
                     },
                 )
 
-    # Seed from model.api_key if model.provider=='custom' and model.base_url matches
+    # Seed from model.api_key when model.provider is a custom transport or
+    # already carries a canonical custom:<name> identity and model.base_url matches.
     try:
         config = _load_config_safe()
         model_cfg = config.get("model") if config else None
         if isinstance(model_cfg, dict):
             model_provider = str(model_cfg.get("provider") or "").strip().lower()
             model_base_url = str(model_cfg.get("base_url") or "").strip().rstrip("/")
+            model_requested_provider = str(
+                model_cfg.get("requested_provider") or ""
+            ).strip()
+            if model_provider.startswith(CUSTOM_POOL_PREFIX) and not model_requested_provider:
+                model_requested_provider = model_provider
             model_api_key = ""
             for k in ("api_key", "api"):
                 v = model_cfg.get(k)
                 if isinstance(v, str) and v.strip():
                     model_api_key = v.strip()
                     break
-            if model_provider == "custom" and model_base_url and model_api_key:
-                # Check if this model's base_url matches our custom provider
-                matched_key = get_custom_provider_pool_key(model_base_url)
+            if model_provider in {"custom", model_requested_provider} and model_base_url and model_api_key:
+                matched_key = get_custom_provider_pool_key(
+                    model_base_url,
+                    provider_name=model_requested_provider or None,
+                )
                 if matched_key == pool_key:
                     source = "model_config"
                     if not _is_suppressed(pool_key, source):

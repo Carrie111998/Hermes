@@ -6,7 +6,7 @@ import logging
 import os
 import re
 from urllib.parse import urlparse
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +63,44 @@ def _getenv(name: str, default: str = "") -> str:
 
 def _normalize_custom_provider_name(value: str) -> str:
     return value.strip().lower().replace(" ", "-")
+
+
+def _named_custom_provider_key_env(entry: Dict[str, Any]) -> str:
+    """Return the environment-variable name for a named custom provider.
+
+    ``key_env`` is Hermes' canonical spelling; ``api_key_env`` is accepted as
+    a compatibility alias used by older/imported provider configurations.
+    """
+    return str(entry.get("key_env") or entry.get("api_key_env") or "").strip()
+
+
+def _resolve_named_custom_api_key(
+    entry: Dict[str, Any],
+    *,
+    explicit_api_key: Optional[str] = None,
+    getenv: Callable[[str, str], str] = _getenv,
+) -> str:
+    """Resolve a named custom-provider key with explicit/env/inline precedence.
+
+    ``explicit_api_key`` is a call-local override. For config-backed named
+    providers, an explicitly referenced environment variable is authoritative
+    over a stale inline ``api_key``. ``getenv`` is injectable so credential-pool
+    seeding can preserve its profile ``.env`` precedence.
+    """
+    explicit = str(explicit_api_key or "").strip()
+    if explicit:
+        return explicit
+
+    key_env = _named_custom_provider_key_env(entry)
+    if key_env:
+        env_key = getenv(key_env, "").strip()
+        if env_key:
+            return env_key
+
+    inline = str(entry.get("api_key") or "").strip()
+    if inline.startswith("${") and inline.endswith("}"):
+        inline = getenv(inline[2:-1], "").strip()
+    return inline
 
 
 def _loopback_hostname(host: str) -> bool:
@@ -715,12 +753,8 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
             # they're not configured.
             if not is_provider_enabled(entry):
                 continue
-            # Resolve the API key from the env var name stored in key_env
-            key_env = str(entry.get("key_env", "") or "").strip()
-            resolved_api_key = _getenv(key_env, "").strip() if key_env else ""
-            # Fall back to inline api_key when key_env is absent or unresolvable
-            if not resolved_api_key:
-                resolved_api_key = str(entry.get("api_key", "") or "").strip()
+            key_env = _named_custom_provider_key_env(entry)
+            resolved_api_key = _resolve_named_custom_api_key(entry)
 
             display_name = entry.get("name", "")
             if requested_norm in custom_provider_aliases(
@@ -780,9 +814,9 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
         result = {
             "name": name.strip(),
             "base_url": base_url.strip(),
-            "api_key": str(entry.get("api_key", "") or "").strip(),
+            "api_key": _resolve_named_custom_api_key(entry),
         }
-        key_env = str(entry.get("key_env", "") or "").strip()
+        key_env = _named_custom_provider_key_env(entry)
         if key_env:
             result["key_env"] = key_env
         if provider_key:
@@ -1905,6 +1939,7 @@ def resolve_runtime_provider(
                     or getattr(entry, "base_url", None)
                     or ""
                 ),
+                provider_name=requested_provider,
             )
         ):
             return _resolve_runtime_from_pool_entry(

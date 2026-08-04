@@ -58,7 +58,9 @@ def test_routing_to_different_model_marks_routed_and_resolves_credentials():
         "provider": "openrouter", "model": "google/gemini-3-flash-preview",
     }}}
     fake_rp = {
-        "provider": "openrouter", "api_key": "or-key",
+        "provider": "custom",
+        "requested_provider": "custom:review-provider",
+        "api_key": "or-key",
         "base_url": "https://openrouter.ai/api/v1", "api_mode": "chat_completions",
         "credential_pool": "routed-pool",
         "request_overrides": {"extra_body": {"store": False}},
@@ -68,7 +70,8 @@ def test_routing_to_different_model_marks_routed_and_resolves_credentials():
          patch("hermes_cli.runtime_provider.resolve_runtime_provider", return_value=fake_rp):
         rt = br._resolve_review_runtime(agent)
     assert rt["routed"] is True
-    assert rt["provider"] == "openrouter"
+    assert rt["provider"] == "custom"
+    assert rt["requested_provider"] == "custom:review-provider"
     assert rt["model"] == "google/gemini-3-flash-preview"
     assert rt["api_key"] == "or-key"
     assert rt["credential_pool"] == "routed-pool"

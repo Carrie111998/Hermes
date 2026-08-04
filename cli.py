@@ -8192,6 +8192,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 _reset_result = _switch_model(
                     raw_input=_config_model,
                     current_provider=self.provider or "",
+                    current_requested_provider=self.requested_provider or "",
                     current_model=self.model or "",
                     current_base_url=self.base_url or "",
                     current_api_key=self.api_key or "",
@@ -8203,13 +8204,20 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         self.agent.switch_model(
                             new_model=_reset_result.new_model,
                             new_provider=_reset_result.target_provider,
+                            requested_provider=(
+                                _reset_result.requested_provider
+                                or _reset_result.target_provider
+                            ),
                             api_key=_reset_result.api_key,
                             base_url=_reset_result.base_url,
                             api_mode=_reset_result.api_mode,
                         )
                     self.model = _reset_result.new_model
                     self.provider = _reset_result.target_provider
-                    self.requested_provider = _reset_result.target_provider
+                    self.requested_provider = (
+                        _reset_result.requested_provider
+                        or _reset_result.target_provider
+                    )
                     self._explicit_api_key = _reset_result.api_key
                     self._explicit_base_url = _reset_result.base_url
                     if _reset_result.api_key:
@@ -9032,6 +9040,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 agent.switch_model(
                     new_model=snapshot.get("model", ""),
                     new_provider=snapshot.get("provider", ""),
+                    requested_provider=(
+                        snapshot.get("requested_provider")
+                        or snapshot.get("provider", "")
+                    ),
                     api_key=snapshot.get("api_key", ""),
                     base_url=snapshot.get("base_url", ""),
                     api_mode=snapshot.get("api_mode", ""),
@@ -9135,7 +9147,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         }
         self.model = result.new_model
         self.provider = result.target_provider
-        self.requested_provider = result.target_provider
+        self.requested_provider = result.requested_provider or result.target_provider
         # Always overwrite explicit overrides so stale credentials from the
         # previous provider (e.g. Ollama api_key/base_url) don't leak into
         # the new provider's credential resolution on the next turn.
@@ -9153,6 +9165,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 self.agent.switch_model(
                     new_model=result.new_model,
                     new_provider=result.target_provider,
+                    requested_provider=(
+                        result.requested_provider or result.target_provider
+                    ),
                     api_key=result.api_key,
                     base_url=result.base_url,
                     api_mode=result.api_mode,
@@ -9219,7 +9234,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         if persist_global:
             HermesCLI._clear_persisted_context_for_model_switch(self, result)
             save_config_value("model.default", result.new_model)
-            save_config_value("model.provider", result.target_provider)
+            save_config_value(
+                "model.provider",
+                result.requested_provider or result.target_provider,
+            )
             # base_url/api_mode were previously never persisted here, so a
             # global switch left the OLD provider's endpoint/wire-protocol in
             # config.yaml. result.base_url/api_mode are always freshly
@@ -9282,6 +9300,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 result = switch_model(
                     raw_input=chosen_model,
                     current_provider=self.provider or "",
+                    current_requested_provider=self.requested_provider or "",
                     current_model=self.model or "",
                     current_base_url=self.base_url or "",
                     current_api_key=self.api_key or "",
@@ -9425,6 +9444,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         result = switch_model(
             raw_input=model_input,
             current_provider=self.provider or "",
+            current_requested_provider=self.requested_provider or "",
             current_model=self.model or "",
             current_base_url=self.base_url or "",
             current_api_key=self.api_key or "",
@@ -9478,7 +9498,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         }
         self.model = result.new_model
         self.provider = result.target_provider
-        self.requested_provider = result.target_provider
+        self.requested_provider = result.requested_provider or result.target_provider
         # Always overwrite explicit overrides so stale credentials from the
         # previous provider (e.g. Ollama api_key/base_url) don't leak into
         # the new provider's credential resolution on the next turn.
@@ -9497,6 +9517,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 self.agent.switch_model(
                     new_model=result.new_model,
                     new_provider=result.target_provider,
+                    requested_provider=(
+                        result.requested_provider or result.target_provider
+                    ),
                     api_key=result.api_key,
                     base_url=result.base_url,
                     api_mode=result.api_mode,
@@ -9572,7 +9595,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         if persist_global:
             HermesCLI._clear_persisted_context_for_model_switch(self, result)
             save_config_value("model.default", result.new_model)
-            save_config_value("model.provider", result.target_provider)
+            save_config_value(
+                "model.provider",
+                result.requested_provider or result.target_provider,
+            )
             # See _apply_model_switch_result above for why base_url/api_mode
             # must be synced on every global switch (#25106).
             save_config_value("model.base_url", result.base_url or None)

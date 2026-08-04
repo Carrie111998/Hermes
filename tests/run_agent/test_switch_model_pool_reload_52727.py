@@ -110,6 +110,45 @@ class TestSwitchModelReloadsCredentialPool:
         # load_pool MUST have been called with the new provider.
         load_pool_mock.assert_called_once_with("groq")
 
+    def test_switch_to_named_custom_provider_keeps_transport_and_pool_identity_separate(self, monkeypatch):
+        monkeypatch.setattr(
+            "agent.credential_pool._load_config_safe",
+            lambda: {
+                "custom_providers": [
+                    {
+                        "name": "provider-a",
+                        "base_url": "https://gateway.example/v1",
+                    },
+                    {
+                        "name": "provider-b",
+                        "base_url": "https://gateway.example/v1",
+                    },
+                ]
+            },
+        )
+        old_pool = _make_pool("opencode-go")
+        new_pool = _make_pool("custom:provider-b")
+        agent = _make_agent("opencode-go", "qwen-coder", old_pool)
+
+        with patch(
+            "agent.credential_pool.load_pool",
+            return_value=new_pool,
+        ) as load_pool_mock:
+            switch_model(
+                agent,
+                new_model="provider-b-model",
+                new_provider="custom",
+                requested_provider="custom:provider-b",
+                api_key="provider-b-key",
+                base_url="https://gateway.example/v1",
+                api_mode="chat_completions",
+            )
+
+        assert agent.provider == "custom"
+        assert agent.requested_provider == "custom:provider-b"
+        assert agent._credential_pool is new_pool
+        load_pool_mock.assert_called_once_with("custom:provider-b")
+
     def test_switch_to_same_provider_does_not_reload_pool(self):
         """Re-selecting the current provider must NOT churn the pool reference."""
         existing_pool = _make_pool("opencode-go")

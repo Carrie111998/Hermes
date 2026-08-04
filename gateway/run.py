@@ -6846,6 +6846,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             override_model = override.get("model", model)
             override_runtime = {
                 "provider": override.get("provider"),
+                # ``provider`` is the runtime transport.  Keep the original
+                # configured identity separately so a named custom endpoint
+                # does not re-resolve as bare ``custom`` after cache eviction.
+                "requested_provider": (
+                    override.get("requested_provider")
+                    or override.get("provider")
+                ),
                 "api_key": override.get("api_key"),
                 "base_url": override.get("base_url"),
                 "api_mode": override.get("api_mode"),
@@ -6855,7 +6862,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if override_runtime.get("api_key"):
                 if override_runtime.get("credential_pool") is None:
                     override_runtime["credential_pool"] = _credential_pool_for_provider(
-                        override.get("provider")
+                        override.get("requested_provider") or override.get("provider")
                     )
                 logger.debug(
                     "Session model override (fast): session=%s config_model=%s -> override_model=%s provider=%s",
@@ -22454,19 +22461,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return
         if not persisted:
             return
+        requested_provider = (
+            persisted.get("requested_provider") or persisted.get("provider")
+        )
         override: Dict[str, Any] = {
             "model": persisted.get("model"),
             "provider": persisted.get("provider"),
+            "requested_provider": requested_provider,
             "base_url": persisted.get("base_url"),
         }
-        provider = persisted.get("provider")
-        if provider:
+        if requested_provider:
             # Re-resolve credentials for the persisted provider. On failure
             # (e.g. credentials were removed since the switch) keep the
             # credential-less override — _resolve_session_agent_runtime falls
             # back to env-based resolution and applies model/provider on top.
             try:
-                runtime = _resolve_runtime_agent_kwargs_for_provider(provider)
+                runtime = _resolve_runtime_agent_kwargs_for_provider(
+                    requested_provider
+                )
+                override["provider"] = runtime.get("provider") or override.get(
+                    "provider"
+                )
+                override["requested_provider"] = runtime.get(
+                    "requested_provider"
+                ) or requested_provider
                 override["api_key"] = runtime.get("api_key")
                 override["api_mode"] = runtime.get("api_mode")
                 override["credential_pool"] = runtime.get("credential_pool")
@@ -22476,12 +22494,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.debug(
                     "Credential re-resolution failed for persisted override "
                     "(provider=%s); using credential-less override",
-                    provider, exc_info=True,
+                    requested_provider, exc_info=True,
                 )
         self._session_state(session_key).conversation.model_override = override
         logger.info(
-            "Rehydrated persisted /model override for session=%s: model=%s provider=%s",
-            session_key, override.get("model"), provider or "",
+            "Rehydrated persisted /model override for session=%s: model=%s "
+            "provider=%s requested_provider=%s",
+            session_key,
+            override.get("model"),
+            override.get("provider") or "",
+            override.get("requested_provider") or "",
         )
 
     def _apply_session_model_override(
@@ -22500,17 +22522,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not override:
             return model, runtime_kwargs
         model = override.get("model", model)
-        for key in ("provider", "api_key", "base_url", "api_mode", "credential_pool"):
+        for key in (
+            "provider",
+            "requested_provider",
+            "api_key",
+            "base_url",
+            "api_mode",
+            "credential_pool",
+        ):
             val = override.get(key)
             if val is not None:
                 runtime_kwargs[key] = val
+        if not runtime_kwargs.get("requested_provider"):
+            runtime_kwargs["requested_provider"] = override.get("provider")
         if (
             runtime_kwargs.get("api_key")
             and runtime_kwargs.get("credential_pool") is None
             and override.get("provider")
         ):
             runtime_kwargs["credential_pool"] = _credential_pool_for_provider(
-                override.get("provider")
+                override.get("requested_provider") or override.get("provider")
             )
         return model, runtime_kwargs
 

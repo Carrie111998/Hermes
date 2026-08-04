@@ -78,6 +78,64 @@ def test_cli_model_once_records_restore_and_does_not_persist(monkeypatch):
     assert "next turn only" in printed[-1]
 
 
+def test_cli_model_once_keeps_named_custom_identity_on_live_agent(monkeypatch):
+    """Typed /model --once keeps transport and named identity distinct."""
+    import cli as cli_mod
+
+    stub = _StubCLI()
+    stub.provider = "custom"
+    stub.requested_provider = "custom:account-a"
+    stub.agent = _FakeAgent()
+    stub.agent.provider = "custom"
+    stub._snapshot_model_runtime = cli_mod.HermesCLI._snapshot_model_runtime.__get__(stub)
+
+    monkeypatch.setattr(cli_mod, "_cprint", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        cli_mod,
+        "save_config_value",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not persist")),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.inventory.load_picker_context",
+        lambda: SimpleNamespace(
+            user_providers=None,
+            custom_providers=None,
+            with_overrides=lambda **_: SimpleNamespace(
+                user_providers=None, custom_providers=None
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.switch_model",
+        lambda **_: ModelSwitchResult(
+            success=True,
+            new_model="account-b-model",
+            target_provider="custom",
+            requested_provider="custom:account-b",
+            provider_changed=True,
+            api_key="account-b-key",
+            base_url="https://shared.example/v1",
+            api_mode="chat_completions",
+            provider_label="Account B",
+        ),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.resolve_display_context_length",
+        lambda *a, **k: None,
+    )
+
+    cli_mod.HermesCLI._handle_model_switch(
+        stub,
+        "/model account-b-model --provider account-b --once",
+    )
+
+    assert stub.provider == "custom"
+    assert stub.requested_provider == "custom:account-b"
+    assert stub.agent.calls[-1]["new_provider"] == "custom"
+    assert stub.agent.calls[-1]["requested_provider"] == "custom:account-b"
+    assert stub._pending_one_turn_model_restore["requested_provider"] == "custom:account-a"
+
+
 def test_cli_restore_model_runtime_snapshot_restores_agent():
     import cli as cli_mod
 

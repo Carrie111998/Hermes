@@ -43,6 +43,18 @@ class _StubCLI:
     _pending_model_switch_note = ""
 
 
+class _SwitchingAgent:
+    """Capture the public live-switch contract without constructing a client."""
+
+    def __init__(self):
+        self.calls = []
+        self._custom_providers = None
+        self._config_context_length = None
+
+    def switch_model(self, **kwargs):
+        self.calls.append(kwargs)
+
+
 def _run_display(monkeypatch, result):
     import cli as cli_mod
 
@@ -52,6 +64,41 @@ def _run_display(monkeypatch, result):
     monkeypatch.setattr(cli_mod, "save_config_value", lambda *a, **k: None)
     cli_mod.HermesCLI._apply_model_switch_result(_StubCLI(), result, False)
     return captured
+
+
+def test_picker_apply_keeps_named_custom_identity_on_cli_and_live_agent(
+    monkeypatch,
+):
+    """The picker consumer must pass both transport and named identity through."""
+    import cli as cli_mod
+
+    captured: list[str] = []
+    monkeypatch.setattr(cli_mod, "_cprint", lambda s, *a, **k: captured.append(str(s)))
+    monkeypatch.setattr(cli_mod, "save_config_value", lambda *a, **k: None)
+    agent = _SwitchingAgent()
+    cli = _StubCLI()
+    cli.agent = agent
+    cli.model = "old-model"
+    cli.provider = "custom"
+    cli.requested_provider = "custom:account-a"
+    result = ModelSwitchResult(
+        success=True,
+        new_model="named-model",
+        target_provider="custom",
+        requested_provider="custom:account-b",
+        provider_changed=True,
+        api_key="account-b-key",
+        base_url="https://shared.example/v1",
+        api_mode="chat_completions",
+        provider_label="Account B",
+    )
+
+    cli_mod.HermesCLI._apply_model_switch_result(cli, result, False)
+
+    assert cli.provider == "custom"
+    assert cli.requested_provider == "custom:account-b"
+    assert agent.calls[-1]["new_provider"] == "custom"
+    assert agent.calls[-1]["requested_provider"] == "custom:account-b"
 
 
 def test_picker_path_uses_provider_aware_context_on_codex(monkeypatch):

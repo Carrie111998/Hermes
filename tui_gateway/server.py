@@ -3617,6 +3617,7 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
     # the provider override makes ``session.resume`` fail with "No LLM provider configured".
     # Only restore an explicit provider; otherwise leave it unset so resume falls back to
     # the configured default, matching the working CLI path.
+    requested_provider = str(model_config.get("requested_provider") or "").strip()
     explicit_provider = str(model_config.get("provider") or "").strip()
     billing_provider = str(
         model_config.get("billing_provider") or row.get("billing_provider") or ""
@@ -3624,6 +3625,7 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
     provider = explicit_provider
     if not provider and billing_provider.lower() not in _BARE_BILLING_PROVIDERS:
         provider = billing_provider
+    transport_provider = provider
     base_url = str(model_config.get("base_url") or "").strip()
     api_mode = str(model_config.get("api_mode") or "").strip()
     reasoning_config = model_config.get("reasoning_config")
@@ -3653,6 +3655,7 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
                 "custom provider identity recovery failed", exc_info=True
             )
         provider = healed or ("" if not base_url else provider)
+        transport_provider = explicit_provider if requested_provider else provider
 
     if model:
         # Use the same dict-shaped override that live /model switches use so a
@@ -3660,13 +3663,18 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
         # initial resume and later rebuilds (/new). Deliberately do not persist
         # or restore raw api_key here; endpoint credentials should continue to
         # come from config/env/provider resolution rather than the session DB.
-        overrides["model_override"] = {
+        model_override = {
             "model": model,
-            "provider": provider or None,
+            "provider": transport_provider or None,
             "base_url": base_url or None,
             "api_mode": api_mode or None,
         }
-    if provider:
+        if requested_provider:
+            model_override["requested_provider"] = requested_provider
+        overrides["model_override"] = model_override
+    if requested_provider:
+        overrides["provider_override"] = requested_provider
+    elif provider:
         overrides["provider_override"] = provider
     if isinstance(reasoning_config, dict):
         overrides["reasoning_config_override"] = reasoning_config
@@ -3684,6 +3692,9 @@ def _runtime_model_config(agent, existing: dict | None = None) -> dict:
     config = dict(existing or {})
     model = str(getattr(agent, "model", "") or "").strip()
     provider = str(getattr(agent, "provider", "") or "").strip()
+    requested_provider = str(
+        getattr(agent, "requested_provider", "") or ""
+    ).strip()
     base_url = str(getattr(agent, "base_url", "") or "").strip()
     api_mode = str(getattr(agent, "api_mode", "") or "").strip()
     reasoning_config = getattr(agent, "reasoning_config", None)
@@ -3721,6 +3732,10 @@ def _runtime_model_config(agent, existing: dict | None = None) -> dict:
                     "custom provider identity lookup failed", exc_info=True
                 )
         config["provider"] = provider
+    if requested_provider:
+        config["requested_provider"] = requested_provider
+    else:
+        config.pop("requested_provider", None)
     if base_url:
         config["base_url"] = base_url
     else:
@@ -4277,6 +4292,9 @@ def _snapshot_agent_model_runtime(agent) -> dict:
     return {
         "model": getattr(agent, "model", ""),
         "provider": getattr(agent, "provider", ""),
+        "requested_provider": getattr(
+            agent, "requested_provider", getattr(agent, "provider", "")
+        ),
         "api_key": getattr(agent, "api_key", ""),
         "base_url": getattr(agent, "base_url", ""),
         "api_mode": getattr(agent, "api_mode", ""),
@@ -4302,6 +4320,10 @@ def _restore_agent_model_runtime(agent, snapshot: dict | None) -> None:
         agent.switch_model(
             new_model=snapshot.get("model", ""),
             new_provider=snapshot.get("provider", ""),
+            requested_provider=(
+                snapshot.get("requested_provider")
+                or snapshot.get("provider", "")
+            ),
             api_key=snapshot.get("api_key", ""),
             base_url=snapshot.get("base_url", ""),
             api_mode=snapshot.get("api_mode", ""),
@@ -4361,6 +4383,9 @@ def _apply_model_switch(
         raise ValueError("/model --once requires a live session")
     if agent:
         current_provider = getattr(agent, "provider", "") or ""
+        current_requested_provider = (
+            getattr(agent, "requested_provider", "") or current_provider
+        )
         current_model = getattr(agent, "model", "") or ""
         current_base_url = getattr(agent, "base_url", "") or ""
         current_api_key = getattr(agent, "api_key", "") or ""
@@ -4369,10 +4394,12 @@ def _apply_model_switch(
         current_provider = explicit_provider.strip()
         current_base_url = ""
         current_api_key = ""
+        current_requested_provider = current_provider
         if not explicit_provider:
             runtime = resolve_runtime_provider(requested=None)
             current_provider = str(runtime.get("provider", "") or "")
             current_base_url = str(runtime.get("base_url", "") or "")
+            current_requested_provider = str(runtime.get("requested_provider") or current_provider)
             # Preserve a callable api_key (Azure Foundry Entra ID bearer
             # provider) unchanged — ``str(...)`` would produce
             # ``"<function ...>"`` and poison downstream switch_model
@@ -4408,6 +4435,7 @@ def _apply_model_switch(
         explicit_provider=explicit_provider,
         user_providers=user_provs,
         custom_providers=custom_provs,
+        current_requested_provider=current_requested_provider,
     )
     if not result.success:
         raise ValueError(result.error_message or "model switch failed")
@@ -4462,6 +4490,10 @@ def _apply_model_switch(
             agent.switch_model(
                 new_model=result.new_model,
                 new_provider=result.target_provider,
+                requested_provider=(
+                    getattr(result, "requested_provider", "")
+                    or result.target_provider
+                ),
                 api_key=result.api_key,
                 base_url=result.base_url,
                 api_mode=result.api_mode,
@@ -4508,6 +4540,9 @@ def _apply_model_switch(
         session["model_override"] = {
             "model": result.new_model,
             "provider": result.target_provider,
+            "requested_provider": (
+                getattr(result, "requested_provider", "") or result.target_provider
+            ),
             "base_url": result.base_url,
             "api_key": result.api_key,
             "api_mode": result.api_mode,
@@ -5939,6 +5974,9 @@ def _background_agent_kwargs(agent, task_id: str) -> dict:
         "base_url": getattr(agent, "base_url", None) or None,
         "api_key": getattr(agent, "api_key", None) or None,
         "provider": getattr(agent, "provider", None) or None,
+        "requested_provider": getattr(agent, "requested_provider", None)
+        or getattr(agent, "provider", None)
+        or None,
         "api_mode": getattr(agent, "api_mode", None) or None,
         "acp_command": getattr(agent, "acp_command", None) or None,
         "acp_args": getattr(agent, "acp_args", None) or None,
@@ -6352,7 +6390,12 @@ def _make_agent(
     # also pass scalar model/provider/runtime knobs from the persisted DB row.
     if isinstance(model_override, dict) and model_override.get("model"):
         model = str(model_override.get("model") or "")
-        requested_provider = model_override.get("provider") or provider_override or None
+        requested_provider = (
+            model_override.get("requested_provider")
+            or model_override.get("provider")
+            or provider_override
+            or None
+        )
         override_base_url = model_override.get("base_url")
         override_api_key = model_override.get("api_key")
         override_api_mode = model_override.get("api_mode")
@@ -6418,6 +6461,12 @@ def _make_agent(
         model=model,
         max_iterations=_cfg_max_turns(cfg, 500),
         provider=runtime.get("provider"),
+        requested_provider=(
+            runtime.get("requested_provider")
+            or requested_provider
+            or runtime.get("provider")
+            or ""
+        ),
         base_url=runtime.get("base_url"),
         api_key=runtime.get("api_key"),
         api_mode=runtime.get("api_mode"),

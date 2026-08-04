@@ -20,6 +20,7 @@ closure the PR changed, against a real temp ``HERMES_HOME``.
 """
 
 import types
+from threading import Lock
 
 import yaml
 import pytest
@@ -53,6 +54,9 @@ def _make_runner(adapter):
     runner._voice_mode = {}
     runner._session_model_overrides = {}
     runner._running_agents = {}
+    runner._agent_cache = {}
+    runner._agent_cache_lock = Lock()
+    runner._session_key_for_source = lambda source: "named-custom-session"
     return runner
 
 
@@ -199,6 +203,99 @@ async def test_picker_tap_global_flag_persists(tmp_path, monkeypatch, seed_model
     assert "api_key" not in written["model"]
     assert "api_mode" not in written["model"]
     assert "context_length" not in written["model"]
+
+
+def _fake_named_custom_switch_result():
+    """A successful switch whose runtime transport differs from its identity."""
+    from hermes_cli.model_switch import ModelSwitchResult
+
+    return ModelSwitchResult(
+        success=True,
+        new_model="account-b-model",
+        target_provider="custom",
+        requested_provider="custom:account-b",
+        provider_changed=True,
+        api_key="account-b-key",
+        base_url="https://shared.example/v1",
+        api_mode="chat_completions",
+        provider_label="Account B",
+        is_global=False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_picker_tap_preserves_named_custom_identity_in_live_and_session_state(
+    tmp_path, monkeypatch
+):
+    """Picker tap must keep ``custom`` transport and ``custom:account-b`` identity."""
+    adapter = _FakePickerAdapter()
+    _setup_isolated_home(
+        tmp_path,
+        monkeypatch,
+        {"default": "old-model", "provider": "custom:account-a"},
+    )
+    runner = _make_runner(adapter)
+    calls = []
+    switch_calls = []
+
+    class _CachedAgent:
+        def switch_model(self, **kwargs):
+            calls.append(kwargs)
+
+    runner._session_model_overrides["named-custom-session"] = {
+        "model": "account-a-model",
+        "provider": "custom",
+        "requested_provider": "custom:account-a",
+        "base_url": "https://shared.example/v1",
+    }
+    runner._agent_cache = {}
+    runner._agent_cache_lock = Lock()
+
+    def _switch(**kwargs):
+        switch_calls.append(kwargs)
+        return _fake_named_custom_switch_result()
+
+    monkeypatch.setattr("hermes_cli.model_switch.switch_model", _switch)
+    monkeypatch.setattr(runner, "_evict_cached_agent", lambda *_args: None)
+    monkeypatch.setattr(
+        runner,
+        "_session_key_for_source",
+        lambda _source: "named-custom-session",
+    )
+    runner._agent_cache["named-custom-session"] = (_CachedAgent(), None)
+
+    confirmation = await _drive_picker(runner, _make_event("/model --session"))
+
+    assert "account-b-model" in confirmation
+    assert switch_calls[-1]["current_provider"] == "custom"
+    assert switch_calls[-1]["current_requested_provider"] == "custom:account-a"
+    assert calls[-1]["new_provider"] == "custom"
+    assert calls[-1]["requested_provider"] == "custom:account-b"
+    override = runner._session_model_overrides["named-custom-session"]
+    assert override["provider"] == "custom"
+    assert override["requested_provider"] == "custom:account-b"
+
+
+@pytest.mark.asyncio
+async def test_picker_tap_global_persists_named_custom_identity(
+    tmp_path, monkeypatch
+):
+    """Gateway config must store the named identity, never bare custom."""
+    adapter = _FakePickerAdapter()
+    cfg_path = _setup_isolated_home(
+        tmp_path,
+        monkeypatch,
+        {"default": "old-model", "provider": "custom:account-a"},
+    )
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.switch_model",
+        lambda **_kwargs: _fake_named_custom_switch_result(),
+    )
+
+    await _drive_picker(_make_runner(adapter), _make_event("/model --global"))
+
+    written = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+    assert written["model"]["provider"] == "custom:account-b"
 
 
 @pytest.mark.asyncio

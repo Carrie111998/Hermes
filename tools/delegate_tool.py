@@ -1202,6 +1202,7 @@ def _build_child_agent(
     parent_agent,
     # Credential overrides from delegation config (provider:model resolution)
     override_provider: Optional[str] = None,
+    override_requested_provider: Optional[str] = None,
     override_base_url: Optional[str] = None,
     override_api_key: Optional[str] = None,
     override_api_mode: Optional[str] = None,
@@ -1370,6 +1371,11 @@ def _build_child_agent(
     # Resolve effective credentials: config override > parent inherit
     effective_model = model or parent_agent.model
     effective_provider = override_provider or getattr(parent_agent, "provider", None)
+    effective_requested_provider = (
+        override_requested_provider
+        or getattr(parent_agent, "requested_provider", None)
+        or effective_provider
+    )
     effective_base_url = override_base_url or parent_agent.base_url
     if not override_base_url:
         effective_base_url = _inherit_parent_base_url(parent_agent, effective_base_url)
@@ -1508,6 +1514,7 @@ def _build_child_agent(
             api_key=effective_api_key,
             model=effective_model,
             provider=effective_provider,
+            requested_provider=str(effective_requested_provider or effective_provider or ""),
             api_mode=effective_api_mode,
             acp_command=effective_acp_command,
             acp_args=effective_acp_args,
@@ -1570,7 +1577,10 @@ def _build_child_agent(
     # Share a credential pool with the child when possible so subagents can
     # rotate credentials on rate limits instead of getting pinned to one key.
     child_pool = _resolve_child_credential_pool(
-        effective_provider, parent_agent, effective_base_url
+        effective_provider,
+        parent_agent,
+        effective_base_url,
+        effective_requested_provider,
     )
     if child_pool is not None:
         child._credential_pool = child_pool
@@ -2953,6 +2963,14 @@ def delegate_task(
             task_count=n_tasks,
             parent_agent=parent_agent,
             override_provider=creds["provider"],
+            override_requested_provider=(
+                str(
+                    creds.get("requested_provider")
+                    or creds.get("provider")
+                    or ""
+                ).strip()
+                or None
+            ),
             override_base_url=creds["base_url"],
             override_api_key=creds["api_key"],
             override_api_mode=creds["api_mode"],
@@ -3395,6 +3413,7 @@ def _resolve_child_credential_pool(
     effective_provider: Optional[str],
     parent_agent,
     effective_base_url: Optional[str] = None,
+    effective_requested_provider: Optional[str] = None,
 ):
     """Resolve a credential pool for the child agent.
 
@@ -3427,7 +3446,11 @@ def _resolve_child_credential_pool(
         try:
             from agent.credential_pool import get_custom_provider_pool_key, load_pool
 
-            child_key = get_custom_provider_pool_key(effective_base_url)
+            child_identity = str(effective_requested_provider or "").strip()
+            child_key = get_custom_provider_pool_key(
+                effective_base_url,
+                provider_name=child_identity or None,
+            )
             if child_key is None:
                 # Unregistered endpoint (raw delegation.base_url with no
                 # matching custom_providers entry) -> no shared pool exists.
@@ -3437,7 +3460,8 @@ def _resolve_child_credential_pool(
 
             # Reuse the parent's pool only when it is the same custom endpoint.
             parent_key = get_custom_provider_pool_key(
-                getattr(parent_agent, "base_url", None)
+                getattr(parent_agent, "base_url", None),
+                provider_name=getattr(parent_agent, "requested_provider", None),
             )
             if (
                 parent_pool is not None
@@ -3554,6 +3578,7 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
         return {
             "model": configured_model,
             "provider": provider,
+            "requested_provider": provider,
             "base_url": configured_base_url,
             "api_key": api_key,
             "api_mode": api_mode,
@@ -3564,6 +3589,7 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
         return {
             "model": configured_model,
             "provider": None,
+            "requested_provider": None,
             "base_url": None,
             "api_key": None,
             "api_mode": None,
@@ -3594,6 +3620,7 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
     return {
         "model": configured_model or runtime.get("model") or None,
         "provider": configured_provider if runtime.get("provider") == _RUNTIME_PROVIDER_CUSTOM else runtime.get("provider"),
+        "requested_provider": runtime.get("requested_provider") or configured_provider,
         "base_url": runtime.get("base_url"),
         "api_key": api_key,
         "api_mode": runtime.get("api_mode"),

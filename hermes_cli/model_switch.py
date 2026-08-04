@@ -440,6 +440,7 @@ class ModelSwitchResult:
     success: bool
     new_model: str = ""
     target_provider: str = ""
+    requested_provider: str = ""
     provider_changed: bool = False
     api_key: str = ""
     base_url: str = ""
@@ -451,6 +452,29 @@ class ModelSwitchResult:
     capabilities: Optional[ModelCapabilities] = None
     model_info: Optional[ModelInfo] = None
     is_global: bool = False
+
+
+def _canonical_requested_provider_identity(
+    transport_provider: str,
+    requested_provider: str,
+) -> str:
+    """Return the durable identity paired with a resolved transport provider.
+
+    A named custom endpoint is executed through the ``custom`` transport but
+    must remain addressable as ``custom:<name>`` for config persistence and
+    credential-pool selection.  Other providers retain their existing identity
+    unchanged.  This intentionally canonicalizes from the *requested* name,
+    never from a reverse URL lookup: shared endpoints are not identity-safe.
+    """
+    transport = str(transport_provider or "").strip().lower()
+    requested = str(requested_provider or "").strip()
+    if transport != "custom":
+        return requested or transport
+    if not requested or requested.lower() == "custom":
+        return "custom"
+    if requested.lower().startswith("custom:"):
+        requested = requested.split(":", 1)[1].strip()
+    return custom_provider_slug(requested)
 
 
 @dataclass(frozen=True)
@@ -1214,6 +1238,7 @@ def switch_model(
     explicit_provider: str = "",
     user_providers: dict = None,
     custom_providers: list | None = None,
+    current_requested_provider: str = "",
 ) -> ModelSwitchResult:
     """Core model-switching pipeline shared between CLI and gateway.
 
@@ -1258,11 +1283,15 @@ def switch_model(
         validate_requested_model,
         opencode_model_api_mode,
     )
-    from hermes_cli.runtime_provider import resolve_runtime_provider
+    from hermes_cli.runtime_provider import (
+        _resolve_named_custom_api_key,
+        resolve_runtime_provider,
+    )
 
     resolved_alias = ""
     new_model = raw_input.strip()
     target_provider = current_provider
+    requested_provider = current_provider
     resolved_moa_preset = False
 
     # =================================================================
@@ -1300,6 +1329,7 @@ def switch_model(
             )
 
         target_provider = pdef.id
+        requested_provider = pdef.id
         if target_provider == "moa" and not new_model:
             try:
                 from hermes_cli.config import load_config
@@ -1561,8 +1591,23 @@ def switch_model(
     # COMMON PATH: Resolve credentials, normalize, get metadata
     # =================================================================
 
-    provider_changed = target_provider != current_provider
-    provider_label = get_label(target_provider)
+    # ``target_provider`` starts as the routing identity because aliases,
+    # provider definitions and model validation need the named custom slug.
+    # Runtime transport is finalized from `resolve_runtime_provider()` below.
+    if target_provider == current_provider and not explicit_provider:
+        requested_provider = current_requested_provider or target_provider
+    else:
+        requested_provider = target_provider
+    route_provider = target_provider
+    provider_changed = bool(
+        route_provider != current_provider
+        or (
+            current_provider == "custom"
+            and current_requested_provider
+            and requested_provider != current_requested_provider
+        )
+    )
+    provider_label = get_label(route_provider)
     if target_provider == "custom" and current_base_url:
         provider_label = "Custom endpoint"
     if target_provider.startswith("custom:"):
@@ -1578,6 +1623,8 @@ def switch_model(
     api_key = current_api_key
     base_url = current_base_url
     api_mode = ""
+    runtime_provider = route_provider
+    runtime_requested_provider = requested_provider
 
     if provider_changed or explicit_provider:
         import os
@@ -1595,13 +1642,7 @@ def switch_model(
         if _user_pdef is not None and _user_pdef.base_url:
             _ucfg = (user_providers or {}).get(explicit_provider.strip().lower()) \
                 or (user_providers or {}).get(target_provider) or {}
-            _ukey = str(_ucfg.get("api_key", "") or "").strip()
-            if _ukey.startswith("${") and _ukey.endswith("}"):
-                _ukey = os.environ.get(_ukey[2:-1], "").strip()
-            if not _ukey:
-                _kenv = str(_ucfg.get("key_env", "") or "").strip()
-                if _kenv:
-                    _ukey = os.environ.get(_kenv, "").strip()
+            _ukey = _resolve_named_custom_api_key(_ucfg)
             try:
                 runtime = resolve_runtime_provider(
                     requested=target_provider,
@@ -1612,6 +1653,10 @@ def switch_model(
                 api_key = runtime.get("api_key", "") or _ukey
                 base_url = runtime.get("base_url", "") or _user_pdef.base_url
                 api_mode = runtime.get("api_mode", "")
+                runtime_provider = str(runtime.get("provider") or route_provider)
+                runtime_requested_provider = str(
+                    runtime.get("requested_provider") or requested_provider
+                )
             except Exception:
                 api_key = _ukey
                 base_url = _user_pdef.base_url
@@ -1629,6 +1674,10 @@ def switch_model(
                 api_key = runtime.get("api_key", "")
                 base_url = runtime.get("base_url", "")
                 api_mode = runtime.get("api_mode", "")
+                runtime_provider = str(runtime.get("provider") or route_provider)
+                runtime_requested_provider = str(
+                    runtime.get("requested_provider") or requested_provider
+                )
             except Exception as e:
                 return ModelSwitchResult(
                     success=False,
@@ -1643,7 +1692,7 @@ def switch_model(
     else:
         try:
             runtime = resolve_runtime_provider(
-                requested=current_provider,
+                requested=current_requested_provider or current_provider,
                 target_model=new_model,
             )
             # If resolution fell through to "custom" (e.g. named custom provider like
@@ -1653,6 +1702,10 @@ def switch_model(
             api_key = runtime.get("api_key", "")
             base_url = runtime.get("base_url", "")
             api_mode = runtime.get("api_mode", "")
+            runtime_provider = str(runtime.get("provider") or route_provider)
+            runtime_requested_provider = str(
+                runtime.get("requested_provider") or requested_provider
+            )
         except Exception:
             pass
 
@@ -1811,12 +1864,24 @@ def switch_model(
     if hermes_warn:
         warnings.append(hermes_warn)
 
-    # --- Build result ---
+    # Runtime resolver is authoritative for the transport/identity pair. Keep
+    # the named route provider for validation and metadata, but emit transport
+    # in target_provider and the canonical menu key in requested_provider.
+    result_target_provider = runtime_provider or route_provider
+    result_requested_provider = _canonical_requested_provider_identity(
+        result_target_provider,
+        runtime_requested_provider or requested_provider,
+    )
     return ModelSwitchResult(
         success=True,
         new_model=new_model,
-        target_provider=target_provider,
-        provider_changed=provider_changed,
+        target_provider=result_target_provider,
+        requested_provider=result_requested_provider,
+        provider_changed=bool(
+            result_target_provider != current_provider
+            or result_requested_provider
+            != (current_requested_provider or current_provider)
+        ),
         api_key=api_key,
         base_url=base_url,
         api_mode=api_mode,
@@ -2537,6 +2602,11 @@ def list_authenticated_providers(
         from collections import OrderedDict as _OD3
 
         from hermes_cli.config import is_provider_enabled
+        from hermes_cli.runtime_provider import (
+            _getenv,
+            _named_custom_provider_key_env,
+            _resolve_named_custom_api_key,
+        )
 
         ep_groups: "_OD3[tuple, dict]" = _OD3()
         for ep_name, ep_cfg in user_providers.items():
@@ -2555,17 +2625,18 @@ def list_authenticated_providers(
                 or ep_cfg.get("url", "")
                 or ""
             )
-            key_env = str(ep_cfg.get("key_env", "") or "").strip()
-            inline_api_key = str(ep_cfg.get("api_key", "") or "").strip()
+            key_env = _named_custom_provider_key_env(ep_cfg)
+            resolved_api_key = _resolve_named_custom_api_key(ep_cfg)
+            env_api_key = _getenv(key_env, "").strip() if key_env else ""
             api_mode = str(
                 ep_cfg.get("api_mode")
                 or ep_cfg.get("transport")
                 or ""
             ).strip().lower()
             credential_identity = (
-                inline_api_key
-                if inline_api_key
-                else (f"env:{key_env}" if key_env else "")
+                f"env:{key_env}"
+                if env_api_key or (key_env and not resolved_api_key)
+                else resolved_api_key
             )
             api_url_norm = str(api_url).strip().rstrip("/").lower()
             # Per-provider extra_headers participate in the group identity
@@ -2671,10 +2742,7 @@ def list_authenticated_providers(
             # - Without an api_key AND no explicit models: probe anyway so
             #   bare-endpoint providers (local llama.cpp / Ollama servers)
             #   still show their full model catalog.
-            api_key = str(ep_cfg.get("api_key", "") or "").strip()
-            if not api_key:
-                key_env = str(ep_cfg.get("key_env", "") or "").strip()
-                api_key = os.environ.get(key_env, "").strip() if key_env else ""
+            api_key = _resolve_named_custom_api_key(ep_cfg)
             discover = ep_cfg.get("discover_models", True)
             if isinstance(discover, str):
                 discover = discover.lower() not in {"false", "no", "0"}
@@ -2803,6 +2871,12 @@ def list_authenticated_providers(
     if custom_providers and isinstance(custom_providers, list):
         from collections import OrderedDict
 
+        from hermes_cli.runtime_provider import (
+            _getenv,
+            _named_custom_provider_key_env,
+            _resolve_named_custom_api_key,
+        )
+
         # Key by endpoint + credential identity + wire protocol + display
         # prefix instead of slug: names frequently differ per model
         # ("Ollama — X") while the endpoint stays the same.  Keep same-host
@@ -2828,20 +2902,18 @@ def list_authenticated_providers(
             ).strip().rstrip("/")
             if not raw_name or not api_url:
                 continue
-            inline_api_key = (entry.get("api_key") or "").strip()
-            key_env = (entry.get("key_env") or "").strip()
-            api_key = inline_api_key or (
-                os.environ.get(key_env, "").strip() if key_env else ""
-            )
+            key_env = _named_custom_provider_key_env(entry)
+            api_key = _resolve_named_custom_api_key(entry)
+            env_api_key = _getenv(key_env, "").strip() if key_env else ""
             api_mode = str(
                 entry.get("api_mode")
                 or entry.get("transport")
                 or ""
             ).strip().lower()
             credential_identity = (
-                inline_api_key
-                if inline_api_key
-                else (f"env:{key_env}" if key_env else "")
+                f"env:{key_env}"
+                if env_api_key or (key_env and not api_key)
+                else api_key
             )
 
             # Read discover_models from the entry (same semantics as

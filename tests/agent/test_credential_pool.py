@@ -1257,6 +1257,111 @@ def test_custom_endpoint_pool_seeds_from_config(tmp_path, monkeypatch):
     assert entries[0].source == "config:Together.ai"
 
 
+def test_custom_endpoint_pool_key_env_overrides_inline_config_key(tmp_path, monkeypatch):
+    """A named provider's env key must win when its pool seed is refreshed."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setenv("HERMES_TEST_CUSTOM_POOL_API_KEY", "env-first-pool-key")
+    _write_auth_store(tmp_path, {"version": 1})
+
+    config_path = tmp_path / "hermes" / "config.yaml"
+    import yaml
+
+    config_path.write_text(yaml.dump({
+        "custom_providers": [
+            {
+                "name": "Env First Pool",
+                "base_url": "https://pool.example/v1",
+                "api_key_env": "HERMES_TEST_CUSTOM_POOL_API_KEY",
+                "api_key": "stale-inline-pool-key",
+            }
+        ]
+    }))
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("custom:env-first-pool")
+    entries = pool.entries()
+
+    assert len(entries) == 1
+    assert entries[0].source == "config:Env First Pool"
+    assert entries[0].access_token == "env-first-pool-key"
+
+
+def test_custom_endpoint_pool_reads_key_env_from_dotenv(tmp_path, monkeypatch):
+    """Pool seeding must honor profile .env before CLI bootstrap loads it."""
+    home = tmp_path / "hermes"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.delenv("HERMES_TEST_DOTENV_POOL_API_KEY", raising=False)
+    _write_auth_store(tmp_path, {"version": 1})
+
+    import yaml
+
+    (home / ".env").write_text(
+        "HERMES_TEST_DOTENV_POOL_API_KEY=dotenv-pool-key\n",
+        encoding="utf-8",
+    )
+    (home / "config.yaml").write_text(yaml.dump({
+        "custom_providers": [
+            {
+                "name": "Dotenv Pool",
+                "base_url": "https://dotenv-pool.example/v1",
+                "key_env": "HERMES_TEST_DOTENV_POOL_API_KEY",
+                "api_key": "stale-inline-pool-key",
+            }
+        ]
+    }))
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("custom:dotenv-pool")
+    entries = pool.entries()
+
+    assert len(entries) == 1
+    assert entries[0].access_token == "dotenv-pool-key"
+
+
+def test_custom_endpoint_pool_uses_profile_scoped_env_key(tmp_path, monkeypatch):
+    """Multiplexed pool seeding must use the active profile's environment."""
+    home = tmp_path / "hermes"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_TEST_SCOPED_POOL_API_KEY", "other-profile-key")
+    _write_auth_store(tmp_path, {"version": 1})
+
+    import yaml
+
+    (home / ".env").write_text(
+        "HERMES_TEST_SCOPED_POOL_API_KEY=active-profile-key\n",
+        encoding="utf-8",
+    )
+    (home / "config.yaml").write_text(yaml.dump({
+        "custom_providers": [
+            {
+                "name": "Scoped Pool",
+                "base_url": "https://scoped.example/v1",
+                "key_env": "HERMES_TEST_SCOPED_POOL_API_KEY",
+                "api_key": "stale-inline-pool-key",
+            }
+        ]
+    }))
+
+    from agent import secret_scope as secret_scope
+    from agent.credential_pool import load_pool
+
+    secret_scope.set_multiplex_active(True)
+    token = secret_scope.set_secret_scope(
+        secret_scope.build_profile_secret_scope(home)
+    )
+    try:
+        pool = load_pool("custom:scoped-pool")
+    finally:
+        secret_scope.reset_secret_scope(token)
+        secret_scope.set_multiplex_active(False)
+
+    entries = pool.entries()
+    assert len(entries) == 1
+    assert entries[0].access_token == "active-profile-key"
+
+
 def test_custom_endpoint_pool_seeds_from_model_config(tmp_path, monkeypatch):
     """Verify seeding from model.api_key when model.provider=='custom' and base_url matches."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
