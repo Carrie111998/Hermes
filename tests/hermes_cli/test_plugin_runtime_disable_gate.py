@@ -244,3 +244,31 @@ class TestBundledPluginAssetGate:
                 resp = test_client.get("/dashboard-plugins/goodbundled/dist/index.js")
                 assert resp.status_code == 200
 
+
+def test_dashboard_disable_then_cli_enable_clears_legacy_deny_residue(
+    monkeypatch, tmp_path,
+):
+    """A fresh loader must see the plugin after cross-surface activation."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    (tmp_path / "home").mkdir()
+
+    from hermes_cli.config import save_config
+    from hermes_cli.plugins import PluginManager
+    from hermes_cli.plugins_cmd import (
+        _get_disabled_set,
+        cmd_enable,
+        dashboard_set_agent_plugin_enabled,
+    )
+
+    save_config({"plugins": {"enabled": ["web/exa"], "disabled": []}})
+    with patch("hermes_cli.plugins_cmd._toggle_plugin_toolset"):
+        result = dashboard_set_agent_plugin_enabled("web-exa", enabled=False)
+    assert result["ok"] is True
+
+    cmd_enable("web/exa", allow_tool_override=False)
+
+    assert _get_disabled_set() == set()
+    manager = PluginManager()
+    manager.discover_and_load()
+    assert manager._plugins["web/exa"].enabled is True
+

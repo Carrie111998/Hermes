@@ -181,6 +181,37 @@ def test_save_platform_tools_preserves_mcp_server_names():
     assert "terminal" not in saved_toolsets
 
 
+def test_langfuse_post_setup_repairs_stale_deny_alias(tmp_path):
+    entry = (
+        "langfuse",
+        "",
+        "",
+        "bundled",
+        tmp_path / "observability" / "langfuse",
+        "observability/langfuse",
+    )
+
+    with patch(
+        "hermes_cli.plugins_cmd._discover_all_plugins",
+        return_value=[entry],
+    ), patch(
+        "hermes_cli.plugins_cmd._get_enabled_set",
+        return_value={"observability/langfuse"},
+    ), patch(
+        "hermes_cli.plugins_cmd._get_disabled_set",
+        return_value={"langfuse"},
+    ), patch("hermes_cli.plugins_cmd._save_enabled_set") as save_enabled, patch(
+        "hermes_cli.plugins_cmd._save_disabled_set"
+    ) as save_disabled, patch(
+        "hermes_cli.tools_config._pip_install"
+    ) as pip_install:
+        pip_install.return_value.returncode = 0
+        _run_post_setup("langfuse")
+
+    assert save_enabled.call_args[0][0] == {"observability/langfuse"}
+    assert save_disabled.call_args[0][0] == set()
+
+
 
 
 

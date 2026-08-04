@@ -18,7 +18,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, NamedTuple, Optional
 
 from hermes_constants import get_hermes_home
 from hermes_cli._subprocess_compat import noninteractive_git_env
@@ -261,10 +261,19 @@ def _repo_name_from_url(url: str) -> str:
     return name
 
 
+def _manifest_file(plugin_dir: Path) -> Optional[Path]:
+    """Return the preferred manifest file in *plugin_dir*, if any."""
+    for filename in ("plugin.yaml", "plugin.yml"):
+        manifest_file = plugin_dir / filename
+        if manifest_file.exists():
+            return manifest_file
+    return None
+
+
 def _read_manifest(plugin_dir: Path) -> dict:
-    """Read plugin.yaml and return the parsed dict, or empty dict."""
-    manifest_file = plugin_dir / "plugin.yaml"
-    if not manifest_file.exists():
+    """Read the preferred plugin manifest and return the parsed dict."""
+    manifest_file = _manifest_file(plugin_dir)
+    if manifest_file is None:
         return {}
     try:
         import yaml
@@ -272,7 +281,7 @@ def _read_manifest(plugin_dir: Path) -> dict:
         with open(manifest_file, encoding="utf-8") as f:
             return yaml.safe_load(f) or {}
     except Exception as e:
-        logger.warning("Failed to read plugin.yaml in %s: %s", plugin_dir, e)
+        logger.warning("Failed to read %s in %s: %s", manifest_file.name, plugin_dir, e)
         return {}
 
 
@@ -535,8 +544,7 @@ def _install_plugin_core(identifier: str, *, force: bool) -> tuple[Path, dict, s
 
         shutil.move(str(tmp_target), str(target))
 
-    has_yaml = (target / "plugin.yaml").exists() or (target / "plugin.yml").exists()
-    if not has_yaml and not (target / "__init__.py").exists():
+    if _manifest_file(target) is None and not (target / "__init__.py").exists():
         logger.warning(
             "%s has no plugin.yaml / __init__.py; may not be a valid plugin",
             plugin_name,
@@ -590,9 +598,7 @@ def cmd_install(
         console.print(f"[red]Error:[/red] {e}")
         sys.exit(1)
 
-    if not (target / "plugin.yaml").exists() and not (target / "plugin.yml").exists() and not (
-        target / "__init__.py"
-    ).exists():
+    if _manifest_file(target) is None and not (target / "__init__.py").exists():
         console.print(
             f"[yellow]Warning:[/yellow] {installed_name} doesn't contain plugin.yaml "
             f"or __init__.py. It may not be a valid Hermes plugin.",
@@ -616,12 +622,15 @@ def cmd_install(
             should_enable = False
 
     if should_enable:
-        enabled = _get_enabled_set()
-        disabled = _get_disabled_set()
-        enabled.add(installed_name)
-        disabled.discard(installed_name)
-        _save_enabled_set(enabled)
-        _save_disabled_set(disabled)
+        result = _set_plugin_activation(installed_name, enable=True)
+        if result is None and _manifest_file(target) is None:
+            _persist_unresolved_install_activation(installed_name)
+        elif result is None or result.blocked:
+            console.print(
+                f"[red]Plugin '{installed_name}' could not be enabled because "
+                "its activation alias is ambiguous.[/red]"
+            )
+            sys.exit(1)
         console.print(
             f"[green]✓[/green] Plugin [bold]{installed_name}[/bold] enabled.",
         )
@@ -744,9 +753,19 @@ def ensure_basic_auth_plugin_enabled_in_config(cfg: dict) -> bool:
         return False
     if not (set(disabled) & _BASIC_AUTH_PLUGIN_KEYS):
         return False
-    plugins_cfg["disabled"] = sorted(
-        set(disabled) - _BASIC_AUTH_PLUGIN_KEYS
+    enabled = plugins_cfg.get("enabled", [])
+    enabled_set = set(enabled) if isinstance(enabled, list) else set()
+    update = _normalize_plugin_activation(
+        "dashboard_auth/basic",
+        enabled_set,
+        set(disabled),
+        enable=True,
     )
+    if update is None or update.blocked:
+        return False
+    if update.disabled == set(disabled):
+        return False
+    plugins_cfg["disabled"] = sorted(update.disabled)
     return True
 
 
@@ -790,40 +809,153 @@ def _resolve_plugin_key(name: str) -> Optional[str]:
     ``disable`` write the same key that ``PluginManager`` matches against —
     nested category plugins (e.g. ``observability/nemo_relay``) included.
     """
-    entries = _discover_all_plugins()
-    # 1. Exact match on canonical key or manifest name — always unambiguous.
+    resolved = _resolve_plugin_entry(name)
+    return resolved[5] if resolved is not None else None
+
+
+def _plugin_loader_aliases(entry: tuple) -> set[str]:
+    """Return the aliases recognized by the runtime loader."""
+    manifest_name, _version, _description, _source, _directory, key = entry
+    return {alias for alias in (key, manifest_name) if alias}
+
+
+def _plugin_legacy_aliases(entry: tuple) -> set[str]:
+    """Return directory and leaf aliases accepted by the CLI resolver."""
+    _manifest_name, _version, _description, _source, directory, key = entry
+    aliases = {key.rsplit("/", 1)[-1]}
+    if isinstance(directory, Path):
+        aliases.add(directory.name)
+    return {alias for alias in aliases if alias}
+
+
+def _resolve_plugin_entry(name: str, entries: Optional[list] = None) -> Optional[tuple]:
+    """Resolve *name* to one discovered entry, or refuse an ambiguous alias."""
+    if entries is None:
+        entries = _discover_all_plugins()
+
+    # Canonical keys and manifest names are authoritative. This also handles a
+    # canonical key that happens to equal another plugin's legacy alias.
     for entry in entries:
-        # entry = (name, version, description, source, dir_path, key)
-        if name == entry[5] or name == entry[0]:
-            return entry[5]
-    # 2. Fall back to a bare leaf-name match (e.g. "nemo_relay" ->
-    #    "observability/nemo_relay"), but only when it resolves to exactly one
-    #    plugin so we never silently pick the wrong same-named nested plugin.
-    leaf_matches = [entry[5] for entry in entries if name == entry[5].split("/")[-1]]
-    if len(leaf_matches) == 1:
-        return leaf_matches[0]
-    return None
+        if name == entry[5]:
+            return entry
+    for entry in entries:
+        if name == entry[0]:
+            return entry
+
+    matches = [entry for entry in entries if name in _plugin_legacy_aliases(entry)]
+    keys = {entry[5] for entry in matches}
+    if len(keys) != 1:
+        return None
+    return next(entry for entry in matches if entry[5] in keys)
 
 
-def _resolve_plugin_key_and_source(name: str) -> Optional[tuple]:
+def _resolve_plugin_key_and_source(
+    name: str, entries: Optional[list] = None,
+) -> Optional[tuple]:
     """Resolve *name* to ``(canonical_key, source)`` or ``None`` if no match.
 
     Mirrors :func:`_resolve_plugin_key`'s normalization but also returns the
     plugin's source (``"bundled"``, ``"user"``, ``"project"``, ...) so the
     enable path can tell whether a built-in-override consent prompt is needed.
     """
-    entries = _discover_all_plugins()
-    for entry in entries:
-        # entry = (name, version, description, source, dir_path, key)
-        if name == entry[5] or name == entry[0]:
-            return (entry[5], entry[3])
-    leaf_matches = [
-        (entry[5], entry[3]) for entry in entries
-        if name == entry[5].split("/")[-1]
-    ]
-    if len(leaf_matches) == 1:
-        return leaf_matches[0]
-    return None
+    resolved = _resolve_plugin_entry(name, entries=entries)
+    return (resolved[5], resolved[3]) if resolved is not None else None
+
+
+class _PluginActivationUpdate(NamedTuple):
+    key: str
+    enabled: set
+    disabled: set
+    blocked: bool
+
+
+class _PluginActivationResult(NamedTuple):
+    key: str
+    changed: bool
+    blocked: bool
+
+
+def _normalize_plugin_activation(
+    name: str,
+    enabled: set,
+    disabled: set,
+    *,
+    enable: bool,
+    entries: Optional[list] = None,
+) -> Optional[_PluginActivationUpdate]:
+    """Compute canonical activation state without writing configuration."""
+    if entries is None:
+        entries = _discover_all_plugins()
+    entry = _resolve_plugin_entry(name, entries=entries)
+    if entry is None:
+        return None
+
+    key = entry[5]
+    loader_aliases = _plugin_loader_aliases(entry)
+    owners: dict[str, set[str]] = {}
+    for candidate in entries:
+        for alias in _plugin_loader_aliases(candidate):
+            owners.setdefault(alias, set()).add(candidate[5])
+    unique_loader_aliases = {
+        alias for alias in loader_aliases if owners.get(alias) == {key}
+    }
+
+    # PluginManager gates on the canonical key and manifest name. Preserve an
+    # ambiguous deny alias because removing it could enable a sibling too.
+    blocked = enable and any(
+        alias in disabled and alias not in unique_loader_aliases
+        for alias in loader_aliases
+    )
+    if blocked:
+        return _PluginActivationUpdate(key, set(enabled), set(disabled), True)
+
+    new_enabled = set(enabled)
+    new_disabled = set(disabled)
+    new_enabled.difference_update(unique_loader_aliases)
+    new_disabled.difference_update(unique_loader_aliases)
+    if enable:
+        new_enabled.add(key)
+    else:
+        new_disabled.add(key)
+    return _PluginActivationUpdate(key, new_enabled, new_disabled, False)
+
+
+def _set_plugin_activation(
+    name: str, *, enable: bool, entries: Optional[list] = None,
+) -> Optional[_PluginActivationResult]:
+    """Normalize one activation request and persist only canonical state."""
+    current_enabled = _get_enabled_set()
+    current_disabled = _get_disabled_set()
+    update = _normalize_plugin_activation(
+        name,
+        current_enabled,
+        current_disabled,
+        enable=enable,
+        entries=entries,
+    )
+    if update is None:
+        return None
+    if update.blocked:
+        return _PluginActivationResult(update.key, False, True)
+
+    changed = (
+        update.enabled != current_enabled
+        or update.disabled != current_disabled
+    )
+    if changed:
+        _save_enabled_set(update.enabled)
+        _save_disabled_set(update.disabled)
+    return _PluginActivationResult(update.key, changed, False)
+
+
+def _persist_unresolved_install_activation(name: str) -> None:
+    """Keep manifestless installs compatible with the legacy installer path."""
+    enabled = _get_enabled_set()
+    disabled = _get_disabled_set()
+    enabled.add(name)
+    disabled.discard(name)
+    _save_enabled_set(enabled)
+    _save_disabled_set(disabled)
 
 
 def _set_plugin_entry_flag(plugin_id: str, key: str, value: bool) -> None:
@@ -867,31 +999,18 @@ def cmd_enable(name: str, allow_tool_override: Optional[bool] = None) -> None:
         sys.exit(1)
     key, source = resolved
 
-    enabled = _get_enabled_set()
-    disabled = _get_disabled_set()
+    result = _set_plugin_activation(key, enable=True)
+    if result is None:
+        console.print(f"[red]Plugin '{name}' is not installed or bundled.[/red]")
+        sys.exit(1)
+    if result.blocked:
+        console.print(
+            f"[red]Cannot enable '{key}': an ambiguous disabled alias would "
+            "also affect another plugin.[/red]"
+        )
+        sys.exit(1)
 
-    already_enabled = key in enabled and key not in disabled
-
-    if not already_enabled:
-        enabled.add(key)
-        disabled.discard(key)
-        # Drop every alias of this plugin from the disabled list so an
-        # explicit disable under a different form can't keep it off. The
-        # loader's disable check matches on BOTH the canonical key
-        # (``web/firecrawl``) AND the manifest name (``web-firecrawl``);
-        # a stale entry under either form makes "explicit disable wins"
-        # (plugins.py) silently veto this enable. Discard the key, its
-        # bare leaf, and the manifest name. (#40190 follow-up.)
-        bare = key.split("/")[-1]
-        if bare != key:
-            disabled.discard(bare)
-        for entry in _discover_all_plugins():
-            # entry = (name, version, description, source, dir_path, key)
-            if entry[5] == key:
-                disabled.discard(entry[0])
-                break
-        _save_enabled_set(enabled)
-        _save_disabled_set(disabled)
+    if result.changed:
         console.print(
             f"[green]✓[/green] Plugin [bold]{key}[/bold] enabled. "
             "Takes effect on next session."
@@ -957,26 +1076,17 @@ def cmd_disable(name: str) -> None:
         console.print(f"[red]Plugin '{name}' is not installed or bundled.[/red]")
         sys.exit(1)
 
-    enabled = _get_enabled_set()
-    disabled = _get_disabled_set()
-
-    if key not in enabled and key in disabled:
+    result = _set_plugin_activation(key, enable=False)
+    if result is None:
+        console.print(f"[red]Plugin '{name}' is not installed or bundled.[/red]")
+        sys.exit(1)
+    if result.changed:
+        console.print(
+            f"[yellow]\u2298[/yellow] Plugin [bold]{key}[/bold] disabled. "
+            "Takes effect on next session."
+        )
+    else:
         console.print(f"[dim]Plugin '{key}' is already disabled.[/dim]")
-        return
-
-    enabled.discard(key)
-    # Drop any legacy bare-name entry from the allow-list too, so a stale
-    # bare name can't keep a nested plugin loading after an explicit disable.
-    bare = key.split("/")[-1]
-    if bare != key:
-        enabled.discard(bare)
-    disabled.add(key)
-    _save_enabled_set(enabled)
-    _save_disabled_set(disabled)
-    console.print(
-        f"[yellow]\u2298[/yellow] Plugin [bold]{key}[/bold] disabled. "
-        "Takes effect on next session."
-    )
 
 
 def _plugin_exists(name: str) -> bool:
@@ -989,10 +1099,8 @@ def _read_manifest_info(d: Path, prefix: str):
 
     Returns None if no manifest file exists.
     """
-    manifest_file = d / "plugin.yaml"
-    if not manifest_file.exists():
-        manifest_file = d / "plugin.yml"
-    if not manifest_file.exists():
+    manifest_file = _manifest_file(d)
+    if manifest_file is None:
         return None
     try:
         import yaml
@@ -1428,14 +1536,14 @@ def cmd_toggle() -> None:
     try:
         import curses
         _run_composite_ui(curses, plugin_keys, plugin_labels, plugin_selected,
-                          disabled_set, categories, console)
+                          disabled_set, categories, console, entries=entries)
     except ImportError:
         _run_composite_fallback(plugin_keys, plugin_labels, plugin_selected,
-                                disabled_set, categories, console)
+                                disabled_set, categories, console, entries=entries)
 
 
 def _run_composite_ui(curses, plugin_keys, plugin_labels, plugin_selected,
-                      disabled, categories, console):
+                      disabled, categories, console, *, entries=None):
     """Custom curses screen with checkboxes + category action rows."""
     from hermes_cli.curses_ui import flush_stdin
 
@@ -1655,26 +1763,26 @@ def _run_composite_ui(curses, plugin_keys, plugin_labels, plugin_selected,
     curses.wrapper(_draw)
     flush_stdin()
 
-    # Persist by canonical key. Unchecked plugins are written to the
-    # disabled-list so they stay off even if a future plugin auto-enables
-    # itself — but we ONLY ever write the canonical key (never the bare
-    # manifest name), so the disabled-list can't drift out of sync with
-    # what ``cmd_enable`` clears or what PluginManager gates on (#40190).
-    new_enabled: set = set()
-    new_disabled: set = set(disabled)  # preserve existing disabled state for unseen plugins
-    for i, key in enumerate(plugin_keys):
-        bare = key.split("/")[-1]
-        if i in chosen:
-            new_enabled.add(key)
-            new_disabled.discard(key)
-            # Drop any stale legacy bare-leaf disable so re-enabling here
-            # fully clears the plugin from the disabled-list.
-            if bare != key:
-                new_disabled.discard(bare)
-        else:
-            new_disabled.add(key)
-
+    # Normalize each requested transition against the same alias ownership
+    # rules as the direct CLI and dashboard writers.
+    if entries is None:
+        entries = _discover_all_plugins()
     prev_enabled = _get_enabled_set()
+    new_enabled: set = set(prev_enabled)
+    new_disabled: set = set(disabled)
+    for i, key in enumerate(plugin_keys):
+        update = _normalize_plugin_activation(
+            key,
+            new_enabled,
+            new_disabled,
+            enable=i in chosen,
+            entries=entries,
+        )
+        if update is None or update.blocked:
+            continue
+        new_enabled = update.enabled
+        new_disabled = update.disabled
+
     enabled_changed = new_enabled != prev_enabled
     disabled_changed = new_disabled != disabled
 
@@ -1682,8 +1790,8 @@ def _run_composite_ui(curses, plugin_keys, plugin_labels, plugin_selected,
         _save_enabled_set(new_enabled)
         _save_disabled_set(new_disabled)
         console.print(
-            f"\n[green]\u2713[/green] General plugins: {len(new_enabled)} enabled, "
-            f"{len(plugin_keys) - len(new_enabled)} disabled."
+            f"\n[green]\u2713[/green] General plugins: {len(chosen)} enabled, "
+            f"{len(plugin_keys) - len(chosen)} disabled."
         )
     elif n_plugins > 0:
         console.print("\n[dim]General plugins unchanged.[/dim]")
@@ -1702,7 +1810,7 @@ def _run_composite_ui(curses, plugin_keys, plugin_labels, plugin_selected,
 
 
 def _run_composite_fallback(plugin_keys, plugin_labels, plugin_selected,
-                            disabled, categories, console):
+                            disabled, categories, console, *, entries=None):
     """Text-based fallback for the composite plugins UI."""
     from hermes_cli.colors import Colors, color
 
@@ -1730,21 +1838,23 @@ def _run_composite_fallback(plugin_keys, plugin_labels, plugin_selected,
                 return
             print()
 
-        # Persist by canonical key only — never the bare manifest name — so
-        # the disabled-list stays aligned with cmd_enable / PluginManager
-        # (#40190).
-        new_enabled: set = set()
+        if entries is None:
+            entries = _discover_all_plugins()
+        prev_enabled = _get_enabled_set()
+        new_enabled: set = set(prev_enabled)
         new_disabled: set = set(disabled)
         for i, key in enumerate(plugin_keys):
-            bare = key.split("/")[-1]
-            if i in chosen:
-                new_enabled.add(key)
-                new_disabled.discard(key)
-                if bare != key:
-                    new_disabled.discard(bare)
-            else:
-                new_disabled.add(key)
-        prev_enabled = _get_enabled_set()
+            update = _normalize_plugin_activation(
+                key,
+                new_enabled,
+                new_disabled,
+                enable=i in chosen,
+                entries=entries,
+            )
+            if update is None or update.blocked:
+                continue
+            new_enabled = update.enabled
+            new_disabled = update.disabled
         if new_enabled != prev_enabled or new_disabled != disabled:
             _save_enabled_set(new_enabled)
             _save_disabled_set(new_disabled)
@@ -1794,12 +1904,17 @@ def dashboard_install_plugin(
 
     missing_env = _missing_requires_env_names(installed_manifest)
     if enable:
-        en = _get_enabled_set()
-        dis = _get_disabled_set()
-        en.add(installed_name)
-        dis.discard(installed_name)
-        _save_enabled_set(en)
-        _save_disabled_set(dis)
+        result = _set_plugin_activation(installed_name, enable=True)
+        if result is None and _manifest_file(target) is None:
+            _persist_unresolved_install_activation(installed_name)
+        elif result is None or result.blocked:
+            return {
+                "ok": False,
+                "error": (
+                    f"Plugin '{installed_name}' could not be enabled because "
+                    "its activation alias is ambiguous."
+                ),
+            }
 
     hint: str | None = None
     ap = target / "after-install.md"
@@ -1816,7 +1931,7 @@ def dashboard_install_plugin(
     }
 
 
-def _get_plugin_toolset_key(name: str) -> Optional[str]:
+def _get_plugin_toolset_key(name: str, entries: Optional[list] = None) -> Optional[str]:
     """Return the toolset key a plugin registers its tools under, or None.
 
     Queries the live tool registry — the plugin must already be loaded.
@@ -1834,40 +1949,52 @@ def _get_plugin_toolset_key(name: str) -> Optional[str]:
         discover_plugins()  # idempotent — ensures plugins are loaded
         manager = get_plugin_manager()
         for _key, loaded in manager._plugins.items():
-            if loaded.manifest.name == name or _key == name:
+            manifest = loaded.manifest
+            if (
+                manifest.name == name
+                or getattr(manifest, "key", "") == name
+                or _key == name
+            ):
                 for tool_name in loaded.tools_registered:
                     entry = registry.get_entry(tool_name)
                     if entry and entry.toolset:
                         return entry.toolset
-                break
     except Exception:
         pass
 
     # Fallback: read provides_tools from manifest on disk and query registry
     try:
         from hermes_cli.plugins import get_bundled_plugins_dir
+        candidates: list[Path] = []
+        resolved = _resolve_plugin_entry(name, entries=entries)
+        if resolved is not None and isinstance(resolved[4], Path):
+            candidates.append(resolved[4])
         for base in (get_bundled_plugins_dir(), _plugins_dir()):
             if not base.is_dir():
                 continue
             candidate = base / name
-            if candidate.is_dir():
-                manifest = _read_manifest(candidate)
-                for tool_name in manifest.get("provides_tools") or []:
-                    entry = registry.get_entry(tool_name)
-                    if entry and entry.toolset:
-                        return entry.toolset
+            if candidate.is_dir() and candidate not in candidates:
+                candidates.append(candidate)
+        for candidate in candidates:
+            manifest = _read_manifest(candidate)
+            for tool_name in manifest.get("provides_tools") or []:
+                entry = registry.get_entry(tool_name)
+                if entry and entry.toolset:
+                    return entry.toolset
     except Exception:
         pass
 
     return None
 
 
-def _toggle_plugin_toolset(name: str, *, enable: bool) -> None:
+def _toggle_plugin_toolset(
+    name: str, *, enable: bool, entries: Optional[list] = None,
+) -> None:
     """Add or remove a plugin's toolset from platform_toolsets for all platforms.
 
     Only acts if the plugin actually provides tools (has a toolset key).
     """
-    toolset_key = _get_plugin_toolset_key(name)
+    toolset_key = _get_plugin_toolset_key(name, entries=entries)
     if not toolset_key:
         return
 
@@ -1906,31 +2033,25 @@ def dashboard_set_agent_plugin_enabled(name: str, *, enabled: bool) -> dict[str,
     For plugins that provide tools (toolsets), also toggles the toolset in
     ``platform_toolsets`` so the agent actually sees the tools in sessions.
     """
-    if not _plugin_exists(name):
+    entries = _discover_all_plugins()
+    resolved = _resolve_plugin_key_and_source(name, entries=entries)
+    if resolved is None:
         return {"ok": False, "error": f"Plugin '{name}' is not installed or bundled."}
-
-    en = _get_enabled_set()
-    dis = _get_disabled_set()
-
-    if enabled:
-        if name in en and name not in dis:
-            return {"ok": True, "name": name, "unchanged": True}
-        en.add(name)
-        dis.discard(name)
-        _save_enabled_set(en)
-        _save_disabled_set(dis)
-        _toggle_plugin_toolset(name, enable=True)
-        return {"ok": True, "name": name, "unchanged": False}
-
-    if name not in en and name in dis:
-        return {"ok": True, "name": name, "unchanged": True}
-
-    en.discard(name)
-    dis.add(name)
-    _save_enabled_set(en)
-    _save_disabled_set(dis)
-    _toggle_plugin_toolset(name, enable=False)
-    return {"ok": True, "name": name, "unchanged": False}
+    key, _source = resolved
+    result = _set_plugin_activation(key, enable=enabled, entries=entries)
+    if result is None:
+        return {"ok": False, "error": f"Plugin '{name}' is not installed or bundled."}
+    if result.blocked:
+        return {
+            "ok": False,
+            "error": (
+                f"Plugin '{name}' could not be enabled because its activation "
+                "alias is ambiguous."
+            ),
+        }
+    if result.changed:
+        _toggle_plugin_toolset(key, enable=enabled, entries=entries)
+    return {"ok": True, "name": name, "unchanged": not result.changed}
 
 
 def _user_installed_plugin_dir(name: str) -> Optional[Path]:
