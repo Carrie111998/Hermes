@@ -128,6 +128,44 @@ def test_ca_parent_writer_group_requires_explicit_opt_in(monkeypatch):
     )
 
 
+def test_absent_install_parent_accepts_only_root_controlled_existing_ancestor(
+    monkeypatch,
+):
+    existing = {
+        Path("/"): _parent_stat(mode=0o755),
+        Path("/trusted-root"): _parent_stat(mode=0o700),
+    }
+    created = []
+    monkeypatch.setattr(
+        activation.os.path,
+        "lexists",
+        lambda path: Path(path) in existing,
+    )
+    monkeypatch.setattr(
+        activation.os,
+        "lstat",
+        lambda path: existing[Path(path)],
+    )
+    monkeypatch.setattr(activation, "_list_xattrs", lambda _path: ())
+    monkeypatch.setattr(
+        activation.os,
+        "mkdir",
+        lambda *args, **kwargs: created.append((args, kwargs)),
+    )
+
+    activation._validate_existing_root_ancestor_chain(
+        Path("/trusted-root/future/config")
+    )
+
+    assert created == []
+
+    existing[Path("/trusted-root")] = _parent_stat(mode=0o777)
+    with pytest.raises(PermissionError, match="not root-controlled"):
+        activation._validate_existing_root_ancestor_chain(
+            Path("/trusted-root/future/config")
+        )
+
+
 @pytest.mark.parametrize(
     ("mode", "uid", "gid", "xattrs"),
     (
@@ -1638,6 +1676,81 @@ def test_packaged_preflight_requires_fresh_initial_collector_but_attests_db_befo
             require_original_boot=False,
         )
     assert trusted_reads == []
+
+
+def test_packaged_preflight_allows_absent_future_install_parent(monkeypatch):
+    plan = _collector_bound_native_plan()
+    payload = b"staged-writer-config"
+    source = Path("/staged/writer.json")
+    target = Path("/trusted-root/future/writer.json")
+    checked = []
+
+    class Receipt:
+        def to_mapping(self):
+            return {"receipt_sha256": "5" * 64}
+
+    receipt = Receipt()
+    monkeypatch.setattr(
+        activation,
+        "_load_bound_config_collector_receipt",
+        lambda *_args, **_kwargs: receipt,
+    )
+    monkeypatch.setattr(
+        activation,
+        "current_host_identity_sha256",
+        lambda: "2" * 64,
+    )
+    monkeypatch.setattr(activation, "_verify_native_release", lambda _plan: None)
+    monkeypatch.setattr(
+        activation,
+        "_native_artifact_contract",
+        lambda _plan: {
+            "writer_config": activation.InstallArtifact(
+                source_path=source,
+                target_path=target,
+                sha256=activation.hashlib.sha256(payload).hexdigest(),
+                mode=0o440,
+                uid=0,
+                gid=activation.CANARY_WRITER_GID,
+                maximum_bytes=activation._MAX_CONFIG_BYTES,
+            )
+        },
+    )
+    monkeypatch.setattr(
+        activation,
+        "_read_trusted_file",
+        lambda path, **_kwargs: payload if Path(path) == source else b"trusted-ca",
+    )
+    monkeypatch.setattr(activation.os.path, "lexists", lambda _path: False)
+    monkeypatch.setattr(
+        activation,
+        "_validate_existing_root_ancestor_chain",
+        lambda path: checked.append(Path(path)),
+    )
+    monkeypatch.setattr(
+        activation,
+        "_verify_database_read_only",
+        lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        activation,
+        "_require_off_disabled",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        activation,
+        "_require_off_or_absent",
+        lambda *_args, **_kwargs: None,
+    )
+
+    activation._verify_native_preflight_inputs(
+        plan,
+        runner=lambda _command: None,
+        require_installed=False,
+        require_original_boot=False,
+    )
+
+    assert checked == [target.parent]
 
 
 def test_final_preflight_reads_database_ca_with_writer_group(monkeypatch):

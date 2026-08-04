@@ -76,6 +76,128 @@ def _collector_receipt() -> dict[str, Any]:
     return {**unsigned, "receipt_sha256": recovery._sha256_json(unsigned)}
 
 
+def _native_plan_mapping(
+    *,
+    writer_sha256: str,
+    gateway_sha256: str,
+    writer_unit_sha256: str,
+    gateway_unit_sha256: str,
+    collector_sha256: str = COLLECTOR_SHA256,
+) -> dict[str, Any]:
+    root = f"/opt/muncho-canary-releases/{SOURCE_REVISION}"
+    interpreter = f"{root}/venv/bin/python"
+    return {
+        "schema": "muncho-writer-native-observation-plan.v2",
+        "boot_id_sha256": "b" * 64,
+        "host_identity_sha256": "c" * 64,
+        "observation_id": "11111111-1111-4111-8111-111111111111",
+        "revision": SOURCE_REVISION,
+        "artifact_root": root,
+        "artifact_sha256": "d" * 64,
+        "release_manifest_file_sha256": "d" * 64,
+        "config_collector_receipt_sha256": collector_sha256,
+        "gateway_unit": {
+            "name": "hermes-cloud-gateway.service",
+            "path": "/etc/systemd/system/hermes-cloud-gateway.service",
+            "sha256": gateway_unit_sha256,
+        },
+        "writer_unit": {
+            "name": "muncho-canonical-writer.service",
+            "path": "/etc/systemd/system/muncho-canonical-writer.service",
+            "sha256": writer_unit_sha256,
+        },
+        "gateway_argv": [
+            interpreter,
+            "-B",
+            "-I",
+            "-m",
+            "gateway.canonical_writer_gateway_bootstrap",
+        ],
+        "writer_argv": [
+            interpreter,
+            "-B",
+            "-I",
+            "-m",
+            "gateway.canonical_writer_bootstrap",
+            "--config",
+            "/etc/muncho-canonical-writer/writer.json",
+        ],
+        "gateway_config": {
+            "path": "/etc/hermes/config.yaml",
+            "sha256": gateway_sha256,
+        },
+        "writer_config": {
+            "path": "/etc/muncho-canonical-writer/writer.json",
+            "sha256": writer_sha256,
+        },
+        "identities": {
+            "gateway_uid": 993,
+            "gateway_gid": 992,
+            "gateway_supplementary_gids": [990, 992],
+            "writer_uid": 999,
+            "writer_gid": 994,
+            "writer_supplementary_gids": [991, 994],
+            "socket_group_gid": 990,
+            "projector_uid": 992,
+            "projector_gid": 991,
+            "gateway_home": "/var/lib/hermes-gateway",
+            "writer_home": "/nonexistent",
+            "projector_home": "/nonexistent",
+        },
+        "database": {
+            "ip_network": "10.91.0.3/32",
+            "tls_server_name": (
+                "14-0d81ef63-2cac-4a64-84ad-c4f58c0cfd56.europe-west3.sql.goog"
+            ),
+            "ca_path": "/etc/muncho/trust/cloudsql-server-ca.pem",
+            "ca_sha256": "d" * 64,
+        },
+        "discord": {
+            "unit_name": "muncho-discord-egress.service",
+            "config_path": "/etc/muncho/discord-edge.json",
+            "token_path": "/etc/muncho/discord-edge-credentials/bot-token",
+            "socket_path": "/run/muncho-discord-egress/edge.sock",
+            "required_absent": True,
+        },
+        "native_discovery_policy": {
+            "allowed_roots": ["/usr/lib"],
+            "allowed_kernel_executable_mappings": ["[vdso]", "[vsyscall]"],
+            "maximum_mappings": 256,
+            "required_owner_uid": 0,
+            "required_owner_gid": 0,
+            "require_regular": True,
+            "require_single_link": True,
+            "forbid_symlink": True,
+            "forbid_acl": True,
+            "forbid_xattrs": True,
+            "forbid_writable": True,
+            "forbid_deleted": True,
+            "exclude_artifact_root": True,
+            "digest_algorithm": "sha256",
+        },
+        "legacy_helper_path": (
+            "/opt/adventico-ai-platform/canonical-brain/bin/"
+            "cloud_sql_synthetic_write_gate.py"
+        ),
+        "external_iam_policy_sha256": "e" * 64,
+    }
+
+
+def _legacy_plan(current: dict[str, Any]) -> dict[str, Any]:
+    unsigned = {
+        name: item
+        for name, item in current.items()
+        if name not in {"plan_sha256", "staged_artifacts"}
+    }
+    unsigned["schema"] = recovery.LEGACY_PLAN_SCHEMA
+    unsigned["invariants"] = {
+        name: item
+        for name, item in current["invariants"].items()
+        if name != "staged_artifacts_deleted"
+    }
+    return {**unsigned, "plan_sha256": recovery._sha256_json(unsigned)}
+
+
 def test_cli_imports_under_remote_minimal_python() -> None:
     completed = subprocess.run(
         [
@@ -144,6 +266,12 @@ def recovery_tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, 
     staging_root.mkdir(parents=True)
     writer_path = staging_root / "writer.json"
     gateway_path = staging_root / "gateway.yaml"
+    native_plan_path = staging_root / "native-observation-plan.json"
+    writer_unit_path = staging_root / "muncho-canonical-writer.service"
+    phase_b_unit_path = (
+        staging_root / "muncho-canonical-writer-phase-b-readiness.service"
+    )
+    gateway_unit_path = staging_root / "hermes-cloud-gateway.service"
     writer_raw = b'{"writer":"stopped"}'
     gateway_raw = b"gateway: stopped\n"
     writer_path.write_bytes(writer_raw)
@@ -183,28 +311,64 @@ def recovery_tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, 
         "DEFAULT_GATEWAY_CONFIG_SOURCE_PATH",
         gateway_path,
     )
+    monkeypatch.setattr(
+        recovery,
+        "DEFAULT_STAGED_NATIVE_PLAN_PATH",
+        native_plan_path,
+    )
+    monkeypatch.setattr(
+        recovery,
+        "DEFAULT_STAGED_WRITER_UNIT_PATH",
+        writer_unit_path,
+    )
+    monkeypatch.setattr(
+        recovery,
+        "DEFAULT_STAGED_PHASE_B_READINESS_UNIT_PATH",
+        phase_b_unit_path,
+    )
+    monkeypatch.setattr(
+        recovery,
+        "DEFAULT_STAGED_GATEWAY_UNIT_PATH",
+        gateway_unit_path,
+    )
     monkeypatch.setattr(recovery, "CONFIG_COLLECTOR_EVIDENCE_ROOT", evidence_root)
     monkeypatch.setattr(
         recovery,
         "_ACTIVATION_PATHS",
-        (writer_path, gateway_path, foreign_path),
+        (
+            writer_path,
+            gateway_path,
+            native_plan_path,
+            foreign_path,
+            writer_unit_path,
+            phase_b_unit_path,
+            gateway_unit_path,
+        ),
     )
     monkeypatch.setattr(recovery, "_STOPPED_SERVICE_UNITS", (unit,))
     monkeypatch.setattr(recovery, "_collect_service_states", lambda: service_states)
     monkeypatch.setattr(recovery, "_trusted_config", lambda path: path.read_bytes())
 
-    def validate_directory(path: Path) -> None:
-        if not path.is_dir() or frozenset(os.listdir(path)) != {
+    def validate_directory(path: Path) -> frozenset[str]:
+        pair = frozenset({
             "writer.json",
             "gateway.yaml",
-        }:
+        })
+        bundle = pair | frozenset({
+            "native-observation-plan.json",
+            "muncho-canonical-writer.service",
+            "muncho-canonical-writer-phase-b-readiness.service",
+            "hermes-cloud-gateway.service",
+        })
+        if not path.is_dir() or frozenset(os.listdir(path)) not in {pair, bundle}:
             raise RuntimeError("test staging directory is not exact")
+        return frozenset(os.listdir(path))
 
     monkeypatch.setattr(recovery, "_validate_staging_directory", validate_directory)
-    receipt = SimpleNamespace(
-        sha256=COLLECTOR_SHA256,
-        value={"release_revision": SOURCE_REVISION},
-    )
+    collector_value = _collector_receipt()
+    collector_value["writer_config_sha256"] = _sha256(writer_raw)
+    collector_value["gateway_config_sha256"] = _sha256(gateway_raw)
+    receipt = SimpleNamespace(sha256=COLLECTOR_SHA256, value=collector_value)
     monkeypatch.setattr(
         recovery,
         "_matching_collector_receipt",
@@ -232,6 +396,10 @@ def recovery_tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, 
         "gateway_path": gateway_path,
         "writer_raw": writer_raw,
         "gateway_raw": gateway_raw,
+        "native_plan_path": native_plan_path,
+        "writer_unit_path": writer_unit_path,
+        "phase_b_unit_path": phase_b_unit_path,
+        "gateway_unit_path": gateway_unit_path,
         "recovery_root": recovery_root,
         "foreign_path": foreign_path,
         "service_states": service_states,
@@ -247,7 +415,12 @@ def test_plan_binds_exact_receipt_and_fixed_pair(recovery_tree: dict[str, Any]) 
     assert plan["collector_receipt_sha256"] == COLLECTOR_SHA256
     assert plan["writer_config_sha256"] == _sha256(recovery_tree["writer_raw"])
     assert plan["gateway_config_sha256"] == _sha256(recovery_tree["gateway_raw"])
+    assert plan["staged_artifacts"] == {
+        "gateway.yaml": _sha256(recovery_tree["gateway_raw"]),
+        "writer.json": _sha256(recovery_tree["writer_raw"]),
+    }
     assert plan["invariants"]["staged_configs_deleted"] is False
+    assert plan["invariants"]["staged_artifacts_deleted"] is False
     assert (
         recovery.validate_plan_mapping(
             plan,
@@ -255,6 +428,55 @@ def test_plan_binds_exact_receipt_and_fixed_pair(recovery_tree: dict[str, Any]) 
         )
         == plan
     )
+
+
+def test_legacy_pair_plan_and_receipt_remain_valid_after_upgrade(
+    recovery_tree: dict[str, Any],
+) -> None:
+    current = recovery.plan_stopped_writer_residue_recovery(TARGET_REVISION)
+    legacy = _legacy_plan(current)
+
+    assert recovery.validate_plan_mapping(legacy) == legacy
+
+    receipt_unsigned = recovery._receipt_unsigned(
+        legacy,
+        service_states_after=recovery_tree["service_states"],
+        created_at_unix=321,
+    )
+    receipt = {
+        **receipt_unsigned,
+        "receipt_sha256": recovery._sha256_json(receipt_unsigned),
+    }
+    assert receipt["schema"] == recovery.LEGACY_RECEIPT_SCHEMA
+    assert "staged_artifacts" not in receipt
+    assert recovery.validate_receipt_mapping(receipt, plan=legacy) == receipt
+
+
+def test_legacy_persisted_intent_resumes_after_rename_and_stays_idempotent(
+    recovery_tree: dict[str, Any],
+) -> None:
+    legacy = _legacy_plan(
+        recovery.plan_stopped_writer_residue_recovery(TARGET_REVISION)
+    )
+    recovery_tree["recovery_root"].mkdir()
+    recovery._write_intent(legacy)
+    os.rename(recovery_tree["staging_root"], Path(legacy["archive_path"]))
+
+    receipt = recovery.apply_stopped_writer_residue_recovery(
+        TARGET_REVISION,
+        legacy["plan_sha256"],
+        clock=lambda: 654,
+        lifecycle_lock=contextlib.nullcontext,
+    )
+    repeated = recovery.apply_stopped_writer_residue_recovery(
+        TARGET_REVISION,
+        legacy["plan_sha256"],
+        clock=lambda: 999,
+        lifecycle_lock=contextlib.nullcontext,
+    )
+
+    assert receipt["schema"] == recovery.LEGACY_RECEIPT_SCHEMA
+    assert repeated == receipt
 
 
 def test_apply_atomically_quarantines_and_is_idempotent(
@@ -275,6 +497,7 @@ def test_apply_atomically_quarantines_and_is_idempotent(
     assert receipt["state"] == "staging_residue_quarantined_services_stopped"
     assert receipt["source_activation_paths_absent"] is True
     assert receipt["staged_configs_deleted"] is False
+    assert receipt["staged_artifacts_deleted"] is False
 
     repeated = recovery.apply_stopped_writer_residue_recovery(
         TARGET_REVISION,
@@ -304,6 +527,91 @@ def test_apply_resumes_after_atomic_rename_before_terminal_receipt(
     assert Path(plan["receipt_path"]).is_file()
 
 
+def test_apply_quarantines_complete_preflight_bundle_without_deleting_artifacts(
+    recovery_tree: dict[str, Any],
+) -> None:
+    writer_unit = b"[Service]\nExecStart=/writer\n"
+    gateway_unit = b"[Service]\nExecStart=/gateway\n"
+    native_plan = _native_plan_mapping(
+        writer_sha256=_sha256(recovery_tree["writer_raw"]),
+        gateway_sha256=_sha256(recovery_tree["gateway_raw"]),
+        writer_unit_sha256=_sha256(writer_unit),
+        gateway_unit_sha256=_sha256(gateway_unit),
+    )
+    phase_b_unit = recovery.render_phase_b_readiness_service(
+        revision=SOURCE_REVISION,
+        artifact_root=f"/opt/muncho-canary-releases/{SOURCE_REVISION}",
+        artifact_sha256="d" * 64,
+    ).encode()
+    extras = {
+        recovery_tree["native_plan_path"]: recovery._canonical_bytes(native_plan),
+        recovery_tree["writer_unit_path"]: writer_unit,
+        recovery_tree["phase_b_unit_path"]: phase_b_unit,
+        recovery_tree["gateway_unit_path"]: gateway_unit,
+    }
+    for path, raw in extras.items():
+        path.write_bytes(raw)
+
+    plan = recovery.plan_stopped_writer_residue_recovery(TARGET_REVISION)
+
+    assert set(plan["staged_artifacts"]) == {
+        "writer.json",
+        "gateway.yaml",
+        "native-observation-plan.json",
+        "muncho-canonical-writer.service",
+        "muncho-canonical-writer-phase-b-readiness.service",
+        "hermes-cloud-gateway.service",
+    }
+    for path, raw in extras.items():
+        assert plan["staged_artifacts"][path.name] == _sha256(raw)
+
+    receipt = recovery.apply_stopped_writer_residue_recovery(
+        TARGET_REVISION,
+        plan["plan_sha256"],
+        clock=lambda: 789,
+        lifecycle_lock=contextlib.nullcontext,
+    )
+
+    archive = Path(plan["archive_path"])
+    assert not recovery_tree["staging_root"].exists()
+    for path, raw in extras.items():
+        assert (archive / path.name).read_bytes() == raw
+    assert receipt["staged_artifacts"] == plan["staged_artifacts"]
+    assert receipt["staged_artifacts_deleted"] is False
+
+
+def test_plan_rejects_unbound_complete_preflight_bundle(
+    recovery_tree: dict[str, Any],
+) -> None:
+    writer_unit = b"[Service]\nExecStart=/writer\n"
+    gateway_unit = b"[Service]\nExecStart=/gateway\n"
+    native_plan = _native_plan_mapping(
+        writer_sha256=_sha256(recovery_tree["writer_raw"]),
+        gateway_sha256=_sha256(recovery_tree["gateway_raw"]),
+        writer_unit_sha256=_sha256(writer_unit),
+        gateway_unit_sha256=_sha256(gateway_unit),
+        collector_sha256="f" * 64,
+    )
+    extras = {
+        recovery_tree["native_plan_path"]: recovery._canonical_bytes(native_plan),
+        recovery_tree["writer_unit_path"]: writer_unit,
+        recovery_tree["phase_b_unit_path"]: recovery.render_phase_b_readiness_service(
+            revision=SOURCE_REVISION,
+            artifact_root=f"/opt/muncho-canary-releases/{SOURCE_REVISION}",
+            artifact_sha256="d" * 64,
+        ).encode(),
+        recovery_tree["gateway_unit_path"]: gateway_unit,
+    }
+    for path, raw in extras.items():
+        path.write_bytes(raw)
+
+    with pytest.raises(
+        ValueError,
+        match="config_collector_receipt_sha256 binding drifted",
+    ):
+        recovery.plan_stopped_writer_residue_recovery(TARGET_REVISION)
+
+
 def test_plan_rejects_partial_or_foreign_activation_residue(
     recovery_tree: dict[str, Any],
 ) -> None:
@@ -324,3 +632,29 @@ def test_plan_digest_rejects_any_path_drift(recovery_tree: dict[str, Any]) -> No
 
     with pytest.raises(ValueError, match="fixed path drifted"):
         recovery.validate_plan_mapping(drifted)
+
+
+def test_v2_plan_rejects_non_string_artifact_digest(
+    recovery_tree: dict[str, Any],
+) -> None:
+    plan = recovery.plan_stopped_writer_residue_recovery(TARGET_REVISION)
+    drifted = dict(plan)
+    drifted["staged_artifacts"] = dict(plan["staged_artifacts"])
+    drifted["staged_artifacts"]["writer.json"] = int("1" * 64)
+
+    with pytest.raises(ValueError, match="staged writer.json digest is invalid"):
+        recovery.validate_plan_mapping(drifted)
+
+
+def test_receipt_missing_digest_fails_as_validation_error(
+    recovery_tree: dict[str, Any],
+) -> None:
+    plan = recovery.plan_stopped_writer_residue_recovery(TARGET_REVISION)
+    unsigned = recovery._receipt_unsigned(
+        plan,
+        service_states_after=recovery_tree["service_states"],
+        created_at_unix=741,
+    )
+
+    with pytest.raises(ValueError, match="recovery receipt digest is invalid"):
+        recovery.validate_receipt_mapping(unsigned, plan=plan)
