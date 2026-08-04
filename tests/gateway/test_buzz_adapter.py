@@ -360,9 +360,11 @@ class TestMentionGating:
 
 
 def _tagged_event(event_id, channel, *, content, pubkey=OTHER_PUBKEY,
-                  created_at=1000, kind=9, p=None, reply_to=None):
+                  created_at=1000, kind=9, p=None, root=None, reply_to=None):
     """Event with the tag shapes observed on a live relay (h/p/e tags)."""
     tags = [["h", channel]]
+    if root:
+        tags.append(["e", root, "", "root"])
     if reply_to:
         tags.append(["e", reply_to, "", "reply"])
     if p:
@@ -434,6 +436,7 @@ class TestDmClassification:
         assert adapter._channel_state[CHANNEL]["chat_type"] == "group"
         # It carried a mention, so it dispatches — but as a group message.
         assert [d["chat_type"] for d in adapter._dispatched] == ["group"]
+        assert adapter._dispatched[0]["thread_id"] == "root-event"
 
         # And once the mention is absent, the channel gate drops the message
         # even though the earlier reply p-tagged us.
@@ -443,6 +446,20 @@ class TestDmClassification:
         )
         assert len(adapter._dispatched) == 1
 
+    @pytest.mark.asyncio
+    async def test_nested_channel_reply_preserves_canonical_root(self, adapter):
+        await self._poll_with(
+            adapter, CHANNEL,
+            _tagged_event(
+                "e1",
+                CHANNEL,
+                content="@chip nested reply",
+                root="thread-root",
+                reply_to="immediate-parent",
+            ),
+        )
+
+        assert adapter._dispatched[0]["thread_id"] == "thread-root"
 
     @pytest.mark.asyncio
     async def test_channel_like_metadata_blocks_latch_even_without_mention(self, adapter):
@@ -478,6 +495,26 @@ class TestDmClassification:
         assert a._may_reclassify_as_dm(DM_CHANNEL) is True
         assert CHANNEL not in a._channel_state
         assert a._may_reclassify_as_dm(CHANNEL) is False
+
+
+class TestThreadAnchorExtraction:
+
+    def test_prefers_root_over_reply_regardless_of_tag_order(self):
+        event = {
+            "tags": [
+                ["e", "immediate-parent", "", "reply"],
+                ["e", "thread-root", "", "root"],
+            ]
+        }
+        assert BuzzAdapter._thread_id_from_event(event) == "thread-root"
+
+    def test_falls_back_to_reply_then_first_unmarked_event(self):
+        assert BuzzAdapter._thread_id_from_event(
+            {"tags": [["e", "reply-anchor", "", "reply"]]}
+        ) == "reply-anchor"
+        assert BuzzAdapter._thread_id_from_event(
+            {"tags": [["e", "legacy-anchor"]]}
+        ) == "legacy-anchor"
 
 
 # ── Sending ───────────────────────────────────────────────────────────────
@@ -741,7 +778,6 @@ class TestStandaloneSend:
         assert captured["auth_tag"] == ""
         # The private key must never be part of argv
         assert all("nsec1x" not in str(a) for a in captured["args"])
-
     @pytest.mark.asyncio
     async def test_standalone_send_uses_config_auth_tag(self, monkeypatch, tmp_path):
         from gateway.config import PlatformConfig
@@ -767,5 +803,3 @@ class TestStandaloneSend:
         )
         assert result == {"success": True, "message_id": "evt-cron"}
         assert captured["auth_tag"] == '["delegation","owner","app","sig"]'
-
-
