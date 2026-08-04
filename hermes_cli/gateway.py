@@ -6394,6 +6394,23 @@ def _configure_platform(platform: dict) -> None:
         print_info(f"  {platform['install_hint']}")
 
 
+def _is_setup_progress(status: str) -> bool:
+    """Whether a platform status means the user made meaningful progress.
+
+    Used by the post-setup gateway install/restart offer so that rows which
+    exist only to explain why a platform cannot be configured (e.g. Matrix's
+    ``unavailable on this OS`` placeholder on native Windows) are never
+    treated as setup progress.
+    """
+    s = status.lower()
+    return not (
+        s == "not configured"
+        or s.startswith("partially")
+        or s.startswith("plugin disabled")
+        or s.startswith("unavailable")
+    )
+
+
 def gateway_setup():
     """Interactive setup for messaging platforms + gateway service."""
     if is_managed():
@@ -6501,16 +6518,10 @@ def gateway_setup():
     # Consider any platform (built-in or plugin) where the user has made
     # meaningful progress.  ``_platform_status`` already handles plugin
     # entries via their check_fn and per-platform dual-states like
-    # WhatsApp's "enabled, not paired".
-    def _is_progress(status: str) -> bool:
-        s = status.lower()
-        return not (
-            s == "not configured"
-            or s.startswith("partially")
-            or s.startswith("plugin disabled")
-        )
-
-    any_configured = any(_is_progress(_platform_status(p)) for p in _all_platforms())
+    # WhatsApp's "enabled, not paired". Rows that merely explain why a
+    # platform cannot be configured (Matrix's ``unavailable on this OS``
+    # placeholder on native Windows) never count as progress.
+    any_configured = any(_is_setup_progress(_platform_status(p)) for p in _all_platforms())
 
     if any_configured:
         print()
