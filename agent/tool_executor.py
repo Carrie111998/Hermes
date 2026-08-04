@@ -1815,6 +1815,8 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         agent._touch_activity(f"tool completed: {name} ({tool_duration:.1f}s){_status_suffix}")
 
         display_function_result = function_result
+        from agent.agent_runtime_helpers import remember_tool_result, tool_result_reference_hint
+        remember_tool_result(agent, tc.id, display_function_result)
         function_result = maybe_persist_tool_result(
             content=function_result,
             tool_name=name,
@@ -1823,6 +1825,8 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             config=_tool_budget,
         ) if not _is_multimodal_tool_result(function_result) else function_result
         _record_persisted_path_for_stub(agent, tool_call_id, function_result)
+        if not _is_multimodal_tool_result(function_result):
+            function_result += tool_result_reference_hint(tc.id, display_function_result)
 
         subdir_hints = agent._subdirectory_hints.check_tool_call(name, args)
         if subdir_hints:
@@ -2737,6 +2741,8 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             logging.debug("Tool result (%d chars): %s", len(_log_result), _log_result)
 
         display_function_result = function_result
+        from agent.agent_runtime_helpers import remember_tool_result, tool_result_reference_hint
+        remember_tool_result(agent, tool_call.id, display_function_result)
         function_result = maybe_persist_tool_result(
             content=function_result,
             tool_name=function_name,
@@ -2745,6 +2751,8 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             config=_tool_budget,
         ) if not _is_multimodal_tool_result(function_result) else function_result
         _record_persisted_path_for_stub(agent, tool_call_id, function_result)
+        if not _is_multimodal_tool_result(function_result):
+            function_result += tool_result_reference_hint(tool_call.id, display_function_result)
 
         # Discover subdirectory context files from tool arguments
         subdir_hints = agent._subdirectory_hints.check_tool_call(function_name, function_args)
