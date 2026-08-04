@@ -63,6 +63,50 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+def test_parallel_runner_isolates_and_removes_pytest_basetemp(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parent.parent
+    runner = repo_root / "scripts" / "run_tests_parallel.py"
+    probe_dir = tmp_path / "basetemp-probe"
+    probe_dir.mkdir()
+    handoff = tmp_path / "basetemp.txt"
+    probe = probe_dir / "test_basetemp_probe.py"
+    probe.write_text(
+        textwrap.dedent(
+            f"""
+            from pathlib import Path
+
+            def test_records_basetemp(tmp_path_factory):
+                Path({str(handoff)!r}).write_text(str(tmp_path_factory.getbasetemp()))
+            """
+        ).strip()
+        + "\n"
+    )
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(runner),
+            "--paths",
+            str(probe_dir),
+            "-j",
+            "1",
+            "--file-timeout",
+            "30",
+        ],
+        cwd=repo_root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        encoding="utf-8",
+        errors="replace",
+        timeout=60,
+    )
+
+    assert proc.returncode == 0, proc.stdout
+    pytest_basetemp = Path(handoff.read_text())
+    assert pytest_basetemp.name.startswith("hermes-pytest-")
+    assert not pytest_basetemp.exists()
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only probe")
 @pytest.mark.live_system_guard_bypass
 def test_grandchild_leak_is_killed_by_runner(tmp_path: Path) -> None:

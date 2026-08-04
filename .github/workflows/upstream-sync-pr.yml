@@ -1,0 +1,181 @@
+name: Stable Release Sync PR
+# Fork setup required for this workflow to create PRs:
+#   Settings → Actions → General → Workflow permissions:
+#     ✓ "Allow GitHub Actions to create and approve pull requests"
+#   Without this, gh pr create fails with:
+#     "GitHub Actions is not permitted to create or approve pull requests"
+#   The `pull-requests: write` permission below is necessary but not sufficient —
+#   the repository setting is a separate security gate.
+
+on:
+  schedule:
+    # Daily is sufficient for the published stable-release channel.
+    - cron: '17 7 * * *'
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: stable-release-sync-pr
+  cancel-in-progress: true
+
+jobs:
+  sync:
+    name: Create and auto-land stable release PR
+    if: github.repository == 'pai-scaffolde/hermes-agent'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Detect GitHub App credentials
+        id: app-auth
+        env:
+          APP_ID: ${{ secrets.APP_ID }}
+          APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "$APP_ID" ] && [ -n "$APP_PRIVATE_KEY" ]; then
+            echo "has_app_token=true" >> "$GITHUB_OUTPUT"
+            echo "token_source=github-app" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_app_token=false" >> "$GITHUB_OUTPUT"
+            echo "token_source=github-token" >> "$GITHUB_OUTPUT"
+            echo "::warning::APP_ID/APP_PRIVATE_KEY are not configured; falling back to GITHUB_TOKEN. Branch pushes/PR updates may not trigger every downstream workflow automatically."
+          fi
+
+      # Prefer repository GitHub App credentials so branch pushes/PR updates
+      # trigger the normal pull_request CI gates. When the app is not installed,
+      # keep the scheduled sync alive with GITHUB_TOKEN and make the weaker
+      # downstream-trigger behavior explicit in the logs.
+      - name: Generate GitHub App token
+        id: app-token
+        if: steps.app-auth.outputs.has_app_token == 'true'
+        uses: actions/create-github-app-token@7bfa3a4717ef143a604ee0a99d859b8886a96d00 # v1.9.3
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+      - name: Checkout fork main
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token || github.token }}
+
+      - name: Create or update stable release PR
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
+          BRANCH: automation/upstream-release-sync
+          UPSTREAM_URL: https://github.com/NousResearch/hermes-agent.git
+          TOKEN_SOURCE: ${{ steps.app-auth.outputs.token_source }}
+        run: |
+          set -euo pipefail
+
+          if [ "$TOKEN_SOURCE" = "github-token" ]; then
+            echo "::notice::Using GITHUB_TOKEN fallback because APP_ID/APP_PRIVATE_KEY are absent. Reviewers may need to rerun PR checks manually."
+          fi
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+          git remote add upstream "$UPSTREAM_URL"
+          git fetch origin main
+          LATEST_TAG="$(gh api repos/NousResearch/hermes-agent/releases/latest --jq '.tag_name')"
+          if [ -z "$LATEST_TAG" ] || [ "$LATEST_TAG" = "null" ]; then
+            echo "::error::NousResearch/hermes-agent has no published stable release tag."
+            exit 1
+          fi
+          git fetch upstream "refs/tags/$LATEST_TAG:refs/tags/$LATEST_TAG"
+          LATEST_SHA="$(git rev-list -n 1 "$LATEST_TAG")"
+          echo "Latest stable release: $LATEST_TAG ($LATEST_SHA)"
+
+          if git merge-base --is-ancestor "$LATEST_SHA" origin/main; then
+            echo "Fork main already contains stable release $LATEST_TAG; nothing to sync."
+            exit 0
+          fi
+
+          git checkout -B "$BRANCH" origin/main
+
+          # Release-channel model: merge only a published stable tag. Unreleased
+          # upstream/main drift remains advisory until Nous cuts a release.
+          if ! git merge --no-ff --no-edit "$LATEST_SHA"; then
+            git merge --abort || true
+            {
+              echo "### Stable release sync failed"
+              echo ""
+              echo "Merging $LATEST_TAG ($LATEST_SHA) into the Scaffolde fork hit conflicts."
+              echo ""
+              echo "Resolve locally on a release-sync branch while preserving the Scaffolde fork contract:"
+              echo ""
+              echo '```bash'
+              echo "git fetch origin upstream --tags"
+              echo "git checkout -B sync/nous-$LATEST_TAG origin/main"
+              echo "git merge $LATEST_TAG"
+              echo "# resolve conflicts, then:"
+              echo "git push -u origin HEAD"
+              echo "gh pr create --base main --head <branch>"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::Merging stable release $LATEST_TAG into the Scaffolde fork hit conflicts."
+            exit 1
+          fi
+
+          git push --force-with-lease origin "HEAD:$BRANCH"
+
+          cat > /tmp/upstream-sync-pr-body.md <<EOF
+          Automated stable-release sync from NousResearch/hermes-agent into pai-scaffolde/hermes-agent.
+
+          This branch merges \`$LATEST_TAG\` (\`$LATEST_SHA\`) into the current Scaffolde fork main while
+          preserving the fork contract. Review the diff and let CI run here.
+
+          Policy:
+          - Published stable tags are the automatic intake boundary; unreleased upstream main is advisory.
+          - Existing CI/checks must pass before landing.
+          - Land with a normal merge commit. Do not squash; squashing hides
+            the upstream merge boundary and makes the next sync harder to inspect.
+          - Auto-merge is enabled only after the required CI gate passes.
+
+          Source:
+          - upstream release: NousResearch/hermes-agent $LATEST_TAG ($LATEST_SHA)
+          - fork base: pai-scaffolde/hermes-agent main (PAI patch stack)
+          EOF
+
+          PR_NUMBER="$(gh pr list \
+            --repo "$GITHUB_REPOSITORY" \
+            --head "$BRANCH" \
+            --base main \
+            --state open \
+            --json number \
+            --jq '.[0].number // empty')"
+
+          if [ -n "$PR_NUMBER" ]; then
+            gh pr edit "$PR_NUMBER" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "chore: sync Nous Hermes $LATEST_TAG stable release" \
+              --body-file /tmp/upstream-sync-pr-body.md
+          else
+            PR_URL="$(gh pr create \
+              --repo "$GITHUB_REPOSITORY" \
+              --base main \
+              --head "$BRANCH" \
+              --title "chore: sync Nous Hermes $LATEST_TAG stable release" \
+              --body-file /tmp/upstream-sync-pr-body.md)"
+            PR_NUMBER="${PR_URL##*/}"
+          fi
+
+          # Pushes made by GITHUB_TOKEN do not emit pull_request workflows.
+          # workflow_dispatch is an explicit recursion-safe exception, so run
+          # CI against the exact PR head when App credentials are unavailable.
+          if [ "$TOKEN_SOURCE" = "github-token" ]; then
+            gh workflow run ci.yml --repo "$GITHUB_REPOSITORY" --ref "$BRANCH"
+          fi
+
+          gh pr merge "$PR_NUMBER" \
+            --repo "$GITHUB_REPOSITORY" \
+            --auto \
+            --merge \
+            --delete-branch
