@@ -1266,8 +1266,17 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
         _omit_temp = False
         _fixed_temp = None
 
-    # Provider preferences (aggregator profile decides whether to emit them).
-    _prefs = _provider_preferences_for_agent(agent)
+    # Provider preferences are OpenRouter-router knobs only. Never attach them
+    # for Nous Portal (or any non-OR path) — the Portal hard-rejects a
+    # caller-supplied ``provider`` object with HTTP 400.
+    _prefs = (
+        _provider_preferences_for_agent(agent)
+        if (
+            (agent.provider or "").strip().lower() == "openrouter"
+            or _is_or
+        )
+        else {}
+    )
 
     # Anthropic-compatible max-output fallback (last resort only — applied in
     # build_kwargs *after* ephemeral/user/profile max_tokens, never overriding
@@ -2241,7 +2250,14 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
 
             # Merge the profile's canonical body even when routing is unset:
             # profiles may always emit required metadata such as Portal tags.
-            provider_preferences = _provider_preferences_for_agent(agent)
+            # Provider prefs are OpenRouter-only (Nous hard-rejects them).
+            _is_or_summary = (
+                (agent.provider or "").strip().lower() == "openrouter"
+                or agent._is_openrouter_url()
+            )
+            provider_preferences = (
+                _provider_preferences_for_agent(agent) if _is_or_summary else {}
+            )
             profile_extra_body = {}
             try:
                 from providers import get_provider_profile
@@ -2260,10 +2276,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
 
             if profile_extra_body:
                 summary_extra_body.update(profile_extra_body)
-            if provider_preferences and "provider" not in profile_extra_body and (
-                (agent.provider or "").strip().lower() == "openrouter"
-                or agent._is_openrouter_url()
-            ):
+            if provider_preferences and "provider" not in profile_extra_body and _is_or_summary:
                 summary_extra_body["provider"] = provider_preferences
 
             # Pareto Code router plugin — model-gated. Same shape as
