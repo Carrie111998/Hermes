@@ -2304,6 +2304,16 @@ def _run_job_script(
                 "encoding": "utf-8",
                 "errors": "replace",
             }
+        else:
+            # Give the script its own POSIX process group so a killpg()
+            # aimed at the gateway's own group — an external supervisor
+            # signalling the gateway's foreground group, or any future MCP
+            # lifecycle teardown/orphan sweep — can never reach a running
+            # no_agent script. Mirrors the start_new_session isolation
+            # already used for every other Hermes-spawned subprocess
+            # (mcp_stdio_watchdog, terminal/code-exec children, the LSP
+            # client) for the same reason (#78432).
+            popen_kwargs = {"start_new_session": True}
         env = build_subprocess_env()
         env.update(env_overlay)
         # Use the job's workdir as the subprocess cwd when configured,

@@ -118,3 +118,43 @@ def test_run_job_script_path_traversal_still_blocked(hermes_env):
     ok, output = _run_job_script("/etc/passwd")
     assert ok is False
     assert "Blocked" in output or "outside" in output
+
+
+@pytest.mark.skipif(
+    not hasattr(__import__("os"), "getpgid"),
+    reason="process groups are POSIX-only",
+)
+def test_run_job_script_gets_own_process_group(hermes_env):
+    """#78432: a no_agent script must not share the gateway's process group.
+
+    Previously ``_run_job_script`` spawned via a plain ``subprocess.run``
+    with no ``start_new_session``, so on POSIX the child inherited the
+    caller's (gateway's) process group verbatim. Any killpg() aimed at that
+    shared group — an external supervisor signalling the gateway's
+    foreground group, or a future MCP lifecycle teardown/orphan sweep —
+    would kill the script as collateral damage. The fix isolates the script
+    into its own process group, matching every other Hermes-spawned
+    subprocess (mcp_stdio_watchdog, terminal/code-exec children, the LSP
+    client).
+    """
+    import os
+
+    from cron.scheduler import _run_job_script
+
+    script_path = hermes_env / "scripts" / "pgid_probe.py"
+    script_path.write_text(
+        "import os\nprint(os.getpgid(os.getpid()))\nprint(os.getpid())\n"
+    )
+
+    caller_pgid = os.getpgid(os.getpid())
+
+    success, output = _run_job_script(str(script_path))
+    assert success is True
+
+    script_pgid_str, script_pid_str = output.strip().splitlines()
+    script_pgid, script_pid = int(script_pgid_str), int(script_pid_str)
+
+    # The script must be its own process-group leader, not a member of the
+    # caller's group.
+    assert script_pgid == script_pid
+    assert script_pgid != caller_pgid
