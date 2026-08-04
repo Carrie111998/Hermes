@@ -1186,6 +1186,9 @@ platform_toolsets:
 # Set the corresponding API key in .env: GROQ_API_KEY, OPENAI_API_KEY, or MISTRAL_API_KEY.
 stt:
   enabled: true
+  # Max seconds the messaging gateway waits for one transcription (including
+  # local fallback) before it releases the chat and surfaces the audio path.
+  gateway_timeout_seconds: 45
   # provider: "local"          # auto-detected if omitted
   local:
     model: "base"              # tiny | base | small | medium | large-v3 | turbo
