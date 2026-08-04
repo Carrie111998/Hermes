@@ -130,17 +130,25 @@ function upgrade(localUrl) {
 
 test('managed.signin-assignment-chat', async t => {
   const statePath = makeSandbox(t, 'managed-signin-assignment-chat')
+  const deviceCodeVerifier = 'V'.repeat(43)
   let clock = 1_000
   let claims = 0
-  const desktop = await pollEvaDeviceCode('A'.repeat(32), {
+  const desktop = await pollEvaDeviceCode('A'.repeat(32), deviceCodeVerifier, {
     now: () => clock,
     pollMs: 5,
     timeoutMs: 30,
     sleep: async delay => {
       clock += delay
     },
-    fetchImpl: async () => {
+    fetchImpl: async (url, init) => {
       claims += 1
+      assert.deepEqual(JSON.parse(init.body), {
+        action: 'claim_desktop_device_code',
+        device_code: 'A'.repeat(32),
+        device_code_verifier: deviceCodeVerifier
+      })
+      assert.equal(String(url).includes(deviceCodeVerifier), false)
+      assert.equal(JSON.stringify(init.headers ?? {}).includes(deviceCodeVerifier), false)
       if (claims === 1) {
         return new Response(JSON.stringify({ error: 'Invalid or expired one-time code' }), {
           status: 401,
