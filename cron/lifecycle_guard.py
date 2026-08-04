@@ -171,7 +171,16 @@ def contains_launchctl_submit_command(command: str) -> bool:
 
 
 def _resolve_terminal_script_path(candidate: str, cwd: Optional[str]) -> Path:
-    path = Path(candidate).expanduser()
+    # ``Path.expanduser`` raises ValueError (not OSError) when the leading
+    # segment carries an embedded NUL — e.g. a "~\0/x.sh" token produced by
+    # tokenizing a binary's decoded bytes. Such a token cannot name a real
+    # script, so fall back to the raw path instead of crashing the guard and
+    # taking down the whole terminal call (#76762 sibling).
+    path = Path(candidate)
+    try:
+        path = path.expanduser()
+    except ValueError:
+        pass
     if not path.is_absolute():
         path = Path(cwd or Path.cwd()) / path
     return path
@@ -259,6 +268,11 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
     try:
         descriptor = os.open(path, flags)
     except OSError:
+        return None, False
+    except ValueError:
+        # os.open raises ValueError (not OSError) for paths with embedded
+        # NUL bytes. Such a "path" cannot name a real script — treat it as
+        # nothing to scan rather than crashing the whole tool call.
         return None, False
     try:
         metadata = os.fstat(descriptor)
