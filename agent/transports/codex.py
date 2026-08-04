@@ -5,10 +5,149 @@ This transport owns format conversion and normalization — NOT client lifecycle
 streaming, or the _run_codex_stream() call path.
 """
 
+import hashlib
+import json
+import re
 from typing import Any, Dict, List, Optional
 
 from agent.transports.base import ProviderTransport
 from agent.transports.types import NormalizedResponse, ToolCall
+
+
+def _bounded_prompt_cache_key(value: Any) -> Optional[str]:
+    """Return a provider-safe cache key without changing session identity."""
+    if value is None:
+        return None
+    key = str(value).strip()
+    if not key:
+        return None
+    if len(key) <= 64:
+        return key
+    # Match _content_cache_key's compact, collision-resistant routing-key shape.
+    digest = hashlib.sha256(key.encode("utf-8", errors="replace")).hexdigest()[:24]
+    return f"pck_{digest}"
+
+
+# Wire-name used when Hermes keeps client-side web_search on xAI Responses.
+# A function literally named ``web_search`` collides with Grok's native
+# server-side tool (incomplete hang or HTTP 400 duplicate names); this alias
+# avoids that while still dispatching through Hermes's configured provider
+# (Firecrawl / Tavily / …). Mapped back to ``web_search`` in normalize_response.
+_XAI_CLIENT_WEB_SEARCH_ALIAS = "hermes_web_search"
+
+
+def _xai_prefers_native_web_search() -> bool:
+    """True when xAI Responses should use Grok's native ``web_search`` built-in.
+
+    Delegates to the web-search registry's provider resolution (which reads
+    ``web.search_backend`` / ``web.backend`` from config) and checks whether
+    the resolved provider is xAI. Falls back to the legacy ``_get_search_backend``
+    probe when the registry has no providers loaded. On any resolution failure,
+    returns True (fail-closed to native — preserves the #48108 incomplete-hang
+    fix rather than risk reintroducing it).
+    """
+    try:
+        from agent.web_search_registry import get_active_search_provider
+
+        provider = get_active_search_provider()
+        if provider is not None:
+            return getattr(provider, "name", None) == "xai"
+
+        from tools.web_tools import _get_search_backend
+
+        return (_get_search_backend() or "").strip().lower() == "xai"
+    except Exception:
+        # Fail closed to native — same behavior as pre-fix main.
+        return True
+
+
+def _rename_client_web_search_for_xai(response_tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Rename client ``web_search`` → alias so xAI won't hijack it server-side."""
+    rewritten: List[Dict[str, Any]] = []
+    for tool in response_tools:
+        if isinstance(tool, dict) and tool.get("name") == "web_search":
+            aliased = dict(tool)
+            aliased["name"] = _XAI_CLIENT_WEB_SEARCH_ALIAS
+            rewritten.append(aliased)
+        else:
+            rewritten.append(tool)
+    return rewritten
+
+
+_EXTENDED_PROMPT_CACHE_MODELS = (
+    "gpt-5.5-pro",
+    "gpt-5.5",
+    "gpt-5.4",
+    "gpt-5.2",
+    "gpt-5.1-codex-max",
+    "gpt-5.1-codex-mini",
+    "gpt-5.1-chat-latest",
+    "gpt-5.1-codex",
+    "gpt-5.1",
+    "gpt-5-codex",
+    "gpt-5",
+    "gpt-4.1",
+)
+_EXTENDED_PROMPT_CACHE_MODEL_RE = re.compile(
+    rf"(?:^|[./:])(?:{'|'.join(re.escape(name) for name in _EXTENDED_PROMPT_CACHE_MODELS)})"
+    r"(?:-\d{4}-\d{2}-\d{2})?$"
+)
+
+
+def _default_prompt_cache_retention_for_request(
+    model: str,
+    base_url: Any,
+) -> Optional[str]:
+    """Return ``24h`` for supported models on Amazon Bedrock Mantle."""
+    from utils import base_url_hostname
+
+    hostname_parts = base_url_hostname(str(base_url or "")).split(".")
+    is_bedrock_mantle = (
+        len(hostname_parts) == 4
+        and hostname_parts[0] == "bedrock-mantle"
+        and bool(hostname_parts[1])
+        and hostname_parts[2:] == ["api", "aws"]
+    )
+    if not is_bedrock_mantle:
+        return None
+
+    normalized = str(model or "").strip().lower().replace("_", "-")
+    if _EXTENDED_PROMPT_CACHE_MODEL_RE.search(normalized):
+        return "24h"
+    return None
+
+
+def _content_cache_key(instructions: str, tools: Optional[List[Dict[str, Any]]]) -> Optional[str]:
+    """Content-address the prompt cache key from the static request prefix.
+
+    Returns ``pck_<sha256[:24]>`` of (instructions + sorted tool schemas), or
+    None when there is nothing static to key on. The cache key is a routing
+    hint only — never a correctness boundary — so two requests sharing a system
+    prompt and tool set intentionally resolve to the same warm prefix bucket.
+
+    The fix this exists for: recurring cron jobs build session_id as
+    ``cron_<id>_<timestamp>``, so using session_id as the cache key made every
+    fire cache-cold. The static prefix (identity + tools) is identical across
+    fires, so hashing it gives a stable key that stays warm within the
+    provider's cache TTL. Sorting tools by name keeps the hash insertion-order
+    independent.
+    """
+    if not instructions and not tools:
+        return None
+    tools_part = ""
+    if tools:
+        sorted_tools = sorted(
+            (t for t in tools if isinstance(t, dict)),
+            key=lambda t: str(t.get("name") or t.get("type") or ""),
+        )
+        tools_part = json.dumps(
+            sorted_tools, sort_keys=True, ensure_ascii=False, separators=(",", ":")
+        )
+    # \x00 separator so instructions ending in the tool JSON can't collide with
+    # a request whose instructions contain that JSON and whose tools are empty.
+    content = f"{instructions or ''}\x00{tools_part}"
+    digest = hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest()[:24]
+    return f"pck_{digest}"
 
 
 class ResponsesApiTransport(ProviderTransport):
@@ -32,9 +171,9 @@ class ResponsesApiTransport(ProviderTransport):
         """Classify the current Responses endpoint from transport params."""
         from agent.codex_responses_adapter import _classify_responses_issuer
         return _classify_responses_issuer(
-            is_xai_responses=bool(params.get("is_xai_responses")),
-            is_github_responses=bool(params.get("is_github_responses")),
-            is_codex_backend=bool(params.get("is_codex_backend")),
+            is_xai_responses=params.get("is_xai_responses") is True,
+            is_github_responses=params.get("is_github_responses") is True,
+            is_codex_backend=params.get("is_codex_backend") is True,
             base_url=params.get("base_url"),
         )
 
@@ -45,7 +184,8 @@ class ResponsesApiTransport(ProviderTransport):
         self._last_issuer_kind = issuer
         return _chat_messages_to_responses_input(
             messages,
-            is_xai_responses=bool(kwargs.get("is_xai_responses")),
+            is_xai_responses=kwargs.get("is_xai_responses") is True,
+            is_github_responses=kwargs.get("is_github_responses") is True,
             replay_encrypted_reasoning=bool(
                 kwargs.get("replay_encrypted_reasoning", True)
             ),
@@ -71,7 +211,10 @@ class ResponsesApiTransport(ProviderTransport):
         params:
             instructions: str — system prompt (extracted from messages[0] if not given)
             reasoning_config: dict | None — {effort, enabled}
-            session_id: str | None — used for prompt_cache_key + xAI conv header
+            session_id: str | None — transcript/session id; drives the xAI
+                x-grok-conv-id header and the Codex cache-scope headers, and is
+                the fallback prompt_cache_key when there is no static prefix to
+                content-address
             max_tokens: int | None — max_output_tokens
             timeout: float | None — per-request timeout forwarded to the SDK
             request_overrides: dict | None — extra kwargs merged in
@@ -99,9 +242,9 @@ class ResponsesApiTransport(ProviderTransport):
         if not instructions:
             instructions = DEFAULT_AGENT_IDENTITY
 
-        is_github_responses = params.get("is_github_responses", False)
-        is_codex_backend = params.get("is_codex_backend", False)
-        is_xai_responses = params.get("is_xai_responses", False)
+        is_github_responses = params.get("is_github_responses") is True
+        is_codex_backend = params.get("is_codex_backend") is True
+        is_xai_responses = params.get("is_xai_responses") is True
         replay_encrypted_reasoning = bool(
             params.get("replay_encrypted_reasoning", True)
         )
@@ -125,9 +268,52 @@ class ResponsesApiTransport(ProviderTransport):
                 reasoning_effort = reasoning_config["effort"]
 
         _effort_clamp = {"minimal": "low"}
+        if "gpt-5.6" in (model or "").lower():
+            # Ultra is the Codex product tier; the Responses API wire value is max.
+            _effort_clamp["ultra"] = "max"
+        if params.get("is_xai_responses", False):
+            # xAI Responses tops out at high; keep generic stronger values usable.
+            _effort_clamp.update({"xhigh": "high", "max": "high", "ultra": "high"})
         reasoning_effort = _effort_clamp.get(reasoning_effort, reasoning_effort)
 
         response_tools = _responses_tools(tools)
+
+        # xAI server-side web search vs Hermes web providers.
+        #
+        # grok models on xAI's /v1/responses surface have a *native*,
+        # server-executed web search.  A client-side function literally named
+        # ``web_search`` collides with that engine: declared as a plain
+        # ``function`` rather than ``{"type": "web_search"}``, the search
+        # dispatches but never reconciles → incomplete turn + 3 retries.
+        # Verified live against grok-composer-2.5-fast (2026-06); see #48108.
+        #
+        # Two modes, chosen by the user's web-search backend config:
+        #
+        # 1. **Native** (active/configured backend is ``xai``, or resolution
+        #    fails): drop the client ``web_search`` function and declare
+        #    xAI's built-in instead. 1:1 swap only when client ``web_search``
+        #    was already present — never an additive grant.
+        # 2. **Client** (Firecrawl / Tavily / Exa / … configured or resolved):
+        #    keep Hermes dispatch so ``web.backend`` / ``web.search_backend``
+        #    is honored, but rename the wire tool to
+        #    ``hermes_web_search`` so Grok cannot hijack the name. The alias
+        #    is mapped back to ``web_search`` in ``normalize_response``.
+        if is_xai_responses and response_tools:
+            has_client_web_search = any(
+                isinstance(t, dict) and t.get("name") == "web_search"
+                for t in response_tools
+            )
+            if has_client_web_search:
+                if _xai_prefers_native_web_search():
+                    filtered = [
+                        t for t in response_tools
+                        if not (isinstance(t, dict) and t.get("name") == "web_search")
+                    ]
+                    filtered.append({"type": "web_search"})
+                    response_tools = filtered
+                else:
+                    response_tools = _rename_client_web_search_for_xai(response_tools)
+
         # ``tools`` MUST be omitted entirely when there are no functions to
         # expose: the openai SDK's ``responses.stream()`` / ``responses.parse()``
         # eagerly call ``_make_tools(tools)`` which does ``for tool in tools``
@@ -142,6 +328,7 @@ class ResponsesApiTransport(ProviderTransport):
             "input": _chat_messages_to_responses_input(
                 payload_messages,
                 is_xai_responses=is_xai_responses,
+                is_github_responses=is_github_responses,
                 replay_encrypted_reasoning=replay_encrypted_reasoning,
                 current_issuer_kind=issuer_kind,
             ),
@@ -153,10 +340,24 @@ class ResponsesApiTransport(ProviderTransport):
             kwargs["parallel_tool_calls"] = True
 
         session_id = params.get("session_id")
+        # prompt_cache_key is content-addressed from the static prefix
+        # (instructions + tools), NOT session_id — recurring cron jobs carry a
+        # per-fire timestamp in session_id (cron_<id>_<ts>) that made every run
+        # cache-cold. session_id is left untouched for transcript isolation and
+        # the cache-scope routing headers below. Falls back to session_id when
+        # there is no static content to hash.
+        cache_key = _content_cache_key(instructions, response_tools) or session_id
         # xAI Responses takes prompt_cache_key in extra_body (set further
         # down); GitHub Models opts out of cache-key routing entirely.
-        if not is_github_responses and not is_xai_responses and session_id:
-            kwargs["prompt_cache_key"] = session_id
+        if not is_github_responses and not is_xai_responses and cache_key:
+            kwargs["prompt_cache_key"] = cache_key
+
+        cache_retention = _default_prompt_cache_retention_for_request(
+            model,
+            params.get("base_url"),
+        )
+        if cache_retention:
+            kwargs.setdefault("prompt_cache_retention", cache_retention)
 
         if reasoning_enabled and is_xai_responses:
             from agent.model_metadata import grok_supports_reasoning_effort
@@ -192,6 +393,13 @@ class ResponsesApiTransport(ProviderTransport):
         if request_overrides:
             kwargs.update(request_overrides)
 
+        if "prompt_cache_key" in kwargs:
+            bounded_cache_key = _bounded_prompt_cache_key(kwargs["prompt_cache_key"])
+            if bounded_cache_key:
+                kwargs["prompt_cache_key"] = bounded_cache_key
+            else:
+                kwargs.pop("prompt_cache_key", None)
+
         # xAI Responses API rejects ``service_tier`` (HTTP 400 "Argument not
         # supported: service_tier") — hit when ``/fast`` priority-processing
         # mode lingers from a prior model in the same session, or when a
@@ -225,7 +433,7 @@ class ResponsesApiTransport(ProviderTransport):
             # remain high.  Send session_id / x-client-request-id as HTTP
             # headers while keeping ``prompt_cache_key`` in the body for
             # standard OpenAI routing as a belt-and-braces fallback.
-            cache_scope_id = str(session_id or "").strip()
+            cache_scope_id = _bounded_prompt_cache_key(session_id)
             if cache_scope_id:
                 existing_extra_headers = kwargs.get("extra_headers")
                 merged_extra_headers: Dict[str, str] = {}
@@ -267,8 +475,16 @@ class ResponsesApiTransport(ProviderTransport):
             merged_extra_body: Dict[str, Any] = {}
             if isinstance(existing_extra_body, dict):
                 merged_extra_body.update(existing_extra_body)
-            merged_extra_body.setdefault("prompt_cache_key", session_id)
+            merged_extra_body.setdefault("prompt_cache_key", cache_key)
             kwargs["extra_body"] = merged_extra_body
+
+        extra_body = kwargs.get("extra_body")
+        if isinstance(extra_body, dict) and "prompt_cache_key" in extra_body:
+            bounded_cache_key = _bounded_prompt_cache_key(extra_body["prompt_cache_key"])
+            if bounded_cache_key:
+                extra_body["prompt_cache_key"] = bounded_cache_key
+            else:
+                extra_body.pop("prompt_cache_key", None)
 
         return kwargs
 
@@ -295,9 +511,14 @@ class ResponsesApiTransport(ProviderTransport):
                     provider_data["call_id"] = tc.call_id
                 if hasattr(tc, "response_item_id") and tc.response_item_id:
                     provider_data["response_item_id"] = tc.response_item_id
+                name = tc.function.name if hasattr(tc, "function") else getattr(tc, "name", "")
+                # Undo the xAI client-path wire alias so Hermes dispatches
+                # the real ``web_search`` tool (Firecrawl / etc.).
+                if name == _XAI_CLIENT_WEB_SEARCH_ALIAS:
+                    name = "web_search"
                 tool_calls.append(ToolCall(
-                    id=tc.id if hasattr(tc, "id") else (tc.function.name if hasattr(tc, "function") else None),
-                    name=tc.function.name if hasattr(tc, "function") else getattr(tc, "name", ""),
+                    id=tc.id if hasattr(tc, "id") else (name or None),
+                    name=name,
                     arguments=tc.function.arguments if hasattr(tc, "function") else getattr(tc, "arguments", "{}"),
                     provider_data=provider_data or None,
                 ))
@@ -323,24 +544,65 @@ class ResponsesApiTransport(ProviderTransport):
     def validate_response(self, response: Any) -> bool:
         """Check Codex Responses API response has valid output structure.
 
-        Returns True only if response.output is a non-empty list.
-        Does NOT check output_text fallback — the caller handles that
-        with diagnostic logging for stream backfill recovery.
+        Returns True only if response.output is a non-empty list. Also treats
+        terminal content-filter incomplete responses as valid: the Responses API
+        may return status=incomplete with incomplete_details.reason='content_filter'
+        and no output items. That is a provider refusal signal, not a malformed
+        response, and must reach normalization so the agent loop can use the
+        content-policy / fallback path instead of invalid-response retries.
+
+        Does NOT check output_text fallback — the caller handles that with
+        diagnostic logging for stream backfill recovery.
         """
         if response is None:
             return False
         output = getattr(response, "output", None)
         if not isinstance(output, list) or not output:
-            return False
+            status = str(getattr(response, "status", "") or "").strip().lower()
+            incomplete_details = getattr(response, "incomplete_details", None)
+            if isinstance(incomplete_details, dict):
+                reason = str(incomplete_details.get("reason") or "").strip().lower()
+            else:
+                reason = str(getattr(incomplete_details, "reason", "") or "").strip().lower()
+            return status == "incomplete" and reason == "content_filter"
         return True
 
-    def preflight_kwargs(self, api_kwargs: Any, *, allow_stream: bool = False) -> dict:
+    def preflight_kwargs(
+        self,
+        api_kwargs: Any,
+        *,
+        allow_stream: bool = False,
+        is_github_responses: bool = False,
+        sanitize_harmony_tokens: bool = False,
+    ) -> dict:
         """Validate and sanitize Codex API kwargs before the call.
 
         Normalizes input items, strips unsupported fields, validates structure.
+        ``sanitize_harmony_tokens`` is enabled only for the ChatGPT Codex
+        backend, which rejects literal reserved Harmony wire tokens in text.
         """
         from agent.codex_responses_adapter import _preflight_codex_api_kwargs
-        return _preflight_codex_api_kwargs(api_kwargs, allow_stream=allow_stream)
+
+        normalized = _preflight_codex_api_kwargs(
+            api_kwargs,
+            allow_stream=allow_stream,
+            is_github_responses=is_github_responses,
+            sanitize_harmony_tokens=sanitize_harmony_tokens,
+        )
+        if "prompt_cache_key" in normalized:
+            bounded = _bounded_prompt_cache_key(normalized["prompt_cache_key"])
+            if bounded:
+                normalized["prompt_cache_key"] = bounded
+            else:
+                normalized.pop("prompt_cache_key", None)
+        extra_body = normalized.get("extra_body")
+        if isinstance(extra_body, dict) and "prompt_cache_key" in extra_body:
+            bounded = _bounded_prompt_cache_key(extra_body["prompt_cache_key"])
+            if bounded:
+                extra_body["prompt_cache_key"] = bounded
+            else:
+                extra_body.pop("prompt_cache_key", None)
+        return normalized
 
     def map_finish_reason(self, raw_reason: str) -> str:
         """Map Codex response.status to OpenAI finish_reason.
