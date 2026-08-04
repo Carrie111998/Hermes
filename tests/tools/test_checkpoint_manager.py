@@ -14,7 +14,6 @@ from unittest.mock import patch
 
 from tools.checkpoint_manager import (
     CheckpointManager,
-    DEFAULT_EXCLUDES,
     _shadow_repo_path,
     _init_store,
     _run_git,
@@ -1067,6 +1066,34 @@ def _tracked_names(store, work_dir):
     return set(files.splitlines())
 
 
+def _seed_nested_repo(path, *, commit):
+    """A nested git repo, isolated from the developer's real git config.
+
+    Without the isolation a global ``commit.gpgsign = true`` (or a global
+    ``core.hooksPath``) makes the setup commit fail, which is exactly what
+    ``_init_store`` guards the real store against.
+    """
+    env = {
+        **os.environ,
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_SYSTEM": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
+    }
+    path.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "-q", str(path)], check=True, env=env,
+                   capture_output=True)
+    (path / "f.txt").write_text("x\n")
+    if not commit:
+        return
+    subprocess.run(["git", "-C", str(path), "add", "-A"], check=True, env=env,
+                   capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(path), "-c", "user.email=t@t", "-c", "user.name=t",
+         "-c", "commit.gpgsign=false", "commit", "-qm", "seed"],
+        check=True, env=env, capture_output=True,
+    )
+
+
 class TestUnreadablePaths:
     def test_node_compile_cache_is_excluded(self, mgr, work_dir, checkpoint_base):
         """Hermes' own Node compile cache never enters a snapshot."""
@@ -1135,8 +1162,60 @@ class TestUnreadablePaths:
         finally:
             blocked.chmod(0o644)
 
-    def test_default_excludes_lists_node_compile_cache(self):
-        assert "node-compile-cache/" in DEFAULT_EXCLUDES
+    def test_existing_store_picks_up_new_excludes(
+        self, tmp_path, checkpoint_base, monkeypatch,
+    ):
+        """A store created by an older release must gain new exclude patterns.
+
+        ``info/exclude`` used to be written only when the store was created, so
+        every already-initialised store — i.e. every upgrading user — kept
+        snapshotting anything added to ``DEFAULT_EXCLUDES`` afterwards.
+        """
+        monkeypatch.setattr("tools.checkpoint_manager.CHECKPOINT_BASE", checkpoint_base)
+        wd = tmp_path / "proj"
+        wd.mkdir()
+        (wd / "a.py").write_text("1\n")
+
+        # Create the store, then age it: drop the newest pattern back out, the
+        # way a store written by the previous release would look.
+        CheckpointManager(enabled=True, max_snapshots=5).ensure_checkpoint(str(wd), "seed")
+        store = _store_path(checkpoint_base)
+        exclude = store / "info" / "exclude"
+        aged = [ln for ln in exclude.read_text(encoding="utf-8").splitlines()
+                if ln != "node-compile-cache/"]
+        exclude.write_text("\n".join(aged) + "\n", encoding="utf-8")
+        assert "node-compile-cache/" not in exclude.read_text(encoding="utf-8")
+
+        # A later run (fresh manager == restarted process) must refresh it.
+        cache = wd / "node-compile-cache" / "v1"
+        cache.mkdir(parents=True)
+        (cache / "blob").write_bytes(b"compiled\n")
+        (wd / "a.py").write_text("2\n")
+        m2 = CheckpointManager(enabled=True, max_snapshots=5)
+        assert m2.ensure_checkpoint(str(wd), "after upgrade") is True
+
+        assert "node-compile-cache/" in exclude.read_text(encoding="utf-8")
+        names = _tracked_names(store, wd)
+        assert not any(n.startswith("node-compile-cache/") for n in names)
+
+    def test_exclude_refresh_is_a_no_op_when_current(
+        self, tmp_path, checkpoint_base, monkeypatch,
+    ):
+        """The refresh sits on the per-checkpoint path — it must not rewrite."""
+        monkeypatch.setattr("tools.checkpoint_manager.CHECKPOINT_BASE", checkpoint_base)
+        wd = tmp_path / "proj"
+        wd.mkdir()
+        (wd / "a.py").write_text("1\n")
+        CheckpointManager(enabled=True, max_snapshots=5).ensure_checkpoint(str(wd), "seed")
+
+        exclude = _store_path(checkpoint_base) / "info" / "exclude"
+        before = exclude.stat().st_mtime_ns
+
+        (wd / "a.py").write_text("2\n")
+        m2 = CheckpointManager(enabled=True, max_snapshots=5)
+        assert m2.ensure_checkpoint(str(wd), "next") is True
+
+        assert exclude.stat().st_mtime_ns == before, "unchanged excludes must not be rewritten"
 
     @needs_posix_perms
     def test_skipped_paths_are_logged_not_swallowed(
@@ -1175,10 +1254,7 @@ class TestUnreadablePaths:
         wd = tmp_path / "proj"
         wd.mkdir()
         (wd / "keep.py").write_text("kept = True\n")
-        nested = wd / "vendored"
-        nested.mkdir()
-        subprocess.run(["git", "init", "-q", str(nested)], check=True)
-        (nested / "f.txt").write_text("x\n")
+        _seed_nested_repo(wd / "vendored", commit=False)
 
         m = CheckpointManager(enabled=True, max_snapshots=5)
         assert m.ensure_checkpoint(str(wd), "initial") is True
@@ -1195,16 +1271,7 @@ class TestUnreadablePaths:
         wd = tmp_path / "proj"
         wd.mkdir()
         (wd / "keep.py").write_text("kept = True\n")
-        nested = wd / "vendored"
-        nested.mkdir()
-        subprocess.run(["git", "init", "-q", str(nested)], check=True)
-        (nested / "f.txt").write_text("x\n")
-        subprocess.run(["git", "-C", str(nested), "add", "-A"], check=True)
-        subprocess.run(
-            ["git", "-C", str(nested), "-c", "user.email=t@t", "-c", "user.name=t",
-             "commit", "-qm", "seed"],
-            check=True,
-        )
+        _seed_nested_repo(wd / "vendored", commit=True)
 
         m = CheckpointManager(enabled=True, max_snapshots=5)
         with caplog.at_level(logging.WARNING, logger="tools.checkpoint_manager"):
