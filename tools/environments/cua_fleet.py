@@ -75,11 +75,18 @@ class CuaFleetConfig:
     timeout: int = 60
     ready_timeout: float = 600
     request_timeout: float = 30
+    bind_deadline: int | None = None
 
     def __post_init__(self) -> None:
         replicas = self.spec.get("replicas")
         if isinstance(replicas, bool) or not isinstance(replicas, int) or replicas < 1:
             raise ValueError("spec.replicas must be a positive integer")
+        if self.bind_deadline is not None and (
+            isinstance(self.bind_deadline, bool)
+            or not isinstance(self.bind_deadline, int)
+            or self.bind_deadline < 1
+        ):
+            raise ValueError("bind_deadline must be a positive integer or None")
         if "template" in self.spec or "services" in self.spec:
             raise ValueError(
                 "spec.template/spec.services are gone: the VM shape now lives in "
@@ -434,6 +441,24 @@ def _create_template_request(
     )
 
 
+def _claim_spec(sandbox_api: Any, pool: Any, config: CuaFleetConfig) -> Any:
+    """A claim spec only when the SDK's default cannot carry the config.
+
+    ``spec=None`` makes the SDK clone the pool's own ``sandbox_template_ref``
+    into the claim, so anything hand-built has to take that ref from the pool
+    resource rather than rebuild the name, or the two can drift and the claim
+    binds to nothing.
+    """
+    if config.bind_deadline is None:
+        return None
+    return sandbox_api.ClaimSpec(
+        sandbox_template_ref=pool.resource.spec.sandbox_template_ref,
+        warmpool=None,
+        bind_deadline=config.bind_deadline,
+        lifecycle=None,
+    )
+
+
 class CuaFleetDesktopProvider:
     name = "cua_fleet"
 
@@ -496,9 +521,10 @@ class CuaFleetDesktopProvider:
                     sandbox_api.Template.reconcile(template_request),
                     self.config.request_timeout,
                 )
-            # spec=None lets the SDK derive the claim from the pool's own spec,
-            # which keeps the template ref correct by construction.
-            claim_context = pool.claim()
+            claim_spec = _claim_spec(sandbox_api, pool, self.config)
+            claim_context = (
+                pool.claim() if claim_spec is None else pool.claim(spec=claim_spec)
+            )
             sandbox = worker.run(claim_context.__aenter__(), self.config.ready_timeout)
             entered_claim = True
         except BaseException:

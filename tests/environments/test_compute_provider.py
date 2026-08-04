@@ -403,6 +403,7 @@ class _FakeClaimContext:
 class _FakePool:
     def __init__(self):
         self.name = "hermes-desktop"
+        self.resource = SimpleNamespace(spec=None)
         self.claim_contexts: list[_FakeClaimContext] = []
         self.claim_specs: list[object | None] = []
 
@@ -562,6 +563,7 @@ class _FakeSandboxApi:
         async def reconcile(cls, request):
             _FakeSandboxApi.reconcile_requests.append(request)
             _FakeSandboxApi.pool.name = request.namespace
+            _FakeSandboxApi.pool.resource = SimpleNamespace(spec=request.spec)
             return _FakeSandboxApi.pool
 
     class Template:
@@ -732,6 +734,46 @@ def test_cua_fleet_lets_the_sdk_derive_the_claim_from_the_pool_spec() -> None:
     assert _FakeSandboxApi.pool.claim_specs == [None]
 
     provider.release(lease)
+
+
+def test_cua_fleet_takes_the_claim_template_ref_from_the_reconciled_pool() -> None:
+    _FakeSandboxApi.reset()
+    provider = CuaFleetDesktopProvider(
+        CuaFleetConfig(
+            client_id="ukey-test",
+            client_secret="secret",
+            pool="hermes-cua-pool",
+            spec=_pool_spec(),
+            template_spec=_template_spec(),
+            bind_deadline=900,
+        ),
+        sandbox_module=_FakeSandboxApi,
+    )
+
+    lease = provider.acquire("task-bind-deadline")
+
+    claim_spec = _FakeSandboxApi.pool.claim_specs[0]
+    assert isinstance(claim_spec, _FakeClaimSpec)
+    # The ref is the pool resource's own object, so it cannot drift from the
+    # template that was reconciled alongside it.
+    assert (
+        claim_spec.sandbox_template_ref
+        is _FakeSandboxApi.reconcile_requests[0].spec.sandbox_template_ref
+    )
+    assert claim_spec.sandbox_template_ref.name == "hermes-cua-pool-template"
+    assert claim_spec.sandbox_template_ref.name == (
+        _FakeSandboxApi.template_requests[0].name
+    )
+    assert claim_spec.warmpool is None
+    assert claim_spec.bind_deadline == 900
+    assert claim_spec.lifecycle is None
+
+    provider.release(lease)
+
+
+def test_cua_fleet_rejects_a_non_positive_bind_deadline() -> None:
+    with pytest.raises(ValueError, match="bind_deadline"):
+        CuaFleetConfig(bind_deadline=0)
 
 
 def test_cua_fleet_environment_routes_terminal_through_named_server_service() -> None:
