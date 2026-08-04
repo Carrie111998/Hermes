@@ -40,7 +40,7 @@ import uuid
 import threading
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from agent.context_engine import (
     automatic_compaction_status_message,
@@ -221,6 +221,7 @@ class CompressionCommitFence:
         self._lock = threading.Lock()
         self._cancelled = False
         self._commit_started = False
+        self._cancel_callbacks: list[Callable[[], None]] = []
         # Forward-progress telemetry: the compression worker touches this
         # whenever the streamed summary call produces a token (see
         # ContextCompressor._call_summary_llm). Waiters use it to distinguish
@@ -248,11 +249,14 @@ class CompressionCommitFence:
         Returns ``False`` when the worker had already entered the boundary; in
         that case acquiring this lock waits until all session mutation finishes.
         """
+        callbacks: list[Callable[[], None]] = []
         with self._lock:
             if self._commit_started:
                 return False
             self._cancelled = True
-            return True
+            callbacks, self._cancel_callbacks = self._cancel_callbacks, []
+        self._run_cancel_callbacks(callbacks)
+        return True
 
     def try_cancel_before_commit(self) -> Optional[bool]:
         """Non-blocking form of :meth:`cancel_before_commit`.
@@ -262,13 +266,37 @@ class CompressionCommitFence:
         """
         if not self._lock.acquire(blocking=False):
             return None
+        callbacks: list[Callable[[], None]] = []
         try:
             if self._commit_started:
                 return False
             self._cancelled = True
-            return True
+            callbacks, self._cancel_callbacks = self._cancel_callbacks, []
         finally:
             self._lock.release()
+        self._run_cancel_callbacks(callbacks)
+        return True
+
+    def add_cancel_callback(self, callback: Callable[[], None]) -> None:
+        """Run ``callback`` when cancellation wins before the commit boundary."""
+        run_now = False
+        with self._lock:
+            if self._cancelled:
+                run_now = True
+            elif not self._commit_started:
+                self._cancel_callbacks.append(callback)
+        if run_now:
+            self._run_cancel_callbacks([callback])
+
+    @staticmethod
+    def _run_cancel_callbacks(callbacks: list[Callable[[], None]]) -> None:
+        for callback in callbacks:
+            try:
+                callback()
+            except Exception:
+                logger.debug(
+                    "compression cancellation callback failed", exc_info=True
+                )
 
     def begin_commit(self) -> bool:
         """Enter the commit boundary unless cancellation already won."""
@@ -1604,14 +1632,16 @@ def compress_context(
             _complete_compaction_lifecycle()
             return messages, _existing_sp
     _lock_released = False
+    _lock_release_guard = threading.Lock()
 
     def _release_lock() -> None:
         """Release the lock keyed on the OLD session_id (before rotation)."""
         nonlocal _lock_released
+        with _lock_release_guard:
+            if _lock_released:
+                return
+            _lock_released = True
         _complete_compaction_lifecycle()
-        if _lock_released:
-            return
-        _lock_released = True
         if getattr(agent, "_active_compression_lock_holder", None) == _lock_holder:
             agent._active_compression_lock_holder = None
         if _lock_refresher is not None:
@@ -1627,6 +1657,12 @@ def compress_context(
 
     if _lock_holder is not None:
         agent._active_compression_lock_holder = _lock_holder
+        if commit_fence is not None:
+            # A timed-out executor thread may remain blocked in its summary
+            # provider long after the caller moves on. The fence guarantees it
+            # can no longer mutate the transcript, so retaining the write lock
+            # would only make subsequent turns impossible to persist.
+            commit_fence.add_cancel_callback(_release_lock)
 
     # A delayed contender can acquire the parent lock after the winning path
     # has released it and completed rotation. The lock serializes work but does
@@ -1693,14 +1729,16 @@ def compress_context(
     _activity_heartbeat: Optional[_CompressionActivityHeartbeat] = None
     try:
         if _lock_holder is not None:
-            _lock_refresher = _CompressionLockLeaseRefresher(
-                _lock_db,
-                _lock_sid,
-                _lock_holder,
-                _lock_ttl,
-                _lock_refresh_interval,
-            )
-            _lock_refresher.start()
+            with _lock_release_guard:
+                if not _lock_released:
+                    _lock_refresher = _CompressionLockLeaseRefresher(
+                        _lock_db,
+                        _lock_sid,
+                        _lock_holder,
+                        _lock_ttl,
+                        _lock_refresh_interval,
+                    )
+                    _lock_refresher.start()
 
         # The caller's history snapshot predates lease acquisition. Reload the
         # durable parent after the lease is live; MORE durable rows than the

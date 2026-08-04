@@ -472,6 +472,65 @@ def test_cancelled_commit_fence_blocks_late_session_db_compaction(
     assert db.get_compression_lock_holder(session_id) is None
 
 
+def test_cancelled_commit_fence_releases_lock_before_summary_returns(
+    tmp_path: Path,
+) -> None:
+    """A timed-out summary must not block persistence while it winds down."""
+    from agent.conversation_compression import CompressionCommitFence
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session_id = "HYGIENE_TIMEOUT_WRITES"
+    db.create_session(session_id, source="discord")
+
+    agent = _build_agent_with_db(db, session_id)
+    agent.compression_in_place = True
+    agent._cached_system_prompt = "sys"
+    summary_started = threading.Event()
+    release_summary = threading.Event()
+
+    def _stuck_summary(*_args, **_kwargs):
+        summary_started.set()
+        assert release_summary.wait(timeout=5)
+        return [
+            {"role": "user", "content": "[CONTEXT COMPACTION] summary"},
+            {"role": "user", "content": "tail"},
+        ]
+
+    agent.context_compressor.compress.side_effect = _stuck_summary
+    messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
+    fence = CompressionCommitFence()
+    result = {}
+
+    worker = threading.Thread(
+        target=lambda: result.setdefault(
+            "value",
+            agent._compress_context(
+                messages,
+                "sys",
+                approx_tokens=120_000,
+                commit_fence=fence,
+            ),
+        ),
+        name="timed-out-hygiene-write-release",
+    )
+    worker.start()
+    assert summary_started.wait(timeout=2)
+    assert db.get_compression_lock_holder(session_id) is not None
+
+    assert fence.cancel_before_commit() is True
+
+    # The provider call is still blocked, but the cancelled worker can no
+    # longer commit. New turns must therefore be able to persist immediately.
+    assert db.get_compression_lock_holder(session_id) is None
+    db.append_message(session_id, "user", "retry while summary winds down")
+
+    release_summary.set()
+    worker.join(timeout=5)
+    assert not worker.is_alive()
+    assert result["value"][0] is messages
+    assert db.get_compression_lock_holder(session_id) is None
+
+
 def test_fence_cancelled_compression_leaves_lock_reacquirable(tmp_path: Path) -> None:
     """A fence-cancelled attempt must not poison the per-session lock.
 
