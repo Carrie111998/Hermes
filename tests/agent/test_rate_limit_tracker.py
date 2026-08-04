@@ -8,6 +8,7 @@ from agent.rate_limit_tracker import (
     parse_rate_limit_headers,
     format_rate_limit_display,
     format_rate_limit_compact,
+    throttle_seconds_from_state,
     _fmt_count,
     _fmt_seconds,
     _bar,
@@ -112,6 +113,57 @@ class TestBucket:
     def test_remaining_seconds_expired(self):
         b = RateLimitBucket(limit=800, remaining=795, reset_seconds=30.0, captured_at=time.time() - 60)
         assert b.remaining_seconds_now == 0.0
+
+    def test_is_exhausted_only_when_known_quota_empty(self):
+        assert RateLimitBucket(limit=100, remaining=0).is_exhausted
+        assert RateLimitBucket(limit=100, remaining=-1).is_exhausted
+        assert not RateLimitBucket(limit=100, remaining=1).is_exhausted
+        assert not RateLimitBucket(limit=0, remaining=0).is_exhausted
+
+
+class TestProactiveThrottle:
+    def test_no_throttle_when_capacity_remains(self):
+        state = parse_rate_limit_headers(NOUS_HEADERS, provider="nous")
+        assert throttle_seconds_from_state(state) is None
+
+    def test_throttle_when_success_headers_show_exhausted_request_bucket(self):
+        state = parse_rate_limit_headers(
+            {
+                **NOUS_HEADERS,
+                "x-ratelimit-remaining-requests": "0",
+                "x-ratelimit-reset-requests": "12",
+            },
+            provider="nous",
+        )
+        assert state is not None
+        assert throttle_seconds_from_state(state) == pytest.approx(12, abs=1)
+
+    def test_throttle_uses_longest_exhausted_bucket(self):
+        state = parse_rate_limit_headers(
+            {
+                **NOUS_HEADERS,
+                "x-ratelimit-remaining-requests": "0",
+                "x-ratelimit-reset-requests": "12",
+                "x-ratelimit-remaining-tokens-1h": "0",
+                "x-ratelimit-reset-tokens-1h": "120",
+            },
+            provider="nous",
+        )
+        assert state is not None
+        assert throttle_seconds_from_state(state) == pytest.approx(120, abs=1)
+
+    def test_no_throttle_for_expired_exhausted_bucket(self):
+        state = RateLimitState(
+            requests_min=RateLimitBucket(
+                limit=100,
+                remaining=0,
+                reset_seconds=1,
+                captured_at=time.time() - 2,
+            ),
+            captured_at=time.time() - 2,
+            provider="nous",
+        )
+        assert throttle_seconds_from_state(state) is None
 
 
 class TestFormatting:
