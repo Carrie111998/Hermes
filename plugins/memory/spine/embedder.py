@@ -33,7 +33,11 @@ def _load_model() -> Optional[object]:
         from sentence_transformers import SentenceTransformer
 
         _model = SentenceTransformer(_model_name)
-        logger.info("Embedder loaded: %s (dim=%d)", _model_name, _model.get_embedding_dimension())
+        logger.info(
+            "Embedder loaded: %s (dim=%d)",
+            _model_name,
+            _model.get_embedding_dimension(),
+        )
         return _model
     except Exception as e:
         logger.error("Failed to load embedder %s: %s", _model_name, e)
