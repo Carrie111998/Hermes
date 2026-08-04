@@ -1,0 +1,79 @@
+# =============================================================================
+# PATTERN: LOOP-UNTIL-DONE (bounded revision loop)
+# Wiki reference: docs/wiki/concepts/dynamic-workflow-engineering.md
+#   Key Patterns → "6. Loop-Until-Done" — "Loop: Spawn Agent → Check
+#   Condition → [Continue / Stop]"
+# -----------------------------------------------------------------------------
+# USE WHEN: quality is only known after inspection — the work must be
+# produced, checked, and re-done until it passes. The wiki's unbounded
+# loop (continue until a stop condition) is represented in the static
+# engine as a BOUNDED review loop: FAIL → revise → re-review, with a
+# hard retry budget per reviewer.
+#
+# WHAT EACH PIECE ACHIEVES:
+#   - The loop IS the review loop: producer → reviewer → (FAIL: producer
+#     reset to ready, revise, re-review) → PASS terminates.
+#   - `max_retries` is the loop bound. Each FAIL consumes one round from
+#     the reviewer's budget. When exhausted, the reviewer stays terminal
+#     and the failure surfaces to the operator — the loop can never spin
+#     forever.
+#   - The reviewer's task text IS the stop condition: its PASS/FAIL
+#     verdict encodes "condition met" vs "keep looping". Make the
+#     criteria explicit in the reviewer task so the verdict is grounded.
+#   - A `when:` guard on the producer is the "no more errors / no new
+#     findings" variant: e.g. a follow-up node that runs only when the
+#     revision produced no outstanding blockers.
+#   - TRUE unbounded loop-until-done (no retry ceiling) is NOT supported
+#     by the static engine — bounded loops only. Dynamic mode was the
+#     unbounded path and is paused (see wiki gap note).
+# =============================================================================
+
+name: my-loop-until-done
+description: "Bounded revision loop — rework until reviewer PASS or budget spent."
+
+roles:
+  producer: edison
+  verifier: raven
+
+nodes:
+
+  # ── Producer: the loop body — re-dispatched on every FAIL round ──
+  build:
+    agent: "{producer}"
+    task: >
+      Produce {context.objective} to the required standard:
+      {context.definition_of_done}. Complete when done.
+    timeout_minutes: 45
+    channel: debug
+    fallback_on_timeout: retry
+    max_retries: 3                # THE LOOP BOUND — 3 revision rounds max
+    reviews:
+      - verify
+
+  # ── Verifier: the stop-condition check ──
+  verify:
+    agent: "{verifier}"
+    depends_on: [build]
+    task: >
+      Check the build card ({build}) against:
+      {context.definition_of_done}
+      Stop-condition contract — your summary MUST start with:
+        PASS → every criterion met; no more revisions needed.
+        FAIL → list each unmet criterion precisely; the producer will
+               revise and you will re-check (budget: {max_retries} rounds).
+      Always complete with a verdict. Never block.
+    timeout_minutes: 30
+    channel: debug
+    fallback_on_timeout: retry
+
+# ── Stop-condition follow-up variant (when: guard) ──
+# A downstream node that only runs once the loop PASSED:
+#
+#   package:
+#     agent: "{packager}"
+#     task: "Package the verified result {build}."
+#     depends_on: [build, verify]
+#     when: '{verify.status} == "done"'
+#
+# (verify is done exactly when it PASSED — a FAIL resets build to ready
+# and the loop re-enters, so package only ever sees a passing round.)

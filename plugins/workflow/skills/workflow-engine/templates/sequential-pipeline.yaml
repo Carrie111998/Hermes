@@ -1,0 +1,68 @@
+# =============================================================================
+# PATTERN: SEQUENTIAL PIPELINE
+# Wiki reference: docs/wiki/concepts/dynamic-workflow-engineering.md
+#   DAG Topology → "Sequential Pipeline | A → B → C | Clear sequence of
+#   stages, each feeds next"
+# -----------------------------------------------------------------------------
+# USE WHEN: a strict order of stages where each stage consumes the previous
+# one's output. No parallelism, no branching, no review gates.
+#
+# WHAT EACH PIECE ACHIEVES:
+#   - `depends_on: [prev-node]` is the ONLY thing that creates ordering.
+#     A node is dispatched only when every node in its depends_on is done.
+#   - The engine topologically sorts nodes into layers; nodes with no unmet
+#     dependencies share a layer and would run in parallel (see
+#     parallel-fanout.yaml when you want that).
+#   - Downstream nodes reference upstream output via `{node-id}` (full
+#     result text), `{phaseN.node-id}`, or `{nodes.node-id.card_id}`
+#     (kanban card id) in task text.
+#   - `fallback_on_timeout` decides what happens when a stage times out:
+#       skip     → node fails, all downstream SKIP (cascade)   [default]
+#       degraded → node marked degraded, downstream proceeds with warning
+#       retry    → card re-created (up to 3 attempts)
+#     Choose it deliberately for every node that has downstream consumers —
+#     the validator warns when it is missing.
+# =============================================================================
+
+name: my-sequential-pipeline
+description: "Sequential stages — each node starts when its predecessor completes."
+
+roles:
+  analyst: nikola        # ← replace with real profile names
+  designer: edison
+  implementer: newton
+
+nodes:
+
+  # ── Stage 1: nothing depends on it → runs first ──
+  analyze:
+    agent: "{analyst}"
+    task: >
+      Analyze {context.objective}. Produce a findings brief.
+      Complete this card when the brief is written.
+    timeout_minutes: 30
+    channel: debug
+    fallback_on_timeout: skip
+
+  # ── Stage 2: pinned after analyze by depends_on ──
+  design:
+    agent: "{designer}"
+    task: >
+      Read the analysis from the analyze card ({analyze}).
+      Produce a design doc: architecture, component interfaces, data flow.
+      Complete when the design doc is written.
+    depends_on: [analyze]
+    timeout_minutes: 30
+    channel: debug
+    fallback_on_timeout: skip
+
+  # ── Stage 3: pinned after design ──
+  implement:
+    agent: "{implementer}"
+    task: >
+      Read the design doc ({design}). Implement it in the repo.
+      Complete when the implementation is done and committed.
+    depends_on: [design]
+    timeout_minutes: 60
+    channel: debug
+    fallback_on_timeout: skip

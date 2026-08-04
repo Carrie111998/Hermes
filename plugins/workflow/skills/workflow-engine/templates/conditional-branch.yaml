@@ -1,0 +1,101 @@
+# =============================================================================
+# PATTERN: CONDITIONAL BRANCH (classify-and-act / routing)
+# Wiki reference: docs/wiki/concepts/dynamic-workflow-engineering.md
+#   Key Patterns → "4. Classify-and-Act"
+#   DAG Topology → "Conditional Branch | A → [if X: B, if Y: C]"
+# -----------------------------------------------------------------------------
+# USE WHEN: the path through the graph depends on a decision made by an
+# earlier node (or on context values supplied at workflow_start).
+#
+# WHAT EACH PIECE ACHIEVES:
+#   - `when:` on a node is the branch condition. Non-empty when: is
+#     evaluated at dispatch time; truthy → node runs, falsy → node is
+#     SKIPPED (reported as skipped in the summary).
+#   - References allowed inside when: expressions (NOTE: when: has its own
+#     resolver — {node-id.result} works HERE but NOT in task text):
+#       {node-id.status} {node-id.result} {node-id.error} {node-id.attempts}
+#       {node-id.duration_seconds} {node-id.error_count} {context.key}
+#     Operators: ==, !=, >, <, >=, <=, contains, starts_with, in,
+#     and, or, not
+#   - Branch nodes still need depends_on: [classifier] — the when: decides
+#     WHETHER to run, depends_on decides WHEN it may run. A validator warns
+#     when when: references a node not in depends_on.
+#   - The merge node depends_on BOTH branches. If a branch was skipped,
+#     the merge still proceeds (skipped nodes do not block the DAG) — but
+#     reference only the branch you know ran, or guard with `{branch}`
+#     being empty.
+#   - `{context.key}` values come from the `context` / `inputs` dict passed
+#     to workflow_start — a cheap way to route without an extra agent.
+#   - Classify-and-act variant: a classifier AGENT node decides, then the
+#     when: conditions read its {classify.result} (valid in when: only).
+# =============================================================================
+
+name: my-conditional-branch
+description: "Route execution by a classifier node's decision or context."
+
+roles:
+  classifier: nikola
+  route-a: edison
+  route-b: newton
+  merge: hopper
+
+nodes:
+
+  # ── Classifier: makes the decision the branches react to ──
+  classify:
+    agent: "{classifier}"
+    task: >
+      Read {context.objective}. Decide: is this a 'bugfix' or a 'feature'?
+      Your completion summary must contain exactly one of:
+      "DECISION: bugfix" or "DECISION: feature".
+      Complete when the decision is stated.
+    timeout_minutes: 15
+    channel: debug
+    fallback_on_timeout: skip
+
+  # ── Branch A: runs only when the classifier said bugfix ──
+  bugfix-track:
+    agent: "{route-a}"
+    task: >
+      The classifier decided: bugfix. Fix {context.objective}.
+      Complete when the fix is done.
+    depends_on: [classify]
+    when: '{classify.result} contains "DECISION: bugfix"'
+    timeout_minutes: 45
+    channel: debug
+    fallback_on_timeout: skip
+
+  # ── Branch B: runs only when the classifier said feature ──
+  feature-track:
+    agent: "{route-b}"
+    task: >
+      The classifier decided: feature. Build {context.objective}.
+      Complete when the feature is built.
+    depends_on: [classify]
+    when: '{classify.result} contains "DECISION: feature"'
+    timeout_minutes: 45
+    channel: debug
+    fallback_on_timeout: skip
+
+  # ── Merge: runs after the branch that executed ──
+  merge:
+    agent: "{merge}"
+    task: >
+      Consolidate the outcome. Branch output: {bugfix-track}
+      (empty if that branch was skipped).
+      Complete with the final status.
+    depends_on: [bugfix-track, feature-track]
+    timeout_minutes: 15
+    channel: debug
+    fallback_on_timeout: skip
+
+# ── Context-routing variant (no classifier agent) ──
+# Route purely on inputs passed to workflow_start:
+#
+#   workflow_start(workflow="my-conditional-branch",
+#                  context={"priority": "high"})
+#
+#   fast-track:
+#     when: '{context.priority} == "high"'
+#   standard-track:
+#     when: '{context.priority} == "normal"'

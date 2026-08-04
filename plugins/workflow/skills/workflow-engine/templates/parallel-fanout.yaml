@@ -1,0 +1,103 @@
+# =============================================================================
+# PATTERN: PARALLEL FAN-OUT (barrier + synthesize)
+# Wiki reference: docs/wiki/concepts/dynamic-workflow-engineering.md
+#   Key Patterns → "1. Fan-out-and-Synthesize"
+#   DAG Topology → "Parallel Fan-out | A → [B, C, D] → E | Independent
+#   subtasks, barrier at merge"
+# -----------------------------------------------------------------------------
+# USE WHEN: one task splits into several independent subtasks, all run
+# concurrently, then a merge node combines their outputs.
+#
+# WHAT EACH PIECE ACHIEVES:
+#   - Parallelism is IMPLICIT: any nodes whose depends_on is satisfied at
+#     the same time share a topological layer and are dispatched together.
+#     You do NOT declare "parallel: true" anywhere — just don't create
+#     cross-dependencies between the fan-out nodes.
+#   - The merge node depends_on ALL fan-out nodes — that is the barrier.
+#     It is dispatched only when every fan-out node is done, exactly like
+#     the wiki's barrier-waits-for-all semantics.
+#   - Each fan-out node gets its own clean context window and kanban card —
+#     the wiki's "no cross-contamination" property.
+#   - The merge node reads each subtask's output via {subtask} (bare node
+#     id = full result text; {phase1.track-a} also works).
+#   - `outputs:` on a node names its produced artifacts for downstream
+#     validation; optional but useful for fan-out → synthesize flows.
+#   - All fan-out nodes run on DIFFERENT agents (roles) so work is truly
+#     parallel and each worker has an isolated session.
+# =============================================================================
+
+name: my-parallel-fanout
+description: "Split work into independent subtasks, barrier, synthesize."
+
+roles:
+  orchestrator: nikola
+  worker-a: edison
+  worker-b: newton
+  worker-c: raven
+  synthesizer: hopper
+
+nodes:
+
+  # ── Stage 1: decompose the task ──
+  decompose:
+    agent: "{orchestrator}"
+    task: >
+      Read {context.objective}. Split it into exactly three independent
+      research tracks. List the three tracks explicitly in your summary.
+      Complete when done.
+    timeout_minutes: 30
+    channel: debug
+    fallback_on_timeout: skip
+
+  # ── Stage 2: THREE parallel workers — no depends_on between them ──
+  # All three depend only on decompose → same layer → dispatched together.
+  track-a:
+    agent: "{worker-a}"
+    task: >
+      Research track A from the decompose card ({decompose}).
+      Produce your findings. Complete when done.
+    depends_on: [decompose]
+    timeout_minutes: 45
+    channel: debug
+    fallback_on_timeout: degraded
+    outputs:
+      - track_a_findings
+
+  track-b:
+    agent: "{worker-b}"
+    task: >
+      Research track B from the decompose card ({decompose}).
+      Produce your findings. Complete when done.
+    depends_on: [decompose]
+    timeout_minutes: 45
+    channel: debug
+    fallback_on_timeout: degraded
+    outputs:
+      - track_b_findings
+
+  track-c:
+    agent: "{worker-c}"
+    task: >
+      Research track C from the decompose card ({decompose}).
+      Produce your findings. Complete when done.
+    depends_on: [decompose]
+    timeout_minutes: 45
+    channel: debug
+    fallback_on_timeout: degraded
+    outputs:
+      - track_c_findings
+
+  # ── Stage 3: barrier + synthesize — depends on ALL three tracks ──
+  synthesize:
+    agent: "{synthesizer}"
+    task: >
+      Merge the three track findings:
+      - Track A: {track-a}
+      - Track B: {track-b}
+      - Track C: {track-c}
+      Produce one consolidated report with a synthesis of all three.
+      Complete when the report is written.
+    depends_on: [track-a, track-b, track-c]
+    timeout_minutes: 30
+    channel: debug
+    fallback_on_timeout: skip

@@ -1,0 +1,100 @@
+# =============================================================================
+# PATTERN: ORCHESTRATOR-WORKERS (generate-and-filter)
+# Wiki reference: docs/wiki/concepts/dynamic-workflow-engineering.md
+#   Key Patterns → "5. Generate-and-Filter"
+#   Key Patterns → "1. Fan-out-and-Synthesize" (orchestrator variant)
+# -----------------------------------------------------------------------------
+# USE WHEN: one orchestrator delegates bounded subtasks to parallel workers,
+# then filters/selects the best results. Differs from parallel-fanout in
+# that workers produce MULTIPLE candidate outputs and a filter/rank step
+# keeps only the best — not a blind merge of everything.
+#
+# WHAT EACH PIECE ACHIEVES:
+#   - Orchestrator node first: defines the work items for the workers and
+#     states them in its summary ({orchestrate} — bare node id).
+#   - Parallel workers (no cross-depends_on) each take a slice — they run
+#     in the same layer, dispatched together.
+#   - The filter/rank node depends_on ALL workers = barrier, then applies
+#     a rubric: keep top K, discard the rest. This is the wiki's
+#     Generate N → Filter → Deduplicate → Rank → Top K.
+#   - Workers get isolated contexts (no cross-contamination) — each card
+#     is a fresh agent session.
+#   - For a pure tournament (wiki pattern 3: pairwise judging), replace
+#     the filter node with judge nodes that compare pairs and a final node
+#     that picks the winner from the pairwise results.
+# =============================================================================
+
+name: my-orchestrator-workers
+description: "Orchestrator delegates to parallel workers, filter keeps top K."
+
+roles:
+  orchestrator: nikola
+  worker-1: edison
+  worker-2: newton
+  worker-3: raven
+  filter: hopper
+
+nodes:
+
+  # ── Orchestrator: defines the candidate space ──
+  orchestrate:
+    agent: "{orchestrator}"
+    task: >
+      For {context.objective}: enumerate exactly three distinct candidate
+      approaches. Number them 1, 2, 3 with a one-line description each.
+      Complete when the three candidates are listed.
+    timeout_minutes: 15
+    channel: debug
+    fallback_on_timeout: skip
+
+  # ── Parallel workers: one per candidate — same layer, no cross deps ──
+  candidate-1:
+    agent: "{worker-1}"
+    task: >
+      Develop candidate 1 from the orchestrate card ({orchestrate}).
+      Produce a full working proposal. Complete when done.
+    depends_on: [orchestrate]
+    timeout_minutes: 45
+    channel: debug
+    fallback_on_timeout: degraded
+    outputs:
+      - candidate_1
+
+  candidate-2:
+    agent: "{worker-2}"
+    task: >
+      Develop candidate 2 from the orchestrate card ({orchestrate}).
+      Produce a full working proposal. Complete when done.
+    depends_on: [orchestrate]
+    timeout_minutes: 45
+    channel: debug
+    fallback_on_timeout: degraded
+    outputs:
+      - candidate_2
+
+  candidate-3:
+    agent: "{worker-3}"
+    task: >
+      Develop candidate 3 from the orchestrate card ({orchestrate}).
+      Produce a full working proposal. Complete when done.
+    depends_on: [orchestrate]
+    timeout_minutes: 45
+    channel: debug
+    fallback_on_timeout: degraded
+    outputs:
+      - candidate_3
+
+  # ── Filter: barrier (depends on all) + rubric ranking ──
+  filter:
+    agent: "{filter}"
+    task: >
+      Rank these three candidates against {context.rubric}:
+      1. {candidate-1}
+      2. {candidate-2}
+      3. {candidate-3}
+      Keep the single best candidate; explain why it wins.
+      Complete with your recommendation.
+    depends_on: [candidate-1, candidate-2, candidate-3]
+    timeout_minutes: 30
+    channel: debug
+    fallback_on_timeout: skip

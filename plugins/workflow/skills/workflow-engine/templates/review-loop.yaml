@@ -1,0 +1,94 @@
+# =============================================================================
+# PATTERN: REVIEW LOOP (adversarial verification)
+# Wiki reference: docs/wiki/concepts/dynamic-workflow-engineering.md
+#   Key Patterns → "2. Adversarial Verification"
+#   DAG Topology → "Review Loop | A → B(verify) → [pass: done, fail: A]"
+# -----------------------------------------------------------------------------
+# USE WHEN: work must pass a quality gate before it is accepted. The
+# producer's output is verified by a separate agent; failure sends the
+# work back for revision and the reviewer re-checks it.
+#
+# WHAT EACH PIECE ACHIEVES:
+#   - `reviews: [reviewer-node-1, reviewer-node-2]` ON THE PRODUCER NODE is
+#     the core of the pattern. It declares which nodes review this node's
+#     output. Reviewers run SEQUENTIALLY in list order.
+#   - Reviewers are NOT dispatched at workflow start — the engine creates
+#     their cards only when the reviewed work is done. They do not appear
+#     in the producer's depends_on.
+#   - Reviewer nodes are plain nodes that happen to be named in a reviews:
+#     list. They must have depends_on: [producer] to be dispatched after
+#     the producer completes.
+#   - VERDICT CONTRACT: the reviewer must lead its completion summary with
+#     PASS or FAIL (first line). The engine reads the summary:
+#       PASS → reviewer done; next reviewer dispatched (or work accepted)
+#       FAIL → producer card enriched with the review, reset to ready,
+#              producer re-does the work, ALL reviewers re-dispatch
+#   - `max_retries` (per-review > node > workflow > default 3) bounds how
+#     many rounds each reviewer gets before it stays terminal and the
+#     failure is escalated to the operator. Set it on the producer node.
+#   - `inherit_workspace: true` on a reviewer makes it start in the
+#     producer's project dir (needed when the reviewer must read real
+#     files). Default false = blind review in scratch (sealed envelope).
+#   - NEVER block a review card. Always complete with PASS/FAIL.
+# =============================================================================
+
+name: my-review-loop
+description: "Produce → adversarial review → rework on FAIL, accept on PASS."
+
+roles:
+  author: edison
+  reviewer: raven
+
+nodes:
+
+  # ── Producer: declares WHO reviews it ──
+  implement:
+    agent: "{author}"
+    task: >
+      Implement {context.objective} in the repo. Commit your work.
+      Complete this card when the implementation is done.
+    timeout_minutes: 60
+    channel: debug
+    fallback_on_timeout: retry
+    max_retries: 3                # max re-review rounds before escalation
+    reviews:
+      - qa-review                 # reviewers run in this order
+
+  # ── Reviewer: a normal node, referenced by the producer's reviews: ──
+  qa-review:
+    agent: "{reviewer}"
+    depends_on: [implement]
+    task: >
+      Review the implement card ({implement}).
+      Check against these criteria: {context.acceptance_criteria}.
+
+      Verdict contract — your completion summary MUST start with:
+        PASS — the work meets the criteria
+        FAIL — list the specific blockers the author must fix
+
+      If PASS, include evidence. If FAIL, be specific about what to fix.
+      Do NOT block this card — always complete it with a verdict.
+    timeout_minutes: 30
+    channel: debug
+    fallback_on_timeout: retry
+    # inherit_workspace: true     # uncomment to let the reviewer see the
+                                  # author's files instead of blind review
+
+# ── MULTI-REVIEWER variant (sequential pipeline of reviewers) ──
+# Add reviewers to the list and give each one a node:
+#
+#   implement:
+#     reviews:
+#       - qa-review
+#       - security-review        # runs AFTER qa-review passes
+#
+#   security-review:
+#     agent: "{security}"
+#     depends_on: [implement]    # not on qa-review — the engine sequences
+#                                # reviewers itself via the reviews: list
+#     task: >
+#       Security review of {implement}. Lead with PASS or FAIL.
+#       ...
+#
+# On ANY reviewer FAIL, the producer resets to ready and ALL reviewers
+# re-dispatch after the revised work completes — not just the failing one.

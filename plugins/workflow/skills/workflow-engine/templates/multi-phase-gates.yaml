@@ -1,0 +1,90 @@
+# =============================================================================
+# PATTERN: MULTI-PHASE WITH PRIVACY BARRIER (gates)
+# Wiki reference: docs/wiki/concepts/dynamic-workflow-engineering.md
+#   DAG Topology → "Multi-Phase | [Phase 1] → Gate → [Phase 2] → Gate →
+#   [Phase 3] | Privacy barriers between phases"
+# -----------------------------------------------------------------------------
+# USE WHEN: phases must not see each other's internals — e.g. a premortem /
+# failure-imagination phase whose output must not bias later position
+# agents, or client work that must stay isolated from delivery work.
+#
+# WHAT EACH PIECE ACHIEVES:
+#   - `synthetic: true` on a node creates a GATE: no agent, no kanban card,
+#     auto-completed the moment its depends_on are done. It exists purely
+#     to enforce ordering — a zero-cost barrier in the DAG.
+#   - Gates keep the "Phase 1 → Phase 2" boundary structural: even if you
+#     add more nodes to phase 1 later, nothing in phase 2 dispatches until
+#     the gate closes.
+#   - `privacy_gate: true` on a REAL node excludes its output from template
+#     lookup for downstream nodes — downstream agents literally cannot see
+#     that node's result. Use on phase-1 producer nodes whose content must
+#     not leak (e.g. premortem failure imagination).
+#   - Combine: synthetic gate for ordering + privacy_gate on the sensitive
+#     producer so phase-2 agents never read phase-1 internals.
+#   - Phases can also be labeled explicitly with `phase:` for template
+#     substitution ({phase1.X}) — optional, engine auto-labels by layer
+#     index otherwise.
+# =============================================================================
+
+name: my-multi-phase
+description: "Phase-separated execution with privacy barriers between phases."
+
+roles:
+  phase1-agent: edison
+  phase2-agent: newton
+  phase3-agent: raven
+
+nodes:
+
+  # ── PHASE 1 ──
+  # privacy_gate: downstream nodes cannot read this node's result
+  premortem:
+    agent: "{phase1-agent}"
+    task: >
+      Run a premortem on {context.objective}: enumerate every way this
+      could fail catastrophically. Be exhaustive. Complete when done.
+    privacy_gate: true
+    timeout_minutes: 30
+    channel: debug
+    fallback_on_timeout: skip
+
+  # ── BARRIER: synthetic gate — auto-completes when premortem is done ──
+  # No agent, no card. Enforces the phase boundary structurally.
+  phase1-gate:
+    synthetic: true
+    depends_on: [premortem]
+    task: "Privacy barrier: phase 1 sealed"
+
+  # ── PHASE 2 ──
+  # NOTE: this agent CANNOT see {premortem} — privacy_gate excludes it.
+  position:
+    agent: "{phase2-agent}"
+    task: >
+      Produce a position on {context.objective}. Do NOT consult the
+      premortem — this phase is isolated by design. Complete when done.
+    depends_on: [phase1-gate]
+    timeout_minutes: 30
+    channel: debug
+    fallback_on_timeout: skip
+
+  phase2-gate:
+    synthetic: true
+    depends_on: [position]
+    task: "Privacy barrier: phase 2 sealed"
+
+  # ── PHASE 3 ──
+  final-report:
+    agent: "{phase3-agent}"
+    task: >
+      Combine the phase-2 position ({position}) into the final
+      deliverable for {context.objective}. Complete when the report is
+      written.
+    depends_on: [phase2-gate]
+    timeout_minutes: 30
+    channel: debug
+    fallback_on_timeout: skip
+
+# ── Variant: gate WITHOUT privacy ──
+# Set privacy_gate: false (or omit it) on premortem and phase-2 agents CAN
+# read {premortem} — the synthetic gate then only enforces ordering,
+# not secrecy. Privacy barriers are opt-in per node.

@@ -129,6 +129,24 @@ In current review flows, reviewers never block: they complete with a PASS/FAIL v
 | `{run_short_id}` | Time-only portion |
 | `{date}` | Current date |
 
+## Workflow Templates
+
+Bundled YAML templates in `templates/` map the wiki's graph-engineering patterns (see `docs/wiki/concepts/dynamic-workflow-engineering.md`) onto the engine's schema. Each file is a working pipeline with comments explaining what every construct achieves. Copy → rename → edit roles and tasks.
+
+The template files ship inside the plugin bundle at `<plugin install>/skills/workflow-engine/templates/` — read them directly with `read_file` when you need the exact YAML (the table below captures the pattern so you can also reproduce it inline).
+
+| Pattern | Template | Key constructs |
+|---|---|---|
+| Sequential pipeline | `templates/sequential-pipeline.yaml` | `depends_on` chains, `fallback_on_timeout` |
+| Parallel fan-out + synthesize | `templates/parallel-fanout.yaml` | implicit same-layer parallelism, barrier via `depends_on` on all tracks |
+| Review loop (adversarial verification) | `templates/review-loop.yaml` | `reviews:` list on producer, PASS/FAIL verdict contract, `max_retries`, `inherit_workspace` |
+| Conditional branch (classify-and-act) | `templates/conditional-branch.yaml` | `when:` expressions on branches, `{node-id.result} contains ...` |
+| Multi-phase with privacy barriers | `templates/multi-phase-gates.yaml` | `synthetic: true` gates, `privacy_gate: true` on sealed producers |
+| Orchestrator-workers (generate-and-filter) | `templates/orchestrator-workers.yaml` | parallel candidates, barrier, rubric filter |
+| Loop-until-done (bounded) | `templates/loop-until-done.yaml` | review loop as bounded loop, `max_retries` as ceiling, `when:` stop-condition follow-up |
+
+Engine support note: the wiki's unbounded loop-until-done and mid-run dynamic graph extension are **not** representable in static YAML — the engine's loop is the bounded review loop, and dynamic extension lives in (paused) dynamic mode.
+
 ## Common Pitfalls
 
 | Symptom | Cause | Fix |
