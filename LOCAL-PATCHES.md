@@ -44,7 +44,48 @@ Local commits (relative to upstream `origin/main`): `git log origin/main..HEAD`.
 | test             | NONE. Gap: this patch has no regression test — a clean upstream merge could eat it silently. Add one (same shape as `TestGlobalContextAdds`) when time allows. |
 | why not upstream | Local product decision, not an upstream feature request.                                                                                                       |
 
-## 4. Global context FALLBACK (SUPERSEDED — do not resurrect)
+## 4. Hindsight client pin + per-operation reasoning effort (ACTIVE)
+
+|                  |                                                                                                                                                                                                                                                                                                                                        |
+| ---------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| commit           | `61e1c669d` + per-op effort follow-up                                                                                                                                                                                                                                                                                                  |
+| file:line        | `plugins/memory/hindsight/__init__.py` (`_build_embedded_profile_env`), `pyproject.toml:174`, `tools/lazy_deps.py`, `uv.lock`                                                                                                                                                                                                          |
+| what             | `hindsight-client` pinned to `0.8.6` (matches the running daemon API), and `_build_embedded_profile_env` propagates `llm_reasoning_effort` plus the per-operation keys (`retain_`, `reflect_`, `consolidation_`) to `HINDSIGHT_API_*_LLM_REASONING_EFFORT`, so `config.json` reaches the daemon and survives `.env` re-materialization. |
+| why it exists    | Upstream maps only 6 fixed keys, so effort never reached the daemon. The pin exists because the client must match the daemon's API version.                                                                                                                                                                                            |
+| test             | NONE. Gap.                                                                                                                                                                                                                                                                                                                             |
+| why not upstream | The pin is local (upstream quarantines new releases for 14 days via `exclude-newer`). The effort passthrough is a genuine upstream gap.                                                                                                                                                                                                |
+
+**`uv.lock` caveat:** the `pyproject.toml` pin alone does NOTHING — `uv sync --frozen`
+obeys the lock, not the pyproject, and the upstream lock pinned `0.6.1`. The lock was
+regenerated with `uv lock --exclude-newer-package hindsight-client=false`. A rebase that
+takes the upstream `uv.lock` silently reverts the client to `0.6.1`; re-run that command.
+
+## 5. `uv sync` UNINSTALLS the Hindsight daemon (operational trap — not a patch)
+
+`hindsight-all` (which provides the `hindsight-api` daemon, plus `torch` and
+`sentence-transformers` for the local embedding/reranker models) is NOT in
+`pyproject.toml`. The plugin installs it at runtime into the live venv
+(`install_specs` → `sys.executable`, `plugins/memory/hindsight/__init__.py:1005`).
+
+`uv sync --frozen` removes everything absent from the lock — so **step 7 of the update
+skill uninstalls the daemon every time**. It is not noticed immediately: a running
+daemon keeps serving from memory, and only fails to come back on the next restart,
+taking Hermes AND OpenCode memory down with it (both use the same bank).
+
+After every `uv sync`, reinstall:
+
+```bash
+uv pip install --python venv/bin/python "hindsight-all==0.8.6" "hindsight-client==0.8.6" \
+  --exclude-newer-package hindsight-all=false \
+  --exclude-newer-package hindsight-api=false \
+  --exclude-newer-package hindsight-api-slim=false \
+  --exclude-newer-package hindsight-client=false
+```
+
+Verify with `./venv/bin/python -c "import hindsight_api"` — if it raises
+`ModuleNotFoundError`, the daemon is a zombie and will not restart.
+
+## 6. Global context FALLBACK (SUPERSEDED — do not resurrect)
 
 |           |                                                                                                                                                                                |
 | --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
