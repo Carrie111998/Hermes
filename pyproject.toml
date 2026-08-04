@@ -377,6 +377,7 @@ exclude-newer-package = { vercel = false, nemo-relay = false, huggingface_hub = 
 py-modules = [
   "run_agent",
   "model_tools",
+  "registry_transaction",
   "toolsets",
   "batch_runner",
   "trajectory_compressor",
