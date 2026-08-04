@@ -430,6 +430,28 @@ class TestClassifyApiError:
         assert result.reason == FailoverReason.format_error
         assert result.retryable is False
 
+    def test_492_kimi_coding_is_rate_limit(self):
+        """Kimi-for-Coding subscription surface (api.kimi.com/coding) returns a
+        non-standard HTTP 492 for plan-level usage/concurrency throttling — the
+        subscription analog of the API's 429. It is transient, so it must
+        classify as a rate limit (retry + eager failover), NOT the generic
+        non-retryable 4xx format_error bucket, which would treat a temporary
+        throttle as a permanent bad request and skip the backoff/failover path."""
+        e = MockAPIError("Too Many Requests", status_code=492)
+        result = classify_api_error(e, provider="kimi-coding", model="k3")
+        assert result.reason == FailoverReason.rate_limit
+        assert result.retryable is True
+        assert result.should_fallback is True
+
+    def test_492_non_kimi_provider_stays_format_error(self):
+        """Guard the boundary: 492 is only Kimi-coding's throttle code. From any
+        other provider it is an unknown non-standard 4xx and must remain a
+        non-retryable format_error (don't broaden the special-case)."""
+        e = MockAPIError("Weird", status_code=492)
+        result = classify_api_error(e, provider="openai")
+        assert result.reason == FailoverReason.format_error
+        assert result.retryable is False
+
     def test_message_only_overloaded_without_status_is_overloaded(self):
         """Some Anthropic-compatible proxies surface 'overloaded' in the
         message with no 503/529 status_code. It must classify as overloaded

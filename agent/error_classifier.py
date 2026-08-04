@@ -1141,6 +1141,24 @@ def _classify_by_status(
     if status_code == 408:
         return result_fn(FailoverReason.timeout, retryable=True)
 
+    # Kimi-for-Coding subscription surface (api.kimi.com/coding) returns a
+    # non-standard HTTP 492 for plan-level usage/concurrency throttling — the
+    # subscription analog of the pay-as-you-go API's 429 (which Kimi uses for
+    # every rate/concurrency/quota limit). It is transient and clears with
+    # backoff or lower concurrency. Without this branch it falls into the
+    # generic "other 4xx" bucket below as a non-retryable format_error, so the
+    # retry loop treats a temporary throttle as a permanent bad request: no
+    # backoff-retry on Kimi, and only the last-ditch client-error fallback
+    # instead of the eager rate-limit failover. Scope to the Kimi/Moonshot
+    # provider so an unrelated provider's custom 492 is not misread.
+    if status_code == 492 and ("kimi" in provider or "moonshot" in provider):
+        return result_fn(
+            FailoverReason.rate_limit,
+            retryable=True,
+            should_rotate_credential=True,
+            should_fallback=True,
+        )
+
     # Other 4xx — non-retryable
     if 400 <= status_code < 500:
         return result_fn(
