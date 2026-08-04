@@ -1024,3 +1024,350 @@ def test_contract_responses_are_deterministic_and_run_filters_are_rejected(
         ).status_code
         == 400
     )
+
+
+def _paged_board(
+    client: TestClient,
+    *,
+    page_size: int = 2,
+    cursor: str | None = None,
+    snapshot_watermark: int | None = None,
+):
+    params: dict[str, str] = {
+        "board": "default",
+        "include_archived": "true",
+        "page_size": str(page_size),
+    }
+    if cursor is not None:
+        params["cursor"] = cursor
+    if snapshot_watermark is not None:
+        params["snapshot_watermark"] = str(snapshot_watermark)
+    return client.get("/api/plugins/kanban/portfolio/board", params=params)
+
+
+def test_paginated_board_is_snapshot_bound_complete_and_zero_write(
+    client: TestClient, home: Path
+) -> None:
+    conn = kb.connect()
+    try:
+        ids = [
+            kb.create_task(conn, title=f"page-{index}", body=f"body-{index}")
+            for index in range(5)
+        ]
+        conn.execute("UPDATE tasks SET status = 'archived' WHERE id = ?", (ids[3],))
+    finally:
+        conn.close()
+    before_dump = _logical_dump(kb.kanban_db_path())
+    before_tree = _tree_fingerprint(home)
+
+    pages: list[dict] = []
+    response = _paged_board(client)
+    while True:
+        assert response.status_code == 200, response.text
+        page = response.json()
+        pages.append(page)
+        if page["page"]["final"]:
+            break
+        response = _paged_board(
+            client,
+            cursor=page["page"]["next_cursor"],
+            snapshot_watermark=page["snapshot_watermark"],
+        )
+
+    assert {page["contract"] for page in pages} == {
+        kb.PORTFOLIO_KANBAN_ZERO_WRITE_PAGE_GET_CONTRACT
+    }
+    assert {page["snapshot_watermark"] for page in pages} == {
+        pages[0]["snapshot_watermark"]
+    }
+    assert [page["page"]["index"] for page in pages] == list(range(len(pages)))
+    assert [page["page"]["start_ordinal"] for page in pages] == [0, 2, 4]
+    traversed = [task_id for page in pages for task_id in page["page"]["task_ids"]]
+    column_ids = {
+        task["id"]
+        for page in pages
+        for column in page["columns"]
+        for task in column["tasks"]
+    }
+    assert traversed == sorted(ids)
+    assert column_ids == set(traversed)
+    assert len(traversed) == len(set(traversed)) == pages[-1]["task_count"]
+    assert pages[-1]["exhaustive"] is True
+    assert pages[-1]["completion_proof"] == {
+        "snapshot_watermark": pages[0]["snapshot_watermark"],
+        "task_count": len(ids),
+        "aggregate_counts": {
+            "links": 0,
+            "comments": 0,
+            "runs": 0,
+            "attachments": 0,
+        },
+        "traversed_task_count": len(ids),
+        "traversal_digest": pages[-1]["page"]["traversal_digest"],
+    }
+    assert any(
+        task["id"] == ids[3]
+        for page in pages
+        for column in page["columns"]
+        for task in column["tasks"]
+    )
+    assert _tree_fingerprint(home) == before_tree
+    assert _logical_dump(kb.kanban_db_path()) == before_dump
+
+
+def test_paginated_board_rejects_malformed_duplicate_missing_and_unknown_cursor_evidence(
+    client: TestClient,
+) -> None:
+    conn = kb.connect()
+    try:
+        for index in range(3):
+            kb.create_task(conn, title=f"cursor-{index}")
+    finally:
+        conn.close()
+    first = _paged_board(client)
+    assert first.status_code == 200
+    payload = first.json()
+    cursor = payload["page"]["next_cursor"]
+    watermark = payload["snapshot_watermark"]
+    assert cursor
+
+    assert (
+        _paged_board(
+            client, cursor="not-a-cursor", snapshot_watermark=watermark
+        ).status_code
+        == 400
+    )
+    assert _paged_board(client, cursor=cursor).status_code == 400
+    assert _paged_board(client, snapshot_watermark=watermark).status_code == 400
+    assert (
+        client.get(
+            "/api/plugins/kanban/portfolio/board",
+            params=[
+                ("board", "default"),
+                ("include_archived", "true"),
+                ("page_size", "2"),
+                ("cursor", cursor),
+                ("cursor", cursor),
+                ("snapshot_watermark", str(watermark)),
+            ],
+        ).status_code
+        == 400
+    )
+    assert (
+        client.get(
+            "/api/plugins/kanban/portfolio/board",
+            params={
+                "board": "default",
+                "include_archived": "true",
+                "page_size": "2",
+                "unexpected": "value",
+            },
+        ).status_code
+        == 400
+    )
+
+
+def test_paginated_board_rejects_mixed_watermark_and_mutation_between_pages(
+    client: TestClient,
+) -> None:
+    conn = kb.connect()
+    try:
+        for index in range(3):
+            kb.create_task(conn, title=f"mutation-{index}")
+    finally:
+        conn.close()
+    first = _paged_board(client)
+    assert first.status_code == 200
+    page = first.json()
+    cursor = page["page"]["next_cursor"]
+    watermark = page["snapshot_watermark"]
+    assert (
+        _paged_board(
+            client, cursor=cursor, snapshot_watermark=watermark + 1
+        ).status_code
+        == 409
+    )
+
+    conn = kb.connect()
+    try:
+        conn.execute(
+            "UPDATE tasks SET title = title || '-changed' WHERE id = ("
+            "SELECT id FROM tasks ORDER BY id LIMIT 1)"
+        )
+        assert (
+            int(
+                conn.execute("SELECT COALESCE(MAX(id), 0) FROM task_events").fetchone()[
+                    0
+                ]
+            )
+            == watermark
+        )
+    finally:
+        conn.close()
+    stale = _paged_board(client, cursor=cursor, snapshot_watermark=watermark)
+    assert stale.status_code == 409
+    assert "restart" in stale.text.lower()
+
+
+def test_paginated_board_rejects_in_place_unvisited_latest_summary_mutation(
+    client: TestClient,
+) -> None:
+    conn = kb.connect()
+    try:
+        task_ids = sorted(
+            kb.create_task(conn, title=f"summary-{index}") for index in range(3)
+        )
+        unvisited_id = task_ids[-1]
+        run_id = conn.execute(
+            "INSERT INTO task_runs "
+            "(task_id, status, started_at, ended_at, summary) "
+            "VALUES (?, 'completed', 1, 2, 'before') RETURNING id",
+            (unvisited_id,),
+        ).fetchone()["id"]
+    finally:
+        conn.close()
+
+    first = _paged_board(client, page_size=1)
+    assert first.status_code == 200
+    page = first.json()
+    assert page["page"]["task_ids"] == [task_ids[0]]
+
+    conn = kb.connect()
+    try:
+        watermark = page["snapshot_watermark"]
+        conn.execute("UPDATE task_runs SET summary = 'after' WHERE id = ?", (run_id,))
+        assert conn.execute("SELECT MAX(id) FROM task_events").fetchone()[0] in (
+            None,
+            watermark,
+        )
+    finally:
+        conn.close()
+
+    stale = _paged_board(
+        client,
+        page_size=1,
+        cursor=page["page"]["next_cursor"],
+        snapshot_watermark=watermark,
+    )
+    assert stale.status_code == 409
+
+
+def test_paginated_board_rejects_compensating_task_mutation(
+    client: TestClient,
+) -> None:
+    conn = kb.connect()
+    try:
+        task_ids = sorted(
+            kb.create_task(conn, title=f"compensating-{index}") for index in range(3)
+        )
+        first_unvisited_id, second_unvisited_id = task_ids[1:]
+        conn.execute(
+            "UPDATE tasks SET revision = 2 WHERE id = ?", (first_unvisited_id,)
+        )
+        conn.execute(
+            "UPDATE tasks SET revision = 3 WHERE id = ?", (second_unvisited_id,)
+        )
+    finally:
+        conn.close()
+
+    first = _paged_board(client, page_size=1)
+    assert first.status_code == 200
+    page = first.json()
+
+    conn = kb.connect()
+    try:
+        before = tuple(
+            conn.execute("SELECT SUM(revision), MAX(revision) FROM tasks").fetchone()
+        )
+        conn.execute(
+            "UPDATE tasks SET title = title || '-changed', revision = 3 WHERE id = ?",
+            (first_unvisited_id,),
+        )
+        conn.execute(
+            "UPDATE tasks SET title = title || '-changed', revision = 2 WHERE id = ?",
+            (second_unvisited_id,),
+        )
+        assert (
+            tuple(
+                conn.execute(
+                    "SELECT SUM(revision), MAX(revision) FROM tasks"
+                ).fetchone()
+            )
+            == before
+        )
+    finally:
+        conn.close()
+
+    stale = _paged_board(
+        client,
+        page_size=1,
+        cursor=page["page"]["next_cursor"],
+        snapshot_watermark=page["snapshot_watermark"],
+    )
+    assert stale.status_code == 409
+
+
+def test_paginated_board_rejects_oversized_individual_row_before_materialization(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    conn = kb.connect()
+    try:
+        kb.create_task(conn, title="oversized-page-row", body="x" * 1_200)
+    finally:
+        conn.close()
+    monkeypatch.setattr(portfolio, "MAX_PREMATERIALIZATION_SOURCE_BYTES", 1_000)
+    calls = 0
+    original = kb.Task.from_row
+
+    def spy(row: sqlite3.Row) -> kb.Task:
+        nonlocal calls
+        calls += 1
+        return original(row)
+
+    monkeypatch.setattr(kb.Task, "from_row", spy)
+    response = _paged_board(client, page_size=1)
+    assert response.status_code == 413
+    assert calls == 0
+
+
+def test_paginated_board_rejects_oversized_source_before_task_materialization(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="oversized-page-source")
+        conn.execute(
+            "INSERT INTO task_runs "
+            "(task_id, status, started_at, ended_at, summary) "
+            "VALUES (?, 'completed', 1, 2, ?)",
+            (task_id, "x" * 1_200),
+        )
+    finally:
+        conn.close()
+    monkeypatch.setattr(portfolio, "MAX_PREMATERIALIZATION_SOURCE_BYTES", 1_000)
+    calls = 0
+    original = kb.Task.from_row
+
+    def spy(row: sqlite3.Row) -> kb.Task:
+        nonlocal calls
+        calls += 1
+        return original(row)
+
+    monkeypatch.setattr(kb.Task, "from_row", spy)
+    response = _paged_board(client, page_size=1)
+    assert response.status_code == 413
+    assert calls == 0
+
+
+def test_paginated_board_fails_closed_on_malformed_task_without_omitting_it(
+    client: TestClient,
+) -> None:
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="malformed-status")
+        conn.execute(
+            "UPDATE tasks SET status = 'future-status' WHERE id = ?", (task_id,)
+        )
+    finally:
+        conn.close()
+    assert _paged_board(client, page_size=1).status_code == 503

@@ -36,8 +36,12 @@ the port.
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
+import hmac
 import json
 import logging
+import secrets
 import sqlite3
 import time
 from dataclasses import asdict
@@ -66,6 +70,10 @@ from hermes_cli import kanban_diagnostics as kd
 log = logging.getLogger(__name__)
 
 router = APIRouter()
+
+# Continuation tokens are process-local capabilities. A restart intentionally
+# invalidates in-flight traversals, forcing a fresh snapshot and watermark.
+_PAGE_CURSOR_KEY = secrets.token_bytes(32)
 
 
 # ---------------------------------------------------------------------------
@@ -288,7 +296,10 @@ def _bounded_contract_response(value: dict[str, Any]) -> dict[str, Any]:
 
 
 def _enforce_pre_materialization_byte_bound(
-    conn: sqlite3.Connection, *, task_id: Optional[str] = None
+    conn: sqlite3.Connection,
+    *,
+    task_id: Optional[str] = None,
+    task_ids: Optional[list[str]] = None,
 ) -> None:
     """SQL-bound every row-backed string before constructing Python objects.
 
@@ -298,12 +309,20 @@ def _enforce_pre_materialization_byte_bound(
     The selected CTE scopes all evidence to the authoritative board or card;
     unrelated legacy rows do not consume the budget.
     """
-    selected = (
-        "SELECT id FROM tasks"
-        if task_id is None
-        else "SELECT id FROM tasks WHERE id = ?"
-    )
-    values: tuple[Any, ...] = () if task_id is None else (task_id,)
+    if task_id is not None and task_ids is not None:
+        raise ValueError("task_id and task_ids are mutually exclusive")
+    if task_ids is not None:
+        if not task_ids:
+            return
+        placeholders = ",".join("?" for _value in task_ids)
+        selected = f"SELECT id FROM tasks WHERE id IN ({placeholders})"
+        values: tuple[Any, ...] = tuple(task_ids)
+    elif task_id is not None:
+        selected = "SELECT id FROM tasks WHERE id = ?"
+        values = (task_id,)
+    else:
+        selected = "SELECT id FROM tasks"
+        values = ()
     sql = f"""
         WITH selected AS ({selected}), source_rows(collection, bytes) AS (
             SELECT 'tasks',
@@ -545,6 +564,460 @@ def _links_for(conn: sqlite3.Connection, task_id: str) -> dict[str, list[str]]:
 
 
 # ---------------------------------------------------------------------------
+# Snapshot-bound portfolio board pagination
+# ---------------------------------------------------------------------------
+
+
+def _canonical_json_bytes(value: Any) -> bytes:
+    return json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+
+
+def _encode_page_cursor(payload: dict[str, Any]) -> str:
+    body = base64.urlsafe_b64encode(_canonical_json_bytes(payload)).rstrip(b"=")
+    signature = hmac.new(_PAGE_CURSOR_KEY, body, hashlib.sha256).hexdigest().encode()
+    return (body + b"." + signature).decode("ascii")
+
+
+def _decode_page_cursor(cursor: str) -> dict[str, Any]:
+    try:
+        body, supplied = cursor.encode("ascii").split(b".", 1)
+        expected = hmac.new(_PAGE_CURSOR_KEY, body, hashlib.sha256).hexdigest().encode()
+        if not hmac.compare_digest(supplied, expected):
+            raise ValueError("signature mismatch")
+        raw = base64.urlsafe_b64decode(body + b"=" * (-len(body) % 4))
+        value = json.loads(raw)
+    except (UnicodeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError("invalid portfolio pagination cursor") from exc
+    required = {
+        "v",
+        "board",
+        "page_size",
+        "page_index",
+        "watermark",
+        "last_id",
+        "seen",
+        "task_count",
+        "aggregate_counts",
+        "state_fingerprint",
+        "traversal_digest",
+    }
+    if not isinstance(value, dict) or set(value) != required:
+        raise ValueError("invalid portfolio pagination cursor fields")
+    integer_fields = ("v", "page_size", "page_index", "watermark", "seen", "task_count")
+    if any(
+        not isinstance(value[name], int) or isinstance(value[name], bool)
+        for name in integer_fields
+    ):
+        raise ValueError("invalid portfolio pagination cursor integer")
+    if value["v"] != 2 or any(value[name] < 0 for name in integer_fields[1:]):
+        raise ValueError("unsupported portfolio pagination cursor")
+    if not all(
+        isinstance(value[name], str) and value[name]
+        for name in ("board", "last_id", "state_fingerprint", "traversal_digest")
+    ):
+        raise ValueError("invalid portfolio pagination cursor identity")
+    aggregate_counts = value["aggregate_counts"]
+    if not isinstance(aggregate_counts, dict) or set(aggregate_counts) != {
+        "links",
+        "comments",
+        "runs",
+        "attachments",
+    }:
+        raise ValueError("invalid portfolio pagination cursor counts")
+    if any(
+        not isinstance(item, int) or isinstance(item, bool) or item < 0
+        for item in aggregate_counts.values()
+    ):
+        raise ValueError("invalid portfolio pagination cursor counts")
+    return value
+
+
+def _board_aggregate_counts(conn: sqlite3.Connection) -> dict[str, int]:
+    counts = {
+        "links": int(
+            conn.execute("SELECT COUNT(*) AS n FROM task_links").fetchone()["n"]
+        ),
+        "comments": int(
+            conn.execute("SELECT COUNT(*) AS n FROM task_comments").fetchone()["n"]
+        ),
+        "runs": int(
+            conn.execute("SELECT COUNT(*) AS n FROM task_runs").fetchone()["n"]
+        ),
+        "attachments": int(
+            conn.execute("SELECT COUNT(*) AS n FROM task_attachments").fetchone()["n"]
+        ),
+    }
+    if any(
+        value > kanban_portfolio.MAX_BOARD_AGGREGATE_ROWS for value in counts.values()
+    ):
+        raise kanban_portfolio.PortfolioSnapshotTooLarge(
+            "Kanban board aggregates exceeded exhaustive row bound"
+        )
+    return counts
+
+
+def _board_state_fingerprint(
+    conn: sqlite3.Connection,
+    *,
+    task_count: int,
+    aggregate_counts: dict[str, int],
+    watermark: int,
+) -> str:
+    """Hash every row that can affect paginated board evidence.
+
+    Counts, rowids, and revision sums are only change indicators, not content
+    commitments: in-place edits and compensating revisions can preserve all of
+    them.  Stream the bounded rows in deterministic order so the cursor binds
+    the exact task fields, relationship/count inputs, and run summaries used by
+    later pages without collecting the whole board in Python.
+    """
+    sources = (
+        ("tasks", "id"),
+        ("task_links", "parent_id, child_id"),
+        ("task_comments", "id"),
+        ("task_runs", "id"),
+        ("task_attachments", "id"),
+    )
+    digest = hashlib.sha256()
+    header = _canonical_json_bytes({
+        "task_count": task_count,
+        "aggregate_counts": aggregate_counts,
+        "watermark": watermark,
+    })
+    digest.update(len(header).to_bytes(8, "big"))
+    digest.update(header)
+    for table, ordering in sources:
+        marker = table.encode("ascii")
+        digest.update(len(marker).to_bytes(8, "big"))
+        digest.update(marker)
+        for row in conn.execute(f"SELECT * FROM {table} ORDER BY {ordering}"):
+            encoded = _canonical_json_bytes(list(row))
+            digest.update(len(encoded).to_bytes(8, "big"))
+            digest.update(encoded)
+    return digest.hexdigest()
+
+
+def _enforce_board_fingerprint_row_bounds(conn: sqlite3.Connection) -> None:
+    """Reject an oversized fingerprint source before streaming full rows."""
+    text_columns = {
+        "tasks": (
+            "id",
+            "title",
+            "body",
+            "assignee",
+            "status",
+            "created_by",
+            "workspace_kind",
+            "workspace_path",
+            "branch_name",
+            "project_id",
+            "claim_lock",
+            "tenant",
+            "result",
+            "idempotency_key",
+            "last_failure_error",
+            "workflow_template_id",
+            "current_step_key",
+            "skills",
+            "model_override",
+            "provider_override",
+            "session_id",
+            "block_kind",
+        ),
+        "task_links": ("parent_id", "child_id"),
+        "task_comments": ("task_id", "author", "body"),
+        "task_runs": (
+            "task_id",
+            "profile",
+            "step_key",
+            "status",
+            "claim_lock",
+            "outcome",
+            "summary",
+            "metadata",
+            "error",
+        ),
+        "task_attachments": (
+            "task_id",
+            "filename",
+            "stored_path",
+            "content_type",
+            "uploaded_by",
+        ),
+    }
+    limit = kanban_portfolio.MAX_PREMATERIALIZATION_SOURCE_BYTES
+    for table, columns in text_columns.items():
+        byte_expression = " + ".join(
+            f"length(CAST(COALESCE({column}, '') AS BLOB))" for column in columns
+        )
+        maximum = int(
+            conn.execute(
+                f"SELECT COALESCE(MAX({byte_expression}), 0) AS bytes FROM {table}"
+            ).fetchone()["bytes"]
+        )
+        if maximum > limit:
+            raise kanban_portfolio.PortfolioSnapshotTooLarge(
+                f"Kanban {table} fingerprint source exceeded byte bound"
+            )
+
+
+def _page_columns(
+    conn: sqlite3.Connection, tasks: list[kanban_db.Task]
+) -> tuple[list[dict[str, Any]], list[str], list[str]]:
+    task_ids = [task.id for task in tasks]
+    names = [*BOARD_COLUMNS, "archived"]
+    columns: dict[str, list[dict[str, Any]]] = {name: [] for name in names}
+    if not tasks:
+        return ([{"name": name, "tasks": []} for name in names], [], [])
+    placeholders = ",".join("?" for _value in task_ids)
+    values = tuple(task_ids)
+    summaries = kanban_db.latest_summaries(conn, task_ids)
+    link_counts: dict[str, dict[str, int]] = {}
+    for row in conn.execute(
+        "SELECT DISTINCT parent_id, child_id FROM task_links "
+        f"WHERE parent_id IN ({placeholders}) OR child_id IN ({placeholders}) "
+        "ORDER BY parent_id, child_id",
+        values + values,
+    ):
+        link_counts.setdefault(row["parent_id"], {"parents": 0, "children": 0})[
+            "children"
+        ] += 1
+        link_counts.setdefault(row["child_id"], {"parents": 0, "children": 0})[
+            "parents"
+        ] += 1
+    comment_counts = {
+        row["task_id"]: int(row["n"])
+        for row in conn.execute(
+            "SELECT task_id, COUNT(*) AS n FROM task_comments "
+            f"WHERE task_id IN ({placeholders}) GROUP BY task_id ORDER BY task_id",
+            values,
+        )
+    }
+    progress: dict[str, dict[str, int]] = {}
+    for row in conn.execute(
+        "SELECT l.parent_id, t.status FROM task_links l "
+        "JOIN tasks t ON t.id = l.child_id "
+        f"WHERE l.parent_id IN ({placeholders}) ORDER BY l.parent_id, l.child_id",
+        values,
+    ):
+        item = progress.setdefault(row["parent_id"], {"done": 0, "total": 0})
+        item["total"] += 1
+        if row["status"] == "done":
+            item["done"] += 1
+    for task in tasks:
+        if task.status not in columns:
+            raise kanban_portfolio.PortfolioSnapshotUnavailable(
+                "Kanban board contains an unknown status"
+            )
+        preview = summaries.get(task.id)
+        item = _task_dict(
+            task,
+            latest_summary=(preview[:_CARD_SUMMARY_PREVIEW_CHARS] if preview else None),
+            include_volatile_metrics=False,
+        )
+        item["link_counts"] = link_counts.get(task.id, {"parents": 0, "children": 0})
+        item["comment_count"] = comment_counts.get(task.id, 0)
+        item["progress"] = progress.get(task.id)
+        columns[task.status].append(item)
+    tenants = sorted({task.tenant for task in tasks if task.tenant is not None})
+    assignees = sorted({
+        task.assignee
+        for task in tasks
+        if task.assignee is not None and task.status != "archived"
+    })
+    return (
+        [{"name": name, "tasks": columns[name]} for name in names],
+        tenants,
+        assignees,
+    )
+
+
+def _get_board_zero_write_page(
+    conn: sqlite3.Connection,
+    *,
+    slug: str,
+    page_size: int,
+    cursor: Optional[str],
+    snapshot_watermark: Optional[int],
+) -> dict[str, Any]:
+    task_count = int(conn.execute("SELECT COUNT(*) AS n FROM tasks").fetchone()["n"])
+    if task_count > kanban_portfolio.MAX_BOARD_TASKS:
+        raise kanban_portfolio.PortfolioSnapshotTooLarge(
+            "Kanban board exceeded exhaustive task bound"
+        )
+    invalid_status = conn.execute(
+        "SELECT id FROM tasks WHERE status NOT IN ("
+        + ",".join("?" for _value in kanban_db.VALID_STATUSES)
+        + ") LIMIT 1",
+        tuple(sorted(kanban_db.VALID_STATUSES)),
+    ).fetchone()
+    if invalid_status is not None:
+        raise kanban_portfolio.PortfolioSnapshotUnavailable(
+            "Kanban board contains an unknown status"
+        )
+    aggregate_counts = _board_aggregate_counts(conn)
+    watermark = int(
+        conn.execute(
+            "SELECT COALESCE(MAX(id), 0) AS value FROM task_events"
+        ).fetchone()["value"]
+    )
+    _enforce_board_fingerprint_row_bounds(conn)
+    state_fingerprint = _board_state_fingerprint(
+        conn,
+        task_count=task_count,
+        aggregate_counts=aggregate_counts,
+        watermark=watermark,
+    )
+    start_ordinal = 0
+    page_index = 0
+    last_id: Optional[str] = None
+    traversal_digest = hashlib.sha256(
+        _canonical_json_bytes({
+            "contract": kanban_db.PORTFOLIO_KANBAN_ZERO_WRITE_PAGE_GET_CONTRACT,
+            "board": slug,
+            "watermark": watermark,
+            "page_size": page_size,
+            "task_count": task_count,
+            "aggregate_counts": aggregate_counts,
+            "state_fingerprint": state_fingerprint,
+        })
+    ).hexdigest()
+    if cursor is not None:
+        decoded = _decode_page_cursor(cursor)
+        if decoded["board"] != slug or decoded["page_size"] != page_size:
+            raise ValueError("portfolio pagination cursor binding mismatch")
+        if snapshot_watermark != decoded["watermark"]:
+            raise HTTPException(
+                status_code=409,
+                detail="snapshot watermark mismatch; restart pagination",
+            )
+        if watermark != decoded["watermark"]:
+            raise HTTPException(
+                status_code=409,
+                detail="Kanban board mutated; restart pagination",
+            )
+        if (
+            decoded["task_count"] != task_count
+            or decoded["aggregate_counts"] != aggregate_counts
+            or decoded["state_fingerprint"] != state_fingerprint
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Kanban board snapshot changed; restart pagination",
+            )
+        last_id = decoded["last_id"]
+        start_ordinal = decoded["seen"]
+        page_index = decoded["page_index"]
+        traversal_digest = decoded["traversal_digest"]
+        actual_ordinal = int(
+            conn.execute(
+                "SELECT COUNT(*) AS n FROM tasks WHERE id <= ?", (last_id,)
+            ).fetchone()["n"]
+        )
+        if actual_ordinal != start_ordinal:
+            raise ValueError(
+                "portfolio pagination cursor has a gap or duplicate position"
+            )
+    elif snapshot_watermark is not None:
+        raise ValueError("snapshot_watermark requires a continuation cursor")
+
+    if last_id is None:
+        id_rows = conn.execute(
+            "SELECT id FROM tasks ORDER BY id ASC LIMIT ?", (page_size,)
+        ).fetchall()
+    else:
+        id_rows = conn.execute(
+            "SELECT id FROM tasks WHERE id > ? ORDER BY id ASC LIMIT ?",
+            (last_id, page_size),
+        ).fetchall()
+    task_ids = [row["id"] for row in id_rows]
+    _enforce_pre_materialization_byte_bound(conn, task_ids=task_ids)
+    if task_ids:
+        placeholders = ",".join("?" for _value in task_ids)
+        rows = conn.execute(
+            f"SELECT * FROM tasks WHERE id IN ({placeholders}) ORDER BY id ASC",
+            tuple(task_ids),
+        ).fetchall()
+    else:
+        rows = []
+    tasks = [kanban_db.Task.from_row(row) for row in rows]
+    columns, tenants, assignees = _page_columns(conn, tasks)
+    end_ordinal = start_ordinal + len(tasks)
+    final = end_ordinal == task_count
+    if end_ordinal > task_count or (not final and not tasks):
+        raise kanban_portfolio.PortfolioSnapshotUnavailable(
+            "Kanban pagination traversal is incomplete"
+        )
+    traversal_digest = hashlib.sha256(
+        _canonical_json_bytes({
+            "prior": traversal_digest,
+            "page_index": page_index,
+            "start_ordinal": start_ordinal,
+            "task_ids": task_ids,
+        })
+    ).hexdigest()
+    next_cursor = None
+    if not final:
+        next_cursor = _encode_page_cursor({
+            "v": 2,
+            "board": slug,
+            "page_size": page_size,
+            "page_index": page_index + 1,
+            "watermark": watermark,
+            "last_id": task_ids[-1],
+            "seen": end_ordinal,
+            "task_count": task_count,
+            "aggregate_counts": aggregate_counts,
+            "state_fingerprint": state_fingerprint,
+            "traversal_digest": traversal_digest,
+        })
+    completion_proof = None
+    if final:
+        completion_proof = {
+            "snapshot_watermark": watermark,
+            "task_count": task_count,
+            "aggregate_counts": aggregate_counts,
+            "traversed_task_count": end_ordinal,
+            "traversal_digest": traversal_digest,
+        }
+    return _bounded_contract_response({
+        "contract": kanban_db.PORTFOLIO_KANBAN_ZERO_WRITE_PAGE_GET_CONTRACT,
+        "board": slug,
+        "archive_inclusive": True,
+        "unfiltered": True,
+        "exhaustive": final,
+        "bounded": True,
+        "task_count": task_count,
+        "task_limit": kanban_portfolio.MAX_BOARD_TASKS,
+        "aggregate_counts": aggregate_counts,
+        "aggregate_row_limit": kanban_portfolio.MAX_BOARD_AGGREGATE_ROWS,
+        "page_size_limit": kanban_portfolio.MAX_BOARD_PAGE_SIZE,
+        "columns": columns,
+        "tenants": tenants,
+        "assignees": assignees,
+        "latest_event_id": watermark,
+        "event_watermark": watermark,
+        "snapshot_watermark": watermark,
+        "ordering": "task_id_ascending",
+        "page": {
+            "index": page_index,
+            "size": page_size,
+            "returned_task_count": len(tasks),
+            "task_ids": task_ids,
+            "start_ordinal": start_ordinal,
+            "end_ordinal": end_ordinal,
+            "cursor": cursor,
+            "next_cursor": next_cursor,
+            "final": final,
+            "traversal_digest": traversal_digest,
+        },
+        "completion_proof": completion_proof,
+    })
+
+
+# ---------------------------------------------------------------------------
 # GET /board
 # ---------------------------------------------------------------------------
 
@@ -554,13 +1027,41 @@ def get_board_zero_write(
     request: Request,
     board: str = Query(..., min_length=1, description="Explicit Kanban board slug"),
     include_archived: bool = Query(...),
+    page_size: Optional[int] = Query(
+        None, ge=1, le=kanban_portfolio.MAX_BOARD_PAGE_SIZE
+    ),
+    cursor: Optional[str] = Query(None, min_length=1, max_length=4096),
+    snapshot_watermark: Optional[int] = Query(None, ge=0),
 ):
-    """Return the complete archive-inclusive board from a zero-write snapshot."""
+    """Return a complete v1 board or one snapshot-bound v2 board page."""
     keys = [key for key, _value in request.query_params.multi_items()]
-    if set(keys) - {"board", "include_archived"} or len(keys) != 2:
+    counts_by_key = {key: keys.count(key) for key in set(keys)}
+    paginated = page_size is not None
+    allowed = (
+        {"board", "include_archived", "page_size", "cursor", "snapshot_watermark"}
+        if paginated
+        else {"board", "include_archived"}
+    )
+    required = (
+        {"board", "include_archived", "page_size"}
+        if paginated
+        else {"board", "include_archived"}
+    )
+    if (
+        set(keys) - allowed
+        or not required.issubset(keys)
+        or any(value != 1 for value in counts_by_key.values())
+        or ((cursor is None) != (snapshot_watermark is None))
+    ):
         raise HTTPException(
             status_code=400,
-            detail="the exhaustive board contract accepts only board and include_archived",
+            detail=(
+                "the paginated board contract requires unique board, "
+                "include_archived, and page_size parameters; cursor and "
+                "snapshot_watermark must be supplied together"
+                if paginated
+                else "the exhaustive board contract accepts only board and include_archived"
+            ),
         )
     if not include_archived:
         raise HTTPException(
@@ -569,6 +1070,16 @@ def get_board_zero_write(
         )
     try:
         with kanban_portfolio.zero_write_snapshot(board) as (slug, conn):
+            if paginated:
+                # ``paginated`` implies a validated non-null page_size.
+                assert page_size is not None
+                return _get_board_zero_write_page(
+                    conn,
+                    slug=slug,
+                    page_size=page_size,
+                    cursor=cursor,
+                    snapshot_watermark=snapshot_watermark,
+                )
             values: tuple[Any, ...] = ()
             clause = ""
             selected_clause = ""

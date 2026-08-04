@@ -171,6 +171,9 @@ KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
 KANBAN_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
 PORTFOLIO_KANBAN_ZERO_WRITE_GET_CONTRACT = "hermes-kanban-dashboard-get-zero-write-v1"
+PORTFOLIO_KANBAN_ZERO_WRITE_PAGE_GET_CONTRACT = (
+    "hermes-kanban-dashboard-get-zero-write-page-v2"
+)
 PORTFOLIO_KANBAN_CONDITIONAL_ARCHIVE_CONTRACT = (
     "hermes-kanban-conditional-archive-cas-v1"
 )
