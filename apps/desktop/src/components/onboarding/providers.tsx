@@ -1,5 +1,6 @@
 import { RowButton } from '@/components/ui/row-button'
 import { useI18n } from '@/i18n'
+import { isManagedEvaosAgent, managedProviderDisplayValue } from '@/i18n/managed-brand'
 import { Check, ChevronRight, Terminal } from '@/lib/icons'
 import type { OAuthProvider } from '@/types/hermes'
 
@@ -17,7 +18,17 @@ const PROVIDER_DISPLAY: Record<string, { order: number; title: string }> = {
 
 const assetPath = (path: string) => `${import.meta.env.BASE_URL}${path.replace(/^\/+/, '')}`
 
-export const providerTitle = (p: OAuthProvider) => PROVIDER_DISPLAY[p.id]?.title ?? p.name
+export const providerTitle = (p: OAuthProvider) =>
+  managedProviderDisplayValue(p.id, PROVIDER_DISPLAY[p.id]?.title ?? p.name)
+
+export const managedOAuthProviders = (providers: OAuthProvider[], managed = isManagedEvaosAgent()) =>
+  managed ? providers.filter(provider => provider.id !== 'nous') : providers
+
+export const isManagedLocalCliProviderUnavailable = (
+  provider: OAuthProvider,
+  managed = isManagedEvaosAgent()
+): boolean => managed && provider.flow === 'external'
+
 const orderOf = (p: OAuthProvider) => PROVIDER_DISPLAY[p.id]?.order ?? 99
 
 export const sortProviders = (providers: OAuthProvider[]) =>
@@ -110,10 +121,16 @@ export function ProviderRow({
 }) {
   const { t } = useI18n()
   const loggedIn = provider.status?.logged_in
+  const unavailable = isManagedLocalCliProviderUnavailable(provider)
   const Trail = provider.flow === 'external' ? Terminal : ChevronRight
 
   return (
-    <RowButton className={PROVIDER_ROW_CLASS} onClick={() => onSelect(provider)}>
+    <RowButton
+      className={PROVIDER_ROW_CLASS}
+      disabled={unavailable}
+      onClick={() => onSelect(provider)}
+      title={unavailable ? t.onboarding.managedUnavailableDescription : undefined}
+    >
       <div className="min-w-0">
         <div className="flex items-center gap-2">
           <span className="text-[length:var(--conversation-text-font-size)] font-semibold">
@@ -121,9 +138,15 @@ export function ProviderRow({
           </span>
           {loggedIn ? <ConnectedTag /> : null}
         </div>
-        <p className="mt-1 text-xs leading-5 text-muted-foreground">{t.onboarding.flowSubtitles[provider.flow]}</p>
+        <p className="mt-1 text-xs leading-5 text-muted-foreground">
+          {unavailable ? t.onboarding.managedUnavailableDescription : t.onboarding.flowSubtitles[provider.flow]}
+        </p>
       </div>
-      <Trail className="size-4 text-muted-foreground transition group-hover:text-foreground" />
+      {unavailable ? (
+        <span className="shrink-0 text-xs font-medium text-muted-foreground">{t.onboarding.managedUnavailable}</span>
+      ) : (
+        <Trail className="size-4 text-muted-foreground transition group-hover:text-foreground" />
+      )}
     </RowButton>
   )
 }

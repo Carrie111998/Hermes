@@ -55,6 +55,7 @@ import {
   Wrench,
   Zap
 } from '@/lib/icons'
+import { isManagedConfigFieldVisible } from '@/lib/managed-ui-policy'
 import { normalize } from '@/lib/text'
 import { cn } from '@/lib/utils'
 import { resolveVersionStatus } from '@/lib/version-status'
@@ -532,6 +533,7 @@ function CommandPaletteBody({ onExited }: { onExited: () => void }) {
   const { availableThemes, mode, resolvedMode, setMode, setTheme, themeName } = useTheme()
   const [search, setSearch] = useState('')
   const [page, setPage] = useState<string | null>(null)
+  const managedEva = Boolean(window.hermesDesktop?.eva)
 
   // The Update row names the same install the statusbar names — same target
   // selection, same resolver. Reduced to the label string: an in-flight apply
@@ -806,7 +808,13 @@ function CommandPaletteBody({ onExited }: { onExited: () => void }) {
             label: t.shell.statusbar.cron,
             run: go(CRON_ROUTE)
           },
-          { action: 'nav.profiles', icon: Users, id: 'nav-profiles', label: t.profiles.title, run: go(PROFILES_ROUTE) },
+          {
+            action: 'nav.profiles',
+            icon: Users,
+            id: 'nav-profiles',
+            label: t.profiles.title,
+            run: go(PROFILES_ROUTE)
+          },
           { action: 'nav.agents', icon: Cpu, id: 'nav-agents', label: t.agents.title, run: go(AGENTS_ROUTE) },
           {
             icon: Starmap,
@@ -864,21 +872,25 @@ function CommandPaletteBody({ onExited }: { onExited: () => void }) {
             label: cc.sections.usage,
             run: go(`${COMMAND_CENTER_ROUTE}?section=usage`)
           },
-          {
-            icon: RefreshCw,
-            id: 'cc-restart-gateway',
-            keywords: ['gateway', 'restart', 'messaging', 'reconnect', 'system'],
-            label: cc.restartGateway,
-            run: () => void runGatewayRestart()
-          },
-          {
-            detail: updateVersionLabel,
-            icon: Download,
-            id: 'cc-update-hermes',
-            keywords: ['update', 'upgrade', 'hermes', 'version', 'system', 'restart'],
-            label: cc.updateHermes,
-            run: () => requestActiveUpdate()
-          }
+          ...(!managedEva
+            ? [
+                {
+                  icon: RefreshCw,
+                  id: 'cc-restart-gateway',
+                  keywords: ['gateway', 'restart', 'messaging', 'reconnect', 'system'],
+                  label: cc.restartGateway,
+                  run: () => void runGatewayRestart()
+                },
+                {
+                  detail: updateVersionLabel,
+                  icon: Download,
+                  id: 'cc-update-hermes',
+                  keywords: ['update', 'upgrade', 'hermes', 'version', 'system', 'restart'],
+                  label: cc.updateHermes,
+                  run: () => requestActiveUpdate()
+                }
+              ]
+            : [])
         ]
       },
       {
@@ -945,6 +957,7 @@ function CommandPaletteBody({ onExited }: { onExited: () => void }) {
     contributedItems,
     dismissedAutoProjects,
     go,
+    managedEva,
     projectTree,
     selectTick,
     settingsSectionLabel,
@@ -1085,13 +1098,15 @@ function CommandPaletteBody({ onExited }: { onExited: () => void }) {
     }
 
     const fieldItems = SECTIONS.flatMap(section =>
-      section.keys.map(key => ({
-        icon: section.icon,
-        id: `field-${key}`,
-        keywords: ['settings', key, section.label, settingsSectionLabel(section)],
-        label: `${settingsSectionLabel(section)}: ${configFieldLabel(key)}`,
-        run: go(`${SETTINGS_ROUTE}?tab=config:${section.id}&field=${encodeURIComponent(key)}`)
-      }))
+      section.keys
+        .filter(key => isManagedConfigFieldVisible(key, managedEva))
+        .map(key => ({
+          icon: section.icon,
+          id: `field-${key}`,
+          keywords: ['settings', key, section.label, settingsSectionLabel(section)],
+          label: `${settingsSectionLabel(section)}: ${configFieldLabel(key)}`,
+          run: go(`${SETTINGS_ROUTE}?tab=config:${section.id}&field=${encodeURIComponent(key)}`)
+        }))
     )
 
     result.push({ heading: t.commandCenter.settingsFields, items: fieldItems })
@@ -1135,6 +1150,7 @@ function CommandPaletteBody({ onExited }: { onExited: () => void }) {
     configFieldLabel,
     go,
     goSession,
+    managedEva,
     mcpServers,
     mode,
     resolvedMode,

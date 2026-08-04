@@ -137,6 +137,135 @@ def test_oauth_provider_status_uses_profile_query(tmp_path, monkeypatch):
     assert observed_homes == [profile_home]
 
 
+def test_oauth_provider_status_requires_session_token():
+    resp = client.get("/api/providers/oauth")
+
+    assert resp.status_code == 401
+
+
+def test_oauth_provider_status_omits_token_preview_and_filesystem_label(monkeypatch):
+    from hermes_cli import web_server as ws
+
+    fake_catalog = [{
+        "id": "fake-oauth",
+        "name": "Fake OAuth",
+        "flow": "pkce",
+        "cli_command": "hermes auth add fake-oauth",
+        "docs_url": "https://example.com",
+        "status_fn": lambda: {
+            "logged_in": True,
+            "source": "hermes_pkce",
+            "source_label": "Hermes PKCE (/Users/alice/.hermes/oauth.json)",
+            "token_preview": "…secret",
+            "expires_at": "2026-08-04T12:00:00Z",
+            "has_refresh_token": True,
+        },
+    }]
+    monkeypatch.setattr(ws, "_build_oauth_catalog", lambda: fake_catalog)
+
+    resp = client.get("/api/providers/oauth", headers=HEADERS)
+
+    assert resp.status_code == 200, resp.text
+    status = resp.json()["providers"][0]["status"]
+    assert status == {
+        "logged_in": True,
+        "source": "hermes_pkce",
+        "expires_at": "2026-08-04T12:00:00Z",
+        "has_refresh_token": True,
+    }
+
+
+def test_oauth_poll_requires_token_and_rejects_profile_substitution():
+    from hermes_cli import web_server as ws
+
+    session_id = "profile-bound-poll"
+    ws._oauth_sessions[session_id] = {
+        "session_id": session_id,
+        "provider": "nous",
+        "flow": "device_code",
+        "profile": "coder",
+        "created_at": time.time(),
+        "status": "pending",
+        "error_message": None,
+        "expires_at": time.time() + 600,
+    }
+    path = f"/api/providers/oauth/nous/poll/{session_id}"
+    try:
+        unauthenticated = client.get(path)
+        mismatch = client.get(f"{path}?profile=reviewer", headers=HEADERS)
+        matching = client.get(f"{path}?profile=coder", headers=HEADERS)
+        legacy_omitted = client.get(path, headers=HEADERS)
+
+        assert unauthenticated.status_code == 401
+        assert mismatch.status_code == 400
+        assert mismatch.json()["detail"] == "Profile mismatch for OAuth session"
+        assert matching.status_code == 200
+        assert matching.json()["status"] == "pending"
+        # Existing clients may omit the query; the session still remains bound
+        # to its captured profile for every persistence operation.
+        assert legacy_omitted.status_code == 200
+    finally:
+        ws._oauth_sessions.pop(session_id, None)
+
+
+def test_oauth_submit_rejects_profile_substitution_before_exchange():
+    from hermes_cli import web_server as ws
+
+    session_id = "profile-bound-submit"
+    ws._oauth_sessions[session_id] = {
+        "session_id": session_id,
+        "provider": "anthropic",
+        "flow": "pkce",
+        "profile": "coder",
+        "created_at": time.time(),
+        "status": "pending",
+        "error_message": None,
+        "verifier": "verifier",
+        "state": "state",
+    }
+    try:
+        resp = client.post(
+            "/api/providers/oauth/anthropic/submit?profile=reviewer",
+            headers=HEADERS,
+            json={"session_id": session_id, "code": "authorization-code"},
+        )
+
+        assert resp.status_code == 400
+        assert resp.json()["detail"] == "Profile mismatch for OAuth session"
+        assert ws._oauth_sessions[session_id]["status"] == "pending"
+    finally:
+        ws._oauth_sessions.pop(session_id, None)
+
+
+def test_oauth_cancel_rejects_profile_substitution_without_removing_session():
+    from hermes_cli import web_server as ws
+
+    session_id = "profile-bound-cancel"
+    ws._oauth_sessions[session_id] = {
+        "session_id": session_id,
+        "provider": "openai-codex",
+        "flow": "device_code",
+        "profile": "coder",
+        "created_at": time.time(),
+        "status": "pending",
+        "error_message": None,
+    }
+    path = f"/api/providers/oauth/sessions/{session_id}"
+    try:
+        mismatch = client.delete(f"{path}?profile=reviewer", headers=HEADERS)
+
+        assert mismatch.status_code == 400
+        assert mismatch.json()["detail"] == "Profile mismatch for OAuth session"
+        assert session_id in ws._oauth_sessions
+        assert "cancelled" not in ws._oauth_sessions[session_id]
+
+        matching = client.delete(f"{path}?profile=coder", headers=HEADERS)
+        assert matching.status_code == 200
+        assert session_id not in ws._oauth_sessions
+    finally:
+        ws._oauth_sessions.pop(session_id, None)
+
+
 def test_oauth_start_stores_profile_for_background_completion(tmp_path, monkeypatch):
     from hermes_cli import web_server as ws
 
@@ -693,7 +822,6 @@ def test_status_falls_through_to_generic_dispatcher_for_catalog_only_provider():
     assert out["token_preview"] and "sk-future-secret-token-xyz" not in out["token_preview"]
     assert out["expires_at"] == "2026-12-01T00:00:00Z"
     assert out["has_refresh_token"] is True
-
 
 
 

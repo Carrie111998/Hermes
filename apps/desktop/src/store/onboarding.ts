@@ -2,6 +2,7 @@ import { atom } from 'nanostores'
 
 import {
   cancelOAuthSession,
+  getApiRequestProfile,
   getGlobalModelOptions,
   getRecommendedDefaultModel,
   listOAuthProviders,
@@ -159,6 +160,7 @@ const INITIAL: DesktopOnboardingState = {
 export const $desktopOnboarding = atom<DesktopOnboardingState>(INITIAL)
 
 let pollTimer: number | null = null
+let oauthFlowProfile: null | string = null
 let providersRefreshPromise: null | Promise<void> = null
 
 const errMessage = (e: unknown) => (e instanceof Error ? e.message : String(e))
@@ -192,7 +194,7 @@ function shouldPreserveConfiguredOnFallback(runtime: RuntimeReadinessResult, sta
 }
 
 function notifyReady(provider: string) {
-  notify({ kind: 'success', title: 'Hermes is ready', message: `${provider} connected.` })
+  notify({ kind: 'success', title: 'evaOS Agent is ready', message: `${provider} connected.` })
 }
 
 // Human-friendly labels for tools auto-routed through the Nous Tool Gateway,
@@ -220,7 +222,7 @@ function notifyGatewayTools(tools: string[] | undefined) {
   notify({
     durationMs: 8000,
     kind: 'info',
-    message: `${list} now run through your Nous subscription — no separate API keys needed.`,
+    message: `${list} now run through your Electric Sheep account — no separate API keys needed.`,
     title: 'Tool Gateway enabled'
   })
 }
@@ -361,8 +363,8 @@ function providerResolutionFailure(reason: null | string) {
   const detail = reason?.trim()
 
   return detail
-    ? `Connected, but Hermes still cannot resolve a usable provider. ${detail}`
-    : 'Connected, but Hermes still cannot resolve a usable provider.'
+    ? `Connected, but evaOS Agent still cannot resolve a usable provider. ${detail}`
+    : 'Connected, but evaOS Agent still cannot resolve a usable provider.'
 }
 
 async function refreshProviders() {
@@ -537,7 +539,7 @@ export async function refreshOnboarding(ctx: OnboardingContext) {
       kind: 'error',
       title: 'Runtime not ready',
       message:
-        'Hermes Desktop could not verify the running backend on startup. Some features may be unavailable until the gateway is reachable.'
+        'evaOS Agent could not verify the running backend on startup. Some features may be unavailable until the gateway is reachable.'
     })
 
     return false
@@ -587,9 +589,10 @@ export async function startProviderOAuth(provider: OAuthProvider, ctx: Onboardin
   }
 
   setFlow({ status: 'starting', provider })
+  oauthFlowProfile = getApiRequestProfile()
 
   try {
-    const start = await startOAuthLogin(provider.id)
+    const start = await startOAuthLogin(provider.id, oauthFlowProfile)
     const browserUrl = start.flow === 'device_code' ? start.verification_url : start.auth_url
     await openSignInUrl(browserUrl)
 
@@ -609,7 +612,7 @@ export async function startProviderOAuth(provider: OAuthProvider, ctx: Onboardin
 // Poll a session-backed device-code flow until it resolves.
 async function pollSession(provider: OAuthProvider, start: DeviceStart, ctx: OnboardingContext) {
   try {
-    const { error_message, status } = await pollOAuthSession(provider.id, start.session_id)
+    const { error_message, status } = await pollOAuthSession(provider.id, start.session_id, oauthFlowProfile)
 
     if (status === 'approved') {
       clearPoll()
@@ -650,7 +653,7 @@ export async function submitOnboardingCode(ctx: OnboardingContext) {
   setFlow({ status: 'submitting', provider, start })
 
   try {
-    const resp = await submitOAuthCode(provider.id, start.session_id, code.trim())
+    const resp = await submitOAuthCode(provider.id, start.session_id, code.trim(), oauthFlowProfile)
 
     if (resp.ok && resp.status === 'approved') {
       setFlow({ status: 'success', provider })
@@ -674,9 +677,10 @@ export function cancelOnboardingFlow() {
   const sessionId = sessionIdFor($desktopOnboarding.get().flow)
 
   if (sessionId) {
-    cancelOAuthSession(sessionId).catch(() => undefined)
+    cancelOAuthSession(sessionId, oauthFlowProfile).catch(() => undefined)
   }
 
+  oauthFlowProfile = null
   setFlow({ status: 'idle' })
 }
 
@@ -739,7 +743,7 @@ export async function recheckExternalSignin(ctx: OnboardingContext) {
       provider,
       message:
         reason?.trim() ||
-        `Hermes still cannot reach ${provider.name}. Run \`${provider.cli_command}\` in a terminal first.`
+        `evaOS Agent still cannot reach ${provider.name}. Run \`${provider.cli_command}\` in a terminal first.`
     })
   )
 }
@@ -854,7 +858,7 @@ export async function saveOnboardingLocalEndpoint(baseUrl: string, apiKey: strin
     if (!runtime.ready) {
       const detail = (runtime.reason ?? '').trim()
 
-      return { ok: false, message: detail || `Saved, but Hermes still cannot reach ${url}.` }
+      return { ok: false, message: detail || `Saved, but evaOS Agent still cannot reach ${url}.` }
     }
 
     notifyReady('Local / custom endpoint')

@@ -44,6 +44,7 @@ jobs:
       python: ${{ steps.classify.outputs.python }}
       python_prod: ${{ steps.classify.outputs.python_prod }}
       frontend: ${{ steps.classify.outputs.frontend }}
+      managed_desktop: ${{ steps.classify.outputs.managed_desktop }}
       site: ${{ steps.classify.outputs.site }}
       scan: ${{ steps.classify.outputs.scan }}
       deps: ${{ steps.classify.outputs.deps }}
@@ -104,6 +105,15 @@ jobs:
     # delete the `false &&` below — nothing else changed.
     if: ${{ false && (needs.detect.outputs.python_prod == 'true' || needs.detect.outputs.frontend == 'true') }}
     uses: ./.github/workflows/e2e-desktop.yml
+
+  e2e-desktop-managed:
+    name: Managed Desktop E2E
+    needs: detect
+    # Managed behavior spans the Electron renderer and the Python gateway.
+    # The dedicated classifier therefore fails open across either product
+    # surface, and the aggregate gate requires an actual success.
+    if: needs.detect.outputs.managed_desktop == 'true'
+    uses: ./.github/workflows/e2e-desktop-managed.yml
 
   docs-site:
     name: Docs Site
@@ -194,7 +204,7 @@ jobs:
   # ─────────────────────────────────────────────────────────────────────
   comment-live:
     name: CI review comment (live)
-    needs: [detect, review-labels, lockfile-diff, supply-chain, osv-scanner, uv-lockfile, history-check, contributor-check, e2e-desktop]
+    needs: [detect, review-labels, lockfile-diff, supply-chain, osv-scanner, uv-lockfile, history-check, contributor-check, e2e-desktop, e2e-desktop-managed]
     if: always() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork != true
     runs-on: ubuntu-latest
     timeout-minutes: 40
@@ -261,7 +271,8 @@ jobs:
   # ─────────────────────────────────────────────────────────────────────
   # Gate: runs after everything. ``if: always()`` ensures it reports a
   # status even when some deps were skipped. Only actual ``failure``
-  # results cause it to fail; ``skipped`` is treated as success.
+  # results cause it to fail. ``skipped`` is generally treated as success,
+  # except that a frontend change requires managed Desktop E2E to succeed.
   #
   # Branch protection should require ONLY this check.
   #
@@ -276,6 +287,7 @@ jobs:
       - lint
       - js-tests
       - e2e-desktop
+      - e2e-desktop-managed
       - docs-site
       - history-check
       - contributor-check
@@ -308,12 +320,20 @@ jobs:
           with open('$GITHUB_OUTPUT', 'a') as f:
               f.write(f'needs-json={json.dumps(compact)}\n')
           failed = [name for name, info in needs.items() if info['result'] == 'failure']
+          managed_required = needs['detect']['outputs']['managed_desktop'] == 'true'
+          managed_result = needs['e2e-desktop-managed']['result']
+          managed_gate_failed = managed_required and managed_result != 'success'
           for name, info in sorted(needs.items()):
               result = info['result']
-              icon = '✅' if result in ('success', 'skipped') else '❌'
+              required_managed_failure = name == 'e2e-desktop-managed' and managed_gate_failed
+              icon = '✅' if result in ('success', 'skipped') and not required_managed_failure else '❌'
               print(f'{icon} {name}: {result}')
+          if managed_gate_failed:
+              print(f'::error::Managed-product changes require successful managed Desktop E2E; result was {managed_result}')
           if failed:
               print(f'::error::{len(failed)} job(s) failed: {\", \".join(failed)}')
+              sys.exit(1)
+          if managed_gate_failed:
               sys.exit(1)
           print('All checks passed (or were skipped)')
           "

@@ -28,6 +28,7 @@ beforeEach(() => {
 afterEach(() => {
   cleanup()
   vi.clearAllMocks()
+  Reflect.deleteProperty(window, 'hermesDesktop')
 })
 
 async function renderField(value: unknown, onChange = vi.fn()) {
@@ -67,6 +68,20 @@ const CHAIN = [
 ]
 
 describe('FallbackModelsField', () => {
+  it('renders managed customer branding for backend Nous provider labels', async () => {
+    Object.defineProperty(window, 'hermesDesktop', {
+      configurable: true,
+      value: { eva: {} },
+      writable: true
+    })
+    await renderField([{ provider: 'nous', model: 'hermes-4' }])
+
+    fireEvent.click(screen.getAllByRole('combobox')[0])
+
+    expect((await screen.findAllByText('Electric Sheep')).length).toBeGreaterThan(0)
+    expect(screen.queryByText('Nous')).toBeNull()
+  })
+
   it('renders each {provider, model} entry as its own row (never "[object Object]")', async () => {
     await renderField(CHAIN)
 

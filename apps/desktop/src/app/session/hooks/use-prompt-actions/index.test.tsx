@@ -4069,6 +4069,74 @@ describe('usePromptActions busy-gateway churn tolerance (#64327)', () => {
     })
   })
 
+  it('resumes a just-created chat when the first submit reconnects onto a fresh gateway runtime', async () => {
+    // Managed remote sequence from #14:
+    // session.create succeeds and establishes a durable stored id, the relay
+    // drops before prompt.submit, useGatewayRequest reconnects, and the fresh
+    // gateway no longer knows the volatile runtime id. The first submit then
+    // returns "session not found"; recover through the stored id instead of
+    // leaving a dead sidebar row that can never resume.
+    const calls: { method: string; params?: Record<string, unknown> }[] = []
+    const selectedStoredSessionIdRef: MutableRefObject<string | null> = { current: null }
+    const activeSessionIdRef: MutableRefObject<string | null> = { current: null }
+    let routeToken = '/'
+    let submitAttempts = 0
+
+    const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+      calls.push({ method, params })
+
+      if (method === 'prompt.submit') {
+        submitAttempts += 1
+
+        if (submitAttempts === 1) {
+          throw new Error('session not found')
+        }
+      }
+
+      if (method === 'session.resume') {
+        return { session_id: 'rt-new-chat-recovered' } as never
+      }
+
+      return {} as never
+    })
+
+    const createBackendSessionForSend = vi.fn(async () => {
+      activeSessionIdRef.current = 'rt-new-chat'
+      selectedStoredSessionIdRef.current = 'stored-new-chat'
+      routeToken = '/stored-new-chat'
+
+      return 'rt-new-chat'
+    })
+
+    let handle: HarnessHandle | null = null
+    render(
+      <Harness
+        activeSessionId={null}
+        activeSessionIdRef={activeSessionIdRef}
+        createBackendSessionForSend={createBackendSessionForSend}
+        getRouteToken={() => routeToken}
+        onReady={h => (handle = h)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+        selectedStoredSessionIdRef={selectedStoredSessionIdRef}
+        storedSessionId={null}
+      />
+    )
+    await waitFor(() => expect(handle).not.toBeNull())
+
+    expect(await handle!.submitText('first message across reconnect')).toBe(true)
+    expect(calls.map(call => call.method)).toEqual(['prompt.submit', 'session.resume', 'prompt.submit'])
+    expect(calls[1]?.params).toEqual({
+      session_id: 'stored-new-chat',
+      source: 'desktop',
+      omit_messages: true
+    })
+    expect(calls[2]?.params).toEqual({
+      session_id: 'rt-new-chat-recovered',
+      text: 'first message across reconnect'
+    })
+  })
+
   it('still aborts when the user genuinely moves to a different chat mid-submit', async () => {
     // The churn tolerance must not weaken the real guard: selection AND route
     // moving to another actual chat is a user switch and must abort.

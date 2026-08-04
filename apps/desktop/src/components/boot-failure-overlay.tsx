@@ -31,6 +31,11 @@ const GatewaySettings = lazy(() =>
 type BusyAction = 'local' | 'repair' | 'retry' | 'signin' | null
 type RecoveryView = 'connect' | 'recovery'
 
+export async function completeManagedSignIn(signIn: () => Promise<unknown>, reload: () => void): Promise<void> {
+  await signIn()
+  reload()
+}
+
 // A remote gateway whose access cookie has lapsed (e.g. the dashboard
 // restarted on the remote box) boots into this overlay with a reauth-shaped
 // error. The local-recovery buttons (Retry resets the local bootstrap latch;
@@ -46,6 +51,7 @@ export function BootFailureOverlay() {
   const boot = useStore($desktopBoot)
   const onboarding = useStore($desktopOnboarding)
   const { t } = useI18n()
+  const copy = t.boot.failure
   const [busy, setBusy] = useState<BusyAction>(null)
   const [logs, setLogs] = useState<string[]>([])
   const [showLogs, setShowLogs] = useState(false)
@@ -58,6 +64,7 @@ export function BootFailureOverlay() {
   // to the full Settings page (keeps the user on the recovery surface, no z-index
   // juggling, no second connection form to maintain).
   const [view, setView] = useState<RecoveryView>('recovery')
+  const managedEva = Boolean(window.hermesDesktop?.eva)
 
   const visible = Boolean(boot.error) && !boot.running
   // While first-run onboarding owns the picker/flow we let it surface its own
@@ -70,17 +77,22 @@ export function BootFailureOverlay() {
       return
     }
 
-    void window.hermesDesktop
-      ?.getRecentLogs()
+    const getRecentLogs = window.hermesDesktop?.getRecentLogs
+
+    if (!getRecentLogs || managedEva) {
+      return
+    }
+
+    void getRecentLogs()
       .then(res => setLogs(res.lines ?? []))
       .catch(() => undefined)
-  }, [boot.error, visible])
+  }, [boot.error, managedEva, visible])
 
   // Resolve whether this boot failure is a remote-gateway reauth so we can
   // offer the actionable "Sign in" path instead of the local-only recovery
   // buttons. Runs whenever the overlay becomes visible.
   useEffect(() => {
-    if (!visible) {
+    if (!visible || managedEva) {
       setRemoteReauth(null)
       setConnectionConfig(null)
       setRemoteFailure(false)
@@ -137,7 +149,7 @@ export function BootFailureOverlay() {
     return () => {
       cancelled = true
     }
-  }, [boot.error, visible])
+  }, [boot.error, managedEva, visible])
 
   if (!visible || suppressed) {
     return null
@@ -145,13 +157,33 @@ export function BootFailureOverlay() {
 
   const retry = async () => {
     setBusy('retry')
-    await window.hermesDesktop?.resetBootstrap().catch(() => undefined)
+
+    if (managedEva) {
+      await window.hermesDesktop.eva.refresh().catch(() => undefined)
+    } else {
+      await window.hermesDesktop?.resetBootstrap?.().catch(() => undefined)
+    }
+
     window.location.reload()
+  }
+
+  const signInManaged = async () => {
+    setBusy('signin')
+
+    try {
+      await completeManagedSignIn(
+        () => window.hermesDesktop.eva.signIn(),
+        () => window.location.reload()
+      )
+    } catch (err) {
+      notifyError(err, copy.managedSignInFailed)
+      setBusy(null)
+    }
   }
 
   const repair = async () => {
     setBusy('repair')
-    await window.hermesDesktop?.repairBootstrap().catch(() => undefined)
+    await window.hermesDesktop?.repairBootstrap?.().catch(() => undefined)
     window.location.reload()
   }
 
@@ -198,8 +230,7 @@ export function BootFailureOverlay() {
     }
   }
 
-  const openLogs = () => void window.hermesDesktop?.revealLogs().catch(() => undefined)
-  const copy = t.boot.failure
+  const openLogs = () => void window.hermesDesktop?.revealLogs?.().catch(() => undefined)
 
   const label = signInLabel(remoteReauth, {
     identityProvider: copy.identityProvider,
@@ -248,7 +279,20 @@ export function BootFailureOverlay() {
   let actions: RecoveryAction[]
   let hint: string
 
-  if (remoteReauth) {
+  if (managedEva) {
+    actions = [
+      retryAction,
+      {
+        key: 'signin',
+        label: t.settings.gateway.managed.signIn,
+        onClick: () => void signInManaged(),
+        icon: <LogIn />,
+        variant: 'secondary',
+        busy: 'signin'
+      }
+    ]
+    hint = copy.managedAssignmentHint
+  } else if (remoteReauth) {
     actions = [
       {
         key: 'signin',
@@ -334,10 +378,12 @@ export function BootFailureOverlay() {
                   {action.label}
                 </Button>
               ))}
-              <Button onClick={openLogs} variant="ghost">
-                <FileText />
-                {copy.openLogs}
-              </Button>
+              {!managedEva ? (
+                <Button onClick={openLogs} variant="ghost">
+                  <FileText />
+                  {copy.openLogs}
+                </Button>
+              ) : null}
             </div>
             <p className="text-xs text-muted-foreground">{hint}</p>
           </div>

@@ -12,13 +12,11 @@ export interface ResolveGatewayWsUrlDeps {
    * OAuth-gated gateways use single-use tickets, so callers should mint
    * immediately before opening the socket.
    */
-  getGatewayWsUrl?: (profile?: null | string) => Promise<GatewayWsUrlResult>
+  getGatewayWsUrl?: (profile?: null | string, endpointPath?: string) => Promise<GatewayWsUrlResult>
 }
 
 export type GatewayWsUrlResult =
-  | string
-  | { ok: true; wsUrl: string }
-  | { error: string; needsOauthLogin?: boolean; ok: false }
+  string | { ok: true; wsUrl: string } | { error: string; needsOauthLogin?: boolean; ok: false }
 
 export class GatewayReauthRequiredError extends Error {
   readonly needsOauthLogin = true
@@ -36,7 +34,40 @@ export function isGatewayReauthRequired(error: unknown): error is GatewayReauthR
   )
 }
 
-export async function resolveGatewayWsUrl(deps: ResolveGatewayWsUrlDeps, conn: GatewayWsConnection): Promise<string> {
+function targetGatewayWsEndpoint(wsUrl: string, endpointPath: string, profile: null | string): string {
+  if (endpointPath === '/api/ws') {
+    return wsUrl
+  }
+
+  const endpoint = new URL(endpointPath, 'http://desktop.invalid')
+  const resolved = new URL(wsUrl)
+
+  if (resolved.pathname.endsWith(endpoint.pathname)) {
+    return wsUrl
+  }
+
+  if (!resolved.pathname.endsWith('/api/ws')) {
+    throw new Error('The refreshed WebSocket URL did not target the requested endpoint.')
+  }
+
+  resolved.pathname = resolved.pathname.replace(/\/api\/ws$/, () => endpoint.pathname)
+
+  for (const [key, value] of endpoint.searchParams.entries()) {
+    resolved.searchParams.append(key, value)
+  }
+
+  if (profile) {
+    resolved.searchParams.set('profile', profile)
+  }
+
+  return resolved.toString()
+}
+
+export async function resolveGatewayWsUrl(
+  deps: ResolveGatewayWsUrlDeps,
+  conn: GatewayWsConnection,
+  endpointPath = '/api/ws'
+): Promise<string> {
   const mint = deps.getGatewayWsUrl
   const profile = conn.profile ?? null
 
@@ -46,14 +77,14 @@ export async function resolveGatewayWsUrl(deps: ResolveGatewayWsUrlDeps, conn: G
     }
 
     try {
-      const result = await mint(profile)
+      const result = await mint(profile, endpointPath)
 
       if (typeof result === 'string') {
-        return result
+        return targetGatewayWsEndpoint(result, endpointPath, profile)
       }
 
       if (result.ok) {
-        return result.wsUrl
+        return targetGatewayWsEndpoint(result.wsUrl, endpointPath, profile)
       }
 
       if (result.needsOauthLogin) {
@@ -79,18 +110,18 @@ export async function resolveGatewayWsUrl(deps: ResolveGatewayWsUrlDeps, conn: G
   }
 
   if (mint) {
-    const fresh = await mint(profile).catch(() => null)
+    const fresh = await mint(profile, endpointPath).catch(() => null)
 
     if (typeof fresh === 'string') {
-      return fresh
+      return targetGatewayWsEndpoint(fresh, endpointPath, profile)
     }
 
     if (fresh?.ok) {
-      return fresh.wsUrl
+      return targetGatewayWsEndpoint(fresh.wsUrl, endpointPath, profile)
     }
   }
 
-  return conn.wsUrl
+  return targetGatewayWsEndpoint(conn.wsUrl, endpointPath, profile)
 }
 
 export type WebSocketAuthParam = readonly [name: string, value: string]

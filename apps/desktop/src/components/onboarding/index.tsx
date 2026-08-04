@@ -7,6 +7,7 @@ import { Input } from '@/components/ui/input'
 import { Progress } from '@/components/ui/progress'
 import { getGlobalModelOptions } from '@/hermes'
 import { useI18n } from '@/i18n'
+import { isManagedEvaosAgent } from '@/i18n/managed-brand'
 import { Check, ChevronDown, ChevronLeft, KeyRound, Loader2 } from '@/lib/icons'
 import { isProviderSetupErrorMessage } from '@/lib/provider-setup-errors'
 import { cn } from '@/lib/utils'
@@ -32,6 +33,7 @@ import { DocsLink, FlowPanel, Status } from './flow'
 import {
   FeaturedProviderRow,
   FireworksProviderRow,
+  managedOAuthProviders,
   OpenRouterProviderRow,
   ProviderRow,
   sortProviders
@@ -40,7 +42,9 @@ import {
 export {
   FeaturedProviderRow,
   FireworksProviderRow,
+  isManagedLocalCliProviderUnavailable,
   KeyProviderRow,
+  managedOAuthProviders,
   OpenRouterProviderRow,
   ProviderRow,
   providerTitle,
@@ -101,7 +105,7 @@ const API_KEY_OPTIONS: ApiKeyOption[] = [
     id: 'local',
     name: 'Local / custom endpoint',
     envKey: 'OPENAI_BASE_URL',
-    docsUrl: 'https://github.com/NousResearch/hermes-agent#bring-your-own-endpoint',
+    docsUrl: 'https://www.electricsheephq.com',
     placeholder: 'http://127.0.0.1:8000/v1'
   }
 ]
@@ -179,7 +183,22 @@ function useApiKeyCatalog(): ApiKeyOption[] {
 // → surface-out (520ms, held back by [transition-delay:660ms]). Finalize after.
 const ONBOARDING_EXIT_MS = 1180
 
-export function DesktopOnboardingOverlay({
+export function DesktopOnboardingOverlay(props: DesktopOnboardingOverlayProps) {
+  const onboarding = useStore($desktopOnboarding)
+
+  // Managed evaOS Agent authenticates through Electric Sheep and connects to the
+  // administrator-bound remote agent, so unmanaged first-run setup must not
+  // cover enrollment. A manual provider flow is different: Settings already
+  // selected the broker-assigned runtime/profile and intentionally opens this
+  // shared overlay to connect or reauthenticate that runtime's provider.
+  if (isManagedEvaosAgent() && !onboarding.manual) {
+    return null
+  }
+
+  return <DesktopProviderOnboardingOverlay {...props} />
+}
+
+function DesktopProviderOnboardingOverlay({
   enabled,
   onCompleted,
   profile,
@@ -423,6 +442,7 @@ const persistShowAll = (value: boolean) => {
 export function Picker({ ctx }: { ctx: OnboardingContext }) {
   const { t } = useI18n()
   const { localEndpoint, manual, mode, providers } = useStore($desktopOnboarding)
+  const managedEva = isManagedEvaosAgent()
   const [showAll, setShowAll] = useState(readShowAll)
   // Which key-form option to preselect when we flip to 'apikey' mode. The
   // OpenRouter row selects its key; the generic link lands on the first option.
@@ -465,8 +485,14 @@ export function Picker({ ctx }: { ctx: OnboardingContext }) {
   }
 
   const select = (p: OAuthProvider) => void startProviderOAuth(p, ctx)
-  const featured = ordered.find(p => p.id === FEATURED_ID) ?? null
-  const rest = featured ? ordered.filter(p => p.id !== FEATURED_ID) : ordered
+  const featured = managedEva ? null : (ordered.find(p => p.id === FEATURED_ID) ?? null)
+
+  const rest = managedEva
+    ? managedOAuthProviders(ordered, true)
+    : featured
+      ? ordered.filter(p => p.id !== FEATURED_ID)
+      : ordered
+
   // Collapse the secondary providers behind a disclosure only when Nous
   // Portal is present to anchor the choice — otherwise show the full list.
   const collapsible = Boolean(featured) && rest.length > 0
@@ -476,8 +502,8 @@ export function Picker({ ctx }: { ctx: OnboardingContext }) {
     <div className="grid gap-2">
       <div className="grid max-h-[60dvh] gap-2 overflow-y-auto p-1">
         {featured ? <FeaturedProviderRow onSelect={select} provider={featured} /> : null}
-        {/* Slot #2 — always visible, matching CANONICAL_PROVIDERS (Nous → Fireworks). */}
-        <FireworksProviderRow onClick={() => openKeyForm('FIREWORKS_API_KEY')} />
+        {/* Slot #2 in unmanaged mode, matching CANONICAL_PROVIDERS (Nous → Fireworks). */}
+        {managedEva ? null : <FireworksProviderRow onClick={() => openKeyForm('FIREWORKS_API_KEY')} />}
         {showRest ? (
           <>
             {rest.map(p => (

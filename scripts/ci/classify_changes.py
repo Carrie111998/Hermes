@@ -15,6 +15,9 @@ Lanes:
   skipping those product jobs.
 * ``docker_meta`` — Dockerfiles etc.
 * ``frontend``    — TS typecheck matrix + desktop build.
+* ``managed_desktop`` — managed Desktop behavioral lane. It is deliberately
+  conservative: any product Python or frontend change can affect the remote
+  backend contract, so either class keeps the lane on.
 * ``site``        — Docusaurus + generated skill docs.
 * ``scan``        — supply-chain scan (Python files, .pth, setup hooks).
 * ``deps``        — pyproject.toml dependency bounds check.
@@ -126,6 +129,7 @@ def classify(files: list[str]) -> dict[str, bool]:
         "mcp_catalog": any(_is_mcp_catalog(f) for f in files),
         "ci_review": any(_is_ci_review(f) for f in files),
     }
+    ret["managed_desktop"] = ret["python_prod"] or ret["frontend"]
     if not files or any(f.startswith(".github/") for f in files):
         ret["python"] = True
         ret["python_prod"] = True
@@ -136,6 +140,7 @@ def classify(files: list[str]) -> dict[str, bool]:
         ret["deps"] = True
         ret["npm_lock"] = True
         ret["ci_review"] = True
+        ret["managed_desktop"] = True
 
         # explicitly skip mcp catalog here. it's not needed unless those files are modified.
     return ret

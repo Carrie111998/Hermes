@@ -7,6 +7,7 @@ import { Tip } from '@/components/ui/tooltip'
 import { $pluginRecords, type PluginRecord, setPluginEnabled } from '@/contrib/plugins-store'
 import { discoverRuntimePlugins } from '@/contrib/runtime-loader'
 import { useI18n } from '@/i18n'
+import { isManagedEvaosAgent } from '@/i18n/managed-brand'
 import { triggerHaptic } from '@/lib/haptics'
 import { Package } from '@/lib/icons'
 import { notifyError } from '@/store/notifications'
@@ -88,6 +89,7 @@ function PluginRow({ record }: { record: PluginRecord }) {
 
 export function PluginsSettings() {
   const { t } = useI18n()
+  const managedEva = isManagedEvaosAgent()
   const p = t.settings.plugins
   const records = useStore($pluginRecords)
 
@@ -100,23 +102,25 @@ export function PluginsSettings() {
       <SectionHeading icon={Package} meta={p.count(rows.length)} title={p.title} />
       <p className="mb-4 text-[length:var(--conversation-caption-font-size)] text-(--ui-text-tertiary)">{p.blurb}</p>
 
-      <div className="mb-4 flex items-center gap-2">
-        <Button onClick={() => void revealPluginsDir()} size="sm" variant="outline">
-          <Codicon name="folder-opened" size="0.8rem" />
-          {p.openFolder}
-        </Button>
-        <Button
-          onClick={() => {
-            triggerHaptic('selection')
-            void discoverRuntimePlugins()
-          }}
-          size="sm"
-          variant="outline"
-        >
-          <Codicon name="refresh" size="0.8rem" />
-          {p.rescan}
-        </Button>
-      </div>
+      {!managedEva && (
+        <div className="mb-4 flex items-center gap-2">
+          <Button onClick={() => void revealPluginsDir()} size="sm" variant="outline">
+            <Codicon name="folder-opened" size="0.8rem" />
+            {p.openFolder}
+          </Button>
+          <Button
+            onClick={() => {
+              triggerHaptic('selection')
+              void discoverRuntimePlugins()
+            }}
+            size="sm"
+            variant="outline"
+          >
+            <Codicon name="refresh" size="0.8rem" />
+            {p.rescan}
+          </Button>
+        </div>
+      )}
 
       {rows.length === 0 ? (
         <EmptyState title={p.empty} />

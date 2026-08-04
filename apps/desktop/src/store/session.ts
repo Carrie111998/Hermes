@@ -129,6 +129,35 @@ export async function syncConfiguredDefaultProjectDir(): Promise<string> {
  *  packaged, optional Settings override). Clears stale install-dir paths that
  *  PR #37586's localStorage stickiness can preserve across the #37536 fix. */
 export async function ensureDefaultWorkspaceCwd(): Promise<void> {
+  const seedLiveCwd = (cwd: string) => {
+    if (cwd && !$activeSessionId.get()) {
+      setCurrentCwd(cwd)
+    }
+  }
+
+  const alignRemoteWorkspace = () => {
+    const remoteRemembered = getRememberedWorkspaceCwd()
+    if (!$activeSessionId.get()) {
+      setCurrentCwdTransient(remoteRemembered)
+
+      if (!remoteRemembered) {
+        setCurrentBranch('')
+      }
+    }
+  }
+
+  // Remote workspaces belong to the assigned backend. Do not consult or
+  // sanitize local project-directory settings during managed boot: branded
+  // builds deliberately block those local filesystem IPC channels.
+  if ($connection.get()?.mode === 'remote') {
+    // A connection switch can leave the previous local/backend cwd live even
+    // when this remote has never remembered a workspace. Clear that stale
+    // value so seedDefaultCwd() can adopt the remote backend default.
+    alignRemoteWorkspace()
+
+    return
+  }
+
   const sanitize = window.hermesDesktop?.sanitizeWorkspaceCwd
 
   if (!sanitize) {
@@ -136,24 +165,22 @@ export async function ensureDefaultWorkspaceCwd(): Promise<void> {
   }
 
   await syncConfiguredDefaultProjectDir()
-  const configured = getConfiguredDefaultProjectDir()
-
-  const seedLiveCwd = (cwd: string) => {
-    if (cwd && !$activeSessionId.get()) {
-      setCurrentCwd(cwd)
-    }
-  }
-
-  const remembered = getRememberedWorkspaceCwd()
-
   if ($connection.get()?.mode === 'remote') {
-    seedLiveCwd(remembered)
+    alignRemoteWorkspace()
 
     return
   }
 
+  const configured = getConfiguredDefaultProjectDir()
+  const remembered = getRememberedWorkspaceCwd()
+
   if (configured) {
     const { cwd } = await sanitize(configured)
+    if ($connection.get()?.mode === 'remote') {
+      alignRemoteWorkspace()
+
+      return
+    }
     seedLiveCwd(cwd)
 
     return
@@ -161,6 +188,11 @@ export async function ensureDefaultWorkspaceCwd(): Promise<void> {
 
   if (remembered) {
     const { cwd } = await sanitize(remembered)
+    if ($connection.get()?.mode === 'remote') {
+      alignRemoteWorkspace()
+
+      return
+    }
     seedLiveCwd(cwd)
   }
 }

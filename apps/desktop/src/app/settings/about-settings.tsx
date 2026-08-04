@@ -4,7 +4,9 @@ import { useEffect, useState } from 'react'
 import { BrandMark } from '@/components/brand-mark'
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
+import type { EvaManagedStatus } from '@/global'
 import { type Translations, useI18n } from '@/i18n'
+import { isManagedEvaosAgent } from '@/i18n/managed-brand'
 import { CheckCircle2, ExternalLink, Loader2, RefreshCw } from '@/lib/icons'
 import { cn } from '@/lib/utils'
 import {
@@ -45,7 +47,59 @@ function relativeTime(ms: number | undefined, a: Translations['settings']['about
   return a.daysAgo(Math.round(diff / 86_400_000))
 }
 
-export function AboutSettings() {
+function ManagedAboutSettings() {
+  const { t } = useI18n()
+  const a = t.settings.about
+  const version = useStore($desktopVersion)
+  const [managedStatus, setManagedStatus] = useState<EvaManagedStatus | null>(null)
+
+  useEffect(() => {
+    let active = true
+    const status = window.hermesDesktop?.eva?.status
+
+    void refreshDesktopVersion()
+
+    if (status) {
+      void status()
+        .then(next => {
+          if (active) {
+            setManagedStatus(next)
+          }
+        })
+        .catch(() => undefined)
+    }
+
+    return () => {
+      active = false
+    }
+  }, [])
+
+  return (
+    <SettingsContent>
+      <div className="flex flex-col items-center gap-3 pt-6 pb-2 text-center">
+        <BrandMark className="size-20 rounded-2xl" />
+        <div>
+          <h2 className="text-lg font-semibold tracking-tight">evaOS Agent</h2>
+          <p className="mt-1 text-xs text-muted-foreground">
+            {version?.appVersion ? a.version(version.appVersion) : a.versionUnavailable}
+          </p>
+        </div>
+      </div>
+
+      <div className="mx-auto mt-4 w-full max-w-2xl overflow-hidden rounded-xl border border-border/70">
+        <ListRow description={a.managed.businessDescription} title={a.managed.businessTitle} />
+        <ListRow
+          description={a.managed.updateChannelDescription(managedStatus?.updateChannel ?? 'managed')}
+          title={a.managed.updateChannelTitle}
+        />
+        <ListRow description={a.managed.attributionDescription} title={a.managed.attributionTitle} />
+        <ListRow description={a.managed.distributionDescription} title={a.managed.distributionTitle} />
+      </div>
+    </SettingsContent>
+  )
+}
+
+function UnmanagedAboutSettings() {
   const { t } = useI18n()
   const a = t.settings.about
   const version = useStore($desktopVersion)
@@ -180,4 +234,8 @@ export function AboutSettings() {
       </div>
     </SettingsContent>
   )
+}
+
+export function AboutSettings() {
+  return isManagedEvaosAgent() ? <ManagedAboutSettings /> : <UnmanagedAboutSettings />
 }

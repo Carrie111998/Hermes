@@ -61,12 +61,14 @@ describe('Hermes REST helpers', () => {
     )
   })
 
-  it('uses a longer timeout for the all-profile session list', async () => {
+  it('routes the all-profile endpoint through the primary backend independently of its selector', async () => {
+    setApiRequestProfile('work')
     await listAllProfileSessions(50, 1)
 
     expect(api).toHaveBeenCalledWith(
       expect.objectContaining({
         path: '/api/profiles/sessions?limit=50&offset=0&min_messages=1&archived=exclude&order=recent&profile=all',
+        profile: 'default',
         timeoutMs: 60_000
       })
     )

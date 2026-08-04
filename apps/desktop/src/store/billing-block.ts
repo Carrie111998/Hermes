@@ -1,6 +1,7 @@
 import type { BillingBlock } from '@hermes/shared'
 import { atom } from 'nanostores'
 
+import { isManagedEvaosAgent } from '@/i18n/managed-brand'
 import { openExternalLink } from '@/lib/external-link'
 
 /**
@@ -24,6 +25,35 @@ export const $billingBlock = atom<ActiveBillingBlock | null>(null)
  * `useNavigate` — to open Settings → Billing in-app. See `contrib/wiring.tsx`.
  */
 export const $billingSettingsRequest = atom(0)
+
+export interface BillingBlockPresentationCopy {
+  fallbackMessage: string
+  titleNous: string
+  titleProvider: (provider: string) => string
+}
+
+export interface BillingBlockPresentation {
+  message: string
+  title: string
+}
+
+export function billingBlockPresentation(
+  block: BillingBlock,
+  managed: boolean,
+  copy: BillingBlockPresentationCopy
+): BillingBlockPresentation {
+  if (managed && block.is_nous) {
+    return {
+      title: 'evaOS Agent access unavailable',
+      message: 'Contact Electric Sheep support to restore access.'
+    }
+  }
+
+  return {
+    title: block.is_nous ? copy.titleNous : copy.titleProvider(block.provider_label),
+    message: block.message.split('\n')[0]?.trim() || copy.fallbackMessage
+  }
+}
 
 export function setBillingBlock(sessionId: string, block: BillingBlock): void {
   $billingBlock.set({ at: Date.now(), block, sessionId })
@@ -49,13 +79,27 @@ export function requestBillingSettings(): void {
   $billingSettingsRequest.set($billingSettingsRequest.get() + 1)
 }
 
+export function billingRecoveryAvailable(block: BillingBlock): boolean {
+  if (!isManagedEvaosAgent()) {
+    return true
+  }
+
+  return !block.is_nous && Boolean(block.billing_url)
+}
+
 /**
  * The single recovery action for a billing wall, shared by the toast and the
- * in-chat banner so both behave identically: Nous routes to the in-app
+ * in-chat banner so both behave identically: Nous routes to the upstream
  * Settings → Billing surface; a third-party provider deep-links to its own
  * billing page (falling back to the in-app surface only if we have no URL).
+ * Managed evaOS Agent exposes only provider-owned URLs: its upstream Billing
+ * surface is hidden and therefore cannot serve as a recovery fallback.
  */
 export function runBillingRecovery(block: BillingBlock): void {
+  if (!billingRecoveryAvailable(block)) {
+    return
+  }
+
   if (block.is_nous) {
     requestBillingSettings()
 

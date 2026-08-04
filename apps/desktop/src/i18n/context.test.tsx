@@ -227,6 +227,39 @@ describe('I18nProvider', () => {
     expect(document.documentElement.lang).toBe('en')
   })
 
+  it('keeps managed locale state aligned with managed translations', async () => {
+    const originalDesktop = window.hermesDesktop
+    ;(window as unknown as { hermesDesktop: unknown }).hermesDesktop = { eva: {} }
+    const saveConfig = vi.fn().mockResolvedValue({ ok: true })
+    const configClient: I18nConfigClient = {
+      getConfig: vi
+        .fn()
+        .mockResolvedValueOnce({ display: { language: 'zh-Hans' } })
+        .mockResolvedValueOnce({ display: { language: 'zh-Hans' } }),
+      saveConfig
+    }
+
+    try {
+      render(
+        <I18nProvider configClient={configClient}>
+          <LanguageProbe target="ja" />
+        </I18nProvider>
+      )
+
+      await waitFor(() => expect(screen.getByTestId('loading').textContent).toBe('false'))
+      expect(screen.getByTestId('locale').textContent).toBe('zh')
+      expect(screen.getByTestId('label').textContent).toBe('语言')
+
+      fireEvent.click(screen.getByRole('button', { name: 'switch' }))
+
+      await waitFor(() => expect(screen.getByTestId('locale').textContent).toBe('ja'))
+      expect(screen.getByTestId('label').textContent).toBe('言語')
+      expect(saveConfig).toHaveBeenCalledWith({ display: { language: 'ja' } })
+    } finally {
+      ;(window as unknown as { hermesDesktop: unknown }).hermesDesktop = originalDesktop
+    }
+  })
+
   it('rolls back the visible locale when saving fails', async () => {
     const configClient: I18nConfigClient = {
       getConfig: vi.fn().mockResolvedValue({ display: { language: 'en' } }),

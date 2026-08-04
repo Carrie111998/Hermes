@@ -45,6 +45,16 @@ export const ja = defineLocale({
     off: 'オフ'
   },
 
+  quickEntry: {
+    inputLabel: 'クイック入力',
+    askPlaceholder: 'Hermes に質問…',
+    disconnectedPlaceholder: '未接続です — Hermes を開いて再接続してください',
+    sendTo: '送信先',
+    targetLabel: '対象セッション',
+    currentChat: '現在のチャット',
+    newSession: '新しいセッション'
+  },
+
   fileMenu: {
     revealFinder: 'Finder で表示',
     revealExplorer: 'エクスプローラーで表示',
@@ -106,6 +116,9 @@ export const ja = defineLocale({
       signInIncompleteTitle: 'サインインが完了していません',
       signInIncompleteMessage: '認証が完了する前にログインウィンドウが閉じられました。',
       signInFailed: 'サインインに失敗しました',
+      managedAssignmentHint:
+        'ビジネスの割り当ては Electric Sheep によって選択されています。アクセスが変更または取り消された場合は、もう一度サインインしてください。',
+      managedSignInFailed: 'マネージドアクセスにサインインできませんでした。もう一度お試しください。',
       signInToRemoteGateway: 'リモートゲートウェイにサインイン',
       signInWithProvider: provider => `${provider} でサインイン`,
       identityProvider: 'ID プロバイダー'
@@ -642,7 +655,18 @@ export const ja = defineLocale({
       justNow: 'たった今',
       minAgo: count => `${count} 分前`,
       hoursAgo: count => `${count} 時間前`,
-      daysAgo: count => `${count} 日前`
+      daysAgo: count => `${count} 日前`,
+      managed: {
+        businessTitle: 'マネージドビジネスベータ',
+        businessDescription:
+          'アカウント、割り当てられたエージェント、アクセスポリシー、ソフトウェア更新は Electric Sheep が管理します。',
+        updateChannelTitle: '更新チャンネル',
+        updateChannelDescription: channel => `${channel} · Electric Sheep の署名付き更新`,
+        attributionTitle: 'オープンソースの帰属',
+        attributionDescription: 'Hermes Agent by Nous Research を MIT License の下で使用しています。',
+        distributionTitle: '配布',
+        distributionDescription: '署名済み Apple Silicon 向けマネージドビジネスベータ。公開リリースではありません。'
+      }
     },
     config: {
       none: 'なし',
@@ -695,6 +719,22 @@ export const ja = defineLocale({
       clear: 'クリア'
     },
     gateway: {
+      managed: {
+        loading: 'マネージド evaOS Agent のアクセスを読み込み中…',
+        title: 'Electric Sheep により管理',
+        description:
+          'evaOS Agent はビジネス管理者が割り当てたエージェントにのみ接続します。ローカルバックエンド、カスタムゲートウェイ URL、未加工のセッショントークン、外部ゲートウェイの上書きは無効です。',
+        accountTitle: 'Electric Sheep アカウント',
+        notSignedIn: 'サインインしていません',
+        businessTitle: 'ビジネス',
+        assignedAfterSignIn: 'サインイン後に割り当て',
+        agentTitle: '割り当て済みエージェント',
+        updateChannelTitle: '更新チャンネル',
+        signIn: 'evaOS Agent にサインイン',
+        refresh: '割り当て済みアクセスを更新',
+        signOut: 'サインアウト',
+        failed: 'マネージドアクセスを読み込めませんでした。再試行するか Electric Sheep サポートに連絡してください。'
+      },
       loading: 'ゲートウェイ設定を読み込み中...',
       unavailableTitle: 'ゲートウェイ設定は利用できません',
       unavailableDesc: 'デスクトップ IPC ブリッジはゲートウェイ設定を公開していません。',
@@ -891,6 +931,10 @@ export const ja = defineLocale({
       collapse: '折りたたむ',
       connectAnother: '別のプロバイダーを接続',
       otherProviders: 'その他のプロバイダー',
+      reauthenticate: '再認証',
+      managedUnavailable: '利用不可',
+      managedUnavailableDescription:
+        'このプロバイダーはローカル CLI でのサインインが必要なため、割り当てられたマネージドエージェントを設定できません。',
       removeConfirm: provider => `${provider} を削除しますか？`,
       removeKeyManaged: provider => `${provider} は API キーで設定されています。API Keys から削除してください。`,
       removedTitle: 'アカウントを削除しました',
@@ -971,6 +1015,8 @@ export const ja = defineLocale({
       nousAuthDoneTitle: 'Nous Portal に接続しました',
       nousAuthDoneMessage: 'サブスクリプションのバックエンドが有効になりました。',
       nousAuthFailed: 'Nous Portal のサインインが完了しませんでした',
+      managedUnavailableTitle: 'プロバイダーは利用できません',
+      managedUnavailableMessage: provider => `${provider} はマネージドエージェントでは利用できません。`,
       noApiKeyRequired: 'API キーは不要です。',
       postSetupHint: step =>
         `このバックエンドは一度だけインストールが必要です (${step})。このマシン上で実行され、数分かかる場合があります。`,
@@ -2139,6 +2185,9 @@ export const ja = defineLocale({
     chooseLater: '後でプロバイダーを選択します',
     recommended: '推奨',
     connected: '接続済み',
+    managedUnavailable: '利用不可',
+    managedUnavailableDescription:
+      'このプロバイダーはローカル CLI でのサインインが必要なため、割り当てられたマネージドエージェントを設定できません。',
     featuredPitch: '1 つのサブスクリプションで 300 以上の最先端モデル — Hermes を実行するための推奨方法',
     fireworksPitch: '直接モデル API — Fireworks がホストする最先端モデル',
     openRouterPitch: '1 つのキーで数百のモデル — 堅実なデフォルト',

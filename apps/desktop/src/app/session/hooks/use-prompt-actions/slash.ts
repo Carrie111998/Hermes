@@ -3,6 +3,7 @@ import { type MutableRefObject, useCallback, useRef } from 'react'
 
 import { getProfiles } from '@/hermes'
 import type { Translations } from '@/i18n'
+import { isManagedEvaosAgent } from '@/i18n/managed-brand'
 import { type ChatMessage, toChatMessages } from '@/lib/chat-messages'
 import { parseCommandDispatch, parseSlashCommand, sessionTitle } from '@/lib/chat-runtime'
 import {
@@ -15,6 +16,7 @@ import {
   resolveDesktopCommand
 } from '@/lib/desktop-slash-commands'
 import { isMissingRpcMethod } from '@/lib/gateway-rpc'
+import { sanitizeDesktopSlashOutput } from '@/lib/managed-slash-output'
 import { setSessionYolo } from '@/lib/yolo-session'
 import { openCommandPalettePage } from '@/store/command-palette'
 import { setComposerDraft } from '@/store/composer'
@@ -249,7 +251,10 @@ export function useSlashCommand(deps: SlashCommandDeps) {
           return
         }
 
-        const { render: renderSlashOutput, sessionId, storedSessionId } = resolved
+        const { render, sessionId, storedSessionId } = resolved
+
+        const renderSlashOutput = (text: string) =>
+          render(sanitizeDesktopSlashOutput(name, text, isManagedEvaosAgent()))
 
         if (!isDesktopSlashCommand(name)) {
           renderSlashOutput(desktopSlashUnavailableMessage(name) || `/${name} is not available in the desktop app.`)

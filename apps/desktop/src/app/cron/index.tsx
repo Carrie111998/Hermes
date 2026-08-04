@@ -44,6 +44,7 @@ import {
   updateCronJob
 } from '@/hermes'
 import { type Translations, useI18n } from '@/i18n'
+import { isManagedEvaosAgent, managedProviderDisplayValue } from '@/i18n/managed-brand'
 import { AlertTriangle } from '@/lib/icons'
 import { requestModelOptions } from '@/lib/model-options'
 import { asText } from '@/lib/text'
@@ -1147,7 +1148,9 @@ function CronEditorDialog({
                     )}
                     {modelProviders.map(provider => (
                       <SelectGroup key={provider.slug}>
-                        <SelectLabel>{provider.name}</SelectLabel>
+                        <SelectLabel>
+                          {managedProviderDisplayValue(provider.slug, provider.name, isManagedEvaosAgent())}
+                        </SelectLabel>
                         {(provider.models ?? []).map(model => (
                           <SelectItem
                             className="font-mono"

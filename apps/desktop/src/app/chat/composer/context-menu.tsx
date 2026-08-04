@@ -44,6 +44,10 @@ export function ContextMenu({
   // extend this menu through the same registry as every other surface.
   const attachmentProviders = useComposerAttachmentProviders()
 
+  const localAttachmentsAvailable = Boolean(
+    onPasteClipboardImage || onPickFiles || onPickFolders || onPickImages
+  )
+
   return (
     <>
       <DropdownMenu>
@@ -65,25 +69,29 @@ export function ContextMenu({
           </DropdownMenuTrigger>
         </Tip>
         <DropdownMenuContent align="start" className={cn('w-60', composerPanelCard)} side="top" sideOffset={6}>
-          <DropdownMenuLabel className="px-2 pb-0.5 pt-0.5 text-[0.625rem] font-semibold uppercase tracking-wider text-(--ui-text-tertiary)">
-            {c.attachLabel}
-          </DropdownMenuLabel>
-          <ContextMenuItem disabled={!onPickFiles} icon={FileText} onSelect={onPickFiles}>
-            {c.files}
-          </ContextMenuItem>
-          <ContextMenuItem disabled={!onPickFolders} icon={FolderOpen} onSelect={onPickFolders}>
-            {c.folder}
-          </ContextMenuItem>
-          <ContextMenuItem disabled={!onPickImages} icon={ImageIcon} onSelect={onPickImages}>
-            {c.images}
-          </ContextMenuItem>
-          <ContextMenuItem
-            disabled={!onPasteClipboardImage}
-            icon={Clipboard}
-            onSelect={onPasteClipboardImage ? () => void onPasteClipboardImage() : undefined}
-          >
-            {c.pasteImage}
-          </ContextMenuItem>
+          {localAttachmentsAvailable ? (
+            <>
+              <DropdownMenuLabel className="px-2 pb-0.5 pt-0.5 text-[0.625rem] font-semibold uppercase tracking-wider text-(--ui-text-tertiary)">
+                {c.attachLabel}
+              </DropdownMenuLabel>
+              <ContextMenuItem disabled={!onPickFiles} icon={FileText} onSelect={onPickFiles}>
+                {c.files}
+              </ContextMenuItem>
+              <ContextMenuItem disabled={!onPickFolders} icon={FolderOpen} onSelect={onPickFolders}>
+                {c.folder}
+              </ContextMenuItem>
+              <ContextMenuItem disabled={!onPickImages} icon={ImageIcon} onSelect={onPickImages}>
+                {c.images}
+              </ContextMenuItem>
+              <ContextMenuItem
+                disabled={!onPasteClipboardImage}
+                icon={Clipboard}
+                onSelect={onPasteClipboardImage ? () => void onPasteClipboardImage() : undefined}
+              >
+                {c.pasteImage}
+              </ContextMenuItem>
+            </>
+          ) : null}
           <ContextMenuItem icon={Link} onSelect={onOpenUrlDialog}>
             {c.url}
           </ContextMenuItem>

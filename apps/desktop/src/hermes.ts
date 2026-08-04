@@ -1,5 +1,7 @@
-import { JsonRpcGatewayClient } from '@hermes/shared'
+import { JsonRpcGatewayClient, resolveGatewayWsUrl } from '@hermes/shared'
 
+import { isManagedEvaosAgent } from '@/i18n/managed-brand'
+import { assertManagedGatewayMethodAllowed } from '@/lib/managed-ui-policy'
 import { reconnectBackoffDelayMs } from '@/lib/reconnect-backoff'
 import type {
   ActionResponse,
@@ -227,12 +229,23 @@ export type {
 export class HermesGateway extends JsonRpcGatewayClient {
   constructor() {
     super({
-      closedErrorMessage: 'Hermes gateway connection closed',
-      connectErrorMessage: 'Could not connect to Hermes gateway',
+      closedErrorMessage: 'evaOS Agent gateway connection closed',
+      connectErrorMessage: 'Could not connect to evaOS Agent gateway',
       createRequestId: nextId => nextId,
-      notConnectedErrorMessage: 'Hermes gateway is not connected',
+      notConnectedErrorMessage: 'evaOS Agent gateway is not connected',
       requestTimeoutMs: DEFAULT_GATEWAY_REQUEST_TIMEOUT_MS
     })
+  }
+
+  override request<T>(
+    method: string,
+    params: Record<string, unknown> = {},
+    timeoutMs?: number,
+    signal?: AbortSignal
+  ): Promise<T> {
+    assertManagedGatewayMethodAllowed(method, isManagedEvaosAgent())
+
+    return super.request<T>(method, params, timeoutMs, signal)
   }
 }
 
@@ -243,9 +256,25 @@ export class HermesGateway extends JsonRpcGatewayClient {
 // the call; each pooled backend already has its own HERMES_HOME, so no backend
 // change is needed. Null → primary, so single-profile users are unaffected.
 let _apiProfile: null | string = null
+const apiProfileListeners = new Set<(profile: null | string) => void>()
 
 export function setApiRequestProfile(profile: null | string): void {
-  _apiProfile = profile || null
+  const next = profile || null
+
+  if (_apiProfile === next) {
+    return
+  }
+
+  _apiProfile = next
+  for (const listener of apiProfileListeners) {
+    listener(next)
+  }
+}
+
+export function subscribeApiRequestProfile(listener: (profile: null | string) => void): () => void {
+  apiProfileListeners.add(listener)
+
+  return () => apiProfileListeners.delete(listener)
 }
 
 function profileScoped(profile?: null | string): { profile?: string } {
@@ -293,7 +322,7 @@ function pluginPathSuffix(caller: string, path: string): string {
  *  declared-capability seam; today the namespace IS the boundary. */
 export async function pluginRest<T>(pluginId: string, path: string, opts: PluginRestOptions = {}): Promise<T> {
   if (!window.hermesDesktop?.api) {
-    throw new Error('Hermes desktop bridge unavailable')
+    throw new Error('evaOS Agent desktop bridge unavailable')
   }
 
   const suffix = pluginPathSuffix('pluginRest', path)
@@ -310,35 +339,95 @@ export async function pluginRest<T>(pluginId: string, path: string, opts: Plugin
 
 /** The plugin WebSocket door — the live twin of `pluginRest`, scoped the same
  *  way: `path` is relative to `/api/plugins/<pluginId>` ('/events' → the
- *  plugin's own event stream). Token-mode backends auth via the same query
- *  credential the app's own sockets use; OAuth remotes resolve null (callers
- *  keep their polling fallback — every consumer must have one anyway, since a
- *  socket can drop). Auto-reconnects with backoff until disposed. */
+ *  plugin's own event stream). The bridge mints a fresh credential for this
+ *  exact endpoint and active profile; managed tickets never expose the runtime
+ *  secret to the renderer. Auto-reconnects with backoff until disposed. */
 export function pluginSocket(pluginId: string, path: string, onMessage: (data: unknown) => void): () => void {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(pluginId)) {
+    throw new Error(`pluginSocket: invalid plugin id "${pluginId}"`)
+  }
+
   const suffix = pluginPathSuffix('pluginSocket', path)
+  const endpointPath = `/api/plugins/${pluginId}${suffix}`
 
   let socket: null | WebSocket = null
+  let reconnectTimer: null | number = null
   let disposed = false
   let attempt = 0
+  let generation = 0
 
-  const connect = async () => {
-    const connection = await window.hermesDesktop.getConnection().catch(() => null)
+  const clearReconnectTimer = () => {
+    if (reconnectTimer !== null) {
+      window.clearTimeout(reconnectTimer)
+      reconnectTimer = null
+    }
+  }
 
-    // No bridge / OAuth cookie auth (WS tickets are single-use, core-managed):
-    // stay on the polling fallback rather than half-working.
-    if (disposed || !connection || connection.authMode === 'oauth') {
+  const scheduleReconnect = (immediate = false) => {
+    if (disposed || reconnectTimer !== null) {
       return
     }
 
-    const base = connection.baseUrl.replace(/^http/, 'ws')
-    const join = suffix.includes('?') ? '&' : '?'
-    socket = new WebSocket(
-      `${base}/api/plugins/${pluginId}${suffix}${join}token=${encodeURIComponent(connection.token)}`
-    )
+    const delay = immediate
+      ? 0
+      : reconnectBackoffDelayMs(attempt, {
+          baseDelayMs: 500,
+          capMs: 30_000
+        })
 
-    socket.onmessage = event => {
-      attempt = 0
+    if (!immediate) {
+      attempt += 1
+    }
+    reconnectTimer = window.setTimeout(() => {
+      reconnectTimer = null
+      void connect()
+    }, delay)
+  }
 
+  const connect = async () => {
+    const connectingGeneration = generation
+    const desktop = window.hermesDesktop
+    const profile = getApiRequestProfile()
+    const connection = await desktop?.getConnection(profile).catch(() => null)
+
+    if (disposed || connectingGeneration !== generation) {
+      return
+    }
+    if (!desktop || !connection) {
+      scheduleReconnect()
+      return
+    }
+
+    // Managed loopback tickets are single-use and endpoint-bound. Falling back
+    // to the cached core-gateway URL after a broker failure would either reuse
+    // a stale ticket or retarget a credential minted for another endpoint.
+    let wsUrl: null | string = null
+
+    if (connection.baseUrl.startsWith('eva-managed://')) {
+      const result = await desktop.getGatewayWsUrl?.(profile, endpointPath).catch(() => null)
+      wsUrl = typeof result === 'string' ? result : result?.ok ? result.wsUrl : null
+    } else {
+      wsUrl = await resolveGatewayWsUrl(desktop, connection, endpointPath).catch(() => null)
+    }
+
+    if (disposed || connectingGeneration !== generation) {
+      return
+    }
+    if (!wsUrl) {
+      scheduleReconnect()
+      return
+    }
+
+    const nextSocket = new WebSocket(wsUrl)
+    socket = nextSocket
+
+    nextSocket.onopen = () => {
+      if (socket === nextSocket) {
+        attempt = 0
+      }
+    }
+
+    nextSocket.onmessage = event => {
       try {
         onMessage(JSON.parse(String(event.data)))
       } catch {
@@ -346,25 +435,35 @@ export function pluginSocket(pluginId: string, path: string, onMessage: (data: u
       }
     }
 
-    socket.onclose = () => {
-      socket = null
-
-      if (!disposed) {
-        // Full-jitter exponential backoff: same rationale as the gateway
-        // socket reconnect loops — an immediate-retry loop across many
-        // desktop clients floods the gateway with connection attempts
-        // during a restart.
-        window.setTimeout(() => void connect(), reconnectBackoffDelayMs(attempt, { baseDelayMs: 500, capMs: 30_000 }))
-        attempt += 1
+    nextSocket.onclose = () => {
+      if (socket !== nextSocket) {
+        return
       }
+      socket = null
+      scheduleReconnect()
     }
   }
+
+  const unsubscribeProfile = subscribeApiRequestProfile(() => {
+    generation += 1
+    attempt = 0
+    clearReconnectTimer()
+    const previous = socket
+    socket = null
+    previous?.close()
+    scheduleReconnect(true)
+  })
 
   void connect()
 
   return () => {
     disposed = true
-    socket?.close()
+    generation += 1
+    unsubscribeProfile()
+    clearReconnectTimer()
+    const previous = socket
+    socket = null
+    previous?.close()
   }
 }
 
@@ -419,6 +518,10 @@ export async function listAllProfileSessions(
     path:
       `/api/profiles/sessions?limit=${limit}&offset=0&min_messages=${Math.max(0, minMessages)}` +
       `&archived=${archived}&order=${order}&profile=${encodeURIComponent(profile)}${sourceParam}${excludeParam}`,
+    // This aggregate endpoint is served by the primary backend. Keep its
+    // endpoint-level selector independent from Electron's backend-routing
+    // profile so managed policy can reject ambiguous query-only selectors.
+    profile: 'default',
     timeoutMs: SESSION_LIST_REQUEST_TIMEOUT_MS
   })
 
@@ -867,34 +970,43 @@ export function disconnectOAuthProvider(providerId: string): Promise<{ ok: boole
   })
 }
 
-export function startOAuthLogin(providerId: string): Promise<OAuthStartResponse> {
+export function startOAuthLogin(providerId: string, profile?: null | string): Promise<OAuthStartResponse> {
   return window.hermesDesktop.api<OAuthStartResponse>({
-    ...profileScoped(),
+    ...profileScoped(profile),
     path: `/api/providers/oauth/${encodeURIComponent(providerId)}/start`,
     method: 'POST',
     body: {}
   })
 }
 
-export function submitOAuthCode(providerId: string, sessionId: string, code: string): Promise<OAuthSubmitResponse> {
+export function submitOAuthCode(
+  providerId: string,
+  sessionId: string,
+  code: string,
+  profile?: null | string
+): Promise<OAuthSubmitResponse> {
   return window.hermesDesktop.api<OAuthSubmitResponse>({
-    ...profileScoped(),
+    ...profileScoped(profile),
     path: `/api/providers/oauth/${encodeURIComponent(providerId)}/submit`,
     method: 'POST',
     body: { session_id: sessionId, code }
   })
 }
 
-export function pollOAuthSession(providerId: string, sessionId: string): Promise<OAuthPollResponse> {
+export function pollOAuthSession(
+  providerId: string,
+  sessionId: string,
+  profile?: null | string
+): Promise<OAuthPollResponse> {
   return window.hermesDesktop.api<OAuthPollResponse>({
-    ...profileScoped(),
+    ...profileScoped(profile),
     path: `/api/providers/oauth/${encodeURIComponent(providerId)}/poll/${encodeURIComponent(sessionId)}`
   })
 }
 
-export function cancelOAuthSession(sessionId: string): Promise<{ ok: boolean }> {
+export function cancelOAuthSession(sessionId: string, profile?: null | string): Promise<{ ok: boolean }> {
   return window.hermesDesktop.api<{ ok: boolean }>({
-    ...profileScoped(),
+    ...profileScoped(profile),
     path: `/api/providers/oauth/sessions/${encodeURIComponent(sessionId)}`,
     method: 'DELETE'
   })
@@ -1374,7 +1486,7 @@ export function instantiateAutomationBlueprint(
   profile: string
 ): Promise<CronJob> {
   return window.hermesDesktop.api<CronJob>({
-    ...profileScoped(),
+    ...profileScoped(profile),
     path: `/api/cron/blueprints/instantiate?profile=${encodeURIComponent(profile)}`,
     method: 'POST',
     body

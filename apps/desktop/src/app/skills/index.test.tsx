@@ -6,6 +6,7 @@ import type * as ReactRouterDom from 'react-router'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type * as HermesApi from '@/hermes'
+import { en } from '@/i18n/en'
 import { queryClient } from '@/lib/query-client'
 
 const getSkills = vi.fn()
@@ -86,6 +87,7 @@ beforeEach(() => {
 afterEach(() => {
   cleanup()
   vi.clearAllMocks()
+  Reflect.deleteProperty(window, 'hermesDesktop')
   // Shared singleton client — drop cached skills/toolsets so each test refetches.
   queryClient.clear()
 })
@@ -153,5 +155,30 @@ describe('SkillsView toolset management', () => {
     // Internal route change into the Models section with the aux slot target —
     // consumed by ModelSettings' deep-link highlight. Never an external URL.
     await waitFor(() => expect(navigateSpy).toHaveBeenCalledWith('/settings?tab=config:model&aux=vision'))
+  })
+})
+
+describe('evaOS managed upstream capabilities', () => {
+  it('keeps upstream Hub, MCP, toggles, and configuration controls available', async () => {
+    Object.defineProperty(window, 'hermesDesktop', {
+      configurable: true,
+      value: { eva: {} }
+    })
+    getSkills.mockResolvedValue([
+      {
+        name: 'electric-sheep-demo',
+        description: 'Approved demo capability',
+        category: 'managed',
+        enabled: true
+      }
+    ])
+
+    await renderSkills()
+
+    expect((await screen.findAllByText('Web Search')).length).toBeGreaterThan(0)
+    expect(screen.getByRole('switch', { name: en.skills.toggleToolset('Web Search', false) })).toBeTruthy()
+    expect(screen.getByText('MCP')).toBeTruthy()
+    expect(screen.getByText('Browse Hub')).toBeTruthy()
+    await waitFor(() => expect(getToolsetConfig).toHaveBeenCalledWith('web'))
   })
 })

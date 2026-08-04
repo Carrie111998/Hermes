@@ -29,6 +29,20 @@ async function rejectsWithCode(promise, code: string) {
   })
 }
 
+function captureThrown(action: () => unknown): Error {
+  let thrown: unknown
+
+  try {
+    action()
+  } catch (error) {
+    thrown = error
+  }
+
+  assert.ok(thrown instanceof Error)
+
+  return thrown
+}
+
 test('clampDataUrlReadMaxMb defaults and bounds the attach size preference', () => {
   assert.equal(clampDataUrlReadMaxMb(undefined), DATA_URL_READ_DEFAULT_MAX_MB)
   assert.equal(clampDataUrlReadMaxMb(0), 1)
@@ -89,6 +103,56 @@ test('encryptDesktopSecret requires available secure storage', () => {
     () => encryptDesktopSecret('token', { isEncryptionAvailable: () => false, encryptString: () => Buffer.alloc(0) }),
     /Secure token storage is unavailable/
   )
+})
+
+test('encryptDesktopSecret gives managed users only branded secure-storage recovery', () => {
+  const unavailable = captureThrown(() =>
+    encryptDesktopSecret('token', { isEncryptionAvailable: () => false, encryptString: () => Buffer.alloc(0) }, true)
+  )
+
+  const failedEncryption = captureThrown(() =>
+    encryptDesktopSecret(
+      'token',
+      {
+        isEncryptionAvailable: () => true,
+        encryptString: () => {
+          throw new Error('keychain denied')
+        }
+      },
+      true
+    )
+  )
+
+  for (const error of [unavailable, failedEncryption]) {
+    assert.match(error.message, /evaOS Agent/)
+    assert.match(error.message, /Enable OS keychain access and try again/)
+    assert.match(error.message, /contact Electric Sheep support/)
+    assert.doesNotMatch(error.message, /HERMES_DESKTOP_REMOTE_(?:URL|TOKEN)/)
+  }
+})
+
+test('encryptDesktopSecret preserves unmanaged environment fallback recovery', () => {
+  const unavailable = captureThrown(() =>
+    encryptDesktopSecret('token', { isEncryptionAvailable: () => false, encryptString: () => Buffer.alloc(0) }, false)
+  )
+
+  const failedEncryption = captureThrown(() =>
+    encryptDesktopSecret(
+      'token',
+      {
+        isEncryptionAvailable: () => true,
+        encryptString: () => {
+          throw new Error('keychain denied')
+        }
+      },
+      false
+    )
+  )
+
+  for (const error of [unavailable, failedEncryption]) {
+    assert.match(error.message, /HERMES_DESKTOP_REMOTE_URL/)
+    assert.match(error.message, /HERMES_DESKTOP_REMOTE_TOKEN/)
+  }
 })
 
 test('encryptDesktopSecret stores safeStorage base64 payload', () => {

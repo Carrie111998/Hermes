@@ -12,11 +12,17 @@
 import { allowErrorBanners, test } from './test'
 
 import {
+  IS_MANAGED_EVAOS_AGENT,
   type DeadBackendFixture,
   setupDeadBackend,
   waitForBootFailure,
 } from './fixtures'
 import { expectVisualSnapshot } from './visual-snapshot'
+
+test.skip(
+  IS_MANAGED_EVAOS_AGENT,
+  'The managed product cannot start a local backend; local boot-failure coverage is not applicable.',
+)
 
 let fixture: DeadBackendFixture | null = null
 

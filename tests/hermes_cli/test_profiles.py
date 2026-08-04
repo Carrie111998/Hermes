@@ -23,6 +23,7 @@ from hermes_cli.profiles import (
     normalize_profile_name,
     validate_profile_name,
     get_profile_dir,
+    profile_exists,
     create_profile,
     delete_profile,
     list_profiles,
@@ -105,6 +106,28 @@ class TestGetProfileDir:
         tmp_path = profile_env
         result = get_profile_dir("default")
         assert result == tmp_path / ".hermes"
+
+    def test_named_profile_is_normalized_and_contained(self, profile_env):
+        tmp_path = profile_env
+        result = get_profile_dir("Coder")
+        assert result == tmp_path / ".hermes" / "profiles" / "coder"
+
+    @pytest.mark.parametrize("name", ["../escape", "../../.bashrc", "/tmp/escape", "has space"])
+    def test_unsafe_profile_name_cannot_escape_profiles_root(self, profile_env, name):
+        with pytest.raises(ValueError):
+            get_profile_dir(name)
+
+
+class TestProfileExists:
+    @pytest.mark.parametrize("name", [None, "", "../escape", "has space", "hermes"])
+    def test_invalid_names_return_false(self, profile_env, name):
+        assert profile_exists(name) is False
+
+    def test_missing_and_existing_profiles(self, profile_env):
+        assert profile_exists("missing") is False
+        (_get_profiles_root() / "coder").mkdir(parents=True)
+        assert profile_exists("Coder") is True
+        assert profile_exists("default") is True
 
 
 # ===================================================================
@@ -814,6 +837,4 @@ class TestProfilesToServe:
         assert set(serve) == {"default", "coder", "writer"}
         assert serve["default"] == _get_default_hermes_home()
         assert serve["coder"] == get_profile_dir("coder")
-
-
 

@@ -48,7 +48,7 @@ function resolveTimeoutMs(timeoutMs, fallbackMs = DEFAULT_FETCH_TIMEOUT_MS) {
   return fallback
 }
 
-function encryptDesktopSecret(value, safeStorageApi) {
+function encryptDesktopSecret(value, safeStorageApi, managed = true) {
   const raw = String(value || '')
 
   if (!raw) {
@@ -64,8 +64,15 @@ function encryptDesktopSecret(value, safeStorageApi) {
   }
 
   if (!encryptionAvailable) {
+    if (managed) {
+      throw new Error(
+        'Secure token storage is unavailable, so evaOS Agent cannot save managed access securely. ' +
+          'Enable OS keychain access and try again, or contact Electric Sheep support.'
+      )
+    }
+
     throw new Error(
-      'Secure token storage is unavailable, so Hermes Desktop cannot save remote gateway tokens. ' +
+      'Secure token storage is unavailable, so evaOS Agent cannot save remote gateway tokens. ' +
         'Set HERMES_DESKTOP_REMOTE_URL and HERMES_DESKTOP_REMOTE_TOKEN in your environment, or enable OS keychain access and try again.'
     )
   }
@@ -77,6 +84,14 @@ function encryptDesktopSecret(value, safeStorageApi) {
     }
   } catch (error) {
     const detail = error instanceof Error && error.message ? ` (${error.message})` : ''
+
+    if (managed) {
+      throw new Error(
+        `Failed to encrypt evaOS Agent managed access for secure storage${detail}. ` +
+          'Enable OS keychain access and try again, or contact Electric Sheep support.'
+      )
+    }
+
     throw new Error(
       `Failed to encrypt the remote gateway token for secure storage${detail}. ` +
         'Set HERMES_DESKTOP_REMOTE_URL and HERMES_DESKTOP_REMOTE_TOKEN in your environment as a fallback.'

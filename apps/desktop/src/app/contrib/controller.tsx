@@ -38,9 +38,11 @@ import { Slot } from '@/contrib/react/slot'
 import { useContributions } from '@/contrib/react/use-contributions'
 import { registry } from '@/contrib/registry'
 import { discoverRuntimePlugins } from '@/contrib/runtime-loader'
+import { isManagedEvaosAgent } from '@/i18n/managed-brand'
 import { sessionTitle as storedSessionTitle } from '@/lib/chat-runtime'
 import { FileText, LayoutDashboard, PanelBottom, Terminal, Zap } from '@/lib/icons'
 import { type KeybindContribution, KEYBINDS_AREA } from '@/lib/keybinds/actions'
+import { isManagedTerminalUiVisible } from '@/lib/managed-ui-policy'
 import { setYoloEnabled } from '@/lib/yolo-session'
 import { pruneComposerPopoutZones } from '@/store/composer-popout'
 import {
@@ -98,6 +100,7 @@ import { ContribWiring, WiredPane } from './wiring'
 // ONE render identity for the workspace pane — syncWorkspaceTitle re-registers
 // the contribution (new title) and a fresh closure would remount the chat.
 const renderWorkspacePane = () => <WiredPane part="chatRoutes" />
+const terminalUiVisible = isManagedTerminalUiVisible(isManagedEvaosAgent())
 
 // Boot-hidden panes mount behind display:none (instant-toggle contract) — defer
 // them to idle so they're off the first-paint path, warm before reveal.
@@ -168,22 +171,26 @@ registry.registerMany([
     },
     render: renderWorkspacePane
   },
-  {
-    id: 'terminal',
-    area: 'panes',
-    title: 'terminal',
-    // revealOnPreset: choosing a layout that places the terminal (e.g.
-    // "Terminal deck") turns takeover on so the zone actually shows, instead of
-    // staying collapsed behind the ⌃` toggle. height sizes the fixed track (a
-    // single-pane zone declaring a height is a fixed track — the preset weight
-    // is moot): a short deck, not a third of the window.
-    //
-    // NO minHeight: a tool panel drags all the way down to its collapsed
-    // header (the sash floors it at COLLAPSED_ZONE_PX and folds the zone to
-    // its rail there). A real floor left a sliver of unusable terminal.
-    data: { placement: 'bottom', height: '20vh', maxHeight: '80vh', revealOnPreset: true },
-    render: () => <WiredPane part="terminal" />
-  },
+  ...(terminalUiVisible
+    ? [
+        {
+          id: 'terminal',
+          area: 'panes',
+          title: 'terminal',
+          // revealOnPreset: choosing a layout that places the terminal (e.g.
+          // "Terminal deck") turns takeover on so the zone actually shows, instead of
+          // staying collapsed behind the ⌃` toggle. height sizes the fixed track (a
+          // single-pane zone declaring a height is a fixed track — the preset weight
+          // is moot): a short deck, not a third of the window.
+          //
+          // NO minHeight: a tool panel drags all the way down to its collapsed
+          // header (the sash floors it at COLLAPSED_ZONE_PX and folds the zone to
+          // its rail there). A real floor left a sliver of unusable terminal.
+          data: { placement: 'bottom', height: '20vh', maxHeight: '80vh', revealOnPreset: true },
+          render: () => <WiredPane part="terminal" />
+        }
+      ]
+    : []),
   {
     id: 'files',
     area: 'panes',
@@ -272,16 +279,20 @@ registry.registerMany([
   }),
   // The agent's write -> see loop: rescan <hermes home>/desktop-plugins
   // without relaunching (same-id reloads dispose the previous incarnation).
-  {
-    id: 'plugins.reload',
-    area: PALETTE_AREA,
-    data: {
-      id: 'plugins.reload',
-      label: 'Reload desktop plugins',
-      keywords: ['plugins', 'reload', 'refresh', 'desktop'],
-      run: () => void discoverRuntimePlugins()
-    } satisfies PaletteContribution
-  },
+  ...(!isManagedEvaosAgent()
+    ? [
+        {
+          id: 'plugins.reload',
+          area: PALETTE_AREA,
+          data: {
+            id: 'plugins.reload',
+            label: 'Reload desktop plugins',
+            keywords: ['plugins', 'reload', 'refresh', 'desktop'],
+            run: () => void discoverRuntimePlugins()
+          } satisfies PaletteContribution
+        }
+      ]
+    : []),
   {
     id: 'layout.reset',
     area: PALETTE_AREA,
@@ -329,29 +340,30 @@ registry.registerMany([
 // zones collapse to nothing while their pane is hidden (no target / ⌘G off).
 // This static spot is just the seed — dockPaneBeside keeps preview adjacent
 // to files WHEREVER files moves (see the target listeners below).
+const DEFAULT_RAIL_TREE = split(
+  'row',
+  [
+    group(['review'], { id: 'grp-review' }),
+    group(['preview'], { id: 'grp-preview' }),
+    group(['files'], { id: 'grp-files' })
+  ],
+  [1, 1, 1.2],
+  'spl-rail'
+)
+
 const DEFAULT_TREE = split(
   'row',
   [
     group(['sessions'], { id: 'grp-sessions' }),
     group(['workspace'], { id: 'grp-main' }),
-    split(
-      'column',
-      [
-        split(
-          'row',
-          [
-            group(['review'], { id: 'grp-review' }),
-            group(['preview'], { id: 'grp-preview' }),
-            group(['files'], { id: 'grp-files' })
-          ],
-          [1, 1, 1.2],
-          'spl-rail'
-        ),
-        group(['terminal'], { id: 'grp-terminal' })
-      ],
-      [1.6, 1],
-      'spl-right'
-    )
+    terminalUiVisible
+      ? split(
+          'column',
+          [DEFAULT_RAIL_TREE, group(['terminal'], { id: 'grp-terminal' })],
+          [1.6, 1],
+          'spl-right'
+        )
+      : DEFAULT_RAIL_TREE
   ],
   [1, 3.4, 1.25],
   'spl-root'
@@ -359,7 +371,10 @@ const DEFAULT_TREE = split(
 
 const FOCUS_TREE = split(
   'row',
-  [group(['sessions']), group(['workspace', 'files', 'preview', 'review', 'terminal'])],
+  [
+    group(['sessions']),
+    group(terminalUiVisible ? ['workspace', 'files', 'preview', 'review', 'terminal'] : ['workspace', 'files', 'preview', 'review'])
+  ],
   [1, 4.6]
 )
 
@@ -384,8 +399,12 @@ const QUAD_TREE = split(
 registry.registerMany([
   { id: 'default', area: 'layouts', title: 'Default', order: 0, data: DEFAULT_TREE },
   { id: 'focus', area: 'layouts', title: 'Focus', order: 10, data: FOCUS_TREE },
-  { id: 'terminal-deck', area: 'layouts', title: 'Terminal deck', order: 20, data: TERMINAL_TREE },
-  { id: 'quad', area: 'layouts', title: 'Quad', order: 30, data: QUAD_TREE }
+  ...(terminalUiVisible
+    ? [
+        { id: 'terminal-deck', area: 'layouts', title: 'Terminal deck', order: 20, data: TERMINAL_TREE },
+        { id: 'quad', area: 'layouts', title: 'Quad', order: 30, data: QUAD_TREE }
+      ]
+    : [])
 ])
 
 declareDefaultTree(DEFAULT_TREE)
@@ -542,28 +561,34 @@ bindPaneVisibility(
 )
 // ⌃` / statusbar toggle — the terminal COLLAPSES to a rail (tab stays), not
 // hides; PTYs stay alive while collapsed (see PersistentTerminal).
-bindToolPaneCollapse(
-  'terminal',
-  $terminalTakeover,
-  () => setTerminalTakeover(false),
-  () => setTerminalTakeover(true)
-)
+
+if (terminalUiVisible) {
+  bindToolPaneCollapse(
+    'terminal',
+    $terminalTakeover,
+    () => setTerminalTakeover(false),
+    () => setTerminalTakeover(true)
+  )
+}
 // ⌘K door onto the same pane the keybind and statusbar pill flip — was a
 // one-way "open" row under Go to, so it never showed on/off and couldn't hide.
 // Reads the TREE like every other pane toggle: `$terminalTakeover` stays true
 // behind a stacked sibling tab or a minimized zone, which would light the row
 // "on" for a terminal that isn't on screen.
-registry.register(
-  paletteToggle({
-    id: 'view.showTerminal',
-    label: 'Toggle terminal',
-    action: 'view.showTerminal',
-    icon: Terminal,
-    keywords: ['terminal', 'shell', 'console', 'pty'],
-    get: () => isPaneVisible('terminal'),
-    set: () => togglePaneVisible('terminal')
-  })
-)
+
+if (terminalUiVisible) {
+  registry.register(
+    paletteToggle({
+      id: 'view.showTerminal',
+      label: 'Toggle terminal',
+      action: 'view.showTerminal',
+      icon: Terminal,
+      keywords: ['terminal', 'shell', 'console', 'pty'],
+      get: () => isPaneVisible('terminal'),
+      set: () => togglePaneVisible('terminal')
+    })
+  )
+}
 
 // Preview EXISTS only while something is previewed (old-shell semantics:
 // closing the last preview tab closes the pane; a new target opens + fronts

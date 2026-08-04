@@ -1,5 +1,6 @@
-import { TRANSLATIONS } from './catalog'
+import { MANAGED_TRANSLATIONS, TRANSLATIONS } from './catalog'
 import { DEFAULT_LOCALE } from './languages'
+import { isManagedEvaosAgent } from './managed-brand'
 import type { Locale } from './types'
 
 let runtimeLocale: Locale = DEFAULT_LOCALE
@@ -62,5 +63,7 @@ export function getRuntimeI18nLocale(): Locale {
 }
 
 export function translateNow(key: string, ...args: unknown[]): string {
-  return translateFrom(locale => TRANSLATIONS[locale], runtimeLocale, key, args)
+  const catalog = isManagedEvaosAgent() ? MANAGED_TRANSLATIONS : TRANSLATIONS
+
+  return translateFrom(locale => catalog[locale], runtimeLocale, key, args)
 }

@@ -96,6 +96,36 @@ describe('resolveGatewayWsUrl', () => {
     it('treats a missing authMode as non-oauth (falls back safely)', async () => {
       await expect(resolveGatewayWsUrl({}, { wsUrl: tokenConn.wsUrl })).resolves.toBe(tokenConn.wsUrl)
     })
+
+    it('requests a fresh exact endpoint ticket without adding the profile to a managed loopback URL', async () => {
+      const getGatewayWsUrl = vi.fn().mockResolvedValue('ws://127.0.0.1:4123/api/audio/speak-stream?ticket=fresh')
+
+      const connection = { ...tokenConn, profile: 'research' }
+
+      await expect(resolveGatewayWsUrl({ getGatewayWsUrl }, connection, '/api/audio/speak-stream')).resolves.toBe(
+        'ws://127.0.0.1:4123/api/audio/speak-stream?ticket=fresh'
+      )
+      expect(getGatewayWsUrl).toHaveBeenCalledWith('research', '/api/audio/speak-stream')
+    })
+
+    it('retargets a legacy token URL while preserving auth, plugin query, and profile', async () => {
+      const connection = { ...tokenConn, profile: 'research' }
+
+      const resolved = await resolveGatewayWsUrl({}, connection, '/api/plugins/kanban/events?mode=live')
+
+      const url = new URL(resolved)
+
+      expect(url.pathname).toBe('/api/plugins/kanban/events')
+      expect(url.searchParams.get('token')).toBe('abc')
+      expect(url.searchParams.get('mode')).toBe('live')
+      expect(url.searchParams.get('profile')).toBe('research')
+    })
+
+    it('treats dollar replacement sequences in plugin endpoint paths literally', async () => {
+      const resolved = await resolveGatewayWsUrl({}, tokenConn, '/api/plugins/kanban/$&events')
+
+      expect(new URL(resolved).pathname).toBe('/api/plugins/kanban/$&events')
+    })
   })
 })
 

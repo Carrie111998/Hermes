@@ -2,8 +2,9 @@ import { createContext, type ReactNode, useCallback, useContext, useEffect, useM
 
 import { getHermesConfigRecord, type HermesConfigRecord, saveHermesConfig } from '@/hermes'
 
-import { TRANSLATIONS } from './catalog'
+import { MANAGED_TRANSLATIONS, TRANSLATIONS } from './catalog'
 import { DEFAULT_LOCALE, localeConfigValue, normalizeLocale } from './languages'
+import { isManagedEvaosAgent } from './managed-brand'
 import { setRuntimeI18nLocale } from './runtime'
 import type { Locale, Translations } from './types'
 
@@ -93,7 +94,8 @@ export interface I18nProviderProps {
 }
 
 export function I18nProvider({ children, configClient = defaultConfigClient, initialLocale }: I18nProviderProps) {
-  const [locale, setLocaleState] = useState<Locale>(() => normalizeLocale(initialLocale))
+  const managed = isManagedEvaosAgent()
+  const [locale, setLocaleState] = useState<Locale>(() => (managed ? DEFAULT_LOCALE : normalizeLocale(initialLocale)))
   const [isLoadingConfig, setIsLoadingConfig] = useState(false)
   const [isSavingLocale, setIsSavingLocale] = useState(false)
   const [configLoadError, setConfigLoadError] = useState<Error | null>(null)
@@ -139,7 +141,7 @@ export function I18nProvider({ children, configClient = defaultConfigClient, ini
     return () => {
       cancelled = true
     }
-  }, [configClient, initialLocale])
+  }, [configClient, initialLocale, managed])
 
   const setLocale = useCallback(
     async (next: Locale) => {
@@ -183,9 +185,9 @@ export function I18nProvider({ children, configClient = defaultConfigClient, ini
       locale,
       saveError,
       setLocale,
-      t: TRANSLATIONS[locale]
+      t: managed ? MANAGED_TRANSLATIONS[locale] : TRANSLATIONS[locale]
     }),
-    [configLoadError, isLoadingConfig, isSavingLocale, locale, saveError, setLocale]
+    [configLoadError, isLoadingConfig, isSavingLocale, locale, managed, saveError, setLocale]
   )
 
   return <I18nContext.Provider value={value}>{children}</I18nContext.Provider>

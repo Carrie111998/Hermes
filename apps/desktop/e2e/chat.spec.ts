@@ -10,9 +10,19 @@
 
 import { expect, test } from './test'
 
-import { type MockBackendFixture, setupMockBackend, waitForAppReady } from './fixtures'
+import {
+  IS_MANAGED_EVAOS_AGENT,
+  type MockBackendFixture,
+  setupMockBackend,
+  waitForAppReady,
+} from './fixtures'
 import { BLOCKING_CLARIFY_QUESTION, BLOCKING_CLARIFY_TRIGGER } from './mock-server'
 import { expectVisualSnapshot } from './visual-snapshot'
+
+test.skip(
+  IS_MANAGED_EVAOS_AGENT,
+  'The managed product uses the assigned remote backend; local mock chat is not applicable.',
+)
 
 let fixture: MockBackendFixture | null = null
 

@@ -12,6 +12,7 @@ import {
   togglePaneVisible
 } from '@/components/pane-shell/tree/store'
 import { onReleaseTypingFocus } from '@/components/ui/keyboard-first'
+import { isManagedEvaosAgent } from '@/i18n/managed-brand'
 import { findBarClaimsCombo } from '@/lib/find-in-page'
 import { contributedKeybindHandler, PROFILE_SLOT_COUNT, SESSION_SLOT_COUNT } from '@/lib/keybinds/actions'
 import { comboAllowedInInput, comboFromEvent, isEditableTarget } from '@/lib/keybinds/combo'
@@ -85,6 +86,35 @@ export interface KeybindRuntimeDeps {
 }
 
 type HandlerMap = Record<string, () => void>
+
+export function terminalKeybindHandlers(managed = isManagedEvaosAgent()): HandlerMap {
+  if (managed) {
+    return {}
+  }
+
+  return {
+    'view.showTerminal': () => togglePaneVisible('terminal'),
+    'view.newTerminal': () => {
+      createTerminal()
+      setTerminalTakeover(true)
+    },
+    'view.nextTerminal': () => isPaneVisible('terminal') && cycleTerminal(1),
+    'view.prevTerminal': () => isPaneVisible('terminal') && cycleTerminal(-1),
+    'view.closeTerminal': () => isPaneVisible('terminal') && closeActiveTerminal()
+  }
+}
+
+function toggleRightSidebarFromKeybind(managed = isManagedEvaosAgent()): void {
+  if (layoutHasRootSide('right')) {
+    toggleFileBrowserOpen()
+
+    return
+  }
+
+  if (!managed) {
+    togglePaneVisible('terminal')
+  }
+}
 
 // Mount once near the top of the app. Owns the single global keydown listener
 // for every rebindable hotkey: it runs the matched action, or — while capture
@@ -189,24 +219,13 @@ export function useKeybinds(deps: KeybindRuntimeDeps): void {
     // ⌘J toggles the right sidebar — but a layout with no right side (e.g.
     // terminal-on-bottom) would leave it a dead key, so it falls back to the
     // terminal there. The single "secondary panel" toggle.
-    'view.toggleRightSidebar': () =>
-      layoutHasRootSide('right') ? toggleFileBrowserOpen() : togglePaneVisible('terminal'),
+    'view.toggleRightSidebar': () => toggleRightSidebarFromKeybind(),
     'view.toggleReview': toggleReview,
     'view.toggleStatusbar': toggleStatusbarVisible,
     'view.showFiles': showFiles,
-    'view.showTerminal': () => togglePaneVisible('terminal'),
-    // Create first so the pane's open-effect ensure sees a non-empty set and
-    // doesn't also spawn one — net effect is exactly one fresh terminal.
-    'view.newTerminal': () => {
-      createTerminal()
-      setTerminalTakeover(true)
-    },
-    // Switch / close only act while the terminal is actually ON SCREEN — ask
-    // the tree, not the toggle store (which stays true behind a stacked
-    // sibling tab or a minimized zone).
-    'view.nextTerminal': () => isPaneVisible('terminal') && cycleTerminal(1),
-    'view.prevTerminal': () => isPaneVisible('terminal') && cycleTerminal(-1),
-    'view.closeTerminal': () => isPaneVisible('terminal') && closeActiveTerminal(),
+    // Managed Eva has no local shell bridge. Keep these actions out of the
+    // handler map so persisted hotkeys cannot open a dead terminal surface.
+    ...terminalKeybindHandlers(),
     'view.flipPanes': togglePanesFlipped,
     // ⌘W: close the focused tab (terminal / preview target / zone tree tab).
     // On the main tab with session tabs stacked, it shifts the next one in —

@@ -6,6 +6,7 @@ import {
   getCronJob,
   getCronJobRuns,
   getCronJobs,
+  instantiateAutomationBlueprint,
   pauseCronJob,
   resumeCronJob,
   setApiRequestProfile,
@@ -70,5 +71,16 @@ describe('cron helpers are profile-scoped', () => {
     // Omitting the arg keeps the legacy unfiltered path.
     void getCronJobs()
     expect(api.mock.calls.at(-1)?.[0].path).toBe('/api/cron/jobs')
+  })
+
+  it('routes blueprint creation through the writable target profile', () => {
+    setApiRequestProfile('coder')
+
+    void instantiateAutomationBlueprint({ blueprint: 'daily-brief', values: {} }, 'default')
+
+    expect(api.mock.calls.at(-1)?.[0]).toMatchObject({
+      profile: 'default',
+      path: '/api/cron/blueprints/instantiate?profile=default'
+    })
   })
 })

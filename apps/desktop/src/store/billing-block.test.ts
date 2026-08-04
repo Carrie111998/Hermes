@@ -1,5 +1,5 @@
 import type { BillingBlock } from '@hermes/shared'
-import { beforeEach, expect, test, vi } from 'vitest'
+import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 
 vi.mock('@/lib/external-link', () => ({ openExternalLink: vi.fn() }))
 
@@ -8,7 +8,9 @@ import { openExternalLink } from '@/lib/external-link'
 import {
   $billingBlock,
   $billingSettingsRequest,
+  billingBlockPresentation,
   billingCtaLabel,
+  billingRecoveryAvailable,
   clearBillingBlock,
   requestBillingSettings,
   runBillingRecovery,
@@ -31,6 +33,10 @@ beforeEach(() => {
   $billingBlock.set(null)
   $billingSettingsRequest.set(0)
   vi.clearAllMocks()
+})
+
+afterEach(() => {
+  Reflect.deleteProperty(window, 'hermesDesktop')
 })
 
 test('setBillingBlock stores the block against its session', () => {
@@ -58,6 +64,108 @@ test('runBillingRecovery routes Nous to in-app Settings, never an external link'
   runBillingRecovery(makeBlock({ is_nous: true, provider: 'nous', provider_label: 'Nous Portal' }))
   expect($billingSettingsRequest.get()).toBe(1)
   expect(openExternalLink).not.toHaveBeenCalled()
+})
+
+test('managed Nous recovery never navigates to the hidden in-app Billing surface', () => {
+  Object.defineProperty(window, 'hermesDesktop', {
+    configurable: true,
+    value: { eva: {} },
+    writable: true
+  })
+
+  runBillingRecovery(makeBlock({ is_nous: true, provider: 'nous', provider_label: 'Nous Portal' }))
+
+  expect($billingSettingsRequest.get()).toBe(0)
+  expect(openExternalLink).not.toHaveBeenCalled()
+})
+
+test('managed recovery suppresses Nous but preserves provider-owned billing URLs', () => {
+  Object.defineProperty(window, 'hermesDesktop', {
+    configurable: true,
+    value: { eva: {} },
+    writable: true
+  })
+
+  const providerBlock = makeBlock({ billing_url: 'https://openrouter.ai/settings/credits', provider: 'openrouter' })
+
+  expect(billingRecoveryAvailable(providerBlock)).toBe(true)
+  expect(billingRecoveryAvailable(makeBlock({ is_nous: true, provider: 'nous' }))).toBe(false)
+
+  runBillingRecovery(providerBlock)
+  expect(openExternalLink).toHaveBeenCalledWith('https://openrouter.ai/settings/credits')
+  expect($billingSettingsRequest.get()).toBe(0)
+})
+
+test('managed recovery suppresses third-party blocks without a provider-owned billing URL', () => {
+  Object.defineProperty(window, 'hermesDesktop', {
+    configurable: true,
+    value: { eva: {} },
+    writable: true
+  })
+
+  const providerBlock = makeBlock({ billing_url: null, provider: 'custom' })
+
+  expect(billingRecoveryAvailable(providerBlock)).toBe(false)
+
+  runBillingRecovery(providerBlock)
+  expect(openExternalLink).not.toHaveBeenCalled()
+  expect($billingSettingsRequest.get()).toBe(0)
+})
+
+test('managed credit-wall presentation ignores backend entitlement and provider copy', () => {
+  const presentation = billingBlockPresentation(
+    makeBlock({
+      is_nous: true,
+      message: 'Your Nous subscription has no credits. Open https://portal.nousresearch.com/billing.',
+      provider: 'nous',
+      provider_label: 'Nous Portal'
+    }),
+    true,
+    {
+      fallbackMessage: 'Add credits to keep going.',
+      titleNous: 'Out of Nous credits',
+      titleProvider: provider => `Out of credits — ${provider}`
+    }
+  )
+
+  expect(presentation).toEqual({
+    message: 'Contact Electric Sheep support to restore access.',
+    title: 'evaOS Agent access unavailable'
+  })
+})
+
+test('unmanaged credit-wall presentation preserves upstream provider and backend copy', () => {
+  const presentation = billingBlockPresentation(
+    makeBlock({ message: 'Raw backend entitlement.\nMore detail.' }),
+    false,
+    {
+      fallbackMessage: 'Fallback.',
+      titleNous: 'Out of Nous credits',
+      titleProvider: provider => `Out of credits — ${provider}`
+    }
+  )
+
+  expect(presentation).toEqual({
+    message: 'Raw backend entitlement.',
+    title: 'Out of credits — OpenAI'
+  })
+})
+
+test('managed third-party presentation preserves provider and backend copy', () => {
+  const presentation = billingBlockPresentation(
+    makeBlock({ message: 'Raw provider entitlement.\nMore detail.' }),
+    true,
+    {
+      fallbackMessage: 'Fallback.',
+      titleNous: 'Out of Nous credits',
+      titleProvider: provider => `Out of credits — ${provider}`
+    }
+  )
+
+  expect(presentation).toEqual({
+    message: 'Raw provider entitlement.',
+    title: 'Out of credits — OpenAI'
+  })
 })
 
 test('runBillingRecovery deep-links a third-party provider to its billing page', () => {

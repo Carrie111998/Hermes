@@ -20,6 +20,7 @@ import { usePointerQuiet } from '@/components/ui/keyboard-first'
 import { Skeleton } from '@/components/ui/skeleton'
 import type { HermesGateway } from '@/hermes'
 import { useI18n } from '@/i18n'
+import { isManagedEvaosAgent, managedProviderDisplayValue } from '@/i18n/managed-brand'
 import { modelOptionsQueryKey, requestModelOptions } from '@/lib/model-options'
 import { displayModelName, modelDisplayParts } from '@/lib/model-status-label'
 import { DEFAULT_REASONING_EFFORT, reasoningEffortLabel } from '@/lib/reasoning-effort'
@@ -371,7 +372,14 @@ export function ModelCatalogMenu({
                   textValue=""
                 >
                   <span className="truncate">
-                    <HighlightMatches query={search} text={group.provider.name} />
+                    <HighlightMatches
+                      query={search}
+                      text={managedProviderDisplayValue(
+                        group.provider.slug,
+                        group.provider.name,
+                        isManagedEvaosAgent()
+                      )}
+                    />
                   </span>
                   <DisclosureCaret
                     className="shrink-0 text-(--ui-text-tertiary) opacity-0 transition group-hover/label:opacity-100"
