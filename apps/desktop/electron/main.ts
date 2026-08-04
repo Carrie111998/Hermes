@@ -145,6 +145,7 @@ import {
 } from './hardening'
 import { createLinkTitleWindow, guardLinkTitleSession, readLinkTitleWindowTitle } from './link-title-window'
 import { ensureMainWindow } from './main-window-lifecycle'
+import { classifyManagedDeepLink } from './managed-deep-link'
 import {
   oauthGuardMayHardFail,
   oauthSessionIsLive,
@@ -12070,13 +12071,24 @@ function handleDeepLink(url) {
   }
 
   if (EVA_MANAGED_BUILD) {
-    if (parsed.protocol === `${HERMES_PROTOCOL}:` && parsed.hostname === 'auth' && parsed.pathname === '/callback') {
+    const managedLink = classifyManagedDeepLink(url, HERMES_PROTOCOL)
+
+    if (managedLink.type === 'auth-callback') {
       void evaManagedRuntime.completeCallback(url).catch(error => {
         rememberLog(`[eva-auth] callback rejected: ${error?.code || 'invalid-callback'}`)
       })
-    } else {
-      rememberLog('[deeplink] ignoring unsupported managed-app URL')
+
+      return
     }
+
+    if (managedLink.type === 'blueprint') {
+      deliverDeepLinkPayload(managedLink.payload)
+
+      return
+    }
+
+    rememberLog('[deeplink] ignoring unsupported managed-app URL')
+
     return
   }
 
@@ -12087,8 +12099,10 @@ function handleDeepLink(url) {
   parsed.searchParams.forEach((v, k) => {
     params[k] = v
   })
-  const payload = { kind, name, params }
+  deliverDeepLinkPayload({ kind, name, params })
+}
 
+function deliverDeepLinkPayload(payload) {
   if (!_rendererReadyForDeepLink || !mainWindow || mainWindow.isDestroyed()) {
     _pendingDeepLink = payload
 
@@ -12102,7 +12116,7 @@ function handleDeepLink(url) {
 
     mainWindow.focus()
     mainWindow.webContents.send('hermes:deep-link', payload)
-    rememberLog(`[deeplink] delivered ${kind}/${name}`)
+    rememberLog(`[deeplink] delivered ${payload.kind}/${payload.name}`)
   } catch (err) {
     rememberLog(`[deeplink] delivery failed: ${err.message}`)
   }
@@ -12116,10 +12130,7 @@ ipcMain.handle('hermes:deep-link-ready', () => {
   if (_pendingDeepLink) {
     const queued = _pendingDeepLink
     _pendingDeepLink = null
-    handleDeepLink(
-      `${HERMES_PROTOCOL}://${queued.kind}/${encodeURIComponent(queued.name)}` +
-        (Object.keys(queued.params).length ? '?' + new URLSearchParams(queued.params).toString() : '')
-    )
+    deliverDeepLinkPayload(queued)
   }
 
   return { ok: true }

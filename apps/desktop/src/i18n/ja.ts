@@ -116,6 +116,9 @@ export const ja = defineLocale({
       signInIncompleteTitle: 'サインインが完了していません',
       signInIncompleteMessage: '認証が完了する前にログインウィンドウが閉じられました。',
       signInFailed: 'サインインに失敗しました',
+      managedAssignmentHint:
+        'ビジネスの割り当ては Electric Sheep によって選択されています。アクセスが変更または取り消された場合は、もう一度サインインしてください。',
+      managedSignInFailed: 'マネージドアクセスにサインインできませんでした。もう一度お試しください。',
       signInToRemoteGateway: 'リモートゲートウェイにサインイン',
       signInWithProvider: provider => `${provider} でサインイン`,
       identityProvider: 'ID プロバイダー'

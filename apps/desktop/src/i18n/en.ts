@@ -115,6 +115,9 @@ export const en: Translations = {
       signInIncompleteTitle: 'Sign-in incomplete',
       signInIncompleteMessage: 'The login window closed before authentication finished.',
       signInFailed: 'Sign-in failed',
+      managedAssignmentHint:
+        'Your business assignment is selected by Electric Sheep. Sign in again if access was changed or revoked.',
+      managedSignInFailed: 'Could not sign in to managed access. Try again.',
       signInToRemoteGateway: 'Sign in to remote gateway',
       signInWithProvider: provider => `Sign in with ${provider}`,
       identityProvider: 'your identity provider'

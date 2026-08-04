@@ -113,6 +113,8 @@ export const zh: Translations = {
       signInIncompleteTitle: '登录未完成',
       signInIncompleteMessage: '登录窗口在认证完成前关闭。',
       signInFailed: '登录失败',
+      managedAssignmentHint: '你的业务分配由 Electric Sheep 选择。如果访问权限已更改或撤销，请重新登录。',
+      managedSignInFailed: '无法登录托管访问。请重试。',
       signInToRemoteGateway: '登录远程网关',
       signInWithProvider: provider => `使用 ${provider} 登录`,
       identityProvider: '你的身份提供方'

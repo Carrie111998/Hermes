@@ -158,6 +158,8 @@ export interface Translations {
       signInIncompleteTitle: string
       signInIncompleteMessage: string
       signInFailed: string
+      managedAssignmentHint: string
+      managedSignInFailed: string
       signInToRemoteGateway: string
       signInWithProvider: (provider: string) => string
       identityProvider: string

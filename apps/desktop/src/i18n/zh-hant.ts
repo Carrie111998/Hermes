@@ -113,6 +113,8 @@ export const zhHant = defineLocale({
       signInIncompleteTitle: '登入未完成',
       signInIncompleteMessage: '登入視窗在驗證完成前關閉。',
       signInFailed: '登入失敗',
+      managedAssignmentHint: '你的企業指派由 Electric Sheep 選定。如果存取權已變更或撤銷，請重新登入。',
+      managedSignInFailed: '無法登入受管理存取權。請重試。',
       signInToRemoteGateway: '登入遠端閘道',
       signInWithProvider: provider => `使用 ${provider} 登入`,
       identityProvider: '您的身分提供方'

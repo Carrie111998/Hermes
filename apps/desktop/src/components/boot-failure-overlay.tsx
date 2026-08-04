@@ -31,6 +31,11 @@ const GatewaySettings = lazy(() =>
 type BusyAction = 'local' | 'repair' | 'retry' | 'signin' | null
 type RecoveryView = 'connect' | 'recovery'
 
+export async function completeManagedSignIn(signIn: () => Promise<unknown>, reload: () => void): Promise<void> {
+  await signIn()
+  reload()
+}
+
 // A remote gateway whose access cookie has lapsed (e.g. the dashboard
 // restarted on the remote box) boots into this overlay with a reauth-shaped
 // error. The local-recovery buttons (Retry resets the local bootstrap latch;
@@ -46,6 +51,7 @@ export function BootFailureOverlay() {
   const boot = useStore($desktopBoot)
   const onboarding = useStore($desktopOnboarding)
   const { t } = useI18n()
+  const copy = t.boot.failure
   const [busy, setBusy] = useState<BusyAction>(null)
   const [logs, setLogs] = useState<string[]>([])
   const [showLogs, setShowLogs] = useState(false)
@@ -163,8 +169,16 @@ export function BootFailureOverlay() {
 
   const signInManaged = async () => {
     setBusy('signin')
-    await window.hermesDesktop.eva.signIn().catch(() => undefined)
-    window.location.reload()
+
+    try {
+      await completeManagedSignIn(
+        () => window.hermesDesktop.eva.signIn(),
+        () => window.location.reload()
+      )
+    } catch (err) {
+      notifyError(err, copy.managedSignInFailed)
+      setBusy(null)
+    }
   }
 
   const repair = async () => {
@@ -217,7 +231,6 @@ export function BootFailureOverlay() {
   }
 
   const openLogs = () => void window.hermesDesktop?.revealLogs?.().catch(() => undefined)
-  const copy = t.boot.failure
 
   const label = signInLabel(remoteReauth, {
     identityProvider: copy.identityProvider,
@@ -268,7 +281,7 @@ export function BootFailureOverlay() {
 
   if (managedEva) {
     actions = [retryAction]
-    hint = 'Your business assignment is selected by Electric Sheep. Sign in again if access was changed or revoked.'
+    hint = copy.managedAssignmentHint
   } else if (remoteReauth) {
     actions = [
       {

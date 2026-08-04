@@ -1,10 +1,11 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { $desktopBoot } from '@/store/boot'
+import { $notifications, clearNotifications } from '@/store/notifications'
 import { $desktopOnboarding } from '@/store/onboarding'
 
-import { BootFailureOverlay } from './boot-failure-overlay'
+import { BootFailureOverlay, completeManagedSignIn } from './boot-failure-overlay'
 
 // Remote-backend users hit a hard boot failure that isn't OAuth reauth (token
 // auth, wrong URL, unreachable host). The recovery screen must let them fix the
@@ -48,6 +49,7 @@ const remoteToken = {
 }
 
 beforeEach(() => {
+  clearNotifications()
   $desktopOnboarding.set({
     configured: true,
     flow: { status: 'idle' },
@@ -62,9 +64,65 @@ beforeEach(() => {
   failBoot()
 })
 
-afterEach(cleanup)
+afterEach(() => {
+  cleanup()
+  clearNotifications()
+})
 
 describe('BootFailureOverlay', () => {
+  it('reloads only after managed sign-in succeeds', async () => {
+    const reload = vi.fn()
+
+    await expect(completeManagedSignIn(() => Promise.reject(new Error('sign-in failed')), reload)).rejects.toThrow(
+      'sign-in failed'
+    )
+    expect(reload).not.toHaveBeenCalled()
+
+    await completeManagedSignIn(() => Promise.resolve(), reload)
+    expect(reload).toHaveBeenCalledOnce()
+  })
+
+  it('localizes managed assignment recovery and keeps failed sign-in retryable', async () => {
+    const original = window.hermesDesktop
+    const signIn = vi.fn().mockRejectedValue(new Error('managed broker unavailable'))
+
+    Object.defineProperty(window, 'hermesDesktop', {
+      configurable: true,
+      value: { eva: { signIn } },
+      writable: true
+    })
+
+    try {
+      render(<BootFailureOverlay />)
+
+      expect(
+        screen.getByText(
+          'Your business assignment is selected by Electric Sheep. Sign in again if access was changed or revoked.'
+        )
+      ).toBeTruthy()
+
+      const button = screen.getByRole('button', { name: 'Sign in to remote gateway' })
+      fireEvent.click(button)
+
+      await waitFor(() => expect(signIn).toHaveBeenCalledOnce())
+      await waitFor(() =>
+        expect($notifications.get()).toEqual([
+          expect.objectContaining({
+            kind: 'error',
+            title: 'Could not sign in to managed access. Try again.'
+          })
+        ])
+      )
+      expect((button as HTMLButtonElement).disabled).toBe(false)
+    } finally {
+      Object.defineProperty(window, 'hermesDesktop', {
+        configurable: true,
+        value: original,
+        writable: true
+      })
+    }
+  })
+
   it('swaps to the in-place gateway settings view (no route nav) and back', async () => {
     render(<BootFailureOverlay />)
 

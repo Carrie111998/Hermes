@@ -1,11 +1,14 @@
 import { AssistantRuntimeProvider, type ThreadMessage, useExternalStoreRuntime } from '@assistant-ui/react'
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { useEffect, useState } from 'react'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+
+import { I18nProvider } from '@/i18n'
 
 import { Thread } from '.'
 
 const createdAt = new Date('2026-05-01T00:00:00.000Z')
+const originalDesktop = window.hermesDesktop
 
 const resizeObservers = new Set<TestResizeObserver>()
 
@@ -477,6 +480,14 @@ describe('assistant-ui streaming renderer', () => {
     resizeObservers.clear()
   })
 
+  afterEach(() => {
+    Object.defineProperty(window, 'hermesDesktop', {
+      configurable: true,
+      value: originalDesktop,
+      writable: true
+    })
+  })
+
   it('renders assistant text incrementally before completion', async () => {
     let controls: StreamingControls | undefined
 
@@ -484,7 +495,17 @@ describe('assistant-ui streaming renderer', () => {
       controls = next
     }
 
-    const { container } = render(<StreamingHarness onControls={registerControls} />)
+    Object.defineProperty(window, 'hermesDesktop', {
+      configurable: true,
+      value: { eva: {} },
+      writable: true
+    })
+
+    const { container } = render(
+      <I18nProvider configClient={null}>
+        <StreamingHarness onControls={registerControls} />
+      </I18nProvider>
+    )
 
     expect(screen.getByRole('status', { name: 'evaOS Agent is loading a response' })).toBeTruthy()
 
