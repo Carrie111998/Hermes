@@ -1,10 +1,6 @@
 ---
 name: multi-role-router
-description: >
-  Hook that automatically routes each inbound message to the worker profile
-  (role) best suited to handle it, using a fast auxiliary LLM classifier and
-  a short conversation-history window to keep continuations in the current
-  session. Installs as a message:pre_route hook under ~/.hermes/hooks/.
+description: Routes inbound gateway messages to per-role sessions.
 metadata:
   hermes:
     tags:

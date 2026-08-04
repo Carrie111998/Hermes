@@ -410,7 +410,7 @@ async def handle(event_type: str, context: Dict[str, Any]) -> Optional[Dict[str,
     # ------------------------------------------------------------------
     config = _load_hermes_config()
 
-    # Respect the /role auto off flag
+    # Respect the multi_role_router.auto config toggle
     router_config = config.get("multi_role_router")
     if not isinstance(router_config, dict):
         router_config = {}

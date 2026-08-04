@@ -41,8 +41,8 @@ current session.
 ## Installation
 
 ```bash
-# Copy the hook into ~/.hermes/hooks/
-cp -r ~/.hermes/hermes-agent/optional-skills/multi-role-router ~/.hermes/hooks/
+# From a hermes-agent checkout, copy the hook into ~/.hermes/hooks/
+cp -r optional-skills/multi-role-router ~/.hermes/hooks/
 
 # Restart the gateway (or run hermes gateway restart)
 # The hook loads automatically on startup.
@@ -114,17 +114,18 @@ worker profile (the profile name and the role name should match). The
 `description` field is what the classifier reads — be explicit about what
 kinds of tasks belong here.
 
-## Slash commands
+## Controlling the router
 
-Once the hook is installed, you can control it with the `/role` commands
-(from RFC #5143, requires hermes-agent >= the release that ships the commands):
+The router is controlled entirely through `~/.hermes/config.yaml` (no
+slash commands are shipped with this hook):
 
-| Command | Effect |
-|---------|--------|
-| `/role list` | Show all configured roles and their current session IDs |
-| `/role auto on` | Enable automatic routing (default) |
-| `/role auto off` | Disable routing; all messages stay in current session |
-| `/role switch <name>` | Manually switch to the named role's session |
+- `multi_role_router.auto: false` — disable automatic routing; every
+  message stays in the current session. Remove the key or set it back
+  to `true` to re-enable. The hook re-reads config on every message,
+  so no gateway restart is needed.
+- `roles:` — the role definitions the classifier reads (see above).
+- Delete `~/.hermes/hooks/multi-role-router/meta.yaml` to reset all
+  role→session mappings (see [State file](#state-file)).
 
 ## State file
 
@@ -153,8 +154,8 @@ If no `roles:` section is present in config.yaml, these defaults apply:
 ## Troubleshooting
 
 **The router keeps switching when I don't want it to.**
-Add more role descriptions to disambiguate, or temporarily disable with
-`/role auto off` (or `multi_role_router.auto: false` in config.yaml).
+Add more role descriptions to disambiguate, or temporarily disable
+routing with `multi_role_router.auto: false` in config.yaml.
 
 **I see `[multi-role-router] No base_url configured` in the logs.**
 The hook can't reach the auxiliary LLM. Add an `auxiliary.triage_specifier`
