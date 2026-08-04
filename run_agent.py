@@ -2192,7 +2192,10 @@ class AIAgent:
             )
         except Exception as exc:
             self._db_flush_scan_prefix = None
-            logger.warning("Session DB append_message failed: %s", exc)
+            logger.debug(
+                "Session DB append_message failed canonical_error_class=%s",
+                exc.__class__.__name__,
+            )
             return _CanonicalAppendOutcome(
                 committed_units=tuple(committed_units),
                 remaining_units=tuple(plan.pending_units[len(committed_units) :]),
@@ -2253,6 +2256,76 @@ class AIAgent:
         }:
             return True, state_value
         return False, state_value
+
+    def _persist_log_signature(
+        self,
+        *,
+        outcome: str,
+        canonical_units_committed: int,
+        spooled_units: int,
+        canonical_error_class: Optional[str],
+        failure_class: Optional[str],
+        receipt_count: int,
+    ) -> Tuple[str, int, int, Optional[str], Optional[str], int]:
+        return (
+            outcome,
+            int(canonical_units_committed),
+            int(spooled_units),
+            canonical_error_class,
+            failure_class,
+            int(receipt_count),
+        )
+
+    def _log_persist_outcome(
+        self,
+        *,
+        outcome: str,
+        canonical_units_committed: int,
+        spooled_units: int,
+        canonical_error_class: Optional[str],
+        failure_class: Optional[str],
+        receipt_count: int,
+    ) -> None:
+        signature = self._persist_log_signature(
+            outcome=outcome,
+            canonical_units_committed=canonical_units_committed,
+            spooled_units=spooled_units,
+            canonical_error_class=canonical_error_class,
+            failure_class=failure_class,
+            receipt_count=receipt_count,
+        )
+        previous = getattr(self, "_persist_degraded_log_state", None)
+        now = time.monotonic()
+        degraded = outcome != "canonical"
+        if degraded:
+            if (
+                previous is not None
+                and previous.get("signature") == signature
+                and (now - float(previous.get("logged_at", 0.0))) < 300.0
+            ):
+                return
+            logger.warning(
+                "Session persistence degraded outcome=%s canonical_units_committed=%d spooled_units=%d canonical_error_class=%s failure_class=%s receipt_count=%d",
+                outcome,
+                canonical_units_committed,
+                spooled_units,
+                canonical_error_class,
+                failure_class,
+                receipt_count,
+            )
+            self._persist_degraded_log_state = {"signature": signature, "logged_at": now}
+            return
+        if previous is not None:
+            logger.info(
+                "Session persistence recovered outcome=%s canonical_units_committed=%d spooled_units=%d canonical_error_class=%s failure_class=%s receipt_count=%d",
+                outcome,
+                canonical_units_committed,
+                spooled_units,
+                canonical_error_class,
+                failure_class,
+                receipt_count,
+            )
+            self._persist_degraded_log_state = None
 
     def _persist_session(self, messages: List[Dict], conversation_history: List[Dict] = None):
         """Save session state, preferring canonical DB writes and falling back to the spool."""
@@ -2321,6 +2394,14 @@ class AIAgent:
                 if self._session_db is not None:
                     self._session_db.flush_token_counts()
                 note_turn_persisted(self)
+                self._log_persist_outcome(
+                    outcome="canonical",
+                    canonical_units_committed=len(canonical_outcome.committed_units),
+                    spooled_units=0,
+                    canonical_error_class=None,
+                    failure_class=None,
+                    receipt_count=0,
+                )
                 return SessionPersistResult(
                     state=SessionPersistState.CANONICAL,
                     canonical_units_committed=len(canonical_outcome.committed_units),
@@ -2373,12 +2454,13 @@ class AIAgent:
                 and len(durable_spooled_units) == len(canonical_outcome.remaining_units)
             ):
                 note_turn_persisted(self)
-                logger.warning(
-                    "Session persistence outcome=spooled session_id=%s unit_ids=%s canonical_error_class=%s receipt_count=%d",
-                    self.session_id,
-                    [unit.persistence_unit_id for unit in canonical_outcome.remaining_units],
-                    canonical_outcome.error.__class__.__name__,
-                    len(spool_receipts),
+                self._log_persist_outcome(
+                    outcome="spooled",
+                    canonical_units_committed=len(canonical_outcome.committed_units),
+                    spooled_units=len(canonical_outcome.remaining_units),
+                    canonical_error_class=canonical_outcome.error.__class__.__name__,
+                    failure_class=None,
+                    receipt_count=len(spool_receipts),
                 )
                 return SessionPersistResult(
                     state=SessionPersistState.SPOOLED,
@@ -2390,13 +2472,13 @@ class AIAgent:
                 )
 
             failure = spool_error or canonical_outcome.error
-            logger.warning(
-                "Session persistence outcome=not_durable session_id=%s unit_ids=%s canonical_error_class=%s spool_error_class=%s receipt_count=%d",
-                self.session_id,
-                [unit.persistence_unit_id for unit in canonical_outcome.remaining_units],
-                canonical_outcome.error.__class__.__name__,
-                failure.__class__.__name__ if failure is not None else None,
-                len(spool_receipts),
+            self._log_persist_outcome(
+                outcome="not_durable",
+                canonical_units_committed=len(canonical_outcome.committed_units),
+                spooled_units=len(durable_spooled_units),
+                canonical_error_class=canonical_outcome.error.__class__.__name__,
+                failure_class=(failure.__class__.__name__ if failure is not None else None),
+                receipt_count=len(spool_receipts),
             )
             return SessionPersistResult(
                 state=SessionPersistState.NOT_DURABLE,

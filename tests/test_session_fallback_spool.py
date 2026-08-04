@@ -4,7 +4,9 @@ import errno
 import os
 import stat
 import threading
+import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -1594,3 +1596,1276 @@ def test_corrupt_active_with_zero_prefix_publishes_evidence_and_blocker(spool_ho
         assert active_path.read_bytes() == b""
     finally:
         _close_runtime(runtime)
+
+
+def _write_status_blocker_state(home: Path) -> dict[str, object]:
+    root = home / spool.SPOOL_ROOT_NAME
+    sealed = root / spool.SEALED_DIR_NAME
+    blockers = sealed / spool.BLOCKERS_DIR_NAME
+    quarantine = root / spool.QUARANTINE_DIR_NAME
+    lock_path = root / spool.LOCK_FILE_NAME
+    root.mkdir(parents=True, exist_ok=True)
+    sealed.mkdir(parents=True, exist_ok=True)
+    blockers.mkdir(parents=True, exist_ok=True)
+    quarantine.mkdir(parents=True, exist_ok=True)
+    lock_path.write_bytes(b"")
+
+    clean_frame = spool._frame_bytes_for_record(_record("status-blocked"))
+    corrupt_frame = bytearray(spool._frame_bytes_for_record(_record("status-bad", attempt_index=1)))
+    corrupt_frame[-1] ^= 0x01
+    prefix_path = sealed / "00000000000000000001.prefix.spool"
+    prefix_path.write_bytes(clean_frame)
+
+    evidence_base = f"seq-{1:020d}-checksum_mismatch-vp{len(clean_frame)}"
+    evidence_spool = quarantine / f"{evidence_base}.spool"
+    evidence_sidecar = quarantine / f"{evidence_base}.json"
+    evidence_spool.write_bytes(clean_frame + bytes(corrupt_frame))
+    evidence_sidecar.write_bytes(
+        spool._canonical_json_bytes(
+            {
+                "schema_version": 1,
+                "segment_sequence": f"{1:020d}",
+                "source_kind": "sealed",
+                "tail_status": "checksum_mismatch",
+                "valid_prefix_bytes": len(clean_frame),
+                "original_size_bytes": len(clean_frame) + len(corrupt_frame),
+                "evidence_spool_name": evidence_spool.name,
+            }
+        )
+    )
+    blocker_path = blockers / "00000000000000000001.blocker.json"
+    blocker_path.write_bytes(
+        spool._canonical_json_bytes(
+            {
+                "schema_version": 1,
+                "segment_sequence": f"{1:020d}",
+                "source_kind": "sealed",
+                "tail_status": "checksum_mismatch",
+                "valid_prefix_bytes": len(clean_frame),
+                "acked_prefix_bytes": 0,
+                "blocking_offset": len(clean_frame),
+                "prefix_segment_name": prefix_path.name,
+                "evidence_spool_name": evidence_spool.name,
+                "evidence_sidecar_name": evidence_sidecar.name,
+                "original_size_bytes": len(clean_frame) + len(corrupt_frame),
+            }
+        )
+    )
+    return {
+        "prefix_path": prefix_path,
+        "blocker_path": blocker_path,
+        "evidence_spool": evidence_spool,
+        "evidence_sidecar": evidence_sidecar,
+        "blocking_offset": len(clean_frame),
+    }
+
+
+def _status_scandir_matches(target: object, expected_path: Path) -> bool:
+    return isinstance(target, int) and spool._same_file_stat(os.fstat(target), expected_path.stat())
+
+
+class _StatusFaultingDirEntry:
+    def __init__(
+        self,
+        wrapped,
+        *,
+        stat_exc=None,
+        symlink_exc=None,
+    ):
+        self._wrapped = wrapped
+        self._stat_exc = stat_exc
+        self._symlink_exc = symlink_exc
+        self.name = wrapped.name
+
+    def __getattr__(self, name):
+        return getattr(self._wrapped, name)
+
+    def is_symlink(self):
+        if self._symlink_exc is not None:
+            raise self._symlink_exc
+        return self._wrapped.is_symlink()
+
+    def stat(self, *, follow_symlinks=True):
+        if self._stat_exc is not None:
+            raise self._stat_exc
+        return self._wrapped.stat(follow_symlinks=follow_symlinks)
+
+
+class _StatusFaultingScandir:
+    def __init__(
+        self,
+        entries,
+        *,
+        iteration_exc=None,
+        raise_after: int = 0,
+    ):
+        self._entries = iter(entries)
+        self._iteration_exc = iteration_exc
+        self._raise_after = raise_after
+        self._yielded = 0
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self._iteration_exc is not None and self._yielded >= self._raise_after:
+            raise self._iteration_exc
+        entry = next(self._entries)
+        self._yielded += 1
+        return entry
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+        return False
+
+    def close(self):
+        return None
+
+
+def test_collect_session_fallback_spool_status_missing_root_is_empty_and_non_creating(
+    spool_home, monkeypatch
+):
+    before = sorted(path.relative_to(spool_home) for path in spool_home.rglob("*"))
+
+    monkeypatch.setattr(
+        spool.os,
+        "fstatvfs",
+        lambda _fd: SimpleNamespace(f_bavail=0, f_blocks=10, f_frsize=1),
+    )
+
+    status = spool.collect_session_fallback_spool_status(now=100.0)
+
+    assert status.schema_version == 1
+    assert status.state == "empty"
+    assert status.reasons == ()
+    assert status.pending_units == 0
+    assert status.pending_frames == 0
+    assert status.pending_bytes == 0
+    assert status.oldest_pending_age_seconds is None
+    assert status.retry_pending is False
+    assert status.ack_pending is False
+    assert status.blocker_present is False
+    assert status.blocker_sequence is None
+    assert status.blocker_offset is None
+    assert status.blocker_reason_class is None
+    assert status.blocker_source_kind is None
+    assert status.inspection_error_class is None
+    assert not (spool_home / spool.SPOOL_ROOT_NAME).exists()
+    after = sorted(path.relative_to(spool_home) for path in spool_home.rglob("*"))
+    assert after == before
+
+
+def test_collect_session_fallback_spool_status_counts_clean_backlog_age_and_capacity(spool_home):
+    root, active_path, lock_path, _ = _paths(spool_home)
+    sealed_dir = root / spool.SEALED_DIR_NAME
+    root.mkdir(parents=True, exist_ok=True)
+    sealed_dir.mkdir(parents=True, exist_ok=True)
+    lock_path.write_bytes(b"")
+
+    first = spool._frame_bytes_for_record(_record("status-unit-a"))
+    second = spool._frame_bytes_for_record(_record("status-unit-b", attempt_index=1))
+    active = spool._frame_bytes_for_record(_record("status-unit-c", attempt_index=2))
+    segment_path = sealed_dir / "00000000000000000001.spool"
+    segment_path.write_bytes(first + second)
+    active_path.write_bytes(active)
+
+    os.utime(segment_path, (75.0, 75.0))
+    os.utime(active_path, (90.0, 90.0))
+
+    status = spool.collect_session_fallback_spool_status(now=100.0)
+
+    assert status.state == "degraded"
+    assert status.reasons == ("pending_backlog",)
+    assert status.pending_units == 3
+    assert status.pending_frames == 3
+    assert status.pending_bytes == len(first + second) + len(active)
+    assert status.oldest_pending_age_seconds == pytest.approx(25.0)
+    assert status.capacity_used_bytes == len(first + second) + len(active)
+    assert status.capacity_cap_bytes == spool.TOTAL_CAP_BYTES
+    assert status.capacity_remaining_bytes == spool.TOTAL_CAP_BYTES - (len(first + second) + len(active))
+    assert status.capacity_state == "ok"
+    assert status.blocker_present is False
+    assert status.retry_pending is False
+    assert status.ack_pending is False
+
+
+def test_collect_session_fallback_spool_status_reports_blocker_metadata_without_mutation(spool_home):
+    paths = _write_status_blocker_state(spool_home)
+    before = {
+        name: hashlib.sha256(Path(path).read_bytes()).hexdigest()
+        for name, path in paths.items()
+        if isinstance(path, Path)
+    }
+
+    status = spool.collect_session_fallback_spool_status(now=100.0)
+
+    assert status.state == "degraded"
+    assert status.blocker_present is True
+    assert status.blocker_sequence == 1
+    assert status.blocker_offset == paths["blocking_offset"]
+    assert status.blocker_reason_class == "checksum_mismatch"
+    assert status.blocker_source_kind == "sealed"
+    assert "blocker" in status.reasons
+    assert "pending_backlog" in status.reasons
+
+    after = {
+        name: hashlib.sha256(Path(path).read_bytes()).hexdigest()
+        for name, path in paths.items()
+        if isinstance(path, Path)
+    }
+    assert after == before
+
+
+def test_collect_session_fallback_spool_status_missing_append_lock_is_inspection_only(
+    spool_home,
+):
+    root, active_path, _lock_path, _ = _paths(spool_home)
+    root.mkdir(parents=True, exist_ok=True)
+    active_path.write_bytes(spool._frame_bytes_for_record(_record("missing-lock")))
+
+    status = spool.collect_session_fallback_spool_status(now=100.0)
+
+    assert status.state == "degraded"
+    assert status.inspection_error_class == "missing_append_lock"
+    assert "inspection_error" in status.reasons
+    assert status.blocker_present is False
+    assert status.blocker_sequence is None
+    assert status.blocker_offset is None
+    assert status.blocker_reason_class is None
+    assert status.blocker_source_kind is None
+
+
+def test_collect_session_fallback_spool_status_fails_closed_for_invalid_blocker_json(spool_home):
+    paths = _write_status_blocker_state(spool_home)
+    blocker_path = Path(str(paths["blocker_path"]))
+    blocker_path.write_text('{"schema_version":1}\n', encoding="utf-8")
+
+    status = spool.collect_session_fallback_spool_status(now=100.0)
+
+    assert status.state == "degraded"
+    assert "inspection_error" in status.reasons
+    assert status.inspection_error_class == "invalid_blocker_json"
+    assert status.blocker_present is False
+    assert status.blocker_sequence is None
+    assert status.blocker_offset is None
+    assert status.blocker_reason_class is None
+    assert status.blocker_source_kind is None
+
+
+def test_collect_session_fallback_spool_status_reports_capacity_and_disk_from_home_descriptor(
+    spool_home, monkeypatch
+):
+    root, active_path, lock_path, _ = _paths(spool_home)
+    root.mkdir(parents=True, exist_ok=True)
+    lock_path.write_bytes(b"")
+    active = spool._frame_bytes_for_record(_record("status-capacity"))
+    active_path.write_bytes(active)
+    captured = {}
+
+    def _fake_fstatvfs(fd):
+        captured["fd"] = fd
+        return SimpleNamespace(f_bavail=0, f_blocks=10, f_frsize=8)
+
+    monkeypatch.setattr(spool.os, "fstatvfs", _fake_fstatvfs)
+    monkeypatch.setattr(spool, "TOTAL_CAP_BYTES", len(active) + 1)
+
+    constrained = spool.collect_session_fallback_spool_status(now=100.0)
+
+    assert isinstance(captured["fd"], int)
+    assert constrained.capacity_remaining_bytes == 1
+    assert constrained.capacity_state == "constrained"
+    assert constrained.disk_free_bytes == 0
+    assert constrained.disk_total_bytes == 80
+    assert constrained.disk_headroom_threshold_bytes == 1
+    assert constrained.disk_state == "low"
+
+    monkeypatch.setattr(spool, "TOTAL_CAP_BYTES", len(active))
+    full = spool.collect_session_fallback_spool_status(now=100.0)
+    assert full.capacity_remaining_bytes == 0
+    assert full.capacity_state == "full"
+
+
+def test_collect_session_fallback_spool_status_degrades_when_disk_probe_fails(spool_home, monkeypatch):
+    root, active_path, lock_path, _ = _paths(spool_home)
+    root.mkdir(parents=True, exist_ok=True)
+    lock_path.write_bytes(b"")
+    active_path.write_bytes(spool._frame_bytes_for_record(_record("status-disk-fail")))
+
+    def _boom(_fd):
+        raise OSError(errno.EIO, "boom disk path should stay hidden")
+
+    monkeypatch.setattr(spool.os, "fstatvfs", _boom)
+    status = spool.collect_session_fallback_spool_status(now=100.0)
+
+    assert status.state == "degraded"
+    assert "inspection_error" in status.reasons
+    assert status.inspection_error_class == "disk_probe_failed"
+    assert status.disk_state == "unknown"
+    assert status.disk_free_bytes is None
+    assert status.disk_total_bytes is None
+    assert "boom disk path should stay hidden" not in repr(status)
+
+
+def test_collect_session_fallback_spool_status_valid_blocker_survives_later_disk_probe_failure(
+    spool_home, monkeypatch
+):
+    _write_status_blocker_state(spool_home)
+
+    def _boom(_fd):
+        raise OSError(errno.EIO, "later disk probe failure")
+
+    monkeypatch.setattr(spool.os, "fstatvfs", _boom)
+    status = spool.collect_session_fallback_spool_status(now=100.0)
+
+    assert status.state == "degraded"
+    assert status.inspection_error_class == "disk_probe_failed"
+    assert status.blocker_present is True
+    assert status.blocker_sequence == 1
+    assert status.blocker_reason_class == "checksum_mismatch"
+    assert status.blocker_source_kind == "sealed"
+
+
+def test_collect_session_fallback_spool_status_artifact_bound_exhaustion_is_degraded(spool_home, monkeypatch):
+    root, active_path, lock_path, _ = _paths(spool_home)
+    sealed_dir = root / spool.SEALED_DIR_NAME
+    root.mkdir(parents=True, exist_ok=True)
+    sealed_dir.mkdir(parents=True, exist_ok=True)
+    lock_path.write_bytes(b"")
+    (root / spool.HIGHWATER_FILE_NAME).write_text(
+        '{"last_reserved_sequence":"00000000000000000001","schema_version":1}',
+        encoding="utf-8",
+    )
+    (sealed_dir / "00000000000000000001.spool").write_bytes(
+        spool._frame_bytes_for_record(_record("status-bound-sealed", attempt_index=1))
+    )
+
+    monkeypatch.setattr(spool, "STATUS_SCAN_ARTIFACT_LIMIT", 1)
+    monkeypatch.setattr(
+        spool,
+        "_durable_capacity_inventory",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("status bound should preflight before capacity inventory")),
+    )
+    status = spool.collect_session_fallback_spool_status(now=100.0)
+
+    assert status.state == "degraded"
+    assert status.inspection_error_class == "artifact_limit_exceeded"
+    assert "inspection_error" in status.reasons
+    assert status.blocker_present is False
+    assert status.blocker_sequence is None
+    assert status.blocker_offset is None
+    assert status.blocker_reason_class is None
+    assert status.blocker_source_kind is None
+
+
+def test_collect_session_fallback_spool_status_fully_acked_segment_reports_ack_pending_without_backlog(
+    spool_home,
+):
+    root, _active_path, lock_path, _ = _paths(spool_home)
+    sealed_dir = root / spool.SEALED_DIR_NAME
+    sealed_dir.mkdir(parents=True, exist_ok=True)
+    lock_path.write_bytes(b"")
+    segment_path = sealed_dir / "00000000000000000001.spool"
+    frame_bytes = spool._frame_bytes_for_record(_record("ack-only"))
+    segment_path.write_bytes(frame_bytes)
+    os.utime(segment_path, (75.0, 75.0))
+    decoded = spool.decode_spool_segment(segment_path)
+    frame = decoded.prefix_frames[0]
+    acks_dir = sealed_dir / spool.ACKS_DIR_NAME
+    acks_dir.mkdir(parents=True, exist_ok=True)
+    ack_name = f"{segment_path.name}.ap{decoded.valid_prefix_bytes:020d}.json"
+    (acks_dir / ack_name).write_bytes(
+        spool._canonical_json_bytes(
+            {
+                "schema_version": 1,
+                "segment_sequence": "00000000000000000001",
+                "segment_name": segment_path.name,
+                "segment_kind": "clean",
+                "segment_size_bytes": decoded.valid_prefix_bytes,
+                "acked_prefix_bytes": decoded.valid_prefix_bytes,
+                "valid_prefix_bytes": decoded.valid_prefix_bytes,
+                "tail_status": decoded.tail_status.value,
+                "last_frame_offset": frame.frame_offset,
+                "last_frame_length": frame.frame_length,
+                "last_frame_checksum_hex": frame.checksum_hex,
+            }
+        )
+    )
+
+    status = spool.collect_session_fallback_spool_status(now=100.0)
+
+    assert status.pending_units == 0
+    assert status.pending_frames == 0
+    assert status.pending_bytes == 0
+    assert "pending_backlog" not in status.reasons
+    assert status.ack_pending is True
+    assert status.oldest_pending_age_seconds == pytest.approx(25.0)
+
+
+def test_collect_session_fallback_spool_status_partial_ack_subtracts_exact_prefix(
+    spool_home,
+):
+    root, _active_path, lock_path, _ = _paths(spool_home)
+    sealed_dir = root / spool.SEALED_DIR_NAME
+    sealed_dir.mkdir(parents=True, exist_ok=True)
+    lock_path.write_bytes(b"")
+    first = spool._frame_bytes_for_record(_record("partial-a"))
+    second = spool._frame_bytes_for_record(_record("partial-b", attempt_index=1))
+    segment_path = sealed_dir / "00000000000000000001.spool"
+    segment_path.write_bytes(first + second)
+    os.utime(segment_path, (75.0, 75.0))
+    acks_dir = sealed_dir / spool.ACKS_DIR_NAME
+    acks_dir.mkdir(parents=True, exist_ok=True)
+    ack_name = f"{segment_path.name}.ap{len(first):020d}.json"
+    (acks_dir / ack_name).write_bytes(
+        spool._canonical_json_bytes(
+            _ack_payload(
+                segment_sequence=1,
+                segment_name=segment_path.name,
+                acked_prefix_bytes=len(first),
+                valid_prefix_bytes=len(first + second),
+            )
+        )
+    )
+
+    status = spool.collect_session_fallback_spool_status(now=100.0)
+
+    assert status.pending_units == 1
+    assert status.pending_frames == 1
+    assert status.pending_bytes == len(second)
+    assert status.ack_pending is True
+    assert status.oldest_pending_age_seconds == pytest.approx(25.0)
+
+
+def test_collect_session_fallback_spool_status_blocker_prefix_subtracts_acked_prefix_once(
+    spool_home,
+):
+    first = spool._frame_bytes_for_record(_record("blocker-a"))
+    second = spool._frame_bytes_for_record(_record("blocker-b", attempt_index=1))
+    corrupt_tail = bytearray(spool._frame_bytes_for_record(_record("blocker-c", attempt_index=2)))
+    corrupt_tail[-1] ^= 0x01
+    state = _write_status_blocker_state(spool_home)
+    prefix_path = Path(str(state["prefix_path"]))
+    evidence_spool = Path(str(state["evidence_spool"]))
+    evidence_sidecar = Path(str(state["evidence_sidecar"]))
+    prefix_path.write_bytes(first + second)
+    blocker_path = Path(str(state["blocker_path"]))
+    payload = json.loads(blocker_path.read_text(encoding="utf-8"))
+    evidence_base = f"seq-{1:020d}-checksum_mismatch-vp{len(first + second)}"
+    new_evidence_spool = evidence_spool.with_name(f"{evidence_base}.spool")
+    new_evidence_sidecar = evidence_sidecar.with_name(f"{evidence_base}.json")
+    evidence_spool.unlink()
+    evidence_sidecar.unlink()
+    new_evidence_spool.write_bytes(first + second + bytes(corrupt_tail))
+    new_evidence_sidecar.write_bytes(
+        spool._canonical_json_bytes(
+            {
+                "schema_version": 1,
+                "segment_sequence": f"{1:020d}",
+                "source_kind": "sealed",
+                "tail_status": "checksum_mismatch",
+                "valid_prefix_bytes": len(first + second),
+                "original_size_bytes": len(first + second + bytes(corrupt_tail)),
+                "evidence_spool_name": new_evidence_spool.name,
+            }
+        )
+    )
+    payload["valid_prefix_bytes"] = len(first + second)
+    payload["acked_prefix_bytes"] = len(first)
+    payload["blocking_offset"] = len(first + second)
+    payload["evidence_spool_name"] = new_evidence_spool.name
+    payload["evidence_sidecar_name"] = new_evidence_sidecar.name
+    payload["original_size_bytes"] = len(first + second + bytes(corrupt_tail))
+    blocker_path.write_bytes(spool._canonical_json_bytes(payload))
+
+    status = spool.collect_session_fallback_spool_status(now=100.0)
+
+    assert status.blocker_present is True
+    assert status.pending_units == 1
+    assert status.pending_frames == 1
+    assert status.pending_bytes == len(second)
+    assert status.capacity_used_bytes >= len(first + second)
+
+
+def test_collect_session_fallback_spool_status_invalid_ack_is_inspection_degradation(
+    spool_home,
+):
+    root, _active_path, lock_path, _ = _paths(spool_home)
+    sealed_dir = root / spool.SEALED_DIR_NAME
+    sealed_dir.mkdir(parents=True, exist_ok=True)
+    lock_path.write_bytes(b"")
+    segment_path = sealed_dir / "00000000000000000001.spool"
+    frame_bytes = spool._frame_bytes_for_record(_record("invalid-ack"))
+    segment_path.write_bytes(frame_bytes)
+    acks_dir = sealed_dir / spool.ACKS_DIR_NAME
+    acks_dir.mkdir(parents=True, exist_ok=True)
+    (acks_dir / f"{segment_path.name}.ap{len(frame_bytes):020d}.json").write_text(
+        '{"schema_version":1}\n',
+        encoding="utf-8",
+    )
+
+    status = spool.collect_session_fallback_spool_status(now=100.0)
+
+    assert status.state == "degraded"
+    assert status.inspection_error_class == "invalid_ack_json"
+    assert "inspection_error" in status.reasons
+    assert status.blocker_present is False
+    assert status.blocker_sequence is None
+    assert status.blocker_source_kind is None
+
+
+@pytest.mark.skipif(fcntl is None, reason="POSIX flock required")
+def test_collect_session_fallback_spool_status_lock_contention_is_bounded_and_non_mutating(spool_home):
+    assert fcntl is not None
+    root, active_path, lock_path, _ = _paths(spool_home)
+    root.mkdir(parents=True, exist_ok=True)
+    lock_path.write_bytes(b"")
+    active_path.write_bytes(spool._frame_bytes_for_record(_record("status-lock")))
+    before = active_path.read_bytes()
+
+    with lock_path.open("a+") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        status = spool.collect_session_fallback_spool_status(now=100.0)
+
+    assert status.state == "degraded"
+    assert status.inspection_error_class == "append_lock_busy"
+    assert "inspection_error" in status.reasons
+    assert status.blocker_present is False
+    assert status.blocker_sequence is None
+    assert status.blocker_offset is None
+    assert status.blocker_reason_class is None
+    assert status.blocker_source_kind is None
+    assert active_path.read_bytes() == before
+
+
+def _status_write_ack_sidecar(segment_path: Path, *, acked_prefix_bytes: int) -> None:
+    acks_dir = segment_path.parent / spool.ACKS_DIR_NAME
+    acks_dir.mkdir(parents=True, exist_ok=True)
+    ack_name = f"{segment_path.name}.ap{acked_prefix_bytes:020d}.json"
+    (acks_dir / ack_name).write_bytes(
+        spool._canonical_json_bytes(
+            _ack_payload(
+                segment_sequence=int(segment_path.name[:20]),
+                segment_name=segment_path.name,
+                acked_prefix_bytes=acked_prefix_bytes,
+                valid_prefix_bytes=segment_path.stat().st_size,
+                segment_kind=(
+                    "prefix" if segment_path.name.endswith(".prefix.spool") else "clean"
+                ),
+            )
+        )
+    )
+
+
+def _mutate_status_blocker_case(paths: dict[str, object], case_name: str) -> None:
+    blocker_path = Path(str(paths["blocker_path"]))
+    prefix_path = Path(str(paths["prefix_path"]))
+    evidence_spool = Path(str(paths["evidence_spool"]))
+    evidence_sidecar = Path(str(paths["evidence_sidecar"]))
+    payload = json.loads(blocker_path.read_text(encoding="utf-8"))
+
+    if case_name == "negative_acked_prefix":
+        payload["acked_prefix_bytes"] = -1
+        blocker_path.write_bytes(spool._canonical_json_bytes(payload))
+        return
+    if case_name == "acked_prefix_gt_valid_prefix":
+        payload["acked_prefix_bytes"] = payload["valid_prefix_bytes"] + 1
+        blocker_path.write_bytes(spool._canonical_json_bytes(payload))
+        return
+    if case_name == "prefix_name_none_with_nonzero_offsets":
+        payload["prefix_segment_name"] = None
+        blocker_path.write_bytes(spool._canonical_json_bytes(payload))
+        return
+    if case_name == "wrong_expected_prefix_name":
+        payload["prefix_segment_name"] = f"{1:020d}.spool"
+        blocker_path.write_bytes(spool._canonical_json_bytes(payload))
+        return
+    if case_name == "wrong_expected_evidence_names":
+        payload["evidence_spool_name"] = "wrong-evidence.spool"
+        payload["evidence_sidecar_name"] = "wrong-evidence.json"
+        blocker_path.write_bytes(spool._canonical_json_bytes(payload))
+        return
+    if case_name == "wrong_evidence_metadata":
+        evidence_payload = json.loads(evidence_sidecar.read_text(encoding="utf-8"))
+        evidence_payload["valid_prefix_bytes"] = evidence_payload["valid_prefix_bytes"] + 1
+        evidence_sidecar.write_bytes(spool._canonical_json_bytes(evidence_payload))
+        return
+    if case_name == "missing_prefix_artifact":
+        prefix_path.unlink()
+        return
+    if case_name == "nonregular_evidence_artifact":
+        evidence_spool.unlink()
+        evidence_spool.mkdir()
+        return
+    raise AssertionError(f"unknown blocker case: {case_name}")
+
+
+def test_collect_session_fallback_spool_status_decodes_sealed_segments_from_fds_only(
+    spool_home, monkeypatch
+):
+    root, _active_path, lock_path, _ = _paths(spool_home)
+    sealed_dir = root / spool.SEALED_DIR_NAME
+    sealed_dir.mkdir(parents=True, exist_ok=True)
+    lock_path.write_bytes(b"")
+    segment_path = sealed_dir / "00000000000000000001.spool"
+    segment_path.write_bytes(spool._frame_bytes_for_record(_record("status-fd-only")))
+
+    called = []
+
+    def _forbidden(path, **_kwargs):
+        called.append(str(path))
+        raise AssertionError("status path re-resolution")
+
+    monkeypatch.setattr(spool, "decode_spool_segment", _forbidden)
+
+    status = spool.collect_session_fallback_spool_status(now=100.0)
+
+    assert called == []
+    assert status.inspection_error_class is None
+    assert status.pending_units == 1
+    assert status.pending_frames == 1
+    assert status.pending_bytes == segment_path.stat().st_size
+
+
+def test_collect_session_fallback_spool_status_ack_directory_scan_count_is_constant(
+    spool_home, monkeypatch
+):
+    root, _active_path, lock_path, _ = _paths(spool_home)
+    sealed_dir = root / spool.SEALED_DIR_NAME
+    acks_dir = sealed_dir / spool.ACKS_DIR_NAME
+    sealed_dir.mkdir(parents=True, exist_ok=True)
+    acks_dir.mkdir(parents=True, exist_ok=True)
+    lock_path.write_bytes(b"")
+
+    for sequence in range(1, 4):
+        segment_path = sealed_dir / f"{sequence:020d}.spool"
+        segment_path.write_bytes(
+            spool._frame_bytes_for_record(
+                _record(f"status-ack-scan-{sequence}", attempt_index=sequence - 1)
+            )
+        )
+        _status_write_ack_sidecar(
+            segment_path,
+            acked_prefix_bytes=segment_path.stat().st_size,
+        )
+
+    ack_dir_stat = acks_dir.stat()
+    counts = {"scans": 0, "entries": 0}
+    original_scandir = spool.os.scandir
+
+    class _CountingScandir:
+        def __init__(self, iterator, *, count_entries: bool):
+            self._iterator = iterator
+            self._count_entries = count_entries
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            entry = next(self._iterator)
+            if self._count_entries:
+                counts["entries"] += 1
+            return entry
+
+        def __enter__(self):
+            self._iterator.__enter__()
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return self._iterator.__exit__(exc_type, exc, tb)
+
+        def close(self):
+            return self._iterator.close()
+
+    def _counting_scandir(target):
+        iterator = original_scandir(target)
+        count_entries = False
+        if isinstance(target, int) and spool._same_file_stat(os.fstat(target), ack_dir_stat):
+            counts["scans"] += 1
+            count_entries = True
+        return _CountingScandir(iterator, count_entries=count_entries)
+
+    monkeypatch.setattr(spool.os, "scandir", _counting_scandir)
+
+    status = spool.collect_session_fallback_spool_status(now=100.0)
+
+    assert status.ack_pending is True
+    assert counts["scans"] == 3
+    assert counts["entries"] == 9
+
+
+def test_collect_session_fallback_spool_status_oldest_age_uses_zero_prefix_blocker_queue_head(
+    spool_home,
+):
+    runtime = spool._open_locked_runtime()
+    try:
+        sealed_dir = spool._sealed_dir()
+        sealed_dir.mkdir(parents=True, exist_ok=True)
+        corrupt_frame = bytearray(spool._frame_bytes_for_record(_record("zero-prefix-head")))
+        corrupt_frame[0] = 0x00
+        spool._active_spool_path().write_bytes(bytes(corrupt_frame))
+        with spool._append_lock(runtime.lock_fd, str(spool._lock_path())):
+            published = spool._reconcile_active_spool_for_replay(runtime)
+    finally:
+        _close_runtime(runtime)
+
+    assert published is not None
+    assert published["valid_prefix_bytes"] == 0
+
+    blocker_path = spool._blockers_dir() / "00000000000000000001.blocker.json"
+    segment_path = sealed_dir / "00000000000000000002.spool"
+    segment_path.write_bytes(spool._frame_bytes_for_record(_record("later-segment")))
+    now = time.time()
+    os.utime(blocker_path, (now - 3600, now - 3600))
+    os.utime(segment_path, (now - 10, now - 10))
+
+    status = spool.collect_session_fallback_spool_status(now=now)
+
+    assert status.blocker_present is True
+    assert status.pending_frames == 1
+    assert status.oldest_pending_age_seconds == pytest.approx(3600.0, abs=1.0)
+
+
+def test_collect_session_fallback_spool_status_oldest_age_uses_nonzero_prefix_queue_head(
+    spool_home,
+):
+    paths = _write_status_blocker_state(spool_home)
+    blocker_path = Path(str(paths["blocker_path"]))
+    prefix_path = Path(str(paths["prefix_path"]))
+    now = time.time()
+    os.utime(blocker_path, (now - 3600, now - 3600))
+    os.utime(prefix_path, (now - 10, now - 10))
+
+    status = spool.collect_session_fallback_spool_status(now=now)
+
+    assert status.blocker_present is True
+    assert status.pending_frames == 1
+    assert status.oldest_pending_age_seconds == pytest.approx(10.0, abs=1.0)
+
+
+def test_collect_session_fallback_spool_status_blocker_preflight_direntry_stat_race_is_exception_safe(
+    spool_home, monkeypatch
+):
+    root, _active_path, lock_path, _ = _paths(spool_home)
+    blockers_dir = root / spool.SEALED_DIR_NAME / spool.BLOCKERS_DIR_NAME
+    blockers_dir.mkdir(parents=True, exist_ok=True)
+    lock_path.write_bytes(b"")
+    (blockers_dir / "00000000000000000001.blocker.json").write_bytes(b"not-json\n")
+
+    original_scandir = spool.os.scandir
+    injected = {"done": False}
+
+    def _racing_scandir(target):
+        iterator = original_scandir(target)
+        if not injected["done"] and _status_scandir_matches(target, blockers_dir):
+            entries = list(iterator)
+            iterator.close()
+            injected["done"] = True
+            return _StatusFaultingScandir(
+                [
+                    _StatusFaultingDirEntry(
+                        entries[0],
+                        stat_exc=FileNotFoundError("raced away"),
+                    ),
+                    *entries[1:],
+                ]
+            )
+        return iterator
+
+    monkeypatch.setattr(spool.os, "scandir", _racing_scandir)
+
+    status = spool.collect_session_fallback_spool_status(now=100.0)
+
+    assert status.state == "degraded"
+    assert status.inspection_error_class == "entry_replaced"
+    assert "inspection_error" in status.reasons
+    assert "raced away" not in repr(status)
+
+
+def test_collect_session_fallback_spool_status_segment_direntry_stat_race_after_preflight_is_exception_safe(
+    spool_home, monkeypatch
+):
+    root, _active_path, lock_path, _ = _paths(spool_home)
+    sealed_dir = root / spool.SEALED_DIR_NAME
+    sealed_dir.mkdir(parents=True, exist_ok=True)
+    lock_path.write_bytes(b"")
+    (sealed_dir / "00000000000000000001.spool").write_bytes(
+        spool._frame_bytes_for_record(_record("segment-stat-race"))
+    )
+
+    original_scandir = spool.os.scandir
+    sealed_scans = {"count": 0}
+
+    def _racing_scandir(target):
+        iterator = original_scandir(target)
+        if _status_scandir_matches(target, sealed_dir):
+            sealed_scans["count"] += 1
+            if sealed_scans["count"] == 2:
+                entries = list(iterator)
+                iterator.close()
+                return _StatusFaultingScandir(
+                    [
+                        _StatusFaultingDirEntry(
+                            entry,
+                            stat_exc=(
+                                FileNotFoundError("segment replaced")
+                                if entry.name.endswith(".spool")
+                                else None
+                            ),
+                        )
+                        for entry in entries
+                    ]
+                )
+        return iterator
+
+    monkeypatch.setattr(spool.os, "scandir", _racing_scandir)
+
+    status = spool.collect_session_fallback_spool_status(now=100.0)
+
+    assert status.state == "degraded"
+    assert status.inspection_error_class == "entry_replaced"
+    assert "inspection_error" in status.reasons
+    assert "segment replaced" not in repr(status)
+
+
+def test_collect_session_fallback_spool_status_nested_scandir_iteration_oserror_is_exception_safe(
+    spool_home, monkeypatch
+):
+    root, _active_path, lock_path, _ = _paths(spool_home)
+    blockers_dir = root / spool.SEALED_DIR_NAME / spool.BLOCKERS_DIR_NAME
+    blockers_dir.mkdir(parents=True, exist_ok=True)
+    lock_path.write_bytes(b"")
+    (blockers_dir / "00000000000000000001.blocker.json").write_bytes(b"not-json\n")
+
+    original_scandir = spool.os.scandir
+    injected = {"done": False}
+
+    def _racing_scandir(target):
+        iterator = original_scandir(target)
+        if not injected["done"] and _status_scandir_matches(target, blockers_dir):
+            iterator.close()
+            injected["done"] = True
+            return _StatusFaultingScandir(
+                [],
+                iteration_exc=OSError(errno.EIO, "nested iteration boom"),
+            )
+        return iterator
+
+    monkeypatch.setattr(spool.os, "scandir", _racing_scandir)
+
+    status = spool.collect_session_fallback_spool_status(now=100.0)
+
+    assert status.state == "degraded"
+    assert status.inspection_error_class == "inspection_error"
+    assert "inspection_error" in status.reasons
+    assert "nested iteration boom" not in repr(status)
+
+
+def test_collect_session_fallback_spool_status_symlink_shaped_metadata_race_maps_to_symlink_refused(
+    spool_home, monkeypatch
+):
+    root, _active_path, lock_path, _ = _paths(spool_home)
+    sealed_dir = root / spool.SEALED_DIR_NAME
+    sealed_dir.mkdir(parents=True, exist_ok=True)
+    lock_path.write_bytes(b"")
+    (sealed_dir / "00000000000000000001.spool").write_bytes(
+        spool._frame_bytes_for_record(_record("segment-eloop-race"))
+    )
+
+    original_scandir = spool.os.scandir
+    sealed_scans = {"count": 0}
+
+    def _racing_scandir(target):
+        iterator = original_scandir(target)
+        if _status_scandir_matches(target, sealed_dir):
+            sealed_scans["count"] += 1
+            if sealed_scans["count"] == 2:
+                entries = list(iterator)
+                iterator.close()
+                return _StatusFaultingScandir(
+                    [
+                        _StatusFaultingDirEntry(
+                            entry,
+                            stat_exc=(
+                                OSError(errno.ELOOP, "symlink loop should stay hidden")
+                                if entry.name.endswith(".spool")
+                                else None
+                            ),
+                        )
+                        for entry in entries
+                    ]
+                )
+        return iterator
+
+    monkeypatch.setattr(spool.os, "scandir", _racing_scandir)
+
+    status = spool.collect_session_fallback_spool_status(now=100.0)
+
+    assert status.state == "degraded"
+    assert status.inspection_error_class == "symlink_refused"
+    assert "inspection_error" in status.reasons
+    assert "symlink loop should stay hidden" not in repr(status)
+
+
+def test_collect_session_fallback_spool_status_home_open_race_is_exception_safe(
+    spool_home, monkeypatch
+):
+    monkeypatch.setattr(
+        spool,
+        "_open_home_dir_fd",
+        lambda _home_path: (_ for _ in ()).throw(FileNotFoundError("home vanished")),
+    )
+
+    status = spool.collect_session_fallback_spool_status(now=100.0)
+
+    assert status.state == "degraded"
+    assert status.reasons == ("inspection_error",)
+    assert status.inspection_error_class == "entry_replaced"
+    assert "home vanished" not in repr(status)
+
+
+def test_collect_session_fallback_spool_status_segment_replacement_after_open_fails_closed(
+    spool_home, monkeypatch
+):
+    root, _active_path, lock_path, _ = _paths(spool_home)
+    sealed_dir = root / spool.SEALED_DIR_NAME
+    sealed_dir.mkdir(parents=True, exist_ok=True)
+    lock_path.write_bytes(b"")
+    segment_path = sealed_dir / "00000000000000000001.spool"
+    segment_path.write_bytes(spool._frame_bytes_for_record(_record("status-swap-a")))
+    replacement_frame = spool._frame_bytes_for_record(
+        _record("status-swap-b", attempt_index=1)
+    )
+    original_read_exact = spool._read_exact_from_fd
+    swapped = {"done": False}
+
+    def _swap(fd: int, *, offset: int, length: int) -> bytes:
+        if not swapped["done"] and length == spool.HEADER_SIZE:
+            swapped["done"] = True
+            parked = segment_path.with_name(segment_path.name + ".parked")
+            os.replace(segment_path, parked)
+            segment_path.write_bytes(replacement_frame)
+        return original_read_exact(fd, offset=offset, length=length)
+
+    monkeypatch.setattr(spool, "_read_exact_from_fd", _swap)
+
+    status = spool.collect_session_fallback_spool_status(now=100.0)
+
+    assert status.state == "degraded"
+    assert status.inspection_error_class == "entry_replaced"
+
+
+def test_collect_session_fallback_spool_status_active_replacement_during_scan_fails_closed(
+    spool_home, monkeypatch
+):
+    root, active_path, lock_path, _ = _paths(spool_home)
+    root.mkdir(parents=True, exist_ok=True)
+    lock_path.write_bytes(b"")
+    active_path.write_bytes(spool._frame_bytes_for_record(_record("status-active-swap-old")))
+    replacement_frame = spool._frame_bytes_for_record(
+        _record(
+            "status-active-swap-new",
+            attempt_index=1,
+            contents=("replacement-is-longer",),
+        )
+    )
+    parked_path = root / "held-active.spool"
+    original_scan = spool._scan_fd
+    swapped = {"done": False}
+
+    def _swap(fd: int):
+        if not swapped["done"]:
+            swapped["done"] = True
+            os.replace(active_path, parked_path)
+            active_path.write_bytes(replacement_frame)
+        return original_scan(fd)
+
+    monkeypatch.setattr(spool, "_scan_fd", _swap)
+
+    status = spool.collect_session_fallback_spool_status(now=100.0)
+
+    assert status.state == "degraded"
+    assert status.inspection_error_class == "entry_replaced"
+    assert "inspection_error" in status.reasons
+    assert status.pending_units == 0
+    assert status.pending_frames == 0
+    assert status.pending_bytes == 0
+    assert active_path.read_bytes() == replacement_frame
+
+
+def test_collect_session_fallback_spool_status_active_file_stat_oserror_is_exception_safe(
+    spool_home, monkeypatch
+):
+    root, _active_path, lock_path, _ = _paths(spool_home)
+    sealed_dir = root / spool.SEALED_DIR_NAME
+    sealed_dir.mkdir(parents=True, exist_ok=True)
+    lock_path.write_bytes(b"")
+    segment_path = sealed_dir / "00000000000000000001.spool"
+    corrupt_frame = bytearray(spool._frame_bytes_for_record(_record("status-bad-tail")))
+    corrupt_frame[0] = 0x00
+    segment_path.write_bytes(bytes(corrupt_frame))
+
+    status = spool.collect_session_fallback_spool_status(now=100.0)
+
+    assert status.state == "degraded"
+    assert status.inspection_error_class == spool.SpoolTailStatus.BAD_MAGIC.value
+
+
+@pytest.mark.skipif(os.name != "posix", reason="symlink security is POSIX-only")
+def test_collect_session_fallback_spool_status_segment_symlink_fails_closed(spool_home):
+    root, _active_path, lock_path, _ = _paths(spool_home)
+    sealed_dir = root / spool.SEALED_DIR_NAME
+    sealed_dir.mkdir(parents=True, exist_ok=True)
+    lock_path.write_bytes(b"")
+    target = spool_home / "symlink-target.spool"
+    target.write_bytes(spool._frame_bytes_for_record(_record("status-symlink-target")))
+    (sealed_dir / "00000000000000000001.spool").symlink_to(target)
+
+    status = spool.collect_session_fallback_spool_status(now=100.0)
+
+    assert status.state == "degraded"
+    assert status.inspection_error_class == "symlink_refused"
+
+
+def test_collect_session_fallback_spool_status_segment_nonregular_artifact_fails_closed(
+    spool_home,
+):
+    root, _active_path, lock_path, _ = _paths(spool_home)
+    sealed_dir = root / spool.SEALED_DIR_NAME
+    sealed_dir.mkdir(parents=True, exist_ok=True)
+    lock_path.write_bytes(b"")
+    (sealed_dir / "00000000000000000001.spool").mkdir()
+
+    status = spool.collect_session_fallback_spool_status(now=100.0)
+
+    assert status.state == "degraded"
+    assert status.inspection_error_class == "unexpected_artifact"
+
+
+@pytest.mark.parametrize(
+    "case_name",
+    [
+        "negative_acked_prefix",
+        "acked_prefix_gt_valid_prefix",
+        "prefix_name_none_with_nonzero_offsets",
+        "wrong_expected_prefix_name",
+        "wrong_expected_evidence_names",
+        "wrong_evidence_metadata",
+        "missing_prefix_artifact",
+        "nonregular_evidence_artifact",
+    ],
+)
+def test_collect_session_fallback_spool_status_invalid_blocker_relationships_fail_closed(
+    spool_home, case_name
+):
+    paths = _write_status_blocker_state(spool_home)
+    _mutate_status_blocker_case(paths, case_name)
+
+    status = spool.collect_session_fallback_spool_status(now=100.0)
+
+    assert status.state == "degraded"
+    assert status.inspection_error_class == "invalid_blocker_json"
+    assert "inspection_error" in status.reasons
+    assert status.blocker_present is False
+    assert status.blocker_sequence is None
+    assert status.blocker_offset is None
+    assert status.blocker_reason_class is None
+    assert status.blocker_source_kind is None
+
+
+def _publish_status_ack_tombstone(
+    *,
+    sequence: int,
+    unit_id: str,
+    attempt_index: int = 0,
+) -> tuple[Path, Path, bytes]:
+    runtime = spool._open_locked_runtime()
+    try:
+        sealed_dir = spool._sealed_dir()
+        acks_dir = spool._acks_dir()
+        sealed_dir.mkdir(parents=True, exist_ok=True)
+        acks_dir.mkdir(parents=True, exist_ok=True)
+        segment_path = sealed_dir / f"{sequence:020d}.spool"
+        frame_bytes = spool._frame_bytes_for_record(
+            _record(unit_id, attempt_index=attempt_index)
+        )
+        segment_path.write_bytes(frame_bytes)
+        decoded = spool.decode_spool_segment(segment_path)
+        frame = decoded.prefix_frames[0]
+        spool._publish_ack_sidecar_strict(
+            runtime,
+            segment_sequence=sequence,
+            segment_path=segment_path,
+            ack_payload={
+                "schema_version": 1,
+                "segment_sequence": f"{sequence:020d}",
+                "segment_name": segment_path.name,
+                "segment_kind": "clean",
+                "segment_size_bytes": decoded.valid_prefix_bytes,
+                "acked_prefix_bytes": decoded.valid_prefix_bytes,
+                "valid_prefix_bytes": decoded.valid_prefix_bytes,
+                "tail_status": decoded.tail_status.value,
+                "last_frame_offset": frame.frame_offset,
+                "last_frame_length": frame.frame_length,
+                "last_frame_checksum_hex": frame.checksum_hex,
+            },
+        )
+        segment_path.unlink()
+    finally:
+        _close_runtime(runtime)
+    ack_path = next(spool._acks_dir().glob(f"{sequence:020d}.spool.ap*.json"))
+    return segment_path, ack_path, frame_bytes
+
+
+def test_collect_session_fallback_spool_status_preflight_beats_blocker_parse(
+    spool_home, monkeypatch
+):
+    root, _active_path, lock_path, _ = _paths(spool_home)
+    blockers_dir = root / spool.SEALED_DIR_NAME / spool.BLOCKERS_DIR_NAME
+    blockers_dir.mkdir(parents=True, exist_ok=True)
+    lock_path.write_bytes(b"")
+    for sequence in (1, 2):
+        (blockers_dir / f"{sequence:020d}.blocker.json").write_bytes(b"not-json\n")
+
+    parsed = {"count": 0}
+    real_load = spool._load_canonical_json_entry
+
+    def _counting_load(**kwargs):
+        parsed["count"] += 1
+        return real_load(**kwargs)
+
+    monkeypatch.setattr(spool, "STATUS_SCAN_ARTIFACT_LIMIT", 1)
+    monkeypatch.setattr(spool, "_load_canonical_json_entry", _counting_load)
+
+    status = spool.collect_session_fallback_spool_status(now=100.0)
+
+    assert status.state == "degraded"
+    assert status.inspection_error_class == "artifact_limit_exceeded"
+    assert parsed["count"] == 0
+
+
+def test_collect_session_fallback_spool_status_orphan_ack_tombstone_reports_ack_cleanup(
+    spool_home,
+):
+    _segment_path, ack_path, _frame_bytes = _publish_status_ack_tombstone(
+        sequence=1,
+        unit_id="ack-tombstone-cleanup",
+    )
+    now = time.time()
+    os.utime(ack_path, (now - 1200, now - 1200))
+
+    status = spool.collect_session_fallback_spool_status(now=now)
+
+    assert status.state == "degraded"
+    assert status.reasons == ("ack_pending",)
+    assert status.pending_units == 0
+    assert status.pending_frames == 0
+    assert status.pending_bytes == 0
+    assert status.ack_pending is True
+    assert status.oldest_pending_age_seconds == pytest.approx(1200.0, abs=1.0)
+    assert status.inspection_error_class is None
+
+
+def test_collect_session_fallback_spool_status_orphan_tombstone_keeps_fifo_age_over_later_segment(
+    spool_home,
+):
+    _segment_path, ack_path, _frame_bytes = _publish_status_ack_tombstone(
+        sequence=1,
+        unit_id="ack-tombstone-fifo",
+    )
+    root, _active_path, lock_path, _ = _paths(spool_home)
+    sealed_dir = root / spool.SEALED_DIR_NAME
+    lock_path.write_bytes(b"")
+    later_segment = sealed_dir / "00000000000000000002.spool"
+    later_bytes = spool._frame_bytes_for_record(
+        _record("later-clean-segment", attempt_index=1)
+    )
+    later_segment.write_bytes(later_bytes)
+    now = time.time()
+    os.utime(ack_path, (now - 1200, now - 1200))
+    os.utime(later_segment, (now - 10, now - 10))
+
+    status = spool.collect_session_fallback_spool_status(now=now)
+
+    assert status.ack_pending is True
+    assert status.pending_units == 1
+    assert status.pending_frames == 1
+    assert status.pending_bytes == len(later_bytes)
+    assert status.oldest_pending_age_seconds == pytest.approx(1200.0, abs=1.0)
+
+
+def test_collect_session_fallback_spool_status_orphan_ack_winner_beats_lower_partial_candidate(
+    spool_home,
+):
+    root, _active_path, lock_path, _ = _paths(spool_home)
+    sealed_dir = root / spool.SEALED_DIR_NAME
+    acks_dir = sealed_dir / spool.ACKS_DIR_NAME
+    sealed_dir.mkdir(parents=True, exist_ok=True)
+    acks_dir.mkdir(parents=True, exist_ok=True)
+    lock_path.write_bytes(b"")
+    first = spool._frame_bytes_for_record(_record("orphan-ack-a"))
+    second = spool._frame_bytes_for_record(_record("orphan-ack-b", attempt_index=1))
+    segment_path = sealed_dir / "00000000000000000001.spool"
+    segment_path.write_bytes(first + second)
+    partial_name = f"{segment_path.name}.ap{len(first):020d}.json"
+    full_name = f"{segment_path.name}.ap{len(first + second):020d}.json"
+    (acks_dir / partial_name).write_bytes(
+        spool._canonical_json_bytes(
+            _ack_payload(
+                segment_sequence=1,
+                segment_name=segment_path.name,
+                acked_prefix_bytes=len(first),
+                valid_prefix_bytes=len(first + second),
+            )
+        )
+    )
+    (acks_dir / full_name).write_bytes(
+        spool._canonical_json_bytes(
+            _ack_payload(
+                segment_sequence=1,
+                segment_name=segment_path.name,
+                acked_prefix_bytes=len(first + second),
+                valid_prefix_bytes=len(first + second),
+            )
+        )
+    )
+    segment_path.unlink()
+    now = time.time()
+    os.utime(acks_dir / full_name, (now - 1200, now - 1200))
+
+    status = spool.collect_session_fallback_spool_status(now=now)
+
+    assert status.state == "degraded"
+    assert status.reasons == ("ack_pending",)
+    assert status.pending_units == 0
+    assert status.pending_frames == 0
+    assert status.pending_bytes == 0
+    assert status.ack_pending is True
+    assert status.inspection_error_class is None
+    assert status.oldest_pending_age_seconds == pytest.approx(1200.0, abs=1.0)
+
+
+def test_collect_session_fallback_spool_status_ack_open_race_is_exception_safe(
+    spool_home, monkeypatch
+):
+    root, _active_path, lock_path, _ = _paths(spool_home)
+    sealed_dir = root / spool.SEALED_DIR_NAME
+    sealed_dir.mkdir(parents=True, exist_ok=True)
+    lock_path.write_bytes(b"")
+    segment_path = sealed_dir / "00000000000000000001.spool"
+    frame_bytes = spool._frame_bytes_for_record(_record("ack-race"))
+    segment_path.write_bytes(frame_bytes)
+    _status_write_ack_sidecar(segment_path, acked_prefix_bytes=len(frame_bytes))
+
+    def _boom(**_kwargs):
+        raise FileNotFoundError("ack vanished")
+
+    monkeypatch.setattr(spool, "_load_ack_payload_from_fd", _boom)
+
+    status = spool.collect_session_fallback_spool_status(now=100.0)
+
+    assert status.state == "degraded"
+    assert status.inspection_error_class == "entry_replaced"
+    assert "inspection_error" in status.reasons

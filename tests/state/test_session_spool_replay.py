@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import errno
 import json
+import logging
+import multiprocessing as mp
+import os
 import sqlite3
+from pathlib import Path
 
 import pytest
 
@@ -91,6 +96,34 @@ def _write_sealed_segment(home, sequence: int, *records: spool.SessionSpoolRecor
     return segment_path
 
 
+def _close_runtime_fds(runtime) -> None:
+    spool._close_fd_quietly(runtime.lock_fd)
+    spool._close_fd_quietly(runtime.root_fd)
+    spool._close_fd_quietly(runtime.home_fd)
+
+
+def _hold_replay_owner_lock(home_path: str, ready_conn, release_conn) -> None:
+    os.environ["HERMES_HOME"] = home_path
+    runtime = spool._open_locked_runtime()
+    owner = None
+    try:
+        owner = spool._try_acquire_replay_owner(runtime)
+        ready_conn.send(owner is not None)
+        release_conn.recv()
+    finally:
+        if owner is not None:
+            spool._close_fd_quietly(owner.fd)
+        ready_conn.close()
+        release_conn.close()
+        _close_runtime_fds(runtime)
+
+
+def _replay_owner_context():
+    if "fork" in mp.get_all_start_methods():
+        return mp.get_context("fork")
+    return mp.get_context()
+
+
 def _backfill_record(
     unit_id: str,
     *,
@@ -114,6 +147,14 @@ def _backfill_record(
 def _fts_message_count(db) -> int:
     with db._lock:
         return int(db._conn.execute("SELECT COUNT(*) FROM messages_fts").fetchone()[0])
+
+
+def _replay_messages_for_state(caplog, state: str) -> list[str]:
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == spool.__name__ and f"state={state}" in record.getMessage()
+    ]
 
 
 def _assert_existing_row_backfilled(session, *, parent_session_id: str) -> None:
@@ -1222,6 +1263,270 @@ def test_retry_cooldown_skips_early_trigger_and_allows_later_takeover(
         db.close()
 
 
+def test_owner_busy_returns_truthful_backlog_without_mutating_or_taking_over_owner(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / ".hermes"
+    home.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    spool._REPLAY_COOLDOWNS.clear()
+    spool._REPLAY_LOG_STATE.clear()
+    append = spool.append_records((_record(unit_id="owner-busy", content="alpha"),))
+    active_path = Path(append.unit_results[0].receipt.path)
+    active_bytes = active_path.read_bytes()
+    sealed_dir = home / spool.SPOOL_ROOT_NAME / spool.SEALED_DIR_NAME
+    context = _replay_owner_context()
+    ready_parent, ready_child = context.Pipe()
+    release_parent, release_child = context.Pipe()
+    proc = context.Process(
+        target=_hold_replay_owner_lock,
+        args=(str(home), ready_child, release_child),
+    )
+    proc.start()
+    ready_child.close()
+    release_child.close()
+    assert ready_parent.recv() is True
+    try:
+        result = spool.replay_to_session_db(object(), trigger="manual")
+
+        assert proc.is_alive()
+        assert result.state is spool.ReplayRunState.OWNER_BUSY
+        assert result.pending_bytes_after == len(active_bytes)
+        assert result.pending_frames_after == 1
+        assert result.ack_pending is False
+        assert result.first_blocked_segment is None
+        assert result.first_blocked_offset is None
+        assert active_path.read_bytes() == active_bytes
+        assert not sealed_dir.exists()
+
+        runtime = spool._open_locked_runtime()
+        try:
+            assert spool._try_acquire_replay_owner(runtime) is None
+        finally:
+            _close_runtime_fds(runtime)
+    finally:
+        release_parent.send(True)
+        proc.join(5)
+        ready_parent.close()
+        release_parent.close()
+
+    assert proc.exitcode == 0
+
+
+def test_owner_busy_snapshot_failure_returns_unknown_metrics_without_mutation_or_takeover(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / ".hermes"
+    home.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    spool._REPLAY_COOLDOWNS.clear()
+    spool._REPLAY_LOG_STATE.clear()
+    append = spool.append_records((_record(unit_id="owner-busy-unknown", content="alpha"),))
+    active_path = Path(append.unit_results[0].receipt.path)
+    active_bytes = active_path.read_bytes()
+    sealed_dir = home / spool.SPOOL_ROOT_NAME / spool.SEALED_DIR_NAME
+    context = _replay_owner_context()
+    ready_parent, ready_child = context.Pipe()
+    release_parent, release_child = context.Pipe()
+    proc = context.Process(
+        target=_hold_replay_owner_lock,
+        args=(str(home), ready_child, release_child),
+    )
+    proc.start()
+    ready_child.close()
+    release_child.close()
+    assert ready_parent.recv() is True
+
+    def _snapshot_boom(_runtime):
+        raise OSError(errno.EIO, f"secondary snapshot race {active_path} owner-busy-unknown")
+
+    monkeypatch.setattr(spool, "_snapshot_pending_backlog", _snapshot_boom)
+    try:
+        result = spool.replay_to_session_db(object(), trigger="manual")
+
+        assert proc.is_alive()
+        assert result.state is spool.ReplayRunState.OWNER_BUSY
+        assert result.pending_bytes_after == -1
+        assert result.pending_frames_after == -1
+        assert result.ack_pending is False
+        assert result.first_blocked_segment is None
+        assert result.first_blocked_offset is None
+        assert active_path.read_bytes() == active_bytes
+        assert not sealed_dir.exists()
+
+        runtime = spool._open_locked_runtime()
+        try:
+            assert spool._try_acquire_replay_owner(runtime) is None
+        finally:
+            _close_runtime_fds(runtime)
+    finally:
+        release_parent.send(True)
+        proc.join(5)
+        ready_parent.close()
+        release_parent.close()
+
+    assert proc.exitcode == 0
+
+
+def test_retry_cooldown_returns_truthful_backlog_without_reacquiring_owner(
+    tmp_path, monkeypatch, caplog
+):
+    home = tmp_path / ".hermes"
+    home.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    spool._REPLAY_COOLDOWNS.clear()
+    spool._REPLAY_LOG_STATE.clear()
+    clock = {"now": 100.0}
+    monkeypatch.setattr(spool.time, "monotonic", lambda: clock["now"])
+    db = SessionDB(db_path=home / "state.db")
+    caplog.set_level(logging.INFO)
+    segment_path = _write_sealed_segment(
+        home,
+        1,
+        _record(unit_id="cooldown-truth", content="alpha"),
+    )
+    segment_bytes = segment_path.read_bytes()
+    ack_dir = home / spool.SPOOL_ROOT_NAME / spool.SEALED_DIR_NAME / spool.ACKS_DIR_NAME
+    original_publish = spool._publish_ack_sidecar_strict
+    original_try_owner = spool._try_acquire_replay_owner
+    calls = {"ack": 0, "owner": 0}
+
+    def _count_owner(runtime):
+        calls["owner"] += 1
+        return original_try_owner(runtime)
+
+    def _busy_once(runtime, *, segment_sequence, segment_path, ack_payload):
+        calls["ack"] += 1
+        if calls["ack"] == 1:
+            raise OSError(
+                errno.EBUSY,
+                f"busy {segment_path} cooldown-truth-key-0 alpha",
+            )
+        return original_publish(
+            runtime,
+            segment_sequence=segment_sequence,
+            segment_path=segment_path,
+            ack_payload=ack_payload,
+        )
+
+    monkeypatch.setattr(spool, "_try_acquire_replay_owner", _count_owner)
+    monkeypatch.setattr(spool, "_publish_ack_sidecar_strict", _busy_once)
+    try:
+        first = spool.replay_to_session_db(db, trigger="manual")
+        second = spool.replay_to_session_db(db, trigger="manual")
+    finally:
+        db.close()
+
+    messages = _replay_messages_for_state(caplog, "retry_pending")
+
+    assert first.state is spool.ReplayRunState.RETRY_PENDING
+    assert first.retry_class == "ack_publish_busy"
+    assert first.ack_pending is True
+    assert first.cooldown_seconds > 0
+    assert first.pending_bytes_after == len(segment_bytes)
+    assert first.pending_frames_after == 1
+    assert second.state is spool.ReplayRunState.RETRY_PENDING
+    assert second.retry_class == "ack_publish_busy"
+    assert second.ack_pending is True
+    assert second.cooldown_seconds > 0
+    assert second.pending_bytes_after == len(segment_bytes)
+    assert second.pending_frames_after == 1
+    assert segment_path.read_bytes() == segment_bytes
+    assert ack_dir.exists()
+    assert sorted(ack_dir.glob("*.json")) == []
+    assert calls["ack"] == 1
+    assert calls["owner"] == 1
+    assert len(messages) == 1
+    assert "retry_class=ack_publish_busy" in messages[0]
+    assert "ack_pending=True" in messages[0]
+    assert f"pending_bytes={len(segment_bytes)}" in messages[0]
+    assert "pending_frames=1" in messages[0]
+
+
+def test_retry_cooldown_snapshot_failure_returns_unknown_metrics_without_reacquiring_owner(
+    tmp_path, monkeypatch, caplog
+):
+    home = tmp_path / ".hermes"
+    home.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    spool._REPLAY_COOLDOWNS.clear()
+    spool._REPLAY_LOG_STATE.clear()
+    clock = {"now": 100.0}
+    monkeypatch.setattr(spool.time, "monotonic", lambda: clock["now"])
+    db = SessionDB(db_path=home / "state.db")
+    caplog.set_level(logging.INFO)
+    segment_path = _write_sealed_segment(
+        home,
+        1,
+        _record(unit_id="cooldown-unknown", content="alpha"),
+    )
+    segment_bytes = segment_path.read_bytes()
+    ack_dir = home / spool.SPOOL_ROOT_NAME / spool.SEALED_DIR_NAME / spool.ACKS_DIR_NAME
+    original_publish = spool._publish_ack_sidecar_strict
+    original_try_owner = spool._try_acquire_replay_owner
+    calls = {"ack": 0, "owner": 0}
+
+    def _count_owner(runtime):
+        calls["owner"] += 1
+        return original_try_owner(runtime)
+
+    def _busy_once(runtime, *, segment_sequence, segment_path, ack_payload):
+        calls["ack"] += 1
+        if calls["ack"] == 1:
+            raise OSError(
+                errno.EBUSY,
+                f"busy {segment_path} cooldown-unknown-key-0 alpha",
+            )
+        return original_publish(
+            runtime,
+            segment_sequence=segment_sequence,
+            segment_path=segment_path,
+            ack_payload=ack_payload,
+        )
+
+    def _snapshot_boom(_runtime):
+        raise OSError(
+            errno.EIO,
+            f"secondary snapshot race {segment_path} cooldown-unknown-key-0 alpha",
+        )
+
+    monkeypatch.setattr(spool, "_try_acquire_replay_owner", _count_owner)
+    monkeypatch.setattr(spool, "_publish_ack_sidecar_strict", _busy_once)
+    try:
+        first = spool.replay_to_session_db(db, trigger="manual")
+        spool._REPLAY_LOG_STATE.clear()
+        monkeypatch.setattr(spool, "_snapshot_pending_backlog", _snapshot_boom)
+        second = spool.replay_to_session_db(db, trigger="manual")
+    finally:
+        db.close()
+
+    messages = _replay_messages_for_state(caplog, "retry_pending")
+    joined = "\n".join(messages)
+
+    assert first.state is spool.ReplayRunState.RETRY_PENDING
+    assert first.retry_class == "ack_publish_busy"
+    assert first.pending_bytes_after == len(segment_bytes)
+    assert first.pending_frames_after == 1
+    assert second.state is spool.ReplayRunState.RETRY_PENDING
+    assert second.retry_class == "ack_publish_busy"
+    assert second.ack_pending is True
+    assert second.cooldown_seconds > 0
+    assert second.pending_bytes_after == -1
+    assert second.pending_frames_after == -1
+    assert segment_path.read_bytes() == segment_bytes
+    assert ack_dir.exists()
+    assert sorted(ack_dir.glob("*.json")) == []
+    assert calls["ack"] == 1
+    assert calls["owner"] == 1
+    assert len(messages) == 2
+    assert "pending_bytes=-1" in messages[-1]
+    assert "pending_frames=-1" in messages[-1]
+    assert "secondary snapshot race" not in joined
+    assert str(segment_path) not in joined
+    assert "cooldown-unknown-key-0" not in joined
+    assert "alpha" not in joined
+
+
 def test_replay_to_session_db_seals_clean_active_spool_before_replaying(db, tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -1239,3 +1544,1448 @@ def test_replay_to_session_db_seals_clean_active_spool_before_replaying(db, tmp_
     assert sealed_entries == []
     assert active_path.exists()
     assert active_path.read_bytes() == b""
+
+
+def test_ack_publish_enospc_returns_not_durable_and_next_retry_is_duplicate_safe(
+    db, tmp_path, monkeypatch, caplog
+):
+    home = tmp_path / ".hermes"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    segment_path = _write_sealed_segment(home, 1, _record(unit_id="unit-enospc", content="alpha"))
+    segment_bytes = segment_path.read_bytes()
+    caplog.set_level(logging.INFO)
+
+    def _enospc(*_args, **_kwargs):
+        raise OSError(errno.ENOSPC, f"disk full {segment_path} unit-enospc-key-0 alpha")
+
+    monkeypatch.setattr(spool, "_publish_ack_sidecar_strict", _enospc)
+
+    first = spool.replay_to_session_db(db, trigger="manual")
+    first_log = next(
+        record.getMessage()
+        for record in caplog.records
+        if record.name == spool.__name__ and "state=not_durable" in record.getMessage()
+    )
+
+    assert first.state is spool.ReplayRunState.NOT_DURABLE
+    assert first.error_class == "errno_enospc"
+    assert segment_path.exists()
+    assert first.pending_bytes_after == len(segment_bytes)
+    assert spool._pending_frames_for_log(first) == 1
+    assert [row["content"] for row in db.get_messages("replay-session")] == ["alpha"]
+    assert _fts_message_count(db) == 1
+    assert "pending_frames=1" in first_log
+    assert f"pending_bytes={len(segment_bytes)}" in first_log
+    assert "disk full" not in first_log
+    assert str(segment_path) not in first_log
+    assert "unit-enospc-key-0" not in first_log
+    assert "alpha" not in first_log
+
+    monkeypatch.undo()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    second = spool.replay_to_session_db(db, trigger="manual")
+
+    assert second.state is spool.ReplayRunState.REPLAYED
+    assert second.frames_committed == 0
+    assert second.frames_duplicated == 1
+    assert second.frames_acked == 1
+    assert [row["content"] for row in db.get_messages("replay-session")] == ["alpha"]
+    assert _fts_message_count(db) == 1
+    assert not segment_path.exists()
+
+
+def test_second_ack_publish_enospc_reports_only_unacked_frame_and_retry_stays_duplicate_safe(
+    db, tmp_path, monkeypatch, caplog
+):
+    home = tmp_path / ".hermes"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    segment_path = _write_sealed_segment(
+        home,
+        1,
+        _record(unit_id="second-ack-enospc-a", content="alpha"),
+        _record(unit_id="second-ack-enospc-b", content="second-is-longer"),
+    )
+    decoded = spool.decode_spool_segment(segment_path)
+    first_frame, second_frame = decoded.prefix_frames
+    caplog.set_level(logging.INFO)
+    original_publish = spool._publish_ack_sidecar_strict
+    calls = {"count": 0}
+
+    def _fail_second(runtime, *, segment_sequence, segment_path, ack_payload):
+        calls["count"] += 1
+        if calls["count"] == 2:
+            raise OSError(
+                errno.ENOSPC,
+                f"disk full {segment_path} second-ack-enospc-b-key-0 second-is-longer",
+            )
+        return original_publish(
+            runtime,
+            segment_sequence=segment_sequence,
+            segment_path=segment_path,
+            ack_payload=ack_payload,
+        )
+
+    monkeypatch.setattr(spool, "_publish_ack_sidecar_strict", _fail_second)
+
+    first = spool.replay_to_session_db(db, trigger="manual")
+    messages = _replay_messages_for_state(caplog, "not_durable")
+    ack_dir = home / spool.SPOOL_ROOT_NAME / spool.SEALED_DIR_NAME / spool.ACKS_DIR_NAME
+
+    assert first.state is spool.ReplayRunState.NOT_DURABLE
+    assert first.error_class == "errno_enospc"
+    assert first.frames_acked == 1
+    assert first.pending_frames_after == 1
+    assert first.pending_bytes_after == second_frame.frame_length
+    assert first.ack_pending is True
+    assert sorted(path.name for path in ack_dir.glob("*.json")) == [
+        f"{segment_path.name}.ap{first_frame.frame_length:020d}.json"
+    ]
+    assert [row["content"] for row in db.get_messages("replay-session")] == [
+        "alpha",
+        "second-is-longer",
+    ]
+    assert _fts_message_count(db) == 2
+    assert len(messages) == 1
+    assert "pending_frames=1" in messages[0]
+    assert f"pending_bytes={second_frame.frame_length}" in messages[0]
+    assert "disk full" not in messages[0]
+    assert str(segment_path) not in messages[0]
+    assert "second-ack-enospc-b-key-0" not in messages[0]
+    assert "second-is-longer" not in messages[0]
+
+    monkeypatch.setattr(spool, "_publish_ack_sidecar_strict", original_publish)
+
+    second = spool.replay_to_session_db(db, trigger="manual")
+
+    assert second.state is spool.ReplayRunState.REPLAYED
+    assert second.frames_committed == 0
+    assert second.frames_duplicated == 2
+    assert second.frames_acked == 2
+    assert [row["content"] for row in db.get_messages("replay-session")] == [
+        "alpha",
+        "second-is-longer",
+    ]
+    assert _fts_message_count(db) == 2
+    assert not segment_path.exists()
+
+
+@pytest.mark.parametrize(
+    ("raised", "expected_retry_class"),
+    [
+        (OSError(errno.EBUSY, "busy"), "ack_publish_busy"),
+        (spool.SpoolRetryableReplayError("ack_cleanup_busy", ack_pending=True), "ack_cleanup_busy"),
+    ],
+)
+def test_second_ack_publish_retry_pending_reports_exact_unacked_frame_metadata(
+    db, tmp_path, monkeypatch, caplog, raised, expected_retry_class
+):
+    home = tmp_path / ".hermes"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    spool._REPLAY_COOLDOWNS.clear()
+    spool._REPLAY_LOG_STATE.clear()
+    clock = {"now": 100.0}
+    monkeypatch.setattr(spool.time, "monotonic", lambda: clock["now"])
+    segment_path = _write_sealed_segment(
+        home,
+        1,
+        _record(unit_id="second-ack-retry-a", content="alpha"),
+        _record(unit_id="second-ack-retry-b", content="second-is-longer"),
+    )
+    decoded = spool.decode_spool_segment(segment_path)
+    first_frame, second_frame = decoded.prefix_frames
+    caplog.set_level(logging.INFO)
+    original_publish = spool._publish_ack_sidecar_strict
+    calls = {"count": 0}
+
+    def _fail_second(runtime, *, segment_sequence, segment_path, ack_payload):
+        calls["count"] += 1
+        if calls["count"] == 2:
+            raise raised
+        return original_publish(
+            runtime,
+            segment_sequence=segment_sequence,
+            segment_path=segment_path,
+            ack_payload=ack_payload,
+        )
+
+    monkeypatch.setattr(spool, "_publish_ack_sidecar_strict", _fail_second)
+
+    result = spool.replay_to_session_db(db, trigger="manual")
+    messages = _replay_messages_for_state(caplog, "retry_pending")
+
+    assert result.state is spool.ReplayRunState.RETRY_PENDING
+    assert result.retry_class == expected_retry_class
+    assert result.pending_frames_after == 1
+    assert result.pending_bytes_after == second_frame.frame_length
+    assert result.ack_pending is True
+    assert result.cooldown_seconds > 0
+    assert len(messages) == 1
+    assert f"retry_class={expected_retry_class}" in messages[0]
+    assert "ack_pending=True" in messages[0]
+    assert "pending_frames=1" in messages[0]
+    assert f"pending_bytes={second_frame.frame_length}" in messages[0]
+    assert str(segment_path) not in messages[0]
+    assert "second-is-longer" not in messages[0]
+
+
+def test_blocker_prefix_retry_metrics_exclude_durable_acked_prefix(db, tmp_path, monkeypatch, caplog):
+    home = tmp_path / ".hermes"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    first = _record(unit_id="blocker-prefix-a", content="alpha")
+    second = _record(unit_id="blocker-prefix-b", content="beta-longer")
+    third = _record(unit_id="blocker-prefix-c", content="gamma")
+    first_frame = spool._frame_bytes_for_record(first)
+    second_frame = spool._frame_bytes_for_record(second)
+    third_frame = bytearray(spool._frame_bytes_for_record(third))
+    third_frame[-1] ^= 0x01
+    prefix_path = _write_blocker_backed_prefix_state(
+        home,
+        sequence=1,
+        source_kind="sealed",
+        prefix_bytes=first_frame + second_frame,
+        original_bytes=first_frame + second_frame + bytes(third_frame),
+        tail_status="checksum_mismatch",
+    )
+    blocker_path = (
+        home
+        / spool.SPOOL_ROOT_NAME
+        / spool.SEALED_DIR_NAME
+        / spool.BLOCKERS_DIR_NAME
+        / "00000000000000000001.blocker.json"
+    )
+    blocker_payload = json.loads(blocker_path.read_text(encoding="utf-8"))
+    blocker_payload["acked_prefix_bytes"] = len(first_frame)
+    blocker_path.write_bytes(spool._canonical_json_bytes(blocker_payload))
+    db.reconcile_bootstrap_and_append_messages_batch(
+        first.bootstrap,
+        first.batch_messages,
+        replay_patience_s=2.0,
+    )
+    caplog.set_level(logging.INFO)
+
+    def _blocked(*_args, **_kwargs):
+        raise hermes_state.CompressionSessionClosedError("replay-session")
+
+    monkeypatch.setattr(db, "reconcile_bootstrap_and_append_messages_batch", _blocked)
+
+    result = spool.replay_to_session_db(db, trigger="manual")
+    messages = _replay_messages_for_state(caplog, "blocked_integrity")
+
+    assert result.state is spool.ReplayRunState.BLOCKED_INTEGRITY
+    assert result.error_class == "CompressionSessionClosedError"
+    assert result.first_blocked_segment == 1
+    assert result.first_blocked_offset == len(first_frame)
+    assert result.pending_frames_after == 1
+    assert result.pending_bytes_after == len(second_frame)
+    assert result.ack_pending is True
+    assert prefix_path.exists()
+    assert [row["content"] for row in db.get_messages("replay-session")] == ["alpha"]
+    assert len(messages) == 1
+    assert "pending_frames=1" in messages[0]
+    assert f"pending_bytes={len(second_frame)}" in messages[0]
+    assert "replay-session" not in messages[0]
+    assert str(prefix_path) not in messages[0]
+    assert "beta-longer" not in messages[0]
+
+
+def test_blocker_prefix_ack_publish_enospc_returns_not_durable_until_repaired(
+    db, tmp_path, monkeypatch, caplog
+):
+    home = tmp_path / ".hermes"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    spool._REPLAY_COOLDOWNS.clear()
+    spool._REPLAY_LOG_STATE.clear()
+
+    first = _record(unit_id="blocker-prefix-ack-enospc-a", content="alpha")
+    second = _record(unit_id="blocker-prefix-ack-enospc-b", content="beta-longer")
+    later = _record(unit_id="blocker-prefix-ack-enospc-c", content="gamma")
+    corrupt_tail = bytearray(
+        spool._frame_bytes_for_record(
+            _record(unit_id="blocker-prefix-ack-enospc-tail", content="corrupt-tail")
+        )
+    )
+    corrupt_tail[-1] ^= 0x01
+    first_frame = spool._frame_bytes_for_record(first)
+    second_frame = spool._frame_bytes_for_record(second)
+    prefix_path = _write_blocker_backed_prefix_state(
+        home,
+        sequence=1,
+        source_kind="sealed",
+        prefix_bytes=first_frame + second_frame,
+        original_bytes=first_frame + second_frame + bytes(corrupt_tail),
+        tail_status="checksum_mismatch",
+    )
+    blocker_path = (
+        home
+        / spool.SPOOL_ROOT_NAME
+        / spool.SEALED_DIR_NAME
+        / spool.BLOCKERS_DIR_NAME
+        / "00000000000000000001.blocker.json"
+    )
+    ack_dir = home / spool.SPOOL_ROOT_NAME / spool.SEALED_DIR_NAME / spool.ACKS_DIR_NAME
+    full_ack_path = ack_dir / f"00000000000000000001.prefix.spool.ap{len(first_frame) + len(second_frame):020d}.json"
+    evidence_spool, evidence_sidecar = _assert_metadata_only_replay_evidence(
+        home,
+        sequence=1,
+        expected_source_kind="sealed",
+        expected_tail_status="checksum_mismatch",
+        expected_valid_prefix_bytes=len(first_frame) + len(second_frame),
+        expected_original_size_bytes=len(first_frame) + len(second_frame) + len(corrupt_tail),
+    )
+    caplog.set_level(logging.INFO)
+    original_publish = spool._publish_ack_sidecar_strict
+    calls = {"count": 0}
+
+    def _fail_first(runtime, *, segment_sequence, segment_path, ack_payload):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise OSError(
+                errno.ENOSPC,
+                f"injected {prefix_path} blocker-prefix-ack-enospc-a-key-0 alpha",
+            )
+        return original_publish(
+            runtime,
+            segment_sequence=segment_sequence,
+            segment_path=segment_path,
+            ack_payload=ack_payload,
+        )
+
+    monkeypatch.setattr(spool, "_publish_ack_sidecar_strict", _fail_first)
+
+    first_result = spool.replay_to_session_db(db, trigger="manual")
+    messages = _replay_messages_for_state(caplog, "not_durable")
+
+    assert first_result.state is spool.ReplayRunState.NOT_DURABLE
+    assert first_result.error_class == "errno_enospc"
+    assert first_result.frames_decoded == 1
+    assert first_result.frames_committed == 1
+    assert first_result.frames_duplicated == 0
+    assert first_result.frames_acked == 0
+    assert first_result.bytes_decoded == len(first_frame)
+    assert first_result.bytes_acked == 0
+    assert first_result.pending_frames_after == 2
+    assert first_result.pending_bytes_after == len(first_frame) + len(second_frame)
+    assert first_result.ack_pending is True
+    assert prefix_path.exists()
+    assert blocker_path.exists()
+    assert evidence_spool.exists()
+    assert evidence_sidecar.exists()
+    assert prefix_path.read_bytes() == first_frame + second_frame
+    assert evidence_spool.read_bytes() == first_frame + second_frame + bytes(corrupt_tail)
+    assert sorted(path.name for path in ack_dir.glob("*.json")) == []
+    assert [row["content"] for row in db.get_messages("replay-session")] == ["alpha"]
+    assert [row["content"] for row in db.get_messages("replay-session") if row["content"] == "gamma"] == []
+    assert len(messages) == 1
+    assert "error_class=errno_enospc" in messages[0]
+    assert "pending_frames=2" in messages[0]
+    assert f"pending_bytes={len(first_frame) + len(second_frame)}" in messages[0]
+    assert "injected" not in messages[0]
+    assert "OSError" not in messages[0]
+    assert str(prefix_path) not in messages[0]
+    assert str(blocker_path) not in messages[0]
+    assert str(evidence_spool) not in messages[0]
+    assert "blocker-prefix-ack-enospc-a-key-0" not in messages[0]
+    assert "alpha" not in messages[0]
+    assert "beta-longer" not in messages[0]
+
+    monkeypatch.setattr(spool, "_publish_ack_sidecar_strict", original_publish)
+
+    second_result = spool.replay_to_session_db(db, trigger="manual")
+
+    assert second_result.state is spool.ReplayRunState.BLOCKED_INTEGRITY
+    assert second_result.error_class == "checksum_mismatch"
+    assert second_result.first_blocked_segment == 1
+    assert second_result.first_blocked_offset == len(first_frame) + len(second_frame)
+    assert second_result.frames_committed == 1
+    assert second_result.frames_duplicated == 1
+    assert second_result.frames_acked == 2
+    assert [row["content"] for row in db.get_messages("replay-session")] == [
+        "alpha",
+        "beta-longer",
+    ]
+    assert [row["content"] for row in db.get_messages("replay-session") if row["content"] == "gamma"] == []
+    assert prefix_path.exists()
+    assert blocker_path.exists()
+    assert evidence_spool.exists()
+    assert evidence_sidecar.exists()
+    assert full_ack_path.exists()
+
+    blocker_path.unlink()
+    evidence_spool.unlink()
+    evidence_sidecar.unlink()
+    later_segment = _write_sealed_segment(home, 2, later)
+
+    third_result = spool.replay_to_session_db(db, trigger="manual")
+
+    assert third_result.state is spool.ReplayRunState.REPLAYED
+    assert third_result.frames_committed == 1
+    assert third_result.frames_duplicated == 2
+    assert third_result.frames_acked == 3
+    assert [row["content"] for row in db.get_messages("replay-session")] == [
+        "alpha",
+        "beta-longer",
+        "gamma",
+    ]
+    assert not prefix_path.exists()
+    assert not later_segment.exists()
+
+
+def test_second_ack_publish_snapshot_failure_returns_unknown_metrics_without_leaking_context(
+    db, tmp_path, monkeypatch, caplog
+):
+    home = tmp_path / ".hermes"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    spool._REPLAY_COOLDOWNS.clear()
+    spool._REPLAY_LOG_STATE.clear()
+    clock = {"now": 100.0}
+    monkeypatch.setattr(spool.time, "monotonic", lambda: clock["now"])
+    segment_path = _write_sealed_segment(
+        home,
+        1,
+        _record(unit_id="snapshot-unknown-a", content="alpha"),
+        _record(unit_id="snapshot-unknown-b", content="second-is-longer"),
+    )
+    caplog.set_level(logging.INFO)
+    original_publish = spool._publish_ack_sidecar_strict
+    calls = {"count": 0}
+
+    def _fail_second(runtime, *, segment_sequence, segment_path, ack_payload):
+        calls["count"] += 1
+        if calls["count"] == 2:
+            raise OSError(errno.EBUSY, f"busy {segment_path} snapshot-unknown-b-key-0 second-is-longer")
+        return original_publish(
+            runtime,
+            segment_sequence=segment_sequence,
+            segment_path=segment_path,
+            ack_payload=ack_payload,
+        )
+
+    def _snapshot_boom(_runtime):
+        raise OSError(errno.EIO, f"snapshot blew up {segment_path} second-is-longer")
+
+    monkeypatch.setattr(spool, "_publish_ack_sidecar_strict", _fail_second)
+    monkeypatch.setattr(spool, "_snapshot_pending_backlog", _snapshot_boom)
+
+    result = spool.replay_to_session_db(db, trigger="manual")
+    messages = _replay_messages_for_state(caplog, "retry_pending")
+
+    assert result.state is spool.ReplayRunState.RETRY_PENDING
+    assert result.retry_class == "ack_publish_busy"
+    assert result.ack_pending is True
+    assert result.cooldown_seconds > 0
+    assert result.pending_bytes_after == -1
+    assert result.pending_frames_after == -1
+    assert len(messages) == 1
+    assert "retry_class=ack_publish_busy" in messages[0]
+    assert "ack_pending=True" in messages[0]
+    assert "pending_bytes=-1" in messages[0]
+    assert "pending_frames=-1" in messages[0]
+    assert "snapshot blew up" not in messages[0]
+    assert str(segment_path) not in messages[0]
+    assert "snapshot-unknown-b-key-0" not in messages[0]
+    assert "second-is-longer" not in messages[0]
+
+
+def test_fully_acked_cleanup_busy_returns_retry_pending_with_zero_backlog_and_duplicate_safe(
+    db, tmp_path, monkeypatch, caplog
+):
+    home = tmp_path / ".hermes"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    spool._REPLAY_COOLDOWNS.clear()
+    spool._REPLAY_LOG_STATE.clear()
+    clock = {"now": 100.0}
+    monkeypatch.setattr(spool.time, "monotonic", lambda: clock["now"])
+    record = _record(unit_id="ack-cleanup-busy", content="alpha")
+    frame = spool._frame_bytes_for_record(record)
+    segment_path = _write_sealed_segment(home, 1, record)
+    ack_path = (
+        home
+        / spool.SPOOL_ROOT_NAME
+        / spool.SEALED_DIR_NAME
+        / spool.ACKS_DIR_NAME
+        / f"{segment_path.name}.ap{len(frame):020d}.json"
+    )
+    caplog.set_level(logging.INFO)
+    original_delete = spool._delete_fully_acked_segment
+
+    def _busy(*_args, **_kwargs):
+        raise OSError(
+            errno.EBUSY,
+            f"delete failed {segment_path} ack-cleanup-busy-key-0 alpha",
+        )
+
+    monkeypatch.setattr(spool, "_delete_fully_acked_segment", _busy)
+
+    first = spool.replay_to_session_db(db, trigger="manual")
+    messages = _replay_messages_for_state(caplog, "retry_pending")
+
+    assert first.state is spool.ReplayRunState.RETRY_PENDING
+    assert first.retry_class == "ack_cleanup_busy"
+    assert first.ack_pending is True
+    assert first.cooldown_seconds > 0
+    assert first.frames_committed == 1
+    assert first.frames_duplicated == 0
+    assert first.frames_acked == 1
+    assert first.pending_bytes_after == 0
+    assert first.pending_frames_after == 0
+    assert [row["content"] for row in db.get_messages("replay-session")] == ["alpha"]
+    assert _fts_message_count(db) == 1
+    assert segment_path.exists()
+    assert ack_path.exists()
+    assert len(messages) == 1
+    assert "retry_class=ack_cleanup_busy" in messages[0]
+    assert "ack_pending=True" in messages[0]
+    assert "pending_bytes=0" in messages[0]
+    assert "pending_frames=0" in messages[0]
+    assert "delete failed" not in messages[0]
+    assert str(segment_path) not in messages[0]
+    assert "ack-cleanup-busy-key-0" not in messages[0]
+    assert "alpha" not in messages[0]
+
+    monkeypatch.setattr(spool, "_delete_fully_acked_segment", original_delete)
+    clock["now"] += first.cooldown_seconds + 0.01
+
+    second = spool.replay_to_session_db(db, trigger="manual")
+
+    assert second.state is spool.ReplayRunState.REPLAYED
+    assert second.frames_committed == 0
+    assert second.frames_duplicated == 1
+    assert second.frames_acked == 1
+    assert [row["content"] for row in db.get_messages("replay-session")] == ["alpha"]
+    assert _fts_message_count(db) == 1
+    assert not segment_path.exists()
+    assert not ack_path.exists()
+
+
+def test_fully_acked_cleanup_enospc_returns_not_durable_with_zero_backlog_and_duplicate_safe(
+    db, tmp_path, monkeypatch, caplog
+):
+    home = tmp_path / ".hermes"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    record = _record(unit_id="ack-cleanup-enospc", content="alpha")
+    frame = spool._frame_bytes_for_record(record)
+    segment_path = _write_sealed_segment(home, 1, record)
+    ack_path = (
+        home
+        / spool.SPOOL_ROOT_NAME
+        / spool.SEALED_DIR_NAME
+        / spool.ACKS_DIR_NAME
+        / f"{segment_path.name}.ap{len(frame):020d}.json"
+    )
+    caplog.set_level(logging.INFO)
+    original_delete = spool._delete_fully_acked_segment
+
+    def _enospc(*_args, **_kwargs):
+        raise OSError(
+            errno.ENOSPC,
+            f"delete failed {segment_path} ack-cleanup-enospc-key-0 alpha",
+        )
+
+    monkeypatch.setattr(spool, "_delete_fully_acked_segment", _enospc)
+
+    first = spool.replay_to_session_db(db, trigger="manual")
+    messages = _replay_messages_for_state(caplog, "not_durable")
+
+    assert first.state is spool.ReplayRunState.NOT_DURABLE
+    assert first.error_class == "errno_enospc"
+    assert first.ack_pending is True
+    assert first.frames_committed == 1
+    assert first.frames_duplicated == 0
+    assert first.frames_acked == 1
+    assert first.pending_bytes_after == 0
+    assert first.pending_frames_after == 0
+    assert [row["content"] for row in db.get_messages("replay-session")] == ["alpha"]
+    assert _fts_message_count(db) == 1
+    assert segment_path.exists()
+    assert ack_path.exists()
+    assert len(messages) == 1
+    assert "error_class=errno_enospc" in messages[0]
+    assert "pending_bytes=0" in messages[0]
+    assert "pending_frames=0" in messages[0]
+    assert "delete failed" not in messages[0]
+    assert str(segment_path) not in messages[0]
+    assert "ack-cleanup-enospc-key-0" not in messages[0]
+    assert "alpha" not in messages[0]
+
+    monkeypatch.setattr(spool, "_delete_fully_acked_segment", original_delete)
+
+    second = spool.replay_to_session_db(db, trigger="manual")
+
+    assert second.state is spool.ReplayRunState.REPLAYED
+    assert second.frames_committed == 0
+    assert second.frames_duplicated == 1
+    assert second.frames_acked == 1
+    assert [row["content"] for row in db.get_messages("replay-session")] == ["alpha"]
+    assert _fts_message_count(db) == 1
+    assert not segment_path.exists()
+    assert not ack_path.exists()
+
+
+@pytest.mark.parametrize(
+    ("raised", "expected_state", "expected_retry_class", "expected_error_class"),
+    [
+        (
+            OSError(errno.EBUSY, "busy"),
+            spool.ReplayRunState.RETRY_PENDING,
+            "ack_cleanup_busy",
+            None,
+        ),
+        (
+            OSError(errno.ENOSPC, "disk full"),
+            spool.ReplayRunState.NOT_DURABLE,
+            None,
+            "errno_enospc",
+        ),
+    ],
+)
+def test_fully_acked_cleanup_snapshot_failure_returns_unknown_metrics_without_masking_outcome(
+    db,
+    tmp_path,
+    monkeypatch,
+    caplog,
+    raised,
+    expected_state,
+    expected_retry_class,
+    expected_error_class,
+):
+    home = tmp_path / ".hermes"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    record = _record(unit_id="ack-cleanup-snapshot", content="alpha")
+    segment_path = _write_sealed_segment(home, 1, record)
+    caplog.set_level(logging.INFO)
+
+    def _fail_delete(*_args, **_kwargs):
+        raise OSError(
+            raised.errno,
+            f"cleanup boom {segment_path} ack-cleanup-snapshot-key-0 alpha",
+        )
+
+    def _snapshot_boom(_runtime):
+        raise OSError(
+            errno.EIO,
+            f"snapshot blew up {segment_path} ack-cleanup-snapshot-key-0 alpha",
+        )
+
+    monkeypatch.setattr(spool, "_delete_fully_acked_segment", _fail_delete)
+    monkeypatch.setattr(spool, "_snapshot_pending_backlog", _snapshot_boom)
+
+    result = spool.replay_to_session_db(db, trigger="manual")
+    state_messages = _replay_messages_for_state(caplog, expected_state.value)
+    joined = "\n".join(state_messages)
+
+    assert result.state is expected_state
+    assert result.retry_class == expected_retry_class
+    assert result.error_class == expected_error_class
+    assert result.ack_pending is True
+    assert result.pending_bytes_after == -1
+    assert result.pending_frames_after == -1
+    if expected_state is spool.ReplayRunState.RETRY_PENDING:
+        assert result.cooldown_seconds > 0
+    assert len(state_messages) == 1
+    assert "snapshot blew up" not in joined
+    assert "cleanup boom" not in joined
+    assert str(segment_path) not in joined
+    assert "ack-cleanup-snapshot-key-0" not in joined
+    assert "alpha" not in joined
+
+
+def test_reconcile_active_enospc_returns_not_durable_with_truthful_pending_backlog(
+    tmp_path, monkeypatch, caplog
+):
+    home = tmp_path / ".hermes"
+    home.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    record = _record(unit_id="active-not-durable", content="alpha")
+    append = spool.append_records((record,))
+    active_path = home / spool.SPOOL_ROOT_NAME / spool.ACTIVE_SPOOL_NAME
+    surviving_bytes = active_path.read_bytes()
+    caplog.set_level(logging.INFO)
+
+    def _enospc(_runtime):
+        raise OSError(
+            errno.ENOSPC,
+            f"disk full {active_path} active-not-durable-key-0 alpha",
+        )
+
+    monkeypatch.setattr(spool, "_reconcile_active_spool_for_replay", _enospc)
+
+    result = spool.replay_to_session_db(object(), trigger="startup")
+    message = next(
+        record.getMessage()
+        for record in caplog.records
+        if record.name == spool.__name__ and "state=not_durable" in record.getMessage()
+    )
+
+    assert Path(append.unit_results[0].receipt.path) == active_path
+    assert result.state is spool.ReplayRunState.NOT_DURABLE
+    assert result.error_class == "errno_enospc"
+    assert active_path.read_bytes() == surviving_bytes
+    assert result.pending_bytes_after == len(surviving_bytes)
+    assert spool._pending_frames_for_log(result) == 1
+    assert f"pending_bytes={len(surviving_bytes)}" in message
+    assert "pending_frames=1" in message
+    assert "disk full" not in message
+    assert str(active_path) not in message
+    assert "active-not-durable-key-0" not in message
+    assert "alpha" not in message
+
+
+def test_post_rename_active_recreate_enospc_returns_not_durable_with_truthful_sealed_backlog(
+    db, tmp_path, monkeypatch, caplog
+):
+    home = tmp_path / ".hermes"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    record = _record(
+        unit_id="post-rename-active-create-failure",
+        content="post-rename-active-create-failure",
+    )
+    append = spool.append_records((record,))
+    active_path = home / spool.SPOOL_ROOT_NAME / spool.ACTIVE_SPOOL_NAME
+    caplog.set_level(logging.INFO)
+    original_open_file_at = spool._open_file_at
+
+    def _fail_recreate(parent_fd, name, **kwargs):
+        if (
+            name == spool.ACTIVE_SPOOL_NAME
+            and kwargs.get("create")
+            and not active_path.exists()
+        ):
+            raise OSError(
+                errno.ENOSPC,
+                f"disk full {active_path} post-rename-active-create-failure-key-0 post-rename-active-create-failure",
+            )
+        return original_open_file_at(parent_fd, name, **kwargs)
+
+    monkeypatch.setattr(spool, "_open_file_at", _fail_recreate)
+
+    first = spool.replay_to_session_db(db, trigger="manual")
+    first_log = next(
+        record.getMessage()
+        for record in caplog.records
+        if record.name == spool.__name__ and "state=not_durable" in record.getMessage()
+    )
+    sealed = sorted((home / spool.SPOOL_ROOT_NAME / spool.SEALED_DIR_NAME).glob("*.spool"))
+    surviving_bytes = sum(path.stat().st_size for path in sealed)
+
+    assert Path(append.unit_results[0].receipt.path) == active_path
+    assert first.state is spool.ReplayRunState.NOT_DURABLE
+    assert first.error_class == "errno_enospc"
+    assert not active_path.exists()
+    assert len(sealed) == 1
+    assert surviving_bytes > 0
+    assert first.pending_bytes_after == surviving_bytes
+    assert spool._pending_frames_for_log(first) == 1
+    assert db.get_messages("replay-session") == []
+    assert f"pending_bytes={surviving_bytes}" in first_log
+    assert "pending_frames=1" in first_log
+    assert "disk full" not in first_log
+    assert str(active_path) not in first_log
+    assert "post-rename-active-create-failure-key-0" not in first_log
+    assert "post-rename-active-create-failure" not in first_log
+
+    monkeypatch.setattr(spool, "_open_file_at", original_open_file_at)
+    second = spool.replay_to_session_db(db, trigger="manual")
+    third = spool.replay_to_session_db(db, trigger="manual")
+
+    assert second.state is spool.ReplayRunState.REPLAYED
+    assert second.frames_committed == 1
+    assert [row["content"] for row in db.get_messages("replay-session")] == [
+        "post-rename-active-create-failure"
+    ]
+    assert third.state is spool.ReplayRunState.EMPTY
+
+
+def test_early_setup_not_durable_snapshot_counts_preexisting_sealed_partial_ack_backlog(
+    tmp_path, monkeypatch, caplog
+):
+    home = tmp_path / ".hermes"
+    home.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    first_record = _record(unit_id="sealed-partial-a", content="alpha")
+    second_record = _record(unit_id="sealed-partial-b", content="beta")
+    segment_path = _write_sealed_segment(home, 1, first_record, second_record)
+    first_frame = spool._frame_bytes_for_record(first_record)
+    second_frame = spool._frame_bytes_for_record(second_record)
+    _write_ack_sidecar(
+        home,
+        segment_path.name,
+        len(first_frame),
+        segment_path.stat().st_size,
+        sequence=1,
+    )
+    (home / spool.SPOOL_ROOT_NAME / spool.ACTIVE_SPOOL_NAME).write_bytes(b"")
+    caplog.set_level(logging.INFO)
+
+    def _enospc(_runtime):
+        raise OSError(
+            errno.ENOSPC,
+            f"disk full {segment_path} sealed-partial-a-key-0 alpha",
+        )
+
+    monkeypatch.setattr(spool, "_reconcile_active_spool_for_replay", _enospc)
+
+    result = spool.replay_to_session_db(object(), trigger="startup")
+    message = next(
+        record.getMessage()
+        for record in caplog.records
+        if record.name == spool.__name__ and "state=not_durable" in record.getMessage()
+    )
+
+    assert result.state is spool.ReplayRunState.NOT_DURABLE
+    assert result.error_class == "errno_enospc"
+    assert result.pending_bytes_after == len(second_frame)
+    assert spool._pending_frames_for_log(result) == 1
+    assert result.ack_pending is True
+    assert f"pending_bytes={len(second_frame)}" in message
+    assert "pending_frames=1" in message
+    assert "disk full" not in message
+    assert str(segment_path) not in message
+    assert "sealed-partial-a-key-0" not in message
+    assert "alpha" not in message
+
+
+def test_not_durable_pending_snapshot_unknown_preserves_original_error_and_logs_known_unknown_transitions(
+    tmp_path, monkeypatch, caplog
+):
+    home = tmp_path / ".hermes"
+    home.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    spool._REPLAY_COOLDOWNS.clear()
+    spool._REPLAY_LOG_STATE.clear()
+    monkeypatch.setattr(spool.time, "monotonic", lambda: 100.0)
+    record = _record(unit_id="snapshot-unknown", content="alpha")
+    append = spool.append_records((record,))
+    active_path = Path(append.unit_results[0].receipt.path)
+    caplog.set_level(logging.INFO)
+
+    def _enospc(_runtime):
+        raise OSError(
+            errno.ENOSPC,
+            f"disk full {active_path} snapshot-unknown-key-0 alpha",
+        )
+
+    monkeypatch.setattr(spool, "_reconcile_active_spool_for_replay", _enospc)
+    original_snapshot = getattr(spool, "_snapshot_pending_backlog", None)
+
+    first = spool.replay_to_session_db(object(), trigger="startup")
+
+    def _snapshot_boom(_runtime):
+        raise OSError(errno.EIO, f"secondary snapshot race {active_path} alpha")
+
+    monkeypatch.setattr(spool, "_snapshot_pending_backlog", _snapshot_boom)
+    second = spool.replay_to_session_db(object(), trigger="startup")
+    monkeypatch.setattr(spool, "_snapshot_pending_backlog", original_snapshot)
+    third = spool.replay_to_session_db(object(), trigger="startup")
+
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == spool.__name__ and "state=not_durable" in record.getMessage()
+    ]
+    joined = "\n".join(messages)
+
+    assert first.state is spool.ReplayRunState.NOT_DURABLE
+    assert first.error_class == "errno_enospc"
+    assert first.pending_bytes_after == active_path.stat().st_size
+    assert first.pending_frames_after == 1
+
+    assert second.state is spool.ReplayRunState.NOT_DURABLE
+    assert second.error_class == "errno_enospc"
+    assert second.pending_bytes_after == -1
+    assert second.pending_frames_after == -1
+
+    assert third.state is spool.ReplayRunState.NOT_DURABLE
+    assert third.error_class == "errno_enospc"
+    assert third.pending_bytes_after == active_path.stat().st_size
+    assert third.pending_frames_after == 1
+
+    assert len(messages) == 3
+    assert f"pending_bytes={active_path.stat().st_size}" in messages[0]
+    assert "pending_frames=1" in messages[0]
+    assert "pending_bytes=-1" in messages[1]
+    assert "pending_frames=-1" in messages[1]
+    assert f"pending_bytes={active_path.stat().st_size}" in messages[2]
+    assert "pending_frames=1" in messages[2]
+    assert "secondary snapshot race" not in joined
+    assert str(active_path) not in joined
+    assert "snapshot-unknown-key-0" not in joined
+    assert "alpha" not in joined
+
+
+def test_not_durable_active_replacement_during_snapshot_returns_unknown_backlog(
+    tmp_path, monkeypatch, caplog
+):
+    home = tmp_path / ".hermes"
+    home.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    spool._REPLAY_COOLDOWNS.clear()
+    spool._REPLAY_LOG_STATE.clear()
+    record = _record(unit_id="snapshot-race", content="alpha")
+    append = spool.append_records((record,))
+    active_path = Path(append.unit_results[0].receipt.path)
+    replacement_frame = spool._frame_bytes_for_record(
+        _record(
+            unit_id="snapshot-race-replacement",
+            content="replacement-is-longer",
+        )
+    )
+    parked_path = active_path.with_name("held-active.spool")
+    caplog.set_level(logging.INFO)
+
+    def _enospc(_runtime):
+        raise OSError(
+            errno.ENOSPC,
+            f"disk full {active_path} snapshot-race-key-0 alpha",
+        )
+
+    monkeypatch.setattr(spool, "_reconcile_active_spool_for_replay", _enospc)
+    original_scan = spool._scan_fd
+    swapped = {"done": False}
+
+    def _swap(fd: int):
+        if not swapped["done"]:
+            swapped["done"] = True
+            os.replace(active_path, parked_path)
+            active_path.write_bytes(replacement_frame)
+        return original_scan(fd)
+
+    monkeypatch.setattr(spool, "_scan_fd", _swap)
+
+    result = spool.replay_to_session_db(object(), trigger="startup")
+    message = next(
+        record.getMessage()
+        for record in caplog.records
+        if record.name == spool.__name__ and "state=not_durable" in record.getMessage()
+    )
+
+    assert result.state is spool.ReplayRunState.NOT_DURABLE
+    assert result.error_class == "errno_enospc"
+    assert result.pending_bytes_after == -1
+    assert result.pending_frames_after == -1
+    assert active_path.read_bytes() == replacement_frame
+    assert "error_class=errno_enospc" in message
+    assert "pending_bytes=-1" in message
+    assert "pending_frames=-1" in message
+    assert "disk full" not in message
+    assert str(active_path) not in message
+    assert "snapshot-race-key-0" not in message
+    assert "alpha" not in message
+
+
+def test_prepare_busy_returns_retry_pending_with_truthful_active_backlog_and_duplicate_safe(
+    db, tmp_path, monkeypatch, caplog
+):
+    home = tmp_path / ".hermes"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    spool._REPLAY_COOLDOWNS.clear()
+    spool._REPLAY_LOG_STATE.clear()
+    clock = {"now": 100.0}
+    monkeypatch.setattr(spool.time, "monotonic", lambda: clock["now"])
+    record = _record(unit_id="prepare-busy", content="alpha")
+    append = spool.append_records((record,))
+    active_path = Path(append.unit_results[0].receipt.path)
+    active_bytes = active_path.read_bytes()
+    caplog.set_level(logging.INFO)
+    original_reconcile = spool._reconcile_active_spool_for_replay
+    calls = {"count": 0}
+
+    def _busy(_runtime):
+        calls["count"] += 1
+        raise OSError(errno.EBUSY, f"busy {active_path} prepare-busy-key-0 alpha")
+
+    monkeypatch.setattr(spool, "_reconcile_active_spool_for_replay", _busy)
+
+    first = spool.replay_to_session_db(db, trigger="startup")
+    messages = _replay_messages_for_state(caplog, "retry_pending")
+
+    assert first.state is spool.ReplayRunState.RETRY_PENDING
+    assert first.retry_class == "spool_prepare_busy"
+    assert first.ack_pending is False
+    assert first.cooldown_seconds > 0
+    assert first.pending_bytes_after == len(active_bytes)
+    assert first.pending_frames_after == 1
+    assert first.first_blocked_segment is None
+    assert first.first_blocked_offset is None
+    assert active_path.read_bytes() == active_bytes
+    assert calls["count"] == 1
+    assert len(messages) == 1
+    assert "retry_class=spool_prepare_busy" in messages[0]
+    assert "ack_pending=False" in messages[0]
+    assert f"pending_bytes={len(active_bytes)}" in messages[0]
+    assert "pending_frames=1" in messages[0]
+    assert f"busy {active_path}" not in messages[0]
+    assert str(active_path) not in messages[0]
+    assert "prepare-busy-key-0" not in messages[0]
+    assert "alpha" not in messages[0]
+
+    second = spool.replay_to_session_db(db, trigger="startup")
+
+    assert second.state is spool.ReplayRunState.RETRY_PENDING
+    assert second.retry_class == "spool_prepare_busy"
+    assert second.ack_pending is False
+    assert second.cooldown_seconds > 0
+    assert calls["count"] == 1
+
+    monkeypatch.setattr(spool, "_reconcile_active_spool_for_replay", original_reconcile)
+    clock["now"] += first.cooldown_seconds + 0.01
+
+    third = spool.replay_to_session_db(db, trigger="startup")
+    fourth = spool.replay_to_session_db(db, trigger="startup")
+
+    assert third.state is spool.ReplayRunState.REPLAYED
+    assert third.frames_committed == 1
+    assert third.frames_duplicated == 0
+    assert [row["content"] for row in db.get_messages("replay-session")] == ["alpha"]
+    assert _fts_message_count(db) == 1
+    assert active_path.exists()
+    assert active_path.read_bytes() == b""
+    assert fourth.state is spool.ReplayRunState.EMPTY
+
+
+def test_prepare_busy_snapshot_failure_returns_unknown_metrics_without_masking_retry_class(
+    tmp_path, monkeypatch, caplog
+):
+    home = tmp_path / ".hermes"
+    home.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    spool._REPLAY_COOLDOWNS.clear()
+    spool._REPLAY_LOG_STATE.clear()
+    monkeypatch.setattr(spool.time, "monotonic", lambda: 100.0)
+    record = _record(unit_id="prepare-busy-unknown", content="alpha")
+    append = spool.append_records((record,))
+    active_path = Path(append.unit_results[0].receipt.path)
+    active_bytes = active_path.read_bytes()
+    caplog.set_level(logging.INFO)
+
+    def _busy(_runtime):
+        raise OSError(
+            errno.EBUSY,
+            f"busy {active_path} prepare-busy-unknown-key-0 alpha",
+        )
+
+    def _snapshot_boom(_runtime):
+        raise OSError(
+            errno.EIO,
+            f"secondary snapshot race {active_path} prepare-busy-unknown-key-0 alpha",
+        )
+
+    monkeypatch.setattr(spool, "_reconcile_active_spool_for_replay", _busy)
+    monkeypatch.setattr(spool, "_snapshot_pending_backlog", _snapshot_boom)
+
+    result = spool.replay_to_session_db(object(), trigger="startup")
+    messages = _replay_messages_for_state(caplog, "retry_pending")
+    joined = "\n".join(messages)
+
+    assert result.state is spool.ReplayRunState.RETRY_PENDING
+    assert result.retry_class == "spool_prepare_busy"
+    assert result.ack_pending is False
+    assert result.cooldown_seconds > 0
+    assert result.pending_bytes_after == -1
+    assert result.pending_frames_after == -1
+    assert result.first_blocked_segment is None
+    assert result.first_blocked_offset is None
+    assert active_path.read_bytes() == active_bytes
+    assert len(messages) == 1
+    assert "retry_class=spool_prepare_busy" in messages[0]
+    assert "ack_pending=False" in messages[0]
+    assert "pending_bytes=-1" in messages[0]
+    assert "pending_frames=-1" in messages[0]
+    assert f"busy {active_path}" not in joined
+    assert "secondary snapshot race" not in joined
+    assert str(active_path) not in joined
+    assert "prepare-busy-unknown-key-0" not in joined
+    assert "alpha" not in joined
+
+
+def test_corrupt_active_evidence_enospc_returns_not_durable_and_leaves_active_bytes_truthful(
+    db, tmp_path, monkeypatch, caplog
+):
+    home = tmp_path / ".hermes"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    spool.append_records((_record(unit_id="corrupt-active-enospc"),))
+
+    active_path = home / spool.SPOOL_ROOT_NAME / spool.ACTIVE_SPOOL_NAME
+    corrupted = bytearray(active_path.read_bytes())
+    corrupted[0] = 0
+    active_path.write_bytes(bytes(corrupted))
+    caplog.set_level(logging.INFO)
+
+    def _enospc(*_args, **_kwargs):
+        raise OSError(
+            errno.ENOSPC,
+            f"disk full {active_path} corrupt-active-enospc-key-0 hello replay",
+        )
+
+    monkeypatch.setattr(spool, "_write_sidecar_json", _enospc)
+
+    result = spool.replay_to_session_db(db, trigger="startup")
+    message = next(
+        record.getMessage()
+        for record in caplog.records
+        if record.name == spool.__name__ and "state=not_durable" in record.getMessage()
+    )
+
+    assert result.state is spool.ReplayRunState.NOT_DURABLE
+    assert result.error_class == "errno_enospc"
+    assert active_path.read_bytes() == bytes(corrupted)
+    assert result.pending_bytes_after == len(corrupted)
+    assert spool._pending_frames_for_log(result) == 0
+    blockers = sorted((home / spool.SPOOL_ROOT_NAME / spool.SEALED_DIR_NAME / spool.BLOCKERS_DIR_NAME).glob("*.blocker.json"))
+    assert blockers == []
+    assert f"pending_bytes={len(corrupted)}" in message
+    assert "pending_frames=0" in message
+    assert "disk full" not in message
+    assert str(active_path) not in message
+    assert "corrupt-active-enospc-key-0" not in message
+    assert "hello replay" not in message
+
+
+def test_corrupt_sealed_publish_enospc_returns_not_durable_with_truthful_backlog(
+    tmp_path, monkeypatch, caplog
+):
+    home = tmp_path / ".hermes"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    first_segment = _write_sealed_segment(home, 1, _record(unit_id="corrupt-sealed-a", content="alpha"))
+    corrupted = bytearray(first_segment.read_bytes())
+    corrupted[0] = 0
+    first_segment.write_bytes(bytes(corrupted))
+    later_segment = _write_sealed_segment(
+        home,
+        2,
+        _record(unit_id="corrupt-sealed-b", content="beta"),
+    )
+    caplog.set_level(logging.INFO)
+
+    def _enospc(*_args, **_kwargs):
+        raise OSError(
+            errno.ENOSPC,
+            f"disk full {first_segment} corrupt-sealed-a-key-0 alpha",
+        )
+
+    monkeypatch.setattr(spool, "_publish_corrupt_sealed_segment_state", _enospc)
+
+    result = spool.replay_to_session_db(object(), trigger="manual")
+    message = next(
+        record.getMessage()
+        for record in caplog.records
+        if record.name == spool.__name__ and "state=not_durable" in record.getMessage()
+    )
+    expected_bytes = first_segment.stat().st_size + later_segment.stat().st_size
+
+    assert result.state is spool.ReplayRunState.NOT_DURABLE
+    assert result.error_class == "errno_enospc"
+    assert first_segment.read_bytes() == bytes(corrupted)
+    assert later_segment.exists()
+    assert result.pending_bytes_after == expected_bytes
+    assert spool._pending_frames_for_log(result) == 1
+    assert f"pending_bytes={expected_bytes}" in message
+    assert "pending_frames=1" in message
+    assert "disk full" not in message
+    assert str(first_segment) not in message
+    assert "corrupt-sealed-a-key-0" not in message
+    assert "alpha" not in message
+
+
+def test_corrupt_sealed_publish_busy_returns_retry_pending_with_truthful_prefix_backlog_and_duplicate_safe(
+    db, tmp_path, monkeypatch, caplog
+):
+    home = tmp_path / ".hermes"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    spool._REPLAY_COOLDOWNS.clear()
+    spool._REPLAY_LOG_STATE.clear()
+    clock = {"now": 100.0}
+    monkeypatch.setattr(spool.time, "monotonic", lambda: clock["now"])
+    clean_frame = spool._frame_bytes_for_record(
+        _record(unit_id="corrupt-publish-busy", content="alpha")
+    )
+    corrupt_frame = bytearray(
+        spool._frame_bytes_for_record(_record(unit_id="corrupt-publish-busy-tail", content="beta"))
+    )
+    corrupt_frame[-1] ^= 0x01
+    segment_path = home / spool.SPOOL_ROOT_NAME / spool.SEALED_DIR_NAME / "00000000000000000001.spool"
+    segment_path.parent.mkdir(parents=True, exist_ok=True)
+    segment_bytes = clean_frame + bytes(corrupt_frame)
+    segment_path.write_bytes(segment_bytes)
+    caplog.set_level(logging.INFO)
+    original_publish = spool._publish_corrupt_sealed_segment_state
+
+    def _busy(*_args, **_kwargs):
+        raise OSError(
+            errno.EBUSY,
+            f"busy {segment_path} corrupt-publish-busy-key-0 alpha",
+        )
+
+    monkeypatch.setattr(spool, "_publish_corrupt_sealed_segment_state", _busy)
+
+    first = spool.replay_to_session_db(db, trigger="manual")
+    messages = _replay_messages_for_state(caplog, "retry_pending")
+
+    assert first.state is spool.ReplayRunState.RETRY_PENDING
+    assert first.retry_class == "corrupt_publish_busy"
+    assert first.ack_pending is False
+    assert first.cooldown_seconds > 0
+    assert first.frames_committed == 1
+    assert first.frames_duplicated == 0
+    assert first.frames_acked == 0
+    assert first.pending_bytes_after == len(clean_frame)
+    assert first.pending_frames_after == 1
+    assert [row["content"] for row in db.get_messages("replay-session")] == ["alpha"]
+    assert _fts_message_count(db) == 1
+    assert segment_path.read_bytes() == segment_bytes
+    assert len(messages) == 1
+    assert "retry_class=corrupt_publish_busy" in messages[0]
+    assert "ack_pending=False" in messages[0]
+    assert f"pending_bytes={len(clean_frame)}" in messages[0]
+    assert "pending_frames=1" in messages[0]
+    assert f"busy {segment_path}" not in messages[0]
+    assert str(segment_path) not in messages[0]
+    assert "corrupt-publish-busy-key-0" not in messages[0]
+    assert "alpha" not in messages[0]
+
+    monkeypatch.setattr(spool, "_publish_corrupt_sealed_segment_state", original_publish)
+    clock["now"] += first.cooldown_seconds + 0.01
+
+    second = spool.replay_to_session_db(db, trigger="manual")
+    blocker_path = (
+        home
+        / spool.SPOOL_ROOT_NAME
+        / spool.SEALED_DIR_NAME
+        / spool.BLOCKERS_DIR_NAME
+        / "00000000000000000001.blocker.json"
+    )
+    prefix_path = (
+        home
+        / spool.SPOOL_ROOT_NAME
+        / spool.SEALED_DIR_NAME
+        / "00000000000000000001.prefix.spool"
+    )
+    evidence_spool, evidence_sidecar = _assert_metadata_only_replay_evidence(
+        home,
+        sequence=1,
+        expected_source_kind="sealed",
+        expected_tail_status="checksum_mismatch",
+        expected_valid_prefix_bytes=len(clean_frame),
+        expected_original_size_bytes=len(segment_bytes),
+    )
+
+    assert second.state is spool.ReplayRunState.BLOCKED_INTEGRITY
+    assert second.error_class == "checksum_mismatch"
+    assert second.first_blocked_segment == 1
+    assert second.first_blocked_offset == len(clean_frame)
+    assert second.frames_committed == 0
+    assert second.frames_duplicated == 1
+    assert second.frames_acked == 0
+    assert [row["content"] for row in db.get_messages("replay-session")] == ["alpha"]
+    assert _fts_message_count(db) == 1
+    assert not segment_path.exists()
+    assert prefix_path.exists()
+    assert blocker_path.exists()
+    assert evidence_spool.read_bytes() == segment_bytes
+    assert evidence_sidecar.exists()
+
+
+def test_corrupt_sealed_publish_busy_snapshot_failure_returns_unknown_metrics_without_masking_retry_class(
+    db, tmp_path, monkeypatch, caplog
+):
+    home = tmp_path / ".hermes"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    spool._REPLAY_COOLDOWNS.clear()
+    spool._REPLAY_LOG_STATE.clear()
+    clock = {"now": 100.0}
+    monkeypatch.setattr(spool.time, "monotonic", lambda: clock["now"])
+    clean_frame = spool._frame_bytes_for_record(
+        _record(unit_id="corrupt-publish-unknown-a", content="alpha")
+    )
+    corrupt_frame = bytearray(
+        spool._frame_bytes_for_record(_record(unit_id="corrupt-publish-unknown-b", content="beta"))
+    )
+    corrupt_frame[-1] ^= 0x01
+    first_segment = home / spool.SPOOL_ROOT_NAME / spool.SEALED_DIR_NAME / "00000000000000000001.spool"
+    first_segment.parent.mkdir(parents=True, exist_ok=True)
+    first_segment.write_bytes(clean_frame + bytes(corrupt_frame))
+    _write_sealed_segment(home, 2, _record(unit_id="corrupt-publish-unknown-c", content="gamma"))
+    caplog.set_level(logging.INFO)
+
+    def _busy(*_args, **_kwargs):
+        raise OSError(
+            errno.EBUSY,
+            f"busy {first_segment} corrupt-publish-unknown-a-key-0 alpha",
+        )
+
+    def _snapshot_boom(_fd, **_kwargs):
+        raise OSError(
+            errno.EIO,
+            f"secondary snapshot race {first_segment} corrupt-publish-unknown-a-key-0 alpha",
+        )
+
+    monkeypatch.setattr(spool, "_publish_corrupt_sealed_segment_state", _busy)
+    monkeypatch.setattr(spool, "_scan_fd", _snapshot_boom)
+
+    result = spool.replay_to_session_db(db, trigger="manual")
+    messages = _replay_messages_for_state(caplog, "retry_pending")
+
+    assert result.state is spool.ReplayRunState.RETRY_PENDING
+    assert result.retry_class == "corrupt_publish_busy"
+    assert result.ack_pending is False
+    assert result.cooldown_seconds > 0
+    assert result.pending_bytes_after == -1
+    assert result.pending_frames_after == -1
+    assert len(messages) == 1
+    assert "retry_class=corrupt_publish_busy" in messages[0]
+    assert "pending_bytes=-1" in messages[0]
+    assert "pending_frames=-1" in messages[0]
+    assert "secondary snapshot race" not in messages[0]
+    assert str(first_segment) not in messages[0]
+    assert "corrupt-publish-unknown-a-key-0" not in messages[0]
+    assert "alpha" not in messages[0]
+
+
+def test_replay_degraded_logs_are_deduped_and_recovery_logs_once(
+    db, tmp_path, monkeypatch, caplog
+):
+    home = tmp_path / ".hermes"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    _write_sealed_segment(home, 1, _record(unit_id="unit-log", content="alpha"))
+    clock = {"now": 100.0}
+    monkeypatch.setattr(spool.time, "monotonic", lambda: clock["now"])
+    caplog.set_level(logging.INFO)
+
+    def _busy(*_args, **_kwargs):
+        raise hermes_state.CompressionSessionBusyError("busy")
+
+    monkeypatch.setattr(db, "reconcile_bootstrap_and_append_messages_batch", _busy)
+    first = spool.replay_to_session_db(db, trigger="manual")
+    second = spool.replay_to_session_db(db, trigger="manual")
+
+    clock["now"] += second.cooldown_seconds + 0.01
+
+    def _closed(*_args, **_kwargs):
+        raise hermes_state.CompressionSessionClosedError("replay-session")
+
+    monkeypatch.setattr(db, "reconcile_bootstrap_and_append_messages_batch", _closed)
+    third = spool.replay_to_session_db(db, trigger="manual")
+
+    monkeypatch.setattr(
+        db,
+        "reconcile_bootstrap_and_append_messages_batch",
+        lambda *_args, **_kwargs: hermes_state.AppendMessagesBatchResult(inserted_count=1, duplicate_count=0),
+    )
+    fourth = spool.replay_to_session_db(db, trigger="manual")
+
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == spool.__name__
+    ]
+    joined = "\n".join(messages)
+
+    assert first.state is spool.ReplayRunState.RETRY_PENDING
+    assert first.retry_class == "compression_busy"
+    assert second.state is spool.ReplayRunState.RETRY_PENDING
+    assert third.state is spool.ReplayRunState.BLOCKED_INTEGRITY
+    assert third.error_class == "CompressionSessionClosedError"
+    assert fourth.state is spool.ReplayRunState.REPLAYED
+    assert len(messages) == 3
+    assert "state=retry_pending" in messages[0]
+    assert "retry_class=compression_busy" in messages[0]
+    assert "state=blocked_integrity" in messages[1]
+    assert "error_class=CompressionSessionClosedError" in messages[1]
+    assert "state=replayed" in messages[2]
+    assert "alpha" not in joined
+    assert "replay-session" not in joined
+
+
+def test_replay_silent_blocked_branch_logs_and_empty_recovery_clears_state(
+    tmp_path, monkeypatch, caplog
+):
+    home = tmp_path / ".hermes"
+    home.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    clock = {"now": 100.0}
+    monkeypatch.setattr(spool.time, "monotonic", lambda: clock["now"])
+    caplog.set_level(logging.INFO)
+
+    saved = {
+        name: getattr(spool, name)
+        for name in (
+            "_reconcile_active_spool_for_replay",
+            "_seal_clean_active_spool_for_replay",
+            "_first_blocker_sequence",
+            "_load_blocker_backed_prefix_replay_state",
+            "_ordered_segment_entries",
+        )
+    }
+    spool._reconcile_active_spool_for_replay = lambda _runtime: None
+    spool._seal_clean_active_spool_for_replay = lambda _runtime: None
+    spool._first_blocker_sequence = lambda **_kwargs: 1
+
+    def _blocked(**_kwargs):
+        raise spool.SpoolBlockedReplayError("compression_closed", frame_offset=0)
+
+    spool._load_blocker_backed_prefix_replay_state = _blocked
+    spool._ordered_segment_entries = lambda **_kwargs: []
+
+    try:
+        first = spool.replay_to_session_db(object(), trigger="manual")
+        spool._first_blocker_sequence = lambda **_kwargs: None
+        second = spool.replay_to_session_db(object(), trigger="manual")
+    finally:
+        for name, value in saved.items():
+            setattr(spool, name, value)
+
+    messages = [record.getMessage() for record in caplog.records if record.name == spool.__name__]
+    joined = "\n".join(messages)
+
+    assert first.state is spool.ReplayRunState.BLOCKED_INTEGRITY
+    assert first.error_class == "compression_closed"
+    assert second.state is spool.ReplayRunState.EMPTY
+    assert len(messages) == 2
+    assert "state=blocked_integrity" in messages[0]
+    assert "error_class=compression_closed" in messages[0]
+    assert "state=empty" in messages[1]
+    assert "replay-session" not in joined
+    assert "unit-" not in joined
+
+
+def test_replay_silent_retry_branch_logs_truthful_pending_metadata(
+    db, tmp_path, monkeypatch, caplog
+):
+    home = tmp_path / ".hermes"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    first = _record(unit_id="blocked-prefix-a", content="alpha")
+    second = _record(unit_id="blocked-prefix-b", content="beta")
+    clean_frame = spool._frame_bytes_for_record(first)
+    corrupt_frame = bytearray(spool._frame_bytes_for_record(second))
+    corrupt_frame[-1] ^= 0x01
+    _write_blocker_backed_prefix_state(
+        home,
+        sequence=1,
+        source_kind="sealed",
+        prefix_bytes=clean_frame,
+        original_bytes=clean_frame + bytes(corrupt_frame),
+        tail_status="checksum_mismatch",
+    )
+    clock = {"now": 100.0}
+    monkeypatch.setattr(spool.time, "monotonic", lambda: clock["now"])
+    caplog.set_level(logging.INFO)
+
+    def _busy(*_args, **_kwargs):
+        raise hermes_state.CompressionSessionBusyError("busy")
+
+    monkeypatch.setattr(db, "reconcile_bootstrap_and_append_messages_batch", _busy)
+
+    result = spool.replay_to_session_db(db, trigger="manual")
+
+    messages = [record.getMessage() for record in caplog.records if record.name == spool.__name__]
+    joined = "\n".join(messages)
+
+    assert result.state is spool.ReplayRunState.RETRY_PENDING
+    assert result.retry_class == "compression_busy"
+    assert len(messages) == 1
+    assert "state=retry_pending" in messages[0]
+    assert "retry_class=compression_busy" in messages[0]
+    assert "pending_frames=1" in messages[0]
+    assert f"pending_bytes={len(clean_frame)}" in messages[0]
+    assert "alpha" not in joined
+    assert "replay-session" not in joined

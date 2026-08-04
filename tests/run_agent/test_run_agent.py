@@ -593,6 +593,108 @@ def test_flush_messages_to_session_db_stops_when_replay_returns_retry_pending(ag
     assert db.calls == []
 
 
+@pytest.mark.parametrize(
+    "replay_result",
+    [
+        SimpleNamespace(state=spool.ReplayRunState.BLOCKED_INTEGRITY, error_class="CompressionSessionClosedError"),
+        SimpleNamespace(
+            state=spool.ReplayRunState.RETRY_PENDING,
+            retry_class="ack_cleanup_busy",
+            ack_pending=True,
+            cooldown_seconds=1.0,
+        ),
+        SimpleNamespace(state=spool.ReplayRunState.NOT_DURABLE, error_class="errno_enospc"),
+    ],
+)
+def test_persist_session_replay_degraded_does_not_flush_tokens_or_note_turn(
+    agent, monkeypatch, replay_result
+):
+    db = _RecordingBatchDB()
+    _prime_batch_flush_agent(agent, db)
+    monkeypatch.setattr(run_agent.session_spool, "replay_to_session_db", lambda *_args, **_kwargs: replay_result)
+
+    with patch("agent.agent_runtime_helpers.note_turn_persisted") as note_turn_persisted:
+        result = agent._persist_session([{"role": "user", "content": "hello"}], [])
+
+    assert result.state is run_agent.SessionPersistState.NOT_DURABLE
+    db.flush_token_counts.assert_not_called()
+    note_turn_persisted.assert_not_called()
+    assert db.calls == []
+
+
+def test_persist_session_historical_replay_does_not_stamp_live_markers(agent, monkeypatch):
+    db = _RecordingBatchDB()
+    _prime_batch_flush_agent(agent, db)
+    _install_inflight_marker(agent)
+    live_message = {"role": "user", "content": "hello replay then persist"}
+
+    def _replay(*_args, **_kwargs):
+        assert run_agent._DB_PERSISTED_MARKER not in live_message
+        assert run_agent._DB_SPOOLED_MARKER not in live_message
+        assert agent._inflight_turn_id == "session-123:t1:aaaa"
+        return SimpleNamespace(state=spool.ReplayRunState.REPLAYED)
+
+    monkeypatch.setattr(run_agent.session_spool, "replay_to_session_db", _replay)
+
+    try:
+        with patch("agent.agent_runtime_helpers.note_turn_persisted") as note_turn_persisted:
+            result = agent._persist_session([live_message], [])
+    finally:
+        _clear_inflight_markers()
+
+    assert result.state is run_agent.SessionPersistState.CANONICAL
+    assert live_message[run_agent._DB_PERSISTED_MARKER] is True
+    assert live_message.get(run_agent._DB_SPOOLED_MARKER) is not True
+    note_turn_persisted.assert_called_once()
+
+
+def test_persist_session_degraded_logs_are_redacted_deduped_and_recovery_visible(
+    agent, monkeypatch, caplog
+):
+    db = _RecordingBatchDB(outcomes=[RuntimeError("db down"), RuntimeError("db down"), RuntimeError("db down")])
+    _prime_batch_flush_agent(agent, db)
+    clock = {"now": 100.0}
+    monkeypatch.setattr(run_agent.time, "monotonic", lambda: clock["now"])
+    caplog.set_level(logging.INFO)
+
+    failure_append = MagicMock(side_effect=spool.SpoolDurabilityError("spool down"))
+    monkeypatch.setattr(run_agent.session_spool, "append_records", failure_append)
+
+    with patch("agent.agent_runtime_helpers.note_turn_persisted") as note_turn_persisted:
+        first = agent._persist_session([{"role": "user", "content": "hello one"}], [])
+        second = agent._persist_session([{"role": "user", "content": "hello two"}], [])
+        monkeypatch.setattr(
+            run_agent.session_spool,
+            "append_records",
+            lambda records: _spool_append_result(*records),
+        )
+        third = agent._persist_session([{"role": "user", "content": "hello three"}], [])
+        fourth = agent._persist_session([{"role": "user", "content": "hello four"}], [])
+
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == run_agent.__name__
+    ]
+    joined = "\n".join(messages)
+
+    assert first.state is run_agent.SessionPersistState.NOT_DURABLE
+    assert second.state is run_agent.SessionPersistState.NOT_DURABLE
+    assert third.state is run_agent.SessionPersistState.SPOOLED
+    assert fourth.state is run_agent.SessionPersistState.CANONICAL
+    assert len(messages) == 3
+    assert "outcome=not_durable" in messages[0]
+    assert "outcome=spooled" in messages[1]
+    assert "outcome=canonical" in messages[2]
+    assert "session-123" not in joined
+    assert "hello one" not in joined
+    assert "db down" not in joined
+    assert "spool down" not in joined
+    assert "unit_ids" not in joined
+    db.flush_token_counts.assert_called_once()
+    assert note_turn_persisted.call_count == 2
+
+
 @pytest.fixture()
 def agent_with_memory_tool():
     """Agent whose valid_tool_names includes 'memory'."""

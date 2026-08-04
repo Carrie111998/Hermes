@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import errno
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -21,6 +22,8 @@ from hermes_state import (
     CompressionSessionClosedError,
     SessionDBBatchMessage,
 )
+
+logger = logging.getLogger(__name__)
 
 try:  # pragma: no cover - Windows-only import path
     import fcntl  # type: ignore[attr-defined]
@@ -53,6 +56,9 @@ MAX_FRAME_BYTES = MAX_PAYLOAD_BYTES + HEADER_SIZE
 TOTAL_CAP_BYTES = 64 * 1024 * 1024
 LOCK_TIMEOUT_SECONDS = 5.0
 LOCK_RETRY_SECONDS = 0.02
+STATUS_LOCK_TIMEOUT_SECONDS = 0.25
+STATUS_LOCK_RETRY_SECONDS = 0.01
+STATUS_SCAN_ARTIFACT_LIMIT = 4096
 SEGMENT_SEQUENCE_WIDTH = 20
 MAX_SEGMENT_SEQUENCE = 18446744073709551615
 _REPLAY_RETRYABLE_ERRNOS = {
@@ -67,6 +73,17 @@ _LOCK_CONTENTION_ERRNOS = {
 }
 _CURRENT_QUARANTINE_DIR_FD: int | None = None
 _REPLAY_COOLDOWNS: dict[str, dict[str, Any]] = {}
+_REPLAY_LOG_STATE: dict[str, dict[str, Any]] = {}
+_STATUS_REASON_ORDER = (
+    "pending_backlog",
+    "blocker",
+    "retry_cooldown",
+    "ack_pending",
+    "capacity_constrained",
+    "capacity_full",
+    "disk_low",
+    "inspection_error",
+)
 
 
 class SpoolTailStatus(str, Enum):
@@ -197,12 +214,42 @@ class ReplayRunResult:
     bytes_decoded: int = 0
     bytes_acked: int = 0
     pending_bytes_after: int = 0
+    pending_frames_after: int | None = None
     first_blocked_segment: int | None = None
     first_blocked_offset: int | None = None
     retry_class: str | None = None
     error_class: str | None = None
     ack_pending: bool = False
     cooldown_seconds: float = 0.0
+
+
+@dataclass(frozen=True)
+class SessionFallbackSpoolStatus:
+    schema_version: int
+    state: str
+    reasons: tuple[str, ...]
+    pending_units: int
+    pending_frames: int
+    pending_bytes: int
+    oldest_pending_age_seconds: float | None
+    retry_pending: bool
+    retry_class: str | None
+    cooldown_seconds: float
+    ack_pending: bool
+    blocker_present: bool
+    blocker_sequence: int | None
+    blocker_offset: int | None
+    blocker_reason_class: str | None
+    blocker_source_kind: str | None
+    capacity_used_bytes: int
+    capacity_cap_bytes: int
+    capacity_remaining_bytes: int
+    capacity_state: str
+    disk_free_bytes: int | None
+    disk_total_bytes: int | None
+    disk_headroom_threshold_bytes: int
+    disk_state: str
+    inspection_error_class: str | None
 
 
 @dataclass(frozen=True)
@@ -233,8 +280,55 @@ class _DurableCapacityInventory:
     other_artifact_bytes: int
 
 
+@dataclass(frozen=True)
+class _StatusSegmentSnapshot:
+    sequence: int
+    name: str
+    size_bytes: int
+    frame_count: int
+    mtime_ns: int
+    decoded: DecodedSegment
+
+
+@dataclass(frozen=True)
+class _StatusAckDirectorySnapshot:
+    winners_by_segment: Mapping[str, Mapping[str, Any]]
+    orphan_tombstone_sequence: int | None = None
+    orphan_tombstone_mtime_ns: int | None = None
+    blocked_orphan_sequence: int | None = None
+
+
+@dataclass(frozen=True)
+class _StatusBlockerSnapshot:
+    present: bool = False
+    sequence: int | None = None
+    offset: int | None = None
+    reason_class: str | None = None
+    source_kind: str | None = None
+    mtime_ns: int | None = None
+    acked_prefix_bytes: int = 0
+    valid_prefix_bytes: int = 0
+    prefix_segment_name: str | None = None
+    zero_prefix: bool = False
+
+
+@dataclass(frozen=True)
+class _PendingBacklogSnapshot:
+    pending_bytes: int
+    pending_frames: int
+    ack_pending: bool = False
+    first_blocked_segment: int | None = None
+    first_blocked_offset: int | None = None
+
+
 class SessionFallbackSpoolError(RuntimeError):
     pass
+
+
+class _StatusInspectionError(SessionFallbackSpoolError):
+    def __init__(self, error_class: str):
+        super().__init__(error_class)
+        self.error_class = error_class
 
 
 class SpoolPathSecurityError(SessionFallbackSpoolError):
@@ -393,13 +487,124 @@ def _cooldown_result(runtime: _AnchoredRuntime, *, trigger: str) -> ReplayRunRes
     remaining = float(state["next_eligible"] - time.monotonic())
     if remaining <= 0:
         return None
+    pending_snapshot = _capture_replay_terminal_backlog(
+        runtime,
+        ack_pending=bool(state.get("ack_pending", False)),
+    )
     return ReplayRunResult(
         state=ReplayRunState.RETRY_PENDING,
         trigger=trigger,
+        pending_bytes_after=pending_snapshot.pending_bytes,
+        pending_frames_after=pending_snapshot.pending_frames,
+        first_blocked_segment=pending_snapshot.first_blocked_segment,
+        first_blocked_offset=pending_snapshot.first_blocked_offset,
         retry_class=str(state.get("retry_class") or "retry_pending"),
-        ack_pending=bool(state.get("ack_pending", False)),
+        ack_pending=pending_snapshot.ack_pending,
         cooldown_seconds=remaining,
     )
+
+
+def _classify_nonretryable_replay_error(exc: BaseException) -> str:
+    if isinstance(exc, OSError) and exc.errno is not None:
+        errno_name = errno.errorcode.get(exc.errno)
+        if errno_name:
+            return f"errno_{errno_name.lower()}"
+    return exc.__class__.__name__
+
+
+def _pending_frames_for_log(result: ReplayRunResult) -> int:
+    if result.pending_frames_after is not None:
+        return int(result.pending_frames_after)
+    return -1
+
+
+def _pending_backlog_signature_state(result: ReplayRunResult) -> str | None:
+    if result.state is not ReplayRunState.NOT_DURABLE:
+        return None
+    pending_frames = result.pending_frames_after
+    if int(result.pending_bytes_after) < 0:
+        return "pending_bytes_unknown"
+    if pending_frames is not None and int(pending_frames) < 0:
+        return "pending_frames_unknown"
+    return None
+
+
+def _log_replay_run_result(runtime: _AnchoredRuntime, result: ReplayRunResult) -> None:
+    state = getattr(result.state, "value", result.state)
+    state_text = str(state)
+    signature = (
+        state_text,
+        result.retry_class,
+        result.error_class,
+        result.first_blocked_segment,
+        result.first_blocked_offset,
+        result.ack_pending,
+        _pending_backlog_signature_state(result),
+    )
+    key = _replay_root_key(runtime)
+    previous = _REPLAY_LOG_STATE.get(key)
+    now = time.monotonic()
+    if state_text in {
+        ReplayRunState.RETRY_PENDING.value,
+        ReplayRunState.BLOCKED_INTEGRITY.value,
+        ReplayRunState.NOT_DURABLE.value,
+    }:
+        if (
+            previous is not None
+            and previous.get("signature") == signature
+            and (now - float(previous.get("logged_at", 0.0))) < 300.0
+        ):
+            return
+        pending_frames = _pending_frames_for_log(result)
+        pending_bytes = int(result.pending_bytes_after)
+        if state_text == ReplayRunState.RETRY_PENDING.value:
+            logger.warning(
+                "Fallback spool replay degraded state=%s trigger=%s retry_class=%s ack_pending=%s cooldown_seconds=%.3f pending_frames=%d pending_bytes=%d",
+                state_text,
+                result.trigger,
+                result.retry_class,
+                result.ack_pending,
+                result.cooldown_seconds,
+                pending_frames,
+                pending_bytes,
+            )
+        elif state_text == ReplayRunState.BLOCKED_INTEGRITY.value:
+            logger.error(
+                "Fallback spool replay degraded state=%s trigger=%s error_class=%s first_blocked_segment=%s first_blocked_offset=%s pending_frames=%d pending_bytes=%d",
+                state_text,
+                result.trigger,
+                result.error_class,
+                result.first_blocked_segment,
+                result.first_blocked_offset,
+                pending_frames,
+                pending_bytes,
+            )
+        else:
+            logger.error(
+                "Fallback spool replay degraded state=%s trigger=%s error_class=%s pending_frames=%d pending_bytes=%d",
+                state_text,
+                result.trigger,
+                result.error_class,
+                pending_frames,
+                pending_bytes,
+            )
+        _REPLAY_LOG_STATE[key] = {"signature": signature, "logged_at": now}
+        return
+    if (
+        previous is not None
+        and state_text in {ReplayRunState.EMPTY.value, ReplayRunState.REPLAYED.value}
+    ):
+        logger.info(
+            "Fallback spool replay recovered state=%s trigger=%s",
+            state_text,
+            result.trigger,
+        )
+        _REPLAY_LOG_STATE.pop(key, None)
+
+
+def _log_and_return_replay_result(runtime: _AnchoredRuntime, result: ReplayRunResult) -> ReplayRunResult:
+    _log_replay_run_result(runtime, result)
+    return result
 
 
 def _is_retryable_replay_os_error(exc: OSError) -> bool:
@@ -414,6 +619,215 @@ def _remaining_segment_bytes(ordered_segments: Sequence[tuple[int, str, Path]], 
         except OSError:
             continue
     return total
+
+
+def _measure_active_pending_backlog(runtime: _AnchoredRuntime) -> tuple[int, int]:
+    active_fd: int | None = None
+    try:
+        active_fd = _open_file_optional(
+            runtime.root_fd,
+            ACTIVE_SPOOL_NAME,
+            full_path=runtime.active_path,
+        )
+        if active_fd is None:
+            return 0, 0
+        pending_bytes = max(0, int(os.fstat(active_fd).st_size))
+        if pending_bytes == 0:
+            return 0, 0
+        try:
+            return pending_bytes, _scan_fd(active_fd).frame_count
+        except OSError:
+            return pending_bytes, -1
+    except (OSError, SpoolDurabilityError, SpoolPathSecurityError):
+        return -1, -1
+    finally:
+        if active_fd is not None:
+            _close_fd_quietly(active_fd)
+
+
+def _measure_remaining_segment_backlog(
+    runtime: _AnchoredRuntime,
+    *,
+    ordered_segments: Sequence[tuple[int, str, Path]],
+    start_index: int,
+    current_segment_name: str | None = None,
+    current_segment_frame_count: int | None = None,
+    current_segment_pending_bytes: int | None = None,
+) -> tuple[int, int]:
+    if start_index >= len(ordered_segments):
+        return 0, 0
+    sealed_fd: int | None = None
+    pending_bytes = 0
+    pending_frames = 0
+    try:
+        sealed_fd = _open_dir_optional(runtime.root_fd, SEALED_DIR_NAME, full_path=_sealed_dir())
+        if sealed_fd is None:
+            return -1, -1
+        for index, (_sequence, segment_name, _segment_path) in enumerate(
+            ordered_segments[start_index:], start=start_index
+        ):
+            segment_fd: int | None = None
+            try:
+                segment_fd = os.open(segment_name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=sealed_fd)
+                segment_stat = os.fstat(segment_fd)
+                _status_assert_regular_fd_matches_entry(
+                    parent_fd=sealed_fd,
+                    name=segment_name,
+                    entry_stat=segment_stat,
+                    fd=segment_fd,
+                    error_class="entry_replaced",
+                    default_error_class="inspection_error",
+                )
+                if (
+                    index == start_index
+                    and current_segment_name is not None
+                    and current_segment_frame_count is not None
+                    and segment_name == current_segment_name
+                ):
+                    if current_segment_pending_bytes is not None:
+                        pending_bytes += max(0, int(current_segment_pending_bytes))
+                    else:
+                        pending_bytes += max(0, int(segment_stat.st_size))
+                    pending_frames += max(0, int(current_segment_frame_count))
+                    continue
+                pending_bytes += max(0, int(segment_stat.st_size))
+                pending_frames += _scan_fd(segment_fd).frame_count
+            except (
+                _StatusInspectionError,
+                OSError,
+                SpoolDurabilityError,
+                SpoolPathSecurityError,
+            ):
+                return -1, -1
+            finally:
+                if segment_fd is not None:
+                    _close_fd_quietly(segment_fd)
+        return pending_bytes, pending_frames
+    except (OSError, SpoolDurabilityError, SpoolPathSecurityError):
+        return -1, -1
+    finally:
+        if sealed_fd is not None:
+            _close_fd_quietly(sealed_fd)
+
+
+def _unknown_pending_backlog_snapshot(
+    *,
+    ack_pending: bool = False,
+    first_blocked_segment: int | None = None,
+    first_blocked_offset: int | None = None,
+) -> _PendingBacklogSnapshot:
+    return _PendingBacklogSnapshot(
+        pending_bytes=-1,
+        pending_frames=-1,
+        ack_pending=ack_pending,
+        first_blocked_segment=first_blocked_segment,
+        first_blocked_offset=first_blocked_offset,
+    )
+
+
+def _snapshot_pending_backlog(runtime: _AnchoredRuntime) -> _PendingBacklogSnapshot:
+    active_fd: int | None = None
+    lock_held = False
+    try:
+        if not _try_acquire_status_lock(runtime.lock_fd):
+            return _unknown_pending_backlog_snapshot()
+        lock_held = True
+        _status_count_protocol_artifacts(
+            root_fd=runtime.root_fd,
+            limit=STATUS_SCAN_ARTIFACT_LIMIT,
+        )
+        pending_bytes = 0
+        pending_frames = 0
+        active_fd = _open_file_optional(
+            runtime.root_fd,
+            ACTIVE_SPOOL_NAME,
+            full_path=runtime.active_path,
+        )
+        if active_fd is not None:
+            active_stat = os.fstat(active_fd)
+            _status_assert_active_fd_matches_entry(
+                root_fd=runtime.root_fd,
+                entry_stat=active_stat,
+                fd=active_fd,
+            )
+            pending_bytes = max(0, int(active_stat.st_size))
+            if pending_bytes > 0:
+                active_scan = _scan_fd(active_fd)
+                _status_assert_active_fd_matches_entry(
+                    root_fd=runtime.root_fd,
+                    entry_stat=active_stat,
+                    fd=active_fd,
+                )
+                pending_frames = active_scan.frame_count
+
+        blocker = _status_load_blocker_snapshot(root_fd=runtime.root_fd)
+        segments = _status_collect_segment_snapshots(root_fd=runtime.root_fd)
+        ack_snapshot = _status_scan_ack_sidecars(
+            root_fd=runtime.root_fd,
+            segment_sizes={item.name: item.size_bytes for item in segments},
+        )
+        if ack_snapshot.blocked_orphan_sequence is not None:
+            return _unknown_pending_backlog_snapshot(
+                ack_pending=True,
+                first_blocked_segment=ack_snapshot.blocked_orphan_sequence,
+            )
+
+        ack_pending = (
+            blocker.acked_prefix_bytes > 0
+            or ack_snapshot.orphan_tombstone_sequence is not None
+        )
+        for item in segments:
+            acked_prefix_bytes, segment_ack_pending = _status_effective_acked_prefix(
+                segment=item,
+                ack_snapshot=ack_snapshot,
+                blocker=blocker,
+            )
+            segment_pending_frames, segment_pending_bytes = _status_pending_prefix_metrics(
+                item.decoded,
+                acked_prefix_bytes=acked_prefix_bytes,
+                error_class="invalid_ack_json",
+            )
+            pending_frames += segment_pending_frames
+            pending_bytes += segment_pending_bytes
+            ack_pending = ack_pending or segment_ack_pending
+
+        return _PendingBacklogSnapshot(
+            pending_bytes=pending_bytes,
+            pending_frames=pending_frames,
+            ack_pending=ack_pending,
+            first_blocked_segment=blocker.sequence if blocker.present else None,
+            first_blocked_offset=blocker.offset if blocker.present else None,
+        )
+    finally:
+        if active_fd is not None:
+            _close_fd_quietly(active_fd)
+        if lock_held:
+            _release_status_lock(runtime.lock_fd)
+
+
+def _capture_pending_backlog_snapshot(runtime: _AnchoredRuntime) -> _PendingBacklogSnapshot:
+    try:
+        return _snapshot_pending_backlog(runtime)
+    except Exception:
+        return _unknown_pending_backlog_snapshot()
+
+
+def _capture_replay_terminal_backlog(
+    runtime: _AnchoredRuntime,
+    *,
+    ack_pending: bool = False,
+) -> _PendingBacklogSnapshot:
+    snapshot = _capture_pending_backlog_snapshot(runtime)
+    merged_ack_pending = bool(snapshot.ack_pending or ack_pending)
+    if merged_ack_pending == snapshot.ack_pending:
+        return snapshot
+    return _PendingBacklogSnapshot(
+        pending_bytes=snapshot.pending_bytes,
+        pending_frames=snapshot.pending_frames,
+        ack_pending=merged_ack_pending,
+        first_blocked_segment=snapshot.first_blocked_segment,
+        first_blocked_offset=snapshot.first_blocked_offset,
+    )
 
 
 def _replay_db_call(
@@ -1416,8 +1830,8 @@ def scan_spool(
         os.close(fd)
 
 
-def decode_spool_segment(
-    path: Path,
+def _decode_spool_segment_fd(
+    fd: int,
     *,
     start_offset: int = 0,
     max_file_bytes: int = TOTAL_CAP_BYTES,
@@ -1425,6 +1839,120 @@ def decode_spool_segment(
 ) -> DecodedSegment:
     if start_offset < 0:
         raise SpoolDurabilityError(f"invalid decode offset for fallback spool segment: {start_offset}")
+    file_size = os.fstat(fd).st_size
+    payload_cap = max_frame_bytes - HEADER_SIZE
+    budget = min(file_size, max_file_bytes if max_file_bytes > 0 else file_size)
+    offset = start_offset
+    frames: list[SessionSpoolFrame] = []
+    while offset < file_size:
+        if offset + HEADER_SIZE > budget:
+            return DecodedSegment(
+                prefix_frames=tuple(frames),
+                valid_prefix_bytes=offset,
+                tail_status=SpoolTailStatus.SCAN_LIMIT_EXCEEDED,
+                tail_offset=offset,
+            )
+        header = _read_exact_from_fd(fd, offset=offset, length=HEADER_SIZE)
+        if len(header) < HEADER_SIZE:
+            return DecodedSegment(
+                prefix_frames=tuple(frames),
+                valid_prefix_bytes=offset,
+                tail_status=SpoolTailStatus.INCOMPLETE_EOF,
+                tail_offset=offset,
+            )
+        if header[:4] != HEADER_MAGIC:
+            tail_status = SpoolTailStatus.BAD_MAGIC
+        elif header[4] != FRAME_VERSION:
+            tail_status = SpoolTailStatus.BAD_VERSION
+        elif header[5] != RECORD_KIND_SESSION_PERSISTENCE_UNIT:
+            tail_status = SpoolTailStatus.BAD_RECORD_KIND
+        elif header[6:8] != b"\x00\x00":
+            tail_status = SpoolTailStatus.NONZERO_RESERVED
+        else:
+            tail_status = None
+        if tail_status is not None:
+            return DecodedSegment(
+                prefix_frames=tuple(frames),
+                valid_prefix_bytes=offset,
+                tail_status=tail_status,
+                tail_offset=offset,
+            )
+        payload_len = int.from_bytes(header[8:16], "big")
+        if payload_len == 0 or payload_len > payload_cap:
+            return DecodedSegment(
+                prefix_frames=tuple(frames),
+                valid_prefix_bytes=offset,
+                tail_status=SpoolTailStatus.OVERSIZED_LENGTH,
+                tail_offset=offset,
+            )
+        frame_length = HEADER_SIZE + payload_len
+        if offset + frame_length > budget:
+            return DecodedSegment(
+                prefix_frames=tuple(frames),
+                valid_prefix_bytes=offset,
+                tail_status=SpoolTailStatus.SCAN_LIMIT_EXCEEDED,
+                tail_offset=offset,
+            )
+        payload = _read_exact_from_fd(fd, offset=offset + HEADER_SIZE, length=payload_len)
+        if len(payload) < payload_len:
+            return DecodedSegment(
+                prefix_frames=tuple(frames),
+                valid_prefix_bytes=offset,
+                tail_status=SpoolTailStatus.INCOMPLETE_EOF,
+                tail_offset=offset,
+            )
+        expected_digest = blake2s(header[4:16] + payload, digest_size=16).digest()
+        if header[16:32] != expected_digest:
+            return DecodedSegment(
+                prefix_frames=tuple(frames),
+                valid_prefix_bytes=offset,
+                tail_status=SpoolTailStatus.CHECKSUM_MISMATCH,
+                tail_offset=offset,
+            )
+        try:
+            payload_obj = json.loads(
+                payload.decode("utf-8"),
+                object_pairs_hook=_reject_duplicate_json_keys,
+            )
+        except (UnicodeDecodeError, json.JSONDecodeError, _DuplicateJsonKeyError):
+            return DecodedSegment(
+                prefix_frames=tuple(frames),
+                valid_prefix_bytes=offset,
+                tail_status=SpoolTailStatus.INVALID_JSON,
+                tail_offset=offset,
+            )
+        if not _validate_payload_schema(payload_obj):
+            return DecodedSegment(
+                prefix_frames=tuple(frames),
+                valid_prefix_bytes=offset,
+                tail_status=SpoolTailStatus.INVALID_SCHEMA,
+                tail_offset=offset,
+            )
+        frames.append(
+            SessionSpoolFrame(
+                record=_record_from_payload_object(payload_obj),
+                frame_offset=offset,
+                frame_length=frame_length,
+                payload_length=payload_len,
+                checksum_hex=header[16:32].hex(),
+            )
+        )
+        offset += frame_length
+    return DecodedSegment(
+        prefix_frames=tuple(frames),
+        valid_prefix_bytes=offset,
+        tail_status=SpoolTailStatus.CLEAN,
+        tail_offset=None,
+    )
+
+
+def decode_spool_segment(
+    path: Path,
+    *,
+    start_offset: int = 0,
+    max_file_bytes: int = TOTAL_CAP_BYTES,
+    max_frame_bytes: int = MAX_FRAME_BYTES,
+) -> DecodedSegment:
     if not path.exists():
         return DecodedSegment(
             prefix_frames=(),
@@ -1435,110 +1963,11 @@ def decode_spool_segment(
     _require_existing_file(path)
     fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     try:
-        file_size = os.fstat(fd).st_size
-        payload_cap = max_frame_bytes - HEADER_SIZE
-        budget = min(file_size, max_file_bytes if max_file_bytes > 0 else file_size)
-        offset = start_offset
-        frames: list[SessionSpoolFrame] = []
-        while offset < file_size:
-            if offset + HEADER_SIZE > budget:
-                return DecodedSegment(
-                    prefix_frames=tuple(frames),
-                    valid_prefix_bytes=offset,
-                    tail_status=SpoolTailStatus.SCAN_LIMIT_EXCEEDED,
-                    tail_offset=offset,
-                )
-            header = _read_exact_from_fd(fd, offset=offset, length=HEADER_SIZE)
-            if len(header) < HEADER_SIZE:
-                return DecodedSegment(
-                    prefix_frames=tuple(frames),
-                    valid_prefix_bytes=offset,
-                    tail_status=SpoolTailStatus.INCOMPLETE_EOF,
-                    tail_offset=offset,
-                )
-            if header[:4] != HEADER_MAGIC:
-                tail_status = SpoolTailStatus.BAD_MAGIC
-            elif header[4] != FRAME_VERSION:
-                tail_status = SpoolTailStatus.BAD_VERSION
-            elif header[5] != RECORD_KIND_SESSION_PERSISTENCE_UNIT:
-                tail_status = SpoolTailStatus.BAD_RECORD_KIND
-            elif header[6:8] != b"\x00\x00":
-                tail_status = SpoolTailStatus.NONZERO_RESERVED
-            else:
-                tail_status = None
-            if tail_status is not None:
-                return DecodedSegment(
-                    prefix_frames=tuple(frames),
-                    valid_prefix_bytes=offset,
-                    tail_status=tail_status,
-                    tail_offset=offset,
-                )
-            payload_len = int.from_bytes(header[8:16], "big")
-            if payload_len == 0 or payload_len > payload_cap:
-                return DecodedSegment(
-                    prefix_frames=tuple(frames),
-                    valid_prefix_bytes=offset,
-                    tail_status=SpoolTailStatus.OVERSIZED_LENGTH,
-                    tail_offset=offset,
-                )
-            frame_length = HEADER_SIZE + payload_len
-            if offset + frame_length > budget:
-                return DecodedSegment(
-                    prefix_frames=tuple(frames),
-                    valid_prefix_bytes=offset,
-                    tail_status=SpoolTailStatus.SCAN_LIMIT_EXCEEDED,
-                    tail_offset=offset,
-                )
-            payload = _read_exact_from_fd(fd, offset=offset + HEADER_SIZE, length=payload_len)
-            if len(payload) < payload_len:
-                return DecodedSegment(
-                    prefix_frames=tuple(frames),
-                    valid_prefix_bytes=offset,
-                    tail_status=SpoolTailStatus.INCOMPLETE_EOF,
-                    tail_offset=offset,
-                )
-            expected_digest = blake2s(header[4:16] + payload, digest_size=16).digest()
-            if header[16:32] != expected_digest:
-                return DecodedSegment(
-                    prefix_frames=tuple(frames),
-                    valid_prefix_bytes=offset,
-                    tail_status=SpoolTailStatus.CHECKSUM_MISMATCH,
-                    tail_offset=offset,
-                )
-            try:
-                payload_obj = json.loads(
-                    payload.decode("utf-8"),
-                    object_pairs_hook=_reject_duplicate_json_keys,
-                )
-            except (UnicodeDecodeError, json.JSONDecodeError, _DuplicateJsonKeyError):
-                return DecodedSegment(
-                    prefix_frames=tuple(frames),
-                    valid_prefix_bytes=offset,
-                    tail_status=SpoolTailStatus.INVALID_JSON,
-                    tail_offset=offset,
-                )
-            if not _validate_payload_schema(payload_obj):
-                return DecodedSegment(
-                    prefix_frames=tuple(frames),
-                    valid_prefix_bytes=offset,
-                    tail_status=SpoolTailStatus.INVALID_SCHEMA,
-                    tail_offset=offset,
-                )
-            frames.append(
-                SessionSpoolFrame(
-                    record=_record_from_payload_object(payload_obj),
-                    frame_offset=offset,
-                    frame_length=frame_length,
-                    payload_length=payload_len,
-                    checksum_hex=header[16:32].hex(),
-                )
-            )
-            offset += frame_length
-        return DecodedSegment(
-            prefix_frames=tuple(frames),
-            valid_prefix_bytes=offset,
-            tail_status=SpoolTailStatus.CLEAN,
-            tail_offset=None,
+        return _decode_spool_segment_fd(
+            fd,
+            start_offset=start_offset,
+            max_file_bytes=max_file_bytes,
+            max_frame_bytes=max_frame_bytes,
         )
     finally:
         os.close(fd)
@@ -2208,6 +2637,60 @@ def _open_dir_optional(parent_fd: int, name: str, *, full_path: Path) -> int | N
     return fd
 
 
+def _open_file_optional(parent_fd: int, name: str, *, full_path: Path) -> int | None:
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent_fd)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.ENOTDIR, errno.EISDIR}:
+            raise SpoolPathSecurityError(f"symlinked fallback spool path refused: {full_path}") from exc
+        raise SpoolDurabilityError(f"unable to open fallback spool file {full_path}: {exc}") from exc
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise SpoolPathSecurityError(f"fallback spool path is not a regular file: {full_path}")
+        _assert_entry_matches_fd(parent_fd, name, fd, expect="file", label=str(full_path))
+    except BaseException:
+        _close_fd_quietly(fd)
+        raise
+    return fd
+
+
+def _try_acquire_status_lock(fd: int) -> bool:
+    deadline = time.monotonic() + STATUS_LOCK_TIMEOUT_SECONDS
+    while True:
+        try:
+            if fcntl is not None:
+                fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            elif msvcrt is not None:  # pragma: no cover - Windows-only branch
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            else:  # pragma: no cover - unsupported platform
+                raise _StatusInspectionError("append_lock_unavailable")
+            return True
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(STATUS_LOCK_RETRY_SECONDS)
+        except OSError as exc:
+            if _is_lock_contention_error(exc):
+                if time.monotonic() >= deadline:
+                    return False
+                time.sleep(STATUS_LOCK_RETRY_SECONDS)
+                continue
+            raise _StatusInspectionError("append_lock_error") from exc
+
+
+def _release_status_lock(fd: int) -> None:
+    try:
+        if fcntl is not None:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        elif msvcrt is not None:  # pragma: no cover - Windows-only branch
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+    except OSError:
+        pass
+
+
 def _collect_sequences_from_directory(
     *,
     dir_fd: int,
@@ -2381,6 +2864,1180 @@ def _durable_capacity_inventory(
             _close_fd_quietly(acks_fd)
         if sealed_fd is not None:
             _close_fd_quietly(sealed_fd)
+
+
+def _ordered_status_reasons(reasons: set[str]) -> tuple[str, ...]:
+    return tuple(reason for reason in _STATUS_REASON_ORDER if reason in reasons)
+
+
+def _probe_disk_from_home_fd(
+    home_fd: int,
+    *,
+    threshold_bytes: int,
+) -> tuple[int | None, int | None, str, str | None]:
+    if not hasattr(os, "fstatvfs"):
+        return None, None, "unknown", "disk_probe_failed"
+    try:
+        statvfs = os.fstatvfs(home_fd)
+    except OSError:
+        return None, None, "unknown", "disk_probe_failed"
+    free_bytes = int(statvfs.f_bavail) * int(statvfs.f_frsize)
+    total_bytes = int(statvfs.f_blocks) * int(statvfs.f_frsize)
+    state = "low" if free_bytes < max(0, int(threshold_bytes)) else "ok"
+    return free_bytes, total_bytes, state, None
+
+
+def _classify_status_os_error(
+    exc: OSError,
+    *,
+    default_error_class: str = "inspection_error",
+) -> str:
+    if isinstance(exc, FileNotFoundError):
+        return "entry_replaced"
+    if exc.errno in {errno.ELOOP, errno.ENOTDIR, errno.EISDIR}:
+        return "symlink_refused"
+    return default_error_class
+
+
+def _classify_status_exception(
+    exc: BaseException,
+    *,
+    default_error_class: str = "inspection_error",
+) -> str:
+    if isinstance(exc, _StatusInspectionError):
+        return exc.error_class
+    if isinstance(exc, SpoolPathSecurityError):
+        return "symlink_refused"
+    if isinstance(exc, OSError):
+        return _classify_status_os_error(exc, default_error_class=default_error_class)
+    cause = getattr(exc, "__cause__", None)
+    if isinstance(cause, SpoolPathSecurityError):
+        return "symlink_refused"
+    if isinstance(cause, OSError):
+        return _classify_status_os_error(cause, default_error_class=default_error_class)
+    return default_error_class
+
+
+def _status_iter_dir_entries(
+    dir_fd: int,
+    *,
+    default_error_class: str = "inspection_error",
+):
+    try:
+        entries = os.scandir(dir_fd)
+    except OSError as exc:
+        raise _StatusInspectionError(
+            _classify_status_os_error(exc, default_error_class=default_error_class)
+        ) from exc
+    try:
+        while True:
+            try:
+                entry = next(entries)
+            except StopIteration:
+                break
+            except OSError as exc:
+                raise _StatusInspectionError(
+                    _classify_status_os_error(exc, default_error_class=default_error_class)
+                ) from exc
+            yield entry
+    finally:
+        close = getattr(entries, "close", None)
+        if close is not None:
+            close()
+
+
+def _status_entry_is_symlink(
+    entry,
+    *,
+    default_error_class: str = "inspection_error",
+) -> bool:
+    try:
+        return entry.is_symlink()
+    except OSError as exc:
+        raise _StatusInspectionError(
+            _classify_status_os_error(exc, default_error_class=default_error_class)
+        ) from exc
+
+
+def _status_entry_stat(
+    entry,
+    *,
+    default_error_class: str = "inspection_error",
+) -> os.stat_result:
+    try:
+        return entry.stat(follow_symlinks=False)
+    except OSError as exc:
+        raise _StatusInspectionError(
+            _classify_status_os_error(exc, default_error_class=default_error_class)
+        ) from exc
+
+
+def _status_root_has_entries(root_fd: int) -> bool:
+    for _entry in _status_iter_dir_entries(root_fd):
+        return True
+    return False
+
+
+def _status_pending_prefix_metrics(
+    decoded: DecodedSegment,
+    *,
+    acked_prefix_bytes: int,
+    error_class: str,
+) -> tuple[int, int]:
+    if acked_prefix_bytes < 0 or acked_prefix_bytes > decoded.valid_prefix_bytes:
+        raise _StatusInspectionError(error_class)
+    pending_frames = 0
+    pending_bytes = 0
+    for frame in decoded.prefix_frames:
+        frame_end = frame.frame_offset + frame.frame_length
+        if frame_end <= acked_prefix_bytes:
+            continue
+        if frame.frame_offset < acked_prefix_bytes:
+            raise _StatusInspectionError(error_class)
+        pending_frames += 1
+        pending_bytes += frame.frame_length
+    return pending_frames, pending_bytes
+
+
+def _status_assert_regular_fd_matches_entry(
+    *,
+    parent_fd: int,
+    name: str,
+    entry_stat: os.stat_result,
+    fd: int,
+    error_class: str,
+    default_error_class: str | None = None,
+) -> None:
+    normalized_default_error_class = (
+        error_class if default_error_class is None else default_error_class
+    )
+    try:
+        current_stat = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except (FileNotFoundError, OSError) as exc:
+        raise _StatusInspectionError(
+            _classify_status_os_error(
+                exc,
+                default_error_class=normalized_default_error_class,
+            )
+        ) from exc
+    try:
+        target_stat = os.fstat(fd)
+    except OSError as exc:
+        raise _StatusInspectionError(
+            _classify_status_os_error(
+                exc,
+                default_error_class=normalized_default_error_class,
+            )
+        ) from exc
+    if not stat.S_ISREG(current_stat.st_mode) or not stat.S_ISREG(target_stat.st_mode):
+        raise _StatusInspectionError(error_class)
+    if not _same_file_stat(entry_stat, target_stat) or not _same_file_stat(
+        current_stat, target_stat
+    ):
+        raise _StatusInspectionError(error_class)
+
+
+def _status_assert_active_fd_matches_entry(
+    *,
+    root_fd: int,
+    entry_stat: os.stat_result,
+    fd: int,
+) -> None:
+    _status_assert_regular_fd_matches_entry(
+        parent_fd=root_fd,
+        name=ACTIVE_SPOOL_NAME,
+        entry_stat=entry_stat,
+        fd=fd,
+        error_class="entry_replaced",
+        default_error_class="inspection_error",
+    )
+
+
+def _status_load_orphan_ack_payload(
+    *,
+    dir_fd: int,
+    entry_name: str,
+    expected_segment_name: str,
+) -> tuple[int, Mapping[str, Any]]:
+    parsed = _parse_ack_sidecar_name(entry_name)
+    if parsed is None:
+        raise SpoolDurabilityError(f"invalid ack sidecar: {entry_name}")
+    _sequence, entry_segment_name, acked_prefix = parsed
+    if entry_segment_name != expected_segment_name:
+        raise SpoolDurabilityError(f"invalid ack sidecar: {entry_name}")
+    fd = os.open(entry_name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dir_fd)
+    try:
+        raw = _read_exact_from_fd(fd, offset=0, length=os.fstat(fd).st_size)
+    finally:
+        os.close(fd)
+    try:
+        payload = json.loads(raw.decode("utf-8"), object_pairs_hook=_reject_duplicate_json_keys)
+    except (UnicodeDecodeError, json.JSONDecodeError, _DuplicateJsonKeyError):
+        raise SpoolDurabilityError(f"invalid ack sidecar: {entry_name}")
+    segment_size_bytes = payload.get("segment_size_bytes")
+    if isinstance(segment_size_bytes, bool) or not isinstance(segment_size_bytes, int):
+        raise SpoolDurabilityError(f"invalid ack sidecar: {entry_name}")
+    validated = _validate_ack_payload(
+        raw_bytes=raw,
+        payload=payload,
+        ack_name=entry_name,
+        expected_segment_name=expected_segment_name,
+        segment_size_bytes=int(segment_size_bytes),
+    )
+    return acked_prefix, validated
+
+
+def _classify_status_ack_os_error(exc: OSError) -> str:
+    return _classify_status_os_error(exc, default_error_class="invalid_ack_json")
+
+
+def _status_scan_ack_sidecars(
+    *,
+    root_fd: int,
+    segment_sizes: Mapping[str, int],
+) -> _StatusAckDirectorySnapshot:
+    sealed_fd = _open_dir_optional(root_fd, SEALED_DIR_NAME, full_path=_sealed_dir())
+    if sealed_fd is None:
+        return _StatusAckDirectorySnapshot(winners_by_segment={})
+    acks_fd: int | None = None
+    try:
+        acks_fd = _open_dir_optional(sealed_fd, ACKS_DIR_NAME, full_path=_acks_dir())
+        if acks_fd is None:
+            return _StatusAckDirectorySnapshot(winners_by_segment={})
+        winners: dict[str, Mapping[str, Any]] = {}
+        orphan_winners: dict[str, tuple[int, int, Mapping[str, Any], int]] = {}
+        blocked_orphan_sequence: int | None = None
+        candidate_counts: dict[str, int] = {}
+        for entry in _status_iter_dir_entries(
+            acks_fd,
+            default_error_class="invalid_ack_json",
+        ):
+            if _status_entry_is_symlink(
+                entry,
+                default_error_class="invalid_ack_json",
+            ):
+                raise _StatusInspectionError("symlink_refused")
+            entry_stat = _status_entry_stat(
+                entry,
+                default_error_class="invalid_ack_json",
+            )
+            if stat.S_ISDIR(entry_stat.st_mode):
+                raise _StatusInspectionError("unexpected_artifact")
+            if not stat.S_ISREG(entry_stat.st_mode):
+                raise _StatusInspectionError("unexpected_artifact")
+            if entry.name.startswith("."):
+                try:
+                    temp_parsed = _parse_protocol_temp_sequence(
+                        entry.name,
+                        dir_fd=acks_fd,
+                        label=_acks_dir() / entry.name,
+                    )
+                except OSError as exc:
+                    raise _StatusInspectionError(_classify_status_ack_os_error(exc)) from exc
+                except (SpoolDurabilityError, SpoolPathSecurityError) as exc:
+                    raise _StatusInspectionError("unexpected_artifact") from exc
+                if temp_parsed is not None:
+                    continue
+            parsed = _parse_ack_sidecar_name(entry.name)
+            if parsed is None:
+                raise _StatusInspectionError("unexpected_artifact")
+            sequence, segment_name, acked_prefix = parsed
+            candidate_counts[segment_name] = candidate_counts.get(segment_name, 0) + 1
+            if candidate_counts[segment_name] > 64:
+                raise _StatusInspectionError("invalid_ack_json")
+            try:
+                if segment_name in segment_sizes:
+                    _acked_prefix, validated = _load_ack_payload_from_fd(
+                        dir_fd=acks_fd,
+                        entry_name=entry.name,
+                        expected_segment_name=segment_name,
+                        segment_size_bytes=segment_sizes[segment_name],
+                    )
+                    current_winner = winners.get(segment_name)
+                    if current_winner is None or acked_prefix > int(
+                        current_winner["acked_prefix_bytes"]
+                    ):
+                        winners[segment_name] = validated
+                    continue
+                _acked_prefix, validated = _status_load_orphan_ack_payload(
+                    dir_fd=acks_fd,
+                    entry_name=entry.name,
+                    expected_segment_name=segment_name,
+                )
+            except OSError as exc:
+                raise _StatusInspectionError(_classify_status_ack_os_error(exc)) from exc
+            except SpoolDurabilityError as exc:
+                raise _StatusInspectionError("invalid_ack_json") from exc
+            current_orphan = orphan_winners.get(segment_name)
+            if current_orphan is None or acked_prefix > current_orphan[1]:
+                orphan_winners[segment_name] = (
+                    sequence,
+                    acked_prefix,
+                    validated,
+                    int(entry_stat.st_mtime_ns),
+                )
+
+        orphan_tombstone_sequence: int | None = None
+        orphan_tombstone_mtime_ns: int | None = None
+        for sequence, _acked_prefix, validated, mtime_ns in orphan_winners.values():
+            validated_acked_prefix = int(validated["acked_prefix_bytes"])
+            validated_valid_prefix = int(validated["valid_prefix_bytes"])
+            segment_size_bytes = int(validated["segment_size_bytes"])
+            if (
+                validated_acked_prefix == validated_valid_prefix
+                and validated_valid_prefix == segment_size_bytes
+            ):
+                if (
+                    orphan_tombstone_sequence is None
+                    or sequence < orphan_tombstone_sequence
+                ):
+                    orphan_tombstone_sequence = sequence
+                    orphan_tombstone_mtime_ns = mtime_ns
+                continue
+            blocked_orphan_sequence = (
+                sequence
+                if blocked_orphan_sequence is None
+                else min(blocked_orphan_sequence, sequence)
+            )
+        return _StatusAckDirectorySnapshot(
+            winners_by_segment=winners,
+            orphan_tombstone_sequence=orphan_tombstone_sequence,
+            orphan_tombstone_mtime_ns=orphan_tombstone_mtime_ns,
+            blocked_orphan_sequence=blocked_orphan_sequence,
+        )
+    finally:
+        if acks_fd is not None:
+            _close_fd_quietly(acks_fd)
+        _close_fd_quietly(sealed_fd)
+
+
+def _status_effective_acked_prefix(
+    *,
+    segment: _StatusSegmentSnapshot,
+    ack_snapshot: _StatusAckDirectorySnapshot,
+    blocker: _StatusBlockerSnapshot,
+) -> tuple[int, bool]:
+    winner = ack_snapshot.winners_by_segment.get(segment.name)
+    acked_prefix_bytes = 0
+    ack_pending = False
+    if winner is not None:
+        acked_prefix_bytes = int(winner["acked_prefix_bytes"])
+        ack_pending = True
+    if blocker.present and blocker.prefix_segment_name == segment.name and blocker.acked_prefix_bytes > 0:
+        if blocker.valid_prefix_bytes != segment.size_bytes:
+            raise _StatusInspectionError("invalid_blocker_json")
+        acked_prefix_bytes = max(acked_prefix_bytes, blocker.acked_prefix_bytes)
+        ack_pending = True
+    return acked_prefix_bytes, ack_pending
+
+
+def _status_count_directory_protocol_artifacts(
+    *,
+    dir_fd: int,
+    dir_path: Path,
+    parsers: tuple,
+    allowed_dirs: set[str],
+    limit: int,
+    counted: list[int],
+    legacy_quarantine_ok: bool = False,
+) -> None:
+    for entry in _status_iter_dir_entries(dir_fd):
+        if _status_entry_is_symlink(entry):
+            raise _StatusInspectionError("symlink_refused")
+        entry_stat = _status_entry_stat(entry)
+        if stat.S_ISDIR(entry_stat.st_mode) and entry.name in allowed_dirs:
+            continue
+        matched = False
+        for parser in parsers:
+            if parser(entry.name) is not None:
+                matched = True
+                break
+        if not matched and entry.name.startswith("."):
+            try:
+                temp_parsed = _parse_protocol_temp_sequence(
+                    entry.name,
+                    dir_fd=dir_fd,
+                    label=dir_path / entry.name,
+                )
+            except OSError as exc:
+                raise _StatusInspectionError(
+                    _classify_status_os_error(exc)
+                ) from exc
+            except SpoolPathSecurityError as exc:
+                raise _StatusInspectionError("symlink_refused") from exc
+            except SpoolDurabilityError as exc:
+                raise _StatusInspectionError("unexpected_artifact") from exc
+            if temp_parsed is not None:
+                matched = True
+        if not matched and legacy_quarantine_ok and _is_legacy_quarantine_name(entry.name):
+            matched = True
+        if not matched:
+            raise _StatusInspectionError("unexpected_artifact")
+        counted[0] += 1
+        if counted[0] > limit:
+            raise _StatusInspectionError("artifact_limit_exceeded")
+
+
+def _status_count_protocol_artifacts(*, root_fd: int, limit: int) -> None:
+    counted = [0]
+    for entry in _status_iter_dir_entries(root_fd):
+        label = _spool_root() / entry.name
+        if _status_entry_is_symlink(entry):
+            raise _StatusInspectionError("symlink_refused")
+        entry_stat = _status_entry_stat(entry)
+        if stat.S_ISDIR(entry_stat.st_mode):
+            if entry.name in {SEALED_DIR_NAME, QUARANTINE_DIR_NAME}:
+                continue
+            raise _StatusInspectionError("unexpected_artifact")
+        if not stat.S_ISREG(entry_stat.st_mode):
+            raise _StatusInspectionError("unexpected_artifact")
+        if entry.name in {LOCK_FILE_NAME, REPLAY_OWNER_LOCK_NAME}:
+            continue
+        if entry.name in {ACTIVE_SPOOL_NAME, HIGHWATER_FILE_NAME}:
+            counted[0] += 1
+            if counted[0] > limit:
+                raise _StatusInspectionError("artifact_limit_exceeded")
+            continue
+        if entry.name.startswith("."):
+            try:
+                temp_parsed = _parse_protocol_temp_sequence(
+                    entry.name,
+                    dir_fd=root_fd,
+                    label=label,
+                )
+            except OSError as exc:
+                raise _StatusInspectionError(
+                    _classify_status_os_error(exc)
+                ) from exc
+            except SpoolPathSecurityError as exc:
+                raise _StatusInspectionError("symlink_refused") from exc
+            except SpoolDurabilityError as exc:
+                raise _StatusInspectionError("unexpected_artifact") from exc
+            if temp_parsed is not None:
+                counted[0] += 1
+                if counted[0] > limit:
+                    raise _StatusInspectionError("artifact_limit_exceeded")
+                continue
+        raise _StatusInspectionError("unexpected_artifact")
+
+    sealed_fd = _open_dir_optional(root_fd, SEALED_DIR_NAME, full_path=_sealed_dir())
+    if sealed_fd is not None:
+        try:
+            _status_count_directory_protocol_artifacts(
+                dir_fd=sealed_fd,
+                dir_path=_sealed_dir(),
+                parsers=(_parse_sealed_segment_sequence,),
+                allowed_dirs={ACKS_DIR_NAME, BLOCKERS_DIR_NAME},
+                limit=limit,
+                counted=counted,
+            )
+            acks_fd = _open_dir_optional(sealed_fd, ACKS_DIR_NAME, full_path=_acks_dir())
+            if acks_fd is not None:
+                try:
+                    _status_count_directory_protocol_artifacts(
+                        dir_fd=acks_fd,
+                        dir_path=_acks_dir(),
+                        parsers=(_parse_ack_sidecar_sequence,),
+                        allowed_dirs=set(),
+                        limit=limit,
+                        counted=counted,
+                    )
+                finally:
+                    _close_fd_quietly(acks_fd)
+            blockers_fd = _open_dir_optional(sealed_fd, BLOCKERS_DIR_NAME, full_path=_blockers_dir())
+            if blockers_fd is not None:
+                try:
+                    _status_count_directory_protocol_artifacts(
+                        dir_fd=blockers_fd,
+                        dir_path=_blockers_dir(),
+                        parsers=(_parse_blocker_sequence,),
+                        allowed_dirs=set(),
+                        limit=limit,
+                        counted=counted,
+                    )
+                finally:
+                    _close_fd_quietly(blockers_fd)
+        finally:
+            _close_fd_quietly(sealed_fd)
+
+    quarantine_fd = _open_dir_optional(root_fd, QUARANTINE_DIR_NAME, full_path=_quarantine_dir())
+    if quarantine_fd is not None:
+        try:
+            _status_count_directory_protocol_artifacts(
+                dir_fd=quarantine_fd,
+                dir_path=_quarantine_dir(),
+                parsers=(_parse_replay_quarantine_sequence,),
+                allowed_dirs=set(),
+                limit=limit,
+                counted=counted,
+                legacy_quarantine_ok=True,
+            )
+        finally:
+            _close_fd_quietly(quarantine_fd)
+
+
+def _status_collect_segment_snapshots(*, root_fd: int) -> list[_StatusSegmentSnapshot]:
+    sealed_fd = _open_dir_optional(root_fd, SEALED_DIR_NAME, full_path=_sealed_dir())
+    if sealed_fd is None:
+        return []
+    try:
+        snapshots: list[_StatusSegmentSnapshot] = []
+        for entry in _status_iter_dir_entries(sealed_fd):
+            if _status_entry_is_symlink(entry):
+                raise _StatusInspectionError("symlink_refused")
+            entry_stat = _status_entry_stat(entry)
+            if stat.S_ISDIR(entry_stat.st_mode):
+                if entry.name in {ACKS_DIR_NAME, BLOCKERS_DIR_NAME}:
+                    continue
+                raise _StatusInspectionError("unexpected_artifact")
+            if not stat.S_ISREG(entry_stat.st_mode):
+                raise _StatusInspectionError("unexpected_artifact")
+            if entry.name.startswith("."):
+                try:
+                    temp_parsed = _parse_protocol_temp_sequence(
+                        entry.name,
+                        dir_fd=sealed_fd,
+                        label=_sealed_dir() / entry.name,
+                    )
+                except OSError as exc:
+                    raise _StatusInspectionError(
+                        _classify_status_os_error(exc)
+                    ) from exc
+                except SpoolPathSecurityError as exc:
+                    raise _StatusInspectionError("symlink_refused") from exc
+                except SpoolDurabilityError as exc:
+                    raise _StatusInspectionError("unexpected_artifact") from exc
+                if temp_parsed is not None:
+                    continue
+            match = re.fullmatch(r"(\d{20})(?:\.prefix)?\.spool", entry.name)
+            if not match:
+                raise _StatusInspectionError("unexpected_artifact")
+            try:
+                segment_fd = os.open(entry.name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=sealed_fd)
+            except OSError as exc:
+                raise _StatusInspectionError(_classify_status_os_error(exc)) from exc
+            try:
+                _status_assert_regular_fd_matches_entry(
+                    parent_fd=sealed_fd,
+                    name=entry.name,
+                    entry_stat=entry_stat,
+                    fd=segment_fd,
+                    error_class="entry_replaced",
+                    default_error_class="inspection_error",
+                )
+                decoded = _decode_spool_segment_fd(segment_fd)
+                if decoded.tail_status is not SpoolTailStatus.CLEAN:
+                    raise _StatusInspectionError(decoded.tail_status.value)
+                _status_assert_regular_fd_matches_entry(
+                    parent_fd=sealed_fd,
+                    name=entry.name,
+                    entry_stat=entry_stat,
+                    fd=segment_fd,
+                    error_class="entry_replaced",
+                    default_error_class="inspection_error",
+                )
+                snapshots.append(
+                    _StatusSegmentSnapshot(
+                        sequence=int(match.group(1)),
+                        name=entry.name,
+                        size_bytes=decoded.valid_prefix_bytes,
+                        frame_count=len(decoded.prefix_frames),
+                        mtime_ns=int(entry_stat.st_mtime_ns),
+                        decoded=decoded,
+                    )
+                )
+            finally:
+                _close_fd_quietly(segment_fd)
+        snapshots.sort(key=lambda item: (item.sequence, item.name))
+        return snapshots
+    finally:
+        _close_fd_quietly(sealed_fd)
+
+
+def _status_load_blocker_snapshot(*, root_fd: int) -> _StatusBlockerSnapshot:
+    sealed_fd = _open_dir_optional(root_fd, SEALED_DIR_NAME, full_path=_sealed_dir())
+    if sealed_fd is None:
+        return _StatusBlockerSnapshot()
+    blockers_fd: int | None = None
+    quarantine_fd: int | None = None
+    prefix_fd = -1
+    evidence_spool_fd = -1
+    try:
+        blockers_fd = _open_dir_optional(sealed_fd, BLOCKERS_DIR_NAME, full_path=_blockers_dir())
+        if blockers_fd is None:
+            return _StatusBlockerSnapshot()
+        blocker_entries: list[tuple[int, str, os.stat_result]] = []
+        for entry in _status_iter_dir_entries(blockers_fd):
+            if _status_entry_is_symlink(entry):
+                raise _StatusInspectionError("symlink_refused")
+            entry_stat = _status_entry_stat(entry)
+            if stat.S_ISDIR(entry_stat.st_mode):
+                raise _StatusInspectionError("unexpected_artifact")
+            if not stat.S_ISREG(entry_stat.st_mode):
+                raise _StatusInspectionError("unexpected_artifact")
+            if entry.name.startswith("."):
+                try:
+                    temp_parsed = _parse_protocol_temp_sequence(
+                        entry.name,
+                        dir_fd=blockers_fd,
+                        label=_blockers_dir() / entry.name,
+                    )
+                except OSError as exc:
+                    raise _StatusInspectionError(
+                        _classify_status_os_error(exc)
+                    ) from exc
+                except SpoolPathSecurityError as exc:
+                    raise _StatusInspectionError("symlink_refused") from exc
+                except SpoolDurabilityError as exc:
+                    raise _StatusInspectionError("unexpected_artifact") from exc
+                if temp_parsed is not None:
+                    continue
+            sequence = _parse_blocker_sequence(entry.name)
+            if sequence is None:
+                raise _StatusInspectionError("unexpected_artifact")
+            blocker_entries.append((sequence, entry.name, entry_stat))
+        if not blocker_entries:
+            return _StatusBlockerSnapshot()
+        blocker_entries.sort(key=lambda item: item[0])
+        sequence, entry_name, entry_stat = blocker_entries[0]
+        try:
+            payload = _load_canonical_json_entry(
+                dir_fd=blockers_fd,
+                entry_name=entry_name,
+                label=_blockers_dir() / entry_name,
+                invalid_message=f"invalid corruption blocker: {_blockers_dir() / entry_name}",
+            )
+        except (OSError, SpoolDurabilityError, SpoolPathSecurityError) as exc:
+            raise _StatusInspectionError(
+                _classify_status_exception(
+                    exc,
+                    default_error_class="invalid_blocker_json",
+                )
+            ) from exc
+        required_fields = {
+            "schema_version",
+            "segment_sequence",
+            "source_kind",
+            "tail_status",
+            "valid_prefix_bytes",
+            "acked_prefix_bytes",
+            "blocking_offset",
+            "prefix_segment_name",
+            "evidence_spool_name",
+            "evidence_sidecar_name",
+            "original_size_bytes",
+        }
+        if set(payload.keys()) != required_fields:
+            raise _StatusInspectionError("invalid_blocker_json")
+        if payload.get("schema_version") != 1 or payload.get("segment_sequence") != _format_segment_sequence(sequence):
+            raise _StatusInspectionError("invalid_blocker_json")
+        source_kind = payload.get("source_kind")
+        if source_kind not in {"active", "sealed"}:
+            raise _StatusInspectionError("invalid_blocker_json")
+        try:
+            tail_status = SpoolTailStatus(str(payload.get("tail_status")))
+        except ValueError as exc:
+            raise _StatusInspectionError("invalid_blocker_json") from exc
+        blocking_offset = payload.get("blocking_offset")
+        valid_prefix_bytes = payload.get("valid_prefix_bytes")
+        acked_prefix_bytes = payload.get("acked_prefix_bytes")
+        original_size_bytes = payload.get("original_size_bytes")
+        if not all(
+            isinstance(value, int) and not isinstance(value, bool)
+            for value in (
+                blocking_offset,
+                valid_prefix_bytes,
+                acked_prefix_bytes,
+                original_size_bytes,
+            )
+        ):
+            raise _StatusInspectionError("invalid_blocker_json")
+        assert isinstance(blocking_offset, int) and not isinstance(blocking_offset, bool)
+        assert isinstance(valid_prefix_bytes, int) and not isinstance(valid_prefix_bytes, bool)
+        assert isinstance(acked_prefix_bytes, int) and not isinstance(acked_prefix_bytes, bool)
+        assert isinstance(original_size_bytes, int) and not isinstance(
+            original_size_bytes, bool
+        )
+        blocking_offset = int(blocking_offset)
+        valid_prefix_bytes = int(valid_prefix_bytes)
+        acked_prefix_bytes = int(acked_prefix_bytes)
+        original_size_bytes = int(original_size_bytes)
+        if (
+            blocking_offset < 0
+            or valid_prefix_bytes < 0
+            or acked_prefix_bytes < 0
+            or acked_prefix_bytes > valid_prefix_bytes
+            or original_size_bytes < 0
+        ):
+            raise _StatusInspectionError("invalid_blocker_json")
+        prefix_segment_name = payload.get("prefix_segment_name")
+        if prefix_segment_name is not None and not isinstance(prefix_segment_name, str):
+            raise _StatusInspectionError("invalid_blocker_json")
+        evidence_spool_name = payload.get("evidence_spool_name")
+        evidence_sidecar_name = payload.get("evidence_sidecar_name")
+        if not isinstance(evidence_spool_name, str) or not isinstance(
+            evidence_sidecar_name, str
+        ):
+            raise _StatusInspectionError("invalid_blocker_json")
+        sequence_str = _format_segment_sequence(sequence)
+        expected_evidence_base = (
+            f"seq-{sequence_str}-{tail_status.value}-vp{valid_prefix_bytes}"
+        )
+        if (
+            evidence_spool_name != f"{expected_evidence_base}.spool"
+            or evidence_sidecar_name != f"{expected_evidence_base}.json"
+        ):
+            raise _StatusInspectionError("invalid_blocker_json")
+
+        quarantine_fd = _open_dir_optional(
+            root_fd, QUARANTINE_DIR_NAME, full_path=_quarantine_dir()
+        )
+        if quarantine_fd is None:
+            raise _StatusInspectionError("invalid_blocker_json")
+        try:
+            evidence_payload = _load_canonical_json_entry(
+                dir_fd=quarantine_fd,
+                entry_name=evidence_sidecar_name,
+                label=_quarantine_dir() / evidence_sidecar_name,
+                invalid_message=(
+                    f"invalid replay evidence sidecar: {_quarantine_dir() / evidence_sidecar_name}"
+                ),
+            )
+        except (OSError, SpoolDurabilityError, SpoolPathSecurityError) as exc:
+            raise _StatusInspectionError(
+                _classify_status_exception(
+                    exc,
+                    default_error_class="invalid_blocker_json",
+                )
+            ) from exc
+        expected_evidence_payload = {
+            "schema_version": 1,
+            "segment_sequence": sequence_str,
+            "source_kind": str(source_kind),
+            "tail_status": tail_status.value,
+            "valid_prefix_bytes": valid_prefix_bytes,
+            "original_size_bytes": original_size_bytes,
+            "evidence_spool_name": evidence_spool_name,
+        }
+        if dict(evidence_payload) != expected_evidence_payload:
+            raise _StatusInspectionError("invalid_blocker_json")
+
+        try:
+            evidence_entry_stat = os.stat(
+                evidence_spool_name,
+                dir_fd=quarantine_fd,
+                follow_symlinks=False,
+            )
+            if not stat.S_ISREG(evidence_entry_stat.st_mode):
+                raise _StatusInspectionError("invalid_blocker_json")
+            evidence_spool_fd = os.open(
+                evidence_spool_name,
+                os.O_RDONLY | os.O_NOFOLLOW,
+                dir_fd=quarantine_fd,
+            )
+            _status_assert_regular_fd_matches_entry(
+                parent_fd=quarantine_fd,
+                name=evidence_spool_name,
+                entry_stat=evidence_entry_stat,
+                fd=evidence_spool_fd,
+                error_class="invalid_blocker_json",
+            )
+            if int(os.fstat(evidence_spool_fd).st_size) != original_size_bytes:
+                raise _StatusInspectionError("invalid_blocker_json")
+        except (FileNotFoundError, OSError) as exc:
+            raise _StatusInspectionError(
+                "symlink_refused"
+                if exc.errno in {errno.ELOOP, errno.ENOTDIR, errno.EISDIR}
+                else "invalid_blocker_json"
+            ) from exc
+        finally:
+            if evidence_spool_fd >= 0:
+                _close_fd_quietly(evidence_spool_fd)
+                evidence_spool_fd = -1
+
+        if prefix_segment_name is None:
+            if valid_prefix_bytes != 0 or acked_prefix_bytes != 0 or blocking_offset != 0:
+                raise _StatusInspectionError("invalid_blocker_json")
+            return _StatusBlockerSnapshot(
+                present=True,
+                sequence=sequence,
+                offset=blocking_offset,
+                reason_class=tail_status.value,
+                source_kind=str(source_kind),
+                mtime_ns=int(entry_stat.st_mtime_ns),
+                acked_prefix_bytes=acked_prefix_bytes,
+                valid_prefix_bytes=valid_prefix_bytes,
+                prefix_segment_name=None,
+                zero_prefix=True,
+            )
+
+        expected_prefix_name = f"{sequence_str}.prefix.spool"
+        if (
+            prefix_segment_name != expected_prefix_name
+            or valid_prefix_bytes <= 0
+            or blocking_offset != valid_prefix_bytes
+        ):
+            raise _StatusInspectionError("invalid_blocker_json")
+        try:
+            prefix_entry_stat = os.stat(
+                prefix_segment_name,
+                dir_fd=sealed_fd,
+                follow_symlinks=False,
+            )
+            if not stat.S_ISREG(prefix_entry_stat.st_mode):
+                raise _StatusInspectionError("invalid_blocker_json")
+            prefix_fd = os.open(
+                prefix_segment_name,
+                os.O_RDONLY | os.O_NOFOLLOW,
+                dir_fd=sealed_fd,
+            )
+            _status_assert_regular_fd_matches_entry(
+                parent_fd=sealed_fd,
+                name=prefix_segment_name,
+                entry_stat=prefix_entry_stat,
+                fd=prefix_fd,
+                error_class="invalid_blocker_json",
+            )
+            if int(os.fstat(prefix_fd).st_size) != valid_prefix_bytes:
+                raise _StatusInspectionError("invalid_blocker_json")
+            decoded_prefix = _decode_spool_segment_fd(prefix_fd)
+            if (
+                decoded_prefix.tail_status is not SpoolTailStatus.CLEAN
+                or decoded_prefix.valid_prefix_bytes != valid_prefix_bytes
+            ):
+                raise _StatusInspectionError("invalid_blocker_json")
+            _status_assert_regular_fd_matches_entry(
+                parent_fd=sealed_fd,
+                name=prefix_segment_name,
+                entry_stat=prefix_entry_stat,
+                fd=prefix_fd,
+                error_class="invalid_blocker_json",
+            )
+        except (FileNotFoundError, OSError) as exc:
+            raise _StatusInspectionError(
+                "symlink_refused"
+                if exc.errno in {errno.ELOOP, errno.ENOTDIR, errno.EISDIR}
+                else "invalid_blocker_json"
+            ) from exc
+        finally:
+            if prefix_fd >= 0:
+                _close_fd_quietly(prefix_fd)
+                prefix_fd = -1
+        return _StatusBlockerSnapshot(
+            present=True,
+            sequence=sequence,
+            offset=blocking_offset,
+            reason_class=tail_status.value,
+            source_kind=str(source_kind),
+            mtime_ns=int(entry_stat.st_mtime_ns),
+            acked_prefix_bytes=acked_prefix_bytes,
+            valid_prefix_bytes=valid_prefix_bytes,
+            prefix_segment_name=prefix_segment_name,
+            zero_prefix=False,
+        )
+    finally:
+        if evidence_spool_fd >= 0:
+            _close_fd_quietly(evidence_spool_fd)
+        if prefix_fd >= 0:
+            _close_fd_quietly(prefix_fd)
+        if quarantine_fd is not None:
+            _close_fd_quietly(quarantine_fd)
+        if blockers_fd is not None:
+            _close_fd_quietly(blockers_fd)
+        _close_fd_quietly(sealed_fd)
+
+
+def collect_session_fallback_spool_status(*, now: float | None = None) -> SessionFallbackSpoolStatus:
+    observed_at = time.time() if now is None else float(now)
+    home_path = Path(get_hermes_home())
+    root_path = _spool_root()
+    active_path = _active_spool_path()
+    runtime: _AnchoredRuntime | None = None
+    home_fd = -1
+    root_fd = -1
+    lock_fd = -1
+    lock_held = False
+    inspection_error_class: str | None = None
+    reasons: set[str] = set()
+    pending_units = 0
+    pending_frames = 0
+    pending_bytes = 0
+    oldest_pending_age_seconds: float | None = None
+    retry_pending = False
+    retry_class = None
+    cooldown_seconds = 0.0
+    ack_pending = False
+    blocker = _StatusBlockerSnapshot()
+    capacity_used_bytes = 0
+    capacity_cap_bytes = max(0, int(TOTAL_CAP_BYTES))
+    capacity_remaining_bytes = capacity_cap_bytes
+    capacity_state = "ok"
+    disk_free_bytes: int | None = None
+    disk_total_bytes: int | None = None
+    disk_state = "unknown"
+    root_missing = False
+
+    try:
+        try:
+            home_fd = _open_home_dir_fd(home_path)
+            runtime = _AnchoredRuntime(
+                home_path=home_path,
+                root_path=root_path,
+                quarantine_path=_quarantine_dir(),
+                active_path=active_path,
+                home_fd=home_fd,
+                root_fd=-1,
+                lock_fd=-1,
+            )
+            maybe_root_fd = _open_dir_optional(home_fd, SPOOL_ROOT_NAME, full_path=root_path)
+            if maybe_root_fd is None:
+                root_missing = True
+            else:
+                root_fd = maybe_root_fd
+
+                runtime = _AnchoredRuntime(
+                    home_path=home_path,
+                    root_path=root_path,
+                    quarantine_path=_quarantine_dir(),
+                    active_path=active_path,
+                    home_fd=home_fd,
+                    root_fd=root_fd,
+                    lock_fd=-1,
+                )
+
+                root_populated = _status_root_has_entries(root_fd)
+                maybe_lock_fd = _open_file_optional(root_fd, LOCK_FILE_NAME, full_path=_lock_path())
+                if maybe_lock_fd is None and root_populated:
+                    inspection_error_class = "missing_append_lock"
+                elif maybe_lock_fd is not None:
+                    lock_fd = maybe_lock_fd
+                    if not _try_acquire_status_lock(lock_fd):
+                        inspection_error_class = "append_lock_busy"
+                    else:
+                        lock_held = True
+
+                if inspection_error_class is None:
+                    _status_count_protocol_artifacts(root_fd=root_fd, limit=STATUS_SCAN_ARTIFACT_LIMIT)
+
+                    active_fd = _open_file_optional(root_fd, ACTIVE_SPOOL_NAME, full_path=active_path)
+                    active_size = 0
+                    active_frames = 0
+                    active_mtime_ns: int | None = None
+                    try:
+                        if active_fd is not None:
+                            active_stat = os.fstat(active_fd)
+                            _status_assert_active_fd_matches_entry(
+                                root_fd=root_fd,
+                                entry_stat=active_stat,
+                                fd=active_fd,
+                            )
+                            active_size = int(active_stat.st_size)
+                            active_mtime_ns = int(active_stat.st_mtime_ns)
+                            active_scan = _scan_fd(active_fd)
+                            _status_assert_active_fd_matches_entry(
+                                root_fd=root_fd,
+                                entry_stat=active_stat,
+                                fd=active_fd,
+                            )
+                            if active_scan.tail_status is not SpoolTailStatus.CLEAN:
+                                raise _StatusInspectionError(active_scan.tail_status.value)
+                            active_frames = active_scan.frame_count
+                    finally:
+                        if active_fd is not None:
+                            _close_fd_quietly(active_fd)
+
+                    blocker = _status_load_blocker_snapshot(root_fd=root_fd)
+                    segments = _status_collect_segment_snapshots(
+                        root_fd=root_fd,
+                    )
+                    ack_snapshot = _status_scan_ack_sidecars(
+                        root_fd=root_fd,
+                        segment_sizes={item.name: item.size_bytes for item in segments},
+                    )
+                    if ack_snapshot.blocked_orphan_sequence is not None:
+                        raise _StatusInspectionError("invalid_ack_json")
+
+                    inventory = _durable_capacity_inventory(runtime, root_fd)
+                    capacity_used_bytes = active_size + inventory.quarantine_bytes + inventory.other_artifact_bytes
+                    capacity_remaining_bytes = max(0, capacity_cap_bytes - capacity_used_bytes)
+                    if capacity_remaining_bytes == 0:
+                        capacity_state = "full"
+                    elif capacity_remaining_bytes < MAX_FRAME_BYTES:
+                        capacity_state = "constrained"
+
+                    ack_pending = (
+                        blocker.acked_prefix_bytes > 0
+                        or ack_snapshot.orphan_tombstone_sequence is not None
+                    )
+                    pending_frames = active_frames
+                    pending_units = active_frames
+                    pending_bytes = active_size
+                    for item in segments:
+                        acked_prefix_bytes, segment_ack_pending = _status_effective_acked_prefix(
+                            segment=item,
+                            ack_snapshot=ack_snapshot,
+                            blocker=blocker,
+                        )
+                        segment_pending_frames, segment_pending_bytes = _status_pending_prefix_metrics(
+                            item.decoded,
+                            acked_prefix_bytes=acked_prefix_bytes,
+                            error_class="invalid_ack_json",
+                        )
+                        pending_frames += segment_pending_frames
+                        pending_units += segment_pending_frames
+                        pending_bytes += segment_pending_bytes
+                        ack_pending = ack_pending or segment_ack_pending
+
+                    oldest_mtime_ns: int | None = None
+                    oldest_sequence: int | None = None
+                    first_segment = segments[0] if segments else None
+                    blocker_uses_prefix_queue_head = (
+                        blocker.present
+                        and not blocker.zero_prefix
+                        and blocker.sequence is not None
+                        and first_segment is not None
+                        and first_segment.sequence == blocker.sequence
+                        and blocker.prefix_segment_name == first_segment.name
+                    )
+                    if (
+                        blocker.present
+                        and blocker.sequence is not None
+                        and blocker.mtime_ns is not None
+                        and not blocker_uses_prefix_queue_head
+                    ):
+                        oldest_sequence = blocker.sequence
+                        oldest_mtime_ns = blocker.mtime_ns
+                    if (
+                        ack_snapshot.orphan_tombstone_sequence is not None
+                        and ack_snapshot.orphan_tombstone_mtime_ns is not None
+                        and (
+                            oldest_sequence is None
+                            or ack_snapshot.orphan_tombstone_sequence < oldest_sequence
+                        )
+                    ):
+                        oldest_sequence = ack_snapshot.orphan_tombstone_sequence
+                        oldest_mtime_ns = ack_snapshot.orphan_tombstone_mtime_ns
+                    if first_segment is not None and (
+                        oldest_sequence is None
+                        or first_segment.sequence < oldest_sequence
+                        or blocker_uses_prefix_queue_head
+                    ):
+                        oldest_sequence = first_segment.sequence
+                        oldest_mtime_ns = first_segment.mtime_ns
+                    if oldest_mtime_ns is None and active_frames > 0 and active_mtime_ns is not None:
+                        oldest_mtime_ns = active_mtime_ns
+                    if oldest_mtime_ns is not None:
+                        oldest_pending_age_seconds = max(0.0, observed_at - (oldest_mtime_ns / 1_000_000_000))
+
+                    cooldown_state = _REPLAY_COOLDOWNS.get(_replay_root_key(runtime))
+                    if cooldown_state is not None:
+                        remaining = float(cooldown_state["next_eligible"] - time.monotonic())
+                        if remaining > 0:
+                            retry_pending = True
+                            retry_class = str(cooldown_state.get("retry_class") or "retry_pending")
+                            cooldown_seconds = remaining
+        except (OSError, SpoolDurabilityError, SpoolPathSecurityError, _StatusInspectionError) as exc:
+            inspection_error_class = _classify_status_exception(exc)
+
+        if root_missing and inspection_error_class is None:
+            disk_free_bytes, disk_total_bytes, disk_state, _disk_error_class = _probe_disk_from_home_fd(
+                home_fd,
+                threshold_bytes=capacity_remaining_bytes,
+            )
+            return SessionFallbackSpoolStatus(
+                schema_version=1,
+                state="empty",
+                reasons=(),
+                pending_units=0,
+                pending_frames=0,
+                pending_bytes=0,
+                oldest_pending_age_seconds=None,
+                retry_pending=False,
+                retry_class=None,
+                cooldown_seconds=0.0,
+                ack_pending=False,
+                blocker_present=False,
+                blocker_sequence=None,
+                blocker_offset=None,
+                blocker_reason_class=None,
+                blocker_source_kind=None,
+                capacity_used_bytes=0,
+                capacity_cap_bytes=capacity_cap_bytes,
+                capacity_remaining_bytes=capacity_remaining_bytes,
+                capacity_state="ok",
+                disk_free_bytes=disk_free_bytes,
+                disk_total_bytes=disk_total_bytes,
+                disk_headroom_threshold_bytes=capacity_remaining_bytes,
+                disk_state=disk_state,
+                inspection_error_class=None,
+            )
+
+        if pending_frames > 0 or pending_bytes > 0:
+            reasons.add("pending_backlog")
+        if blocker.present:
+            reasons.add("blocker")
+        if retry_pending:
+            reasons.add("retry_cooldown")
+        if ack_pending:
+            reasons.add("ack_pending")
+        if capacity_state == "constrained":
+            reasons.add("capacity_constrained")
+        elif capacity_state == "full":
+            reasons.add("capacity_full")
+        if home_fd >= 0:
+            disk_free_bytes, disk_total_bytes, disk_state, disk_error_class = _probe_disk_from_home_fd(
+                home_fd,
+                threshold_bytes=capacity_remaining_bytes,
+            )
+            if disk_state == "low":
+                reasons.add("disk_low")
+            elif disk_error_class is not None and inspection_error_class is None:
+                inspection_error_class = disk_error_class
+        if inspection_error_class is not None:
+            reasons.add("inspection_error")
+
+        state = "degraded" if reasons else "healthy"
+        blocker_present = blocker.present
+        blocker_sequence = blocker.sequence
+        blocker_offset = blocker.offset
+        blocker_reason_class = blocker.reason_class
+        blocker_source_kind = blocker.source_kind
+
+        return SessionFallbackSpoolStatus(
+            schema_version=1,
+            state=state,
+            reasons=_ordered_status_reasons(reasons),
+            pending_units=pending_units,
+            pending_frames=pending_frames,
+            pending_bytes=pending_bytes,
+            oldest_pending_age_seconds=oldest_pending_age_seconds,
+            retry_pending=retry_pending,
+            retry_class=retry_class,
+            cooldown_seconds=cooldown_seconds,
+            ack_pending=ack_pending,
+            blocker_present=blocker_present,
+            blocker_sequence=blocker_sequence,
+            blocker_offset=blocker_offset,
+            blocker_reason_class=blocker_reason_class,
+            blocker_source_kind=blocker_source_kind,
+            capacity_used_bytes=capacity_used_bytes,
+            capacity_cap_bytes=capacity_cap_bytes,
+            capacity_remaining_bytes=capacity_remaining_bytes,
+            capacity_state=capacity_state,
+            disk_free_bytes=disk_free_bytes,
+            disk_total_bytes=disk_total_bytes,
+            disk_headroom_threshold_bytes=capacity_remaining_bytes,
+            disk_state=disk_state,
+            inspection_error_class=inspection_error_class,
+        )
+    finally:
+        if lock_held and lock_fd >= 0:
+            _release_status_lock(lock_fd)
+        if lock_fd >= 0:
+            _close_fd_quietly(lock_fd)
+        if root_fd >= 0:
+            _close_fd_quietly(root_fd)
+        _close_fd_quietly(home_fd)
 
 
 def _collect_sequence_inventory(*, runtime: _AnchoredRuntime, root_fd: int) -> list[int]:
@@ -3640,28 +5297,78 @@ def replay_to_session_db(session_db, *, trigger: str) -> ReplayRunResult:
     try:
         cooldown = _cooldown_result(runtime, trigger=trigger)
         if cooldown is not None:
+            _log_replay_run_result(runtime, cooldown)
             return cooldown
         owner = _try_acquire_replay_owner(runtime)
         if owner is None:
-            return ReplayRunResult(state=ReplayRunState.OWNER_BUSY, trigger=trigger)
+            pending_snapshot = _capture_replay_terminal_backlog(runtime)
+            return ReplayRunResult(
+                state=ReplayRunState.OWNER_BUSY,
+                trigger=trigger,
+                pending_bytes_after=pending_snapshot.pending_bytes,
+                pending_frames_after=pending_snapshot.pending_frames,
+                first_blocked_segment=pending_snapshot.first_blocked_segment,
+                first_blocked_offset=pending_snapshot.first_blocked_offset,
+                ack_pending=pending_snapshot.ack_pending,
+            )
 
-        with _append_lock(runtime.lock_fd, str(_lock_path())):
-            _ensure_directory(_sealed_dir(), mode=ROOT_MODE)
-            _ensure_directory(_acks_dir(), mode=ROOT_MODE)
-            _ensure_directory(_blockers_dir(), mode=ROOT_MODE)
-            reconciled_active = _reconcile_active_spool_for_replay(runtime)
-            if reconciled_active is None:
-                _seal_clean_active_spool_for_replay(runtime)
+        try:
+            with _append_lock(runtime.lock_fd, str(_lock_path())):
+                _ensure_directory(_sealed_dir(), mode=ROOT_MODE)
+                _ensure_directory(_acks_dir(), mode=ROOT_MODE)
+                _ensure_directory(_blockers_dir(), mode=ROOT_MODE)
+                reconciled_active = _reconcile_active_spool_for_replay(runtime)
+                if reconciled_active is None:
+                    _seal_clean_active_spool_for_replay(runtime)
+        except OSError as exc:
+            if not _is_retryable_replay_os_error(exc):
+                pending_snapshot = _capture_pending_backlog_snapshot(runtime)
+                return _log_and_return_replay_result(
+                    runtime,
+                    ReplayRunResult(
+                        state=ReplayRunState.NOT_DURABLE,
+                        trigger=trigger,
+                        pending_bytes_after=pending_snapshot.pending_bytes,
+                        pending_frames_after=pending_snapshot.pending_frames,
+                        first_blocked_segment=pending_snapshot.first_blocked_segment,
+                        first_blocked_offset=pending_snapshot.first_blocked_offset,
+                        ack_pending=pending_snapshot.ack_pending,
+                        error_class=_classify_nonretryable_replay_error(exc),
+                    ),
+                )
+            pending_snapshot = _capture_replay_terminal_backlog(runtime)
+            cooldown_seconds = _register_replay_cooldown(
+                runtime,
+                retry_class="spool_prepare_busy",
+                ack_pending=pending_snapshot.ack_pending,
+            )
+            return _log_and_return_replay_result(
+                runtime,
+                ReplayRunResult(
+                    state=ReplayRunState.RETRY_PENDING,
+                    trigger=trigger,
+                    pending_bytes_after=pending_snapshot.pending_bytes,
+                    pending_frames_after=pending_snapshot.pending_frames,
+                    first_blocked_segment=pending_snapshot.first_blocked_segment,
+                    first_blocked_offset=pending_snapshot.first_blocked_offset,
+                    retry_class="spool_prepare_busy",
+                    ack_pending=pending_snapshot.ack_pending,
+                    cooldown_seconds=cooldown_seconds,
+                ),
+            )
 
         _tombstones, blocked_orphan_sequence = _classify_ack_tombstones(
             runtime=runtime,
             root_fd=runtime.root_fd,
         )
         if blocked_orphan_sequence is not None:
-            return ReplayRunResult(
-                state=ReplayRunState.BLOCKED_INTEGRITY,
-                trigger=trigger,
-                first_blocked_segment=blocked_orphan_sequence,
+            return _log_and_return_replay_result(
+                runtime,
+                ReplayRunResult(
+                    state=ReplayRunState.BLOCKED_INTEGRITY,
+                    trigger=trigger,
+                    first_blocked_segment=blocked_orphan_sequence,
+                ),
             )
 
         blocker_sequence = _first_blocker_sequence(runtime=runtime, root_fd=runtime.root_fd)
@@ -3674,34 +5381,43 @@ def replay_to_session_db(session_db, *, trigger: str) -> ReplayRunResult:
                     blocker_sequence=blocker_sequence,
                 )
             except SpoolBlockedReplayError as exc:
-                return ReplayRunResult(
-                    state=ReplayRunState.BLOCKED_INTEGRITY,
-                    trigger=trigger,
-                    first_blocked_segment=blocker_sequence,
-                    first_blocked_offset=exc.frame_offset,
-                    error_class=exc.error_class,
+                return _log_and_return_replay_result(
+                    runtime,
+                    ReplayRunResult(
+                        state=ReplayRunState.BLOCKED_INTEGRITY,
+                        trigger=trigger,
+                        first_blocked_segment=blocker_sequence,
+                        first_blocked_offset=exc.frame_offset,
+                        error_class=exc.error_class,
+                    ),
                 )
 
         ordered_segments = _ordered_segment_entries(runtime=runtime, root_fd=runtime.root_fd)
         if not ordered_segments:
             if blocker_sequence is not None:
-                return ReplayRunResult(
-                    state=ReplayRunState.BLOCKED_INTEGRITY,
-                    trigger=trigger,
-                    first_blocked_segment=blocker_sequence,
-                    first_blocked_offset=(
-                        blocked_prefix_state.blocking_offset
-                        if blocked_prefix_state is not None
-                        else None
-                    ),
-                    error_class=(
-                        blocked_prefix_state.tail_status.value
-                        if blocked_prefix_state is not None
-                        else None
+                return _log_and_return_replay_result(
+                    runtime,
+                    ReplayRunResult(
+                        state=ReplayRunState.BLOCKED_INTEGRITY,
+                        trigger=trigger,
+                        first_blocked_segment=blocker_sequence,
+                        first_blocked_offset=(
+                            blocked_prefix_state.blocking_offset
+                            if blocked_prefix_state is not None
+                            else None
+                        ),
+                        error_class=(
+                            blocked_prefix_state.tail_status.value
+                            if blocked_prefix_state is not None
+                            else None
+                        ),
                     ),
                 )
             _clear_replay_cooldown(runtime)
-            return ReplayRunResult(state=ReplayRunState.EMPTY, trigger=trigger)
+            return _log_and_return_replay_result(
+                runtime,
+                ReplayRunResult(state=ReplayRunState.EMPTY, trigger=trigger),
+            )
 
         max_frames, max_bytes, max_seconds = _trigger_budget(trigger)
         start_monotonic = time.monotonic()
@@ -3720,6 +5436,7 @@ def replay_to_session_db(session_db, *, trigger: str) -> ReplayRunResult:
                     and (time.monotonic() - start_monotonic) >= max_seconds
                 )
             ):
+                pending_snapshot = _capture_replay_terminal_backlog(runtime)
                 return ReplayRunResult(
                     state=ReplayRunState.PARTIALLY_REPLAYED,
                     trigger=trigger,
@@ -3730,126 +5447,160 @@ def replay_to_session_db(session_db, *, trigger: str) -> ReplayRunResult:
                     frames_acked=frames_acked,
                     bytes_decoded=bytes_decoded,
                     bytes_acked=bytes_acked,
-                    pending_bytes_after=_remaining_segment_bytes(ordered_segments, segment_index),
+                    pending_bytes_after=pending_snapshot.pending_bytes,
+                    pending_frames_after=pending_snapshot.pending_frames,
+                    ack_pending=pending_snapshot.ack_pending,
                 )
             if blocker_sequence is not None and segment_sequence > blocker_sequence:
-                return ReplayRunResult(
-                    state=ReplayRunState.BLOCKED_INTEGRITY,
-                    trigger=trigger,
-                    segment_count_seen=len(ordered_segments),
-                    frames_decoded=frames_decoded,
-                    frames_committed=frames_committed,
-                    frames_duplicated=frames_duplicated,
-                    frames_acked=frames_acked,
-                    bytes_decoded=bytes_decoded,
-                    bytes_acked=bytes_acked,
-                    pending_bytes_after=_remaining_segment_bytes(ordered_segments, segment_index),
-                    first_blocked_segment=blocker_sequence,
-                    first_blocked_offset=(
-                        blocked_prefix_state.blocking_offset
-                        if blocked_prefix_state is not None
-                        else None
-                    ),
-                    error_class=(
-                        blocked_prefix_state.tail_status.value
-                        if blocked_prefix_state is not None
-                        else None
+                pending_snapshot = _capture_replay_terminal_backlog(runtime)
+                return _log_and_return_replay_result(
+                    runtime,
+                    ReplayRunResult(
+                        state=ReplayRunState.BLOCKED_INTEGRITY,
+                        trigger=trigger,
+                        segment_count_seen=len(ordered_segments),
+                        frames_decoded=frames_decoded,
+                        frames_committed=frames_committed,
+                        frames_duplicated=frames_duplicated,
+                        frames_acked=frames_acked,
+                        bytes_decoded=bytes_decoded,
+                        bytes_acked=bytes_acked,
+                        pending_bytes_after=pending_snapshot.pending_bytes,
+                        pending_frames_after=pending_snapshot.pending_frames,
+                        first_blocked_segment=blocker_sequence,
+                        first_blocked_offset=(
+                            blocked_prefix_state.blocking_offset
+                            if blocked_prefix_state is not None
+                            else None
+                        ),
+                        ack_pending=pending_snapshot.ack_pending,
+                        error_class=(
+                            blocked_prefix_state.tail_status.value
+                            if blocked_prefix_state is not None
+                            else None
+                        ),
                     ),
                 )
             if blocker_sequence is not None and segment_sequence == blocker_sequence:
                 if blocked_prefix_state is None:
-                    return ReplayRunResult(
-                        state=ReplayRunState.BLOCKED_INTEGRITY,
-                        trigger=trigger,
-                        segment_count_seen=len(ordered_segments),
-                        frames_decoded=frames_decoded,
-                        frames_committed=frames_committed,
-                        frames_duplicated=frames_duplicated,
-                        frames_acked=frames_acked,
-                        bytes_decoded=bytes_decoded,
-                        bytes_acked=bytes_acked,
-                        pending_bytes_after=_remaining_segment_bytes(ordered_segments, segment_index),
-                        first_blocked_segment=blocker_sequence,
+                    pending_snapshot = _capture_replay_terminal_backlog(runtime)
+                    return _log_and_return_replay_result(
+                        runtime,
+                        ReplayRunResult(
+                            state=ReplayRunState.BLOCKED_INTEGRITY,
+                            trigger=trigger,
+                            segment_count_seen=len(ordered_segments),
+                            frames_decoded=frames_decoded,
+                            frames_committed=frames_committed,
+                            frames_duplicated=frames_duplicated,
+                            frames_acked=frames_acked,
+                            bytes_decoded=bytes_decoded,
+                            bytes_acked=bytes_acked,
+                            pending_bytes_after=pending_snapshot.pending_bytes,
+                            pending_frames_after=pending_snapshot.pending_frames,
+                            first_blocked_segment=blocker_sequence,
+                            ack_pending=pending_snapshot.ack_pending,
+                        ),
                     )
                 if segment_name != blocked_prefix_state.prefix_segment_name:
-                    return ReplayRunResult(
-                        state=ReplayRunState.BLOCKED_INTEGRITY,
-                        trigger=trigger,
-                        segment_count_seen=len(ordered_segments),
-                        frames_decoded=frames_decoded,
-                        frames_committed=frames_committed,
-                        frames_duplicated=frames_duplicated,
-                        frames_acked=frames_acked,
-                        bytes_decoded=bytes_decoded,
-                        bytes_acked=bytes_acked,
-                        pending_bytes_after=_remaining_segment_bytes(ordered_segments, segment_index),
-                        first_blocked_segment=blocker_sequence,
-                        first_blocked_offset=blocked_prefix_state.blocking_offset,
-                        error_class="invalid_blocker_relationship",
+                    pending_snapshot = _capture_replay_terminal_backlog(runtime)
+                    return _log_and_return_replay_result(
+                        runtime,
+                        ReplayRunResult(
+                            state=ReplayRunState.BLOCKED_INTEGRITY,
+                            trigger=trigger,
+                            segment_count_seen=len(ordered_segments),
+                            frames_decoded=frames_decoded,
+                            frames_committed=frames_committed,
+                            frames_duplicated=frames_duplicated,
+                            frames_acked=frames_acked,
+                            bytes_decoded=bytes_decoded,
+                            bytes_acked=bytes_acked,
+                            pending_bytes_after=pending_snapshot.pending_bytes,
+                            pending_frames_after=pending_snapshot.pending_frames,
+                            first_blocked_segment=blocker_sequence,
+                            first_blocked_offset=blocked_prefix_state.blocking_offset,
+                            ack_pending=pending_snapshot.ack_pending,
+                            error_class="invalid_blocker_relationship",
+                        ),
                     )
                 decoded = decode_spool_segment(segment_path)
                 if (
                     decoded.tail_status is not SpoolTailStatus.CLEAN
                     or decoded.valid_prefix_bytes != blocked_prefix_state.valid_prefix_bytes
                 ):
-                    return ReplayRunResult(
-                        state=ReplayRunState.BLOCKED_INTEGRITY,
-                        trigger=trigger,
-                        segment_count_seen=len(ordered_segments),
-                        frames_decoded=frames_decoded,
-                        frames_committed=frames_committed,
-                        frames_duplicated=frames_duplicated,
-                        frames_acked=frames_acked,
-                        bytes_decoded=bytes_decoded,
-                        bytes_acked=bytes_acked,
-                        pending_bytes_after=_remaining_segment_bytes(ordered_segments, segment_index),
-                        first_blocked_segment=blocker_sequence,
-                        first_blocked_offset=blocked_prefix_state.blocking_offset,
-                        error_class="invalid_blocker_relationship",
+                    pending_snapshot = _capture_replay_terminal_backlog(runtime)
+                    return _log_and_return_replay_result(
+                        runtime,
+                        ReplayRunResult(
+                            state=ReplayRunState.BLOCKED_INTEGRITY,
+                            trigger=trigger,
+                            segment_count_seen=len(ordered_segments),
+                            frames_decoded=frames_decoded,
+                            frames_committed=frames_committed,
+                            frames_duplicated=frames_duplicated,
+                            frames_acked=frames_acked,
+                            bytes_decoded=bytes_decoded,
+                            bytes_acked=bytes_acked,
+                            pending_bytes_after=pending_snapshot.pending_bytes,
+                            pending_frames_after=pending_snapshot.pending_frames,
+                            first_blocked_segment=blocker_sequence,
+                            first_blocked_offset=blocked_prefix_state.blocking_offset,
+                            ack_pending=pending_snapshot.ack_pending,
+                            error_class="invalid_blocker_relationship",
+                        ),
                     )
                 for frame in decoded.prefix_frames:
                     frame_end = frame.frame_offset + frame.frame_length
                     if frame_end <= blocked_prefix_state.acked_prefix_bytes:
                         continue
                     if frame.frame_offset < blocked_prefix_state.acked_prefix_bytes:
-                        return ReplayRunResult(
-                            state=ReplayRunState.BLOCKED_INTEGRITY,
-                            trigger=trigger,
-                            segment_count_seen=len(ordered_segments),
-                            frames_decoded=frames_decoded,
-                            frames_committed=frames_committed,
-                            frames_duplicated=frames_duplicated,
-                            frames_acked=frames_acked,
-                            bytes_decoded=bytes_decoded,
-                            bytes_acked=bytes_acked,
-                            pending_bytes_after=_remaining_segment_bytes(
-                                ordered_segments, segment_index
+                        pending_snapshot = _capture_replay_terminal_backlog(runtime)
+                        return _log_and_return_replay_result(
+                            runtime,
+                            ReplayRunResult(
+                                state=ReplayRunState.BLOCKED_INTEGRITY,
+                                trigger=trigger,
+                                segment_count_seen=len(ordered_segments),
+                                frames_decoded=frames_decoded,
+                                frames_committed=frames_committed,
+                                frames_duplicated=frames_duplicated,
+                                frames_acked=frames_acked,
+                                bytes_decoded=bytes_decoded,
+                                bytes_acked=bytes_acked,
+                                pending_bytes_after=pending_snapshot.pending_bytes,
+                                pending_frames_after=pending_snapshot.pending_frames,
+                                first_blocked_segment=blocker_sequence,
+                                first_blocked_offset=blocked_prefix_state.blocking_offset,
+                                ack_pending=pending_snapshot.ack_pending,
+                                error_class="invalid_blocker_relationship",
                             ),
-                            first_blocked_segment=blocker_sequence,
-                            first_blocked_offset=blocked_prefix_state.blocking_offset,
-                            error_class="invalid_blocker_relationship",
                         )
                     frames_decoded += 1
                     bytes_decoded += frame.frame_length
                     try:
                         result = _replay_db_call(session_db, frame)
                     except SpoolBlockedReplayError as exc:
-                        return ReplayRunResult(
-                            state=ReplayRunState.BLOCKED_INTEGRITY,
-                            trigger=trigger,
-                            segment_count_seen=len(ordered_segments),
-                            frames_decoded=frames_decoded,
-                            frames_committed=frames_committed,
-                            frames_duplicated=frames_duplicated,
-                            frames_acked=frames_acked,
-                            bytes_decoded=bytes_decoded,
-                            bytes_acked=bytes_acked,
-                            pending_bytes_after=_remaining_segment_bytes(
-                                ordered_segments, segment_index
+                        pending_snapshot = _capture_replay_terminal_backlog(runtime)
+                        return _log_and_return_replay_result(
+                            runtime,
+                            ReplayRunResult(
+                                state=ReplayRunState.BLOCKED_INTEGRITY,
+                                trigger=trigger,
+                                segment_count_seen=len(ordered_segments),
+                                frames_decoded=frames_decoded,
+                                frames_committed=frames_committed,
+                                frames_duplicated=frames_duplicated,
+                                frames_acked=frames_acked,
+                                bytes_decoded=bytes_decoded,
+                                bytes_acked=bytes_acked,
+                                pending_bytes_after=pending_snapshot.pending_bytes,
+                                pending_frames_after=pending_snapshot.pending_frames,
+                                first_blocked_segment=segment_sequence,
+                                first_blocked_offset=exc.frame_offset,
+                                ack_pending=pending_snapshot.ack_pending,
+                                error_class=exc.error_class,
                             ),
-                            first_blocked_segment=segment_sequence,
-                            first_blocked_offset=exc.frame_offset,
-                            error_class=exc.error_class,
                         )
                     except SpoolRetryableReplayError as exc:
                         cooldown_seconds = _register_replay_cooldown(
@@ -3857,22 +5608,28 @@ def replay_to_session_db(session_db, *, trigger: str) -> ReplayRunResult:
                             retry_class=exc.retry_class,
                             ack_pending=exc.ack_pending,
                         )
-                        return ReplayRunResult(
-                            state=ReplayRunState.RETRY_PENDING,
-                            trigger=trigger,
-                            segment_count_seen=len(ordered_segments),
-                            frames_decoded=frames_decoded,
-                            frames_committed=frames_committed,
-                            frames_duplicated=frames_duplicated,
-                            frames_acked=frames_acked,
-                            bytes_decoded=bytes_decoded,
-                            bytes_acked=bytes_acked,
-                            pending_bytes_after=_remaining_segment_bytes(
-                                ordered_segments, segment_index
-                            ),
-                            retry_class=exc.retry_class,
+                        pending_snapshot = _capture_replay_terminal_backlog(
+                            runtime,
                             ack_pending=exc.ack_pending,
-                            cooldown_seconds=cooldown_seconds,
+                        )
+                        return _log_and_return_replay_result(
+                            runtime,
+                            ReplayRunResult(
+                                state=ReplayRunState.RETRY_PENDING,
+                                trigger=trigger,
+                                segment_count_seen=len(ordered_segments),
+                                frames_decoded=frames_decoded,
+                                frames_committed=frames_committed,
+                                frames_duplicated=frames_duplicated,
+                                frames_acked=frames_acked,
+                                bytes_decoded=bytes_decoded,
+                                bytes_acked=bytes_acked,
+                                pending_bytes_after=pending_snapshot.pending_bytes,
+                                pending_frames_after=pending_snapshot.pending_frames,
+                                retry_class=exc.retry_class,
+                                ack_pending=pending_snapshot.ack_pending,
+                                cooldown_seconds=cooldown_seconds,
+                            ),
                         )
                     if result.inserted_count > 0:
                         frames_committed += 1
@@ -3895,22 +5652,28 @@ def replay_to_session_db(session_db, *, trigger: str) -> ReplayRunResult:
                             retry_class=exc.retry_class,
                             ack_pending=exc.ack_pending,
                         )
-                        return ReplayRunResult(
-                            state=ReplayRunState.RETRY_PENDING,
-                            trigger=trigger,
-                            segment_count_seen=len(ordered_segments),
-                            frames_decoded=frames_decoded,
-                            frames_committed=frames_committed,
-                            frames_duplicated=frames_duplicated,
-                            frames_acked=frames_acked,
-                            bytes_decoded=bytes_decoded,
-                            bytes_acked=bytes_acked,
-                            pending_bytes_after=_remaining_segment_bytes(
-                                ordered_segments, segment_index
-                            ),
-                            retry_class=exc.retry_class,
+                        pending_snapshot = _capture_replay_terminal_backlog(
+                            runtime,
                             ack_pending=exc.ack_pending,
-                            cooldown_seconds=cooldown_seconds,
+                        )
+                        return _log_and_return_replay_result(
+                            runtime,
+                            ReplayRunResult(
+                                state=ReplayRunState.RETRY_PENDING,
+                                trigger=trigger,
+                                segment_count_seen=len(ordered_segments),
+                                frames_decoded=frames_decoded,
+                                frames_committed=frames_committed,
+                                frames_duplicated=frames_duplicated,
+                                frames_acked=frames_acked,
+                                bytes_decoded=bytes_decoded,
+                                bytes_acked=bytes_acked,
+                                pending_bytes_after=pending_snapshot.pending_bytes,
+                                pending_frames_after=pending_snapshot.pending_frames,
+                                retry_class=exc.retry_class,
+                                ack_pending=pending_snapshot.ack_pending,
+                                cooldown_seconds=cooldown_seconds,
+                            ),
                         )
                     except OSError as exc:
                         if _is_retryable_replay_os_error(exc):
@@ -3919,7 +5682,109 @@ def replay_to_session_db(session_db, *, trigger: str) -> ReplayRunResult:
                                 retry_class="ack_publish_busy",
                                 ack_pending=True,
                             )
-                            return ReplayRunResult(
+                            pending_snapshot = _capture_replay_terminal_backlog(
+                                runtime,
+                                ack_pending=True,
+                            )
+                            return _log_and_return_replay_result(
+                                runtime,
+                                ReplayRunResult(
+                                    state=ReplayRunState.RETRY_PENDING,
+                                    trigger=trigger,
+                                    segment_count_seen=len(ordered_segments),
+                                    frames_decoded=frames_decoded,
+                                    frames_committed=frames_committed,
+                                    frames_duplicated=frames_duplicated,
+                                    frames_acked=frames_acked,
+                                    bytes_decoded=bytes_decoded,
+                                    bytes_acked=bytes_acked,
+                                    pending_bytes_after=pending_snapshot.pending_bytes,
+                                    pending_frames_after=pending_snapshot.pending_frames,
+                                    retry_class="ack_publish_busy",
+                                    ack_pending=pending_snapshot.ack_pending,
+                                    cooldown_seconds=cooldown_seconds,
+                                ),
+                            )
+                        pending_snapshot = _capture_replay_terminal_backlog(
+                            runtime,
+                            ack_pending=True,
+                        )
+                        return _log_and_return_replay_result(
+                            runtime,
+                            ReplayRunResult(
+                                state=ReplayRunState.NOT_DURABLE,
+                                trigger=trigger,
+                                segment_count_seen=len(ordered_segments),
+                                frames_decoded=frames_decoded,
+                                frames_committed=frames_committed,
+                                frames_duplicated=frames_duplicated,
+                                frames_acked=frames_acked,
+                                bytes_decoded=bytes_decoded,
+                                bytes_acked=bytes_acked,
+                                pending_bytes_after=pending_snapshot.pending_bytes,
+                                pending_frames_after=pending_snapshot.pending_frames,
+                                ack_pending=pending_snapshot.ack_pending,
+                                error_class=_classify_nonretryable_replay_error(exc),
+                            ),
+                        )
+                pending_snapshot = _capture_replay_terminal_backlog(runtime)
+                return _log_and_return_replay_result(
+                    runtime,
+                    ReplayRunResult(
+                        state=ReplayRunState.BLOCKED_INTEGRITY,
+                        trigger=trigger,
+                        segment_count_seen=len(ordered_segments),
+                        frames_decoded=frames_decoded,
+                        frames_committed=frames_committed,
+                        frames_duplicated=frames_duplicated,
+                        frames_acked=frames_acked,
+                        bytes_decoded=bytes_decoded,
+                        bytes_acked=bytes_acked,
+                        pending_bytes_after=pending_snapshot.pending_bytes,
+                        pending_frames_after=pending_snapshot.pending_frames,
+                        first_blocked_segment=blocker_sequence,
+                        first_blocked_offset=blocked_prefix_state.blocking_offset,
+                        ack_pending=pending_snapshot.ack_pending,
+                        error_class=blocked_prefix_state.tail_status.value,
+                    ),
+                )
+            decoded = decode_spool_segment(segment_path)
+            if decoded.tail_status is not SpoolTailStatus.CLEAN:
+                for frame in decoded.prefix_frames:
+                    frames_decoded += 1
+                    bytes_decoded += frame.frame_length
+                    try:
+                        result = _replay_db_call(session_db, frame)
+                    except SpoolBlockedReplayError as exc:
+                        return _log_and_return_replay_result(
+                            runtime,
+                            ReplayRunResult(
+                                state=ReplayRunState.BLOCKED_INTEGRITY,
+                                trigger=trigger,
+                                segment_count_seen=len(ordered_segments),
+                                frames_decoded=frames_decoded,
+                                frames_committed=frames_committed,
+                                frames_duplicated=frames_duplicated,
+                                frames_acked=frames_acked,
+                                bytes_decoded=bytes_decoded,
+                                bytes_acked=bytes_acked,
+                                pending_bytes_after=_remaining_segment_bytes(
+                                    ordered_segments, segment_index
+                                ),
+                                first_blocked_segment=segment_sequence,
+                                first_blocked_offset=exc.frame_offset,
+                                error_class=exc.error_class,
+                            ),
+                        )
+                    except SpoolRetryableReplayError as exc:
+                        cooldown_seconds = _register_replay_cooldown(
+                            runtime,
+                            retry_class=exc.retry_class,
+                            ack_pending=exc.ack_pending,
+                        )
+                        return _log_and_return_replay_result(
+                            runtime,
+                            ReplayRunResult(
                                 state=ReplayRunState.RETRY_PENDING,
                                 trigger=trigger,
                                 segment_count_seen=len(ordered_segments),
@@ -3932,106 +5797,89 @@ def replay_to_session_db(session_db, *, trigger: str) -> ReplayRunResult:
                                 pending_bytes_after=_remaining_segment_bytes(
                                     ordered_segments, segment_index
                                 ),
-                                retry_class="ack_publish_busy",
-                                ack_pending=True,
+                                retry_class=exc.retry_class,
+                                ack_pending=exc.ack_pending,
                                 cooldown_seconds=cooldown_seconds,
-                            )
-                        raise
-                return ReplayRunResult(
-                    state=ReplayRunState.BLOCKED_INTEGRITY,
-                    trigger=trigger,
-                    segment_count_seen=len(ordered_segments),
-                    frames_decoded=frames_decoded,
-                    frames_committed=frames_committed,
-                    frames_duplicated=frames_duplicated,
-                    frames_acked=frames_acked,
-                    bytes_decoded=bytes_decoded,
-                    bytes_acked=bytes_acked,
-                    pending_bytes_after=_remaining_segment_bytes(ordered_segments, segment_index),
-                    first_blocked_segment=blocker_sequence,
-                    first_blocked_offset=blocked_prefix_state.blocking_offset,
-                    error_class=blocked_prefix_state.tail_status.value,
-                )
-            decoded = decode_spool_segment(segment_path)
-            if decoded.tail_status is not SpoolTailStatus.CLEAN:
-                for frame in decoded.prefix_frames:
-                    frames_decoded += 1
-                    bytes_decoded += frame.frame_length
-                    try:
-                        result = _replay_db_call(session_db, frame)
-                    except SpoolBlockedReplayError as exc:
-                        return ReplayRunResult(
-                            state=ReplayRunState.BLOCKED_INTEGRITY,
-                            trigger=trigger,
-                            segment_count_seen=len(ordered_segments),
-                            frames_decoded=frames_decoded,
-                            frames_committed=frames_committed,
-                            frames_duplicated=frames_duplicated,
-                            frames_acked=frames_acked,
-                            bytes_decoded=bytes_decoded,
-                            bytes_acked=bytes_acked,
-                            pending_bytes_after=_remaining_segment_bytes(
-                                ordered_segments, segment_index
                             ),
-                            first_blocked_segment=segment_sequence,
-                            first_blocked_offset=exc.frame_offset,
-                            error_class=exc.error_class,
-                        )
-                    except SpoolRetryableReplayError as exc:
-                        cooldown_seconds = _register_replay_cooldown(
-                            runtime,
-                            retry_class=exc.retry_class,
-                            ack_pending=exc.ack_pending,
-                        )
-                        return ReplayRunResult(
-                            state=ReplayRunState.RETRY_PENDING,
-                            trigger=trigger,
-                            segment_count_seen=len(ordered_segments),
-                            frames_decoded=frames_decoded,
-                            frames_committed=frames_committed,
-                            frames_duplicated=frames_duplicated,
-                            frames_acked=frames_acked,
-                            bytes_decoded=bytes_decoded,
-                            bytes_acked=bytes_acked,
-                            pending_bytes_after=_remaining_segment_bytes(
-                                ordered_segments, segment_index
-                            ),
-                            retry_class=exc.retry_class,
-                            ack_pending=exc.ack_pending,
-                            cooldown_seconds=cooldown_seconds,
                         )
                     if result.inserted_count > 0:
                         frames_committed += 1
                     else:
                         frames_duplicated += 1
-                with _append_lock(runtime.lock_fd, str(_lock_path())):
-                    _publish_corrupt_sealed_segment_state(
-                        runtime,
-                        segment_sequence=segment_sequence,
-                        segment_name=segment_name,
-                        decoded_segment=decoded,
-                    )
-                return ReplayRunResult(
-                    state=ReplayRunState.BLOCKED_INTEGRITY,
-                    trigger=trigger,
-                    segment_count_seen=len(ordered_segments),
-                    frames_decoded=frames_decoded,
-                    frames_committed=frames_committed,
-                    frames_duplicated=frames_duplicated,
-                    frames_acked=frames_acked,
-                    bytes_decoded=bytes_decoded,
-                    bytes_acked=bytes_acked,
-                    first_blocked_segment=segment_sequence,
-                    first_blocked_offset=decoded.tail_offset,
-                    error_class=decoded.tail_status.value,
-                )
-            for frame in decoded.prefix_frames:
-                frames_decoded += 1
-                bytes_decoded += frame.frame_length
                 try:
-                    result = _replay_db_call(session_db, frame)
-                except SpoolBlockedReplayError as exc:
-                    return ReplayRunResult(
+                    with _append_lock(runtime.lock_fd, str(_lock_path())):
+                        _publish_corrupt_sealed_segment_state(
+                            runtime,
+                            segment_sequence=segment_sequence,
+                            segment_name=segment_name,
+                            decoded_segment=decoded,
+                        )
+                except OSError as exc:
+                    if _is_retryable_replay_os_error(exc):
+                        cooldown_seconds = _register_replay_cooldown(
+                            runtime,
+                            retry_class="corrupt_publish_busy",
+                            ack_pending=False,
+                        )
+                        pending_bytes_after, pending_frames_after = (
+                            _measure_remaining_segment_backlog(
+                                runtime,
+                                ordered_segments=ordered_segments,
+                                start_index=segment_index,
+                                current_segment_name=segment_name,
+                                current_segment_frame_count=len(decoded.prefix_frames),
+                                current_segment_pending_bytes=decoded.valid_prefix_bytes,
+                            )
+                        )
+                        return _log_and_return_replay_result(
+                            runtime,
+                            ReplayRunResult(
+                                state=ReplayRunState.RETRY_PENDING,
+                                trigger=trigger,
+                                segment_count_seen=len(ordered_segments),
+                                frames_decoded=frames_decoded,
+                                frames_committed=frames_committed,
+                                frames_duplicated=frames_duplicated,
+                                frames_acked=frames_acked,
+                                bytes_decoded=bytes_decoded,
+                                bytes_acked=bytes_acked,
+                                pending_bytes_after=pending_bytes_after,
+                                pending_frames_after=pending_frames_after,
+                                retry_class="corrupt_publish_busy",
+                                ack_pending=False,
+                                cooldown_seconds=cooldown_seconds,
+                            ),
+                        )
+                    if not _is_retryable_replay_os_error(exc):
+                        pending_bytes_after, pending_frames_after = (
+                            _measure_remaining_segment_backlog(
+                                runtime,
+                                ordered_segments=ordered_segments,
+                                start_index=segment_index,
+                                current_segment_name=segment_name,
+                                current_segment_frame_count=len(decoded.prefix_frames),
+                            )
+                        )
+                        return _log_and_return_replay_result(
+                            runtime,
+                            ReplayRunResult(
+                                state=ReplayRunState.NOT_DURABLE,
+                                trigger=trigger,
+                                segment_count_seen=len(ordered_segments),
+                                frames_decoded=frames_decoded,
+                                frames_committed=frames_committed,
+                                frames_duplicated=frames_duplicated,
+                                frames_acked=frames_acked,
+                                bytes_decoded=bytes_decoded,
+                                bytes_acked=bytes_acked,
+                                pending_bytes_after=pending_bytes_after,
+                                pending_frames_after=pending_frames_after,
+                                error_class=_classify_nonretryable_replay_error(exc),
+                            ),
+                        )
+                return _log_and_return_replay_result(
+                    runtime,
+                    ReplayRunResult(
                         state=ReplayRunState.BLOCKED_INTEGRITY,
                         trigger=trigger,
                         segment_count_seen=len(ordered_segments),
@@ -4041,12 +5889,37 @@ def replay_to_session_db(session_db, *, trigger: str) -> ReplayRunResult:
                         frames_acked=frames_acked,
                         bytes_decoded=bytes_decoded,
                         bytes_acked=bytes_acked,
-                        pending_bytes_after=_remaining_segment_bytes(
-                            ordered_segments, segment_index
-                        ),
                         first_blocked_segment=segment_sequence,
-                        first_blocked_offset=exc.frame_offset,
-                        error_class=exc.error_class,
+                        first_blocked_offset=decoded.tail_offset,
+                        error_class=decoded.tail_status.value,
+                    ),
+                )
+            for frame in decoded.prefix_frames:
+                frames_decoded += 1
+                bytes_decoded += frame.frame_length
+                try:
+                    result = _replay_db_call(session_db, frame)
+                except SpoolBlockedReplayError as exc:
+                    pending_snapshot = _capture_replay_terminal_backlog(runtime)
+                    return _log_and_return_replay_result(
+                        runtime,
+                        ReplayRunResult(
+                            state=ReplayRunState.BLOCKED_INTEGRITY,
+                            trigger=trigger,
+                            segment_count_seen=len(ordered_segments),
+                            frames_decoded=frames_decoded,
+                            frames_committed=frames_committed,
+                            frames_duplicated=frames_duplicated,
+                            frames_acked=frames_acked,
+                            bytes_decoded=bytes_decoded,
+                            bytes_acked=bytes_acked,
+                            pending_bytes_after=pending_snapshot.pending_bytes,
+                            pending_frames_after=pending_snapshot.pending_frames,
+                            first_blocked_segment=segment_sequence,
+                            first_blocked_offset=exc.frame_offset,
+                            ack_pending=pending_snapshot.ack_pending,
+                            error_class=exc.error_class,
+                        ),
                     )
                 except SpoolRetryableReplayError as exc:
                     cooldown_seconds = _register_replay_cooldown(
@@ -4054,22 +5927,28 @@ def replay_to_session_db(session_db, *, trigger: str) -> ReplayRunResult:
                         retry_class=exc.retry_class,
                         ack_pending=exc.ack_pending,
                     )
-                    return ReplayRunResult(
-                        state=ReplayRunState.RETRY_PENDING,
-                        trigger=trigger,
-                        segment_count_seen=len(ordered_segments),
-                        frames_decoded=frames_decoded,
-                        frames_committed=frames_committed,
-                        frames_duplicated=frames_duplicated,
-                        frames_acked=frames_acked,
-                        bytes_decoded=bytes_decoded,
-                        bytes_acked=bytes_acked,
-                        pending_bytes_after=_remaining_segment_bytes(
-                            ordered_segments, segment_index
-                        ),
-                        retry_class=exc.retry_class,
+                    pending_snapshot = _capture_replay_terminal_backlog(
+                        runtime,
                         ack_pending=exc.ack_pending,
-                        cooldown_seconds=cooldown_seconds,
+                    )
+                    return _log_and_return_replay_result(
+                        runtime,
+                        ReplayRunResult(
+                            state=ReplayRunState.RETRY_PENDING,
+                            trigger=trigger,
+                            segment_count_seen=len(ordered_segments),
+                            frames_decoded=frames_decoded,
+                            frames_committed=frames_committed,
+                            frames_duplicated=frames_duplicated,
+                            frames_acked=frames_acked,
+                            bytes_decoded=bytes_decoded,
+                            bytes_acked=bytes_acked,
+                            pending_bytes_after=pending_snapshot.pending_bytes,
+                            pending_frames_after=pending_snapshot.pending_frames,
+                            retry_class=exc.retry_class,
+                            ack_pending=pending_snapshot.ack_pending,
+                            cooldown_seconds=cooldown_seconds,
+                        ),
                     )
                 if result.inserted_count > 0:
                     frames_committed += 1
@@ -4092,29 +5971,13 @@ def replay_to_session_db(session_db, *, trigger: str) -> ReplayRunResult:
                         retry_class=exc.retry_class,
                         ack_pending=exc.ack_pending,
                     )
-                    return ReplayRunResult(
-                        state=ReplayRunState.RETRY_PENDING,
-                        trigger=trigger,
-                        segment_count_seen=len(ordered_segments),
-                        frames_decoded=frames_decoded,
-                        frames_committed=frames_committed,
-                        frames_duplicated=frames_duplicated,
-                        frames_acked=frames_acked,
-                        bytes_decoded=bytes_decoded,
-                        bytes_acked=bytes_acked,
-                        pending_bytes_after=_remaining_segment_bytes(ordered_segments, segment_index),
-                        retry_class=exc.retry_class,
+                    pending_snapshot = _capture_replay_terminal_backlog(
+                        runtime,
                         ack_pending=exc.ack_pending,
-                        cooldown_seconds=cooldown_seconds,
                     )
-                except OSError as exc:
-                    if _is_retryable_replay_os_error(exc):
-                        cooldown_seconds = _register_replay_cooldown(
-                            runtime,
-                            retry_class="ack_publish_busy",
-                            ack_pending=True,
-                        )
-                        return ReplayRunResult(
+                    return _log_and_return_replay_result(
+                        runtime,
+                        ReplayRunResult(
                             state=ReplayRunState.RETRY_PENDING,
                             trigger=trigger,
                             segment_count_seen=len(ordered_segments),
@@ -4124,25 +5987,130 @@ def replay_to_session_db(session_db, *, trigger: str) -> ReplayRunResult:
                             frames_acked=frames_acked,
                             bytes_decoded=bytes_decoded,
                             bytes_acked=bytes_acked,
-                            pending_bytes_after=_remaining_segment_bytes(ordered_segments, segment_index),
+                            pending_bytes_after=pending_snapshot.pending_bytes,
+                            pending_frames_after=pending_snapshot.pending_frames,
+                            retry_class=exc.retry_class,
+                            ack_pending=pending_snapshot.ack_pending,
+                            cooldown_seconds=cooldown_seconds,
+                        ),
+                    )
+                except OSError as exc:
+                    if _is_retryable_replay_os_error(exc):
+                        cooldown_seconds = _register_replay_cooldown(
+                            runtime,
                             retry_class="ack_publish_busy",
                             ack_pending=True,
-                            cooldown_seconds=cooldown_seconds,
                         )
-                    raise
-            with _append_lock(runtime.lock_fd, str(_lock_path())):
-                _delete_fully_acked_segment(segment_path)
+                        pending_snapshot = _capture_replay_terminal_backlog(
+                            runtime,
+                            ack_pending=True,
+                        )
+                        return _log_and_return_replay_result(
+                            runtime,
+                            ReplayRunResult(
+                                state=ReplayRunState.RETRY_PENDING,
+                                trigger=trigger,
+                                segment_count_seen=len(ordered_segments),
+                                frames_decoded=frames_decoded,
+                                frames_committed=frames_committed,
+                                frames_duplicated=frames_duplicated,
+                                frames_acked=frames_acked,
+                                bytes_decoded=bytes_decoded,
+                                bytes_acked=bytes_acked,
+                                pending_bytes_after=pending_snapshot.pending_bytes,
+                                pending_frames_after=pending_snapshot.pending_frames,
+                                retry_class="ack_publish_busy",
+                                ack_pending=pending_snapshot.ack_pending,
+                                cooldown_seconds=cooldown_seconds,
+                            ),
+                        )
+                    pending_snapshot = _capture_replay_terminal_backlog(
+                        runtime,
+                        ack_pending=True,
+                    )
+                    return _log_and_return_replay_result(
+                        runtime,
+                        ReplayRunResult(
+                            state=ReplayRunState.NOT_DURABLE,
+                            trigger=trigger,
+                            segment_count_seen=len(ordered_segments),
+                            frames_decoded=frames_decoded,
+                            frames_committed=frames_committed,
+                            frames_duplicated=frames_duplicated,
+                            frames_acked=frames_acked,
+                            bytes_decoded=bytes_decoded,
+                            bytes_acked=bytes_acked,
+                            pending_bytes_after=pending_snapshot.pending_bytes,
+                            pending_frames_after=pending_snapshot.pending_frames,
+                            ack_pending=pending_snapshot.ack_pending,
+                            error_class=_classify_nonretryable_replay_error(exc),
+                        ),
+                    )
+            try:
+                with _append_lock(runtime.lock_fd, str(_lock_path())):
+                    _delete_fully_acked_segment(segment_path)
+            except OSError as exc:
+                pending_snapshot = _capture_replay_terminal_backlog(
+                    runtime,
+                    ack_pending=True,
+                )
+                if _is_retryable_replay_os_error(exc):
+                    cooldown_seconds = _register_replay_cooldown(
+                        runtime,
+                        retry_class="ack_cleanup_busy",
+                        ack_pending=True,
+                    )
+                    return _log_and_return_replay_result(
+                        runtime,
+                        ReplayRunResult(
+                            state=ReplayRunState.RETRY_PENDING,
+                            trigger=trigger,
+                            segment_count_seen=len(ordered_segments),
+                            frames_decoded=frames_decoded,
+                            frames_committed=frames_committed,
+                            frames_duplicated=frames_duplicated,
+                            frames_acked=frames_acked,
+                            bytes_decoded=bytes_decoded,
+                            bytes_acked=bytes_acked,
+                            pending_bytes_after=pending_snapshot.pending_bytes,
+                            pending_frames_after=pending_snapshot.pending_frames,
+                            retry_class="ack_cleanup_busy",
+                            ack_pending=pending_snapshot.ack_pending,
+                            cooldown_seconds=cooldown_seconds,
+                        ),
+                    )
+                return _log_and_return_replay_result(
+                    runtime,
+                    ReplayRunResult(
+                        state=ReplayRunState.NOT_DURABLE,
+                        trigger=trigger,
+                        segment_count_seen=len(ordered_segments),
+                        frames_decoded=frames_decoded,
+                        frames_committed=frames_committed,
+                        frames_duplicated=frames_duplicated,
+                        frames_acked=frames_acked,
+                        bytes_decoded=bytes_decoded,
+                        bytes_acked=bytes_acked,
+                        pending_bytes_after=pending_snapshot.pending_bytes,
+                        pending_frames_after=pending_snapshot.pending_frames,
+                        ack_pending=pending_snapshot.ack_pending,
+                        error_class=_classify_nonretryable_replay_error(exc),
+                    ),
+                )
         _clear_replay_cooldown(runtime)
-        return ReplayRunResult(
-            state=ReplayRunState.REPLAYED,
-            trigger=trigger,
-            segment_count_seen=len(ordered_segments),
-            frames_decoded=frames_decoded,
-            frames_committed=frames_committed,
-            frames_duplicated=frames_duplicated,
-            frames_acked=frames_acked,
-            bytes_decoded=bytes_decoded,
-            bytes_acked=bytes_acked,
+        return _log_and_return_replay_result(
+            runtime,
+            ReplayRunResult(
+                state=ReplayRunState.REPLAYED,
+                trigger=trigger,
+                segment_count_seen=len(ordered_segments),
+                frames_decoded=frames_decoded,
+                frames_committed=frames_committed,
+                frames_duplicated=frames_duplicated,
+                frames_acked=frames_acked,
+                bytes_decoded=bytes_decoded,
+                bytes_acked=bytes_acked,
+            ),
         )
     finally:
         if owner is not None:
