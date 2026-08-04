@@ -15,7 +15,12 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from agent.context_compressor import ContextCompressor
-from agent.turn_context import TurnContext, build_turn_context
+from agent.turn_context import (
+    TurnContext,
+    bind_turn_source_identity,
+    build_turn_context,
+    current_turn_source_identity,
+)
 from hermes_state import SessionDB
 
 
@@ -206,6 +211,58 @@ def test_returns_turn_context_with_user_message_appended():
     assert ctx.messages[-1] == {"role": "user", "content": "hello"}
     assert ctx.current_turn_user_idx == len(ctx.messages) - 1
     assert ctx.active_system_prompt == "SYSTEM"
+
+
+def test_pre_llm_hook_receives_trusted_current_turn_source_identity():
+    agent = _FakeAgent()
+    captured = {}
+
+    def capture(hook_name, **kwargs):
+        if hook_name == "pre_llm_call":
+            captured.update(kwargs)
+        return []
+
+    with bind_turn_source_identity("wamid-current-turn"):
+        with patch("hermes_cli.lifecycle.invoke_hook", side_effect=capture):
+            _build(agent)
+
+    assert captured["source_message_id"] == "wamid-current-turn"
+    assert captured["source_identity_trusted"] is True
+
+
+def test_pre_llm_hook_downgrades_trust_when_source_identity_is_empty():
+    agent = _FakeAgent()
+    captured = {}
+
+    def capture(hook_name, **kwargs):
+        if hook_name == "pre_llm_call":
+            captured.update(kwargs)
+        return []
+
+    with patch("hermes_cli.lifecycle.invoke_hook", side_effect=capture):
+        _build(agent)
+
+    assert captured["source_message_id"] == ""
+    assert captured["source_identity_trusted"] is False
+
+
+def test_nested_synthetic_hook_clears_identity_and_restores_parent():
+    agent = _FakeAgent()
+    captured = {}
+
+    def capture(hook_name, **kwargs):
+        if hook_name == "pre_llm_call":
+            captured.update(kwargs)
+        return []
+
+    with bind_turn_source_identity("adapter-parent-id"):
+        with bind_turn_source_identity(None):
+            with patch("hermes_cli.lifecycle.invoke_hook", side_effect=capture):
+                _build(agent, user_message="synthetic child prompt")
+        assert current_turn_source_identity() == ("adapter-parent-id", True)
+
+    assert captured["source_message_id"] == ""
+    assert captured["source_identity_trusted"] is False
 
 
 # ── Trivial-prompt prefetch gate (PR #25350 salvage) ─────────────────────────
@@ -411,6 +468,33 @@ class _TitlingAgent:
         self.api_mode = "chat_completions"
         self._session_db = MagicMock()
         self._session_db_created = True
+
+
+def test_source_identity_context_is_isolated_between_overlapping_threads():
+    from agent import turn_context as turn_context_module
+
+    barrier = threading.Barrier(2)
+    observed = {}
+
+    def capture(label, source_message_id):
+        with turn_context_module.bind_turn_source_identity(source_message_id):
+            barrier.wait(timeout=5)
+            observed[label] = turn_context_module.current_turn_source_identity()
+
+    first = threading.Thread(target=capture, args=("first", "message-1"))
+    second = threading.Thread(target=capture, args=("second", "message-2"))
+    first.start()
+    second.start()
+    first.join(timeout=5)
+    second.join(timeout=5)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert observed == {
+        "first": ("message-1", True),
+        "second": ("message-2", True),
+    }
+    assert turn_context_module.current_turn_source_identity() == ("", False)
 
 
 def _title_turn(platform, message="Fix the login button"):

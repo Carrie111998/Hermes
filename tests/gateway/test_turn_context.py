@@ -15,7 +15,9 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from agent.turn_context import bind_turn_source_identity, current_turn_source_identity
 from gateway.config import Platform
+from gateway.platforms.base import MessageEvent, trusted_source_message_id
 from gateway.session import SessionSource
 from gateway.turn_context import TurnContext
 
@@ -39,6 +41,35 @@ class TestTurnContext:
         assert b.last_progress_msg == [None]
         assert b.repeat_count == [0]
         assert b._cleanup_msg_ids == []
+
+    def test_source_identity_is_separate_from_reply_routing_anchor(self):
+        ctx = TurnContext(
+            event_message_id="reply-or-thread-anchor",
+            source_message_id="adapter-event-id",
+        )
+
+        assert ctx.event_message_id == "reply-or-thread-anchor"
+        assert ctx.source_message_id == "adapter-event-id"
+
+    def test_internal_event_never_has_trusted_source_identity(self):
+        event = MessageEvent(
+            text="[SYSTEM: background process completed]",
+            message_id="stale-reply-anchor",
+            internal=True,
+        )
+
+        assert trusted_source_message_id(event) is None
+
+    def test_turn_source_identity_is_normalized_nested_and_restored(self):
+        assert current_turn_source_identity() == ("", False)
+
+        with bind_turn_source_identity("  wamid-current  "):
+            assert current_turn_source_identity() == ("wamid-current", True)
+            with bind_turn_source_identity(None):
+                assert current_turn_source_identity() == ("", False)
+            assert current_turn_source_identity() == ("wamid-current", True)
+
+        assert current_turn_source_identity() == ("", False)
 
     def test_shared_containers_visible_to_outer_scope(self):
         # The outer body and the runner share the SAME list objects, so
