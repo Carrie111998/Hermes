@@ -560,6 +560,67 @@ def test_skills_manage_search_uses_tools_hub_sources(server):
     search.assert_called_once_with("showroom", ["source"], source_filter="all", limit=20)
 
 
+def test_command_dispatch_retry_resends_prompt_merged_onto_marker(server):
+    """/retry must resend a real prompt alternation-repair merged onto a
+    bookkeeping marker's tail, not skip past it as pure bookkeeping (#74350).
+
+    Reproduces the exact shape repair_message_sequence produces: a
+    personality-switch marker followed immediately by a real user turn with
+    no assistant reply in between gets merged into one row whose `content`
+    is `marker + "\\n\\n" + real_text` but whose `display_kind` survives the
+    merge untouched — except now `merged_real_turn` is also set so /retry
+    (and /undo, and rewind) still recognize it as a real turn.
+    """
+    sid = "test-session-retry-merged-marker"
+    marker = (
+        "[System: The user has changed the assistant's personality. "
+        "From this point forward, adopt the following persona and respond "
+        "accordingly: You are a pirate.]"
+    )
+    history = [
+        {"role": "user", "content": "first question"},
+        {"role": "assistant", "content": "first answer"},
+        {
+            "role": "user",
+            "content": marker + "\n\n" + "what's the weather like today?",
+            "display_kind": "personality_switch",
+            "display_metadata": {"marker_text": marker},
+            "merged_real_turn": True,
+        },
+    ]
+    server._sessions[sid] = {
+        "session_key": sid,
+        "agent": None,
+        "history": history,
+        "history_lock": threading.Lock(),
+        "history_version": 0,
+    }
+    # Captured before dispatch: /retry truncates `history` in place, so
+    # reading history[-1] afterward would see "first answer" instead.
+    expected_message = history[-1]["content"]
+
+    resp = server.handle_request({
+        "id": "r4c",
+        "method": "command.dispatch",
+        "params": {"name": "retry", "session_id": sid},
+    })
+
+    assert "error" not in resp
+    result = resp["result"]
+    assert result["type"] == "send"
+    # The resent text is the merged row's full content (marker + real
+    # prompt) since /retry resends raw `content`, not the display
+    # projection — the point under test is that this row was selected as
+    # the retry target at all, instead of /retry falling through to the
+    # error path or an earlier real turn.
+    assert result["message"] == expected_message
+    # Truncated through the merged row itself (and nothing earlier).
+    assert [m["content"] for m in server._sessions[sid]["history"]] == [
+        "first question",
+        "first answer",
+    ]
+
+
 # ── dispatch(): pool routing for long handlers (#12546) ──────────────
 
 

@@ -735,6 +735,18 @@ def repair_message_sequence(agent, messages: List[Dict]) -> int:
             # content alone — collapsing image/audio blocks risks
             # mangling the attachment structure.
             if isinstance(prev_content, str) and isinstance(new_content, str):
+                if prev.get("display_kind") and not msg.get("display_kind") and new_content:
+                    # A real user turn got merged onto a bookkeeping-marker
+                    # row (personality/model switch). display_kind and
+                    # display_metadata are left untouched below so the
+                    # display projection can still recognize the marker and
+                    # strip just its own span (_bookkeeping_marker_span) —
+                    # but /undo, /retry, and rewind ordinal selection treat
+                    # "role=user with no display_kind" as the definition of
+                    # a real turn, and would otherwise skip this row
+                    # entirely, silently dropping the visible prompt riding
+                    # on the marker's tail (#74350).
+                    prev["merged_real_turn"] = True
                 prev["content"] = (
                     (prev_content + "\n\n" + new_content)
                     if prev_content and new_content

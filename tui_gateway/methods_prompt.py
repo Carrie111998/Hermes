@@ -165,7 +165,9 @@ def _(rid, params: dict) -> dict:
             history = session.get("history", [])
             user_indices = [
                 i for i, m in enumerate(history)
-                if m.get("role") == "user" and not m.get("display_kind")
+                if m.get("role") == "user" and (
+                    not m.get("display_kind") or m.get("merged_real_turn")
+                )
             ]
             # Reject out-of-range ordinals on BOTH ends. A negative value would
             # otherwise sail past the upper-bound check and hit Python's negative

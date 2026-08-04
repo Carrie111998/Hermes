@@ -2321,15 +2321,19 @@ def _(rid, params: dict) -> dict:
     removed = 0
     with session["history_lock"]:
         history = session.get("history", [])
-        # Truncate from the last *real* user turn (no display_kind). Popping
-        # only trailing assistant/tool then one user left timeline markers
-        # (async_delegation_complete, model_switch, …) as the undo target —
-        # so session.undo removed bookkeeping instead of the last exchange.
-        # Match list_recent_user_messages / CLI turn counting.
+        # Truncate from the last *real* user turn (no display_kind, or a
+        # merged row where alternation-repair concatenated a real prompt
+        # onto a bookkeeping marker's tail — see merged_real_turn, #74350).
+        # Popping only trailing assistant/tool then one user left timeline
+        # markers (async_delegation_complete, model_switch, …) as the undo
+        # target — so session.undo removed bookkeeping instead of the last
+        # exchange. Match list_recent_user_messages / CLI turn counting.
         last_user_idx = None
         for i in range(len(history) - 1, -1, -1):
             msg = history[i]
-            if msg.get("role") == "user" and not msg.get("display_kind"):
+            if msg.get("role") == "user" and (
+                not msg.get("display_kind") or msg.get("merged_real_turn")
+            ):
                 last_user_idx = i
                 break
         if last_user_idx is not None:

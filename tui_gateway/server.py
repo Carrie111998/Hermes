@@ -5854,6 +5854,16 @@ def _apply_personality_to_session(
     knows to pivot its style from this point forward (without this, LLMs tend to
     continue the tone established by earlier messages in the transcript).
 
+    The marker is persisted durably (mirrors ``_append_model_switch_marker``)
+    and carries structured ``display_kind``/``display_metadata`` instead of
+    relying on the "[System:" text-prefix convention alone. Alternation-repair
+    may later merge the very next real user turn onto this row's content
+    (consecutive ``user`` rows get concatenated) — ``display_kind`` and
+    ``display_metadata`` survive that merge untouched since only ``content``
+    is rewritten, so the hide-projection can still recognize the marker
+    unambiguously and strip only its own span instead of dropping the whole
+    merged row (and the real prompt riding on its tail) (#74315).
+
     Returns (history_reset, info) — history_reset is always False since we
     preserve the conversation.
     """
@@ -5877,9 +5887,42 @@ def _apply_personality_to_session(
                 "[System: The user has cleared the personality overlay. "
                 "From this point forward, respond in your normal default style.]"
             )
+        entry = {
+            "role": "user",
+            "content": marker,
+            "display_kind": "personality_switch",
+            "display_metadata": {"marker_text": marker},
+        }
         with session["history_lock"]:
-            session["history"].append({"role": "user", "content": marker})
+            session["history"].append(entry)
             session["history_version"] = int(session.get("history_version", 0)) + 1
+
+        session_key = str(session.get("session_key") or "").strip()
+        if session_key:
+            try:
+                db = getattr(agent, "_session_db", None)
+                if db is not None:
+                    db.append_message(
+                        session_id=session_key,
+                        role="user",
+                        content=marker,
+                        display_kind="personality_switch",
+                        display_metadata={"marker_text": marker},
+                    )
+                else:
+                    _ensure_session_db_row(session)
+                    with _session_db(session) as scoped_db:
+                        if scoped_db is not None:
+                            scoped_db.append_message(
+                                session_id=session_key,
+                                role="user",
+                                content=marker,
+                                display_kind="personality_switch",
+                                display_metadata={"marker_text": marker},
+                            )
+            except Exception:
+                logger.debug("failed to persist personality marker", exc_info=True)
+
         info = _session_info(agent)
         _emit("session.info", sid, info)
         return False, info
@@ -6855,6 +6898,45 @@ def _is_display_hidden_marker(role: str | None, text: str) -> bool:
     return role == "user" and text.lstrip().startswith("[System:")
 
 
+# display_kind values that mark a row as gateway bookkeeping (a synthetic
+# pivot notice, not something the user typed) rather than ordinary chat
+# content. See _bookkeeping_marker_span.
+_BOOKKEEPING_MARKER_KINDS = frozenset({"model_switch", "personality_switch"})
+
+
+def _bookkeeping_marker_span(m: dict, content_text: str) -> tuple[str, bool] | None:
+    """Split a bookkeeping-marker row into its marker span and any real content.
+
+    Alternation-repair merges consecutive ``user`` rows by concatenating
+    their content (``marker_text + "\\n\\n" + real_text``); ``display_kind``
+    and ``display_metadata`` are left untouched by that merge since only
+    ``content`` is rewritten. When a row's own marker text was recorded at
+    write time (``display_metadata["marker_text"]``), that lets this
+    projection tell a bare marker apart from a marker a real user turn got
+    merged onto — the old text-prefix check (:func:`_is_display_hidden_marker`)
+    could only hide the whole row, silently swallowing the merged-in real
+    prompt (#74315).
+
+    Returns ``(visible_text, is_pure_marker)`` when this row is a recognized
+    bookkeeping marker with a recorded span, else ``None`` (caller should fall
+    back to :func:`_is_display_hidden_marker`'s legacy text-prefix handling).
+    """
+    if m.get("display_kind") not in _BOOKKEEPING_MARKER_KINDS:
+        return None
+    meta = m.get("display_metadata")
+    marker_text = meta.get("marker_text") if isinstance(meta, dict) else None
+    if not isinstance(marker_text, str) or not marker_text:
+        return None
+    if content_text == marker_text:
+        return "", True
+    prefix = marker_text + "\n\n"
+    if content_text.startswith(prefix):
+        return content_text[len(prefix):], False
+    # Content diverged from the recorded span (edited/truncated some other
+    # way) — don't guess, fall back to the legacy handling.
+    return None
+
+
 def _skill_scaffold_projection(content_text: str) -> str:
     """Return the invocation a slash-skill-expanded turn came from, else "".
 
@@ -6940,7 +7022,21 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
         if m.get("display_kind") == "hidden":
             continue
         content_text = _coerce_message_text(m.get("content"))
-        if _is_display_hidden_marker(role, content_text):
+        # A bookkeeping marker (model-switch/personality-switch) that
+        # alternation-repair merged a real user turn onto still carries its
+        # own display_kind/display_metadata (the merge only rewrites
+        # content) — strip just the marker's span instead of falling
+        # through to the text-prefix check, which would hide the whole row
+        # and silently swallow the real prompt riding on its tail (#74315).
+        suppress_display_kind = False
+        marker_span = _bookkeeping_marker_span(m, content_text)
+        if marker_span is not None:
+            visible_text, is_pure_marker = marker_span
+            if is_pure_marker:
+                continue
+            content_text = visible_text
+            suppress_display_kind = True
+        elif _is_display_hidden_marker(role, content_text):
             continue
         if role == "assistant" and m.get("tool_calls"):
             for tc in m["tool_calls"]:
@@ -7004,10 +7100,17 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
         # Forward display-only timeline metadata so the TUI can render
         # model switches and delegation completions as events instead of
         # opaque user messages, and hide compaction handoffs entirely.
-        display_kind = m.get("display_kind") or _legacy_display_kind(role, content_text)
+        # A stripped marker span (suppress_display_kind) is real user
+        # content now, not the marker — it must render as an ordinary
+        # message, not carry the marker's display_kind/display_metadata.
+        display_kind = (
+            None
+            if suppress_display_kind
+            else m.get("display_kind") or _legacy_display_kind(role, content_text)
+        )
         if display_kind:
             msg["display_kind"] = display_kind
-        if m.get("display_metadata"):
+        if m.get("display_metadata") and not suppress_display_kind:
             msg["display_metadata"] = m["display_metadata"]
         messages.append(msg)
 
