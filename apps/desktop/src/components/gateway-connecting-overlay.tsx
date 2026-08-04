@@ -125,7 +125,9 @@ export function GatewayConnectingOverlay() {
   // device-code flow; do not leave the initial connecting scrim over that
   // enrollment surface.
   const managedEnrollmentPending =
-    boot.phase === 'renderer.enrollment' || boot.phase === 'eva.sign-in-required'
+    boot.phase === 'renderer.enrollment' ||
+    boot.phase === 'eva.sign-in-required' ||
+    boot.phase === 'eva.sign-in'
 
   if (managedEnrollmentPending && !previewing) {
     return null
