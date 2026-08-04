@@ -10,9 +10,9 @@ stale value and its ``echo $HERMES_SESSION_ID`` reported a FOREIGN session's id
 — overriding the correct per-command Popen env injected by
 ``_inject_session_context_env``.
 
-The fix strips the per-session bridged vars (HERMES_SESSION_* / UI /
-CRON_AUTO_DELIVER_) from the snapshot at both dump sites in
-``tools/environments/base.py``; they are re-injected fresh on every command.
+The fix strips per-session bridged vars and the delegated-child process marker
+from the snapshot at both dump sites in ``tools/environments/base.py``; the
+current command's values are restored fresh after sourcing the snapshot.
 """
 
 import os
@@ -28,10 +28,10 @@ from tools.environments.base import (
 
 
 # ---------------------------------------------------------------------------
-# Unit: the exclusion regex matches exactly the bridged vars, nothing else.
+# Unit: the exclusion regex covers gateway-bridged and transient runtime vars.
 # ---------------------------------------------------------------------------
 
-def test_regex_matches_bridged_session_vars():
+def test_regex_matches_snapshot_transient_vars():
     rx = re.compile(_SNAPSHOT_EXCLUDED_ENV_REGEX)
     # Every var the gateway bridges must be excluded.
     from gateway.session_context import _VAR_MAP
@@ -39,6 +39,7 @@ def test_regex_matches_bridged_session_vars():
     for name in _VAR_MAP:
         line = f'declare -x {name}="whatever"'
         assert rx.search(line), f"{name} should be excluded from the snapshot"
+    assert rx.search('declare -x HERMES_DELEGATED_CHILD_CONTEXT="1"')
 
 
 def test_export_snippet_shape():
@@ -50,6 +51,7 @@ def test_export_snippet_shape():
     assert "${!HERMES_SESSION_*}" in snippet
     assert "${!HERMES_CRON_AUTO_DELIVER_*}" in snippet
     assert "HERMES_UI_SESSION_ID" in snippet
+    assert "HERMES_DELEGATED_CHILD_CONTEXT" in snippet
     assert "grep -vE" not in snippet
     assert '"$__hermes_snap_tmp"' in snippet
     # The redirection must be attached to a brace group wrapping the dump,
@@ -104,5 +106,80 @@ def test_shared_snapshot_no_cross_session_leak(tmp_path):
         if os.path.exists(snap):
             with open(snap) as f:
                 assert "HERMES_SESSION_ID" not in f.read()
+    finally:
+        env.cleanup()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX bash snapshot path")
+def test_delegated_child_marker_does_not_leak_from_snapshot_to_parent(tmp_path, monkeypatch):
+    """A snapshot made by a delegated child must not taint later parent calls."""
+    from agent.delegation_context import delegated_child_context
+    from tools.environments.local import LocalEnvironment
+
+    monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
+    with delegated_child_context():
+        env = LocalEnvironment(cwd=str(tmp_path), timeout=30)
+    try:
+        result = env.execute(
+            'printf "marker=<%s>\\n" "${HERMES_DELEGATED_CHILD_CONTEXT:-}"'
+        )
+
+        assert result["returncode"] == 0
+        assert "marker=<>" in result["output"]
+        with open(env._snapshot_path) as snap:
+            assert "HERMES_DELEGATED_CHILD_CONTEXT" not in snap.read()
+    finally:
+        env.cleanup()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX bash snapshot path")
+def test_delegated_child_marker_stays_local_to_the_child_command(tmp_path, monkeypatch):
+    """A child restores its live marker despite a stale snapshot."""
+    from agent.delegation_context import delegated_child_context
+    from tools.environments.local import LocalEnvironment
+
+    monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
+    env = LocalEnvironment(cwd=str(tmp_path), timeout=30)
+    try:
+        with open(env._snapshot_path, "a") as snap:
+            snap.write('declare -x HERMES_DELEGATED_CHILD_CONTEXT="stale"\n')
+
+        with delegated_child_context():
+            child = env.execute(
+                'printf "marker=<%s>\\n" "${HERMES_DELEGATED_CHILD_CONTEXT:-}"'
+            )
+        parent = env.execute(
+            'printf "marker=<%s>\\n" "${HERMES_DELEGATED_CHILD_CONTEXT:-}"'
+        )
+
+        assert child["returncode"] == 0
+        assert "marker=<1>" in child["output"]
+        assert parent["returncode"] == 0
+        assert "marker=<>" in parent["output"]
+        with open(env._snapshot_path) as snap:
+            assert "HERMES_DELEGATED_CHILD_CONTEXT" not in snap.read()
+    finally:
+        env.cleanup()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX bash snapshot path")
+def test_parent_command_clears_marker_from_a_preexisting_snapshot(tmp_path, monkeypatch):
+    """The first parent command repairs a snapshot written by an older version."""
+    from tools.environments.local import LocalEnvironment
+
+    monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
+    env = LocalEnvironment(cwd=str(tmp_path), timeout=30)
+    try:
+        with open(env._snapshot_path, "a") as snap:
+            snap.write('declare -x HERMES_DELEGATED_CHILD_CONTEXT="1"\n')
+
+        result = env.execute(
+            'printf "marker=<%s>\\n" "${HERMES_DELEGATED_CHILD_CONTEXT:-}"'
+        )
+
+        assert result["returncode"] == 0
+        assert "marker=<>" in result["output"]
+        with open(env._snapshot_path) as snap:
+            assert "HERMES_DELEGATED_CHILD_CONTEXT" not in snap.read()
     finally:
         env.cleanup()

@@ -463,13 +463,21 @@ def _cwd_marker(session_id: str) -> str:
 # should only carry the user's own shell state (PATH, functions, exports they
 # set), not Hermes' per-turn session identity.
 #
-# Kept in sync with gateway.session_context._VAR_MAP: every bridged name starts
-# with one of these prefixes (or is HERMES_UI_SESSION_ID). Used by unit tests
-# as the Python-side contract for the exclusion set; the dump path unsets by
+# Gateway-bridged names follow these prefixes (or are HERMES_UI_SESSION_ID);
+# this set also includes transient runtime markers. Used by unit tests as the
+# Python-side contract for snapshot exclusions; the dump path unsets by
 # name/prefix instead of grepping declare lines (see below / issue #71296).
 _SNAPSHOT_EXCLUDED_ENV_REGEX = (
-    "^declare -x (HERMES_SESSION_|HERMES_UI_SESSION_ID|HERMES_CRON_AUTO_DELIVER_|HERMES_CRON_SESSION)"
+    "^declare -x (HERMES_SESSION_|HERMES_UI_SESSION_ID|HERMES_CRON_AUTO_DELIVER_|"
+    "HERMES_CRON_SESSION|HERMES_DELEGATED_CHILD_CONTEXT)"
 )
+# This marker is valid only for a process descended from ``delegate_task``.
+# A shared terminal snapshot outlives that process, so persisting the marker
+# would make a later parent command look like a delegated child and reject its
+# Kanban mutations.
+_SNAPSHOT_RUNTIME_EXCLUDED_ENV_NAMES = frozenset({
+    "HERMES_DELEGATED_CHILD_CONTEXT",
+})
 _SHELL_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
@@ -478,8 +486,9 @@ def _export_dump_excluding_session_vars(
     excluded_names: Iterable[str] = (),
 ) -> str:
     """Return a shell snippet that dumps ``export -p`` to *tmp_path* minus the
-    per-session bridged vars (see ``_SNAPSHOT_EXCLUDED_ENV_REGEX``) and any
-    additional names supplied by the caller.
+    per-session bridged vars, transient runtime vars (see
+    ``_SNAPSHOT_EXCLUDED_ENV_REGEX``), and any additional names supplied by
+    the caller.
 
     Unset the bridged vars in a subshell *before* ``export -p``. A line-based
     ``grep -vE`` filter is unsafe: bash 3.2 prints a value containing a newline
@@ -502,10 +511,11 @@ def _export_dump_excluding_session_vars(
     # because ``unset`` with only missing names is ignored under 2>/dev/null.
     # Quote caller-provided names so malformed configuration can never become
     # shell syntax. Valid environment names remain unquoted by shlex.quote().
-    safe_names = {
+    safe_names = set(_SNAPSHOT_RUNTIME_EXCLUDED_ENV_NAMES)
+    safe_names.update(
         name for name in excluded_names
         if isinstance(name, str) and name
-    }
+    )
     extra_unset = " ".join(shlex.quote(name) for name in sorted(safe_names))
     if extra_unset:
         extra_unset = f" {extra_unset}"
@@ -602,26 +612,27 @@ class BaseEnvironment(ABC):
         return ()
 
     def _snapshot_excluded_passthrough_names(self) -> tuple[str, ...]:
-        """Return profile-scoped names that must not persist in the snapshot.
+        """Return transient runtime and profile-scoped snapshot exclusions.
 
         The set is monotonic for the environment lifetime. A skill/config
         allowlist can be cleared after a value was captured; retaining the
         exclusion prevents that old value from becoming visible to a later
         profile through the shared snapshot.
         """
+        names = set(_SNAPSHOT_RUNTIME_EXCLUDED_ENV_NAMES)
         if not self._profile_scoped_passthrough:
-            return ()
+            return tuple(sorted(names))
         try:
             from agent.secret_scope import is_multiplex_active
             if is_multiplex_active():
                 from tools.env_passthrough import get_all_passthrough
-                names = (
+                profile_names = (
                     *get_all_passthrough(),
                     *self._additional_profile_scoped_passthrough_names(),
                 )
                 self._snapshot_passthrough_names.update(
                     name
-                    for name in names
+                    for name in profile_names
                     if isinstance(name, str) and _SHELL_ENV_NAME_RE.fullmatch(name)
                 )
         except Exception:
@@ -629,7 +640,8 @@ class BaseEnvironment(ABC):
                 "Could not refresh profile-scoped snapshot exclusions",
                 exc_info=True,
             )
-        return tuple(sorted(self._snapshot_passthrough_names))
+        names.update(self._snapshot_passthrough_names)
+        return tuple(sorted(names))
 
     def init_session(self):
         """Capture login shell environment into a snapshot file.
