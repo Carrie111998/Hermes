@@ -2545,6 +2545,15 @@ def terminal_tool(
                         if stat.S_ISREG(metadata.st_mode) and metadata.st_size <= 1024 * 1024:
                             data = local_path.read_bytes()
                             if len(data) <= 1024 * 1024:
+                                # A NUL byte means this is a binary (ELF/Mach-O/PE),
+                                # not a shell script — decoding it with
+                                # errors="replace" preserves the NULs, and the
+                                # guard's recursive scan would tokenize machine
+                                # code into junk paths and crash on embedded NUL
+                                # bytes. Mirror the binary check in
+                                # lifecycle_guard._read_referenced_script.
+                                if b"\x00" in data:
+                                    return None
                                 return data.decode("utf-8", errors="replace")
                 except Exception:
                     pass
