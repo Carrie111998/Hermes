@@ -269,7 +269,6 @@ from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
     MessageType,
-    ProcessingOutcome,
     SendResult,
     classify_send_error,
     cache_image_from_bytes,

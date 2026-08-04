@@ -269,6 +269,18 @@ async def test_clear_reactions_malformed_message_id_returns_false():
 
 
 @pytest.mark.asyncio
+async def test_clear_reactions_happy_path_calls_bot():
+    """_clear_reactions happy path: clears via set_message_reaction(None)."""
+    adapter = _make_adapter()
+    adapter._bot.set_message_reaction = AsyncMock(return_value=True)
+    result = await adapter._clear_reactions("123", "456")
+    assert result is True
+    adapter._bot.set_message_reaction.assert_awaited_once_with(
+        chat_id=123, message_id=456, reaction=None
+    )
+
+
+@pytest.mark.asyncio
 async def test_set_reaction_api_error_is_swallowed(monkeypatch):
     """Bot API errors must be downgraded to False + debug log, never raised."""
     monkeypatch.setenv("TELEGRAM_REACTIONS", "true")
