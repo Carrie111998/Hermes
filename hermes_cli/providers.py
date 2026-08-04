@@ -117,6 +117,25 @@ HERMES_OVERLAYS: Dict[str, HermesOverlay] = {
         base_url_override="https://api.stepfun.ai/step_plan/v1",
         base_url_env_var="STEPFUN_BASE_URL",
     ),
+    # AgentRouter relays several upstream vendors behind one key, so it is an
+    # aggregator on both routes. The Anthropic route's base URL deliberately
+    # omits ``/v1`` — the Anthropic SDK appends ``/v1/messages`` itself — which
+    # also means host_mandated_api_mode() can't infer the wire from the URL;
+    # these overlays are what pin the transport.
+    "agentrouter": HermesOverlay(
+        transport="openai_chat",
+        is_aggregator=True,
+        extra_env_vars=("AGENTROUTER_API_KEY",),
+        base_url_override="https://agentrouter.org/v1",
+        base_url_env_var="AGENTROUTER_BASE_URL",
+    ),
+    "agentrouter-anthropic": HermesOverlay(
+        transport="anthropic_messages",
+        is_aggregator=True,
+        extra_env_vars=("AGENTROUTER_API_KEY",),
+        base_url_override="https://agentrouter.org",
+        base_url_env_var="AGENTROUTER_ANTHROPIC_BASE_URL",
+    ),
     "minimax": HermesOverlay(
         transport="anthropic_messages",
         base_url_env_var="MINIMAX_BASE_URL",
@@ -304,6 +323,11 @@ ALIASES: Dict[str, str] = {
     "minimax-china": "minimax-cn",
     "minimax_cn": "minimax-cn",
 
+    # agentrouter (two wires, one host — see HERMES_OVERLAYS above)
+    "agent-router": "agentrouter",
+    "agentrouter-openai": "agentrouter",
+    "agentrouter-claude": "agentrouter-anthropic",
+
     # anthropic
     "claude": "anthropic",
     "claude-code": "anthropic",
@@ -408,6 +432,8 @@ _LABEL_OVERRIDES: Dict[str, str] = {
     "xiaomi": "Xiaomi MiMo",
     "gmi": "GMI Cloud",
     "upstage": "Upstage Solar",
+    "agentrouter": "AgentRouter",
+    "agentrouter-anthropic": "AgentRouter (Claude)",
     "tencent-tokenhub": "Tencent TokenHub",
     "lmstudio": "LM Studio",
     "local": "Local endpoint",

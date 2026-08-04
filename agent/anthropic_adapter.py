@@ -596,8 +596,8 @@ def _requires_bearer_auth(base_url: str | None) -> bool:
     Some third-party /anthropic endpoints implement Anthropic's Messages API but
     require Authorization: Bearer instead of Anthropic's native x-api-key header.
     MiniMax's global and China Anthropic-compatible endpoints, Azure AI
-    Foundry's Anthropic-style endpoint, Palantir Foundry's LLM proxy, and Nous
-    Portal's Messages route follow this pattern.
+    Foundry's Anthropic-style endpoint, Palantir Foundry's LLM proxy, Nous
+    Portal's Messages route, and AgentRouter's relay follow this pattern.
     """
     if _is_nous_portal_endpoint(base_url):
         return True
@@ -613,6 +613,14 @@ def _requires_bearer_auth(base_url: str | None) -> bool:
         # Hostname match (not substring) so e.g. evil.com/palantirfoundry
         # paths don't trigger Bearer auth.
         or base_url_host_matches(normalized, "palantirfoundry.com")
+        # AgentRouter's Anthropic-compatible relay (https://agentrouter.org,
+        # no /v1 and no /anthropic suffix) documents its key as an
+        # ANTHROPIC_AUTH_TOKEN, i.e. Authorization: Bearer. Its ``ak-…`` keys
+        # carry no sk-ant-api prefix, so without this they'd fall through to
+        # OAuth-shape detection and then to x-api-key, which the relay 401s on.
+        # Hostname match so lookalike paths (evil.test/agentrouter.org/…)
+        # don't opt into Bearer auth.
+        or base_url_host_matches(normalized, "agentrouter.org")
     )
 
 

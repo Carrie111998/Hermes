@@ -23,6 +23,8 @@ You need at least one way to connect to an LLM. Use `hermes model` to switch pro
 | **Fireworks AI** | `FIREWORKS_API_KEY` in `~/.hermes/.env` (provider: `fireworks`; aliases: `fireworks-ai`, `fw`) |
 | **NovitaAI** | `NOVITA_API_KEY` in `~/.hermes/.env` (provider: `novita`, 200+ models, Model API, Agent Sandbox, GPU Cloud) |
 | **AI Gateway** | `AI_GATEWAY_API_KEY` in `~/.hermes/.env` (provider: `ai-gateway`) |
+| **AgentRouter** | `AGENTROUTER_API_KEY` in `~/.hermes/.env` (provider: `agentrouter`, OpenAI-compatible route: GPT / GLM; aliases: `agent-router`, `agentrouter-openai`) |
+| **AgentRouter (Claude)** | `AGENTROUTER_API_KEY` in `~/.hermes/.env` (provider: `agentrouter-anthropic`, Anthropic Messages route: Claude Opus; alias: `agentrouter-claude`) |
 | **z.ai / GLM** | `GLM_API_KEY` in `~/.hermes/.env` (provider: `zai`) |
 | **Kimi / Moonshot** | `KIMI_API_KEY` in `~/.hermes/.env` (provider: `kimi-coding`) |
 | **Kimi / Moonshot (China)** | `KIMI_CN_API_KEY` in `~/.hermes/.env` (provider: `kimi-coding-cn`; aliases: `kimi-cn`, `moonshot-cn`) |
@@ -539,6 +541,40 @@ model:
 ```
 
 The base URL can be overridden with `STEPFUN_BASE_URL` (default: `https://api.stepfun.com/v1`).
+
+### AgentRouter
+
+[AgentRouter](https://agentrouter.org) relays several upstream model families behind a single API key. Grab a key from the [token console](https://agentrouter.org/console/token) and put it in `~/.hermes/.env`:
+
+```bash
+AGENTROUTER_API_KEY=ak-your-key-here
+```
+
+AgentRouter exposes **two wire protocols on the same host**, and they are not interchangeable — which family you want decides which provider you pick:
+
+| Provider | Endpoint | Models |
+|----------|----------|--------|
+| `agentrouter` | `https://agentrouter.org/v1` (OpenAI-compatible) | `gpt-5.5`, `gpt-5.6`, `glm-5.2` |
+| `agentrouter-anthropic` | `https://agentrouter.org` (Anthropic Messages) | `claude-opus-4-6`, `claude-opus-4-7`, `claude-opus-4-8` |
+
+```bash
+# GPT / GLM over the OpenAI-compatible route
+hermes chat --provider agentrouter --model gpt-5.5
+
+# Claude Opus over the Anthropic Messages route
+hermes chat --provider agentrouter-anthropic --model claude-opus-4-6
+```
+
+Or set one permanently in `config.yaml`:
+```yaml
+model:
+  provider: "agentrouter-anthropic"
+  default: "claude-opus-4-6"
+```
+
+Both routes authenticate with the same `AGENTROUTER_API_KEY`, sent as `Authorization: Bearer`. Aliases: `agent-router` / `agentrouter-openai` → `agentrouter`, `agentrouter-claude` → `agentrouter-anthropic`.
+
+Base URLs can be overridden with `AGENTROUTER_BASE_URL` and `AGENTROUTER_ANTHROPIC_BASE_URL`. Note that the Anthropic route deliberately carries **no** `/v1` suffix — the Anthropic SDK appends `/v1/messages` itself, so adding it yourself produces a 404.
 
 ### Hugging Face Inference Providers
 

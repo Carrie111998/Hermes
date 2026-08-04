@@ -1,0 +1,5 @@
+name: agentrouter-provider
+kind: model-provider
+version: 1.0.0
+description: AgentRouter relay (OpenAI-compatible + Anthropic Messages routes)
+author: Nous Research
