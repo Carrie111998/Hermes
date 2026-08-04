@@ -22,6 +22,7 @@ def _make_state(
     layers=None,
     states=None,
     session_info=None,
+    run_id="test-run-001",
 ):
     """Build a minimal engine state dict for testing."""
     if layers is None:
@@ -47,6 +48,7 @@ def _make_state(
     return {
         "workflow_name": workflow_name,
         "kanban_board": kanban_board,
+        "run_id": run_id,
         "layers": layers,
         "states": states,
         "session_info": session_info,
@@ -105,6 +107,62 @@ class TestNotifyWorkflowComplete:
         # Clean up
         for m in markers:
             os.unlink(m)
+
+    def test_writes_single_marker_per_round(self, tmp_path):
+        """Same (run_id, round) never writes a second marker.
+
+        Regression: the supervisor and the completed hook both call
+        _notify_workflow_complete — without the dedup guard, one
+        logical completion produced 2+ identical injected messages
+        (seen live 2026-08-04 on run 70893).
+        """
+        from plugins.workflow import _notify_workflow_complete
+
+        state = _make_state(run_id="dedup-run")
+        state_path = _write_state_file(tmp_path, state, run_id="dedup-run")
+
+        fake_completions = tmp_path / "completions"
+        with patch("plugins.workflow._find_state_for_card") as mock_find:
+            mock_find.return_value = (state, str(state_path))
+            with patch("plugins.workflow.analyst.analyze_status") as mock_analyst:
+                mock_analyst.return_value = MagicMock(success=False, result=None)
+                with patch("plugins.workflow._COMPLETIONS_DIR", fake_completions):
+                    _notify_workflow_complete("t_node-a")
+                    # Second call = the hook echo of the same round
+                    _notify_workflow_complete("t_node-a")
+
+        markers = list((fake_completions / "test-workflow").glob("*.json"))
+        assert len(markers) == 1, f"expected 1 marker per round, got {len(markers)}"
+        data = json.loads(markers[0].read_text())
+        assert data["delivery_key"] == "dedup-run:0"
+
+    def test_writes_new_marker_for_new_round(self, tmp_path):
+        """Bumping 'round' (auto-resume re-open) delivers again.
+
+        Each re-activation of a completed run is a NEW round and must
+        produce exactly one fresh delivery — the restarted workflow
+        still notifies the originating session.
+        """
+        from plugins.workflow import _notify_workflow_complete
+
+        state = _make_state(run_id="dedup-run")
+        state["round"] = 1
+        state_path = _write_state_file(tmp_path, state, run_id="dedup-run")
+
+        fake_completions = tmp_path / "completions"
+        with patch("plugins.workflow._find_state_for_card") as mock_find:
+            mock_find.return_value = (state, str(state_path))
+            with patch("plugins.workflow.analyst.analyze_status") as mock_analyst:
+                mock_analyst.return_value = MagicMock(success=False, result=None)
+                with patch("plugins.workflow._COMPLETIONS_DIR", fake_completions):
+                    _notify_workflow_complete("t_node-a")
+                    _notify_workflow_complete("t_node-a")
+
+        markers = list((fake_completions / "test-workflow").glob("*.json"))
+        assert len(markers) == 1, f"expected 1 marker for round 1, got {len(markers)}"
+        data = json.loads(markers[0].read_text())
+        assert data["delivery_key"] == "dedup-run:1"
+        assert data["round"] == 1
 
     def test_does_not_write_marker_when_final_nodes_pending(self, tmp_path):
         """No marker when final layer nodes are not all done."""

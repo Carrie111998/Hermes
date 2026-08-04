@@ -461,6 +461,7 @@ def _reopen_completed_run(task_id: str) -> bool:
             logger.error("Auto-resume reviewer reset failed for %s: %s", task_id, e)
 
         state.pop("final_status", None)
+        state["round"] = state.get("round", 0) + 1  # new delivery round
         state["updated_at"] = datetime.now(timezone.utc).isoformat()
         with open(state_path, "w") as _f:
             json.dump(state, _f, indent=2)
@@ -940,6 +941,29 @@ def _notify_workflow_complete(task_id: str, state=None):
             heading += f" ({failed_count} failed)"
         full_message = f"{heading}\n\nNodes:\n{message}"
 
+        # Dedup: one delivery per (run_id, round). Both the supervisor
+        # (engine _fire_completion_notification) and the completed hook
+        # (_on_kanban_task_completed) call this — without the guard,
+        # each final-layer completion writes 2+ identical markers and
+        # the watcher injects each one (seen live 2026-08-04: 4 messages
+        # for one logical completion). 'round' bumps on every auto-resume
+        # re-open so a restarted run still delivers exactly once.
+        run_id = state.get("run_id", "unknown")
+        round_no = state.get("round", 0)
+        delivery_key = f"{run_id}:{round_no}"
+        wf_marker_dir = _COMPLETIONS_DIR / workflow_name
+        wf_marker_dir.mkdir(parents=True, exist_ok=True)
+        for existing in _glob.glob(str(wf_marker_dir / f"*_{run_id}.json")):
+            try:
+                existing_data = json.loads(Path(existing).read_text())
+                if existing_data.get("delivery_key") == delivery_key:
+                    print(
+                        f"   ℹ  Delivery already sent for {delivery_key} — skipping duplicate marker"
+                    )
+                    return
+            except Exception:
+                continue
+
         marker = {
             "session_key": session_key,
             "platform": session_info.get("platform", ""),
@@ -953,11 +977,10 @@ def _notify_workflow_complete(task_id: str, state=None):
             "message": full_message,
             "nodes": all_nodes,
             "run_id": state.get("run_id", ""),
+            "delivery_key": delivery_key,
+            "round": round_no,
         }
         ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%f")
-        run_id = state.get("run_id", "unknown")
-        wf_marker_dir = _COMPLETIONS_DIR / workflow_name
-        wf_marker_dir.mkdir(parents=True, exist_ok=True)
         marker_path = wf_marker_dir / f"{ts}_{run_id}.json"
         # Atomic write: temp file → rename (prevents TOCTOU reads of partial JSON)
         tmp_fd, tmp_path = tempfile.mkstemp(suffix=".json")
