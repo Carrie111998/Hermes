@@ -182,3 +182,23 @@ class TestBuildMemoryContextBlockWarnsOnViolation:
 
         assert not any("pre-wrapped" in rec.message for rec in caplog.records)
         assert "plain fact about user" in out
+
+
+class TestSanitizeContextInternalTaggedBlocks:
+    def test_strips_non_user_visible_internal_blocks(self):
+        leaked = (
+            "Visible before\n"
+            "<prior_memory_file><context>hidden</context></prior_memory_file>\n"
+            "Visible middle\n"
+            "<ai_identity_seed>also hidden</ai_identity_seed>\n"
+            "Visible after"
+        )
+
+        out = sanitize_context(leaked)
+
+        assert "prior_memory_file" not in out
+        assert "ai_identity_seed" not in out
+        assert "hidden" not in out
+        assert "Visible before" in out
+        assert "Visible middle" in out
+        assert "Visible after" in out
