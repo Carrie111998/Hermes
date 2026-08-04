@@ -441,7 +441,7 @@ def _event_metadata_is_valid(event: Any) -> bool:
 
 
 def client_active_counter(event: Any) -> tuple[str, dict[str, str]] | None:
-    """Return the active-install counter for one empty allowlisted mark."""
+    """Return the client-active counter for one empty allowlisted mark."""
     if not _event_metadata_is_valid(event):
         return None
     if (

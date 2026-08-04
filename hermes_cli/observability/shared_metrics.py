@@ -140,7 +140,7 @@ class SharedMetricsStore:
             )
 
     def record_first_usable(self, resource: dict[str, str]) -> bool:
-        """Record the first usable Hermes runtime boundary once per install."""
+        """Record the first usable Hermes runtime boundary once per profile."""
         return self._record_once(
             CLIENT_FIRST_USABLE_METRIC,
             _FIRST_USABLE_STATE_KEY,
