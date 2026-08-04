@@ -276,6 +276,77 @@ test('failed forced refresh preserves the last-known-good runtime atomically', a
   assert.equal(runtime.status().runtimeSessionActive, true)
 })
 
+test('refresh preserves renderer state while reconnecting the same customer and agent assignment', async t => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'eva-runtime-refresh-same-assignment-'))
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
+  const statePath = path.join(directory, 'eva-enrollment.json')
+  writeActiveEnrollment(statePath)
+
+  let connectionResets = 0
+  let rendererResets = 0
+  const runtime = makeManagedRuntime(statePath, {
+    launchRuntime: async () => ({
+      schemaVersion: 'evaos.hermes_desktop_enrollment.v1',
+      customerId: 'customer-one',
+      runtime: 'hermes',
+      agentId: 'main',
+      baseUrl: 'https://hermes-customer-one.ecs.electricsheephq.com',
+      token: 'refreshed-runtime-token',
+      expiresAt: FUTURE
+    }),
+    resetConnection: () => {
+      connectionResets += 1
+    },
+    resetRenderer: async () => {
+      rendererResets += 1
+    }
+  })
+
+  await runtime.refresh()
+
+  const persisted = JSON.parse(fs.readFileSync(statePath, 'utf8'))
+  assert.equal(persisted.runtime.token, 'refreshed-runtime-token')
+  assert.equal(connectionResets, 1)
+  assert.equal(rendererResets, 0)
+})
+
+test('refresh resets renderer state when either assignment identity changes', async t => {
+  for (const assignment of [
+    { customerId: 'customer-two', agentId: 'main' },
+    { customerId: 'customer-one', agentId: 'secondary' }
+  ]) {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'eva-runtime-refresh-new-assignment-'))
+    t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
+    const statePath = path.join(directory, 'eva-enrollment.json')
+    writeActiveEnrollment(statePath)
+
+    let connectionResets = 0
+    let rendererResets = 0
+    const runtime = makeManagedRuntime(statePath, {
+      launchRuntime: async () => ({
+        schemaVersion: 'evaos.hermes_desktop_enrollment.v1',
+        customerId: assignment.customerId,
+        runtime: 'hermes',
+        agentId: assignment.agentId,
+        baseUrl: `https://hermes-${assignment.customerId}.ecs.electricsheephq.com`,
+        token: 'new-assignment-runtime-token',
+        expiresAt: FUTURE
+      }),
+      resetConnection: () => {
+        connectionResets += 1
+      },
+      resetRenderer: async () => {
+        rendererResets += 1
+      }
+    })
+
+    await runtime.refresh()
+
+    assert.equal(connectionResets, 1)
+    assert.equal(rendererResets, 1)
+  }
+})
+
 test('production reauthentication errors trigger one runtime re-enrollment', async t => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'eva-runtime-production-401-'))
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }))

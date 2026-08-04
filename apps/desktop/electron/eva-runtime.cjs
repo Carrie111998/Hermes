@@ -434,9 +434,16 @@ function createEvaManagedRuntime(options) {
   }
 
   async function refresh() {
+    const previousRuntime = readState().runtime
     const runtime = await ensureRuntimeEnrollment({ force: true })
     const status = publicEvaEnrollmentStatus({ ...readState(), runtime })
-    await resetRenderer()
+    if (
+      !previousRuntime ||
+      previousRuntime.customerId !== runtime.customerId ||
+      previousRuntime.agentId !== runtime.agentId
+    ) {
+      await resetRenderer()
+    }
     return status
   }
 
