@@ -258,7 +258,16 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
     try:
         descriptor = os.open(path, flags)
-    except OSError:
+    except (OSError, ValueError):
+        # OSError: missing/unreadable path. ValueError: embedded NUL byte —
+        # os.open rejects those before any syscall, so this raises instead of
+        # returning an errno. The NUL arrives the same way #76762 described:
+        # the walk tokenizes a binary's decoded contents and feeds a
+        # NUL-bearing token straight back here, so the skip-binaries intent
+        # of #76762 has to cover the open() call too, not only the later
+        # content check (which this crash never reaches). Fail open like the
+        # OSError case: a NUL-bearing path can never name a real executable
+        # script, so there is nothing to scan and nothing that can run.
         return None, False
     try:
         metadata = os.fstat(descriptor)
@@ -313,10 +322,14 @@ def _contains_unsafe_gateway_action(
     for script_path in _iter_referenced_shell_scripts(command, cwd=cwd):
         try:
             resolved = script_path.resolve(strict=False)
-        except (OSError, ValueError):
+        except (OSError, ValueError, RuntimeError):
             # OSError: unreadable/long paths. ValueError: embedded NUL byte
             # from a binary's decoded contents tokenized as a path — a
             # guarded path must never crash the guard (#76762).
+            # RuntimeError: CPython's pathlib raises it (not OSError) for a
+            # symlink loop, so a self-referential script path crashed the
+            # guard the same way. Keep the unresolved path: the visited-set
+            # de-duplication degrades but the scan still runs.
             resolved = script_path
         if resolved in visited:
             continue
