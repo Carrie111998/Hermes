@@ -3,11 +3,11 @@
 
 The stopped-release publisher deliberately refuses to cross any pre-existing
 activation path.  A writer preflight, however, can durably stage the collector
-pair before a later planner step fails.  This module closes that lifecycle gap
-without deleting evidence: it binds the exact pair to its append-only collector
-receipt, writes a crash-resumable intent, and atomically renames the whole
-staging directory into a root-only archive while every canary service remains
-stopped and disabled.
+pair and the complete planner bundle before a later verification step fails.
+This module closes that lifecycle gap without deleting evidence: it binds one
+of those two exact namespaces to its append-only collector receipt, writes a
+crash-resumable intent, and atomically renames the whole staging directory into
+a root-only archive while every canary service remains stopped and disabled.
 """
 
 from __future__ import annotations
@@ -23,6 +23,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, ContextManager, Mapping, NoReturn, Sequence
 
+from gateway.canonical_writer_host_authority import NativeObservationPlan
+from gateway.canonical_writer_release_contract import (
+    GATEWAY_UNIT_NAME,
+    WRITER_UNIT_NAME,
+    render_phase_b_readiness_service,
+)
 from scripts.canary.writer_release import (
     _ACTIVATION_PATHS,
     _SERVICE_PROPERTIES,
@@ -37,8 +43,10 @@ from scripts.canary.writer_release import (
 )
 
 
-PLAN_SCHEMA = "muncho-stopped-writer-residue-recovery-plan.v1"
-RECEIPT_SCHEMA = "muncho-stopped-writer-residue-recovery.v1"
+LEGACY_PLAN_SCHEMA = "muncho-stopped-writer-residue-recovery-plan.v1"
+LEGACY_RECEIPT_SCHEMA = "muncho-stopped-writer-residue-recovery.v1"
+PLAN_SCHEMA = "muncho-stopped-writer-residue-recovery-plan.v2"
+RECEIPT_SCHEMA = "muncho-stopped-writer-residue-recovery.v2"
 FAILURE_SCHEMA = "muncho-stopped-writer-residue-recovery-failure.v1"
 
 DEFAULT_WRITER_CONFIG_SOURCE_PATH = Path(
@@ -46,6 +54,19 @@ DEFAULT_WRITER_CONFIG_SOURCE_PATH = Path(
 )
 DEFAULT_GATEWAY_CONFIG_SOURCE_PATH = Path(
     "/etc/muncho/writer-activation/staged/gateway.yaml"
+)
+DEFAULT_STAGED_NATIVE_PLAN_PATH = Path(
+    "/etc/muncho/writer-activation/staged/native-observation-plan.json"
+)
+DEFAULT_STAGED_WRITER_UNIT_PATH = Path(
+    "/etc/muncho/writer-activation/staged/muncho-canonical-writer.service"
+)
+DEFAULT_STAGED_PHASE_B_READINESS_UNIT_PATH = Path(
+    "/etc/muncho/writer-activation/staged/"
+    "muncho-canonical-writer-phase-b-readiness.service"
+)
+DEFAULT_STAGED_GATEWAY_UNIT_PATH = Path(
+    "/etc/muncho/writer-activation/staged/hermes-cloud-gateway.service"
 )
 CONFIG_COLLECTOR_EVIDENCE_ROOT = Path(
     "/var/lib/muncho-writer-canary-evidence/config-collector"
@@ -58,11 +79,19 @@ if _ACTIVATION_PATHS[:2] != (
     DEFAULT_GATEWAY_CONFIG_SOURCE_PATH,
 ):
     raise RuntimeError("stopped writer residue path contract drifted")
+if not {
+    DEFAULT_STAGED_NATIVE_PLAN_PATH,
+    DEFAULT_STAGED_WRITER_UNIT_PATH,
+    DEFAULT_STAGED_PHASE_B_READINESS_UNIT_PATH,
+    DEFAULT_STAGED_GATEWAY_UNIT_PATH,
+}.issubset(_ACTIVATION_PATHS):
+    raise RuntimeError("stopped writer planner residue path contract drifted")
 
 _REVISION_RE = re.compile(r"^[0-9a-f]{40}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _RECEIPT_NAME_RE = re.compile(r"^([0-9a-f]{64})\.json$")
 _MAX_CONFIG_BYTES = 2 * 1024 * 1024
+_MAX_UNIT_BYTES = 256 * 1024
 _MAX_PLAN_BYTES = 2 * 1024 * 1024
 _MAX_RECEIPT_BYTES = 2 * 1024 * 1024
 _COLLECTOR_RECEIPT_SCHEMA = "muncho-writer-config-collector-receipt.v1"
@@ -118,10 +147,22 @@ _COLLECTOR_DATABASE_CA_PATH = Path("/etc/muncho/trust/cloudsql-server-ca.pem")
 _COLLECTOR_TLS_RE = re.compile(
     r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.europe-west3\.sql\.goog$"
 )
-_FIXED_STAGED_NAMES = frozenset({
-    DEFAULT_WRITER_CONFIG_SOURCE_PATH.name,
-    DEFAULT_GATEWAY_CONFIG_SOURCE_PATH.name,
-})
+
+
+def _collector_pair_names() -> frozenset[str]:
+    return frozenset({
+        DEFAULT_WRITER_CONFIG_SOURCE_PATH.name,
+        DEFAULT_GATEWAY_CONFIG_SOURCE_PATH.name,
+    })
+
+
+def _planner_bundle_names() -> frozenset[str]:
+    return _collector_pair_names() | frozenset({
+        DEFAULT_STAGED_NATIVE_PLAN_PATH.name,
+        DEFAULT_STAGED_WRITER_UNIT_PATH.name,
+        DEFAULT_STAGED_PHASE_B_READINESS_UNIT_PATH.name,
+        DEFAULT_STAGED_GATEWAY_UNIT_PATH.name,
+    })
 
 
 @dataclass(frozen=True)
@@ -234,11 +275,152 @@ def _ensure_exact_directory(path: Path, *, mode: int = 0o700) -> None:
     _validate_root_parent_chain(path.parent)
 
 
-def _validate_staging_directory(path: Path) -> None:
+def _validate_staging_directory(path: Path) -> frozenset[str]:
     _validate_exact_directory(path)
     entries = frozenset(os.listdir(path))
-    if entries != _FIXED_STAGED_NAMES:
+    if entries not in {_collector_pair_names(), _planner_bundle_names()}:
         raise RuntimeError("stopped writer residue namespace is not exact")
+    return entries
+
+
+def _trusted_staged_artifact(root: Path, name: str) -> bytes:
+    path = root / name
+    if name in _collector_pair_names():
+        return _trusted_config(path)
+    maximum = (
+        _MAX_PLAN_BYTES
+        if name == DEFAULT_STAGED_NATIVE_PLAN_PATH.name
+        else _MAX_UNIT_BYTES
+    )
+    return _trusted_publication(path, maximum=maximum)
+
+
+def _staged_artifact_digests(root: Path) -> dict[str, str]:
+    entries = _validate_staging_directory(root)
+    return {
+        name: _sha256_bytes(_trusted_staged_artifact(root, name))
+        for name in sorted(entries)
+    }
+
+
+def _recoverable_activation_paths(names: Sequence[str]) -> frozenset[Path]:
+    entries = frozenset(names)
+    if entries not in {_collector_pair_names(), _planner_bundle_names()}:
+        raise ValueError("residue recovery staged artifact names are invalid")
+    return frozenset(STAGING_ROOT / name for name in entries)
+
+
+def _plan_staged_artifacts(plan: Mapping[str, Any]) -> dict[str, str]:
+    if plan.get("schema") == LEGACY_PLAN_SCHEMA:
+        return {
+            DEFAULT_GATEWAY_CONFIG_SOURCE_PATH.name: str(
+                plan["gateway_config_sha256"]
+            ),
+            DEFAULT_WRITER_CONFIG_SOURCE_PATH.name: str(
+                plan["writer_config_sha256"]
+            ),
+        }
+    artifacts = plan.get("staged_artifacts")
+    if not isinstance(artifacts, Mapping):
+        raise ValueError("residue recovery staged artifacts are invalid")
+    return dict(artifacts)
+
+
+def _decode_native_plan(raw: bytes) -> NativeObservationPlan:
+    try:
+        value = json.loads(
+            raw.decode("utf-8", errors="strict"),
+            object_pairs_hook=_reject_duplicate_keys,
+            parse_constant=_reject_json_constant,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise ValueError("staged native observation plan is invalid") from exc
+    if not isinstance(value, Mapping):
+        raise ValueError("staged native observation plan is invalid")
+    plan = NativeObservationPlan.from_mapping(value)
+    if raw != _canonical_bytes(plan.to_mapping()) or plan.sha256 != _sha256_bytes(raw):
+        raise ValueError("staged native observation plan is not canonical")
+    return plan
+
+
+def _validate_planner_bundle_bindings(
+    *,
+    root: Path,
+    staged_artifacts: Mapping[str, str],
+    collector: _CollectorReceipt,
+) -> None:
+    names = frozenset(staged_artifacts)
+    if names == _collector_pair_names():
+        return
+    if names != _planner_bundle_names():
+        raise ValueError("residue recovery staged artifact names are invalid")
+
+    native_raw = _trusted_staged_artifact(
+        root,
+        DEFAULT_STAGED_NATIVE_PLAN_PATH.name,
+    )
+    native = _decode_native_plan(native_raw)
+    value = native.value
+    source_revision = _revision(
+        collector.value["release_revision"],
+        "collector release revision",
+    )
+    if (
+        collector.value["writer_config_sha256"]
+        != staged_artifacts[DEFAULT_WRITER_CONFIG_SOURCE_PATH.name]
+        or collector.value["gateway_config_sha256"]
+        != staged_artifacts[DEFAULT_GATEWAY_CONFIG_SOURCE_PATH.name]
+    ):
+        raise ValueError("staged config collector binding drifted")
+    expected_root = f"/opt/muncho-canary-releases/{source_revision}"
+    expected = {
+        "revision": source_revision,
+        "artifact_root": expected_root,
+        "artifact_sha256": collector.value["release_artifact_sha256"],
+        "release_manifest_file_sha256": collector.value[
+            "release_manifest_file_sha256"
+        ],
+        "config_collector_receipt_sha256": collector.sha256,
+        "writer_config": {
+            "path": "/etc/muncho-canonical-writer/writer.json",
+            "sha256": staged_artifacts[DEFAULT_WRITER_CONFIG_SOURCE_PATH.name],
+        },
+        "gateway_config": {
+            "path": "/etc/hermes/config.yaml",
+            "sha256": staged_artifacts[DEFAULT_GATEWAY_CONFIG_SOURCE_PATH.name],
+        },
+        "writer_unit": {
+            "name": WRITER_UNIT_NAME,
+            "path": f"/etc/systemd/system/{WRITER_UNIT_NAME}",
+            "sha256": staged_artifacts[DEFAULT_STAGED_WRITER_UNIT_PATH.name],
+        },
+        "gateway_unit": {
+            "name": GATEWAY_UNIT_NAME,
+            "path": f"/etc/systemd/system/{GATEWAY_UNIT_NAME}",
+            "sha256": staged_artifacts[DEFAULT_STAGED_GATEWAY_UNIT_PATH.name],
+        },
+        "database": {
+            "ip_network": f"{collector.value['database']['host']}/32",
+            "tls_server_name": collector.value["database"]["tls_server_name"],
+            "ca_path": collector.value["database"]["ca_path"],
+            "ca_sha256": collector.value["database"]["ca_sha256"],
+        },
+    }
+    for name, binding in expected.items():
+        if value.get(name) != binding:
+            raise ValueError(f"staged native observation {name} binding drifted")
+
+    phase_b_raw = _trusted_staged_artifact(
+        root,
+        DEFAULT_STAGED_PHASE_B_READINESS_UNIT_PATH.name,
+    )
+    expected_phase_b = render_phase_b_readiness_service(
+        revision=source_revision,
+        artifact_root=expected_root,
+        artifact_sha256=str(collector.value["release_artifact_sha256"]),
+    ).encode("utf-8", errors="strict")
+    if phase_b_raw != expected_phase_b:
+        raise ValueError("staged Phase-B readiness unit binding drifted")
 
 
 def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -397,14 +579,12 @@ def _matching_collector_receipt(
     return matches[0]
 
 
-def _activation_inventory() -> list[dict[str, str]]:
+def _activation_inventory(staged_names: Sequence[str]) -> list[dict[str, str]]:
+    recoverable = _recoverable_activation_paths(staged_names)
     inventory: list[dict[str, str]] = []
     for path in _ACTIVATION_PATHS:
         present = os.path.lexists(path)
-        if path in {
-            DEFAULT_WRITER_CONFIG_SOURCE_PATH,
-            DEFAULT_GATEWAY_CONFIG_SOURCE_PATH,
-        }:
+        if path in recoverable:
             if not present:
                 raise RuntimeError("stopped writer residue is partial")
             state = "present_receipt_bound_residue"
@@ -459,15 +639,18 @@ def _validate_service_states(value: Any) -> list[dict[str, Any]]:
 
 
 def _plan_from_live(target_revision: str) -> dict[str, Any]:
-    _validate_staging_directory(STAGING_ROOT)
-    inventory = _activation_inventory()
-    writer_raw = _trusted_config(DEFAULT_WRITER_CONFIG_SOURCE_PATH)
-    gateway_raw = _trusted_config(DEFAULT_GATEWAY_CONFIG_SOURCE_PATH)
-    writer_sha256 = _sha256_bytes(writer_raw)
-    gateway_sha256 = _sha256_bytes(gateway_raw)
+    staged_artifacts = _staged_artifact_digests(STAGING_ROOT)
+    inventory = _activation_inventory(tuple(staged_artifacts))
+    writer_sha256 = staged_artifacts[DEFAULT_WRITER_CONFIG_SOURCE_PATH.name]
+    gateway_sha256 = staged_artifacts[DEFAULT_GATEWAY_CONFIG_SOURCE_PATH.name]
     collector, collector_path = _matching_collector_receipt(
         writer_sha256=writer_sha256,
         gateway_sha256=gateway_sha256,
+    )
+    _validate_planner_bundle_bindings(
+        root=STAGING_ROOT,
+        staged_artifacts=staged_artifacts,
+        collector=collector,
     )
     source_revision = _revision(
         collector.value["release_revision"],
@@ -486,6 +669,7 @@ def _plan_from_live(target_revision: str) -> dict[str, Any]:
         "writer_config_sha256": writer_sha256,
         "gateway_config_path": str(DEFAULT_GATEWAY_CONFIG_SOURCE_PATH),
         "gateway_config_sha256": gateway_sha256,
+        "staged_artifacts": staged_artifacts,
         "source_staging_root": str(STAGING_ROOT),
         "archive_path": str(archive),
         "intent_path": str(_intent_path(target_revision)),
@@ -499,6 +683,7 @@ def _plan_from_live(target_revision: str) -> dict[str, Any]:
             "credential_content_or_digest_recorded": False,
             "staging_directory_renamed_atomically": True,
             "staged_configs_deleted": False,
+            "staged_artifacts_deleted": False,
         },
     }
     return {**unsigned, "plan_sha256": _sha256_json(unsigned)}
@@ -511,6 +696,9 @@ def validate_plan_mapping(
 ) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         raise ValueError("residue recovery plan is not an object")
+    schema = value.get("schema")
+    if schema not in {LEGACY_PLAN_SCHEMA, PLAN_SCHEMA}:
+        raise ValueError("residue recovery plan fields are not exact")
     expected_fields = {
         "schema",
         "target_release_revision",
@@ -530,7 +718,9 @@ def validate_plan_mapping(
         "invariants",
         "plan_sha256",
     }
-    if set(value) != expected_fields or value.get("schema") != PLAN_SCHEMA:
+    if schema == PLAN_SCHEMA:
+        expected_fields.add("staged_artifacts")
+    if set(value) != expected_fields:
         raise ValueError("residue recovery plan fields are not exact")
     target = _revision(value["target_release_revision"])
     source = _revision(value["source_release_revision"], "collector release revision")
@@ -543,6 +733,19 @@ def validate_plan_mapping(
     )
     writer_sha = _digest(value["writer_config_sha256"], "writer config digest")
     gateway_sha = _digest(value["gateway_config_sha256"], "gateway config digest")
+    artifacts = _plan_staged_artifacts(value)
+    artifact_names = frozenset(artifacts)
+    _recoverable_activation_paths(tuple(artifact_names))
+    if any(
+        not isinstance(name, str) or _digest(digest, f"staged {name} digest") != digest
+        for name, digest in artifacts.items()
+    ):
+        raise ValueError("residue recovery staged artifacts are invalid")
+    if (
+        artifacts.get(DEFAULT_WRITER_CONFIG_SOURCE_PATH.name) != writer_sha
+        or artifacts.get(DEFAULT_GATEWAY_CONFIG_SOURCE_PATH.name) != gateway_sha
+    ):
+        raise ValueError("residue recovery config artifact binding drifted")
     if (
         value["writer_config_path"] != str(DEFAULT_WRITER_CONFIG_SOURCE_PATH)
         or value["gateway_config_path"] != str(DEFAULT_GATEWAY_CONFIG_SOURCE_PATH)
@@ -557,27 +760,24 @@ def validate_plan_mapping(
     inventory = value["activation_inventory"]
     if not isinstance(inventory, list) or len(inventory) != len(_ACTIVATION_PATHS):
         raise ValueError("residue recovery inventory is invalid")
+    recoverable = _recoverable_activation_paths(tuple(artifact_names))
     for path, item in zip(_ACTIVATION_PATHS, inventory, strict=True):
         expected_state = (
-            "present_receipt_bound_residue"
-            if path
-            in {
-                DEFAULT_WRITER_CONFIG_SOURCE_PATH,
-                DEFAULT_GATEWAY_CONFIG_SOURCE_PATH,
-            }
-            else "absent"
+            "present_receipt_bound_residue" if path in recoverable else "absent"
         )
         if item != {"path": str(path), "state": expected_state}:
             raise ValueError("residue recovery inventory drifted")
-    invariants = value["invariants"]
-    if invariants != {
+    expected_invariants = {
         "services_started": False,
         "units_installed": False,
         "daemon_reloaded": False,
         "credential_content_or_digest_recorded": False,
         "staging_directory_renamed_atomically": True,
         "staged_configs_deleted": False,
-    }:
+    }
+    if schema == PLAN_SCHEMA:
+        expected_invariants["staged_artifacts_deleted"] = False
+    if value["invariants"] != expected_invariants:
         raise ValueError("residue recovery invariants drifted")
     _validate_service_states(value["service_states"])
     unsigned = {name: item for name, item in value.items() if name != "plan_sha256"}
@@ -613,19 +813,12 @@ def _validate_current_state(plan: Mapping[str, Any]) -> str:
     if source_exists == archive_exists:
         raise RuntimeError("residue recovery state is ambiguous")
     current_root = source if source_exists else archive
-    _validate_staging_directory(current_root)
-    writer_path = current_root / DEFAULT_WRITER_CONFIG_SOURCE_PATH.name
-    gateway_path = current_root / DEFAULT_GATEWAY_CONFIG_SOURCE_PATH.name
-    if (
-        _sha256_bytes(_trusted_config(writer_path)) != plan["writer_config_sha256"]
-        or _sha256_bytes(_trusted_config(gateway_path)) != plan["gateway_config_sha256"]
-    ):
-        raise RuntimeError("residue recovery config digest drifted")
+    current_artifacts = _staged_artifact_digests(current_root)
+    if current_artifacts != _plan_staged_artifacts(plan):
+        raise RuntimeError("residue recovery staged artifact digest drifted")
+    recoverable = _recoverable_activation_paths(tuple(current_artifacts))
     for path in _ACTIVATION_PATHS:
-        if path in {
-            DEFAULT_WRITER_CONFIG_SOURCE_PATH,
-            DEFAULT_GATEWAY_CONFIG_SOURCE_PATH,
-        }:
+        if path in recoverable:
             if source_exists != os.path.lexists(path):
                 raise RuntimeError("residue recovery source presence drifted")
         elif os.path.lexists(path):
@@ -670,8 +863,9 @@ def _receipt_unsigned(
 ) -> dict[str, Any]:
     if type(created_at_unix) is not int or created_at_unix < 0:
         raise ValueError("residue recovery receipt time is invalid")
-    return {
-        "schema": RECEIPT_SCHEMA,
+    legacy = plan.get("schema") == LEGACY_PLAN_SCHEMA
+    unsigned = {
+        "schema": LEGACY_RECEIPT_SCHEMA if legacy else RECEIPT_SCHEMA,
         "ok": True,
         "state": "staging_residue_quarantined_services_stopped",
         "target_release_revision": plan["target_release_revision"],
@@ -691,6 +885,10 @@ def _receipt_unsigned(
         "staged_configs_deleted": False,
         "created_at_unix": created_at_unix,
     }
+    if not legacy:
+        unsigned["staged_artifacts"] = _plan_staged_artifacts(plan)
+        unsigned["staged_artifacts_deleted"] = False
+    return unsigned
 
 
 def validate_receipt_mapping(
@@ -701,43 +899,25 @@ def validate_receipt_mapping(
     validated_plan = validate_plan_mapping(plan)
     if not isinstance(value, Mapping):
         raise ValueError("residue recovery receipt is not an object")
-    unsigned_fields = set(
-        _receipt_unsigned(
-            validated_plan,
-            service_states_after=list(validated_plan["service_states"]),
-            created_at_unix=0,
-        )
-    )
-    if set(value) != unsigned_fields | {"receipt_sha256"}:
-        raise ValueError("residue recovery receipt fields are not exact")
+    created_at = value.get("created_at_unix")
+    service_states_after = value.get("service_states_after")
     if (
-        value.get("schema") != RECEIPT_SCHEMA
-        or value.get("ok") is not True
-        or value.get("state") != "staging_residue_quarantined_services_stopped"
-        or value.get("target_release_revision")
-        != validated_plan["target_release_revision"]
-        or value.get("source_release_revision")
-        != validated_plan["source_release_revision"]
-        or value.get("plan_sha256") != validated_plan["plan_sha256"]
-        or value.get("collector_receipt_sha256")
-        != validated_plan["collector_receipt_sha256"]
-        or value.get("writer_config_sha256") != validated_plan["writer_config_sha256"]
-        or value.get("gateway_config_sha256") != validated_plan["gateway_config_sha256"]
-        or value.get("source_staging_root") != validated_plan["source_staging_root"]
-        or value.get("archive_path") != validated_plan["archive_path"]
-        or value.get("intent_path") != validated_plan["intent_path"]
-        or value.get("receipt_path") != validated_plan["receipt_path"]
-        or value.get("service_states_before") != validated_plan["service_states"]
-        or value.get("service_states_after") != validated_plan["service_states"]
-        or value.get("services_stopped_and_disabled") is not True
-        or value.get("source_activation_paths_absent") is not True
-        or value.get("staged_configs_deleted") is not False
-        or type(value.get("created_at_unix")) is not int
-        or value["created_at_unix"] < 0
+        type(created_at) is not int
+        or created_at < 0
+        or service_states_after != validated_plan["service_states"]
     ):
         raise ValueError("residue recovery receipt binding drifted")
-    unsigned = {name: item for name, item in value.items() if name != "receipt_sha256"}
-    if _digest(value["receipt_sha256"], "recovery receipt digest") != _sha256_json(
+    unsigned = _receipt_unsigned(
+        validated_plan,
+        service_states_after=list(service_states_after),
+        created_at_unix=created_at,
+    )
+    observed_unsigned = {
+        name: item for name, item in value.items() if name != "receipt_sha256"
+    }
+    if observed_unsigned != unsigned:
+        raise ValueError("residue recovery receipt binding drifted")
+    if _digest(value.get("receipt_sha256"), "recovery receipt digest") != _sha256_json(
         unsigned
     ):
         raise ValueError("residue recovery receipt digest drifted")
@@ -766,7 +946,7 @@ def apply_stopped_writer_residue_recovery(
     clock: Callable[[], float] = time.time,
     lifecycle_lock: Callable[[], ContextManager[Any]] = _host_activation_lock,
 ) -> dict[str, Any]:
-    """Persist, atomically quarantine, and attest one exact residue pair."""
+    """Persist, atomically quarantine, and attest one exact residue set."""
 
     target = _revision(target_revision)
     approved = _digest(approved_plan_sha256, "approved recovery plan digest")

@@ -326,6 +326,27 @@ def _validate_root_parent_chain(
         current = current.parent
 
 
+def _validate_existing_root_ancestor_chain(path: Path) -> None:
+    """Validate the nearest existing ancestor without creating ``path``.
+
+    Stopped native preflight deliberately runs before live config directories
+    exist.  Missing descendants therefore carry no authority yet; the first
+    existing ancestor must still be an exact root-controlled directory.  The
+    later install path creates every missing component through
+    ``_ensure_root_directory`` and revalidates the complete parent chain.
+    """
+
+    if not path.is_absolute() or ".." in path.parts:
+        raise ValueError("activation parent path is invalid")
+    current = path
+    while not os.path.lexists(current):
+        parent = current.parent
+        if parent == current:
+            raise ValueError("activation parent path is unavailable")
+        current = parent
+    _validate_root_parent_chain(current)
+
+
 def _list_xattrs(path: Path) -> tuple[str, ...]:
     lister = getattr(os, "listxattr", None)
     if not callable(lister):
@@ -2685,7 +2706,7 @@ def _verify_native_preflight_inputs(
         elif require_installed:
             raise RuntimeError(f"native {name} installed artifact is absent")
         else:
-            _validate_root_parent_chain(artifact.target_path.parent)
+            _validate_existing_root_ancestor_chain(artifact.target_path.parent)
     database = plan.value["database"]
     ca_path = Path(database["ca_path"])
     if ca_path != DEFAULT_DATABASE_CA_PATH:

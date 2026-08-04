@@ -288,6 +288,79 @@ def _fixed_service_environment(*, user: str, home: str) -> list[str]:
     ]
 
 
+def render_phase_b_readiness_service(
+    *,
+    revision: str,
+    artifact_root: str | os.PathLike[str],
+    artifact_sha256: str,
+) -> str:
+    """Render the fixed Phase-B unit from its sealed release bindings."""
+
+    if not isinstance(revision, str) or _REVISION_RE.fullmatch(revision) is None:
+        raise ValueError("release manifest revision is invalid")
+    if (
+        not isinstance(artifact_sha256, str)
+        or _SHA256_RE.fullmatch(artifact_sha256) is None
+    ):
+        raise ValueError("release artifact digest is invalid")
+    release_root = _absolute_normalized_path(
+        artifact_root,
+        "manifest artifact root",
+    )
+    if (
+        release_root.parent != DEFAULT_RELEASE_BASE
+        or release_root.name != revision
+    ):
+        raise ValueError("release path is not revision-addressed")
+    interpreter = release_root / "venv/bin/python"
+    readiness_hardening = [
+        line
+        for line in _common_hardening(address_families="AF_UNIX AF_INET AF_INET6")
+        if line
+        not in {
+            "CapabilityBoundingSet=",
+            "AmbientCapabilities=",
+            "ProcSubset=pid",
+        }
+    ]
+    lines = [
+        "# Fixed root read-only collector for Canonical Writer Phase-B readiness.",
+        f"# ArtifactSHA256={artifact_sha256}",
+        "[Unit]",
+        "Description=Muncho Canonical Writer Phase-B readiness (fixed root oneshot)",
+        "After=network-online.target",
+        "Wants=network-online.target",
+        f"Before={WRITER_UNIT_NAME}",
+        "AssertPathIsDirectory=/etc/muncho/canonical-writer-phase-b",
+        "AssertPathIsDirectory=/var/lib/muncho/canonical-writer-phase-b",
+        "AssertPathExists=/etc/muncho/trust/cloudsql-server-ca.pem",
+        "",
+        "[Service]",
+        "Type=oneshot",
+        "User=root",
+        "Group=root",
+        f"WorkingDirectory={release_root}",
+        f"ExecStart={interpreter} -B -I -m {PHASE_B_READINESS_MODULE}",
+        "RemainAfterExit=yes",
+        "TimeoutStartSec=120s",
+        "TimeoutStopSec=15s",
+        "KillMode=mixed",
+        "LimitCORE=0",
+        *_fixed_service_environment(user="root", home="/root"),
+        *readiness_hardening,
+        "CapabilityBoundingSet=CAP_DAC_READ_SEARCH",
+        "AmbientCapabilities=",
+        f"BindReadOnlyPaths={release_root}",
+        "ReadOnlyPaths=/etc/muncho/canonical-writer-phase-b",
+        "ReadOnlyPaths=/etc/muncho/trust/cloudsql-server-ca.pem",
+        "ReadWritePaths=/var/lib/muncho/canonical-writer-phase-b",
+        "ReadWritePaths=/var/lib/muncho/canonical-writer-phase-b-readiness",
+        "StandardOutput=journal",
+        "StandardError=journal",
+    ]
+    return "\n".join(lines) + "\n"
+
+
 def render_systemd_units(
     manifest: ReleaseManifest,
     spec: WriterOnlyUnitSpec,
@@ -385,53 +458,6 @@ def render_systemd_units(
         "",
         "[Install]",
         "WantedBy=multi-user.target",
-    ]
-    readiness_hardening = [
-        line
-        for line in _common_hardening(address_families="AF_UNIX AF_INET AF_INET6")
-        if line
-        not in {
-            "CapabilityBoundingSet=",
-            "AmbientCapabilities=",
-            "ProcSubset=pid",
-        }
-    ]
-    phase_b_readiness_lines = [
-        "# Fixed root read-only collector for Canonical Writer Phase-B readiness.",
-        f"# ArtifactSHA256={manifest.artifact_sha256}",
-        "[Unit]",
-        "Description=Muncho Canonical Writer Phase-B readiness (fixed root oneshot)",
-        "After=network-online.target",
-        "Wants=network-online.target",
-        f"Before={WRITER_UNIT_NAME}",
-        "AssertPathIsDirectory=/etc/muncho/canonical-writer-phase-b",
-        "AssertPathIsDirectory=/var/lib/muncho/canonical-writer-phase-b",
-        "AssertPathExists=/etc/muncho/trust/cloudsql-server-ca.pem",
-        "",
-        "[Service]",
-        "Type=oneshot",
-        "User=root",
-        "Group=root",
-        f"WorkingDirectory={release_root}",
-        (
-            f"ExecStart={interpreter} -B -I -m {PHASE_B_READINESS_MODULE}"
-        ),
-        "RemainAfterExit=yes",
-        "TimeoutStartSec=120s",
-        "TimeoutStopSec=15s",
-        "KillMode=mixed",
-        "LimitCORE=0",
-        *_fixed_service_environment(user="root", home="/root"),
-        *readiness_hardening,
-        "CapabilityBoundingSet=CAP_DAC_READ_SEARCH",
-        "AmbientCapabilities=",
-        f"BindReadOnlyPaths={release_root}",
-        "ReadOnlyPaths=/etc/muncho/canonical-writer-phase-b",
-        "ReadOnlyPaths=/etc/muncho/trust/cloudsql-server-ca.pem",
-        "ReadWritePaths=/var/lib/muncho/canonical-writer-phase-b",
-        "ReadWritePaths=/var/lib/muncho/canonical-writer-phase-b-readiness",
-        "StandardOutput=journal",
-        "StandardError=journal",
     ]
     gateway_lines = [
         "# Generated from a digest-bound writer-only release; do not edit.",
@@ -538,7 +564,11 @@ def render_systemd_units(
         ),
     ]
     writer = "\n".join(writer_lines) + "\n"
-    phase_b_readiness = "\n".join(phase_b_readiness_lines) + "\n"
+    phase_b_readiness = render_phase_b_readiness_service(
+        revision=manifest.revision,
+        artifact_root=release_root,
+        artifact_sha256=manifest.artifact_sha256,
+    )
     gateway = "\n".join(gateway_lines) + "\n"
     exporter = "\n".join(exporter_lines) + "\n"
     tmpfiles = "\n".join(tmpfiles_lines) + "\n"
@@ -607,6 +637,7 @@ __all__ = [
     "PHASE_B_READINESS_MODULE",
     "PHASE_B_READINESS_UNIT_NAME",
     "ReleaseManifest",
+    "render_phase_b_readiness_service",
     "SystemdUnitBundle",
     "TMPFILES_NAME",
     "TreeEntry",
