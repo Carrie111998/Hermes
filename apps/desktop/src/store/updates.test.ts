@@ -353,6 +353,21 @@ describe('requestActiveUpdate', () => {
     expect($updateOverlayTarget.get()).toBe('backend')
   })
 
+  it('applies only the Electric Sheep CLIENT update in managed remote mode', async () => {
+    setRemote(true)
+    $updateStatus.set(status({ behind: 3 }))
+    ;(globalThis as unknown as { window: { hermesDesktop: object } }).window.hermesDesktop = {
+      eva: {},
+      updates: { apply: applyClientMock, check: checkClientMock }
+    }
+
+    requestActiveUpdate()
+    await vi.waitFor(() => expect(applyClientMock).toHaveBeenCalled())
+
+    expect(updateHermesSpy).not.toHaveBeenCalled()
+    expect($updateOverlayTarget.get()).toBe('client')
+  })
+
   it('always opens the overlay, so selecting the row is never a silent no-op', () => {
     setRemote(false)
     $updateStatus.set(status({ behind: 3 }))

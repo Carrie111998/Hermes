@@ -5437,7 +5437,7 @@ function buildApplicationMenu() {
       label: APP_NAME,
       submenu: [
         { label: `About ${APP_NAME}`, click: () => showAboutPanelFresh() },
-        ...(EVA_MANAGED_BUILD ? [] : [checkForUpdatesItem]),
+        checkForUpdatesItem,
         { type: 'separator' },
         { role: 'services' },
         { type: 'separator' },
@@ -5540,7 +5540,7 @@ function buildApplicationMenu() {
   template.push({
     label: 'Help',
     role: 'help',
-    submenu: EVA_MANAGED_BUILD ? [] : [checkForUpdatesItem]
+    submenu: [checkForUpdatesItem]
   })
 
   return Menu.buildFromTemplate(template)

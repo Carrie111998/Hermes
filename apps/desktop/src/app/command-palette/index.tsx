@@ -547,7 +547,7 @@ function CommandPaletteBody({ onExited }: { onExited: () => void }) {
   const backendApply = useStore($backendUpdateApply)
 
   const updateVersionLabel = useMemo(() => {
-    const backend = connection?.mode === 'remote'
+    const backend = connection?.mode === 'remote' && !managedEva
     const apply = backend ? backendApply : clientApply
     const status = backend ? backendStatus : clientStatus
 
@@ -562,7 +562,16 @@ function CommandPaletteBody({ onExited }: { onExited: () => void }) {
       updateAvailable: status?.updateAvailable,
       version: backend ? status?.currentVersion : desktopVersion?.appVersion
     }).label
-  }, [backendApply, backendStatus, clientApply, clientStatus, connection?.mode, desktopVersion?.appVersion, t])
+  }, [
+    backendApply,
+    backendStatus,
+    clientApply,
+    clientStatus,
+    connection?.mode,
+    desktopVersion?.appVersion,
+    managedEva,
+    t
+  ])
 
   // cmdk's onSelect doesn't forward the triggering event — keep the last
   // click/keydown modifiers so session rows can honour ⌘-Enter / ⌘-click.
@@ -880,17 +889,19 @@ function CommandPaletteBody({ onExited }: { onExited: () => void }) {
                   keywords: ['gateway', 'restart', 'messaging', 'reconnect', 'system'],
                   label: cc.restartGateway,
                   run: () => void runGatewayRestart()
-                },
-                {
-                  detail: updateVersionLabel,
-                  icon: Download,
-                  id: 'cc-update-hermes',
-                  keywords: ['update', 'upgrade', 'hermes', 'version', 'system', 'restart'],
-                  label: cc.updateHermes,
-                  run: () => requestActiveUpdate()
                 }
               ]
-            : [])
+            : []),
+          {
+            detail: updateVersionLabel,
+            icon: Download,
+            id: managedEva ? 'cc-update-evaos-agent' : 'cc-update-hermes',
+            keywords: managedEva
+              ? ['update', 'upgrade', 'evaos', 'agent', 'version']
+              : ['update', 'upgrade', 'hermes', 'version', 'system', 'restart'],
+            label: managedEva ? t.settings.about.updates : cc.updateHermes,
+            run: () => requestActiveUpdate()
+          }
         ]
       },
       {
