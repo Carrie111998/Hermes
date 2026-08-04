@@ -877,20 +877,25 @@ async def test_control_command_preserves_followup_arriving_during_topic_recovery
     adapter._busy_text_mode = "queue"
     adapter._busy_text_debounce_seconds = 60.0
     adapter._busy_text_hard_cap_seconds = 60.0
-    recovered_source = _alice_source(thread_id="topic-7")
+    # Latest-main limits Telegram topic recovery to the private-DM lanes where
+    # it is meaningful. Keep this race probe on that real recovery path rather
+    # than forcing every group message through the shared executor.
+    recovered_source = _alice_source(chat_type="dm", thread_id="topic-7")
     session_key = build_session_key(recovered_source, group_sessions_per_user=False)
     adapter._active_sessions[session_key] = asyncio.Event()
 
-    command = _text_event(f"/{cmd}", _alice_source(), message_id=f"cmd-{cmd}")
+    command = _text_event(
+        f"/{cmd}", _alice_source(chat_type="dm"), message_id=f"cmd-{cmd}"
+    )
     stale_source = (
-        _bob_source(thread_id="topic-7")
+        _bob_source(chat_type="dm", thread_id="topic-7")
         if same_sender
-        else _carol_source(thread_id="topic-7")
+        else _carol_source(chat_type="dm", thread_id="topic-7")
     )
     stale = _text_event("stale-before-control", stale_source, message_id="stale")
     during = _text_event(
         "follow-up-during-topic-recovery",
-        _bob_source(thread_id="topic-7"),
+        _bob_source(chat_type="dm", thread_id="topic-7"),
         message_id="during",
     )
     recovery_entered = threading.Event()
