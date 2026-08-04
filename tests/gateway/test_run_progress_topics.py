@@ -1318,3 +1318,23 @@ class TestSlackReplyInThreadProgressRouting:
         ) is None
 
 
+class TestBuzzProgressRouting:
+    """Buzz progress must stay under the triggering conversation."""
+
+    def test_top_level_message_uses_event_as_thread_anchor(self):
+        from gateway.run import _resolve_progress_thread_id
+
+        assert _resolve_progress_thread_id(
+            "buzz",
+            source_thread_id=None,
+            event_message_id="trigger-event",
+        ) == "trigger-event"
+
+    def test_existing_thread_keeps_canonical_source_root(self):
+        from gateway.run import _resolve_progress_thread_id
+
+        assert _resolve_progress_thread_id(
+            "buzz",
+            source_thread_id="canonical-root",
+            event_message_id="nested-reply",
+        ) == "canonical-root"
