@@ -26,6 +26,9 @@ interface UseAutoSpeakReplies {
   sessionId: string | null | undefined
 }
 
+const MAX_RETRIES = 3
+const RETRY_DELAY_MS = 100
+
 /**
  * Pure-TTS auto-speak: when `voice.auto_tts` is on, read each completed assistant
  * turn aloud — no dictation, no conversation loop. Stays off while a full voice
@@ -47,6 +50,9 @@ export function useAutoSpeakReplies({
   const latest = useRef({ conversationActive, failureLabel, markSpoken, pendingReply })
   latest.current = { conversationActive, failureLabel, markSpoken, pendingReply }
 
+  const retryTimerRef = useRef<number>()
+  const retryCountRef = useRef(0)
+
   useEffect(() => {
     if (!enabled) {
       return undefined
@@ -65,9 +71,24 @@ export function useAutoSpeakReplies({
 
       const reply = pendingReply()
 
-      if (!reply || reply.pending) {
+      if (!reply) {
         return
       }
+
+      if (reply.pending) {
+        if (retryCountRef.current >= MAX_RETRIES) {
+          return
+        }
+        clearTimeout(retryTimerRef.current)
+        retryCountRef.current += 1
+        retryTimerRef.current = setTimeout(() => {
+          speakLatest()
+        }, RETRY_DELAY_MS)
+        return
+      }
+
+      // Reply settled — reset retry counter.
+      retryCountRef.current = 0
 
       markSpoken()
       // Only one window voices a given reply when the same chat is open in
@@ -86,6 +107,10 @@ export function useAutoSpeakReplies({
     // ($voicePlayback → idle), which frees us to read the next held reply.
     const stops = [$messages.subscribe(speakLatest), $voicePlayback.listen(speakLatest)]
 
-    return () => stops.forEach(f => f())
+    return () => {
+      clearTimeout(retryTimerRef.current)
+      retryCountRef.current = 0
+      stops.forEach(f => f())
+    }
   }, [$messages, enabled, sessionId])
 }
