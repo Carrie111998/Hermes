@@ -2259,7 +2259,7 @@ def _repair_node_deps_on_current_checkout(print_completion) -> None:
 
 
 def _update_node_dependencies() -> list[str]:
-    """Refresh Node deps for the ui-tui and web workspaces.
+    """Refresh Node deps for the ui-tui, nested Ink, and web workspaces.
 
     Returns the list of labels whose npm install failed (empty on success),
     so the caller can treat a Node refresh failure as a partial update rather
@@ -2286,7 +2286,7 @@ def _update_node_dependencies() -> list[str]:
                 (_m().PROJECT_ROOT / workspace / "package.json").exists()
                 for workspace in ("ui-tui", "web")
             ):
-                failed.append("ui-tui, web workspaces")
+                failed.append("ui-tui, @hermes/ink, web workspaces")
             return failed
         return []
 
@@ -2318,7 +2318,8 @@ def _update_node_dependencies() -> list[str]:
     # @streamdown/math is a desktop-only import now declared in
     # apps/desktop/package.json. That means a plain workspace-scoped install
     # can never prune anything root-only, so we only need to name the
-    # workspaces the CLI/TUI/web build actually requires. apps/desktop pulls
+    # workspaces the CLI/TUI/web build actually requires, including the nested
+    # @hermes/ink runtime package. apps/desktop pulls
     # in Electron as a devDependency with a ~200MB postinstall download, so
     # it's deliberately never named here — desktop deps install on demand
     # (see _desktop_build_needed).
@@ -2332,8 +2333,16 @@ def _update_node_dependencies() -> list[str]:
         return list(labels)
 
     install_args = [
-        "--no-fund", "--no-audit", "--prefer-offline", "--progress=false",
-        "--workspace", "ui-tui", "--workspace", "web",
+        "--no-fund",
+        "--no-audit",
+        "--prefer-offline",
+        "--progress=false",
+        "--workspace",
+        "ui-tui",
+        "--workspace",
+        "ui-tui/packages/hermes-ink",
+        "--workspace",
+        "web",
         # Root package.json's own devDependencies (the shared ESLint flat
         # config every workspace's eslint.config.mjs imports) are otherwise
         # pruned by this scoped install, same as agent-browser/@streamdown
@@ -2361,14 +2370,14 @@ def _update_node_dependencies() -> list[str]:
     )
     if result.returncode == 0:
         _record_npm_lockfile_hash(shared_hermes_root)
-        print("  ✓ ui-tui, web workspaces installed (desktop skipped)")
+        print("  ✓ ui-tui, @hermes/ink, web workspaces installed (desktop skipped)")
         failures: list[str] = []
     else:
         print("  ⚠ npm install failed")
         stderr = (result.stderr or "").strip() if result.stderr else ""
         if stderr:
             print(f"    {stderr.splitlines()[-1]}")
-        failures = _partial_update_failure("ui-tui, web workspaces")
+        failures = _partial_update_failure("ui-tui, @hermes/ink, web workspaces")
 
     return failures
 
