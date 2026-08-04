@@ -283,6 +283,62 @@ Additionally, validate user inputs:
     },
 ]
 
+# ---------------------------------------------------------------------------
+# Credential/secret patterns — generic, vendor-neutral.
+#
+# These detect hardcoded credentials being written to disk. Rules use the
+# "user:" prefix so they bypass the static RuleId enum (see rule_names_to_mask).
+# No vendor-specific token prefixes are hardcoded: the prefix+entropy heuristic
+# matches any `vendor_prefix_secret` shape, so new providers match without
+# maintenance. Doc extensions are skipped so redacted examples (e.g.
+# `ghp_...` in READMEs) don't false-positive.
+# ---------------------------------------------------------------------------
+CREDENTIAL_PATTERNS = [
+    {
+        # Generic API-key/token shape: 1-13 alnum prefix, a - or _ separator,
+        # then a secret body. Body must contain a 13+ consecutive alnum run
+        # (catches sk-..., ghp_..., xoxb-...-...; excludes UUIDs where the
+        # longest run is 12).
+        "ruleName": "user:hardcoded_api_key",
+        "regex": r"\b[a-zA-Z][a-zA-Z0-9]{1,12}[-_][A-Za-z0-9_-]*[A-Za-z0-9]{13,}[A-Za-z0-9_-]*\b",
+        "path_filter": lambda p: not p.endswith(_DOC_EXTS),
+        "reminder": (
+            "Possible hardcoded API key/secret/token detected. Credentials must "
+            "never be committed — move to an environment variable or a gitignored "
+            ".env file. If this is a test fixture or intentionally redacted "
+            "example, briefly document that in a comment."
+        ),
+    },
+    {
+        # AWS-style access key IDs: uppercase prefix + 15+ alnum, NO separator
+        # (AKIAIOSFODNN7EXAMPLE). Separate rule — the general rule requires a
+        # -/_ separator.
+        "ruleName": "user:hardcoded_aws_key_id",
+        "regex": r"\b[A-Z]{2,6}[A-Z0-9]{15,}\b",
+        "path_filter": lambda p: not p.endswith(_DOC_EXTS),
+        "reminder": (
+            "Possible hardcoded AWS access key ID detected. AWS credentials "
+            "must never be committed — move to environment variables or a "
+            "gitignored .env file."
+        ),
+    },
+    {
+        # .env files hold secrets; remind that they must stay gitignored.
+        # .env.example/.env.sample/.env.template are commit-able — excluded.
+        "ruleName": "user:secret_env_file",
+        "path_check": lambda p: p.endswith(".env")
+        or (
+            ".env." in p.split("/")[-1]
+            and not p.split("/")[-1].endswith((".example", ".sample", ".template"))
+        ),
+        "reminder": (
+            "Writing to a .env file. .env contains secrets — verify it is "
+            "gitignored and never commit it. For committed config, use a "
+            ".env.example or config template with placeholder values only."
+        ),
+    },
+]
+
 
 class RuleId(IntEnum):
     """

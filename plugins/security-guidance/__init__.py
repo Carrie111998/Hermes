@@ -79,7 +79,7 @@ def _plugin_disabled() -> bool:
 # Pre-compile the regex patterns once.  Substring patterns stay as plain
 # strings — ``str.__contains__`` is faster than a regex of literal chars.
 _COMPILED: List[Dict[str, Any]] = []
-for _rule in _patterns.SECURITY_PATTERNS:
+for _rule in _patterns.SECURITY_PATTERNS + _patterns.CREDENTIAL_PATTERNS:
     _entry: Dict[str, Any] = {
         "ruleName": _rule["ruleName"],
         "reminder": _rule["reminder"],
