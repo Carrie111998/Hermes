@@ -239,7 +239,7 @@ This installs everything — the complete Hermes experience:
 | **Rust acceleration** | `llm-pipeline` (LLM transport), `context-governor` (prompt compaction), `poly-kv` (vector scoring) | Active by default, silent Python fallback on error |
 | **Skills pack** | 70+ skills — README generation, code review, GPU benchmarking, council deliberation, email automation, device maintenance, research synthesis, and more | `~/.hermes/skills/` |
 | **Agent hooks** | 12 hooks — memory recall/capture, context compaction, CEA edit telemetry, knowledge-router classification, council trimming | `~/.hermes/agent-hooks/` (auto-discovered) |
-| **semantic-memory MCP** | Persistent knowledge base with semantic search, graph edges, factor-graph belief propagation, contradiction detection | `~/.local/bin/semantic-memory-mcp` |
+| **semantic-memory MCP** | Persistent knowledge base with semantic search, graph edges, factor-graph belief propagation, contradiction detection. Auto-starts on boot via systemd | `~/.local/bin/semantic-memory-mcp` |
 | **agent-graph MCP** | Multi-agent graph orchestration — run 9+ LLM nodes in parallel fan-out, council deliberation, plan→critique→refine pipelines, HITL approvals | `~/.local/bin/agent-graph-mcp` + daemon |
 
 ### What the installer configures automatically
@@ -286,7 +286,8 @@ The installer doesn't ship secrets. After installation:
 # 1. Set your LLM provider API key
 export OPENAI_API_KEY=sk-...
 
-# 2. Start the agent-graph daemon (if installed)
+# 2. Start the daemons (semantic-memory auto-starts on next login)
+systemctl --user start semantic-memory   # if you want it now
 agent-graph-mcpd --base-url https://api.deepseek.com/v1 --model deepseek-v4-pro &
 
 # 3. Run setup to configure providers

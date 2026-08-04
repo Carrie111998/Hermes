@@ -332,6 +332,33 @@ install_mcp_servers() {
         echo
         info "MCP servers will be available after restarting Hermes."
         info "Agent hooks auto-discover from ~/.hermes/agent-hooks/ — no config needed."
+
+        # Create systemd user unit for semantic-memory daemon (auto-start on boot)
+        if [ "$WITH_SEMANTIC_MEMORY" = true ]; then
+            step "Creating semantic-memory systemd unit (auto-start on boot)..."
+            local unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+            mkdir -p "$unit_dir"
+            cat > "$unit_dir/semantic-memory.service" << UNITEOF
+[Unit]
+Description=Semantic Memory knowledge base daemon
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=$HOME/.local/bin/semantic-memory-mcp --memory-dir $HERMES_HOME/semantic-memory.db --embedder candle --tool-profile full
+Restart=on-failure
+RestartSec=5
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=default.target
+UNITEOF
+            systemctl --user daemon-reload 2>/dev/null
+            systemctl --user enable semantic-memory.service 2>/dev/null && \
+                ok "semantic-memory will auto-start on next login" || \
+                warn "Could not enable semantic-memory systemd unit — start manually: systemctl --user start semantic-memory"
+            info "Start now: systemctl --user start semantic-memory"
+        fi
     fi
 }
 
@@ -449,6 +476,10 @@ if '${WITH_SEMANTIC_MEMORY}' == 'true':
     disabled = cfg['agent'].setdefault('disabled_toolsets', [])
     if 'memory' not in disabled:
         disabled.append('memory')
+    # Add memory-dir arg so the binary persists data
+    cfg.setdefault('mcp_servers', {})
+    sm = cfg['mcp_servers'].setdefault('semantic_memory', {})
+    sm.setdefault('args', ['--memory-dir', os.path.expanduser('$HERMES_HOME/semantic-memory.db')])
 
 # Set agent-graph socket args if installed
 if '${WITH_AGENT_GRAPH}' == 'true':
