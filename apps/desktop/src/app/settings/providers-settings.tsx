@@ -7,6 +7,8 @@ import {
   FEATURED_ID,
   FeaturedProviderRow,
   FireworksProviderRow,
+  isManagedLocalCliProviderUnavailable,
+  managedOAuthProviders,
   OpenRouterProviderRow,
   ProviderRow,
   providerTitle,
@@ -152,7 +154,7 @@ function OAuthPicker({
   const featured = managedEva ? null : (ordered.find(p => p.id === FEATURED_ID && !p.status?.logged_in) ?? null)
 
   const rest = managedEva
-    ? ordered.filter(p => p.id !== FEATURED_ID)
+    ? managedOAuthProviders(ordered, true)
     : featured
       ? ordered.filter(p => p.id !== FEATURED_ID)
       : ordered
@@ -241,18 +243,27 @@ function ConnectedProviderRow({
   const { t } = useI18n()
   const copy = t.settings.providers
   const title = providerTitle(provider)
+  const managedUnavailable = isManagedLocalCliProviderUnavailable(provider)
   const Trail = provider.flow === 'external' ? Terminal : ChevronRight
+
   // Hermes can clear this provider's creds via the API.
   const canDisconnect = provider.disconnectable ?? provider.flow !== 'external'
+
   // External (CLI-managed) provider Hermes can't clear via the API, but ships a
   // command we can run in the embedded terminal (Electron shell only).
-  const terminalDisconnect = !canDisconnect && Boolean(provider.disconnect_command) && canRunInTerminal()
+  const terminalDisconnect =
+    !managedUnavailable && !canDisconnect && Boolean(provider.disconnect_command) && canRunInTerminal()
+
   // Only fall back to a static "remove it elsewhere" hint when we offer no button.
   const showHint = !canDisconnect && !terminalDisconnect
 
   return (
     <div className="group grid grid-cols-[minmax(0,1fr)_auto] items-center gap-1 rounded-[6px] transition-colors hover:bg-(--ui-control-hover-background)">
-      <RowButton className="min-w-0 px-3 py-2.5 text-left" onClick={() => onSelect(provider)}>
+      <RowButton
+        className="min-w-0 px-3 py-2.5 text-left"
+        disabled={managedUnavailable}
+        onClick={() => onSelect(provider)}
+      >
         <div className="flex min-w-0 items-center gap-2">
           <span className="truncate text-[length:var(--conversation-text-font-size)] font-semibold">{title}</span>
           <span className="inline-flex shrink-0 items-center gap-1 bg-primary/10 px-2 py-0.5 text-xs font-medium text-primary">
@@ -261,17 +272,27 @@ function ConnectedProviderRow({
           </span>
         </div>
         <p className="mt-1 text-xs leading-5 text-muted-foreground">{t.onboarding.flowSubtitles[provider.flow]}</p>
-        {showHint && (
+        {managedUnavailable ? (
+          <p className="mt-0.5 truncate text-[0.68rem] leading-5 text-muted-foreground/70">
+            {copy.managedUnavailableDescription}
+          </p>
+        ) : showHint ? (
           <p className="mt-0.5 truncate text-[0.68rem] leading-5 text-muted-foreground/70">
             {provider.flow === 'external' ? copy.removeExternalGeneric(title) : copy.removeKeyManaged(title)}
           </p>
-        )}
+        ) : null}
       </RowButton>
       <div className="flex items-center gap-1 pr-2">
-        <Trail className="size-4 text-muted-foreground transition group-hover:text-foreground" />
-        <Button onClick={() => onSelect(provider)} size="inline" type="button" variant="textStrong">
-          {copy.reauthenticate}
-        </Button>
+        {managedUnavailable ? (
+          <span className="text-xs font-medium text-muted-foreground">{copy.managedUnavailable}</span>
+        ) : (
+          <>
+            <Trail className="size-4 text-muted-foreground transition group-hover:text-foreground" />
+            <Button onClick={() => onSelect(provider)} size="inline" type="button" variant="textStrong">
+              {copy.reauthenticate}
+            </Button>
+          </>
+        )}
         {canDisconnect && (
           <Button
             aria-label={`${t.common.remove} ${title}`}

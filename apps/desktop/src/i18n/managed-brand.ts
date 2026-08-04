@@ -14,12 +14,21 @@ const BRAND_REPLACEMENTS: ReadonlyArray<readonly [RegExp, string]> = [
 const UPSTREAM_BRAND_RE =
   /Eva by Electric Sheep|Hermes Desktop|Hermes Agent|Nous Portal|Nous Research|\bHermes\b|\bEva\b|\bNous\b/
 
+const LEGAL_ATTRIBUTION = 'Hermes Agent by Nous Research'
+
 export function isManagedEvaosAgent(): boolean {
   return typeof window !== 'undefined' && Boolean(window.hermesDesktop?.eva)
 }
 
 export function sanitizeManagedBrandText(value: string): string {
-  return BRAND_REPLACEMENTS.reduce((current, [pattern, replacement]) => current.replace(pattern, replacement), value)
+  const protectedValue = value.replaceAll(LEGAL_ATTRIBUTION, '\uE100LEGAL_ATTRIBUTION\uE101')
+
+  const sanitized = BRAND_REPLACEMENTS.reduce(
+    (current, [pattern, replacement]) => current.replace(pattern, replacement),
+    protectedValue
+  )
+
+  return sanitized.replaceAll('\uE100LEGAL_ATTRIBUTION\uE101', LEGAL_ATTRIBUTION)
 }
 
 function isNousProviderIdentity(providerIdentity: null | string | undefined): boolean {
@@ -77,8 +86,8 @@ export function managedProviderDisplayValue<T>(
   return value
 }
 
-function sanitizeFunctionResult(value: unknown, args: unknown[]): string {
-  let rendered = String(value)
+function sanitizeStringResult(value: string, args: unknown[]): string {
+  let rendered = value
 
   const protectedArgs = args.filter(
     (arg, index, values): arg is string =>
@@ -98,6 +107,22 @@ function sanitizeFunctionResult(value: unknown, args: unknown[]): string {
   })
 
   return rendered
+}
+
+function sanitizeFunctionResult(value: unknown, args: unknown[]): unknown {
+  if (typeof value === 'string') {
+    return sanitizeStringResult(value, args)
+  }
+
+  if (Array.isArray(value)) {
+    return value.map(entry => sanitizeFunctionResult(entry, args))
+  }
+
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value).map(([key, entry]) => [key, sanitizeFunctionResult(entry, args)]))
+  }
+
+  return value
 }
 
 function sanitizeCatalogValue(value: unknown): unknown {

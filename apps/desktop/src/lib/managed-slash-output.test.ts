@@ -44,9 +44,34 @@ describe('sanitizeDesktopSlashOutput', () => {
     const result = sanitizeDesktopSlashOutput('/usage', output, true)
 
     expect(result).toContain('📊 Session Token Usage')
-    expect(result).toContain('Model:                     evaOS Agent-3')
+    expect(result).toContain('Model:                     hermes-3')
     expect(result).toContain('Total tokens:')
     expect(result).not.toMatch(/nous|account limits|subscription|topup|balance|plan:/i)
+  })
+
+  it('preserves non-Nous account limits and exact model identifiers', () => {
+    const output = [
+      '📊 Session Token Usage',
+      'Model: NousResearch/Hermes-3-Llama-3.1-70B',
+      'Total tokens: 1,500',
+      '',
+      '📈 Account limits',
+      'Provider: OpenAI Codex',
+      '5 hour limit: 83% remaining',
+      'Banked resets: 1 · run /usage reset',
+      '',
+      '📈 Nous credits',
+      'Provider: nous (Max)',
+      'Top up: https://portal.nousresearch.com/billing'
+    ].join('\n')
+
+    const result = sanitizeDesktopSlashOutput('/usage', output, true)
+
+    expect(result).toContain('Model: NousResearch/Hermes-3-Llama-3.1-70B')
+    expect(result).toContain('📈 Account limits')
+    expect(result).toContain('Provider: OpenAI Codex')
+    expect(result).toContain('Banked resets: 1 · run /usage reset')
+    expect(result).not.toMatch(/Nous credits|Provider: nous|portal\.nousresearch/i)
   })
 
   it('preserves paid-session and rate-limit facts while dropping trailing portal account sections', () => {

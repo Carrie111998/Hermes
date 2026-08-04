@@ -155,6 +155,8 @@ function ScopeChip({ active, label, onSelect }: { active: boolean; label: string
 // Diagnostics row are redundant there (the card owns its header + a single
 // reconnect action), so only the connection controls render.
 function EvaManagedGatewaySettings({ embedded = false }: { embedded?: boolean } = {}) {
+  const { t } = useI18n()
+  const g = t.settings.gateway.managed
   const [status, setStatus] = useState<EvaManagedStatus | null>(null)
   const [busy, setBusy] = useState<'refresh' | 'sign-in' | 'sign-out' | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -168,16 +170,16 @@ function EvaManagedGatewaySettings({ embedded = false }: { embedded?: boolean } 
           setStatus(next)
         }
       })
-      .catch(err => {
+      .catch(() => {
         if (!cancelled) {
-          setError(err instanceof Error ? err.message : String(err))
+          setError(g.failed)
         }
       })
 
     return () => {
       cancelled = true
     }
-  }, [])
+  }, [g.failed])
 
   const run = async (action: 'refresh' | 'sign-in' | 'sign-out') => {
     setBusy(action)
@@ -193,8 +195,8 @@ function EvaManagedGatewaySettings({ embedded = false }: { embedded?: boolean } 
 
         setStatus(next)
       }
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err))
+    } catch {
+      setError(g.failed)
     } finally {
       setBusy(null)
     }
@@ -204,7 +206,7 @@ function EvaManagedGatewaySettings({ embedded = false }: { embedded?: boolean } 
     return (
       <PageLoader
         className="-mt-[calc(var(--titlebar-height)+1rem)] h-[calc(100%+var(--titlebar-height)+1rem)]"
-        label="Loading managed evaOS Agent access…"
+        label={g.loading}
       />
     )
   }
@@ -216,21 +218,18 @@ function EvaManagedGatewaySettings({ embedded = false }: { embedded?: boolean } 
           <div className="flex items-start gap-3">
             <Globe className="mt-0.5 size-5 text-primary" />
             <div>
-              <h2 className="font-semibold">Managed by Electric Sheep</h2>
-              <p className="mt-1 text-sm text-muted-foreground">
-                evaOS Agent connects only to the agent assigned by your business administrator. Local backends, custom
-                gateway URLs, raw session tokens, and external gateway overrides are disabled.
-              </p>
+              <h2 className="font-semibold">{g.title}</h2>
+              <p className="mt-1 text-sm text-muted-foreground">{g.description}</p>
             </div>
           </div>
         </div>
 
         {status ? (
           <div className="overflow-hidden rounded-xl border border-border/70">
-            <ListRow description={status.email ?? 'Not signed in'} title="Electric Sheep account" />
-            <ListRow description={status.customerId ?? 'Assigned after sign-in'} title="Business" />
-            <ListRow description={status.agentId ?? 'Assigned after sign-in'} title="Assigned agent" />
-            <ListRow description={status.updateChannel} title="Update channel" />
+            <ListRow description={status.email ?? g.notSignedIn} title={g.accountTitle} />
+            <ListRow description={status.customerId ?? g.assignedAfterSignIn} title={g.businessTitle} />
+            <ListRow description={status.agentId ?? g.assignedAfterSignIn} title={g.agentTitle} />
+            <ListRow description={status.updateChannel} title={g.updateChannelTitle} />
           </div>
         ) : null}
 
@@ -244,17 +243,17 @@ function EvaManagedGatewaySettings({ embedded = false }: { embedded?: boolean } 
           {status?.signedOut || !status?.desktopSessionActive ? (
             <Button disabled={busy !== null} onClick={() => void run('sign-in')}>
               {busy === 'sign-in' ? <Loader2 className="size-4 animate-spin" /> : <LogIn className="size-4" />}
-              Sign in to evaOS Agent
+              {g.signIn}
             </Button>
           ) : (
             <>
               <Button disabled={busy !== null} onClick={() => void run('refresh')} variant="outline">
                 {busy === 'refresh' ? <Loader2 className="size-4 animate-spin" /> : <Check className="size-4" />}
-                Refresh assigned access
+                {g.refresh}
               </Button>
               <Button disabled={busy !== null} onClick={() => void run('sign-out')} variant="outline">
                 {busy === 'sign-out' ? <Loader2 className="size-4 animate-spin" /> : null}
-                Sign out
+                {g.signOut}
               </Button>
             </>
           )}

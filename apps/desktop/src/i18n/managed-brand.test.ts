@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
+import { ar } from './ar'
 import { en } from './en'
 import { ja } from './ja'
 import { createManagedTranslations, managedProviderDisplayValue, sanitizeManagedBrandText } from './managed-brand'
@@ -14,9 +15,9 @@ function collectRenderedCopy(value: unknown, copy: string[] = []): string[] {
   }
 
   if (typeof value === 'function') {
-    copy.push(String(value('Example', '1', '2', '3')))
+    const rendered = value('Example', '1', '2', '3')
 
-    return copy
+    return collectRenderedCopy(rendered, copy)
   }
 
   if (value && typeof value === 'object' && !Array.isArray(value)) {
@@ -73,13 +74,26 @@ describe('managed evaOS Agent branding', () => {
     )
   })
 
-  it('keeps managed customer copy in all four shipped locales free of upstream product branding', () => {
-    const visibleCopy = [en, ja, zh, zhHant].flatMap(locale => collectRenderedCopy(createManagedTranslations(locale)))
+  it('keeps managed customer copy in every shipped locale free of upstream product branding outside legal copy', () => {
+    const visibleCopy = [en, ja, zh, zhHant, ar].flatMap(locale =>
+      collectRenderedCopy(createManagedTranslations(locale))
+    )
 
     const upstreamProductBrand =
       /\b(?:Hermes Desktop|Hermes Agent|Nous Portal|Nous Research|Eva by Electric Sheep|Hermes|Nous|Eva)\b/
 
-    expect(visibleCopy.filter(value => upstreamProductBrand.test(value))).toEqual([])
+    expect(
+      visibleCopy.filter(value => !value.includes('Hermes Agent by Nous Research') && upstreamProductBrand.test(value))
+    ).toEqual([])
     expect(visibleCopy.filter(value => /evaOS Agent agent/i.test(value))).toEqual([])
+  })
+
+  it('preserves object-valued translation results and legal attribution', () => {
+    const managed = createManagedTranslations(en)
+
+    expect(managed.sidebar.projects.branchOff()).toEqual({ after: '', before: 'branch off ' })
+    expect(sanitizeManagedBrandText('Built on Hermes Agent by Nous Research, used under the MIT License.')).toBe(
+      'Built on Hermes Agent by Nous Research, used under the MIT License.'
+    )
   })
 })

@@ -13,6 +13,7 @@ describe('QuickEntryApp', () => {
 
   it('renders branded capture copy from the locale catalog', () => {
     ;(window as unknown as { hermesDesktop: object }).hermesDesktop = {
+      eva: {},
       quickEntry: {
         dismiss: () => undefined,
         onShown: () => () => undefined,

@@ -42,7 +42,7 @@ export function billingBlockPresentation(
   managed: boolean,
   copy: BillingBlockPresentationCopy
 ): BillingBlockPresentation {
-  if (managed) {
+  if (managed && block.is_nous) {
     return {
       title: 'evaOS Agent access unavailable',
       message: 'Contact Electric Sheep support to restore access.'
@@ -79,8 +79,8 @@ export function requestBillingSettings(): void {
   $billingSettingsRequest.set($billingSettingsRequest.get() + 1)
 }
 
-export function billingRecoveryAvailable(_block: BillingBlock): boolean {
-  return !isManagedEvaosAgent()
+export function billingRecoveryAvailable(block: BillingBlock): boolean {
+  return !isManagedEvaosAgent() || !block.is_nous
 }
 
 /**
@@ -88,8 +88,8 @@ export function billingRecoveryAvailable(_block: BillingBlock): boolean {
  * in-chat banner so both behave identically: Nous routes to the upstream
  * Settings → Billing surface; a third-party provider deep-links to its own
  * billing page (falling back to the in-app surface only if we have no URL).
- * Managed evaOS Agent exposes no billing action; Electric Sheep owns account
- * recovery outside the upstream provider surfaces.
+ * Managed evaOS Agent suppresses only Nous-owned recovery; third-party
+ * provider recovery remains provider-owned and actionable.
  */
 export function runBillingRecovery(block: BillingBlock): void {
   if (!billingRecoveryAvailable(block)) {

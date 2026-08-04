@@ -571,10 +571,24 @@ export function ToolsetConfigPanel({ toolset, onConfiguredChange }: ToolsetConfi
       return
     }
 
+    const providerDisplayName = managedProviderDisplayValue(provider.name, provider.name, managedEva)
+
+    // Managed agents cannot complete the local Nous Portal entitlement flow.
+    // Fail closed unless the backend has already confirmed this managed
+    // provider is ready, so a failed selection cannot be persisted first.
+    if (managedEva && provider.requires_nous_auth && provider.status !== 'ready') {
+      notify({
+        kind: 'warning',
+        title: copy.managedUnavailableTitle,
+        message: copy.managedUnavailableMessage(providerDisplayName)
+      })
+
+      return
+    }
+
     providerChoiceClaimedRef.current = true
     setExpandedProvider(provider.name)
     setSelecting(provider.name)
-    const providerDisplayName = managedProviderDisplayValue(provider.name, provider.name, managedEva)
 
     try {
       const result = await selectToolsetProvider(toolset, provider.name)
@@ -591,16 +605,6 @@ export function ToolsetConfigPanel({ toolset, onConfiguredChange }: ToolsetConfi
       )
 
       if (result.needs_nous_auth) {
-        if (managedEva) {
-          notify({
-            kind: 'warning',
-            title: 'Provider unavailable',
-            message: 'This backend is not available for your managed agent.'
-          })
-
-          return
-        }
-
         // Managed Nous row selected without Portal entitlement: the config
         // keys are written but the backend won't activate until the user
         // signs in (the CLI runs this gate inline; the GUI surfaces it as a

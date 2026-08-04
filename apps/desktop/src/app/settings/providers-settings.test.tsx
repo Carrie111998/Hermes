@@ -115,7 +115,7 @@ describe('ProvidersSettings', () => {
   it('disconnects a connected provider account and refreshes the accounts list', async () => {
     await renderProvidersSettings()
 
-    const remove = await screen.findByRole('button', { name: 'Remove Electric Sheep account' })
+    const remove = await screen.findByRole('button', { name: 'Remove Nous Portal' })
     await act(async () => {
       fireEvent.click(remove)
     })
@@ -128,7 +128,7 @@ describe('ProvidersSettings', () => {
     await renderProvidersSettings()
 
     await act(async () => {
-      fireEvent.click(await screen.findByText('Electric Sheep account'))
+      fireEvent.click(await screen.findByText('Nous Portal'))
     })
 
     expect(startManualProviderOAuth).toHaveBeenCalledWith('nous')
@@ -153,6 +153,31 @@ describe('ProvidersSettings', () => {
     expect(await screen.findByText('Qwen Code')).toBeTruthy()
     expect(screen.queryByRole('button', { name: 'Remove Qwen Code' })).toBeNull()
     expect(screen.getByText(/managed by its own CLI/)).toBeTruthy()
+  })
+
+  it('keeps local-CLI providers visible but explicitly unavailable for managed accounts', async () => {
+    Object.defineProperty(window, 'hermesDesktop', {
+      configurable: true,
+      value: { eva: {} },
+      writable: true
+    })
+    listOAuthProviders.mockResolvedValue({
+      providers: [
+        provider('qwen-oauth', false, {
+          cli_command: 'hermes auth add qwen-oauth',
+          flow: 'external',
+          name: 'Qwen (via Qwen CLI)'
+        })
+      ]
+    })
+
+    await renderProvidersSettings()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Other providers' }))
+    expect(await screen.findByText('Qwen Code')).toBeTruthy()
+    expect(screen.getByText('Unavailable')).toBeTruthy()
+    expect((screen.getByRole('button', { name: /Qwen Code/ }) as HTMLButtonElement).disabled).toBe(true)
+    expect(startManualProviderOAuth).not.toHaveBeenCalled()
   })
 
   it('renders a Keys card for a backend-tagged provider with no PROVIDER_GROUPS prefix', async () => {

@@ -39,6 +39,15 @@ export const ar = defineLocale({
     on: 'مفعل',
     off: 'معطل'
   },
+  quickEntry: {
+    inputLabel: 'الإدخال السريع',
+    askPlaceholder: 'اسأل Hermes…',
+    disconnectedPlaceholder: 'غير متصل — افتح Hermes لإعادة الاتصال',
+    sendTo: 'إرسال إلى',
+    targetLabel: 'الجلسة المستهدفة',
+    currentChat: 'المحادثة الحالية',
+    newSession: 'جلسة جديدة'
+  },
   fileMenu: {
     revealFinder: 'إظهار في Finder',
     revealExplorer: 'إظهار في File Explorer',
@@ -610,7 +619,17 @@ export const ar = defineLocale({
       justNow: 'الآن',
       minAgo: count => `قبل ${count} دقيقة`,
       hoursAgo: count => `قبل ${count} ساعة`,
-      daysAgo: count => `قبل ${count} يوم`
+      daysAgo: count => `قبل ${count} يوم`,
+      managed: {
+        businessTitle: 'نسخة أعمال تجريبية مُدارة',
+        businessDescription: 'تدير Electric Sheep حسابك والوكيل المعيّن وسياسة الوصول وتحديثات البرنامج.',
+        updateChannelTitle: 'قناة التحديث',
+        updateChannelDescription: channel => `${channel} · تحديثات موقّعة من Electric Sheep`,
+        attributionTitle: 'نَسب المصدر المفتوح',
+        attributionDescription: 'مبني على Hermes Agent by Nous Research ويُستخدم بموجب MIT License.',
+        distributionTitle: 'التوزيع',
+        distributionDescription: 'نسخة أعمال تجريبية مُدارة وموقّعة لـ Apple Silicon، وليست إصداراً عاماً.'
+      }
     },
     config: {
       none: 'لا شيء',
@@ -657,6 +676,22 @@ export const ar = defineLocale({
       clear: 'مسح'
     },
     gateway: {
+      managed: {
+        loading: 'جار تحميل وصول evaOS Agent المُدار…',
+        title: 'تديره Electric Sheep',
+        description:
+          'يتصل evaOS Agent فقط بالوكيل الذي عيّنه مسؤول مؤسستك. تم تعطيل الخلفيات المحلية وروابط البوابة المخصصة ورموز الجلسات الخام وتجاوزات البوابة الخارجية.',
+        accountTitle: 'حساب Electric Sheep',
+        notSignedIn: 'لم يتم تسجيل الدخول',
+        businessTitle: 'المؤسسة',
+        assignedAfterSignIn: 'يُعيّن بعد تسجيل الدخول',
+        agentTitle: 'الوكيل المعيّن',
+        updateChannelTitle: 'قناة التحديث',
+        signIn: 'تسجيل الدخول إلى evaOS Agent',
+        refresh: 'تحديث الوصول المعيّن',
+        signOut: 'تسجيل الخروج',
+        failed: 'تعذر تحميل الوصول المُدار. أعد المحاولة أو تواصل مع دعم Electric Sheep.'
+      },
       loading: 'جار تحميل إعدادات البوابة...',
       unavailableTitle: 'إعدادات البوابة غير متاحة',
       unavailableDesc: 'جسر IPC في سطح المكتب لا يوفّر إعدادات البوابة.',
@@ -816,6 +851,10 @@ export const ar = defineLocale({
       collapse: 'طي',
       connectAnother: 'ربط مزود آخر',
       otherProviders: 'مزودون آخرون',
+      reauthenticate: 'إعادة المصادقة',
+      managedUnavailable: 'غير متاح',
+      managedUnavailableDescription:
+        'يتطلب هذا المزوّد تسجيل دخول عبر CLI محلي ولا يمكنه إعداد الوكيل المُدار المعيّن لك.',
       disconnect: 'قطع الاتصال',
       disconnectInTerminal: 'قطع الاتصال (يشغّل أمر الإزالة في الطرفية)',
       removeConfirm: provider => `إزالة ${provider}؟`,
@@ -882,6 +921,8 @@ export const ar = defineLocale({
       noProviders: 'لا يوجد مزوّدون متاحون لمجموعة الأدوات هذه الآن.',
       ready: 'جاهز',
       nousIncluded: 'مُضمّن مع اشتراك Nous — سجّل الدخول إلى Nous Portal للتفعيل.',
+      managedUnavailableTitle: 'المزوّد غير متاح',
+      managedUnavailableMessage: provider => `${provider} غير متاح لوكيلك المُدار.`,
       noApiKeyRequired: 'لا يلزم مفتاح API.',
       postSetupHint: step =>
         `تحتاج هذه الخلفية إلى تثبيت لمرة واحدة (${step}). يعمل على هذا الجهاز — قد يستغرق بضع دقائق.`,
@@ -1926,6 +1967,9 @@ export const ar = defineLocale({
     chooseLater: 'سأختار مزوّدا لاحقا',
     recommended: 'موصى به',
     connected: 'متصل',
+    managedUnavailable: 'غير متاح',
+    managedUnavailableDescription:
+      'يتطلب هذا المزوّد تسجيل دخول عبر CLI محلي ولا يمكنه إعداد الوكيل المُدار المعيّن لك.',
     featuredPitch: 'اشتراك واحد، أكثر من 300 نموذج متقدم — الطريقة الموصى بها لتشغيل Hermes',
     fireworksPitch: 'نماذج مفتوحة سريعة مع استضافة Fireworks.',
     openRouterPitch: 'مفتاح واحد لمئات النماذج — خيار افتراضي جيد',

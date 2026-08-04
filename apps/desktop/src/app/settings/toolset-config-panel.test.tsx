@@ -826,7 +826,6 @@ describe('ToolsetConfigPanel', () => {
         needs_nous_auth: true,
         feature: 'browser'
       })
-
       const { ToolsetConfigPanel } = await import('./toolset-config-panel')
       render(<ToolsetConfigPanel onConfiguredChange={vi.fn()} toolset="browser" />)
 
@@ -869,9 +868,11 @@ describe('ToolsetConfigPanel', () => {
       render(<ToolsetConfigPanel onConfiguredChange={vi.fn()} toolset="browser" />)
 
       const managedRow = await screen.findByRole('button', { name: /Electric Sheep managed service/ })
+
       if (managedRow.getAttribute('aria-expanded') !== 'true') {
         fireEvent.click(managedRow)
       }
+
       await waitFor(() => expect(managedRow.getAttribute('aria-expanded')).toBe('true'))
       expect(screen.getByText('managed')).toBeTruthy()
       expect(screen.getByText('Managed Browser Use included with your managed agent')).toBeTruthy()
@@ -882,9 +883,10 @@ describe('ToolsetConfigPanel', () => {
         expect(notify).toHaveBeenCalledWith({
           kind: 'warning',
           title: 'Provider unavailable',
-          message: 'This backend is not available for your managed agent.'
+          message: 'Electric Sheep managed service (Browser Use cloud) is not available for your managed agent.'
         })
       )
+      expect(selectToolsetProvider).not.toHaveBeenCalled()
       expect(startOAuthLogin).not.toHaveBeenCalled()
       expect(pollOAuthSession).not.toHaveBeenCalled()
     })
@@ -953,7 +955,9 @@ describe('ToolsetConfigPanel', () => {
         writable: true
       })
 
-      getToolsetConfig.mockResolvedValue(nousBrowserConfig())
+      const entitledConfig = nousBrowserConfig()
+      entitledConfig.providers[0]!.status = 'ready'
+      getToolsetConfig.mockResolvedValue(entitledConfig)
       selectToolsetProvider.mockResolvedValue({
         ok: true,
         name: 'browser',
@@ -964,9 +968,11 @@ describe('ToolsetConfigPanel', () => {
       render(<ToolsetConfigPanel onConfiguredChange={vi.fn()} toolset="browser" />)
 
       const managedRow = await screen.findByRole('button', { name: /Electric Sheep managed service/ })
+
       if (managedRow.getAttribute('aria-expanded') !== 'true') {
         fireEvent.click(managedRow)
       }
+
       await waitFor(() => expect(managedRow.getAttribute('aria-expanded')).toBe('true'))
       fireEvent.click(await screen.findByRole('button', { name: /Use this backend/ }))
 

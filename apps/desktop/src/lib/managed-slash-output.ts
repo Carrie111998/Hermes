@@ -2,11 +2,8 @@ import { sanitizeManagedBrandText } from '@/i18n/managed-brand'
 
 const ANSI_ESCAPE_RE = new RegExp(String.raw`\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])`, 'g')
 
-const BILLING_SECTION_START_RE =
-  /^(?:📈\s*)?(?:\*\*)?(?:account limits|nous credits)(?:\*\*)?$|^plan:\s|^billing(?:\s|:)|^subscription(?:\s|:)/i
-
-const BILLING_LINE_RE =
-  /\/(?:subscription|topup|upgrade)\b|\bbilling\b|\bportal\b|\bcredits?\b|\btop[ -]?up\b|\bbalance\b|\bspendable\b/i
+const NOUS_BILLING_RE =
+  /\bnous credits?\b|^\s*provider:\s*nous\b|portal\.nousresearch\.com|\/(?:subscription|topup|upgrade)\b/i
 
 const MANAGED_USAGE_EMPTY = 'No session token usage is available yet.'
 
@@ -14,27 +11,28 @@ function comparableLine(line: string): string {
   return line.replace(ANSI_ESCAPE_RE, '').replace(/[*_`]/g, '').trim()
 }
 
-function sanitizeManagedUsageOutput(output: string): string {
-  const kept: string[] = []
-  let droppingAccountBlock = false
+function isNousBillingSection(section: string): boolean {
+  return section.split('\n').some(line => NOUS_BILLING_RE.test(comparableLine(line)))
+}
 
-  for (const line of output.split('\n')) {
-    const comparable = comparableLine(line)
-
-    if (BILLING_SECTION_START_RE.test(comparable)) {
-      droppingAccountBlock = true
-    }
-
-    if (droppingAccountBlock || BILLING_LINE_RE.test(comparable)) {
-      continue
-    }
-
-    kept.push(line)
+function sanitizeManagedUsageProse(line: string): string {
+  if (/^\s*model\s*:/i.test(comparableLine(line))) {
+    return line
   }
 
-  const sanitized = sanitizeManagedBrandText(kept.join('\n'))
-    .replace(/\bhermes\b/gi, 'evaOS Agent')
-    .replace(/\bnous\b/gi, 'Electric Sheep')
+  return line
+    .replace(/Hermes Desktop/g, 'evaOS Agent')
+    .replace(/Hermes Agent/g, 'evaOS Agent')
+    .replace(/Nous Portal/g, 'Electric Sheep account')
+    .replace(/Nous Research/g, 'Electric Sheep')
+}
+
+function sanitizeManagedUsageOutput(output: string): string {
+  const sanitized = output
+    .split(/\n{2,}/)
+    .filter(section => !isNousBillingSection(section))
+    .map(section => section.split('\n').map(sanitizeManagedUsageProse).join('\n'))
+    .join('\n\n')
     .replace(/\n{3,}/g, '\n\n')
     .trim()
 

@@ -66,7 +66,7 @@ test('runBillingRecovery routes Nous to in-app Settings, never an external link'
   expect(openExternalLink).not.toHaveBeenCalled()
 })
 
-test('managed recovery never navigates to the hidden in-app Billing surface', () => {
+test('managed Nous recovery never navigates to the hidden in-app Billing surface', () => {
   Object.defineProperty(window, 'hermesDesktop', {
     configurable: true,
     value: { eva: {} },
@@ -74,26 +74,32 @@ test('managed recovery never navigates to the hidden in-app Billing surface', ()
   })
 
   runBillingRecovery(makeBlock({ is_nous: true, provider: 'nous', provider_label: 'Nous Portal' }))
-  runBillingRecovery(makeBlock({ billing_url: null, is_nous: false, provider: 'custom' }))
 
   expect($billingSettingsRequest.get()).toBe(0)
   expect(openExternalLink).not.toHaveBeenCalled()
 })
 
-test('managed recovery exposes no action, including provider-owned billing URLs', () => {
+test('managed recovery suppresses Nous but preserves provider-owned billing URLs', () => {
   Object.defineProperty(window, 'hermesDesktop', {
     configurable: true,
     value: { eva: {} },
     writable: true
   })
 
-  expect(billingRecoveryAvailable(makeBlock())).toBe(false)
+  const providerBlock = makeBlock({ billing_url: 'https://openrouter.ai/settings/credits', provider: 'openrouter' })
+
+  expect(billingRecoveryAvailable(providerBlock)).toBe(true)
   expect(billingRecoveryAvailable(makeBlock({ is_nous: true, provider: 'nous' }))).toBe(false)
+
+  runBillingRecovery(providerBlock)
+  expect(openExternalLink).toHaveBeenCalledWith('https://openrouter.ai/settings/credits')
+  expect($billingSettingsRequest.get()).toBe(0)
 })
 
 test('managed credit-wall presentation ignores backend entitlement and provider copy', () => {
   const presentation = billingBlockPresentation(
     makeBlock({
+      is_nous: true,
       message: 'Your Nous subscription has no credits. Open https://portal.nousresearch.com/billing.',
       provider: 'nous',
       provider_label: 'Nous Portal'
@@ -125,6 +131,23 @@ test('unmanaged credit-wall presentation preserves upstream provider and backend
 
   expect(presentation).toEqual({
     message: 'Raw backend entitlement.',
+    title: 'Out of credits — OpenAI'
+  })
+})
+
+test('managed third-party presentation preserves provider and backend copy', () => {
+  const presentation = billingBlockPresentation(
+    makeBlock({ message: 'Raw provider entitlement.\nMore detail.' }),
+    true,
+    {
+      fallbackMessage: 'Fallback.',
+      titleNous: 'Out of Nous credits',
+      titleProvider: provider => `Out of credits — ${provider}`
+    }
+  )
+
+  expect(presentation).toEqual({
+    message: 'Raw provider entitlement.',
     title: 'Out of credits — OpenAI'
   })
 })

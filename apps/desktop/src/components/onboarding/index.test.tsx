@@ -1,6 +1,7 @@
 import { cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, describe, expect, it } from 'vitest'
 
+import { I18nProvider } from '@/i18n'
 import { $desktopOnboarding, type DesktopOnboardingState, type OnboardingContext } from '@/store/onboarding'
 import type { OAuthProvider } from '@/types/hermes'
 
@@ -65,11 +66,7 @@ describe('onboarding Picker', () => {
     })
 
     render(
-      <DesktopOnboardingOverlay
-        enabled={false}
-        profile="default"
-        requestGateway={async () => undefined as never}
-      />
+      <DesktopOnboardingOverlay enabled={false} profile="default" requestGateway={async () => undefined as never} />
     )
 
     expect(screen.queryByText("Let's connect Eva to your assigned agent")).toBeNull()
@@ -95,10 +92,12 @@ describe('onboarding Picker', () => {
     })
 
     render(
-      <DesktopOnboardingOverlay enabled={false} profile="default" requestGateway={async () => undefined as never} />
+      <I18nProvider configClient={null}>
+        <DesktopOnboardingOverlay enabled={false} profile="default" requestGateway={async () => undefined as never} />
+      </I18nProvider>
     )
 
-    expect(screen.getByText('Connect evaOS Agent to your assigned agent')).toBeTruthy()
+    expect(screen.getByText("Let's get you setup with evaOS Agent")).toBeTruthy()
     expect(screen.getByRole('button', { name: 'Close' })).toBeTruthy()
   })
 
@@ -123,11 +122,11 @@ describe('onboarding Picker', () => {
     expect(screen.getByText('Anthropic API Key')).toBeTruthy()
   })
 
-  it('features the Electric Sheep account and hides other providers behind a disclosure', () => {
+  it('features Nous Portal upstream and hides other providers behind a disclosure', () => {
     setProviders([provider('anthropic', 'Anthropic Claude'), provider('nous', 'Nous Portal')])
     render(<Picker ctx={ctx} />)
 
-    expect(screen.getByText('Electric Sheep account')).toBeTruthy()
+    expect(screen.getByText('Nous Portal')).toBeTruthy()
     expect(screen.getByText('Recommended')).toBeTruthy()
     // Fireworks is the always-visible #2 slot (after Nous), even while OAuth
     // alternatives stay collapsed behind the disclosure.
@@ -152,11 +151,11 @@ describe('onboarding Picker', () => {
     const labels = screen
       .getAllByRole('button')
       .map(el => el.textContent ?? '')
-      .filter(text => /Electric Sheep account|Fireworks AI|OpenAI OAuth|MiniMax|OpenRouter/.test(text))
+      .filter(text => /Nous Portal|Fireworks AI|OpenAI OAuth|MiniMax|OpenRouter/.test(text))
 
     const indexOf = (needle: string) => labels.findIndex(text => text.includes(needle))
-    expect(indexOf('Electric Sheep account')).toBeGreaterThanOrEqual(0)
-    expect(indexOf('Fireworks AI')).toBeGreaterThan(indexOf('Electric Sheep account'))
+    expect(indexOf('Nous Portal')).toBeGreaterThanOrEqual(0)
+    expect(indexOf('Fireworks AI')).toBeGreaterThan(indexOf('Nous Portal'))
     expect(indexOf('OpenAI OAuth')).toBeGreaterThan(indexOf('Fireworks AI'))
     expect(indexOf('MiniMax')).toBeGreaterThan(indexOf('OpenAI OAuth'))
   })

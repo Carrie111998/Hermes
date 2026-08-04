@@ -5,17 +5,15 @@ import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
 import { Tip } from '@/components/ui/tooltip'
 import { useI18n } from '@/i18n'
+import { isManagedEvaosAgent } from '@/i18n/managed-brand'
 import {
   $billingBlock,
+  billingBlockPresentation,
   billingCtaLabel,
   billingRecoveryAvailable,
   clearBillingBlock,
   runBillingRecovery
 } from '@/store/billing-block'
-
-function firstLine(text: string): string {
-  return (text || '').split('\n')[0]?.trim() ?? ''
-}
 
 /**
  * Persistent, in-stack billing wall for THIS session. Rendered as a shared
@@ -37,8 +35,7 @@ export function BillingBanner({ sessionId }: { sessionId: null | string }) {
 
   const { block } = active
   const copy = t.billingBlock
-  const title = block.is_nous ? copy.titleNous : copy.titleProvider(block.provider_label)
-  const message = firstLine(block.message) || copy.fallbackMessage
+  const { message, title } = billingBlockPresentation(block, isManagedEvaosAgent(), copy)
   const canRecover = billingRecoveryAvailable(block)
 
   return (

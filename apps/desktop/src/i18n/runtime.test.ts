@@ -48,7 +48,8 @@ describe('desktop i18n runtime translator', () => {
         en: 'evaOS Agent is ready',
         ja: 'evaOS Agent の準備ができました',
         zh: 'evaOS Agent 桌面版已就绪',
-        'zh-hant': 'evaOS Agent 已就緒'
+        'zh-hant': 'evaOS Agent 已就緒',
+        ar: 'evaOS Agent جاهز'
       } as const
 
       for (const [locale, expected] of Object.entries(expectedReady)) {
@@ -102,7 +103,7 @@ describe('desktop i18n runtime translator', () => {
       boot.ready = undefined
       setRuntimeI18nLocale('ja')
 
-      expect(translateNow('boot.ready')).toBe('evaOS Agent is ready')
+      expect(translateNow('boot.ready')).toBe('Hermes Desktop is ready')
     } finally {
       boot.ready = originalReady
     }
