@@ -655,6 +655,19 @@ class RelaySessionCoordinator:
                             logger.warning(
                                 "Hermes Relay turn finalization failed", exc_info=True
                             )
+                        # Always null the handle after the pop attempt — both
+                        # the success and failure paths consume the handle.
+                        # A failed pop leaves the nemo_relay native scope in
+                        # a corrupted position; the next push with the same
+                        # handle will raise "scope handle is not at the top
+                        # of the stack" and cascade into a
+                        # session_persistence_failed turn. Clearing the
+                        # field here puts the turn context in a clean
+                        # terminal state for any path that reads
+                        # ``turn.handle or session.handle`` (e.g. the
+                        # parent-handle resolver at line 824) and forces
+                        # the next turn to push a fresh scope.
+                        turn.handle = None
             finally:
                 try:
                     # Delegated agents own one turn. Close their conversation

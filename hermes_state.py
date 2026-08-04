@@ -2346,6 +2346,32 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if patience_s is None:
             patience_s = self._WRITE_PATIENCE_S
         deadline = time.monotonic() + patience_s
+        # Guard against the closed-conn reuse case: close() sets
+        # self._conn = None (line ~2546), and a sibling SessionDB instance or
+        # a re-use path may try to write without re-opening. Without this
+        # guard we get 'NoneType' object has no attribute 'execute' and the
+        # caller logs a generic "Session DB append_message failed" — which is
+        # the operator-tab-hang signature we're fixing. Re-open lazily here
+        # and let the original error surface if re-open fails too.
+        if self._conn is None:
+            try:
+                self._conn = _connect_tracked_db(
+                    str(self.db_path),
+                    check_same_thread=False,
+                    timeout=1.0,
+                    isolation_level=None,
+                )
+                self._conn.row_factory = sqlite3.Row
+                self._wal_active = (
+                    apply_wal_with_fallback(self._conn, db_label="state.db") == "wal"
+                )
+                apply_database_pragmas(self._conn, db_label="state.db")
+                self._conn.execute("PRAGMA foreign_keys=ON")
+                self._init_schema()
+            except Exception as _reopen_exc:
+                raise sqlite3.OperationalError(
+                    f"state.db connection is closed; lazy re-open failed: {_reopen_exc}"
+                ) from _reopen_exc
         while True:
             try:
                 with self._lock:
