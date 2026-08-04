@@ -331,6 +331,38 @@ def test_merge_pending_matches_sender_on_user_id_alt():
     )
 
 
+def test_merge_pending_rejects_equal_raw_id_when_stable_ids_conflict():
+    """Contradictory stable IDs cannot be overridden by a reused raw ID."""
+    pending = {
+        "shared": _text_event(
+            "alice secret",
+            _group_source(
+                user_id="shared-phone",
+                user_id_alt="uuid-alice",
+                user_name="Alice",
+            ),
+            message_id="a1",
+        )
+    }
+    bob = _text_event(
+        "bob instruction",
+        _group_source(
+            user_id="shared-phone",
+            user_id_alt="uuid-bob",
+            user_name="Bob",
+        ),
+        message_id="b1",
+    )
+
+    absorbed = merge_pending_message_event(
+        pending, "shared", bob, merge_text=True
+    )
+
+    assert absorbed is False
+    assert pending["shared"].text == "alice secret"
+    assert pending["shared"].source.user_id_alt == "uuid-alice"
+
+
 def test_merge_pending_matches_same_raw_sender_when_alt_is_asymmetric():
     """A conditionally populated alternate ID must not split one person's album."""
     pending = {

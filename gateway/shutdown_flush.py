@@ -28,12 +28,16 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 import time
 import uuid
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
+
+_write_order_lock = threading.Lock()
+_last_write_order = 0
 
 
 def _get_flush_dir():
@@ -58,12 +62,21 @@ def _fsync_directory(path: Path) -> None:
         os.close(directory_fd)
 
 
+def _next_write_order() -> int:
+    """Return a process-monotonic file order, even if the clock stalls."""
+    global _last_write_order
+    with _write_order_lock:
+        _last_write_order = max(time.time_ns(), _last_write_order + 1)
+        return _last_write_order
+
+
 def _write_payload(flush_dir: Path, payload: Dict[str, Any]) -> None:
-    """Atomically write one private, uniquely named recovery payload."""
+    """Atomically write one private, uniquely named ordered recovery payload."""
     from utils import atomic_json_write
 
+    order = _next_write_order()
     file_id = uuid.uuid4().hex
-    final_path = flush_dir / f"pending-{file_id}.json"
+    final_path = flush_dir / f"pending-{order:020d}-{file_id}.json"
     atomic_json_write(
         final_path,
         payload,
@@ -83,6 +96,7 @@ def flush_pending_to_file(
     pending: Dict[str, Any],
     *,
     reason: str = "shutdown",
+    session_ids: Optional[Dict[str, str]] = None,
 ) -> int:
     """Serialise non-empty ``_pending_messages`` slots to disk.
 
@@ -113,6 +127,9 @@ def flush_pending_to_file(
             serialised = _serialise_value(value)
             if serialised is None:
                 continue
+            session_id = (session_ids or {}).get(session_key)
+            if session_id:
+                serialised.setdefault("session_id", session_id)
             _write_payload(
                 flush_dir,
                 {
@@ -141,6 +158,7 @@ def flush_queued_events_to_file(
     queued: Dict[str, Any],
     *,
     reason: str = "shutdown_queued",
+    session_ids: Optional[Dict[str, str]] = None,
 ) -> int:
     """Serialise every runner FIFO event without collapsing a session's tail.
 
@@ -161,6 +179,9 @@ def flush_queued_events_to_file(
                 serialised = _serialise_value(value)
                 if serialised is None:
                     continue
+                session_id = (session_ids or {}).get(session_key)
+                if session_id:
+                    serialised.setdefault("session_id", session_id)
                 _write_payload(
                     flush_dir,
                     {

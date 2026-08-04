@@ -2452,19 +2452,17 @@ def _sender_ids_match(
 ) -> Optional[bool]:
     """Compare sender IDs only within their source-field namespace.
 
-    A match on either directly comparable field proves the same sender. When
-    comparable fields exist but all differ, the senders differ. ``None`` means
-    neither field was directly comparable and callers must stay conservative.
+    Stable alternate IDs take precedence when both sources carry one; a raw-ID
+    match cannot override contradictory stable identities. Otherwise compare
+    raw IDs when both are available. ``None`` means neither namespace was
+    directly comparable and callers must stay conservative.
     """
-    comparisons = []
     for field in ("user_id_alt", "user_id"):
         existing_value = getattr(existing_source, field, None)
         incoming_value = getattr(incoming_source, field, None)
         if existing_value and incoming_value:
-            comparisons.append(str(existing_value) == str(incoming_value))
-    if not comparisons:
-        return None
-    return any(comparisons)
+            return str(existing_value) == str(incoming_value)
+    return None
 
 
 def _source_has_sender_id(source: Any) -> bool:
@@ -2487,12 +2485,13 @@ def pending_merge_sender_conflict(
     under a single ``[Verified sender: ...]`` envelope — the turn claims an
     author it does not have.
 
-    The guard is deliberately conservative: directly comparable alternate and
-    raw IDs are checked independently, and a match on either proves the same
-    sender. Identity-bearing sources with no comparable namespace fail closed;
-    equal text in different ID fields is not proof of identity. When either
-    whole source has no identity, the compatibility fallback remains "unknown"
-    and the merge proceeds exactly as it did before.
+    The guard is deliberately conservative: directly comparable alternate IDs
+    take precedence over raw IDs, while a raw match remains sufficient when an
+    alternate ID is absent on either side. Identity-bearing sources with no
+    comparable namespace fail closed; equal text in different ID fields is not
+    proof of identity. When either whole source has no identity, the
+    compatibility fallback remains "unknown" and the merge proceeds exactly as
+    it did before.
 
     In per-user/DM sessions the guard is unreachable by construction:
     ``build_session_key`` appends ``user_id_alt or user_id`` when ``isolate_user``

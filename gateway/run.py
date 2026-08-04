@@ -13010,10 +13010,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     flush_queued_events_to_file,
                 )
 
-                flush_pending_to_file(dict(self._pending_messages), reason="shutdown")
+                pending_messages = dict(self._pending_messages)
+                queued_events = dict(self._queued_events)
+                session_ids = {}
+                for session_key in pending_messages.keys() | queued_events.keys():
+                    try:
+                        session_id = self.session_store.peek_session_id(session_key)
+                    except Exception:
+                        session_id = None
+                    if session_id:
+                        session_ids[session_key] = session_id
+
+                flush_pending_to_file(
+                    pending_messages,
+                    reason="shutdown",
+                    session_ids=session_ids,
+                )
                 flush_queued_events_to_file(
-                    dict(self._queued_events),
+                    queued_events,
                     reason="shutdown_queued",
+                    session_ids=session_ids,
                 )
             except Exception:
                 pass

@@ -12,8 +12,12 @@ import pytest
 from gateway.shutdown_flush import (
     _serialise_value,
     flush_pending_to_file,
+    flush_queued_events_to_file,
     recover_pending_to_db,
 )
+from gateway.config import Platform
+from gateway.platforms.base import MessageEvent
+from gateway.session import SessionSource
 
 
 def _make_flush_dir(tmp_path: Path) -> Path:
@@ -95,6 +99,71 @@ def test_recover_inserts_via_append_message_and_deletes_file(tmp_path, monkeypat
         timestamp=ts,
     )
     assert not flush_file.exists()
+
+
+def test_real_fifo_events_flush_and_recover_with_session_identity(tmp_path, monkeypatch):
+    flush_dir = _make_flush_dir(tmp_path)
+    monkeypatch.setattr(
+        "gateway.shutdown_flush._get_flush_dir", lambda: flush_dir
+    )
+    session_key = "agent:main:signal:group:shared"
+    session_id = "20260805_010203_fifo"
+    source = SessionSource(
+        platform=Platform.SIGNAL,
+        chat_id="group.shared",
+        chat_type="group",
+        user_id="+15550001111",
+        user_id_alt="uuid-alice",
+    )
+    events = [MessageEvent(text=text, source=source) for text in ("FIRST", "SECOND", "THIRD")]
+
+    flushed = flush_queued_events_to_file(
+        {session_key: events},
+        session_ids={session_key: session_id},
+    )
+    mock_db = MagicMock()
+    recovered = recover_pending_to_db(mock_db)
+
+    assert flushed == 3
+    assert recovered == 3
+    assert [call.kwargs["session_id"] for call in mock_db.append_message.call_args_list] == [
+        session_id,
+        session_id,
+        session_id,
+    ]
+    assert [call.kwargs["content"] for call in mock_db.append_message.call_args_list] == [
+        "FIRST",
+        "SECOND",
+        "THIRD",
+    ]
+    assert list(flush_dir.glob("*.json")) == []
+
+
+def test_fifo_recovery_order_does_not_depend_on_random_uuid_names(tmp_path, monkeypatch):
+    flush_dir = _make_flush_dir(tmp_path)
+    monkeypatch.setattr(
+        "gateway.shutdown_flush._get_flush_dir", lambda: flush_dir
+    )
+
+    class _ForcedUuid:
+        def __init__(self, value):
+            self.hex = value
+
+    forced = iter(("f" * 32, "0" * 32, "8" * 32))
+    monkeypatch.setattr("gateway.shutdown_flush.time.time_ns", lambda: 123)
+    monkeypatch.setattr(
+        "gateway.shutdown_flush.uuid.uuid4",
+        lambda: _ForcedUuid(next(forced)),
+    )
+    events = [MessageEvent(text=text) for text in ("FIRST", "SECOND", "THIRD")]
+
+    assert flush_queued_events_to_file({"shared": events}) == 3
+    recovered_payloads = [
+        json.loads(path.read_text(encoding="utf-8"))["data"]["text"]
+        for path in sorted(flush_dir.glob("*.json"))
+    ]
+
+    assert recovered_payloads == ["FIRST", "SECOND", "THIRD"]
 
 
 def test_serialise_object_with_text():
