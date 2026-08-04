@@ -123,12 +123,14 @@ from types import SimpleNamespace as _SimpleNamespace
 def _should_use_ri_pipeline(agent) -> bool:
     """Return True when the RiPipeline fast path should be used.
 
-    Active when HERMES_RI_PIPELINE=1 and the native extension is available.
-    Provider-agnostic — works for any OpenAI-compatible provider (ollama-launch,
-    deepseek, openrouter, etc.). Set HERMES_RI_PIPELINE_PROVIDERS to a
-    comma-separated whitelist to restrict (e.g. 'ollama-launch,deepseek').
+    Active by default when the native extension is available.
+    Provider-agnostic — works for any OpenAI-compatible provider.
+    Set HERMES_RI_PIPELINE=0 to disable, or HERMES_RI_PIPELINE_PROVIDERS
+    to a comma-separated whitelist (e.g. 'ollama-launch,deepseek').
     """
-    if not (_os.environ.get("HERMES_RI_PIPELINE") and _NATIVE_AVAILABLE):
+    if _os.environ.get("HERMES_RI_PIPELINE") == "0":
+        return False
+    if not _NATIVE_AVAILABLE:
         return False
 
     whitelist = _os.environ.get("HERMES_RI_PIPELINE_PROVIDERS", "")

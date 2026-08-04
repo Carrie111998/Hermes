@@ -214,21 +214,28 @@ See `hermes claw migrate --help` for all options, or use the `openclaw-migration
 
 ---
 
-## RecursiveIntell Rust Acceleration (optional)
+## RecursiveIntell Rust Acceleration
 
-Hermes can route through [RecursiveIntell](https://github.com/RecursiveIntell)'s Rust stack for faster, receipt-backed LLM calls, context compaction, and vector scoring. All paths are opt-in and fall back to pure Python when disabled.
+Hermes automatically uses [RecursiveIntell](https://github.com/RecursiveIntell)'s Rust stack when the native extensions are installed. Every path falls back silently to pure Python on any error — no config needed to disable.
 
-### Enable a path
+### Active paths
 
-| Env var | What it accelerates | Rust crate |
-|---------|-------------------|------------|
-| `HERMES_RI_PIPELINE=1` | LLM transport (any OpenAI-compatible provider) | [`llm-pipeline`](https://crates.io/crates/llm-pipeline) |
-| `HERMES_RI_AGENT_GRAPH=1` | Agent-graph MCP reads (SQLite direct) | [`agent-graph-mcp`](https://crates.io/crates/agent-graph-mcp) |
-| `HERMES_RI_POLY_KV=1` | Semantic-memory vector scoring | [`poly-kv`](https://crates.io/crates/poly-kv) |
+| Path | What it accelerates | Rust crate | Status |
+|------|-------------------|------------|--------|
+| LLM transport | All chat completions (OpenAI-compatible providers) | [`llm-pipeline`](https://crates.io/crates/llm-pipeline) | ✅ Wired into `chat_completion_helpers.py` |
+| Context compaction | Deterministic prompt trimming before LLM summarization | [`context-governor`](https://crates.io/crates/context-governor) | ✅ Active via `ri-context-governor` plugin |
+| Agent-graph reads | Direct SQLite reads for MCP agent-graph state | [`agent-graph-mcp`](https://crates.io/crates/agent-graph-mcp) | ⚠️ Transport built, consumer pending |
+| Vector scoring | Semantic-memory similarity scoring | [`poly-kv`](https://crates.io/crates/poly-kv) | ⚠️ Transport built, consumer pending |
 
-### Rust context-governor
+### Disable a path
 
-Set `context.engine: ri-context-governor` in `config.yaml` to use the [`context-governor`](https://crates.io/crates/context-governor) crate for deterministic, receipt-backed context compaction. A Rust first pass trims the prompt; if savings are insufficient, a configurable LLM summarizer handles the rest. See `agent/transports/ri_context_compressor.py` for the two-stage pipeline.
+Set the corresponding env var to `0`:
+
+```bash
+HERMES_RI_PIPELINE=0     # fall back to Python httpx for LLM calls
+HERMES_RI_AGENT_GRAPH=0  # fall back to MCP for agent-graph reads
+HERMES_RI_POLY_KV=0      # fall back to pure Python vector scoring
+```
 
 ### Install
 
@@ -236,11 +243,7 @@ Set `context.engine: ri-context-governor` in `config.yaml` to use the [`context-
 pip install llm-pipeline context-governor poly-kv
 ```
 
-Binaries are published on crates.io. The Python wheels bundle precompiled `.so` extensions built with PyO3 + maturin.
-
-### Fallback
-
-Every accelerated path follows the same contract: check the env var → try the native import → on any error, return `None` and fall through to the existing Python path. Unset the env var to disable a path without code changes.
+All three are published on crates.io with precompiled PyO3 wheels. The context-governor plugin (`context.engine: ri-context-governor`) uses the Rust first pass automatically; set the summarization fallback model in `agent/transports/ri_context_compressor.py`.
 
 ---
 
