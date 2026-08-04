@@ -273,20 +273,45 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
     return None
 
 
+def _load_update_check_settings() -> tuple[str, dict]:
+    """Return the configured update-check mode and stable-tag settings."""
+    try:
+        from hermes_cli.config import load_config
+        from hermes_cli.stable_update import (
+            STABLE_TAG_STRATEGIES,
+            configured_update_channel,
+            stable_update_config,
+        )
+
+        config = load_config()
+        if configured_update_channel(config) == "release":
+            return "release", {}
+        updates = config.get("updates", {}) if isinstance(config, dict) else {}
+        legacy_strategy = str(updates.get("check_strategy") or "").strip().lower()
+        if bool(updates.get("stable_tags")) or legacy_strategy in STABLE_TAG_STRATEGIES:
+            return "stable-tags", stable_update_config(config)
+    except Exception:
+        pass
+    return "branch", {}
+
+
 def check_for_updates() -> Optional[int]:
     """Check whether a Hermes update is available.
 
-    Two paths: if ``HERMES_REVISION`` is set (nix builds embed it), compare
-    it to upstream main via ``git ls-remote``. Otherwise look for a local
-    git checkout and count commits behind ``origin/main``.
+    By default this compares the current checkout against ``origin/main``.
+    Release mode compares it with official Nous GitHub release tags. The legacy
+    stable-tag mode retains explicitly configured custom remotes and patterns.
 
     Returns the number of commits behind, ``UPDATE_AVAILABLE_NO_COUNT`` (-1)
     if behind but the count is unknown, ``0`` if up-to-date, or ``None`` if
     the check failed or doesn't apply. Cached for 6 hours.
     """
+    global _update_context
+
     hermes_home = get_hermes_home()
     cache_file = hermes_home / ".update_check"
     embedded_rev = os.environ.get("HERMES_REVISION") or None
+    mode, update_settings = _load_update_check_settings()
 
     # Docker images have no working tree to count commits against — the
     # published image excludes `.git` (see .dockerignore) and sets no
@@ -302,43 +327,93 @@ def check_for_updates() -> Optional[int]:
     except Exception:
         pass
 
-    # Read cache — invalidate if the embedded rev OR installed version has
-    # changed since the last check.
+    # Read cache — invalidate if the embedded rev, installed version, or update
+    # mode changed since the last check.
     now = time.time()
     try:
         if cache_file.exists():
             cached = json.loads(cache_file.read_text(encoding="utf-8"))
+            cached_mode = cached.get("mode")
+            # Mode-less caches predate update tracks and contain branch commit
+            # counts. They remain valid for branch users only; reusing one in
+            # Release Track would restore branch terminology and skip the
+            # official release lookup for up to six hours.
+            cache_mode_matches = cached_mode == mode or (cached_mode is None and mode == "branch")
+            if mode == "stable-tags":
+                stable_cfg = cached.get("stable", {}) if isinstance(cached, dict) else {}
+                cache_mode_matches = cache_mode_matches and (
+                    stable_cfg.get("pattern") == update_settings.get("pattern")
+                    and stable_cfg.get("remote") == update_settings.get("remote")
+                )
             if (
                 now - cached.get("ts", 0) < _UPDATE_CHECK_CACHE_SECONDS
                 and cached.get("rev") == embedded_rev
                 and cached.get("ver") == VERSION
+                and cache_mode_matches
             ):
+                _update_context = cached.get("context", {}) or {}
                 return cached.get("behind")
     except Exception:
         pass
 
-    if embedded_rev:
+    context: dict = {"mode": mode}
+    if embedded_rev and mode not in {"release", "stable-tags"}:
         behind = _check_via_rev(embedded_rev)
     else:
-        # Prefer the running code's location over the profile-scoped path.
-        # $HERMES_HOME/hermes-agent/ may be a stale copy from --clone-all;
-        # Path(__file__) always resolves to the actual installed checkout.
-        repo_dir = Path(__file__).parent.parent.resolve()
-        if not (repo_dir / ".git").exists():
-            repo_dir = hermes_home / "hermes-agent"
-        if not (repo_dir / ".git").exists():
+        repo_dir = _resolve_repo_dir()
+        if repo_dir is None:
             # No git checkout and no embedded revision — can't determine
             # update status. This is the Docker path (already short-circuited
             # above) or an unsupported install without a source tree.
             behind = None
+        elif mode == "release":
+            try:
+                from hermes_cli.stable_update import official_release_status
+
+                status = official_release_status(repo_dir)
+                context = status
+                behind = None if status.get("error") else (
+                    0 if status.get("up_to_date") else UPDATE_AVAILABLE_NO_COUNT
+                )
+            except Exception:
+                behind = None
+        elif mode == "stable-tags":
+            try:
+                from hermes_cli.stable_update import stable_update_status
+
+                status = stable_update_status(
+                    repo_dir,
+                    pattern=update_settings.get("pattern") or "v20*",
+                    remote=update_settings.get("remote") or "origin",
+                    fetch=True,
+                )
+                if update_settings.get("command"):
+                    status["update_command"] = update_settings["command"]
+                context = status
+                behind = None if status.get("error") else (
+                    0 if status.get("up_to_date") else UPDATE_AVAILABLE_NO_COUNT
+                )
+            except Exception:
+                behind = None
         else:
             behind = _check_via_local_git(repo_dir)
 
+    _update_context = context
     try:
-        cache_file.write_text(
-            json.dumps({"ts": now, "behind": behind, "rev": embedded_rev, "ver": VERSION}),
-            encoding="utf-8",
-        )
+        cache_payload = {
+            "ts": now,
+            "behind": behind,
+            "rev": embedded_rev,
+            "ver": VERSION,
+            "mode": mode,
+            "context": context,
+        }
+        if mode == "stable-tags":
+            cache_payload["stable"] = {
+                "pattern": update_settings.get("pattern"),
+                "remote": update_settings.get("remote"),
+            }
+        cache_file.write_text(json.dumps(cache_payload), encoding="utf-8")
     except Exception:
         pass
 
@@ -404,6 +479,42 @@ def get_git_banner_state(repo_dir: Optional[Path] = None) -> Optional[dict]:
             pass
         return None
 
+    mode, update_settings = _load_update_check_settings()
+    if mode == "release":
+        local = _git_short_hash(repo_dir, "HEAD")
+        context = get_update_context()
+        if context.get("mode") != "official-releases":
+            context = {}
+        return {
+            "mode": "release",
+            "latest_tag": context.get("latest_tag"),
+            "current_tag": context.get("current_release_tag"),
+            "local": local,
+            "up_to_date": context.get("up_to_date"),
+            "error": context.get("error"),
+        }
+    if mode == "stable-tags":
+        try:
+            from hermes_cli.stable_update import stable_update_status
+
+            status = stable_update_status(
+                repo_dir,
+                pattern=update_settings.get("pattern") or "v20*",
+                remote=update_settings.get("remote") or "origin",
+                fetch=False,
+            )
+            local = _git_short_hash(repo_dir, "HEAD")
+            if not status.get("error") and local:
+                return {
+                    "mode": "stable-tags",
+                    "stable_tag": status.get("latest_tag"),
+                    "current_tag": status.get("current_tag"),
+                    "local": local,
+                    "up_to_date": status.get("up_to_date"),
+                }
+        except Exception:
+            pass
+
     upstream = _git_short_hash(repo_dir, "origin/main")
     local = _git_short_hash(repo_dir, "HEAD")
     if not upstream or not local:
@@ -434,7 +545,7 @@ def get_git_banner_state(repo_dir: Optional[Path] = None) -> Optional[dict]:
     except Exception:
         ahead = 0
 
-    return {"upstream": upstream, "local": local, "ahead": max(ahead, 0)}
+    return {"mode": "branch", "upstream": upstream, "local": local, "ahead": max(ahead, 0)}
 
 
 _RELEASE_URL_BASE = "https://github.com/NousResearch/hermes-agent/releases/tag"
@@ -492,6 +603,28 @@ def format_banner_version_label() -> str:
     if not state:
         return base
 
+    if state.get("mode") == "stable-tags":
+        stable_tag = state.get("stable_tag")
+        current_tag = state.get("current_tag")
+        local = state.get("local")
+        if stable_tag and current_tag == stable_tag:
+            return f"{base} · stable {stable_tag}"
+        if stable_tag and current_tag:
+            return f"{base} · stable {stable_tag} · local {current_tag}"
+        if stable_tag and local:
+            return f"{base} · stable {stable_tag} · local {local}"
+        return base
+
+    if state.get("mode") == "release":
+        latest_tag = state.get("latest_tag")
+        current_tag = state.get("current_tag")
+        local = state.get("local")
+        if latest_tag and current_tag == latest_tag:
+            return f"{base} · Release Track {latest_tag}"
+        if latest_tag and local:
+            return f"{base} · Release Track {latest_tag} · local {local}"
+        return f"{base} · Release Track"
+
     upstream = state["upstream"]
     local = state["local"]
     ahead = int(state.get("ahead") or 0)
@@ -508,7 +641,23 @@ def format_banner_version_label() -> str:
 # =========================================================================
 
 _update_result: Optional[int] = None
+_update_context: dict = {}
 _update_check_done = threading.Event()
+
+
+def get_update_context() -> dict:
+    """Return metadata from the most recent update check."""
+    return dict(_update_context or {})
+
+
+def _format_official_release_notice(update_context: dict, update_command: str) -> str:
+    """Render official-release status without branch or commit terminology."""
+    target_tag = update_context.get("target_tag") or update_context.get("latest_tag")
+    line = "[bold yellow]⚠ Release Track update available[/]"
+    if target_tag:
+        line = f"[bold yellow]⚠ Release Track update {target_tag} available[/]"
+        line += f"[dim yellow] — run [bold]{update_command} --release {target_tag}[/bold] to update[/]"
+    return line
 
 
 def prefetch_update_check():
@@ -861,7 +1010,24 @@ def build_welcome_banner(console: "Console", model: str, cwd: str,
         behind = get_update_result(timeout=0.5)
         if behind is not None and behind != 0:
             from hermes_cli.config import get_managed_update_command, recommended_update_command
-            if behind > 0:
+            update_context = get_update_context()
+            if update_context.get("mode") == "official-releases":
+                right_lines.append(_format_official_release_notice(update_context, recommended_update_command()))
+            elif update_context.get("mode") == "stable-tags":
+                target_tag = update_context.get("target_tag") or update_context.get("latest_tag")
+                current_tag = update_context.get("current_tag")
+                line = "[bold yellow]⚠ stable release available[/]"
+                if target_tag:
+                    line = f"[bold yellow]⚠ stable release {target_tag} available[/]"
+                if current_tag and target_tag and current_tag != target_tag:
+                    line += f"[dim yellow], current {current_tag}[/]"
+                stable_cmd = update_context.get("update_command")
+                if stable_cmd:
+                    line += f"[dim yellow], run [bold]{stable_cmd}[/bold][/]"
+                else:
+                    line += "[dim yellow], run your stable-tag update workflow[/]"
+                right_lines.append(line)
+            elif behind > 0:
                 commits_word = "commit" if behind == 1 else "commits"
                 right_lines.append(
                     f"[bold yellow]⚠ {behind} {commits_word} behind[/]"

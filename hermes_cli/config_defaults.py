@@ -2743,6 +2743,10 @@ DEFAULT_CONFIG = {
 
     # ``hermes update`` behaviour.
     "updates": {
+        # Update track shared by CLI, dashboard, and desktop. ``main`` preserves
+        # the historical fast-moving behavior for existing installations;
+        # consumer desktop installs seed ``release`` on their first launch.
+        "channel": "main",
         # Pre-update safety backup — ONE consolidated mechanism, three modes:
         #
         #   quick (default) — snapshot critical small state files (pairing

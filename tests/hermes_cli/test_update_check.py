@@ -33,6 +33,42 @@ def test_check_for_updates_uses_cache(tmp_path, monkeypatch):
     mock_run.assert_not_called()
 
 
+def test_release_mode_rejects_legacy_modeless_branch_cache(tmp_path, monkeypatch):
+    """Release Track must not reuse pre-feature branch commit counts."""
+    import hermes_cli.banner as banner
+    import hermes_cli.stable_update as stable_update
+    from hermes_cli import __version__
+
+    repo_dir = tmp_path / "hermes-agent"
+    repo_dir.mkdir()
+    (repo_dir / ".git").mkdir()
+    cache_file = tmp_path / ".update_check"
+    cache_file.write_text(
+        json.dumps({"ts": time.time(), "behind": 3, "ver": __version__}),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(banner, "_load_update_check_settings", lambda: ("release", {}))
+    monkeypatch.setattr(banner, "_resolve_repo_dir", lambda: repo_dir)
+    status = {
+        "mode": "official-releases",
+        "latest_tag": "v2026.7.20",
+        "target_tag": "v2026.7.20",
+        "up_to_date": False,
+        "error": None,
+    }
+    official_status = MagicMock(return_value=status)
+    monkeypatch.setattr(stable_update, "official_release_status", official_status)
+
+    banner._update_context = {}
+    result = banner.check_for_updates()
+
+    assert result == banner.UPDATE_AVAILABLE_NO_COUNT
+    official_status.assert_called_once_with(repo_dir)
+    assert banner.get_update_context()["mode"] == "official-releases"
+
+
 
 
 
@@ -56,6 +92,47 @@ def test_prefetch_non_blocking():
         # Wait for the background thread to finish
         banner._update_check_done.wait(timeout=5)
         assert banner._update_result == 5
+
+
+def test_check_for_updates_stable_tags_returns_no_count_and_context(tmp_path, monkeypatch):
+    """Stable-tag mode reports release availability without branch commit counts."""
+    import hermes_cli.banner as banner
+    import hermes_cli.stable_update as stable_update
+
+    repo_dir = tmp_path / "hermes-agent"
+    repo_dir.mkdir()
+    (repo_dir / ".git").mkdir()
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        banner,
+        "_load_update_check_settings",
+        lambda: (
+            "stable-tags",
+            {"pattern": "v20*", "remote": "origin", "command": "stable-update switch"},
+        ),
+    )
+    monkeypatch.setattr(banner, "_resolve_repo_dir", lambda: repo_dir)
+    monkeypatch.setattr(
+        stable_update,
+        "stable_update_status",
+        lambda *args, **kwargs: {
+            "mode": "stable-tags",
+            "current_tag": "v2026.5.7",
+            "latest_tag": "v2026.5.16",
+            "target_tag": "v2026.5.16",
+            "up_to_date": False,
+            "update_available": True,
+            "error": None,
+        },
+    )
+
+    banner._update_context = {}
+    result = banner.check_for_updates()
+
+    assert result == banner.UPDATE_AVAILABLE_NO_COUNT
+    assert banner.get_update_context()["target_tag"] == "v2026.5.16"
+    assert banner.get_update_context()["update_command"] == "stable-update switch"
 
 
 

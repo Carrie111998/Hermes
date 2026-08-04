@@ -8,13 +8,13 @@ description: "How to update Hermes Agent to the latest version or uninstall it"
 
 ## Updating
 
-Update to the latest version with a single command:
+Update with a single command:
 
 ```bash
 hermes update
 ```
 
-This pulls the latest code from `main`, updates dependencies, and prompts you to configure any new options that were added since your last update.
+By default, this pulls the latest code from `main`, updates dependencies, and prompts you to configure any new options that were added since your last update. You can instead pin updates to official tagged releases with the release track described below.
 
 :::tip
 `hermes update` automatically detects new configuration options and prompts you to add them. If you skipped that prompt, you can manually run `hermes config check` to see missing options, then `hermes config migrate` to interactively add them.
@@ -25,11 +25,46 @@ This pulls the latest code from `main`, updates dependencies, and prompts you to
 When you run `hermes update`, the following steps occur:
 
 1. **Pre-update snapshot** — a lightweight state snapshot is saved by default (covers pairing data, cron jobs, `config.yaml`, `.env`, `auth.json`, and other state files that get modified at runtime; individual files over 1 GiB are skipped so a large sessions DB never slows the update down). Controlled by `updates.pre_update_backup` (`quick` by default, `full` for a zip of all of `HERMES_HOME`, `off` to disable). Recoverable via the snapshot restore flow described under [Snapshots and rollback](../user-guide/checkpoints-and-rollback.md).
-2. **Git pull** — pulls the latest code from the `main` branch and updates submodules
+2. **Target resolution and checkout** — updates the selected branch (the `main` branch by default), or resolves and checks out the exact commit for an official release when using the release track; submodules are updated afterward
 3. **Post-pull syntax validation + auto-rollback** — after the pull, Hermes compiles the nine critical files every `hermes` invocation imports at startup. If any fails to parse (e.g. an orphan merge-conflict marker, an accidentally truncated file), Hermes runs `git reset --hard <pre-pull-sha>` to roll the install back so your shell stays bootable. Re-run `hermes update` once the upstream fix lands.
 4. **Dependency install** — runs `uv pip install -e ".[all]"` to pick up new or changed dependencies
 5. **Config migration** — detects new config options added since your version and prompts you to set them
 6. **Gateway auto-restart** — running gateways are refreshed after the update completes so the new code takes effect immediately. Service-managed gateways (systemd on Linux, launchd on macOS) are restarted through the service manager. Manual gateways are relaunched automatically when Hermes can map the running PID back to a profile.
+
+### Pinning official releases: `--release`
+
+Use the release track to install an official version published on the [GitHub releases page](https://github.com/NousResearch/hermes-agent/releases), rather than following the moving tip of a branch:
+
+```bash
+hermes update --release                 # latest published release
+hermes update --release v2026.7.20      # one exact release
+hermes update --check --release         # check the latest release only
+hermes update --check --release v2026.7.20
+```
+
+Official release tags use the date-based form `vYYYY.M.D`, with an optional fourth numeric component such as `vYYYY.M.D.N`. An explicitly requested tag must also exist as a published GitHub release. Hermes resolves the release through the official `NousResearch/hermes-agent` repository, verifies the tag's peeled commit, fetches that exact commit, and checks it out. `--release` and `--branch` are mutually exclusive.
+
+A release checkout intentionally uses a **detached HEAD**. This means the source tree is pinned to the release commit instead of being attached to a local branch. It is normal for `git status` to report `HEAD detached`; do not create commits there unless you intend to manage a custom checkout. A later release-track update moves the detached HEAD to the exact commit of the selected release. Running a branch-track update instead switches the checkout back to that branch.
+
+`hermes update --check --release` resolves the latest official release and compares its exact commit with the currently installed `HEAD`. It reports an update whenever those commits differ, including when `HEAD` is a descendant of the release tag on `main`. The check fetches release metadata and the selected tag, but it does not check out the release, reinstall dependencies, or restart gateways.
+
+For an exact check-to-install handoff, `--release-commit <full-40-character-SHA>` can accompany `--release [TAG]`. Hermes refuses the update if the official tag no longer resolves to that checked commit. `--release-commit` is invalid without `--release`.
+
+### Choosing a persistent update track: `updates.channel`
+
+The command-line flags above select a target for one invocation. To make release updates the default, set `updates.channel` in `~/.hermes/config.yaml`:
+
+```yaml
+updates:
+  channel: release
+```
+
+The supported values are:
+
+- `main` (default) — bare `hermes update` and `hermes update --check` follow `origin/main`.
+- `release` — bare `hermes update` pins the latest official release, and bare `hermes update --check` checks the latest official release.
+
+An explicit `--release [TAG]` selects a release for that invocation without changing the saved channel. An explicit `--branch <name>` is a one-time branch-track override, including when `updates.channel` is `release`.
 
 ### Updating against a non-default branch: `--branch`
 
@@ -62,7 +97,7 @@ In the desktop app this is **Settings → Advanced → In-App Update Local Chang
 
 ### Preview-only: `hermes update --check`
 
-Want to know if an update is available before pulling? Run `hermes update --check` — it fetches and compares commits against `origin/main`. No files are modified, no gateway is restarted. Useful in scripts and cron jobs that gate on "is there an update".
+Want to know if an update is available before installing it? Run `hermes update --check`. On the default `main` channel it fetches and compares commits against `origin/main`; on the `release` channel it performs the exact official-release comparison described above. Add `--branch <name>` or `--release [TAG]` to check a one-time target. The command does not check out code, reinstall dependencies, or restart gateways. It is useful in scripts and cron jobs that gate on "is there an update".
 
 ### Full pre-update backup: `--backup`
 
@@ -103,6 +138,10 @@ $ hermes update
 Close the listed processes and re-run. If you're sure the concurrent process won't interfere (rare — usually only useful when an antivirus shim is mis-attributed), pass `--force` to skip the check. In that case the updater will still retry the `.exe` rename with exponential backoff and, on stubborn locks, schedule the replacement for next reboot via `MoveFileEx(MOVEFILE_DELAY_UNTIL_REBOOT)` so the update can complete.
 
 A second, separate guard refuses to touch the venv while any process is running from its Python interpreter (the Desktop app's backend, a gateway, a Python REPL). Those processes keep native extension files (`.pyd`) locked, and a dependency sync that dies partway on an access-denied error strands the install between versions. This guard is **not** bypassed by `--force`; if you're certain the detected holders are false positives, use the explicit `hermes update --force-venv`.
+
+:::warning Release track and the Windows ZIP fallback
+When Git file I/O is unavailable or fails on Windows, Hermes can fall back to a ZIP archive of the moving `main` branch. That archive cannot preserve an exact release pin, so release-track updates deliberately stop instead of silently installing `main`. Resolve the Git file-I/O problem, then rerun `hermes update --release`. The same ZIP fallback limitation applies when `updates.channel` is `release`.
+:::
 
 Expected output looks like:
 
@@ -165,7 +204,7 @@ You can also update directly from Telegram, Discord, Slack, WhatsApp, or Teams b
 /update
 ```
 
-This pulls the latest code, updates dependencies, and restarts running gateways. The bot will briefly go offline during the restart (typically 5–15 seconds) and then resume.
+This updates from the target selected by `updates.channel`, updates dependencies, and restarts running gateways. The bot will briefly go offline during the restart (typically 5–15 seconds) and then resume.
 
 ### Manual Update
 

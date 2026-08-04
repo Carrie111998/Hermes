@@ -5037,6 +5037,7 @@ from hermes_cli.update_cmd import (  # noqa: F401
     _add_upstream_remote,
     _atomic_replace_dir,
     _capture_head_sha,
+    _cmd_update_check_release,
     _cmd_update_check,
     _cmd_update_impl,
     _cold_start_windows_gateway_after_update,
@@ -5075,6 +5076,10 @@ from hermes_cli.update_cmd import (  # noqa: F401
     _refresh_active_lazy_features,
     _refresh_active_memory_provider_dependencies,
     _refresh_windows_gateway_launchers,
+    _configured_release_request,
+    _head_is_at_or_after,
+    _latest_release_tag,
+    _resolve_release_request,
     _reload_updated_runtime_modules,
     _resolve_pre_update_backup_mode,
     _resolve_stash_selector,
@@ -5102,11 +5107,13 @@ from hermes_cli.update_cmd import (  # noqa: F401
     _write_marker_file,
     _write_update_incomplete_marker,
     _write_update_planned_stop_marker,
+    _tag_exists,
     _UPDATE_RUNTIME_RELOAD_MODULES,
     _UPDATE_CRITICAL_FILES,
     _UPDATE_CRITICAL_MODULES,
     OFFICIAL_REPO_URLS,
     OFFICIAL_REPO_URL,
+    RELEASE_LATEST,
     SKIP_UPSTREAM_PROMPT_FILE,
     _PRE_UPDATE_SNAPSHOT_KEEP,
     _PRE_UPDATE_SNAPSHOT_MAX_FILE_SIZE,
@@ -9084,6 +9091,12 @@ def cmd_update(args):
         managed_error("update Hermes Agent")
         return
 
+    # Release pins and branch tips are contradictory one-shot targets.
+    if getattr(args, "release", None) is not None and getattr(args, "branch", None):
+        print("✗ --release and --branch are mutually exclusive.")
+        print("  Use --release to pin a tagged version, or --branch to track a branch tip.")
+        sys.exit(1)
+
     # Docker users can't ``git pull`` — the image excludes ``.git`` from
     # the build context.  Bail with a friendly explanation pointing at
     # ``docker pull`` BEFORE any of the apply-path / check-path branches
@@ -9100,6 +9113,10 @@ def cmd_update(args):
         sys.exit(1)
 
     if getattr(args, "check", False):
+        release_request = _configured_release_request(args)
+        if release_request is not None:
+            _cmd_update_check_release(release_request)
+            return
         # --check honors --branch so the "any new commits?" answer matches
         # what a subsequent `hermes update --branch=<x>` would actually pull.
         branch = _resolve_update_branch(args)

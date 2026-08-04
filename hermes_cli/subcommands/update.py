@@ -62,6 +62,27 @@ def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
         ),
     )
     update_parser.add_argument(
+        "--release",
+        nargs="?",
+        const="latest",
+        default=None,
+        metavar="TAG",
+        help=(
+            "Pin to an official tagged release instead of tracking a branch. "
+            "Use --release alone for the latest vYYYY.M.D tag, or provide an "
+            "exact tag. The release is checked out as a detached HEAD."
+        ),
+    )
+    update_parser.add_argument(
+        "--release-commit",
+        default=None,
+        metavar="SHA",
+        help=(
+            "Require --release to resolve to this full 40-character Git commit "
+            "SHA. Used to preserve the commit verified by an earlier update check."
+        ),
+    )
+    update_parser.add_argument(
         "--force",
         action="store_true",
         default=False,
@@ -73,4 +94,10 @@ def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
         default=False,
         help="Windows: mutate the venv even while other processes are running from its interpreter (desktop backend, gateway, terminals). Those processes keep native .pyd files locked, so the dependency sync will likely fail partway and strand the install half-updated. Use only if you know the detected holders are false positives.",
     )
-    update_parser.set_defaults(func=cmd_update)
+
+    def _dispatch_update(args):
+        if args.release_commit and args.release is None:
+            update_parser.error("--release-commit requires --release")
+        return cmd_update(args)
+
+    update_parser.set_defaults(func=_dispatch_update)
