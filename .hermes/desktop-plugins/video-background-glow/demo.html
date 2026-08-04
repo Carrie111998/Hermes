@@ -1,0 +1,543 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Hermes Video Background + Glowing Text Demo</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    
+    :root {
+      --bg-primary: #0a0a0f;
+      --bg-secondary: #11111a;
+      --fg-primary: #f0f0f5;
+      --fg-muted: #888899;
+      --accent-cyan: #00ffea;
+      --accent-magenta: #ff00ea;
+      --accent-gold: #ffd700;
+      --glass-bg: rgba(17, 17, 26, 0.7);
+      --glass-border: rgba(255, 255, 255, 0.08);
+      --glow-cyan: 0 0 30px #00ffea, 0 0 60px #00ffea44;
+      --glow-magenta: 0 0 30px #ff00ea, 0 0 60px #ff00ea44;
+      --glow-gold: 0 0 30px #ffd700, 0 0 60px #ffd70044;
+    }
+
+    body {
+      min-height: 100vh;
+      background: var(--bg-primary);
+      color: var(--fg-primary);
+      font-family: 'JetBrains Mono', 'Fira Code', monospace;
+      overflow: hidden;
+      position: relative;
+    }
+
+    /* Video Background */
+    .video-bg {
+      position: fixed;
+      top: 0; left: 0; right: 0; bottom: 0;
+      z-index: -2;
+      overflow: hidden;
+    }
+
+    .video-bg video {
+      width: 100%; height: 100%;
+      object-fit: cover;
+      opacity: 0.35;
+      filter: saturate(1.2) contrast(1.1);
+    }
+
+    .video-bg::after {
+      content: '';
+      position: absolute;
+      inset: 0;
+      background: 
+        radial-gradient(ellipse at 20% 20%, rgba(0, 255, 234, 0.08) 0%, transparent 50%),
+        radial-gradient(ellipse at 80% 80%, rgba(255, 0, 234, 0.08) 0%, transparent 50%),
+        radial-gradient(ellipse at 50% 50%, rgba(0, 0, 0, 0.4) 0%, transparent 70%);
+      pointer-events: none;
+    }
+
+    /* Animated Grid Overlay */
+    .grid-overlay {
+      position: fixed;
+      inset: 0;
+      z-index: -1;
+      background-image: 
+        linear-gradient(rgba(0, 255, 234, 0.03) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(0, 255, 234, 0.03) 1px, transparent 1px);
+      background-size: 60px 60px;
+      animation: gridMove 20s linear infinite;
+    }
+
+    @keyframes gridMove {
+      0% { transform: translate(0, 0); }
+      100% { transform: translate(60px, 60px); }
+    }
+
+    /* Floating Orbs */
+    .orb {
+      position: fixed;
+      border-radius: 50%;
+      filter: blur(60px);
+      opacity: 0.4;
+      animation: orbFloat 15s ease-in-out infinite;
+      pointer-events: none;
+    }
+
+    .orb-1 { width: 400px; height: 400px; background: var(--accent-cyan); top: -100px; left: -100px; animation-delay: 0s; }
+    .orb-2 { width: 300px; height: 300px; background: var(--accent-magenta); bottom: -50px; right: -50px; animation-delay: -5s; }
+    .orb-3 { width: 200px; height: 200px; background: var(--accent-gold); top: 50%; left: 50%; transform: translate(-50%, -50%); animation-delay: -10s; }
+
+    @keyframes orbFloat {
+      0%, 100% { transform: translate(0, 0) scale(1); }
+      25% { transform: translate(30px, -20px) scale(1.1); }
+      50% { transform: translate(-20px, 30px) scale(0.95); }
+      75% { transform: translate(10px, -30px) scale(1.05); }
+    }
+
+    /* Main Content */
+    .container {
+      position: relative;
+      z-index: 10;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 2rem;
+    }
+
+    /* Glowing Text System */
+    .glow-text {
+      position: relative;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.15em;
+      background: linear-gradient(135deg, var(--fg-primary) 0%, var(--accent-cyan) 50%, var(--fg-primary) 100%);
+      background-size: 200% 200%;
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+      animation: gradientShift 4s ease-in-out infinite;
+    }
+
+    .glow-text::before {
+      content: attr(data-text);
+      position: absolute;
+      inset: 0;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+      filter: blur(8px);
+      opacity: 0.6;
+      animation: glowPulse 3s ease-in-out infinite alternate;
+    }
+
+    @keyframes gradientShift {
+      0%, 100% { background-position: 0% 50%; }
+      50% { background-position: 100% 50%; }
+    }
+
+    @keyframes glowPulse {
+      0% { filter: blur(8px); opacity: 0.4; }
+      100% { filter: blur(16px); opacity: 0.8; }
+    }
+
+    /* Glow Variants */
+    .glow-cyan { --text-glow: var(--glow-cyan); }
+    .glow-magenta { --text-glow: var(--glow-magenta); }
+    .glow-gold { --text-glow: var(--glow-gold); }
+
+    .glow-cyan::after { text-shadow: var(--glow-cyan); }
+    .glow-magenta::after { text-shadow: var(--glow-magenta); }
+    .glow-gold::after { text-shadow: var(--glow-gold); }
+
+    .hero-title {
+      font-size: clamp(2.5rem, 8vw, 6rem);
+      line-height: 1.1;
+      margin-bottom: 1rem;
+      text-align: center;
+    }
+
+    .hero-subtitle {
+      font-size: clamp(1rem, 3vw, 1.5rem);
+      color: var(--fg-muted);
+      text-align: center;
+      max-width: 600px;
+      margin-bottom: 3rem;
+      font-weight: 400;
+      text-transform: none;
+      letter-spacing: normal;
+    }
+
+    /* Feature Cards */
+    .features {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 1.5rem;
+      width: 100%;
+      max-width: 1000px;
+      margin-top: 2rem;
+    }
+
+    .feature-card {
+      background: var(--glass-bg);
+      border: 1px solid var(--glass-border);
+      border-radius: 16px;
+      padding: 2rem;
+      backdrop-filter: blur(20px);
+      transition: all 0.4s cubic-bezier(0.23, 1, 0.32, 1);
+      position: relative;
+      overflow: hidden;
+    }
+
+    .feature-card::before {
+      content: '';
+      position: absolute;
+      top: 0; left: 0; right: 0;
+      height: 2px;
+      background: linear-gradient(90deg, var(--accent-cyan), var(--accent-magenta), var(--accent-gold));
+      background-size: 200% 100%;
+      animation: borderFlow 3s linear infinite;
+      opacity: 0;
+      transition: opacity 0.3s;
+    }
+
+    .feature-card:hover::before { opacity: 1; }
+    .feature-card:hover {
+      transform: translateY(-8px);
+      border-color: var(--accent-cyan);
+      box-shadow: 0 20px 40px rgba(0, 255, 234, 0.1), 0 0 60px rgba(0, 255, 234, 0.05);
+    }
+
+    @keyframes borderFlow {
+      0% { background-position: 0% 50%; }
+      100% { background-position: 200% 50%; }
+    }
+
+    .feature-icon {
+      font-size: 2.5rem;
+      margin-bottom: 1rem;
+      display: inline-block;
+      animation: iconFloat 3s ease-in-out infinite;
+    }
+
+    @keyframes iconFloat {
+      0%, 100% { transform: translateY(0); }
+      50% { transform: translateY(-6px); }
+    }
+
+    .feature-title {
+      font-size: 1.25rem;
+      font-weight: 600;
+      margin-bottom: 0.5rem;
+      background: linear-gradient(135deg, var(--accent-cyan), var(--accent-magenta));
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+
+    .feature-desc {
+      color: var(--fg-muted);
+      font-size: 0.95rem;
+      line-height: 1.6;
+    }
+
+    /* Stats Bar */
+    .stats {
+      display: flex;
+      gap: 3rem;
+      margin-top: 3rem;
+      flex-wrap: wrap;
+      justify-content: center;
+    }
+
+    .stat {
+      text-align: center;
+    }
+
+    .stat-value {
+      font-size: clamp(2rem, 5vw, 3rem);
+      font-weight: 700;
+      background: linear-gradient(135deg, var(--accent-cyan), var(--accent-gold));
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+
+    .stat-label {
+      font-size: 0.85rem;
+      color: var(--fg-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      margin-top: 0.25rem;
+    }
+
+    /* CTA Button */
+    .cta {
+      margin-top: 3rem;
+      display: inline-flex;
+      align-items: center;
+      gap: 0.75rem;
+      padding: 1rem 2.5rem;
+      background: transparent;
+      border: 2px solid var(--accent-cyan);
+      border-radius: 100px;
+      color: var(--accent-cyan);
+      font-family: inherit;
+      font-size: 1rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      cursor: pointer;
+      position: relative;
+      overflow: hidden;
+      transition: all 0.3s;
+    }
+
+    .cta::before {
+      content: '';
+      position: absolute;
+      inset: 0;
+      background: linear-gradient(135deg, var(--accent-cyan), var(--accent-magenta));
+      opacity: 0;
+      transition: opacity 0.3s;
+      z-index: -1;
+    }
+
+    .cta:hover {
+      color: var(--bg-primary);
+      border-color: transparent;
+    }
+
+    .cta:hover::before { opacity: 1; }
+
+    .cta:focus-visible {
+      outline: 2px solid var(--accent-cyan);
+      outline-offset: 4px;
+    }
+
+    /* Reduced Motion */
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after {
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.01ms !important;
+      }
+    }
+
+    /* Scroll Indicator */
+    .scroll-hint {
+      position: fixed;
+      bottom: 2rem;
+      left: 50%;
+      transform: translateX(-50%);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 0.5rem;
+      color: var(--fg-muted);
+      font-size: 0.8rem;
+      text-transform: uppercase;
+      letter-spacing: 0.2em;
+      opacity: 0.6;
+      animation: scrollBounce 2s ease-in-out infinite;
+      pointer-events: none;
+    }
+
+    @keyframes scrollBounce {
+      0%, 100% { transform: translateX(-50%) translateY(0); }
+      50% { transform: translateX(-50%) translateY(10px); }
+    }
+
+    .scroll-hint svg {
+      width: 24px; height: 24px;
+      stroke: currentColor;
+      fill: none;
+      stroke-width: 2;
+    }
+  </style>
+</head>
+<body>
+  <!-- Video Background (placeholder - replace with actual video) -->
+  <div class="video-bg">
+    <video autoplay loop muted playsinline poster="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 1920 1080'%3E%3Crect fill='%230a0a0f' width='1920' height='1080'/%3E%3C/svg%3E">
+      <!-- Replace source with your video file -->
+      <!-- <source src="your-background.mp4" type="video/mp4"> -->
+    </video>
+  </div>
+
+  <!-- Grid Overlay -->
+  <div class="grid-overlay" aria-hidden="true"></div>
+
+  <!-- Floating Orbs -->
+  <div class="orb orb-1" aria-hidden="true"></div>
+  <div class="orb orb-2" aria-hidden="true"></div>
+  <div class="orb orb-3" aria-hidden="true"></div>
+
+  <main class="container">
+    <h1 class="glow-text hero-title glow-cyan" data-text="HERMES">HERMES</h1>
+    <p class="hero-subtitle">Video background + glowing text customization — premium glassmorphism UI with motion vars, floating orbs, and cyberpunk aesthetics. Built for the Hermes desktop app.</p>
+
+    <div class="features">
+      <article class="feature-card">
+        <div class="feature-icon">🎬</div>
+        <h3 class="feature-title">Video Backgrounds</h3>
+        <p class="feature-desc">Full-screen MP4/WebM backgrounds with overlay gradients, opacity control, and poster fallbacks. Supports local files and remote URLs.</p>
+      </article>
+      <article class="feature-card">
+        <div class="feature-icon">✨</div>
+        <h3 class="feature-title">Glowing Text System</h3>
+        <p class="feature-desc">Multi-layer glow with CSS custom properties — cyan, magenta, gold variants. Animated gradient text with blur glow pulses.</p>
+      </article>
+      <article class="feature-card">
+        <div class="feature-icon">🔮</div>
+        <h3 class="feature-title">Floating Orbs</h3>
+        <p class="feature-desc">Animated gradient orbs with blur filters, organic float motion, and color theming. Perfect for memory-orbits visualization.</p>
+      </article>
+      <article class="feature-card">
+        <div class="feature-icon">🪟</div>
+        <h3 class="feature-title">Glassmorphism Panels</h3>
+        <p class="feature-desc">Backdrop-filter blur cards with animated border gradients, hover lift, and depth shadows. Premium feel throughout.</p>
+      </article>
+      <article class="feature-card">
+        <div class="feature-icon">⚡</div>
+        <h3 class="feature-title">Motion Variables</h3>
+        <p class="feature-desc">Chronos-Motion inspired tokens: duration, easing, stagger, reduced-motion respect. Consistent animation language.</p>
+      </article>
+      <article class="feature-card">
+        <div class="feature-icon">🎨</div>
+        <h3 class="feature-title">Themeable Core</h3>
+        <p class="feature-desc">CSS custom properties for every color, glow, spacing, and timing token. Swap themes without touching markup.</p>
+      </article>
+    </div>
+
+    <div class="stats" role="list" aria-label="Customization stats">
+      <div class="stat" role="listitem">
+        <div class="stat-value glow-text glow-gold" data-text="6">6</div>
+        <div class="stat-label">Glow Variants</div>
+      </div>
+      <div class="stat" role="listitem">
+        <div class="stat-value glow-text glow-cyan" data-text="60">60</div>
+        <div class="stat-label">FPS Target</div>
+      </div>
+      <div class="stat" role="listitem">
+        <div class="stat-value glow-text glow-magenta" data-text="0">0</div>
+        <div class="stat-label">Dependencies</div>
+      </div>
+      <div class="stat" role="listitem">
+        <div class="stat-value glow-text glow-cyan" data-text="1">1</div>
+        <div class="stat-label">HTML File</div>
+      </div>
+    </div>
+
+    <button class="cta" type="button">
+      <span>Apply to Hermes</span>
+      <svg width="20" height="20" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
+    </button>
+
+    <div class="scroll-hint" aria-hidden="true">
+      <span>Explore</span>
+      <svg viewBox="0 0 24 24"><path d="M12 5v14M19 12l-7 7-7-7"/></svg>
+    </div>
+  </main>
+
+  <script>
+    // Video background handler - replace with actual video
+    const videoBg = document.querySelector('.video-bg video');
+    
+    // If no video source, create a procedural canvas background
+    if (!videoBg.querySelector('source')) {
+      const canvas = document.createElement('canvas');
+      const ctx = canvas.getContext('2d');
+      canvas.style.width = '100%';
+      canvas.style.height = '100%';
+      canvas.style.objectFit = 'cover';
+      
+      let time = 0;
+      function resize() {
+        canvas.width = window.innerWidth * devicePixelRatio;
+        canvas.height = window.innerHeight * devicePixelRatio;
+        canvas.style.width = window.innerWidth + 'px';
+        canvas.style.height = window.innerHeight + 'px';
+      }
+      resize();
+      window.addEventListener('resize', resize);
+
+      function draw() {
+        time += 0.008;
+        const w = canvas.width, h = canvas.height;
+        
+        // Dark base
+        ctx.fillStyle = '#0a0a0f';
+        ctx.fillRect(0, 0, w, h);
+        
+        // Moving gradient waves
+        for (let i = 0; i < 3; i++) {
+          const gradient = ctx.createLinearGradient(0, 0, w, h);
+          const phase = time + i * 2;
+          gradient.addColorStop(0, `hsla(${180 + Math.sin(phase) * 30}, 100%, 50%, 0.03)`);
+          gradient.addColorStop(0.5, `hsla(${300 + Math.cos(phase) * 30}, 100%, 50%, 0.02)`);
+          gradient.addColorStop(1, `hsla(${60 + Math.sin(phase * 0.7) * 30}, 100%, 50%, 0.03)`);
+          ctx.fillStyle = gradient;
+          ctx.fillRect(0, (Math.sin(phase) * 0.3 + 0.5) * h - 200, w, 400);
+        }
+        
+        // Particle field
+        ctx.fillStyle = '#00ffea22';
+        for (let i = 0; i < 50; i++) {
+          const x = (Math.sin(time * 0.5 + i * 0.3) * 0.5 + 0.5) * w;
+          const y = (Math.cos(time * 0.3 + i * 0.7) * 0.5 + 0.5) * h;
+          const size = Math.max(1, Math.sin(time + i) * 2 + 2);
+          ctx.beginPath();
+          ctx.arc(x, y, size, 0, Math.PI * 2);
+          ctx.fill();
+        }
+        
+        requestAnimationFrame(draw);
+      }
+      draw();
+      
+      videoBg.replaceWith(canvas);
+    }
+
+    // Intersection observer for scroll animations
+    const observer = new IntersectionObserver((entries) => {
+      entries.forEach(entry => {
+        if (entry.isIntersecting) {
+          entry.target.style.animationPlayState = 'running';
+        }
+      });
+    }, { threshold: 0.1 });
+
+    document.querySelectorAll('.feature-card').forEach((card, i) => {
+      card.style.animationDelay = `${i * 0.1}s`;
+      observer.observe(card);
+    });
+
+    // CTA click handler
+    document.querySelector('.cta').addEventListener('click', () => {
+      const btn = document.querySelector('.cta');
+      const original = btn.innerHTML;
+      btn.innerHTML = '<span>Copied to clipboard!</span>';
+      btn.style.borderColor = '#00ffea';
+      navigator.clipboard.writeText(`
+<!-- Hermes Video Background + Glowing Text Plugin -->
+<!-- Drop this into ~/.hermes/desktop-plugins/video-background-glow/plugin.js -->
+      `).then(() => {
+        setTimeout(() => {
+          btn.innerHTML = original;
+          btn.style.borderColor = '';
+        }, 2000);
+      });
+    });
+
+    // Keyboard navigation for CTA
+    document.querySelector('.cta').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        e.target.click();
+      }
+    });
+  </script>
+</body>
+</html>

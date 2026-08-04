@@ -1,0 +1,56 @@
+name: video-glow-theme
+description: Cosmic video background with glowing neon text - perfect for immersive AI interaction
+
+colors:
+  # Base colors - transparent/dark to let video shine through
+  background: "transparent"  # Let video show
+  background_secondary: "rgba(10,10,20,0.3)"  # Semi-transparent panels
+  background_tertiary: "rgba(10,10,20,0.5)"
+  
+  # Accent colors - vibrant neons that will glow
+  ui_accent: "#00ffff"   # Cyan
+  banner_accent: "#ff00ff" # Magenta
+  
+  # Text colors - bright for readability with glow effect
+  banner_title: "#00ffff"   # Cyan
+  banner_text: "#ffffff"    # White
+  ui_text: "#e0e0ff"        # Light blue-white
+  ui_text_secondary: "#a0a0d0"
+  ui_text_tertiary: "#606090"
+  
+  # Muted/text secondary
+  banner_dim: "#8a7fb5"     # Muted purple
+  banner_border: "#3a2a63"  # Dark purple
+  ui_border: "#3a2a63"      # Dark purple
+  ui_stroke: "#3a2a63"
+  ui_stroke_secondary: "#2a1a4a"
+  
+  # Status colors - still visible but not overpowering
+  ui_ok: "#00ff88"    # Green
+  ui_warn: "#ffff00"  # Yellow
+  ui_error: "#ff0060" # Pink/red
+  
+  # UI backgrounds - semi-transparent
+  ui_bg: "rgba(10,10,20,0.4)"
+  ui_bg_elevated: "rgba(15,15,30,0.6)"
+  ui_bg_overlay: "rgba(20,20,40,0.7)"
+  ui_bg_hover: "rgba(30,30,60,0.5)"
+  
+  # CLI/TIME chrome - keep readable
+  prompt: "#e0e0ff"
+  input_rule: "#00ffff"
+  response_border: "#ff00ff"
+  status_bar_bg: "rgba(10,10,20,0.5)"
+  status_bar_text: "#e0e0ff"
+  status_bar_good: "#00ff88"
+  status_bar_warn: "#ffff00"
+  status_bar_critical: "#ff0060"
+  session_label: "#00ffff"
+  session_border: "#3a2a63"
+
+branding:
+  agent_name: Hermes Agent
+  prompt_symbol: "❯"
+  help_header: "(~˘▾˘)~ Cosmic Assistant"
+
+tool_prefix: "∞"

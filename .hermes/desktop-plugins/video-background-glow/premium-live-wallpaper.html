@@ -1,0 +1,665 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Premium Live Wallpaper — Hermes</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    :root {
+      /* Premium dark palette */
+      --bg-deep: #050508;
+      --bg-base: #0a0a0f;
+      --bg-elevated: #11111a;
+      --fg-primary: #f0f0f5;
+      --fg-muted: #7a7a8a;
+      --fg-subtle: #4a4a5a;
+
+      /* Accent colors - restrained, premium */
+      --accent-cyan: #00e5d0;
+      --accent-magenta: #d400a8;
+      --accent-gold: #e8b82c;
+      --accent-white: #ffffff;
+
+      /* Glass */
+      --glass-bg: rgba(17, 17, 26, 0.65);
+      --glass-border: rgba(255, 255, 255, 0.06);
+      --glass-highlight: rgba(255, 255, 255, 0.03);
+
+      /* Glows */
+      --glow-cyan: 0 0 40px rgba(0, 229, 208, 0.35), 0 0 80px rgba(0, 229, 208, 0.15);
+      --glow-magenta: 0 0 40px rgba(212, 0, 168, 0.35), 0 0 80px rgba(212, 0, 168, 0.15);
+      --glow-gold: 0 0 40px rgba(232, 184, 44, 0.35), 0 0 80px rgba(232, 184, 44, 0.15);
+      --glow-white: 0 0 30px rgba(255, 255, 255, 0.25), 0 0 60px rgba(255, 255, 255, 0.1);
+    }
+
+    @media (prefers-color-scheme: light) {
+      :root {
+        --bg-deep: #f8f8fc;
+        --bg-base: #ffffff;
+        --bg-elevated: #f0f0f5;
+        --fg-primary: #1a1a2e;
+        --fg-muted: #6a6a7a;
+        --fg-subtle: #aaaab5;
+        --glass-bg: rgba(255, 255, 255, 0.75);
+        --glass-border: rgba(0, 0, 0, 0.05);
+        --glass-highlight: rgba(255, 255, 255, 0.5);
+      }
+    }
+
+    html, body {
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: var(--bg-deep);
+      color: var(--fg-primary);
+      font-family: 'SF Pro Display', 'JetBrains Mono', -apple-system, BlinkMacSystemFont, sans-serif;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+    }
+
+    /* ===== LAYERS ===== */
+    .layer {
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+    }
+
+    /* Layer 0: Deep base gradient */
+    .layer-base {
+      z-index: 0;
+      background:
+        radial-gradient(ellipse 80% 60% at 20% 20%, rgba(0, 229, 208, 0.04) 0%, transparent 60%),
+        radial-gradient(ellipse 60% 80% at 80% 80%, rgba(212, 0, 168, 0.035) 0%, transparent 60%),
+        radial-gradient(ellipse 100% 100% at 50% 100%, rgba(232, 184, 44, 0.025) 0%, transparent 50%),
+        var(--bg-deep);
+    }
+
+    /* Layer 1: Animated gradient mesh */
+    .layer-mesh {
+      z-index: 1;
+      opacity: 0.45;
+    }
+
+    .mesh-blob {
+      position: absolute;
+      border-radius: 50%;
+      filter: blur(120px);
+      animation: blobFloat 20s ease-in-out infinite;
+    }
+
+    .blob-1 {
+      width: 600px; height: 600px;
+      background: radial-gradient(circle at 30% 30%, var(--accent-cyan), transparent 70%);
+      top: -150px; left: -150px;
+      animation-delay: 0s;
+    }
+
+    .blob-2 {
+      width: 500px; height: 500px;
+      background: radial-gradient(circle at 70% 70%, var(--accent-magenta), transparent 70%);
+      bottom: -100px; right: -100px;
+      animation-delay: -7s;
+    }
+
+    .blob-3 {
+      width: 400px; height: 400px;
+      background: radial-gradient(circle at 50% 50%, var(--accent-gold), transparent 70%);
+      top: 50%; left: 50%;
+      transform: translate(-50%, -50%);
+      animation-delay: -14s;
+    }
+
+    @keyframes blobFloat {
+      0%, 100% { transform: translate(0, 0) scale(1); opacity: 1; }
+      25% { transform: translate(40px, -30px) scale(1.08); opacity: 0.85; }
+      50% { transform: translate(-30px, 40px) scale(0.95); opacity: 1; }
+      75% { transform: translate(20px, -40px) scale(1.05); opacity: 0.9; }
+    }
+
+    /* Layer 2: Fine particle field */
+    .layer-particles {
+      z-index: 2;
+    }
+
+    .particle {
+      position: absolute;
+      width: 2px; height: 2px;
+      border-radius: 50%;
+      background: var(--accent-cyan);
+      opacity: 0;
+      animation: particleDrift 30s linear infinite;
+    }
+
+    .particle:nth-child(3n) { background: var(--accent-magenta); animation-duration: 35s; }
+    .particle:nth-child(5n) { background: var(--accent-gold); animation-duration: 28s; }
+    .particle:nth-child(7n) { background: var(--accent-white); animation-duration: 40s; width: 1.5px; height: 1.5px; }
+
+    @keyframes particleDrift {
+      0% { transform: translateY(100vh) translateX(0) scale(0); opacity: 0; }
+      10% { opacity: 0.6; }
+      90% { opacity: 0.4; }
+      100% { transform: translateY(-100px) translateX(var(--drift-x)) scale(1); opacity: 0; }
+    }
+
+    /* Layer 3: Subtle grid */
+    .layer-grid {
+      z-index: 3;
+      opacity: 0.025;
+      background-image:
+        linear-gradient(rgba(0, 229, 208, 1) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(0, 229, 208, 1) 1px, transparent 1px);
+      background-size: 80px 80px;
+      animation: gridDrift 60s linear infinite;
+    }
+
+    @keyframes gridDrift {
+      0% { transform: translate(0, 0); }
+      100% { transform: translate(80px, 80px); }
+    }
+
+    /* Layer 4: Content */
+    .layer-content {
+      z-index: 10;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      padding: 2rem;
+      pointer-events: auto;
+    }
+
+    /* ===== PREMIUM GLOWING TEXT ===== */
+    .glow-text {
+      position: relative;
+      display: inline-block;
+      font-weight: 600;
+      letter-spacing: -0.02em;
+      line-height: 1.1;
+    }
+
+    /* Base gradient text */
+    .gradient-text {
+      background: linear-gradient(135deg, var(--fg-primary) 0%, var(--fg-muted) 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+      background-size: 200% 200%;
+      animation: gradientFlow 8s ease-in-out infinite;
+    }
+
+    /* Glow layers behind text */
+    .glow-text::before,
+    .glow-text::after {
+      content: attr(data-text);
+      position: absolute;
+      inset: 0;
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+      pointer-events: none;
+      z-index: -1;
+    }
+
+    /* Soft blur glow */
+    .glow-text::before {
+      background: linear-gradient(135deg, var(--glow-color-1), var(--glow-color-2));
+      filter: blur(24px);
+      opacity: 0.35;
+      animation: glowPulse 4s ease-in-out infinite alternate;
+    }
+
+    /* Sharp highlight glow */
+    .glow-text::after {
+      background: linear-gradient(135deg, var(--glow-color-1), var(--glow-color-2));
+      filter: blur(4px);
+      opacity: 0;
+      animation: glowPulseSharp 3s ease-in-out infinite alternate;
+    }
+
+    @keyframes gradientFlow {
+      0%, 100% { background-position: 0% 50%; }
+      50% { background-position: 100% 50%; }
+    }
+
+    @keyframes glowPulse {
+      0% { filter: blur(20px); opacity: 0.25; transform: scale(1); }
+      100% { filter: blur(32px); opacity: 0.45; transform: scale(1.02); }
+    }
+
+    @keyframes glowPulseSharp {
+      0% { filter: blur(3px); opacity: 0.15; }
+      100% { filter: blur(6px); opacity: 0; }
+    }
+
+    /* Text variants */
+    .text-hero {
+      font-size: clamp(3.5rem, 12vw, 10rem);
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      margin-bottom: 1rem;
+    }
+
+    .text-hero::before { --glow-color-1: var(--accent-cyan); --glow-color-2: var(--accent-magenta); }
+    .text-hero::after { --glow-color-1: var(--accent-cyan); --glow-color-2: var(--accent-magenta); }
+
+    .text-sub {
+      font-size: clamp(1.25rem, 3vw, 2rem);
+      font-weight: 400;
+      letter-spacing: 0.15em;
+      text-transform: uppercase;
+      color: var(--fg-muted);
+      margin-bottom: 0.5rem;
+    }
+
+    .text-tagline {
+      font-size: clamp(1rem, 2.5vw, 1.35rem);
+      font-weight: 300;
+      letter-spacing: 0.02em;
+      line-height: 1.7;
+      max-width: 60ch;
+      text-align: center;
+      color: var(--fg-muted);
+      margin: 2rem 0 3rem;
+    }
+
+    .text-tagline .accent {
+      color: var(--accent-cyan);
+      font-weight: 500;
+    }
+
+    .text-tagline .accent-2 {
+      color: var(--accent-magenta);
+      font-weight: 500;
+    }
+
+    .text-tagline .accent-3 {
+      color: var(--accent-gold);
+      font-weight: 500;
+    }
+
+    /* Accent glowing words inline */
+    .glow-inline {
+      position: relative;
+      display: inline-block;
+      background: linear-gradient(135deg, var(--glow-c1), var(--glow-c2));
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+
+    .glow-inline::before {
+      content: attr(data-text);
+      position: absolute;
+      inset: 0;
+      background: linear-gradient(135deg, var(--glow-c1), var(--glow-c2));
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+      filter: blur(8px);
+      opacity: 0.4;
+      animation: inlineGlow 3s ease-in-out infinite alternate;
+    }
+
+    @keyframes inlineGlow {
+      0% { filter: blur(6px); opacity: 0.3; }
+      100% { filter: blur(12px); opacity: 0; }
+    }
+
+    /* ===== GLASS UI ELEMENTS ===== */
+    .glass-card {
+      background: var(--glass-bg);
+      border: 1px solid var(--glass-border);
+      border-radius: 20px;
+      padding: 2rem 3rem;
+      backdrop-filter: blur(30px);
+      box-shadow:
+        0 4px 24px rgba(0, 0, 0, 0.3),
+        0 0 0 1px var(--glass-highlight) inset,
+        0 1px 0 rgba(255, 255, 255, 0.02) inset;
+      transition: all 0.4s cubic-bezier(0.23, 1, 0.32, 1);
+    }
+
+    .glass-card:hover {
+      border-color: rgba(0, 229, 208, 0.2);
+      box-shadow:
+        0 8px 40px rgba(0, 0, 0, 0.4),
+        0 0 0 1px rgba(0, 229, 208, 0.1) inset,
+        0 0 60px rgba(0, 229, 208, 0.05),
+        0 1px 0 rgba(255, 255, 255, 0.03) inset;
+    }
+
+    .stat-row {
+      display: flex;
+      gap: 3rem;
+      margin-top: 1.5rem;
+      padding-top: 1.5rem;
+      border-top: 1px solid var(--glass-border);
+    }
+
+    .stat {
+      text-align: center;
+    }
+
+    .stat-value {
+      font-size: 2.5rem;
+      font-weight: 700;
+      font-variant-numeric: tabular-nums;
+      background: linear-gradient(135deg, var(--fg-primary), var(--fg-muted));
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+      line-height: 1;
+    }
+
+    .stat-label {
+      font-size: 0.7rem;
+      font-weight: 500;
+      letter-spacing: 0.15em;
+      text-transform: uppercase;
+      color: var(--fg-subtle);
+      margin-top: 0.35rem;
+    }
+
+    /* Time display */
+    .time-display {
+      font-family: 'SF Mono', 'JetBrains Mono', monospace;
+      font-size: clamp(1.5rem, 4vw, 3rem);
+      font-weight: 300;
+      font-variant-numeric: tabular-nums;
+      letter-spacing: 0.05em;
+      color: var(--fg-primary);
+      opacity: 0.7;
+      margin: 1.5rem 0;
+    }
+
+    .time-display .colon { animation: blink 1s ease-in-out infinite; }
+
+    @keyframes blink {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.3; }
+    }
+
+    /* ===== INTERACTIVE HINT ===== */
+    .interact-hint {
+      position: fixed;
+      bottom: 2rem;
+      left: 50%;
+      transform: translateX(-50%);
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      padding: 0.75rem 1.5rem;
+      background: var(--glass-bg);
+      border: 1px solid var(--glass-border);
+      border-radius: 100px;
+      backdrop-filter: blur(20px);
+      font-size: 0.8rem;
+      color: var(--fg-muted);
+      opacity: 0.7;
+      animation: hintFloat 3s ease-in-out infinite;
+      pointer-events: none;
+      z-index: 20;
+    }
+
+    .interact-hint kbd {
+      background: var(--bg-base);
+      border: 1px solid var(--glass-border);
+      border-radius: 6px;
+      padding: 0.15rem 0.5rem;
+      font-family: inherit;
+      font-size: 0.7rem;
+      color: var(--fg-primary);
+    }
+
+    @keyframes hintFloat {
+      0%, 100% { transform: translateX(-50%) translateY(0); }
+      50% { transform: translateX(-50%) translateY(-6px); }
+    }
+
+    /* ===== REDUCED MOTION ===== */
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after {
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.01ms !important;
+      }
+    }
+
+    /* ===== MOBILE ===== */
+    @media (max-width: 768px) {
+      .stat-row { gap: 1.5rem; }
+      .glass-card { padding: 1.5rem; }
+      .interact-hint { display: none; }
+    }
+  </style>
+</head>
+<body>
+  <!-- Layer 0: Base -->
+  <div class="layer layer-base"></div>
+
+  <!-- Layer 1: Gradient mesh blobs -->
+  <div class="layer layer-mesh">
+    <div class="mesh-blob blob-1"></div>
+    <div class="mesh-blob blob-2"></div>
+    <div class="mesh-blob blob-3"></div>
+  </div>
+
+  <!-- Layer 2: Particles (generated via JS) -->
+  <div class="layer layer-particles" id="particles"></div>
+
+  <!-- Layer 3: Grid -->
+  <div class="layer layer-grid"></div>
+
+  <!-- Layer 4: Content -->
+  <main class="layer layer-content">
+    <div class="glass-card" id="mainCard">
+      <!-- Hero text -->
+      <h1 class="glow-text text-hero gradient-text" data-text="HERMES">
+        HERMES
+      </h1>
+
+      <!-- Subtitle -->
+      <p class="text-sub">Premium Live Wallpaper</p>
+
+      <!-- Time -->
+      <div class="time-display" id="timeDisplay">00:00:00</div>
+
+      <!-- Tagline -->
+      <p class="text-tagline">
+        A <span class="glow-inline accent" data-text="living background" style="--glow-c1: var(--accent-cyan); --glow-c2: var(--accent-magenta);">living background</span>
+        with <span class="glow-inline accent-2" data-text="breathing gradients" style="--glow-c1: var(--accent-magenta); --glow-c2: var(--accent-gold);">breathing gradients</span>,
+        <span class="glow-inline accent-3" data-text="floating particles" style="--glow-c1: var(--accent-gold); --glow-c2: var(--accent-cyan);">floating particles</span>,
+        and <span class="glow-inline accent" data-text="glassmorphism depth" style="--glow-c1: var(--accent-cyan); --glow-c2: var(--accent-white);">glassmorphism depth</span>.
+        Restrained. Sophisticated. Alive.
+      </p>
+
+      <!-- Stats -->
+      <div class="stat-row">
+        <div class="stat">
+          <div class="stat-value" id="fpsValue">60</div>
+          <div class="stat-label">FPS</div>
+        </div>
+        <div class="stat">
+          <div class="stat-value" id="particleCount">80</div>
+          <div class="stat-label">Particles</div>
+        </div>
+        <div class="stat">
+          <div class="stat-value" id="uptimeValue">0s</div>
+          <div class="stat-label">Uptime</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Interaction hint -->
+    <div class="interact-hint">
+      <kbd>Space</kbd> Pause &nbsp;|&nbsp; <kbd>H</kbd> Hide UI &nbsp;|&nbsp; <kbd>G</kbd> Toggle Grid
+    </div>
+  </main>
+
+  <script>
+    // ===== CONFIGURATION =====
+    const CONFIG = {
+      particleCount: 80,
+      particleColors: ['#00e5d0', '#d400a8', '#e8b82c', '#ffffff'],
+      meshSpeed: 1,
+      gridSpeed: 1,
+      reducedMotion: window.matchMedia('(prefers-reduced-motion: reduce)').matches
+    };
+
+    // ===== STATE =====
+    let particles = [];
+    let startTime = performance.now();
+    let lastFrame = startTime;
+    let frameCount = 0;
+    let fps = 60;
+    let paused = false;
+    let uiHidden = false;
+    let gridVisible = true;
+
+    // ===== DOM =====
+    const particlesContainer = document.getElementById('particles');
+    const timeDisplay = document.getElementById('timeDisplay');
+    const fpsValue = document.getElementById('fpsValue');
+    const particleCountEl = document.getElementById('particleCount');
+    const uptimeValue = document.getElementById('uptimeValue');
+    const mainCard = document.getElementById('mainCard');
+    const interactHint = document.querySelector('.interact-hint');
+    const gridLayer = document.querySelector('.layer-grid');
+
+    // ===== PARTICLE SYSTEM =====
+    function createParticles() {
+      particlesContainer.innerHTML = '';
+      particles = [];
+
+      for (let i = 0; i < CONFIG.particleCount; i++) {
+        const p = document.createElement('div');
+        p.className = 'particle';
+
+        // Random properties
+        const color = CONFIG.particleColors[Math.floor(Math.random() * CONFIG.particleColors.length)];
+        const size = Math.random() * 2 + 1; // 1-3px
+        const left = Math.random() * 100;
+        const driftX = (Math.random() - 0.5) * 200; // -100 to 100px
+        const duration = 25 + Math.random() * 20; // 25-45s
+        const delay = Math.random() * -duration; // Staggered start
+
+        p.style.cssText = `
+          left: ${left}%;
+          width: ${size}px;
+          height: ${size}px;
+          background: ${color};
+          --drift-x: ${driftX}px;
+          animation-duration: ${duration}s;
+          animation-delay: ${delay}s;
+          opacity: 0;
+        `;
+
+        particlesContainer.appendChild(p);
+        particles.push({ element: p, color, size, left, driftX, duration });
+      }
+    }
+
+    // ===== TIME & STATS =====
+    function updateTime() {
+      const now = new Date();
+      const hh = String(now.getHours()).padStart(2, '0');
+      const mm = String(now.getMinutes()).padStart(2, '0');
+      const ss = String(now.getSeconds()).padStart(2, '0');
+      timeDisplay.textContent = `${hh}:${mm}:${ss}`;
+    }
+
+    function updateStats(now) {
+      frameCount++;
+      if (now - lastFrame >= 1000) {
+        fps = Math.round(frameCount * 1000 / (now - lastFrame));
+        frameCount = 0;
+        lastFrame = now;
+        fpsValue.textContent = fps;
+      }
+
+      const uptime = Math.floor((now - startTime) / 1000);
+      const m = Math.floor(uptime / 60);
+      const s = uptime % 60;
+      uptimeValue.textContent = m > 0 ? `${m}m ${s}s` : `${s}s`;
+
+      particleCountEl.textContent = CONFIG.particleCount;
+    }
+
+    // ===== MAIN LOOP =====
+    function animate(now) {
+      if (!paused && !CONFIG.reducedMotion) {
+        updateStats(now);
+      }
+      updateTime();
+      requestAnimationFrame(animate);
+    }
+
+    // ===== INTERACTIONS =====
+    function togglePause() {
+      paused = !paused;
+      document.body.style.setProperty('--paused', paused ? '1' : '0');
+      // Visual feedback
+      mainCard.style.transform = paused ? 'scale(0.98)' : 'scale(1)';
+      setTimeout(() => mainCard.style.transform = '', 150);
+    }
+
+    function toggleUI() {
+      uiHidden = !uiHidden;
+      mainCard.style.opacity = uiHidden ? '0' : '1';
+      mainCard.style.pointerEvents = uiHidden ? 'none' : 'auto';
+      mainCard.style.transform = uiHidden ? 'translateY(20px)' : 'translateY(0)';
+      interactHint.style.opacity = uiHidden ? '0' : '0.7';
+    }
+
+    function toggleGrid() {
+      gridVisible = !gridVisible;
+      gridLayer.style.opacity = gridVisible ? '0.025' : '0';
+    }
+
+    document.addEventListener('keydown', (e) => {
+      if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+
+      switch (e.code) {
+        case 'Space': e.preventDefault(); togglePause(); break;
+        case 'KeyH': toggleUI(); break;
+        case 'KeyG': toggleGrid(); break;
+      }
+    });
+
+    // Pause when tab hidden
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) paused = true;
+      else paused = false;
+    });
+
+    // ===== INIT =====
+    function init() {
+      createParticles();
+      updateTime();
+      requestAnimationFrame(animate);
+
+      // Recreate particles on resize (debounced)
+      let resizeTimer;
+      window.addEventListener('resize', () => {
+        clearTimeout(resizeTimer);
+        resizeTimer = setTimeout(createParticles, 300);
+      });
+
+      // Initialize card animation
+      mainCard.style.transition = 'opacity 0.5s cubic-bezier(0.23,1,0.32,1), transform 0.5s cubic-bezier(0.23,1,0.32,1)';
+      interactHint.style.transition = 'opacity 0.3s ease';
+    }
+
+    // Start
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', init);
+    } else {
+      init();
+    }
+  </script>
+</body>
+</html>

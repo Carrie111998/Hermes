@@ -1,0 +1,897 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Memory Graph - Rlay's Second Brain</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    :root {
+      --bg-primary: #0a0a0f;
+      --bg-secondary: #11111a;
+      --fg-primary: #f0f0f5;
+      --fg-muted: #888899;
+      --accent-cyan: #00ffea;
+      --accent-magenta: #ff00ea;
+      --accent-gold: #ffd700;
+      --glass-bg: rgba(17, 17, 26, 0.7);
+      --glass-border: rgba(255, 255, 255, 0.08);
+      --link-color: rgba(0, 255, 234, 0.3);
+      --node-size: 12;
+    }
+
+    body {
+      min-height: 100vh;
+      background: var(--bg-primary);
+      color: var(--fg-primary);
+      font-family: 'JetBrains Mono', 'Fira Code', monospace;
+      position: relative;
+      /* Removed overflow: hidden to allow scrolling */
+    }
+
+    /* Video Background */
+    .video-bg {
+      position: fixed;
+      top: 0; left: 0; right: 0; bottom: 0;
+      z-index: -2;
+      overflow: hidden;
+    }
+
+    .video-bg video {
+      width: 100%; height: 100%;
+      object-fit: cover;
+      opacity: 0.35;
+      filter: saturate(1.2) contrast(1.1);
+    }
+
+    .video-bg::after {
+      content: '';
+      position: absolute;
+      inset: 0;
+      background:
+        radial-gradient(ellipse at 20% 20%, rgba(0, 255, 234, 0.08) 0%, transparent 50%),
+        radial-gradient(ellipse at 80% 80%, rgba(255, 0, 234, 0.08) 0%, transparent 50%),
+        radial-gradient(ellipse at 50% 50%, rgba(0, 0, 0, 0.4) 0%, transparent 70%);
+      pointer-events: none;
+    }
+
+    /* Animated Grid Overlay */
+    .grid-overlay {
+      position: fixed;
+      inset: 0;
+      z-index: -1;
+      pointer-events: none;
+      background-image:
+        linear-gradient(rgba(0, 255, 234, 0.03) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(0, 255, 234, 0.03) 1px, transparent 1px);
+      background-size: 60px 60px;
+      animation: gridMove 20s linear infinite;
+    }
+
+    @keyframes gridMove {
+      0% { transform: translate(0, 0); }
+      100% { transform: translate(60px, 60px); }
+    }
+
+    /* Floating Orbs */
+    .orb {
+      position: fixed;
+      border-radius: 50%;
+      filter: blur(60px);
+      opacity: 0.4;
+      animation: orbFloat 15s ease-in-out infinite;
+      pointer-events: none;
+    }
+
+    .orb-1 { width: 400px; height: 400px; background: var(--accent-cyan); top: -100px; left: -100px; animation-delay: 0s; }
+    .orb-2 { width: 300px; height: 300px; background: var(--accent-magenta); bottom: -50px; right: -50px; animation-delay: -5s; }
+    .orb-3 { width: 200px; height: 200px; background: var(--accent-gold); top: 50%; left: 50%; transform: translate(-50%, -50%); animation-delay: -10s; }
+
+    @keyframes orbFloat {
+      0%, 100% { transform: translate(0, 0) scale(1); }
+      25% { transform: translate(30px, -20px) scale(1.1); }
+      50% { transform: translate(-20px, 30px) scale(0.95); }
+      75% { transform: translate(10px, -30px) scale(1.05); }
+    }
+
+    /* Main Content */
+    .container {
+      position: relative;
+      z-index: 10;
+      min-height: 100vh;
+      padding: 2rem;
+      /* Allow scrolling */
+    }
+
+    /* Header */
+    .header {
+      text-align: center;
+      margin-bottom: 3rem;
+    }
+
+    .title {
+      font-size: clamp(2.5rem, 8vw, 5rem);
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.15em;
+      position: relative;
+      display: inline-block;
+      margin-bottom: 1rem;
+      background: linear-gradient(135deg, var(--fg-primary) 0%, var(--accent-cyan) 50%, var(--fg-primary) 100%);
+      background-size: 200% 200%;
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+      animation: gradientShift 4s ease-in-out infinite;
+    }
+
+    .title::before {
+      content: attr(data-text);
+      position: absolute;
+      inset: 0;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+      filter: blur(8px);
+      opacity: 0.6;
+      animation: glowPulse 3s ease-in-out infinite alternate;
+    }
+
+    .subtitle {
+      font-size: clamp(1rem, 3vw, 1.5rem);
+      color: var(--fg-muted);
+      max-width: 800px;
+      margin: 0 auto;
+      line-height: 1.6;
+    }
+
+    @keyframes gradientShift {
+      0%, 100% { background-position: 0% 50%; }
+      50% { background-position: 100% 50%; }
+    }
+
+    @keyframes glowPulse {
+      0% { filter: blur(8px); opacity: 0.4; }
+      100% { filter: blur(16px); opacity: 0.8; }
+    }
+
+    /* Graph Container */
+    #graph-container {
+      position: relative;
+      width: 100%;
+      height: 1400px; /* Increased height for more nodes */
+      margin: 0 auto;
+      background: var(--glass-bg);
+      border: 1px solid var(--glass-border);
+      border-radius: 16px;
+      backdrop-filter: blur(20px);
+      overflow: visible;
+    }
+
+    /* Links/Edges */
+    .link {
+      stroke: var(--link-color);
+      stroke-width: 1.5;
+      transition: stroke-width 0.3s, opacity 0.3s;
+    }
+
+    .link:hover {
+      stroke-width: 2.5;
+      opacity: 0.8;
+    }
+
+    /* Nodes */
+    .node {
+      cursor: pointer;
+      transition: transform 0.2s, r 0.2s;
+    }
+
+    .node:hover {
+      transform: scale(1.2);
+    }
+
+    .node circle {
+      fill: var(--fg-primary);
+      stroke: var(--accent-cyan);
+      stroke-width: 2px;
+      filter: drop-shadow(0 0 5px rgba(0, 255, 234, 0.3));
+    }
+
+    .node text {
+      pointer-events: none;
+      font-size: 9px;
+      fill: var(--fg-primary);
+      text-anchor: middle;
+      dy:-18px;
+      text-shadow: 0 0 3px rgba(0,0,0,0.5);
+      font-weight: 600;
+    }
+
+    /* Node Types - Different colors for different categories */
+    .node-project circle { fill: var(--accent-cyan); }
+    .node-template circle { fill: var(--accent-magenta); }
+    .node-resource circle { fill: var(--accent-gold); }
+    .node-note circle { fill: var(--fg-primary); }
+    .node-copilot circle { fill: #a855f7; } /* purple for copilot */
+
+    /* Legend */
+    .legend {
+      position: fixed;
+      bottom: 20px;
+      left: 20px;
+      background: var(--glass-bg);
+      border: 1px solid var(--glass-border);
+      border-radius: 12px;
+      padding: 1rem;
+      backdrop-filter: blur(10px);
+      font-size: 0.9rem;
+      z-index: 100;
+    }
+
+    .legend-item {
+      display: flex;
+      align-items: center;
+      margin-bottom: 0.5rem;
+    }
+
+    .legend-color {
+      width: 12px;
+      height: 12px;
+      border-radius: 50%;
+      margin-right: 0.5rem;
+    }
+
+    .legend-color.project { background: var(--accent-cyan); }
+    .legend-color.template { background: var(--accent-magenta); }
+    .legend-color.resource { background: var(--accent-gold); }
+    .legend-color.note { background: var(--fg-primary); }
+    .legend-color.copilot { background: #a855f7; }
+
+    /* Controls */
+    .controls {
+      position: fixed;
+      top: 20px;
+      right: 20px;
+      background: var(--glass-bg);
+      border: 1px solid var(--glass-border);
+      border-radius: 12px;
+      padding: 1rem;
+      backdrop-filter: blur(10px);
+      z-index: 100;
+      display: flex;
+      flex-direction: column;
+      gap: 0.75rem;
+      align-items: flex-end;
+    }
+
+    .controls-row {
+      display: flex;
+      gap: 0.5rem;
+      align-items: center;
+    }
+
+    .search-box {
+      padding: 0.5rem 1rem;
+      background: var(--bg-secondary);
+      border: 2px solid var(--glass-border);
+      border-radius: 8px;
+      color: var(--fg-primary);
+      font-family: inherit;
+      font-size: 0.9rem;
+      width: 200px;
+      transition: border-color 0.3s;
+    }
+
+    .search-box:focus {
+      outline: none;
+      border-color: var(--accent-cyan);
+    }
+
+    .btn {
+      padding: 0.5rem 1rem;
+      background: transparent;
+      border: 2px solid var(--accent-cyan);
+      border-radius: 8px;
+      color: var(--accent-cyan);
+      font-family: inherit;
+      font-size: 0.9rem;
+      cursor: pointer;
+      transition: all 0.3s;
+    }
+
+    .btn:hover {
+      background: var(--accent-cyan);
+      color: var(--bg-primary);
+    }
+
+    .btn:active {
+      transform: scale(0.95);
+    }
+
+    .btn.secondary {
+      border-color: var(--fg-muted);
+      color: var(--fg-muted);
+    }
+
+    .btn.secondary:hover {
+      background: var(--fg-muted);
+      color: var(--bg-primary);
+    }
+
+    /* Info Panel */
+    #info-panel {
+      position: fixed;
+      bottom: 20px;
+      right: 20px;
+      background: var(--glass-bg);
+      border: 1px solid var(--glass-border);
+      border-radius: 12px;
+      padding: 1.5rem;
+      max-width: 300px;
+      max-height: 200px;
+      overflow-y: auto;
+      backdrop-filter: blur(10px);
+      z-index: 100;
+      font-size: 0.9rem;
+      line-height: 1.5;
+      display: none;
+    }
+
+    #info-panel h3 {
+      margin-top: 0;
+      color: var(--accent-cyan);
+      border-bottom: 1px solid var(--glass-border);
+      padding-bottom: 0.5rem;
+    }
+
+    /* Tooltip */
+    .tooltip {
+      position: absolute;
+      background: var(--glass-bg);
+      border: 1px solid var(--glass-border);
+      border-radius: 8px;
+      padding: 0.75rem 1rem;
+      pointer-events: none;
+      backdrop-filter: blur(10px);
+      z-index: 200;
+      font-size: 0.85rem;
+      max-width: 250px;
+      opacity: 0;
+      transition: opacity 0.2s;
+      pointer-events: none;
+    }
+
+    .tooltip.visible {
+      opacity: 1;
+    }
+
+    @media (max-width: 768px) {
+      .container {
+        padding: 1rem;
+      }
+
+      .title {
+        font-size: 2rem;
+      }
+
+      #graph-container {
+        height: 1000px;
+      }
+
+      .controls, .legend, #info-panel {
+        position: static;
+        margin: 1rem 0;
+        max-width: 100%;
+      }
+    }
+  </style>
+</head>
+<body>
+  <!-- Video Background (placeholder) -->
+  <div class="video-bg">
+    <video autoplay loop muted playsinline poster="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 1920 1080'%3E%3Crect fill='%230a0a0f' width='1920' height='1080'/%3E%3C/svg%3E">
+      <!-- Replace source with your video file -->
+      <!-- <source src="your-background.mp4" type="video/mp4"> -->
+    </video>
+  </div>
+
+  <!-- Grid Overlay -->
+  <div class="grid-overlay" aria-hidden="true"></div>
+
+  <!-- Floating Orbs -->
+  <div class="orb orb-1" aria-hidden="true"></div>
+  <div class="orb orb-2" aria-hidden="true"></div>
+  <div class="orb orb-3" aria-hidden="true"></div>
+
+  <main class="container">
+    <header class="header">
+      <h1 class="title" data-text="MEMORY GRAPH">MEMORY GRAPH</h1>
+      <p class="subtitle">Visualizing your Obsidian vault connections - Rlay's Second Brain (111 notes, 57 links)</p>
+    </header>
+
+    <!-- Controls -->
+    <div class="controls">
+      <div class="controls-row">
+        <input type="text" class="search-box" id="search-box" placeholder="Search nodes...">
+      </div>
+      <div class="controls-row">
+        <button class="btn" id="reset-btn">Reset View</button>
+        <button class="btn" id="info-toggle">Info</button>
+      </div>
+      <div class="controls-row">
+        <button class="btn secondary" id="export-btn">Export PNG</button>
+        <button class="btn secondary" id="fit-btn">Fit All</button>
+      </div>
+    </div>
+
+    <!-- Graph Container -->
+    <div id="graph-container">
+      <!-- Graph will be rendered here by D3.js -->
+    </div>
+
+    <!-- Info Panel -->
+    <div id="info-panel">
+      <h3>Node Info</h3>
+      <div id="info-content">Click on a node to see details</div>
+    </div>
+
+    <!-- Tooltip -->
+    <div class="tooltip" id="tooltip"></div>
+
+    <!-- Legend -->
+    <div class="legend">
+      <div>Node Types:</div>
+      <div class="legend-item"><div class="legend-color project"></div><span>Projects (1)</span></div>
+      <div class="legend-item"><div class="legend-color template"></div><span>Templates (5)</span></div>
+      <div class="legend-item"><div class="legend-color resource"></div><span>Resources (74)</span></div>
+      <div class="legend-item"><div class="legend-color note"></div><span>Notes (16)</span></div>
+      <div class="legend-item"><div class="legend-color copilot"></div><span>Copilot (15)</span></div>
+    </div>
+  </main>
+
+  <script src="https://d3js.org/d3.v7.min.js"></script>
+  <script>
+    // ===== REAL VAULT DATA (111 nodes, 57 links) =====
+    const nodes = [
+      {id: "dashboard", name: "Dashboard", category: "Notes"},
+      {id: "untitled", name: "Untitled", category: "Notes"},
+      {id: "00-memory-orbits-dashboard", name: "00-Memory-Orbits-Dashboard", category: "Notes"},
+      {id: "home", name: "Home", category: "Notes"},
+      {id: "test-note", name: "Test note", category: "Notes"},
+      {id: "2026-08-03", name: "2026-08-03", category: "Notes"},
+      {id: "00-vault-organization", name: "00-Vault-Organization", category: "Notes"},
+      {id: "rlay-auto-index", name: "Auto-Index", category: "Notes"},
+      {id: "rlay-index", name: "Index", category: "Notes"},
+      {id: "inbox-create-a-link", name: "create a link", category: "Notes"},
+      {id: "copilot-copilot-custom-prompts-rewrite-as-tweet", name: "Rewrite as tweet", category: "Copilot"},
+      {id: "copilot-copilot-custom-prompts-clip-web-page", name: "Clip Web Page", category: "Copilot"},
+      {id: "copilot-copilot-custom-prompts-fix-grammar-and-spelling", name: "Fix grammar and spelling", category: "Copilot"},
+      {id: "copilot-copilot-custom-prompts-make-longer", name: "Make longer", category: "Copilot"},
+      {id: "copilot-copilot-custom-prompts-explain-like-i-am-5", name: "Explain like I am 5", category: "Copilot"},
+      {id: "copilot-copilot-custom-prompts-translate-to-chinese", name: "Translate to Chinese", category: "Copilot"},
+      {id: "copilot-copilot-custom-prompts-clip-youtube-transcript", name: "Clip YouTube Transcript", category: "Copilot"},
+      {id: "copilot-copilot-custom-prompts-make-shorter", name: "Make shorter", category: "Copilot"},
+      {id: "copilot-copilot-custom-prompts-rewrite-as-tweet-thread", name: "Rewrite as tweet thread", category: "Copilot"},
+      {id: "copilot-copilot-custom-prompts-simplify", name: "Simplify", category: "Copilot"},
+      {id: "copilot-copilot-custom-prompts-emojify", name: "Emojify", category: "Copilot"},
+      {id: "copilot-copilot-custom-prompts-generate-table-of-contents", name: "Generate table of contents", category: "Copilot"},
+      {id: "copilot-copilot-custom-prompts-summarize", name: "Summarize", category: "Copilot"},
+      {id: "copilot-copilot-custom-prompts-remove-urls", name: "Remove URLs", category: "Copilot"},
+      {id: "copilot-copilot-custom-prompts-generate-glossary", name: "Generate glossary", category: "Copilot"},
+      {id: "projects-mg-win-food-delivery-app-mg-win-food-delivery-app", name: "Mg Win Food Delivery App", category: "Projects"},
+      {id: "resources-freetiers", name: "FREE_TIERS", category: "Resources"},
+      {id: "resources-ai-prompts-templates-default-gettags", name: "getTags", category: "Resources"},
+      {id: "resources-ai-prompts-templates-default-getoutline", name: "getOutline", category: "Resources"},
+      {id: "resources-ai-prompts-templates-default-getideas", name: "getIdeas", category: "Resources"},
+      {id: "resources-ai-prompts-templates-default-rewrite", name: "rewrite", category: "Resources"},
+      {id: "resources-ai-prompts-templates-default-gettitles", name: "getTitles", category: "Resources"},
+      {id: "resources-ai-prompts-templates-default-summarizelarge", name: "summarizeLarge", category: "Resources"},
+      {id: "resources-ai-prompts-templates-default-simplify", name: "simplify", category: "Resources"},
+      {id: "resources-ai-prompts-templates-default-getparagraph", name: "getParagraph", category: "Resources"},
+      {id: "resources-ai-prompts-templates-default-getemailneg", name: "getEmailNeg", category: "Resources"},
+      {id: "resources-ai-prompts-templates-default-summarize", name: "summarize", category: "Resources"},
+      {id: "resources-ai-prompts-templates-default-getemailpos", name: "getEmailPos", category: "Resources"},
+      {id: "resources-ai-prompts-templates-dalle-artvangogh", name: "artVanGogh", category: "Resources"},
+      {id: "resources-ai-prompts-templates-dalle-artwatercolor", name: "artWatercolor", category: "Resources"},
+      {id: "resources-ai-prompts-templates-dalle-modfanart", name: "modFanart", category: "Resources"},
+      {id: "resources-ai-prompts-templates-dalle-artstock", name: "artStock", category: "Resources"},
+      {id: "resources-ai-prompts-templates-dalle-artdeco", name: "artDeco", category: "Resources"},
+      {id: "resources-ai-prompts-templates-dalle-quamacro", name: "quaMacro", category: "Resources"},
+      {id: "resources-ai-prompts-templates-dalle-ligstudio", name: "ligStudio", category: "Resources"},
+      {id: "resources-ai-prompts-templates-dalle-artspraypainted", name: "artSprayPainted", category: "Resources"},
+      {id: "resources-ai-prompts-templates-dalle-quabokeh", name: "quaBokeh", category: "Resources"},
+      {id: "resources-ai-prompts-templates-dalle-ligflare", name: "ligFlare", category: "Resources"},
+      {id: "resources-ai-prompts-templates-dalle-art3d", name: "art3D", category: "Resources"},
+      {id: "resources-ai-prompts-templates-dalle-artbauhaus", name: "artBauhaus", category: "Resources"},
+      {id: "resources-ai-prompts-templates-dalle-artsalvadordali", name: "artSalvadorDali", category: "Resources"},
+      {id: "resources-ai-prompts-templates-dalle-sitnature", name: "sitNature", category: "Resources"},
+      {id: "resources-ai-prompts-templates-dalle-getphotos", name: "getPhotos", category: "Resources"},
+      {id: "resources-ai-prompts-templates-dalle-artchildrendrawing", name: "artChildrenDrawing", category: "Resources"},
+      {id: "resources-ai-prompts-templates-dalle-artcyberpunk", name: "artCyberpunk", category: "Resources"},
+      {id: "resources-ai-prompts-templates-dalle-artnormanrockwell", name: "artNormanRockwell", category: "Resources"},
+      {id: "resources-ai-prompts-templates-dalle-qua15mm", name: "qua15mm", category: "Resources"},
+      {id: "resources-ai-prompts-templates-dalle-artline", name: "artLine", category: "Resources"},
+      {id: "resources-ai-prompts-templates-dalle-artmodern", name: "artModern", category: "Resources"},
+      {id: "resources-ai-prompts-templates-dalle-modphotorealistic", name: "modPhotorealistic", category: "Resources"},
+      {id: "resources-ai-prompts-templates-dalle-qua4k", name: "qua4K", category: "Resources"},
+      {id: "resources-ai-prompts-templates-dalle-artukiyoe", name: "artUkiyoe", category: "Resources"},
+      {id: "resources-ai-prompts-templates-dalle-getphoto2", name: "getPhoto2", category: "Resources"},
+      {id: "resources-ai-prompts-templates-dalle-arttakashimurakami", name: "artTakashiMurakami", category: "Resources"},
+      {id: "resources-ai-prompts-templates-dalle-artwarhol", name: "artWarhol", category: "Resources"},
+      {id: "resources-ai-prompts-templates-dalle-artvaporwave", name: "artVaporwave", category: "Resources"},
+      {id: "resources-ai-prompts-templates-dalle-liggoldenhour", name: "ligGoldenHour", category: "Resources"},
+      {id: "resources-ai-prompts-templates-dalle-getphoto", name: "getPhoto", category: "Resources"},
+      {id: "resources-ai-prompts-templates-dalle-qua35mm", name: "qua35mm", category: "Resources"},
+      {id: "resources-ai-prompts-templates-dalle-dall-e-core", name: "dall-e-core", category: "Resources"},
+      {id: "resources-ai-prompts-templates-dalle-artlowpoly", name: "artLowPoly", category: "Resources"},
+      {id: "resources-ai-prompts-templates-dalle-artclaymation", name: "artClaymation", category: "Resources"},
+      {id: "resources-ai-prompts-templates-dalle-artcartoon", name: "artCartoon", category: "Resources"},
+      {id: "resources-ai-prompts-templates-dalle-artbanksy", name: "artBanksy", category: "Resources"},
+      {id: "resources-ai-prompts-templates-dalle-ligambient", name: "ligAmbient", category: "Resources"},
+      {id: "resources-ai-prompts-templates-dalle-artpixel", name: "artPixel", category: "Resources"},
+      {id: "resources-ai-prompts-templates-dalle-artdigital", name: "artDigital", category: "Resources"},
+      {id: "resources-ai-prompts-templates-dalle-artgraffiti", name: "artGraffiti", category: "Resources"},
+      {id: "resources-ai-prompts-templates-dalle-artpencilsketch", name: "artPencilSketch", category: "Resources"},
+      {id: "resources-ai-prompts-templates-dalle-artpsychedelic", name: "artPsychedelic", category: "Resources"},
+      {id: "resources-ai-prompts-templates-dalle-modawardwinning", name: "modAwardWinning", category: "Resources"},
+      {id: "resources-ai-prompts-templates-dalle-arttimburton", name: "artTimBurton", category: "Resources"},
+      {id: "resources-ai-prompts-templates-dalle-artsteampunk", name: "artSteampunk", category: "Resources"},
+      {id: "resources-ai-prompts-templates-dalle-artcoloringbook", name: "artColoringBook", category: "Resources"},
+      {id: "resources-ai-prompts-templates-dalle-artsynthwave", name: "artSynthwave", category: "Resources"},
+      {id: "resources-ai-prompts-templates-dalle-modartstation", name: "modArtStation", category: "Resources"},
+      {id: "resources-ai-prompts-templates-dalle-quacinematic", name: "quaCinematic", category: "Resources"},
+      {id: "resources-ai-prompts-templates-dalle-qua200mm", name: "qua200mm", category: "Resources"},
+      {id: "resources-ai-prompts-templates-dalle-artanime", name: "artAnime", category: "Resources"},
+      {id: "resources-ai-prompts-templates-dalle-quatiltshift", name: "quaTiltShift", category: "Resources"},
+      {id: "resources-ai-prompts-templates-dalle-moddetailed", name: "modDetailed", category: "Resources"},
+      {id: "resources-ai-prompts-templates-dalle-artballpointpen", name: "artBallPointPen", category: "Resources"},
+      {id: "resources-ai-prompts-templates-dalle-qua85mm", name: "qua85mm", category: "Resources"},
+      {id: "resources-ai-prompts-templates-dalle-ligcinematic", name: "ligCinematic", category: "Resources"},
+      {id: "resources-ai-prompts-templates-dalle-artglitchcore", name: "artGlitchcore", category: "Resources"},
+      {id: "resources-ai-prompts-templates-tts-speakalloy", name: "speakAlloy", category: "Resources"},
+      {id: "resources-ai-prompts-templates-tts-listen", name: "listen", category: "Resources"},
+      {id: "resources-ai-prompts-templates-huggingface-summarizebart", name: "summarizeBART", category: "Resources"},
+      {id: "resources-ai-prompts-templates-huggingface-classify-bart-large-mnli", name: "classify-bart-large-mnli", category: "Resources"},
+      {id: "resources-ai-prompts-templates-huggingface-completetextbloom", name: "completeTextBloom", category: "Resources"},
+      {id: "daily-notes-2026-07-26", name: "2026-07-26", category: "Notes"},
+      {id: "daily-notes-2026-07-29", name: "2026-07-29", category: "Notes"},
+      {id: "daily-notes-2026-07-28", name: "2026-07-28", category: "Notes"},
+      {id: "daily-notes-2026-08-01", name: "2026-08-01", category: "Notes"},
+      {id: "daily-notes-2026-07-21", name: "2026-07-21", category: "Notes"},
+      {id: "daily-notes-2026-07-14", name: "2026-07-14", category: "Notes"},
+      {id: "templates-weekly-orbit-review", name: "Weekly Orbit Review", category: "Templates"},
+      {id: "templates-project", name: "Project", category: "Templates"},
+      {id: "templates-daily-note", name: "Daily Note", category: "Templates"},
+      {id: "templates-resource", name: "Resource", category: "Templates"},
+      {id: "templates-project-plan", name: "Project Plan", category: "Templates"},
+    ];
+
+    // Links representing connections between notes (real wikilinks)
+    const links = [
+      {source: "dashboard", target: "00-vault-organization", type: "wikilink"},
+      {source: "dashboard", target: "templates-daily-note", type: "wikilink"},
+      {source: "dashboard", target: "templates-project", type: "wikilink"},
+      {source: "dashboard", target: "templates-resource", type: "wikilink"},
+      {source: "00-memory-orbits-dashboard", target: "templates-daily-note", type: "wikilink"},
+      {source: "00-memory-orbits-dashboard", target: "templates-project", type: "wikilink"},
+      {source: "00-memory-orbits-dashboard", target: "templates-resource", type: "wikilink"},
+      {source: "rlay-auto-index", target: "templates-daily-note", type: "wikilink"},
+      {source: "rlay-auto-index", target: "templates-project", type: "wikilink"},
+      {source: "rlay-auto-index", target: "templates-weekly-orbit-review", type: "wikilink"},
+      {source: "rlay-auto-index", target: "templates-resource", type: "wikilink"},
+      {source: "rlay-index", target: "templates-daily-note", type: "wikilink"},
+      {source: "rlay-index", target: "templates-project", type: "wikilink"},
+      {source: "rlay-index", target: "templates-weekly-orbit-review", type: "wikilink"},
+      {source: "rlay-index", target: "templates-resource", type: "wikilink"},
+      {source: "rlay-index", target: "resources-freetiers", type: "wikilink"},
+      {source: "rlay-index", target: "copilot-copilot-custom-prompts-summarize", type: "wikilink"},
+      {source: "rlay-index", target: "copilot-copilot-custom-prompts-simplify", type: "wikilink"},
+      {source: "rlay-index", target: "resources-ai-prompts-templates-default-rewrite", type: "wikilink"},
+      {source: "rlay-index", target: "resources-ai-prompts-templates-default-getoutline", type: "wikilink"},
+      {source: "rlay-index", target: "resources-ai-prompts-templates-default-getideas", type: "wikilink"},
+      {source: "rlay-index", target: "resources-ai-prompts-templates-default-gettags", type: "wikilink"},
+      {source: "rlay-index", target: "resources-ai-prompts-templates-default-gettitles", type: "wikilink"},
+      {source: "rlay-index", target: "resources-ai-prompts-templates-default-getparagraph", type: "wikilink"},
+      {source: "rlay-index", target: "resources-ai-prompts-templates-default-getemailpos", type: "wikilink"},
+      {source: "rlay-index", target: "resources-ai-prompts-templates-default-getemailneg", type: "wikilink"},
+      {source: "rlay-index", target: "resources-ai-prompts-templates-dalle-modphotorealistic", type: "wikilink"},
+      {source: "rlay-index", target: "resources-ai-prompts-templates-dalle-quacinematic", type: "wikilink"},
+      {source: "rlay-index", target: "resources-ai-prompts-templates-dalle-quabokeh", type: "wikilink"},
+      {source: "rlay-index", target: "resources-ai-prompts-templates-dalle-quamacro", type: "wikilink"},
+      {source: "rlay-index", target: "resources-ai-prompts-templates-dalle-quatiltshift", type: "wikilink"},
+      {source: "rlay-index", target: "resources-ai-prompts-templates-dalle-qua15mm", type: "wikilink"},
+      {source: "rlay-index", target: "resources-ai-prompts-templates-dalle-qua35mm", type: "wikilink"},
+      {source: "rlay-index", target: "resources-ai-prompts-templates-dalle-qua85mm", type: "wikilink"},
+      {source: "rlay-index", target: "resources-ai-prompts-templates-dalle-qua200mm", type: "wikilink"},
+      {source: "rlay-index", target: "resources-ai-prompts-templates-dalle-qua4k", type: "wikilink"},
+      {source: "rlay-index", target: "resources-ai-prompts-templates-dalle-sitnature", type: "wikilink"},
+      {source: "rlay-index", target: "resources-ai-prompts-templates-huggingface-completetextbloom", type: "wikilink"},
+      {source: "rlay-index", target: "resources-ai-prompts-templates-huggingface-classify-bart-large-mnli", type: "wikilink"},
+      {source: "rlay-index", target: "resources-ai-prompts-templates-tts-speakalloy", type: "wikilink"},
+      {source: "rlay-index", target: "resources-ai-prompts-templates-tts-listen", type: "wikilink"},
+      {source: "rlay-index", target: "copilot-copilot-custom-prompts-translate-to-chinese", type: "wikilink"},
+      {source: "rlay-index", target: "copilot-copilot-custom-prompts-rewrite-as-tweet", type: "wikilink"},
+      {source: "rlay-index", target: "copilot-copilot-custom-prompts-remove-urls", type: "wikilink"},
+      {source: "rlay-index", target: "copilot-copilot-custom-prompts-make-shorter", type: "wikilink"},
+      {source: "rlay-index", target: "copilot-copilot-custom-prompts-make-longer", type: "wikilink"},
+      {source: "rlay-index", target: "copilot-copilot-custom-prompts-generate-table-of-contents", type: "wikilink"},
+      {source: "rlay-index", target: "copilot-copilot-custom-prompts-generate-glossary", type: "wikilink"},
+      {source: "rlay-index", target: "copilot-copilot-custom-prompts-fix-grammar-and-spelling", type: "wikilink"},
+      {source: "rlay-index", target: "copilot-copilot-custom-prompts-explain-like-i-am-5", type: "wikilink"},
+      {source: "rlay-index", target: "copilot-copilot-custom-prompts-emojify", type: "wikilink"},
+      {source: "rlay-index", target: "copilot-copilot-custom-prompts-clip-youtube-transcript", type: "wikilink"},
+      {source: "rlay-index", target: "copilot-copilot-custom-prompts-clip-web-page", type: "wikilink"},
+      {source: "rlay-index", target: "test-note", type: "wikilink"},
+      {source: "rlay-index", target: "untitled", type: "wikilink"},
+      {source: "templates-daily-note", target: "dashboard", type: "wikilink"},
+      {source: "templates-project-plan", target: "templates-project", type: "wikilink"},
+    ];
+
+    // ===== SET UP THE SVG CONTAINER =====
+    const width = 1400;
+    const height = 1400;
+
+    const svg = d3.select("#graph-container")
+      .append("svg")
+      .attr("width", width)
+      .attr("height", height)
+      .style("position", "absolute")
+      .style("top", 0)
+      .style("left", 0);
+
+    // Add zoom and pan capabilities
+    const zoom = d3.zoom()
+      .scaleExtent([0.15, 4])
+      .on("zoom", (event) => {
+        g.attr("transform", event.transform);
+      });
+
+    svg.call(zoom);
+
+    const g = svg.append("g");
+
+    // Create links
+    const link = g.append("g")
+      .attr("class", "links")
+      .selectAll("line")
+      .data(links)
+      .enter()
+      .append("line")
+      .attr("class", "link")
+      .style("stroke", (d) => {
+        // Color links by type
+        switch(d.type) {
+          case "wikilink": return "#00ffea";      // cyan for wikilinks
+          case "contains": return "#00ffea";
+          case "uses": return "#ff00ea";
+          case "related": return "#ffd700";
+          case "based-on": return "#88c0d0";
+          case "inspired-by": return "#b48ead";
+          case "references": return "#a3be8c";
+          default: return "rgba(0, 255, 234, 0.3)";
+        }
+      });
+
+    // Create nodes
+    const node = g.append("g")
+      .attr("class", "nodes")
+      .selectAll("g")
+      .data(nodes)
+      .enter()
+      .append("g")
+      .attr("class", "node")
+      .call(d3.drag()
+        .on("start", dragstarted)
+        .on("drag", dragged)
+        .on("end", dragended));
+
+    node.append("circle")
+      .attr("r", (d) => {
+        // Size based on category importance
+        switch(d.category) {
+          case "Projects": return 18;
+          case "Templates": return 14;
+          case "Resources": return 8;
+          case "Copilot": return 10;
+          case "Notes": return 12;
+          default: return 10;
+        }
+      })
+      .attr("class", (d) => `node-${d.category.toLowerCase()}`)
+      .on("mouseover", function(event, d) {
+        d3.select(this).transition()
+          .duration(200)
+          .attr("r", d.category === "Projects" ? 22 :
+                 d.category === "Templates" ? 18 :
+                 d.category === "Resources" ? 12 :
+                 d.category === "Copilot" ? 14 : 16);
+
+        // Show info panel
+        showInfo(d);
+      })
+      .on("mouseout", function() {
+        d3.select(this).transition()
+          .duration(200)
+          .attr("r", (d) => {
+            switch(d.category) {
+              case "Projects": return 18;
+              case "Templates": return 14;
+              case "Resources": return 8;
+              case "Copilot": return 10;
+              default: return 12;
+            }
+          });
+      })
+      .on("click", function(event, d) {
+        showInfo(d);
+      });
+
+    node.append("text")
+      .attr("dy", ".35em")
+      .text((d) => d.name)
+      .style("font-size", (d) => {
+        switch(d.category) {
+          case "Projects": return "11px";
+          case "Templates": return "10px";
+          case "Resources": return "8px";
+          case "Copilot": return "9px";
+          default: return "9px";
+        }
+      })
+      .style("text-anchor", "middle");
+
+    // Tooltip element
+    const tooltip = d3.select("#tooltip");
+
+    // Show tooltip on hover
+    node.on("mousemove", function(event, d) {
+      tooltip.style("left", (event.pageX + 15) + "px")
+             .style("top", (event.pageY - 10) + "px")
+             .html(`<strong>${d.name}</strong><br><em>${d.category}</em>`)
+             .classed("visible", true);
+    })
+    .on("mouseout", function() {
+      tooltip.classed("visible", false);
+    });
+
+    // Simulation
+    const simulation = d3.forceSimulation(nodes)
+      .force("link", d3.forceLink(links).id(d => d.id).distance(120))
+      .force("charge", d3.forceManyBody().strength(-300))
+      .force("center", d3.forceCenter(width / 2, height / 2))
+      .force("collision", d3.forceCollide(d => {
+        switch(d.category) {
+          case "Projects": return 22;
+          case "Templates": return 18;
+          case "Resources": return 14;
+          case "Copilot": return 15;
+          default: return 16;
+        }
+      }));
+
+    simulation.on("tick", () => {
+      link
+        .attr("x1", d => d.source.x)
+        .attr("y1", d => d.source.y)
+        .attr("x2", d => d.target.x)
+        .attr("y2", d => d.target.y);
+
+      node
+        .attr("transform", d => `translate(${d.x},${d.y})`);
+    });
+
+    // Drag functions
+    function dragstarted(event, d) {
+      if (!event.active) simulation.alphaTarget(0.3).restart();
+      d.fx = d.x;
+      d.fy = d.y;
+    }
+
+    function dragged(event, d) {
+      d.fx = event.x;
+      d.fy = event.y;
+    }
+
+    function dragended(event, d) {
+      if (!event.active) simulation.alphaTarget(0);
+      d.fx = null;
+      d.fy = null;
+    }
+
+    // Info panel functions
+    function showInfo(nodeData) {
+      const infoContent = document.getElementById('info-content');
+      infoContent.innerHTML = `
+        <p><strong>${nodeData.name}</strong></p>
+        <p><em>${nodeData.category}</em></p>
+        <p>Connections: ${links.filter(l => l.source === nodeData.id || l.target === nodeData.id).length}</p>
+      `;
+      document.getElementById('info-panel').style.display = 'block';
+    }
+
+    // Event listeners
+    document.getElementById('reset-btn').addEventListener('click', () => {
+      svg.transition()
+        .duration(750)
+        .call(zoom.transform, d3.zoomIdentity);
+    });
+
+    document.getElementById('info-toggle').addEventListener('click', () => {
+      const panel = document.getElementById('info-panel');
+      panel.style.display = panel.style.display === 'none' ? 'block' : 'none';
+    });
+
+    // Fit all nodes in view
+    document.getElementById('fit-btn').addEventListener('click', () => {
+      const bounds = g.node().getBBox();
+      const fullWidth = width;
+      const fullHeight = height;
+      const scale = Math.min(fullWidth / bounds.width, fullHeight / bounds.height) * 0.85;
+      const translate = [
+        (fullWidth - bounds.width * scale) / 2 - bounds.x * scale,
+        (fullHeight - bounds.height * scale) / 2 - bounds.y * scale
+      ];
+      svg.transition()
+        .duration(750)
+        .call(zoom.transform, d3.zoomIdentity.translate(translate[0], translate[1]).scale(scale));
+    });
+
+    // Export as PNG
+    document.getElementById('export-btn').addEventListener('click', () => {
+      const svgElement = document.querySelector('#graph-container svg');
+      const serializer = new XMLSerializer();
+      const svgString = serializer.serializeToString(svgElement);
+      const canvas = document.createElement('canvas');
+      const ctx = canvas.getContext('2d');
+      const img = new Image();
+      const svgBlob = new Blob([svgString], {type: 'image/svg+xml;charset=utf-8'});
+      const url = URL.createObjectURL(svgBlob);
+
+      img.onload = () => {
+        canvas.width = width * 2;
+        canvas.height = height * 2;
+        ctx.scale(2, 2);
+        ctx.drawImage(img, 0, 0);
+        URL.revokeObjectURL(url);
+
+        const link = document.createElement('a');
+        link.download = 'memory-graph.png';
+        link.href = canvas.toDataURL('image/png');
+        link.click();
+      };
+
+      img.src = url;
+    });
+
+    // Search/filter nodes
+    document.getElementById('search-box').addEventListener('input', (event) => {
+      const query = event.target.value.toLowerCase().trim();
+
+      node.style('display', (d) => {
+        if (!query) return null;
+        const matches = d.name.toLowerCase().includes(query) ||
+                       d.category.toLowerCase().includes(query);
+        return matches ? null : 'none';
+      });
+
+      link.style('display', (d) => {
+        if (!query) return null;
+        const sourceMatch = d.source.name.toLowerCase().includes(query) ||
+                           d.source.category.toLowerCase().includes(query);
+        const targetMatch = d.target.name.toLowerCase().includes(query) ||
+                           d.target.category.toLowerCase().includes(query);
+        return (sourceMatch && targetMatch) ? null : 'none';
+      });
+    });
+
+    // Close info panel when clicking outside
+    document.addEventListener('click', (event) => {
+      const panel = document.getElementById('info-panel');
+      if (panel && !panel.contains(event.target) &&
+          !event.target.closest('.node')) {
+        panel.style.display = 'none';
+      }
+    });
+  </script>
+</body>
+</html>

@@ -1,0 +1,72 @@
+{
+  "$schema": "./skin.schema.json",
+  "id": "video-background-glow",
+  "name": "Video Background + Glowing Text",
+  "description": "Premium Hermes skin with video backgrounds, glowing text, floating orbs, quantum plasma galaxy, and glassmorphism effects",
+  "version": "1.0.0",
+  "author": "Hermes Customization",
+  "preview": "./preview.png",
+  "tags": [
+    "video",
+    "background",
+    "glow",
+    "orb",
+    "glassmorphism",
+    "premium"
+  ],
+  "variables": {
+    "--bg-primary": "#0a0a0f",
+    "--bg-secondary": "#11111a",
+    "--fg-primary": "#f0f0f5",
+    "--fg-muted": "#888899",
+    "--accent-cyan": "#00ffea",
+    "--accent-magenta": "#ff00ea",
+    "--accent-gold": "#ffd700",
+    "--glass-bg": "rgba(17, 17, 26, 0.7)",
+    "--glass-border": "rgba(255, 255, 255, 0.08)",
+    "--video-bg-opacity": "0.35",
+    "--grid-opacity": "0.03",
+    "--orb-opacity": "0.4",
+    "--glow-intensity": "1"
+  },
+  "styles": [
+    "plugin://video-background-glow/plugin.js"
+  ],
+  "settings": {
+    "videoSource": {
+      "type": "string",
+      "default": "",
+      "description": "Path or URL to video background (leave empty for procedural background)"
+    },
+    "enableOrbs": {
+      "type": "boolean",
+      "default": true,
+      "description": "Enable floating animated orbs"
+    },
+    "enableGrid": {
+      "type": "boolean",
+      "default": true,
+      "description": "Enable animated grid overlay"
+    },
+    "glowIntensity": {
+      "type": "slider",
+      "min": 0.1,
+      "max": 3.0,
+      "step": 0.1,
+      "default": 1.0,
+      "description": "Glow effect intensity"
+    },
+    "mode": {
+      "type": "select",
+      "options": [
+        "video",
+        "quantum-galaxy"
+      ],
+      "default": "quantum-galaxy",
+      "description": "Visualization mode: video background or quantum plasma galaxy"
+    }
+  },
+  "dependencies": [],
+  "conflicts": [],
+  "priority": 100
+}
