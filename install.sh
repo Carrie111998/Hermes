@@ -303,9 +303,35 @@ install_mcp_servers() {
 
     if [ "$installed_any" = true ]; then
         echo
-        ok "MCP servers installed. Register them in Hermes config or run:"
-        info "  hermes mcp add semantic-memory -- ..."
-        info "  hermes mcp add agent-graph -- ..."
+        ok "MCP servers installed. Registering in Hermes config..."
+
+        # Register semantic-memory if installed
+        if [ "$WITH_SEMANTIC_MEMORY" = true ]; then
+            if [ "$USE_VENV" = true ]; then
+                "$INSTALL_DIR/.venv/bin/hermes" config set mcp_servers.semantic_memory.command "$HOME/.local/bin/semantic-memory-mcp" 2>/dev/null
+                "$INSTALL_DIR/.venv/bin/hermes" config set mcp_servers.semantic_memory.enabled true 2>/dev/null
+            else
+                hermes config set mcp_servers.semantic_memory.command "$HOME/.local/bin/semantic-memory-mcp" 2>/dev/null
+                hermes config set mcp_servers.semantic_memory.enabled true 2>/dev/null
+            fi
+            ok "semantic-memory registered"
+        fi
+
+        # Register agent-graph if installed
+        if [ "$WITH_AGENT_GRAPH" = true ]; then
+            if [ "$USE_VENV" = true ]; then
+                "$INSTALL_DIR/.venv/bin/hermes" config set mcp_servers.agent_graph.command "$HOME/.local/bin/agent-graph-mcp" 2>/dev/null
+                "$INSTALL_DIR/.venv/bin/hermes" config set mcp_servers.agent_graph.enabled true 2>/dev/null
+            else
+                hermes config set mcp_servers.agent_graph.command "$HOME/.local/bin/agent-graph-mcp" 2>/dev/null
+                hermes config set mcp_servers.agent_graph.enabled true 2>/dev/null
+            fi
+            ok "agent-graph registered"
+        fi
+
+        echo
+        info "MCP servers will be available after restarting Hermes."
+        info "Agent hooks auto-discover from ~/.hermes/agent-hooks/ — no config needed."
     fi
 }
 
@@ -375,13 +401,15 @@ install_josh_setup() {
     echo -e "  ${BOLD}What you get:${NC}"
     echo    "    • 70+ skills — READMEs, code review, GPU benchmarking, email, etc."
     echo    "    • 12 agent hooks — memory recall, context compaction, telemetry"
-    echo    "    • semantic-memory MCP server — knowledge base + search"
-    echo    "    • agent-graph MCP server — multi-agent graph orchestration"
+    echo    "    • semantic-memory MCP server — knowledge base + search (auto-registered)"
+    echo    "    • agent-graph MCP server — multi-agent graphs (auto-registered)"
+    echo    "    • Built-in memory disabled — semantic-memory replaces it"
     echo
     echo -e "  ${BOLD}What you still need to provide:${NC}"
     echo    "    • LLM provider API key (set OPENAI_API_KEY)"
-    echo    "    • Start agent-graph daemon: agent-graph-mcpd --model <your-model>"
-    echo    "    • Run 'hermes setup' to configure your providers"
+    echo    "    • Start agent-graph daemon: agent-graph-mcpd --base-url <url> --model <model> &"
+    echo    "    • Start semantic-memory daemon if using persistent mode"
+    echo    "    • Run 'hermes setup' to configure your LLM providers"
     echo
 }
 
@@ -399,6 +427,39 @@ configure_ri_defaults() {
         hermes config set context.engine ri-context-governor 2>/dev/null || true
     fi
     ok "Context engine: ri-context-governor"
+
+    # If semantic-memory was installed, disable built-in memory and configure MCP
+    if [ "$WITH_SEMANTIC_MEMORY" = true ] || [ "$WITH_AGENT_GRAPH" = true ]; then
+        step "Configuring MCP servers..."
+        local py
+        if [ "$USE_VENV" = true ] && [ -f "$INSTALL_DIR/.venv/bin/python" ]; then
+            py="$INSTALL_DIR/.venv/bin/python"
+        else
+            py="python3"
+        fi
+        "$py" -c "
+import yaml, os
+cfg_path = os.path.expanduser('$HERMES_HOME/config.yaml')
+with open(cfg_path) as f:
+    cfg = yaml.safe_load(f) or {}
+
+# Disable built-in memory if semantic-memory is installed
+if '${WITH_SEMANTIC_MEMORY}' == 'true':
+    cfg.setdefault('agent', {})
+    disabled = cfg['agent'].setdefault('disabled_toolsets', [])
+    if 'memory' not in disabled:
+        disabled.append('memory')
+
+# Set agent-graph socket args if installed
+if '${WITH_AGENT_GRAPH}' == 'true':
+    cfg.setdefault('mcp_servers', {})
+    ag = cfg['mcp_servers'].setdefault('agent_graph', {})
+    ag.setdefault('args', ['--socket', '/tmp/agent-graph/mcp.sock'])
+
+with open(cfg_path, 'w') as f:
+    yaml.safe_dump(cfg, f, default_flow_style=False)
+" 2>/dev/null && ok "MCP config written" || warn "Could not write MCP config — configure mcp_servers manually"
+    fi
 }
 
 # ── Setup wizard ────────────────────────────────────────────────────
@@ -437,13 +498,9 @@ print_next_steps() {
     echo
 
     if [ "$WITH_SEMANTIC_MEMORY" = true ] || [ "$WITH_AGENT_GRAPH" = true ]; then
-        echo -e "  ${BOLD}MCP servers installed:${NC}"
-        [ "$WITH_SEMANTIC_MEMORY" = true ] && echo "    semantic-memory → knowledge base + memory search"
+        echo -e "  ${BOLD}MCP servers installed + registered:${NC}"
+        [ "$WITH_SEMANTIC_MEMORY" = true ] && echo "    semantic-memory → knowledge base + memory search (built-in memory disabled)"
         [ "$WITH_AGENT_GRAPH" = true ] && echo "    agent-graph     → multi-agent graph orchestration (daemon: agent-graph-mcpd)"
-        echo
-        echo -e "  ${BOLD}Register in Hermes:${NC}"
-        echo    "    hermes mcp add semantic-memory -- ~/.local/bin/semantic-memory-mcp"
-        echo    "    hermes mcp add agent-graph -- ~/.local/bin/agent-graph-mcp --socket /tmp/agent-graph/mcp.sock"
         echo
     fi
 
