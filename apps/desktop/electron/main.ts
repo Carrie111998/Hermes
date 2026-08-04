@@ -5177,7 +5177,7 @@ function installContextMenu(window) {
 // 'media'/'audioCapture' permission AND mediaTypes either includes 'audio' OR
 // is empty/absent (the Windows case). Video is still denied.
 function isAudioCapturePermission(permission, details) {
-  if (permission === 'audioCapture') {
+  if (isMediaCapturePermission(permission, details)) {
     return true
   }
 
@@ -5207,7 +5207,7 @@ function installMediaPermissions() {
   // the check defaults to false and the mic is denied before the request
   // handler ever runs.
   session.defaultSession.setPermissionCheckHandler((_webContents, permission, _origin, details) => {
-    if (permission === 'media' || permission === ('audioCapture' as any) /* todo: is this needed? */) {
+    if (permission === 'media' || isMediaCapturePermission(permission, details)) {
       // details.mediaType is a single string here (not the mediaTypes array).
       const mediaType = details?.mediaType
 
