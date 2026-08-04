@@ -257,6 +257,37 @@ class TestBridgeDispatch:
         assert "remain available" in result["hint"]
         assert "before concluding" in result["hint"]
 
+    @pytest.mark.parametrize(
+        "name",
+        ["terminal", "mcp__notes__command_execute"],
+    )
+    def test_tool_describe_recovers_visible_eager_tool(self, name):
+        from tools.tool_search import (
+            dispatch_tool_describe,
+            is_deferrable_tool_name,
+        )
+
+        result = dispatch_tool_describe(
+            {"name": name},
+            current_tool_defs=[_td(name, "Visible session tool")],
+        )
+
+        assert not is_deferrable_tool_name(name)
+        payload = json.loads(result)
+        assert payload["name"] == name
+        assert payload["invocation"] == "direct"
+        assert f"Call '{name}' directly" in payload["hint"]
+
+    def test_tool_describe_rejects_unavailable_eager_tool(self):
+        from tools.tool_search import dispatch_tool_describe
+
+        result = dispatch_tool_describe(
+            {"name": "terminal"},
+            current_tool_defs=[_td("web_search", "Search the web")],
+        )
+
+        assert "error" in json.loads(result)
+
 
     def test_resolve_underlying_call_parses_object_args(self):
         from tools.tool_search import resolve_underlying_call
@@ -296,6 +327,66 @@ class TestHandleFunctionCallIntegration:
         # Without a real registry, the matches will be empty, but the
         # dispatch path completed without error.
         assert "matches" in parsed or "error" in parsed
+
+    @pytest.mark.parametrize(
+        ("name", "arguments"),
+        [
+            ("terminal", {"command": "echo recovered"}),
+            ("mcp__notes__command_execute", {"command": "open_daily_note"}),
+        ],
+    )
+    def test_tool_call_dispatches_visible_eager_tool(
+        self, monkeypatch, name, arguments
+    ):
+        import model_tools
+        from tools.tool_search import is_deferrable_tool_name
+
+        monkeypatch.setattr(
+            model_tools,
+            "get_tool_definitions",
+            lambda **_kw: [_td(name, "Visible session tool")],
+        )
+        seen = {}
+
+        def dispatch(name, args, **_kw):
+            seen.update(name=name, args=args)
+            return json.dumps({"ok": True})
+
+        monkeypatch.setattr(model_tools.registry, "dispatch", dispatch)
+
+        result = model_tools.handle_function_call(
+            function_name="tool_call",
+            function_args={
+                "name": name,
+                "arguments": arguments,
+            },
+        )
+
+        assert not is_deferrable_tool_name(name)
+        assert json.loads(result) == {"ok": True}
+        assert seen == {
+            "name": name,
+            "args": arguments,
+        }
+
+    def test_tool_call_rejects_out_of_scope_eager_tool(self, monkeypatch):
+        import model_tools
+
+        monkeypatch.setattr(
+            model_tools,
+            "get_tool_definitions",
+            lambda **_kw: [_td("web_search", "Search the web")],
+        )
+
+        result = model_tools.handle_function_call(
+            function_name="tool_call",
+            function_args={
+                "name": "mcp__notes__command_execute",
+                "arguments": {"command": "should_not_run"},
+            },
+        )
+
+        assert "not available in this session" in json.loads(result)["error"]
 
 
 class TestRegression_OpenClawCron84141:
