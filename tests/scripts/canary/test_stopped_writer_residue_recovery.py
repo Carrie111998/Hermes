@@ -267,6 +267,7 @@ def recovery_tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, 
     writer_path = staging_root / "writer.json"
     gateway_path = staging_root / "gateway.yaml"
     native_plan_path = staging_root / "native-observation-plan.json"
+    installed_native_plan_path = activation_root / "native-observation-plan.json"
     writer_unit_path = staging_root / "muncho-canonical-writer.service"
     phase_b_unit_path = (
         staging_root / "muncho-canonical-writer-phase-b-readiness.service"
@@ -318,6 +319,11 @@ def recovery_tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, 
     )
     monkeypatch.setattr(
         recovery,
+        "DEFAULT_INSTALLED_NATIVE_PLAN_PATH",
+        installed_native_plan_path,
+    )
+    monkeypatch.setattr(
+        recovery,
         "DEFAULT_STAGED_WRITER_UNIT_PATH",
         writer_unit_path,
     )
@@ -339,6 +345,7 @@ def recovery_tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, 
             writer_path,
             gateway_path,
             native_plan_path,
+            installed_native_plan_path,
             foreign_path,
             writer_unit_path,
             phase_b_unit_path,
@@ -397,6 +404,7 @@ def recovery_tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, 
         "writer_raw": writer_raw,
         "gateway_raw": gateway_raw,
         "native_plan_path": native_plan_path,
+        "installed_native_plan_path": installed_native_plan_path,
         "writer_unit_path": writer_unit_path,
         "phase_b_unit_path": phase_b_unit_path,
         "gateway_unit_path": gateway_unit_path,
@@ -578,6 +586,140 @@ def test_apply_quarantines_complete_preflight_bundle_without_deleting_artifacts(
         assert (archive / path.name).read_bytes() == raw
     assert receipt["staged_artifacts"] == plan["staged_artifacts"]
     assert receipt["staged_artifacts_deleted"] is False
+
+
+def _write_complete_bundle_with_installed_native(
+    recovery_tree: dict[str, Any],
+) -> tuple[dict[Path, bytes], bytes]:
+    writer_unit = b"[Service]\nExecStart=/writer\n"
+    gateway_unit = b"[Service]\nExecStart=/gateway\n"
+    native_plan = _native_plan_mapping(
+        writer_sha256=_sha256(recovery_tree["writer_raw"]),
+        gateway_sha256=_sha256(recovery_tree["gateway_raw"]),
+        writer_unit_sha256=_sha256(writer_unit),
+        gateway_unit_sha256=_sha256(gateway_unit),
+    )
+    native_raw = recovery._canonical_bytes(native_plan)
+    phase_b_unit = recovery.render_phase_b_readiness_service(
+        revision=SOURCE_REVISION,
+        artifact_root=f"/opt/muncho-canary-releases/{SOURCE_REVISION}",
+        artifact_sha256="d" * 64,
+    ).encode()
+    extras = {
+        recovery_tree["native_plan_path"]: native_raw,
+        recovery_tree["writer_unit_path"]: writer_unit,
+        recovery_tree["phase_b_unit_path"]: phase_b_unit,
+        recovery_tree["gateway_unit_path"]: gateway_unit,
+    }
+    for path, raw in extras.items():
+        path.write_bytes(raw)
+    recovery_tree["installed_native_plan_path"].write_bytes(native_raw)
+    return extras, native_raw
+
+
+def test_apply_archives_identical_installed_native_plan_crash_safely(
+    recovery_tree: dict[str, Any],
+) -> None:
+    extras, native_raw = _write_complete_bundle_with_installed_native(recovery_tree)
+
+    plan = recovery.plan_stopped_writer_residue_recovery(TARGET_REVISION)
+
+    assert plan["schema"] == recovery.INSTALLED_NATIVE_PLAN_SCHEMA
+    installed = plan["installed_native_observation_plan"]
+    assert installed == {
+        "source_path": str(recovery_tree["installed_native_plan_path"]),
+        "sha256": _sha256(native_raw),
+        "archive_path": str(
+            recovery._installed_native_archive_path(
+                TARGET_REVISION,
+                SOURCE_REVISION,
+                COLLECTOR_SHA256,
+            )
+        ),
+    }
+
+    receipt = recovery.apply_stopped_writer_residue_recovery(
+        TARGET_REVISION,
+        plan["plan_sha256"],
+        clock=lambda: 890,
+        lifecycle_lock=contextlib.nullcontext,
+    )
+
+    archive = Path(plan["archive_path"])
+    installed_archive = Path(installed["archive_path"])
+    assert not recovery_tree["staging_root"].exists()
+    assert not recovery_tree["installed_native_plan_path"].exists()
+    assert installed_archive.read_bytes() == native_raw
+    for path, raw in extras.items():
+        assert (archive / path.name).read_bytes() == raw
+    assert receipt["schema"] == recovery.INSTALLED_NATIVE_RECEIPT_SCHEMA
+    assert receipt["installed_native_observation_plan"] == installed
+    assert receipt["installed_native_observation_plan_archived"] is True
+    assert receipt["installed_native_observation_plan_deleted"] is False
+
+    repeated = recovery.apply_stopped_writer_residue_recovery(
+        TARGET_REVISION,
+        plan["plan_sha256"],
+        clock=lambda: 999,
+        lifecycle_lock=contextlib.nullcontext,
+    )
+    assert repeated == receipt
+
+
+def test_apply_resumes_after_installed_native_plan_rename(
+    recovery_tree: dict[str, Any],
+) -> None:
+    _extras, native_raw = _write_complete_bundle_with_installed_native(recovery_tree)
+    plan = recovery.plan_stopped_writer_residue_recovery(TARGET_REVISION)
+    recovery_tree["recovery_root"].mkdir()
+    recovery._write_intent(plan)
+    installed = plan["installed_native_observation_plan"]
+    os.rename(
+        recovery_tree["installed_native_plan_path"],
+        Path(installed["archive_path"]),
+    )
+
+    receipt = recovery.apply_stopped_writer_residue_recovery(
+        TARGET_REVISION,
+        plan["plan_sha256"],
+        clock=lambda: 901,
+        lifecycle_lock=contextlib.nullcontext,
+    )
+
+    assert receipt["created_at_unix"] == 901
+    assert Path(installed["archive_path"]).read_bytes() == native_raw
+    assert Path(plan["archive_path"]).is_dir()
+
+
+def test_apply_resumes_after_staging_rename_with_installed_plan_still_live(
+    recovery_tree: dict[str, Any],
+) -> None:
+    _write_complete_bundle_with_installed_native(recovery_tree)
+    plan = recovery.plan_stopped_writer_residue_recovery(TARGET_REVISION)
+    recovery_tree["recovery_root"].mkdir()
+    recovery._write_intent(plan)
+    os.rename(recovery_tree["staging_root"], Path(plan["archive_path"]))
+
+    receipt = recovery.apply_stopped_writer_residue_recovery(
+        TARGET_REVISION,
+        plan["plan_sha256"],
+        clock=lambda: 902,
+        lifecycle_lock=contextlib.nullcontext,
+    )
+
+    assert receipt["created_at_unix"] == 902
+    assert not recovery_tree["installed_native_plan_path"].exists()
+    assert Path(plan["installed_native_observation_plan"]["archive_path"]).is_file()
+
+
+def test_plan_rejects_installed_native_plan_that_differs_from_staging(
+    recovery_tree: dict[str, Any],
+) -> None:
+    _write_complete_bundle_with_installed_native(recovery_tree)
+    recovery_tree["installed_native_plan_path"].write_bytes(b"{}")
+
+    with pytest.raises(ValueError, match="native observation plan is invalid"):
+        recovery.plan_stopped_writer_residue_recovery(TARGET_REVISION)
 
 
 def test_plan_rejects_unbound_complete_preflight_bundle(
