@@ -33,7 +33,7 @@ def _codex_switch_result():
 
     return ModelSwitchResult(
         success=True,
-        new_model="gpt-5.5",
+        new_model="gpt-5.6-sol",
         target_provider="openai-codex",
         provider_changed=True,
         api_key="codex-token",
@@ -50,7 +50,7 @@ async def test_session_model_switch_does_not_reuse_global_context_override(tmp_p
 
     The profile can be globally configured for a different 1M-token model.
     Before the fix, the confirmation message reused that stale global
-    ``model.context_length`` and claimed Codex gpt-5.5 had 1,000,000 tokens.
+    ``model.context_length`` and claimed Codex gpt-5.6-sol had 1,000,000 tokens.
     """
     import gateway.run as gateway_run
 
@@ -76,9 +76,9 @@ async def test_session_model_switch_does_not_reuse_global_context_override(tmp_p
     monkeypatch.setattr("hermes_cli.model_switch.switch_model", lambda **kw: _codex_switch_result())
     monkeypatch.setattr("hermes_cli.model_cost_guard.expensive_model_warning", lambda *a, **kw: None)
 
-    result = await _make_runner()._handle_model_command(_make_event("/model gpt-5.5 --provider openai-codex --session"))
+    result = await _make_runner()._handle_model_command(_make_event("/model gpt-5.6-sol --provider openai-codex --session"))
 
     assert result is not None
-    assert "gpt-5.5" in result
+    assert "gpt-5.6-sol" in result
     assert "272,000" in result
     assert "1,000,000" not in result
