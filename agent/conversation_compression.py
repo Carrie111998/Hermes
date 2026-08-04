@@ -1924,7 +1924,14 @@ def is_real_user_message(message: Any) -> bool:
         ContextCompressor._has_compressed_summary_metadata(message)
         or ContextCompressor._is_context_summary_content(content)
     ):
-        return False
+        # A compaction handoff can share a user-role carrier with protected
+        # tail content. Strip only the summary envelope and classify the
+        # preserved portion recursively; a standalone summary unwraps to
+        # ``None`` and remains internal.
+        unwrapped = ContextCompressor._strip_context_summary_handoff_message(
+            dict(message)
+        )
+        return bool(unwrapped) and is_real_user_message(unwrapped)
     if has_non_text_content(content):
         return True
 

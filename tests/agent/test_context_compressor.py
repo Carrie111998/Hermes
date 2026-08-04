@@ -501,6 +501,51 @@ class TestNonStringContent:
         ]
         assert c._latest_user_task_snapshot(only_synthetic) is None
 
+    def test_auto_focus_skips_all_shared_internal_user_scaffolding(self):
+        from agent.message_content import OUTPUT_LIMIT_CONTINUATION_REQUEST
+
+        messages = [
+            {"role": "user", "content": "fix the login bug on prod"},
+            {"role": "assistant", "content": "on it"},
+            {"role": "user", "content": OUTPUT_LIMIT_CONTINUATION_REQUEST},
+        ]
+
+        focus = ContextCompressor._derive_auto_focus_topic(messages)
+        assert focus is not None
+        assert "fix the login bug on prod" in focus
+        assert OUTPUT_LIMIT_CONTINUATION_REQUEST not in focus
+        assert (
+            ContextCompressor._derive_auto_focus_topic(
+                [{"role": "user", "content": OUTPUT_LIMIT_CONTINUATION_REQUEST}]
+            )
+            is None
+        )
+
+    def test_fallback_summary_labels_internal_rows_without_user_attribution(self):
+        from agent.context_compressor import _NO_USER_TASK_SENTINEL
+        from agent.message_content import OUTPUT_LIMIT_CONTINUATION_REQUEST
+
+        with patch(
+            "agent.context_compressor.get_model_context_length", return_value=100000
+        ):
+            c = ContextCompressor(model="test", quiet_mode=True)
+
+        messages = [
+            {"role": "user", "content": "fix the login bug on prod"},
+            {"role": "assistant", "content": "on it"},
+            {"role": "user", "content": OUTPUT_LIMIT_CONTINUATION_REQUEST},
+        ]
+        summary = c._build_static_fallback_summary(messages)
+        assert "User asked: 'fix the login bug on prod'" in summary
+        assert f"INTERNAL CONTEXT: {OUTPUT_LIMIT_CONTINUATION_REQUEST}" in summary
+        assert f"User asked: {OUTPUT_LIMIT_CONTINUATION_REQUEST!r}" not in summary
+
+        internal_only = c._build_static_fallback_summary(
+            [{"role": "user", "content": OUTPUT_LIMIT_CONTINUATION_REQUEST}]
+        )
+        assert _NO_USER_TASK_SENTINEL in internal_only
+        assert f"User asked: {OUTPUT_LIMIT_CONTINUATION_REQUEST!r}" not in internal_only
+
     def test_grounding_preserves_following_sections_across_regrounding(self):
         """The snapshot rewrite must keep later headings intact — twice.
 

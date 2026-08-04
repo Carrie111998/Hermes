@@ -651,11 +651,10 @@ async def test_heavy_first_exchange_auto_title_persists_and_renames_bound_topic(
     runner = _make_runner(session_db=db)
     runner._gateway_loop = asyncio.get_running_loop()
     monkeypatch.setattr(title_generator, "_auto_title_enabled", lambda: True)
-    monkeypatch.setattr(
-        title_generator,
-        "generate_title",
-        lambda *_args, **_kwargs: "Heavy First Turn",
-    )
+    monkeypatch.setattr(title_generator, "_title_language", lambda: "")
+    title_response = MagicMock()
+    title_response.choices[0].message.content = "  Heavy First Turn  "
+    monkeypatch.setattr(title_generator, "call_llm", lambda **_kwargs: title_response)
 
     rename_done = threading.Event()
 

@@ -51,13 +51,21 @@ class CaptureAdapter(BasePlatformAdapter):
 
 class CaptureQueuedNativeImageAgent:
     calls = []
+    display_kinds = []
 
     def __init__(self, **kwargs):
         self.tools = []
         self.tool_progress_callback = kwargs.get("tool_progress_callback")
 
-    def run_conversation(self, message, conversation_history=None, task_id=None):
+    def run_conversation(
+        self,
+        message,
+        conversation_history=None,
+        task_id=None,
+        persist_user_display_kind=None,
+    ):
         type(self).calls.append(message)
+        type(self).display_kinds.append(persist_user_display_kind)
         return {
             "final_response": f"done-{len(type(self).calls)}",
             "messages": [],
@@ -93,6 +101,7 @@ def _make_runner(adapter):
 @pytest.mark.asyncio
 async def test_queued_followup_uses_pending_event_session_key_for_native_images(monkeypatch, tmp_path):
     CaptureQueuedNativeImageAgent.calls = []
+    CaptureQueuedNativeImageAgent.display_kinds = []
 
     fake_dotenv = types.ModuleType("dotenv")
     fake_dotenv.load_dotenv = lambda *args, **kwargs: None
@@ -149,3 +158,52 @@ async def test_queued_followup_uses_pending_event_session_key_for_native_images(
     assert queued_message[0]["type"] == "text"
     assert queued_message[0]["text"].startswith("describe this")
     assert any(part.get("type") == "image_url" for part in queued_message)
+    assert CaptureQueuedNativeImageAgent.display_kinds == [None, None]
+
+
+@pytest.mark.asyncio
+async def test_queued_internal_followup_propagates_hidden_display_kind(
+    monkeypatch, tmp_path
+):
+    CaptureQueuedNativeImageAgent.calls = []
+    CaptureQueuedNativeImageAgent.display_kinds = []
+
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = CaptureQueuedNativeImageAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(
+        gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"}
+    )
+
+    adapter = CaptureAdapter()
+    runner = _make_runner(adapter)
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_type="group",
+    )
+    adapter._pending_messages["agent:main:telegram:group:-1001"] = MessageEvent(
+        text="generic internal completion",
+        message_type=MessageType.TEXT,
+        source=source,
+        internal=True,
+    )
+
+    result = await runner._run_agent(
+        message="hello",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-internal-followup",
+        session_key="agent:main:telegram:group:-1001",
+    )
+
+    assert result["final_response"] == "done-2"
+    assert CaptureQueuedNativeImageAgent.display_kinds == [None, "hidden"]

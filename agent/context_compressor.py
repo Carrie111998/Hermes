@@ -3267,13 +3267,18 @@ class ContextCompressor(ContextEngine):
                             parsed = args
                         _collect_paths_from_jsonish(parsed)
 
+        from agent.conversation_compression import is_real_user_message
+
         for msg in turns_to_summarize:
             role = msg.get("role", "unknown")
-            text = _compact_fallback_turn(msg.get("content"))
+            synthetic_user = role == "user" and not is_real_user_message(msg)
+            content_message = msg
+            if role == "user" and not synthetic_user:
+                content_message = (
+                    self._strip_context_summary_handoff_message(msg) or msg
+                )
+            text = _compact_fallback_turn(content_message.get("content"))
             _collect_path_mentions(text, relevant_files)
-            synthetic_user = (
-                role == "user" and self._is_synthetic_compression_user_turn(msg)
-            )
 
             turn_text = text
             turn_tool_names: list[str] = []
@@ -4285,14 +4290,15 @@ This compaction should PRIORITISE preserving all information related to the focu
         messages: List[Dict[str, Any]],
     ) -> Optional[str]:
         """Infer a compact focus hint from the most recent real user turns."""
+        from agent.conversation_compression import is_real_user_message
+
         candidates: list[str] = []
         for idx in range(len(messages) - 1, -1, -1):
             msg = messages[idx]
-            if msg.get("role") != "user":
+            if not is_real_user_message(msg):
                 continue
-            if cls._is_synthetic_compression_user_turn(msg):
-                continue
-            content = msg.get("content")
+            content_message = cls._strip_context_summary_handoff_message(msg) or msg
+            content = content_message.get("content")
             text = _redact_compaction_text(_content_text_for_contains(content).strip())
             if not text:
                 continue
@@ -4329,14 +4335,15 @@ This compaction should PRIORITISE preserving all information related to the focu
         # snapshot can never anchor on user-role scaffolding (todo
         # snapshots, truncation notices, background-process reports) —
         # the exact class of turn this grounding exists to bypass.
-        from agent.conversation_compression import _is_real_user_message
+        from agent.conversation_compression import is_real_user_message
 
         for msg in reversed(messages):
             if msg.get("role") != "user":
                 continue
-            if not _is_real_user_message(msg):
+            if not is_real_user_message(msg):
                 continue
-            content = msg.get("content")
+            content_message = cls._strip_context_summary_handoff_message(msg) or msg
+            content = content_message.get("content")
             text = _redact_compaction_text(_content_text_for_contains(content).strip())
             if not text:
                 continue

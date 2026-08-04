@@ -2,7 +2,13 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from agent.message_content import flatten_message_text, has_non_text_content
+from agent.message_content import (
+    build_cli_handoff_notice,
+    build_resume_recovery_note,
+    flatten_message_text,
+    has_non_text_content,
+    is_internal_user_scaffolding_text,
+)
 from tools.todo_tool import TODO_INJECTION_HEADER
 
 
@@ -60,3 +66,66 @@ def test_media_with_todo_text_keeps_structured_provenance():
 
     assert has_non_text_content(content)
     assert flatten_message_text(content) == todo
+
+
+def test_goal_continuations_match_only_complete_runtime_messages():
+    from hermes_cli.goals import (
+        CONTINUATION_PROMPT_TEMPLATE,
+        CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE,
+        CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE,
+    )
+
+    prompts = [
+        CONTINUATION_PROMPT_TEMPLATE.format(goal="Ship the title fix"),
+        CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE.format(
+            goal="Ship the title fix",
+            contract_block="Outcome: fixed\nVerification: focused tests pass",
+        ),
+        CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE.format(
+            goal="Ship the title fix",
+            subgoals_block="1. Preserve media provenance",
+        ),
+    ]
+
+    for prompt in prompts:
+        assert is_internal_user_scaffolding_text(prompt)
+        assert not is_internal_user_scaffolding_text(
+            f"Why did Hermes send this?\n{prompt}"
+        )
+        assert not is_internal_user_scaffolding_text(
+            f"{prompt}\nPlease explain that message."
+        )
+
+
+def test_pure_resume_recovery_notes_are_internal_but_new_human_text_is_not():
+    for reason in ("restart_timeout", "shutdown_timeout", "other"):
+        for interactive in (True, False):
+            note = build_resume_recovery_note(reason, "", interactive=interactive)
+            assert is_internal_user_scaffolding_text(note)
+            assert not is_internal_user_scaffolding_text(
+                f"Please explain this note:\n{note}"
+            )
+
+            note_with_human_message = build_resume_recovery_note(
+                reason,
+                "Please review the new failure",
+                interactive=interactive,
+            )
+            assert not is_internal_user_scaffolding_text(note_with_human_message)
+
+
+def test_cli_handoff_notice_matches_only_the_complete_runtime_envelope():
+    notice = build_cli_handoff_notice("Title repair")
+
+    assert is_internal_user_scaffolding_text(notice)
+    assert not is_internal_user_scaffolding_text(
+        f"Why did Hermes send this?\n{notice}"
+    )
+    assert not is_internal_user_scaffolding_text(
+        f"{notice}\nPlease explain the handoff."
+    )
+    assert not is_internal_user_scaffolding_text(build_cli_handoff_notice(""))
+    assert not is_internal_user_scaffolding_text(build_cli_handoff_notice("   "))
+    assert not is_internal_user_scaffolding_text(
+        build_cli_handoff_notice("Title\nrepair")
+    )

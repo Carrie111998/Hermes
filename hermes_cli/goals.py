@@ -114,6 +114,47 @@ CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE = (
 )
 
 
+def _continuation_prompt_pattern(template: str, *fields: str) -> re.Pattern[str]:
+    """Compile a full-envelope matcher for a rendered continuation template."""
+
+    pattern = re.escape(template)
+    for field_name in fields:
+        token = re.escape("{" + field_name + "}")
+        pattern = pattern.replace(token, rf"(?P<{field_name}>.+?)")
+    return re.compile(rf"\A{pattern}\Z", re.DOTALL)
+
+
+_CONTINUATION_PROMPT_PATTERNS = (
+    _continuation_prompt_pattern(CONTINUATION_PROMPT_TEMPLATE, "goal"),
+    _continuation_prompt_pattern(
+        CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE,
+        "goal",
+        "contract_block",
+    ),
+    _continuation_prompt_pattern(
+        CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE,
+        "goal",
+        "subgoals_block",
+    ),
+)
+
+
+def is_goal_continuation_prompt(text: str) -> bool:
+    """Return whether *text* is one exact runtime-generated goal continuation.
+
+    The full template envelope is required. Human prose that merely quotes or
+    discusses one of these prompts therefore remains genuine user input.
+    """
+
+    if not isinstance(text, str) or not text:
+        return False
+    for pattern in _CONTINUATION_PROMPT_PATTERNS:
+        match = pattern.fullmatch(text)
+        if match and all(value.strip() for value in match.groupdict().values()):
+            return True
+    return False
+
+
 JUDGE_SYSTEM_PROMPT = (
     "You are a strict judge evaluating whether an autonomous agent has "
     "achieved a user's stated goal. You receive the goal text, the agent's "
@@ -1791,6 +1832,7 @@ __all__ = [
     "CONTINUATION_PROMPT_TEMPLATE",
     "CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE",
     "CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE",
+    "is_goal_continuation_prompt",
     "JUDGE_USER_PROMPT_TEMPLATE",
     "JUDGE_USER_PROMPT_WITH_SUBGOALS_TEMPLATE",
     "JUDGE_USER_PROMPT_WITH_CONTRACT_TEMPLATE",

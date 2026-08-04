@@ -13,6 +13,8 @@ from agent.context_compressor import SUMMARY_PREFIX
 from agent.message_content import (
     EXACT_INTERNAL_USER_REQUESTS,
     MAX_ITERATIONS_SUMMARY_REQUEST,
+    build_cli_handoff_notice,
+    build_resume_recovery_note,
     build_tool_call_stream_continuation_request,
 )
 from hermes_state import SessionDB
@@ -243,6 +245,75 @@ class TestRealUserMessageClassification:
             structured,
         ):
             assert not is_real_user_message(message)
+
+    def test_merged_compaction_carriers_preserve_genuine_user_provenance(self):
+        from agent.context_compressor import (
+            COMPRESSED_SUMMARY_METADATA_KEY,
+            _MERGED_PRIOR_CONTEXT_HEADER,
+            _MERGED_SUMMARY_DELIMITER,
+            _SUMMARY_END_MARKER,
+        )
+        from agent.conversation_compression import is_real_user_message
+
+        forced_user_leading = {
+            "role": "user",
+            "content": (
+                f"{SUMMARY_PREFIX}\nCompacted work so far.\n\n"
+                f"{_SUMMARY_END_MARKER}\n\nPlease finish the title fix"
+            ),
+            COMPRESSED_SUMMARY_METADATA_KEY: True,
+        }
+        merged_into_tail = {
+            "role": "user",
+            "content": (
+                f"{_MERGED_PRIOR_CONTEXT_HEADER}\nPlease finish the title fix\n\n"
+                f"{_MERGED_SUMMARY_DELIMITER}\n\n"
+                f"{SUMMARY_PREFIX}\nCompacted work so far."
+            ),
+            COMPRESSED_SUMMARY_METADATA_KEY: True,
+        }
+        media_tail = {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": f"{_MERGED_PRIOR_CONTEXT_HEADER}\n"},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "https://example.test/diagram.png"},
+                },
+                {
+                    "type": "text",
+                    "text": (
+                        f"{_MERGED_SUMMARY_DELIMITER}\n\n"
+                        f"{SUMMARY_PREFIX}\nCompacted work so far."
+                    ),
+                },
+            ],
+            COMPRESSED_SUMMARY_METADATA_KEY: True,
+        }
+
+        assert is_real_user_message(forced_user_leading)
+        assert is_real_user_message(merged_into_tail)
+        assert is_real_user_message(media_tail)
+
+    def test_merged_compaction_carrier_with_only_internal_tail_stays_internal(self):
+        from agent.context_compressor import (
+            COMPRESSED_SUMMARY_METADATA_KEY,
+            _MERGED_PRIOR_CONTEXT_HEADER,
+            _MERGED_SUMMARY_DELIMITER,
+        )
+        from agent.conversation_compression import is_real_user_message
+
+        message = {
+            "role": "user",
+            "content": (
+                f"{_MERGED_PRIOR_CONTEXT_HEADER}\n{TODO_INJECTION_HEADER}\n- [>] Continue\n\n"
+                f"{_MERGED_SUMMARY_DELIMITER}\n\n"
+                f"{SUMMARY_PREFIX}\nCompacted work so far."
+            ),
+            COMPRESSED_SUMMARY_METADATA_KEY: True,
+        }
+
+        assert not is_real_user_message(message)
 
     def test_todo_and_compression_continuation_rows_are_internal(self):
         from collections import UserDict
@@ -789,6 +860,119 @@ class TestMaybeAutoTitle:
                 MAX_ITERATIONS_SUMMARY_REQUEST,
                 "notification handled",
                 history,
+            )
+
+        thread_cls.assert_not_called()
+
+    def test_internal_current_trigger_never_starts_a_title_thread(self):
+        from tools.process_registry import format_process_notification
+
+        notifications = [
+            format_process_notification(
+                {
+                    "type": "async_delegation",
+                    "delegation_id": "deleg-current",
+                    "goal": "Inspect the title gate",
+                    "status": "completed",
+                    "summary": "The gate counted synthetic rows.",
+                }
+            ),
+            format_process_notification(
+                {
+                    "type": "completion",
+                    "session_id": "proc-current",
+                    "command": "run focused tests",
+                    "exit_code": 0,
+                    "output": "passed",
+                }
+            ),
+        ]
+
+        with patch("agent.title_generator.threading.Thread") as thread_cls:
+            for notification in notifications:
+                history = [
+                    {"role": "user", "content": "Fix the title gate"},
+                    {"role": "assistant", "content": "I started the work."},
+                    {"role": "user", "content": notification},
+                    {"role": "assistant", "content": "The background work finished."},
+                ]
+                maybe_auto_title(
+                    MagicMock(),
+                    "sess-current-internal",
+                    notification,
+                    "The background work finished.",
+                    history,
+                )
+
+        thread_cls.assert_not_called()
+
+    def test_goal_recovery_and_handoff_current_triggers_never_start_a_title_thread(
+        self,
+    ):
+        from hermes_cli.goals import (
+            CONTINUATION_PROMPT_TEMPLATE,
+            CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE,
+            CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE,
+        )
+
+        internal_triggers = [
+            CONTINUATION_PROMPT_TEMPLATE.format(goal="Ship the fix"),
+            CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE.format(
+                goal="Ship the fix",
+                contract_block="Outcome: fixed\nVerification: tests pass",
+            ),
+            CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE.format(
+                goal="Ship the fix",
+                subgoals_block="1. Keep media genuine",
+            ),
+            build_resume_recovery_note("restart_timeout", "", interactive=True),
+            build_resume_recovery_note("shutdown_timeout", "", interactive=False),
+            build_cli_handoff_notice("Title repair"),
+        ]
+
+        with patch("agent.title_generator.threading.Thread") as thread_cls:
+            for trigger in internal_triggers:
+                history = [
+                    {"role": "user", "content": "Fix the title gate"},
+                    {"role": "assistant", "content": "I started the work."},
+                    {"role": "user", "content": trigger},
+                    {"role": "assistant", "content": "The internal turn completed."},
+                ]
+                maybe_auto_title(
+                    MagicMock(),
+                    "sess-current-runtime",
+                    trigger,
+                    "The internal turn completed.",
+                    history,
+                )
+
+        thread_cls.assert_not_called()
+
+    def test_explicit_hidden_current_turn_survives_timestamp_rendering(self):
+        clean_notification = "generic internal wake event"
+        timestamped_notification = (
+            "[Sent at 2026-08-04 10:00 UTC]\n" + clean_notification
+        )
+        current_turn = {
+            "role": "user",
+            "content": clean_notification,
+            "display_kind": "hidden",
+        }
+        history = [
+            {"role": "user", "content": "Fix the title gate"},
+            {"role": "assistant", "content": "I started the work."},
+            current_turn,
+            {"role": "assistant", "content": "The wake turn completed."},
+        ]
+
+        with patch("agent.title_generator.threading.Thread") as thread_cls:
+            maybe_auto_title(
+                MagicMock(),
+                "sess-timestamped-internal",
+                timestamped_notification,
+                "The wake turn completed.",
+                history,
+                current_user_turn=current_turn,
             )
 
         thread_cls.assert_not_called()

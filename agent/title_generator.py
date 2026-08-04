@@ -6,7 +6,8 @@ adds latency to the user-facing reply.
 
 import logging
 import threading
-from typing import Callable, Optional
+from collections.abc import Mapping
+from typing import Any, Callable, Optional
 
 from agent.auxiliary_client import call_llm
 
@@ -363,6 +364,7 @@ def maybe_auto_title(
     main_runtime: dict = None,
     title_callback: Optional[TitleCallback] = None,
     runtime_validator: Optional[RuntimeValidator] = None,
+    current_user_turn: Optional[Mapping[str, Any]] = None,
 ) -> None:
     """Fire-and-forget title generation after the first exchange.
 
@@ -374,6 +376,29 @@ def maybe_auto_title(
         return
 
     from agent.conversation_compression import is_real_user_message
+
+    # A background completion can re-enter a session after an earlier human
+    # turn.  Counting genuine history alone would make that internal trigger
+    # eligible to title the conversation from its notification text.  Reuse
+    # the same provenance classifier for the current trigger, retaining any
+    # explicit synthetic/display metadata carried by its history row.
+    classified_current_turn: Mapping[str, Any] = (
+        current_user_turn
+        if current_user_turn is not None
+        else {"role": "user", "content": user_message}
+    )
+    if current_user_turn is None:
+        for message in reversed(conversation_history or []):
+            get = getattr(message, "get", None)
+            if (
+                callable(get)
+                and get("role") == "user"
+                and get("content") == user_message
+            ):
+                classified_current_turn = message
+                break
+    if not is_real_user_message(classified_current_turn):
+        return
 
     # Long turns can add Hermes-authored user-role scaffolding. Count only
     # genuine user intent so those internal rows cannot close the title gate.

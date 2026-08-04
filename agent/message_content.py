@@ -94,6 +94,13 @@ _WATCH_DISABLED_RE = re.compile(
     r"Falling back to notify_on_complete semantics; you'll get exactly one "
     r"notification when the process exits\.\]\Z"
 )
+_CLI_HANDOFF_PREFIX = '[Session was just handed off from CLI ("'
+_CLI_HANDOFF_SUFFIX = (
+    '") to this channel. The full prior conversation history is loaded above. '
+    "Briefly confirm you're working here and summarize what we were working on, "
+    "so the user can continue from this device.]"
+)
+_CLI_HANDOFF_TITLE_RE = re.compile(r"[^\r\n]{1,512}\Z")
 
 
 def _field(value: Any, key: str) -> Any:
@@ -166,6 +173,74 @@ def build_tool_call_stream_continuation_request(tool_names: Iterable[str]) -> st
     )
 
 
+def build_resume_recovery_note(
+    reason: str | None,
+    message: str = "",
+    *,
+    interactive: bool = True,
+) -> str:
+    """Build the recovery note for an interrupted gateway turn."""
+
+    reason_phrase = (
+        "a gateway restart"
+        if reason == "restart_timeout"
+        else "a gateway shutdown"
+        if reason == "shutdown_timeout"
+        else "a gateway interruption"
+    )
+    if message:
+        resume_guidance = (
+            "Address the user's NEW message below FIRST and focus "
+            "on what the user is asking now."
+        )
+        tail_guidance = (
+            "Do NOT re-execute old tool calls — skip any "
+            "unfinished work from the conversation history."
+        )
+    elif interactive:
+        resume_guidance = (
+            "Report to the user that the session was restored "
+            "successfully and ask what they would like to do next."
+        )
+        tail_guidance = (
+            "Do NOT re-execute old tool calls — skip any "
+            "unfinished work from the conversation history."
+        )
+    else:
+        resume_guidance = (
+            "No user is present on this non-interactive platform, "
+            "so do NOT emit a 'session restored' acknowledgement "
+            "or ask questions. Review the conversation history and "
+            "CONTINUE the interrupted task to completion."
+        )
+        tail_guidance = (
+            "Do NOT re-run tool calls whose results already "
+            "appear in the history — resume from the first step "
+            "that has no recorded result."
+        )
+    return (
+        f"[System note: The previous turn was interrupted by "
+        f"{reason_phrase}; the gateway is now back online. "
+        f"Any restart/shutdown command in the history has already "
+        f"run — do NOT re-execute or verify it. {resume_guidance} "
+        f"{tail_guidance}]"
+        + (f"\n\n{message}" if message else "")
+    )
+
+
+_PURE_RESUME_RECOVERY_NOTES = frozenset(
+    build_resume_recovery_note(reason, "", interactive=interactive)
+    for reason in ("restart_timeout", "shutdown_timeout", None)
+    for interactive in (True, False)
+)
+
+
+def build_cli_handoff_notice(cli_title: str) -> str:
+    """Build the synthetic user-role notice for a CLI-to-gateway handoff."""
+
+    return _CLI_HANDOFF_PREFIX + str(cli_title) + _CLI_HANDOFF_SUFFIX
+
+
 def _is_tool_call_stream_continuation(text: str) -> bool:
     if not (
         text.startswith(_TOOL_CALL_STREAM_CONTINUATION_PREFIX)
@@ -210,6 +285,31 @@ def _is_background_process_notification(text: str) -> bool:
     return False
 
 
+def _is_pure_resume_recovery_note(text: str) -> bool:
+    return text in _PURE_RESUME_RECOVERY_NOTES
+
+
+def _is_cli_handoff_notice(text: str) -> bool:
+    if not (
+        text.startswith(_CLI_HANDOFF_PREFIX)
+        and text.endswith(_CLI_HANDOFF_SUFFIX)
+    ):
+        return False
+    title = text[len(_CLI_HANDOFF_PREFIX) : -len(_CLI_HANDOFF_SUFFIX)]
+    return bool(title.strip() and _CLI_HANDOFF_TITLE_RE.fullmatch(title))
+
+
+def _is_goal_continuation_request(text: str) -> bool:
+    # Lazy import avoids coupling the lightweight content helpers to goal
+    # state/database setup during module initialization.
+    try:
+        from hermes_cli.goals import is_goal_continuation_prompt
+
+        return is_goal_continuation_prompt(text)
+    except Exception:
+        return False
+
+
 def is_internal_user_scaffolding_text(text: str) -> bool:
     """Recognize stable Hermes-authored user-role wire formats narrowly."""
 
@@ -219,4 +319,7 @@ def is_internal_user_scaffolding_text(text: str) -> bool:
         or _is_tool_call_stream_continuation(normalized)
         or _is_async_delegation_notification(normalized)
         or _is_background_process_notification(normalized)
+        or _is_pure_resume_recovery_note(normalized)
+        or _is_cli_handoff_notice(normalized)
+        or _is_goal_continuation_request(normalized)
     )
