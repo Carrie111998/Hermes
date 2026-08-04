@@ -143,6 +143,7 @@ The template files ship inside the plugin bundle at `<plugin install>/skills/wor
 | Conditional branch (classify-and-act) | `templates/conditional-branch.yaml` | `when:` expressions on branches, `{node-id.result} contains ...` |
 | Multi-phase with privacy barriers | `templates/multi-phase-gates.yaml` | `synthetic: true` gates, `privacy_gate: true` on sealed producers |
 | Orchestrator-workers (generate-and-filter) | `templates/orchestrator-workers.yaml` | parallel candidates, barrier, rubric filter |
+| Tournament (pairwise judging) | `templates/tournament.yaml` | N parallel contenders, N(N-1)/2 pairwise judges, champion by majority — picks ONE winner (vs council's decision landscape) |
 | Loop-until-done (bounded) | `templates/loop-until-done.yaml` | review loop as bounded loop, `max_retries` as ceiling, `when:` stop-condition follow-up |
 
 Engine support note: the wiki's unbounded loop-until-done and mid-run dynamic graph extension are **not** representable in static YAML — the engine's loop is the bounded review loop, and dynamic extension lives in (paused) dynamic mode.

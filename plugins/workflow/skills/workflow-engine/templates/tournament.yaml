@@ -1,0 +1,157 @@
+# =============================================================================
+# PATTERN: TOURNAMENT (pairwise judging)
+# Wiki reference: docs/wiki/concepts/dynamic-workflow-engineering.md
+#   Key Patterns → "3. Tournament" — "Spawn N agents that each attempt the
+#   same task using different approaches, then judge results pairwise."
+# -----------------------------------------------------------------------------
+# USE WHEN: you must pick the SINGLE BEST of N competing approaches.
+# Comparative judgment is more reliable than absolute scoring — each judge
+# sees exactly two candidates and picks the better one.
+#
+# DISTINCT FROM COUNCIL: our council pipeline is adversarial collaboration —
+# independent positions → probes → reflections → a decision LANDSCAPE, no
+# winner. A tournament ELIMINATES: pairwise judges decide, a champion node
+# crowns the winner. Use tournament when you need ONE answer; council when
+# you need the full disagreement map.
+#
+# WHAT EACH PIECE ACHIEVES:
+#   - The N contenders are parallel nodes in the same layer (no cross
+#     depends_on). Each attempts the SAME task with a DIFFERENT approach;
+#     they dispatch together and never see each other — the wiki's
+#     "no cross-contamination" property.
+#   - Judge nodes are the pairwise comparisons: judge-i-vs-j depends_on
+#     candidate-i and candidate-j ONLY. The engine dispatches all judges in
+#     parallel once both candidates complete. Each comparison is its own
+#     agent with an isolated context — the wiki's "each comparison is its
+#     own agent".
+#   - Judge verdict contract: complete with a summary whose FIRST LINE is
+#     "WINNER: contender-<id>". Deterministic and parseable, so the
+#     champion node can read verdicts mechanically (same convention as the
+#     PASS/FAIL first-line contract in review loops).
+#   - The champion node depends_on ALL judges — the bracket barrier — and
+#     crowns the winner by majority of pairwise wins, reading each verdict
+#     via {judge-*-vs-*}. Ties fall back to the judge justifications.
+#   - The bracket is STATIC in the YAML: the wiki's "deterministic loop
+#     holds the bracket" collapses to plain DAG structure here — nothing
+#     needs to be computed at runtime.
+#   - Judge count grows as N(N-1)/2: 3 contenders → 3 judges, 4 → 6.
+#     Judges are the expensive part (each is a full agent session) — cap N
+#     at 4-5 to keep token spend sane.
+#   - `fallback_on_timeout: degraded` on contenders/judges lets the bracket
+#     finish even if one contender fails — the judges still compare, the
+#     champion still crowns. Use `skip` only when every branch is required.
+# =============================================================================
+
+name: my-tournament
+description: "N approaches compete; pairwise judges crown a single winner."
+
+roles:
+  contender-a: edison
+  contender-b: newton
+  contender-c: raven
+  judge: hopper
+  champion: nikola
+
+nodes:
+
+  # ── Round 0: the contenders — SAME task, DIFFERENT approaches ──
+  # No depends_on between them → same topological layer → parallel, blind.
+  contender-a:
+    agent: "{contender-a}"
+    task: >
+      Solve {context.objective} using approach A: {context.approach_a}.
+      Produce a complete, self-contained solution. Complete when done.
+    timeout_minutes: 45
+    channel: debug
+    fallback_on_timeout: degraded
+
+  contender-b:
+    agent: "{contender-b}"
+    task: >
+      Solve {context.objective} using approach B: {context.approach_b}.
+      Produce a complete, self-contained solution. Complete when done.
+    timeout_minutes: 45
+    channel: debug
+    fallback_on_timeout: degraded
+
+  contender-c:
+    agent: "{contender-c}"
+    task: >
+      Solve {context.objective} using approach C: {context.approach_c}.
+      Produce a complete, self-contained solution. Complete when done.
+    timeout_minutes: 45
+    channel: debug
+    fallback_on_timeout: degraded
+
+  # ── Round 1: pairwise judges — one agent per comparison ──
+  # Each depends on exactly TWO candidates → dispatched in parallel once
+  # both complete. Each judge is blind to the third contender.
+  judge-a-vs-b:
+    agent: "{judge}"
+    task: >
+      Compare these two solutions to {context.objective}:
+      Candidate A: {contender-a}
+      Candidate B: {contender-b}
+
+      Judge against {context.rubric}. Verdict contract — your completion
+      summary MUST start with "WINNER: contender-a" or
+      "WINNER: contender-b", then a short justification.
+    depends_on: [contender-a, contender-b]
+    timeout_minutes: 20
+    channel: debug
+    fallback_on_timeout: degraded
+
+  judge-a-vs-c:
+    agent: "{judge}"
+    task: >
+      Compare these two solutions to {context.objective}:
+      Candidate A: {contender-a}
+      Candidate C: {contender-c}
+
+      Judge against {context.rubric}. Verdict contract — your completion
+      summary MUST start with "WINNER: contender-a" or
+      "WINNER: contender-c", then a short justification.
+    depends_on: [contender-a, contender-c]
+    timeout_minutes: 20
+    channel: debug
+    fallback_on_timeout: degraded
+
+  judge-b-vs-c:
+    agent: "{judge}"
+    task: >
+      Compare these two solutions to {context.objective}:
+      Candidate B: {contender-b}
+      Candidate C: {contender-c}
+
+      Judge against {context.rubric}. Verdict contract — your completion
+      summary MUST start with "WINNER: contender-b" or
+      "WINNER: contender-c", then a short justification.
+    depends_on: [contender-b, contender-c]
+    timeout_minutes: 20
+    channel: debug
+    fallback_on_timeout: degraded
+
+  # ── Round 2: the champion — reads all pairwise verdicts ──
+  champion:
+    agent: "{champion}"
+    task: >
+      Three pairwise verdicts on {context.objective}:
+      A vs B → {judge-a-vs-b}
+      A vs C → {judge-a-vs-c}
+      B vs C → {judge-b-vs-c}
+
+      Crown the overall winner by majority of pairwise wins (on a tie, use
+      the judge justifications). Complete with "CHAMPION: contender-<id>"
+      and a one-paragraph rationale.
+    depends_on: [judge-a-vs-b, judge-a-vs-c, judge-b-vs-c]
+    timeout_minutes: 15
+    channel: debug
+    fallback_on_timeout: skip
+
+# ── Scaling notes ──
+#   3 contenders → 3 judges (shown above)
+#   4 contenders → 6 judges (add contender-d + judge-a-vs-d,
+#                            judge-b-vs-d, judge-c-vs-d; champion reads 6)
+#   Judge count = N(N-1)/2 — cap N at 4-5.
+#   All judges use the same {judge} role above. For diverse judging lenses
+#   (correctness vs maintainability), split judges across roles instead.
