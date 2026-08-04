@@ -739,31 +739,37 @@ Security and delivery contract:
   message, delivered card, initiator, registered action, and issuance-time
   policy. Normal gateway authorization and the policy both run before the
   atomic claim and before plugin code.
-- One action instance is claimed once. Double clicks, callback retries, and a
-  gateway restart do not run the handler again. A process failure after claim
-  remains fail-closed as already processed; Hermes does not claim network-wide
-  exactly-once execution. Use `external_action_id` as the downstream
-  idempotency key and return `downstream_replay()` when that system reports an
-  earlier success.
+- One action instance has at most one active claim. Concurrent clicks return
+  Processing without running the handler again. Terminal outcomes and their
+  sanitized messages are replayed exactly; a process failure after claim is
+  recovered as a terminal Unknown outcome and is never executed again. Hermes
+  does not claim network-wide exactly-once execution. Use `external_action_id`
+  as the downstream idempotency key and return `downstream_replay()` when that
+  system reports an earlier success.
 - Handler outcomes are `succeeded`, `downstream_replay`, `conflict`, or
   `retryable_failure`. Unexpected exceptions are hidden behind generic text.
   Typed conflict/retryable exceptions expose only the bounded public message
-  you deliberately provide; never include payload or exception internals.
+  you deliberately provide; never include payload or exception internals. A
+  retryable failure reactivates the same bound action and Feishu retains a
+  Retry button; all profile, chat, card, operator, expiry, and policy checks run
+  again before the next atomic claim.
 - Feishu WebSocket renders a native card and updates it from Processing to the
   truthful final state, retrying a transient final edit three times. If every
-  edit fails, the durable claim still prevents replay; another click resolves
-  inline as Already processed. A denied, unknown, or pre-claim failure never
-  replaces the shared card, so an unauthorized viewer cannot remove live
-  buttons. Other adapters send `fallback_text` exactly through their normal
-  text-send path and create no clickable ledger state (and therefore do not
-  require a native initiator or source-message ID).
+  terminal edit fails, another authenticated callback on the original bound
+  card reconstructs the durable final status and sanitized message. A denied,
+  unknown, or pre-claim failure never replaces the shared card, so an
+  unauthorized viewer cannot remove live buttons. Other adapters send
+  `fallback_text` exactly through their normal text-send path and create no
+  clickable ledger state (and therefore do not require a native initiator or
+  source-message ID).
 - Native delivery is two-phase: Hermes reserves opaque IDs, sends the card,
   then binds the provider's returned card-message ID. If that final bind fails,
   Hermes marks the reservation unusable when possible and best-effort replaces
   the delivered card with a non-actionable failure state. The profile-local
   schema is created/migrated transactionally alongside existing `state.db`
-  tables; stale crash rows are retained fail-closed, then pruned after the
-  bounded retention window.
+  tables. Shutdown drains action tasks before disconnecting adapters; cancelled
+  claims and processing rows found after a process crash become terminal
+  Unknown outcomes. Stale rows are pruned after the bounded retention window.
 - `post_tool_call` remains observational: sending a card does not replace the
   tool result or mutate the transcript, cached system prompt, toolsets, or
   message roles.

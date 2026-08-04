@@ -340,6 +340,7 @@ InteractiveActionStatus = Literal[
     "expired",
     "conflict",
     "retryable_failure",
+    "unknown_outcome",
 ]
 
 
@@ -354,7 +355,11 @@ _DEFAULT_RESULT_MESSAGES: dict[str, str] = {
     "conflict": "The confirmation could not be applied because its state changed.",
     "retryable_failure": (
         "The confirmation could not be completed right now. "
-        "Create a new confirmation to retry."
+        "Use the same confirmation to retry."
+    ),
+    "unknown_outcome": (
+        "Hermes could not verify whether this confirmation took effect. "
+        "Do not retry it; verify the downstream state first."
     ),
 }
 
@@ -422,6 +427,10 @@ class InteractiveActionResult:
     def retryable_failure(cls, message: str = "") -> "InteractiveActionResult":
         return cls._make("retryable_failure", message)
 
+    @classmethod
+    def unknown_outcome(cls) -> "InteractiveActionResult":
+        return cls._make("unknown_outcome")
+
 
 @dataclass(frozen=True)
 class PreparedInteractiveCard:
@@ -456,6 +465,7 @@ class _StoredAction:
     payload_json: str
     state: str
     outcome: str | None
+    user_message: str
     expires_at: float
 
     def handler_context(
@@ -479,7 +489,14 @@ class _StoredAction:
 
 @dataclass(frozen=True)
 class _ClaimResult:
-    status: Literal["claimed", "already_processed", "denied", "unknown", "expired"]
+    status: Literal[
+        "claimed",
+        "processing",
+        "finished",
+        "denied",
+        "unknown",
+        "expired",
+    ]
     record: _StoredAction | None = None
 
 
@@ -518,6 +535,7 @@ class SQLiteInteractiveActionStorage:
         "payload_json",
         "state",
         "outcome",
+        "user_message",
         "expires_at",
         "created_at",
         "updated_at",
@@ -554,6 +572,7 @@ class SQLiteInteractiveActionStorage:
             path_key = str(path.resolve(strict=False))
             if path_key not in self._schema_ready_paths:
                 self._ensure_schema(conn)
+                self._reconcile_processing_from_prior_process(conn)
                 self._schema_ready_paths.add(path_key)
         except Exception:
             conn.close()
@@ -609,6 +628,7 @@ class SQLiteInteractiveActionStorage:
                     payload_json TEXT NOT NULL,
                     state TEXT NOT NULL,
                     outcome TEXT,
+                    user_message TEXT NOT NULL DEFAULT '',
                     expires_at REAL NOT NULL,
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL
@@ -622,6 +642,12 @@ class SQLiteInteractiveActionStorage:
                        DEFAULT 'initiator_only'"""
                 )
                 columns.add("authorization_policy")
+            if "user_message" not in columns:
+                conn.execute(
+                    """ALTER TABLE interactive_actions
+                       ADD COLUMN user_message TEXT NOT NULL DEFAULT ''"""
+                )
+                columns.add("user_message")
             missing = cls._REQUIRED_COLUMNS - columns
             if missing:
                 missing_names = ", ".join(sorted(missing))
@@ -631,6 +657,49 @@ class SQLiteInteractiveActionStorage:
             conn.execute(
                 """CREATE INDEX IF NOT EXISTS idx_interactive_actions_expiry
                    ON interactive_actions(expires_at, state)"""
+            )
+            for status, message in _DEFAULT_RESULT_MESSAGES.items():
+                conn.execute(
+                    """UPDATE interactive_actions
+                       SET user_message=?
+                       WHERE state='finished' AND outcome=? AND user_message=''""",
+                    (message, status),
+                )
+            conn.execute(
+                """UPDATE interactive_actions
+                   SET outcome='already_processed', user_message=?
+                   WHERE state='finished' AND outcome IS NULL""",
+                (_DEFAULT_RESULT_MESSAGES["already_processed"],),
+            )
+            conn.execute(
+                """UPDATE interactive_actions
+                   SET state='active'
+                   WHERE state='finished' AND outcome='retryable_failure'"""
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+    @classmethod
+    def _reconcile_processing_from_prior_process(
+        cls,
+        conn: sqlite3.Connection,
+    ) -> None:
+        """Terminalize crash-left processing rows once for this storage startup."""
+
+        if conn.execute(
+            "SELECT 1 FROM interactive_actions WHERE state='processing' LIMIT 1"
+        ).fetchone() is None:
+            return
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute(
+                """UPDATE interactive_actions
+                   SET state='finished', outcome='unknown_outcome',
+                       user_message=?, updated_at=?
+                   WHERE state='processing'""",
+                (_DEFAULT_RESULT_MESSAGES["unknown_outcome"], time.time()),
             )
             conn.commit()
         except Exception:
@@ -657,6 +726,7 @@ class SQLiteInteractiveActionStorage:
             payload_json=row["payload_json"],
             state=row["state"],
             outcome=row["outcome"],
+            user_message=row["user_message"],
             expires_at=float(row["expires_at"]),
         )
 
@@ -837,21 +907,8 @@ class SQLiteInteractiveActionStorage:
                 if record is None:
                     conn.rollback()
                     return _ClaimResult("unknown")
-                if record.state in {"processing", "finished"}:
-                    conn.rollback()
-                    return _ClaimResult("already_processed", record)
-                if now >= record.expires_at:
-                    conn.execute(
-                        """UPDATE interactive_actions
-                           SET state='expired', updated_at=?
-                           WHERE action_instance_id=? AND state IN ('active', 'awaiting_delivery')""",
-                        (now, callback.action_instance_id),
-                    )
-                    conn.commit()
-                    return _ClaimResult("expired", record)
                 binding_matches = (
-                    record.state == "active"
-                    and callback.profile_id == record.profile_id
+                    callback.profile_id == record.profile_id
                     and callback.platform == record.platform
                     and callback.chat_id == record.chat_id
                     # Feishu callback payloads do not always expose the topic
@@ -866,6 +923,24 @@ class SQLiteInteractiveActionStorage:
                 if not binding_matches:
                     conn.rollback()
                     return _ClaimResult("denied", record)
+                if record.state == "processing":
+                    conn.rollback()
+                    return _ClaimResult("processing", record)
+                if record.state == "finished":
+                    conn.rollback()
+                    return _ClaimResult("finished", record)
+                if now >= record.expires_at:
+                    conn.execute(
+                        """UPDATE interactive_actions
+                           SET state='expired', updated_at=?
+                           WHERE action_instance_id=? AND state IN ('active', 'awaiting_delivery')""",
+                        (now, callback.action_instance_id),
+                    )
+                    conn.commit()
+                    return _ClaimResult("expired", record)
+                if record.state != "active":
+                    conn.rollback()
+                    return _ClaimResult("denied", record)
                 cursor = conn.execute(
                     """UPDATE interactive_actions
                        SET state='processing', updated_at=?
@@ -874,7 +949,7 @@ class SQLiteInteractiveActionStorage:
                 )
                 if cursor.rowcount != 1:
                     conn.rollback()
-                    return _ClaimResult("already_processed", record)
+                    return _ClaimResult("processing", record)
                 conn.commit()
                 return _ClaimResult("claimed", record)
             except Exception:
@@ -889,21 +964,25 @@ class SQLiteInteractiveActionStorage:
         *,
         result: InteractiveActionResult,
         now: float,
-    ) -> None:
+    ) -> bool:
+        next_state = "active" if result.status == "retryable_failure" else "finished"
         with self._lock:
             conn = self._connect()
             try:
                 cursor = conn.execute(
                     """UPDATE interactive_actions
-                       SET state='finished', outcome=?, updated_at=?
+                       SET state=?, outcome=?, user_message=?, updated_at=?
                        WHERE action_instance_id=? AND state='processing'""",
-                    (result.status, now, action_instance_id),
+                    (
+                        next_state,
+                        result.status,
+                        _sanitize_public_message(result.user_message),
+                        now,
+                        action_instance_id,
+                    ),
                 )
-                if cursor.rowcount != 1:
-                    raise RuntimeError(
-                        "interactive action final state was not persisted"
-                    )
                 conn.commit()
+                return cursor.rowcount == 1
             finally:
                 conn.close()
 
@@ -1149,7 +1228,15 @@ class InteractiveActionManager:
             return InteractiveActionResult.denied()
 
         claim = self.storage.claim(callback, now=self._clock())
-        if claim.status == "already_processed":
+        if claim.status == "processing":
+            return InteractiveActionResult.processing()
+        if claim.status == "finished" and claim.record is not None:
+            outcome = claim.record.outcome
+            if outcome in _DEFAULT_RESULT_MESSAGES:
+                return InteractiveActionResult(
+                    status=cast(InteractiveActionStatus, outcome),
+                    user_message=claim.record.user_message,
+                )
             return InteractiveActionResult.already_processed()
         if claim.status == "denied":
             return InteractiveActionResult.denied()
@@ -1171,13 +1258,33 @@ class InteractiveActionManager:
         """Run one already-claimed handler and durably record its final state."""
 
         context = claim.record.handler_context(claim.callback)
-        result = await self._run_handler(claim.registration.handler, context)
-        self.storage.finish(
+        try:
+            result = await self._run_handler(claim.registration.handler, context)
+        except asyncio.CancelledError:
+            try:
+                self.mark_unknown_outcome(claim)
+            except Exception as exc:
+                logger.warning(
+                    "Interactive action cancellation persistence failed (%s)",
+                    type(exc).__name__,
+                )
+            raise
+        if not self.storage.finish(
             claim.callback.action_instance_id,
             result=result,
             now=self._clock(),
-        )
+        ):
+            raise RuntimeError("interactive action final state was not persisted")
         return result
+
+    def mark_unknown_outcome(self, claim: ClaimedInteractiveAction) -> bool:
+        """Terminalize a still-processing claim without overwriting a result."""
+
+        return self.storage.finish(
+            claim.callback.action_instance_id,
+            result=InteractiveActionResult.unknown_outcome(),
+            now=self._clock(),
+        )
 
     async def _run_handler(
         self,

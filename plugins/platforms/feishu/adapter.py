@@ -2094,6 +2094,7 @@ class FeishuAdapter(BasePlatformAdapter):
         chat_id: str,
         card_id: str,
         result: Any,
+        action_instance_id: Optional[str] = None,
     ) -> SendResult:
         """Replace a plugin card with its truthful final action state."""
 
@@ -2101,7 +2102,10 @@ class FeishuAdapter(BasePlatformAdapter):
         if not self._client or not card_id:
             return SendResult(success=False, error="interactive card is unavailable")
         try:
-            card = self._build_interactive_action_status_card(result)
+            card = self._build_interactive_action_status_card(
+                result,
+                action_instance_id=action_instance_id,
+            )
             body = self._build_update_message_body(
                 msg_type="interactive",
                 content=json.dumps(card, ensure_ascii=False),
@@ -2868,7 +2872,11 @@ class FeishuAdapter(BasePlatformAdapter):
         return True
 
     @staticmethod
-    def _build_interactive_action_status_card(result: Any) -> Dict[str, Any]:
+    def _build_interactive_action_status_card(
+        result: Any,
+        *,
+        action_instance_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
         status = str(getattr(result, "status", "retryable_failure") or "")
         title, template = {
             "processing": ("⏳ Processing", "blue"),
@@ -2880,18 +2888,34 @@ class FeishuAdapter(BasePlatformAdapter):
             "expired": ("⌛ Expired", "grey"),
             "conflict": ("⚠️ Conflict", "orange"),
             "retryable_failure": ("⚠️ Retryable failure", "orange"),
+            "unknown_outcome": ("⚠️ Outcome unknown", "grey"),
         }.get(status, ("⚠️ Retryable failure", "orange"))
         message = str(
             getattr(result, "user_message", "The confirmation could not be completed.")
             or "The confirmation could not be completed."
         )
+        elements: List[Dict[str, Any]] = [
+            {"tag": "markdown", "content": message}
+        ]
+        if status == "retryable_failure" and action_instance_id:
+            elements.append({
+                "tag": "action",
+                "actions": [{
+                    "tag": "button",
+                    "text": {"tag": "plain_text", "content": "Retry"},
+                    "type": "primary",
+                    "value": {
+                        "hermes_interactive_action_id": action_instance_id,
+                    },
+                }],
+            })
         return {
             "config": {"wide_screen_mode": True},
             "header": {
                 "title": {"content": title, "tag": "plain_text"},
                 "template": template,
             },
-            "elements": [{"tag": "markdown", "content": message}],
+            "elements": elements,
         }
 
     def _handle_plugin_interactive_action(
@@ -2947,6 +2971,7 @@ class FeishuAdapter(BasePlatformAdapter):
             "already_processed",
             "expired",
             "conflict",
+            "unknown_outcome",
         }:
             card = CallBackCard()
             card.type = "raw"

@@ -619,6 +619,70 @@ def test_ledger_migrates_pre_policy_schema_without_losing_rows(tmp_path):
     assert record.card_id == "om_card"
 
 
+@pytest.mark.asyncio
+async def test_ledger_migrates_existing_schema_and_replays_safe_terminal_result(
+    tmp_path,
+):
+    import sqlite3
+
+    from gateway.interactive_actions import (
+        InteractiveActionManager,
+        InteractiveActionResult,
+        SQLiteInteractiveActionStorage,
+    )
+
+    db_path = tmp_path / "state.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """CREATE TABLE interactive_actions (
+                action_instance_id TEXT PRIMARY KEY,
+                plugin_action TEXT NOT NULL,
+                external_action_id TEXT NOT NULL,
+                authorization_policy TEXT NOT NULL DEFAULT 'initiator_only',
+                profile_id TEXT NOT NULL,
+                platform TEXT NOT NULL,
+                chat_id TEXT NOT NULL,
+                thread_id TEXT,
+                initiator_id TEXT NOT NULL,
+                initiator_name TEXT NOT NULL,
+                message_id TEXT NOT NULL,
+                card_id TEXT,
+                payload_json TEXT NOT NULL,
+                state TEXT NOT NULL,
+                outcome TEXT,
+                expires_at REAL NOT NULL,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            )"""
+        )
+        conn.execute(
+            """INSERT INTO interactive_actions VALUES (
+                'ia_instance_1', 'proposal-plugin/apply', 'proposal-v1',
+                'initiator_only', 'work', 'feishu', 'oc_chat', 'om_root',
+                'ou_initiator', 'Alice', 'om_trigger', 'om_card', '{}',
+                'finished', 'conflict', 2000, 1000, 1000
+            )"""
+        )
+
+    plugins = PluginManager()
+    context = _plugin_context("proposal-plugin", plugins)
+    context.register_interactive_action("apply", lambda _ctx: None)
+    manager = InteractiveActionManager(
+        storage=SQLiteInteractiveActionStorage(db_path),
+        registrations=plugins._interactive_actions,
+        clock=lambda: 1_001.0,
+    )
+
+    replay = await manager.dispatch(_callback(), gateway_authorize=lambda: True)
+
+    assert replay == InteractiveActionResult.conflict()
+    with sqlite3.connect(db_path) as conn:
+        columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(interactive_actions)")
+        }
+    assert "user_message" in columns
+
+
 def test_concurrent_ledger_schema_initialization_is_idempotent(tmp_path):
     from concurrent.futures import ThreadPoolExecutor
     import sqlite3
@@ -638,6 +702,7 @@ def test_concurrent_ledger_schema_initialization_is_idempotent(tmp_path):
             row[1] for row in conn.execute("PRAGMA table_info(interactive_actions)")
         ]
     assert columns.count("authorization_policy") == 1
+    assert columns.count("user_message") == 1
 
 
 def test_default_ledger_resolves_profile_home_on_each_operation(tmp_path):
@@ -783,23 +848,99 @@ async def test_atomic_double_click_executes_handler_once(tmp_path):
     completed = await first
 
     assert completed.status == "succeeded"
-    assert duplicate.status == "already_processed"
+    assert duplicate.status == "processing"
     assert len(calls) == 1
 
 
 @pytest.mark.asyncio
-async def test_durable_replay_after_manager_restart_never_reexecutes(tmp_path):
+@pytest.mark.parametrize("state", ["processing", "finished"])
+@pytest.mark.parametrize(
+    "copied_callback",
+    [
+        _callback(card_id="om_copied_card"),
+        _callback(chat_id="oc_other"),
+        _callback(profile_id="personal"),
+        _callback(platform="slack"),
+        _callback(thread_id="om_other_thread"),
+    ],
+    ids=("wrong-card", "wrong-chat", "wrong-profile", "wrong-platform", "wrong-thread"),
+)
+async def test_processing_and_finished_replay_require_original_card_binding(
+    tmp_path,
+    state,
+    copied_callback,
+):
+    from gateway.interactive_actions import (
+        ClaimedInteractiveAction,
+        InteractiveActionResult,
+    )
+
+    _plugins, manager = _registered_manager(
+        tmp_path,
+        lambda _ctx: InteractiveActionResult.succeeded(
+            "Proposal applied from the original card."
+        ),
+    )
+    prepared = manager.prepare_card(
+        plugin_id="proposal-plugin",
+        envelope=_proposal_envelope(),
+        origin=_origin(),
+    )
+    manager.activate_card(prepared, card_id="om_card")
+
+    if state == "processing":
+        claim = manager.claim_action(_callback(), gateway_authorize=lambda: True)
+        assert isinstance(claim, ClaimedInteractiveAction)
+        expected_original = InteractiveActionResult.processing()
+    else:
+        expected_original = await manager.dispatch(
+            _callback(),
+            gateway_authorize=lambda: True,
+        )
+
+    copied_replay = await manager.dispatch(
+        copied_callback,
+        gateway_authorize=lambda: True,
+    )
+    original_replay = await manager.dispatch(
+        _callback(),
+        gateway_authorize=lambda: True,
+    )
+
+    assert copied_replay == InteractiveActionResult.denied()
+    assert original_replay == expected_original
+
+
+@pytest.mark.asyncio
+async def test_durable_replay_after_manager_restart_returns_exact_sanitized_result(
+    tmp_path,
+):
     from gateway.interactive_actions import (
         InteractiveActionManager,
+        InteractiveActionResult,
         SQLiteInteractiveActionStorage,
     )
 
     calls = []
+
+    def handler(ctx):
+        calls.append(ctx)
+        return InteractiveActionResult.succeeded(
+            "  Proposal applied.\nReceipt 42.  "
+        )
+
     plugins, first_manager = _registered_manager(
         tmp_path,
-        lambda ctx: calls.append(ctx),
+        handler,
     )
-    await _issue_and_dispatch(first_manager)
+    _prepared, completed = await _issue_and_dispatch(first_manager)
+    assert completed == InteractiveActionResult.succeeded(
+        "Proposal applied. Receipt 42."
+    )
+    assert (
+        first_manager.storage.get("ia_instance_1").user_message
+        == "Proposal applied. Receipt 42."
+    )
 
     reconstructed = InteractiveActionManager(
         storage=SQLiteInteractiveActionStorage(tmp_path / "state.db"),
@@ -812,8 +953,117 @@ async def test_durable_replay_after_manager_restart_never_reexecutes(tmp_path):
         gateway_authorize=lambda: True,
     )
 
-    assert replay.status == "already_processed"
+    assert replay == completed
     assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_retryable_failure_reactivates_same_bound_action_for_success(tmp_path):
+    from gateway.interactive_actions import InteractiveActionResult
+
+    calls = []
+
+    def handler(ctx):
+        calls.append(ctx)
+        if len(calls) == 1:
+            return InteractiveActionResult.retryable_failure(
+                "Proposal service is temporarily unavailable."
+            )
+        return InteractiveActionResult.succeeded("Proposal applied on retry.")
+
+    _plugins, manager = _registered_manager(tmp_path, handler)
+    prepared = manager.prepare_card(
+        plugin_id="proposal-plugin",
+        envelope=_proposal_envelope(),
+        origin=_origin(),
+    )
+    manager.activate_card(prepared, card_id="om_card")
+
+    transient = await manager.dispatch(_callback(), gateway_authorize=lambda: True)
+    after_transient = manager.storage.get("ia_instance_1")
+    retried = await manager.dispatch(_callback(), gateway_authorize=lambda: True)
+
+    assert transient == InteractiveActionResult.retryable_failure(
+        "Proposal service is temporarily unavailable."
+    )
+    assert after_transient.state == "active"
+    assert after_transient.outcome == "retryable_failure"
+    assert retried == InteractiveActionResult.succeeded(
+        "Proposal applied on retry."
+    )
+    assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_cancellation_during_handler_persists_terminal_unknown_outcome(tmp_path):
+    from gateway.interactive_actions import InteractiveActionResult
+
+    entered = asyncio.Event()
+
+    async def handler(_ctx):
+        entered.set()
+        await asyncio.Event().wait()
+
+    _plugins, manager = _registered_manager(tmp_path, handler)
+    prepared = manager.prepare_card(
+        plugin_id="proposal-plugin",
+        envelope=_proposal_envelope(),
+        origin=_origin(),
+    )
+    manager.activate_card(prepared, card_id="om_card")
+    task = asyncio.create_task(
+        manager.dispatch(_callback(), gateway_authorize=lambda: True)
+    )
+    await entered.wait()
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    replay = await manager.dispatch(_callback(), gateway_authorize=lambda: True)
+    assert replay == InteractiveActionResult.unknown_outcome()
+    assert manager.storage.get("ia_instance_1").state == "finished"
+
+
+@pytest.mark.asyncio
+async def test_storage_startup_reconciles_prior_processing_to_unknown_outcome(
+    tmp_path,
+):
+    from gateway.interactive_actions import (
+        ClaimedInteractiveAction,
+        InteractiveActionManager,
+        InteractiveActionResult,
+        SQLiteInteractiveActionStorage,
+    )
+
+    calls = []
+    plugins, first_manager = _registered_manager(
+        tmp_path,
+        lambda ctx: calls.append(ctx),
+    )
+    prepared = first_manager.prepare_card(
+        plugin_id="proposal-plugin",
+        envelope=_proposal_envelope(),
+        origin=_origin(),
+    )
+    first_manager.activate_card(prepared, card_id="om_card")
+    claim = first_manager.claim_action(
+        _callback(),
+        gateway_authorize=lambda: True,
+    )
+    assert isinstance(claim, ClaimedInteractiveAction)
+    assert first_manager.storage.get("ia_instance_1").state == "processing"
+
+    restarted = InteractiveActionManager(
+        storage=SQLiteInteractiveActionStorage(tmp_path / "state.db"),
+        registrations=plugins._interactive_actions,
+        clock=lambda: 1_001.0,
+    )
+    replay = await restarted.dispatch(_callback(), gateway_authorize=lambda: True)
+
+    assert replay == InteractiveActionResult.unknown_outcome()
+    assert restarted.storage.get("ia_instance_1").state == "finished"
+    assert calls == []
 
 
 @pytest.mark.asyncio
@@ -1207,7 +1457,13 @@ async def test_gateway_callback_returns_processing_only_after_claim_and_edits_fi
     runner._interactive_action_tasks = set()
     runner._is_user_authorized = lambda _source: True
     runner.config = SimpleNamespace(multiplex_profiles=False)
-    adapter = SimpleNamespace(update_interactive_card=AsyncMock())
+    updates = []
+
+    async def update_interactive_card(*, chat_id, card_id, result):
+        updates.append((chat_id, card_id, result))
+        return SimpleNamespace(success=True)
+
+    adapter = SimpleNamespace(update_interactive_card=update_interactive_card)
     source = SessionSource(
         platform=Platform.FEISHU,
         chat_id="oc_chat",
@@ -1229,10 +1485,135 @@ async def test_gateway_callback_returns_processing_only_after_claim_and_edits_fi
     assert manager.storage.get("ia_instance_1").state == "processing"
     await asyncio.wait_for(handled.wait(), timeout=1)
     await asyncio.gather(*runner._interactive_action_tasks)
-    adapter.update_interactive_card.assert_awaited_once()
-    final = adapter.update_interactive_card.await_args.kwargs["result"]
+    assert len(updates) == 1
+    final = updates[0][2]
     assert final.status == "succeeded"
     assert manager.storage.get("ia_instance_1").state == "finished"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "let_task_start",
+    [False, True],
+    ids=("before-task-start", "during-initial-sleep"),
+)
+async def test_gateway_cancellation_during_initial_sleep_marks_unknown_outcome(
+    tmp_path,
+    let_task_start,
+):
+    from gateway.config import Platform
+    from gateway.interactive_actions import InteractiveActionResult
+    from gateway.run import GatewayRunner
+    from gateway.session import SessionSource
+
+    calls = []
+    _plugins, manager = _registered_manager(
+        tmp_path,
+        lambda ctx: calls.append(ctx),
+    )
+    prepared = manager.prepare_card(
+        plugin_id="proposal-plugin",
+        envelope=_proposal_envelope(),
+        origin=_origin(),
+    )
+    manager.activate_card(prepared, card_id="om_card")
+    runner = object.__new__(GatewayRunner)
+    runner._interactive_action_manager = manager
+    runner._interactive_action_tasks = set()
+    runner._is_user_authorized = lambda _source: True
+    runner.config = SimpleNamespace(multiplex_profiles=False)
+    adapter = SimpleNamespace(update_interactive_card=AsyncMock())
+    source = SessionSource(
+        platform=Platform.FEISHU,
+        chat_id="oc_chat",
+        chat_type="group",
+        user_id="ou_initiator",
+        user_name="Alice",
+        thread_id="om_root",
+        message_id="om_card",
+        profile="work",
+    )
+
+    initial = await runner._begin_interactive_action_from_adapter(
+        callback=_callback(),
+        source=source,
+        adapter=adapter,
+    )
+    task = next(iter(runner._interactive_action_tasks))
+    if let_task_start:
+        await asyncio.sleep(0)
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+    assert initial.status == "processing"
+    replay = await manager.dispatch(_callback(), gateway_authorize=lambda: True)
+    assert replay == InteractiveActionResult.unknown_outcome()
+    assert calls == []
+    adapter.update_interactive_card.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_gateway_cancellation_during_final_card_update_preserves_finish(
+    tmp_path,
+):
+    from gateway.config import Platform
+    from gateway.interactive_actions import InteractiveActionResult
+    from gateway.run import GatewayRunner
+    from gateway.session import SessionSource
+
+    update_started = asyncio.Event()
+
+    async def update_interactive_card(**_kwargs):
+        update_started.set()
+        await asyncio.Event().wait()
+
+    _plugins, manager = _registered_manager(
+        tmp_path,
+        lambda _ctx: InteractiveActionResult.succeeded(
+            "Proposal applied before card refresh."
+        ),
+    )
+    prepared = manager.prepare_card(
+        plugin_id="proposal-plugin",
+        envelope=_proposal_envelope(),
+        origin=_origin(),
+    )
+    manager.activate_card(prepared, card_id="om_card")
+    runner = object.__new__(GatewayRunner)
+    runner._interactive_action_manager = manager
+    runner._interactive_action_tasks = set()
+    runner._interactive_action_task_claims = {}
+    runner._is_user_authorized = lambda _source: True
+    runner.config = SimpleNamespace(multiplex_profiles=False)
+    adapter = SimpleNamespace(update_interactive_card=update_interactive_card)
+    source = SessionSource(
+        platform=Platform.FEISHU,
+        chat_id="oc_chat",
+        chat_type="group",
+        user_id="ou_initiator",
+        user_name="Alice",
+        thread_id="om_root",
+        message_id="om_card",
+        profile="work",
+    )
+
+    await runner._begin_interactive_action_from_adapter(
+        callback=_callback(),
+        source=source,
+        adapter=adapter,
+    )
+    await update_started.wait()
+    task = next(iter(runner._interactive_action_tasks))
+    assert manager.storage.get("ia_instance_1").outcome == "succeeded"
+
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+    replay = await manager.dispatch(_callback(), gateway_authorize=lambda: True)
+
+    assert replay == InteractiveActionResult.succeeded(
+        "Proposal applied before card refresh."
+    )
+    assert manager.storage.get("ia_instance_1").outcome == "succeeded"
 
 
 @pytest.mark.asyncio

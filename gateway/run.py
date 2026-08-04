@@ -5616,6 +5616,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             registrations=lambda: get_plugin_manager().get_interactive_actions(),
         )
         self._interactive_action_tasks: set[asyncio.Task] = set()
+        self._interactive_action_task_claims: dict[
+            asyncio.Task, tuple[Any, SessionSource]
+        ] = {}
         self._warn_if_docker_media_delivery_is_risky()
         _gateway_runner_ref = _weakref.ref(self)
 
@@ -11986,6 +11989,62 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._systemd_watchdog = None
         await watchdog.stop()
 
+    async def _drain_interactive_action_tasks(self) -> None:
+        """Bound action completion before adapters needed for card edits close."""
+
+        current = asyncio.current_task()
+        tracked = getattr(self, "_interactive_action_tasks", None)
+        if not isinstance(tracked, set):
+            return
+        tasks = {
+            task
+            for task in tracked
+            if isinstance(task, asyncio.Task)
+            and task is not current
+            and not task.done()
+        }
+        if not tasks:
+            return
+
+        timeout = self._adapter_disconnect_timeout_secs()
+        done, pending = await asyncio.wait(tasks, timeout=max(0.0, timeout))
+        if done:
+            await asyncio.gather(*done, return_exceptions=True)
+        if not pending:
+            return
+
+        logger.warning(
+            "Timed out after %.1fs draining %d interactive action task(s); cancelling",
+            timeout,
+            len(pending),
+        )
+        claims = getattr(self, "_interactive_action_task_claims", None)
+        for task in pending:
+            bound = claims.get(task) if isinstance(claims, dict) else None
+            if bound is not None:
+                claim, source = bound
+                self._mark_interactive_action_unknown_outcome(
+                    claim=claim,
+                    source=source,
+                )
+            task.cancel()
+
+        cancellation_grace = min(max(timeout, 0.1), 1.0)
+        cancelled, stubborn = await asyncio.wait(
+            pending,
+            timeout=cancellation_grace,
+        )
+        if cancelled:
+            await asyncio.gather(*cancelled, return_exceptions=True)
+        if stubborn:
+            logger.warning(
+                "%d cancelled interactive action task(s) did not stop within %.1fs",
+                len(stubborn),
+                cancellation_grace,
+            )
+            for task in stubborn:
+                task.add_done_callback(consume_detached_task_result)
+
     async def stop(
         self,
         *,
@@ -12293,6 +12352,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     await self._cleanup_agent_resources_off_loop(
                         _agent, context="shutdown idle-cache"
                     )
+
+            await self._drain_interactive_action_tasks()
 
             for platform, adapter in list(self.adapters.items()):
                 await self._bounded_adapter_teardown(adapter, platform)
@@ -23183,8 +23244,64 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             tasks = set()
             self._interactive_action_tasks = tasks
         tasks.add(task)
-        task.add_done_callback(tasks.discard)
+        claims = getattr(self, "_interactive_action_task_claims", None)
+        if not isinstance(claims, dict):
+            claims = {}
+            self._interactive_action_task_claims = claims
+        claims[task] = (claim, source)
+        task.add_done_callback(
+            lambda completed: self._interactive_action_task_done(
+                completed,
+                claim=claim,
+                source=source,
+            )
+        )
         return InteractiveActionResult.processing()
+
+    def _interactive_action_task_done(
+        self,
+        task: asyncio.Task,
+        *,
+        claim: Any,
+        source: SessionSource,
+    ) -> None:
+        """Release task tracking and terminalize a cancelled claimed action."""
+
+        tasks = getattr(self, "_interactive_action_tasks", None)
+        if isinstance(tasks, set):
+            tasks.discard(task)
+        claims = getattr(self, "_interactive_action_task_claims", None)
+        if isinstance(claims, dict):
+            claims.pop(task, None)
+        if not task.cancelled():
+            return
+        self._mark_interactive_action_unknown_outcome(
+            claim=claim,
+            source=source,
+        )
+
+    def _mark_interactive_action_unknown_outcome(
+        self,
+        *,
+        claim: Any,
+        source: SessionSource,
+    ) -> None:
+        """Persist cancellation ambiguity without overwriting durable truth."""
+
+        manager = self._interactive_action_manager
+        try:
+            if getattr(getattr(self, "config", None), "multiplex_profiles", False):
+                with _profile_runtime_scope(
+                    self._resolve_profile_home_for_source(source)
+                ):
+                    manager.mark_unknown_outcome(claim)
+            else:
+                manager.mark_unknown_outcome(claim)
+        except Exception as exc:
+            logger.warning(
+                "Interactive action cancellation persistence failed (%s)",
+                type(exc).__name__,
+            )
 
     async def _complete_interactive_action(
         self,
@@ -23217,10 +23334,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         update_failure_type = "rejected"
         for attempt in range(3):
             try:
-                update = await adapter.update_interactive_card(
-                    chat_id=claim.record.chat_id,
-                    card_id=claim.record.card_id or "",
-                    result=result,
+                update_card = adapter.update_interactive_card
+                update_kwargs = {
+                    "chat_id": claim.record.chat_id,
+                    "card_id": claim.record.card_id or "",
+                    "result": result,
+                }
+                try:
+                    update_params = inspect.signature(update_card).parameters
+                    supports_action_id = (
+                        "action_instance_id" in update_params
+                        or any(
+                            param.kind is inspect.Parameter.VAR_KEYWORD
+                            for param in update_params.values()
+                        )
+                    )
+                except (TypeError, ValueError):
+                    supports_action_id = False
+                if supports_action_id:
+                    update_kwargs["action_instance_id"] = (
+                        claim.record.action_instance_id
+                    )
+                update = await update_card(
+                    **update_kwargs,
                 )
                 if getattr(update, "success", False):
                     return

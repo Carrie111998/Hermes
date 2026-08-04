@@ -334,6 +334,7 @@ class TestFeishuPluginInteractiveCard:
             ("denied", "Denied", "red"),
             ("conflict", "Conflict", "orange"),
             ("retryable_failure", "Retryable failure", "orange"),
+            ("unknown_outcome", "Outcome unknown", "grey"),
         ],
     )
     def test_status_cards_distinguish_truthful_states(
@@ -387,6 +388,42 @@ class TestFeishuPluginInteractiveCard:
         assert request.request_body.msg_type == "interactive"
         card = json.loads(request.request_body.content)
         assert card["header"]["template"] == "green"
+
+    @pytest.mark.asyncio
+    async def test_retryable_update_keeps_same_opaque_action_reclaimable(self):
+        from gateway.interactive_actions import InteractiveActionResult
+
+        adapter = _make_adapter()
+        response = SimpleNamespace(
+            success=lambda: True,
+            data=SimpleNamespace(message_id="om_card"),
+        )
+        with (
+            patch.object(
+                adapter._client.im.v1.message,
+                "update",
+                return_value=response,
+            ),
+            patch.object(
+                adapter,
+                "_run_blocking",
+                new_callable=AsyncMock,
+                return_value=response,
+            ) as run_blocking,
+        ):
+            result = await adapter.update_interactive_card(
+                chat_id="oc_chat",
+                card_id="om_card",
+                result=InteractiveActionResult.retryable_failure(),
+                action_instance_id="ia_opaque_123",
+            )
+
+        assert result.success is True
+        request = run_blocking.await_args.args[1]
+        card = json.loads(request.request_body.content)
+        assert card["elements"][1]["actions"][0]["value"] == {
+            "hermes_interactive_action_id": "ia_opaque_123"
+        }
 
 
 # ===========================================================================
@@ -708,6 +745,21 @@ class TestCardActionCallbackResponse:
         )
 
         assert response.card is None
+
+    def test_unknown_outcome_replay_replaces_card_with_terminal_warning(
+        self,
+        _patch_callback_card_types,
+    ):
+        from gateway.interactive_actions import InteractiveActionResult
+
+        adapter = _make_adapter()
+        result = InteractiveActionResult.unknown_outcome()
+
+        response = adapter._build_interactive_action_callback_response(result)
+
+        assert response.card is not None
+        assert "Outcome unknown" in response.card.data["header"]["title"]["content"]
+        assert response.card.data["elements"][0]["content"] == result.user_message
 
     def test_unknown_non_hermes_action_preserves_synthetic_card_path(
         self,

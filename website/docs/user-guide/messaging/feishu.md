@@ -286,11 +286,14 @@ are authenticated by the Feishu connection, checked by normal gateway
 authorization plus the plugin's action policy, and atomically claimed from the
 profile-local ledger. They bypass `/card`, the model, and the conversation
 transcript. The card first shows **Processing** only after authorization and a
-successful claim, then is replaced with Applied, Already processed, Expired,
-Conflict, or Retryable failure. A denied, unknown, or pre-claim failure does
-not replace the shared card, so an unauthorized viewer cannot remove the
-initiator's live buttons. Hermes retries transient final-card edits three
-times; the durable claim remains fail-closed if Feishu still rejects the edit.
+successful claim, then is replaced with Applied, Downstream replay, Expired,
+Conflict, Retryable failure, or Outcome unknown. Retryable failures retain a
+button for another authenticated claim of the same bound action. Terminal
+status and sanitized text are stored durably and replayed exactly after callback
+retries or restart. A denied, unknown, or pre-claim failure does not replace the
+shared card, so an unauthorized viewer cannot remove the initiator's live
+buttons. Hermes retries transient final-card edits three times and drains active
+actions before disconnecting the adapter during shutdown.
 See [Build a Hermes Plugin — Send a gateway
 confirmation card](/developer-guide/plugins#send-a-gateway-confirmation-card).
 

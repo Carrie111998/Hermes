@@ -3525,6 +3525,7 @@ class BasePlatformAdapter(ABC):
         chat_id: str,
         card_id: str,
         result: Any,
+        action_instance_id: Optional[str] = None,
     ) -> SendResult:
         """Update native card state; unsupported adapters fail explicitly."""
 
