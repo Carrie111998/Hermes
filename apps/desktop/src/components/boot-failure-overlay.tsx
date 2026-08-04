@@ -280,7 +280,17 @@ export function BootFailureOverlay() {
   let hint: string
 
   if (managedEva) {
-    actions = [retryAction]
+    actions = [
+      retryAction,
+      {
+        key: 'signin',
+        label: t.settings.gateway.managed.signIn,
+        onClick: () => void signInManaged(),
+        icon: <LogIn />,
+        variant: 'secondary',
+        busy: 'signin'
+      }
+    ]
     hint = copy.managedAssignmentHint
   } else if (remoteReauth) {
     actions = [
@@ -368,12 +378,6 @@ export function BootFailureOverlay() {
                   {action.label}
                 </Button>
               ))}
-              {managedEva ? (
-                <Button disabled={Boolean(busy)} onClick={() => void signInManaged()} variant="secondary">
-                  {busy === 'signin' ? <Loader2 className="animate-spin" /> : <LogIn />}
-                  {copy.signInToRemoteGateway}
-                </Button>
-              ) : null}
               {!managedEva ? (
                 <Button onClick={openLogs} variant="ghost">
                   <FileText />

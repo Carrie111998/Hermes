@@ -1,18 +1,18 @@
 import type { Translations } from './types'
 
 const BRAND_REPLACEMENTS: ReadonlyArray<readonly [RegExp, string]> = [
-  [/Eva by Electric Sheep/g, 'evaOS Agent'],
-  [/Hermes Desktop/g, 'evaOS Agent'],
-  [/Hermes Agent/g, 'evaOS Agent'],
-  [/Nous Portal/g, 'Electric Sheep account'],
-  [/Nous Research/g, 'Electric Sheep'],
-  [/\bHermes\b/g, 'evaOS Agent'],
-  [/\bEva\b/g, 'evaOS Agent'],
-  [/\bNous\b/g, 'Electric Sheep']
+  [/Eva by Electric Sheep/gi, 'evaOS Agent'],
+  [/Hermes Desktop/gi, 'evaOS Agent'],
+  [/Hermes Agent/gi, 'evaOS Agent'],
+  [/Nous Portal/gi, 'Electric Sheep account'],
+  [/Nous Research/gi, 'Electric Sheep'],
+  [/\bHermes\b/gi, 'evaOS Agent'],
+  [/\bEva\b/gi, 'evaOS Agent'],
+  [/\bNous\b/gi, 'Electric Sheep']
 ]
 
 const UPSTREAM_BRAND_RE =
-  /Eva by Electric Sheep|Hermes Desktop|Hermes Agent|Nous Portal|Nous Research|\bHermes\b|\bEva\b|\bNous\b/
+  /Eva by Electric Sheep|Hermes Desktop|Hermes Agent|Nous Portal|Nous Research|\bHermes\b|\bEva\b|\bNous\b/i
 
 const LEGAL_ATTRIBUTION = 'Hermes Agent by Nous Research'
 
@@ -51,7 +51,7 @@ function sanitizeManagedProviderText(value: string): string {
 
   return sanitizeManagedBrandText(
     value
-      .replace(/Nous Subscription/g, 'Electric Sheep managed service')
+      .replace(/Nous Subscription/gi, 'Electric Sheep managed service')
       .replace(/billed to your subscription/gi, 'included with your managed agent')
   )
 }

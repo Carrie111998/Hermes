@@ -40,6 +40,8 @@ describe('managed evaOS Agent branding', () => {
 
   it('sanitizes managed Nous provider labels while preserving unmanaged and other-provider labels', () => {
     expect(managedProviderDisplayValue('nous', 'Nous Portal', true)).toBe('Electric Sheep account')
+    expect(managedProviderDisplayValue('nous', 'nous subscription', true)).toBe('Electric Sheep managed service')
+    expect(managedProviderDisplayValue('nous', 'nOuS pOrTaL', true)).toBe('Electric Sheep account')
     expect(managedProviderDisplayValue('Nous Subscription (Browser Use cloud)', 'subscription', true)).toBe('managed')
     expect(
       managedProviderDisplayValue(

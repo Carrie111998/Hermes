@@ -101,7 +101,8 @@ describe('BootFailureOverlay', () => {
         )
       ).toBeTruthy()
 
-      const button = screen.getByRole('button', { name: 'Sign in to remote gateway' })
+      const button = screen.getByRole('button', { name: 'Sign in to evaOS Agent' })
+      expect(screen.queryByRole('button', { name: 'Sign in to remote gateway' })).toBeNull()
       fireEvent.click(button)
 
       await waitFor(() => expect(signIn).toHaveBeenCalledOnce())
