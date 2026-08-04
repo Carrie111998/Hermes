@@ -1796,7 +1796,25 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 "Rate-limit backoff level %d: cooldown %d s (%.1f min, backoff#%d)",
                 backoff_count, backoff_seconds, backoff_seconds / 60, backoff_count + 1,
             )
-    if agent._fallback_index >= len(agent._fallback_chain):
+    chain = getattr(agent, "_fallback_chain", None)
+    if not isinstance(chain, (list, tuple)):
+        logger.warning(
+            "Fallback unavailable: invalid fallback chain type %s",
+            type(chain).__name__,
+        )
+        agent._fallback_chain = []
+        agent._fallback_index = 0
+        return False
+
+    try:
+        index = int(getattr(agent, "_fallback_index", 0) or 0)
+    except (TypeError, ValueError):
+        index = 0
+    if index < 0:
+        index = 0
+    agent._fallback_index = index
+
+    if index >= len(chain):
         # Chain exhausted.  If we actually walked a non-empty chain and the
         # failure was NOT a rate-limit/billing event (those already armed
         # their own 60s cooldown above), arm a short cooldown so the next
@@ -1804,7 +1822,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         # _fallback_index=0 and re-marshaling the whole context across every
         # provider again.  Guards the cross-turn replay storm in #24996.
         if (
-            len(agent._fallback_chain) > 0
+            len(chain) > 0
             and reason not in {FailoverReason.rate_limit, FailoverReason.billing, FailoverReason.upstream_rate_limit}
         ):
             _existing_cooldown = getattr(agent, "_rate_limited_until", 0) or 0
@@ -1813,8 +1831,8 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 time.monotonic() + _FALLBACK_EXHAUSTED_COOLDOWN_S,
             )
         return False
-    fb = agent._fallback_chain[agent._fallback_index]
-    agent._fallback_index += 1
+    fb = chain[index]
+    agent._fallback_index = index + 1
     if not isinstance(fb, dict):
         return agent._try_activate_fallback(reason)
     fb_key = _fallback_entry_key(fb)

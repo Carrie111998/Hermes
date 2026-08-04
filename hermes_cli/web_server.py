@@ -7864,7 +7864,16 @@ async def validate_provider_credential(body: EnvVarUpdate, request: Request):
         api_key = (body.api_key or "").strip()
         headers = {"Authorization": f"Bearer {api_key}"} if api_key else None
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(8.0)) as client:
+            from tools.url_safety import SSRFProtectedTransport
+
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(8.0),
+                transport=SSRFProtectedTransport(
+                    allow_private_urls=not bool(
+                        getattr(request.app.state, "auth_required", False)
+                    )
+                ),
+            ) as client:
                 resp = await client.get(url, headers=headers)
             return {"ok": True, "reachable": True, "message": "", "models": _parse_model_ids(resp)}
         except Exception:

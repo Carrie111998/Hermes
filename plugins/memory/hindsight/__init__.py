@@ -1225,7 +1225,16 @@ class HindsightMemoryProvider(MemoryProvider):
         means "no longer pending" and is treated as done. Transient errors
         return False so the caller keeps waiting until its deadline.
         """
-        from hindsight_client_api.exceptions import NotFoundException
+        # Prefer the typed NotFound from hindsight-client when importable.
+        # Importing ``hindsight_client_api`` can fail (missing extra, aiohttp
+        # circular init, etc.); never let that kill the prefetch thread.
+        not_found_types: tuple[type[BaseException], ...] = ()
+        try:
+            from hindsight_client_api.exceptions import NotFoundException as _NF
+
+            not_found_types = (_NF,)
+        except Exception:  # pragma: no cover - optional / fragile import path
+            pass
 
         try:
             resp = self._run_hindsight_operation(
@@ -1233,11 +1242,15 @@ class HindsightMemoryProvider(MemoryProvider):
                     bank_id=bank_id, operation_id=op_id
                 )
             )
-        except NotFoundException:
+        except not_found_types:
             return True
         except Exception as exc:
+            # Duck-type 404 / NotFound even when the SDK class couldn't import.
+            if type(exc).__name__ == "NotFoundException" or getattr(exc, "status", None) == 404:
+                return True
             logger.debug("Prefetch: operation status check failed for %s: %s", op_id, exc)
             return False
+
         status = str(getattr(resp, "status", "") or "").lower()
         return status in {"completed", "failed"}
 
@@ -1753,9 +1766,10 @@ class HindsightMemoryProvider(MemoryProvider):
             # read-after-write signal), because async retain returns on
             # acceptance rather than durability. Runs on the background prefetch
             # thread, never the reply path, so it adds no response latency.
-            if self._prefetch_waits_for_retain:
-                self._wait_for_retains_drained(self._prefetch_retain_drain_timeout)
+            # Drain failures must not skip recall — same as timeout behavior.
             try:
+                if self._prefetch_waits_for_retain:
+                    self._wait_for_retains_drained(self._prefetch_retain_drain_timeout)
                 if self._prefetch_method == "reflect":
                     logger.debug("Prefetch: calling reflect (bank=%s, query_len=%d)", self._bank_id, len(query))
                     resp = self._run_hindsight_operation(lambda client: client.areflect(bank_id=self._bank_id, query=query, budget=self._budget))

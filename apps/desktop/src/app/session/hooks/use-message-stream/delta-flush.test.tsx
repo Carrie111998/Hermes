@@ -10,6 +10,7 @@ import { createClientSessionState } from '@/lib/chat-runtime'
 import { useSessionStateCache } from '../use-session-state-cache'
 
 import { useMessageStream } from './index'
+import { STREAM_DELTA_FLUSH_MS } from './utils'
 
 const SID = 'session-1'
 let appendAssistantDelta: ((sessionId: string, delta: string) => void) | null = null
@@ -236,23 +237,24 @@ describe('useMessageStream delta flush scheduling', () => {
     })
 
     // A second flush starts before the first flush's frame lands.
+    // sinceLast=10ms, so the wait is STREAM_DELTA_FLUSH_MS - 10.
     now = 1010
     act(() => appendAssistantDelta!(SID, 'b'))
     await act(async () => {
-      await vi.advanceTimersByTimeAsync(23)
+      await vi.advanceTimersByTimeAsync(STREAM_DELTA_FLUSH_MS)
     })
 
     expect(assistantText()).toBe('ab')
     expect(rafCallbacks).toHaveLength(2)
 
     // The stale callback must not overwrite the newer flush's cost. If it
-    // did, cost would read 30ms and the next gap would stretch to 70ms.
+    // did, cost would read 30ms and the next gap would stretch past the floor.
     now = 1030
     act(() => rafCallbacks[0](1000))
 
     act(() => appendAssistantDelta!(SID, 'c'))
     await act(async () => {
-      await vi.advanceTimersByTimeAsync(13)
+      await vi.advanceTimersByTimeAsync(STREAM_DELTA_FLUSH_MS)
     })
 
     expect(assistantText()).toBe('abc')

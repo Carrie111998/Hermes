@@ -690,7 +690,14 @@ class TestPrefetchServerRetainVisibility:
 
     def test_operation_notfound_treated_as_complete(self, provider):
         """A NotFound (completed+evicted) op is treated as done, not pending."""
-        from hindsight_client_api.exceptions import NotFoundException
+        try:
+            from hindsight_client_api.exceptions import NotFoundException
+        except Exception:
+            class NotFoundException(Exception):
+                def __init__(self, status=404, reason="gone"):
+                    self.status = status
+                    self.reason = reason
+                    super().__init__(reason)
 
         client = _make_mock_client()
         client.operations = MagicMock()

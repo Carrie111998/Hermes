@@ -5393,24 +5393,41 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         rowcount = self._execute_write(_do)
         return rowcount > 0
 
-    def get_session_by_title(self, title: str) -> Optional[Dict[str, Any]]:
-        """Look up a session by exact title. Returns session dict or None."""
-        with self._read_ctx() as conn:
-            cursor = conn.execute(
-                "SELECT s.*, "
-                "COALESCE(sp.prompt, s.system_prompt) AS _system_prompt_resolved "
-                "FROM sessions s "
-                "LEFT JOIN system_prompts sp ON sp.hash = s.system_prompt_hash "
-                "WHERE s.title = ?",
-                (title,),
+    def get_session_by_title(
+        self,
+        title: str,
+        source: str = None,
+        user_id: str = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Look up a session by exact title. Returns session dict or None.
+
+        Optional ``source`` / ``user_id`` narrow the match the same way
+        ``resolve_session_by_title`` does (gateway resume + desktop).
+        """
+        where_clauses = ["s.title = ?"]
+        params: list[Any] = [title]
+        order_clause = ""
+        if source:
+            where_clauses.append("s.source = ?")
+            params.append(source)
+        if user_id is not None:
+            where_clauses.append("(s.user_id = ? OR s.user_id IS NULL)")
+            params.append(user_id)
+            order_clause = (
+                " ORDER BY CASE WHEN s.user_id = ? THEN 0 ELSE 1 END, "
+                "s.started_at DESC"
             )
             params.append(user_id)
         query = (
-            f"SELECT * FROM sessions WHERE {' AND '.join(where_clauses)}"
+            "SELECT s.*, "
+            "COALESCE(sp.prompt, s.system_prompt) AS _system_prompt_resolved "
+            "FROM sessions s "
+            "LEFT JOIN system_prompts sp ON sp.hash = s.system_prompt_hash "
+            f"WHERE {' AND '.join(where_clauses)}"
             f"{order_clause} LIMIT 1"
         )
-        with self._lock:
-            cursor = self._conn.execute(query, params)
+        with self._read_ctx() as conn:
+            cursor = conn.execute(query, params)
             row = cursor.fetchone()
         return self._session_row_dict(row) if row else None
 
@@ -5449,8 +5466,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             f"WHERE {' AND '.join(where_clauses)} "
             f"ORDER BY {order_prefix}started_at DESC"
         )
-        with self._lock:
-            cursor = self._conn.execute(query, params)
+        with self._read_ctx() as conn:
+            cursor = conn.execute(query, params)
             numbered = cursor.fetchall()
 
         if numbered:
