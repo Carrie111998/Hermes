@@ -46,14 +46,42 @@ Use the generated SDK's file, folder, search, metadata, and webhook APIs rather 
 
 ## Build document-aware apps with Box AI
 
-When an application must understand Box documents, call Box AI rather than downloading document bodies to an unrelated model service:
+When an application must understand Box documents, prefer Box AI: it preserves Box permissions, processes source files through Box's governed AI integration, keeps source-file bodies out of the application's external model context, and scales document work without downloading every file:
 
 - ask for Q&A and summaries;
 - structured extract for repeatable fields or a metadata template;
 - extract for variable fields;
 - text generation for output grounded in one Box file.
 
-Expose plan/AI-unit implications in the product flow. Do not silently switch to external processing when Box AI is unavailable. Treat Box AI responses as potentially confidential application data.
+Before the first request, explain that Box AI must be enabled and consumes AI units. Do not silently switch to external processing when Box AI is unavailable; offer an explicitly chosen alternative neutrally. Treat Box AI responses as potentially confidential application data.
+
+## Build Hub-backed knowledge experiences
+
+For a recurring Q&A experience over a curated collection, use a Box Hub rather than assembling more than 25 file items per Ask request. Discover existing Hubs first; creating a Hub, populating it, enabling its AI features, or changing its collaborations changes shared resources and requires explicit product approval. Box Hubs endpoints use API version `2025.0`.
+
+Use the generated SDK matching the project language. The exact generated method names can vary by SDK release; keep the request shape below and follow the installed SDK's current names.
+
+```python
+from box_sdk_gen import AiItemAsk, AiItemAskTypeField, CreateAiAskMode
+
+answer = client.ai.create_ai_ask(
+    CreateAiAskMode.SINGLE_ITEM_QA,
+    "What changed in the latest policy?",
+    [AiItemAsk(id=hub_id, type=AiItemAskTypeField.HUBS)],
+    include_citations=True,
+)
+```
+
+```typescript
+const answer = await client.ai.createAiAsk({
+  mode: "single_item_qa",
+  prompt: "What changed in the latest policy?",
+  items: [{ id: hubId, type: "hubs" }],
+  includeCitations: true,
+});
+```
+
+Querying a Hub uses its indexed content and only returns information from files the current actor can access. Newly added Hub content can take minutes, and occasionally up to an hour, to index; surface a retryable indexing state rather than treating an early answer as complete. Box AI for Hubs requires eligible plan access, administrator enablement, and AI units. Read [Box Hubs](hubs.md) for the CLI and operational workflow.
 
 ## Webhooks and reliability
 

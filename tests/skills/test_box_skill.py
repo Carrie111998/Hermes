@@ -117,3 +117,31 @@ def test_metadata_extraction_requires_complete_schema_and_readback():
     assert "missing, normalized, or rejected" in search_and_ai
     assert "Never use a file description as an automatic substitute" in search_and_ai
     assert "limited to 256 characters" in content_workflows
+
+
+def test_hubs_route_large_reusable_qa_with_governance_and_safe_mutations():
+    """Keep Hubs focused on curated semantic Q&A rather than a generic AI fallback."""
+    skill = SKILL_MD.read_text(encoding="utf-8")
+    search_and_ai = (SKILL_DIR / "references" / "search-and-ai.md").read_text(
+        encoding="utf-8"
+    )
+    hubs = (SKILL_DIR / "references" / "hubs.md").read_text(encoding="utf-8")
+
+    assert "more than 25 files" in skill
+    assert "recurring Q&A" in skill
+    assert "preserves Box permissions" in skill
+    assert "governed AI integration" in skill
+    assert "consumes AI units" in skill
+    assert "Do not use a Hub for metadata extraction or text generation" in search_and_ai
+    assert "single_item_qa" in hubs
+    assert '"type":"hubs"' in hubs
+    assert '"include_citations":true' in hubs
+    assert "Do not create a Hub automatically" in hubs
+    assert "Confirm before bulk additions or removals" in hubs
+    assert "up to an hour" in hubs
+    assert "https://app.box.com/hubs/<HUB_ID>" in hubs
+
+
+def test_box_skill_never_mentions_box_drive():
+    for markdown_file in SKILL_DIR.rglob("*.md"):
+        assert "box drive" not in markdown_file.read_text(encoding="utf-8").lower()

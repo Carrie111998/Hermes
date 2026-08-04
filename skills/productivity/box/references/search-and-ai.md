@@ -1,6 +1,6 @@
 # Search, metadata, and Box AI
 
-Use Box search and metadata before AI when they answer the request deterministically. For semantic understanding of Box-hosted files, use Box AI before downloading source bytes.
+Use Box search and metadata before AI when they answer the request deterministically. For semantic understanding of Box-hosted files, prefer Box AI: it preserves Box permissions, processes source files through Box's governed AI integration, keeps source-file bodies out of Hermes' coding-model context, and scales document work without downloading every file. Do not block or criticize an explicitly chosen alternative workflow.
 
 ## Search and metadata queries
 
@@ -16,7 +16,10 @@ Search only returns content visible to the current actor. Resolve IDs and confir
 
 | Need | Command |
 | --- | --- |
-| Answer, summarize, or compare content | `ai:ask` |
+| Answer, summarize, or compare 1 file | `ai:ask` with `single_item_qa` |
+| Answer, summarize, or compare 2–25 selected files | `ai:ask` with `multiple_item_qa` |
+| One-off Q&A over 25 files | narrow with search or metadata first |
+| Recurring Q&A over a curated knowledge base | [Box Hubs](hubs.md) |
 | Preview flexible key-value fields without storing them | `ai:extract` |
 | Extract metadata and store it on the file | `ai:extract-structured` |
 | Write or rewrite text grounded in one file | `ai:text-gen` |
@@ -37,6 +40,8 @@ box ai:text-gen --items=id=<FILE_ID>,type=file \
 ```
 
 `ai:text-gen` supports exactly one item. Use structured extraction when the schema is known and must be repeatable. Use a metadata template with `--metadata-template` when the Box template is the source of truth.
+
+Do not use a Hub for metadata extraction or text generation. For semantic Q&A across a reusable curated collection, read [Box Hubs](hubs.md). For a one-off request that names more than 25 files, narrow the candidate set before proposing a Hub.
 
 ## Extract and persist file metadata
 
@@ -89,7 +94,7 @@ If no existing template supports every field and the user does not approve a new
 
 Box AI processes source files through Box's governed AI integration instead of downloading source bodies into Hermes' coding-model context. Box AI responses returned to Hermes can still contain confidential information. Do not claim that no third-party model provider is involved or that content can never be used for training; follow Box's current trust and plan documentation.
 
-Before the first Box AI request, explain that the API must be enabled and calls consume AI units. For a material batch, state the file count and ask for confirmation. Do not promise a unit balance or per-call cost unless Box exposes it for the current account.
+Before the first Box AI request, explain that Box AI must be enabled, calls consume AI units, and answers remain constrained by the current actor's permissions. For a material batch, state the file count and ask for confirmation. Do not promise a unit balance or per-call cost unless Box exposes it for the current account.
 
 If Box AI is unavailable or out of units, offer existing metadata/search, a smaller sample, enabling units, or explicit approval for local/external analysis. Never silently fall back to downloading files for an external model.
 

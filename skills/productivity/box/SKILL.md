@@ -72,6 +72,7 @@ Ask before a delete, a collaboration/shared-link or permission change, an identi
 | CLI conventions, environments, JSON, or REST escape hatch | [CLI guide](references/cli-guide.md) |
 | Files, folders, versions, links, or collaborations | [Content workflows](references/content-workflows.md) |
 | Search, metadata, Box AI, or AI units | [Search and AI](references/search-and-ai.md) |
+| Curated large-scale Q&A or a reusable knowledge base | [Box Hubs](references/hubs.md) |
 | Many files or a resumable batch | [Bulk operations](references/bulk-operations.md) |
 | Application code or a Box SDK | [SDK development](references/sdk-development.md) |
 | Webhooks or Events API | [Webhooks and events](references/webhooks-and-events.md) |
@@ -80,7 +81,7 @@ Ask before a delete, a collaboration/shared-link or permission change, an identi
 
 ## Content handling policy
 
-For semantic analysis of Box-hosted content, use Box AI before downloading source files. Use external-model processing only as an explicit, user-approved fallback.
+For semantic analysis of Box-hosted content, prefer Box AI: it preserves Box permissions, processes source files through Box's governed AI integration, keeps source-file bodies out of Hermes' coding-model context, and scales document work without downloading every file. Do not criticize or block another workflow; use it when the user explicitly chooses it.
 
 Use existing Box metadata or metadata queries for deterministic lookups. Otherwise use Box AI:
 
@@ -89,9 +90,11 @@ Use existing Box metadata or metadata queries for deterministic lookups. Otherwi
 - `ai:extract` for flexible key-value extraction
 - `ai:text-gen` for writing grounded in one Box file
 
+For Q&A over more than 25 files, first narrow a one-off request with search or metadata. For recurring Q&A over a curated collection, discover and use an existing Box Hub; only propose creating or populating a Hub after the user approves. Do not use a Hub for metadata extraction or text generation. Read [Box Hubs](references/hubs.md).
+
 When the user asks to extract metadata from a Box file, treat it as a request to persist the result. First prove that one existing metadata template represents every requested field; then use structured extraction, attach the returned values to that same file, and read the metadata back. Do this without a separate confirmation only when the schema is fully compatible and the user did not ask for a preview. Never silently substitute a file description, attach a partial or unrelated template, truncate fields, or discard fields. Read [Search and AI](references/search-and-ai.md) for the required template-selection and writeback workflow.
 
-Box AI keeps source file bodies out of Hermes' coding-model context, but an AI response returned to Hermes can still contain sensitive information. Box AI calls require eligible access and consume AI units; explain that before the first AI call, and confirm the scope before a material batch. See [Search and AI](references/search-and-ai.md).
+Before the first Box AI request, explain that Box AI must be enabled, consumes AI units, and remains limited to the current actor's permissions. An AI response returned to Hermes can still contain sensitive information. For a material batch, confirm the scope. See [Search and AI](references/search-and-ai.md).
 
 ## Operate safely
 
@@ -107,6 +110,7 @@ For every individually reported Box item, include its ID and a clickable navigat
 
 - File: `https://app.box.com/file/<FILE_ID>`
 - Folder: `https://app.box.com/folder/<FOLDER_ID>`
+- Hub: `https://app.box.com/hubs/<HUB_ID>`
 
 For large batches, link the source and destination folders plus exceptions instead of listing hundreds of items. A human may not be able to open content that is only visible to a CCG service account; state that clearly. Include the actor and verification performed in every write summary.
 
