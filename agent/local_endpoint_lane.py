@@ -7,7 +7,8 @@ server never receives overlapping work from separate Hermes processes.
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+import asyncio
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 import hashlib
 import json
@@ -16,7 +17,7 @@ from pathlib import Path
 import tempfile
 import threading
 import time
-from typing import Callable, Iterator
+from typing import AsyncIterator, Callable, Iterator
 from urllib.parse import urlparse
 import uuid
 
@@ -246,8 +247,82 @@ def local_endpoint_lane(
                 lock_handle.close()
 
 
+@asynccontextmanager
+async def async_local_endpoint_lane(
+    base_url: str,
+    *,
+    state_root: Path | None = None,
+    enabled: bool = True,
+    timeout_s: float | None = None,
+    poll_interval_s: float = 0.05,
+    stale_after_s: float = 30.0,
+    cancel_check: Callable[[], bool] | None = None,
+) -> AsyncIterator[LocalEndpointLease]:
+    """Async, cancellation-safe mirror of :func:`local_endpoint_lane`.
+
+    File waiting runs off the event-loop thread.  If the coroutine is
+    cancelled while queued, cancellation is signalled to that worker and its
+    cleanup is awaited before :class:`asyncio.CancelledError` is propagated.
+    """
+
+    cancelled = threading.Event()
+
+    def should_cancel() -> bool:
+        return cancelled.is_set() or (
+            cancel_check is not None and cancel_check()
+        )
+
+    manager = local_endpoint_lane(
+        base_url,
+        state_root=state_root,
+        enabled=enabled,
+        timeout_s=timeout_s,
+        poll_interval_s=poll_interval_s,
+        stale_after_s=stale_after_s,
+        cancel_check=should_cancel,
+    )
+    enter_task = asyncio.create_task(asyncio.to_thread(manager.__enter__))
+    entered = False
+    lease: LocalEndpointLease | None = None
+    try:
+        try:
+            lease = await asyncio.shield(enter_task)
+            entered = True
+        except asyncio.CancelledError:
+            cancelled.set()
+            try:
+                lease = await enter_task
+                entered = True
+            except InterruptedError:
+                pass
+            if entered:
+                await asyncio.to_thread(manager.__exit__, None, None, None)
+                entered = False
+            raise
+
+        try:
+            yield lease
+        except BaseException as exc:
+            await asyncio.to_thread(
+                manager.__exit__,
+                type(exc),
+                exc,
+                exc.__traceback__,
+            )
+            entered = False
+            raise
+        else:
+            await asyncio.to_thread(manager.__exit__, None, None, None)
+            entered = False
+    finally:
+        cancelled.set()
+        if entered:
+            await asyncio.to_thread(manager.__exit__, None, None, None)
+
+
 __all__ = [
     "LocalEndpointLease",
+    "async_local_endpoint_lane",
     "lane_dir_for_endpoint",
     "local_endpoint_lane",
 ]

@@ -1,3 +1,4 @@
+import asyncio
 import json
 import multiprocessing
 import os
@@ -10,6 +11,7 @@ import psutil
 
 import agent.local_endpoint_lane as lane_module
 from agent.local_endpoint_lane import (
+    async_local_endpoint_lane,
     lane_dir_for_endpoint,
     local_endpoint_lane,
 )
@@ -384,3 +386,100 @@ def test_live_stale_head_ticket_is_not_pruned(tmp_path: Path) -> None:
 
     assert live.exists()
     live.unlink()
+
+
+@pytest.mark.asyncio
+async def test_async_lane_preserves_fifo_order(tmp_path: Path) -> None:
+    order: list[str] = []
+    first_acquired = asyncio.Event()
+    release_first = asyncio.Event()
+
+    async def worker(name: str, hold: bool = False) -> None:
+        async with async_local_endpoint_lane(
+            ENDPOINT,
+            state_root=tmp_path,
+            poll_interval_s=0.01,
+            timeout_s=2.0,
+        ):
+            order.append(name)
+            if hold:
+                first_acquired.set()
+                await release_first.wait()
+
+    first = asyncio.create_task(worker("first", hold=True))
+    await asyncio.wait_for(first_acquired.wait(), timeout=1.0)
+    second = asyncio.create_task(worker("second"))
+    lane_dir = lane_dir_for_endpoint(ENDPOINT, state_root=tmp_path)
+    await asyncio.to_thread(
+        _wait_for,
+        lambda: len(list(lane_dir.glob("ticket-*.json"))) == 1,
+    )
+    third = asyncio.create_task(worker("third"))
+    await asyncio.to_thread(
+        _wait_for,
+        lambda: len(list(lane_dir.glob("ticket-*.json"))) == 2,
+    )
+    release_first.set()
+    await asyncio.wait_for(asyncio.gather(first, second, third), timeout=3.0)
+
+    assert order == ["first", "second", "third"]
+
+
+@pytest.mark.asyncio
+async def test_async_wait_cancellation_cleans_ticket(tmp_path: Path) -> None:
+    holder_ready = threading.Event()
+    release_holder = threading.Event()
+
+    def holder() -> None:
+        with local_endpoint_lane(ENDPOINT, state_root=tmp_path):
+            holder_ready.set()
+            release_holder.wait(timeout=5.0)
+
+    holder_thread = threading.Thread(target=holder, daemon=True)
+    holder_thread.start()
+    assert holder_ready.wait(timeout=2.0)
+
+    async def waiter() -> None:
+        async with async_local_endpoint_lane(
+            ENDPOINT,
+            state_root=tmp_path,
+            poll_interval_s=0.01,
+        ):
+            raise AssertionError("cancelled waiter acquired the lane")
+
+    waiter_task = asyncio.create_task(waiter())
+    lane_dir = lane_dir_for_endpoint(ENDPOINT, state_root=tmp_path)
+    await asyncio.to_thread(
+        _wait_for,
+        lambda: bool(list(lane_dir.glob("ticket-*.json"))),
+    )
+    waiter_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter_task
+
+    assert not list(lane_dir.glob("ticket-*.json"))
+    release_holder.set()
+    holder_thread.join(timeout=2.0)
+
+
+@pytest.mark.asyncio
+async def test_async_holder_cancellation_releases_lane(tmp_path: Path) -> None:
+    acquired = asyncio.Event()
+
+    async def holder() -> None:
+        async with async_local_endpoint_lane(ENDPOINT, state_root=tmp_path):
+            acquired.set()
+            await asyncio.Event().wait()
+
+    holder_task = asyncio.create_task(holder())
+    await asyncio.wait_for(acquired.wait(), timeout=1.0)
+    holder_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await holder_task
+
+    async with async_local_endpoint_lane(
+        ENDPOINT,
+        state_root=tmp_path,
+        timeout_s=0.2,
+    ) as lease:
+        assert lease.coordinated is True
