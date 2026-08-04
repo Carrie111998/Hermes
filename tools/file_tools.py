@@ -10,7 +10,7 @@ import sys
 import threading
 from pathlib import Path, PurePosixPath
 
-from agent.file_safety import get_read_block_error
+from agent.file_safety import find_git_worktree_pointer_file, get_read_block_error
 from tools.binary_extensions import has_binary_extension
 from tools.file_operations import (
     ShellFileOperations,
@@ -698,6 +698,24 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
             f"Refusing to write to Hermes config file: {filepath}\n"
             "Agent cannot modify security-sensitive configuration. "
             "Edit ~/.hermes/config.yaml directly or use 'hermes config' instead."
+        )
+    # Git worktree ``.git`` pointer FILES (#78565): a linked worktree's
+    # repository link is a plain FILE named ``.git`` containing
+    # ``gitdir: <path>``. Writing that file — or anything below it —
+    # atomically replaces/severs the pointer and the worktree becomes a
+    # zombie (git commands inside it die, and git tooling refuses to
+    # remove it). ``.git`` DIRECTORY components (normal repos,
+    # submodules) are not pointers and remain writable.
+    try:
+        resolved_real = os.path.realpath(os.path.expanduser(filepath))
+    except OSError:
+        resolved_real = filepath
+    if find_git_worktree_pointer_file(resolved_real) is not None:
+        return (
+            f"Refusing to write to git worktree .git pointer path: {filepath}\n"
+            "Writing here replaces the 'gitdir: <path>' link that attaches the "
+            "worktree to its repository and severs the worktree from git. "
+            "Use the terminal or git commands instead."
         )
     return None
 
