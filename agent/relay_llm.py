@@ -794,11 +794,11 @@ def _logical_parent(
         with turn.logical_llm_lock:
             handle = turn.logical_llm_calls.get(request_id)
             if handle is None:
-                handle = runtime.run_in_session(
+                handle = runtime.push_scope(
                     session,
-                    runtime.relay.scope.push,
                     relay_runtime.LOGICAL_LLM_SCOPE,
                     runtime.relay.ScopeType.Function,
+                    kind="logical_llm",
                     handle=parent,
                     input={},
                     metadata={
@@ -830,25 +830,16 @@ def _complete_logical(
                 return
         if lease.session is None:
             return
-        try:
-            lease.host.run_in_session(
-                lease.session,
-                lease.host.relay.scope.pop,
-                handle,
-                output={"outcome": outcome},
-                metadata={
-                    relay_runtime.RUNTIME_SCHEMA_KEY: relay_runtime.RUNTIME_SCHEMA_VERSION,
-                    relay_runtime.RUNTIME_INSTANCE_KEY: lease.host.runtime_id,
-                },
-            )
-        except Exception:
-            # The provider result is authoritative. Retain the handle so turn
-            # finalization can retry cleanup without changing that result.
-            logger.warning(
-                "Hermes Relay logical LLM finalization failed",
-                exc_info=True,
-            )
-            return
+        # The provider result is authoritative: a buried scope is parked on
+        # the session (drained by a later pop or close_session) rather than
+        # turning the turn boundary into a failure. The logical call is
+        # dropped from the turn either way — the session registry now owns
+        # any retry, so _finish_logical_calls must not see it again.
+        lease.host.pop_scope(
+            lease.session,
+            handle,
+            output={"outcome": outcome},
+        )
         with turn.logical_llm_lock:
             if turn.logical_llm_calls.get(request_id) is handle:
                 turn.logical_llm_calls.pop(request_id, None)
