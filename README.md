@@ -254,6 +254,14 @@ When you use `--with-josh-setup` (or the individual flags), the installer wires 
 | `mcp_servers.agent_graph` registered (with socket args) | Graph orchestration available on next restart |
 | Hooks auto-discovered from `~/.hermes/agent-hooks/` | No config needed — any `.py` file is loaded |
 
+**How this affects the learning loop:** Hermes' built-in learning loop (skill creation, memory recall, knowledge capture, session search) is **enhanced**, not broken. The agent hooks intercept memory operations at the hook level and route them to semantic-memory's vector + graph backend — giving you semantic search, knowledge graph edges, and factor-graph belief propagation instead of basic FTS5 keyword search. Skill creation and cron nudges are unchanged.
+
+**Caveat:** If the semantic-memory daemon is down AND built-in memory is disabled, the agent has no memory backend. Keep the daemon running, or re-enable the built-in `memory` toolset as a fallback:
+
+```bash
+hermes config unset agent.disabled_toolsets
+```
+
 ### Installer flags
 
 | Flag | What it does |
