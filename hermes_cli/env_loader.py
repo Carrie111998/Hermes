@@ -340,6 +340,20 @@ def _sanitize_loaded_credentials() -> None:
 
 
 def _load_dotenv_with_fallback(path: Path, *, override: bool) -> None:
+    # HERMES_DASHBOARD_SESSION_TOKEN is injected by the desktop shell at
+    # process spawn time, always paired with HERMES_DESKTOP='1' (both
+    # spawn paths in apps/desktop/electron/main.ts). A dotenv file may
+    # contain a *stale* persisted value from a previous update. Loading
+    # with override=True would clobber the injected token, breaking the
+    # desktop↔gateway WebSocket auth handshake. Save/restore it around
+    # the load, gated on the desktop marker so an unmarked token
+    # (plain shell export) keeps the documented ".env overrides stale
+    # shell exports" rule. The guard lives HERE so every override=True
+    # load path (user env, project env, managed env, gateway hot-reload
+    # re-entry) is protected uniformly, not just the startup user-env load.
+    _desktop_session_token: str | None = None
+    if override and os.environ.get("HERMES_DESKTOP") == "1":
+        _desktop_session_token = os.environ.get("HERMES_DASHBOARD_SESSION_TOKEN")
     try:
         load_dotenv(dotenv_path=path, override=override, encoding="utf-8")
     except UnicodeDecodeError:
@@ -350,6 +364,8 @@ def _load_dotenv_with_fallback(path: Path, *, override: bool) -> None:
     # typically come from copy-pasting keys from PDFs or rich-text editors
     # that substitute Unicode lookalike glyphs (e.g. ʋ U+028B for v).
     _sanitize_loaded_credentials()
+    if _desktop_session_token is not None:
+        os.environ["HERMES_DASHBOARD_SESSION_TOKEN"] = _desktop_session_token
 
 
 def _sanitize_env_file_if_needed(path: Path) -> None:
@@ -485,20 +501,7 @@ def load_hermes_dotenv(
         _sanitize_env_file_if_needed(project_env_path)
 
     if user_env.exists():
-        # HERMES_DASHBOARD_SESSION_TOKEN is injected by the desktop shell at
-        # process spawn time, always paired with HERMES_DESKTOP='1' (both
-        # spawn paths in apps/desktop/electron/main.ts). The user .env may
-        # contain a *stale* persisted value from a previous update. Loading
-        # with override=True would clobber the injected token, breaking the
-        # desktop↔gateway WebSocket auth handshake. Save/restore it around
-        # the .env load, gated on the desktop marker so an unmarked token
-        # (plain shell export) keeps the documented ".env overrides stale
-        # shell exports" rule.
-        _desktop_session_token = os.environ.get("HERMES_DASHBOARD_SESSION_TOKEN")
-        _is_desktop_spawn = os.environ.get("HERMES_DESKTOP") == "1"
         _load_dotenv_with_fallback(user_env, override=True)
-        if _is_desktop_spawn and _desktop_session_token is not None:
-            os.environ["HERMES_DASHBOARD_SESSION_TOKEN"] = _desktop_session_token
         loaded.append(user_env)
         # Mirror reload_env() known-key cleanup so inherited Hermes keys
         # absent from this profile's .env do not leak into the runtime.

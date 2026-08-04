@@ -546,3 +546,75 @@ def test_desktop_token_preservation_does_not_affect_other_keys(tmp_path, monkeyp
 
     assert os.getenv("HERMES_DASHBOARD_SESSION_TOKEN") == "injected-fresh-token"
     assert os.getenv("OPENAI_BASE_URL") == "https://profile.example/v1"
+
+
+def test_desktop_token_survives_project_env_load(tmp_path, monkeypatch):
+    """The guard must cover the project .env fallback path (override=True).
+
+    When no user .env exists, the project .env loads with override=True and
+    could clobber the desktop-injected token exactly like the user env does.
+    With a user .env present the project env loads override=False, so this
+    test pins the no-user-env case where the clobber was still possible.
+    """
+    home = tmp_path / "hermes"
+    home.mkdir()
+    project_env = tmp_path / "project" / ".env"
+    project_env.parent.mkdir()
+    project_env.write_text(
+        "HERMES_DASHBOARD_SESSION_TOKEN=stale-persisted-token\n",
+        encoding="utf-8",
+    )
+    injected = "injected-fresh-token-xyz789"
+    monkeypatch.setenv("HERMES_DASHBOARD_SESSION_TOKEN", injected)
+    monkeypatch.setenv("HERMES_DESKTOP", "1")
+
+    load_hermes_dotenv(hermes_home=home, project_env=project_env)
+
+    assert os.getenv("HERMES_DASHBOARD_SESSION_TOKEN") == injected
+
+
+def test_desktop_token_survives_managed_env_load(tmp_path, monkeypatch):
+    """The guard must cover the managed-scope .env load (override=True).
+
+    Managed scope is applied last with override=True and would replace the
+    injected token with a stale pinned value just like the user env would.
+    ``HERMES_MANAGED_DIR`` is the documented test hook for managed scope.
+    """
+    managed_dir = tmp_path / "managed"
+    managed_dir.mkdir()
+    (managed_dir / ".env").write_text(
+        "HERMES_DASHBOARD_SESSION_TOKEN=stale-managed-token\n",
+        encoding="utf-8",
+    )
+    injected = "injected-fresh-token-managed"
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed_dir))
+    monkeypatch.setenv("HERMES_DASHBOARD_SESSION_TOKEN", injected)
+    monkeypatch.setenv("HERMES_DESKTOP", "1")
+
+    load_hermes_dotenv(hermes_home=tmp_path / "hermes")
+
+    assert os.getenv("HERMES_DASHBOARD_SESSION_TOKEN") == injected
+
+
+def test_desktop_token_survives_hot_reload_reentry(tmp_path, monkeypatch):
+    """Re-running load_hermes_dotenv (gateway per-turn reload) must not clobber.
+
+    gateway/run.py's _reload_runtime_env_preserving_config_authority calls
+    load_hermes_dotenv() again on later turns to pick up rotated keys; that
+    second user_env override=True load must not replace the injected token
+    with the stale .env value.
+    """
+    home = tmp_path / "hermes"
+    home.mkdir()
+    (home / ".env").write_text(
+        "HERMES_DASHBOARD_SESSION_TOKEN=stale-persisted-token\n",
+        encoding="utf-8",
+    )
+    injected = "injected-fresh-token-hotreload"
+    monkeypatch.setenv("HERMES_DASHBOARD_SESSION_TOKEN", injected)
+    monkeypatch.setenv("HERMES_DESKTOP", "1")
+
+    load_hermes_dotenv(hermes_home=home)
+    load_hermes_dotenv(hermes_home=home)
+
+    assert os.getenv("HERMES_DASHBOARD_SESSION_TOKEN") == injected
