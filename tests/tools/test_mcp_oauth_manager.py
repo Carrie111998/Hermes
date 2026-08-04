@@ -108,11 +108,12 @@ async def test_disk_watch_invalidates_on_mtime_change(tmp_path, monkeypatch):
     provider = mgr.get_or_build_provider("srv", "https://example.com/mcp", None)
     assert provider is not None
 
-    # First call: records mtime (zero -> real) -> returns True
+    # First call: records mtime (zero -> real) but does NOT invalidate —
+    # the zero default means "never read", not "file changed" (#77369).
     changed1 = await mgr.invalidate_if_disk_changed("srv")
-    assert changed1 is True
+    assert changed1 is False
 
-    # No file change -> False
+    # No file change -> False (baseline already recorded)
     changed2 = await mgr.invalidate_if_disk_changed("srv")
     assert changed2 is False
 

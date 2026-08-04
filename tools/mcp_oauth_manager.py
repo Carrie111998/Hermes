@@ -664,6 +664,27 @@ class MCPOAuthManager:
             if mtime_ns != entry.last_mtime_ns:
                 old = entry.last_mtime_ns
                 entry.last_mtime_ns = mtime_ns
+                # last_mtime_ns defaults to 0 ("never read"). A freshly
+                # created _ProviderEntry therefore always looks "changed"
+                # on its first check, even when the tokens file has not
+                # moved at all. Each false invalidation forces a full
+                # OAuth re-initialization on the next request, which on a
+                # hosted OAuth MCP server regularly exceeds
+                # connect_timeout — producing a bare TimeoutError, then
+                # the retry ladder, then parking. The server ends up
+                # unavailable most of the time while remaining perfectly
+                # healthy when tested on its own (#77369).
+                #
+                # Fix: when last_mtime_ns was 0 (never read), this is the
+                # FIRST observation, not a change. Record the mtime so the
+                # NEXT check has a real baseline, but do NOT invalidate.
+                if old == 0:
+                    logger.debug(
+                        "MCP OAuth '%s': first mtime observation (%d), "
+                        "recording baseline — no invalidation",
+                        server_name, mtime_ns,
+                    )
+                    return False
                 # Force the SDK's OAuthClientProvider to reload from storage
                 # on its next auth flow. `_initialized` is private API but
                 # stable across the MCP SDK versions we pin (>=1.26.0).
