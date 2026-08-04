@@ -426,8 +426,19 @@ def test_non_stream_result_survives_logical_scope_close_failure(
         metadata={"api_mode": "custom", "api_request_id": "request-close"},
     )
 
+    # The provider result is authoritative even when scope cleanup fails.
     assert result is raw_response
-    assert "request-close" in turn.logical_llm_calls
+    # New contract: the failed handle is parked on the session (not retained
+    # on the turn) and the opportunistic drain immediately retries it — here
+    # the retry succeeds, leaving nothing parked and nothing registered.
+    session = turn.lease.session
+    assert session is not None
+    assert session.pending_handles == []
+    assert {kind for kind, _handle in session.scope_registry} <= {
+        "session",
+        "turn",
+    }, "failed logical handle must be drained, not leaked in the registry"
+    assert pop_calls == 2, "parked handle must be retried exactly once"
     relay_runtime.SESSION_COORDINATOR.end_turn(turn, outcome="success")
     assert turn.logical_llm_calls == {}
 

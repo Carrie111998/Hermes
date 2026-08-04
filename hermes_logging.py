@@ -337,6 +337,28 @@ def setup_logging(
         formatter=RedactingFormatter(_LOG_FORMAT),
     )
 
+    # --- error-ledger.jsonl (ERROR+) — structured machine-readable ledger ---
+    # One JSON object per line; consumed by `hermes errors` and the doctor
+    # "Recent Error History" section. See agent/error_ledger.py for the
+    # choke-point design and the atomic-append record-size bound.
+    try:
+        from agent.error_ledger import ErrorLedgerFormatter
+
+        _add_rotating_handler(
+            root,
+            log_dir / "error-ledger.jsonl",
+            level=logging.ERROR,
+            max_bytes=2 * 1024 * 1024,
+            backup_count=2,
+            formatter=ErrorLedgerFormatter(),
+        )
+    except Exception:
+        # Ledger is a diagnostic optimization — it must never break logging
+        # setup itself (e.g. during partial installs or import cycles).
+        logging.getLogger(__name__).debug(
+            "error-ledger handler unavailable", exc_info=True
+        )
+
     # --- gateway.log (INFO+, gateway component only) ------------------------
     if mode == "gateway":
         _add_rotating_handler(

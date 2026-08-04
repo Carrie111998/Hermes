@@ -470,6 +470,7 @@ from hermes_cli.subcommands.uninstall import build_uninstall_parser
 from hermes_cli.subcommands.dashboard import build_dashboard_parser
 from hermes_cli.subcommands.gui import build_gui_parser
 from hermes_cli.subcommands.logs import build_logs_parser
+from hermes_cli.subcommands.errors import build_errors_parser
 from hermes_cli.subcommands.prompt_size import build_prompt_size_parser
 from hermes_cli.subcommands.memory import build_memory_parser
 from hermes_cli.subcommands.acp import build_acp_parser
@@ -10548,6 +10549,79 @@ def cmd_console(args):
     return run_console_repl()
 
 
+def cmd_errors(args):
+    """Query the structured JSONL error ledger."""
+    import json as _json
+    import re as _re
+
+    from agent.error_ledger import read_recent, summarize
+
+    since_str = getattr(args, "since", None)
+    since_seconds = None
+    if since_str:
+        m = _re.match(r"^(\d+)\s*([smhd])$", since_str.strip().lower())
+        if not m:
+            print(f"Invalid --since value: {since_str!r} (use e.g. 30m, 1h, 2d)")
+            return 1
+        value = int(m.group(1))
+        since_seconds = value * {"s": 1, "m": 60, "h": 3600, "d": 86400}[m.group(2)]
+
+    category = getattr(args, "category", None)
+    limit = max(1, getattr(args, "limit", 20) or 20)
+
+    if getattr(args, "stats", False):
+        stats = summarize(
+            since_seconds=since_seconds or 86400.0,
+        )
+        if not stats["ledger_exists"]:
+            print("No error ledger yet (logs/error-ledger.jsonl). "
+                  "It is written once the gateway/CLI restarts with the ledger handler.")
+            return 0
+        window = f"last {int(since_seconds or 86400) // 3600 or 1}h" if since_seconds else "last 24h"
+        print(f"Error ledger stats ({window}): {stats['total']} error(s)")
+        if stats["by_category"]:
+            print("  By category:")
+            for cat, n in sorted(stats["by_category"].items(), key=lambda kv: -kv[1]):
+                print(f"    {cat}: {n}")
+        if stats["by_logger"]:
+            print("  Top loggers:")
+            for lg, n in sorted(stats["by_logger"].items(), key=lambda kv: -kv[1])[:8]:
+                print(f"    {lg}: {n}")
+        return 0
+
+    records = read_recent(limit=limit, since_seconds=since_seconds, category=category)
+    if not records:
+        print("No matching errors in the ledger"
+              + (f" (category={category})" if category else "")
+              + (f" (since {since_str})" if since_str else "")
+              + ". The ledger collects ERROR+ records; see `hermes logs errors` for WARNING+.")
+        return 0
+
+    if getattr(args, "json", False):
+        for rec in records:
+            print(_json.dumps(rec, ensure_ascii=False))
+        return 0
+
+    for rec in records:
+        ts = (rec.get("ts") or "?").replace("T", " ").replace("+00:00", "Z")
+        cat = rec.get("category") or "general"
+        lg = rec.get("logger") or "?"
+        sid = rec.get("session")
+        head = f"{ts}  [{cat}]  {lg}"
+        if sid:
+            head += f"  ({sid})"
+        print(head)
+        msg = (rec.get("message") or "").strip()
+        print(f"    {msg[:300]}")
+        if rec.get("detail"):
+            print(f"    detail: {rec['detail']}")
+        if rec.get("exc_type"):
+            tb = (rec.get("traceback") or "").strip().splitlines()
+            tail = tb[-1] if tb else rec["exc_type"]
+            print(f"    exc: {tail[:200]}")
+    return 0
+
+
 def _build_provider_choices() -> list[str]:
     """Build the --provider choices list from CANONICAL_PROVIDERS + 'auto'."""
     try:
@@ -12420,6 +12494,11 @@ def main():
     # logs command  (parser built in hermes_cli/subcommands/logs.py)
     # =========================================================================
     build_logs_parser(subparsers, cmd_logs=cmd_logs)
+
+    # =========================================================================
+    # errors command  (parser built in hermes_cli/subcommands/errors.py)
+    # =========================================================================
+    build_errors_parser(subparsers, cmd_errors=cmd_errors)
 
     # =========================================================================
     # prompt-size command  (parser built in hermes_cli/subcommands/prompt_size.py)

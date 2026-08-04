@@ -1424,6 +1424,34 @@ def run_doctor(args):
     except Exception:
         pass
 
+    _section("Recent Error History")
+    try:
+        from agent.error_ledger import read_recent, summarize as _ledger_summarize
+
+        _stats = _ledger_summarize(since_seconds=86400.0)
+        if not _stats["ledger_exists"]:
+            check_info("Error ledger not written yet (restart the gateway/CLI once)")
+        else:
+            _size_kb = _stats["ledger_bytes"] / 1024
+            if _stats["total"] == 0:
+                check_ok(f"No errors in last 24h (ledger {_size_kb:.0f} KB)")
+            else:
+                check_warn(
+                    f"{_stats['total']} error(s) in last 24h (ledger {_size_kb:.0f} KB)"
+                )
+                _cats = sorted(
+                    _stats["by_category"].items(), key=lambda kv: -kv[1]
+                )
+                for _cat, _n in _cats[:4]:
+                    check_info(f"{_cat}: {_n}")
+                _recent = read_recent(limit=5, since_seconds=86400.0)
+                for _rec in _recent[:3]:
+                    _msg = (_rec.get("message") or "").strip().replace("\n", " ")
+                    check_info(f"latest [{_rec.get('category') or 'general'}]: {_msg[:110]}")
+                check_info("Full list: hermes errors --since 24h")
+    except Exception:
+        check_info("Error ledger unavailable")
+
     _section("Directory Structure")
     hermes_home = HERMES_HOME
     if hermes_home.exists():

@@ -24,6 +24,11 @@ RUNTIME_SCHEMA_KEY = "hermes.relay.schema_version"
 RUNTIME_SCHEMA_VERSION = "hermes.relay.runtime.v1"
 RUNTIME_INSTANCE_KEY = "hermes.relay.runtime_instance"
 _PROFILE_KEY_CACHE: dict[str, str] = {}
+# Safety bound for the boundary drain loop. Every iteration pops a distinct
+# hermes-tracked handle from ``session.pending_handles``, so the loop is
+# bounded by the registry size; this cap additionally guards against a
+# corrupted registry ever spinning the loop.
+_MAX_DRAIN_SCOPES = 64
 
 
 @dataclass
@@ -36,6 +41,19 @@ class RelaySession:
     closing: bool = False
     handle: Any = None
     context: contextvars.Context | None = None
+    # Registry of every hermes-pushed scope handle on this session's shared
+    # native stack, in push order. The stack is LIFO and also receives pushes
+    # from threads that copy this session's context (bg-review forks, MoA
+    # panels), so a boundary pop can fail with "scope handle is not at the
+    # top of the stack". Failed boundary pops park their handles here and
+    # :meth:`RelayRuntime._drain_parked_handles` retries them after later
+    # pops make progress; close_session uses the registry for a final
+    # reverse-order drain instead of leaking the native stack.
+    pending_handles: list[Any] = field(default_factory=list, repr=False)
+    scope_registry: list[tuple[str, Any]] = field(default_factory=list, repr=False)
+    scope_registry_lock: threading.RLock = field(
+        default_factory=threading.RLock, repr=False
+    )
 
 
 class RelayRuntime:
@@ -126,6 +144,7 @@ class RelayRuntime:
                     session.context = None
                     raise
                 session.context = context
+                self._register_scope(session, "session", session.handle)
         return session
 
     def register_subagent(
@@ -246,6 +265,233 @@ class RelayRuntime:
         task = context.run(asyncio.create_task, invoke())
         return await task
 
+    def _park_handle(self, session: RelaySession, handle: Any) -> None:
+        """Register a hermes-tracked scope handle whose pop failed.
+
+        The native stack is LIFO and shared by every thread that copies this
+        session's context (bg-review forks, MoA panels). When a pop fails
+        with "scope handle is not at the top of the stack" a concurrent
+        producer still holds a newer scope; the handle is parked here and
+        retried by :meth:`_drain_parked_handles` once later pops make
+        progress, instead of leaking into close_session/shutdown.
+        """
+        if handle is None:
+            return
+        with session.lock:
+            if handle not in session.pending_handles:
+                session.pending_handles.append(handle)
+
+    def _unpark_handle(self, session: RelaySession, handle: Any) -> None:
+        if handle is None:
+            return
+        with session.lock:
+            try:
+                session.pending_handles.remove(handle)
+            except ValueError:
+                pass
+
+    def _register_scope(self, session: RelaySession, kind: str, handle: Any) -> None:
+        """Track every hermes-pushed handle so close_session can drain them."""
+        if handle is None:
+            return
+        with session.scope_registry_lock:
+            session.scope_registry.append((kind, handle))
+
+    def _deregister_scope(self, session: RelaySession, handle: Any) -> None:
+        if handle is None:
+            return
+        with session.scope_registry_lock:
+            session.scope_registry[:] = [
+                entry for entry in session.scope_registry if entry[1] is not handle
+            ]
+        self._unpark_handle(session, handle)
+
+    def push_scope(
+        self,
+        session: RelaySession,
+        name: str,
+        scope_type: Any,
+        *,
+        kind: str,
+        handle: Any = None,
+        data: Any = None,
+        input: Any = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> Any:
+        """Push a scope onto the session's stack and register the handle.
+
+        Every handle pushed through this helper is recorded in
+        ``session.scope_registry`` so boundary cleanup (end_turn,
+        close_session) can find and drain scopes that concurrent producers
+        pushed but never popped.
+        """
+        pushed = self.run_in_session(
+            session,
+            self.relay.scope.push,
+            name,
+            scope_type,
+            handle=handle,
+            data=data,
+            input=input,
+            metadata=metadata,
+        )
+        self._register_scope(session, kind, pushed)
+        return pushed
+
+    def _drain_parked_handles(self, session: RelaySession) -> None:
+        """Best-effort LIFO drain of parked scope handles.
+
+        Parked handles are retried in park order (failing pops run
+        newest-scope-first, so park order approximates LIFO). Every time a
+        pop succeeds or the handle is already gone, the scan restarts from
+        the head because the stack top changed. ``not found`` means the
+        owner (or an earlier drain) already closed the scope. ``not at the
+        top`` means a newer scope is still live, so the handle stays parked
+        for a later pass. Bounded by ``_MAX_DRAIN_SCOPES`` restarts.
+        """
+        for _ in range(_MAX_DRAIN_SCOPES):
+            with session.lock:
+                parked = list(session.pending_handles)
+            if not parked:
+                return
+            progressed = False
+            for handle in parked:
+                try:
+                    self.run_in_session(
+                        session,
+                        self.relay.scope.pop,
+                        handle,
+                        output={},
+                        metadata={
+                            RUNTIME_SCHEMA_KEY: RUNTIME_SCHEMA_VERSION,
+                            RUNTIME_INSTANCE_KEY: self.runtime_id,
+                        },
+                        allow_closing=True,
+                    )
+                except RuntimeError as exc:
+                    message = str(exc)
+                    if "not found" in message:
+                        # Already closed elsewhere — treat as drained.
+                        self._deregister_scope(session, handle)
+                        progressed = True
+                        break
+                    if "not at the top" in message:
+                        # Still buried under a live scope; try the next one.
+                        continue
+                    self._deregister_scope(session, handle)
+                    progressed = True
+                    break
+                except Exception:
+                    logger.debug(
+                        "Hermes Relay parked-handle drain pop failed",
+                        exc_info=True,
+                    )
+                    self._deregister_scope(session, handle)
+                    progressed = True
+                    break
+                else:
+                    self._deregister_scope(session, handle)
+                    progressed = True
+                    break
+            if not progressed:
+                return
+        # Loop exhausted with progress every pass: more parked handles than
+        # _MAX_DRAIN_SCOPES restarts could clear. Loud, not silent — a leak
+        # past the cap means scopes survive session teardown.
+        with session.lock:
+            leftover = len(session.pending_handles)
+        logger.warning(
+            "Hermes Relay parked-handle drain exhausted %s restarts for "
+            "session %s — %d handle(s) remain parked (possible leak)",
+            _MAX_DRAIN_SCOPES,
+            session.session_id,
+            leftover,
+        )
+
+    def _drain_registry(self, session: RelaySession) -> None:
+        """Pop every registered non-session scope, newest-first.
+
+        Used by close_session to clear scopes a concurrent producer pushed
+        but never popped (dead bg-review fork, late MoA panel). Handles
+        already closed resolve via ``not found``; handles buried under an
+        unregistered foreign scope stay parked. Bounded restarts.
+        """
+        for _ in range(_MAX_DRAIN_SCOPES):
+            with session.scope_registry_lock:
+                handles = [
+                    handle
+                    for _kind, handle in session.scope_registry
+                    if handle is not session.handle
+                ]
+            if not handles:
+                return
+            progressed = False
+            for handle in reversed(handles):
+                if self.pop_scope(session, handle, output={}, allow_closing=True):
+                    progressed = True
+                    break
+            if not progressed:
+                return
+        # Loop exhausted with progress every pass: registry larger than
+        # _MAX_DRAIN_SCOPES restarts could clear. Loud, not silent.
+        with session.scope_registry_lock:
+            leftover = len(
+                [h for _k, h in session.scope_registry if h is not session.handle]
+            )
+        logger.warning(
+            "Hermes Relay registry drain exhausted %s restarts for session %s "
+            "— %d registered scope(s) remain (possible leak)",
+            _MAX_DRAIN_SCOPES,
+            session.session_id,
+            leftover,
+        )
+
+    def pop_scope(
+        self,
+        session: RelaySession,
+        handle: Any,
+        *,
+        output: dict[str, Any] | None = None,
+        metadata: dict[str, Any] | None = None,
+        allow_closing: bool = False,
+    ) -> bool:
+        """Pop one scope, parking it on a LIFO violation instead of raising.
+
+        Returns True when the scope was closed (or was already closed). When
+        a newer scope is still live on the shared native stack ("not at the
+        top"), the handle is parked on ``session.pending_handles`` for a
+        later drain and False is returned. A successful pop opportunistically
+        drains parked handles, so the stack recovers as concurrent producers
+        finish. ``not found`` means the scope was already closed elsewhere;
+        the registry entry is dropped and True is returned.
+        """
+        if handle is None:
+            return True
+        payload = dict(metadata or {})
+        payload.setdefault(RUNTIME_SCHEMA_KEY, RUNTIME_SCHEMA_VERSION)
+        payload.setdefault(RUNTIME_INSTANCE_KEY, self.runtime_id)
+        try:
+            self.run_in_session(
+                session,
+                self.relay.scope.pop,
+                handle,
+                output=output,
+                metadata=payload,
+                allow_closing=allow_closing,
+            )
+        except RuntimeError as exc:
+            message = str(exc)
+            if "not found" in message:
+                self._deregister_scope(session, handle)
+                return True
+            self._park_handle(session, handle)
+            self._drain_parked_handles(session)
+            return False
+        else:
+            self._deregister_scope(session, handle)
+            self._drain_parked_handles(session)
+            return True
+
     def emit_mark(
         self,
         name: str,
@@ -297,7 +543,15 @@ class RelayRuntime:
         return result if isinstance(result, dict) else args
 
     def close_session(self, event: dict[str, Any]) -> None:
-        """Close one session scope and remove it from the core registry."""
+        """Close one session scope and remove it from the core registry.
+
+        Before popping the session scope, every hermes-registered scope on
+        this session's stack is drained (newest-first). Without this, turn
+        or logical scopes a concurrent producer left open would sit above
+        the session handle and the native LIFO pop would fail with
+        "scope handle is not at the top of the stack" — the signature that
+        used to flood ``closed with errors`` warnings at shutdown.
+        """
         session_id = _session_id(event)
         with self._sessions_lock:
             session = self._sessions.get(session_id)
@@ -311,21 +565,24 @@ class RelayRuntime:
             if session.closing:
                 return
             session.closing = True
+            self._drain_registry(session)
+            self._drain_parked_handles(session)
             if session.handle is not None:
-                try:
-                    self.run_in_session(
-                        session,
-                        self.relay.scope.pop,
-                        session.handle,
-                        output={},
-                        metadata={
-                            RUNTIME_SCHEMA_KEY: RUNTIME_SCHEMA_VERSION,
-                            RUNTIME_INSTANCE_KEY: self.runtime_id,
-                        },
-                        allow_closing=True,
-                    )
-                except Exception as exc:
-                    failures.append(f"session scope close failed: {exc}")
+                closed = self.pop_scope(
+                    session,
+                    session.handle,
+                    output={},
+                    allow_closing=True,
+                )
+                if not closed:
+                    with session.lock:
+                        still_open = list(session.pending_handles)
+                    if still_open:
+                        failures.append(
+                            "session scope close failed: %d scope(s) still open "
+                            "on the native stack (parked for drain)"
+                            % len(still_open)
+                        )
         try:
             self.relay.subscribers.flush()
         except Exception as exc:
@@ -602,11 +859,11 @@ class RelaySessionCoordinator:
         turn = RelayTurnContext(lease=lease, turn_id=turn_id, task_id=task_id)
         if isinstance(lease.host, RelayRuntime) and lease.session is not None:
             try:
-                turn.handle = lease.host.run_in_session(
+                turn.handle = lease.host.push_scope(
                     lease.session,
-                    lease.host.relay.scope.push,
                     TURN_SCOPE,
                     lease.host.relay.ScopeType.Function,
+                    kind="turn",
                     handle=lease.session.handle,
                     input={},
                     metadata={
@@ -640,20 +897,22 @@ class RelaySessionCoordinator:
                 if isinstance(lease.host, RelayRuntime) and lease.session is not None:
                     self._finish_logical_calls(turn, outcome=outcome)
                     if turn.handle is not None:
-                        try:
-                            lease.host.run_in_session(
-                                lease.session,
-                                lease.host.relay.scope.pop,
-                                turn.handle,
-                                output={"outcome": outcome},
-                                metadata={
-                                    RUNTIME_SCHEMA_KEY: RUNTIME_SCHEMA_VERSION,
-                                    RUNTIME_INSTANCE_KEY: lease.host.runtime_id,
-                                },
-                            )
-                        except Exception:
-                            logger.warning(
-                                "Hermes Relay turn finalization failed", exc_info=True
+                        closed = lease.host.pop_scope(
+                            lease.session,
+                            turn.handle,
+                            output={"outcome": outcome},
+                        )
+                        if not closed:
+                            # A concurrent producer (bg-review fork, MoA
+                            # panel) still holds a newer scope on the shared
+                            # native stack. The turn handle is parked on the
+                            # session and will be drained by a later pop or
+                            # by close_session — no warning: this is the
+                            # expected recovery path, not a malfunction.
+                            logger.info(
+                                "Hermes Relay turn scope parked for drain "
+                                "(newer scope still open on session %s)",
+                                lease.session.session_id,
                             )
             finally:
                 try:
@@ -722,36 +981,18 @@ class RelaySessionCoordinator:
         with turn.logical_llm_lock:
             logical_calls = list(turn.logical_llm_calls.items())
             turn.logical_llm_calls.clear()
-        for index in range(len(logical_calls) - 1, -1, -1):
-            request_id, logical_handle = logical_calls[index]
-            try:
-                lease.host.run_in_session(
-                    lease.session,
-                    lease.host.relay.scope.pop,
-                    logical_handle,
-                    output={"outcome": outcome},
-                    metadata={
-                        RUNTIME_SCHEMA_KEY: RUNTIME_SCHEMA_VERSION,
-                        RUNTIME_INSTANCE_KEY: lease.host.runtime_id,
-                    },
-                )
-            except Exception:
-                with turn.logical_llm_lock:
-                    # Relay scopes are stack-owned. If the newest remaining
-                    # handle cannot close, older handles cannot close safely
-                    # either, so retain the unclosed prefix for diagnostics.
-                    for pending_request_id, pending_handle in logical_calls[
-                        : index + 1
-                    ]:
-                        turn.logical_llm_calls.setdefault(
-                            pending_request_id,
-                            pending_handle,
-                        )
-                logger.warning(
-                    "Hermes Relay logical LLM finalization failed",
-                    exc_info=True,
-                )
-                break
+        # Newest-first: the native stack is LIFO, so pop in reverse push
+        # order. ``pop_scope`` parks handles that are still buried under a
+        # concurrent producer's scope instead of raising; the session's
+        # drain paths (later pops, close_session) retry them. No retained
+        # prefix on the turn: the turn is closed, so anything parked here
+        # must live on the session registry to be found later.
+        for _request_id, logical_handle in reversed(logical_calls):
+            lease.host.pop_scope(
+                lease.session,
+                logical_handle,
+                output={"outcome": outcome},
+            )
 
     @staticmethod
     def _reset_turn_context(turn: RelayTurnContext) -> None:

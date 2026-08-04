@@ -3168,7 +3168,14 @@ def run_job(
         # re-read from storage every tick so a ``cronjob action=update
         # model=...`` after a failed run takes effect on the next tick — there
         # is no in-memory cache.
-        model = job.get("model") or os.getenv("HERMES_MODEL") or ""
+        _job_model_raw = job.get("model")
+        if isinstance(_job_model_raw, dict):
+            # Legacy/pinned jobs written by ``cronjob action=create`` carry a
+            # full provider block under "model" ({provider, model, base_url}).
+            # Unpack the inner name so resolution sees a string; top-level
+            # job["provider"]/job["base_url"] already hold the same values.
+            _job_model_raw = _job_model_raw.get("model") or ""
+        model = _job_model_raw or os.getenv("HERMES_MODEL") or ""
 
         # cron.model / cron.model_provider: a deliberate cron-fleet default
         # so unattended jobs stop shadowing chat `/model` switches. When an
@@ -3206,7 +3213,11 @@ def run_job(
                     _cron_default_provider = str(
                         _cron_cfg_for_model.get("model_provider") or ""
                     ).strip()
-                if not job.get("model"):
+                if not model:
+                    # NB: ``model`` is the already-unpacked per-job/env value;
+                    # re-checking raw job["model"] here would treat a dict
+                    # block lacking the inner name as "pinned" and skip the
+                    # cron/config fallback entirely.
                     if _cron_default_model:
                         # Cron-fleet default beats the global chat model: it is
                         # the user's explicit "cron runs on this" setting.
@@ -3417,9 +3428,12 @@ def run_job(
                         f"provider '{_provider_snapshot}' -> '{_current_provider}'"
                     )
             _model_snapshot = (job.get("model_snapshot") or "").strip().lower()
+            _job_model_pinned = job.get("model")
+            if isinstance(_job_model_pinned, dict):
+                _job_model_pinned = _job_model_pinned.get("model") or ""
             if (
                 _model_snapshot
-                and not (job.get("model") or "").strip()
+                and not str(_job_model_pinned or "").strip()
                 and not _cron_default_model
             ):
                 _current_model = str(primary_model_for_drift or "").strip().lower()
@@ -3736,7 +3750,13 @@ def run_job(
         
     except Exception as e:
         error_msg = f"{type(e).__name__}: {str(e)}"
-        logger.exception("Job '%s' failed: %s", job_name, error_msg)
+        logger.exception(
+            "Job '%s' failed: %s", job_name, error_msg,
+            extra={
+                "error_category": "cron",
+                "error_detail": f"job_id={job_id} name={job_name}",
+            },
+        )
         
         output = f"""# Cron Job: {job_name} (FAILED)
 
