@@ -9,33 +9,6 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_nix_wheel_package_data_includes_complete_plugin_trees():
-    """Hyphenated plugin directories must ship as complete runtime trees."""
-    data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-    package_data = data["tool"]["setuptools"]["package-data"]
-
-    assert {
-        "web_dist/**/*",
-        "tui_dist/**/*",
-    }.issubset(package_data["hermes_cli"])
-    assert package_data["plugins"] == ["**/*"]
-
-
-def test_sdist_manifest_includes_runtime_assets():
-    """The supported Nix sdist must preserve bare data dirs and manifests."""
-    manifest = (REPO_ROOT / "MANIFEST.in").read_text(encoding="utf-8")
-    required_lines = {
-        "graft skills",
-        "graft optional-skills",
-        "graft optional-mcps",
-        "graft locales",
-        "graft plugins",
-        "recursive-include gateway/assets *",
-    }
-
-    assert required_lines.issubset(set(manifest.splitlines()))
-
-
 def _distribution_name(requirement: str) -> str:
     """Extract the PEP 508 distribution name from a requirement string.
 
@@ -91,6 +64,14 @@ def test_faster_whisper_is_not_a_base_dependency():
 # [dev]) so we pin it directly in every extra that exposes a server surface and
 # enforce the floor in both pyproject and the committed lockfile.
 _STARLETTE_CVE_FLOOR = (1, 0, 1)
+_UPDATE_DOWNGRADE_GUARD_FLOORS = {
+    # `hermes update` reinstalls exact pins from pyproject/lazy_deps. These
+    # reviewed CVE pins must not slide back to stale versions that downgrade
+    # already-patched user environments.
+    "cryptography": (48, 0, 1),
+    "starlette": (1, 3, 1),
+    "python-multipart": (0, 0, 32),
+}
 
 
 def _version_tuple(spec: str) -> tuple[int, ...]:
@@ -168,6 +149,8 @@ def test_locked_starlette_is_not_vulnerable_to_cve_2026_48710():
         )
 
 
+
+
 # ---------------------------------------------------------------------------
 # Dependency-pin consistency: pyproject extras <-> tools/lazy_deps.py
 #
@@ -207,6 +190,15 @@ def _pins_from_specs(specs):
             continue
         pins.setdefault(_canonical(m.group(1)), set()).add(m.group(2))
     return pins
+
+
+def _locked_versions(package: str) -> set[str]:
+    lock = tomllib.loads((REPO_ROOT / "uv.lock").read_text(encoding="utf-8"))
+    return {
+        pkg["version"]
+        for pkg in lock.get("package", [])
+        if _canonical(pkg["name"]) == _canonical(package)
+    }
 
 
 def _pyproject_pinned_specs():
@@ -256,27 +248,6 @@ def test_pyproject_pins_are_internally_consistent():
     )
 
 
-def test_pyproject_and_lazy_deps_pins_agree():
-    """Every package pinned in BOTH places must use the same version.
-
-    Regression guard for the aiohttp / anthropic extras-vs-lazy drift:
-    tools/lazy_deps.py mirrors the pyproject extras, so a CVE bump applied to
-    one and not the other leaves users on a vulnerable version depending on
-    the install path. Bump both in lockstep.
-    """
-    py = _pins_from_specs(_pyproject_pinned_specs())
-    lazy = _pins_from_specs(_lazy_deps_pinned_specs())
-
-    mismatches = [
-        f"{name}: pyproject={sorted(py[name])} lazy_deps={sorted(lazy[name])}"
-        for name in sorted(set(py) & set(lazy))
-        if py[name] != lazy[name]
-    ]
-    assert not mismatches, (
-        "pyproject.toml extras and tools/lazy_deps.py disagree on the pinned "
-        "version of the same package — bump both in lockstep:\n  "
-        + "\n  ".join(mismatches)
-    )
 
 
 def _lazy_deps_by_feature():

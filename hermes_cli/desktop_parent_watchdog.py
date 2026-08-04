@@ -64,11 +64,13 @@ def _should_exit_for_parent(
     """
 
     current_parent = getppid()
+    if not pid_exists(parent_pid):
+        return True
     if current_parent == parent_pid:
         return False
     if current_parent in _ORPHAN_PARENT_PIDS:
         return True
-    return not pid_exists(parent_pid)
+    return False
 
 
 def start_desktop_parent_watchdog(
