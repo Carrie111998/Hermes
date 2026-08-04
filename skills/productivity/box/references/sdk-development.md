@@ -11,10 +11,10 @@ Inspect the repository for existing Box clients, `BOX_` configuration, token sto
 | Identity | Use when |
 | --- | --- |
 | OAuth | each end user connects their own Box account |
-| CCG | a server-side app needs its own service-account identity |
+| CCG | a server-side app needs a dedicated App User runtime identity |
 | `as_user` / managed user | an authorized enterprise app must act as a specified user |
 
-OAuth follows the user's permissions and app scopes. CCG is a separate identity and needs folder collaboration unless enterprise capabilities explicitly provide another model.
+OAuth follows the user's permissions and app scopes. For CCG, use the Service Account to provision a dedicated App User, then run normal application work as that App User. The App User needs folder collaboration unless enterprise capabilities explicitly provide another model.
 
 ## Use an official SDK
 

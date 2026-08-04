@@ -192,3 +192,21 @@ def test_box_skill_selects_auth_by_runtime_topology_and_avoids_default_home_assu
     assert "active Hermes home's `.env` file" in ccg
     assert "~/.hermes/.env" not in ccg
     assert "uses POSIX shell syntax" in rest
+
+
+def test_ccg_uses_a_dedicated_app_user_for_normal_hermes_work():
+    """Keep CCG's elevated provisioning identity out of the normal runtime path."""
+    skill = SKILL_MD.read_text(encoding="utf-8")
+    ccg = (SKILL_DIR / "references" / "ccg-setup.md").read_text(encoding="utf-8")
+
+    assert "dedicated App User" in skill
+    assert "Service Account — control plane" in ccg
+    assert "App User — Hermes runtime identity" in ccg
+    assert "Do not configure normal Hermes work to run as the Service Account" in ccg
+    assert "**App Details** sidebar" in ccg
+    assert "**App Access Only**" in ccg
+    assert "**Generate User Access Tokens**" in ccg
+    assert 'box users:create "Hermes Production Agent" --app-user' in ccg
+    assert "--ccg-user <APP_USER_ID> --name hermes-agent --set-as-current" in ccg
+    assert "returned `id` is exactly `<APP_USER_ID>`" in ccg
+    assert "<APP_USER_EMAIL>" in ccg

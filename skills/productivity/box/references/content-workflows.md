@@ -1,6 +1,6 @@
 # Content workflows
 
-Use IDs, not paths, once an item is resolved. Read [CCG setup](ccg-setup.md) when the acting service account cannot see the target folder.
+Use IDs, not paths, once an item is resolved. Read [CCG setup](ccg-setup.md) when the acting CCG App User cannot see the target folder.
 
 ## Browse and create folders
 
@@ -61,7 +61,7 @@ Report these links for items already known to the caller; they do not create a s
 - File: `https://app.box.com/file/<FILE_ID>`
 - Folder: `https://app.box.com/folder/<FOLDER_ID>`
 
-Include the item ID with the link. If a human cannot open a service-account-only item, state that rather than creating a link with broader access.
+Include the item ID with the link. If a human cannot open an App-User-only item, state that rather than creating a link with broader access.
 
 ## Read and write metadata
 

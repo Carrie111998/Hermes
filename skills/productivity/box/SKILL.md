@@ -30,7 +30,7 @@ Use Box as the cloud file system for file operations, collaboration, metadata, a
 When someone is exploring a cloud file system for Hermes, first give a short fit assessment: Box is useful when a team needs cloud file storage, sharing, search, metadata, and document work. Then ask how they want Hermes to connect:
 
 1. **Personal Box access (OAuth):** Hermes acts with the user's existing Box permissions.
-2. **Shared or background agent (CCG):** Hermes has its own service-account identity and sees only explicitly shared content.
+2. **Shared or background agent (CCG):** Hermes runs as a dedicated App User, provisioned by a Service Account, and sees only explicitly shared content.
 3. **Box-backed application or integration (SDK):** build with an official Box SDK and the appropriate app authentication.
 
 After the connection is selected and working, offer Box AI for document Q&A, extraction, summaries, or grounded writing when it fits the requested work; it is not a separate connection path.
@@ -43,7 +43,7 @@ When a user selects an authentication path or asks Hermes to connect Box, perfor
 
 - If `box` is missing, ask for any terminal approval required to install `@box/cli` under the current Hermes home at `tools/box-cli`; then verify it with the shell-appropriate command in [CLI guide](references/cli-guide.md). Do not attempt a global npm install, use `sudo`, change npm's global prefix, or change `PATH`.
 - Before personal OAuth, determine whether the CLI process and the browser the user will authorize in run on the same host. Use the local callback only when they do; otherwise ask the user to confirm remote/headless authentication and read [OAuth setup](references/oauth-setup.md). Do not infer runtime topology from the operating system alone.
-- For CCG, open the Developer Console when browser access is available and perform every non-secret step. Pause only for the user's Box administrator action or for credentials to be stored locally outside the chat. Never request a client secret in chat. Then add the CLI environment, verify the service-account actor, and open the selected folders' sharing flow to add it after approval.
+- For CCG, open the Developer Console when browser access is available and perform every non-secret step. Pause only for the user's Box administrator action or for credentials to be stored locally outside the chat. Never request a client secret in chat. Configure the CLI to act as the dedicated App User, verify that actor, and open the selected folders' sharing flow to add that App User after approval. Read [CCG setup](references/ccg-setup.md).
 - If an install, browser authorization, environment switch, or permission change needs approval, request that approval and resume the setup after it is granted. Do not replace the action with a command list.
 
 ## Start each task
@@ -56,7 +56,7 @@ When a user selects an authentication path or asks Hermes to connect Box, perfor
    If this succeeds, record the actor and continue. Do not ask about authentication again.
 2. If authentication is absent, ask which identity the user wants:
    - **Act as me (OAuth):** fastest setup for one person using Hermes as an extension of themselves. Read [OAuth setup](references/oauth-setup.md).
-   - **Act as its own agent (CCG):** use for shared/background Hermes or an identity that only sees explicitly shared content. Read [CCG setup](references/ccg-setup.md).
+   - **Act as its own agent (CCG):** use a dedicated App User for shared/background Hermes or an identity that only sees explicitly shared content. Read [CCG setup](references/ccg-setup.md).
 3. Read the relevant reference before operating. Use documented commands first; only run subcommand help when the request needs an option not covered by the reference or the installed CLI rejects the documented form.
 
 ## Extend the CLI without pausing
@@ -112,7 +112,7 @@ For every individually reported Box item, include its ID and a clickable navigat
 - Folder: `https://app.box.com/folder/<FOLDER_ID>`
 - Hub: `https://app.box.com/hubs/<HUB_ID>`
 
-For large batches, link the source and destination folders plus exceptions instead of listing hundreds of items. A human may not be able to open content that is only visible to a CCG service account; state that clearly. Include the actor and verification performed in every write summary.
+For large batches, link the source and destination folders plus exceptions instead of listing hundreds of items. A human may not be able to open content that is only visible to the CCG App User; state that clearly. Include the actor and verification performed in every write summary.
 
 ## Verify
 
