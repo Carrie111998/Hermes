@@ -861,6 +861,79 @@ WORKFLOW_LIST_SCHEMA: Dict[str, Any] = {
     },
 }
 
+def handle_workflow_synthesize(args: Dict[str, Any], **kwargs: Any) -> str:
+    """Synthesize a static pipeline template from a completed dynamic workflow.
+
+    Captures the discovered DAG shape (nodes, dependencies, review-loop
+    patterns, rework budget) as a reusable static YAML in
+    ``$HERMES_HOME/workflows/`` so future runs use the fast, bounded,
+    kanban-backed static path instead of re-discovering the shape.
+    """
+    try:
+        from plugins.workflow.synthesize import synthesize_template
+    except Exception as exc:
+        logger.exception("synthesize import failed")
+        return _err(f"synthesize module unavailable: {exc}")
+
+    workflow_id = str(args.get("workflow_id") or "").strip()
+    if not workflow_id:
+        return _err("workflow_id is required (the dynamic workflow to capture)")
+
+    name = str(args.get("name") or "").strip()
+    role_map = args.get("role_map") or {}
+    if not isinstance(role_map, dict):
+        return _err("role_map must be an object mapping {role: agent}")
+    overwrite = bool(args.get("overwrite", False))
+
+    try:
+        result = synthesize_template(
+            workflow_id,
+            name=name or "",
+            role_map=role_map,
+            overwrite=overwrite,
+        )
+    except Exception as exc:
+        logger.exception("workflow_synthesize failed for %s", workflow_id)
+        return _err(f"synthesis failed: {exc}")
+
+    if not result.get("ok"):
+        return _err(result.get("error", "synthesis failed"))
+    return _ok(result)
+
+
+WORKFLOW_SYNTHESIZE_SCHEMA: Dict[str, Any] = {
+    "name": "workflow_synthesize",
+    "description": (
+        "Synthesize a reusable static pipeline template from a completed "
+        "dynamic workflow. Captures the discovered DAG shape (nodes, "
+        "dependencies, review-loop patterns) as YAML in $HERMES_HOME/workflows/ "
+        "so future runs use workflow_start directly."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "workflow_id": {
+                "type": "string",
+                "description": "Dynamic workflow id to capture (searched across scopes).",
+            },
+            "name": {
+                "type": "string",
+                "description": "Template name (defaults from workflow_id).",
+            },
+            "role_map": {
+                "type": "object",
+                "description": "Optional {role: agent} mapping applied to the generated YAML.",
+            },
+            "overwrite": {
+                "type": "boolean",
+                "description": "Replace an existing template with the same name.",
+            },
+        },
+        "required": ["workflow_id"],
+    },
+}
+
+
 WORKFLOW_SHOW_SCHEMA: Dict[str, Any] = {
     "name": "workflow_show",
     "description": (

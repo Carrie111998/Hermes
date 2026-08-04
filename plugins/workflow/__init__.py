@@ -120,12 +120,14 @@ def register(ctx):
         handle_workflow_status,
         handle_workflow_list,
         handle_workflow_show,
+        handle_workflow_synthesize,
         WORKFLOW_START_SCHEMA,
         WORKFLOW_VIEW_SCHEMA,
         WORKFLOW_VALIDATE_SCHEMA,
         WORKFLOW_STATUS_SCHEMA,
         WORKFLOW_LIST_SCHEMA,
         WORKFLOW_SHOW_SCHEMA,
+        WORKFLOW_SYNTHESIZE_SCHEMA,
     )
 
     _TOOLS = [
@@ -135,6 +137,7 @@ def register(ctx):
         (WORKFLOW_STATUS_SCHEMA,   handle_workflow_status),
         (WORKFLOW_LIST_SCHEMA,     handle_workflow_list),
         (WORKFLOW_SHOW_SCHEMA,     handle_workflow_show),
+        (WORKFLOW_SYNTHESIZE_SCHEMA, handle_workflow_synthesize),
     ]
 
     for schema, handler in _TOOLS:

@@ -272,6 +272,25 @@ def _lookup_workflow(
     return _workflows.get((scope_key, workflow_id))
 
 
+def find_workflow_by_id(
+    workflow_id: str,
+) -> DynamicWorkflow | None:
+    """Find a workflow by id across all scopes and stores.
+
+    Searches active workflows first, then recently completed ones
+    (retained for eviction). Used by cross-scope consumers such as
+    template synthesis, which save a run's DAG shape regardless of
+    which session created it.
+    """
+    for key, wf in _workflows.items():
+        if key[1] == workflow_id:
+            return wf
+    for key, (wf, _ts) in _completed_workflows.items():
+        if key[1] == workflow_id:
+            return wf
+    return None
+
+
 def _validate_id_format(value: str, label: str) -> str | None:
     """Check that an id matches the allowed pattern.  Returns an error
     string on failure, ``None`` on success."""
