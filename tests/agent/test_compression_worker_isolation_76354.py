@@ -95,7 +95,12 @@ def test_f3_mutating_engine_cannot_touch_live_transcript_after_timeout(
         engine_started.set()
         msgs[:] = [{"role": "assistant", "content": "ENGINE GARBAGE"}]
         mutated_lists.append(msgs)
-        assert release_engine.wait(timeout=30)
+        # Long wait: the host must be able to time out and run its byte-identity
+        # assertions WHILE this worker stays blocked. Under 8-worker CI load the
+        # main thread can be starved past a 30s budget, which fails the
+        # isolation assertions vacuously. 300s keeps the worker blocked for the
+        # entire test while tolerating scheduler starvation.
+        assert release_engine.wait(timeout=300)
         return msgs
 
     agent.context_compressor.compress.side_effect = _mutating_engine
@@ -108,7 +113,9 @@ def test_f3_mutating_engine_cannot_touch_live_transcript_after_timeout(
             live, "sys", approx_tokens=120_000
         )
         # Host timed out and returned while the engine is STILL blocked.
-        assert engine_started.wait(timeout=5)
+        # Generous wait: under loaded CI the worker thread can be delayed
+        # starting; the host's timeout path does not depend on it.
+        assert engine_started.wait(timeout=60)
         assert not release_engine.is_set()
         assert returned is live
         # ── The core assertion, made while the worker keeps running ──────
