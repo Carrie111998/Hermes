@@ -34,6 +34,7 @@ except ImportError:  # pragma: no cover
 
 import urllib.error
 import urllib.request
+from urllib.parse import quote
 
 SCROLL_LIMIT = 200
 
@@ -131,6 +132,7 @@ class _QdrantAdapter:
         elif qdrant_url:
             self._mode = "http"
             self._url = qdrant_url.rstrip("/")
+            self._api_key = api_key
             self._client = None
         else:
             raise ValueError("Either qdrant_path or qdrant_url must be provided.")
@@ -185,17 +187,23 @@ class _QdrantAdapter:
 
     def _api_post(self, path: str, body: dict, timeout: int = 120) -> dict:
         data = json.dumps(body).encode()
+        headers: dict[str, str] = {"Content-Type": "application/json"}
+        if self._api_key:
+            headers["api-key"] = self._api_key
         req = urllib.request.Request(
             f"{self._url}{path}",
             data=data,
             method="POST",
-            headers={"Content-Type": "application/json"},
+            headers=headers,
         )
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read())
 
     def _api_get(self, path: str, timeout: int = 30) -> dict:
-        req = urllib.request.Request(f"{self._url}{path}", method="GET")
+        headers: dict[str, str] = {}
+        if self._api_key:
+            headers["api-key"] = self._api_key
+        req = urllib.request.Request(f"{self._url}{path}", method="GET", headers=headers)
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read())
 
@@ -216,7 +224,7 @@ class _QdrantAdapter:
 
             try:
                 result = self._api_post(
-                    f"/collections/{collection}/points/scroll", body
+                    f"/collections/{quote(collection, safe='')}/points/scroll", body
                 )
             except urllib.error.URLError as exc:
                 print(f"[ERROR] Qdrant scroll failed: {exc}", file=sys.stderr)
@@ -249,11 +257,20 @@ def extract_text(payload: dict) -> str:
     )
 
 
+def _yaml_escape(val: object) -> str:
+    """Escape double quotes in a value so it is safe inside YAML double-quoted strings."""
+    s = str(val)
+    if '"' in s:
+        return s.replace('"', '\\"')
+    return s
+
+
 def render_markdown(point_id: str, payload: dict) -> str:
     """Render a single Qdrant point as a Markdown file with YAML frontmatter."""
-    agent_id = payload.get("agent_id", "")
-    created_at = payload.get("created_at", "")
-    updated_at = payload.get("updated_at", "")
+    agent_id = _yaml_escape(payload.get("agent_id", ""))
+    created_at = _yaml_escape(payload.get("created_at", ""))
+    updated_at = _yaml_escape(payload.get("updated_at", ""))
+    safe_id = _yaml_escape(point_id)
     # Score is not stored in the Qdrant payload — it only exists in search results.
     # We leave it blank; the sync script will not overwrite this field.
     score = payload.get("score", "")
@@ -264,7 +281,7 @@ def render_markdown(point_id: str, payload: dict) -> str:
     # (values may contain colons, brackets, or other YAML special characters).
     frontmatter_lines = [
         "---",
-        f'id: "{point_id}"',
+        f'id: "{safe_id}"',
         f'agent_id: "{agent_id}"',
         f"score: {score}",
         f'created_at: "{created_at}"',
@@ -309,7 +326,11 @@ def export_vault(adapter: "_QdrantAdapter", collection: str, user_id: str, vault
             continue
 
         md_content = render_markdown(point_id, payload)
-        dest = vault_dir / f"{point_id}.md"
+        dest = (vault_dir / f"{point_id}.md").resolve()
+        if not str(dest).startswith(str(vault_dir.resolve())):
+            print(f"[SKIP] {point_id}: unsafe path (contains path separators)", file=sys.stderr)
+            skipped += 1
+            continue
         dest.write_text(md_content, encoding="utf-8")
         written += 1
 
@@ -381,8 +402,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--api-key",
-        default=None,
-        help="Qdrant API key (HTTP mode only).",
+        default=os.environ.get("QDRANT_API_KEY"),
+        help="Qdrant API key (HTTP mode only). Also reads QDRANT_API_KEY env var.",
     )
     return parser.parse_args()
 
