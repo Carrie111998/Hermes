@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { group } from '@/components/pane-shell/tree/model'
 import { $layoutTree, reorderTreePane } from '@/components/pane-shell/tree/store'
+import type * as TreeStoreModule from '@/components/pane-shell/tree/store'
 import { openSessionTile } from '@/store/session-states'
 
 import { requestComposerInsertRefs } from './composer/focus'
@@ -17,10 +18,8 @@ import { startSessionDrag } from './session-drag'
 
 vi.mock('@/store/session-states', () => ({ openSessionTile: vi.fn() }))
 vi.mock('./composer/focus', () => ({ requestComposerInsertRefs: vi.fn() }))
-vi.mock('@/components/pane-shell/tree/store', async () => {
-  const actual = await vi.importActual<typeof import('@/components/pane-shell/tree/store')>(
-    '@/components/pane-shell/tree/store'
-  )
+vi.mock('@/components/pane-shell/tree/store', async importActual => {
+  const actual = await importActual<typeof TreeStoreModule>()
 
   return {
     ...actual,
