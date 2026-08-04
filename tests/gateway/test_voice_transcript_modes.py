@@ -92,7 +92,7 @@ class TestVoiceTranscriptSettings:
             "discord": {
                 "voice_transcript_destination": "file",
                 "voice_transcript_dir": str(tmp_path / "vc-logs"),
-                "voice_transcripts_to_agent": False,
+                "voice_transcript_agent_turns": False,
             }
         }
         with patch("hermes_cli.config.load_config", return_value=cfg):
@@ -113,7 +113,7 @@ class TestVoiceTranscriptSettings:
         cfg = {
             "discord": {
                 "voice_transcript_destination": "channel",
-                "voice_transcripts_to_agent": True,
+                "voice_transcript_agent_turns": True,
             }
         }
         runner._voice_transcript_prefs[DISCORD_KEY] = {
@@ -221,7 +221,7 @@ class TestVoiceChannelInputRouting:
             "discord": {
                 "voice_transcript_destination": destination,
                 "voice_transcript_dir": str(tmp_path / "vc-logs"),
-                "voice_transcripts_to_agent": to_agent,
+                "voice_transcript_agent_turns": to_agent,
             }
         }
 

@@ -18208,7 +18208,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             transcript_dir = str(
                 discord_cfg.get("voice_transcript_dir") or ""
             ).strip()
-            to_agent = bool(discord_cfg.get("voice_transcripts_to_agent", True))
+            to_agent = bool(discord_cfg.get("voice_transcript_agent_turns", True))
         except Exception as e:
             logger.debug("Could not load discord voice transcript config: %s", e)
         prefs = getattr(self, "_voice_transcript_prefs", {}).get(voice_key) or {}
@@ -18304,7 +18304,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 pass
 
-        # discord.voice_transcripts_to_agent = false: the transcript has been
+        # discord.voice_transcript_agent_turns = false: the transcript has been
         # captured above; skip agent dispatch entirely so the LLM never sees
         # voice input (passive stenographer). Typed messages in the bound text
         # channel still reach the agent normally.
