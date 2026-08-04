@@ -1066,6 +1066,20 @@ def _resolve_named_custom_runtime(
             pass
     if requested_norm == "custom" and explicit_base_url:
         base_url = explicit_base_url.strip().rstrip("/")
+        # An alias only carries a resolved URL, while a matching configured
+        # custom provider also owns its key, transport, and request settings.
+        # Recover that identity before falling back to the URL-only path.
+        # Keep an explicit session key when supplied for the same endpoint;
+        # direct-alias host changes intentionally call this without one.
+        configured_identity = find_custom_provider_identity(base_url)
+        if configured_identity:
+            configured_runtime = _resolve_named_custom_runtime(
+                requested_provider=configured_identity,
+                explicit_api_key=explicit_api_key,
+                explicit_base_url=base_url,
+            )
+            if configured_runtime:
+                return configured_runtime
         # Check credential pool first — mirrors the named-custom-provider path
         # so bare `provider: custom` with a configured custom_providers entry
         # also gets its api_key from the pool instead of env var fallbacks.
@@ -1075,9 +1089,13 @@ def _resolve_named_custom_runtime(
             return pool_result
         _da_is_openai_url   = base_url_host_matches(base_url, "openai.com") or base_url_host_matches(base_url, "openai.azure.com")
         _da_is_openrouter   = base_url_host_matches(base_url, "openrouter.ai")
+        # Match host, not substring — look-alikes must not receive OLLAMA_API_KEY
+        # (GHSA-76xc-57q6-vm5m). Mirrors the plain-custom path below.
+        _da_is_ollama_url   = base_url_host_matches(base_url, "ollama.com")
         api_key_candidates = [
             (explicit_api_key or "").strip(),
             # Gate env key fallbacks on authoritative hosts (#28660)
+            (_getenv("OLLAMA_API_KEY", "").strip()     if _da_is_ollama_url  else ""),
             (_getenv("OPENAI_API_KEY", "").strip()     if _da_is_openai_url else ""),
             (_getenv("OPENROUTER_API_KEY", "").strip() if _da_is_openrouter  else ""),
             # Bonus (#28660): derive `<VENDOR>_API_KEY` from the host so users
@@ -1089,9 +1107,16 @@ def _resolve_named_custom_runtime(
             (c for c in api_key_candidates if has_usable_secret(c)),
             "",
         ) or "no-key-required"
+        model_cfg = _get_model_config()
+        configured_base_url = _normalize_base_url_for_match(model_cfg.get("base_url"))
+        api_mode = (
+            _resolve_plain_custom_api_mode(model_cfg, base_url)
+            if configured_base_url == _normalize_base_url_for_match(base_url)
+            else _detect_api_mode_for_url(base_url) or "chat_completions"
+        )
         return {
             "provider": "custom",
-            "api_mode": _detect_api_mode_for_url(base_url) or "chat_completions",
+            "api_mode": api_mode,
             "base_url": base_url,
             "api_key": api_key,
             "source": "direct-alias",

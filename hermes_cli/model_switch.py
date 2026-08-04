@@ -1642,14 +1642,28 @@ def switch_model(
                 )
     else:
         try:
+            # Bare custom/local sessions carry their live endpoint in current_*.
+            # resolve_runtime_provider("custom") without an explicit/config URL
+            # falls through to the OpenRouter default, which would replace the
+            # session endpoint on a same-provider /model switch. Pass the
+            # session URL/key as explicit so resolution stays on this endpoint
+            # (credential pool can still rotate keys for that URL). Named
+            # custom:* providers and built-ins (OpenCode, etc.) omit these so
+            # config endpoint/key rotation and base_url tweaks still run.
+            _same_provider_kwargs: dict = {}
+            if current_provider in {"custom", "local"} and current_base_url:
+                _same_provider_kwargs["explicit_base_url"] = current_base_url
+                if current_api_key:
+                    _same_provider_kwargs["explicit_api_key"] = current_api_key
             runtime = resolve_runtime_provider(
                 requested=current_provider,
                 target_model=new_model,
+                **_same_provider_kwargs,
             )
-            # If resolution fell through to "custom" (e.g. named custom provider like
-            # "ollama-launch" that resolve_runtime_provider doesn't know), keep existing
-            # credentials. Otherwise use the resolved values (picks up credential rotation,
-            # base_url adjustments for OpenCode, etc.).
+            # Use resolver output as-is. Bare custom/local already pinned the
+            # live session endpoint via explicit_* above (blocks OpenRouter
+            # fallthrough). Broad empty-result refill from current_* is owned
+            # by #44502 - do not duplicate it here.
             api_key = runtime.get("api_key", "")
             base_url = runtime.get("base_url", "")
             api_mode = runtime.get("api_mode", "")
@@ -1661,8 +1675,30 @@ def switch_model(
         _ensure_direct_aliases()
         _da = DIRECT_ALIASES.get(resolved_alias)
         if _da is not None and _da.base_url:
-            base_url = _da.base_url
-            api_mode = ""  # clear so determine_api_mode re-detects from URL
+            alias_url = _da.base_url
+            # Same-provider bare custom/local may have just preserved the live
+            # session credential for the prior host. If the alias points at a
+            # different endpoint, drop that credential and re-resolve for host
+            # B (pool / host-gated env / host-derived key) before validation so
+            # key A is never probed against B, while authenticated aliases still
+            # get B's configured key. no-key-required only when B has none.
+            if (base_url or "").rstrip("/") != alias_url.rstrip("/"):
+                try:
+                    runtime = resolve_runtime_provider(
+                        requested=target_provider,
+                        target_model=new_model,
+                        explicit_base_url=alias_url,
+                    )
+                    api_key = runtime.get("api_key", "") or "no-key-required"
+                    api_mode = runtime.get("api_mode", "") or ""
+                except Exception:
+                    api_key = "no-key-required"
+                    api_mode = ""
+            else:
+                api_mode = ""  # clear so determine_api_mode re-detects from URL
+                if not api_key:
+                    api_key = "no-key-required"
+            base_url = alias_url
             if not api_key:
                 api_key = "no-key-required"
 

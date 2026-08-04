@@ -897,3 +897,576 @@ def test_excluded_providers_hides_builtin_row(monkeypatch):
     )
 
 
+# ---------------------------------------------------------------------------
+# Same-provider bare custom: keep session endpoint (no OpenRouter fallthrough)
+# ---------------------------------------------------------------------------
+
+
+def _clear_provider_env(monkeypatch) -> None:
+    for key in (
+        "OPENROUTER_API_KEY",
+        "OPENROUTER_BASE_URL",
+        "OPENAI_API_KEY",
+        "CUSTOM_BASE_URL",
+        "CUSTOM_API_KEY",
+        "HERMES_INFERENCE_PROVIDER",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+
+def test_same_provider_bare_custom_keeps_session_endpoint(tmp_path, monkeypatch):
+    """Same-provider /model on bare custom must not fall through to OpenRouter.
+
+    Without a trustworthy config model.base_url, resolve_runtime_provider("custom")
+    defaults to OpenRouter. Session-only custom endpoints must keep current_*.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _clear_provider_env(monkeypatch)
+    monkeypatch.setattr(
+        "hermes_cli.models.validate_requested_model",
+        lambda *a, **k: _MOCK_VALIDATION,
+    )
+    monkeypatch.setattr("hermes_cli.model_switch.get_model_info", lambda *a, **k: None)
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.get_model_capabilities", lambda *a, **k: None
+    )
+
+    session_url = "https://my-private-llm.example.com/v1"
+    session_key = "sk-session-custom-key"
+    result = switch_model(
+        raw_input="model-b",
+        current_provider="custom",
+        current_model="model-a",
+        current_api_key=session_key,
+        current_base_url=session_url,
+    )
+
+    assert result.success is True
+    assert result.base_url.rstrip("/") == session_url
+    assert result.api_key == session_key
+    assert "openrouter.ai" not in (result.base_url or "").lower()
+
+
+def test_same_provider_bare_custom_passes_session_creds_to_resolve(
+    tmp_path, monkeypatch
+):
+    """Bare-custom same-provider resolve must receive explicit session URL/key."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _clear_provider_env(monkeypatch)
+    monkeypatch.setattr(
+        "hermes_cli.models.validate_requested_model",
+        lambda *a, **k: _MOCK_VALIDATION,
+    )
+    monkeypatch.setattr("hermes_cli.model_switch.get_model_info", lambda *a, **k: None)
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.get_model_capabilities", lambda *a, **k: None
+    )
+
+    captured: dict = {}
+
+    def _fake_resolve(**kwargs):
+        captured.update(kwargs)
+        return {
+            "provider": "custom",
+            "api_key": kwargs.get("explicit_api_key") or "",
+            "base_url": kwargs.get("explicit_base_url") or "",
+            "api_mode": "chat_completions",
+        }
+
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider", _fake_resolve
+    )
+
+    session_url = "https://my-private-llm.example.com/v1"
+    session_key = "sk-session-custom-key"
+    result = switch_model(
+        raw_input="model-b",
+        current_provider="custom",
+        current_model="model-a",
+        current_api_key=session_key,
+        current_base_url=session_url,
+    )
+
+    assert result.success is True
+    assert captured.get("explicit_base_url") == session_url
+    assert captured.get("explicit_api_key") == session_key
+    assert captured.get("requested") == "custom"
+
+
+def test_same_provider_named_provider_does_not_force_session_url(
+    tmp_path, monkeypatch
+):
+    """Non-custom same-provider switches must not pin explicit session URL.
+
+    OpenCode and similar providers still need resolve-time base_url adjustments.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _clear_provider_env(monkeypatch)
+    monkeypatch.setattr(
+        "hermes_cli.models.validate_requested_model",
+        lambda *a, **k: _MOCK_VALIDATION,
+    )
+    monkeypatch.setattr("hermes_cli.model_switch.get_model_info", lambda *a, **k: None)
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.get_model_capabilities", lambda *a, **k: None
+    )
+
+    captured: dict = {}
+
+    def _fake_resolve(**kwargs):
+        captured.update(kwargs)
+        return {
+            "provider": "opencode-go",
+            "api_key": "sk-rotated",
+            "base_url": "https://api.opencode-go.com/v2",
+            "api_mode": "chat_completions",
+        }
+
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider", _fake_resolve
+    )
+
+    result = switch_model(
+        raw_input="kimi-k2.5",
+        current_provider="opencode-go",
+        current_model="mimo-v2.5",
+        current_api_key="sk-old",
+        current_base_url="https://api.opencode-go.com/v1",
+    )
+
+    assert result.success is True
+    assert "explicit_base_url" not in captured or captured.get("explicit_base_url") in (
+        None,
+        "",
+    )
+    assert result.base_url == "https://api.opencode-go.com/v2"
+    assert result.api_key == "sk-rotated"
+
+
+def test_same_provider_empty_resolve_does_not_refill_from_session(
+    tmp_path, monkeypatch
+):
+    """Empty resolver output must not be refilled from current_* here.
+
+    Broad empty-result credential preservation is owned by #44502. This PR
+    only blocks non-empty OpenRouter fallthrough for bare custom/local via
+    explicit_*; non-custom same-provider switches keep resolver values as-is.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _clear_provider_env(monkeypatch)
+    monkeypatch.setattr(
+        "hermes_cli.models.validate_requested_model",
+        lambda *a, **k: _MOCK_VALIDATION,
+    )
+    monkeypatch.setattr("hermes_cli.model_switch.get_model_info", lambda *a, **k: None)
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.get_model_capabilities", lambda *a, **k: None
+    )
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda **kwargs: {
+            "provider": "opencode-go",
+            "api_key": "",
+            "base_url": "",
+            "api_mode": "",
+        },
+    )
+
+    result = switch_model(
+        raw_input="kimi-k2.5",
+        current_provider="opencode-go",
+        current_model="mimo-v2.5",
+        current_api_key="sk-session-key",
+        current_base_url="https://api.opencode-go.com/v1",
+    )
+
+    assert result.success is True
+    assert result.api_key != "sk-session-key"
+    assert (result.base_url or "") != "https://api.opencode-go.com/v1"
+
+
+def test_same_provider_named_custom_adopts_rotated_config_creds(
+    tmp_path, monkeypatch
+):
+    """Named custom:* same-provider /model must re-resolve config rotation.
+
+    Unlike bare custom, custom:relay has a durable config identity. Stale
+    session URL/key must not pin over a rotated configured endpoint/key.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _clear_provider_env(monkeypatch)
+    (tmp_path / "config.yaml").write_text(
+        "custom_providers:\n"
+        "- name: relay\n"
+        "  base_url: https://replacement.example/v1\n"
+        "  api_key: rotated-config-key\n"
+        "  model: model-a\n"
+    )
+    monkeypatch.setattr(
+        "hermes_cli.models.validate_requested_model",
+        lambda *a, **k: _MOCK_VALIDATION,
+    )
+    monkeypatch.setattr("hermes_cli.model_switch.get_model_info", lambda *a, **k: None)
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.get_model_capabilities", lambda *a, **k: None
+    )
+
+    captured: dict = {}
+    from hermes_cli.runtime_provider import resolve_runtime_provider as _real_resolve
+
+    def _spy_resolve(**kwargs):
+        captured.update(kwargs)
+        return _real_resolve(**kwargs)
+
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider", _spy_resolve
+    )
+
+    result = switch_model(
+        raw_input="model-b",
+        current_provider="custom:relay",
+        current_model="model-a",
+        current_api_key="old-session-key",
+        current_base_url="https://retired.example/v1",
+        custom_providers=[
+            {
+                "name": "relay",
+                "base_url": "https://replacement.example/v1",
+                "api_key": "rotated-config-key",
+                "model": "model-a",
+            }
+        ],
+    )
+
+    assert result.success is True
+    assert "explicit_base_url" not in captured or captured.get("explicit_base_url") in (
+        None,
+        "",
+    )
+    assert "explicit_api_key" not in captured or captured.get("explicit_api_key") in (
+        None,
+        "",
+    )
+    assert result.base_url.rstrip("/") == "https://replacement.example/v1"
+    assert result.api_key == "rotated-config-key"
+
+
+def test_same_provider_direct_alias_does_not_send_session_key_to_alias_host(
+    tmp_path, monkeypatch
+):
+    """Direct-alias host change must not reuse the prior session credential.
+
+    Bare-custom same-provider switches preserve session URL/key to avoid
+    OpenRouter fallthrough. When a same-provider direct alias then replaces
+    only base_url, that preserved key must not be validated or returned for
+    the alias host.
+    """
+    import hermes_cli.model_switch as ms
+    from hermes_cli.model_switch import DirectAlias
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _clear_provider_env(monkeypatch)
+
+    session_url = "https://endpoint-a.example/v1"
+    session_key = "sk-endpoint-a-private"
+    alias_url = "https://endpoint-b.example/v1"
+
+    monkeypatch.setattr(
+        ms,
+        "DIRECT_ALIASES",
+        {
+            "alias-b": DirectAlias("model-on-b", "custom", alias_url),
+        },
+    )
+    monkeypatch.setattr(
+        ms,
+        "resolve_alias",
+        lambda raw, prov: ("custom", "model-on-b", "alias-b"),
+    )
+
+    validation_calls: list[dict] = []
+
+    def _capture_validate(model_name, provider, **kwargs):
+        validation_calls.append(
+            {
+                "model_name": model_name,
+                "provider": provider,
+                "api_key": kwargs.get("api_key"),
+                "base_url": kwargs.get("base_url"),
+            }
+        )
+        return _MOCK_VALIDATION
+
+    monkeypatch.setattr(
+        "hermes_cli.models.validate_requested_model", _capture_validate
+    )
+    monkeypatch.setattr("hermes_cli.model_switch.get_model_info", lambda *a, **k: None)
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.get_model_capabilities", lambda *a, **k: None
+    )
+
+    result = switch_model(
+        raw_input="alias-b",
+        current_provider="custom",
+        current_model="model-a",
+        current_api_key=session_key,
+        current_base_url=session_url,
+    )
+
+    assert result.success is True
+    assert result.base_url.rstrip("/") == alias_url.rstrip("/")
+    assert result.api_key != session_key
+    assert validation_calls, "expected validate_requested_model to run"
+    for call in validation_calls:
+        assert (call["base_url"] or "").rstrip("/") == alias_url.rstrip("/")
+        assert call["api_key"] != session_key
+
+
+def test_same_provider_direct_alias_resolves_authenticated_endpoint_b_key(
+    tmp_path, monkeypatch
+):
+    """URL-changing direct alias must resolve endpoint B's configured key.
+
+    Clearing A's session credential is required, but immediately forcing
+    no-key-required rejects authenticated aliases (e.g. host-derived vendor
+    keys / Ollama Cloud) even when B's key is configured.
+    """
+    import hermes_cli.model_switch as ms
+    from hermes_cli.model_switch import DirectAlias
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _clear_provider_env(monkeypatch)
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    monkeypatch.delenv("OLLAMA_API_KEY", raising=False)
+
+    session_url = "https://endpoint-a.example/v1"
+    session_key = "sk-endpoint-a-private"
+    alias_url = "https://api.deepseek.com/v1"
+    endpoint_b_key = "sk-endpoint-b-deepseek"
+
+    monkeypatch.setenv("DEEPSEEK_API_KEY", endpoint_b_key)
+    monkeypatch.setattr(
+        ms,
+        "DIRECT_ALIASES",
+        {
+            "alias-b": DirectAlias("deepseek-chat", "custom", alias_url),
+        },
+    )
+    monkeypatch.setattr(
+        ms,
+        "resolve_alias",
+        lambda raw, prov: ("custom", "deepseek-chat", "alias-b"),
+    )
+
+    validation_calls: list[dict] = []
+
+    def _capture_validate(model_name, provider, **kwargs):
+        validation_calls.append(
+            {
+                "model_name": model_name,
+                "provider": provider,
+                "api_key": kwargs.get("api_key"),
+                "base_url": kwargs.get("base_url"),
+            }
+        )
+        return _MOCK_VALIDATION
+
+    monkeypatch.setattr(
+        "hermes_cli.models.validate_requested_model", _capture_validate
+    )
+    monkeypatch.setattr("hermes_cli.model_switch.get_model_info", lambda *a, **k: None)
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.get_model_capabilities", lambda *a, **k: None
+    )
+
+    result = switch_model(
+        raw_input="alias-b",
+        current_provider="custom",
+        current_model="model-a",
+        current_api_key=session_key,
+        current_base_url=session_url,
+    )
+
+    assert result.success is True
+    assert result.base_url.rstrip("/") == alias_url.rstrip("/")
+    assert result.api_key == endpoint_b_key
+    assert result.api_key != session_key
+    assert result.api_key != "no-key-required"
+    assert validation_calls, "expected validate_requested_model to run"
+    for call in validation_calls:
+        assert (call["base_url"] or "").rstrip("/") == alias_url.rstrip("/")
+        assert call["api_key"] == endpoint_b_key
+
+
+def test_same_provider_direct_alias_resolves_ollama_cloud_key(
+    tmp_path, monkeypatch
+):
+    """Authenticated Ollama Cloud aliases must pick up OLLAMA_API_KEY for B."""
+    import hermes_cli.model_switch as ms
+    from hermes_cli.model_switch import DirectAlias
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _clear_provider_env(monkeypatch)
+    monkeypatch.delenv("OLLAMA_API_KEY", raising=False)
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+
+    session_url = "https://endpoint-a.example/v1"
+    session_key = "sk-endpoint-a-private"
+    alias_url = "https://ollama.com/v1"
+    ollama_key = "sk-ollama-cloud-b"
+
+    monkeypatch.setenv("OLLAMA_API_KEY", ollama_key)
+    monkeypatch.setattr(
+        ms,
+        "DIRECT_ALIASES",
+        {
+            "cloud-llama": DirectAlias("llama3.2", "custom", alias_url),
+        },
+    )
+    monkeypatch.setattr(
+        ms,
+        "resolve_alias",
+        lambda raw, prov: ("custom", "llama3.2", "cloud-llama"),
+    )
+
+    validation_calls: list[dict] = []
+
+    def _capture_validate(model_name, provider, **kwargs):
+        validation_calls.append(
+            {
+                "api_key": kwargs.get("api_key"),
+                "base_url": kwargs.get("base_url"),
+            }
+        )
+        return _MOCK_VALIDATION
+
+    monkeypatch.setattr(
+        "hermes_cli.models.validate_requested_model", _capture_validate
+    )
+    monkeypatch.setattr("hermes_cli.model_switch.get_model_info", lambda *a, **k: None)
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.get_model_capabilities", lambda *a, **k: None
+    )
+
+    result = switch_model(
+        raw_input="cloud-llama",
+        current_provider="custom",
+        current_model="model-a",
+        current_api_key=session_key,
+        current_base_url=session_url,
+    )
+
+    assert result.success is True
+    assert result.base_url.rstrip("/") == alias_url.rstrip("/")
+    assert result.api_key == ollama_key
+    assert result.api_key != session_key
+    assert validation_calls
+    for call in validation_calls:
+        assert call["api_key"] == ollama_key
+
+
+def test_direct_alias_uses_matching_custom_provider_credentials_and_transport(
+    tmp_path, monkeypatch
+):
+    """A direct alias must recover B's configured custom-provider settings."""
+    import hermes_cli.model_switch as ms
+    from hermes_cli.model_switch import DirectAlias
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _clear_provider_env(monkeypatch)
+    monkeypatch.setenv("RELAY_B_KEY", "relay-b-config-key")
+    (tmp_path / "config.yaml").write_text(
+        "custom_providers:\n"
+        "- name: Relay B\n"
+        "  base_url: https://relay-b.example/v1\n"
+        "  key_env: RELAY_B_KEY\n"
+        "  api_mode: anthropic_messages\n"
+    )
+    monkeypatch.setattr(
+        ms,
+        "DIRECT_ALIASES",
+        {
+            "relay-model": DirectAlias(
+                "claude-compatible-model",
+                "custom",
+                "https://relay-b.example/v1",
+            ),
+        },
+    )
+    monkeypatch.setattr(
+        ms,
+        "resolve_alias",
+        lambda raw, prov: ("custom", "claude-compatible-model", "relay-model"),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.models.validate_requested_model",
+        lambda *a, **k: _MOCK_VALIDATION,
+    )
+    monkeypatch.setattr("hermes_cli.model_switch.get_model_info", lambda *a, **k: None)
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.get_model_capabilities", lambda *a, **k: None
+    )
+
+    result = switch_model(
+        raw_input="relay-model",
+        current_provider="custom",
+        current_model="model-a",
+        current_api_key="endpoint-a-key",
+        current_base_url="https://endpoint-a.example/v1",
+    )
+
+    assert result.success is True
+    assert result.base_url == "https://relay-b.example/v1"
+    assert result.api_key == "relay-b-config-key"
+    assert result.api_mode == "anthropic_messages"
+
+
+def test_same_provider_bare_custom_preserves_configured_api_mode(
+    tmp_path, monkeypatch
+):
+    """Explicit session URL resolution must retain the custom endpoint transport."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _clear_provider_env(monkeypatch)
+    (tmp_path / "config.yaml").write_text(
+        "model:\n"
+        "  provider: custom\n"
+        "  base_url: https://relay.example/v1\n"
+        "  api_mode: anthropic_messages\n"
+    )
+    monkeypatch.setattr(
+        "hermes_cli.models.validate_requested_model",
+        lambda *a, **k: _MOCK_VALIDATION,
+    )
+    monkeypatch.setattr("hermes_cli.model_switch.get_model_info", lambda *a, **k: None)
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.get_model_capabilities", lambda *a, **k: None
+    )
+
+    result = switch_model(
+        raw_input="model-b",
+        current_provider="custom",
+        current_model="model-a",
+        current_api_key="relay-session-key",
+        current_base_url="https://relay.example/v1",
+    )
+
+    assert result.success is True
+    assert result.api_mode == "anthropic_messages"
+
+
+def test_custom_provider_key_is_accepted_by_provider_resolution():
+    """A persisted providers: key remains a valid custom provider slug."""
+    pdef = resolve_provider_full(
+        "custom:stable-relay",
+        user_providers={},
+        custom_providers=[
+            {
+                "name": "Friendly Relay",
+                "provider_key": "stable-relay",
+                "base_url": "https://relay.example/v1",
+            },
+        ],
+    )
+
+    assert pdef is not None
+    assert pdef.id == "custom:stable-relay"

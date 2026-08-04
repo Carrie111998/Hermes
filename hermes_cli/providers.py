@@ -813,11 +813,12 @@ def resolve_custom_provider(
             )
 
         slug = custom_provider_slug(display_name, provider_key)
+        provider_key_slug = custom_provider_slug(provider_key) if provider_key else ""
         if requested not in custom_provider_aliases(display_name, provider_key):
             continue
 
         return ProviderDef(
-            id=slug,
+            id=provider_key_slug if requested in {provider_key.lower(), provider_key_slug} else slug,
             name=display_name,
             transport="openai_chat",
             api_key_env_vars=tuple(env_vars),
