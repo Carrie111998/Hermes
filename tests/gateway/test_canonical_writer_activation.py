@@ -197,6 +197,15 @@ def test_native_install_creates_exact_root_parents_before_artifacts(monkeypatch)
             gid=0,
             maximum_bytes=1024,
         ),
+        "phase_b_readiness_unit": activation.InstallArtifact(
+            source_path=Path("/stage/readiness.service"),
+            target_path=Path("/etc/systemd/system/readiness.service"),
+            sha256=digest,
+            mode=0o644,
+            uid=0,
+            gid=0,
+            maximum_bytes=1024,
+        ),
         "gateway_unit": activation.InstallArtifact(
             source_path=Path("/stage/gateway.service"),
             target_path=Path("/etc/systemd/system/gateway.service"),
@@ -240,12 +249,77 @@ def test_native_install_creates_exact_root_parents_before_artifacts(monkeypatch)
     ]
     assert events[3:] == [
         ("install", artifacts[name].target_path)
-        for name in ("writer_config", "gateway_config", "writer_unit", "gateway_unit")
+        for name in (
+            "writer_config",
+            "gateway_config",
+            "writer_unit",
+            "phase_b_readiness_unit",
+            "gateway_unit",
+        )
     ]
     assert created == tuple(
         artifacts[name].target_path
-        for name in ("writer_config", "gateway_config", "writer_unit", "gateway_unit")
+        for name in (
+            "writer_config",
+            "gateway_config",
+            "writer_unit",
+            "phase_b_readiness_unit",
+            "gateway_unit",
+        )
     )
+
+
+def test_native_observation_prestart_rollback_unlinks_exact_reverse_order(
+    monkeypatch,
+):
+    paths = (
+        Path("/etc/muncho-canonical-writer/writer.json"),
+        Path("/etc/systemd/system/muncho-canonical-writer.service"),
+        Path(
+            "/etc/systemd/system/"
+            "muncho-canonical-writer-phase-b-readiness.service"
+        ),
+    )
+    artifacts = {
+        f"artifact-{index}": activation.InstallArtifact(
+            source_path=Path(f"/stage/{index}"),
+            target_path=path,
+            sha256=str(index + 1) * 64,
+            mode=0o644,
+            uid=0,
+            gid=0,
+            maximum_bytes=1024,
+        )
+        for index, path in enumerate(paths)
+    }
+    events = []
+    monkeypatch.setattr(
+        activation,
+        "_native_artifact_contract",
+        lambda _plan: artifacts,
+    )
+    monkeypatch.setattr(
+        activation,
+        "_unlink_exact",
+        lambda path, **kwargs: events.append(("unlink", path, kwargs["sha256"])),
+    )
+
+    def runner(command):
+        events.append(("command", command.argv))
+        return subprocess.CompletedProcess(command.argv, 0, b"", b"")
+
+    activation._rollback_native_observation_artifacts(
+        activation.NativeObservationPlan(value={}),
+        paths,
+        runner=runner,
+    )
+
+    assert events == [
+        ("unlink", paths[2], "3" * 64),
+        ("unlink", paths[1], "2" * 64),
+        ("unlink", paths[0], "1" * 64),
+        ("command", (activation.SYSTEMCTL, "daemon-reload")),
+    ]
 
 
 @pytest.mark.parametrize(

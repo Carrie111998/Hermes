@@ -316,6 +316,7 @@ def test_apply_seals_terminal_receipt_without_install_or_start(tmp_path, monkeyp
             "writer_config": {"sha256": "1" * 64},
             "gateway_config": {"sha256": "2" * 64},
             "writer_unit": {"sha256": "3" * 64},
+            "phase_b_readiness_unit": {"sha256": "5" * 64},
             "gateway_unit": {"sha256": "4" * 64},
         },
     )
@@ -650,6 +651,7 @@ def test_apply_retry_is_safe_after_every_durable_boundary(
             "writer_config": {"sha256": "1" * 64},
             "gateway_config": {"sha256": "2" * 64},
             "writer_unit": {"sha256": "3" * 64},
+            "phase_b_readiness_unit": {"sha256": "5" * 64},
             "gateway_unit": {"sha256": "4" * 64},
         },
     )

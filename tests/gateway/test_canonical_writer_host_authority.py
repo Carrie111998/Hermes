@@ -45,6 +45,14 @@ def _plan_mapping():
             "path": "/etc/systemd/system/muncho-canonical-writer.service",
             "sha256": "4" * 64,
         },
+        "phase_b_readiness_unit": {
+            "name": "muncho-canonical-writer-phase-b-readiness.service",
+            "path": (
+                "/etc/systemd/system/"
+                "muncho-canonical-writer-phase-b-readiness.service"
+            ),
+            "sha256": "a" * 64,
+        },
         "gateway_argv": [
             interpreter,
             "-B",

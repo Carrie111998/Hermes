@@ -821,9 +821,9 @@ def _validate_native_binding(
     expected_units = _expected_unit_bytes(str(plan["revision"]))
     expected_digests = {
         DEFAULT_STAGED_WRITER_UNIT_PATH: native.value["writer_unit"]["sha256"],
-        DEFAULT_STAGED_PHASE_B_READINESS_UNIT_PATH: _sha256_bytes(
-            expected_units[DEFAULT_STAGED_PHASE_B_READINESS_UNIT_PATH]
-        ),
+        DEFAULT_STAGED_PHASE_B_READINESS_UNIT_PATH: native.value[
+            "phase_b_readiness_unit"
+        ]["sha256"],
         DEFAULT_STAGED_GATEWAY_UNIT_PATH: native.value["gateway_unit"]["sha256"],
     }
     for path, payload in expected_units.items():
@@ -1242,11 +1242,7 @@ def _receipt_artifacts(native: NativeObservationPlan) -> Mapping[str, Any]:
         != native.value["gateway_config"]["sha256"]
         or result["writer_unit"]["sha256"] != native.value["writer_unit"]["sha256"]
         or result["phase_b_readiness_unit"]["sha256"]
-        != _sha256_bytes(
-            _expected_unit_bytes(str(native.value["revision"]))[
-                DEFAULT_STAGED_PHASE_B_READINESS_UNIT_PATH
-            ]
-        )
+        != native.value["phase_b_readiness_unit"]["sha256"]
         or result["gateway_unit"]["sha256"] != native.value["gateway_unit"]["sha256"]
         or result["native_observation_plan"]["sha256"] != native.sha256
     ):
