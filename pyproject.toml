@@ -369,7 +369,17 @@ override-dependencies = [
   "pynacl>=1.6,<1.7",
 ]
 exclude-newer = "14 days"
-exclude-newer-package = { vercel = false, nemo-relay = false, huggingface_hub = false }
+# Keep the rolling snapshot for transitive dependencies, but never filter out
+# packages pinned by this project or required to build it. Exact pins are
+# reviewed in the lockfile and must remain installable immediately after release.
+exclude-newer-package = {
+  vercel = false,
+  nemo-relay = false,
+  huggingface_hub = false,
+  pillow = false,
+  setuptools = false,
+  mcp = false,
+}
 
 [tool.setuptools]
 # Top-level single-file modules (not packages). Without this, uv2nix's
