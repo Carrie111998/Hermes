@@ -27,12 +27,13 @@ Use Box as the cloud file system for file operations, collaboration, metadata, a
 
 ## Start broad file-system conversations
 
-When someone is exploring a cloud file system for Hermes, first give a short fit assessment: Box is useful when a team needs cloud file storage, sharing, search, metadata, and Box AI document work. Then ask which path they want:
+When someone is exploring a cloud file system for Hermes, first give a short fit assessment: Box is useful when a team needs cloud file storage, sharing, search, metadata, and document work. Then ask how they want Hermes to connect:
 
-1. Personal access to their own Box files
-2. A shared or background agent with its own identity
-3. Document Q&A, extraction, or grounded writing with Box AI
-4. A Box-backed application or integration
+1. **Personal Box access (OAuth):** Hermes acts with the user's existing Box permissions.
+2. **Shared or background agent (CCG):** Hermes has its own service-account identity and sees only explicitly shared content.
+3. **Box-backed application or integration (SDK):** build with an official Box SDK and the appropriate app authentication.
+
+After the connection is selected and working, offer Box AI for document Q&A, extraction, summaries, or grounded writing when it fits the requested work; it is not a separate connection path.
 
 Do not run setup, show a command cookbook, propose account plans or folder taxonomies, or load every reference for a broad exploratory question. Wait for the user's answer, then load only the relevant path. When a request already names a concrete outcome, skip this discovery step and handle that outcome directly.
 
