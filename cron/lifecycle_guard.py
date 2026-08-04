@@ -253,6 +253,31 @@ def _resolve_script_directory(script_path: str) -> Optional[str]:
     return None
 
 
+def _is_known_binary_format(data: bytes) -> bool:
+    """Return True if *data* starts with a well-known binary magic prefix."""
+    # ELF
+    if data[:4] == b"\x7fELF":
+        return True
+    # Mach-O (32/64-bit, big/little-endian)
+    if data[:4] in {
+        b"\xfe\xed\xfa\xce",
+        b"\xfe\xed\xfa\xcf",
+        b"\xce\xfa\xed\xfe",
+        b"\xcf\xfa\xed\xfe",
+    }:
+        return True
+    # PE / DOS MZ executable
+    if data[:2] == b"MZ":
+        return True
+    # Java class file
+    if data[:4] == b"\xca\xfe\xba\xbe":
+        return True
+    # WebAssembly
+    if data[:4] == b"\x00asm":
+        return True
+    return False
+
+
 def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
     """Return ``(text, unsafe)`` using bounded, regular-file-only reads."""
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
@@ -272,14 +297,21 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
         return None, False
     finally:
         os.close(descriptor)
-    # A NUL byte in the first chunk means this is a binary (ELF/Mach-O/
-    # PE), not a shell script — scanning its decoded contents would
-    # tokenize machine code and feed junk paths into the recursion
-    # (including a `ValueError: embedded null byte` from Path.resolve,
-    # #76762). Treat it as "nothing to scan" rather than unsafe: a binary
-    # executed by the user is not a referenced *shell script*.
+    # A NUL byte in the first chunk *might* mean this is a binary
+    # (ELF/Mach-O/PE) whose decoded contents would tokenize as junk
+    # paths.  However, bash executes text scripts straight past an
+    # embedded NUL, so a single pad byte must not let the guard skip
+    # a script that still runs its lifecycle command (#77927).
+    #
+    # Distinguish by checking well-known binary magic bytes instead of
+    # the mere presence of any NUL.  If the file is not a recognized
+    # binary format, strip NULs and scan the remaining text.
     if b"\x00" in data:
-        return None, False
+        if _is_known_binary_format(data):
+            return None, False
+        # Text script with stray NUL(s) — strip them so downstream
+        # Path.resolve and regex matching cannot raise ValueError.
+        data = data.replace(b"\x00", b"")
     if len(data) > _MAX_REFERENCED_SCRIPT_BYTES:
         return None, True
     return data.decode("utf-8", errors="replace"), False
