@@ -155,10 +155,13 @@ def test_local_oauth_keeps_cli_in_control_and_uses_user_local_npm_install():
     )
     cli = (SKILL_DIR / "references" / "cli-guide.md").read_text(encoding="utf-8")
 
-    local_runner = 'npm exec --prefix "$HOME/.local/share/hermes-box-cli" -- box'
-    assert 'npm install --prefix "$HOME/.local/share/hermes-box-cli" @box/cli' in oauth
+    local_runner = 'npm exec --prefix "$BOX_CLI_HOME" -- box'
+    assert 'BOX_CLI_HOME="${HERMES_HOME:-$HOME/.hermes}/tools/box-cli"' in oauth
+    assert 'npm install --prefix "$BOX_CLI_HOME" @box/cli' in oauth
     assert local_runner in oauth
     assert local_runner in cli
+    assert "$boxCliHome = Join-Path" in cli
+    assert "tools\\box-cli" in cli
     assert "global npm install" in skill
     assert "Do not attempt a global npm install" in cli
     assert "Do not use browser tools" in oauth
@@ -166,4 +169,6 @@ def test_local_oauth_keeps_cli_in_control_and_uses_user_local_npm_install():
     assert "after the local callback path fails" not in oauth
 
     for markdown_file in SKILL_DIR.rglob("*.md"):
-        assert "npm install -g @box/cli" not in markdown_file.read_text(encoding="utf-8")
+        contents = markdown_file.read_text(encoding="utf-8")
+        assert "npm install -g @box/cli" not in contents
+        assert ".local/share/hermes-box-cli" not in contents

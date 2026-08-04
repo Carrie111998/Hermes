@@ -4,19 +4,20 @@ Use OAuth when one person wants Hermes to act with the same Box access they have
 
 ## Local desktop path (default)
 
-Treat a local desktop as the default unless the user says Hermes is running remotely or without a browser callback. If `box` is not already on `PATH`, install the CLI in Hermes' user-local directory; do not use a global npm install, `sudo`, an npm-prefix change, or a `PATH` change:
+Treat a local desktop as the default unless the user says Hermes is running remotely or without a browser callback. If `box` is not already on `PATH`, install the CLI under the current Hermes home at `tools/box-cli`; use the shell-specific setup in [CLI guide](cli-guide.md). On macOS/Linux, run:
 
 ```bash
-npm install --prefix "$HOME/.local/share/hermes-box-cli" @box/cli
-npm exec --prefix "$HOME/.local/share/hermes-box-cli" -- box --version
+BOX_CLI_HOME="${HERMES_HOME:-$HOME/.hermes}/tools/box-cli"
+npm install --prefix "$BOX_CLI_HOME" @box/cli
+npm exec --prefix "$BOX_CLI_HOME" -- box --version
 ```
 
 Use the same runner for every later Box command in this setup. Start one official local login operation without `--code`, leave its terminal process running until it exits, then verify the actor:
 
 ```bash
-npm exec --prefix "$HOME/.local/share/hermes-box-cli" -- \
+npm exec --prefix "$BOX_CLI_HOME" -- \
   box login --default-box-app --name hermes-oauth
-npm exec --prefix "$HOME/.local/share/hermes-box-cli" -- \
+npm exec --prefix "$BOX_CLI_HOME" -- \
   box users:get me --json --fields id,name,login
 ```
 

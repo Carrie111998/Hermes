@@ -4,26 +4,44 @@ Run Box commands through Hermes' `terminal` tool. Prefer the documented command 
 
 ## Use one command runner
 
-If `box` is on `PATH`, run the examples in this guide as written. If it is missing, install the CLI once in Hermes' user-local directory:
+If `box` is on `PATH`, run the examples in this guide as written. If it is missing, install the CLI once under the current Hermes home at `tools/box-cli`. `HERMES_HOME` is optional: Hermes uses its platform default when it is unset (`~/.hermes` on macOS/Linux and `%LOCALAPPDATA%\hermes` on Windows). Choose the command for the current shell.
+
+On macOS/Linux:
 
 ```bash
-npm install --prefix "$HOME/.local/share/hermes-box-cli" @box/cli
+BOX_CLI_HOME="${HERMES_HOME:-$HOME/.hermes}/tools/box-cli"
+npm install --prefix "$BOX_CLI_HOME" @box/cli
 ```
 
-Then run every example by replacing its leading `box` with:
+On Windows PowerShell:
 
-```bash
-npm exec --prefix "$HOME/.local/share/hermes-box-cli" -- box
+```powershell
+$boxCliHome = Join-Path $(if ($env:HERMES_HOME) { $env:HERMES_HOME } else { Join-Path $env:LOCALAPPDATA "hermes" }) "tools\box-cli"
+npm install --prefix $boxCliHome @box/cli
 ```
 
-For example:
+Keep the resolved directory for the whole task. Then run every example by replacing its leading `box` with the runner for the current shell.
+
+On macOS/Linux:
 
 ```bash
-npm exec --prefix "$HOME/.local/share/hermes-box-cli" -- \
+npm exec --prefix "$BOX_CLI_HOME" -- box
+```
+
+On Windows PowerShell:
+
+```powershell
+npm exec --prefix $boxCliHome -- box
+```
+
+For example on macOS/Linux:
+
+```bash
+npm exec --prefix "$BOX_CLI_HOME" -- \
   box users:get me --json --fields id,name,login
 ```
 
-Do not attempt a global npm install, use `sudo`, change npm's global prefix, or change `PATH`. Keep the same runner for the whole task.
+Do not attempt a global npm install, use `sudo`, change npm's global prefix, or change `PATH`.
 
 ## Check identity and control output
 
