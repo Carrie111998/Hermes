@@ -2094,10 +2094,8 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
     email_imap = getenv("EMAIL_IMAP_HOST")
     email_smtp = getenv("EMAIL_SMTP_HOST")
     if all([email_addr, email_pwd, email_imap, email_smtp]):
-        if Platform.EMAIL not in config.platforms:
-            config.platforms[Platform.EMAIL] = PlatformConfig()
-        config.platforms[Platform.EMAIL].enabled = True
-        config.platforms[Platform.EMAIL].extra.update({
+        email_config = _enable_from_env(Platform.EMAIL)
+        email_config.extra.update({
             "address": email_addr,
             "imap_host": email_imap,
             "smtp_host": email_smtp,
