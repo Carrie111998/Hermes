@@ -5761,7 +5761,17 @@ function installContextMenu(window) {
 // through getUserMedia, which Chromium gates behind these two session hooks.
 //
 // The naive `details.mediaTypes.includes('audio')` check works on macOS but
-
+// breaks on Windows: Chromium frequently fires the request with an empty or
+// undefined `mediaTypes`, so a strict check denies it and getUserMedia throws
+// NotAllowedError. We therefore allow the capture permissions and treat absent
+// metadata as allowed.
+//
+// Granting here is not the last gate: the OS still applies its own capture
+// permission (macOS TCC prompts on first use, per the NSMicrophone/NSCamera
+// usage strings), so the user keeps a real allow/deny and can revoke it in
+// System Settings afterwards.
+function isMediaCapturePermission(permission, details) {
+  if (permission === 'audioCapture' || permission === 'videoCapture') {
     return true
   }
 
@@ -5790,7 +5800,7 @@ function installMediaPermissions() {
   // Windows in addition to (or instead of) the request handler. Without it,
   // the check defaults to false and capture is denied before the request
   // handler ever runs.
-session.defaultSession.setPermissionCheckHandler((_webContents, permission, _origin, details) => {
+  session.defaultSession.setPermissionCheckHandler((_webContents, permission, _origin, details) => {
     if (permission === 'media' || isMediaCapturePermission(permission, details)) {
       // details.mediaType is a single string here (not the mediaTypes array).
       const mediaType = details?.mediaType
@@ -5803,7 +5813,6 @@ session.defaultSession.setPermissionCheckHandler((_webContents, permission, _ori
     }
 
     return false
-  })
   })
 }
 
