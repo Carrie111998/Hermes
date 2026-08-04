@@ -10,7 +10,11 @@ import sys
 import threading
 from pathlib import Path, PurePosixPath
 
-from agent.file_safety import find_git_worktree_pointer_file, get_read_block_error
+from agent.file_safety import (
+    find_git_managed_state_target,
+    find_git_worktree_pointer_file,
+    get_read_block_error,
+)
 from tools.binary_extensions import has_binary_extension
 from tools.file_operations import (
     ShellFileOperations,
@@ -716,6 +720,19 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
             "Writing here replaces the 'gitdir: <path>' link that attaches the "
             "worktree to its repository and severs the worktree from git. "
             "Use the terminal or git commands instead."
+        )
+    # Git-managed state inside ``.git`` DIRECTORIES (#78793): HEAD, index,
+    # refs/, objects/, logs/, packed-refs, *_HEAD and friends are
+    # git-owned state.  Replacing any of it via write_file / patch /
+    # delete / move corrupts branch identity and the repository; only
+    # user-owned entries git never rewrites (config, description,
+    # info/exclude, hooks/) stay writable.
+    if find_git_managed_state_target(resolved_real) is not None:
+        return (
+            f"Refusing to write to git-managed state: {filepath}\n"
+            "Writing here replaces repository state that git owns (branch "
+            "identity, refs, index) and corrupts the repository. "
+            "Use terminal git commands instead."
         )
     return None
 
