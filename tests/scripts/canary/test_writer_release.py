@@ -8,6 +8,7 @@ import stat
 import subprocess
 import sys
 import tomllib
+from contextlib import nullcontext
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -83,10 +84,15 @@ def test_writer_release_import_is_stdlib_only_before_venv_exists() -> None:
 
 
 @pytest.fixture(autouse=True)
-def _tmp_path_uses_process_primary_group(tmp_path):
+def _tmp_path_uses_process_primary_group(tmp_path, monkeypatch):
     """Keep BSD tmp-path group inheritance aligned with the test process."""
 
     os.chown(tmp_path, -1, os.getgid())
+    monkeypatch.setattr(
+        writer_release,
+        "host_release_lifecycle_lock",
+        lambda: nullcontext(),
+    )
 
 
 def _spec(tmp_path: Path) -> ReleaseBuildSpec:

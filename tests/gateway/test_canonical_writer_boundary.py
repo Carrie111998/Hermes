@@ -391,19 +391,29 @@ def test_replay_guard_rejects_same_request_id_after_reconnect(tmp_path):
 
 
 @pytest.mark.parametrize(
-    ("mutation", "expected"),
+    ("mutation", "deadline_offset_seconds", "expected"),
     [
-        ({"protocol": "canonical-writer.v0"}, ErrorCode.UNSUPPORTED_VERSION),
-        ({"request_id": "not-a-uuid"}, ErrorCode.INVALID_REQUEST_ID),
-        ({"deadline_unix_ms": 1}, ErrorCode.DEADLINE_EXPIRED),
         (
-            {"deadline_unix_ms": int((time.time() + 60) * 1000)},
+            {"protocol": "canonical-writer.v0"},
+            None,
+            ErrorCode.UNSUPPORTED_VERSION,
+        ),
+        ({"request_id": "not-a-uuid"}, None, ErrorCode.INVALID_REQUEST_ID),
+        ({"deadline_unix_ms": 1}, None, ErrorCode.DEADLINE_EXPIRED),
+        (
+            {},
+            60,
             ErrorCode.DEADLINE_TOO_FAR,
         ),
-        ({"token": "must-not-be-accepted"}, ErrorCode.INVALID_REQUEST),
+        ({"token": "must-not-be-accepted"}, None, ErrorCode.INVALID_REQUEST),
     ],
 )
-def test_strict_request_metadata_is_enforced(tmp_path, mutation, expected):
+def test_strict_request_metadata_is_enforced(
+    tmp_path,
+    mutation,
+    deadline_offset_seconds,
+    expected,
+):
     server, thread, socket_path = _start_server(tmp_path)
     request = make_request(
         CanonicalWriterOperation.PING,
@@ -412,6 +422,13 @@ def test_strict_request_metadata_is_enforced(tmp_path, mutation, expected):
         sequence=1,
         timeout_seconds=2,
     ).to_message()
+    if deadline_offset_seconds is not None:
+        mutation = {
+            **mutation,
+            "deadline_unix_ms": int(
+                (time.time() + deadline_offset_seconds) * 1000
+            ),
+        }
     request.update(mutation)
     try:
         with _connect(socket_path) as conn:

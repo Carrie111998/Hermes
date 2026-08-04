@@ -63,6 +63,10 @@ from gateway.canonical_projection_export import (
     validate_projection_export,
 )
 from gateway.canonical_writer_release_contract import MAX_RELEASE_FILE_BYTES
+from gateway.canonical_writer_lifecycle_lock import (
+    HOST_LIFECYCLE_LOCK_PATH,
+    host_release_lifecycle_lock,
+)
 
 
 ACTIVATION_PLAN_SCHEMA = "muncho-writer-only-activation-plan.v4"
@@ -102,7 +106,7 @@ CANARY_SOCKET_CLIENT_GID = 990
 CANARY_PROJECTOR_GID = 991
 CANARY_PROJECTOR_UID = 992
 PROJECTOR_USER = "muncho-projector"
-ACTIVATION_LOCK_PATH = Path("/run/muncho-writer-activation.lock")
+ACTIVATION_LOCK_PATH = HOST_LIFECYCLE_LOCK_PATH
 
 DEFAULT_PLAN_PATH = Path("/etc/muncho/writer-activation/activation-plan.json")
 DEFAULT_STAGED_PLAN_PATH = Path(
@@ -293,55 +297,8 @@ def _require_root_linux() -> None:
 @contextmanager
 def _host_activation_lock():
     """Serialize every identity/systemd/evidence lifecycle on this host."""
-
-    _require_root_linux()
-    _validate_root_parent_chain(ACTIVATION_LOCK_PATH.parent)
-    base_flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
-    if hasattr(os, "O_NOFOLLOW"):
-        base_flags |= os.O_NOFOLLOW
-    created = False
-    try:
-        descriptor = os.open(
-            ACTIVATION_LOCK_PATH,
-            base_flags | os.O_CREAT | os.O_EXCL,
-            0o600,
-        )
-        created = True
-    except FileExistsError:
-        descriptor = os.open(ACTIVATION_LOCK_PATH, base_flags)
-    try:
-        if created:
-            os.fchown(descriptor, 0, 0)
-            os.fchmod(descriptor, 0o600)
-            os.fsync(descriptor)
-            _fsync_directory(ACTIVATION_LOCK_PATH.parent)
-        item = os.fstat(descriptor)
-        reached = os.lstat(ACTIVATION_LOCK_PATH)
-        if (
-            not stat.S_ISREG(item.st_mode)
-            or item.st_nlink != 1
-            or item.st_uid != 0
-            or item.st_gid != 0
-            or stat.S_IMODE(item.st_mode) != 0o600
-            or (item.st_dev, item.st_ino) != (reached.st_dev, reached.st_ino)
-            or _list_xattrs(ACTIVATION_LOCK_PATH)
-        ):
-            raise PermissionError("activation lock identity is invalid")
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
-            raise RuntimeError(
-                "another writer activation lifecycle is running"
-            ) from exc
-        # Internal callers that compose more than one activation primitive
-        # need the exact open file description, not a second open of the same
-        # path.  Existing callers deliberately ignore the yielded value.
+    with host_release_lifecycle_lock(ACTIVATION_LOCK_PATH) as descriptor:
         yield descriptor
-    finally:
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
-        finally:
-            os.close(descriptor)
 
 
 def _validate_root_parent_chain(
