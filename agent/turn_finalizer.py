@@ -670,7 +670,8 @@ def finalize_turn(
     # (and desktop can toast disk-full) instead of a quiet complete frame.
     if failed and str(_turn_exit_reason) == "session_persistence_failed":
         result["error"] = final_response or (
-            "session storage could not be written — free disk space and try again"
+            "session storage could not be written — a long context compression "
+            "may be in progress; wait a moment and try again"
         )
     # Surface any post-loop cleanup failures so the caller can distinguish a
     # clean turn from one whose trajectory/session/resource teardown raised

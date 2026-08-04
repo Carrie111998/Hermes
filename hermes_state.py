@@ -1819,7 +1819,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     # a writer that is still locked out after this budget must still be
     # refused rather than allowed to land a stale turn in a session whose
     # compression is genuinely long-running or wedged.
-    _COMPRESSION_BUSY_WAIT_S = 5.0
+    _COMPRESSION_BUSY_WAIT_S = 300.0
     _WRITE_RETRY_MIN_S = 0.020   # 20ms
     _WRITE_RETRY_MAX_S = 0.150   # 150ms
     _WRITE_RETRY_SLOW_AFTER_S = 2.0
@@ -2474,15 +2474,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     self._try_incremental_merge_fts()
                 return result
             except SessionCompressionInProgressError:
-                # A live foreign compression lock is transient: the compressor
-                # publishes in a couple of seconds. Without any wait, a steer
-                # that lands mid-compression aborts the user's turn as
-                # session_persistence_failed and sends the operator hunting
-                # disk space that was never the problem (#75083).
+                # A live foreign compression lock is transient but can last
+                # minutes: LLM-streamed context compression routinely takes
+                # 2-10 minutes (observed 129s-148s with ceiling 600s).
+                # Without any wait, a steer that lands mid-compression aborts
+                # the user's turn as session_persistence_failed and sends the
+                # operator hunting disk space that was never the problem
+                # (#75083, #77386).
                 #
                 # The budget is _COMPRESSION_BUSY_WAIT_S, not the write-lock
                 # patience: the lease is a correctness boundary, so a writer
-                # still locked out after a short wait must be refused rather
+                # still locked out after the wait must be refused rather
                 # than left to land a stale turn once a long-running or wedged
                 # compression finally lets go.
                 if compression_deadline is None:
